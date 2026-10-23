@@ -384,7 +384,10 @@ mod tests {
 
         let de: ModelEscalatedEvent = serde_json::from_str(&json).unwrap();
         assert_eq!(de.operation_id, "op-1");
-        assert_eq!(de.model, ModelRef::openrouter("anthropic/claude-3.7-sonnet"));
+        assert_eq!(
+            de.model,
+            ModelRef::openrouter("anthropic/claude-3.7-sonnet")
+        );
         assert!(matches!(de.role, Some(ModelRole::Coder)));
         assert_eq!(de.alias.as_deref(), Some("deep"));
         assert!(matches!(de.effort, Some(ReasoningEffort::High)));

@@ -8,10 +8,10 @@ use std::sync::OnceLock;
 
 use tauqe_protocol::{
     DiscussionPlanAction, DiscussionPlanUpdate, DocTopic, LlmCapability, LlmCommand, LlmOutcome,
-    ModelResult,
+    ModelResult, ProjectConfig,
 };
 
-use crate::edits::protocol::xml::engine::XmlTagSpec;
+use crate::edits::protocol::xml::engine::{self, XmlTagSpec};
 use crate::edits::protocol::xml::tags::{ParsedPlanItem, ParsedPlanTag};
 use crate::edits::protocol::{TerminalOutcome, VerifyOnSuccess, VerifyTarget};
 
@@ -739,5 +739,124 @@ impl CapabilityModule for UserLanguageModule {
             Some(language) => vec![LlmCommand::UserLanguage { language }],
             None => Vec::new(),
         }
+    }
+}
+
+/// Project-declared custom commands published to the model as typed tools.
+///
+/// The module never invents an operation: it renders exactly the allowlist the
+/// `[project.commands]` declaration carries, so the model learns which project
+/// operations exist while remaining unable to compose, chain, or extend a
+/// command line. It contributes no control tag, because an invocation travels
+/// through a typed field rather than through protocol markup.
+pub(crate) struct CustomToolsModule;
+
+/// Renders the declared allowlist as one bullet per runnable command.
+///
+/// A declaration whose reference chain is broken is skipped instead of being
+/// described: `ProjectConfig` validation rejects such a configuration before a
+/// turn runs, so the render path never guesses a command line that resolution
+/// already refused. Iteration follows the declaration map order, so identical
+/// state renders identical bytes.
+fn render_custom_tool_list(project: &ProjectConfig) -> String {
+    let mut rendered = String::new();
+    for (name, spec) in &project.commands {
+        let Ok(resolved) = project.resolve(&format!("commands.{name}"), spec) else {
+            continue;
+        };
+        let mut line = resolved.command;
+        for argument in &resolved.args {
+            line.push(' ');
+            line.push_str(argument);
+        }
+        rendered.push_str(&format!("\n  - `{name}`: runs `{line}`"));
+        if let Some(secs) = resolved.timeout_secs {
+            rendered.push_str(&format!(" within a {secs}s timeout"));
+        }
+    }
+    rendered
+}
+
+static CUSTOM_TOOL_SPECS: OnceLock<Vec<&'static XmlTagSpec>> = OnceLock::new();
+
+impl CapabilityModule for CustomToolsModule {
+    fn capability(&self) -> LlmCapability {
+        LlmCapability::CustomTools
+    }
+
+    fn xml_tag_specs(&self) -> &'static [&'static XmlTagSpec] {
+        resolve_specs(&CUSTOM_TOOL_SPECS, &["custom_tool"])
+    }
+
+    fn json_property_name(&self) -> Option<&'static str> {
+        Some("custom_tools")
+    }
+
+    fn render_contract_rule(&self, ctx: &ContractContext<'_>) -> Option<ContractRule> {
+        let project = ctx.render.project?;
+        if project.commands.is_empty() {
+            return None;
+        }
+        let tools = render_custom_tool_list(project);
+        Some(ContractRule::new(
+            "Project Custom Tools (No Arbitrary Shell)",
+            format!(
+                "The project declares a closed allowlist of commands in `[project.commands]`. You may invoke them strictly by name:{tools}\n  An invocation runs one declared command line unchanged: you cannot compose, chain, extend, or redirect it, and you have no shell to fall back on. A declaration accepts no free-form arguments, so leave `args` empty. When no declared command covers the required operation, report a semantic blocker instead of improvising one."
+            ),
+        ))
+    }
+
+    fn render_xml_instruction(&self, ctx: &PromptRenderContext<'_>) -> Option<String> {
+        let project = ctx.project?;
+        if project.commands.is_empty() {
+            return None;
+        }
+        let tag = ctx.tag_name("custom_tool");
+        let tools = render_custom_tool_list(project);
+        Some(format!(
+            "- Project custom tools: invoke one declared command with <{tag} name=\"...\" /> to run it, and read its exit status, stdout, and stderr in the next round. Only declared names are accepted:{tools}\n  A declaration is a closed command line, so the tag carries no arguments. When no declared command covers the required operation, report a semantic blocker instead of improvising one."
+        ))
+    }
+
+    fn render_structured_instruction(&self, ctx: &PromptRenderContext<'_>) -> Option<String> {
+        let project = ctx.project?;
+        if project.commands.is_empty() {
+            return None;
+        }
+        let names = project
+            .commands
+            .keys()
+            .map(|name| format!("`{name}`"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        Some(format!(
+            "- `custom_tools`: array of typed project command invocations (`name`, `args`) restricted to the declared allowlist ({names}). Each invocation runs exactly the declared command line, so `args` stays empty; an empty array requests no execution."
+        ))
+    }
+
+    /// Decodes every `<custom_tool name="..." />` invocation of the turn.
+    ///
+    /// The tag names one declared command and carries no argument payload, so a
+    /// decoded invocation always holds an absent argument object. Whether the
+    /// name is actually declared is decided by the harness at execution time,
+    /// where an undeclared name is answered with a diagnostic block instead of
+    /// reaching a process.
+    fn decode_xml(
+        &self,
+        normalized_text: &str,
+        _raw_text: &str,
+        _marker: Option<&str>,
+        _editable_paths: &[String],
+    ) -> Vec<LlmCommand> {
+        let Some(spec) = engine::tag_spec("custom_tool") else {
+            return Vec::new();
+        };
+        engine::iter_tags(normalized_text, spec)
+            .filter_map(|found| found.attr("name"))
+            .map(|name| LlmCommand::CustomTool {
+                name,
+                args: serde_json::Value::Null,
+            })
+            .collect()
     }
 }

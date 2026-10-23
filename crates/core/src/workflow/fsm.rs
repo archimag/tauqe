@@ -12,6 +12,7 @@ mod guard;
 mod healing;
 mod proposal;
 mod staging;
+mod tools;
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -26,6 +27,7 @@ use crate::plan::storage::PlanMutationMode;
 use crate::prompt::protocol::PromptProtocol;
 use crate::providers::{LlmProvider, StreamEvent};
 use crate::workflow::common::{compact_history_if_needed_with_budget, record_workflow_response};
+use crate::workflow::discovery::journal::TurnDiscoveryJournal;
 use crate::workflow::policy::ApplyPolicy;
 use crate::workflow::verification::run_workflow_verification;
 use crate::workflow::WorkflowOptions;
@@ -38,6 +40,7 @@ use staging::{
     reask_after_empty_round, run_discovery_phase, run_staging_phase, DiscoveryPhase,
     EmptyStepRetry, StagingPhase, EMPTY_STEP_REMINDER, MAX_EMPTY_STEP_RETRIES,
 };
+use tools::{run_custom_tool_phase, CustomToolPhase};
 
 /// Result of a single FSM turn executed by [`run_fsm_turn`].
 #[derive(Debug, Clone)]
@@ -113,6 +116,20 @@ struct PhaseContext<'a> {
     context_manager: &'a mut ContextManager,
     input_cache: &'a mut TurnInputCache,
     state: &'a mut TurnState,
+    /// Cumulative epistemic tail of the turn.
+    ///
+    /// Discovery findings are not repository files, so they never enter the
+    /// context block. They accumulate here and are replayed with the staging
+    /// and healing rounds, so a later phase keeps the knowledge an earlier
+    /// phase already paid for.
+    journal: TurnDiscoveryJournal,
+    /// Investigation rounds consumed by the turn so far.
+    ///
+    /// Discovery and project-command execution widen what the model knows and
+    /// therefore draw from one shared budget: the model may freely alternate
+    /// file requests, searches, documentation, and diagnostic command runs
+    /// without one kind of investigation starving the other.
+    rounds_used: usize,
     accumulated_text: String,
 }
 
@@ -222,14 +239,14 @@ pub async fn run_fsm_turn(
                 context_manager.prune_missing_files();
             });
             if let Some(id) = turn_id {
-                let _ = history_manager.rollback_entry(id);
+                let _ = history_manager.rollback_entry(id, format!("Turn failed: {}", err));
             }
             return Err(err);
         }
     };
     if outcome.is_cancelled {
         if let Some(id) = turn_id {
-            let _ = history_manager.rollback_entry(id);
+            let _ = history_manager.rollback_entry(id, "Turn cancelled by the developer");
         }
     } else {
         record_session_response(history_manager, &outcome);
@@ -237,13 +254,18 @@ pub async fn run_fsm_turn(
     Ok(outcome)
 }
 
-/// Records the bounded turn prompt in session history after compacting it.
+/// Records the bounded turn prompt in session history before compacting it.
 ///
 /// Session bookkeeping runs once per bounded turn, independently of the number
 /// of proposal attempts, so retried turns never duplicate the user prompt or
-/// trigger redundant compaction passes. The turn declares its mode as a typed
-/// [`TurnIntent`], so an isolated step suppresses history bookkeeping entirely
-/// without being recognized from the shape of its prompt text.
+/// trigger redundant compaction passes. The prompt is recorded first and the
+/// compaction pass follows, so the running turn reaches the developer's
+/// chronicle the moment it starts instead of after a summarization call that
+/// costs a whole provider round trip. Compaction keeps the newest turns in its
+/// tail, so the fresh record survives the rewrite untouched. The turn declares
+/// its mode as a typed [`TurnIntent`], so an isolated step suppresses history
+/// bookkeeping entirely without being recognized from the shape of its prompt
+/// text.
 pub(super) async fn begin_session_turn(
     prompt: &str,
     intent: TurnIntent,
@@ -253,33 +275,36 @@ pub(super) async fn begin_session_turn(
     cancel_rx: &watch::Receiver<bool>,
     options: &WorkflowOptions,
 ) -> Option<u64> {
-    let mut turn_id = None;
-    if !intent.is_isolated_step() {
-        let _ = compact_history_if_needed_with_budget(
-            history_manager,
-            provider,
-            &options.history_model,
-            cancel_rx.clone(),
-            options.history_budget_tokens,
-            options.history_tail_turns,
-        )
-        .await;
-        let context_paths: Vec<String> = context_manager
-            .get_state()
-            .items
-            .iter()
-            .map(|item| item.path.clone())
-            .collect();
-        match history_manager.record_turn(prompt, context_paths) {
-            Ok(entry) => turn_id = entry.id(),
-            Err(err) => {
-                tracing::warn!(
-                    "Failed to record the turn prompt in session history: {}",
-                    err
-                );
-            }
-        }
+    if intent.is_isolated_step() {
+        return None;
     }
+
+    let context_paths: Vec<String> = context_manager
+        .get_state()
+        .items
+        .iter()
+        .map(|item| item.path.clone())
+        .collect();
+    let turn_id = match history_manager.record_turn(prompt, context_paths) {
+        Ok(entry) => entry.id(),
+        Err(err) => {
+            tracing::warn!(
+                "Failed to record the turn prompt in session history: {}",
+                err
+            );
+            None
+        }
+    };
+
+    let _ = compact_history_if_needed_with_budget(
+        history_manager,
+        provider,
+        &options.history_model,
+        cancel_rx.clone(),
+        options.history_budget_tokens,
+        options.history_tail_turns,
+    )
+    .await;
 
     turn_id
 }
@@ -312,6 +337,17 @@ fn isolated_step_capabilities(protocol: &dyn PromptProtocol) -> tauqe_protocol::
         .capability_set()
         .without(tauqe_protocol::LlmCapability::PlanCreation)
         .without(tauqe_protocol::LlmCapability::PlanUpdate)
+}
+
+/// Reports whether a proposal round still carries investigation commands.
+///
+/// Investigation commands widen what the model knows — context files,
+/// repository searches, documentation, directory listings, targeted maps, and
+/// project commands — and never mutate the repository. While one of them is
+/// present, the turn keeps cycling instead of mistaking an intermediate step
+/// for a final answer.
+fn has_investigation_commands(step: &ProposalStep) -> bool {
+    step.has_discovery_commands() || !step.custom_tools().is_empty()
 }
 
 /// Runs the FSM turn cycle without session bookkeeping.
@@ -441,12 +477,18 @@ pub(super) async fn run_fsm_turn_body(
         context_manager,
         input_cache: &mut input_cache,
         state: &mut state,
+        journal: TurnDiscoveryJournal::default(),
+        rounds_used: 0,
         accumulated_text,
     };
 
     let mut pending = step;
     let mut empty_retries = 0;
-    let mut retry_prompt = ctx.prompt.to_string();
+    // Corrective reminders accumulate across the empty rounds of the turn. The
+    // corrective request is composed from the task and the turn journal every
+    // time, so the findings Discovery and the project commands already produced
+    // are never dropped by a re-ask.
+    let mut empty_reminders = String::new();
     let step = loop {
         let step = match run_discovery_phase(&mut ctx, pending).await? {
             DiscoveryPhase::Terminate(outcome) => return Ok(*outcome),
@@ -454,6 +496,30 @@ pub(super) async fn run_fsm_turn_body(
         };
         if let Some(outcome) = finish_on_error_outcome(&mut ctx).await {
             return Ok(outcome);
+        }
+        // A project command runs before anything is staged: its output is
+        // answered through the turn journal, so an invocation never becomes
+        // part of the change set.
+        let rounds_before_tools = ctx.rounds_used;
+        let step = match run_custom_tool_phase(&mut ctx, step).await? {
+            CustomToolPhase::Absent(step) => *step,
+            CustomToolPhase::Executed(step) => *step,
+            CustomToolPhase::Terminate(outcome) => return Ok(*outcome),
+        };
+        // A project-command round hands control back to the model. If the
+        // resulting proposal still carries investigation commands, the turn
+        // keeps cycling through discovery and diagnostic execution until the
+        // shared round budget is spent or the model proposes code edits or a
+        // terminal answer. Without this hand-back, a discovery request emitted
+        // right after a command run would be mistaken for a final answer.
+        let tool_executed = ctx.rounds_used > rounds_before_tools;
+        if tool_executed
+            && step.edits().is_empty()
+            && step.protocol_errors().is_empty()
+            && has_investigation_commands(&step)
+        {
+            pending = step;
+            continue;
         }
         if !step.is_empty_step() {
             break step;
@@ -465,7 +531,12 @@ pub(super) async fn run_fsm_turn_body(
             return Ok(finish_empty_step(&mut ctx).await);
         }
         empty_retries += 1;
-        retry_prompt.push_str(EMPTY_STEP_REMINDER);
+        empty_reminders.push_str(EMPTY_STEP_REMINDER);
+        // The corrective round keeps the knowledge the turn already paid for:
+        // the task first, the accumulated journal next, the reminder last.
+        let retry_prompt = ctx
+            .journal
+            .compose_user_prompt(ctx.prompt, Some(&empty_reminders));
         pending = match reask_after_empty_round(&mut ctx, &retry_prompt, empty_retries).await? {
             EmptyStepRetry::Proposed(step) => *step,
             EmptyStepRetry::Terminate(outcome) => return Ok(*outcome),

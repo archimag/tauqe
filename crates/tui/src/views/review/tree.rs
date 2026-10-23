@@ -776,7 +776,9 @@ pub(crate) fn compute_unified_review_lines(
 mod tests {
     use super::*;
     use crate::views::review::ReviewViewState;
-    use tauqe_protocol::{IssueStatus, IssueType, ModelRef, ReviewIssue, ReviewItem, ReviewSession};
+    use tauqe_protocol::{
+        IssueStatus, IssueType, ModelRef, ReviewIssue, ReviewItem, ReviewSession,
+    };
 
     fn make_item(id: u32) -> ReviewIssue {
         ReviewIssue {

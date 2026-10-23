@@ -13,11 +13,11 @@ pub mod tree;
 
 pub use self::input::{handle_review_key, REVIEW_COMMAND_MAP};
 pub use self::render::render_review_view;
+use self::tree::{collect_subplan_keys, subplan_all_expanded, subplan_key};
 pub(crate) use self::tree::{
     compute_unified_review_lines, format_created_at, issue_status_label, issue_status_style,
     issue_type_badge, issue_type_style, location, model_badge, plan_status_style,
 };
-use self::tree::{collect_subplan_keys, subplan_all_expanded, subplan_key};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum VisibleReviewRow {

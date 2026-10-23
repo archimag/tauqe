@@ -42,6 +42,9 @@ pub enum EditError {
 
     #[error("IO error for '{0}': {1}")]
     Io(String, #[source] std::io::Error),
+
+    #[error("In file '{path}': invalid project configuration: {message}")]
+    InvalidConfig { path: String, message: String },
 }
 
 /// Cumulative in-memory state. Paths are normalized relative to the repository.
@@ -350,7 +353,47 @@ fn stage_file_edits(
             }
         }
     }
+    validate_staged_project_config(path, content.as_deref())?;
     Ok(content)
+}
+
+/// Repository-relative path of the project configuration file.
+const PROJECT_CONFIG_PATH: &str = "tauqe.toml";
+
+/// Validates the staged content of the project configuration file.
+///
+/// The harness must never commit a configuration it could not load on its next
+/// start, so a change set that rewrites `tauqe.toml` is checked while it is
+/// still purely in memory. The validation has two levels: the TOML syntax is
+/// parsed first, and the resulting declaration is then validated semantically,
+/// so dropped model roles or a missing verification command are rejected as
+/// well. A failure surfaces as an ordinary [`EditError`], which activates the
+/// patch-retry loop instead of letting a broken file reach the working tree.
+fn validate_staged_project_config(path: &str, content: Option<&str>) -> Result<(), EditError> {
+    if path != PROJECT_CONFIG_PATH {
+        return Ok(());
+    }
+    let Some(content) = content else {
+        return Ok(());
+    };
+
+    // Level 1 — syntactic validation of the staged bytes.
+    let parsed: crate::config::AppConfig =
+        toml::from_str(content).map_err(|err| EditError::InvalidConfig {
+            path: path.to_string(),
+            message: format!(
+                "the file is not valid TOML: {}",
+                crate::escape::single_line(&err.to_string())
+            ),
+        })?;
+
+    // Level 2 — semantic validation of the mandatory structures the harness
+    // depends on: the model roles must resolve and verification must stay
+    // declared.
+    parsed.validate().map_err(|err| EditError::InvalidConfig {
+        path: path.to_string(),
+        message: crate::escape::single_line(&err),
+    })
 }
 
 /// Applies an EditProposal after validating every file in memory.
@@ -817,5 +860,91 @@ mod staging_tests {
             "a created file must survive the end-of-turn auto sweep"
         );
         assert!(cm.is_editable("generated.rs").unwrap());
+    }
+
+    /// Valid project configuration used by the configuration-validation tests.
+    const VALID_CONFIG: &str = "[models]\nprimary = [\"openrouter:a/b\"]\n\n[project.verify]\ncommand = \"cargo\"\nargs = [\"test\"]\n";
+
+    #[test]
+    fn staged_project_config_syntax_error_is_rejected() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        std::fs::write(root.join("tauqe.toml"), VALID_CONFIG).unwrap();
+        let mut cm = ContextManager::new(root.to_path_buf());
+        cm.add_file("tauqe.toml", ContextAccess::Editable).unwrap();
+
+        let broken = EditOperation::Overwrite {
+            path: "tauqe.toml".into(),
+            content: "[models\nprimary = ]\n".into(),
+        };
+        let result = stage_and_validate_edits(root, &cm, std::slice::from_ref(&broken), None);
+        assert!(!result.is_success());
+        match &result.failed_files[0].error {
+            EditError::InvalidConfig { path, message } => {
+                assert_eq!(path, "tauqe.toml");
+                assert!(
+                    message.contains("not valid TOML"),
+                    "a syntactic rejection must name the TOML syntax: {message}"
+                );
+            }
+            other => panic!("expected a syntactic configuration rejection, got {other:?}"),
+        }
+        assert!(
+            result.staged_state.staged_files.is_empty(),
+            "a rejected configuration must not reach the staged state"
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join("tauqe.toml")).unwrap(),
+            VALID_CONFIG
+        );
+    }
+
+    #[test]
+    fn staged_project_config_without_verification_is_rejected() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        std::fs::write(root.join("tauqe.toml"), VALID_CONFIG).unwrap();
+        let mut cm = ContextManager::new(root.to_path_buf());
+        cm.add_file("tauqe.toml", ContextAccess::Editable).unwrap();
+
+        // Syntactically valid, but the mandatory verification command is gone.
+        let dropped_verify = EditOperation::Overwrite {
+            path: "tauqe.toml".into(),
+            content: "[models]\nprimary = [\"openrouter:a/b\"]\n".into(),
+        };
+        let result =
+            stage_and_validate_edits(root, &cm, std::slice::from_ref(&dropped_verify), None);
+        assert!(!result.is_success());
+        match &result.failed_files[0].error {
+            EditError::InvalidConfig { message, .. } => {
+                assert!(
+                    message.contains("verify"),
+                    "a semantic rejection must name the missing invariant: {message}"
+                );
+            }
+            other => panic!("expected a semantic configuration rejection, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn staged_project_config_preserving_invariants_is_accepted() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        std::fs::write(root.join("tauqe.toml"), VALID_CONFIG).unwrap();
+        let mut cm = ContextManager::new(root.to_path_buf());
+        cm.add_file("tauqe.toml", ContextAccess::Editable).unwrap();
+
+        let extended = EditOperation::Overwrite {
+            path: "tauqe.toml".into(),
+            content: "[models]\nprimary = [\"openrouter:a/b\"]\n\n[project.verify]\ncommand = \"cargo\"\nargs = [\"test\", \"--workspace\"]\n".into(),
+        };
+        let result = stage_and_validate_edits(root, &cm, std::slice::from_ref(&extended), None);
+        assert!(result.is_success());
+        assert!(result.staged_state.staged_files.contains_key("tauqe.toml"));
+        assert_eq!(
+            std::fs::read_to_string(root.join("tauqe.toml")).unwrap(),
+            VALID_CONFIG,
+            "staging must never write the configuration to disk"
+        );
     }
 }

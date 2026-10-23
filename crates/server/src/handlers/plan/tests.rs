@@ -2012,8 +2012,7 @@ async fn test_plan_refine_recovers_from_a_transport_break() {
             },
         ));
     let state =
-        test_state_with_provider(&dir, tauqe_core::config::AppConfig::default(), provider)
-            .await;
+        test_state_with_provider(&dir, tauqe_core::config::AppConfig::default(), provider).await;
 
     let req = Request {
         id: tauqe_protocol::RequestId::Number(1),

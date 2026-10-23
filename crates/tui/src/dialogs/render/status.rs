@@ -208,7 +208,9 @@ fn status_body(body: Rect) -> StatusBody {
             body.x,
             options_y,
             body.width,
-            body.height.saturating_sub(target_h).saturating_sub(spacer_h),
+            body.height
+                .saturating_sub(target_h)
+                .saturating_sub(spacer_h),
         ),
     }
 }
@@ -550,9 +552,7 @@ mod tests {
         let buffer = terminal.backend().buffer();
         let start = area.x.saturating_add(1);
         let end = area.x.saturating_add(area.width).saturating_sub(1);
-        (start..end)
-            .map(|x| buffer[(x, y)].symbol())
-            .collect()
+        (start..end).map(|x| buffer[(x, y)].symbol()).collect()
     }
 
     /// Every air row is drawn blank while its neighbouring content rows are
@@ -583,7 +583,9 @@ mod tests {
             "top inset must stay blank"
         );
         assert!(
-            !interior_row(&terminal, area, body.target.y).trim().is_empty(),
+            !interior_row(&terminal, area, body.target.y)
+                .trim()
+                .is_empty(),
             "the target line must be drawn under the top inset"
         );
         assert!(

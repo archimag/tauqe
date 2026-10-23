@@ -464,23 +464,22 @@ async fn refine_finding_with_architect_inner(
         session_id: Some(format_session_id(SESSION_PREFIX_REVIEW, &session.id)),
     };
 
-    let build_user_prompt = |context_files: &[ContextFileContent],
-                             repo_map: Option<&str>,
-                             repo_dirs: Option<&str>| {
-        let diagnostics_view = diagnostics.map(|d| ReviewRefineDiagnostics {
-            failed_step_id: d.failed_step_id,
-            failure_reason: d.failure_reason,
-        });
-        tauqe_core::review::prompt::build_review_finding_refine_user_prompt(
-            session,
-            item,
-            context_files,
-            repo_map,
-            repo_dirs,
-            diagnostics_view,
-            instructions.as_deref(),
-        )
-    };
+    let build_user_prompt =
+        |context_files: &[ContextFileContent], repo_map: Option<&str>, repo_dirs: Option<&str>| {
+            let diagnostics_view = diagnostics.map(|d| ReviewRefineDiagnostics {
+                failed_step_id: d.failed_step_id,
+                failure_reason: d.failure_reason,
+            });
+            tauqe_core::review::prompt::build_review_finding_refine_user_prompt(
+                session,
+                item,
+                context_files,
+                repo_map,
+                repo_dirs,
+                diagnostics_view,
+                instructions.as_deref(),
+            )
+        };
 
     let output = match run_architect_discovery_loop(
         state,

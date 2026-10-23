@@ -243,7 +243,7 @@ impl ExecutionMode for SingleExecution {
                         context_manager.prune_missing_files();
                     });
                     if let Some(id) = turn_id {
-                        let _ = history_manager.rollback_entry(id);
+                        let _ = history_manager.rollback_entry(id, format!("Turn failed: {}", err));
                     }
                     return Err(err);
                 }
@@ -370,7 +370,7 @@ impl ExecutionMode for SingleExecution {
 
             if turn.is_cancelled {
                 if let Some(id) = turn_id {
-                    let _ = history_manager.rollback_entry(id);
+                    let _ = history_manager.rollback_entry(id, "Turn cancelled by the developer");
                 }
             } else {
                 record_session_response(history_manager, &turn);

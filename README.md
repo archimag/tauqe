@@ -14,6 +14,26 @@ TAUQE is actively self-hosted: starting from the second day of its development, 
 
 ---
 
+## Philosophy & Core Principles
+
+### Primacy of Engineering Principles Over Technology
+
+Technology must adapt to the engineering process, not the engineering process to the limitations of a specific technology.
+
+TAUQE is not an attempt to adapt software development to artificial intelligence. It is an effort to build an engineering environment where the intelligence of the executor does not dictate the structure of the process.
+
+### Humans and AI as Equal Engineering Participants
+
+The engineering process must not depend on who executes the work — a human or an AI.
+
+They are interchangeable within their roles, but differ in capabilities, efficiency, and cost. Tasks should be assigned to whichever participant can deliver the required quality at a reasonable cost.
+
+**What is good for a human must be good for an AI — and vice versa.** Tools, documentation, and engineering practices must be shared and retain their intrinsic value regardless of AI involvement.
+
+TAUQE does not invent a new engineering discipline for AI. It applies proven engineering principles, enabling human and artificial intelligence to reinforce each other's strengths.
+
+---
+
 ## Core Pillars
 
 - **Declarative Invariants Over Imperative Drift:**  

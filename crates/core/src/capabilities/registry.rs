@@ -10,7 +10,7 @@ use std::sync::OnceLock;
 
 use tauqe_protocol::{
     CapabilityPhase, CapabilitySet, DirListRequest, DocTopic, LlmCapability, LlmCommand,
-    ModelResult, RepoSearchRequest, TurnIntent,
+    ModelResult, ProjectConfig, RepoSearchRequest, TurnIntent,
 };
 
 use crate::edits::protocol::xml::engine::{self, XmlTagSpec};
@@ -21,16 +21,18 @@ use crate::edits::protocol::{
 };
 
 use super::builtin::{
-    BlockedModule, DiscoveryModule, DocRequestModule, FileEditsModule, OutcomeModule,
-    PlanCreationModule, PlanUpdateModule, ScratchpadModule, TextMessageModule,
+    BlockedModule, CustomToolsModule, DiscoveryModule, DocRequestModule, FileEditsModule,
+    OutcomeModule, PlanCreationModule, PlanUpdateModule, ScratchpadModule, TextMessageModule,
     ToolchainVerifyModule, UserLanguageModule,
 };
 use super::regime;
 
 /// Context handed to capability modules when they render prompt fragments.
 ///
-/// Both fields are pure render inputs: the permitted editable paths and the
-/// optional per-turn marker suffix. Rendering never performs I/O.
+/// Every field is a pure render input: the permitted editable paths, the
+/// optional per-turn marker suffix, whether an eager symbol map is already
+/// rendered, and the project command allowlist declared by `tauqe.toml`.
+/// Rendering never performs I/O.
 pub struct PromptRenderContext<'a> {
     /// Repository-relative paths the model may modify this turn.
     pub editable_paths: &'a [String],
@@ -41,6 +43,13 @@ pub struct PromptRenderContext<'a> {
     /// A module conditioned on this flag never advertises an on-demand map
     /// request for contours the prompt already carries.
     pub has_eager_repo_map: bool,
+    /// The project command allowlist declared by `tauqe.toml`.
+    ///
+    /// A module that publishes project operations reads the declaration from
+    /// here instead of loading configuration while rendering, so rendering
+    /// stays a pure projection of typed state and an identical declaration
+    /// always produces identical prompt bytes.
+    pub project: Option<&'a ProjectConfig>,
 }
 
 impl<'a> PromptRenderContext<'a> {
@@ -53,12 +62,23 @@ impl<'a> PromptRenderContext<'a> {
             editable_paths,
             marker,
             has_eager_repo_map: false,
+            project: None,
         }
     }
 
     /// Declares whether an eager repository symbol map is already rendered.
     pub fn with_eager_repo_map(mut self, has_eager_repo_map: bool) -> Self {
         self.has_eager_repo_map = has_eager_repo_map;
+        self
+    }
+
+    /// Declares the project command allowlist available to this turn.
+    ///
+    /// The declaration is borrowed from the loaded configuration, so a module
+    /// that publishes project commands never re-reads `tauqe.toml` while
+    /// rendering a prompt.
+    pub fn with_project(mut self, project: Option<&'a ProjectConfig>) -> Self {
+        self.project = project;
         self
     }
 
@@ -372,6 +392,7 @@ static MODULES: &[&dyn CapabilityModule] = &[
     &OutcomeModule,
     &BlockedModule,
     &UserLanguageModule,
+    &CustomToolsModule,
 ];
 
 impl CapabilityRegistry {
@@ -649,6 +670,7 @@ mod tests {
                 "error".to_string(),
                 "blocked".to_string(),
                 "user_language".to_string(),
+                "custom_tool".to_string(),
             ]
         );
         assert_eq!(
@@ -913,5 +935,133 @@ mod tests {
                 .and_then(|module| module.json_property_name());
             assert_eq!(property, Some(expected), "property name for {}", capability);
         }
+    }
+
+    /// Builds a `[project]` declaration carrying one custom command per name.
+    fn project_with_commands(names: &[&str]) -> ProjectConfig {
+        let mut project = ProjectConfig::default();
+        for name in names {
+            project.commands.insert(
+                (*name).to_string(),
+                tauqe_protocol::ProjectCommandSpec {
+                    command: "cargo".to_string(),
+                    args: vec![(*name).to_string()],
+                    timeout_secs: None,
+                },
+            );
+        }
+        project
+    }
+
+    /// Renders the contract for a set that exposes the custom tool surface.
+    fn custom_tools_contract(project: Option<&ProjectConfig>) -> String {
+        let render = PromptRenderContext::new(&[], None).with_project(project);
+        let ctx = ContractContext::new(TurnIntent::InteractiveRepl, render);
+        let set =
+            CapabilitySet::from_slice(&[LlmCapability::TextMessage, LlmCapability::CustomTools]);
+        CapabilityRegistry::global().compose_contract_rules(&set, &ctx)
+    }
+
+    #[test]
+    fn custom_tools_module_publishes_the_declared_allowlist() {
+        let registry = CapabilityRegistry::global();
+        assert!(
+            registry.module(LlmCapability::CustomTools).is_some(),
+            "every capability needs a module, including the custom tool surface"
+        );
+
+        let project = project_with_commands(&["docs", "audit"]);
+        let rendered = custom_tools_contract(Some(&project));
+
+        assert!(rendered.contains("Project Custom Tools (No Arbitrary Shell)"));
+        assert!(rendered.contains("runs `cargo docs`"));
+        assert!(rendered.contains("runs `cargo audit`"));
+        assert!(rendered.contains("no shell to fall back on"));
+        assert!(rendered.contains("leave `args` empty"));
+
+        // The allowlist renders in declaration order, so identical state
+        // produces identical prompt bytes.
+        let audit = rendered.find("`audit`").expect("audit listed");
+        let docs = rendered.find("`docs`").expect("docs listed");
+        assert!(audit < docs);
+
+        // The rule never advertises a control tag the decoder would reject.
+        assert!(!rendered.contains("<blocked"));
+    }
+
+    #[test]
+    fn custom_tools_module_stays_silent_without_declarations() {
+        // An empty allowlist and an absent declaration both contribute no rule,
+        // because there is no tool surface to describe.
+        assert!(!custom_tools_contract(Some(&project_with_commands(&[])))
+            .contains("Project Custom Tools"));
+        let rendered = custom_tools_contract(None);
+        assert!(!rendered.contains("Project Custom Tools"));
+        assert!(!rendered.contains("`custom_tools`"));
+    }
+
+    #[test]
+    fn custom_tools_structured_instruction_follows_the_declaration() {
+        let registry = CapabilityRegistry::global();
+        let set =
+            CapabilitySet::from_slice(&[LlmCapability::TextMessage, LlmCapability::CustomTools]);
+        let project = project_with_commands(&["docs"]);
+
+        let declared = registry.compose_structured_protocol_instructions(
+            &set,
+            &PromptRenderContext::new(&[], None).with_project(Some(&project)),
+        );
+        assert!(declared.contains("`custom_tools`"));
+        assert!(declared.contains("`docs`"));
+
+        let bare = registry
+            .compose_structured_protocol_instructions(&set, &PromptRenderContext::new(&[], None));
+        assert!(!bare.contains("`custom_tools`"));
+    }
+
+    #[test]
+    fn custom_tools_module_renders_xml_instruction_and_decodes_invocations() {
+        let registry = CapabilityRegistry::global();
+        let set =
+            CapabilitySet::from_slice(&[LlmCapability::TextMessage, LlmCapability::CustomTools]);
+        let project = project_with_commands(&["docs"]);
+        let ctx = PromptRenderContext::new(&[], None).with_project(Some(&project));
+
+        let instruction = registry.compose_xml_protocol_instructions(&set, &ctx);
+        assert!(instruction.contains("<custom_tool name"));
+        assert!(instruction.contains("`docs`"));
+        assert!(instruction.contains("runs `cargo docs`"));
+
+        // Without a declaration the module advertises no invocation and no
+        // command line for the model to imitate.
+        let bare = registry
+            .compose_xml_protocol_instructions(&set, &PromptRenderContext::new(&[], None));
+        assert!(!bare.contains("<custom_tool"));
+
+        // A declared invocation decodes into a typed command with no arguments,
+        // because the declaration already names every literal argument.
+        let commands = registry.decode_xml_commands(
+            &set,
+            "Run it.\n<custom_tool name=\"docs\" />",
+            None,
+            &[],
+        );
+        assert!(commands.contains(&LlmCommand::CustomTool {
+            name: "docs".to_string(),
+            args: serde_json::Value::Null,
+        }));
+
+        // A marker-bound tag decodes exactly like an unbound one, so the tool
+        // invocation participates in the turn-marker protection.
+        let marked = registry.decode_xml_commands(
+            &set,
+            "<custom_tool_AB12 name=\"docs\" />",
+            Some("AB12"),
+            &[],
+        );
+        assert!(marked.contains(&LlmCommand::CustomTool {
+            name: "docs".to_string(),
+            args: serde_json::Value::Null,
+        }));
     }
 }

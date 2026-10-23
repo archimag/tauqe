@@ -7,9 +7,7 @@
 use std::sync::Arc;
 
 use tauqe_core::plan::storage::PlanStorage;
-use tauqe_protocol::{
-    errors, PlanExecutePipelineParams, PlanScopeEvaluation, Request, Response,
-};
+use tauqe_protocol::{errors, PlanExecutePipelineParams, PlanScopeEvaluation, Request, Response};
 
 use crate::state::AppState;
 

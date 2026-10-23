@@ -78,13 +78,24 @@ pub enum LlmCapability {
     Blocked,
     /// Detected primary natural language of the user prompt.
     UserLanguage,
+    /// Invocation of a project-declared custom tool.
+    ///
+    /// The project registers a closed allowlist of typed commands in
+    /// `tauqe.toml`, and the model may invoke one of them by name with typed
+    /// arguments. The capability grants exactly the declared commands and never
+    /// an arbitrary shell.
+    CustomTools,
 }
 
 impl LlmCapability {
-    /// Every capability in canonical declaration order.
+    /// Every capability a built-in protocol profile may advertise.
     ///
     /// The order matches the enum declaration so iteration, prompt
-    /// composition, and tests stay deterministic.
+    /// composition, and tests stay deterministic. A declared capability stays
+    /// absent from this list until the capability module that owns its tags,
+    /// prompt text, and decoder is registered: the registry requires a module
+    /// for every advertised capability, so advertising one earlier would offer
+    /// the model a protocol surface nothing can decode.
     pub const ALL: &'static [LlmCapability] = &[
         Self::TextMessage,
         Self::FileEdits,
@@ -97,6 +108,7 @@ impl LlmCapability {
         Self::Outcome,
         Self::Blocked,
         Self::UserLanguage,
+        Self::CustomTools,
     ];
 
     /// Canonical lower-case identifier used on the wire.
@@ -113,6 +125,7 @@ impl LlmCapability {
             Self::Outcome => "outcome",
             Self::Blocked => "blocked",
             Self::UserLanguage => "user_language",
+            Self::CustomTools => "custom_tools",
         }
     }
 
@@ -125,7 +138,8 @@ impl LlmCapability {
             | Self::PlanCreation
             | Self::PlanUpdate
             | Self::Scratchpad
-            | Self::UserLanguage => CapabilityPhase::Execution,
+            | Self::UserLanguage
+            | Self::CustomTools => CapabilityPhase::Execution,
             Self::ToolchainVerify => CapabilityPhase::Verification,
             Self::Outcome | Self::Blocked => CapabilityPhase::Outcome,
         }
@@ -245,6 +259,10 @@ impl CapabilitySet {
     /// harness owns verification for a step, so `TurnIntent::IsolatedStep`
     /// strips it inside `TurnIntent::narrow_capabilities`; removing it here as
     /// well would duplicate that decision in two places.
+    ///
+    /// The project custom tool tag stays advertised for the same reason: the
+    /// XML contour registers and decodes it, and the harness validates every
+    /// invocation against the declared command allowlist before anything runs.
     pub fn isolated_step_xml() -> Self {
         Self::from_slice(&[
             LlmCapability::TextMessage,
@@ -256,6 +274,7 @@ impl CapabilitySet {
             LlmCapability::Outcome,
             LlmCapability::Blocked,
             LlmCapability::UserLanguage,
+            LlmCapability::CustomTools,
         ])
     }
 
@@ -451,7 +470,11 @@ impl FromStr for DocTopic {
 /// The protocol-specific syntax (XML tags, JSON schema) is translated into this
 /// uniform command list so the core pipeline operates purely on semantics. Each
 /// command corresponds to an enabled [`LlmCapability`].
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// `Eq` is deliberately absent: a custom tool invocation carries arbitrary JSON
+/// arguments, and a JSON number may hold a float, so the command list is
+/// comparable only through `PartialEq`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum LlmCommand {
     /// Conversational text emitted to the user interface.
@@ -497,6 +520,17 @@ pub enum LlmCommand {
     },
     /// Detected primary natural language of the user prompt.
     UserLanguage { language: String },
+    /// A typed invocation of one project-declared custom tool.
+    ///
+    /// `name` addresses a command registered in the project configuration, and
+    /// `args` carries the typed argument object the command declares. The
+    /// harness validates both against the declared allowlist, so an invocation
+    /// can never widen into an arbitrary shell command.
+    CustomTool {
+        name: String,
+        #[serde(default)]
+        args: serde_json::Value,
+    },
     /// Protocol syntax or validation error encountered while parsing model output.
     ProtocolError { message: String },
 }
@@ -525,6 +559,7 @@ impl LlmCommand {
             Self::Outcome { .. } => Some(LlmCapability::Outcome),
             Self::Blocked { .. } => Some(LlmCapability::Blocked),
             Self::UserLanguage { .. } => Some(LlmCapability::UserLanguage),
+            Self::CustomTool { .. } => Some(LlmCapability::CustomTools),
             Self::ProtocolError { .. } => None,
         }
     }
@@ -590,6 +625,7 @@ mod tests {
             (LlmCapability::Outcome, "\"outcome\""),
             (LlmCapability::Blocked, "\"blocked\""),
             (LlmCapability::UserLanguage, "\"user_language\""),
+            (LlmCapability::CustomTools, "\"custom_tools\""),
         ];
 
         for (capability, expected) in cases {
@@ -869,12 +905,15 @@ mod tests {
 
     #[test]
     fn test_llm_capability_as_str_and_phase() {
-        assert_eq!(LlmCapability::ALL.len(), 11);
+        assert_eq!(LlmCapability::ALL.len(), 12);
         for capability in LlmCapability::ALL {
             let encoded = format!("\"{}\"", capability.as_str());
             assert_eq!(serde_json::to_string(capability).unwrap(), encoded);
             assert_eq!(capability.to_string(), capability.as_str());
         }
+        // A declared capability joins the advertised list once the module that
+        // owns its tags, prompt text, and decoder is registered.
+        assert!(LlmCapability::ALL.contains(&LlmCapability::CustomTools));
 
         let expectations = [
             (LlmCapability::Discovery, CapabilityPhase::Discovery),
@@ -885,6 +924,7 @@ mod tests {
             (LlmCapability::PlanUpdate, CapabilityPhase::Execution),
             (LlmCapability::Scratchpad, CapabilityPhase::Execution),
             (LlmCapability::UserLanguage, CapabilityPhase::Execution),
+            (LlmCapability::CustomTools, CapabilityPhase::Execution),
             (
                 LlmCapability::ToolchainVerify,
                 CapabilityPhase::Verification,
@@ -943,6 +983,7 @@ mod tests {
         assert!(isolated_xml.contains(LlmCapability::ToolchainVerify));
         assert!(!isolated_xml.contains(LlmCapability::PlanCreation));
         assert!(!isolated_xml.contains(LlmCapability::PlanUpdate));
+        assert!(isolated_xml.contains(LlmCapability::CustomTools));
 
         let develop_structured = CapabilitySet::develop_structured();
         let isolated_structured = CapabilitySet::isolated_step_structured();
@@ -955,10 +996,11 @@ mod tests {
         assert!(!develop_structured.contains(LlmCapability::PlanCreation));
         assert!(!develop_structured.contains(LlmCapability::PlanUpdate));
         // The structured and isolated-step XML profiles share one operational
-        // surface: only plan authoring distinguishes them from `develop_xml`.
+        // surface apart from the project tool tag, which only the XML contour
+        // registers: plan authoring is the other distinguishing axis.
         assert_eq!(
             develop_structured.as_slice(),
-            CapabilitySet::isolated_step_xml().as_slice()
+            isolated_xml.without(LlmCapability::CustomTools).as_slice()
         );
 
         let discussion = CapabilitySet::discussion();
@@ -972,6 +1014,24 @@ mod tests {
         assert!(architect.contains(LlmCapability::PlanCreation));
         assert!(!architect.contains(LlmCapability::FileEdits));
         assert!(!architect.contains(LlmCapability::ToolchainVerify));
+
+        // The custom tool surface is advertised by the XML profiles, which
+        // register and decode the `custom_tool` tag. The structured, discussion,
+        // and architect profiles leave it out because their schema carries no
+        // `custom_tools` field to decode an invocation from.
+        assert!(develop_xml.contains(LlmCapability::CustomTools));
+        assert!(isolated_xml.contains(LlmCapability::CustomTools));
+        for profile in [
+            CapabilitySet::develop_structured(),
+            CapabilitySet::isolated_step_structured(),
+            CapabilitySet::discussion(),
+            CapabilitySet::architect_discovery(),
+        ] {
+            assert!(
+                !profile.contains(LlmCapability::CustomTools),
+                "only the XML profiles advertise the custom tool surface"
+            );
+        }
     }
 
     #[test]
@@ -1074,6 +1134,13 @@ mod tests {
         };
         assert_eq!(language.capability(), Some(LlmCapability::UserLanguage));
 
+        let custom_tool = LlmCommand::CustomTool {
+            name: "migrate".to_string(),
+            args: serde_json::json!({ "database": "primary" }),
+        };
+        assert_eq!(custom_tool.capability(), Some(LlmCapability::CustomTools));
+        assert_eq!(custom_tool.phase(), Some(CapabilityPhase::Execution));
+
         let error = LlmCommand::ProtocolError {
             message: "malformed".to_string(),
         };
@@ -1098,5 +1165,30 @@ mod tests {
             };
             assert_eq!(plan.capability(), Some(LlmCapability::PlanUpdate));
         }
+    }
+
+    #[test]
+    fn test_llm_command_custom_tool_serde_roundtrip() {
+        let tool = LlmCommand::CustomTool {
+            name: "migrate".to_string(),
+            args: serde_json::json!({ "database": "primary", "steps": 2 }),
+        };
+        let json = serde_json::to_string(&tool).unwrap();
+        assert!(json.contains("\"type\":\"custom_tool\""));
+        assert!(json.contains("\"name\":\"migrate\""));
+        assert!(json.contains("\"database\":\"primary\""));
+        assert_eq!(serde_json::from_str::<LlmCommand>(&json).unwrap(), tool);
+
+        // An invocation without arguments still decodes, so a command that
+        // declares none never requires the model to invent an empty object.
+        let bare: LlmCommand =
+            serde_json::from_str(r#"{"type":"custom_tool","name":"status"}"#).unwrap();
+        assert_eq!(
+            bare,
+            LlmCommand::CustomTool {
+                name: "status".to_string(),
+                args: serde_json::Value::Null,
+            }
+        );
     }
 }

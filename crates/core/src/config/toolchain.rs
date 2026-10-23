@@ -117,13 +117,30 @@ impl FormatterConfig {
     }
 }
 
-/// Declarative project toolchain configuration.
+/// Declarative toolchain configuration.
 ///
-/// The flat legacy fields (`check_command`, `timeout_secs`, `target`) keep
-/// existing files working; the typed phase sections and the formatter registry
-/// extend them without changing their meaning.
+/// This section carries harness policy: which project driver is launched, how
+/// verification behaves, and which per-phase commands override deterministic
+/// auto-detection. The project's own commands — the mandatory verification, the
+/// in-memory formatter, and the disk post-hook — are declared in the `[project]`
+/// section and validated by [`crate::config::AppConfig::validate`].
+///
+/// The flat legacy fields (`check_command`, `timeout_secs`, `target`) and the
+/// typed phase sections keep existing files working as harness-level overrides,
+/// so a repository that declared its verification here verifies unchanged.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ToolchainConfig {
+    /// Executable of the project driver.
+    ///
+    /// The driver performs every technology-specific operation — in-memory
+    /// formatting, disk post-hooks, and verification — so the harness never
+    /// carries built-in knowledge of a language. An absent value keeps the
+    /// built-in reference driver.
+    #[serde(default)]
+    pub driver: Option<String>,
+    /// Literal arguments passed to the project driver.
+    #[serde(default)]
+    pub driver_args: Vec<String>,
     /// Legacy custom verification command, used when `[toolchain.check]`
     /// declares no command of its own.
     #[serde(default)]
@@ -154,6 +171,16 @@ pub struct ToolchainConfig {
 }
 
 impl ToolchainConfig {
+    /// Program and arguments of the project driver, when the configuration names
+    /// one.
+    ///
+    /// A blank command resolves to `None`, so a declared but empty value
+    /// degrades to the built-in reference driver instead of spawning an empty
+    /// program.
+    pub fn driver_command_line(&self) -> Option<(String, Vec<String>)> {
+        command_line(self.driver.as_deref(), &self.driver_args)
+    }
+
     /// Effective per-command timeout in seconds.
     ///
     /// Falls back to [`DEFAULT_TOOLCHAIN_TIMEOUT_SECS`] when unset or set to a
@@ -231,6 +258,8 @@ mod tests {
             config.effective_timeout_secs(),
             DEFAULT_TOOLCHAIN_TIMEOUT_SECS
         );
+        assert!(config.driver.is_none());
+        assert!(config.driver_args.is_empty());
         assert!(config.check.is_none());
         assert!(config.lint.is_none());
         assert!(config.test.is_none());
@@ -429,5 +458,33 @@ mod tests {
             rustfmt.effective_timeout_secs(),
             DEFAULT_TOOLCHAIN_TIMEOUT_SECS
         );
+    }
+
+    #[test]
+    fn test_driver_command_line() {
+        assert!(ToolchainConfig::default().driver_command_line().is_none());
+
+        let config = parse(
+            r#"
+            driver = "tauqe-driver-cargo"
+            driver_args = ["--strict"]
+            "#,
+        );
+        assert_eq!(
+            config.driver_command_line(),
+            Some((
+                "tauqe-driver-cargo".to_string(),
+                vec!["--strict".to_string()]
+            ))
+        );
+
+        // A blank command is not a command.
+        let blank = parse(
+            r#"
+            driver = "   "
+            driver_args = ["--strict"]
+            "#,
+        );
+        assert!(blank.driver_command_line().is_none());
     }
 }

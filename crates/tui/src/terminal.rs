@@ -4,12 +4,12 @@ use std::time::Duration;
 
 use crate::config::{DesktopNotificationProtocol, NotificationConfig};
 
+use crossterm::cursor::Show;
 use crossterm::event::{
     self, DisableBracketedPaste, DisableFocusChange, DisableMouseCapture, EnableBracketedPaste,
     EnableFocusChange, EnableMouseCapture, KeyboardEnhancementFlags, PopKeyboardEnhancementFlags,
     PushKeyboardEnhancementFlags,
 };
-use crossterm::cursor::Show;
 use crossterm::execute;
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,

@@ -249,6 +249,7 @@ pub struct PromptAssembly {
     /// Declared intent of this turn, which decides the advertised capability set.
     pub intent: TurnIntent,
     pub turn_scratchpad: Option<String>,
+    pub project: Option<tauqe_protocol::ProjectConfig>,
 }
 
 impl PromptAssembly {
@@ -274,7 +275,14 @@ impl PromptAssembly {
             active_plan: None,
             intent: TurnIntent::InteractiveRepl,
             turn_scratchpad: None,
+            project: None,
         }
+    }
+
+    /// Attaches the project command configuration available to this turn.
+    pub fn with_project(mut self, project: Option<tauqe_protocol::ProjectConfig>) -> Self {
+        self.project = project;
+        self
     }
 
     /// Declares the intent that decides which capabilities this turn advertises.
@@ -303,7 +311,8 @@ impl PromptAssembly {
         prompt.push_str("Environment behavior is declared in `tauqe.toml` at the repository root: model roles, toolchain verification phases, context and repo-map budgets, pinned files, and workflow policy all come from that file. Treat it as the authoritative project configuration surface, and never infer a documented parameter, budget, or project convention from partial source memory.\n\n");
         let has_eager_repo_map = self.has_eager_repo_map();
         let render_ctx = PromptRenderContext::new(&[], effective_protocol.turn_marker())
-            .with_eager_repo_map(has_eager_repo_map);
+            .with_eager_repo_map(has_eager_repo_map)
+            .with_project(self.project.as_ref());
         let contract_ctx = ContractContext::new(self.intent, render_ctx)
             .with_target_language(self.target_language.as_deref());
         prompt.push_str("## Core System Contract\n");

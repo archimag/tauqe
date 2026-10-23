@@ -31,6 +31,7 @@ const XML_DEVELOP_CAPABILITIES: &[LlmCapability] = &[
     LlmCapability::Outcome,
     LlmCapability::Blocked,
     LlmCapability::UserLanguage,
+    LlmCapability::CustomTools,
 ];
 
 /// XML wire-format implementation of [`PromptProtocol`].
@@ -198,6 +199,7 @@ mod tests {
             LlmCapability::Outcome,
             LlmCapability::Blocked,
             LlmCapability::UserLanguage,
+            LlmCapability::CustomTools,
         ] {
             assert!(protocol.supports(capability));
         }

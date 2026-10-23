@@ -222,7 +222,9 @@ impl RetryingProvider {
             );
 
             let reason = summarize(&reason);
-            if !wait_with_countdown(delay, attempt, max_attempts, &reason, &tx, &mut cancel_rx).await {
+            if !wait_with_countdown(delay, attempt, max_attempts, &reason, &tx, &mut cancel_rx)
+                .await
+            {
                 return Ok(());
             }
         }
@@ -897,9 +899,7 @@ mod tests {
     #[tokio::test]
     async fn a_transient_failure_is_retried_transparently() {
         let provider = ScriptedProvider::new(vec![
-            ScriptedAttempt::transient(
-                "OpenRouter stream ended prematurely without [DONE] marker",
-            ),
+            ScriptedAttempt::transient("OpenRouter stream ended prematurely without [DONE] marker"),
             ScriptedAttempt::text("Hello"),
         ]);
 
@@ -1032,9 +1032,7 @@ mod tests {
         let resets: Vec<usize> = events
             .iter()
             .enumerate()
-            .filter_map(|(index, event)| {
-                matches!(event, StreamEvent::ResetStream).then_some(index)
-            })
+            .filter_map(|(index, event)| matches!(event, StreamEvent::ResetStream).then_some(index))
             .collect();
         assert_eq!(
             resets.len(),
@@ -1151,8 +1149,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_runaway_text_stream_is_aborted_at_the_ceiling() {
-        let provider =
-            ScriptedProvider::new(vec![ScriptedAttempt::text_chunks("0123456789", 64)]);
+        let provider = ScriptedProvider::new(vec![ScriptedAttempt::text_chunks("0123456789", 64)]);
 
         let (result, events) = drive_with_ceiling(&provider, fast_config(3), None, 16).await;
 
@@ -1317,9 +1314,9 @@ mod tests {
         );
         assert_eq!(provider.calls(), 1, "a runaway generation is never retried");
         assert!(
-            events.iter().any(
-                |event| matches!(event, StreamEvent::TextDelta(text) if text == "0123456789")
-            ),
+            events
+                .iter()
+                .any(|event| matches!(event, StreamEvent::TextDelta(text) if text == "0123456789")),
             "the answer delta below the ceiling is forwarded"
         );
         assert!(
@@ -1506,10 +1503,9 @@ mod tests {
 
         assert!(result.is_ok(), "the retry must succeed: {:?}", result.err());
         assert_eq!(provider.calls(), 2);
-        assert!(events.iter().any(|event| matches!(
-            event,
-            StreamEvent::RetryingConnection { attempt: 1, .. }
-        )));
+        assert!(events
+            .iter()
+            .any(|event| matches!(event, StreamEvent::RetryingConnection { attempt: 1, .. })));
 
         let partial_at = events
             .iter()

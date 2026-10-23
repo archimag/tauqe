@@ -126,17 +126,17 @@ fn write_document(path: &Path, lifetime: &UsageTotals, operations: u64) -> Resul
         std::fs::create_dir_all(parent)
             .map_err(|err| format!("Failed to create {}: {}", parent.display(), err))?;
     }
-    tauqe_core::atomic_write::write_atomic(path, &payload)
-        .map_err(|err| format!("{:#}", err))
+    tauqe_core::atomic_write::write_atomic(path, &payload).map_err(|err| format!("{:#}", err))
 }
 
 /// Persists the project lifetime totals off the async worker pool.
 async fn persist_lifetime(state: &Arc<AppState>, lifetime: &UsageTotals, operations: u64) {
     let path = telemetry_path(state.repo_root().await.as_path());
     let lifetime = lifetime.clone();
-    let written =
-        tauqe_core::blocking::run_blocking_async(move || write_document(&path, &lifetime, operations))
-            .await;
+    let written = tauqe_core::blocking::run_blocking_async(move || {
+        write_document(&path, &lifetime, operations)
+    })
+    .await;
     match written {
         Ok(Ok(())) => {}
         Ok(Err(err)) => {
@@ -226,16 +226,15 @@ impl AppState {
         let path = telemetry_path(self.repo_root().await.as_path());
         // The document is read from disk, so the read goes to the blocking
         // pool instead of stalling an async worker thread on the file system.
-        let loaded = match tauqe_core::blocking::run_blocking_async(move || read_document(&path))
-            .await
-        {
-            Ok(Some((lifetime, lifetime_operations))) => (lifetime, lifetime_operations),
-            Ok(None) => (UsageTotals::default(), 0),
-            Err(err) => {
-                tracing::warn!(error = %err, "Project telemetry read task failed");
-                (UsageTotals::default(), 0)
-            }
-        };
+        let loaded =
+            match tauqe_core::blocking::run_blocking_async(move || read_document(&path)).await {
+                Ok(Some((lifetime, lifetime_operations))) => (lifetime, lifetime_operations),
+                Ok(None) => (UsageTotals::default(), 0),
+                Err(err) => {
+                    tracing::warn!(error = %err, "Project telemetry read task failed");
+                    (UsageTotals::default(), 0)
+                }
+            };
         {
             let mut snapshot = self.usage.lock().await;
             snapshot.lifetime = loaded.0;
@@ -331,7 +330,12 @@ mod tests {
     fn state_at(root: &Path) -> Arc<AppState> {
         let (out, _rx) = OutChannel::new();
         let (history_sender, _history_rx) = tokio::sync::mpsc::unbounded_channel();
-        AppState::new(AppConfig::default(), root.to_path_buf(), history_sender, out)
+        AppState::new(
+            AppConfig::default(),
+            root.to_path_buf(),
+            history_sender,
+            out,
+        )
     }
 
     fn read_stored_lifetime(root: &Path) -> serde_json::Value {
@@ -450,7 +454,8 @@ mod tests {
     /// zero and the next flush rewrites the document.
     #[test]
     fn unreadable_telemetry_falls_back_to_empty_totals() {
-        let root = std::env::temp_dir().join(format!("tauqe-usage-corrupt-{}", next_operation_id()));
+        let root =
+            std::env::temp_dir().join(format!("tauqe-usage-corrupt-{}", next_operation_id()));
         let _ = std::fs::create_dir_all(root.join(TELEMETRY_DIR));
         std::fs::write(telemetry_path(&root), "{ not telemetry").unwrap();
 

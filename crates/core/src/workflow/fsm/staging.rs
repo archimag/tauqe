@@ -46,10 +46,8 @@ pub(super) async fn run_discovery_phase(
     initial: ProposalStep,
 ) -> anyhow::Result<DiscoveryPhase> {
     let mut step = initial;
-    let mut discovery_round = 0;
-    let mut round_prompt = ctx.prompt.to_string();
 
-    while discovery_round < ctx.options.max_discovery_rounds
+    while ctx.rounds_used < ctx.options.max_discovery_rounds
         && step.edits().is_empty()
         && step.protocol_errors().is_empty()
     {
@@ -102,7 +100,8 @@ pub(super) async fn run_discovery_phase(
             break;
         }
 
-        discovery_round += 1;
+        ctx.rounds_used += 1;
+        let discovery_round = ctx.rounds_used;
         log_fsm_phase(
             ctx.workflow_name,
             ctx.model,
@@ -131,10 +130,11 @@ pub(super) async fn run_discovery_phase(
             })
             .await;
 
-        let feedback = outcome.combined_feedback();
-        if !feedback.is_empty() {
-            round_prompt.push_str(&format!("\n\n{}", feedback));
-        }
+        // Discovery findings are not repository files, so they accumulate in
+        // the turn-scoped journal, an append-only epistemic tail of the user
+        // message, instead of being folded into the context that the patching
+        // phase reads.
+        ctx.journal.record_outcome(&outcome);
 
         let ctx_state = ctx.context_manager.get_state();
         let _ = ctx
@@ -171,6 +171,7 @@ pub(super) async fn run_discovery_phase(
             })
             .await;
 
+        let round_prompt = ctx.journal.compose_user_prompt(ctx.prompt, None);
         step = propose(
             ctx.provider,
             ctx.model,
@@ -470,6 +471,20 @@ pub(super) async fn run_staging_phase(
             .await;
         for (path, error) in &last_failed_errors {
             let reason = format_patch_retry_reason(error);
+            // A rejected project configuration is a self-preservation failure
+            // rather than a stale search block: the harness refuses to commit a
+            // configuration it could not load on its next start, so the
+            // violation is recorded as its own observable event.
+            if let EditError::InvalidConfig { message, .. } = error {
+                tracing::warn!(
+                    workflow = ctx.workflow_name,
+                    model = %ctx.model,
+                    attempt = attempt,
+                    path = path.as_str(),
+                    violation = %message,
+                    "staged project configuration rejected"
+                );
+            }
             tracing::warn!(
                 workflow = ctx.workflow_name,
                 model = %ctx.model,
@@ -509,6 +524,12 @@ pub(super) async fn run_staging_phase(
             retry_log.push_str("\n\n---\n\n");
         }
         retry_log.push_str(&repair_prompt);
+        // A retry round keeps the knowledge Discovery already paid for: the
+        // task comes first, the accumulated journal next, and this round's
+        // repair diagnostics last.
+        let retry_prompt = ctx
+            .journal
+            .compose_user_prompt(ctx.prompt, Some(&retry_log));
         let step_out = propose(
             ctx.provider,
             ctx.model,
@@ -522,7 +543,7 @@ pub(super) async fn run_staging_phase(
             &mut *ctx.input_cache,
             ctx.state,
             ctx.intent,
-            &retry_log,
+            &retry_prompt,
             staged_state.as_ref(),
         )
         .await?;
@@ -1597,6 +1618,57 @@ mod tests {
             std::fs::read_to_string(root.join("a.rs")).unwrap(),
             "pub fn compute() -> i32 { 42 }\n"
         );
+    }
+
+    #[tokio::test]
+    async fn discovery_findings_accumulate_in_an_append_only_journal_tail() {
+        let (_dir, root) = setup_repo(&[("a.rs", TARGET)]);
+        let mut context = context_with_target(&root);
+        let mut history = HistoryManager::new(root.clone());
+
+        let provider = MockLlmProvider::scripted([
+            MockResponse::text("Consulting the docs.\n<doc_request topic=\"git\" />"),
+            MockResponse::text("The documentation answers the question."),
+        ]);
+        let model = ModelRef::openrouter("mock/model");
+        let protocol = XmlPromptProtocol;
+        let mut policy = DirectApplyPolicy::new();
+        let options = WorkflowOptions::default();
+        let (stream_tx, rx) = mpsc::channel(256);
+        drop(rx);
+        let (_cancel_tx, cancel_rx) = watch::channel(false);
+
+        let outcome = run_fsm_turn(
+            "Explain the git workflow",
+            &provider,
+            &model,
+            &mut context,
+            &mut history,
+            &protocol,
+            &mut policy,
+            "git",
+            stream_tx,
+            cancel_rx,
+            &options,
+        )
+        .await
+        .unwrap();
+
+        assert!(matches!(outcome.result, ModelResult::Answer { .. }));
+        assert_eq!(provider.requests().len(), 2);
+
+        // The findings ride in a delimited tail of the user message, after the
+        // original task, so the stable part of the request keeps its bytes.
+        let user = &provider.requests()[1].messages[1];
+        assert_eq!(user.role, "user");
+        let task_at = user.content.find("Explain the git workflow").expect("task");
+        let tail_at = user
+            .content
+            .find("<discovery_journal>")
+            .expect("journal tail");
+        assert!(task_at < tail_at);
+        assert!(user.content.contains("<system_documentation>"));
+        assert!(user.content.trim_end().ends_with("</discovery_journal>"));
     }
 
     #[allow(dead_code)]

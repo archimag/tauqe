@@ -5,7 +5,7 @@ pub mod storage;
 use anyhow::Result;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use tauqe_protocol::{UiHistoryItem, UiHistoryKind};
+use tauqe_protocol::{HistoryEntryStatus, UiHistoryItem, UiHistoryKind};
 
 pub use compaction::{
     build_compacted_history, estimate_entries_tokens, partition_head_tail,
@@ -31,6 +31,9 @@ pub enum HistoryMutation {
         summary: UiHistoryItem,
         tail_ids: Vec<u64>,
     },
+    /// A record was rolled back: its turn failed or was cancelled before the
+    /// result reached the model context.
+    RolledBack { item: UiHistoryItem },
 }
 
 #[derive(Clone)]
@@ -89,6 +92,7 @@ impl HistoryManager {
                 summary: None,
                 commit_hash: None,
                 files: Vec::new(),
+                status: HistoryEntryStatus::Committed,
             },
             HistoryEntry::Turn {
                 prompt, context, ..
@@ -99,6 +103,7 @@ impl HistoryManager {
                 summary: None,
                 commit_hash: None,
                 files: context.clone(),
+                status: HistoryEntryStatus::Committed,
             },
             HistoryEntry::Response {
                 message,
@@ -113,6 +118,7 @@ impl HistoryManager {
                 summary: summary.clone(),
                 commit_hash: commit.clone(),
                 files: files.clone(),
+                status: HistoryEntryStatus::Committed,
             },
             HistoryEntry::Review {
                 model,
@@ -144,15 +150,23 @@ impl HistoryManager {
                     summary: Some(format!("Review: {} findings", findings_count)),
                     commit_hash: None,
                     files: files.clone(),
+                    status: HistoryEntryStatus::Committed,
                 }
             }
         }
     }
 
-    fn notify_entry(&self, entry: &HistoryEntry) {
+    /// Publishes an appended record under an explicit lifecycle status.
+    ///
+    /// A prompt enters the developer's chronicle the moment the turn starts, so
+    /// it is published as [`HistoryEntryStatus::Active`] and only a recorded
+    /// result is published as committed. Both notifications share one shape, so
+    /// the client never has to infer the status from surrounding events.
+    fn notify_entry(&self, entry: &HistoryEntry, status: HistoryEntryStatus) {
         if let Some(listener) = &self.listener {
             let id = entry.id().unwrap_or(self.current_max_id);
-            let item = Self::entry_to_ui_item(id, entry);
+            let mut item = Self::entry_to_ui_item(id, entry);
+            item.status = status;
             (listener.0)(HistoryMutation::Appended { item });
         }
     }
@@ -173,7 +187,7 @@ impl HistoryManager {
             context: context_files,
         };
         self.storage.append_entry(&entry)?;
-        self.notify_entry(&entry);
+        self.notify_entry(&entry, HistoryEntryStatus::Active);
         Ok(entry)
     }
 
@@ -193,7 +207,7 @@ impl HistoryManager {
             files,
         };
         self.storage.append_entry(&entry)?;
-        self.notify_entry(&entry);
+        self.notify_entry(&entry, HistoryEntryStatus::Committed);
         Ok(entry)
     }
 
@@ -215,7 +229,7 @@ impl HistoryManager {
             summary,
         };
         self.storage.append_entry(&entry)?;
-        self.notify_entry(&entry);
+        self.notify_entry(&entry, HistoryEntryStatus::Committed);
         Ok(entry)
     }
 
@@ -338,10 +352,17 @@ impl HistoryManager {
     }
 
     /// Removes an entry by ID, rewriting storage and updating `current_max_id`.
-    pub fn rollback_entry(&mut self, entry_id: u64) -> Result<()> {
+    ///
+    /// A rolled-back record leaves the model context but stays visible in the
+    /// developer's chronicle: the listener receives the discarded record with
+    /// [`HistoryEntryStatus::RolledBack`] together with the interruption reason.
+    /// The client therefore updates exactly the entry the failure refers to
+    /// instead of guessing which prompt was rejected.
+    pub fn rollback_entry(&mut self, entry_id: u64, reason: impl Into<String>) -> Result<()> {
+        let reason = reason.into();
         let mut entries = self.storage.read_entries()?;
         if let Some(pos) = entries.iter().rposition(|e| e.id() == Some(entry_id)) {
-            entries.remove(pos);
+            let discarded = entries.remove(pos);
             self.storage.rewrite_entries(&entries)?;
             self.current_max_id = entries
                 .iter()
@@ -349,6 +370,12 @@ impl HistoryManager {
                 .map(|(idx, e)| e.id().unwrap_or((idx + 1) as u64))
                 .max()
                 .unwrap_or(0);
+            if let Some(listener) = &self.listener {
+                let mut item = Self::entry_to_ui_item(entry_id, &discarded);
+                item.status = HistoryEntryStatus::RolledBack;
+                item.summary = Some(reason);
+                (listener.0)(HistoryMutation::RolledBack { item });
+            }
         }
         Ok(())
     }
@@ -470,13 +497,67 @@ mod tests {
         let entry2 = hm.record_turn("Task 2", vec![]).unwrap();
         assert_eq!(hm.get_entries().unwrap().len(), 2);
 
-        hm.rollback_entry(entry2.id().unwrap()).unwrap();
+        hm.rollback_entry(entry2.id().unwrap(), "Turn cancelled by the developer")
+            .unwrap();
         let entries = hm.get_entries().unwrap();
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].id(), entry1.id());
 
-        hm.rollback_entry(999).unwrap();
+        hm.rollback_entry(999, "Missing entry").unwrap();
         assert_eq!(hm.get_entries().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn test_rollback_notifies_typed_record_with_reason() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        let mut hm = HistoryManager::new(root);
+
+        let received: Arc<std::sync::Mutex<Vec<HistoryMutation>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = Arc::clone(&received);
+        hm.set_listener(move |mutation| {
+            let mut guard = sink.lock().unwrap();
+            guard.push(mutation);
+        });
+
+        let entry = hm.record_turn("Refactor the parser", vec![]).unwrap();
+        let id = entry.id().unwrap();
+        hm.rollback_entry(id, "Turn cancelled by the developer")
+            .unwrap();
+
+        let mutations = received.lock().unwrap();
+        assert_eq!(
+            mutations.len(),
+            2,
+            "the append and the rollback are reported"
+        );
+
+        // The prompt reaches the chronicle the moment the turn starts, so the
+        // developer sees the running task before any result exists.
+        match &mutations[0] {
+            HistoryMutation::Appended { item } => {
+                assert_eq!(item.id, id);
+                assert_eq!(item.status, HistoryEntryStatus::Active);
+                assert_eq!(item.text, "Refactor the parser");
+            }
+            other => panic!("expected an append, got {:?}", other),
+        }
+
+        // The rollback keeps the discarded prompt and carries the reason, so the
+        // client can explain why the turn never reached the model context.
+        match &mutations[1] {
+            HistoryMutation::RolledBack { item } => {
+                assert_eq!(item.id, id);
+                assert_eq!(item.status, HistoryEntryStatus::RolledBack);
+                assert_eq!(item.text, "Refactor the parser");
+                assert_eq!(
+                    item.summary.as_deref(),
+                    Some("Turn cancelled by the developer")
+                );
+            }
+            other => panic!("expected a rollback, got {:?}", other),
+        }
     }
 
     #[test]

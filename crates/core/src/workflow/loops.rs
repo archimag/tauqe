@@ -120,7 +120,9 @@ impl Task for EditLoop {
             Ok(output) => {
                 if output.is_cancelled {
                     if let Some(id) = turn_id {
-                        let _ = env.history.rollback_entry(id);
+                        let _ = env
+                            .history
+                            .rollback_entry(id, "Turn cancelled by the developer");
                     }
                 } else {
                     record_session_response(env.history, &output);
@@ -129,7 +131,9 @@ impl Task for EditLoop {
             }
             Err(err) => {
                 if let Some(id) = turn_id {
-                    let _ = env.history.rollback_entry(id);
+                    let _ = env
+                        .history
+                        .rollback_entry(id, format!("Turn failed: {}", err));
                 }
                 Err(err)
             }

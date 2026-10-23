@@ -368,6 +368,9 @@ pub fn canonical_catalog() -> Vec<LocaleCatalogItem> {
         item("history.item_counter", "History | Item {}/{}", "History info line item counter", None),
         item("history.auto_scroll_on", "[Auto-scroll: ON]", "History auto-scroll enabled indicator", None),
         item("history.auto_scroll_off", "[Auto-scroll: OFF]", "History auto-scroll disabled indicator", None),
+        item("history.badge.in_flight", "IN-FLIGHT", "History badge marking a turn whose prompt is still running", Some(12)),
+        item("history.badge.rolled_back", "ROLLED BACK", "History badge marking a turn whose prompt never reached the model context", Some(14)),
+        item("history.rolled_back_hint", "Not sent to the model context. Press [↑] in the prompt or Ctrl+P to restore it.", "History hint telling the developer how to restore a rolled back prompt", None),
 
         // ------------------------------------------------------------------
         // Plans view headers and empty state.
@@ -709,6 +712,7 @@ pub fn canonical_catalog() -> Vec<LocaleCatalogItem> {
         // ------------------------------------------------------------------
         item("notify.prompt_cleared", "Prompt cleared (C-Y to restore)", "REPL notification after clearing the prompt", None),
         item("notify.prompt_clear_arm", "Press Esc again to clear the prompt", "REPL notification arming the prompt clear", None),
+        item("notify.prompt_rolled_back", "Turn interrupted. The prompt was not saved to the model history. Press [↑] or {}P to restore it into the editor.", "REPL warning notification and the persistent hint row shown when a turn fails or is cancelled before its prompt reached the model history; the placeholder receives the configured meta chord prefix", None),
         item("notify.prompt_send_failed", "Failed to send prompt: {}", "REPL notification when sending a prompt fails", None),
         item("notify.copy_busy", "Cannot copy while model is generating", "REPL notification rejecting a copy while busy", None),
         item("notify.copy_no_response", "No model response to copy", "REPL notification when there is no response to copy", None),

@@ -52,7 +52,12 @@ pub(super) async fn run_apply_and_verify_phase(
     };
 
     let repo_root = ctx.repo_root;
-    let mut guard = TransactionRollbackGuard::new(ctx.policy, ctx.context_manager, repo_root);
+    let mut guard = TransactionRollbackGuard::new(
+        ctx.policy,
+        ctx.context_manager,
+        repo_root,
+        ctx.cancel_rx.clone(),
+    );
 
     let mut total_changed_files = match guard.apply_temporary(&proposal).await {
         Ok(files) => {
@@ -224,7 +229,7 @@ pub(super) async fn run_apply_and_verify_phase(
                 .send(StreamEvent::TextDelta(retry_banner.clone()))
                 .await;
 
-            let retry_prompt = if !healing_protocol_errors.is_empty() {
+            let retry_diagnostics = if !healing_protocol_errors.is_empty() {
                 format!(
                     "The proposed verification repair edits could not be parsed due to protocol syntax errors:\n{}\n\nPlease provide corrected edit blocks to fix the verification failure:\n{}",
                     healing_protocol_errors.iter().map(|e| format!("- {}", e)).collect::<Vec<_>>().join("\n"),
@@ -241,6 +246,12 @@ pub(super) async fn run_apply_and_verify_phase(
                     ctx.state.language.as_deref(),
                 )
             };
+            // The healing round replays the knowledge Discovery already paid
+            // for: the task first, the accumulated journal next, and the
+            // compiler diagnostics last.
+            let retry_prompt = ctx
+                .journal
+                .compose_user_prompt(ctx.prompt, Some(&retry_diagnostics));
             let step_out = propose(
                 ctx.provider,
                 ctx.model,
@@ -351,6 +362,10 @@ pub(super) async fn run_apply_and_verify_phase(
                     false,
                 )
                 .await;
+                // Healing findings join the turn journal, so a later healing
+                // round still sees the documentation or outline this one asked
+                // for.
+                ctx.journal.record_outcome(&discovery_outcome);
                 if !discovery_outcome.added_files.is_empty() {
                     let ctx_state = guard.context_manager.get_state();
                     let _ = ctx
@@ -372,13 +387,17 @@ pub(super) async fn run_apply_and_verify_phase(
                 summary: summary.clone(),
                 edits: retry_edits,
             };
+            // The working copy is snapshotted immediately before the attempt, so
+            // a repair that fails halfway cannot strand the files it already
+            // wrote: the paths it left dirty are collected below and join the
+            // change set like any other artifact.
+            let snapshot_root = ctx.repo_root;
+            let worktree_before = crate::blocking::run_blocking(|| {
+                crate::git::state::snapshot_worktree(snapshot_root)
+            });
             match guard.apply_temporary(&retry_proposal).await {
                 Ok(new_files) => {
-                    for file in new_files {
-                        if !total_changed_files.contains(&file) {
-                            total_changed_files.push(file);
-                        }
-                    }
+                    merge_changed_files(&mut total_changed_files, new_files);
                     if !ctx.intent.is_isolated_step() && !toolchain_config.effective_auto_verify() {
                         if let Some(new_request) = step_out.verify_request() {
                             verify_request = new_request.clone();
@@ -424,6 +443,20 @@ pub(super) async fn run_apply_and_verify_phase(
                     }
                 }
                 Err(error) => {
+                    // A repair rejected midway may still have written some of its
+                    // files. Those paths stay dirty in the working copy, so they
+                    // must join the change set: otherwise the final commit would
+                    // leave them unaccounted for while the turn reports a clean,
+                    // verified tree.
+                    let snapshot_root = ctx.repo_root;
+                    let worktree_after = crate::blocking::run_blocking(|| {
+                        crate::git::state::snapshot_worktree(snapshot_root)
+                    });
+                    let dirty = crate::git::state::changed_worktree_paths(
+                        &worktree_before,
+                        &worktree_after,
+                    );
+                    merge_changed_files(&mut total_changed_files, dirty);
                     verify_outcome = VerificationOutcome {
                         success: false,
                         is_cancelled: false,
@@ -605,6 +638,25 @@ pub(super) async fn run_apply_and_verify_phase(
     .await)
 }
 
+/// Merges newly produced paths into the turn's change set.
+///
+/// The change set is the single source of truth for what the turn touched:
+/// post-hook artifacts, repair-round edits, and the paths a failed repair left
+/// dirty all arrive here. The final atomic commit stages exactly this list, so a
+/// file that is dirty in the working copy can never fall outside it. Ordering is
+/// preserved and each path is recorded once, which keeps the commit
+/// deterministic across healing rounds.
+fn merge_changed_files<I>(total: &mut Vec<String>, new_files: I)
+where
+    I: IntoIterator<Item = String>,
+{
+    for file in new_files {
+        if !total.contains(&file) {
+            total.push(file);
+        }
+    }
+}
+
 /// Working-tree content of every changed file a formatter may rewrite.
 type ChangedFilesSnapshot = Vec<(String, Option<Vec<u8>>)>;
 
@@ -629,9 +681,8 @@ async fn run_best_effort_formatters(
     if changed_files.is_empty() {
         return false;
     }
-    let is_git = crate::blocking::run_blocking(|| {
-        crate::git::state::is_git_repository(Some(repo_root))
-    });
+    let is_git =
+        crate::blocking::run_blocking(|| crate::git::state::is_git_repository(Some(repo_root)));
     let dirty_before = if is_git {
         crate::blocking::run_blocking(|| collect_porcelain_status_files(repo_root))
     } else {
@@ -707,8 +758,12 @@ fn revert_foreign_formatter_modifications(
 ) {
     let dirty_after = collect_porcelain_status_files(repo_root);
     for path_str in dirty_after {
-        let is_foreign = !dirty_before.iter().any(|d| Path::new(d) == Path::new(&path_str))
-            && !changed_files.iter().any(|c| Path::new(c) == Path::new(&path_str));
+        let is_foreign = !dirty_before
+            .iter()
+            .any(|d| Path::new(d) == Path::new(&path_str))
+            && !changed_files
+                .iter()
+                .any(|c| Path::new(c) == Path::new(&path_str));
         if !is_foreign {
             continue;
         }
@@ -809,8 +864,8 @@ async fn auto_register_error_files(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::run_fsm_turn;
+    use super::*;
     use crate::context::ContextManager;
     use crate::history::HistoryManager;
     use crate::prompt::xml::XmlPromptProtocol;
@@ -903,11 +958,24 @@ mod tests {
     }
 
     #[test]
+    fn test_merge_changed_files_keeps_order_and_drops_duplicates() {
+        let mut total: Vec<String> = vec!["src/lib.rs".to_string()];
+
+        merge_changed_files(
+            &mut total,
+            vec!["generated.rs".to_string(), "src/lib.rs".to_string()],
+        );
+        merge_changed_files(&mut total, Vec::new());
+
+        assert_eq!(
+            total,
+            vec!["src/lib.rs".to_string(), "generated.rs".to_string()]
+        );
+    }
+
+    #[test]
     fn test_revert_foreign_formatter_modifications() {
-        let (_dir, root) = setup_repo(&[
-            ("a.rs", "pub fn a() {}\n"),
-            ("b.rs", "pub fn b() {}\n"),
-        ]);
+        let (_dir, root) = setup_repo(&[("a.rs", "pub fn a() {}\n"), ("b.rs", "pub fn b() {}\n")]);
 
         let dirty_before = collect_porcelain_status_files(&root);
         assert!(dirty_before.is_empty());

@@ -177,17 +177,26 @@ All commits must follow the **Conventional Commits** specification:
 
 ## 8. Living Documentation and Conceptual Ontology (`docs/`)
 
-1. **Dual-Use Documentation as First-Class Artifact:**
-   - The user guide and architecture documentation located in `docs/` serve both as the authoritative reference for human developers and as the high-density semantic concept ontology for the AI model.
+1. **Dual-Use Documentation as First-Class Semantic Ontology:**
+   - The user guide and architecture documentation located in `docs/` serve two equally authoritative consumers: the human engineer reading a reference, and the language model loading a machine-readable semantic ontology.
+   - Because the model receives documentation through `<doc_request>`, a chapter is a context payload rather than a book page. Its structure must be optimized for precise, low-noise retrieval: dense, canonical, and self-contained.
    - `docs/src/SUMMARY.md` is pinned as the primary conceptual index and must reflect all chapters.
-2. **Rationale and Intent ("Why" Alongside "How"):**
-   - Documentation must never be a dry catalog of procedural instructions, flags, or keystrokes describing merely *how* a feature operates.
-   - Every chapter, architectural overview, and feature guide must explicitly articulate the underlying engineering motivation, trade-offs, and conceptual rationale (*why* it is designed this way).
-   - Explaining the "why" allows both human engineers and the large language model to grasp the deep architectural intent, preventing misaligned refactorings, drift, and accidental violations of core invariants.
-3. **Mandatory Documentation of Conceptual Changes:**
+2. **One Concept — One Sovereign Chapter:**
+   - Every significant system concept (for example sovereign project contracts, the turn scratchpad, the bounded-turn FSM, model roles, the repo map and its blinkers, the three-tier context, the two-tier configuration) lives in its own sovereign file with a single cohesive subject.
+   - Umbrella "God-chapters" that fuse heterogeneous subsystems into one linear narrative are strictly forbidden. A chapter whose scope needs the word "and" in its title is a signal that it must be split.
+   - The rationale is retrieval fidelity: `<doc_request>` injects exactly one concept, so isolating concepts lets the harness load focused invariants without the context noise of neighboring subsystems.
+3. **The Mandatory Four-Part Conceptual Canon:**
+   - Every conceptual chapter must follow the same four-part structure, in this order:
+     - *Motivation & Invariants ("Why")* — the fundamental problem the concept solves and the system invariants it protects.
+     - *Mental Model & Ontology ("What")* — the strict terminology, definitions, and conceptual apparatus the reader must hold.
+     - *Mechanics & Lifecycle ("How it behaves")* — states, transitions, contracts, and failure outcomes.
+     - *Boundaries & Anti-Patterns ("What it is NOT")* — explicit limits of responsibility and prohibited interpretations.
+   - A uniform skeleton turns documentation into a predictable query target: the model knows where to find intent, vocabulary, behavior, and guardrails in every chapter without re-deriving the layout.
+   - Documentation must never be a dry catalog of procedural instructions, flags, or keystrokes describing merely *how* a feature operates. Articulating the "why" preserves deep architectural intent and prevents misaligned refactorings, drift, and accidental violations of core invariants.
+4. **Mandatory Documentation of Conceptual Changes:**
    - Whenever a task introduces or alters user-facing behavior, context mechanics (e.g., layers, permissions), the bounded turn lifecycle, interface workflows, or keybindings, the corresponding chapters in `docs/src/` must be updated within the same turn.
-   - Obsolete explanations must be revised immediately to prevent documentation rot and model hallucination.
-4. **Accessible Engineering Prose (No Florid or Baroque Language):**
+   - Obsolete explanations must be revised immediately, and superseded chapters deleted rather than left stale, to prevent documentation rot and model hallucination.
+5. **Accessible Engineering Prose (No Florid or Baroque Language):**
    - While documentation must clearly convey deep architectural intent and rationale, it must be written in simple, direct, and unpretentious technical English.
    - High information density does not mean dense or complex grammar; clarity and accessibility take precedence over literary style.
 

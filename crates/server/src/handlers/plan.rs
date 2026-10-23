@@ -17,10 +17,10 @@ mod storage_ops;
 #[cfg(test)]
 mod tests;
 
-pub(crate) use common::find_duplicate_item_ids;
 pub use batch::{
     handle_plan_execute, handle_plan_execute_pipeline, handle_plan_refine, handle_plan_replan,
 };
+pub(crate) use common::find_duplicate_item_ids;
 pub(crate) use step::preload_step_files;
 pub use storage_ops::{
     handle_plan_clear_horizon, handle_plan_delete, handle_plan_get, handle_plan_list,

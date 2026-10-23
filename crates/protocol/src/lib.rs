@@ -29,6 +29,7 @@ pub mod message;
 pub mod methods;
 pub mod model;
 pub mod plan;
+pub mod project;
 pub mod review;
 
 // The crate root re-exports the wire contract explicitly rather than through
@@ -51,11 +52,11 @@ pub use context::{
 };
 pub use discussion::{
     discussion_response_schema, discussion_response_schema_definition, DirListRequest,
-    DiscussionClearFocusParams,
-    DiscussionClearFocusResult, DiscussionContextRequest, DiscussionFocus,
-    DiscussionFocusChangedEvent, DiscussionGetFocusParams, DiscussionGetFocusResult,
-    DiscussionPlanAction, DiscussionPlanUpdate, DiscussionRequest, DiscussionResponse,
-    DiscussionSetFocusParams, DiscussionSetFocusResult, DiscussionTarget, RepoSearchRequest,
+    DiscussionClearFocusParams, DiscussionClearFocusResult, DiscussionContextRequest,
+    DiscussionFocus, DiscussionFocusChangedEvent, DiscussionGetFocusParams,
+    DiscussionGetFocusResult, DiscussionPlanAction, DiscussionPlanUpdate, DiscussionRequest,
+    DiscussionResponse, DiscussionSetFocusParams, DiscussionSetFocusResult, DiscussionTarget,
+    RepoSearchRequest,
 };
 pub use edit::{
     EditFileDoneEvent, EditFileOp, EditFileRetryingEvent, EditFileStartedEvent, EditFileStatus,
@@ -85,8 +86,8 @@ pub use git::{
 };
 pub use glob::{matches_glob_pattern, GlobPattern};
 pub use history::{
-    HistoryCompactedEvent, HistoryEntryAddedEvent, HistoryGetParams, HistoryGetResult,
-    UiHistoryItem, UiHistoryKind,
+    HistoryCompactedEvent, HistoryEntryAddedEvent, HistoryEntryRolledBackEvent, HistoryEntryStatus,
+    HistoryGetParams, HistoryGetResult, UiHistoryItem, UiHistoryKind,
 };
 pub use intent::TurnIntent;
 pub use lifecycle::{CLIENT_SHUTDOWN_WAIT, SHUTDOWN_DRAIN_BUDGET};
@@ -97,14 +98,14 @@ pub use message::{
 pub use model::{
     deserialize_model_ref_lenient, ArchitectTier, BatchFinishStatus, BatchFinishSummary,
     CancelMode, CoderTier, ModelAskParams, ModelCancelParams, ModelChangedEvent,
-    ModelConnectionRetryingEvent, ModelCurrentResult, ModelDeltaEvent, ModelEntry,
-    ModelErrorEvent, ModelEscalatedEvent, ModelFinishedEvent, ModelRef, ModelResult,
-    ModelResultEvent, ModelResultProposal, ModelRole, ModelRolesEffort, ModelRolesEntries,
-    ModelRolesSummary, ModelSelectParams, ModelSelectResult, ModelSelection, ModelStartedEvent,
-    ModelStreamResetEvent, ModelTurnPlanContext, ModelUsageEvent, ModelUsageInfo,
-    ModelUsageTotalsEvent, PlanBatchFinishedEvent, ProviderKind, ReasoningEffort,
-    RepoMapInfoEvent, ReviewBatchFinishedEvent, ToolchainFinishedEvent, ToolchainStartedEvent,
-    TurnPhase, TurnPhaseEvent, UsageTotals, UsageTotalsSnapshot,
+    ModelConnectionRetryingEvent, ModelCurrentResult, ModelDeltaEvent, ModelEntry, ModelErrorEvent,
+    ModelEscalatedEvent, ModelFinishedEvent, ModelRef, ModelResult, ModelResultEvent,
+    ModelResultProposal, ModelRole, ModelRolesEffort, ModelRolesEntries, ModelRolesSummary,
+    ModelSelectParams, ModelSelectResult, ModelSelection, ModelStartedEvent, ModelStreamResetEvent,
+    ModelTurnPlanContext, ModelUsageEvent, ModelUsageInfo, ModelUsageTotalsEvent,
+    PlanBatchFinishedEvent, ProviderKind, ReasoningEffort, RepoMapInfoEvent,
+    ReviewBatchFinishedEvent, ToolchainFinishedEvent, ToolchainStartedEvent, TurnPhase,
+    TurnPhaseEvent, UsageTotals, UsageTotalsSnapshot,
 };
 pub use plan::{
     compute_items_status, ConceptItem, Plan, PlanClearHorizonParams, PlanClearHorizonResult,
@@ -113,6 +114,14 @@ pub use plan::{
     PlanRefineResult, PlanReplanParams, PlanSaveParams, PlanScopeEvaluation, PlanSetActiveParams,
     PlanSetActiveResult, PlanStats, PlanSummary, PlanUpdateItemParams, PlanUpdateItemResult,
     PlanUpdatedEvent, PlanValidationError,
+};
+pub use project::{
+    format_diagnostics, Diagnostic, DiagnosticParserKind, DiagnosticSeverity, ProjectCapabilities,
+    ProjectCheckRequest, ProjectCheckResponse, ProjectCheckStepSpec, ProjectCheckSuiteSpec,
+    ProjectCommandSpec, ProjectConfig, ProjectConfigError, ProjectFormatRequest,
+    ProjectFormatResponse, ProjectFormatterSpec, ProjectHookOutcome, ProjectManifest,
+    ProjectPostHookRequest, ProjectPostHookResponse, ProjectPostHookSpec, ProjectRequest,
+    ProjectResponse, ProjectStepResult, ResolvedProjectCommand, TaskRunnerKind,
 };
 pub use review::{
     IssueStatus, IssueType, ReviewCancelParams, ReviewContentDeltaEvent, ReviewDeleteParams,

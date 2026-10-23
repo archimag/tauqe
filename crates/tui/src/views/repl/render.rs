@@ -45,18 +45,22 @@ pub fn render_repl_view(
     prompt_lines: Vec<Line<'static>>,
     cursor_visual_line: usize,
 ) {
-    // While a discussion focus is active, reserve the single row directly above
-    // the prompt for its status banner. The banner is a pure indicator, so it is
-    // carved out of the response area rather than the prompt itself
-    // (c-visual-anchor).
-    let (model_area, focus_banner_area) =
-        if state.discussion_focus.is_active() && model_area.height > 1 {
-            let chunks =
-                Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).split(model_area);
-            (chunks[0], Some(chunks[1]))
-        } else {
-            (model_area, None)
-        };
+    // A banner is a pure indicator, so it is carved out of the response area
+    // rather than the prompt itself: the rows directly above the prompt host the
+    // rollback recall hint and the discussion focus anchor (c-visual-anchor,
+    // c-3).
+    let banners = banner_rows(state);
+    let banner_count = banners
+        .len()
+        .min(usize::from(model_area.height.saturating_sub(1)));
+    let (model_area, banner_area) = if banner_count > 0 {
+        let height = u16::try_from(banner_count).unwrap_or(u16::MAX);
+        let chunks =
+            Layout::vertical([Constraint::Min(1), Constraint::Length(height)]).split(model_area);
+        (chunks[0], Some(chunks[1]))
+    } else {
+        (model_area, None)
+    };
 
     if let Some(lines) = plan_stepper_lines(state) {
         let body = u16::try_from(lines.len()).unwrap_or(u16::MAX);
@@ -76,11 +80,67 @@ pub fn render_repl_view(
         render_model_pane(frame, state, model_area);
     }
 
-    if let Some(banner_area) = focus_banner_area {
-        render_discussion_focus_banner(frame, state, banner_area);
+    if let Some(banner_area) = banner_area {
+        for (index, banner) in banners.into_iter().take(banner_count).enumerate() {
+            let row = Rect::new(
+                banner_area.x,
+                banner_area
+                    .y
+                    .saturating_add(u16::try_from(index).unwrap_or(u16::MAX)),
+                banner_area.width,
+                1,
+            );
+            match banner {
+                ReplBanner::RolledBackPrompt => render_rolled_back_banner(frame, state, row),
+                ReplBanner::DiscussionFocus => render_discussion_focus_banner(frame, state, row),
+            }
+        }
     }
 
     render_prompt_input(frame, state, input_area, prompt_lines, cursor_visual_line);
+}
+
+/// Indicator rows reserved directly above the prompt; they never overlay it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReplBanner {
+    /// The last prompt never reached the model history; name the recall chords.
+    RolledBackPrompt,
+    /// The active discussion focus anchor.
+    DiscussionFocus,
+}
+
+/// Selects the indicator rows shown above the prompt, ordered top to bottom.
+///
+/// The discussion focus anchor stays in the row closest to the editor, so the
+/// recall hint of a rolled-back prompt reads as the older event above it (c-3).
+fn banner_rows(state: &AppState) -> Vec<ReplBanner> {
+    let mut rows = Vec::new();
+    if state.model.prompt_rolled_back {
+        rows.push(ReplBanner::RolledBackPrompt);
+    }
+    if state.discussion_focus.is_active() {
+        rows.push(ReplBanner::DiscussionFocus);
+    }
+    rows
+}
+
+/// Renders the recall hint for a prompt the harness rolled back out of the
+/// model history.
+///
+/// The row is a pure indicator: it states that the prompt was not recorded and
+/// names the editor chords that restore it into the buffer, so a failed or
+/// cancelled turn never costs the developer the text they just wrote (c-3).
+fn render_rolled_back_banner(frame: &mut ratatui::Frame, state: &AppState, area: Rect) {
+    let engine = current_engine();
+    let palette = engine.palette();
+    let line = Line::from(vec![
+        Span::styled(" ⚠ ", engine.fg(palette.status_warning).bold()),
+        Span::styled(
+            state.prompt_recall_hint(),
+            engine.fg(palette.status_warning),
+        ),
+    ]);
+    frame.render_widget(Paragraph::new(line), area);
 }
 
 /// Renders the active discussion focus as a one-line status banner above the prompt.

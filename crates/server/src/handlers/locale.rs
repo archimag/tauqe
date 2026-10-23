@@ -195,8 +195,8 @@ async fn resolve_locale_provider(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use async_trait::async_trait;
     use crate::transport::OutChannel;
+    use async_trait::async_trait;
     use tauqe_core::providers::mock::{MockLlmProvider, MockResponse};
     use tauqe_core::providers::ResponseFormat;
     use tauqe_protocol::{events, LocaleCatalogItem, LocaleGenerateResult, RequestId};
@@ -280,8 +280,7 @@ mod tests {
             .iter()
             .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
             .filter(|event| {
-                event.get("method").and_then(|method| method.as_str())
-                    == Some(events::MODEL_USAGE)
+                event.get("method").and_then(|method| method.as_str()) == Some(events::MODEL_USAGE)
             })
             .count()
     }
@@ -479,8 +478,9 @@ mod tests {
             cost: Some(0.4),
             ..tauqe_protocol::ModelUsageInfo::default()
         };
-        let provider: Arc<dyn LlmProvider> =
-            Arc::new(MockLlmProvider::scripted([MockResponse::text(raw).with_usage(usage)]));
+        let provider: Arc<dyn LlmProvider> = Arc::new(MockLlmProvider::scripted([
+            MockResponse::text(raw).with_usage(usage),
+        ]));
         let (state, mut rx) = state_with_provider_on_wire(provider).await;
 
         let catalog = params(vec![item("tab.review", "Review", None)]);
@@ -509,8 +509,7 @@ mod tests {
             .iter()
             .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
             .find(|event| {
-                event.get("method").and_then(|method| method.as_str())
-                    == Some(events::MODEL_USAGE)
+                event.get("method").and_then(|method| method.as_str()) == Some(events::MODEL_USAGE)
             })
             .expect("legacy usage event");
         assert_eq!(
@@ -547,7 +546,10 @@ mod tests {
         assert!(snapshot.cur.is_none(), "cancellation closes the window");
         assert_eq!(snapshot.session.total_tokens, 6);
         assert!((snapshot.session.cost - 0.1).abs() < f64::EPSILON);
-        assert!(!state.is_operation_active(), "the operation slot is released");
+        assert!(
+            !state.is_operation_active(),
+            "the operation slot is released"
+        );
 
         let lines = drain_wire(&mut rx);
         assert_eq!(

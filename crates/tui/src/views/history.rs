@@ -2,8 +2,9 @@ use std::collections::{HashMap, HashSet};
 
 use ratatui::style::{Style, Stylize};
 use ratatui::text::{Line, Span};
-use tauqe_protocol::{UiHistoryItem, UiHistoryKind};
+use tauqe_protocol::{HistoryEntryStatus, UiHistoryItem, UiHistoryKind};
 
+use crate::i18n::active_t;
 use crate::ui::wrap_lines;
 
 pub mod input;
@@ -44,17 +45,29 @@ struct CachedCodeBlock {
 struct CachedBody {
     text_len: usize,
     files_len: usize,
+    status: HistoryEntryStatus,
     lines: Vec<Line<'static>>,
     blocks: Vec<CachedCodeBlock>,
 }
 
 /// Caches expensive per-item rendering (markdown, syntax highlighting, wrapping),
-/// keyed by `(item id, expanded)` and invalidated whenever the wrap width changes.
-#[derive(Debug, Clone, Default)]
+/// keyed by `(item id, expanded)` and invalidated whenever the wrap width, the
+/// active light/dark mode, or the record's lifecycle status changes.
+#[derive(Debug, Clone)]
 pub(crate) struct HistoryBodyCache {
     width: Option<usize>,
     theme_mode: crate::config::ThemeMode,
     entries: HashMap<(u64, bool), CachedBody>,
+}
+
+impl Default for HistoryBodyCache {
+    fn default() -> Self {
+        Self {
+            width: None,
+            theme_mode: crate::config::ThemeMode::Auto,
+            entries: HashMap::new(),
+        }
+    }
 }
 
 impl HistoryBodyCache {
@@ -83,10 +96,14 @@ impl HistoryBodyCache {
     ) -> &CachedBody {
         let key = (item.id, is_expanded);
         let theme_mode = self.theme_mode;
-        let stale = self
-            .entries
-            .get(&key)
-            .is_some_and(|b| b.text_len != item.text.len() || b.files_len != item.files.len());
+        // The lifecycle status is part of the rendered body: an in-flight record
+        // that later rolls back gains its status badge and restore hint, so a
+        // body cached under the previous status must be recomputed, never reused.
+        let stale = self.entries.get(&key).is_some_and(|body| {
+            body.text_len != item.text.len()
+                || body.files_len != item.files.len()
+                || body.status != item.status
+        });
         if stale {
             self.entries.remove(&key);
         }
@@ -470,12 +487,38 @@ fn build_item_header(
         engine.fg(palette.text_muted).bold(),
     );
 
+    // The lifecycle status is read from the typed field, never inferred from
+    // surrounding events or message text: a record stays visible in the
+    // developer's chronicle while the model context only receives committed
+    // results.
+    let status_badge = match item.status {
+        HistoryEntryStatus::Committed => None,
+        HistoryEntryStatus::Active => Some(Span::styled(
+            format!(" [{}] ", active_t("history.badge.in_flight")),
+            engine
+                .bg(palette.status_info)
+                .fg(engine.color(palette.text_inverse))
+                .bold(),
+        )),
+        HistoryEntryStatus::RolledBack => Some(Span::styled(
+            format!(" [{}] ", active_t("history.badge.rolled_back")),
+            engine
+                .bg(palette.status_error)
+                .fg(engine.color(palette.text_inverse))
+                .bold(),
+        )),
+    };
+
     let mut header_spans = vec![
         Span::styled(cursor_prefix, prefix_style),
         Span::styled(fold_icon, fold_style),
         badge,
-        id_span,
     ];
+    if let Some(status_badge) = status_badge {
+        header_spans.push(Span::raw(" "));
+        header_spans.push(status_badge);
+    }
+    header_spans.push(id_span);
     if let Some(hash) = &item.commit_hash {
         header_spans.push(Span::raw(" "));
         header_spans.push(Span::styled(
@@ -612,6 +655,15 @@ fn build_item_body(
         }
     }
 
+    // A rolled back record explains why it never reached the model context and
+    // how the developer can recover the prompt without retyping it.
+    if item.status == HistoryEntryStatus::RolledBack {
+        raw_lines.push(Line::from(Span::styled(
+            format!("    {}", active_t("history.rolled_back_hint")),
+            engine.fg(palette.status_warning).italic(),
+        )));
+    }
+
     let mut lines: Vec<Line<'static>> = Vec::new();
     let mut raw_to_visual = Vec::with_capacity(raw_lines.len());
     for line in raw_lines {
@@ -639,6 +691,7 @@ fn build_item_body(
     CachedBody {
         text_len: item.text.len(),
         files_len: item.files.len(),
+        status: item.status,
         lines,
         blocks,
     }
@@ -721,6 +774,7 @@ fn layout_history(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tauqe_protocol::HistoryEntryStatus;
 
     #[test]
     fn test_compute_history_lines_assistant_modified_files() {
@@ -730,6 +784,7 @@ mod tests {
             text: "Updated codebase".to_string(),
             summary: Some("Refactoring".to_string()),
             commit_hash: Some("abcdef1".to_string()),
+            status: HistoryEntryStatus::Committed,
             files: vec![
                 "[EDIT] src/main.rs".to_string(),
                 "[NEW] src/util.rs".to_string(),
@@ -783,6 +838,7 @@ mod tests {
             text: "Line 1\nLine 2\nLine 3\nLine 4\nLine 5".to_string(),
             summary: Some("Overview".to_string()),
             commit_hash: Some("abcdef1".to_string()),
+            status: HistoryEntryStatus::Committed,
             files: vec!["[EDIT] src/lib.rs".to_string()],
         };
         // By default without expanded set: collapsed
@@ -820,6 +876,7 @@ mod tests {
             summary: None,
             commit_hash: None,
             files: Vec::new(),
+            status: HistoryEntryStatus::Committed,
         };
 
         let unwrapped = compute_history_lines(std::slice::from_ref(&item), None, None, None);
@@ -844,6 +901,7 @@ mod tests {
             summary: None,
             commit_hash: None,
             files: Vec::new(),
+            status: HistoryEntryStatus::Committed,
         };
         let item2 = UiHistoryItem {
             id: 2,
@@ -852,6 +910,7 @@ mod tests {
             summary: None,
             commit_hash: None,
             files: Vec::new(),
+            status: HistoryEntryStatus::Committed,
         };
         let lines = compute_history_lines(&[item1, item2], None, Some(1), None);
         let rendered: Vec<String> = lines
@@ -879,6 +938,7 @@ mod tests {
                 summary: None,
                 commit_hash: None,
                 files: Vec::new(),
+                status: HistoryEntryStatus::Committed,
             },
             UiHistoryItem {
                 id: 2,
@@ -887,6 +947,7 @@ mod tests {
                 summary: None,
                 commit_hash: None,
                 files: Vec::new(),
+                status: HistoryEntryStatus::Committed,
             },
         ];
         let mut expanded = HashSet::new();
@@ -915,7 +976,29 @@ mod tests {
         );
         let (fresh_lines, fresh_offsets, fresh_blocks) =
             compute_history_lines_full(&items, Some(60), Some(1), Some(&expanded), None);
-        assert_eq!(cached_lines, fresh_lines);
+
+        // The active palette is process-wide state, so two layouts produced
+        // inside the same test may carry different colors. The cache contract
+        // covers the rendered text and the geometry, so both are compared by
+        // content instead of by resolved style.
+        fn rendered_text(lines: &[Line<'static>]) -> Vec<String> {
+            lines
+                .iter()
+                .map(|line| {
+                    line.spans
+                        .iter()
+                        .map(|span| span.content.as_ref())
+                        .collect::<Vec<_>>()
+                        .join("")
+                })
+                .collect()
+        }
+
+        assert_eq!(
+            rendered_text(&cached_lines),
+            rendered_text(&fresh_lines),
+            "a warm cache must render the same text as a cold one"
+        );
         assert_eq!(cached_offsets, fresh_offsets);
         assert_eq!(cached_blocks.len(), fresh_blocks.len());
 
@@ -929,6 +1012,81 @@ mod tests {
             &mut cache,
         );
         assert_eq!(cache.width, Some(30));
+    }
+
+    fn status_item(id: u64, status: HistoryEntryStatus, summary: Option<&str>) -> UiHistoryItem {
+        UiHistoryItem {
+            id,
+            kind: UiHistoryKind::User,
+            text: "Implement the change".to_string(),
+            summary: summary.map(str::to_string),
+            commit_hash: None,
+            files: Vec::new(),
+            status,
+        }
+    }
+
+    fn render_item(item: &UiHistoryItem) -> Vec<String> {
+        compute_history_lines(std::slice::from_ref(item), None, None, None)
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<Vec<_>>()
+                    .join("")
+            })
+            .collect()
+    }
+
+    #[test]
+    fn test_active_record_is_marked_in_flight() {
+        let active = status_item(1, HistoryEntryStatus::Active, None);
+        let rendered = render_item(&active);
+
+        assert!(
+            rendered.iter().any(|line| line.contains("[IN-FLIGHT]")),
+            "a running prompt must advertise its in-flight status"
+        );
+        assert!(!rendered
+            .iter()
+            .any(|line| line.contains(active_t("history.rolled_back_hint").as_str())));
+    }
+
+    #[test]
+    fn test_rolled_back_record_shows_status_reason_and_restore_hint() {
+        let hint = active_t("history.rolled_back_hint").to_string();
+        let item = status_item(
+            2,
+            HistoryEntryStatus::RolledBack,
+            Some("Turn cancelled by the developer"),
+        );
+        let rendered = render_item(&item);
+
+        assert!(rendered.iter().any(|line| line.contains("[ROLLED BACK]")));
+        assert!(rendered
+            .iter()
+            .any(|line| line.contains("Turn cancelled by the developer")));
+        assert!(
+            rendered.iter().any(|line| line.contains(hint.as_str())),
+            "the restore hint must accompany a rolled back record"
+        );
+    }
+
+    #[test]
+    fn test_body_cache_is_invalidated_when_the_status_changes() {
+        let mut active = status_item(1, HistoryEntryStatus::Active, None);
+        let mut cache = HistoryBodyCache::default();
+
+        let cached = cache.body_for(&active, false, None).clone();
+        active.status = HistoryEntryStatus::RolledBack;
+
+        let recomputed = cache.body_for(&active, false, None).clone();
+        assert!(
+            recomputed.lines.len() > cached.lines.len(),
+            "the restore hint must appear after the status changes"
+        );
+        assert_eq!(recomputed.status, HistoryEntryStatus::RolledBack);
     }
 
     #[test]
@@ -945,6 +1103,7 @@ mod tests {
             summary: None,
             commit_hash: None,
             files: Vec::new(),
+            status: HistoryEntryStatus::Committed,
         }
     }
 

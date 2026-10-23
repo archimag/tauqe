@@ -271,13 +271,8 @@ pub async fn handle_modal_click(
                     // Shared with the keyboard launch so a typed target path
                     // rides along on a mouse click too.
                     let params = serde_json::to_value(dialog.start_params())?;
-                    crate::dialogs::input::confirm_start_review(
-                        state,
-                        st,
-                        server_writer,
-                        params,
-                    )
-                    .await?;
+                    crate::dialogs::input::confirm_start_review(state, st, server_writer, params)
+                        .await?;
                     return Ok(InputResult::Continue);
                 }
 
@@ -391,7 +386,8 @@ pub async fn handle_modal_click(
         }
         Some(ActiveModal::ConfirmQuit) => {
             if st.confirm_quit {
-                let geom = geometry_of(term_rect, &crate::dialogs::render::confirm_quit_params(&st));
+                let geom =
+                    geometry_of(term_rect, &crate::dialogs::render::confirm_quit_params(&st));
                 match check_confirm_hit(&geom, mouse.column, mouse.row) {
                     ModalHit::Confirm => {
                         st.confirm_quit = false;
@@ -755,13 +751,8 @@ pub async fn handle_modal_click(
                 );
 
                 if rect_contains(geo.confirm_button, mouse.column, mouse.row) {
-                    crate::dialogs::input::submit_refine_dialog(
-                        state,
-                        st,
-                        dialog,
-                        server_writer,
-                    )
-                    .await?;
+                    crate::dialogs::input::submit_refine_dialog(state, st, dialog, server_writer)
+                        .await?;
                     return Ok(InputResult::Continue);
                 }
 
@@ -846,7 +837,10 @@ pub async fn handle_modal_click(
         }
         Some(ActiveModal::ClearHistory) => {
             if st.confirm_clear_history {
-                let geom = geometry_of(term_rect, &crate::dialogs::render::clear_history_params(&st));
+                let geom = geometry_of(
+                    term_rect,
+                    &crate::dialogs::render::clear_history_params(&st),
+                );
                 match check_confirm_hit(&geom, mouse.column, mouse.row) {
                     ModalHit::Confirm => {
                         st.confirm_clear_history = false;
@@ -885,8 +879,8 @@ pub async fn handle_modal_click(
                     // the current scroll offset and the exact window the rows are
                     // drawn in, so a click on empty space below the last option
                     // never selects a status (Conventions §6.6).
-                    let clicked_row = dialog.selector.scroll_offset()
-                        + (mouse.row - options_area.y) as usize;
+                    let clicked_row =
+                        dialog.selector.scroll_offset() + (mouse.row - options_area.y) as usize;
                     if clicked_row < options_count {
                         crate::dialogs::input::apply_status_dialog(
                             &mut st,
@@ -914,12 +908,8 @@ pub async fn handle_modal_click(
                 if rect_contains(select_btn, mouse.column, mouse.row) {
                     let selected = dialog.items.get(dialog.selector.selected_index()).cloned();
                     if let Some(item) = selected {
-                        crate::dialogs::input::activate_selection_item(
-                            st,
-                            item,
-                            server_writer,
-                        )
-                        .await?;
+                        crate::dialogs::input::activate_selection_item(st, item, server_writer)
+                            .await?;
                     }
                     return Ok(InputResult::Continue);
                 }
@@ -936,21 +926,16 @@ pub async fn handle_modal_click(
                 // Rows resolve through the same list rectangle the renderer
                 // draws, so the air above the first row and below the last one
                 // never activates an item (Conventions §6.6, §6.7, c-3).
-                let list_area =
-                    crate::dialogs::render::selection::selection_dialog_list_area(
-                        term_rect, item_count,
-                    );
+                let list_area = crate::dialogs::render::selection::selection_dialog_list_area(
+                    term_rect, item_count,
+                );
                 if rect_contains(list_area, mouse.column, mouse.row) {
                     let clicked_visible = (mouse.row - list_area.y) as usize;
                     let clicked_idx = dialog.selector.scroll_offset() + clicked_visible;
                     let clicked = dialog.items.get(clicked_idx).cloned();
                     if let Some(item) = clicked {
-                        crate::dialogs::input::activate_selection_item(
-                            st,
-                            item,
-                            server_writer,
-                        )
-                        .await?;
+                        crate::dialogs::input::activate_selection_item(st, item, server_writer)
+                            .await?;
                     }
                 }
             }

@@ -262,9 +262,7 @@ mod tests {
         let buffer = terminal.backend().buffer();
         let start = area.x.saturating_add(1);
         let end = area.x.saturating_add(area.width).saturating_sub(1);
-        (start..end)
-            .map(|x| buffer[(x, y)].symbol())
-            .collect()
+        (start..end).map(|x| buffer[(x, y)].symbol()).collect()
     }
 
     /// Mouse hit-testing must compute the same button rectangles the renderer

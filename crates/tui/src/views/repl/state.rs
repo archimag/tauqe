@@ -248,6 +248,14 @@ pub struct ReplView {
     pub toolchain: Option<ToolchainState>,
     /// Pending provider reconnect, mirrored from the daemon's countdown.
     pub retrying: Option<RetryingState>,
+    /// True when the last submitted prompt never reached the model history.
+    ///
+    /// The harness commits a prompt to the model context only when the turn
+    /// settles, so a provider failure or a cancellation rolls the record back
+    /// and leaves the editor history as the only place the text still lives.
+    /// The flag drives the recall hint shown above the prompt until the next
+    /// turn starts (c-3).
+    pub prompt_rolled_back: bool,
     pub turn_phase: Option<tauqe_protocol::TurnPhase>,
     pub turn_round: Option<usize>,
     pub turn_max_rounds: Option<usize>,
@@ -299,6 +307,7 @@ impl Default for ReplView {
             last_commit_summary: None,
             toolchain: None,
             retrying: None,
+            prompt_rolled_back: false,
             turn_phase: None,
             turn_round: None,
             turn_max_rounds: None,
@@ -351,6 +360,7 @@ impl ReplView {
         self.last_commit_summary = None;
         self.toolchain = None;
         self.retrying = None;
+        self.prompt_rolled_back = false;
         self.turn_phase = None;
         self.turn_round = None;
         self.turn_max_rounds = None;
@@ -655,6 +665,7 @@ mod turn_reset_tests {
             max_attempts: 3,
             delay_secs: 2,
         });
+        view.prompt_rolled_back = true;
         view.turn_phase = Some(tauqe_protocol::TurnPhase::Healing);
         view.turn_round = Some(2);
         view.turn_max_rounds = Some(4);
@@ -687,6 +698,10 @@ mod turn_reset_tests {
         assert!(view.last_commit_summary.is_none());
         assert!(view.toolchain.is_none());
         assert!(view.retrying.is_none());
+        assert!(
+            !view.prompt_rolled_back,
+            "a new turn clears the recall hint of the rolled-back prompt"
+        );
         assert!(view.turn_phase.is_none());
         assert!(view.turn_round.is_none());
         assert!(view.turn_max_rounds.is_none());

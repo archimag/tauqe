@@ -32,6 +32,8 @@ pub(super) struct TurnInputCache {
     /// `Some` marks the outline as rendered, so an empty tree is frozen as well
     /// instead of re-walking the tracked file list on every round.
     repo_dirs: Option<FrozenRepoDirs>,
+    /// Project configuration frozen on the first proposal round of the turn.
+    project: Option<tauqe_protocol::ProjectConfig>,
 }
 
 /// Repository map frozen for the remaining rounds of a bounded turn.
@@ -172,6 +174,21 @@ impl TurnInputCache {
         self.repo_dirs = Some(FrozenRepoDirs { tree: tree.clone() });
         tree
     }
+
+    /// Returns the effective project configuration frozen at the start of the turn.
+    pub(super) async fn project(
+        &mut self,
+        repo_root: &Path,
+        cancel_rx: Option<&tokio::sync::watch::Receiver<bool>>,
+    ) -> tauqe_protocol::ProjectConfig {
+        if let Some(project) = &self.project {
+            return project.clone();
+        }
+
+        let (project, _) = crate::toolchain::effective_project_config(repo_root, cancel_rx).await;
+        self.project = Some(project.clone());
+        project
+    }
 }
 
 #[cfg(test)]
@@ -296,10 +313,7 @@ mod tests {
         crate::git::cmd::commit_with_developer_author(&root, "Add fixtures", false).unwrap();
 
         let mut cache = TurnInputCache::default();
-        let first = cache
-            .repo_dirs(&root, &[])
-            .await
-            .expect("outline rendered");
+        let first = cache.repo_dirs(&root, &[]).await.expect("outline rendered");
         assert_eq!(first, "src\n  nested\n");
 
         // A folder tracked later would appear in a regenerated outline; the

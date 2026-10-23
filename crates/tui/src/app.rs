@@ -1579,6 +1579,31 @@ impl AppState {
         Some(prompt)
     }
 
+    /// Raises the rollback warning and arms the persistent recall hint for a
+    /// prompt that never reached the model history.
+    ///
+    /// A failed or cancelled turn rolls its history record back, so the text
+    /// survives only in the editor history. The warning states that fact and
+    /// names the recall chords, and the Develop view keeps the same hint on
+    /// screen until the next turn starts (c-3).
+    pub fn notify_prompt_rolled_back(&mut self) {
+        self.model.prompt_rolled_back = true;
+        let hint = self.prompt_recall_hint();
+        self.notify_warning(hint);
+    }
+
+    /// Localized hint naming the editor chords that recall a rolled-back prompt.
+    ///
+    /// The meta chord is projected through the configured modifiers, so the hint
+    /// never advertises a key the developer did not configure (Conventions §5.2).
+    pub fn prompt_recall_hint(&self) -> String {
+        active_t("notify.prompt_rolled_back").replacen(
+            "{}",
+            self.tui_config.input.meta_modifier.emacs_prefix(),
+            1,
+        )
+    }
+
     pub fn update_filtered_candidates(&mut self) {
         self.context_view
             .update_filtered_candidates(&self.context.items, &self.all_repo_files);
@@ -1856,6 +1881,32 @@ mod tests {
         let result = state.take_prompt();
         assert_eq!(result, Some("next planned prompt".to_string()));
         assert!(state.input_editor.is_empty());
+    }
+
+    #[test]
+    fn test_notify_prompt_rolled_back_names_the_configured_recall_chord() {
+        let mut st = test_state();
+        assert!(!st.model.prompt_rolled_back);
+
+        st.notify_prompt_rolled_back();
+
+        assert!(
+            st.model.prompt_rolled_back,
+            "the Develop view keeps the hint until the next turn starts"
+        );
+        let notif = st.active_notification().expect("warning notification");
+        assert_eq!(notif.level, NotificationLevel::Warning);
+        assert!(notif.text.contains("[↑]"));
+        assert!(
+            notif.text.contains("M-P"),
+            "the default meta chord is Alt (M-)"
+        );
+
+        // Re-projecting through the configured meta modifier swaps the chord.
+        st.tui_config.input.meta_modifier = crate::config::MetaModifier::Ctrl;
+        let hint = st.prompt_recall_hint();
+        assert!(hint.contains("C-P"));
+        assert!(!hint.contains("M-P"));
     }
 
     #[test]

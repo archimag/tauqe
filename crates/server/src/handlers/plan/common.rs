@@ -6,8 +6,7 @@ use std::sync::Arc;
 
 use tauqe_core::plan::storage::PlanStorage;
 use tauqe_protocol::{
-    events, ModelErrorEvent, Plan, PlanItem, PlanItemStatus, PlanListChangedEvent,
-    PlanUpdatedEvent,
+    events, ModelErrorEvent, Plan, PlanItem, PlanItemStatus, PlanListChangedEvent, PlanUpdatedEvent,
 };
 
 use crate::state::AppState;
@@ -131,8 +130,6 @@ pub(super) async fn set_step_status(
 /// keeps plan-side call sites unchanged while removing the duplicated body that
 /// cloned the manager and overwrote the shared state afterwards.
 pub(super) use crate::handlers::with_context_mutation;
-
-
 
 /// Returns the declared dependencies of a step that are not yet DONE.
 ///

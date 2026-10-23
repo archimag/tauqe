@@ -61,6 +61,7 @@ The interaction protocol between Tauqe and large language models is strictly div
 6. **Polymorphic Discovery Dispatch:**
    - Discovery phase execution must dispatch through registered handlers implementing `DiscoveryCapabilityHandler` (`crates/core/src/workflow/discovery.rs`) instead of branching on command variants. Each handler owns the validation, disk work, and feedback text of its own capability.
    - The dispatcher resolves repository facts once per round, folds every handler's findings into a single `DiscoveryRoundOutcome`, and halts the round as soon as the files token budget would be breached, so no later capability runs against a context that was never widened.
+   - Findings that are not repository files — search reports, directory listings, targeted outlines, and documentation chapters — never enter the `<context>` block. They accumulate in the turn-scoped `TurnDiscoveryJournal` (`crates/core/src/workflow/discovery/journal.rs`), an append-only, de-duplicated tail of the user message that survives the whole turn, so Staging retries and Verification Healing rounds keep the knowledge Discovery already paid for. `TurnDiscoveryJournal::compose_user_prompt` expresses the message order exactly once — task, journal, phase diagnostics — and the phase executors must obtain their round prompts through it instead of concatenating fragments themselves.
 
 ---
 

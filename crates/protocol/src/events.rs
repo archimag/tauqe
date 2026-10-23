@@ -16,6 +16,7 @@ pub const CONTEXT_CHANGED: &str = "context/changed";
 
 pub const HISTORY_ENTRY_ADDED: &str = "history/entryAdded";
 pub const HISTORY_COMPACTED: &str = "history/compacted";
+pub const HISTORY_ENTRY_ROLLED_BACK: &str = "history/entryRolledBack";
 
 pub const EDIT_STARTED: &str = "edit/started";
 pub const EDIT_FILE_STARTED: &str = "edit/fileStarted";

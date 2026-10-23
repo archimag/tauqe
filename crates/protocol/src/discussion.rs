@@ -451,9 +451,7 @@ where
 /// A `null` payload yields an empty list, and every entry is normalized through
 /// [`DirListRequest::normalized`], so a directly decoded response can no longer
 /// carry an unvalidated or escaping directory path.
-fn deserialize_dir_list_requests<'de, D>(
-    deserializer: D,
-) -> Result<Vec<DirListRequest>, D::Error>
+fn deserialize_dir_list_requests<'de, D>(deserializer: D) -> Result<Vec<DirListRequest>, D::Error>
 where
     D: serde::Deserializer<'de>,
 {
@@ -750,7 +748,10 @@ mod tests {
         // The builder applies the same normalization as the decoder.
         let built = DiscussionResponse::new("x")
             .with_repo_dirs(false)
-            .with_repo_maps(vec!["./crates/core/".to_string(), "../escape.rs".to_string()]);
+            .with_repo_maps(vec![
+                "./crates/core/".to_string(),
+                "../escape.rs".to_string(),
+            ]);
         assert_eq!(built.repo_dirs, Some(false));
         assert_eq!(built.repo_maps, vec!["crates/core".to_string()]);
 

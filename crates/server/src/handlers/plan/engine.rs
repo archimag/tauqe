@@ -22,8 +22,8 @@ use crate::handlers::common::{
 use crate::state::{AppState, OperationGuard};
 
 use super::common::{find_duplicate_item_ids, offload_plan};
-pub(super) use super::horizon::{collect_plan_context_files, PlanHorizonDiagnosticsOwned};
 use super::horizon::resolve_architect_tier;
+pub(super) use super::horizon::{collect_plan_context_files, PlanHorizonDiagnosticsOwned};
 
 /// Unified engine for architect plan horizon synthesis.
 ///
@@ -224,26 +224,25 @@ pub(super) async fn execute_plan_horizon_synthesis(
         session_id: Some(format_session_id(SESSION_PREFIX_ARCHITECT, &plan.id)),
     };
 
-    let build_user_prompt = |context_files: &[ContextFileContent],
-                             repo_map: Option<&str>,
-                             repo_dirs: Option<&str>| {
-        let diag_ref =
-            diagnostics
-                .as_ref()
-                .map(|d| tauqe_core::plan::prompt::PlanHorizonDiagnostics {
-                    blocked_step_id: &d.blocked_step_id,
-                    blocked_reason: d.blocked_reason.as_deref(),
-                    toolchain_status: d.toolchain_status.as_deref(),
-                });
-        tauqe_core::plan::prompt::build_plan_horizon_user_prompt(
-            &plan,
-            context_files,
-            repo_map,
-            repo_dirs,
-            diag_ref,
-            instructions.as_deref(),
-        )
-    };
+    let build_user_prompt =
+        |context_files: &[ContextFileContent], repo_map: Option<&str>, repo_dirs: Option<&str>| {
+            let diag_ref =
+                diagnostics
+                    .as_ref()
+                    .map(|d| tauqe_core::plan::prompt::PlanHorizonDiagnostics {
+                        blocked_step_id: &d.blocked_step_id,
+                        blocked_reason: d.blocked_reason.as_deref(),
+                        toolchain_status: d.toolchain_status.as_deref(),
+                    });
+            tauqe_core::plan::prompt::build_plan_horizon_user_prompt(
+                &plan,
+                context_files,
+                repo_map,
+                repo_dirs,
+                diag_ref,
+                instructions.as_deref(),
+            )
+        };
 
     let output = match run_architect_discovery_loop(
         state,
@@ -436,5 +435,3 @@ pub(super) async fn execute_plan_horizon_synthesis(
         },
     )
 }
-
-

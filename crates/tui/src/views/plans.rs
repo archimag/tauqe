@@ -1059,7 +1059,6 @@ mod tests {
         ));
     }
 
-
     #[test]
     fn test_accordion_navigation_navigates_strictly_across_leaves() {
         let mut view = PlansViewState::default();
@@ -1356,7 +1355,6 @@ mod tests {
         ));
     }
 
-
     #[test]
     fn test_focus_badge_marks_the_anchored_whole_plan() {
         let mut view = PlansViewState::default();
@@ -1429,5 +1427,4 @@ mod tests {
         assert!(view.is_plan_expanded("plan-a"));
         assert_eq!(view.selected_index, 0);
     }
-
 }

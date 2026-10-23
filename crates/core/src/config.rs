@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
-use tauqe_protocol::{ModelRef, ModelRole, ModelRolesSummary, ModelSelection};
+use tauqe_protocol::{ModelRef, ModelRole, ModelRolesSummary, ModelSelection, ProjectConfig};
 
 mod context;
 mod credentials;
@@ -48,6 +48,15 @@ pub struct AppConfig {
     pub develop: DevelopConfig,
     #[serde(default)]
     pub toolchain: ToolchainConfig,
+    /// The `[project]` section: the commands this repository declares.
+    ///
+    /// It is the single surface that tells the harness how to verify, format,
+    /// and post-process the project, and which named commands the model may call
+    /// as typed custom tools. An empty section declares nothing and is rejected
+    /// by [`AppConfig::validate`], because a turn that cannot verify its own
+    /// result must not run.
+    #[serde(default)]
+    pub project: ProjectConfig,
     #[serde(default)]
     pub context: ContextConfig,
     #[serde(default)]
@@ -171,8 +180,18 @@ impl AppConfig {
     }
 
     /// Validates application configuration invariants.
+    ///
+    /// Two layers are checked before a configuration may drive a turn: the
+    /// semantic model roles must resolve, and the `[project]` declaration must
+    /// name a verification command whose reference chain is sound. An invalid
+    /// configuration is rejected as a whole instead of degrading silently,
+    /// because a turn that cannot verify its own result must not run.
     pub fn validate(&self) -> Result<(), String> {
-        self.models.validate()
+        self.models.validate()?;
+        self.project
+            .validate()
+            .map_err(|err| format!("[project] {}", err))?;
+        Ok(())
     }
 }
 
@@ -775,5 +794,98 @@ models = ["deepseek/deepseek-chat", " ", "openai/gpt-4o"]
             vec!["Conventions.md".to_string(), "README.md".to_string()]
         );
         assert_eq!(cfg.max_discovery_rounds, 9);
+    }
+
+    #[test]
+    fn test_project_section_verification_is_mandatory() {
+        let missing: AppConfig =
+            toml::from_str("[models]\nprimary = [\"openrouter:a/b\"]\n").expect("parse config");
+        let err = missing
+            .validate()
+            .expect_err("a configuration without verification must be rejected");
+        assert!(
+            err.contains("verify"),
+            "the diagnostic must name the missing command: {err}"
+        );
+
+        let declared: AppConfig = toml::from_str(
+            r#"
+[models]
+primary = ["openrouter:a/b"]
+
+[project.verify]
+command = "cargo"
+args = ["test"]
+"#,
+        )
+        .expect("parse config");
+        assert!(declared.validate().is_ok());
+        assert_eq!(
+            declared
+                .project
+                .verify_command()
+                .expect("verify resolves")
+                .args,
+            ["test"]
+        );
+    }
+
+    #[test]
+    fn test_project_section_validation_rejects_broken_commands() {
+        let cyclic: AppConfig = toml::from_str(
+            r#"
+[models]
+primary = ["openrouter:a/b"]
+
+[project.verify]
+command = "@first"
+
+[project.commands.first]
+command = "@second"
+
+[project.commands.second]
+command = "@first"
+"#,
+        )
+        .expect("parse config");
+        assert!(cyclic.validate().is_err());
+
+        let unknown: AppConfig = toml::from_str(
+            r#"
+[models]
+primary = ["openrouter:a/b"]
+
+[project.verify]
+command = "@missing"
+"#,
+        )
+        .expect("parse config");
+        assert!(unknown.validate().is_err());
+
+        // A declared command may be reused from `verify`, and the resolved
+        // command line keeps the arguments of the target entry.
+        let reused: AppConfig = toml::from_str(
+            r#"
+[models]
+primary = ["openrouter:a/b"]
+
+[project.verify]
+command = "@check"
+
+[project.commands.check]
+command = "cargo"
+args = ["check", "--all-targets"]
+"#,
+        )
+        .expect("parse config");
+        assert!(reused.validate().is_ok());
+        assert_eq!(
+            reused.project.verify_command().expect("verify resolves"),
+            tauqe_protocol::ResolvedProjectCommand {
+                command: "cargo".to_string(),
+                args: vec!["check".to_string(), "--all-targets".to_string()],
+                timeout_secs: None,
+            }
+        );
     }
 }

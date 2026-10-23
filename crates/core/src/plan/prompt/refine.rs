@@ -542,14 +542,8 @@ mod tests {
 
         // Without a map the compact tree still tells the Architect where
         // subsystems live instead of leaving it blind.
-        let with_dirs = build_plan_horizon_user_prompt(
-            &plan,
-            &[],
-            None,
-            Some("crate\n  src"),
-            None,
-            None,
-        );
+        let with_dirs =
+            build_plan_horizon_user_prompt(&plan, &[], None, Some("crate\n  src"), None, None);
         assert!(with_dirs.contains("## Repository Directories (<repo_dirs>):"));
         assert!(with_dirs.contains("crate\n  src"));
         assert!(!with_dirs.contains("## Codebase Symbol Contours"));

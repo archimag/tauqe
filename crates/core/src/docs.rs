@@ -1,23 +1,56 @@
 //! Documentation embedded into the binary. The same chapters serve human readers
 //! and the model, which requests them on demand via the `<doc_request>` tag.
+//!
+//! Every chapter is a sovereign concept file under `docs/src/`, so a topic maps
+//! to a small, cohesive set of chapters instead of one umbrella narrative.
 
 use tauqe_protocol::DocTopic;
 
 const INTRO: &str = include_str!("../../../docs/src/intro.md");
-const PHILOSOPHY: &str = include_str!("../../../docs/src/ch01-philosophy/semantic-harness.md");
-const CONTEXT: &str = include_str!("../../../docs/src/ch02-context/three-tier-model.md");
-const LIFECYCLE: &str = include_str!("../../../docs/src/ch03-bounded-turn/lifecycle.md");
-const GIT_SAFETY: &str = include_str!("../../../docs/src/ch04-git-safety/checkpoints-and-undo.md");
-const INTERFACE: &str = include_str!("../../../docs/src/ch05-interface/tui-ux.md");
-const REVIEW: &str = include_str!("../../../docs/src/ch06-review/review.md");
-const PLANS: &str = include_str!("../../../docs/src/ch07-plans/plans.md");
-const CONFIG: &str = include_str!("../../../docs/src/ch08-config/configuration.md");
+const SEMANTIC_HARNESS: &str =
+    include_str!("../../../docs/src/ch01-foundations/semantic-harness.md");
+const BOUNDED_TURN: &str = include_str!("../../../docs/src/ch01-foundations/bounded-turn-fsm.md");
+const MODEL_ROLES: &str = include_str!("../../../docs/src/ch01-foundations/model-roles.md");
+const SCRATCHPAD: &str = include_str!("../../../docs/src/ch01-foundations/turn-scratchpad.md");
+const THREE_TIER_CONTEXT: &str =
+    include_str!("../../../docs/src/ch02-perception/three-tier-model.md");
+const DISCUSSION_FOCUS: &str =
+    include_str!("../../../docs/src/ch02-perception/discussion-focus.md");
+const REPO_MAP: &str = include_str!("../../../docs/src/ch02-perception/repo-map.md");
+const DISCOVERY_ENGINE: &str =
+    include_str!("../../../docs/src/ch02-perception/discovery-engine.md");
+const PROJECT_PROTOCOL: &str =
+    include_str!("../../../docs/src/ch03-project/tauqe-project-protocol.md");
+const MODIFICATION_LIFECYCLE: &str =
+    include_str!("../../../docs/src/ch03-project/three-phase-lifecycle.md");
+const VERIFICATION_HEALING: &str =
+    include_str!("../../../docs/src/ch03-project/verification-healing.md");
+const GIT_SAFETY: &str = include_str!("../../../docs/src/ch03-project/git-transactions.md");
+const PLANS: &str = include_str!("../../../docs/src/ch04-workflows/plans.md");
+const REVIEW: &str = include_str!("../../../docs/src/ch04-workflows/review.md");
+const CONFIGURATION: &str = include_str!("../../../docs/src/ch05-system/configuration.md");
+const TUI: &str = include_str!("../../../docs/src/ch05-system/tui-ux.md");
+const I18N: &str = include_str!("../../../docs/src/ch05-system/i18n-subsystem.md");
+
+/// Topics advertised to the model, in the order the system prompt lists them.
+/// The exhaustive match in [`get_documentation`] is the compile-time guard that
+/// keeps this list aligned with [`DocTopic`].
+const TOPICS: &[DocTopic] = &[
+    DocTopic::Overview,
+    DocTopic::Context,
+    DocTopic::Workflow,
+    DocTopic::Git,
+    DocTopic::Interface,
+    DocTopic::Review,
+    DocTopic::Plan,
+    DocTopic::Config,
+    DocTopic::All,
+];
 
 /// Renders the authoritative documentation topics advertised in the system
-/// prompt, derived from [`DocTopic::ALL`] so the hint keeps a single source of
-/// truth.
+/// prompt.
 pub(crate) fn topic_hint() -> String {
-    DocTopic::ALL
+    TOPICS
         .iter()
         .map(DocTopic::as_str)
         .collect::<Vec<_>>()
@@ -25,23 +58,59 @@ pub(crate) fn topic_hint() -> String {
 }
 
 /// Returns the concatenated documentation chapters for the requested topic.
+///
+/// A topic names one cohesive slice of the book's five parts, so a request loads
+/// focused invariants without the context noise of neighboring subsystems.
 pub(crate) fn get_documentation(topic: DocTopic) -> String {
     let sections: &[&str] = match topic {
-        DocTopic::Overview => &[INTRO, PHILOSOPHY],
-        DocTopic::Context => &[CONTEXT],
-        DocTopic::Workflow => &[LIFECYCLE],
+        // Part I: the paradigm and the roles that own "what" and "how".
+        DocTopic::Overview => &[INTRO, SEMANTIC_HARNESS, MODEL_ROLES],
+        // Part II: the perceived working set and how discovery widens it.
+        DocTopic::Context => &[
+            THREE_TIER_CONTEXT,
+            DISCUSSION_FOCUS,
+            REPO_MAP,
+            DISCOVERY_ENGINE,
+        ],
+        // Part I and Part III: the turn machine plus the project work it
+        // delegates to the driver.
+        DocTopic::Workflow => &[
+            BOUNDED_TURN,
+            SCRATCHPAD,
+            PROJECT_PROTOCOL,
+            MODIFICATION_LIFECYCLE,
+            VERIFICATION_HEALING,
+        ],
         DocTopic::Git => &[GIT_SAFETY],
-        DocTopic::Interface => &[INTERFACE],
+        // Part V: the terminal surfaces, including their localization.
+        DocTopic::Interface => &[TUI, I18N],
         DocTopic::Review => &[REVIEW],
         DocTopic::Plan => &[PLANS],
-        DocTopic::Config => &[CONFIG],
+        DocTopic::Config => &[CONFIGURATION],
         DocTopic::All => &[
-            INTRO, PHILOSOPHY, CONTEXT, LIFECYCLE, GIT_SAFETY, INTERFACE, REVIEW, PLANS, CONFIG,
+            INTRO,
+            SEMANTIC_HARNESS,
+            BOUNDED_TURN,
+            MODEL_ROLES,
+            SCRATCHPAD,
+            THREE_TIER_CONTEXT,
+            DISCUSSION_FOCUS,
+            REPO_MAP,
+            DISCOVERY_ENGINE,
+            PROJECT_PROTOCOL,
+            MODIFICATION_LIFECYCLE,
+            VERIFICATION_HEALING,
+            GIT_SAFETY,
+            PLANS,
+            REVIEW,
+            CONFIGURATION,
+            TUI,
+            I18N,
         ],
     };
     sections
         .iter()
-        .map(|s| s.trim())
+        .map(|section| section.trim())
         .collect::<Vec<_>>()
         .join("\n\n")
 }
@@ -51,24 +120,56 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_get_documentation_topics() {
-        assert!(get_documentation(DocTopic::Interface).contains("Ctrl+1"));
+    fn topic_hint_lists_every_advertised_topic() {
+        let hint = topic_hint();
+        for topic in TOPICS {
+            assert!(hint.contains(topic.as_str()));
+        }
+    }
+
+    #[test]
+    fn every_topic_resolves_to_its_chapters() {
+        assert!(get_documentation(DocTopic::Overview).contains("The Semantic Harness"));
+        assert!(get_documentation(DocTopic::Overview).contains("Model Roles and the Coder Ladder"));
+        assert!(get_documentation(DocTopic::Context).contains("Three-Tier Context Model"));
+        assert!(get_documentation(DocTopic::Context).contains("Discovery Engine"));
+        assert!(get_documentation(DocTopic::Workflow).contains("The TauqeProjectProtocol"));
+        assert!(get_documentation(DocTopic::Workflow).contains("Turn Scratchpad"));
+        assert!(get_documentation(DocTopic::Git).contains("Git Safety & Transactions"));
+        assert!(get_documentation(DocTopic::Interface).contains("Keyboard-First Interface"));
+        assert!(
+            get_documentation(DocTopic::Interface).contains("Zero-Hardcode Interface Localization")
+        );
+        assert!(get_documentation(DocTopic::Review).contains("Structured Code Review"));
         assert!(get_documentation(DocTopic::Plan).contains("Local Plans"));
         assert!(
             get_documentation(DocTopic::Config).contains("Configuration and Project Preparation")
         );
-        let all = get_documentation(DocTopic::All);
-        assert!(all.contains("Semantic Harness"));
-        assert!(all.contains("Ctrl+1"));
-        assert!(all.contains("Local Plans"));
-        assert!(all.contains("Configuration and Project Preparation"));
     }
 
     #[test]
-    fn test_topic_hint_lists_every_topic() {
-        let hint = topic_hint();
-        for topic in DocTopic::ALL {
-            assert!(hint.contains(topic.as_str()));
+    fn every_chapter_is_reachable_by_a_topic() {
+        let all = get_documentation(DocTopic::All);
+        for marker in [
+            "Semantic Harness",
+            "Autonomous Bounded Turn FSM",
+            "Model Roles and the Coder Ladder",
+            "Turn Scratchpad",
+            "Three-Tier Context Model",
+            "Discussion Focus",
+            "Repository Map and Blinkers",
+            "Discovery Engine",
+            "The TauqeProjectProtocol",
+            "Three-Phase Modification Lifecycle",
+            "Structured Diagnostics and Verification Healing",
+            "Git Safety & Transactions",
+            "Local Plans",
+            "Structured Code Review",
+            "Configuration and Project Preparation",
+            "Keyboard-First Interface",
+            "Zero-Hardcode Interface Localization",
+        ] {
+            assert!(all.contains(marker), "missing chapter marker: {marker}");
         }
     }
 }

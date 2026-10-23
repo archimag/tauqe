@@ -19,7 +19,23 @@ TAUQE holds the model in a firm grip:
 
 Unlike open-ended coding agents (such as Claude Code or OpenCode) that delegate the development lifecycle, toolchain dispatch, and operational decision-making to an unconstrained LLM loop, TAUQE hardcodes development workflows, state transitions, invariant checks, and Git transactions in deterministic Rust. Language models act as specialized cognitive components within a deterministic harness rather than autonomous process controllers.
 
-### 1.1. The Fundamental Duality: "What" versus "How"
+### 1.1. Primacy of Engineering Principles Over Technology
+
+Technology must adapt to the engineering process, not the engineering process to the limitations of a specific technology.
+
+TAUQE is not an attempt to adapt software development to artificial intelligence. It is an effort to build an engineering environment where the intelligence of the executor does not dictate the structure of the process.
+
+### 1.2. Humans and AI as Equal Engineering Participants
+
+The engineering process must not depend on who executes the work — a human or an AI.
+
+They are interchangeable within their roles, but differ in capabilities, efficiency, and cost. Tasks should be assigned to whichever participant can deliver the required quality at a reasonable cost.
+
+**What is good for a human must be good for an AI — and vice versa.** Tools, documentation, and engineering practices must be shared and retain their intrinsic value regardless of AI involvement.
+
+TAUQE does not invent a new engineering discipline for AI. It applies proven engineering principles, enabling human and artificial intelligence to reinforce each other's strengths.
+
+### 1.3. The Fundamental Duality: "What" versus "How"
 
 Software engineering has always hinged upon two foundational questions: **What** to build and **How** to build it.
 
@@ -29,7 +45,7 @@ In contemporary agentic practices, it is frequently asserted that imperative ins
 
 TAUQE's primary objective is to **liberate the developer's cognitive bandwidth so they can concentrate entirely on 'What'.** The engineer determines the objective, architectural intent, and requirements; the harness firmly steers and confines the model through a bounded turn to solve the *How*, deterministically and safely. TAUQE emphasizes declarative descriptions of the project, its boundaries, and its contracts, eliminating the need for fragile imperative micromanagement.
 
-### 1.2. Model Role Specialization
+### 1.4. Model Role Specialization
 
 TAUQE splits the *What*/*How* duality across dedicated, non-overlapping model roles. Each role keeps a single mandate and never absorbs the responsibility of another:
 
@@ -43,7 +59,7 @@ Each functional role is backed by an ordered list of model entries rather than a
 
 The Architect/Coder boundary is deliberately rigid. The Architect defines the invariant; the Coder implements it. When code generation fails repeatedly, the harness **never switches the Coder into the Architect role**. Instead, escalation is intra-role: the *coder ladder* (`CoderTier`, each tier pairing a model with a reasoning effort) promotes execution to a stronger coder tier within the same *How* competence. Crossing back into the *What* role on a compile failure would blur the boundary the harness exists to enforce and would reintroduce the drift the paradigm is designed to prevent.
 
-### 1.3. Decision Immutability and Guided Autonomy
+### 1.5. Decision Immutability and Guided Autonomy
 
 A prevalent failure mode of autonomous agent loops is silent requirement drift: when an agent encounters friction during code generation, it frequently "changes its mind", weakens acceptance criteria, or alters unrelated subsystems to make tests pass.
 
@@ -52,7 +68,7 @@ TAUQE enforces strict **decision immutability**:
 - The Coder role cannot unilaterally relax requirements or re-architect boundaries.
 - When an invariant cannot be satisfied or an unexpected dependency fails, the model emits a structured `<blocked>` protocol outcome, initiating a controlled replanning cycle rather than speculative drift.
 
-### 1.4. Economic Efficiency via Role-Based Escalation
+### 1.6. Economic Efficiency via Role-Based Escalation
 
 Separating high-level intent from low-level implementation delivers structural cost and token efficiencies:
 - **Frontier reasoning models** are engaged where leverage is highest: initial problem formulation, invariant synthesis, and architectural refinement (Architect).
@@ -139,6 +155,20 @@ The model communicates its intent exclusively through typed protocol tags. Each 
 
 Because these tags are parsed deterministically, the harness can enforce boundaries, react to declared outcomes, and guarantee that no unrecognized side effect ever reaches the operating system. There is no arbitrary shell: interaction with the world happens solely through typed, auditable protocol operations.
 
+### 3.3. Project Integration: Sovereign CLI Contracts & Task Runners
+
+A harness that knows how to run `rustfmt`, how to invoke `tsc`, or how to build a specific repository has smuggled language-specific runtimes into the engine. TAUQE refuses that coupling. Every operation that depends on the concrete technology of a codebase is delegated through sovereign Unix CLI contracts declared directly in the project environment.
+
+The integration rests on four invariants:
+
+- **Single Configuration Surface:** `tauqe.toml` is the sole source of truth for both harness policies and project execution commands (`[project]`). There are no secondary manifests, no background project daemons, and no bespoke RPC drivers.
+- **Sovereign Unix CLI Contracts:** Each project operation adheres to standard OS process semantics:
+  - *In-Memory Format* (`[project.format]`): A pure stream filter taking source text on stdin and emitting formatted code on stdout before any byte touches disk.
+  - *Transactional Post-Hook* (`[project.post_hook]`): Executed strictly after diff application to trigger code generation or migrations; resulting artifacts are deterministically captured via Git status differentials and folded into the turn's atomic commit.
+  - *Deterministic Verification* (`[project.verify]`): Mandatory verification returning exit code 0/1 and structured diagnostics for targeted Verification Healing.
+- **First-Class Task Runner Integration:** TAUQE natively integrates with standard project task runners (`Just`). Recipes tagged with `[group('tauqe')]` are automatically discovered as verification steps or typed LLM tools, while explicit `tauqe.toml` declarations always take precedence (`Config Overrides Runner`).
+- **Process Group Isolation & Self-Preservation:** All commands run in isolated process groups with strict timeout enforcement and clean process-tree teardown. Modifications to `tauqe.toml` by the model undergo mandatory in-memory syntactic parsing during Staging and semantic invariant validation prior to commit.
+
 ---
 
 ## 4. Fundamental Architectural Invariants
@@ -173,7 +203,7 @@ Because these tags are parsed deterministically, the harness can enforce boundar
 
 ```text
 Git                   → Reality and transactional safety
-Project Files         → Manifests and toolchain capabilities
+Project Environment   → Sovereign CLI contracts & task runners
 Tree-sitter Repo Map  → Deterministic symbol awareness
 Bounded Turn          → Autonomous turn lifecycle (Discovery + Staging + Healing)
 Strict Harness        → Enforcing boundaries without shell access

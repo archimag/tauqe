@@ -157,10 +157,17 @@ pub async fn run_workflow_verification(
             target_str
         ));
         for r in results.iter().filter(|r| !r.success) {
+            // A failing command contributes the typed findings its output could
+            // be parsed into, so the healing round reasons about the offending
+            // location instead of a transcript full of ANSI escapes.
+            let body = if r.diagnostics.is_empty() {
+                r.combined_output.trim().to_string()
+            } else {
+                tauqe_protocol::format_diagnostics(&r.diagnostics)
+            };
             report.push_str(&format!(
                 "Command `{}` failed:\n```\n{}\n```\n\n",
-                r.command,
-                r.combined_output.trim()
+                r.command, body
             ));
         }
         if stream_output {
@@ -202,6 +209,35 @@ mod verification_outcome_tests {
             }
         }
         assert!(saw_finished);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_run_workflow_verification_renders_structured_diagnostics() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("tauqe.toml"),
+            "[project.verify]\ncommand = \"sh\"\nargs = ['-c', 'printf \"src/lib.rs:3:5: error: mismatched types\\n\" >&2; exit 1']\n",
+        )
+        .unwrap();
+
+        let (tx, _rx) = mpsc::channel(10);
+        let req = VerifyRequest {
+            target: VerifyTarget::All,
+            on_success: VerifyOnSuccess::Silent,
+        };
+        let outcome = run_workflow_verification(dir.path(), &req, &tx, false, None).await;
+
+        assert!(!outcome.success);
+        assert!(!outcome.is_cancelled);
+        assert!(
+            outcome
+                .report
+                .contains("src/lib.rs:3:5: error: mismatched types"),
+            "the healing input must carry the parsed location: {}",
+            outcome.report
+        );
+        assert!(!outcome.report.contains('\u{1b}'));
     }
 }
 

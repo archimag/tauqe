@@ -50,6 +50,7 @@ pub(super) struct ProposalStep {
     scratchpad: Option<String>,
     language: Option<String>,
     plans: Vec<tauqe_protocol::DiscussionPlanUpdate>,
+    custom_tools: Vec<LlmCommand>,
     protocol_errors: Vec<String>,
     pub(super) is_cancelled: bool,
 }
@@ -124,6 +125,10 @@ impl ProposalStep {
                     }
                 }
                 LlmCommand::Plan { update } => step.plans.push(update.clone()),
+                // A project command invocation is carried as a typed command and
+                // executed by the harness against the declared allowlist before
+                // anything is staged.
+                LlmCommand::CustomTool { .. } => step.custom_tools.push(command.clone()),
                 LlmCommand::ProtocolError { message } => step.protocol_errors.push(message.clone()),
             }
         }
@@ -211,6 +216,16 @@ impl ProposalStep {
         &self.plans
     }
 
+    /// Typed project command invocations carried by the proposal.
+    ///
+    /// Every entry is a `CustomTool` command: the harness validates its name
+    /// against the declared allowlist and its arguments against the declaration
+    /// before anything runs, so an invocation can never widen into an arbitrary
+    /// command line.
+    pub(super) fn custom_tools(&self) -> &[LlmCommand] {
+        &self.custom_tools
+    }
+
     /// Protocol syntax or structure errors encountered during decoding.
     pub(super) fn protocol_errors(&self) -> &[String] {
         &self.protocol_errors
@@ -234,7 +249,8 @@ impl ProposalStep {
     ///
     /// An empty round produced no conversational text, no file edits, no
     /// protocol error, no discovery command, no plan mutation, no verification
-    /// request, and no terminal outcome. Such a round is a transport-level
+    /// request, no project command invocation, and no terminal outcome. Such a
+    /// round is a transport-level
     /// non-answer rather than a validated reply, so the FSM re-asks the model
     /// instead of recording it as an `ModelResult::Answer`. Ephemeral signals
     /// that grant no capability — the scratchpad notes and the detected user
@@ -247,6 +263,7 @@ impl ProposalStep {
             && self.verify_request.is_none()
             && self.terminal_outcome.is_none()
             && self.blocked.is_none()
+            && self.custom_tools.is_empty()
             && !self.has_discovery_commands()
     }
 }
@@ -468,6 +485,7 @@ pub(super) async fn run_proposal_step(
         .await;
 
     let history_tag = cache.history_tag(history_manager, intent).await;
+    let project = cache.project(&repo_root, Some(&cancel_rx)).await;
 
     let mut assembly = PromptAssembly::new(
         repo_state,
@@ -478,7 +496,8 @@ pub(super) async fn run_proposal_step(
         history_tag,
         repo_map,
     )
-    .with_repo_dirs(repo_dirs);
+    .with_repo_dirs(repo_dirs)
+    .with_project(Some(project));
     assembly.target_language = target_language.map(|language| language.to_string());
     assembly.intent = intent;
     assembly.turn_scratchpad = turn_scratchpad.map(|notes| notes.to_string());

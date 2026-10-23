@@ -1,3 +1,4 @@
+pub mod journal;
 pub mod search;
 
 use std::collections::BTreeSet;
@@ -486,9 +487,10 @@ impl DiscoveryCapabilityHandler for RepoDirsHandler {
         } else {
             tree.trim_end().to_string()
         };
-        outcome
-            .feedback_blocks
-            .push(format!("<repo_dirs_feedback>\n{}\n</repo_dirs_feedback>", body));
+        outcome.feedback_blocks.push(format!(
+            "<repo_dirs_feedback>\n{}\n</repo_dirs_feedback>",
+            body
+        ));
         outcome.dir_trees_loaded += 1;
     }
 }
@@ -1164,7 +1166,10 @@ mod tests {
 
         assert_eq!(outcome.dir_trees_loaded, 1);
         assert!(outcome.has_progress(false));
-        assert_eq!(outcome.fsm_banner_summary(), "1 directory tree(s) rendered.");
+        assert_eq!(
+            outcome.fsm_banner_summary(),
+            "1 directory tree(s) rendered."
+        );
         let feedback = outcome.combined_feedback();
         assert!(feedback.contains("<repo_dirs_feedback>"));
         assert!(feedback.contains("src\n  nested"));
@@ -1255,16 +1260,8 @@ mod tests {
         std::fs::create_dir_all(dir.path().join("src/nested")).unwrap();
         std::fs::create_dir_all(dir.path().join("other")).unwrap();
         std::fs::write(dir.path().join("src/alpha.rs"), "pub fn alpha() {}\n").unwrap();
-        std::fs::write(
-            dir.path().join("src/nested/beta.rs"),
-            "pub fn beta() {}\n",
-        )
-        .unwrap();
-        std::fs::write(
-            dir.path().join("other/gamma.rs"),
-            "pub fn gamma() {}\n",
-        )
-        .unwrap();
+        std::fs::write(dir.path().join("src/nested/beta.rs"), "pub fn beta() {}\n").unwrap();
+        std::fs::write(dir.path().join("other/gamma.rs"), "pub fn gamma() {}\n").unwrap();
         let mut cm = ContextManager::new(dir.path().to_path_buf());
         let available = vec![
             "src/alpha.rs".to_string(),

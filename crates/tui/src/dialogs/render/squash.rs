@@ -80,10 +80,7 @@ pub fn render_squash_discard_popup(
     render_modal_confirm(frame, squash_discard_params(dialog));
 }
 
-pub fn render_squash_popup(
-    frame: &mut ratatui::Frame,
-    dialog: &mut crate::app::SquashDialogState,
-) {
+pub fn render_squash_popup(frame: &mut ratatui::Frame, dialog: &mut crate::app::SquashDialogState) {
     let engine = current_engine();
     let palette = engine.palette();
     let area = squash_dialog_area(frame.area());
@@ -355,8 +352,7 @@ pub fn render_squash_popup(
         let (cursor, hint) = if is_msg_focus {
             (
                 "█",
-                active_t("dialog.squash.msg_hint_focused")
-                    .replace("{}", &generate_chord_label()),
+                active_t("dialog.squash.msg_hint_focused").replace("{}", &generate_chord_label()),
             )
         } else {
             (

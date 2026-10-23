@@ -8,8 +8,8 @@ use std::sync::Arc;
 
 use tauqe_core::history::HistoryMutation;
 use tauqe_protocol::{
-    errors, events, methods, Event, HistoryCompactedEvent, HistoryEntryAddedEvent, Request,
-    RequestId, Response, SHUTDOWN_DRAIN_BUDGET,
+    errors, events, methods, Event, HistoryCompactedEvent, HistoryEntryAddedEvent,
+    HistoryEntryRolledBackEvent, Request, RequestId, Response, SHUTDOWN_DRAIN_BUDGET,
 };
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
@@ -116,6 +116,14 @@ async fn main() -> anyhow::Result<()> {
                         .ok(),
                     }
                 }
+                // A rollback is neither an append nor a deletion: the record
+                // leaves the model context but stays in the chronicle with the
+                // discarded prompt and the interruption reason, so the client
+                // updates exactly that entry instead of guessing.
+                HistoryMutation::RolledBack { item } => Event {
+                    method: events::HISTORY_ENTRY_ROLLED_BACK.to_string(),
+                    params: serde_json::to_value(HistoryEntryRolledBackEvent { item }).ok(),
+                },
             };
             out_for_history.send_event(&ev);
         }
@@ -547,6 +555,9 @@ mod tests {
     async fn shutdown_watch_never_completes_on_its_own() {
         let outcome =
             tokio::time::timeout(std::time::Duration::from_millis(20), shutdown_signal()).await;
-        assert!(outcome.is_err(), "the shutdown watch fired without a signal");
+        assert!(
+            outcome.is_err(),
+            "the shutdown watch fired without a signal"
+        );
     }
 }

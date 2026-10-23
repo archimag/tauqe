@@ -245,8 +245,6 @@ pub(super) async fn preload_item_files(state: &Arc<AppState>, repo_root: &Path, 
     }
 }
 
-
-
 #[cfg(test)]
 mod tests {
     use super::*;

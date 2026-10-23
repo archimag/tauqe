@@ -1,16 +1,24 @@
-//! Resolution of verification commands from the project configuration.
+//! Resolution of the project verification command line.
 //!
-//! A verification target selects one or more phases in execution order: `check`,
-//! `lint`, and `test`. Each phase is resolved from its typed configuration
-//! section first, then from the legacy `check_command` field, and finally from
-//! deterministic project auto-detection. A phase switched off with
+//! The project declares its mandatory verification lifecycle in
+//! `[project.verify]` of `tauqe.toml`, and the harness executes that command line
+//! directly as a process in the repository root. An entry may reuse a named
+//! `[project.commands.<name>]` declaration, and its own `timeout_secs` overrides
+//! the harness budget; `ProjectConfig::resolve` follows the reference chain and
+//! rejects a broken one, so the harness never spawns an unintended program.
+//!
+//! A repository that declares no verification command keeps the legacy
+//! deterministic resolution: the typed `[toolchain.check]`, `[toolchain.lint]`,
+//! and `[toolchain.test]` sections first, then the legacy `check_command`, and
+//! finally manifest auto-detection. A phase switched off with
 //! `enabled = false` contributes no command at all, so a project can drop the
 //! lint pass without deleting its configuration.
 
 use std::path::Path;
 
-use crate::config::ToolchainConfig;
-use crate::config::ToolchainPhaseConfig;
+use tauqe_protocol::ProjectConfig;
+
+use crate::config::{ToolchainConfig, ToolchainPhaseConfig};
 use crate::edits::protocol::xml::VerifyTarget;
 
 use super::exec::CommandLine;
@@ -19,7 +27,7 @@ use super::ToolchainKind;
 /// Packaged scripts declared by `package.json`, read once per resolution.
 type PackageScripts = serde_json::Map<String, serde_json::Value>;
 
-/// A single verification phase of the toolchain pipeline.
+/// A single verification phase of the legacy toolchain pipeline.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum VerificationPhase {
     Check,
@@ -58,18 +66,77 @@ pub(super) struct VerificationStep {
     pub timeout_secs: u64,
 }
 
-/// Resolves the verification pipeline for `target` from the repository configuration.
+/// Resolves the verification pipeline for `target`.
+#[cfg(test)]
 pub(super) fn resolve_verification_plan(
     repo_root: &Path,
     target: &VerifyTarget,
 ) -> Vec<VerificationStep> {
     let config = crate::config::load_toolchain_config(repo_root);
+    let project = crate::config::load_section::<ProjectConfig>(repo_root, "project");
+
+    resolve_verification_plan_with_config(repo_root, target, &project, &config)
+}
+
+/// Resolves the verification pipeline using pre-loaded configurations.
+pub(super) fn resolve_verification_plan_with_config(
+    repo_root: &Path,
+    target: &VerifyTarget,
+    project: &ProjectConfig,
+    config: &ToolchainConfig,
+) -> Vec<VerificationStep> {
+    if let Some(step) = declared_verification(project, config) {
+        return vec![step];
+    }
+
+    legacy_plan(repo_root, target, config)
+}
+
+/// Resolves the project-declared verification lifecycle.
+///
+/// The declaration is the single authority on how the repository verifies, so
+/// its command line runs for every target. A declaration whose reference chain
+/// is broken is reported and ignored: the repository then keeps verifying
+/// through deterministic resolution instead of silently skipping verification.
+fn declared_verification(
+    project: &ProjectConfig,
+    config: &ToolchainConfig,
+) -> Option<VerificationStep> {
+    let spec = project.verify.as_ref()?;
+    let resolved = match project.resolve("verify", spec) {
+        Ok(resolved) => resolved,
+        Err(err) => {
+            tracing::warn!(
+                reason = %err,
+                "project verification command ignored; using deterministic resolution"
+            );
+            return None;
+        }
+    };
+
+    let timeout_secs = resolved
+        .timeout_secs
+        .filter(|secs| *secs > 0)
+        .unwrap_or_else(|| config.effective_timeout_secs());
+
+    Some(VerificationStep {
+        command: CommandLine::new(resolved.command, resolved.args),
+        timeout_secs,
+    })
+}
+
+/// Resolves the deterministic pipeline an unmigrated repository keeps.
+fn legacy_plan(
+    repo_root: &Path,
+    target: &VerifyTarget,
+    config: &ToolchainConfig,
+) -> Vec<VerificationStep> {
     let scripts = read_package_scripts(repo_root);
     let (kind, _) = detect_toolchain(repo_root, None);
 
     let mut steps = Vec::new();
     for phase in VerificationPhase::selected(target) {
-        if let Some(step) = phase_step(phase, repo_root, &config, &kind, scripts.as_ref()) {
+        if let Some(step) = phase_step(phase, repo_root, config, &kind, scripts.as_ref()) {
             steps.push(step);
         }
     }
@@ -284,6 +351,63 @@ mod tests {
 
         let check_only = resolve_verification_plan(dir.path(), &VerifyTarget::Check);
         assert_eq!(displays(&check_only), vec!["cargo check --all-targets"]);
+    }
+
+    #[test]
+    fn test_project_verify_is_the_authoritative_lifecycle() {
+        let dir = repo(Some(
+            r#"
+[toolchain.check]
+command = "cargo"
+args = ["check"]
+
+[project.verify]
+command = "cargo"
+args = ["test", "--workspace"]
+"#,
+        ));
+        std::fs::write(dir.path().join("Cargo.toml"), "[package]").unwrap();
+
+        // The declared lifecycle replaces every legacy phase for every target.
+        for target in [
+            VerifyTarget::All,
+            VerifyTarget::Check,
+            VerifyTarget::Clippy,
+            VerifyTarget::Test,
+        ] {
+            let steps = resolve_verification_plan(dir.path(), &target);
+            assert_eq!(displays(&steps), vec!["cargo test --workspace"]);
+        }
+    }
+
+    #[test]
+    fn test_project_verify_resolves_references_and_timeout() {
+        let dir = repo(Some(
+            r#"
+[project.verify]
+command = "@ci"
+
+[project.commands.ci]
+command = "make"
+args = ["verify"]
+timeout_secs = 90
+"#,
+        ));
+
+        let steps = resolve_verification_plan(dir.path(), &VerifyTarget::Check);
+        assert_eq!(displays(&steps), vec!["make verify"]);
+        assert_eq!(steps[0].timeout_secs, 90);
+        assert_eq!(steps[0].command.program(), "make");
+        assert_eq!(steps[0].command.args(), ["verify".to_string()]);
+    }
+
+    #[test]
+    fn test_broken_project_verify_falls_back_to_deterministic_resolution() {
+        let dir = repo(Some("[project.verify]\ncommand = \"@missing\"\n"));
+        std::fs::write(dir.path().join("Cargo.toml"), "[package]").unwrap();
+
+        let steps = resolve_verification_plan(dir.path(), &VerifyTarget::Check);
+        assert_eq!(displays(&steps), vec!["cargo check --all-targets"]);
     }
 
     #[test]

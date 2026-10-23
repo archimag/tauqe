@@ -289,6 +289,34 @@ pub fn discussion_response_schema_definition() -> serde_json::Value {
     })
 }
 
+/// Generates the JSON Schema of a single project custom tool invocation.
+///
+/// A custom tool is a command the project declares in `tauqe.toml`. The harness
+/// publishes exactly the declared commands as typed tools, so an invocation
+/// carries the name of one declared command together with its arguments. The
+/// `name` and the argument container are fixed by the wire contract here, while
+/// the concrete argument properties belong to the command's own declaration: the
+/// harness validates `args` against that declaration instead of accepting an
+/// arbitrary command line, which is what keeps a custom tool from widening into
+/// an unbounded shell.
+pub fn custom_tool_call_schema() -> serde_json::Value {
+    serde_json::json!({
+        "type": "object",
+        "properties": {
+            "name": {
+                "type": "string",
+                "description": "Name of one project-declared command from the custom tool allowlist"
+            },
+            "args": {
+                "type": "object",
+                "description": "Typed argument object validated against the argument schema declared for this command"
+            }
+        },
+        "required": ["name", "args"],
+        "additionalProperties": false
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::{discussion_response_schema, discussion_response_schema_definition};
@@ -298,6 +326,29 @@ mod tests {
         DiscussionResponse, RepoSearchRequest,
     };
     use crate::plan::{ConceptItem, PlanItem, PlanItemStatus};
+
+    #[test]
+    fn test_custom_tool_call_schema_pins_the_invocation_contract() {
+        let schema = super::custom_tool_call_schema();
+        assert_eq!(schema["type"], "object");
+        assert_eq!(schema["properties"]["name"]["type"], "string");
+        // The argument container is an object whose properties are declared by
+        // the project, so a custom tool can never carry a free-form command line.
+        assert_eq!(schema["properties"]["args"]["type"], "object");
+        let properties = schema["properties"]
+            .as_object()
+            .expect("properties object must exist");
+        assert_eq!(properties.len(), 2);
+
+        let required: Vec<&str> = schema["required"]
+            .as_array()
+            .expect("required array must exist")
+            .iter()
+            .filter_map(|field| field.as_str())
+            .collect();
+        assert_eq!(required, ["name", "args"]);
+        assert_eq!(schema["additionalProperties"], serde_json::json!(false));
+    }
 
     #[test]
     fn test_message_is_first_property_in_schema() {

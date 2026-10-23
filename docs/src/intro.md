@@ -49,10 +49,36 @@ TAUQE's interface and transport model inherit directly from two long-standing en
 
 ## Guide Structure
 
-- **[Chapter 1: Philosophy: The Semantic Harness](ch01-philosophy/semantic-harness.md)** — Core mission, the literal harness metaphor, model role specialization, and architectural comparison against agentic loops and manual logisticians.
-- **[Chapter 2: Three-Tier Context Model](ch02-context/three-tier-model.md)** — Architectural rationale of Pinned, User, and Auto context layers, token hygiene, and multi-round Discovery.
-- **[Chapter 3: The Autonomous Bounded Turn](ch03-bounded-turn/lifecycle.md)** — Anatomy of a bounded execution cycle: Discovery, In-Memory Virtual Staging, Patch Retry resilience, and Compiler-driven Self-Healing.
-- **[Chapter 4: Git Safety & Transactions](ch04-git-safety/checkpoints-and-undo.md)** — Why real Git commits beat stashes, author isolation, dirty-tree preservation, and deterministic rollback.
-- **[Chapter 5: Keyboard-First Interface](ch05-interface/tui-ux.md)** — Magit/Org-inspired live document state versus chat bubbles, view spatial hierarchy, and high-density interaction.
-- **[Chapter 6: Structured Code Review](ch06-review/review.md)** — Why AI-assisted review is the primary interface at high generation speeds, finding triage, and selective context injection.
-- **[Chapter 7: Local Plans](ch07-plans/plans.md)** — Managing tactical multi-step tasks, surviving history compaction, and steering work via interactive checklists.
+The book is organized into five orthogonal parts. Each significant concept lives in its own sovereign chapter, so a `<doc_request>` loads focused invariants without the noise of neighboring subsystems.
+
+### Part I — Foundations & Cognitive Architecture
+
+- **[Philosophy: The Semantic Harness](ch01-foundations/semantic-harness.md)** — Core mission, the literal harness metaphor, and the architectural comparison against agentic loops and manual context logisticians.
+- **[The Autonomous Bounded Turn FSM](ch01-foundations/bounded-turn-fsm.md)** — The deterministic finite-state turn: Discovery, in-memory staging, patch retry resilience, verification healing, and rollback.
+- **[Model Roles and the Coder Ladder](ch01-foundations/model-roles.md)** — The mandatory primary role, specialized role lists, the coder and architect ladders, and decision immutability.
+- **[Turn Scratchpad](ch01-foundations/turn-scratchpad.md)** — Turn-local working memory and its isolation from persisted history.
+
+### Part II — Context Perception & Discovery
+
+- **[Three-Tier Context Model](ch02-perception/three-tier-model.md)** — Architectural rationale of Pinned, User, and Auto context layers, token hygiene, and multi-round Discovery.
+- **[Discussion Focus](ch02-perception/discussion-focus.md)** — Anchored architectural dialogue and its typed target.
+- **[Repository Map and Blinkers](ch02-perception/repo-map.md)** — The deterministic Tree-sitter outline and its budgets.
+- **[Discovery Engine](ch02-perception/discovery-engine.md)** — Handler dispatch, round guards, and the cumulative discovery journal.
+
+### Part III — Project Integration & Execution
+
+- **[The TauqeProjectProtocol](ch03-project/tauqe-project-protocol.md)** — The Unix CLI contract project operations obey, the single `[project]` declaration, and the process boundary that keeps the engine technology-agnostic.
+- **[The Three-Phase Modification Lifecycle](ch03-project/three-phase-lifecycle.md)** — In-memory format, disk post-hook, and mandatory verification, in the only order that keeps the tree consistent.
+- **[Structured Diagnostics and Verification Healing](ch03-project/verification-healing.md)** — Typed findings, deterministic reports, and the bounded repair loop that consumes them.
+- **[Git Safety & Transactions](ch03-project/git-transactions.md)** — Checkpoints, temporary step commits, crash recovery, and deterministic rollback.
+
+### Part IV — Workflows
+
+- **[Local Plans](ch04-workflows/plans.md)** — Managing tactical multi-step tasks, surviving history compaction, and steering work via interactive checklists.
+- **[Code Review](ch04-workflows/review.md)** — Why AI-assisted review is the primary interface at high generation speeds, finding triage, and selective context injection.
+
+### Part V — System & Interface
+
+- **[Configuration and Project Preparation](ch05-system/configuration.md)** — The configuration hierarchy and how a project is prepared.
+- **[Keyboard-First Interface](ch05-system/tui-ux.md)** — Magit/Org-inspired live document state versus chat bubbles, view spatial hierarchy, and high-density interaction.
+- **[Zero-Hardcode Interface Localization](ch05-system/i18n-subsystem.md)** — One canonical catalog, custom overlays, and the language directive of a turn.

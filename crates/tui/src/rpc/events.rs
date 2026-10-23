@@ -3,10 +3,10 @@ use tauqe_protocol::{
     events, BatchFinishStatus, BatchFinishSummary, ConfigState, ContextState, EditFileDoneEvent,
     EditFileRetryingEvent, EditFileStartedEvent, EditFinishedEvent, EditHunkEvent, Event,
     GitCommitCreatedEvent, GitSquashApplyResult, HistoryCompactedEvent, HistoryEntryAddedEvent,
-    ModelDeltaEvent, ModelErrorEvent, ModelEscalatedEvent, ModelFinishedEvent, ModelResult,
-    ModelResultEvent, ModelStartedEvent, ModelUsageTotalsEvent, PlanBatchFinishedEvent,
-    RepositoryState, ReviewBatchFinishedEvent, ReviewContentDeltaEvent, ReviewErrorEvent,
-    ReviewFinishedEvent, ReviewReasoningDeltaEvent, ReviewStartedEvent,
+    HistoryEntryRolledBackEvent, ModelDeltaEvent, ModelErrorEvent, ModelEscalatedEvent,
+    ModelFinishedEvent, ModelResult, ModelResultEvent, ModelStartedEvent, ModelUsageTotalsEvent,
+    PlanBatchFinishedEvent, RepositoryState, ReviewBatchFinishedEvent, ReviewContentDeltaEvent,
+    ReviewErrorEvent, ReviewFinishedEvent, ReviewReasoningDeltaEvent, ReviewStartedEvent,
 };
 use tokio::sync::Mutex;
 
@@ -119,6 +119,31 @@ pub async fn handle_event(ev: Event, state: &Arc<Mutex<AppState>>, is_reasoning:
                         data.estimated_tokens,
                         view_height,
                     );
+                }
+            }
+        }
+        events::HISTORY_ENTRY_ROLLED_BACK => {
+            if let Some(params) = ev.params {
+                if let Ok(data) = serde_json::from_value::<HistoryEntryRolledBackEvent>(params) {
+                    // A rollback is neither an append nor a deletion: the turn
+                    // failed or was cancelled before its result reached the
+                    // model context, so the record stays visible in the
+                    // developer's chronicle and its typed status is replaced
+                    // in place. Nothing is inferred from surrounding events.
+                    let item = data.item;
+                    if let Some(existing) =
+                        st.history_view.items.iter_mut().find(|it| it.id == item.id)
+                    {
+                        *existing = item;
+                    } else {
+                        st.history_view.items.push(item);
+                        st.history_view.total_count += 1;
+                    }
+                    // The turn failed or was cancelled before its prompt reached
+                    // the model history, so the editor history is now the only
+                    // place the text lives: warn the developer and name the
+                    // chords that recall it (c-3).
+                    st.notify_prompt_rolled_back();
                 }
             }
         }
@@ -1035,7 +1060,9 @@ fn format_elapsed(seconds: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tauqe_protocol::{ModelRef, ModelRole, ReasoningEffort, UiHistoryItem, UiHistoryKind};
+    use tauqe_protocol::{
+        HistoryEntryStatus, ModelRef, ModelRole, ReasoningEffort, UiHistoryItem, UiHistoryKind,
+    };
 
     fn batch_summary(
         status: BatchFinishStatus,
@@ -1423,6 +1450,7 @@ mod tests {
             summary: None,
             commit_hash: None,
             files: Vec::new(),
+            status: HistoryEntryStatus::Committed,
         }
     }
 
@@ -1537,6 +1565,68 @@ mod tests {
             .unwrap_or(u16::MAX)
             .saturating_sub(5);
         assert_eq!(guard.history_view.scroll, expected_scroll);
+    }
+
+    #[tokio::test]
+    async fn test_history_entry_rolled_back_replaces_the_record_in_place() {
+        let mut st = crate::app::test_state();
+        st.view_mode = crate::app::ViewMode::History;
+        st.history_view.total_count = 1;
+        st.history_view.items = vec![ui_history_item(1, UiHistoryKind::User, "Task")];
+
+        let state = Arc::new(Mutex::new(st));
+        let mut is_reasoning = false;
+        let item = UiHistoryItem {
+            status: HistoryEntryStatus::RolledBack,
+            summary: Some("Turn cancelled by the developer".to_string()),
+            ..ui_history_item(1, UiHistoryKind::User, "Task")
+        };
+        let ev = Event {
+            method: events::HISTORY_ENTRY_ROLLED_BACK.to_string(),
+            params: Some(serde_json::to_value(HistoryEntryRolledBackEvent { item }).unwrap()),
+        };
+
+        handle_event(ev, &state, &mut is_reasoning).await;
+
+        let guard = state.lock().await;
+        assert_eq!(
+            guard.history_view.items.len(),
+            1,
+            "a rollback must never duplicate the record"
+        );
+        assert_eq!(
+            guard.history_view.items[0].status,
+            HistoryEntryStatus::RolledBack
+        );
+        assert_eq!(
+            guard.history_view.items[0].summary.as_deref(),
+            Some("Turn cancelled by the developer")
+        );
+        assert_eq!(guard.history_view.total_count, 1);
+    }
+
+    #[tokio::test]
+    async fn test_history_entry_rolled_back_keeps_an_unseen_record_visible() {
+        let state = Arc::new(Mutex::new(crate::app::test_state()));
+        let mut is_reasoning = false;
+        let item = UiHistoryItem {
+            status: HistoryEntryStatus::RolledBack,
+            ..ui_history_item(9, UiHistoryKind::User, "Lost prompt")
+        };
+        let ev = Event {
+            method: events::HISTORY_ENTRY_ROLLED_BACK.to_string(),
+            params: Some(serde_json::to_value(HistoryEntryRolledBackEvent { item }).unwrap()),
+        };
+
+        handle_event(ev, &state, &mut is_reasoning).await;
+
+        let guard = state.lock().await;
+        assert_eq!(guard.history_view.items.len(), 1);
+        assert_eq!(
+            guard.history_view.items[0].status,
+            HistoryEntryStatus::RolledBack
+        );
+        assert_eq!(guard.history_view.total_count, 1);
     }
 
     #[tokio::test]

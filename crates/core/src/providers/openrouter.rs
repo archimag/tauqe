@@ -828,8 +828,14 @@ mod tests {
         assert_eq!(find_sse_event_boundary(b"abc", 0), None);
         assert_eq!(find_sse_event_boundary(b"abc\n\ndef", 0), Some((3, 2)));
         assert_eq!(find_sse_event_boundary(b"abc\r\n\r\ndef", 0), Some((3, 4)));
-        assert_eq!(find_sse_event_boundary(b"abc\r\n\r\ndef\n\n", 0), Some((3, 4)));
-        assert_eq!(find_sse_event_boundary(b"abc\n\ndef\r\n\r\n", 0), Some((3, 2)));
+        assert_eq!(
+            find_sse_event_boundary(b"abc\r\n\r\ndef\n\n", 0),
+            Some((3, 4))
+        );
+        assert_eq!(
+            find_sse_event_boundary(b"abc\n\ndef\r\n\r\n", 0),
+            Some((3, 2))
+        );
         assert_eq!(find_sse_event_boundary(b"abc\n\ndef", 1), Some((3, 2)));
         assert_eq!(find_sse_event_boundary(b"abc\n\ndef", 4), None);
         assert_eq!(find_sse_event_boundary(b"abc\n\ndef", 99), None);

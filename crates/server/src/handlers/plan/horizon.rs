@@ -138,9 +138,8 @@ mod tests {
         assert_eq!(tier0.effort, Some(ReasoningEffort::Max));
 
         // 2. Custom selection of gemini-flash must use its OWN effort (high), NOT max from deepseek!
-        let selection = ModelSelection::Specific(tauqe_protocol::ModelRef::openrouter(
-            "google/gemini-flash",
-        ));
+        let selection =
+            ModelSelection::Specific(tauqe_protocol::ModelRef::openrouter("google/gemini-flash"));
         let (tier_custom, _, _) = resolve_architect_tier(&cfg, &plan, Some(&selection), None);
         assert_eq!(
             tier_custom.model,
@@ -149,11 +148,9 @@ mod tests {
         assert_eq!(tier_custom.effort, Some(ReasoningEffort::High));
 
         // 3. Custom selection of gemini-argon without effort returns None
-        let selection_argon = ModelSelection::Specific(tauqe_protocol::ModelRef::openrouter(
-            "google/gemini-argon",
-        ));
-        let (tier_argon, _, _) =
-            resolve_architect_tier(&cfg, &plan, Some(&selection_argon), None);
+        let selection_argon =
+            ModelSelection::Specific(tauqe_protocol::ModelRef::openrouter("google/gemini-argon"));
+        let (tier_argon, _, _) = resolve_architect_tier(&cfg, &plan, Some(&selection_argon), None);
         assert_eq!(
             tier_argon.model,
             tauqe_protocol::ModelRef::openrouter("google/gemini-argon")

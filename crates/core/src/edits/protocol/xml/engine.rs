@@ -212,6 +212,15 @@ pub(crate) const XML_TAG_SPECS: &[XmlTagSpec] = &[
         TagCloseMode::Control,
         MarkerPolicy::Strict,
     ),
+    // Project custom tools travel as a self-closing tag naming one declared
+    // command. The invocation stays a closed allowlist: the tag names a command
+    // and never carries a command line of its own.
+    control_spec(
+        "custom_tool",
+        LlmCapability::CustomTools,
+        TagCloseMode::Simple,
+        MarkerPolicy::Strict,
+    ),
     // Parse-only outcome tag. The review contour reads it back from the
     // cleaned assistant text to record why a finding was skipped, so
     // `strip_all_control_tags` must never remove it.
@@ -671,6 +680,13 @@ mod tests {
         );
         assert_eq!(spec_of("dir_list").close_mode, TagCloseMode::Simple);
         assert!(spec_of("dir_list").is_control());
+
+        assert_eq!(
+            spec_of("custom_tool").capability,
+            Some(LlmCapability::CustomTools)
+        );
+        assert_eq!(spec_of("custom_tool").close_mode, TagCloseMode::Simple);
+        assert!(spec_of("custom_tool").is_control());
     }
 
     #[test]

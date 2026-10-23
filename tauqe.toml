@@ -63,18 +63,21 @@ max_retries = 5
 # protocol = "xml"   # active edit protocol: "xml" (default: "xml")
 
 [toolchain]
-# check_command = ""   # custom project verification command (auto-detected by default)
+# Harness-level policy for verification: how the verification pipeline behaves and how
+# the legacy per-phase overrides apply. The project's own commands are declared in the
+# `[project]` section below.
+#
+# check_command = ""   # legacy project-wide verification command (default: auto-detect)
 # max_retries = 5      # maximum retry attempts for compiler/linter self-healing
 # auto_heal = true     # automatically trigger the verification healing loop on check failures (default: true)
 # timeout_secs = 600   # wall-clock timeout in seconds for each verification command (default: 600)
 # auto_verify = true   # automatically run toolchain verification on turns with applied edits (default: true)
 # target = "all"       # default verification target when omitted: "all", "check", "clippy", "test" (default: "all")
 #
-# Verification is a pipeline of typed phases: `check`, then `lint`, then
-# `test`. Each phase resolves its command from its own section, then from the
-# legacy `check_command` field, and finally from deterministic project
-# auto-detection (Cargo.toml, package.json, go.mod). A phase that names no
-# command keeps auto-detection, so declaring a section never disables it.
+# The legacy phases below stay supported as harness-level overrides of deterministic
+# auto-detection, so an existing configuration keeps verifying unchanged. A phase that
+# names no command keeps project auto-detection, so declaring a section never disables
+# it.
 # [toolchain.check]
 # command = "cargo"
 # args = ["check", "--all-targets"]
@@ -89,23 +92,72 @@ max_retries = 5
 # command = "cargo"
 # args = ["test", "--workspace"]
 #
-# Formatters are a registry of named entries. Formatting is best-effort: it runs
-# strictly after a verified build and immediately before the Git commit, and a
-# formatter failure restores the verified content instead of interrupting the
-# turn. `extensions` is mandatory — an entry without it selects no file, so a
-# monorepo registers one formatter per language without touching the others.
-# Arguments are passed to the process literally (never through a shell), so a
-# path with spaces or metacharacters is safe.
-[toolchain.fmt.rustfmt]
-command = "rustfmt"
-extensions = ["rs"]
-timeout_secs = 60
+# [toolchain.fmt.<name>] entries run over the changed files their extension filter
+# claims. `extensions` is mandatory — an entry without it selects no file, so a monorepo
+# registers one formatter per language without touching the others. Arguments are
+# passed to the process literally (never through a shell), so a path with spaces or
+# metacharacters is safe.
+#
+# [toolchain.fmt.rustfmt]
+# command = "rustfmt"
+# extensions = ["rs"]
+# timeout_secs = 60
 
-# Пример форматтера для веб-кода в монорепозиториях:
-# [toolchain.fmt.prettier]
-# command = "npx"
-# args = ["prettier", "--write"]
-# extensions = ["ts", "tsx", "js", "jsx", "mjs", "cjs"]
+[project]
+# The `[project]` section is the single surface that declares what the harness may run
+# for this repository. Every entry is a plain command line executed as a process with
+# literal arguments — never through a shell — so a project command cannot widen into
+# arbitrary command execution. An entry may reuse a declared command by writing
+# `@<name>` as its executable.
+#
+# An optional task runner (`runner = "just"`) delegates project commands to recipes
+# marked with `[group('tauqe')]`. When declared, exported recipes fill the command
+# allowlist and a `verify` recipe provides the verification lifecycle. Declared
+# entries in this section always take precedence over runner recipes.
+#
+# This repository dogfoods the integration: the declared runner exports the
+# `[group('tauqe')]` recipes of `Justfile` (`test`, `clippy`, `fmt`, and the others
+# not declared below), while the explicit entries below override the exported
+# `verify` and `check` recipes. `lint` has no recipe at all, so it stays purely
+# declarative.
+runner = "just"
+#
+# `verify` is mandatory: a change set the harness cannot verify is never accepted, so a
+# missing or blank `verify` invalidates the whole configuration unless provided by a runner.
+[project.verify]
+command = "cargo"
+args = ["test", "--workspace"]
+timeout_secs = 600
+
+# In-memory formatter: reads the staged file content from standard input and writes the
+# rewritten content to standard output, so no byte reaches disk before the change set
+# verifies. Omit the entry to keep every file exactly as authored.
+[project.format]
+command = "rustfmt"
+args = ["--emit", "stdout", "--edition", "2021"]
+timeout_secs = 120
+
+# Disk post-hook: runs strictly after the change set reaches disk and before `verify`, so
+# generated sources and refreshed manifests exist when verification runs. Artifacts it
+# creates are captured through Git and join the same atomic commit.
+# [project.post_hook]
+# command = "cargo"
+# args = ["generate-lockfile"]
+
+# Named project commands, published to the model as typed custom tools. Each entry is an
+# allowlisted process with literal arguments and an optional timeout; the harness never
+# accepts a free-form command line from the model. The build and lint passes that the
+# mandatory `verify` lifecycle does not run on its own stay available to the model as
+# explicit tools.
+[project.commands.check]
+command = "cargo"
+args = ["check", "--all-targets"]
+timeout_secs = 600
+
+[project.commands.lint]
+command = "cargo"
+args = ["clippy", "--all-targets", "--", "-D", "warnings"]
+timeout_secs = 600
 
 [git]
 # upstream = "origin/master"  # base upstream branch for calculating diffs (auto-detected by default)
@@ -142,4 +194,4 @@ pinned = [
 #   # Color depth: "auto" (detected) | "truecolor" | "ansi256" | "ansi16"
 #   # color_depth = "auto"
 #
-# See docs/src/ch05-interface/tui-ux.md (section 5.10) for the design system.
+# See docs/src/ch05-system/tui-ux.md for the semantic design system.
