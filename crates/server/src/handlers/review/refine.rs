@@ -18,6 +18,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use tauqe_core::context::ContextFileContent;
+use tauqe_core::plan::storage::merge_subplan;
 use tauqe_core::providers::{
     format_session_id, JsonSchemaDefinition, ResponseFormat, SESSION_PREFIX_REVIEW,
 };
@@ -25,7 +26,7 @@ use tauqe_core::review::prompt::refine::ReviewRefineDiagnostics;
 use tauqe_core::review::ReviewStorage;
 use tauqe_protocol::{
     errors, events, IssueStatus, ModelDeltaEvent, ModelRole, ModelSelection, ModelStartedEvent,
-    Request, Response, ResponseError, ReviewIssue, ReviewItem, ReviewRefineItemParams,
+    PlanItem, Request, Response, ResponseError, ReviewIssue, ReviewItem, ReviewRefineItemParams,
     ReviewRefineItemResult, ReviewSession,
 };
 
@@ -657,6 +658,14 @@ async fn refine_finding_with_architect_inner(
         ));
     }
 
+    // A structurally valid step list can still be unexecutable once merged with
+    // the finding's immutable `Done` foundation: a `depends_on` may name a step
+    // that neither the foundation nor the new horizon provides, and the horizon
+    // may leave no ready step at all. The verdict is taken from the engine's
+    // synthesis primitive here, before anything reaches storage, so a refused
+    // horizon never rewrites the persisted finding.
+    validate_synthesized_subplan(&item.subplan, &output.items)?;
+
     // Persist the merged subplan through the core domain primitive, which
     // preserves the immutable `Done` foundation and rejects dependency cycles
     // before anything reaches disk.
@@ -725,6 +734,31 @@ async fn refine_finding_with_architect_inner(
     })
 }
 
+/// Validates that a synthesized finding horizon is executable once merged with
+/// the finding's immutable `Done` foundation.
+///
+/// The merge itself belongs to the engine: `merge_subplan` is the single
+/// authoritative synthesis primitive, shared with plan horizon replacement, so
+/// the server only maps its verdict into the typed review error instead of
+/// re-deriving the dependency rules locally. A horizon that references an
+/// unknown step, closes a dependency cycle, or leaves no ready step is reported
+/// as [`errors::INVALID_PLAN_TREE`] before it reaches storage, so a refused
+/// decomposition leaves the stored finding untouched and the caller receives a
+/// precise diagnostic instead of a generic save failure.
+fn validate_synthesized_subplan(
+    existing: &[PlanItem],
+    synthesized: &[PlanItem],
+) -> Result<(), ResponseError> {
+    merge_subplan(existing, synthesized.to_vec())
+        .map(|_| ())
+        .map_err(|err| {
+            refine_error(
+                errors::INVALID_PLAN_TREE,
+                format!("Architect returned an unexecutable subplan: {}", err),
+            )
+        })
+}
+
 /// Builds a typed error for the decomposition helper, mirroring `Response::err`.
 fn refine_error(code: &'static str, message: String) -> ResponseError {
     ResponseError::new(code, message)
@@ -733,7 +767,7 @@ fn refine_error(code: &'static str, message: String) -> ResponseError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tauqe_protocol::{ArchitectTier, ModelRef, ReasoningEffort};
+    use tauqe_protocol::{ArchitectTier, ModelRef, PlanItemStatus, ReasoningEffort};
 
     #[test]
     fn architect_tier_banner_renders_its_reasoning_depth() {
@@ -857,5 +891,81 @@ mod tests {
                 "{status} must stay decomposable by the harness"
             );
         }
+    }
+
+    /// Builds a horizon step in the given execution state.
+    fn step(id: &str, status: PlanItemStatus) -> PlanItem {
+        PlanItem {
+            id: id.to_string(),
+            title: format!("Step {id}"),
+            status,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn synthesized_subplan_refuses_dependency_on_an_unknown_step() {
+        let synthesized = vec![PlanItem {
+            depends_on: vec!["ghost".to_string()],
+            ..step("s-2", PlanItemStatus::Todo)
+        }];
+
+        let err = validate_synthesized_subplan(&[], &synthesized)
+            .expect_err("a horizon depending on an unknown step must be refused");
+        assert_eq!(err.code, errors::INVALID_PLAN_TREE);
+        assert!(
+            err.message.contains("ghost"),
+            "the diagnostic must name the broken dependency: {}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn synthesized_subplan_accepts_dependency_on_the_done_foundation() {
+        // A completed sub-step satisfies the dependency of a new step, so the
+        // reprojected horizon stays executable.
+        let existing = vec![step("s-1", PlanItemStatus::Done)];
+        let synthesized = vec![PlanItem {
+            depends_on: vec!["s-1".to_string()],
+            ..step("s-2", PlanItemStatus::Todo)
+        }];
+
+        assert!(validate_synthesized_subplan(&existing, &synthesized).is_ok());
+    }
+
+    #[test]
+    fn synthesized_subplan_refuses_a_horizon_with_no_ready_step() {
+        // Both references resolve, yet the only candidate waits for a step that
+        // can never become `Done`, so nothing in the horizon could ever start.
+        let synthesized = vec![
+            PlanItem {
+                depends_on: vec!["s-1".to_string()],
+                ..step("s-2", PlanItemStatus::Todo)
+            },
+            step("s-1", PlanItemStatus::Cancelled),
+        ];
+
+        let err = validate_synthesized_subplan(&[], &synthesized)
+            .expect_err("a horizon without a ready step must be refused");
+        assert_eq!(err.code, errors::INVALID_PLAN_TREE);
+        assert!(
+            err.message.contains("cannot start"),
+            "the diagnostic must explain the stalled horizon: {}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn synthesized_subplan_drops_a_collision_with_completed_work() {
+        // A stale identifier that reuses a completed sub-step is dropped by the
+        // merge instead of being reported as a defect, exactly as plan horizon
+        // replacement behaves.
+        let existing = vec![step("s-1", PlanItemStatus::Done)];
+        let synthesized = vec![
+            step("s-1", PlanItemStatus::Todo),
+            step("s-2", PlanItemStatus::Todo),
+        ];
+
+        assert!(validate_synthesized_subplan(&existing, &synthesized).is_ok());
     }
 }

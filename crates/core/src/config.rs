@@ -372,6 +372,33 @@ pub fn load_context_config(repo_root: &Path) -> ContextConfig {
     load_section(repo_root, "context")
 }
 
+/// Validates the project configuration file that governs `repo_root`.
+///
+/// The check is delegated to the engine rather than to a project tool, because
+/// `tauqe.toml` defines the environment the turn runs in: the model roles, the
+/// budgets, and the command lines the harness may execute. Two layers are
+/// checked — the TOML syntax of the file and the semantic invariants enforced by
+/// [`AppConfig::validate`] (resolvable model roles and a sound `[project]`
+/// command chain).
+///
+/// A repository without a configuration file is valid: built-in defaults govern
+/// it, exactly as they do for [`load_config`]. Reading and parsing the file is
+/// blocking filesystem work, so it runs off the async executor thread.
+pub fn validate_project_config_on_disk(repo_root: &Path) -> Result<(), String> {
+    crate::blocking::run_blocking(|| -> Result<(), String> {
+        let Some(path) = find_config_file(Some(repo_root), None) else {
+            return Ok(());
+        };
+        let content = std::fs::read_to_string(&path)
+            .map_err(|err| format!("Failed to read {}: {}", path.display(), err))?;
+        let config: AppConfig = toml::from_str(&content)
+            .map_err(|err| format!("Failed to parse {}: {}", path.display(), err))?;
+        config
+            .validate()
+            .map_err(|err| format!("Invalid configuration in {}: {}", path.display(), err))
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -948,6 +975,64 @@ primary = ["anthropc:claude"]
             vec!["Conventions.md".to_string(), "README.md".to_string()]
         );
         assert_eq!(cfg.max_discovery_rounds, 9);
+    }
+
+    #[test]
+    fn test_validate_project_config_on_disk_accepts_valid_config() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            temp_dir.path().join("tauqe.toml"),
+            r#"
+[models]
+primary = ["openrouter:a/b"]
+
+[project.verify]
+command = "cargo"
+args = ["test"]
+"#,
+        )
+        .unwrap();
+
+        assert!(validate_project_config_on_disk(temp_dir.path()).is_ok());
+    }
+
+    #[test]
+    fn test_validate_project_config_on_disk_accepts_absent_file() {
+        // A repository without a configuration file is governed by built-in
+        // defaults, so the on-disk check has nothing to reject.
+        let temp_dir = tempfile::tempdir().unwrap();
+        assert!(validate_project_config_on_disk(temp_dir.path()).is_ok());
+    }
+
+    #[test]
+    fn test_validate_project_config_on_disk_rejects_malformed_toml() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            temp_dir.path().join("tauqe.toml"),
+            "[models]\ncoder = = \"broken\"\n",
+        )
+        .unwrap();
+
+        let err = validate_project_config_on_disk(temp_dir.path())
+            .expect_err("malformed TOML must be rejected");
+        assert!(err.contains("Failed to parse"), "got: {err}");
+    }
+
+    #[test]
+    fn test_validate_project_config_on_disk_rejects_semantically_invalid_config() {
+        // The file parses as TOML but declares no verification command, so the
+        // semantic layer must reject it.
+        let temp_dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            temp_dir.path().join("tauqe.toml"),
+            "[models]\nprimary = [\"openrouter:a/b\"]\n",
+        )
+        .unwrap();
+
+        let err = validate_project_config_on_disk(temp_dir.path())
+            .expect_err("a configuration without verification must be rejected");
+        assert!(err.contains("Invalid configuration"), "got: {err}");
+        assert!(err.contains("verify"), "got: {err}");
     }
 
     #[test]

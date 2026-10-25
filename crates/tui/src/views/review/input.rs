@@ -768,17 +768,23 @@ pub async fn handle_review_key(
                 st.review.scroll_to_selected();
             }
         }
-        // Paging is free scrolling: it moves the window inside the rendered
-        // document without touching the cursor, so a long expanded subplan can
-        // be read continuously down to its last line and the viewport is never
-        // re-anchored on the selected row (c-1, c-2).
+        // Paging moves the selection by one screenful and lets the cursor own
+        // the viewport, so `PageUp` and `PageDown` keep the active row on screen
+        // and never leave an invisible row as the target of the next command
+        // (c-paging-cursor-sync).
         ReviewAction::PageUp => {
-            let max = st.review.max_scroll();
-            st.review.scroll = st.review.scroll.saturating_sub(page).min(max);
+            if rows_len > 0 {
+                st.review.selected_index =
+                    st.review.selected_index.saturating_sub(usize::from(page));
+                st.review.scroll_to_selected();
+            }
         }
         ReviewAction::PageDown => {
-            let max = st.review.max_scroll();
-            st.review.scroll = st.review.scroll.saturating_add(page).min(max);
+            if rows_len > 0 {
+                st.review.selected_index =
+                    (st.review.selected_index + usize::from(page)).min(rows_len - 1);
+                st.review.scroll_to_selected();
+            }
         }
         ReviewAction::Recenter => {
             st.review.recenter_selected();
@@ -1562,7 +1568,10 @@ mod tests {
         handle_review_key(key, &state, &mut conn).await.unwrap();
         let scroll_second = state.lock().await.review.scroll;
 
-        assert_ne!(scroll_first, scroll_second, "C-l must cycle recenter positions in review view");
+        assert_ne!(
+            scroll_first, scroll_second,
+            "C-l must cycle recenter positions in review view"
+        );
     }
 
     #[tokio::test]
@@ -1749,18 +1758,74 @@ mod tests {
         );
     }
 
-    /// Paging is free scrolling over the rendered document: it reaches the last
-    /// screenful of a long expanded subplan, never scrolls past it, and never
-    /// re-anchors the window on the cursor row (c-1, c-2).
+    /// A session holding `count` collapsed findings, used by the paging tests.
+    fn session_with_items(id: &str, count: u32) -> tauqe_protocol::ReviewSession {
+        use tauqe_protocol::{IssueStatus, IssueType, ReviewIssue, ReviewSession};
+
+        ReviewSession {
+            id: id.to_string(),
+            title: format!("Session {id}"),
+            created_at: 0,
+            model: tauqe_protocol::ModelRef::openrouter("test-model"),
+            description: None,
+            user_prompt: None,
+            target_files: Vec::new(),
+            items: (1..=count)
+                .map(|n| {
+                    ReviewIssue {
+                        id: n,
+                        title: format!("Finding {n}"),
+                        model: None,
+                        issue_type: IssueType::Architecture,
+                        status: IssueStatus::Todo,
+                        description: String::new(),
+                        recommendations: Vec::new(),
+                        files: Vec::new(),
+                        readonly_files: Vec::new(),
+                        plan: Vec::new(),
+                        note: None,
+                    }
+                    .into()
+                })
+                .collect(),
+            raw_markdown: String::new(),
+        }
+    }
+
+    /// Asserts that the row under the cursor lies entirely inside the viewport.
+    fn assert_cursor_visible(view: &mut crate::views::review::ReviewViewState) {
+        let index = view.selected_index;
+        let width = view.content_width.max(10);
+        let rows = view.flatten_rows();
+        let (lines, offsets) = crate::views::review::compute_unified_review_lines(
+            &rows,
+            index,
+            width,
+            view.theme_mode,
+            &mut view.markdown_cache,
+        );
+        let start = offsets.get(index).copied().unwrap_or(0);
+        let end = offsets.get(index + 1).copied().unwrap_or(lines.len());
+        let scroll = view.scroll as usize;
+        let height = view.view_height as usize;
+        assert!(
+            scroll <= start && scroll + height >= end,
+            "the selected row {start}..{end} must stay visible in {scroll}..{}",
+            scroll + height
+        );
+    }
+
+    /// `PageDown` and `PageUp` move the active row by one screenful and the
+    /// viewport follows it, so the cursor never leaves the visible area and an
+    /// invisible row never becomes the target of the next command
+    /// (c-paging-cursor-sync).
     #[tokio::test]
-    async fn test_paging_scrolls_the_viewport_without_snapping_to_the_cursor() {
+    async fn test_paging_moves_the_selection_and_keeps_it_visible() {
         let mut st = crate::app::test_state();
         st.view_mode = ViewMode::Review;
-        st.review.sessions = vec![todo_session("rev-scroll", 1)];
-        st.review.view_height = 20;
-        st.review.rendered_lines = 500;
-        // The cursor rests on the finding while the developer pages away from
-        // it, so paging must never pull the viewport back to this row.
+        st.review.sessions = vec![session_with_items("rev-paging", 60)];
+        st.review.view_height = 10;
+        st.review.content_width = 80;
         st.review.selected_index = 1;
         st.review.scroll = 0;
 
@@ -1772,24 +1837,69 @@ mod tests {
 
         // One page is the viewport height minus the two reserved rows.
         handle_review_key(down, &state, &mut conn).await.unwrap();
-        assert_eq!(state.lock().await.review.scroll, 18);
+        {
+            let mut guard = state.lock().await;
+            assert_eq!(guard.review.selected_index, 9);
+            assert_cursor_visible(&mut guard.review);
+        }
 
-        // Paging to the end stops exactly at the last full screenful instead of
-        // running past the document.
+        // Paging to the end stops on the last row instead of running past it.
         for _ in 0..100 {
             handle_review_key(down, &state, &mut conn).await.unwrap();
         }
         {
-            let guard = state.lock().await;
-            assert_eq!(guard.review.scroll, 480);
-            assert_eq!(
-                guard.review.selected_index, 1,
-                "paging must neither move nor re-anchor the cursor"
-            );
+            let mut guard = state.lock().await;
+            assert_eq!(guard.review.selected_index, 60);
+            assert_cursor_visible(&mut guard.review);
         }
 
-        // Paging back up returns one page without snapping to the cursor.
+        // Paging back up returns one screenful with the cursor still on screen.
         handle_review_key(up, &state, &mut conn).await.unwrap();
-        assert_eq!(state.lock().await.review.scroll, 462);
+        {
+            let mut guard = state.lock().await;
+            assert_eq!(guard.review.selected_index, 52);
+            assert_cursor_visible(&mut guard.review);
+        }
+    }
+
+    /// `Home` and `End` move the cursor to the extremes of the tree and keep it
+    /// inside the viewport (c-scroll-visibility).
+    #[tokio::test]
+    async fn test_home_and_end_keep_the_selection_visible() {
+        let mut st = crate::app::test_state();
+        st.view_mode = ViewMode::Review;
+        st.review.sessions = vec![session_with_items("rev-home-end", 60)];
+        st.review.view_height = 10;
+        st.review.content_width = 80;
+        st.review.selected_index = 0;
+        st.review.scroll = 0;
+
+        let state = Arc::new(Mutex::new(st));
+        let mut conn = RpcConnection::new(Vec::<u8>::new());
+
+        let end = KeyEvent::new(KeyCode::End, crossterm::event::KeyModifiers::NONE);
+        handle_review_key(end, &state, &mut conn).await.unwrap();
+        {
+            let mut guard = state.lock().await;
+            let last = guard.review.row_count() - 1;
+            assert_eq!(guard.review.selected_index, last);
+            assert!(
+                guard.review.scroll > 0,
+                "the last row must scroll the viewport down"
+            );
+            assert_cursor_visible(&mut guard.review);
+        }
+
+        let home = KeyEvent::new(KeyCode::Home, crossterm::event::KeyModifiers::NONE);
+        handle_review_key(home, &state, &mut conn).await.unwrap();
+        {
+            let mut guard = state.lock().await;
+            assert_eq!(guard.review.selected_index, 0);
+            assert_eq!(
+                guard.review.scroll, 0,
+                "the first row must reveal the document top"
+            );
+            assert_cursor_visible(&mut guard.review);
+        }
     }
 }

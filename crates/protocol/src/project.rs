@@ -1,22 +1,13 @@
-//! Wire contract of the project driver protocol.
+//! Project configuration, post-hook outcomes, and diagnostic types.
 //!
 //! TAUQE delegates every operation that depends on the concrete technology of a
-//! code base — formatting, disk-side code generation, and verification — to an
-//! out-of-process *project driver*. The harness itself stays technology
-//! agnostic: it knows nothing about which formatter, compiler, or build system
-//! a repository uses.
+//! code base — formatting, disk-side code generation, and verification — to
+//! commands declared in `tauqe.toml` or exported by a task runner. The harness
+//! itself stays technology agnostic: it knows nothing about which formatter,
+//! compiler, or build system a repository uses.
 //!
-//! The driver speaks a request/response protocol over stdio, and every message
-//! of that protocol is defined here. The contract mirrors the three phases of a
-//! code modification:
-//!
-//! 1. [`ProjectRequest::Format`] rewrites source text **in memory**, while the
-//!    change set still lives in virtual staging and nothing has touched disk.
-//! 2. [`ProjectRequest::PostHook`] runs disk-side side effects (code
-//!    generation, lock-file refreshes) strictly after the edit was written.
-//! 3. [`ProjectRequest::Check`] runs a named verification suite and reports
-//!    typed [`Diagnostic`] values instead of raw terminal output.
-//!
+//! The types in this module represent project configuration, post-hook outcomes,
+//! and structured [`Diagnostic`] findings used for verification healing.
 //! Verification failures travel as structured diagnostics, so a
 //! verification-healing round reasons about the offending file, line, and
 //! message without paying for ANSI escapes and full compiler transcripts in its
@@ -29,25 +20,15 @@ use std::fmt;
 use serde::{Deserialize, Deserializer, Serialize};
 
 pub mod config;
-pub mod manifest;
-
-// The manifest model is part of the project driver wire contract: route
-// selection is what lets one driver serve a polyglot repository. The facade
-// re-exports the declaration types so callers reach them through the `project`
-// module without knowing the internal submodule layout.
-pub use manifest::{
-    DiagnosticParserKind, ProjectCheckStepSpec, ProjectCheckSuiteSpec, ProjectFormatterSpec,
-    ProjectManifest, ProjectPostHookSpec,
-};
 
 // The `[project]` declaration of `tauqe.toml` is re-exported through the facade
-// for the same reason: callers reach it without knowing the submodule layout.
+// so callers reach it without knowing the submodule layout.
 pub use config::{
     ProjectCommandSpec, ProjectConfig, ProjectConfigError, ProjectParameterSpec,
     ResolvedProjectCommand, TaskRunnerKind,
 };
 
-/// Severity of a [`Diagnostic`] reported by a project driver.
+/// Severity of a [`Diagnostic`] reported by toolchain checks.
 ///
 /// The set is closed, and the declaration order is the canonical reporting
 /// order: errors precede warnings, warnings precede notes, and notes precede
@@ -111,13 +92,13 @@ impl<'de> Deserialize<'de> for DiagnosticSeverity {
     }
 }
 
-/// A structured verification diagnostic reported by a project driver.
+/// A structured verification diagnostic reported by toolchain checks.
 ///
-/// The driver parses compiler, linter, and test-runner output into this shape,
-/// so the harness never reasons about terminal transcripts. Every optional field
-/// reflects what a toolchain actually provides: a linker failure has no
-/// location, a test failure has no diagnostic code, and a structured linter
-/// emits no pre-rendered line at all.
+/// Toolchain and verification runners parse compiler, linter, and test-runner
+/// output into this shape, so the harness never reasons about terminal
+/// transcripts. Every optional field reflects what a toolchain actually provides:
+/// a linker failure has no location, a test failure has no diagnostic code, and a
+/// structured linter emits no pre-rendered line at all.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct Diagnostic {
     /// Repository-relative path the diagnostic points at.
@@ -137,7 +118,7 @@ pub struct Diagnostic {
     pub code: Option<String>,
     /// Human-readable message.
     pub message: String,
-    /// The driver's own pre-rendered line, retained verbatim for fidelity.
+    /// Pre-rendered line, retained verbatim for fidelity.
     ///
     /// [`format_diagnostics`] ignores it and renders from the typed fields
     /// instead, so two reports of the same problem never render twice.
@@ -150,11 +131,11 @@ pub struct Diagnostic {
 /// The report is the verification-healing input: it carries no ANSI escapes, no
 /// tool banners, and no duplicated findings.
 ///
-/// Ordering is total and independent of the order the driver reported: severity
-/// first (as declared by [`DiagnosticSeverity`]), then located diagnostics
-/// before unlocated ones, then file, line, column, code, and message. Findings
-/// that differ only in their pre-rendered [`Diagnostic::rendered`] text are
-/// reported once.
+/// Ordering is total and independent of reporting order: severity first (as
+/// declared by [`DiagnosticSeverity`]), then located diagnostics before
+/// unlocated ones, then file, line, column, code, and message. Findings that
+/// differ only in their pre-rendered [`Diagnostic::rendered`] text are reported
+/// once.
 ///
 /// A diagnostic renders as `path:line:column: severity[code]: message`, keeping
 /// only the location parts it actually has: the column is rendered only when the
@@ -195,7 +176,7 @@ fn compare_diagnostics(left: &Diagnostic, right: &Diagnostic) -> Ordering {
 /// Reports whether two diagnostics describe the same finding.
 ///
 /// The pre-rendered text is deliberately excluded: it is a presentation detail
-/// of the producing driver, so the same problem reported twice still collapses
+/// of the producing tool, so the same problem reported twice still collapses
 /// into a single line.
 fn same_finding(left: &Diagnostic, right: &Diagnostic) -> bool {
     left.severity == right.severity
@@ -271,115 +252,6 @@ fn collapse_whitespace(text: &str) -> String {
     text.split_whitespace().collect::<Vec<&str>>().join(" ")
 }
 
-/// A request sent to the project driver.
-///
-/// Requests are internally tagged by `type`, and every variant flattens its
-/// payload into the same object, so a request is always one flat JSON object:
-/// `{"type":"format","path":"src/lib.rs","content":"..."}`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
-pub enum ProjectRequest {
-    /// Asks the driver to describe the facets it implements.
-    Capabilities,
-    /// Formats source text in memory.
-    Format(ProjectFormatRequest),
-    /// Runs disk-side side effects after an edit was written.
-    PostHook(ProjectPostHookRequest),
-    /// Runs a named verification suite.
-    Check(ProjectCheckRequest),
-}
-
-/// A response produced by the project driver.
-///
-/// A response carries the same `type` tag as the request it answers, so the
-/// caller correlates the two without an additional identifier.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
-pub enum ProjectResponse {
-    /// Answer to [`ProjectRequest::Capabilities`].
-    Capabilities { capabilities: ProjectCapabilities },
-    /// Answer to [`ProjectRequest::Format`].
-    Format(ProjectFormatResponse),
-    /// Answer to [`ProjectRequest::PostHook`].
-    PostHook(ProjectPostHookResponse),
-    /// Answer to [`ProjectRequest::Check`].
-    Check(ProjectCheckResponse),
-}
-
-/// Facets a project driver implements.
-///
-/// The driver describes itself once, so the harness can degrade gracefully
-/// instead of issuing a request the driver cannot answer. An absent flag means
-/// the facet is unavailable.
-#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
-pub struct ProjectCapabilities {
-    /// In-memory formatting is available through [`ProjectRequest::Format`].
-    #[serde(default)]
-    pub format: bool,
-    /// A disk post-hook is declared and answers [`ProjectRequest::PostHook`].
-    #[serde(default)]
-    pub post_hook: bool,
-    /// Named check suites the driver accepts, in lexicographic name order.
-    ///
-    /// The manifest keys its suites by name, so this list is the sorted set of
-    /// declared names rather than the order the entries appear in the file.
-    /// Selection over formatters, hooks, and steps obeys the same rule, so a
-    /// manifest author controls precedence by naming.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub suites: Vec<String>,
-    /// Verification reports structured [`Diagnostic`] values rather than raw text.
-    #[serde(default)]
-    pub diagnostics: bool,
-    /// Future facet: project documentation access.
-    #[serde(default)]
-    pub docs: bool,
-    /// Future facet: dependency management operations.
-    #[serde(default)]
-    pub dependencies: bool,
-}
-
-/// Request to format one file in memory.
-///
-/// The driver rewrites `content` without touching the file system, and the
-/// caller feeds the result back into virtual staging. `path` is the
-/// repository-relative path of the file, so the driver can select a formatter by
-/// extension and pick up the formatter configuration nearest to that path.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ProjectFormatRequest {
-    /// Repository-relative path of the file being formatted.
-    pub path: String,
-    /// Full in-memory content to format.
-    pub content: String,
-}
-
-/// Result of formatting one file in memory.
-///
-/// `content` is always the content the caller must keep: the formatted result on
-/// success, the unmodified input when no formatter claimed the file or the
-/// formatter failed.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ProjectFormatResponse {
-    /// Whether a formatter processed the file.
-    pub formatted: bool,
-    /// Content to keep, as described above.
-    pub content: String,
-    /// Name of the formatter entry that claimed the file.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub formatter: Option<String>,
-    /// Failure reason when the formatter could not run.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub error: Option<String>,
-}
-
-/// Request to run disk-side side effects after an edit was written.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ProjectPostHookRequest {
-    /// Repository-relative paths changed by the applied patch, so the driver can
-    /// run only the hooks those paths require.
-    #[serde(default)]
-    pub changed_files: Vec<String>,
-}
-
 /// Result of the disk post-hook phase.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProjectPostHookResponse {
@@ -396,51 +268,10 @@ pub struct ProjectPostHookResponse {
 /// Outcome of one executed post-hook entry.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProjectHookOutcome {
-    /// Name of the hook entry as declared by the project manifest.
+    /// Name of the hook entry as declared by the project configuration.
     pub name: String,
     /// Whether the hook completed successfully.
     pub success: bool,
-    /// Compact failure reason or summary, never the raw command transcript.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub message: Option<String>,
-}
-
-/// Request to run one named verification suite.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ProjectCheckRequest {
-    /// Suite name declared by the project manifest and advertised in
-    /// [`ProjectCapabilities::suites`].
-    pub suite: String,
-    /// Repository-relative paths the current turn changed.
-    #[serde(default)]
-    pub changed_files: Vec<String>,
-}
-
-/// Result of one verification suite.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ProjectCheckResponse {
-    /// Whether every executed step succeeded.
-    pub success: bool,
-    /// Per-step results in execution order.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub steps: Vec<ProjectStepResult>,
-    /// Structured findings parsed from the failing steps.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub diagnostics: Vec<Diagnostic>,
-}
-
-/// Outcome of one executed verification step.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ProjectStepResult {
-    /// Name of the step, such as the phase a suite ran.
-    pub name: String,
-    /// Command line that was executed.
-    pub command: String,
-    /// Whether the step succeeded.
-    pub success: bool,
-    /// Wall-clock duration of the step.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub duration_ms: Option<u64>,
     /// Compact failure reason or summary, never the raw command transcript.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub message: Option<String>,
@@ -469,172 +300,26 @@ mod tests {
         }
     }
 
-    /// Encodes a value and decodes it back as a JSON value for shape checks.
-    fn as_value<T: Serialize>(value: &T) -> serde_json::Value {
-        serde_json::to_value(value).unwrap()
-    }
-
     #[test]
-    fn test_project_request_serde_roundtrip() {
-        let cases = [
-            ProjectRequest::Capabilities,
-            ProjectRequest::Format(ProjectFormatRequest {
-                path: "src/lib.rs".to_string(),
-                content: "fn  main( ){}".to_string(),
-            }),
-            ProjectRequest::PostHook(ProjectPostHookRequest {
-                changed_files: vec!["src/lib.rs".to_string()],
-            }),
-            ProjectRequest::Check(ProjectCheckRequest {
-                suite: "all".to_string(),
-                changed_files: vec!["src/lib.rs".to_string()],
-            }),
-        ];
-
-        for request in cases {
-            let json = serde_json::to_string(&request).unwrap();
-            assert_eq!(
-                serde_json::from_str::<ProjectRequest>(&json).unwrap(),
-                request
-            );
-        }
-
-        // The tag and the payload share one flat object.
-        assert_eq!(
-            as_value(&ProjectRequest::Format(ProjectFormatRequest {
-                path: "src/lib.rs".to_string(),
-                content: "x".to_string(),
-            })),
-            serde_json::json!({
-                "type": "format",
-                "path": "src/lib.rs",
-                "content": "x",
-            })
-        );
-        assert_eq!(
-            as_value(&ProjectRequest::Capabilities),
-            serde_json::json!({ "type": "capabilities" })
-        );
-    }
-
-    #[test]
-    fn test_project_response_serde_roundtrip() {
-        let cases = [
-            ProjectResponse::Capabilities {
-                capabilities: ProjectCapabilities {
-                    format: true,
-                    post_hook: false,
-                    suites: vec!["check".to_string(), "test".to_string()],
-                    diagnostics: true,
-                    docs: false,
-                    dependencies: true,
-                },
-            },
-            ProjectResponse::Format(ProjectFormatResponse {
-                formatted: true,
-                content: "fn main() {}\n".to_string(),
-                formatter: Some("rustfmt".to_string()),
-                error: None,
-            }),
-            ProjectResponse::PostHook(ProjectPostHookResponse {
+    fn test_project_post_hook_response_serde() {
+        let response = ProjectPostHookResponse {
+            success: true,
+            executed_hooks: vec![ProjectHookOutcome {
+                name: "protobuf".to_string(),
                 success: true,
-                executed_hooks: vec![ProjectHookOutcome {
-                    name: "protobuf".to_string(),
-                    success: true,
-                    message: None,
-                }],
-                message: Some("regenerated 2 files".to_string()),
-            }),
-            ProjectResponse::Check(ProjectCheckResponse {
-                success: false,
-                steps: vec![ProjectStepResult {
-                    name: "check".to_string(),
-                    command: "cargo check --all-targets".to_string(),
-                    success: false,
-                    duration_ms: Some(1200),
-                    message: Some("2 errors".to_string()),
-                }],
-                diagnostics: vec![located(
-                    DiagnosticSeverity::Error,
-                    "src/lib.rs",
-                    4,
-                    9,
-                    "mismatched types",
-                )],
-            }),
-        ];
-
-        for response in cases {
-            let json = serde_json::to_string(&response).unwrap();
-            assert_eq!(
-                serde_json::from_str::<ProjectResponse>(&json).unwrap(),
-                response
-            );
-        }
-
-        // A check response nests the typed diagnostics rather than raw output.
-        let value = as_value(&ProjectResponse::Check(ProjectCheckResponse {
-            success: false,
-            steps: Vec::new(),
-            diagnostics: vec![located(
-                DiagnosticSeverity::Error,
-                "src/lib.rs",
-                4,
-                9,
-                "mismatched types",
-            )],
-        }));
+                message: None,
+            }],
+            message: Some("regenerated 2 files".to_string()),
+        };
+        let json = serde_json::to_string(&response).unwrap();
         assert_eq!(
-            value,
-            serde_json::json!({
-                "type": "check",
-                "success": false,
-                "diagnostics": [{
-                    "file": "src/lib.rs",
-                    "line": 4,
-                    "column": 9,
-                    "severity": "error",
-                    "message": "mismatched types",
-                }],
-            })
+            serde_json::from_str::<ProjectPostHookResponse>(&json).unwrap(),
+            response
         );
-    }
-
-    #[test]
-    fn test_project_messages_reject_unknown_or_missing_type() {
-        assert!(serde_json::from_str::<ProjectRequest>(r#"{"type":"teleport"}"#).is_err());
-        assert!(serde_json::from_str::<ProjectResponse>(r#"{"type":"teleport"}"#).is_err());
-        assert!(serde_json::from_str::<ProjectRequest>(r#"{"path":"src/lib.rs"}"#).is_err());
-    }
-
-    #[test]
-    fn test_project_capabilities_defaults_and_absent_facets() {
-        let defaults = ProjectCapabilities::default();
-        assert!(!defaults.format);
-        assert!(!defaults.post_hook);
-        assert!(defaults.suites.is_empty());
-        assert!(!defaults.diagnostics);
-        assert!(!defaults.docs);
-        assert!(!defaults.dependencies);
-
-        // An absent flag means the facet is unavailable, and absent future
-        // facets decode as unsupported instead of failing the handshake.
-        let minimal: ProjectCapabilities = serde_json::from_str(r#"{"format":true}"#).unwrap();
-        assert!(minimal.format);
-        assert!(!minimal.post_hook);
-        assert!(!minimal.diagnostics);
-        assert!(!minimal.docs);
-        assert!(!minimal.dependencies);
-
-        let encoded = as_value(&minimal);
-        assert_eq!(encoded["docs"], serde_json::json!(false));
-        assert_eq!(encoded["dependencies"], serde_json::json!(false));
-        assert!(encoded.get("suites").is_none());
     }
 
     #[test]
     fn test_diagnostic_serde_roundtrip_and_omitted_optionals() {
-        // A diagnostic without a location and without a code still decodes.
         let minimal: Diagnostic = serde_json::from_str(r#"{"message":"linker failed"}"#).unwrap();
         assert_eq!(minimal.severity, DiagnosticSeverity::Error);
         assert!(minimal.file.is_none());
@@ -643,7 +328,7 @@ mod tests {
         assert!(minimal.code.is_none());
         assert!(minimal.rendered.is_none());
 
-        let encoded = as_value(&minimal);
+        let encoded = serde_json::to_value(&minimal).unwrap();
         assert_eq!(
             encoded,
             serde_json::json!({ "severity": "error", "message": "linker failed" })
@@ -692,7 +377,6 @@ mod tests {
             assert_eq!(DiagnosticSeverity::parse_lossy(severity.as_str()), severity);
         }
 
-        // Declaration order is the canonical reporting order.
         assert!(DiagnosticSeverity::Error < DiagnosticSeverity::Warning);
         assert!(DiagnosticSeverity::Warning < DiagnosticSeverity::Note);
         assert!(DiagnosticSeverity::Note < DiagnosticSeverity::Help);
@@ -709,7 +393,6 @@ mod tests {
                 5,
                 "unused import",
             ),
-            // The same finding with a pre-rendered line must be reported once.
             Diagnostic {
                 rendered: Some("\u{1b}[33mwarning\u{1b}[0m unused import".to_string()),
                 ..located(
@@ -742,9 +425,6 @@ mod tests {
         ];
 
         let report = format_diagnostics(&diagnostics);
-        // Severity outranks location: the unlocated summary of the failing
-        // errors stays ahead of the located warning, while a located
-        // diagnostic keeps precedence over an unlocated one of equal severity.
         assert_eq!(
             report,
             "src/a.rs:2:1: error[E0308]: mismatched types\n\
@@ -811,20 +491,17 @@ mod tests {
             "crates/core/src/lib.rs:7: note[note-code]: expected one argument"
         );
 
-        // A blank message leaves only the classified finding.
         let blank = Diagnostic {
             message: "   ".to_string(),
             ..located(DiagnosticSeverity::Warning, "src/x.rs", 3, 1, "")
         };
         assert_eq!(format_diagnostics(&[blank]), "src/x.rs:3:1: warning");
 
-        // An empty finding list renders an empty report.
         assert_eq!(format_diagnostics(&[]), "");
     }
 
     #[test]
     fn test_format_diagnostics_drops_incomplete_locations() {
-        // A location without a file is not addressable, so only the message stays.
         let orphan = Diagnostic {
             line: Some(12),
             column: Some(3),
@@ -833,7 +510,6 @@ mod tests {
         };
         assert_eq!(format_diagnostics(&[orphan]), "error: cannot open input");
 
-        // A column without a line would read as a line number, so it is dropped.
         let column_only = Diagnostic {
             file: Some("src/y.rs".to_string()),
             column: Some(4),

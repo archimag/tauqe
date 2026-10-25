@@ -14,13 +14,15 @@ use tauqe_core::providers::{format_session_id, SESSION_PREFIX_REVIEW};
 use tauqe_core::review::prompt::{apply_finding_architectural_context, ReviewStepFailure};
 use tauqe_core::review::ReviewStorage;
 use tauqe_protocol::{
-    IssueStatus, ModelRole, ModelSelection, Plan, PlanItemStatus, PlanScopeEvaluation, ReviewItem,
-    ReviewSession, TurnIntent,
+    IssueStatus, ModelRole, ModelSelection, Plan, PlanItem, PlanItemStatus, PlanScopeEvaluation,
+    ReviewItem, ReviewSession, TurnIntent,
 };
 
 use crate::handlers::model::{execute_model_turn, StepTurnOptions};
 use crate::handlers::plan::preload_step_files;
 use crate::state::{AppState, OperationGuard};
+
+use crate::handlers::common::append_developer_directives;
 
 use super::super::common::{
     append_model_comment, clear_auto_context, offload_review, persist_finding_update,
@@ -63,12 +65,53 @@ fn format_scope_stall(step_id: Option<&str>, evaluation: &PlanScopeEvaluation) -
     }
 }
 
-/// Appends the developer directives section to an execution prompt when present.
-pub(super) fn append_developer_directives(prompt: &mut String, instructions: Option<&str>) {
-    if let Some(dirs) = instructions.map(str::trim).filter(|d| !d.is_empty()) {
-        prompt.push_str("\n## Developer Directives:\n");
-        prompt.push_str(dirs);
-        prompt.push('\n');
+/// Finds the first leaf sub-step whose dependencies can never be satisfied.
+///
+/// Every leaf is asked through the shared scope evaluator, so readiness is never
+/// re-derived here: the identifier named for replanning is exactly the sub-step
+/// the evaluator reports as blocked by unmet dependencies.
+fn dependency_stalled_step(plan: &Plan) -> Option<String> {
+    fn walk(plan: &Plan, items: &[PlanItem]) -> Option<String> {
+        for item in items {
+            if item.is_leaf() {
+                if matches!(
+                    plan.evaluate_scope(Some(item.id.as_str())),
+                    PlanScopeEvaluation::BlockedByDependencies(_)
+                ) {
+                    return Some(item.id.clone());
+                }
+            } else if let Some(found) = walk(plan, &item.children) {
+                return Some(found);
+            }
+        }
+        None
+    }
+    walk(plan, &plan.items)
+}
+
+/// Classifies a stalled subplan scope for the review batch supervisor.
+///
+/// A scope stalls on dependencies when its leaf sub-steps wait for work that will
+/// never become `Done`: the subplan structure itself is wrong, so the horizon has
+/// to be reprojected around the stalled dependencies. That outcome is therefore a
+/// domain failure attributed to the stalled sub-step, and the supervisor replans
+/// the remaining horizon instead of aborting the batch. Every other stall is a
+/// lifecycle or structural precondition the harness cannot repair by replanning.
+fn classify_scope_stall(
+    plan: &Plan,
+    step_id: Option<&str>,
+    stall: &PlanScopeEvaluation,
+) -> ReviewStepFailure {
+    let reason = format_scope_stall(step_id, stall);
+    match stall {
+        PlanScopeEvaluation::BlockedByDependencies(_) => {
+            let failure = ReviewStepFailure::domain(reason);
+            match dependency_stalled_step(plan) {
+                Some(step) => failure.with_step(step),
+                None => failure,
+            }
+        }
+        _ => ReviewStepFailure::infrastructure(reason),
     }
 }
 
@@ -150,7 +193,10 @@ async fn finish_subplan_interrupted(
 /// turn is cancelled, it is reverted to `Todo` and the finding is marked
 /// `Skipped` with the stop reason recorded in `resolution_notes`. When every
 /// remaining leaf sub-step is `Done`, the finding becomes `Fixed`; otherwise it
-/// returns to `Todo`.
+/// returns to `Todo`. A scope that stalls because its leaf sub-steps depend on
+/// work that will never become `Done` is reported as a domain failure attributed
+/// to the stalled sub-step, so the supervisor replans the remaining horizon
+/// instead of aborting the batch.
 ///
 /// When `step_id` targets a single leaf, only that sub-step runs; the finding
 /// becomes `Fixed` only if the whole subplan is then complete.
@@ -180,10 +226,7 @@ pub(super) async fn run_review_subplan(
     .await;
 
     let marker = state.next_turn_marker().await;
-    let marker_suffix = marker
-        .as_ref()
-        .map(|m| format!("_{}", m))
-        .unwrap_or_default();
+    let protocol = state.config.lock().await.config.develop.protocol;
 
     let (max_retries, auto_level_up, models_config) = {
         let cfg = state.config.lock().await.config.clone();
@@ -232,9 +275,7 @@ pub(super) async fn run_review_subplan(
         PlanScopeEvaluation::AllCompleted => Vec::new(),
         stall => {
             set_item_status(state, repo_root, review_id, item_id, IssueStatus::Todo).await;
-            return Err(ReviewStepFailure::infrastructure(format_scope_stall(
-                step_id, &stall,
-            )));
+            return Err(classify_scope_stall(&plan, step_id, &stall));
         }
     };
 
@@ -267,7 +308,8 @@ pub(super) async fn run_review_subplan(
         let mut prompt = match tauqe_core::plan::prompt::format_plan_step_execution_prompt(
             &plan,
             current_step_id,
-            &marker_suffix,
+            protocol,
+            marker.as_deref(),
         ) {
             Ok(p) => p,
             Err(err) => {
@@ -295,8 +337,9 @@ pub(super) async fn run_review_subplan(
         let mut selection = explicit_selection
             .clone()
             .unwrap_or(ModelSelection::Role(ModelRole::Coder));
-        let mut reasoning_effort = None;
-        let mut ladder_idx = 0usize;
+        let mut ladder_idx = models_config.coder_tier_index(Some(&selection));
+        let mut reasoning_effort =
+            models_config.resolve_selection_effort(ModelRole::Coder, &selection);
         let mut attempt = 0usize;
 
         let step_result: Result<(), ReviewStepFailure> = loop {
@@ -365,7 +408,7 @@ pub(super) async fn run_review_subplan(
             clear_auto_context(state).await;
             preload_step_files(state, repo_root, &step).await;
 
-            if explicit_selection.is_none() && auto_level_up {
+            if auto_level_up {
                 let from_tier = ladder_idx;
                 ladder_idx += 1;
                 let tier = models_config.coder_tier(ladder_idx);
@@ -387,6 +430,8 @@ pub(super) async fn run_review_subplan(
             prompt = tauqe_core::plan::prompt::format_plan_step_retry_prompt(
                 &turn.assistant_text,
                 turn.error.as_deref(),
+                protocol,
+                marker.as_deref(),
             );
             attempt += 1;
         };
@@ -498,6 +543,7 @@ mod tests {
             title: "Return a structured error".to_string(),
             details: Some("Reuse the existing scanner.".to_string()),
             status: PlanItemStatus::Todo,
+            blocked_reason: None,
             files: vec!["crates/x/src/parser.rs".to_string()],
             readonly_files: vec!["crates/x/src/api.rs".to_string()],
             concept_refs: Vec::new(),
@@ -597,5 +643,81 @@ mod tests {
         assert!(err.contains("rev-interrupt"));
 
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Builds a subplan whose only executable leaf depends on a cancelled step,
+    /// so the scope can never become ready.
+    fn stalled_plan() -> Plan {
+        let leaf =
+            |id: &str, title: &str, status: PlanItemStatus, depends_on: Vec<String>| PlanItem {
+                id: id.to_string(),
+                title: title.to_string(),
+                details: None,
+                status,
+                blocked_reason: None,
+                files: Vec::new(),
+                readonly_files: Vec::new(),
+                concept_refs: Vec::new(),
+                depends_on,
+                children: Vec::new(),
+            };
+        Plan {
+            id: "rev-stall".to_string(),
+            title: "Stalled Subplan".to_string(),
+            items: vec![
+                leaf(
+                    "1",
+                    "Abandoned approach",
+                    PlanItemStatus::Cancelled,
+                    Vec::new(),
+                ),
+                leaf(
+                    "2",
+                    "Follow-up step",
+                    PlanItemStatus::Todo,
+                    vec!["1".to_string()],
+                ),
+            ],
+            ..Default::default()
+        }
+    }
+
+    /// A scope stalled on unsatisfiable dependencies is a domain failure of the
+    /// stalled sub-step, so the supervisor replans the horizon instead of
+    /// aborting the batch as an infrastructure error.
+    #[test]
+    fn dependency_stall_is_a_domain_failure_of_the_stalled_step() {
+        let plan = stalled_plan();
+        let stall = plan.evaluate_scope(None);
+        assert!(matches!(
+            stall,
+            PlanScopeEvaluation::BlockedByDependencies(_)
+        ));
+
+        let failure = classify_scope_stall(&plan, None, &stall);
+        assert!(failure.is_domain());
+        assert_eq!(failure.failed_step(), Some("2"));
+    }
+
+    /// A stall the harness cannot repair by replanning the horizon stays an
+    /// infrastructure failure that aborts the batch.
+    #[test]
+    fn blocked_scope_remains_an_infrastructure_failure() {
+        let mut plan = stalled_plan();
+        plan.items[1].status = PlanItemStatus::Blocked;
+        let stall = plan.evaluate_scope(None);
+        assert!(matches!(stall, PlanScopeEvaluation::BlockedByBlockers(_)));
+
+        let failure = classify_scope_stall(&plan, None, &stall);
+        assert!(!failure.is_domain());
+        assert_eq!(failure.failed_step(), None);
+    }
+
+    /// A ready scope names no stalled sub-step.
+    #[test]
+    fn ready_scope_names_no_stalled_step() {
+        let mut plan = stalled_plan();
+        plan.items[0].status = PlanItemStatus::Done;
+        assert_eq!(dependency_stalled_step(&plan), None);
     }
 }

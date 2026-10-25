@@ -1857,7 +1857,13 @@ mod tests {
             (".gitignore", "target/\n"),
             (
                 "tauqe.toml",
-                r#"[project.post_hook]
+                r#"[models]
+primary = ["openrouter:mock/model"]
+
+[project.verify]
+command = "true"
+
+[project.post_hook]
 command = "sh"
 args = ['-c', 'mkdir -p target && printf "artifact\n" > target/artifact.txt']
 "#,
@@ -1934,7 +1940,13 @@ args = ['-c', 'mkdir -p target && printf "artifact\n" > target/artifact.txt']
             ("a.rs", TARGET),
             (
                 "tauqe.toml",
-                r#"[project.format]
+                r#"[models]
+primary = ["openrouter:mock/model"]
+
+[project.verify]
+command = "true"
+
+[project.format]
 command = "sh"
 args = ["-c", "tr a-z A-Z"]
 "#,
@@ -1990,7 +2002,13 @@ args = ["-c", "tr a-z A-Z"]
             ("a.rs", TARGET),
             (
                 "tauqe.toml",
-                r#"[project.format]
+                r#"[models]
+primary = ["openrouter:mock/model"]
+
+[project.verify]
+command = "true"
+
+[project.format]
 command = "sh"
 args = ["-c", "printf 'formatter failed' >&2; exit 3"]
 "#,

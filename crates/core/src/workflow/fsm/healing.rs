@@ -693,7 +693,16 @@ mod tests {
     async fn error_during_healing_triggers_automatic_rollback() {
         let (_dir, root) = setup_repo(&[
             ("a.rs", "pub fn compute() -> i32 { 0 }\n"),
-            ("tauqe.toml", "[project.verify]\ncommand = \"false\"\n"),
+            (
+                "tauqe.toml",
+                concat!(
+                    "[models]\n",
+                    "primary = [\"openrouter:mock/model\"]\n",
+                    "\n",
+                    "[project.verify]\n",
+                    "command = \"false\"\n",
+                ),
+            ),
         ]);
         let mut context = context_with_target(&root);
         let mut history = HistoryManager::new(root.clone());
@@ -759,6 +768,9 @@ mod tests {
         let capture_path = capture.path().join("change-set.txt");
         let config = format!(
             concat!(
+                "[models]\n",
+                "primary = [\"openrouter:mock/model\"]\n",
+                "\n",
                 "[project.verify]\n",
                 "command = \"sh\"\n",
                 "args = ['-c', 'tee {} > /dev/null']\n",
@@ -895,6 +907,9 @@ mod tests {
             (
                 "tauqe.toml",
                 concat!(
+                    "[models]\n",
+                    "primary = [\"openrouter:mock/model\"]\n",
+                    "\n",
                     "[project.verify]\n",
                     "command = \"sh\"\n",
                     "args = ['-c', 'echo run >> Cargo.lock; grep -q \"pub fn compute() -> i32 { 7 }\" a.rs']\n",

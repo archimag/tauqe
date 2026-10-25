@@ -1,6 +1,6 @@
 use crate::escape::{escape_xml_text, single_line};
 use tauqe_protocol::review::ReviewSession;
-use tauqe_protocol::PlanItem;
+use tauqe_protocol::{EditProtocolKind, PlanItem};
 
 pub const REVIEW_STEP_RETRY_PREFIX: &str = "# Correction Required: Review Finding Turn Incomplete";
 
@@ -22,18 +22,41 @@ fn render_paths(paths: &[String]) -> String {
         .join(", ")
 }
 
+/// Renders the suffix a control tag carries, or an empty string when the active
+/// protocol emits no tagged control channel.
+fn marker_suffix(marker: Option<&str>) -> String {
+    marker.map(|m| format!("_{}", m)).unwrap_or_default()
+}
+
 /// Builds a corrective reprompt for a review finding turn that ended without
-/// valid code edits and without a terminal success tag.
+/// valid code edits and without a terminal completion signal.
 ///
 /// The prompt echoes the model's previous response and optional diagnostic
 /// feedback (such as a missing edit block or toolchain verification failure),
-/// then explicitly demands strict adherence to the active edit protocol on the
-/// next turn.
-pub fn format_review_step_retry_prompt(assistant_text: &str, error: Option<&str>) -> String {
+/// then explicitly demands strict adherence to the active protocol on the next
+/// turn: the structured contour asks for a change set and a successful
+/// `outcome`, while the tagged contour asks for an edit block and the success
+/// tag bound to `marker`.
+pub fn format_review_step_retry_prompt(
+    assistant_text: &str,
+    error: Option<&str>,
+    protocol: EditProtocolKind,
+    marker: Option<&str>,
+) -> String {
     let mut out = String::new();
     out.push_str(REVIEW_STEP_RETRY_PREFIX);
     out.push_str("\n\n");
-    out.push_str("Your previous turn ended without applying any verified code changes and without emitting the terminal success tag (`<success>`). This violates the execution protocol.\n\n");
+    match protocol {
+        EditProtocolKind::Structured => out.push_str(
+            "Your previous turn ended without applying any verified code changes and without reporting a successful `outcome`. This violates the execution protocol.\n\n",
+        ),
+        EditProtocolKind::Xml | EditProtocolKind::Mixed => {
+            out.push_str(&format!(
+                "Your previous turn ended without applying any verified code changes and without emitting the terminal success tag (`<success{0}>`). This violates the execution protocol.\n\n",
+                marker_suffix(marker)
+            ));
+        }
+    }
 
     out.push_str("## Previous Assistant Response:\n");
     let previous = assistant_text.trim();
@@ -55,9 +78,21 @@ pub fn format_review_step_retry_prompt(assistant_text: &str, error: Option<&str>
     }
 
     out.push_str("## Required Actions:\n");
-    out.push_str("1. If the finding requires code changes, emit a valid edit block that strictly conforms to the active edit protocol.\n");
-    out.push_str("2. If no code changes are required to resolve the finding, confirm completion explicitly by emitting the terminal success tag.\n");
-    out.push_str("3. Do NOT replace protocol operations with conversational text, and do NOT end the turn without either a valid edit block or the terminal success tag.\n");
+    match protocol {
+        EditProtocolKind::Structured => {
+            out.push_str("1. If the finding requires code changes, emit a valid change set in the `changes` array that strictly conforms to the structured schema.\n");
+            out.push_str("2. If no code changes are required to resolve the finding, confirm completion explicitly by setting the `outcome` field to status \"success\".\n");
+            out.push_str("3. Do NOT replace the structured fields with conversational text, and do NOT end the turn without either a valid `changes` entry or a successful `outcome`.\n");
+        }
+        EditProtocolKind::Xml | EditProtocolKind::Mixed => {
+            out.push_str("1. If the finding requires code changes, emit a valid edit block that strictly conforms to the active edit protocol.\n");
+            out.push_str(&format!(
+                "2. If no code changes are required to resolve the finding, confirm completion explicitly by emitting the terminal success tag (`<success{0}>`).\n",
+                marker_suffix(marker)
+            ));
+            out.push_str("3. Do NOT replace protocol operations with conversational text, and do NOT end the turn without either a valid edit block or the terminal success tag.\n");
+        }
+    }
 
     out
 }
@@ -73,11 +108,19 @@ pub const REVIEW_STEP_EXECUTION_PREFIX: &str = "# Target Review Step Execution:"
 /// This builder embeds the concrete edit-protocol markers and therefore lives in
 /// the core engine beside the sibling plan step prompt rather than in the
 /// dependency-light wire crate.
+///
+/// The execution directives speak the vocabulary of the active protocol: the
+/// structured contour names the response fields it expects (`outcome`,
+/// `blocked`, `context_requests`, `verify`), while the tagged contour names its
+/// control tags bound to `marker`. A structured turn emits no command tag, so
+/// the marker it carries is never used.
 pub fn format_review_step_execution_prompt(
     session: &ReviewSession,
     item_id: u32,
-    marker_suffix: &str,
+    protocol: EditProtocolKind,
+    marker: Option<&str>,
 ) -> Result<String, String> {
+    let marker_suffix = marker_suffix(marker);
     let issue = session
         .issues()
         .into_iter()
@@ -161,29 +204,45 @@ pub fn format_review_step_execution_prompt(
     out.push_str(
         "2. Do NOT touch unrelated code or address other findings outside of this scope.\n",
     );
-    out.push_str("3. Own the implementation (`How`) only, never the requirement (`What`): the architecture prescribed by the finding is fixed by the review. Replacing the designed data structures, rewriting the interfaces or contracts it relies on, substituting the selected components or libraries, or relaxing its constraints and invariants is strictly prohibited.\n");
-    out.push_str("4. Treat every file listed under Protected Contracts as immutable: rely on its interfaces and invariants, but NEVER modify it.\n");
-    out.push_str("5. Keep changes minimal and coherent. Toolchain verification is handled automatically and deterministically by the harness; do NOT emit <verify> tags.\n");
-    out.push_str(&format!(
-        "6. When implementation and verification are complete, emit the completion tag: <success{0} summary=\"...\" />.\n",
-        marker_suffix
-    ));
-    out.push_str(&format!(
-        "7. If the finding is already resolved by earlier changes, is a false positive, or requires no code modifications, do NOT emit unnecessary edits; instead emit <skip{0} reason=\"...\">Detailed explanation</skip{0}>.\n",
-        marker_suffix
-    ));
-    out.push_str(&format!(
-        "8. Discovery Phase: If you need to inspect or edit files listed in <repo_map> that are not yet loaded in <context>, request them immediately using <context_request{0} path=\"...\" access=\"read_only|editable\" /> before writing code or explanations. Do NOT halt with conversational text if the necessary files can simply be requested.\n",
-        marker_suffix
-    ));
-    out.push_str(&format!(
-        "9. If the finding cannot be resolved within the approved architectural decision, because the fix would require a different data structure, a changed interface, a substituted component, or a relaxed constraint, do NOT improvise an alternative design. Stop and emit <blocked{0} reason=\"...\" details=\"...\" /> describing the exact architectural conflict, so the harness starts a controlled replanning cycle.\n",
-        marker_suffix
-    ));
-    out.push_str(&format!(
-        "10. If you encounter an insurmountable technical blocker that is unrelated to the architectural decision, emit the terminal error tag: <error{0} message=\"...\" /> explaining the exact blocker.\n",
-        marker_suffix
-    ));
+    out.push_str(
+        "3. Own the implementation (`How`) only, never the requirement (`What`): the architecture prescribed by the finding is fixed by the review. Replacing the designed data structures, rewriting the interfaces or contracts it relies on, substituting the selected components or libraries, or relaxing its constraints and invariants is strictly prohibited.\n",
+    );
+    out.push_str(
+        "4. Treat every file listed under Protected Contracts as immutable: rely on its interfaces and invariants, but NEVER modify it.\n",
+    );
+    match protocol {
+        EditProtocolKind::Structured => {
+            out.push_str("5. Keep changes minimal and coherent. Toolchain verification is handled automatically and deterministically by the harness; do NOT fill the `verify` field.\n");
+            out.push_str("6. When implementation and verification are complete, set the `outcome` field to status \"success\" and fill in `summary` describing the resolved finding.\n");
+            out.push_str("7. If the finding is already resolved by earlier changes, is a false positive, or requires no code modifications, do NOT emit unnecessary edits; instead set the `outcome` field to status \"skip\" and fill in `reason\" with a detailed explanation.\n");
+            out.push_str("8. Discovery Phase: If you need to inspect or edit files listed in <repo_map> that are not yet loaded in <context>, request them immediately by listing them in the `context_requests` array before writing code or explanations: a repository-relative path is read-only, and an `editable:` prefix (such as `editable:crates/x/src/parser.rs`) marks it editable. Request all necessary files together in a single response to avoid exhausting discovery rounds. Do NOT halt with conversational text if the necessary files can simply be requested.\n");
+            out.push_str("9. If the finding cannot be resolved within the approved architectural decision, because the fix would require a different data structure, a changed interface, a substituted component, or a relaxed constraint, do NOT improvise an alternative design. Stop and fill the `blocked` field with `is_blocked` true, a `reason`, and `details` describing the exact architectural conflict, so the harness starts a controlled replanning cycle.\n");
+            out.push_str("10. If you encounter an insurmountable technical blocker that is unrelated to the architectural decision, set the `outcome` field to status \"error\" and fill in `message` with the exact blocker.\n");
+        }
+        EditProtocolKind::Xml | EditProtocolKind::Mixed => {
+            out.push_str("5. Keep changes minimal and coherent. Toolchain verification is handled automatically and deterministically by the harness; do NOT emit <verify> tags.\n");
+            out.push_str(&format!(
+                "6. When implementation and verification are complete, emit the completion tag: <success{0} summary=\"...\" />.\n",
+                marker_suffix
+            ));
+            out.push_str(&format!(
+                "7. If the finding is already resolved by earlier changes, is a false positive, or requires no code modifications, do NOT emit unnecessary edits; instead emit <skip{0} reason=\"...\">Detailed explanation</skip{0}>.\n",
+                marker_suffix
+            ));
+            out.push_str(&format!(
+                "8. Discovery Phase: If you need to inspect or edit files listed in <repo_map> that are not yet loaded in <context>, request them immediately using <context_request{0} path=\"...\" access=\"read_only|editable\" /> before writing code or explanations. Do NOT halt with conversational text if the necessary files can simply be requested.\n",
+                marker_suffix
+            ));
+            out.push_str(&format!(
+                "9. If the finding cannot be resolved within the approved architectural decision, because the fix would require a different data structure, a changed interface, a substituted component, or a relaxed constraint, do NOT improvise an alternative design. Stop and emit <blocked{0} reason=\"...\" details=\"...\" /> describing the exact architectural conflict, so the harness starts a controlled replanning cycle.\n",
+                marker_suffix
+            ));
+            out.push_str(&format!(
+                "10. If you encounter an insurmountable technical blocker that is unrelated to the architectural decision, emit the terminal error tag: <error{0} message=\"...\" /> explaining the exact blocker.\n",
+                marker_suffix
+            ));
+        }
+    }
 
     Ok(out)
 }
@@ -341,7 +400,9 @@ mod tests {
 
     #[test]
     fn execution_prompt_carries_the_finding_context() {
-        let prompt = format_review_step_execution_prompt(&session(), 3, "").expect("prompt");
+        let prompt =
+            format_review_step_execution_prompt(&session(), 3, EditProtocolKind::Xml, None)
+                .expect("prompt");
 
         assert!(prompt.contains("# Target Review Step Execution"));
         assert!(prompt.contains("Guard the parser"));
@@ -355,7 +416,9 @@ mod tests {
 
     #[test]
     fn execution_prompt_forbids_architectural_drift() {
-        let prompt = format_review_step_execution_prompt(&session(), 3, "").expect("prompt");
+        let prompt =
+            format_review_step_execution_prompt(&session(), 3, EditProtocolKind::Xml, None)
+                .expect("prompt");
 
         // The finding fixes the decision; the turn owns only its execution.
         assert!(prompt.contains("never the requirement (`What`)"));
@@ -367,7 +430,9 @@ mod tests {
 
     #[test]
     fn execution_prompt_routes_control_tags_through_the_marker() {
-        let prompt = format_review_step_execution_prompt(&session(), 3, "_M7").expect("prompt");
+        let prompt =
+            format_review_step_execution_prompt(&session(), 3, EditProtocolKind::Xml, Some("M7"))
+                .expect("prompt");
 
         for tag in [
             "<success_M7 summary=",
@@ -382,17 +447,91 @@ mod tests {
     }
 
     #[test]
+    fn structured_execution_prompt_speaks_the_field_vocabulary() {
+        let prompt =
+            format_review_step_execution_prompt(&session(), 3, EditProtocolKind::Structured, None)
+                .expect("prompt");
+
+        // A structured turn emits no command tag at all.
+        for tag in [
+            "<success",
+            "<skip",
+            "<context_request",
+            "<blocked",
+            "<error",
+            "<verify",
+        ] {
+            assert!(!prompt.contains(tag), "unexpected command tag {tag}");
+        }
+
+        // The directives name the response fields of the structured schema.
+        assert!(prompt.contains("`outcome`"));
+        assert!(prompt.contains("`blocked`"));
+        assert!(prompt.contains("`context_requests`"));
+        assert!(prompt.contains("`verify`"));
+
+        // Payload blocks the model reads stay in both contours.
+        assert!(prompt.contains("<repo_map>"));
+        assert!(prompt.contains("<context>"));
+    }
+
+    #[test]
+    fn structured_execution_prompt_ignores_the_marker() {
+        let prompt = format_review_step_execution_prompt(
+            &session(),
+            3,
+            EditProtocolKind::Structured,
+            Some("M7"),
+        )
+        .expect("prompt");
+
+        assert!(!prompt.contains("M7"));
+    }
+
+    #[test]
+    fn mixed_execution_prompt_keeps_the_tagged_contour() {
+        let prompt =
+            format_review_step_execution_prompt(&session(), 3, EditProtocolKind::Mixed, Some("M7"))
+                .expect("prompt");
+
+        // Mixed encodes code edits through the tagged contour.
+        assert!(prompt.contains("<success_M7 summary="));
+    }
+
+    #[test]
     fn execution_prompt_rejects_an_unknown_finding() {
-        assert!(format_review_step_execution_prompt(&session(), 99, "").is_err());
+        let unknown =
+            format_review_step_execution_prompt(&session(), 99, EditProtocolKind::Xml, None);
+        assert!(unknown.is_err());
     }
 
     #[test]
     fn retry_prompt_demands_a_protocol_operation() {
-        let prompt = format_review_step_retry_prompt("finished <edit> nothing", Some("no edits"));
+        let prompt = format_review_step_retry_prompt(
+            "finished <edit> nothing",
+            Some("no edits"),
+            EditProtocolKind::Xml,
+            None,
+        );
 
         assert!(prompt.starts_with(REVIEW_STEP_RETRY_PREFIX));
         assert!(prompt.contains("&lt;edit&gt;"));
         assert!(prompt.contains("no edits"));
         assert!(prompt.contains("terminal success tag"));
+    }
+
+    #[test]
+    fn structured_retry_prompt_speaks_the_field_vocabulary() {
+        let prompt = format_review_step_retry_prompt(
+            "I stopped early.",
+            Some("no edits"),
+            EditProtocolKind::Structured,
+            Some("M7"),
+        );
+
+        assert!(!prompt.contains("<success"));
+        assert!(!prompt.contains("M7"));
+        assert!(prompt.contains("`changes`"));
+        assert!(prompt.contains("`outcome`"));
     }
 }

@@ -42,6 +42,16 @@ impl DiffRenderCache {
         lines
     }
 
+    /// Discards the cached diff body of a single path.
+    ///
+    /// A repeated edit of the same file restarts its hunk stream from scratch:
+    /// the diff rendered for the previous attempt must never be reused, or the
+    /// viewport would keep showing fragments of a patch that was rejected and
+    /// retried (c-stream-file-reset).
+    pub fn invalidate(&mut self, path: &str) {
+        self.entries.remove(path);
+    }
+
     fn cached_lines(&self, path: &str, fingerprint: u64) -> Option<Vec<Line<'static>>> {
         let entry = self.entries.get(path)?;
         if entry.fingerprint == fingerprint {
@@ -140,4 +150,53 @@ fn render_expanded_diff_lines(file: &StreamingFileEdit) -> Vec<Line<'static>> {
         }
     }
     lines
+}
+
+#[cfg(test)]
+mod invalidate_tests {
+    use super::*;
+
+    use crate::views::repl::state::{FileEditStatus, StreamingHunk};
+
+    fn file_with_hunk(path: &str) -> StreamingFileEdit {
+        StreamingFileEdit {
+            path: path.to_string(),
+            op_type: EditOp::Replace,
+            status: FileEditStatus::Ok,
+            error: None,
+            hunks: vec![StreamingHunk {
+                hunk_index: 0,
+                old_text: "let a = 1;".to_string(),
+                new_text: "let a = 2;".to_string(),
+            }],
+            expanded: true,
+            retry_info: None,
+        }
+    }
+
+    #[test]
+    fn invalidate_drops_only_the_restarted_path() {
+        let mut cache = DiffRenderCache::default();
+        let kept = file_with_hunk("crates/tui/src/main.rs");
+        let retried = file_with_hunk("crates/tui/src/app.rs");
+
+        assert!(!cache.lines_for(&kept).is_empty());
+        assert!(!cache.lines_for(&retried).is_empty());
+        assert_eq!(cache.entries.len(), 2);
+
+        cache.invalidate("crates/tui/src/app.rs");
+
+        assert!(cache.entries.contains_key("crates/tui/src/main.rs"));
+        assert!(
+            !cache.entries.contains_key("crates/tui/src/app.rs"),
+            "the stale diff of the restarted file must be dropped"
+        );
+    }
+
+    #[test]
+    fn invalidate_ignores_an_unknown_path() {
+        let mut cache = DiffRenderCache::default();
+        cache.invalidate("crates/tui/src/never_rendered.rs");
+        assert!(cache.entries.is_empty());
+    }
 }

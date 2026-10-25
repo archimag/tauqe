@@ -88,7 +88,10 @@ verify:
 # publishes it: a second verification channel beside the mandatory `verify`
 # lifecycle would let the model choose a weaker gate. The recipes it reuses stay
 # independently addressable as typed custom tools.
-verify-cargo: check clippy test
+verify-cargo *args="--workspace":
+    cargo check {{args}} --all-targets
+    cargo clippy {{args}} --all-targets -- -D warnings
+    cargo test {{args}}
 
 # Report markdown hygiene findings among the paths it is given. Internal to
 # `scripts/verify.sh`; the `check-md` tool reuses it for the whole corpus.
@@ -118,22 +121,22 @@ format:
 [group('tauqe')]
 [doc('Compile every workspace target')]
 [metadata('timeout', '600')]
-check:
-    cargo check --all-targets
+check *args="--workspace":
+    cargo check {{args}} --all-targets
 
 # Run the workspace test suite
 [group('tauqe')]
 [doc('Run the workspace test suite')]
 [metadata('timeout', '900')]
-test:
-    cargo test --workspace
+test *args="--workspace":
+    cargo test {{args}}
 
 # Lint every workspace target with warnings denied
 [group('tauqe')]
 [doc('Lint every workspace target, denying warnings')]
 [metadata('timeout', '600')]
-clippy:
-    cargo clippy --all-targets -- -D warnings
+clippy *args="--workspace":
+    cargo clippy {{args}} --all-targets -- -D warnings
 
 # Check formatting of every workspace source file
 [group('tauqe')]

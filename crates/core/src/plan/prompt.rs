@@ -30,7 +30,7 @@ pub use step::{
 mod tests {
     use super::*;
     use crate::context::ContextFileContent;
-    use tauqe_protocol::{Plan, PlanItem, PlanItemStatus};
+    use tauqe_protocol::{EditProtocolKind, Plan, PlanItem, PlanItemStatus};
 
     fn sample_plan() -> Plan {
         Plan {
@@ -53,6 +53,7 @@ mod tests {
                     title: "Models".to_string(),
                     details: Some("Claims struct".to_string()),
                     status: PlanItemStatus::Done,
+                    blocked_reason: None,
                     concept_refs: vec!["c-1".to_string()],
                     files: vec!["crates/core/src/models.rs".to_string()],
                     readonly_files: vec![],
@@ -64,6 +65,7 @@ mod tests {
                     title: "Endpoint".to_string(),
                     details: Some("Write handler".to_string()),
                     status: PlanItemStatus::InProgress,
+                    blocked_reason: None,
                     concept_refs: vec!["c-1".to_string()],
                     files: vec!["crates/core/src/handler.rs".to_string()],
                     readonly_files: vec!["crates/core/src/contract.rs".to_string()],
@@ -90,7 +92,9 @@ mod tests {
     fn test_format_plan_step_execution_prompt() {
         let plan = sample_plan();
 
-        let prompt = format_plan_step_execution_prompt(&plan, "2", "_XYZ").unwrap();
+        let prompt =
+            format_plan_step_execution_prompt(&plan, "2", EditProtocolKind::Xml, Some("XYZ"))
+                .unwrap();
         assert!(prompt.contains("Target Plan Step Execution: [jwt-auth:2] Endpoint"));
         assert!(prompt.contains("Already Completed Prerequisites:"));
         assert!(prompt.contains("Architectural Concept (System Invariants & Focus):"));
@@ -109,15 +113,19 @@ mod tests {
 
     #[test]
     fn test_format_plan_step_retry_prompt() {
-        let prompt =
-            format_plan_step_retry_prompt("I think we are done.", Some("No edits were applied"));
+        let prompt = format_plan_step_retry_prompt(
+            "I think we are done.",
+            Some("No edits were applied"),
+            EditProtocolKind::Xml,
+            None,
+        );
         assert!(prompt.contains("Correction Required"));
         assert!(prompt.contains("<previous_response>"));
         assert!(prompt.contains("I think we are done."));
         assert!(prompt.contains("No edits were applied"));
         assert!(prompt.contains("terminal success tag"));
 
-        let empty = format_plan_step_retry_prompt("   ", None);
+        let empty = format_plan_step_retry_prompt("   ", None, EditProtocolKind::Xml, None);
         assert!(empty.contains("(empty response)"));
         assert!(!empty.contains("<previous_response>"));
         assert!(!empty.contains("Diagnostic Feedback"));

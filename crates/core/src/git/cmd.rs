@@ -87,14 +87,50 @@ pub fn run_git_check_ignore(dir: &Path, paths: &[String]) -> Result<Vec<String>>
 }
 
 /// Stages the specified list of files into the Git index.
+///
+/// If a file does not exist on disk (for example, after a staged deletion or move),
+/// it is only passed to `git add` if it is currently tracked in the Git index.
+/// Untracked files that were deleted on disk have no representation in Git and
+/// would otherwise cause `git add -- <path>` to abort with a fatal pathspec error.
 pub fn stage_files(dir: &Path, files: &[String]) -> Result<()> {
     if files.is_empty() {
         return Ok(());
     }
-    let mut add_args = vec!["add", "--"];
+
+    let mut files_to_stage = Vec::new();
+    let mut missing_on_disk = Vec::new();
+
     for f in files {
-        add_args.push(f.as_str());
+        if dir.join(f).exists() {
+            files_to_stage.push(f.as_str());
+        } else {
+            missing_on_disk.push(f.as_str());
+        }
     }
+
+    if !missing_on_disk.is_empty() {
+        // Probe the index in batch for missing files
+        let mut ls_args = vec!["ls-files", "-z", "--"];
+        ls_args.extend_from_slice(&missing_on_disk);
+        if let Ok(tracked_output) = run_git(Some(dir), &ls_args) {
+            let tracked: std::collections::HashSet<&str> = tracked_output
+                .split('\0')
+                .filter(|s| !s.is_empty())
+                .collect();
+            for missing in missing_on_disk {
+                if tracked.contains(missing) {
+                    files_to_stage.push(missing);
+                }
+            }
+        }
+    }
+
+    if files_to_stage.is_empty() {
+        return Ok(());
+    }
+
+    let mut add_args = vec!["add", "--"];
+    add_args.extend_from_slice(&files_to_stage);
     run_git(Some(dir), &add_args)?;
     Ok(())
 }

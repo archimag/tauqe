@@ -72,7 +72,7 @@ pub fn apply_finding_architectural_context(plan: &mut Plan, item: &ReviewItem) {
 mod tests {
     use super::*;
     use tauqe_protocol::review::{IssueStatus, ReviewIssue};
-    use tauqe_protocol::PlanItemStatus;
+    use tauqe_protocol::{EditProtocolKind, PlanItemStatus};
 
     /// Builds a finding whose architectural context the translation consumes.
     fn finding(body: &str, recommendations: &[&str]) -> ReviewItem {
@@ -143,6 +143,7 @@ mod tests {
             title: "Return a structured error".to_string(),
             details: Some("Reuse the existing scanner.".to_string()),
             status: PlanItemStatus::Todo,
+            blocked_reason: None,
             files: vec!["crates/x/src/parser.rs".to_string()],
             readonly_files: vec!["crates/x/src/api.rs".to_string()],
             concept_refs: Vec::new(),
@@ -164,8 +165,13 @@ mod tests {
         };
         apply_finding_architectural_context(&mut plan, &item);
 
-        let prompt = crate::plan::prompt::format_plan_step_execution_prompt(&plan, "1", "_M7")
-            .expect("sub-step prompt");
+        let prompt = crate::plan::prompt::format_plan_step_execution_prompt(
+            &plan,
+            "1",
+            EditProtocolKind::Xml,
+            Some("M7"),
+        )
+        .expect("sub-step prompt");
 
         // The finding body becomes the plan description and the reviewer's
         // decision becomes the concept section, so the sub-step turn sees the

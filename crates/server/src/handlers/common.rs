@@ -161,6 +161,19 @@ pub(crate) async fn preload_readonly_files(
     }
 }
 
+/// Appends the developer directives section to an execution prompt when present.
+///
+/// Every prompt contour that can be started with developer directives — a plan
+/// step, a review finding, a review sub-step — appends them the same way, so a
+/// directive section never drifts between the workflows that accept one.
+pub(crate) fn append_developer_directives(prompt: &mut String, instructions: Option<&str>) {
+    if let Some(dirs) = instructions.map(str::trim).filter(|d| !d.is_empty()) {
+        prompt.push_str("\n## Developer Directives:\n");
+        prompt.push_str(dirs);
+        prompt.push('\n');
+    }
+}
+
 /// Records an Architect synthesis interaction atomically once it reaches a
 /// terminal outcome.
 ///

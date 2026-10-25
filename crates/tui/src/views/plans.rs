@@ -72,6 +72,12 @@ pub enum VisiblePlanRow {
         files: Vec<String>,
         readonly_files: Vec<String>,
         concept_refs: Vec<String>,
+        /// Diagnostic report of the semantic blocker that stopped the step.
+        ///
+        /// Present only while the step is blocked, so the reason survives the
+        /// interrupted turn on disk and in the tree instead of being lost with
+        /// the transient session.
+        blocked_reason: Option<String>,
         depth: usize,
         has_children: bool,
         has_details: bool,
@@ -493,7 +499,12 @@ impl PlansViewState {
         let has_meta = !item.files.is_empty()
             || !item.readonly_files.is_empty()
             || !item.concept_refs.is_empty();
-        let is_expandable = has_children || has_details || has_meta;
+        let has_blocked_reason = item
+            .blocked_reason
+            .as_deref()
+            .map(|reason| !reason.trim().is_empty())
+            .unwrap_or(false);
+        let is_expandable = has_children || has_details || has_meta || has_blocked_reason;
         let is_expanded = self.is_item_expanded(plan_id, &item.id);
 
         out.push(VisiblePlanRow::PlanItem {
@@ -505,6 +516,7 @@ impl PlansViewState {
             files: item.files.clone(),
             readonly_files: item.readonly_files.clone(),
             concept_refs: item.concept_refs.clone(),
+            blocked_reason: item.blocked_reason.clone(),
             depth,
             has_children,
             has_details,
@@ -617,12 +629,17 @@ impl PlansViewState {
         let end = offsets.get(sel + 1).copied().unwrap_or(lines.len());
         let scroll = self.scroll as usize;
 
-        let new_scroll = if sel == 0 {
-            0
+        // A row taller than the viewport cannot be shown whole, so the window
+        // stays inside `[start, end - height]`: entering such a row from above
+        // aligns it to the top of the screen, while a viewport already deep
+        // inside it keeps its offset instead of snapping back to the first line
+        // of the row. A row that fits is revealed completely (c-scroll-visibility).
+        let new_scroll = if end.saturating_sub(start) > height {
+            scroll.clamp(start, end.saturating_sub(height))
         } else if start < scroll {
             start
         } else if end > scroll + height {
-            end.saturating_sub(height).min(start)
+            end.saturating_sub(height)
         } else {
             scroll
         };
@@ -739,7 +756,12 @@ impl PlansViewState {
                 let has_meta = !item.files.is_empty()
                     || !item.readonly_files.is_empty()
                     || !item.concept_refs.is_empty();
-                let is_expandable = has_details || has_meta;
+                let has_blocked_reason = item
+                    .blocked_reason
+                    .as_deref()
+                    .map(|reason| !reason.trim().is_empty())
+                    .unwrap_or(false);
+                let is_expandable = has_details || has_meta || has_blocked_reason;
                 out.push(PlanNodeRef {
                     plan_id: plan_id.to_string(),
                     item_id: Some(item.id.clone()),
@@ -1020,6 +1042,7 @@ mod tests {
             title: title.to_string(),
             details: None,
             status: PlanItemStatus::Todo,
+            blocked_reason: None,
             files: vec![],
             readonly_files: vec![],
             concept_refs: vec![],
@@ -1052,6 +1075,7 @@ mod tests {
                 title: "Step 1".to_string(),
                 details: None,
                 status: PlanItemStatus::Todo,
+                blocked_reason: None,
                 files: vec![],
                 readonly_files: vec![],
                 concept_refs: vec![],
@@ -1112,6 +1136,7 @@ mod tests {
                 title: "Create JWT Signer".to_string(),
                 details: None,
                 status: PlanItemStatus::Todo,
+                blocked_reason: None,
                 files: vec!["src/jwt.rs".to_string()],
                 readonly_files: vec![],
                 concept_refs: vec!["c-1".to_string()],
@@ -1198,6 +1223,7 @@ mod tests {
                     title: "Parent Step 1".to_string(),
                     details: None,
                     status: PlanItemStatus::Todo,
+                    blocked_reason: None,
                     files: vec![],
                     readonly_files: vec![],
                     concept_refs: vec![],
@@ -1208,6 +1234,7 @@ mod tests {
                             title: "Step 1.1 Leaf".to_string(),
                             details: None,
                             status: PlanItemStatus::Todo,
+                            blocked_reason: None,
                             files: vec![],
                             readonly_files: vec![],
                             concept_refs: vec![],
@@ -1219,6 +1246,7 @@ mod tests {
                             title: "Step 1.2 Leaf".to_string(),
                             details: None,
                             status: PlanItemStatus::Todo,
+                            blocked_reason: None,
                             files: vec![],
                             readonly_files: vec![],
                             concept_refs: vec![],
@@ -1232,6 +1260,7 @@ mod tests {
                     title: "Parent Step 2".to_string(),
                     details: None,
                     status: PlanItemStatus::Todo,
+                    blocked_reason: None,
                     files: vec![],
                     readonly_files: vec![],
                     concept_refs: vec![],
@@ -1241,6 +1270,7 @@ mod tests {
                         title: "Step 2.1 Leaf".to_string(),
                         details: None,
                         status: PlanItemStatus::Todo,
+                        blocked_reason: None,
                         files: vec![],
                         readonly_files: vec![],
                         concept_refs: vec![],
@@ -1787,6 +1817,272 @@ mod tests {
             claims(&alt_primary, KeyCode::Char('l'), KeyModifiers::CONTROL),
             vec![PlansAction::Recenter],
             "a raw Ctrl+L must still recenter when the primary modifier is Alt"
+        );
+    }
+
+    /// Line bounds of the row at `index` in the rendered plan tree, derived from
+    /// the same layout offsets the view uses to position its viewport.
+    fn row_bounds(view: &mut PlansViewState, index: usize) -> (usize, usize) {
+        let rows = view.flatten_rows();
+        let (lines, offsets) = compute_unified_plan_lines(
+            &rows,
+            index,
+            view.content_width.max(10),
+            view.theme_mode,
+            &mut view.markdown_cache,
+        );
+        let start = offsets.get(index).copied().unwrap_or(0);
+        let end = offsets.get(index + 1).copied().unwrap_or(lines.len());
+        (start, end)
+    }
+
+    /// A plan holding twenty single-line steps, so every row fits the viewport.
+    fn scroll_fixture(view_height: u16) -> PlansViewState {
+        PlansViewState {
+            plans: vec![Plan {
+                id: "scroll-plan".to_string(),
+                title: "Scroll Plan".to_string(),
+                items: (1..=20)
+                    .map(|i| leaf_item(&i.to_string(), &format!("Step {i}")))
+                    .collect(),
+                ..Default::default()
+            }],
+            view_height,
+            content_width: 80,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn test_scroll_to_selected_reveals_a_row_below_the_viewport() {
+        let mut view = scroll_fixture(5);
+        view.toggle_plan_expanded("scroll-plan");
+
+        let selected = view
+            .flatten_rows()
+            .iter()
+            .position(
+                |row| matches!(row, VisiblePlanRow::PlanItem { item_id, .. } if item_id == "15"),
+            )
+            .expect("the step is rendered in the tree");
+        view.selected_index = selected;
+        view.scroll = 0;
+        view.scroll_to_selected();
+
+        let (start, end) = row_bounds(&mut view, selected);
+        let height = view.view_height as usize;
+        assert!(
+            view.scroll as usize <= start,
+            "the viewport must not start below the selected row"
+        );
+        assert!(
+            view.scroll as usize + height >= end,
+            "the selected row must be fully visible"
+        );
+        assert_eq!(
+            view.scroll as usize,
+            end.saturating_sub(height),
+            "a row below the viewport scrolls its bottom edge into view"
+        );
+
+        // Walking back up to a row above the viewport aligns it to the top.
+        let earlier = view
+            .flatten_rows()
+            .iter()
+            .position(
+                |row| matches!(row, VisiblePlanRow::PlanItem { item_id, .. } if item_id == "5"),
+            )
+            .expect("the earlier step is rendered in the tree");
+        view.selected_index = earlier;
+        view.scroll_to_selected();
+        let (earlier_start, _) = row_bounds(&mut view, earlier);
+        assert_eq!(
+            view.scroll as usize, earlier_start,
+            "a row above the viewport aligns to the top of the screen"
+        );
+    }
+
+    /// A plan holding sixty single-line steps, so the rendered tree is much
+    /// taller than the viewport and every navigation command can move the
+    /// cursor off screen.
+    fn tall_scroll_fixture(view_height: u16) -> PlansViewState {
+        PlansViewState {
+            plans: vec![Plan {
+                id: "scroll-plan".to_string(),
+                title: "Scroll Plan".to_string(),
+                items: (1..=60)
+                    .map(|i| leaf_item(&i.to_string(), &format!("Step {i}")))
+                    .collect(),
+                ..Default::default()
+            }],
+            view_height,
+            content_width: 80,
+            ..Default::default()
+        }
+    }
+
+    /// Asserts that the row at `index` lies entirely inside the viewport.
+    fn assert_selected_row_visible(view: &mut PlansViewState, index: usize) {
+        let (start, end) = row_bounds(view, index);
+        let scroll = view.scroll as usize;
+        let height = view.view_height as usize;
+        assert!(
+            scroll <= start && scroll + height >= end,
+            "the selected row {start}..{end} must be fully visible in {scroll}..{}",
+            scroll + height
+        );
+    }
+
+    /// Selecting the last row must scroll the viewport down to it, selecting a
+    /// middle row must pull the viewport up to it, and selecting the first row
+    /// must reveal the very top of the document (c-scroll-visibility).
+    #[test]
+    fn test_scroll_to_selected_reveals_rows_in_both_directions() {
+        let mut view = tall_scroll_fixture(10);
+        view.toggle_plan_expanded("scroll-plan");
+
+        // Down: the last row must push the viewport away from the top, and the
+        // cursor must rest on a visible row.
+        let last = view.row_count() - 1;
+        view.selected_index = last;
+        view.scroll_to_selected();
+        assert!(
+            view.scroll > 0,
+            "the last row must scroll the viewport down"
+        );
+        assert_selected_row_visible(&mut view, last);
+
+        // Up: a row in the middle must be pulled into view instead of staying
+        // above the viewport top.
+        let middle = last / 2;
+        view.selected_index = middle;
+        view.scroll_to_selected();
+        assert_selected_row_visible(&mut view, middle);
+
+        // Home: the first row reveals the document top.
+        view.selected_index = 0;
+        view.scroll_to_selected();
+        assert_eq!(view.scroll, 0, "the first row must reveal the document top");
+        assert_selected_row_visible(&mut view, 0);
+    }
+
+    /// Entering a tall expanded step from below must reveal its bottom edge
+    /// instead of pinning the viewport to its first screenful, so the lines the
+    /// cursor lands near stay readable (c-scroll-visibility).
+    #[test]
+    fn test_scroll_to_selected_reveals_the_bottom_edge_of_a_tall_row_from_below() {
+        let tall_details = (0..60)
+            .map(|line| format!("Invariant line {line}."))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let mut view = tall_scroll_fixture(5);
+        view.plans[0].items = vec![
+            leaf_item("1", "First step"),
+            PlanItem {
+                id: "2".to_string(),
+                title: "Tall step".to_string(),
+                details: Some(tall_details),
+                status: PlanItemStatus::Todo,
+                ..Default::default()
+            },
+            leaf_item("3", "Last step"),
+        ];
+        view.toggle_plan_expanded("scroll-plan");
+        view.toggle_item_expanded("scroll-plan", "2");
+
+        let tall = view
+            .flatten_rows()
+            .iter()
+            .position(
+                |row| matches!(row, VisiblePlanRow::PlanItem { item_id, .. } if item_id == "2"),
+            )
+            .expect("the tall step is rendered in the tree");
+        let after = view
+            .flatten_rows()
+            .iter()
+            .position(
+                |row| matches!(row, VisiblePlanRow::PlanItem { item_id, .. } if item_id == "3"),
+            )
+            .expect("the following step is rendered in the tree");
+
+        let (start, end) = row_bounds(&mut view, tall);
+        let height = view.view_height as usize;
+        assert!(
+            end - start > height,
+            "the fixture row must be taller than the viewport"
+        );
+
+        // Rest the viewport on the row below the tall step, then move the cursor
+        // up into the tall step.
+        let after_start = row_bounds(&mut view, after).0;
+        view.scroll = u16::try_from(after_start).expect("the viewport offset fits in u16");
+        view.selected_index = tall;
+        view.scroll_to_selected();
+        assert_eq!(
+            view.scroll as usize,
+            end - height,
+            "a tall row entered from below reveals its bottom edge"
+        );
+    }
+
+    /// A row taller than the screen cannot be shown whole: entering it from above
+    /// aligns it to the top, a viewport already deep inside it keeps its offset,
+    /// and an offset past its bottom clamps to the last screenful
+    /// (c-scroll-visibility).
+    #[test]
+    fn test_scroll_to_selected_keeps_a_tall_row_inside_its_bounds() {
+        let tall_details = (0..60)
+            .map(|line| format!("Invariant line {line}."))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let mut view = scroll_fixture(5);
+        view.plans[0].items = vec![
+            leaf_item("1", "First step"),
+            PlanItem {
+                id: "2".to_string(),
+                title: "Tall step".to_string(),
+                details: Some(tall_details),
+                status: PlanItemStatus::Todo,
+                ..Default::default()
+            },
+            leaf_item("3", "Last step"),
+        ];
+        view.toggle_plan_expanded("scroll-plan");
+        view.toggle_item_expanded("scroll-plan", "2");
+
+        let selected = view
+            .flatten_rows()
+            .iter()
+            .position(
+                |row| matches!(row, VisiblePlanRow::PlanItem { item_id, .. } if item_id == "2"),
+            )
+            .expect("the tall step is rendered in the tree");
+        let (start, end) = row_bounds(&mut view, selected);
+        let height = view.view_height as usize;
+        assert!(
+            end - start > height,
+            "the fixture row must be taller than the viewport"
+        );
+
+        view.selected_index = selected;
+        view.scroll = 0;
+        view.scroll_to_selected();
+        assert_eq!(view.scroll as usize, start, "the row aligns to the top");
+
+        view.scroll = (start + 20) as u16;
+        view.scroll_to_selected();
+        assert_eq!(
+            view.scroll as usize,
+            start + 20,
+            "a viewport inside the row keeps its offset instead of snapping back"
+        );
+
+        view.scroll = end as u16;
+        view.scroll_to_selected();
+        assert_eq!(
+            view.scroll as usize,
+            end - height,
+            "an offset past the row bottom clamps to the last screenful"
         );
     }
 }

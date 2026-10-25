@@ -192,6 +192,13 @@ pub(crate) fn compute_unified_plan_lines(
 
     for (idx, row) in rows.iter().enumerate() {
         let is_selected = idx == selected_idx;
+        // The blank separator between plans belongs to the gap before a plan
+        // header, so it is emitted before the offset of that row is recorded.
+        // Otherwise the offset anchors the gap and scrolling stops one line
+        // short of the header it is meant to reveal (c-offset-accuracy).
+        if idx > 0 && matches!(row, VisiblePlanRow::PlanHeader { .. }) {
+            all_lines.push(Line::raw(""));
+        }
         offsets.push(all_lines.len());
 
         let row_style = if is_selected {
@@ -218,10 +225,6 @@ pub(crate) fn compute_unified_plan_lines(
                 focused,
                 architect,
             } => {
-                if idx > 0 {
-                    all_lines.push(Line::raw(""));
-                }
-
                 let fold_icon = if *is_expanded { "▼ " } else { "▶ " };
                 let stats_str = crate::i18n::active_t("plans.done_progress")
                     .replacen("{}", &completed.to_string(), 1)
@@ -468,6 +471,7 @@ pub(crate) fn compute_unified_plan_lines(
                 files,
                 readonly_files,
                 concept_refs,
+                blocked_reason,
                 depth,
                 has_children,
                 has_details: _,
@@ -593,6 +597,31 @@ pub(crate) fn compute_unified_plan_lines(
                             ),
                         ]));
                     }
+                    if let Some(reason) = blocked_reason {
+                        let prepared = prepare_plan_markdown(reason);
+                        if !prepared.is_empty() {
+                            // The blocker is the step's most important detail,
+                            // so it leads the body of a blocked step and keeps
+                            // the semantic error role (Conventions §8.4).
+                            let reason_style = engine.fg(palette.status_error);
+                            let prefix = format!(
+                                "{}{} ",
+                                body_prefix,
+                                crate::i18n::active_t("plans.blocked_prefix")
+                            );
+                            for (index, text) in prepared.lines().enumerate() {
+                                let lead = if index == 0 {
+                                    Span::styled(prefix.clone(), reason_style.bold())
+                                } else {
+                                    Span::styled(body_prefix.clone(), engine.fg(palette.text_muted))
+                                };
+                                row_lines.push(Line::from(vec![
+                                    lead,
+                                    Span::styled(text.to_string(), reason_style),
+                                ]));
+                            }
+                        }
+                    }
                     if let Some(det) = details {
                         let prepared = prepare_plan_markdown(det);
                         if !prepared.is_empty() {
@@ -644,6 +673,7 @@ mod tests {
             title: title.to_string(),
             details: None,
             status: PlanItemStatus::Todo,
+            blocked_reason: None,
             files: vec![],
             readonly_files: vec![],
             concept_refs: vec![],
@@ -863,6 +893,7 @@ mod tests {
                 title: "Phase".to_string(),
                 details: None,
                 status: PlanItemStatus::Todo,
+                blocked_reason: None,
                 files: vec!["parent.rs".to_string()],
                 readonly_files: vec![],
                 concept_refs: vec![],
@@ -872,6 +903,7 @@ mod tests {
                     title: "Leaf Task".to_string(),
                     details: None,
                     status: PlanItemStatus::Todo,
+                    blocked_reason: None,
                     files: vec!["leaf.rs".to_string()],
                     readonly_files: vec![],
                     concept_refs: vec![],
@@ -918,6 +950,7 @@ mod tests {
                 title: "Wire Auth".to_string(),
                 details: None,
                 status: PlanItemStatus::Todo,
+                blocked_reason: None,
                 files: vec!["src/auth.rs".to_string()],
                 readonly_files: vec![
                     "contracts/api.md".to_string(),
@@ -951,6 +984,90 @@ mod tests {
         );
     }
 
+    /// A blocked step reveals its blocker reason once expanded, renders that
+    /// reason with the semantic error style, and hides it again while folded.
+    #[test]
+    fn test_blocked_step_renders_its_reason_when_expanded() {
+        let mut item = leaf_item("1", "Wire Auth");
+        item.status = PlanItemStatus::Blocked;
+        item.blocked_reason = Some("Invariant c-model cannot be satisfied.".to_string());
+
+        let mut view = PlansViewState {
+            plans: vec![Plan {
+                id: "blocked-plan".to_string(),
+                title: "Blocked Plan".to_string(),
+                items: vec![item],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        view.expand_all();
+
+        let (lines, _) = render_view(&mut view, usize::MAX, 200);
+        let text = joined_text(&lines);
+        assert!(
+            text.contains("blocked: Invariant c-model cannot be satisfied."),
+            "the reason line must render with its catalog prefix: {text}"
+        );
+
+        let engine = current_engine();
+        let palette = engine.palette();
+        let reason_line = &lines[find_line(&lines, "Invariant c-model cannot be satisfied.")];
+        let reason_text: String = reason_line
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect();
+        assert!(
+            reason_line
+                .spans
+                .iter()
+                .any(|span| span.style.fg == Some(engine.color(palette.status_error))),
+            "the reason must use the semantic error style: {reason_text}"
+        );
+
+        // Folding the step hides its reason again.
+        view.toggle_item_expanded("blocked-plan", "1");
+        let (folded, _) = render_view(&mut view, usize::MAX, 200);
+        assert!(
+            !joined_text(&folded).contains("Invariant c-model cannot be satisfied."),
+            "a folded step must hide its blocker reason"
+        );
+    }
+
+    /// A blocked step carries no description or file metadata, so the reason
+    /// alone must make the step expandable; otherwise it could never be read.
+    #[test]
+    fn test_blocked_step_without_details_is_expandable() {
+        let mut item = leaf_item("1", "Blocked Step");
+        item.status = PlanItemStatus::Blocked;
+        item.blocked_reason = Some("Waiting on an external contract.".to_string());
+
+        let mut view = PlansViewState {
+            plans: vec![Plan {
+                id: "expandable-plan".to_string(),
+                title: "Expandable Plan".to_string(),
+                items: vec![item],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        view.expand_all();
+
+        let rows = view.flatten_rows();
+        assert!(
+            rows.iter().any(|row| matches!(
+                row,
+                VisiblePlanRow::PlanItem {
+                    item_id,
+                    is_expandable: true,
+                    ..
+                } if item_id == "1"
+            )),
+            "a blocked step must be expandable so its reason can be revealed"
+        );
+    }
+
     #[test]
     fn test_prepare_plan_markdown_does_not_slice_multibyte_whitespace() {
         // A line made only of NBSP (U+00A0) is Unicode whitespace and is
@@ -978,6 +1095,7 @@ mod tests {
                 title: "Step".to_string(),
                 details: None,
                 status: PlanItemStatus::Todo,
+                blocked_reason: None,
                 files: vec![],
                 readonly_files: vec![],
                 concept_refs: vec![],
@@ -1038,6 +1156,56 @@ mod tests {
         assert!(
             rendered.contains("[ARC] planner/model [high]"),
             "the header must name the Architect model and depth: {rendered}"
+        );
+    }
+
+    /// The blank separator between two plans belongs to the gap before the
+    /// second header, so the recorded offset of every plan points straight at
+    /// its header line instead of the empty row above it (c-offset-accuracy).
+    #[test]
+    fn test_plan_offsets_point_at_their_header_not_the_separator_gap() {
+        let mut view = PlansViewState {
+            plans: vec![
+                Plan {
+                    id: "plan-a".to_string(),
+                    title: "Plan A".to_string(),
+                    ..Default::default()
+                },
+                Plan {
+                    id: "plan-b".to_string(),
+                    title: "Plan B".to_string(),
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+
+        let rows = view.flatten_rows();
+        let headers: Vec<usize> = rows
+            .iter()
+            .enumerate()
+            .filter(|(_, row)| matches!(row, VisiblePlanRow::PlanHeader { .. }))
+            .map(|(index, _)| index)
+            .collect();
+        assert_eq!(headers.len(), 2, "both plan headers are visible");
+
+        let (lines, offsets) = render_view(&mut view, usize::MAX, 200);
+        assert_eq!(offsets.len(), rows.len());
+
+        // The first plan starts the document, so its offset is line zero.
+        assert_eq!(offsets[headers[0]], 0);
+
+        // The second plan's offset skips the separator and anchors its header.
+        let second = offsets[headers[1]];
+        assert!(
+            lines[second].to_string().contains("[plan-b]"),
+            "the offset must anchor the header line: {}",
+            lines[second]
+        );
+        assert!(
+            lines[second - 1].to_string().trim().is_empty(),
+            "the separator must sit above the anchored header: {}",
+            lines[second - 1]
         );
     }
 

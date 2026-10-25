@@ -30,7 +30,7 @@ pub fn render_plans_view(
     let rows = state.plans_view.flatten_rows();
     state.plans_view.clamp_selection();
 
-    let (lines, offsets) = if rows.is_empty() {
+    let (lines, _offsets) = if rows.is_empty() {
         (
             vec![
                 Line::raw(""),
@@ -57,24 +57,11 @@ pub fn render_plans_view(
 
     state.plans_view.rendered_lines = lines.len();
 
-    if !rows.is_empty() && height > 0 {
-        let sel = state.plans_view.selected_index.min(rows.len() - 1);
-        let start = offsets.get(sel).copied().unwrap_or(0);
-        let end = offsets.get(sel + 1).copied().unwrap_or(lines.len());
-        let scroll = state.plans_view.scroll as usize;
-
-        let new_scroll = if sel == 0 {
-            0
-        } else if start < scroll {
-            start
-        } else if end > scroll + height as usize {
-            end.saturating_sub(height as usize).min(start)
-        } else {
-            scroll
-        };
-        state.plans_view.scroll = new_scroll as u16;
-    }
-
+    // The renderer only bounds the viewport by the document length. Free
+    // scrolling (wheel, paging) belongs to the developer, so re-anchoring the
+    // window on the cursor every frame would snap it back (c-render-scroll-decoupling).
+    // Positioning the viewport is `scroll_to_selected`'s job and runs only when
+    // the selection moves.
     let max_scroll = (lines.len() as u16).saturating_sub(height);
     if state.plans_view.scroll > max_scroll {
         state.plans_view.scroll = max_scroll;
@@ -270,5 +257,84 @@ fn describe_plan_row(
             }
             spans
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
+    use tauqe_protocol::{Plan, PlanItem, PlanItemStatus};
+
+    fn render_once(terminal: &mut Terminal<TestBackend>, state: &mut crate::app::AppState) {
+        terminal
+            .draw(|f| {
+                let area = f.area();
+                let main_area = Rect::new(0, 0, area.width, area.height.saturating_sub(1));
+                let info_area = Rect::new(0, area.height.saturating_sub(1), area.width, 1);
+                render_plans_view(f, state, main_area, info_area);
+            })
+            .unwrap();
+    }
+
+    /// A plan whose only step carries a body far taller than the viewport, so
+    /// the tree can be scrolled far beyond the first screenful.
+    fn tall_plan_state() -> crate::app::AppState {
+        let mut state = crate::app::test_state();
+        state.plans_view.plans = vec![Plan {
+            id: "tall-plan".to_string(),
+            title: "Tall Plan".to_string(),
+            items: vec![PlanItem {
+                id: "1".to_string(),
+                title: "Tall step".to_string(),
+                details: Some(
+                    (0..120)
+                        .map(|line| format!("Invariant line {line}."))
+                        .collect::<Vec<_>>()
+                        .join("\n"),
+                ),
+                status: PlanItemStatus::Todo,
+                ..Default::default()
+            }],
+            ..Default::default()
+        }];
+        state.plans_view.toggle_plan_expanded("tall-plan");
+        state.plans_view.toggle_item_expanded("tall-plan", "1");
+        state
+    }
+
+    /// A redraw must never pull a freely scrolled viewport back to the cursor
+    /// (c-render-scroll-decoupling): the renderer bounds the scroll by the
+    /// document length only.
+    #[test]
+    fn render_plans_view_preserves_free_scroll_across_frames() {
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        let mut state = tall_plan_state();
+        // The cursor rests on the plan header while the developer reads deep
+        // inside the expanded step.
+        state.plans_view.selected_index = 0;
+        state.plans_view.scroll = 40;
+
+        render_once(&mut terminal, &mut state);
+
+        assert!(
+            state.plans_view.rendered_lines > 40 + state.plans_view.view_height as usize,
+            "the expanded step must extend past the free scroll offset"
+        );
+        assert_eq!(
+            state.plans_view.scroll, 40,
+            "a redraw must not snap the viewport back to the selected row"
+        );
+
+        let max = u16::try_from(state.plans_view.rendered_lines)
+            .unwrap_or(u16::MAX)
+            .saturating_sub(state.plans_view.view_height);
+        state.plans_view.scroll = u16::MAX;
+        render_once(&mut terminal, &mut state);
+        assert_eq!(
+            state.plans_view.scroll, max,
+            "the renderer clamps the viewport by the document length only"
+        );
     }
 }

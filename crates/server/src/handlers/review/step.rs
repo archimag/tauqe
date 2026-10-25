@@ -44,11 +44,11 @@ use tauqe_core::providers::{format_session_id, SESSION_PREFIX_REVIEW};
 use tauqe_core::review::prompt::ReviewStepFailure;
 use tauqe_protocol::{IssueStatus, IssueType, ModelRole, ModelSelection, TurnIntent};
 
+use crate::handlers::common::append_developer_directives;
 use crate::handlers::model::{execute_model_turn, StepTurnOptions};
 use crate::state::{AppState, OperationGuard};
 
 use self::replan::{reload_finding, run_review_subplan_with_replans};
-use self::subplan::append_developer_directives;
 use super::common::{
     clear_auto_context, persist_finding_update, preload_item_files, report_item_failure,
     set_item_status, set_item_status_checked, skip_finding_with_diagnostic, turn_applied_edits,
@@ -225,15 +225,13 @@ async fn run_review_step_inner(
     // Generate the active turn marker before assembling prompts so the target
     // finding prompt and the model turn share the same marker-bound protocol.
     let marker = state.next_turn_marker().await;
-    let marker_suffix = marker
-        .as_ref()
-        .map(|m| format!("_{}", m))
-        .unwrap_or_default();
+    let protocol = state.config.lock().await.config.develop.protocol;
 
     let mut prompt = match tauqe_core::review::prompt::format_review_step_execution_prompt(
         &session,
         item_id,
-        &marker_suffix,
+        protocol,
+        marker.as_deref(),
     ) {
         Ok(p) => p,
         Err(err) => {
@@ -252,16 +250,15 @@ async fn run_review_step_inner(
         )
     };
 
-    // An explicit request-level model or an explicitly assigned finding model
-    // pins the Coder and disables ladder escalation; an unassigned finding
-    // starts on the Coder role and may escalate through the coder ladder when
-    // `auto_level_up` is enabled.
+    // The selected coder is the starting rung of this finding: an explicit
+    // selection runs at its own reasoning depth, and a later escalation
+    // continues above it instead of restarting the ladder at its base.
     let explicit_selection = model.or_else(|| item.model.clone());
     let mut selection = explicit_selection
         .clone()
         .unwrap_or(ModelSelection::Role(ModelRole::Coder));
-    let mut reasoning_effort = None;
-    let mut ladder_idx = 0usize;
+    let mut ladder_idx = models_config.coder_tier_index(Some(&selection));
+    let mut reasoning_effort = models_config.resolve_selection_effort(ModelRole::Coder, &selection);
     let mut attempt = 0usize;
 
     loop {
@@ -495,7 +492,7 @@ async fn run_review_step_inner(
         clear_auto_context(state).await;
         preload_item_files(state, repo_root, &item.files).await;
 
-        if explicit_selection.is_none() && auto_level_up {
+        if auto_level_up {
             let from_tier = ladder_idx;
             ladder_idx += 1;
             let tier = models_config.coder_tier(ladder_idx);
@@ -516,6 +513,8 @@ async fn run_review_step_inner(
         prompt = tauqe_core::review::prompt::format_review_step_retry_prompt(
             &turn.assistant_text,
             turn.error.as_deref(),
+            protocol,
+            marker.as_deref(),
         );
         attempt += 1;
     }

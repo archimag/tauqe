@@ -234,6 +234,18 @@ pub fn canonical_catalog() -> Vec<LocaleCatalogItem> {
         item("dialog.execute_scope.heading_jit", "Project and execute the first implementation horizon autonomously?", "Execute-concept-plan dialog heading", None),
         item("dialog.execute_scope.jit_note", "No implementation horizon has been synthesized yet; the Architect projects the first one before the first step runs.", "Execute-concept-plan note about just-in-time horizon synthesis", None),
 
+        // The execution dialog is a form: it exposes the configured Coder ladder
+        // and a directives editor, so the developer picks the starting rung
+        // before any bounded turn spends tokens (c-tui-selector).
+        item("dialog.execute_scope.step_label", " Step: ", "Execute-scope targeted step field label", None),
+        item("dialog.execute_scope.model_list_title", " Coder Model ", "Execute-scope coder model list title with a single entry", None),
+        item("dialog.execute_scope.model_list_counter", " Coder Model  [{} of {}] ", "Execute-scope coder model list title with a position counter", None),
+        item("dialog.execute_scope.no_models", "  (no coder models configured)", "Execute-scope empty coder model list placeholder", None),
+        item("dialog.execute_scope.editor_title", "Coder Instructions (optional)", "Execute-scope instructions editor block title", None),
+        item("dialog.execute_scope.editor_placeholder", " Additional implementation directives [optional]...", "Execute-scope empty instructions placeholder", None),
+        item("dialog.execute_scope.hint_actions", "Enter execute • ← / → button • Esc cancel", "Execute-scope dialog footer hint while the action bar has focus", None),
+        item("dialog.execute_scope.hint_fields", "{}Enter execute • Tab focus • {} model • Esc cancel", "Execute-scope dialog footer hint while a field has focus", None),
+
         item("dialog.execute_pipeline.title", "Execute Plan Pipeline", "Title for the multi-plan execution pipeline confirmation dialog", None),
         item("dialog.execute_pipeline.heading", "Execute every ready plan as one sequential pipeline?", "Execute-pipeline dialog heading", None),
         item("dialog.execute_pipeline.plans_label", " Plans: ", "Execute-pipeline plans field label", None),
@@ -1148,6 +1160,7 @@ pub fn canonical_catalog() -> Vec<LocaleCatalogItem> {
         item("repl.edits_files_progress", "({}/{} files)", "Develop label counting validated files of the staged edit set", None),
         item("repl.edits_summary_label", "Summary: ", "Develop label prefixing the recorded commit summary", None),
         item("repl.edits_retry_label", "(Retrying {})", "Develop label counting the retry attempt of a failed file", None),
+        item("repl.edits_retry_healing", "compiler rejected edits, generating fixes", "Develop retry reason shown on a staged file returned to the Retrying state while the verification healing loop regenerates its patch", None),
         item("repl.hunk_renamed", "renamed", "Develop label describing a moved file", None),
         item("repl.hunk_rewritten", "rewritten", "Develop label describing an overwritten file", None),
         item("repl.hunk_deleted", "deleted", "Develop label describing a deleted file", None),
@@ -1175,6 +1188,7 @@ pub fn canonical_catalog() -> Vec<LocaleCatalogItem> {
         item("plans.file_count", "{} file(s)", "Tree badge counting target files of a leaf step", None),
         item("plans.ref_count", "{} ref(s)", "Tree badge counting reference files of a leaf step", None),
         item("plans.concept_prefix", "concept: ", "Plans tree label prefixing concept references of a step", None),
+        item("plans.blocked_prefix", "blocked:", "Plans tree label prefixing the reason a step was blocked", None),
 
         // ------------------------------------------------------------------
         // Review info strip and tree-renderer labels (views/review).

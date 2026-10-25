@@ -746,30 +746,47 @@ pub async fn handle_modal_click(
             }
         }
         Some(ActiveModal::ExecuteScope) => {
-            if let Some(target) = st.confirm_execute_scope.clone() {
-                let geom = match crate::dialogs::render::execute_scope_params(&st) {
-                    Some(params) => geometry_of(term_rect, &params),
-                    None => return Ok(InputResult::Continue),
-                };
-                match check_confirm_hit(&geom, mouse.column, mouse.row) {
-                    ModalHit::Confirm => {
-                        st.confirm_execute_scope = None;
-                        st.confirm_button = crate::app::ConfirmDialogButton::Cancel;
-                        crate::dialogs::input::confirm_execute_scope(
-                            state,
-                            st,
-                            server_writer,
-                            target,
-                        )
+            // Executing a step or a whole scope draws the Coder form dialog,
+            // whose action buttons, model rows, and editor area come from one
+            // geometry source shared with the renderer (Conventions §6, §7).
+            if let Some(mut target) = st.confirm_execute_scope.take() {
+                let geo = crate::dialogs::render::execute_scope_dialog_geometry(
+                    term_rect,
+                    target.selector.len(),
+                    target.steps.len() == 1,
+                );
+
+                if rect_contains(geo.confirm_button, mouse.column, mouse.row) {
+                    st.confirm_button = crate::app::ConfirmDialogButton::Cancel;
+                    crate::dialogs::input::confirm_execute_scope(state, st, server_writer, target)
                         .await?;
-                    }
-                    ModalHit::Cancel | ModalHit::Outside => {
-                        st.confirm_execute_scope = None;
-                        st.confirm_button = crate::app::ConfirmDialogButton::Cancel;
-                    }
-                    ModalHit::InsideBody => {}
+                    return Ok(InputResult::Continue);
                 }
+
+                if rect_contains(geo.cancel_button, mouse.column, mouse.row)
+                    || !rect_contains(geo.area, mouse.column, mouse.row)
+                {
+                    // Safe cancellation: dismiss without a turn.
+                    st.confirm_button = crate::app::ConfirmDialogButton::Cancel;
+                    return Ok(InputResult::Continue);
+                }
+
+                if rect_contains(geo.model_rows, mouse.column, mouse.row) {
+                    let visible = geo.model_rows.height as usize;
+                    let start = target.selector.visible_start(visible);
+                    let clicked_row = (mouse.row - geo.model_rows.y) as usize;
+                    let index = start + clicked_row;
+                    if index < target.selector.len() {
+                        target.selector.select_index(index);
+                    }
+                    target.focus = crate::views::plans::RefineDialogFocus::ModelList;
+                } else if rect_contains(geo.editor_area, mouse.column, mouse.row) {
+                    target.focus = crate::views::plans::RefineDialogFocus::InstructionsEditor;
+                }
+
+                st.confirm_execute_scope = Some(target);
             }
+            return Ok(InputResult::Continue);
         }
         Some(ActiveModal::RefineDialog) => {
             if let Some(mut dialog) = st.plans_view.refine_dialog.take() {

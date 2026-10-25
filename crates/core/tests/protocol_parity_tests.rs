@@ -310,6 +310,7 @@ fn plan_definitions_declare_exactly_the_fields_of_the_rust_nodes() {
         title: "Step".to_string(),
         details: Some("details".to_string()),
         status: tauqe_protocol::PlanItemStatus::Todo,
+        blocked_reason: None,
         files: vec!["src/a.rs".to_string()],
         readonly_files: vec!["src/b.rs".to_string()],
         concept_refs: vec!["c-1".to_string()],

@@ -503,6 +503,29 @@ impl ModelsConfig {
             .unwrap_or_else(|| self.fallback_coder_tier())
     }
 
+    /// Returns the ladder position a coder selection starts execution from.
+    ///
+    /// The ladder is the very list [`ModelsConfig::coder_ladder`] exposes, so an
+    /// index returned here is directly usable as the starting rung of a turn.
+    /// The selection is resolved to its concrete model and reasoning depth
+    /// first: an entry matching both wins, because the same model may occupy
+    /// several rungs at different depths; a model-only match is the fallback.
+    /// An absent selection, or a model the ladder does not carry, restarts from
+    /// the base rung instead of guessing a position.
+    pub fn coder_tier_index(&self, selection: Option<&ModelSelection>) -> usize {
+        let Some(selection) = selection else {
+            return 0;
+        };
+        let model = self.resolve_model(selection);
+        let effort = self.resolve_selection_effort(ModelRole::Coder, selection);
+        let ladder = self.coder_ladder();
+        ladder
+            .iter()
+            .position(|entry| entry.model == model && entry.effort == effort)
+            .or_else(|| ladder.iter().position(|entry| entry.model == model))
+            .unwrap_or(0)
+    }
+
     /// Fallback coder rung derived from the deterministic role resolution chain.
     fn fallback_coder_tier(&self) -> ModelEntry {
         ModelEntry::from(self.resolve_role_with_fallback(ModelRole::Coder, None))
@@ -874,7 +897,10 @@ architect = [
             config.resolve_selection_effort(ModelRole::Architect, &tier),
             Some(ReasoningEffort::XHigh)
         );
-        assert_eq!(config.resolve_model(&tier), ModelRef::openrouter("google/gemini-flash"));
+        assert_eq!(
+            config.resolve_model(&tier),
+            ModelRef::openrouter("google/gemini-flash")
+        );
 
         // A tier without a depth resolves to no effort instead of inheriting
         // the first entry's configured one.
@@ -882,7 +908,10 @@ architect = [
             model: ModelRef::openrouter("google/gemini-flash"),
             effort: None,
         };
-        assert_eq!(config.resolve_selection_effort(ModelRole::Architect, &bare), None);
+        assert_eq!(
+            config.resolve_selection_effort(ModelRole::Architect, &bare),
+            None
+        );
     }
 
     #[test]
@@ -1101,7 +1130,10 @@ architect = [
             model: model.clone(),
             effort: None,
         };
-        assert_eq!(config.resolve_selection_effort(ModelRole::Architect, &bare), None);
+        assert_eq!(
+            config.resolve_selection_effort(ModelRole::Architect, &bare),
+            None
+        );
 
         // A bare model reference names no entry, so it keeps the established
         // behavior and reads the depth of the first matching entry.
@@ -1263,5 +1295,90 @@ coder = [
                 "{role}: the legacy form decodes unchanged"
             );
         }
+    }
+
+    #[test]
+    fn test_coder_tier_index_defaults_to_the_base_rung() {
+        let config = parse_models(
+            r#"
+primary = ["openrouter:base/primary"]
+coder = [
+    { model = "openrouter:start/model", effort = "low" },
+    { model = "openrouter:strong/model", effort = "max" },
+]
+"#,
+        );
+
+        // No explicit selection starts execution at the base of the ladder.
+        assert_eq!(config.coder_tier_index(None), 0);
+
+        // A role selection names the model the coder role resolves to, which is
+        // the base rung of the very same ladder.
+        assert_eq!(
+            config.coder_tier_index(Some(&ModelSelection::Role(ModelRole::Coder))),
+            0
+        );
+
+        // A model the ladder does not carry restarts from the base rung instead
+        // of guessing a position.
+        assert_eq!(
+            config.coder_tier_index(Some(&ModelSelection::Specific(ModelRef::openrouter(
+                "unknown/model"
+            )))),
+            0
+        );
+    }
+
+    #[test]
+    fn test_coder_tier_index_matches_effort_then_model() {
+        let config = parse_models(
+            r#"
+primary = ["openrouter:base/primary"]
+coder = [
+    { model = "openrouter:shared/model", effort = "low" },
+    { model = "openrouter:shared/model", effort = "high" },
+    { model = "openrouter:other/model", effort = "max" },
+]
+"#,
+        );
+        let model = ModelRef::openrouter("shared/model");
+
+        // The same model occupies two rungs, so the reasoning depth
+        // distinguishes them instead of collapsing onto the first one.
+        for (effort, index) in [(ReasoningEffort::Low, 0), (ReasoningEffort::High, 1)] {
+            let selection = ModelSelection::Tier {
+                model: model.clone(),
+                effort: Some(effort),
+            };
+            assert_eq!(config.coder_tier_index(Some(&selection)), index, "{effort}");
+            // The returned position is a usable starting rung: the ladder entry
+            // it names is exactly the configured model at the requested depth.
+            let rung = config.coder_tier(index);
+            assert_eq!(rung.model, model, "{effort}");
+            assert_eq!(rung.effort, Some(effort), "{effort}");
+        }
+
+        // A rung naming the model at a depth the ladder does not configure
+        // falls back to the model match, which lands on its first rung.
+        assert_eq!(
+            config.coder_tier_index(Some(&ModelSelection::Tier {
+                model: model.clone(),
+                effort: Some(ReasoningEffort::Max),
+            })),
+            0
+        );
+
+        // A bare model reference carries no depth of its own, so the configured
+        // entry supplies it and the ladder position follows.
+        assert_eq!(
+            config.coder_tier_index(Some(&ModelSelection::Specific(model.clone()))),
+            0
+        );
+        assert_eq!(
+            config.coder_tier_index(Some(&ModelSelection::Specific(ModelRef::openrouter(
+                "other/model"
+            )))),
+            2
+        );
     }
 }

@@ -402,6 +402,7 @@ mod tests {
                 title: "First step".to_string(),
                 details: Some("Details of first step".to_string()),
                 status: PlanItemStatus::Todo,
+                blocked_reason: None,
                 files: vec![],
                 readonly_files: vec![],
                 concept_refs: vec![],

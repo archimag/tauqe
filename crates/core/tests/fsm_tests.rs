@@ -47,6 +47,9 @@ const HEAL_LIB: &str = "pub fn alpha() -> i32 { \"alpha\" }\npub fn beta() -> i3
 /// reports the mismatched return types of the broken library, and `--quiet`
 /// keeps the report free of build progress noise.
 const VERIFY_DECLARATION: &str = "\
+[models]
+primary = [\"openrouter:mock/model\"]
+
 [project.verify]
 command = \"cargo\"
 args = [\"check\", \"--quiet\"]
@@ -2594,6 +2597,9 @@ async fn run_format_turn(repo_root: &std::path::Path) -> (ModelResult, usize) {
 async fn git_workflow_discards_formatter_failure_and_commits_verified_code() {
     let declaration = format!(
         r#"
+[models]
+primary = ["openrouter:mock/model"]
+
 [project.verify]
 command = "grep"
 args = ["-q", "{repair}", "src/lib.rs"]
@@ -2645,6 +2651,9 @@ args = ["-c", "printf garbage; exit 1"]
 async fn git_workflow_commits_in_memory_formatter_output() {
     let declaration = format!(
         r#"
+[models]
+primary = ["openrouter:mock/model"]
+
 [project.verify]
 command = "grep"
 args = ["-q", "{repair}", "src/lib.rs"]
@@ -2963,7 +2972,7 @@ async fn repo_dirs_lists_root_files_and_marks_pinned_conventions() {
     .expect("write target fixture");
     std::fs::write(
         repo_root.join("tauqe.toml"),
-        "[context]\npinned = [\"Conventions.md\"]\n",
+        "[models]\nprimary = [\"openrouter:mock/model\"]\n\n[project.verify]\ncommand = \"true\"\n\n[context]\npinned = [\"Conventions.md\"]\n",
     )
     .expect("write project configuration");
     commit_fixture(
@@ -3613,7 +3622,14 @@ async fn project_verification_reports_structured_diagnostics_for_healing() {
         .expect("write source fixture");
     write_project_config(
         &repo_root,
-        "[project.verify]\ncommand = \"sh\"\nargs = ['-c', 'printf \"src/lib.rs:3:5: error: mismatched types\\n\" >&2; exit 1']\n",
+        concat!(
+            "[models]\n",
+            "primary = [\"openrouter:mock/model\"]\n",
+            "\n",
+            "[project.verify]\n",
+            "command = \"sh\"\n",
+            "args = ['-c', 'printf \"src/lib.rs:3:5: error: mismatched types\\n\" >&2; exit 1']\n",
+        ),
     );
     commit_fixture(&repo_root, &["src.rs", "tauqe.toml"]);
 
@@ -3647,6 +3663,9 @@ async fn post_hook_artifacts_join_the_single_turn_commit() {
     write_project_config(
         &repo_root,
         concat!(
+            "[models]\n",
+            "primary = [\"openrouter:mock/model\"]\n",
+            "\n",
             "[project.verify]\n",
             "command = \"grep\"\n",
             "args = [\"-q\", \"pub fn alpha() -> i32 { 1 }\", \"src/lib.rs\"]\n",
@@ -3748,6 +3767,9 @@ async fn post_hook_artifacts_survive_healing_into_one_commit() {
     write_project_config(
         &repo_root,
         concat!(
+            "[models]\n",
+            "primary = [\"openrouter:mock/model\"]\n",
+            "\n",
             "[project.verify]\n",
             "command = \"grep\"\n",
             "args = [\"-q\", \"pub fn beta() -> i32 { 2 }\", \"src/lib.rs\"]\n",
@@ -3877,6 +3899,9 @@ async fn verification_generated_lock_file_joins_the_single_turn_commit() {
     write_project_config(
         &repo_root,
         concat!(
+            "[models]\n",
+            "primary = [\"openrouter:mock/model\"]\n",
+            "\n",
             "[project.verify]\n",
             "command = \"sh\"\n",
             "args = ['-c', 'echo lockfile > Cargo.lock; grep -q \"pub fn compute() -> i32 { 7 }\" src/lib.rs']\n",
@@ -3981,6 +4006,12 @@ async fn verification_generated_lock_file_joins_the_single_turn_commit() {
 /// the exit status. It edits nothing, which keeps it a pure diagnostic step.
 #[cfg(unix)]
 const PROBE_DECLARATION: &str = "\
+[models]
+primary = [\"openrouter:mock/model\"]
+
+[project.verify]
+command = \"true\"
+
 [project.commands.probe]
 command = \"sh\"
 args = ['-c', 'printf \"probe stdout\\n\"; printf \"probe stderr\\n\" >&2']
@@ -4477,7 +4508,7 @@ async fn auto_context_survives_a_failed_verification() {
         .expect("write helper fixture");
     std::fs::write(
         repo_root.join("tauqe.toml"),
-        "[project.verify]\ncommand = \"sh\"\nargs = ['-c', 'exit 1']\n",
+        "[models]\nprimary = [\"openrouter:mock/model\"]\n\n[project.verify]\ncommand = \"sh\"\nargs = ['-c', 'exit 1']\n",
     )
     .expect("write the project verification declaration");
     commit_fixture(&repo_root, &["target.rs", "helper.rs", "tauqe.toml"]);
@@ -4697,4 +4728,229 @@ async fn a_turn_never_widens_the_user_layer() {
     // transient auto layer and never to the developer-owned user layer.
     assert_eq!(user_layer_paths(&context), vec!["target.rs".to_string()]);
     assert!(context.auto_files().is_empty());
+}
+
+/// A post-hook that corrupts `tauqe.toml` invalidates the environment the turn
+/// runs in: phase zero of the verification pipeline rejects the change set, the
+/// turn fails, and the Git transaction restores the pre-turn working tree.
+#[cfg(unix)]
+#[tokio::test]
+async fn post_hook_corrupting_tauqe_toml_fails_verification_and_rolls_back() {
+    let (_dir, repo_root) = init_repo();
+    std::fs::create_dir_all(repo_root.join("src")).expect("create src directory");
+    std::fs::write(
+        repo_root.join("src/lib.rs"),
+        "pub fn compute() -> i32 { \"compute\" }\n",
+    )
+    .expect("write broken library");
+
+    // The declared hook leaves the project without a valid environment, so the
+    // engine must refuse to verify the change set it produced.
+    let declaration = r#"
+[models]
+primary = ["openrouter:mock/model"]
+
+[project.verify]
+command = "grep"
+args = ["-q", "pub fn compute() -> i32 { 7 }", "src/lib.rs"]
+
+[project.post_hook]
+command = "sh"
+args = ['-c', 'printf "[models]\nprimary = []\n" > tauqe.toml']
+"#;
+    std::fs::write(repo_root.join("tauqe.toml"), declaration)
+        .expect("write the project declaration");
+    commit_fixture(&repo_root, &["src/lib.rs", "tauqe.toml"]);
+
+    let mut context = ContextManager::new(repo_root.clone());
+    context
+        .add_file("src/lib.rs", ContextAccess::Editable)
+        .expect("add library to context");
+    let mut history = HistoryManager::new(repo_root.clone());
+
+    let repair = format!(
+        "{edits}\n<verify_{MARKER} target=\"check\" on_success=\"silent\" />",
+        edits = edit_block(
+            "Repair compute return type",
+            "src/lib.rs",
+            "pub fn compute() -> i32 { \"compute\" }",
+            "pub fn compute() -> i32 { 7 }",
+        ),
+    );
+    let provider = MockLlmProvider::scripted([MockResponse::text(repair)]);
+    let model = ModelRef::openrouter("mock/model");
+    let protocol = tauqe_core::prompt::xml::XmlPromptProtocol
+        .with_turn_marker(MARKER)
+        .expect("marker-bound protocol");
+    let (stream_tx, cancel_rx) = event_channel();
+
+    let mut policy = GitTransactionPolicy::new();
+    let options = WorkflowOptions {
+        max_retries: 0,
+        ..WorkflowOptions::default()
+    };
+    let exec = SingleExecution::new(options);
+    let execution = exec
+        .execute(
+            &mut policy,
+            "Repair the mismatched return type in src/lib.rs",
+            tauqe_protocol::TurnIntent::InteractiveRepl,
+            &provider,
+            &model,
+            &mut context,
+            &mut history,
+            protocol.as_ref(),
+            stream_tx,
+            cancel_rx,
+        )
+        .await
+        .expect("workflow execution succeeds");
+
+    match execution.result {
+        ModelResult::Edit { outcome, .. } => {
+            assert!(
+                !outcome.applied,
+                "a corrupted environment must never be committed"
+            );
+            let error = outcome.error.unwrap_or_default();
+            assert!(
+                error.contains("tauqe.toml"),
+                "the failure must name the corrupted environment file: {error}"
+            );
+        }
+        other => panic!("expected a failed verification, got {other:?}"),
+    }
+
+    assert_eq!(
+        std::fs::read_to_string(repo_root.join("tauqe.toml")).expect("read the declaration"),
+        declaration,
+        "the rollback must restore the pre-turn declaration"
+    );
+    assert_eq!(
+        std::fs::read_to_string(repo_root.join("src/lib.rs")).expect("read the library"),
+        "pub fn compute() -> i32 { \"compute\" }\n",
+        "the rollback must restore the pre-turn source"
+    );
+}
+
+/// A post-hook that keeps `tauqe.toml` valid preserves the harness environment,
+/// so phase zero passes and the turn commits the hook's rewrite of the
+/// declaration together with the repaired source.
+#[cfg(unix)]
+#[tokio::test]
+async fn post_hook_preserving_a_valid_tauqe_toml_commits_the_change_set() {
+    let (_dir, repo_root) = init_repo();
+    std::fs::create_dir_all(repo_root.join("src")).expect("create src directory");
+    std::fs::write(
+        repo_root.join("src/lib.rs"),
+        "pub fn compute() -> i32 { \"compute\" }\n",
+    )
+    .expect("write broken library");
+
+    // The hook rewrites the declaration without changing its meaning, so the
+    // environment stays sound and the verification gate must not refuse it.
+    let declaration = r##"
+[models]
+primary = ["openrouter:mock/model"]
+
+[project.verify]
+command = "grep"
+args = ["-q", "pub fn compute() -> i32 { 7 }", "src/lib.rs"]
+
+[project.post_hook]
+command = "sh"
+args = ['-c', 'printf "# self-preserved\n" >> tauqe.toml']
+"##;
+    std::fs::write(repo_root.join("tauqe.toml"), declaration)
+        .expect("write the project declaration");
+    commit_fixture(&repo_root, &["src/lib.rs", "tauqe.toml"]);
+
+    let mut context = ContextManager::new(repo_root.clone());
+    context
+        .add_file("src/lib.rs", ContextAccess::Editable)
+        .expect("add library to context");
+    let mut history = HistoryManager::new(repo_root.clone());
+
+    let repair = format!(
+        "{edits}\n<verify_{MARKER} target=\"check\" on_success=\"silent\" />",
+        edits = edit_block(
+            "Repair compute return type",
+            "src/lib.rs",
+            "pub fn compute() -> i32 { \"compute\" }",
+            "pub fn compute() -> i32 { 7 }",
+        ),
+    );
+    let provider = MockLlmProvider::scripted([MockResponse::text(repair)]);
+    let model = ModelRef::openrouter("mock/model");
+    let protocol = tauqe_core::prompt::xml::XmlPromptProtocol
+        .with_turn_marker(MARKER)
+        .expect("marker-bound protocol");
+    let (stream_tx, cancel_rx) = event_channel();
+
+    let baseline = commit_count(&repo_root);
+    let mut policy = GitTransactionPolicy::new();
+    let exec = SingleExecution::new(WorkflowOptions::default());
+    let execution = exec
+        .execute(
+            &mut policy,
+            "Repair the mismatched return type in src/lib.rs",
+            tauqe_protocol::TurnIntent::InteractiveRepl,
+            &provider,
+            &model,
+            &mut context,
+            &mut history,
+            protocol.as_ref(),
+            stream_tx,
+            cancel_rx,
+        )
+        .await
+        .expect("workflow execution succeeds");
+
+    match execution.result {
+        ModelResult::Edit { outcome, .. } => {
+            assert!(
+                outcome.error.is_none(),
+                "unexpected error: {:?}",
+                outcome.error
+            );
+            assert!(
+                outcome.applied,
+                "a valid environment must let the change set commit"
+            );
+        }
+        other => panic!("expected applied edits, got {other:?}"),
+    }
+    assert_eq!(
+        provider.requests().len(),
+        1,
+        "a sound declaration must verify on the first attempt"
+    );
+
+    let preserved = std::fs::read_to_string(repo_root.join("tauqe.toml"))
+        .expect("read the rewritten declaration");
+    assert!(
+        preserved.starts_with(declaration),
+        "the preserved declaration must keep its meaning: {preserved:?}"
+    );
+    assert!(
+        preserved.ends_with("# self-preserved\n"),
+        "the hook's rewrite must reach the committed tree: {preserved:?}"
+    );
+
+    let mut paths = commit_paths(&repo_root);
+    paths.sort();
+    assert_eq!(
+        paths,
+        vec!["src/lib.rs".to_string(), "tauqe.toml".to_string()],
+        "the valid rewrite of the declaration joins the single turn commit"
+    );
+    assert_eq!(
+        commit_count(&repo_root),
+        baseline + 1,
+        "the turn must produce exactly one commit"
+    );
+    assert!(
+        worktree_status(&repo_root).is_empty(),
+        "the turn must not leave unaccounted files behind"
+    );
 }

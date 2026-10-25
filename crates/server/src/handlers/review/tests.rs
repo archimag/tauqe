@@ -928,13 +928,15 @@ async fn test_review_semantic_block_skips_finding_without_retry() {
 }
 
 #[tokio::test]
-async fn test_review_explicit_model_disables_ladder_escalation() {
+async fn test_review_explicit_model_starts_ladder_escalation_above_its_rung() {
     let dir = TestDir::new();
     init_repo_with_file(&dir, "src/target.rs");
 
+    // The finding is pinned to the base rung of the coder ladder, and the
+    // ladder carries a stronger rung above it.
     let mut item = test_item(1, IssueStatus::Todo, "src/target.rs");
     item.model = Some(ModelSelection::Specific(
-        tauqe_protocol::ModelRef::openrouter("explicit/model"),
+        tauqe_protocol::ModelRef::openrouter("start/model"),
     ));
 
     let session = test_session("rev-explicit", vec![item]);
@@ -945,11 +947,16 @@ async fn test_review_explicit_model_disables_ladder_escalation() {
         MockResponse::text("No edits."),
     ]));
 
-    // Escalation is enabled, but an explicitly assigned model is pinned
-    // across every retry and must never be replaced by a ladder tier.
+    // The selected coder is the starting rung of the finding: the initial turn
+    // runs on it, and `auto_level_up` continues the ladder above that rung
+    // instead of restarting from its base or being blocked by the selection.
     let mut config = test_config();
     config.develop.max_retries = 1;
     config.models.auto_level_up = true;
+    config.models.coder = Some(vec![
+        tauqe_protocol::ModelRef::openrouter("start/model").into(),
+        tauqe_protocol::ModelRef::openrouter("strong/model").into(),
+    ]);
     let state = test_state_with_provider(&dir, config, provider.clone()).await;
 
     let operation = Arc::new(
@@ -968,9 +975,13 @@ async fn test_review_explicit_model_disables_ladder_escalation() {
 
     let requests = provider.requests();
     assert_eq!(requests.len(), 2);
-    assert!(
-        requests.iter().all(|r| r.model == "explicit/model"),
-        "an explicit model must never be replaced by a ladder tier"
+    assert_eq!(
+        requests[0].model, "start/model",
+        "the selected coder is the starting rung of the finding"
+    );
+    assert_eq!(
+        requests[1].model, "strong/model",
+        "escalation must continue above the selected rung"
     );
 }
 
@@ -3654,4 +3665,439 @@ async fn test_handle_review_delete_broadcasts_typed_focus_release() {
     );
 
     assert!(state.discussion_focus().await.is_none());
+}
+
+/// A Structured-protocol review finding turn speaks the field vocabulary of the
+/// JSON schema: its prompt names no marker-bound control tag, the scripted
+/// response resolves the finding through a change set and a successful
+/// `outcome`, and the finding reaches FIXED.
+#[tokio::test]
+async fn test_review_step_structured_protocol_execution() {
+    let dir = TestDir::new();
+    init_repo_with_file(&dir, "src/target.rs");
+
+    let session = test_session(
+        "rev-structured",
+        vec![test_item(1, IssueStatus::Todo, "src/target.rs")],
+    );
+    ReviewStorage::save_session(dir.path(), &session).unwrap();
+
+    let response = serde_json::json!({
+        "message": "Resolve the finding",
+        "changes": [
+            {
+                "op": "replace",
+                "path": "src/target.rs",
+                "to": "",
+                "old_text": "pub fn target() {}",
+                "new_text": "pub fn target() { /* resolved */ }",
+                "content": ""
+            }
+        ],
+        "context_requests": [],
+        "outcome": {
+            "status": "success",
+            "summary": "Finding resolved",
+            "message": "",
+            "reason": ""
+        }
+    })
+    .to_string();
+    let provider = Arc::new(MockLlmProvider::scripted([MockResponse::text(response)]));
+
+    let mut config = test_config();
+    config.develop.protocol = tauqe_protocol::EditProtocolKind::Structured;
+    config.develop.max_retries = 0;
+    let state = test_state_with_provider(&dir, config, provider.clone()).await;
+
+    let operation = Arc::new(
+        state
+            .try_begin_operation()
+            .expect("register batch operation"),
+    );
+    let outcome = run_review_batch(
+        &state,
+        "rev-structured",
+        make_tasks("rev-structured", &[1]),
+        operation,
+    )
+    .await;
+    assert!(
+        matches!(outcome, BatchOutcome::Completed { items: 1 }),
+        "expected a completed structured batch, got {outcome:?}"
+    );
+
+    // The finding prompt describes the structured response fields instead of
+    // marker-bound control tags.
+    let requests = provider.requests();
+    assert_eq!(requests.len(), 1);
+    let user_prompt = &requests[0].messages[1].content;
+    for tag in ["<success", "<skip", "<context_request"] {
+        assert!(
+            !user_prompt.contains(tag),
+            "a Structured finding prompt must not mention {tag}: {user_prompt}"
+        );
+    }
+    assert!(user_prompt.contains("outcome"));
+    assert!(user_prompt.contains("context_requests"));
+
+    let reloaded = ReviewStorage::load_review(dir.path(), "rev-structured")
+        .unwrap()
+        .unwrap();
+    assert_eq!(reloaded.find_item(1).unwrap().status, IssueStatus::Fixed);
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("src/target.rs")).unwrap(),
+        "pub fn target() { /* resolved */ }\n"
+    );
+}
+
+/// A finding pinned to an intermediate coder rung completes on that very rung:
+/// a verified first attempt neither escalates upward nor falls back to the base
+/// of the ladder.
+#[tokio::test]
+async fn test_review_intermediate_coder_rung_completes_on_the_first_attempt() {
+    let dir = TestDir::new();
+    init_repo_with_file(&dir, "src/target.rs");
+
+    let mut item = test_item(1, IssueStatus::Todo, "src/target.rs");
+    item.model = Some(ModelSelection::Specific(
+        tauqe_protocol::ModelRef::openrouter("mid/model"),
+    ));
+    let session = test_session("rev-mid-tier", vec![item]);
+    ReviewStorage::save_session(dir.path(), &session).unwrap();
+
+    let marker = "REVMIDTIER1";
+    let edit = architecture_edit(marker, "pub fn target() { /* mid tier */ }");
+    let provider = Arc::new(MockLlmProvider::scripted([MockResponse::text(edit)]));
+
+    let mut config = test_config();
+    config.develop.max_retries = 1;
+    config.models.auto_level_up = true;
+    config.models.coder = Some(vec![
+        tauqe_protocol::ModelRef::openrouter("lower/model").into(),
+        tauqe_protocol::ModelRef::openrouter("mid/model").into(),
+        tauqe_protocol::ModelRef::openrouter("strong/model").into(),
+    ]);
+    let state = test_state_with_provider(&dir, config, provider.clone()).await;
+    *state.marker_override.lock().await = Some(marker.to_string());
+
+    let operation = Arc::new(
+        state
+            .try_begin_operation()
+            .expect("register batch operation"),
+    );
+    let outcome = run_review_batch(
+        &state,
+        "rev-mid-tier",
+        make_tasks("rev-mid-tier", &[1]),
+        operation,
+    )
+    .await;
+    assert!(
+        matches!(outcome, BatchOutcome::Completed { items: 1 }),
+        "expected the selected rung to complete the finding, got {outcome:?}"
+    );
+
+    // The pinned rung runs the finding, and no rung above it is consumed.
+    let requests = provider.requests();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].model, "mid/model");
+
+    let reloaded = ReviewStorage::load_review(dir.path(), "rev-mid-tier")
+        .unwrap()
+        .unwrap();
+    assert_eq!(reloaded.find_item(1).unwrap().status, IssueStatus::Fixed);
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("src/target.rs")).unwrap(),
+        "pub fn target() { /* mid tier */ }\n"
+    );
+}
+
+/// A failed verification on an intermediate rung escalates one rung above it:
+/// the pinned coder is the starting tier, and `auto_level_up` continues the
+/// ladder from there instead of restarting at its base or blocking escalation.
+#[tokio::test]
+async fn test_review_intermediate_coder_rung_escalates_above_it() {
+    let dir = TestDir::new();
+    init_repo_with_file(&dir, "src/target.rs");
+
+    let mut item = test_item(1, IssueStatus::Todo, "src/target.rs");
+    item.model = Some(ModelSelection::Specific(
+        tauqe_protocol::ModelRef::openrouter("mid/model"),
+    ));
+    let session = test_session("rev-mid-escalate", vec![item]);
+    ReviewStorage::save_session(dir.path(), &session).unwrap();
+
+    let marker = "REVMIDESC1";
+    // The first attempt proposes no change set, so the ladder advances; the
+    // retried attempt lands the edit and resolves the finding.
+    let edit = architecture_edit(marker, "pub fn target() { /* escalated */ }");
+    let provider = Arc::new(MockLlmProvider::scripted([
+        MockResponse::text("No edits proposed for this finding."),
+        MockResponse::text(edit),
+    ]));
+
+    let mut config = test_config();
+    config.develop.max_retries = 1;
+    config.models.auto_level_up = true;
+    config.models.coder = Some(vec![
+        tauqe_protocol::ModelRef::openrouter("lower/model").into(),
+        tauqe_protocol::ModelRef::openrouter("mid/model").into(),
+        tauqe_protocol::ModelRef::openrouter("strong/model").into(),
+    ]);
+    let state = test_state_with_provider(&dir, config, provider.clone()).await;
+    *state.marker_override.lock().await = Some(marker.to_string());
+
+    let operation = Arc::new(
+        state
+            .try_begin_operation()
+            .expect("register batch operation"),
+    );
+    let outcome = run_review_batch(
+        &state,
+        "rev-mid-escalate",
+        make_tasks("rev-mid-escalate", &[1]),
+        operation,
+    )
+    .await;
+    assert!(
+        matches!(outcome, BatchOutcome::Completed { items: 1 }),
+        "expected the escalated finding to be fixed and the batch to complete, got {outcome:?}"
+    );
+
+    let requests = provider.requests();
+    assert_eq!(requests.len(), 2);
+    assert_eq!(
+        requests[0].model, "mid/model",
+        "the pinned coder is the starting rung of the finding"
+    );
+    assert_eq!(
+        requests[1].model, "strong/model",
+        "escalation must continue above the pinned rung"
+    );
+
+    let reloaded = ReviewStorage::load_review(dir.path(), "rev-mid-escalate")
+        .unwrap()
+        .unwrap();
+    assert_eq!(reloaded.find_item(1).unwrap().status, IssueStatus::Fixed);
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("src/target.rs")).unwrap(),
+        "pub fn target() { /* escalated */ }\n"
+    );
+}
+
+/// A subplan whose only executable leaf waits for a cancelled prerequisite can
+/// never become ready. That is a domain failure of the stalled sub-step, so the
+/// supervisor advances the queue instead of aborting the batch, and the finding
+/// returns to the actionable queue without its horizon being rewritten.
+#[tokio::test]
+async fn test_review_subplan_dependency_stall_does_not_abort_the_batch() {
+    let dir = TestDir::new();
+    init_repo_with_file(&dir, "src/target.rs");
+
+    save_subplan_session(
+        &dir,
+        "rev-dep-stall",
+        vec![
+            subplan_item(
+                "1.1",
+                "Abandoned approach",
+                PlanItemStatus::Cancelled,
+                vec!["src/target.rs"],
+            ),
+            dependent_subplan_item("1.2", "Follow-up step", &["1.1"]),
+        ],
+    );
+
+    let provider = Arc::new(MockLlmProvider::scripted([
+        MockResponse::text("This response must never be consumed."),
+        MockResponse::text("This response must never be consumed."),
+    ]));
+
+    let mut config = test_config();
+    // No replanning budget: the stalled horizon is reported as a domain failure
+    // of the stalled sub-step instead of being reprojected.
+    config.develop.max_replans = 0;
+    let state = test_state_with_provider(&dir, config, provider.clone()).await;
+
+    let operation = Arc::new(
+        state
+            .try_begin_operation()
+            .expect("register batch operation"),
+    );
+    let outcome = run_review_batch(
+        &state,
+        "rev-dep-stall",
+        make_tasks("rev-dep-stall", &[1]),
+        operation,
+    )
+    .await;
+
+    assert!(
+        matches!(outcome, BatchOutcome::Completed { items: 1 }),
+        "a dependency stall is a domain failure: the batch must advance instead of aborting, got {outcome:?}"
+    );
+    assert_eq!(
+        provider.requests().len(),
+        0,
+        "an unexecutable horizon must be rejected before any Coder turn runs"
+    );
+
+    // The finding returns to the actionable queue and the stored horizon is
+    // left exactly as the developer last saw it.
+    let reloaded = ReviewStorage::load_review(dir.path(), "rev-dep-stall")
+        .unwrap()
+        .unwrap();
+    assert_eq!(reloaded.find_item(1).unwrap().status, IssueStatus::Todo);
+    let issue = ReviewIssue::from(reloaded.find_item(1).unwrap().clone());
+    assert_eq!(issue.plan[0].status, PlanItemStatus::Cancelled);
+    assert_eq!(issue.plan[1].status, PlanItemStatus::Todo);
+}
+
+/// A dependency stall with a replanning budget engages the Architect, which
+/// reprojects the remaining horizon around the stalled dependency, so the
+/// finding is resumed from the synthesized horizon instead of being abandoned.
+#[tokio::test]
+async fn test_review_subplan_replans_a_dependency_stalled_horizon() {
+    let dir = TestDir::new();
+    init_repo_with_file(&dir, "src/target.rs");
+
+    save_subplan_session(
+        &dir,
+        "rev-dep-replan",
+        vec![
+            subplan_item(
+                "1.1",
+                "Abandoned approach",
+                PlanItemStatus::Cancelled,
+                vec!["src/target.rs"],
+            ),
+            dependent_subplan_item("1.2", "Follow-up step", &["1.1"]),
+        ],
+    );
+
+    let replan_output = serde_json::json!({
+        "status": "success",
+        "explanation": "Reprojected the stalled horizon onto an independent step",
+        "reason": null,
+        "context_requests": [],
+        "items": [{
+            "id": "2",
+            "title": "Synthesized replacement step",
+            "status": "todo",
+            "files": ["src/target.rs"],
+            "readonly_files": [],
+            "concept_refs": [],
+            "depends_on": [],
+            "children": []
+        }]
+    });
+    let marker = "DEPSTALL1";
+    let edit = architecture_edit(marker, "pub fn target() { /* replanned */ }");
+    let provider = Arc::new(MockLlmProvider::scripted([
+        MockResponse::text(replan_output.to_string()),
+        MockResponse::text(edit),
+    ]));
+
+    let mut config = test_config();
+    config.develop.max_retries = 0;
+    // One replanning round is allowed, so the stalled horizon engages the
+    // Architect instead of leaving the finding skipped.
+    config.develop.max_replans = 1;
+    let state = test_state_with_provider(&dir, config, provider.clone()).await;
+    *state.marker_override.lock().await = Some(marker.to_string());
+
+    let operation = Arc::new(
+        state
+            .try_begin_operation()
+            .expect("register batch operation"),
+    );
+    let outcome = run_review_batch(
+        &state,
+        "rev-dep-replan",
+        make_tasks("rev-dep-replan", &[1]),
+        operation,
+    )
+    .await;
+    assert!(
+        matches!(outcome, BatchOutcome::Completed { items: 1 }),
+        "expected the replanned finding to be fixed and the batch to complete, got {outcome:?}"
+    );
+
+    // Two provider calls: the Architect replan and the synthesized step. The
+    // stalled horizon is rejected before any Coder turn consumes an attempt.
+    assert_eq!(provider.requests().len(), 2);
+
+    let reloaded = ReviewStorage::load_review(dir.path(), "rev-dep-replan")
+        .unwrap()
+        .unwrap();
+    let issue = ReviewIssue::from(reloaded.find_item(1).unwrap().clone());
+    assert_eq!(issue.status, IssueStatus::Fixed);
+    assert!(
+        issue.plan.iter().any(|step| step.id == "2"),
+        "the synthesized step must replace the stalled horizon: {:?}",
+        issue.plan
+    );
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("src/target.rs")).unwrap(),
+        "pub fn target() { /* replanned */ }\n"
+    );
+}
+
+/// A synthesized review horizon that depends on a step which does not exist is
+/// rejected before it reaches disk, so a decomposed finding never receives a
+/// dead-on-arrival subplan.
+#[tokio::test]
+async fn test_replace_uncompleted_subplan_rejects_dangling_dependency() {
+    let dir = TestDir::new();
+
+    save_subplan_session(
+        &dir,
+        "rev-subplan-dangling",
+        vec![subplan_item(
+            "1.1",
+            "Existing step",
+            PlanItemStatus::Done,
+            vec!["src/target.rs"],
+        )],
+    );
+
+    let err = ReviewStorage::replace_uncompleted_subplan(
+        dir.path(),
+        "rev-subplan-dangling",
+        1,
+        vec![tauqe_protocol::PlanItem {
+            id: "2".to_string(),
+            title: "Depends on a ghost".to_string(),
+            status: PlanItemStatus::Todo,
+            depends_on: vec!["ghost".to_string()],
+            ..Default::default()
+        }],
+        tauqe_protocol::ArchitectTier::new(
+            tauqe_protocol::ModelRef::openrouter("test/architect"),
+            None,
+        ),
+        None,
+    )
+    .unwrap_err();
+    let message = err.to_string();
+    assert!(
+        message.contains("Invalid synthesized horizon"),
+        "unexpected error: {message}"
+    );
+    assert!(
+        message.contains("non-existent dependency 'ghost'"),
+        "unexpected error: {message}"
+    );
+
+    // The rejected synthesis leaves the stored finding untouched: the completed
+    // foundation survives and no synthesized step is persisted.
+    let reloaded = ReviewStorage::load_review(dir.path(), "rev-subplan-dangling")
+        .unwrap()
+        .unwrap();
+    let issue = ReviewIssue::from(reloaded.find_item(1).unwrap().clone());
+    assert_eq!(issue.plan.len(), 1);
+    assert_eq!(issue.plan[0].id, "1.1");
+    assert_eq!(issue.plan[0].status, PlanItemStatus::Done);
+    assert_eq!(reloaded.find_item(1).unwrap().status, IssueStatus::Todo);
 }

@@ -381,14 +381,16 @@ fn execute_scope_action(
     // confirmation arms with an empty queue instead of reporting a finished
     // scope (c-5).
     if plan.items.is_empty() && !plan.concept.is_empty() && scope_id.is_none() {
+        let coder_entries = st.coder_entries();
         st.confirm_button = crate::app::ConfirmDialogButton::Cancel;
-        st.confirm_execute_scope = Some(crate::app::ConfirmExecuteScopeState {
-            plan_id: plan.id.clone(),
-            plan_title: plan.title.clone(),
-            scope_title: scope_title.to_string(),
-            step_id: None,
-            steps: Vec::new(),
-        });
+        st.confirm_execute_scope = Some(crate::app::ConfirmExecuteScopeState::new(
+            plan.id.clone(),
+            plan.title.clone(),
+            scope_title.to_string(),
+            None,
+            Vec::new(),
+            coder_entries,
+        ));
         return;
     }
 
@@ -442,14 +444,16 @@ fn execute_scope_action(
             st.notify_error(active_t("notify.plan_item_not_found"));
         }
         tauqe_protocol::PlanScopeEvaluation::Ready(steps) => {
+            let coder_entries = st.coder_entries();
             st.confirm_button = crate::app::ConfirmDialogButton::Cancel;
-            st.confirm_execute_scope = Some(crate::app::ConfirmExecuteScopeState {
-                plan_id: plan.id.clone(),
-                plan_title: plan.title.clone(),
-                scope_title: scope_title.to_string(),
-                step_id: scope_id.map(str::to_string),
+            st.confirm_execute_scope = Some(crate::app::ConfirmExecuteScopeState::new(
+                plan.id.clone(),
+                plan.title.clone(),
+                scope_title.to_string(),
+                scope_id.map(str::to_string),
                 steps,
-            });
+                coder_entries,
+            ));
         }
     }
 }
@@ -515,15 +519,26 @@ pub async fn handle_plans_key(
                 st.plans_view.scroll_to_selected();
             }
         }
+        // Paging moves the selection by one screenful and lets the cursor own
+        // the viewport, so `PageUp` and `PageDown` never scroll the active row
+        // off screen and never leave an invisible row as the target of the next
+        // command (c-paging-cursor-sync).
         PlansAction::PageUp => {
-            let page = st.plans_view.view_height.saturating_sub(2).max(1);
-            st.plans_view.scroll = st.plans_view.scroll.saturating_sub(page);
+            let page = usize::from(st.plans_view.view_height.saturating_sub(2).max(1));
+            let rows_len = st.plans_view.flatten_rows().len();
+            if rows_len > 0 {
+                st.plans_view.selected_index = st.plans_view.selected_index.saturating_sub(page);
+                st.plans_view.scroll_to_selected();
+            }
         }
         PlansAction::PageDown => {
-            let page = st.plans_view.view_height.saturating_sub(2).max(1);
-            let max =
-                (st.plans_view.rendered_lines as u16).saturating_sub(st.plans_view.view_height);
-            st.plans_view.scroll = st.plans_view.scroll.saturating_add(page).min(max);
+            let page = usize::from(st.plans_view.view_height.saturating_sub(2).max(1));
+            let rows_len = st.plans_view.flatten_rows().len();
+            if rows_len > 0 {
+                st.plans_view.selected_index =
+                    (st.plans_view.selected_index + page).min(rows_len - 1);
+                st.plans_view.scroll_to_selected();
+            }
         }
         PlansAction::Recenter => {
             st.plans_view.recenter_selected();
@@ -1054,7 +1069,10 @@ mod tests {
         handle_plans_key(key, &state, &mut conn).await.unwrap();
         let scroll_second = state.lock().await.plans_view.scroll;
 
-        assert_ne!(scroll_first, scroll_second, "C-l must cycle recenter positions in plans view");
+        assert_ne!(
+            scroll_first, scroll_second,
+            "C-l must cycle recenter positions in plans view"
+        );
     }
 
     #[tokio::test]
@@ -1380,5 +1398,166 @@ mod tests {
             resolve(KeyCode::Char('c'), KeyModifiers::NONE),
             Some(PlansAction::CopyMarkdown)
         );
+    }
+
+    /// A plan holding sixty single-line steps, so the rendered tree is much
+    /// taller than the viewport and every navigation command can move the
+    /// cursor off screen.
+    fn tall_plan_state() -> crate::app::AppState {
+        let mut st = crate::app::test_state();
+        st.view_mode = ViewMode::Plans;
+        st.plans_view.plans = vec![tauqe_protocol::Plan {
+            id: "plan-nav".to_string(),
+            title: "Navigation Plan".to_string(),
+            items: (1..=60)
+                .map(|i| tauqe_protocol::PlanItem {
+                    id: i.to_string(),
+                    title: format!("Step {i}"),
+                    status: tauqe_protocol::PlanItemStatus::Todo,
+                    ..Default::default()
+                })
+                .collect(),
+            ..Default::default()
+        }];
+        st.plans_view.expand_all();
+        st.plans_view.view_height = 10;
+        st.plans_view.content_width = 80;
+        st.plans_view.selected_index = 1;
+        st.plans_view.scroll = 0;
+        st
+    }
+
+    /// Asserts that the row under the cursor lies entirely inside the viewport.
+    fn assert_plans_cursor_visible(view: &mut crate::views::plans::PlansViewState) {
+        let index = view.selected_index;
+        let width = view.content_width.max(10);
+        let rows = view.flatten_rows();
+        let (lines, offsets) = crate::views::plans::compute_unified_plan_lines(
+            &rows,
+            index,
+            width,
+            view.theme_mode,
+            &mut view.markdown_cache,
+        );
+        let start = offsets.get(index).copied().unwrap_or(0);
+        let end = offsets.get(index + 1).copied().unwrap_or(lines.len());
+        let scroll = view.scroll as usize;
+        let height = view.view_height as usize;
+        assert!(
+            scroll <= start && scroll + height >= end,
+            "the selected row {start}..{end} must stay visible in {scroll}..{}",
+            scroll + height
+        );
+    }
+
+    /// `n` / `Down` and `p` / `Up` move the cursor off screen and the viewport
+    /// follows it, so an invisible row never becomes the target of the next
+    /// command (c-scroll-visibility).
+    #[tokio::test]
+    async fn test_nav_next_and_prev_keep_the_selection_visible() {
+        let state = Arc::new(Mutex::new(tall_plan_state()));
+        let mut conn = RpcConnection::new(Vec::<u8>::new());
+        let down = KeyEvent::new(KeyCode::Down, crossterm::event::KeyModifiers::NONE);
+        let up = KeyEvent::new(KeyCode::Up, crossterm::event::KeyModifiers::NONE);
+
+        for _ in 0..15 {
+            handle_plans_key(down, &state, &mut conn).await.unwrap();
+        }
+        {
+            let mut guard = state.lock().await;
+            assert_eq!(guard.plans_view.selected_index, 16);
+            assert!(
+                guard.plans_view.scroll > 0,
+                "moving down must scroll the viewport"
+            );
+            assert_plans_cursor_visible(&mut guard.plans_view);
+        }
+
+        // Walking back above the viewport top pulls the viewport up with the
+        // cursor instead of leaving the row invisible.
+        for _ in 0..16 {
+            handle_plans_key(up, &state, &mut conn).await.unwrap();
+        }
+        {
+            let mut guard = state.lock().await;
+            assert_eq!(guard.plans_view.selected_index, 0);
+            assert_eq!(
+                guard.plans_view.scroll, 0,
+                "the first row must reveal the document top"
+            );
+            assert_plans_cursor_visible(&mut guard.plans_view);
+        }
+    }
+
+    /// `Home` and `End` move the cursor to the extremes of the tree and keep it
+    /// inside the viewport (c-scroll-visibility).
+    #[tokio::test]
+    async fn test_home_and_end_keep_the_selection_visible() {
+        let state = Arc::new(Mutex::new(tall_plan_state()));
+        let mut conn = RpcConnection::new(Vec::<u8>::new());
+
+        let end = KeyEvent::new(KeyCode::End, crossterm::event::KeyModifiers::NONE);
+        handle_plans_key(end, &state, &mut conn).await.unwrap();
+        {
+            let mut guard = state.lock().await;
+            let last = guard.plans_view.row_count() - 1;
+            assert_eq!(guard.plans_view.selected_index, last);
+            assert!(
+                guard.plans_view.scroll > 0,
+                "the last row must scroll the viewport down"
+            );
+            assert_plans_cursor_visible(&mut guard.plans_view);
+        }
+
+        let home = KeyEvent::new(KeyCode::Home, crossterm::event::KeyModifiers::NONE);
+        handle_plans_key(home, &state, &mut conn).await.unwrap();
+        {
+            let mut guard = state.lock().await;
+            assert_eq!(guard.plans_view.selected_index, 0);
+            assert_eq!(
+                guard.plans_view.scroll, 0,
+                "the first row must reveal the document top"
+            );
+            assert_plans_cursor_visible(&mut guard.plans_view);
+        }
+    }
+
+    /// `PageDown` and `PageUp` move the active row by one screenful and the
+    /// viewport follows it, so the cursor never leaves the visible area
+    /// (c-paging-cursor-sync).
+    #[tokio::test]
+    async fn test_paging_moves_the_selection_and_keeps_it_visible() {
+        let state = Arc::new(Mutex::new(tall_plan_state()));
+        let mut conn = RpcConnection::new(Vec::<u8>::new());
+        let down = KeyEvent::new(KeyCode::PageDown, crossterm::event::KeyModifiers::NONE);
+        let up = KeyEvent::new(KeyCode::PageUp, crossterm::event::KeyModifiers::NONE);
+
+        // One page is the viewport height minus the two reserved rows.
+        handle_plans_key(down, &state, &mut conn).await.unwrap();
+        {
+            let mut guard = state.lock().await;
+            assert_eq!(guard.plans_view.selected_index, 9);
+            assert_plans_cursor_visible(&mut guard.plans_view);
+        }
+
+        // Paging to the end stops on the last row instead of running past it.
+        for _ in 0..100 {
+            handle_plans_key(down, &state, &mut conn).await.unwrap();
+        }
+        {
+            let mut guard = state.lock().await;
+            let last = guard.plans_view.row_count() - 1;
+            assert_eq!(guard.plans_view.selected_index, last);
+            assert_plans_cursor_visible(&mut guard.plans_view);
+        }
+
+        // Paging back up returns one screenful with the cursor still on screen.
+        handle_plans_key(up, &state, &mut conn).await.unwrap();
+        {
+            let mut guard = state.lock().await;
+            let last = guard.plans_view.row_count() - 1;
+            assert_eq!(guard.plans_view.selected_index, last - 8);
+            assert_plans_cursor_visible(&mut guard.plans_view);
+        }
     }
 }

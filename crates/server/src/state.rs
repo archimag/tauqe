@@ -6,8 +6,8 @@ use tauqe_core::config::AppConfig;
 use tauqe_core::context::ContextManager;
 use tauqe_core::history::{HistoryManager, HistoryMutation};
 use tauqe_protocol::{
-    events, ContextState, DiscussionFocus, DiscussionFocusChangedEvent, Event, ModelRef,
-    ModelSelection, UsageTotalsSnapshot,
+    events, ContextState, DiscussionFocus, DiscussionFocusChangedEvent, EditProtocolKind, Event,
+    ModelRef, ModelSelection, UsageTotalsSnapshot,
 };
 use tokio::sync::{watch, Mutex};
 
@@ -679,14 +679,21 @@ impl AppState {
     }
 
     /// Returns the turn marker for the current turn, or `None` when markers are
-    /// disabled.
+    /// disabled or the active protocol does not carry them.
     ///
     /// The marker binds structural protocol tags to a single turn so literal
-    /// source tags are never mistaken for protocol commands. Production turns
-    /// always generate a fresh marker; deterministic tests may pin it through
-    /// the `marker_override` seam or disable it by injecting a scripted
-    /// provider.
+    /// source tags are never mistaken for protocol commands. It protects XML
+    /// markup only, so a `Structured` turn neither generates nor carries a
+    /// marker at any level of the server or the FSM: the check runs before the
+    /// test seams, because pinning a marker is meaningful in the XML contour
+    /// alone. Production XML and mixed turns always generate a fresh marker;
+    /// deterministic tests may pin it through the `marker_override` seam or
+    /// disable it by injecting a scripted provider.
     pub async fn next_turn_marker(&self) -> Option<String> {
+        let protocol = self.config.lock().await.config.develop.protocol;
+        if protocol == EditProtocolKind::Structured {
+            return None;
+        }
         #[cfg(test)]
         {
             if let Some(marker) = self.marker_override.lock().await.clone() {
@@ -1044,7 +1051,56 @@ mod tests {
                 .await,
             "a model change must rotate the session"
         );
-        assert_ne!(warm, state.session_uuid().await);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The default configuration drives the structured-output protocol, which
+    /// carries no XML markup and therefore needs no injection marker at all.
+    #[tokio::test]
+    async fn next_turn_marker_is_absent_for_the_structured_protocol() {
+        let root = std::env::temp_dir().join(format!("tauqe-state-marker-{}", next_operation_id()));
+        let _ = std::fs::create_dir_all(&root);
+
+        let (out, _rx) = OutChannel::new();
+        let (history_sender, _history_rx) = tokio::sync::mpsc::unbounded_channel();
+        let state = AppState::new(AppConfig::default(), root.clone(), history_sender, out);
+
+        assert_eq!(
+            state.config.lock().await.config.develop.protocol,
+            EditProtocolKind::Structured,
+            "the default configuration must use the structured protocol"
+        );
+        assert!(
+            state.next_turn_marker().await.is_none(),
+            "the structured protocol must not generate a turn marker"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The XML contour protects its markup with a fresh hex marker, so the
+    /// gate must not suppress it.
+    #[tokio::test]
+    async fn next_turn_marker_is_generated_for_the_xml_protocol() {
+        let root = std::env::temp_dir().join(format!("tauqe-state-marker-{}", next_operation_id()));
+        let _ = std::fs::create_dir_all(&root);
+
+        let mut config = AppConfig::default();
+        config.develop.protocol = EditProtocolKind::Xml;
+        let (out, _rx) = OutChannel::new();
+        let (history_sender, _history_rx) = tokio::sync::mpsc::unbounded_channel();
+        let state = AppState::new(config, root.clone(), history_sender, out);
+
+        let marker = state
+            .next_turn_marker()
+            .await
+            .expect("the xml protocol must generate a turn marker");
+        assert_eq!(marker.len(), 16, "the marker must be 16 characters long");
+        assert!(
+            marker.chars().all(|c| c.is_ascii_hexdigit()),
+            "the marker must consist of ASCII hexadecimal digits"
+        );
 
         let _ = std::fs::remove_dir_all(&root);
     }

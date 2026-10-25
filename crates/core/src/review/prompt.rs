@@ -33,13 +33,15 @@ pub use subplan::apply_finding_architectural_context;
 mod tests {
     use super::*;
     use tauqe_protocol::review::ReviewSession;
-    use tauqe_protocol::PlanItem;
+    use tauqe_protocol::{EditProtocolKind, PlanItem};
 
     #[test]
     fn test_format_review_step_retry_prompt() {
         let prompt = format_review_step_retry_prompt(
             "I inspected the file and it looks correct.",
             Some("No edits were applied"),
+            EditProtocolKind::Xml,
+            None,
         );
         assert!(prompt.contains("# Correction Required: Review Finding Turn Incomplete"));
         assert!(prompt.contains("<previous_response>"));
@@ -49,7 +51,7 @@ mod tests {
         assert!(prompt.contains("emit a valid edit block"));
         assert!(prompt.contains("terminal success tag"));
 
-        let empty = format_review_step_retry_prompt("   ", None);
+        let empty = format_review_step_retry_prompt("   ", None, EditProtocolKind::Xml, None);
         assert!(empty.contains("(empty response)"));
         assert!(!empty.contains("<previous_response>"));
         assert!(!empty.contains("Diagnostic Feedback"));
@@ -84,6 +86,7 @@ mod tests {
                     title: "Split module".to_string(),
                     details: Some("Create submodules".to_string()),
                     status: PlanItemStatus::Done,
+                    blocked_reason: None,
                     concept_refs: vec![],
                     files: vec!["crates/core/src/sub.rs".to_string()],
                     readonly_files: vec![],
@@ -97,7 +100,9 @@ mod tests {
             raw_markdown: String::new(),
         };
 
-        let prompt = format_review_step_execution_prompt(&session, 1, "_TAG").unwrap();
+        let prompt =
+            format_review_step_execution_prompt(&session, 1, EditProtocolKind::Xml, Some("TAG"))
+                .unwrap();
         assert!(prompt.contains("Decomposed Subplan Steps:"));
         assert!(prompt.contains(
             "- [DONE] #1.1 Split module (files: crates/core/src/sub.rs): Create submodules"
@@ -185,7 +190,9 @@ mod tests {
             raw_markdown: String::new(),
         };
 
-        let prompt = format_review_step_execution_prompt(&session, 3, "_TAG").unwrap();
+        let prompt =
+            format_review_step_execution_prompt(&session, 3, EditProtocolKind::Xml, Some("TAG"))
+                .unwrap();
         assert!(prompt
             .contains("# Target Review Step Execution: [rev-7:3] Excessive clone in hot path"));
         assert!(prompt.contains("<success_TAG summary=\"...\" />"));

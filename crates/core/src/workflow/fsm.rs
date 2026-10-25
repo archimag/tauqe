@@ -261,6 +261,11 @@ async fn propose(
 /// the supplied [`ApplyPolicy`]. It never parses protocol syntax and never
 /// touches Git directly, which keeps the control flow independent of any single
 /// wire format or transactional backend.
+///
+/// Before the cycle starts, the governing project configuration is validated:
+/// a `tauqe.toml` whose model roles or `[project]` command chain are broken
+/// fails the turn up front, so no provider request is spent against an
+/// environment the harness refuses to run in.
 #[allow(clippy::too_many_arguments)]
 pub async fn run_fsm_turn(
     prompt: &str,
@@ -276,6 +281,25 @@ pub async fn run_fsm_turn(
     cancel_rx: watch::Receiver<bool>,
     options: &WorkflowOptions,
 ) -> anyhow::Result<FsmTurnOutcome> {
+    // The turn executes against the project configuration, so its integrity
+    // is verified before any provider request is spent: a `tauqe.toml` whose
+    // model roles or `[project]` command chain are broken fails the turn up
+    // front with the recorded diagnostic instead of surfacing mid-flight. A
+    // repository without a configuration file is governed by built-in
+    // defaults and passes; the check self-offloads its blocking file reads
+    // off the async executor thread. The gate sits before session bookkeeping,
+    // so a refused turn records no history entry and needs no rollback.
+    let repo_root = context_manager.repo_root().to_path_buf();
+    if let Err(report) = crate::config::validate_project_config_on_disk(&repo_root) {
+        tracing::error!(
+            workflow = workflow_name,
+            model = %model,
+            isolated_step = intent.is_isolated_step(),
+            error = %report,
+            "bounded turn refused: invalid project configuration"
+        );
+        return Err(anyhow::anyhow!("{}", report));
+    }
     let turn_id = begin_session_turn(
         prompt,
         intent,
@@ -1586,6 +1610,54 @@ mod tests {
 
         assert!(outcome_res.is_err(), "turn must fail fast on stream error");
         assert_eq!(std::fs::read_to_string(root.join("a.rs")).unwrap(), TARGET);
+        assert!(history.get_entries().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn invalid_project_config_fails_the_turn_up_front() {
+        let (_dir, root) = setup_repo(&[("a.rs", TARGET)]);
+        let mut context = context_with_target(&root);
+        let mut history = HistoryManager::new(root.clone());
+
+        // A configuration that parses but declares no verification command
+        // is semantically invalid, so the turn must be refused before any
+        // provider request is spent.
+        std::fs::write(
+            root.join("tauqe.toml"),
+            "[models]\nprimary = [\"openrouter:a/b\"]\n",
+        )
+        .unwrap();
+
+        let provider = MockLlmProvider::scripted([MockResponse::text("Ready.")]);
+        let model = ModelRef::openrouter("mock/model");
+        let protocol = XmlPromptProtocol;
+        let mut policy = DirectApplyPolicy::new();
+        let options = WorkflowOptions::default();
+        let (stream_tx, rx) = mpsc::channel(256);
+        drop(rx);
+        let (_cancel_tx, cancel_rx) = watch::channel(false);
+
+        let outcome_res = run_fsm_turn(
+            "Explain a.rs",
+            tauqe_protocol::TurnIntent::InteractiveRepl,
+            &provider,
+            &model,
+            &mut context,
+            &mut history,
+            &protocol,
+            &mut policy,
+            "git",
+            stream_tx,
+            cancel_rx,
+            &options,
+        )
+        .await;
+
+        let err = outcome_res.expect_err("an invalid configuration must fail the turn");
+        assert!(err.to_string().contains("verify"), "got: {}", err);
+        // The turn was refused before the proposal phase: no provider request
+        // was spent and no history entry was recorded.
+        assert!(provider.requests().is_empty());
         assert!(history.get_entries().unwrap().is_empty());
     }
 

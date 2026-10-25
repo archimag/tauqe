@@ -1,5 +1,5 @@
 use super::*;
-use crate::model::{ModelRole, ModelSelection};
+use crate::model::{ModelRef, ModelRole, ModelSelection, ReasoningEffort};
 
 fn item(id: &str, title: &str, status: PlanItemStatus, children: Vec<PlanItem>) -> PlanItem {
     PlanItem {
@@ -97,6 +97,80 @@ fn test_plan_get_params_defaults_the_absent_id() {
     let params: PlanGetParams = serde_json::from_value(serde_json::json!({})).unwrap();
     assert_eq!(params.id, "");
     assert!(serde_json::from_value::<PlanGetParams>(serde_json::json!({ "id": 123 })).is_err());
+}
+
+#[test]
+fn test_plan_execute_params_carry_coder_selection_and_instructions() {
+    // The starting rung of the coder ladder travels whole: the model together
+    // with the reasoning depth it was configured with, so the server never
+    // re-derives the depth from the configured role lists.
+    let params = PlanExecuteParams {
+        plan_id: "core-feature".to_string(),
+        step_id: Some("2".to_string()),
+        model: Some(ModelSelection::Tier {
+            model: ModelRef::openrouter("anthropic/claude-3.5-sonnet"),
+            effort: Some(ReasoningEffort::High),
+        }),
+        instructions: Some("Keep the public API stable".to_string()),
+    };
+    let json = serde_json::to_string(&params).unwrap();
+    assert!(json.contains("\"effort\":\"high\""), "{json}");
+    assert!(json.contains("Keep the public API stable"), "{json}");
+    let de: PlanExecuteParams = serde_json::from_str(&json).unwrap();
+    assert_eq!(de, params);
+
+    // A request that predates the fields keeps decoding unchanged and reports
+    // no explicit selection, so the ladder starts at its base rung.
+    let legacy: PlanExecuteParams = serde_json::from_value(serde_json::json!({
+        "plan_id": "legacy-plan",
+        "step_id": "1"
+    }))
+    .unwrap();
+    assert_eq!(legacy.plan_id, "legacy-plan");
+    assert!(legacy.model.is_none());
+    assert!(legacy.instructions.is_none());
+
+    // An absent selection stays out of the wire form instead of emitting
+    // explicit nulls.
+    let bare_json = serde_json::to_string(&legacy).unwrap();
+    assert!(!bare_json.contains("model"), "{bare_json}");
+    assert!(!bare_json.contains("instructions"), "{bare_json}");
+
+    // A malformed selection fails the typed parse rather than being dropped.
+    assert!(
+        serde_json::from_value::<PlanExecuteParams>(serde_json::json!({
+            "plan_id": "p",
+            "model": 42
+        }))
+        .is_err()
+    );
+}
+
+#[test]
+fn test_plan_execute_pipeline_params_carry_coder_selection_and_instructions() {
+    let params = PlanExecutePipelineParams {
+        plan_ids: vec!["plan-a".to_string(), "plan-b".to_string()],
+        model: Some(ModelSelection::Role(ModelRole::Coder)),
+        instructions: Some("Run the queue end to end".to_string()),
+    };
+    let json = serde_json::to_string(&params).unwrap();
+    assert!(json.contains("\"coder\""), "{json}");
+    assert!(json.contains("Run the queue end to end"), "{json}");
+    let de: PlanExecutePipelineParams = serde_json::from_str(&json).unwrap();
+    assert_eq!(de, params);
+
+    // A legacy queue payload still decodes to an empty selection and empty
+    // directives, so the pipeline starts from the base rung of the ladder.
+    let legacy: PlanExecutePipelineParams =
+        serde_json::from_value(serde_json::json!({ "plan_ids": ["plan-a"] })).unwrap();
+    assert_eq!(legacy.plan_ids, vec!["plan-a".to_string()]);
+    assert!(legacy.model.is_none());
+    assert!(legacy.instructions.is_none());
+
+    // An absent selection adds no key to the document.
+    let bare_json = serde_json::to_string(&legacy).unwrap();
+    assert!(!bare_json.contains("model"), "{bare_json}");
+    assert!(!bare_json.contains("instructions"), "{bare_json}");
 }
 
 #[test]
@@ -223,6 +297,68 @@ fn test_plan_item_ignores_legacy_model_field() {
         serde_json::from_str(r#"{"id":"2","title":"Old step","model":"junior"}"#).unwrap();
     assert_eq!(legacy.id, "2");
     assert_eq!(legacy.title, "Old step");
+}
+
+#[test]
+fn test_plan_item_blocked_reason_serde() {
+    // A blocked step carries the diagnostic report of the semantic blocker
+    // through the wire form unchanged.
+    let mut blocked = item("1", "Blocked step", PlanItemStatus::Blocked, vec![]);
+    blocked.blocked_reason = Some("Missing capability: cargo nextest".to_string());
+
+    let json = serde_json::to_string(&blocked).unwrap();
+    assert!(json.contains("\"blocked_reason\":\"Missing capability: cargo nextest\""));
+    let de: PlanItem = serde_json::from_str(&json).unwrap();
+    assert_eq!(de, blocked);
+
+    // A step that was never blocked keeps its compact record: an absent reason
+    // adds no key to the document.
+    let clean = item("2", "Clean step", PlanItemStatus::Todo, vec![]);
+    assert!(!serde_json::to_string(&clean)
+        .unwrap()
+        .contains("blocked_reason"));
+
+    // A plan written before the field existed stays readable and reports no
+    // reason instead of failing the typed parse.
+    let legacy: PlanItem =
+        serde_json::from_str(r#"{"id":"3","title":"Legacy step","status":"blocked"}"#).unwrap();
+    assert_eq!(legacy.status, PlanItemStatus::Blocked);
+    assert!(legacy.blocked_reason.is_none());
+}
+
+/// The blocker report survives the wire form of a whole plan, not only of one
+/// item: nested leaves keep their reasons, and a step that is not blocked adds
+/// no key to the document.
+#[test]
+fn test_plan_roundtrip_keeps_nested_blocked_reasons() {
+    let reason = "Missing capability: cargo nextest";
+    let mut leaf = item("1.1", "Leaf", PlanItemStatus::Blocked, vec![]);
+    leaf.blocked_reason = Some(reason.to_string());
+    let mut container = item("1", "Group", PlanItemStatus::Blocked, vec![leaf]);
+    container.files = vec!["src/leaf.rs".to_string()];
+
+    let mut clean = item("2", "Clean step", PlanItemStatus::Todo, vec![]);
+    clean.blocked_reason = None;
+
+    let plan = Plan {
+        id: "nested-blocked".to_string(),
+        title: "Nested Blocked".to_string(),
+        items: vec![container, clean],
+        ..Default::default()
+    };
+
+    let json = serde_json::to_string(&plan).unwrap();
+    // Exactly one step carries a report, so the key appears once: an
+    // unblocked step keeps its compact representation.
+    assert_eq!(json.matches("blocked_reason").count(), 1, "{json}");
+
+    let de: Plan = serde_json::from_str(&json).unwrap();
+    assert_eq!(de, plan);
+
+    let stored_leaf = de.find_item("1.1").unwrap();
+    assert_eq!(stored_leaf.status, PlanItemStatus::Blocked);
+    assert_eq!(stored_leaf.blocked_reason.as_deref(), Some(reason));
+    assert!(de.find_item("2").unwrap().blocked_reason.is_none());
 }
 
 #[test]

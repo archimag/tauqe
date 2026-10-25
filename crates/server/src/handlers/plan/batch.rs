@@ -25,7 +25,7 @@ use super::common::offload_plan;
 use super::engine::{execute_plan_horizon_synthesis, PlanHorizonDiagnosticsOwned};
 
 pub use pipeline::handle_plan_execute_pipeline;
-pub(super) use supervisor::{run_plan_batch, BatchOutcome};
+pub(super) use supervisor::{run_plan_batch, BatchOutcome, PlanBatchOptions};
 
 pub async fn handle_plan_execute(req: Request, state: &Arc<AppState>) -> Response {
     let params: PlanExecuteParams = match req.params.and_then(|p| serde_json::from_value(p).ok()) {
@@ -147,6 +147,12 @@ pub async fn handle_plan_execute(req: Request, state: &Arc<AppState>) -> Respons
     state.clear_discussion_focus().await;
 
     let step_ids: Vec<String> = steps.iter().map(|s| s.id.clone()).collect();
+    // The coder selection and the developer directives travel with the request,
+    // so every step of the batch starts from the chosen ladder rung and prompt.
+    let options = PlanBatchOptions {
+        model: params.model,
+        instructions: params.instructions,
+    };
     // The identity of the registered operation travels with the acknowledgement,
     // so a client can attribute every lifecycle event of the batch — the
     // replanning rounds and the terminal `plan/batch_finished` included — to the
@@ -164,7 +170,7 @@ pub async fn handle_plan_execute(req: Request, state: &Arc<AppState>) -> Respons
     let state = Arc::clone(state);
     let plan_id = plan.id.clone();
     tokio::spawn(async move {
-        match run_plan_batch(&state, &plan_id, step_ids, operation).await {
+        match run_plan_batch(&state, &plan_id, step_ids, operation, options).await {
             BatchOutcome::Completed { steps } => {
                 tracing::info!("Plan '{}' batch completed: {} step(s)", plan_id, steps);
             }

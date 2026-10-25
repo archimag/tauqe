@@ -44,6 +44,10 @@ pub use runner::merge_manifest;
 /// is generous.
 pub const DEFAULT_PROJECT_TIMEOUT_SECS: u64 = 600;
 
+/// Name of the configuration file whose integrity the verification pipeline
+/// checks before any declared project command runs.
+const PROJECT_CONFIG_FILE: &str = "tauqe.toml";
+
 /// Outcome of a single project command.
 #[derive(Debug, Clone)]
 pub struct ToolchainCheckResult {
@@ -96,6 +100,12 @@ pub async fn effective_project_config(
 
 /// Runs the declared verification lifecycle, stopping at the first failure.
 ///
+/// The pipeline opens with phase zero: `tauqe.toml` itself is validated on
+/// disk, because it is the declaration every later step obeys. A change set or
+/// a post-hook that leaves the file malformed or semantically unsound fails the
+/// verification immediately, and no declared command is spawned against an
+/// environment the harness can no longer trust.
+///
 /// `[project.verify]` is the single authority on how the repository verifies, so
 /// its command line is the whole pipeline: the harness runs it once with its own
 /// wall-clock budget and takes the exit status as the verdict. A repository that
@@ -114,6 +124,11 @@ pub async fn run_verification_pipeline(
     changed_files: &[String],
     cancel_rx: Option<&watch::Receiver<bool>>,
 ) -> (bool, Vec<ToolchainCheckResult>) {
+    let config_check = check_project_config(repo_root);
+    if !config_check.success {
+        return (false, vec![config_check]);
+    }
+
     let project = effective_project_config(repo_root, cancel_rx).await;
     let steps = commands::resolve_verification_plan(&project);
     let mut results = Vec::new();
@@ -153,6 +168,28 @@ fn change_set_payload(changed_files: &[String]) -> Option<String> {
     let mut payload = changed_files.join("\n");
     payload.push('\n');
     Some(payload)
+}
+
+/// Validates the project configuration file as the zeroth verification step.
+///
+/// `tauqe.toml` governs the environment the turn runs in: the model roles, the
+/// budgets, and the command lines the harness may execute. A model edit or a
+/// post-hook that corrupts the file leaves the project without a trustworthy
+/// environment, so the pipeline reports the parses and semantic verdict as the
+/// change set's verification result and never spawns a declared command. A
+/// repository without a configuration file is governed by built-in defaults and
+/// therefore passes this check.
+fn check_project_config(repo_root: &Path) -> ToolchainCheckResult {
+    let verdict = crate::config::validate_project_config_on_disk(repo_root);
+    ToolchainCheckResult {
+        success: verdict.is_ok(),
+        is_cancelled: false,
+        command: PROJECT_CONFIG_FILE.to_string(),
+        stdout: String::new(),
+        stderr: String::new(),
+        combined_output: verdict.err().unwrap_or_default(),
+        diagnostics: Vec::new(),
+    }
 }
 
 /// Executes a project command with the default wall-clock timeout.
@@ -297,7 +334,10 @@ fn bind_parameters(
     arguments: &BTreeMap<String, String>,
 ) -> Result<Vec<String>, String> {
     for supplied in arguments.keys() {
-        if !parameters.iter().any(|parameter| parameter.name == *supplied) {
+        if !parameters
+            .iter()
+            .any(|parameter| parameter.name == *supplied)
+        {
             let declared = parameters
                 .iter()
                 .map(|parameter| parameter.name.as_str())
@@ -360,6 +400,47 @@ mod tests {
             std::fs::write(dir.path().join("tauqe.toml"), config).unwrap();
         }
         dir
+    }
+
+    #[tokio::test]
+    async fn test_a_corrupted_project_configuration_fails_phase_zero() {
+        // The file parses as TOML but declares no verification command, so the
+        // environment itself is unsound: the pipeline must report that verdict
+        // instead of resolving a project step from it.
+        let dir = repo(Some("[models]\nprimary = [\"openrouter:a/b\"]\n"));
+
+        let (ok, results) = run_verification_pipeline(dir.path(), &[], None).await;
+
+        assert!(!ok, "a corrupted configuration fails verification");
+        assert_eq!(results.len(), 1, "only the phase-zero verdict is reported");
+        assert!(!results[0].success);
+        assert_eq!(results[0].command, PROJECT_CONFIG_FILE);
+        assert!(
+            results[0].combined_output.contains("verify"),
+            "the verdict names the broken invariant: {}",
+            results[0].combined_output
+        );
+    }
+
+    #[tokio::test]
+    async fn test_a_valid_project_configuration_keeps_the_project_pipeline() {
+        let dir = repo(Some(
+            "[models]\nprimary = [\"openrouter:a/b\"]\n[project.verify]\ncommand = \"sh\"\nargs = ['-c', 'exit 0']\n",
+        ));
+
+        let (ok, results) = run_verification_pipeline(dir.path(), &[], None).await;
+
+        assert!(ok);
+        assert_eq!(
+            results.len(),
+            1,
+            "phase zero contributes no verdict on success"
+        );
+        assert!(results[0].success);
+        assert_ne!(
+            results[0].command, PROJECT_CONFIG_FILE,
+            "the declared project command ran instead of the config check"
+        );
     }
 
     #[tokio::test]

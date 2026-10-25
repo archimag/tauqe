@@ -223,13 +223,43 @@ mod verification_outcome_tests {
         assert!(saw_finished);
     }
 
+    #[tokio::test]
+    async fn test_run_workflow_verification_reports_a_corrupted_project_configuration() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("tauqe.toml"),
+            "[models]\nprimary = [\"openrouter:a/b\"]\n",
+        )
+        .unwrap();
+
+        let (tx, _rx) = mpsc::channel(10);
+        let req = VerifyRequest {
+            target: VerifyTarget::All,
+            on_success: VerifyOnSuccess::Silent,
+        };
+        let outcome = run_workflow_verification(dir.path(), &[], &req, &tx, false, None).await;
+
+        assert!(!outcome.success);
+        assert!(!outcome.is_cancelled);
+        assert!(
+            outcome.report.contains("tauqe.toml"),
+            "the healing input must name the corrupted file: {}",
+            outcome.report
+        );
+        assert!(
+            outcome.report.contains("verify"),
+            "the healing input must carry the semantic reason: {}",
+            outcome.report
+        );
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn test_run_workflow_verification_renders_structured_diagnostics() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(
             dir.path().join("tauqe.toml"),
-            "[project.verify]\ncommand = \"sh\"\nargs = ['-c', 'printf \"src/lib.rs:3:5: error: mismatched types\\n\" >&2; exit 1']\n",
+            "[models]\nprimary = [\"openrouter:a/b\"]\n[project.verify]\ncommand = \"sh\"\nargs = ['-c', 'printf \"src/lib.rs:3:5: error: mismatched types\\n\" >&2; exit 1']\n",
         )
         .unwrap();
 
@@ -258,7 +288,7 @@ mod verification_outcome_tests {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(
             dir.path().join("tauqe.toml"),
-            "[project.verify]\ncommand = \"sh\"\nargs = ['-c', 'cat']\n",
+            "[models]\nprimary = [\"openrouter:a/b\"]\n[project.verify]\ncommand = \"sh\"\nargs = ['-c', 'cat']\n",
         )
         .unwrap();
 

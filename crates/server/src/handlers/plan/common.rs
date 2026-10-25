@@ -101,6 +101,11 @@ pub(super) async fn publish_plan(
 
 /// Persists a new status for a plan step and publishes the change.
 ///
+/// `blocked_reason` carries the diagnostic report of the semantic blocker that
+/// stopped the step. `PlanStorage` persists it only for
+/// [`PlanItemStatus::Blocked`] and drops it on every other transition, so a
+/// resumed step never keeps describing a blocker that no longer holds.
+///
 /// `PlanStorage` serializes through a process-global mutex and writes to disk,
 /// so persisting and reloading the plan must run on the blocking pool rather
 /// than on an async worker.
@@ -116,14 +121,20 @@ pub(super) async fn set_step_status(
     plan_id: &str,
     step_id: &str,
     status: PlanItemStatus,
+    blocked_reason: Option<&str>,
 ) {
     // This wrapper is the single sanctioned best-effort boundary: the failure
     // is already journaled by the checked variant, so discarding the result
     // here keeps the write observable without inventing a fresh operation id.
-    let _ = set_step_status_checked(state, repo_root, plan_id, step_id, status).await;
+    let _ =
+        set_step_status_checked(state, repo_root, plan_id, step_id, status, blocked_reason).await;
 }
 
 /// Persists a terminal plan step status and publishes the change.
+///
+/// A `blocked_reason` supplied with [`PlanItemStatus::Blocked`] is stored
+/// beside the status, so the diagnostic survives the interrupted turn on disk
+/// instead of being lost with the transient session.
 ///
 /// Returns `Err` when the write does not land on disk — the storage error, or a
 /// not-found diagnostic — so the caller reports the step as failed instead of
@@ -134,12 +145,22 @@ pub(super) async fn set_step_status_checked(
     plan_id: &str,
     step_id: &str,
     status: PlanItemStatus,
+    blocked_reason: Option<&str>,
 ) -> Result<(), String> {
     let update_root = repo_root.to_path_buf();
     let plan_id_owned = plan_id.to_string();
     let step_id_owned = step_id.to_string();
+    // The storage call runs on the blocking pool, so the report must outlive
+    // the borrow of the caller's string.
+    let blocked_reason_owned = blocked_reason.map(str::to_string);
     let updated = offload_plan(move || {
-        PlanStorage::update_item(&update_root, &plan_id_owned, &step_id_owned, Some(status))
+        PlanStorage::update_item(
+            &update_root,
+            &plan_id_owned,
+            &step_id_owned,
+            Some(status),
+            blocked_reason_owned.as_deref(),
+        )
     })
     .await;
 
@@ -233,9 +254,16 @@ mod tests {
         PlanStorage::save_plan(&root, &plan).unwrap();
 
         // A healthy terminal write persists the status and reports success.
-        set_step_status_checked(&state, &root, "persist-plan", "1", PlanItemStatus::Done)
-            .await
-            .expect("healthy write succeeds");
+        set_step_status_checked(
+            &state,
+            &root,
+            "persist-plan",
+            "1",
+            PlanItemStatus::Done,
+            None,
+        )
+        .await
+        .expect("healthy write succeeds");
         let stored = PlanStorage::load_plan(&root, "persist-plan")
             .unwrap()
             .unwrap();
@@ -246,9 +274,16 @@ mod tests {
         // of a silent success.
         let plan_file = PlanStorage::plans_dir(&root).join("persist-plan.json");
         std::fs::write(&plan_file, b"{ not a valid plan }").unwrap();
-        let err = set_step_status_checked(&state, &root, "persist-plan", "1", PlanItemStatus::Todo)
-            .await
-            .expect_err("persistence failure must surface");
+        let err = set_step_status_checked(
+            &state,
+            &root,
+            "persist-plan",
+            "1",
+            PlanItemStatus::Todo,
+            None,
+        )
+        .await
+        .expect_err("persistence failure must surface");
         assert!(err.contains("Failed to parse plan JSON"));
 
         let _ = std::fs::remove_dir_all(&root);

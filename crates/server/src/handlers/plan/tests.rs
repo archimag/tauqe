@@ -1,6 +1,6 @@
 use super::batch::{
     handle_plan_execute, handle_plan_execute_pipeline, handle_plan_refine, handle_plan_replan,
-    run_plan_batch, BatchOutcome,
+    run_plan_batch, BatchOutcome, PlanBatchOptions,
 };
 use super::common::{turn_applied_edits, unmet_dependencies};
 use crate::state::AppState;
@@ -93,6 +93,7 @@ async fn test_plan_batch_fail_fast_resets_status() {
         "batch",
         vec!["1".to_string(), "2".to_string()],
         operation,
+        PlanBatchOptions::default(),
     )
     .await;
     match outcome {
@@ -154,6 +155,7 @@ async fn test_plan_batch_emits_finished_event() {
         "emit",
         vec!["1".to_string(), "2".to_string()],
         operation,
+        PlanBatchOptions::default(),
     )
     .await;
     assert!(matches!(outcome, BatchOutcome::Failed { .. }));
@@ -199,6 +201,7 @@ async fn test_plan_batch_skips_done_and_stops_on_discussion() {
         "skip",
         vec!["1".to_string(), "2".to_string()],
         operation,
+        PlanBatchOptions::default(),
     )
     .await;
     match outcome {
@@ -245,6 +248,7 @@ async fn test_plan_batch_skips_done_and_stops_on_blocked() {
         "blocked-batch",
         vec!["1".to_string(), "2".to_string(), "3".to_string()],
         operation,
+        PlanBatchOptions::default(),
     )
     .await;
     match outcome {
@@ -1129,7 +1133,14 @@ async fn test_plan_step_binds_the_plan_session() {
             .try_begin_operation()
             .expect("register batch operation"),
     );
-    let outcome = run_plan_batch(&state, "plan-session", vec!["1".to_string()], operation).await;
+    let outcome = run_plan_batch(
+        &state,
+        "plan-session",
+        vec!["1".to_string()],
+        operation,
+        PlanBatchOptions::default(),
+    )
+    .await;
     assert_eq!(outcome, BatchOutcome::Completed { steps: 1 });
 
     // Every step and retry of one plan extends the same warm provider prefix.
@@ -1367,7 +1378,14 @@ async fn test_plan_step_execution_uses_turn_marker() {
             .try_begin_operation()
             .expect("register batch operation"),
     );
-    let outcome = run_plan_batch(&state, "marker-plan", vec!["1".to_string()], operation).await;
+    let outcome = run_plan_batch(
+        &state,
+        "marker-plan",
+        vec!["1".to_string()],
+        operation,
+        PlanBatchOptions::default(),
+    )
+    .await;
     assert!(
         matches!(outcome, BatchOutcome::Completed { steps: 1 }),
         "expected a completed batch, got {:?}",
@@ -1467,7 +1485,14 @@ async fn test_plan_batch_automated_replanning_on_blocked_step() {
             .try_begin_operation()
             .expect("register batch operation"),
     );
-    let outcome = run_plan_batch(&state, "auto-replan", vec!["1".to_string()], operation).await;
+    let outcome = run_plan_batch(
+        &state,
+        "auto-replan",
+        vec!["1".to_string()],
+        operation,
+        PlanBatchOptions::default(),
+    )
+    .await;
 
     assert_eq!(outcome, BatchOutcome::Completed { steps: 1 });
 
@@ -1559,7 +1584,14 @@ async fn test_plan_batch_defers_architect_escalation_until_repeated_failure() {
             .try_begin_operation()
             .expect("register batch operation"),
     );
-    let outcome = run_plan_batch(&state, "lazy-level-up", vec!["1".to_string()], operation).await;
+    let outcome = run_plan_batch(
+        &state,
+        "lazy-level-up",
+        vec!["1".to_string()],
+        operation,
+        PlanBatchOptions::default(),
+    )
+    .await;
     assert_eq!(outcome, BatchOutcome::Completed { steps: 1 });
 
     let requests = provider.requests();
@@ -1647,7 +1679,14 @@ async fn test_plan_batch_automated_replanning_limit_exhausted() {
             .try_begin_operation()
             .expect("register batch operation"),
     );
-    let outcome = run_plan_batch(&state, "limit-replan", vec!["1".to_string()], operation).await;
+    let outcome = run_plan_batch(
+        &state,
+        "limit-replan",
+        vec!["1".to_string()],
+        operation,
+        PlanBatchOptions::default(),
+    )
+    .await;
 
     match outcome {
         BatchOutcome::Blocked {
@@ -1740,6 +1779,7 @@ async fn test_plan_batch_stops_on_abort_without_replanning() {
         "abort-batch",
         vec!["1".to_string(), "2".to_string()],
         operation,
+        PlanBatchOptions::default(),
     )
     .await;
 
@@ -1829,6 +1869,7 @@ async fn test_plan_batch_stops_gracefully_on_soft_stop() {
         "soft-stop",
         vec!["1".to_string(), "2".to_string()],
         operation,
+        PlanBatchOptions::default(),
     )
     .await;
 
@@ -1978,7 +2019,14 @@ async fn test_plan_batch_projects_conceptual_horizon_just_in_time() {
             .try_begin_operation()
             .expect("register batch operation"),
     );
-    let outcome = run_plan_batch(&state, "jit-horizon", Vec::new(), operation).await;
+    let outcome = run_plan_batch(
+        &state,
+        "jit-horizon",
+        Vec::new(),
+        operation,
+        PlanBatchOptions::default(),
+    )
+    .await;
 
     // An empty scheduled scope is not a finished batch: the synthesized step is
     // executed within the same supervisor run.
@@ -2607,5 +2655,370 @@ async fn test_plan_batch_finished_carries_the_registered_operation_id() {
     assert_eq!(
         event["params"]["operation_id"], acknowledged_id,
         "the terminal event must name the operation the acknowledgement returned"
+    );
+}
+
+/// A semantic blocker reported by the coder is durable: the reason lands in the
+/// plan file beside the `BLOCKED` status, so the diagnostic survives the
+/// interrupted turn and can be read from disk afterwards.
+#[tokio::test]
+async fn test_plan_batch_persists_the_blocked_reason_on_disk() {
+    let dir = TestDir::new();
+    tauqe_core::git::init_repository(Some(dir.path()), true).unwrap();
+    std::fs::write(dir.path().join("src.rs"), "pub fn value() -> i32 { 0 }\n").unwrap();
+    tauqe_core::git::cmd::stage_files(dir.path(), &["src.rs".to_string()]).unwrap();
+    tauqe_core::git::cmd::commit_with_developer_author(dir.path(), "Initial", false).unwrap();
+
+    let mut item = test_item("1", PlanItemStatus::Todo);
+    item.title = "Step 1".to_string();
+    item.files = vec!["src.rs".to_string()];
+    let plan = Plan {
+        id: "blocked-reason".to_string(),
+        title: "Blocked Reason".to_string(),
+        created_at: 1,
+        updated_at: 1,
+        items: vec![item],
+        ..Default::default()
+    };
+    PlanStorage::save_plan(dir.path(), &plan).unwrap();
+
+    let marker = "BLOCKEDREASONM1";
+    let reason = "Missing capability: native compiler";
+    let blocked_response = format!("<blocked_{m} reason=\"{r}\" />", m = marker, r = reason);
+    // Only the blocking round is scripted: with `max_replans = 0` the batch ends
+    // immediately, so an exhausted script proves no replanning was engaged.
+    let provider = Arc::new(MockLlmProvider::scripted([MockResponse::text(
+        blocked_response,
+    )]));
+
+    let mut config = tauqe_core::config::AppConfig::default();
+    config.develop.workflow = tauqe_protocol::WorkflowKind::Naive;
+    config.develop.protocol = tauqe_protocol::EditProtocolKind::Xml;
+    config.develop.max_replans = 0;
+    config.models.auto_level_up = false;
+
+    let state = test_state_with_provider(&dir, config, provider).await;
+    *state.marker_override.lock().await = Some(marker.to_string());
+
+    let operation = Arc::new(
+        state
+            .try_begin_operation()
+            .expect("register batch operation"),
+    );
+    let outcome = run_plan_batch(
+        &state,
+        "blocked-reason",
+        vec!["1".to_string()],
+        operation,
+        PlanBatchOptions::default(),
+    )
+    .await;
+
+    match outcome {
+        BatchOutcome::Blocked {
+            completed, step_id, ..
+        } => {
+            assert_eq!(completed, 0);
+            assert_eq!(step_id, "1");
+        }
+        other => panic!("Expected a blocked outcome, got {:?}", other),
+    }
+
+    // The report is read back through the storage engine, not from the
+    // transient turn result.
+    let reloaded = PlanStorage::load_plan(dir.path(), "blocked-reason")
+        .unwrap()
+        .unwrap();
+    let stored = reloaded.find_item("1").unwrap();
+    assert_eq!(stored.status, PlanItemStatus::Blocked);
+    assert_eq!(stored.blocked_reason.as_deref(), Some(reason));
+
+    // The diagnostic is durable on disk, so it outlives the daemon session.
+    let raw =
+        std::fs::read_to_string(PlanStorage::plans_dir(dir.path()).join("blocked-reason.json"))
+            .unwrap();
+    assert!(
+        raw.contains(reason),
+        "the diagnostic must be durable on disk: {raw}"
+    );
+}
+
+/// A Structured-protocol plan step turn speaks the field vocabulary of the JSON
+/// schema: its user prompt names no marker-bound control tag, the scripted
+/// response carries the change set together with a successful `outcome`, and the
+/// step reaches DONE through the very same execution pipeline the tagged contour
+/// uses.
+#[tokio::test]
+async fn test_plan_step_structured_protocol_execution() {
+    let dir = TestDir::new();
+    tauqe_core::git::init_repository(Some(dir.path()), true).unwrap();
+    std::fs::write(dir.path().join("src.rs"), "pub fn value() -> i32 { 0 }\n").unwrap();
+    tauqe_core::git::cmd::stage_files(dir.path(), &["src.rs".to_string()]).unwrap();
+    tauqe_core::git::cmd::commit_with_developer_author(dir.path(), "Initial", false).unwrap();
+
+    let mut item = test_item("1", PlanItemStatus::Todo);
+    item.title = "Set the value".to_string();
+    item.files = vec!["src.rs".to_string()];
+    let plan = Plan {
+        id: "structured-step".to_string(),
+        title: "Structured Step".to_string(),
+        created_at: 1,
+        updated_at: 1,
+        items: vec![item],
+        ..Default::default()
+    };
+    PlanStorage::save_plan(dir.path(), &plan).unwrap();
+
+    let response = serde_json::json!({
+        "message": "Set value to 42",
+        "changes": [
+            {
+                "op": "replace",
+                "path": "src.rs",
+                "to": "",
+                "old_text": "pub fn value() -> i32 { 0 }",
+                "new_text": "pub fn value() -> i32 { 42 }",
+                "content": ""
+            }
+        ],
+        "context_requests": [],
+        "outcome": {
+            "status": "success",
+            "summary": "Value set to 42",
+            "message": "",
+            "reason": ""
+        }
+    })
+    .to_string();
+    let provider = Arc::new(MockLlmProvider::scripted([MockResponse::text(response)]));
+
+    let mut config = tauqe_core::config::AppConfig::default();
+    config.develop.workflow = tauqe_protocol::WorkflowKind::Naive;
+    config.develop.protocol = tauqe_protocol::EditProtocolKind::Structured;
+    config.models.auto_level_up = false;
+    let state = test_state_with_provider(&dir, config, provider.clone()).await;
+
+    let operation = Arc::new(
+        state
+            .try_begin_operation()
+            .expect("register batch operation"),
+    );
+    let outcome = run_plan_batch(
+        &state,
+        "structured-step",
+        vec!["1".to_string()],
+        operation,
+        PlanBatchOptions::default(),
+    )
+    .await;
+    assert_eq!(outcome, BatchOutcome::Completed { steps: 1 });
+
+    // The step prompt describes the structured response fields instead of
+    // marker-bound control tags.
+    let requests = provider.requests();
+    assert_eq!(requests.len(), 1);
+    let user_prompt = &requests[0].messages[1].content;
+    for tag in ["<success", "<context_request", "<blocked", "<verify"] {
+        assert!(
+            !user_prompt.contains(tag),
+            "a Structured step prompt must not mention {tag}: {user_prompt}"
+        );
+    }
+    assert!(user_prompt.contains("outcome"));
+    assert!(user_prompt.contains("context_requests"));
+
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("src.rs")).unwrap(),
+        "pub fn value() -> i32 { 42 }\n"
+    );
+    let reloaded = PlanStorage::load_plan(dir.path(), "structured-step")
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        reloaded.find_item("1").unwrap().status,
+        PlanItemStatus::Done
+    );
+}
+
+/// A batch started from an explicitly selected coder rung runs that rung and
+/// escalates above it, instead of restarting the ladder at its base.
+#[tokio::test]
+async fn test_plan_batch_starts_ladder_from_the_selected_coder_tier() {
+    let dir = TestDir::new();
+    tauqe_core::git::init_repository(Some(dir.path()), true).unwrap();
+    std::fs::write(dir.path().join("src.rs"), "pub fn value() -> i32 { 0 }\n").unwrap();
+    tauqe_core::git::cmd::stage_files(dir.path(), &["src.rs".to_string()]).unwrap();
+    tauqe_core::git::cmd::commit_with_developer_author(dir.path(), "Initial", false).unwrap();
+
+    let mut item = test_item("1", PlanItemStatus::Todo);
+    item.title = "Step 1".to_string();
+    item.files = vec!["src.rs".to_string()];
+    let plan = Plan {
+        id: "start-tier".to_string(),
+        title: "Start Tier".to_string(),
+        created_at: 1,
+        updated_at: 1,
+        items: vec![item],
+        ..Default::default()
+    };
+    PlanStorage::save_plan(dir.path(), &plan).unwrap();
+
+    let marker = "STARTTIERM1";
+    // Round 1 answers without a change set, so the step escalates one rung
+    // above the selected tier. Round 2 applies the edit and completes.
+    let success = format!(
+        "<tauqe_edits_{m} summary=\"Fix value\">\n<edit_{m} path=\"src.rs\">\n<search_{m}>\npub fn value() -> i32 {{ 0 }}\n</search_{m}>\n<replace_{m}>\npub fn value() -> i32 {{ 9 }}\n</replace_{m}>\n</edit_{m}>\n<success_{m} summary=\"done\" />\n</tauqe_edits_{m}>",
+        m = marker
+    );
+    let provider = Arc::new(MockLlmProvider::scripted([
+        MockResponse::text("The step looks complete."),
+        MockResponse::text(success),
+    ]));
+
+    let mut config = tauqe_core::config::AppConfig::default();
+    config.develop.workflow = tauqe_protocol::WorkflowKind::Naive;
+    config.develop.protocol = tauqe_protocol::EditProtocolKind::Xml;
+    config.develop.max_retries = 2;
+    config.models.auto_level_up = true;
+    config.models.primary = vec![tauqe_protocol::ModelRef::openrouter("coder/one").into()];
+    config.models.coder = Some(vec![
+        tauqe_protocol::ModelEntry::new(tauqe_protocol::ModelRef::openrouter("coder/one"), None),
+        tauqe_protocol::ModelEntry::new(tauqe_protocol::ModelRef::openrouter("coder/mid"), None),
+        tauqe_protocol::ModelEntry::new(tauqe_protocol::ModelRef::openrouter("coder/strong"), None),
+    ]);
+
+    let state = test_state_with_provider(&dir, config, provider.clone()).await;
+    *state.marker_override.lock().await = Some(marker.to_string());
+
+    let operation = Arc::new(
+        state
+            .try_begin_operation()
+            .expect("register batch operation"),
+    );
+    let options = PlanBatchOptions {
+        model: Some(tauqe_protocol::ModelSelection::Specific(
+            tauqe_protocol::ModelRef::openrouter("coder/mid"),
+        )),
+        instructions: Some("Keep the public signature.".to_string()),
+    };
+    let outcome = run_plan_batch(
+        &state,
+        "start-tier",
+        vec!["1".to_string()],
+        operation,
+        options,
+    )
+    .await;
+    assert_eq!(outcome, BatchOutcome::Completed { steps: 1 });
+
+    let requests = provider.requests();
+    assert_eq!(requests.len(), 2);
+    // The first round runs the selected rung of the ladder...
+    assert_eq!(requests[0].model, "coder/mid");
+    // ...and the retry escalates above it instead of restarting at the base.
+    assert_eq!(requests[1].model, "coder/strong");
+
+    // The developer directives travel with the step prompt.
+    let user_prompt = &requests[0].messages[1].content;
+    assert!(user_prompt.contains("## Developer Directives:"));
+    assert!(user_prompt.contains("Keep the public signature."));
+
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("src.rs")).unwrap(),
+        "pub fn value() -> i32 { 9 }\n"
+    );
+    let reloaded = PlanStorage::load_plan(dir.path(), "start-tier")
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        reloaded.find_item("1").unwrap().status,
+        PlanItemStatus::Done
+    );
+}
+
+/// A step started from an explicitly selected intermediate coder rung completes
+/// on that very rung: the selection is the starting tier, and a verified first
+/// attempt neither escalates upward nor falls back to the base of the ladder.
+#[tokio::test]
+async fn test_plan_batch_selected_coder_rung_completes_on_the_first_attempt() {
+    let dir = TestDir::new();
+    tauqe_core::git::init_repository(Some(dir.path()), true).unwrap();
+    std::fs::write(dir.path().join("src.rs"), "pub fn value() -> i32 { 0 }\n").unwrap();
+    tauqe_core::git::cmd::stage_files(dir.path(), &["src.rs".to_string()]).unwrap();
+    tauqe_core::git::cmd::commit_with_developer_author(dir.path(), "Initial", false).unwrap();
+
+    let mut item = test_item("1", PlanItemStatus::Todo);
+    item.title = "Step 1".to_string();
+    item.files = vec!["src.rs".to_string()];
+    let plan = Plan {
+        id: "mid-tier-plan".to_string(),
+        title: "Mid Tier Plan".to_string(),
+        created_at: 1,
+        updated_at: 1,
+        items: vec![item],
+        ..Default::default()
+    };
+    PlanStorage::save_plan(dir.path(), &plan).unwrap();
+
+    let marker = "MIDTIERPLAN1";
+    // A verified first attempt: the edit lands and the step carries a terminal
+    // success, so the ladder never has to advance.
+    let response = format!(
+        "<tauqe_edits_{m} summary=\"Set value\">\n<edit_{m} path=\"src.rs\">\n<search_{m}>\npub fn value() -> i32 {{ 0 }}\n</search_{m}>\n<replace_{m}>\npub fn value() -> i32 {{ 3 }}\n</replace_{m}>\n</edit_{m}>\n<success_{m} summary=\"done\" />\n</tauqe_edits_{m}>",
+        m = marker
+    );
+    let provider = Arc::new(MockLlmProvider::scripted([MockResponse::text(response)]));
+
+    let mut config = tauqe_core::config::AppConfig::default();
+    config.develop.workflow = tauqe_protocol::WorkflowKind::Naive;
+    config.develop.protocol = tauqe_protocol::EditProtocolKind::Xml;
+    config.develop.max_retries = 2;
+    config.models.auto_level_up = true;
+    config.models.primary = vec![tauqe_protocol::ModelRef::openrouter("coder/one").into()];
+    config.models.coder = Some(vec![
+        tauqe_protocol::ModelEntry::new(tauqe_protocol::ModelRef::openrouter("coder/one"), None),
+        tauqe_protocol::ModelEntry::new(tauqe_protocol::ModelRef::openrouter("coder/mid"), None),
+        tauqe_protocol::ModelEntry::new(tauqe_protocol::ModelRef::openrouter("coder/strong"), None),
+    ]);
+
+    let state = test_state_with_provider(&dir, config, provider.clone()).await;
+    *state.marker_override.lock().await = Some(marker.to_string());
+
+    let operation = Arc::new(
+        state
+            .try_begin_operation()
+            .expect("register batch operation"),
+    );
+    let options = PlanBatchOptions {
+        model: Some(tauqe_protocol::ModelSelection::Specific(
+            tauqe_protocol::ModelRef::openrouter("coder/mid"),
+        )),
+        instructions: None,
+    };
+    let outcome = run_plan_batch(
+        &state,
+        "mid-tier-plan",
+        vec!["1".to_string()],
+        operation,
+        options,
+    )
+    .await;
+    assert_eq!(outcome, BatchOutcome::Completed { steps: 1 });
+
+    // The selected rung runs the step, and no rung above it is consumed.
+    let requests = provider.requests();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].model, "coder/mid");
+
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("src.rs")).unwrap(),
+        "pub fn value() -> i32 { 3 }\n"
+    );
+    let reloaded = PlanStorage::load_plan(dir.path(), "mid-tier-plan")
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        reloaded.find_item("1").unwrap().status,
+        PlanItemStatus::Done
     );
 }

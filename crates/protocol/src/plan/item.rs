@@ -73,6 +73,13 @@ pub struct PlanItem {
     pub details: Option<String>,
     #[serde(default)]
     pub status: PlanItemStatus,
+    /// Diagnostic report of the semantic blocker that stopped this step.
+    ///
+    /// Present only while the step is blocked: it records why the bounded turn
+    /// could not proceed, so the reason survives the interrupted turn on disk
+    /// and in the interface instead of being lost with the transient session.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub blocked_reason: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub files: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]

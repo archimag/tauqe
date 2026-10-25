@@ -2,7 +2,9 @@ use anyhow::{Context, Result};
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::time::SystemTime;
-use tauqe_protocol::{ArchitectTier, Plan, PlanItem, PlanItemStatus};
+use tauqe_protocol::{
+    ArchitectTier, Plan, PlanItem, PlanItemStatus, PlanScopeEvaluation, PlanValidationError,
+};
 
 use super::PlanStorage;
 
@@ -10,8 +12,10 @@ use super::PlanStorage;
 /// the immutable `Done` foundation.
 ///
 /// Completed steps from `existing` are preserved and protected from ID collisions.
-/// Dependency cycles are rejected, leaf-only file declarations are normalized, and
-/// parent container statuses are refreshed deterministically.
+/// Dependency cycles and structural defects (duplicate identifiers, dependencies on
+/// unknown steps) are rejected, a horizon whose ready set is empty is refused as dead
+/// on arrival, leaf-only file declarations are normalized, and parent container
+/// statuses are refreshed deterministically.
 pub fn merge_subplan(
     existing: &[PlanItem],
     new_horizon_items: Vec<PlanItem>,
@@ -39,8 +43,47 @@ pub fn merge_subplan(
     };
     wrapper.normalize_leaf_files();
     wrapper.refresh_parent_statuses();
+    validate_synthesized_horizon(&wrapper)?;
 
     Ok(wrapper.items)
+}
+
+/// Rejects a synthesized horizon that is structurally invalid or dead on arrival.
+///
+/// The merge is the last point before a horizon reaches disk, so it refuses a plan that
+/// nothing could ever execute. Two properties are enforced:
+///
+/// - Structure: [`Plan::validate`] rejects duplicate identifiers, dependencies naming
+///   unknown steps, self-dependencies, and dependency cycles. Concept references are
+///   excluded from that verdict, because the merged list carries no concept tree to
+///   resolve them against; the stored plan keeps its own concept section untouched.
+/// - Executability: a horizon whose candidate steps exist but whose ready set is empty
+///   can never start. No step is runnable, so no step can ever become `Done` and
+///   unblock the rest, which makes the whole plan dead on arrival.
+fn validate_synthesized_horizon(plan: &Plan) -> Result<()> {
+    if let Err(errors) = plan.validate() {
+        let structural: Vec<String> = errors
+            .into_iter()
+            .filter(|error| !matches!(error, PlanValidationError::MissingConceptRef { .. }))
+            .map(|error| error.to_string())
+            .collect();
+        if !structural.is_empty() {
+            anyhow::bail!("Invalid synthesized horizon: {}", structural.join("; "));
+        }
+    }
+
+    match plan.evaluate_scope(None) {
+        PlanScopeEvaluation::BlockedByDependencies(blocked)
+        | PlanScopeEvaluation::BlockedByBlockers(blocked) => {
+            anyhow::bail!(
+                "Synthesized horizon cannot start: no step is ready for execution ({})",
+                blocked.join("; ")
+            );
+        }
+        _ => {}
+    }
+
+    Ok(())
 }
 
 impl PlanStorage {
@@ -355,6 +398,110 @@ mod tests {
     }
 
     #[test]
+    fn test_merge_subplan_rejects_dangling_dependency() {
+        let new_horizon = vec![PlanItem {
+            id: "1".to_string(),
+            title: "Depends on a ghost".to_string(),
+            status: PlanItemStatus::Todo,
+            depends_on: vec!["ghost".to_string()],
+            ..Default::default()
+        }];
+
+        let err = merge_subplan(&[], new_horizon).unwrap_err();
+        let message = err.to_string();
+        assert!(
+            message.contains("Invalid synthesized horizon"),
+            "unexpected error: {message}"
+        );
+        assert!(
+            message.contains("non-existent dependency 'ghost'"),
+            "unexpected error: {message}"
+        );
+    }
+
+    #[test]
+    fn test_merge_subplan_rejects_duplicate_step_ids() {
+        let new_horizon = vec![
+            PlanItem {
+                id: "1".to_string(),
+                title: "First".to_string(),
+                status: PlanItemStatus::Todo,
+                ..Default::default()
+            },
+            PlanItem {
+                id: "1".to_string(),
+                title: "Second".to_string(),
+                status: PlanItemStatus::Todo,
+                ..Default::default()
+            },
+        ];
+
+        let err = merge_subplan(&[], new_horizon).unwrap_err();
+        let message = err.to_string();
+        assert!(
+            message.contains("Invalid synthesized horizon"),
+            "unexpected error: {message}"
+        );
+        assert!(
+            message.contains("Duplicate step ID"),
+            "unexpected error: {message}"
+        );
+    }
+
+    #[test]
+    fn test_merge_subplan_rejects_stalled_dag() {
+        // Step "1" is structurally valid but can never run: its only dependency
+        // was cancelled, and no later wave can revive it.
+        let new_horizon = vec![
+            PlanItem {
+                id: "1".to_string(),
+                title: "Waits for a cancelled step".to_string(),
+                status: PlanItemStatus::Todo,
+                depends_on: vec!["2".to_string()],
+                ..Default::default()
+            },
+            PlanItem {
+                id: "2".to_string(),
+                title: "Cancelled".to_string(),
+                status: PlanItemStatus::Cancelled,
+                ..Default::default()
+            },
+        ];
+
+        let err = merge_subplan(&[], new_horizon).unwrap_err();
+        let message = err.to_string();
+        assert!(
+            message.contains("cannot start"),
+            "unexpected error: {message}"
+        );
+        assert!(message.contains("#1"), "unexpected error: {message}");
+    }
+
+    #[test]
+    fn test_merge_subplan_accepts_dependency_on_done_foundation() {
+        // A preserved completed step satisfies the dependency of a new step, so
+        // the horizon is executable and must not be rejected.
+        let existing = vec![PlanItem {
+            id: "1".to_string(),
+            title: "Completed".to_string(),
+            status: PlanItemStatus::Done,
+            ..Default::default()
+        }];
+        let new_horizon = vec![PlanItem {
+            id: "2".to_string(),
+            title: "Builds on the foundation".to_string(),
+            status: PlanItemStatus::Todo,
+            depends_on: vec!["1".to_string()],
+            ..Default::default()
+        }];
+
+        let merged = merge_subplan(&existing, new_horizon).unwrap();
+        assert_eq!(merged.len(), 2);
+        assert_eq!(merged[0].id, "1");
+        assert_eq!(merged[1].id, "2");
+    }
+
+    #[test]
     fn test_replace_uncompleted_horizon_preserves_done_foundation() {
         let dir = tempdir().unwrap();
         let root = dir.path();
@@ -610,6 +757,114 @@ mod tests {
 
         // The rejected synthesis never touches the stored plan.
         let stored = PlanStorage::load_plan(root, "cycle-plan").unwrap().unwrap();
+        assert!(stored.items.is_empty());
+        assert!(stored.architect.is_none());
+        assert!(stored.last_replanned_step.is_none());
+    }
+
+    #[test]
+    fn test_replace_uncompleted_horizon_rejects_dangling_dependency() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+
+        let plan = Plan {
+            id: "dangling-plan".to_string(),
+            title: "Dangling".to_string(),
+            items: vec![PlanItem {
+                id: "1".to_string(),
+                title: "Foundation".to_string(),
+                status: PlanItemStatus::Done,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        PlanStorage::save_plan(root, &plan).unwrap();
+
+        // The synthesized step names a dependency no stored step provides, so
+        // the merged horizon is structurally invalid.
+        let new_horizon = vec![PlanItem {
+            id: "2".to_string(),
+            title: "Depends on a ghost".to_string(),
+            status: PlanItemStatus::Todo,
+            depends_on: vec!["ghost".to_string()],
+            ..Default::default()
+        }];
+
+        let err = PlanStorage::replace_uncompleted_horizon(
+            root,
+            "dangling-plan",
+            new_horizon,
+            test_architect(),
+            Some("2".to_string()),
+        )
+        .unwrap_err();
+        let message = err.to_string();
+        assert!(
+            message.contains("Invalid synthesized horizon"),
+            "unexpected error: {message}"
+        );
+        assert!(
+            message.contains("non-existent dependency 'ghost'"),
+            "unexpected error: {message}"
+        );
+
+        // The rejected synthesis never touches the stored plan.
+        let stored = PlanStorage::load_plan(root, "dangling-plan")
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.items.len(), 1);
+        assert_eq!(stored.items[0].id, "1");
+        assert!(stored.architect.is_none());
+        assert!(stored.last_replanned_step.is_none());
+    }
+
+    #[test]
+    fn test_replace_uncompleted_horizon_rejects_dead_on_arrival_horizon() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+
+        let plan = Plan {
+            id: "dead-plan".to_string(),
+            title: "Dead on arrival".to_string(),
+            ..Default::default()
+        };
+        PlanStorage::save_plan(root, &plan).unwrap();
+
+        // Structurally valid but unexecutable: the only pending step waits for
+        // a cancelled one, so the ready set stays empty forever.
+        let new_horizon = vec![
+            PlanItem {
+                id: "1".to_string(),
+                title: "Waits for a cancelled step".to_string(),
+                status: PlanItemStatus::Todo,
+                depends_on: vec!["2".to_string()],
+                ..Default::default()
+            },
+            PlanItem {
+                id: "2".to_string(),
+                title: "Cancelled".to_string(),
+                status: PlanItemStatus::Cancelled,
+                ..Default::default()
+            },
+        ];
+
+        let err = PlanStorage::replace_uncompleted_horizon(
+            root,
+            "dead-plan",
+            new_horizon,
+            test_architect(),
+            None,
+        )
+        .unwrap_err();
+        let message = err.to_string();
+        assert!(
+            message.contains("cannot start"),
+            "unexpected error: {message}"
+        );
+        assert!(message.contains("#1"), "unexpected error: {message}");
+
+        // The dead horizon never reaches disk.
+        let stored = PlanStorage::load_plan(root, "dead-plan").unwrap().unwrap();
         assert!(stored.items.is_empty());
         assert!(stored.architect.is_none());
         assert!(stored.last_replanned_step.is_none());

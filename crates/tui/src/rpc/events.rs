@@ -35,6 +35,43 @@ pub fn fail_safe_reject_edits(model: &mut ReplView, reason: &str) {
     model.edit_final_error = Some(reason.to_string());
 }
 
+/// Re-anchors the Develop viewport to the bottom of the streamed turn.
+///
+/// Streamed file edits and their hunks arrive below the answer block, so a
+/// turn that has already filled the viewport would leave the freshly applied
+/// edits hidden beneath its lower edge. Every editing event re-anchors the
+/// viewport while auto-scroll is enabled, keeping the patch-retry and
+/// verification-healing rounds visible (c-autoscroll-edits).
+fn scroll_to_stream_end(st: &mut AppState) {
+    if st.model.auto_scroll {
+        let height = st.last_model_height;
+        st.model.scroll = st.model.max_scroll(height);
+    }
+}
+
+/// Returns every accepted file of the current turn to the retry state.
+///
+/// Verification is deterministic and authoritative: once the compiler rejects
+/// the applied change set, a file marked `Ok` is no longer settled. The healing
+/// round regenerates its patches, so the view names the pending regeneration
+/// instead of keeping a green mark on code that does not build
+/// (c-healing-phase-visual). Files that already carry their own attempt detail
+/// keep it, because the patch retry owns that message.
+fn mark_files_awaiting_healing(model: &mut ReplView) {
+    if model.files.is_empty() {
+        return;
+    }
+    let reason = active_t("repl.edits_retry_healing");
+    for file in model.files.iter_mut() {
+        if file.status != FileEditStatus::Ok {
+            continue;
+        }
+        file.status = FileEditStatus::Retrying;
+        file.retry_info = Some(reason.clone());
+        file.error = None;
+    }
+}
+
 pub async fn handle_event(ev: Event, state: &Arc<Mutex<AppState>>, is_reasoning: &mut bool) {
     let mut st = state.lock().await;
     match ev.method.as_str() {
@@ -268,6 +305,13 @@ pub async fn handle_event(ev: Event, state: &Arc<Mutex<AppState>>, is_reasoning:
                         tauqe_protocol::TurnPhase::Verification => TurnStatus::Verifying,
                         tauqe_protocol::TurnPhase::Healing => TurnStatus::Healing,
                     };
+                    // Entering the healing phase means the compiler rejected
+                    // the applied change set, so the accepted files are no
+                    // longer settled while their replacements are regenerated
+                    // (c-healing-phase-visual).
+                    if data.phase == tauqe_protocol::TurnPhase::Healing {
+                        mark_files_awaiting_healing(&mut st.model);
+                    }
                 }
             }
         }
@@ -296,6 +340,7 @@ pub async fn handle_event(ev: Event, state: &Arc<Mutex<AppState>>, is_reasoning:
                 if let Ok(data) =
                     serde_json::from_value::<tauqe_protocol::ToolchainFinishedEvent>(params)
                 {
+                    let failed = !data.success;
                     st.model.toolchain = Some(if data.success {
                         ToolchainState::Passed {
                             command: data.command,
@@ -306,6 +351,13 @@ pub async fn handle_event(ev: Event, state: &Arc<Mutex<AppState>>, is_reasoning:
                             message: data.message,
                         }
                     });
+                    // The compiler is authoritative: an accepted patch that no
+                    // longer passes verification is not settled, so the reason
+                    // is projected onto the files before the healing round
+                    // streams its replacements (c-healing-phase-visual).
+                    if failed {
+                        mark_files_awaiting_healing(&mut st.model);
+                    }
                 }
             }
         }
@@ -399,17 +451,27 @@ pub async fn handle_event(ev: Event, state: &Arc<Mutex<AppState>>, is_reasoning:
         events::EDIT_STARTED => {
             st.model.edits_active = true;
             st.model.status = TurnStatus::Editing;
+            scroll_to_stream_end(&mut st);
         }
         events::EDIT_FILE_STARTED => {
             if let Some(params) = ev.params {
                 if let Ok(data) = serde_json::from_value::<EditFileStartedEvent>(params) {
                     st.model.edits_active = true;
                     st.model.status = TurnStatus::Editing;
+                    // A repeated start of one file opens a fresh attempt: the
+                    // hunks of the previous one were rejected by the patch
+                    // retry or invalidated by the compiler during healing, so
+                    // their rendered diff must be dropped before the new
+                    // stream begins and must never accumulate across attempts
+                    // (c-stream-file-reset).
+                    st.model.diff_cache.invalidate(&data.path);
                     if let Some(existing) = st.model.files.iter_mut().find(|f| f.path == data.path)
                     {
                         existing.status = FileEditStatus::Running;
                         existing.op_type = data.op_type;
+                        existing.error = None;
                         existing.retry_info = None;
+                        existing.hunks.clear();
                     } else {
                         st.model.files.push(StreamingFileEdit {
                             path: data.path,
@@ -422,6 +484,7 @@ pub async fn handle_event(ev: Event, state: &Arc<Mutex<AppState>>, is_reasoning:
                         });
                         st.model.selected_file_index = st.model.files.len() - 1;
                     }
+                    scroll_to_stream_end(&mut st);
                 }
             }
         }
@@ -436,6 +499,7 @@ pub async fn handle_event(ev: Event, state: &Arc<Mutex<AppState>>, is_reasoning:
                             new_text: data.new_text,
                         });
                     }
+                    scroll_to_stream_end(&mut st);
                 }
             }
         }
@@ -450,6 +514,7 @@ pub async fn handle_event(ev: Event, state: &Arc<Mutex<AppState>>, is_reasoning:
                             f.error = None;
                         }
                     }
+                    scroll_to_stream_end(&mut st);
                 }
             }
         }
@@ -477,6 +542,7 @@ pub async fn handle_event(ev: Event, state: &Arc<Mutex<AppState>>, is_reasoning:
                         });
                         st.model.selected_file_index = st.model.files.len() - 1;
                     }
+                    scroll_to_stream_end(&mut st);
                 }
             }
         }
@@ -1948,5 +2014,422 @@ mod tests {
         let guard = state.lock().await;
         assert_eq!(guard.model.status, TurnStatus::Error);
         assert!(!guard.model.is_batch);
+    }
+
+    #[tokio::test]
+    async fn test_repeated_edit_file_started_clears_the_previous_attempt() {
+        let mut st = crate::app::test_state();
+        st.model.files.push(StreamingFileEdit {
+            path: "crates/tui/src/main.rs".to_string(),
+            op_type: EditOp::Replace,
+            status: FileEditStatus::Retrying,
+            error: Some("hunk did not match the file".to_string()),
+            hunks: vec![StreamingHunk {
+                hunk_index: 0,
+                old_text: "let a = 1;".to_string(),
+                new_text: "let a = 2;".to_string(),
+            }],
+            expanded: true,
+            retry_info: Some("1/3 retrying: no match".to_string()),
+        });
+
+        let state = Arc::new(Mutex::new(st));
+        let mut is_reasoning = false;
+        let ev = Event {
+            method: events::EDIT_FILE_STARTED.to_string(),
+            params: Some(
+                serde_json::to_value(EditFileStartedEvent {
+                    operation_id: "op-edit".to_string(),
+                    path: "crates/tui/src/main.rs".to_string(),
+                    op_type: EditOp::Replace,
+                })
+                .unwrap(),
+            ),
+        };
+
+        handle_event(ev, &state, &mut is_reasoning).await;
+
+        let guard = state.lock().await;
+        assert_eq!(
+            guard.model.files.len(),
+            1,
+            "a repeated start must never duplicate the file entry"
+        );
+        let file = &guard.model.files[0];
+        assert!(
+            file.hunks.is_empty(),
+            "the rejected attempt's hunks must be dropped before the new stream"
+        );
+        assert_eq!(file.status, FileEditStatus::Running);
+        assert!(file.error.is_none());
+        assert!(file.retry_info.is_none());
+    }
+
+    fn accepted_file(path: &str) -> StreamingFileEdit {
+        StreamingFileEdit {
+            path: path.to_string(),
+            op_type: EditOp::Replace,
+            status: FileEditStatus::Ok,
+            error: None,
+            hunks: Vec::new(),
+            expanded: false,
+            retry_info: None,
+        }
+    }
+
+    fn toolchain_finished_event(success: bool) -> Event {
+        Event {
+            method: events::TOOLCHAIN_FINISHED.to_string(),
+            params: Some(
+                serde_json::to_value(tauqe_protocol::ToolchainFinishedEvent {
+                    operation_id: "op-toolchain".to_string(),
+                    command: "cargo check".to_string(),
+                    success,
+                    message: if success {
+                        None
+                    } else {
+                        Some("error[E0308]: mismatched types".to_string())
+                    },
+                })
+                .unwrap(),
+            ),
+        }
+    }
+
+    fn turn_phase_event(phase: tauqe_protocol::TurnPhase) -> Event {
+        Event {
+            method: events::TURN_PHASE.to_string(),
+            params: Some(
+                serde_json::to_value(tauqe_protocol::TurnPhaseEvent {
+                    operation_id: "op-turn".to_string(),
+                    phase,
+                    round: Some(1),
+                    max_rounds: Some(3),
+                    detail: None,
+                })
+                .unwrap(),
+            ),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_toolchain_failure_returns_accepted_files_to_retrying() {
+        let mut st = crate::app::test_state();
+        st.model.files = vec![
+            accepted_file("crates/tui/src/main.rs"),
+            accepted_file("crates/tui/src/lib.rs"),
+        ];
+
+        let state = Arc::new(Mutex::new(st));
+        let mut is_reasoning = false;
+        handle_event(toolchain_finished_event(false), &state, &mut is_reasoning).await;
+
+        let guard = state.lock().await;
+        assert!(matches!(
+            guard.model.toolchain.as_ref(),
+            Some(ToolchainState::Failed { .. })
+        ));
+        let reason = active_t("repl.edits_retry_healing");
+        for file in &guard.model.files {
+            assert_eq!(
+                file.status,
+                FileEditStatus::Retrying,
+                "a patch rejected by the compiler must not stay green in the view"
+            );
+            assert_eq!(file.retry_info.as_deref(), Some(reason.as_str()));
+            assert!(file.error.is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn test_toolchain_success_keeps_accepted_files_settled() {
+        let mut st = crate::app::test_state();
+        st.model.files = vec![accepted_file("crates/tui/src/main.rs")];
+
+        let state = Arc::new(Mutex::new(st));
+        let mut is_reasoning = false;
+        handle_event(toolchain_finished_event(true), &state, &mut is_reasoning).await;
+
+        let guard = state.lock().await;
+        assert!(matches!(
+            guard.model.toolchain.as_ref(),
+            Some(ToolchainState::Passed { .. })
+        ));
+        assert_eq!(guard.model.files[0].status, FileEditStatus::Ok);
+        assert!(guard.model.files[0].retry_info.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_healing_phase_returns_accepted_files_to_retrying() {
+        let mut st = crate::app::test_state();
+        st.model.files = vec![accepted_file("crates/tui/src/main.rs")];
+        st.model.status = TurnStatus::Verifying;
+
+        let state = Arc::new(Mutex::new(st));
+        let mut is_reasoning = false;
+        handle_event(
+            turn_phase_event(tauqe_protocol::TurnPhase::Healing),
+            &state,
+            &mut is_reasoning,
+        )
+        .await;
+
+        let guard = state.lock().await;
+        assert_eq!(guard.model.status, TurnStatus::Healing);
+        assert_eq!(guard.model.files[0].status, FileEditStatus::Retrying);
+        assert!(guard.model.files[0].retry_info.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_healing_phase_keeps_an_in_flight_attempt_message() {
+        let mut st = crate::app::test_state();
+        st.model.files = vec![StreamingFileEdit {
+            retry_info: Some("1/3 retrying: hunk did not match".to_string()),
+            status: FileEditStatus::Retrying,
+            ..accepted_file("crates/tui/src/stream.rs")
+        }];
+
+        let state = Arc::new(Mutex::new(st));
+        let mut is_reasoning = false;
+        handle_event(
+            turn_phase_event(tauqe_protocol::TurnPhase::Healing),
+            &state,
+            &mut is_reasoning,
+        )
+        .await;
+
+        let guard = state.lock().await;
+        assert_eq!(
+            guard.model.files[0].retry_info.as_deref(),
+            Some("1/3 retrying: hunk did not match"),
+            "the patch-retry detail owns the message of an unfinished attempt"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_non_healing_phase_keeps_accepted_edits() {
+        let mut st = crate::app::test_state();
+        st.model.files = vec![accepted_file("crates/tui/src/main.rs")];
+
+        let state = Arc::new(Mutex::new(st));
+        let mut is_reasoning = false;
+        handle_event(
+            turn_phase_event(tauqe_protocol::TurnPhase::Staging),
+            &state,
+            &mut is_reasoning,
+        )
+        .await;
+
+        let guard = state.lock().await;
+        assert_eq!(guard.model.files[0].status, FileEditStatus::Ok);
+        assert!(guard.model.files[0].retry_info.is_none());
+    }
+
+    const STREAMED_PATH: &str = "crates/tui/src/views/repl/state.rs";
+
+    fn edit_file_started_event(path: &str) -> Event {
+        Event {
+            method: events::EDIT_FILE_STARTED.to_string(),
+            params: Some(
+                serde_json::to_value(EditFileStartedEvent {
+                    operation_id: "op-stream".to_string(),
+                    path: path.to_string(),
+                    op_type: EditOp::Replace,
+                })
+                .unwrap(),
+            ),
+        }
+    }
+
+    fn edit_file_done_event(
+        path: &str,
+        status: tauqe_protocol::EditFileStatus,
+        error: Option<&str>,
+    ) -> Event {
+        Event {
+            method: events::EDIT_FILE_DONE.to_string(),
+            params: Some(
+                serde_json::to_value(EditFileDoneEvent {
+                    operation_id: "op-stream".to_string(),
+                    path: path.to_string(),
+                    status,
+                    error: error.map(str::to_string),
+                    hunks_count: 1,
+                })
+                .unwrap(),
+            ),
+        }
+    }
+
+    fn first_hunk_event(path: &str, old_text: &str, new_text: &str) -> Event {
+        Event {
+            method: events::EDIT_HUNK.to_string(),
+            params: Some(
+                serde_json::to_value(EditHunkEvent {
+                    operation_id: "op-stream".to_string(),
+                    path: path.to_string(),
+                    hunk_index: 0,
+                    old_text: old_text.to_string(),
+                    new_text: new_text.to_string(),
+                })
+                .unwrap(),
+            ),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_edit_hunk_auto_scrolls_the_viewport_to_the_stream_end() {
+        let mut st = crate::app::test_state();
+        st.last_model_height = 10;
+        st.model.auto_scroll = true;
+        st.model.scroll = 0;
+        st.model.rendered_lines_count = 42;
+        st.model.files.push(accepted_file(STREAMED_PATH));
+
+        let state = Arc::new(Mutex::new(st));
+        let mut is_reasoning = false;
+        handle_event(
+            first_hunk_event(STREAMED_PATH, "let a = 1;", "let a = 2;"),
+            &state,
+            &mut is_reasoning,
+        )
+        .await;
+
+        let guard = state.lock().await;
+        assert_eq!(
+            guard.model.scroll, 32,
+            "the streamed hunk must be pulled above the lower viewport edge"
+        );
+        assert_eq!(guard.model.files[0].hunks.len(), 1);
+        assert!(guard.model.auto_scroll);
+    }
+
+    #[tokio::test]
+    async fn test_edit_stream_keeps_a_manual_scroll_position() {
+        let mut st = crate::app::test_state();
+        st.last_model_height = 10;
+        st.model.auto_scroll = false;
+        st.model.scroll = 5;
+        st.model.rendered_lines_count = 42;
+        st.model.files.push(accepted_file(STREAMED_PATH));
+
+        let state = Arc::new(Mutex::new(st));
+        let mut is_reasoning = false;
+        handle_event(
+            Event {
+                method: events::EDIT_STARTED.to_string(),
+                params: None,
+            },
+            &state,
+            &mut is_reasoning,
+        )
+        .await;
+        handle_event(
+            first_hunk_event(STREAMED_PATH, "let a = 1;", "let a = 2;"),
+            &state,
+            &mut is_reasoning,
+        )
+        .await;
+        handle_event(
+            edit_file_done_event(STREAMED_PATH, tauqe_protocol::EditFileStatus::Ok, None),
+            &state,
+            &mut is_reasoning,
+        )
+        .await;
+
+        let guard = state.lock().await;
+        assert_eq!(
+            guard.model.scroll, 5,
+            "a manual scroll survives the whole edit stream"
+        );
+        assert!(!guard.model.auto_scroll);
+    }
+
+    #[tokio::test]
+    async fn test_retry_round_never_accumulates_hunks_across_attempts() {
+        let state = Arc::new(Mutex::new(crate::app::test_state()));
+        let mut is_reasoning = false;
+
+        // Attempt 1: the file starts, streams one hunk, and the patch retry
+        // rejects it before the same file is streamed again.
+        handle_event(
+            edit_file_started_event(STREAMED_PATH),
+            &state,
+            &mut is_reasoning,
+        )
+        .await;
+        handle_event(
+            first_hunk_event(STREAMED_PATH, "let a = 1;", "let a = 2;"),
+            &state,
+            &mut is_reasoning,
+        )
+        .await;
+        handle_event(
+            edit_file_done_event(
+                STREAMED_PATH,
+                tauqe_protocol::EditFileStatus::Error,
+                Some("hunk did not match the file"),
+            ),
+            &state,
+            &mut is_reasoning,
+        )
+        .await;
+        handle_event(
+            Event {
+                method: events::EDIT_FILE_RETRYING.to_string(),
+                params: Some(
+                    serde_json::to_value(EditFileRetryingEvent {
+                        operation_id: "op-stream".to_string(),
+                        path: STREAMED_PATH.to_string(),
+                        attempt: 1,
+                        max_retries: 3,
+                        reason: "hunk did not match the file".to_string(),
+                    })
+                    .unwrap(),
+                ),
+            },
+            &state,
+            &mut is_reasoning,
+        )
+        .await;
+
+        // Attempt 2: the restart begins from an empty hunk list.
+        handle_event(
+            edit_file_started_event(STREAMED_PATH),
+            &state,
+            &mut is_reasoning,
+        )
+        .await;
+        {
+            let guard = state.lock().await;
+            assert_eq!(
+                guard.model.files.len(),
+                1,
+                "one path keeps exactly one streamed entry"
+            );
+            assert!(
+                guard.model.files[0].hunks.is_empty(),
+                "the rejected attempt's hunks must not survive the restart"
+            );
+        }
+        handle_event(
+            first_hunk_event(STREAMED_PATH, "let a = 1;", "let a = 3;"),
+            &state,
+            &mut is_reasoning,
+        )
+        .await;
+
+        let guard = state.lock().await;
+        assert_eq!(guard.model.files.len(), 1);
+        let file = &guard.model.files[0];
+        assert_eq!(
+            file.hunks.len(),
+            1,
+            "the retry carries exactly the hunk of its own attempt"
+        );
+        assert_eq!(file.hunks[0].new_text, "let a = 3;");
+        assert_eq!(file.status, FileEditStatus::Running);
+        assert!(file.error.is_none());
+        assert!(file.retry_info.is_none());
     }
 }

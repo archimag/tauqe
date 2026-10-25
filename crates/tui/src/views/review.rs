@@ -789,9 +789,13 @@ impl ReviewViewState {
         let scroll = self.scroll as usize;
 
         let new_scroll = if end.saturating_sub(start) <= height {
-            // The row fits: reveal it fully, preferring its top edge so it is
-            // read from the beginning.
-            if scroll >= start && scroll + height >= end {
+            // The row fits, so it is fully visible only while its first line
+            // sits at or below the viewport top and its last line at or above
+            // the viewport bottom. A row scrolled off above — what an upward
+            // `p`, `Up`, `Home`, or `AccordionPrev` move produces — therefore
+            // pulls the viewport up instead of staying invisible, and a row
+            // going past the bottom is revealed from its top edge.
+            if scroll <= start && scroll + height >= end {
                 scroll
             } else {
                 start
@@ -1598,5 +1602,99 @@ mod tests {
             last.contains("Invariant line 79."),
             "the last line of the tall step must be reachable: {last}"
         );
+    }
+
+    /// Selecting an earlier row (`p`, `Up`, `Home`, `AccordionPrev`) must pull
+    /// the viewport up to it. A row left above the viewport top is invisible
+    /// even though the cursor rests on it (c-scroll-visibility).
+    #[test]
+    fn test_scroll_to_selected_pulls_the_viewport_up_for_an_earlier_row() {
+        let item_ids: Vec<u32> = (1..=60).collect();
+        let mut view = ReviewViewState {
+            sessions: vec![make_session("rev-up", &item_ids)],
+            view_height: 10,
+            content_width: 80,
+            ..Default::default()
+        };
+
+        let last = view.row_count() - 1;
+        view.selected_index = last;
+        view.scroll_to_selected();
+        assert!(
+            view.scroll > 0,
+            "the last row must push the viewport away from the top"
+        );
+
+        // Moving up to the middle of the list must scroll the viewport up with
+        // the cursor instead of leaving the row above its top edge.
+        let target = last / 2;
+        view.selected_index = target;
+        view.scroll_to_selected();
+        assert_selected_row_visible(&mut view, target);
+
+        // `Home` must reach the very first row the same way.
+        view.selected_index = 0;
+        view.scroll_to_selected();
+        assert_eq!(view.scroll, 0, "the first row must reveal the document top");
+        assert_selected_row_visible(&mut view, 0);
+    }
+
+    /// Asserts that the row at `index` lies entirely inside the viewport.
+    fn assert_selected_row_visible(view: &mut ReviewViewState, index: usize) {
+        let rows = view.flatten_rows();
+        let (lines, offsets) = compute_unified_review_lines(
+            &rows,
+            index,
+            view.content_width.max(10),
+            view.theme_mode,
+            &mut view.markdown_cache,
+        );
+        let start = offsets.get(index).copied().unwrap_or(0);
+        let end = offsets.get(index + 1).copied().unwrap_or(lines.len());
+        let scroll = view.scroll as usize;
+        let height = view.view_height as usize;
+        assert!(
+            scroll <= start && scroll + height >= end,
+            "the selected row {start}..{end} must be fully visible in {scroll}..{}",
+            scroll + height
+        );
+    }
+
+    /// Selecting a row below the viewport (`n`, `Down`, `End`) must scroll the
+    /// viewport down to it, and selecting the first row (`Home`) must reveal the
+    /// very top of the document (c-scroll-visibility).
+    #[test]
+    fn test_scroll_to_selected_reveals_a_row_below_and_the_document_top() {
+        let item_ids: Vec<u32> = (1..=60).collect();
+        let mut view = ReviewViewState {
+            sessions: vec![make_session("rev-nav", &item_ids)],
+            view_height: 10,
+            content_width: 80,
+            ..Default::default()
+        };
+
+        // `End`: the last row pushes the viewport away from the top and stays
+        // inside it.
+        let last = view.row_count() - 1;
+        view.selected_index = last;
+        view.scroll_to_selected();
+        assert!(
+            view.scroll > 0,
+            "the last row must scroll the viewport down"
+        );
+        assert_selected_row_visible(&mut view, last);
+
+        // `n` / `Down`: a row in the middle is revealed instead of staying
+        // above the viewport top.
+        let middle = last / 2;
+        view.selected_index = middle;
+        view.scroll_to_selected();
+        assert_selected_row_visible(&mut view, middle);
+
+        // `Home`: the first row reveals the document top.
+        view.selected_index = 0;
+        view.scroll_to_selected();
+        assert_eq!(view.scroll, 0, "the first row must reveal the document top");
+        assert_selected_row_visible(&mut view, 0);
     }
 }

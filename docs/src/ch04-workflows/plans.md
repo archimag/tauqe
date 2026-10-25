@@ -287,9 +287,10 @@ For each scheduled leaf the server:
 4. runs one streaming bounded turn, as described in *The Autonomous Bounded Turn
    FSM*;
 5. marks the step `Done` only if the turn succeeded — edits applied and the
-   toolchain clean — or if the model declared completion with the terminal success
-   tag. A prose-only answer without edits and without a terminal tag does not close
-   the step.
+   toolchain clean — or if the model declared completion through the active
+   protocol: the terminal success tag of the XML contour, or an `outcome` field with
+   status `success` in the structured contour. A prose-only answer without edits and
+   without a protocol completion signal does not close the step.
 
 Injecting the whole concept tree is what makes the decision explicit to the
 executing model, and it is backed by two independent statements. The step prompt
@@ -316,9 +317,10 @@ protocol drift.
 
 For the latter it re-runs the same step with a corrective prompt that echoes the
 previous answer, includes the diagnostic reason, and restates the active edit
-protocol: produce a valid edit block, or confirm completion explicitly with the
-terminal success tag. Conversational text is never accepted in place of a protocol
-operation.
+protocol in that protocol's own vocabulary: the XML contour asks for a valid edit
+block or the terminal success tag, while the structured contour asks for a `changes`
+array or an `outcome` with status `success`. Conversational text is never accepted in
+place of a protocol operation.
 
 Between attempts the basis is reset deterministically: the failed turn's own file
 changes are rolled back by the Git workflow checkpoint, the transient auto context
@@ -330,7 +332,9 @@ step returns to `Todo` and the batch stops.
 The terminal tag carries a dynamic per-turn marker. A marked tag is preferred, and
 an unmarked terminal tag outside Markdown code fences is accepted as a fallback when
 no marked tag is present, so a literal example in the answer is never mistaken for a
-real signal.
+real signal. That marker is minted only while the XML contour is active, because its
+sole purpose is to bind tagged commands: a structured turn generates none, and its
+completion signal is the typed `outcome` field rather than a tagged spelling.
 
 ### 3.7 Semantic blocking and wave-horizon replanning
 

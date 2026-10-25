@@ -210,9 +210,10 @@ pub async fn handle_plan_update_item(req: Request, state: &Arc<AppState>) -> Res
     let plan_id = params.plan_id.clone();
     let item_id = params.item_id.clone();
     let status = params.status;
-    let updated =
-        offload_plan(move || PlanStorage::update_item(&update_root, &plan_id, &item_id, status))
-            .await;
+    let updated = offload_plan(move || {
+        PlanStorage::update_item(&update_root, &plan_id, &item_id, status, None)
+    })
+    .await;
     match updated {
         Ok(Some(plan)) => {
             emit(

@@ -332,13 +332,62 @@ impl StatusDialogTarget {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// Pending confirmation of a plan step or scope execution.
+///
+/// Executing a step or a scope hands control to the Coder role, so the dialog
+/// carries the configured Coder ladder, a directives editor, and the section
+/// that currently owns the keyboard. The developer therefore picks the
+/// implementing model before any bounded turn spends tokens, exactly as in the
+/// single-target review execution dialog (c-tui-selector).
+#[derive(Debug, Clone)]
 pub struct ConfirmExecuteScopeState {
     pub plan_id: String,
     pub plan_title: String,
     pub scope_title: String,
     pub step_id: Option<String>,
     pub steps: Vec<tauqe_protocol::PlanItem>,
+    /// Coder-role model selector: configured entries, cyclic navigation, and the
+    /// shared embedded-list rendering (c-tui-selector).
+    pub selector: ModelSelector,
+    /// Optional implementation directives forwarded to the Coder turn.
+    pub instructions_editor: InputEditor,
+    /// Section of the dialog that currently owns the keyboard.
+    pub focus: RefineDialogFocus,
+    /// Focused action button; the safe `Cancel` holds the default.
+    pub confirm_button: ConfirmDialogButton,
+}
+
+impl ConfirmExecuteScopeState {
+    /// Builds an execution confirmation over the configured Coder entries.
+    ///
+    /// One constructor serves both shapes — a single step and a whole scope,
+    /// including a concept-only plan whose horizon is projected just-in-time —
+    /// so the state definition cannot drift between them (c-tui-selector).
+    pub fn new(
+        plan_id: String,
+        plan_title: String,
+        scope_title: String,
+        step_id: Option<String>,
+        steps: Vec<tauqe_protocol::PlanItem>,
+        coder_entries: Vec<tauqe_protocol::ModelEntry>,
+    ) -> Self {
+        Self {
+            plan_id,
+            plan_title,
+            scope_title,
+            step_id,
+            steps,
+            selector: ModelSelector::new(ModelRole::Coder, coder_entries, 0),
+            instructions_editor: InputEditor::default(),
+            focus: RefineDialogFocus::default(),
+            confirm_button: ConfirmDialogButton::Cancel,
+        }
+    }
+
+    /// Currently selected Coder entry, if any.
+    pub fn selected_entry(&self) -> Option<&tauqe_protocol::ModelEntry> {
+        self.selector.selected_entry()
+    }
 }
 
 /// Pending confirmation of a multi-plan execution pipeline.

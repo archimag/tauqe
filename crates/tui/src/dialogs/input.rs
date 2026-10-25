@@ -16,6 +16,7 @@ use crate::views::repl::{
 
 mod confirm;
 mod execute_review;
+mod execute_scope;
 mod locale;
 mod prompt;
 mod refine;
@@ -241,6 +242,7 @@ pub(crate) async fn confirm_execute_pipeline(
 ) -> anyhow::Result<()> {
     let params = tauqe_protocol::PlanExecutePipelineParams {
         plan_ids: target.plan_ids,
+        ..Default::default()
     };
     let params = serde_json::to_value(params)?;
     start_turn(
@@ -327,16 +329,35 @@ pub(crate) async fn confirm_execute_review(
 /// Launches a plan-step batch execution from a developer confirmation.
 ///
 /// The plan-step peer of [`confirm_execute_review`], shared by the keyboard and
-/// mouse confirmation paths.
+/// mouse confirmation paths. The selected Coder rung travels whole — the model
+/// together with the reasoning depth it was configured with — so the coder the
+/// developer picked is the coder that starts the ladder, and the optional
+/// directives reach the bounded turn unchanged (c-tui-selector).
 pub(crate) async fn confirm_execute_scope(
     state: &Arc<Mutex<AppState>>,
     st: MutexGuard<'_, AppState>,
     server_writer: &mut RpcConnection,
     target: crate::app::ConfirmExecuteScopeState,
 ) -> anyhow::Result<()> {
+    let model = target
+        .selected_entry()
+        .map(|entry| tauqe_protocol::ModelSelection::Tier {
+            model: entry.model.clone(),
+            effort: entry.effort,
+        });
+    let instructions = {
+        let text = target.instructions_editor.get_text().trim().to_string();
+        if text.is_empty() {
+            None
+        } else {
+            Some(text)
+        }
+    };
     let params = tauqe_protocol::PlanExecuteParams {
         plan_id: target.plan_id,
         step_id: target.step_id,
+        model,
+        instructions,
     };
     let params = serde_json::to_value(params)?;
     start_turn(
@@ -965,16 +986,7 @@ pub(crate) async fn handle_dialog_event(
             return Ok(Some(InputResult::Continue));
         }
         Some(ActiveModal::ExecuteScope) => {
-            if let Some(target) = st.confirm_execute_scope.take() {
-                match resolve_confirm(&mut st, key) {
-                    ConfirmOutcome::Toggled => st.confirm_execute_scope = Some(target),
-                    ConfirmOutcome::Dismissed => {}
-                    ConfirmOutcome::Accepted => {
-                        confirm_execute_scope(state, st, server_writer, target).await?;
-                    }
-                }
-            }
-            return Ok(Some(InputResult::Continue));
+            return execute_scope::handle_execute_scope_dialog(key, state, st, server_writer).await;
         }
         Some(ActiveModal::RefineDialog) => {
             return refine::handle_refine_dialog(key, state, st, server_writer).await;

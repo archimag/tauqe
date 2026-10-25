@@ -11,7 +11,7 @@ use tauqe_core::plan::storage::PlanStorage;
 use tauqe_core::providers::StreamEvent;
 use tauqe_core::workflow::batch::{BatchExecution, BatchStep, BatchStop};
 use tauqe_protocol::{
-    errors, events, BatchFinishStatus, BatchFinishSummary, PlanBatchFinishedEvent,
+    errors, events, BatchFinishStatus, BatchFinishSummary, ModelSelection, PlanBatchFinishedEvent,
     PlanRefineResult, PlanScopeEvaluation, TurnPhase, TurnPhaseEvent,
 };
 use tokio::sync::mpsc;
@@ -48,6 +48,19 @@ pub(in crate::handlers::plan) enum BatchOutcome {
     Stopped {
         completed: usize,
     },
+}
+
+/// Execution options a plan batch forwards to every step it runs.
+///
+/// The coder selection names the ladder rung a step starts from, and the
+/// directives are appended to the prompt of every step. Both travel from the RPC
+/// parameters, so a batch never invents a starting model of its own.
+#[derive(Debug, Clone, Default)]
+pub(in crate::handlers::plan) struct PlanBatchOptions {
+    /// Coder selection the batch starts from, resolved against the coder ladder.
+    pub(crate) model: Option<ModelSelection>,
+    /// Developer directives appended to the prompt of every step.
+    pub(crate) instructions: Option<String>,
 }
 
 /// Emits the single terminal `plan/batch_finished` event for a batch run.
@@ -127,14 +140,17 @@ fn reject_batch(
 /// an automated closed-loop replanning cycle engages: the architect synthesizes a
 /// new horizon around the failure diagnostics up to `max_replans` times.
 /// Once the supervisor terminates, a typed `plan/batch_finished` event carries
-/// the aggregate status, step counters, and elapsed time.
+/// the aggregate status, step counters, and elapsed time. `options` carries the
+/// coder rung the steps start from and the developer directives appended to
+/// every step prompt.
 pub(in crate::handlers::plan) async fn run_plan_batch(
     state: &Arc<AppState>,
     plan_id: &str,
     step_ids: Vec<String>,
     operation: Arc<OperationGuard>,
+    options: PlanBatchOptions,
 ) -> BatchOutcome {
-    run_plan_batch_with(state, plan_id, step_ids, &operation).await
+    run_plan_batch_with(state, plan_id, step_ids, &operation, &options).await
 }
 
 /// Runs one plan's scheduled steps while borrowing the caller's operation.
@@ -148,6 +164,7 @@ pub(super) async fn run_plan_batch_with(
     plan_id: &str,
     mut current_step_ids: Vec<String>,
     operation: &Arc<OperationGuard>,
+    options: &PlanBatchOptions,
 ) -> BatchOutcome {
     let repo_root = state.context.read().await.repo_root().to_path_buf();
     {
@@ -355,6 +372,8 @@ pub(super) async fn run_plan_batch_with(
             plan_id,
             batch_step_ids: &current_step_ids,
             operation,
+            model: options.model.as_ref(),
+            instructions: options.instructions.as_deref(),
         };
 
         let report = BatchExecution::new()

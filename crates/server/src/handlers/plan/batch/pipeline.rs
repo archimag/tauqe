@@ -12,7 +12,7 @@ use tauqe_protocol::{errors, PlanExecutePipelineParams, PlanScopeEvaluation, Req
 use crate::state::AppState;
 
 use super::super::common::offload_plan;
-use super::supervisor::{run_plan_batch_with, BatchOutcome};
+use super::supervisor::{run_plan_batch_with, BatchOutcome, PlanBatchOptions};
 
 /// Runs a queue of plans sequentially under one registered operation.
 ///
@@ -127,6 +127,12 @@ pub async fn handle_plan_execute_pipeline(req: Request, state: &Arc<AppState>) -
     // client can attribute every lifecycle event of the pipeline — each plan's
     // terminal `plan/batch_finished` and its replanning phases included — to
     // the request it just sent.
+    // The coder selection and the developer directives apply to every plan of
+    // the queue, so each plan starts from the chosen ladder rung and prompt.
+    let options = PlanBatchOptions {
+        model: params.model,
+        instructions: params.instructions,
+    };
     let response = Response::ok(
         req.id,
         serde_json::json!({
@@ -138,7 +144,8 @@ pub async fn handle_plan_execute_pipeline(req: Request, state: &Arc<AppState>) -
     let state = Arc::clone(state);
     tokio::spawn(async move {
         for (plan_id, step_ids) in scheduled {
-            let outcome = run_plan_batch_with(&state, &plan_id, step_ids, &operation).await;
+            let outcome =
+                run_plan_batch_with(&state, &plan_id, step_ids, &operation, &options).await;
             match outcome {
                 BatchOutcome::Completed { steps } => {
                     tracing::info!("Pipeline plan '{}' completed: {} step(s)", plan_id, steps);

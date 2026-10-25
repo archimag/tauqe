@@ -117,12 +117,9 @@ pub use plan::{
     PlanUpdatedEvent, PlanValidationError,
 };
 pub use project::{
-    format_diagnostics, Diagnostic, DiagnosticParserKind, DiagnosticSeverity, ProjectCapabilities,
-    ProjectCheckRequest, ProjectCheckResponse, ProjectCheckStepSpec, ProjectCheckSuiteSpec,
-    ProjectCommandSpec, ProjectConfig, ProjectConfigError, ProjectFormatRequest,
-    ProjectFormatResponse, ProjectFormatterSpec, ProjectHookOutcome, ProjectManifest,
-    ProjectParameterSpec, ProjectPostHookRequest, ProjectPostHookResponse, ProjectPostHookSpec,
-    ProjectRequest, ProjectResponse, ProjectStepResult, ResolvedProjectCommand, TaskRunnerKind,
+    format_diagnostics, Diagnostic, DiagnosticSeverity, ProjectCommandSpec, ProjectConfig,
+    ProjectConfigError, ProjectHookOutcome, ProjectParameterSpec, ProjectPostHookResponse,
+    ResolvedProjectCommand, TaskRunnerKind,
 };
 pub use review::{
     IssueStatus, IssueType, ReviewCancelParams, ReviewContentDeltaEvent, ReviewDeleteParams,

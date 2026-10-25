@@ -15,6 +15,7 @@ use tauqe_protocol::{
 };
 use tokio::sync::{mpsc, watch};
 
+use crate::handlers::common::append_developer_directives;
 use crate::handlers::model::{build_apply_policy, execute_model_turn, StepTurnOptions};
 use crate::state::{AppState, OperationGuard};
 
@@ -69,6 +70,7 @@ pub(crate) async fn preload_step_files(state: &Arc<AppState>, repo_root: &Path, 
 /// success contract; once all attempts are exhausted it returns to TODO. The step
 /// reports a typed [`BatchStepOutcome`] so the supervisor can distinguish a
 /// completed step from a failed, semantically blocked, or cancelled one.
+#[allow(clippy::too_many_arguments)]
 async fn run_plan_step(
     state: &Arc<AppState>,
     repo_root: &Path,
@@ -76,6 +78,8 @@ async fn run_plan_step(
     step_id: &str,
     batch_step_ids: &[String],
     operation: Arc<OperationGuard>,
+    model: Option<&ModelSelection>,
+    instructions: Option<&str>,
 ) -> BatchStepOutcome {
     let outcome = run_plan_step_inner(
         state,
@@ -84,12 +88,15 @@ async fn run_plan_step(
         step_id,
         batch_step_ids,
         operation,
+        model,
+        instructions,
     )
     .await;
     clear_auto_context(state).await;
     outcome
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_plan_step_inner(
     state: &Arc<AppState>,
     repo_root: &Path,
@@ -97,6 +104,8 @@ async fn run_plan_step_inner(
     step_id: &str,
     batch_step_ids: &[String],
     operation: Arc<OperationGuard>,
+    model: Option<&ModelSelection>,
+    instructions: Option<&str>,
 ) -> BatchStepOutcome {
     let load_root = repo_root.to_path_buf();
     let load_plan_id = plan_id.to_string();
@@ -159,6 +168,7 @@ async fn run_plan_step_inner(
         plan_id,
         step_id,
         PlanItemStatus::InProgress,
+        None,
     )
     .await;
     tracing::info!(plan_id = plan_id, step_id = step_id, "plan step started");
@@ -170,22 +180,30 @@ async fn run_plan_step_inner(
     // Generate the active turn marker before assembling prompts so the target
     // step prompt and the model turn share the same marker-bound protocol.
     let marker = state.next_turn_marker().await;
-    let marker_suffix = marker
-        .as_ref()
-        .map(|m| format!("_{}", m))
-        .unwrap_or_default();
+    let protocol = state.config.lock().await.config.develop.protocol;
 
     let mut prompt = match tauqe_core::plan::prompt::format_plan_step_execution_prompt(
         &plan,
         step_id,
-        &marker_suffix,
+        protocol,
+        marker.as_deref(),
     ) {
         Ok(p) => p,
         Err(err) => {
-            set_step_status(state, repo_root, plan_id, step_id, PlanItemStatus::Todo).await;
+            set_step_status(
+                state,
+                repo_root,
+                plan_id,
+                step_id,
+                PlanItemStatus::Todo,
+                None,
+            )
+            .await;
             return BatchStepOutcome::failed(err);
         }
     };
+
+    append_developer_directives(&mut prompt, instructions);
 
     let (max_retries, auto_level_up, models_config) = {
         let cfg = state.config.lock().await.config.clone();
@@ -196,9 +214,15 @@ async fn run_plan_step_inner(
         )
     };
 
-    let mut selection = ModelSelection::Role(ModelRole::Coder);
-    let mut reasoning_effort = None;
-    let mut ladder_idx = 0usize;
+    // The selected coder is the starting rung of this step: an explicit
+    // selection runs at its own reasoning depth, and a later escalation
+    // continues above it instead of restarting the ladder at its base.
+    let mut selection = match model {
+        Some(selection) => selection.clone(),
+        None => ModelSelection::Role(ModelRole::Coder),
+    };
+    let mut ladder_idx = models_config.coder_tier_index(Some(&selection));
+    let mut reasoning_effort = models_config.resolve_selection_effort(ModelRole::Coder, &selection);
     let mut attempt = 0usize;
 
     loop {
@@ -230,7 +254,15 @@ async fn run_plan_step_inner(
         let turn = match turn_result {
             Ok(turn) => turn,
             Err(err) => {
-                set_step_status(state, repo_root, plan_id, step_id, PlanItemStatus::Todo).await;
+                set_step_status(
+                    state,
+                    repo_root,
+                    plan_id,
+                    step_id,
+                    PlanItemStatus::Todo,
+                    None,
+                )
+                .await;
                 // The failed turn names the operation it belonged to, so the
                 // failure event is attributable to this batch instead of a fresh
                 // identifier that matches no registered operation.
@@ -244,12 +276,28 @@ async fn run_plan_step_inner(
         };
 
         // Semantic block: the coder reports that the step preconditions cannot
-        // be satisfied as stated. Record the step as BLOCKED, preserving the
-        // coder's report, and stop without a retry cycle. The block is reported
-        // to the supervisor as a distinct outcome so clients can tell a blocked
-        // step apart from a plain failure.
+        // be satisfied as stated. Record the step as BLOCKED together with the
+        // reported diagnostic, and stop without a retry cycle. The block is
+        // reported to the supervisor as a distinct outcome so clients can tell
+        // a blocked step apart from a plain failure.
         if let Some(reason) = turn.blocked.clone() {
-            set_step_status(state, repo_root, plan_id, step_id, PlanItemStatus::Blocked).await;
+            let blocked = set_step_status_checked(
+                state,
+                repo_root,
+                plan_id,
+                step_id,
+                PlanItemStatus::Blocked,
+                Some(reason.as_str()),
+            )
+            .await;
+            if let Err(err) = blocked {
+                // The block is only meaningful when the durable record carries
+                // it: a BLOCKED status that never reached disk would let the
+                // next batch schedule the same step again, so the persistence
+                // failure is reported instead of a block nobody can observe.
+                report_step_failure(state, &turn.operation_id, &err);
+                return BatchStepOutcome::failed(err);
+            }
             report_step_failure(state, &turn.operation_id, &reason);
             return BatchStepOutcome::blocked(reason);
         }
@@ -262,7 +310,15 @@ async fn run_plan_step_inner(
         // failure carries the recommendation so the developer receives the exact
         // command to run.
         if let Some(abort) = turn.abort.clone() {
-            set_step_status(state, repo_root, plan_id, step_id, PlanItemStatus::Todo).await;
+            set_step_status(
+                state,
+                repo_root,
+                plan_id,
+                step_id,
+                PlanItemStatus::Todo,
+                None,
+            )
+            .await;
             let message = abort.to_message();
             tracing::warn!(
                 plan_id = plan_id,
@@ -281,9 +337,15 @@ async fn run_plan_step_inner(
             // write cannot be persisted the step is reported as failed, so a
             // dependent step that re-reads the plan from disk never stalls on
             // a prerequisite the durable record still shows as InProgress.
-            let done =
-                set_step_status_checked(state, repo_root, plan_id, step_id, PlanItemStatus::Done)
-                    .await;
+            let done = set_step_status_checked(
+                state,
+                repo_root,
+                plan_id,
+                step_id,
+                PlanItemStatus::Done,
+                None,
+            )
+            .await;
             if let Err(err) = done {
                 report_step_failure(state, &turn.operation_id, &err);
                 return BatchStepOutcome::failed(err);
@@ -295,7 +357,15 @@ async fn run_plan_step_inner(
         // TODO and the supervisor stops with `BatchStop::Cancelled` instead of
         // reporting a spurious failure.
         if turn.is_cancelled {
-            set_step_status(state, repo_root, plan_id, step_id, PlanItemStatus::Todo).await;
+            set_step_status(
+                state,
+                repo_root,
+                plan_id,
+                step_id,
+                PlanItemStatus::Todo,
+                None,
+            )
+            .await;
             return BatchStepOutcome::cancelled();
         }
 
@@ -308,7 +378,15 @@ async fn run_plan_step_inner(
         });
 
         if attempt >= max_retries {
-            set_step_status(state, repo_root, plan_id, step_id, PlanItemStatus::Todo).await;
+            set_step_status(
+                state,
+                repo_root,
+                plan_id,
+                step_id,
+                PlanItemStatus::Todo,
+                None,
+            )
+            .await;
             if turn.error.is_none() {
                 report_step_failure(state, &turn.operation_id, &reason);
             }
@@ -340,6 +418,8 @@ async fn run_plan_step_inner(
         prompt = tauqe_core::plan::prompt::format_plan_step_retry_prompt(
             &turn.assistant_text,
             turn.error.as_deref(),
+            protocol,
+            marker.as_deref(),
         );
         attempt += 1;
     }
@@ -356,6 +436,10 @@ pub(super) struct PlanStepExecutor<'a> {
     pub(super) plan_id: &'a str,
     pub(super) batch_step_ids: &'a [String],
     pub(super) operation: &'a Arc<OperationGuard>,
+    /// Coder selection the batch starts from, applied to every step it runs.
+    pub(super) model: Option<&'a ModelSelection>,
+    /// Developer directives appended to the prompt of every step.
+    pub(super) instructions: Option<&'a str>,
 }
 
 #[async_trait]
@@ -373,6 +457,8 @@ impl BatchStepExecutor for PlanStepExecutor<'_> {
             &step.id,
             self.batch_step_ids,
             Arc::clone(self.operation),
+            self.model,
+            self.instructions,
         )
         .await)
     }

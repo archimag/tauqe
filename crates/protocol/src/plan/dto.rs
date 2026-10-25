@@ -73,6 +73,17 @@ pub struct PlanClearHorizonResult {
 pub struct PlanExecutePipelineParams {
     #[serde(default)]
     pub plan_ids: Vec<String>,
+    /// Coder selection the pipeline starts from.
+    ///
+    /// It carries the same untagged semantics as `ReviewExecuteParams::model`:
+    /// a semantic role, an explicit model reference, or an explicit role-list
+    /// rung with the reasoning depth of the configured entry the developer
+    /// picked. An absent selection starts the coder ladder at its base rung.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<ModelSelection>,
+    /// Developer directives applied to the queued plans.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub instructions: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -80,6 +91,18 @@ pub struct PlanExecuteParams {
     pub plan_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub step_id: Option<String>,
+    /// Coder selection the execution starts from.
+    ///
+    /// It carries the same untagged semantics as `ReviewExecuteParams::model`,
+    /// so the model together with its reasoning depth travels on the wire and
+    /// the server never re-derives the depth by matching the model against the
+    /// configured coder entries. An absent selection starts the coder ladder
+    /// at its base rung.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<ModelSelection>,
+    /// Developer directives applied to the executed step or scope.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub instructions: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]

@@ -832,6 +832,7 @@ mod tests {
                     title: "Protocol types".to_string(),
                     details: Some("Add discussion schemas".to_string()),
                     status: PlanItemStatus::Done,
+                    blocked_reason: None,
                     files: vec!["crates/protocol/src/discussion.rs".to_string()],
                     readonly_files: vec![],
                     concept_refs: vec!["c-1".to_string()],

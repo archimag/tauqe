@@ -251,3 +251,66 @@ fn isolated_step_carries_no_plan_permission_under_any_focus() {
     assert_step_has_no_plan_permission(EditProtocolKind::Structured, false);
     assert_step_has_no_plan_permission(EditProtocolKind::Structured, true);
 }
+
+/// Creates a unique scratch repository root for a pre-flight integrity test.
+fn scratch_root(tag: &str) -> std::path::PathBuf {
+    let dir = std::env::temp_dir().join(format!(
+        "tauqe-preflight-{tag}-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&dir).expect("create the scratch repository root");
+    dir
+}
+
+/// Runs the deterministic pre-flight gate over a scratch repository that
+/// declares `config`, then removes it.
+async fn preflight_with(config: Option<&str>) -> Result<(), String> {
+    let dir = scratch_root("integrity");
+    if let Some(config) = config {
+        std::fs::write(dir.join("tauqe.toml"), config).expect("write the project declaration");
+    }
+    let verdict = crate::handlers::run_preflight_verification(&dir).await;
+    let _ = std::fs::remove_dir_all(&dir);
+    verdict
+}
+
+/// The pre-flight gate refuses a `tauqe.toml` that is not valid TOML, so no turn
+/// starts against a configuration the engine cannot even parse.
+#[tokio::test]
+async fn preflight_rejects_malformed_tauqe_toml() {
+    let err = preflight_with(Some("[models\nprimary = \"broken\"\n"))
+        .await
+        .expect_err("malformed TOML must be refused before any model call");
+    assert!(err.contains("tauqe.toml"), "got: {err}");
+}
+
+/// The gate refuses a declaration that parses as TOML but violates a semantic
+/// invariant, here the absence of the mandatory verification lifecycle.
+#[tokio::test]
+async fn preflight_rejects_semantically_invalid_tauqe_toml() {
+    let err = preflight_with(Some("[models]\nprimary = [\"openrouter:a/b\"]\n"))
+        .await
+        .expect_err("a configuration without verification must be refused");
+    assert!(err.contains("verify"), "got: {err}");
+}
+
+/// A declaration whose verification command resolves passes the gate untouched.
+#[tokio::test]
+async fn preflight_accepts_a_valid_tauqe_toml() {
+    let verdict = preflight_with(Some(
+        "[models]\nprimary = [\"openrouter:a/b\"]\n\n[project.verify]\ncommand = \"true\"\n",
+    ))
+    .await;
+    assert!(verdict.is_ok(), "got: {:?}", verdict.err());
+}
+
+/// A repository without a declaration is governed by built-in defaults, so the
+/// gate has nothing to reject.
+#[tokio::test]
+async fn preflight_accepts_a_repository_without_a_declaration() {
+    let verdict = preflight_with(None).await;
+    assert!(verdict.is_ok(), "got: {:?}", verdict.err());
+}

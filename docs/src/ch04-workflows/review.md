@@ -236,6 +236,12 @@ turn with the toolchain gate. **Completion contract:** the finding becomes `Fixe
 only if the turn succeeds *and* actually applies verified changes; the turn's edit
 summary is recorded in `note` when the finding has none.
 
+The isolated prompt speaks the vocabulary of the active protocol. The XML contour
+carries its marker-suffixed completion, skip, block, and discovery tags, while the
+structured contour names its response fields instead — `outcome` for completion or a
+declared skip, `blocked` for a conflict with the fixed decision, and
+`context_requests` for discovery — and never advertises a tag it would not emit.
+
 The prompt fixes the decision on two levels. The `IsolatedStep` system contract
 states that the resolving turn owns the implementation only, and the execution
 prompt restates it beside the finding: the designed data structures, the interfaces
@@ -254,9 +260,10 @@ wave bounded by `develop.max_replans`, and only an exhausted budget or a blocked
 Architect leaves the finding `Skipped`.
 
 **Managed skip.** When the model determines that the defect was already addressed by
-earlier work or is not reproducible, it emits the typed skip outcome with a reason.
-The server records the explanation in `note`, transitions the finding to `Skipped`,
-and closes the turn cleanly without requiring code changes.
+earlier work or is not reproducible, it emits the typed skip outcome with a reason —
+the skip tag in the XML contour, `outcome` with status `skip` in the structured
+contour. The server records the explanation in `note`, transitions the finding to
+`Skipped`, and closes the turn cleanly without requiring code changes.
 
 ### Session batch
 
@@ -328,9 +335,13 @@ blocker.
 
 The synthesized horizon is merged with the finding's `Done` foundation: finished
 sub-steps are preserved verbatim, colliding identifiers are dropped deterministically,
-and a dependency cycle rejects the whole plan. Decomposition alone writes no code; it
-turns an undecomposed *what* into executable *how* steps and returns the finding to
-`TODO`.
+and a dependency cycle rejects the whole plan. A horizon that would be dead on arrival
+— a `depends_on` naming a step that neither the foundation nor the new steps provide,
+or a step set whose ready set is empty — is refused before it reaches storage, so the
+finding keeps its previous subplan and the Architect receives the typed
+`INVALID_PLAN_TREE` diagnostic instead of a generic save failure. Decomposition alone
+writes no code; it turns an undecomposed *what* into executable *how* steps and
+returns the finding to `TODO`.
 
 Each decomposition records its Architect configuration on the finding and renders it
 as a compact badge. Escalation follows the same lazy rule as implementation plans, so

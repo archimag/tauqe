@@ -94,6 +94,7 @@ impl ParsedPlanItem {
             title: self.title,
             details: self.details,
             status: self.status.unwrap_or(tauqe_protocol::PlanItemStatus::Todo),
+            blocked_reason: None,
             files: self.files,
             readonly_files: self.readonly_files,
             concept_refs: self.concept_refs,

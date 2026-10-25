@@ -465,15 +465,21 @@ impl PlanStorage {
     }
 
     /// Updates status of a plan item recursively.
+    ///
+    /// `blocked_reason` carries the diagnostic report of the semantic blocker that
+    /// stopped the step. It is persisted only when the step enters
+    /// [`PlanItemStatus::Blocked`]; every other transition drops the stale report,
+    /// so a resumed step never keeps describing a blocker that no longer holds.
     pub fn update_item(
         repo_root: &Path,
         plan_id: &str,
         item_id: &str,
         status: Option<PlanItemStatus>,
+        blocked_reason: Option<&str>,
     ) -> Result<Option<Plan>> {
         crate::blocking::run_blocking(|| {
             let _guard = Self::lock();
-            Self::update_item_unlocked(repo_root, plan_id, item_id, status)
+            Self::update_item_unlocked(repo_root, plan_id, item_id, status, blocked_reason)
         })
     }
 
@@ -483,6 +489,7 @@ impl PlanStorage {
         plan_id: &str,
         item_id: &str,
         status: Option<PlanItemStatus>,
+        blocked_reason: Option<&str>,
     ) -> Result<Option<Plan>> {
         let mut plan = match Self::load_plan_unlocked(repo_root, plan_id)? {
             Some(p) => p,
@@ -493,22 +500,35 @@ impl PlanStorage {
             items: &mut [PlanItem],
             target_id: &str,
             status: Option<PlanItemStatus>,
+            blocked_reason: Option<&str>,
         ) -> bool {
             for item in items {
                 if item.id.eq_ignore_ascii_case(target_id) {
                     if let Some(s) = status {
                         item.status = s;
+                        // The diagnostic report belongs to the Blocked state
+                        // alone: entering it stores the supplied reason, leaving
+                        // it drops the stale report so a stored plan never keeps
+                        // describing a blocker that has been resolved already.
+                        item.blocked_reason = if s == PlanItemStatus::Blocked {
+                            blocked_reason
+                                .map(str::trim)
+                                .filter(|reason| !reason.is_empty())
+                                .map(str::to_string)
+                        } else {
+                            None
+                        };
                     }
                     return true;
                 }
-                if visit_mut(&mut item.children, target_id, status) {
+                if visit_mut(&mut item.children, target_id, status, blocked_reason) {
                     return true;
                 }
             }
             false
         }
 
-        let updated = visit_mut(&mut plan.items, item_id, status);
+        let updated = visit_mut(&mut plan.items, item_id, status, blocked_reason);
         if updated {
             plan.refresh_parent_statuses();
             plan.updated_at = SystemTime::now()
@@ -555,6 +575,7 @@ mod tests {
                     title: "Models".to_string(),
                     details: None,
                     status: PlanItemStatus::Todo,
+                    blocked_reason: None,
                     files: vec![],
                     readonly_files: vec![],
                     concept_refs: vec![],
@@ -564,6 +585,7 @@ mod tests {
                         title: "Token struct".to_string(),
                         details: None,
                         status: PlanItemStatus::Todo,
+                        blocked_reason: None,
                         files: vec![],
                         readonly_files: vec![],
                         concept_refs: vec![],
@@ -576,6 +598,7 @@ mod tests {
                     title: "Endpoint".to_string(),
                     details: None,
                     status: PlanItemStatus::Todo,
+                    blocked_reason: None,
                     files: vec![],
                     readonly_files: vec![],
                     concept_refs: vec![],
@@ -602,7 +625,7 @@ mod tests {
 
         // 4. Update child item
         let updated =
-            PlanStorage::update_item(root, "auth-flow", "1.1", Some(PlanItemStatus::Done))
+            PlanStorage::update_item(root, "auth-flow", "1.1", Some(PlanItemStatus::Done), None)
                 .unwrap()
                 .unwrap();
 
@@ -854,6 +877,7 @@ mod tests {
                         "concurrent-plan",
                         &format!("item-{i}"),
                         Some(PlanItemStatus::Done),
+                        None,
                     );
                 })
             })
@@ -1033,7 +1057,7 @@ mod tests {
         assert_eq!(loaded.items[0].status, PlanItemStatus::Todo);
 
         let updated =
-            PlanStorage::update_item(&root, "runtime-plan", "1", Some(PlanItemStatus::Done))
+            PlanStorage::update_item(&root, "runtime-plan", "1", Some(PlanItemStatus::Done), None)
                 .unwrap()
                 .unwrap();
         assert_eq!(updated.items[0].status, PlanItemStatus::Done);
@@ -1054,5 +1078,60 @@ mod tests {
 
         assert!(PlanStorage::delete_plan(&root, "runtime-plan").unwrap());
         assert!(PlanStorage::load_all(&root).unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_update_item_persists_and_clears_blocked_reason() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+
+        let plan = Plan {
+            id: "blocked-plan".to_string(),
+            title: "Blocked".to_string(),
+            items: vec![PlanItem {
+                id: "1".to_string(),
+                title: "Step".to_string(),
+                status: PlanItemStatus::Todo,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        PlanStorage::save_plan(root, &plan).unwrap();
+
+        // Entering BLOCKED persists the reported diagnostic, trimmed so the
+        // stored report never carries stray padding.
+        let blocked = PlanStorage::update_item(
+            root,
+            "blocked-plan",
+            "1",
+            Some(PlanItemStatus::Blocked),
+            Some("  missing git  "),
+        )
+        .unwrap()
+        .unwrap();
+        let blocked_item = blocked.find_item("1").unwrap();
+        assert_eq!(blocked_item.status, PlanItemStatus::Blocked);
+        assert_eq!(blocked_item.blocked_reason.as_deref(), Some("missing git"));
+
+        // The report is durable: it survives a reload from disk.
+        let stored = PlanStorage::load_plan(root, "blocked-plan")
+            .unwrap()
+            .unwrap();
+        let stored_item = stored.find_item("1").unwrap();
+        assert_eq!(stored_item.blocked_reason.as_deref(), Some("missing git"));
+
+        // Leaving BLOCKED drops the stale report deterministically.
+        let resumed = PlanStorage::update_item(
+            root,
+            "blocked-plan",
+            "1",
+            Some(PlanItemStatus::InProgress),
+            None,
+        )
+        .unwrap()
+        .unwrap();
+        let resumed_item = resumed.find_item("1").unwrap();
+        assert_eq!(resumed_item.status, PlanItemStatus::InProgress);
+        assert!(resumed_item.blocked_reason.is_none());
     }
 }

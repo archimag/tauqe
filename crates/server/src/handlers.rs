@@ -178,8 +178,19 @@ where
 /// each autonomous workflow step. When the repository does not build or its tests
 /// fail, the batch is blocked synchronously before any LLM request or status change,
 /// so a broken tree never triggers a wasted self-healing loop. A repository that
-/// declares no verification command passes transparently.
+/// declares no verification command passes transparently. The project
+/// configuration is validated before the pipeline runs, so a `tauqe.toml`
+/// whose model roles or `[project]` command chain are broken is refused
+/// synchronously as well.
 pub(crate) async fn run_preflight_verification(repo_root: &Path) -> Result<(), String> {
+    // The configuration integrity check runs first: a batch must not launch
+    // against a `tauqe.toml` whose model roles or command chain are broken,
+    // because its steps would fail mid-flight instead of being refused before
+    // any LLM request is spent. The check self-offloads its blocking file
+    // reads off the async executor thread, and a repository without a
+    // configuration file is governed by built-in defaults and passes.
+    tauqe_core::config::validate_project_config_on_disk(repo_root)?;
+
     // A pre-flight gate runs before a turn exists, so it has no change set and
     // the project command conservatively runs its full suite.
     let (ok, results) =
@@ -382,5 +393,46 @@ mod tests {
         let result = run_preflight_verification(&dir).await;
         let _ = std::fs::remove_dir_all(&dir);
         assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_preflight_verification_rejects_invalid_config() {
+        let dir = std::env::temp_dir().join(format!(
+            "tauqe-test-preflight-invalid-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        let _ = std::fs::create_dir_all(&dir);
+        std::fs::write(
+            dir.join("tauqe.toml"),
+            "[models]\nprimary = [\"openrouter:a/b\"]\n",
+        )
+        .unwrap();
+        let result = run_preflight_verification(&dir).await;
+        let _ = std::fs::remove_dir_all(&dir);
+        let err = result.expect_err("an invalid configuration must fail the pre-flight gate");
+        assert!(err.contains("verify"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn test_preflight_verification_accepts_valid_config() {
+        let dir = std::env::temp_dir().join(format!(
+            "tauqe-test-preflight-valid-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        let _ = std::fs::create_dir_all(&dir);
+        std::fs::write(
+            dir.join("tauqe.toml"),
+            "[models]\nprimary = [\"openrouter:a/b\"]\n\n[project.verify]\ncommand = \"true\"\n",
+        )
+        .unwrap();
+        let result = run_preflight_verification(&dir).await;
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(result.is_ok(), "got: {:?}", result.err());
     }
 }
