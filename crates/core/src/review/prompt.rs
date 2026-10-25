@@ -1,15 +1,17 @@
 //! Prompt builders for review workflows.
 //!
-//! The review prompt surface is decomposed into three cohesive submodules:
+//! The review prompt surface is decomposed into four cohesive submodules:
 //! `discussion` (review Q&A and full-session audit prompts), `refine`
-//! (Architect finding decomposition into a resolution subplan), and `step`
-//! (isolated finding resolution, retry, and skip handling). Every public item
-//! is re-exported here so callers keep using the stable `review::prompt::*`
-//! paths.
+//! (Architect finding decomposition into a resolution subplan), `step`
+//! (isolated finding resolution, retry, and skip handling), and `subplan`
+//! (the architectural-context scaffolding a finding hands to its sub-steps).
+//! Every public item is re-exported here so callers keep using the stable
+//! `review::prompt::*` paths.
 
 pub mod discussion;
 pub mod refine;
 pub mod step;
+pub mod subplan;
 
 pub use discussion::{
     build_review_system_prompt, build_review_user_prompt, format_review_discussion_prompt,
@@ -17,13 +19,15 @@ pub use discussion::{
 };
 pub use refine::{
     build_review_finding_refine_system_prompt, build_review_finding_refine_user_prompt,
-    build_review_refine_system_prompt, build_review_refine_user_prompt, MAX_REVIEW_SUBPLAN_DEPTH,
+    build_review_refine_system_prompt, build_review_refine_user_prompt, ReviewRefineDiagnostics,
+    MAX_REVIEW_SUBPLAN_DEPTH,
 };
 pub use step::{
     format_review_step_execution_prompt, format_review_step_failure_note,
     format_review_step_retry_prompt, ReviewStepFailure, REVIEW_STEP_EXECUTION_PREFIX,
     REVIEW_STEP_RETRY_PREFIX,
 };
+pub use subplan::apply_finding_architectural_context;
 
 #[cfg(test)]
 mod tests {
@@ -67,6 +71,7 @@ mod tests {
             items: vec![ReviewItem {
                 id: 1,
                 title: "Refactor architecture".to_string(),
+                subplan_last_replanned_step: None,
                 model: None,
                 issue_type: IssueType::Architecture,
                 severity: tauqe_protocol::ReviewSeverity::Warning,
@@ -114,6 +119,7 @@ mod tests {
             items: vec![ReviewItem {
                 id: 42,
                 title: "Decompose this issue".to_string(),
+                subplan_last_replanned_step: None,
                 model: None,
                 issue_type: IssueType::Bug,
                 severity: tauqe_protocol::ReviewSeverity::Critical,
@@ -163,6 +169,7 @@ mod tests {
             items: vec![ReviewItem {
                 id: 3,
                 title: "Excessive clone in hot path".to_string(),
+                subplan_last_replanned_step: None,
                 model: None,
                 issue_type: IssueType::Performance,
                 severity: tauqe_protocol::ReviewSeverity::Warning,
@@ -201,6 +208,7 @@ mod tests {
             items: vec![ReviewItem {
                 id: 1,
                 title: "Race condition in cache".to_string(),
+                subplan_last_replanned_step: None,
                 model: None,
                 issue_type: IssueType::Bug,
                 severity: tauqe_protocol::ReviewSeverity::Critical,

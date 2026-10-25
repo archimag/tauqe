@@ -27,11 +27,20 @@ tauqe-protocol = { path = "crates/protocol" }
 tauqe-core = { path = "crates/core" }
 
 serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
-tokio = { version = "1.38", features = ["full"] }
+# `preserve_order` keeps JSON object keys in insertion order (IndexMap instead
+# of BTreeMap). The strict discussion schema depends on it: `message` must stay
+# the first property so language models stream the conversational answer before
+# the structural fields. Cargo unifies features across the whole workspace, so
+# the feature is declared once here and every member consumes the plain entry.
+serde_json = { version = "1.0", features = ["preserve_order"] }
+tokio = { version = "1.54", features = ["full"] }
 tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter", "json"] }
+tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter", "json", "time"] }
 tracing-appender = "0.2"
+# Journal timestamps are rendered by the ecosystem crate: `tracing-subscriber`'s
+# `UtcTime` timer formats through `time`, so the daemon holds no local
+# civil-calendar arithmetic (Conventions §1.6).
+time = { version = "0.3", features = ["formatting", "macros"] }
 anyhow = "1.0"
 thiserror = "1.0"
 ratatui = "0.29"
@@ -41,3 +50,21 @@ futures-util = "0.3"
 toml = "0.8"
 regex = "1"
 indexmap = "2"
+async-trait = "0.1"
+getrandom = "0.2"
+# UUID generation and parsing comes from the ecosystem crate. The `v7` feature
+# provides time-ordered identifiers (`Uuid::now_v7`), so no in-repo UUID
+# implementation is needed.
+uuid = { version = "1.0", features = ["v7"] }
+struson = { version = "0.5", features = ["serde"] }
+unicode-width = "0.2"
+pulldown-cmark = { version = "0.12", default-features = false }
+syntect = { version = "5.3", default-features = false, features = ["default-syntaxes", "default-themes", "parsing", "regex-fancy"] }
+similar = "2.7"
+arboard = "3.7"
+toml_edit = "0.22"
+
+# Test-only dependencies shared by workspace crates.
+tempfile = "3"
+wiremock = "0.6"
+

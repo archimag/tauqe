@@ -82,8 +82,12 @@ pub async fn handle_model_select(req: Request, state: &Arc<AppState>) -> Respons
             }
         };
 
-    let (selection, effective_model, roles) = {
+    let (selection, effective_model, roles, previous_model) = {
         let mut guard = state.config.lock().await;
+        // The model that was effective before the switch decides whether the
+        // dialogue session stays warm: a provider's prompt prefix cache belongs
+        // to one concrete model, so only a real model change invalidates it.
+        let previous_model = guard.config.resolve_model(&guard.selection);
         // Restrict the selection to the configured model pools: a role resolves
         // to its base model and an explicit model must already be configured,
         // so a client can only activate a model it was offered.
@@ -106,8 +110,12 @@ pub async fn handle_model_select(req: Request, state: &Arc<AppState>) -> Respons
         }
         guard.selection = params.selection.clone();
         let roles = crate::handlers::config::effective_roles_summary(&guard.config);
-        (guard.selection.clone(), effective, roles)
+        (guard.selection.clone(), effective, roles, previous_model)
     };
+
+    state
+        .maybe_rotate_session_on_model_change(&previous_model, &effective_model)
+        .await;
 
     state.out.send_event(&Event {
         method: events::MODEL_CHANGED.to_string(),

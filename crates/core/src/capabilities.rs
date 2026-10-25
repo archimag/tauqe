@@ -13,6 +13,7 @@
 mod builtin;
 mod regime;
 mod registry;
+mod schema;
 
 pub use registry::{
     render_contract_rules, CapabilityModule, CapabilityRegistry, ContractContext, ContractRule,
@@ -22,7 +23,9 @@ pub use registry::{
 // Protocol-to-command mapping helpers are owned by the capability modules that
 // define the corresponding capability. Re-exporting them keeps a single source
 // of truth for the edit-protocol-to-command conversion.
-pub(crate) use builtin::{map_verify_on_success, map_verify_target};
+pub(crate) use builtin::{
+    abort_invocations, custom_tool_invocations, map_verify_on_success, map_verify_target,
+};
 
 // The tag schema is a single source of truth shared with the parametric XML
 // engine. Re-exporting it here keeps the capability-module contract nameable

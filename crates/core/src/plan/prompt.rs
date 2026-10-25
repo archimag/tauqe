@@ -1,15 +1,18 @@
 //! Prompt builders, DTOs, and JSON schemas for plan workflows.
 //!
-//! The plan prompt surface is decomposed into three cohesive submodules:
-//! `discussion` (plan Q&A and active-context rendering), `refine` (Architect
-//! horizon synthesis and its schemas), and `step` (isolated plan step
+//! The plan prompt surface is decomposed into four cohesive submodules:
+//! `architect` (the Architect tier-resolution policy shared by plan and review
+//! synthesis), `discussion` (plan Q&A and active-context rendering), `refine`
+//! (Architect horizon synthesis and its schemas), and `step` (isolated plan step
 //! execution). Every public item is re-exported here so callers keep using the
 //! stable `plan::prompt::*` paths.
 
+pub mod architect;
 pub mod discussion;
 pub mod refine;
 pub mod step;
 
+pub use architect::{resolve_architect_tier, ArchitectLevelUp};
 pub use discussion::{
     format_active_plan_context, format_plan_discussion_prompt, PLAN_DISCUSSION_PREFIX,
 };
@@ -32,6 +35,7 @@ mod tests {
     fn sample_plan() -> Plan {
         Plan {
             id: "jwt-auth".to_string(),
+            last_replanned_step: None,
             title: "JWT Authentication".to_string(),
             description: Some("Implement secure tokens".to_string()),
             created_at: 100,

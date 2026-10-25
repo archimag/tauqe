@@ -229,6 +229,13 @@ pub struct ReviewItem {
     /// replanning wave reads this back instead of re-deriving a configuration.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub subplan_architect: Option<ArchitectTier>,
+    /// Identifier of the sub-step whose horizon was most recently reprojected.
+    ///
+    /// Mirrors `Plan::last_replanned_step` for the finding's embedded subplan,
+    /// so a repeated failure of the same sub-step is recognized from persisted
+    /// state and escalates the Architect exactly once per failed step.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subplan_last_replanned_step: Option<String>,
     #[serde(default, alias = "note", skip_serializing_if = "Option::is_none")]
     pub resolution_notes: Option<String>,
     #[serde(default, rename = "body", alias = "description")]
@@ -262,6 +269,8 @@ struct ReviewItemWire {
     subplan: Vec<PlanItem>,
     #[serde(default)]
     subplan_architect: Option<ArchitectTier>,
+    #[serde(default)]
+    subplan_last_replanned_step: Option<String>,
     #[serde(default, alias = "note")]
     resolution_notes: Option<String>,
     #[serde(default, alias = "description")]
@@ -282,6 +291,7 @@ impl From<ReviewItemWire> for ReviewItem {
             readonly_files: wire.readonly_files,
             subplan: wire.subplan,
             subplan_architect: wire.subplan_architect,
+            subplan_last_replanned_step: wire.subplan_last_replanned_step,
             resolution_notes: wire.resolution_notes,
             body: wire.body,
         }
@@ -322,14 +332,26 @@ impl From<ReviewIssue> for ReviewItem {
             subplan: issue.plan,
             // The issue view carries no Architect provenance, so a finding
             // rebuilt from it starts without one and the caller records the
-            // configuration that actually produced the plan.
+            // configuration that actually produced the plan. The replan
+            // provenance is carried by the caller for the same reason.
             subplan_architect: None,
+            subplan_last_replanned_step: None,
             resolution_notes: issue.note,
             body: issue.description,
         }
     }
 }
 
+/// Projects a stored finding into its analytical view.
+///
+/// The view carries the plan the Architect produced, but not the provenance of
+/// how that plan was produced: `subplan_architect` and
+/// `subplan_last_replanned_step` are deliberately dropped here. Escalation
+/// state belongs to the persisted finding, never to a projection of it, so a
+/// caller that persists a finding rebuilt from this view must decide what
+/// provenance it keeps instead of inheriting a stale escalation marker. The
+/// storage primitives carry both markers over explicitly for exactly that
+/// reason.
 impl From<ReviewItem> for ReviewIssue {
     fn from(item: ReviewItem) -> Self {
         Self {

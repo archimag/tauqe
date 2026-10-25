@@ -495,9 +495,11 @@ impl ReviewStorage {
             let mut issue = ReviewIssue::from(item.clone());
             updater(&mut issue);
             let mut updated_item = ReviewItem::from(issue.clone());
-            // The issue view carries no Architect provenance, so it is carried
-            // over explicitly instead of being dropped by the round-trip.
+            // The issue view carries no planning provenance, so the Architect
+            // configuration and the reprojected sub-step are carried over
+            // explicitly instead of being dropped by the round-trip.
             updated_item.subplan_architect = item.subplan_architect.clone();
+            updated_item.subplan_last_replanned_step = item.subplan_last_replanned_step.clone();
             *item = updated_item;
             Some(issue)
         } else {
@@ -525,12 +527,18 @@ impl ReviewStorage {
 
     /// Replaces the uncompleted horizon of a review item's subplan while preserving
     /// any already completed (`Done`) steps.
+    ///
+    /// `last_replanned_step` names the sub-step whose horizon this wave
+    /// reprojects. It is recorded on the finding, so a repeated failure of the
+    /// same sub-step is recognized from persisted state instead of in-memory
+    /// supervisor state.
     pub fn replace_uncompleted_subplan(
         repo_root: &Path,
         review_id: &str,
         item_id: u32,
         new_subplan: Vec<PlanItem>,
         architect: ArchitectTier,
+        last_replanned_step: Option<String>,
     ) -> Result<Option<ReviewIssue>> {
         crate::blocking::run_blocking(|| {
             let _guard = Self::lock();
@@ -540,6 +548,7 @@ impl ReviewStorage {
                 item_id,
                 new_subplan,
                 architect,
+                last_replanned_step,
             )
         })
     }
@@ -551,6 +560,7 @@ impl ReviewStorage {
         item_id: u32,
         new_subplan: Vec<PlanItem>,
         architect: ArchitectTier,
+        last_replanned_step: Option<String>,
     ) -> Result<Option<ReviewIssue>> {
         let mut session = match Self::load_review_unlocked(repo_root, review_id)? {
             Some(s) => s,
@@ -587,6 +597,9 @@ impl ReviewStorage {
             // The finding records which Architect configuration produced the
             // horizon, so a later replanning wave can reproduce or escalate it.
             item.subplan_architect = Some(architect);
+            // The reprojected sub-step is persisted with the subplan, so the
+            // next wave reads from disk whether it already failed a round.
+            item.subplan_last_replanned_step = last_replanned_step;
             Some(issue)
         } else {
             None
@@ -695,6 +708,7 @@ mod tests {
             items: vec![ReviewItem {
                 id: 1,
                 title: "Security finding".to_string(),
+                subplan_last_replanned_step: None,
                 model: None,
                 issue_type: IssueType::Security,
                 severity: ReviewSeverity::Critical,
@@ -789,6 +803,7 @@ mod tests {
             .map(|i| ReviewItem {
                 id: i,
                 title: format!("Item {i}"),
+                subplan_last_replanned_step: None,
                 model: None,
                 issue_type: tauqe_protocol::IssueType::Quality,
                 severity: tauqe_protocol::ReviewSeverity::Suggestion,
@@ -1038,6 +1053,7 @@ mod tests {
             items: vec![ReviewItem {
                 id: 1,
                 title: "Finding".to_string(),
+                subplan_last_replanned_step: None,
                 model: None,
                 issue_type: IssueType::Quality,
                 severity: ReviewSeverity::Suggestion,
@@ -1129,6 +1145,7 @@ mod tests {
             items: vec![ReviewItem {
                 id: 1,
                 title: "Finding".to_string(),
+                subplan_last_replanned_step: None,
                 model: None,
                 issue_type: IssueType::Architecture,
                 severity: ReviewSeverity::Warning,
@@ -1180,6 +1197,7 @@ mod tests {
                 ..Default::default()
             }],
             test_architect(),
+            Some("failed-step".to_string()),
         )
         .unwrap()
         .unwrap();
@@ -1195,6 +1213,11 @@ mod tests {
             stored.items[0].subplan_architect,
             Some(test_architect()),
             "the Architect configuration that produced the subplan must be recorded"
+        );
+        assert_eq!(
+            stored.items[0].subplan_last_replanned_step.as_deref(),
+            Some("failed-step"),
+            "the reprojected sub-step must be recorded with the subplan"
         );
 
         assert_eq!(ReviewStorage::load_all(&root).unwrap().len(), 1);
@@ -1226,6 +1249,7 @@ mod tests {
             items: vec![ReviewItem {
                 id: 1,
                 title: "Finding with subplan".to_string(),
+                subplan_last_replanned_step: None,
                 model: None,
                 issue_type: IssueType::Architecture,
                 severity: ReviewSeverity::Warning,
@@ -1268,6 +1292,7 @@ mod tests {
             1,
             new_subplan,
             test_architect(),
+            Some("s-2".to_string()),
         )
         .unwrap()
         .unwrap();
@@ -1285,6 +1310,12 @@ mod tests {
         assert_eq!(issue.plan.len(), 2);
         assert_eq!(issue.plan[0].id, "s-1");
         assert_eq!(issue.plan[1].id, "s-3");
+        // The reprojected sub-step is persisted with the finding and survives a
+        // reload, so escalation is derived from stored state.
+        assert_eq!(
+            loaded.items[0].subplan_last_replanned_step.as_deref(),
+            Some("s-2")
+        );
     }
 
     #[test]
@@ -1303,6 +1334,7 @@ mod tests {
             items: vec![ReviewItem {
                 id: 1,
                 title: "Finding awaiting a subplan".to_string(),
+                subplan_last_replanned_step: None,
                 model: None,
                 issue_type: IssueType::Architecture,
                 severity: ReviewSeverity::Warning,
@@ -1389,6 +1421,7 @@ mod tests {
             items: vec![ReviewItem {
                 id: 1,
                 title: "Architectural finding".to_string(),
+                subplan_last_replanned_step: None,
                 model: None,
                 issue_type: IssueType::Architecture,
                 severity: ReviewSeverity::Warning,
@@ -1418,6 +1451,7 @@ mod tests {
             1,
             new_subplan,
             test_architect(),
+            None,
         )
         .unwrap()
         .unwrap();
@@ -1450,6 +1484,7 @@ mod tests {
             items: vec![ReviewItem {
                 id: 1,
                 title: "Finding under planning".to_string(),
+                subplan_last_replanned_step: None,
                 model: None,
                 issue_type: IssueType::Quality,
                 severity: ReviewSeverity::Suggestion,
@@ -1479,6 +1514,7 @@ mod tests {
             1,
             new_subplan,
             test_architect(),
+            None,
         )
         .unwrap()
         .unwrap();
@@ -1508,6 +1544,7 @@ mod tests {
             items: vec![ReviewItem {
                 id: 1,
                 title: "Finding with extended fields".to_string(),
+                subplan_last_replanned_step: Some("s-9".to_string()),
                 model: None,
                 issue_type: IssueType::Architecture,
                 severity: ReviewSeverity::Warning,
@@ -1564,6 +1601,12 @@ mod tests {
             vec!["crates/protocol/src/lib.rs", "crates/core/src/config.rs"]
         );
         assert_eq!(issues[0].note.as_deref(), Some("Resolved in PR #42"));
+        // The replan provenance is not part of the issue view, so an item
+        // update must carry it over instead of dropping it.
+        assert_eq!(
+            loaded.items[0].subplan_last_replanned_step.as_deref(),
+            Some("s-9")
+        );
     }
 
     /// A finding update round-trips through `ReviewIssue` and back into
@@ -1580,6 +1623,7 @@ mod tests {
         let make_item = |id: u32, issue_type: IssueType, severity: ReviewSeverity| ReviewItem {
             id,
             title: format!("Finding {id}"),
+            subplan_last_replanned_step: None,
             model: None,
             issue_type,
             severity,

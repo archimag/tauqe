@@ -12,7 +12,6 @@ use std::path::Path;
 use tauqe_protocol::TurnIntent;
 
 use crate::history::HistoryManager;
-use crate::repomap::TreeSitterExtractor;
 
 /// Per-turn memoization of deterministic proposal inputs.
 #[derive(Default)]
@@ -73,24 +72,41 @@ impl TurnInputCache {
         let root = repo_root.to_path_buf();
         let targetable = targetable_paths.to_vec();
         // The tracked-file listing and the Tree-sitter pass are blocking file
-        // and subprocess work, so they run off the async executor thread.
-        let map = crate::blocking::run_blocking_async(move || {
-            let available_files =
-                crate::git::list_repository_files(Some(&root)).unwrap_or_default();
-            let extractor = TreeSitterExtractor::new();
-            crate::repomap::generate_repo_map_with_extractor(
-                &root,
-                &available_files,
-                &targetable,
-                token_budget,
-                &extractor,
-            )
-            .ok()
-            .filter(|map| !map.trim().is_empty())
+        // and subprocess work, so they run off the async executor thread. The
+        // pass runs through the process-wide shared extractor, so files whose
+        // modification state is unchanged since an earlier turn are served
+        // from the persistent symbol cache instead of being re-parsed.
+        let map = match crate::blocking::run_blocking_async(move || {
+            let available_files = crate::git::list_repository_files(Some(&root));
+            available_files.map(|files| {
+                crate::repomap::generate_repo_map_with_extractor(
+                    &root,
+                    &files,
+                    &targetable,
+                    token_budget,
+                    crate::repomap::treesitter::shared_extractor(),
+                )
+                .ok()
+                .filter(|map| !map.trim().is_empty())
+            })
         })
         .await
-        .ok()
-        .flatten();
+        {
+            Ok(Ok(map)) => map,
+            // A repository whose listing failed is not an empty repository: the
+            // degradation is recorded before the map is treated as absent.
+            Ok(Err(error)) => {
+                tracing::warn!(
+                    error = %error,
+                    "failed to list repository files; the repository map is unavailable"
+                );
+                None
+            }
+            Err(join_error) => {
+                crate::blocking::log_join_error(&join_error, "repository map generation");
+                None
+            }
+        };
 
         self.repo_map = Some(FrozenRepoMap { map: map.clone() });
         map
@@ -118,8 +134,8 @@ impl TurnInputCache {
         }
 
         let hm = history_manager.clone();
-        let tag = crate::blocking::run_blocking_async(move || {
-            hm.format_history_tag().ok().and_then(|tag| {
+        let tag = match crate::blocking::run_blocking_async(move || {
+            hm.format_history_tag().map(|tag| {
                 let trimmed = tag.trim();
                 if trimmed.is_empty() {
                     None
@@ -129,8 +145,22 @@ impl TurnInputCache {
             })
         })
         .await
-        .ok()
-        .flatten();
+        {
+            Ok(Ok(tag)) => tag,
+            // A history that could not be read is not an empty history: the
+            // degradation is recorded before the block is treated as absent.
+            Ok(Err(error)) => {
+                tracing::warn!(
+                    error = %error,
+                    "failed to format the session history; the turn proceeds without it"
+                );
+                None
+            }
+            Err(join_error) => {
+                crate::blocking::log_join_error(&join_error, "session history formatting");
+                None
+            }
+        };
 
         self.history_tag = Some(FrozenHistoryTag { tag: tag.clone() });
         tag
@@ -156,20 +186,34 @@ impl TurnInputCache {
         let pinned = pinned_patterns.to_vec();
         // Listing the tracked files is blocking subprocess work, so it runs off
         // the async executor thread.
-        let tree = crate::blocking::run_blocking_async(move || {
-            let available_files =
-                crate::git::list_repository_files(Some(&root)).unwrap_or_default();
-            let tree =
-                crate::repomap::dirs::generate_repo_dirs_with_pinned(&available_files, &pinned);
-            if tree.trim().is_empty() {
-                None
-            } else {
-                Some(tree)
-            }
+        let tree = match crate::blocking::run_blocking_async(move || {
+            crate::git::list_repository_files(Some(&root)).map(|available_files| {
+                let tree =
+                    crate::repomap::dirs::generate_repo_dirs_with_pinned(&available_files, &pinned);
+                if tree.trim().is_empty() {
+                    None
+                } else {
+                    Some(tree)
+                }
+            })
         })
         .await
-        .ok()
-        .flatten();
+        {
+            Ok(Ok(tree)) => tree,
+            // A repository whose listing failed is not an empty repository: the
+            // degradation is recorded before the outline is treated as absent.
+            Ok(Err(error)) => {
+                tracing::warn!(
+                    error = %error,
+                    "failed to list repository files; the directory outline is unavailable"
+                );
+                None
+            }
+            Err(join_error) => {
+                crate::blocking::log_join_error(&join_error, "directory outline rendering");
+                None
+            }
+        };
 
         self.repo_dirs = Some(FrozenRepoDirs { tree: tree.clone() });
         tree
@@ -185,7 +229,7 @@ impl TurnInputCache {
             return project.clone();
         }
 
-        let (project, _) = crate::toolchain::effective_project_config(repo_root, cancel_rx).await;
+        let project = crate::toolchain::effective_project_config(repo_root, cancel_rx).await;
         self.project = Some(project.clone());
         project
     }
@@ -345,5 +389,70 @@ mod tests {
             .history_tag(&history_manager, TurnIntent::IsolatedStep)
             .await
             .is_none());
+    }
+
+    /// A repository whose tracked file list cannot be resolved must degrade
+    /// observably: the outline is frozen as absent for the rest of the turn
+    /// and the failed listing leaves a warn record, so the degradation never
+    /// looks like an empty repository.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn unresolvable_repository_freezes_an_absent_outline_with_a_record() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing_root = dir.path().join("no-such-repository");
+        let mut cache = TurnInputCache::default();
+
+        let (buffer, _guard) = crate::blocking::log_capture::install();
+        assert!(cache.repo_dirs(&missing_root, &[]).await.is_none());
+
+        let logs = crate::blocking::log_capture::contents(&buffer);
+        assert!(
+            logs.contains("failed to list repository files"),
+            "the degradation must be observable: {logs}"
+        );
+        assert!(
+            logs.contains("the directory outline is unavailable"),
+            "the degradation must be observable: {logs}"
+        );
+
+        // The degraded outline is frozen: a later round reuses it without
+        // re-running the listing or emitting a second record.
+        assert!(cache.repo_dirs(&missing_root, &[]).await.is_none());
+        assert_eq!(
+            crate::blocking::log_capture::contents(&buffer),
+            logs,
+            "the frozen degradation must not be re-reported"
+        );
+    }
+
+    /// A repository that cannot be inspected must degrade observably as well:
+    /// the map is frozen as absent and the failed listing leaves a warn
+    /// record, so a failed offload never looks like an empty repository.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn unresolvable_repository_freezes_an_absent_repo_map_with_a_record() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing_root = dir.path().join("no-such-repository");
+        let mut cache = TurnInputCache::default();
+
+        let (buffer, _guard) = crate::blocking::log_capture::install();
+        assert!(cache.repo_map(&missing_root, &[], 1000).await.is_none());
+
+        let logs = crate::blocking::log_capture::contents(&buffer);
+        assert!(
+            logs.contains("failed to list repository files"),
+            "the degradation must be observable: {logs}"
+        );
+        assert!(
+            logs.contains("the repository map is unavailable"),
+            "the degradation must be observable: {logs}"
+        );
+
+        // The degraded map is frozen: a later round reuses it without
+        // re-running the listing or emitting a second record.
+        assert!(cache.repo_map(&missing_root, &[], 1000).await.is_none());
+        assert_eq!(
+            crate::blocking::log_capture::contents(&buffer),
+            logs,
+            "the frozen degradation must not be re-reported"
+        );
     }
 }

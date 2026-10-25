@@ -15,6 +15,7 @@ use tokio::sync::Mutex;
 use crate::app::{AppState, ViewMode};
 use crate::input::InputResult;
 use crate::rpc::RpcConnection;
+use crate::ui::UiAction;
 
 pub mod modal;
 
@@ -112,8 +113,10 @@ pub async fn handle_mouse_event(
                     }
                 }
                 ViewMode::Review => {
-                    let max =
-                        (st.review.rendered_lines as u16).saturating_sub(st.review.view_height);
+                    // The wheel is free scrolling like paging: it stops at the
+                    // last screenful of the rendered document and never
+                    // re-anchors the viewport on the cursor (c-1, c-2).
+                    let max = st.review.max_scroll();
                     st.review.scroll = st
                         .review
                         .scroll
@@ -142,195 +145,16 @@ pub async fn handle_mouse_event(
                 return modal::handle_modal_click(mouse, term_rect, state, st, server_writer).await;
             }
 
-            if st.header_clicks.row > 0 && mouse.row == st.header_clicks.row {
-                let areas = st.header_clicks;
-                if areas.repl_tab.1 > 0
-                    && mouse.column >= areas.repl_tab.0
-                    && mouse.column <= areas.repl_tab.1
-                {
-                    crate::input::switch_view(&mut st, ViewMode::Repl, server_writer).await?;
-                    return Ok(InputResult::Continue);
-                } else if areas.plans_tab.1 > 0
-                    && mouse.column >= areas.plans_tab.0
-                    && mouse.column <= areas.plans_tab.1
-                {
-                    crate::input::switch_view(&mut st, ViewMode::Plans, server_writer).await?;
-                    return Ok(InputResult::Continue);
-                } else if areas.review_tab.1 > 0
-                    && mouse.column >= areas.review_tab.0
-                    && mouse.column <= areas.review_tab.1
-                {
-                    crate::input::switch_view(&mut st, ViewMode::Review, server_writer).await?;
-                    return Ok(InputResult::Continue);
-                } else if areas.context_tab.1 > 0
-                    && mouse.column >= areas.context_tab.0
-                    && mouse.column <= areas.context_tab.1
-                {
-                    crate::input::switch_view(&mut st, ViewMode::Context, server_writer).await?;
-                    return Ok(InputResult::Continue);
-                } else if areas.history_tab.1 > 0
-                    && mouse.column >= areas.history_tab.0
-                    && mouse.column <= areas.history_tab.1
-                {
-                    crate::input::switch_view(&mut st, ViewMode::History, server_writer).await?;
-                    return Ok(InputResult::Continue);
-                } else if areas.model_select.1 > 0
-                    && mouse.column >= areas.model_select.0
-                    && mouse.column <= areas.model_select.1
-                {
-                    if st.model.is_busy() {
-                        st.notify_warning(crate::i18n::active_t("notify.model_select_busy"));
-                        return Ok(InputResult::Continue);
-                    }
-                    if st.open_model_dialog() {
-                        return Ok(InputResult::Continue);
-                    }
-                } else if areas.squash_button.1 > 0
-                    && mouse.column >= areas.squash_button.0
-                    && mouse.column <= areas.squash_button.1
-                {
-                    crate::input::open_squash_dialog(&mut st, server_writer).await?;
-                    return Ok(InputResult::Continue);
-                } else if areas.help_button.1 > 0
-                    && mouse.column >= areas.help_button.0
-                    && mouse.column <= areas.help_button.1
-                {
-                    st.show_help = !st.show_help;
-                    return Ok(InputResult::Continue);
-                }
+            // Interactive controls declare their own rectangles while drawing,
+            // so the dispatcher resolves the pointer coordinate against the flat
+            // registry of the current frame and never knows which widget lives
+            // where (c-1, c-2). A hidden or covered surface registers nothing, so
+            // it physically cannot receive the click (c-3).
+            if let Some(action) = st.hit_regions.action_at(mouse.column, mouse.row) {
+                dispatch_ui_action(action, &mut st, server_writer).await?;
+                return Ok(InputResult::Continue);
             }
 
-            if st.view_mode == ViewMode::Repl {
-                let (cx, cy, cw, ch) = st.model.content_rect;
-                if mouse.column >= cx
-                    && mouse.column < cx + cw
-                    && mouse.row >= cy
-                    && mouse.row < cy + ch
-                {
-                    let relative_row = (mouse.row - cy) as usize;
-                    let clicked_visual_line = st.model.scroll as usize + relative_row;
-
-                    if let Some(block) = st
-                        .model
-                        .code_blocks
-                        .iter()
-                        .find(|b| {
-                            clicked_visual_line >= b.visual_start_line
-                                && clicked_visual_line <= b.visual_end_line
-                        })
-                        .cloned()
-                    {
-                        let (btn_rel_start, btn_rel_end) =
-                            crate::markdown::copy_button_span(&block.lang);
-                        let btn_start = cx + btn_rel_start;
-                        let btn_end = cx + btn_rel_end;
-                        let is_button_clicked = clicked_visual_line == block.visual_start_line
-                            && mouse.column >= btn_start
-                            && mouse.column <= btn_end;
-
-                        if is_button_clicked {
-                            let code_to_copy = block.code.clone();
-                            let block_id = block.id;
-                            match crate::clipboard::copy_to_clipboard(&code_to_copy) {
-                                crate::clipboard::CopyResult::Native => {
-                                    st.model.copy_flash =
-                                        Some((block_id, std::time::Instant::now()));
-                                    let lines_count = code_to_copy.lines().count().max(1);
-                                    st.notify_success(
-                                        crate::i18n::active_t("notify.code_copied")
-                                            .replace("{}", &lines_count.to_string()),
-                                    );
-                                    st.model.update_markdown();
-                                }
-                                crate::clipboard::CopyResult::Osc52Only => {
-                                    st.model.copy_flash =
-                                        Some((block_id, std::time::Instant::now()));
-                                    let lines_count = code_to_copy.lines().count().max(1);
-                                    st.notify_success(
-                                        crate::i18n::active_t("notify.code_copied_osc52")
-                                            .replace("{}", &lines_count.to_string()),
-                                    );
-                                    st.model.update_markdown();
-                                }
-                                crate::clipboard::CopyResult::Failed => {
-                                    st.notify_error(crate::i18n::active_t(
-                                        "notify.code_copy_failed",
-                                    ));
-                                }
-                            }
-                        } else if !st.shift_tip_shown {
-                            st.notify_info(crate::i18n::active_t("notify.mouse_shift_tip"));
-                            st.shift_tip_shown = true;
-                        }
-                    }
-                }
-            } else if st.view_mode == ViewMode::History {
-                let (cx, cy, cw, ch) = st.history_view.content_rect;
-                if mouse.column >= cx
-                    && mouse.column < cx + cw
-                    && mouse.row >= cy
-                    && mouse.row < cy + ch
-                {
-                    let relative_row = (mouse.row - cy) as usize;
-                    let clicked_visual_line = st.history_view.scroll as usize + relative_row;
-
-                    if let Some(block) = st
-                        .history_view
-                        .code_blocks
-                        .iter()
-                        .find(|b| {
-                            clicked_visual_line >= b.visual_start_line
-                                && clicked_visual_line <= b.visual_end_line
-                        })
-                        .cloned()
-                    {
-                        let (btn_rel_start, btn_rel_end) =
-                            crate::markdown::copy_button_span(&block.lang);
-                        // History bodies render with a two-column line prefix.
-                        let btn_start = cx + 2 + btn_rel_start;
-                        let btn_end = cx + 2 + btn_rel_end;
-                        let is_button_clicked = clicked_visual_line == block.visual_start_line
-                            && mouse.column >= btn_start
-                            && mouse.column <= btn_end;
-
-                        if is_button_clicked {
-                            let code_to_copy = block.code.clone();
-                            match crate::clipboard::copy_to_clipboard(&code_to_copy) {
-                                crate::clipboard::CopyResult::Native => {
-                                    st.history_view.copy_flash = Some((
-                                        (block.item_id, block.block_id),
-                                        std::time::Instant::now(),
-                                    ));
-                                    let lines_count = code_to_copy.lines().count().max(1);
-                                    st.notify_success(
-                                        crate::i18n::active_t("notify.code_copied")
-                                            .replace("{}", &lines_count.to_string()),
-                                    );
-                                }
-                                crate::clipboard::CopyResult::Osc52Only => {
-                                    st.history_view.copy_flash = Some((
-                                        (block.item_id, block.block_id),
-                                        std::time::Instant::now(),
-                                    ));
-                                    let lines_count = code_to_copy.lines().count().max(1);
-                                    st.notify_success(
-                                        crate::i18n::active_t("notify.code_copied_osc52")
-                                            .replace("{}", &lines_count.to_string()),
-                                    );
-                                }
-                                crate::clipboard::CopyResult::Failed => {
-                                    st.notify_error(crate::i18n::active_t(
-                                        "notify.code_copy_failed",
-                                    ));
-                                }
-                            }
-                        } else if !st.shift_tip_shown {
-                            st.notify_info(crate::i18n::active_t("notify.mouse_shift_tip"));
-                            st.shift_tip_shown = true;
-                        }
-                    }
-                }
-            }
             Ok(InputResult::Continue)
         }
         MouseEventKind::Down(MouseButton::Middle) => {
@@ -343,6 +167,74 @@ pub async fn handle_mouse_event(
             Ok(InputResult::Continue)
         }
         _ => Ok(InputResult::Continue),
+    }
+}
+
+/// Executes the typed intention a component declared together with the
+/// rectangle it drew.
+///
+/// The dispatcher is the only place that maps a [`UiAction`] to a state
+/// transition, and it holds no knowledge of coordinates, widgets, or view
+/// geometry. A component that starts registering a new action therefore touches
+/// its own renderer and this match, never the pointer routing (c-1, c-2).
+async fn dispatch_ui_action(
+    action: UiAction,
+    st: &mut AppState,
+    server_writer: &mut RpcConnection,
+) -> anyhow::Result<()> {
+    match action {
+        UiAction::SwitchView(target) => {
+            crate::input::switch_view(st, target, server_writer).await?;
+        }
+        UiAction::OpenModelSelect => {
+            if st.model.is_busy() {
+                st.notify_warning(crate::i18n::active_t("notify.model_select_busy"));
+            } else {
+                st.open_model_dialog();
+            }
+        }
+        UiAction::ToggleHelp => {
+            st.show_help = !st.show_help;
+        }
+        // A copy report comes from the surface that rendered the block, so the
+        // dispatcher resolves the action against the owning view and reports the
+        // typed outcome; it never recomputes a column or a scroll offset (c-1).
+        UiAction::CopyCodeBlock { item, block } => {
+            let copied = match item {
+                Some(item_id) => st.history_view.copy_code_block(item_id, block),
+                None => st.model.copy_code_block(block),
+            };
+            if let Some((result, lines)) = copied {
+                report_code_copy(st, result, lines);
+            }
+        }
+        UiAction::CodeBlockBody => {
+            // The hint explains once why a click cannot select the code text.
+            if !st.shift_tip_shown {
+                st.notify_info(crate::i18n::active_t("notify.mouse_shift_tip"));
+                st.shift_tip_shown = true;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Reports the outcome of a code-block copy with the shared localized wording.
+///
+/// Both surfaces own the blocks they render and report the same typed
+/// [`crate::clipboard::CopyResult`], so the notification text is written once
+/// and Develop and History can never phrase one outcome differently (c-1).
+fn report_code_copy(st: &mut AppState, result: crate::clipboard::CopyResult, lines: usize) {
+    match result {
+        crate::clipboard::CopyResult::Native => st.notify_success(
+            crate::i18n::active_t("notify.code_copied").replace("{}", &lines.to_string()),
+        ),
+        crate::clipboard::CopyResult::Osc52Only => st.notify_success(
+            crate::i18n::active_t("notify.code_copied_osc52").replace("{}", &lines.to_string()),
+        ),
+        crate::clipboard::CopyResult::Failed => {
+            st.notify_error(crate::i18n::active_t("notify.code_copy_failed"))
+        }
     }
 }
 
@@ -417,6 +309,7 @@ mod tests {
             created_at: 0,
             updated_at: 0,
             architect: None,
+            last_replanned_step: None,
             concept: vec![],
             items: vec![tauqe_protocol::PlanItem {
                 id: "1".to_string(),
@@ -626,7 +519,7 @@ mod tests {
     }
 
     fn architect_entry(name: &str) -> tauqe_protocol::ModelEntry {
-        tauqe_protocol::ModelEntry::new(tauqe_protocol::ModelRef::openrouter(name), None, None)
+        tauqe_protocol::ModelEntry::new(tauqe_protocol::ModelRef::openrouter(name), None)
     }
 
     fn state_with_review_refine_dialog() -> crate::app::AppState {
@@ -757,6 +650,7 @@ mod tests {
             created_at: 0,
             updated_at: 0,
             architect: None,
+            last_replanned_step: None,
             concept: vec![],
             items: vec![tauqe_protocol::PlanItem {
                 id: "1".to_string(),
@@ -911,30 +805,32 @@ mod tests {
         assert_eq!(item.status, tauqe_protocol::PlanItemStatus::Todo);
     }
 
-    /// Builds a state with an open model picker listing two catalog models.
+    /// Builds a state with an open model picker listing two configured primary
+    /// rungs.
     fn state_with_selection_dialog() -> crate::app::AppState {
         let mut st = crate::app::test_state();
         st.last_frame_area = Rect::new(0, 0, 100, 30);
         st.selection_dialog = Some(crate::app::SelectionDialogState::new(
-            crate::app::SelectionDialogKind::ModelCatalog,
             vec![
-                crate::app::SelectionItem::Model(tauqe_protocol::ModelRef::openrouter(
-                    "alpha-unique",
-                )),
-                crate::app::SelectionItem::Model(tauqe_protocol::ModelRef::openrouter(
-                    "beta-unique",
-                )),
+                tauqe_protocol::ModelEntry::new(
+                    tauqe_protocol::ModelRef::openrouter("alpha-unique"),
+                    None,
+                ),
+                tauqe_protocol::ModelEntry::new(
+                    tauqe_protocol::ModelRef::openrouter("beta-unique"),
+                    None,
+                ),
             ],
             0,
         ));
         st
     }
 
-    /// Item count of the open picker, read without cloning the dialog.
+    /// Rung count of the open picker, read without cloning the dialog.
     fn selection_item_count(st: &crate::app::AppState) -> usize {
         st.selection_dialog
             .as_ref()
-            .map(|dialog| dialog.items.len())
+            .map(|dialog| dialog.selector.len())
             .unwrap_or(0)
     }
 
@@ -1100,5 +996,207 @@ mod tests {
 
         assert!(conn.written().is_empty());
         assert!(state.lock().await.review.refine_dialog.is_some());
+    }
+
+    /// A click on a rendered code block body resolves through the registry to
+    /// the one-time selection hint, so the viewport no longer needs an inline
+    /// geometry check inside the pointer dispatcher (c-1, c-2).
+    #[tokio::test]
+    async fn code_block_body_click_shows_the_selection_hint_once() {
+        let mut st = crate::app::test_state();
+        st.view_mode = ViewMode::Repl;
+        st.last_frame_area = Rect::new(0, 0, 100, 30);
+        st.shift_tip_shown = false;
+        st.hit_regions
+            .register(Rect::new(2, 5, 40, 3), UiAction::CodeBlockBody);
+
+        let state = Arc::new(Mutex::new(st));
+        let mut conn = RpcConnection::new(Vec::<u8>::new());
+        handle_mouse_event(left_click(3, 6), &state, &mut conn)
+            .await
+            .unwrap();
+
+        let guard = state.lock().await;
+        assert!(
+            guard.shift_tip_shown,
+            "the hint is shown on the first click"
+        );
+        assert!(guard.notification.is_some());
+    }
+
+    /// A copy action whose block disappeared between the frame and the click is
+    /// dropped silently: the view owns the lookup and reports nothing to copy.
+    #[tokio::test]
+    async fn a_stale_copy_action_copies_nothing() {
+        let mut st = crate::app::test_state();
+        st.view_mode = ViewMode::Repl;
+        st.last_frame_area = Rect::new(0, 0, 100, 30);
+        st.hit_regions.register(
+            Rect::new(2, 5, 10, 1),
+            UiAction::CopyCodeBlock {
+                item: None,
+                block: 7,
+            },
+        );
+
+        let state = Arc::new(Mutex::new(st));
+        let mut conn = RpcConnection::new(Vec::<u8>::new());
+        handle_mouse_event(left_click(3, 5), &state, &mut conn)
+            .await
+            .unwrap();
+
+        let guard = state.lock().await;
+        assert!(guard.notification.is_none());
+        assert!(guard.model.copy_flash.is_none());
+        assert!(conn.written().is_empty());
+    }
+
+    /// Builds a Repl state whose frame registry already holds the regions a
+    /// component declared while drawing.
+    fn state_with_regions(regions: &[(Rect, UiAction)]) -> crate::app::AppState {
+        let mut st = crate::app::test_state();
+        st.view_mode = ViewMode::Repl;
+        st.last_frame_area = Rect::new(0, 0, 100, 30);
+        for (rect, action) in regions {
+            st.hit_regions.register(*rect, *action);
+        }
+        st
+    }
+
+    /// A click resolves through the frame registry to the typed intention a
+    /// component declared, and the dispatcher performs the transition without
+    /// knowing which widget owns the rectangle (c-1, c-2).
+    #[tokio::test]
+    async fn registered_switch_view_click_switches_the_active_tab() {
+        let st = state_with_regions(&[(
+            Rect::new(5, 1, 10, 1),
+            UiAction::SwitchView(ViewMode::Context),
+        )]);
+        let state = Arc::new(Mutex::new(st));
+        let mut conn = RpcConnection::new(Vec::<u8>::new());
+
+        handle_mouse_event(left_click(6, 1), &state, &mut conn)
+            .await
+            .unwrap();
+
+        assert_eq!(state.lock().await.view_mode, ViewMode::Context);
+    }
+
+    /// A click outside every registered region dispatches nothing: the lookup
+    /// never falls back to the nearest region and never triggers a transition
+    /// the developer did not point at (c-2, c-3).
+    #[tokio::test]
+    async fn a_click_outside_every_registered_region_dispatches_nothing() {
+        let st = state_with_regions(&[(
+            Rect::new(5, 1, 10, 1),
+            UiAction::SwitchView(ViewMode::Plans),
+        )]);
+        let state = Arc::new(Mutex::new(st));
+        let mut conn = RpcConnection::new(Vec::<u8>::new());
+
+        handle_mouse_event(left_click(60, 20), &state, &mut conn)
+            .await
+            .unwrap();
+
+        assert_eq!(state.lock().await.view_mode, ViewMode::Repl);
+        assert!(conn.written().is_empty());
+    }
+
+    /// The later declaration wins over the surface it covers, so a button drawn
+    /// on top of a tab receives the click instead of the tab underneath (c-1).
+    #[tokio::test]
+    async fn the_top_most_declaration_wins_over_the_surface_it_covers() {
+        let st = state_with_regions(&[
+            (
+                Rect::new(0, 0, 40, 3),
+                UiAction::SwitchView(ViewMode::Plans),
+            ),
+            (Rect::new(10, 0, 5, 1), UiAction::ToggleHelp),
+        ]);
+        let state = Arc::new(Mutex::new(st));
+        let mut conn = RpcConnection::new(Vec::<u8>::new());
+
+        handle_mouse_event(left_click(12, 0), &state, &mut conn)
+            .await
+            .unwrap();
+
+        let guard = state.lock().await;
+        assert!(guard.show_help);
+        assert_eq!(guard.view_mode, ViewMode::Repl);
+    }
+
+    /// An active modal takes the click before the registry is consulted, so a
+    /// region covered by a dialog cannot fire from under it (c-3).
+    #[tokio::test]
+    async fn an_active_modal_consumes_the_click_before_the_covered_regions() {
+        let mut st = state_with_regions(&[(
+            Rect::new(0, 0, 40, 3),
+            UiAction::SwitchView(ViewMode::Plans),
+        )]);
+        st.open_usage_summary();
+        let state = Arc::new(Mutex::new(st));
+        let mut conn = RpcConnection::new(Vec::<u8>::new());
+
+        handle_mouse_event(left_click(1, 1), &state, &mut conn)
+            .await
+            .unwrap();
+
+        let guard = state.lock().await;
+        assert_eq!(guard.view_mode, ViewMode::Repl);
+        assert!(guard.usage_summary.is_none());
+    }
+
+    /// A cleared registry holds no region of the finished frame, so the same
+    /// coordinate that used to dispatch resolves to nothing (c-3).
+    #[tokio::test]
+    async fn a_cleared_registry_dispatches_nothing() {
+        let mut st = state_with_regions(&[(Rect::new(5, 1, 10, 1), UiAction::ToggleHelp)]);
+        st.hit_regions.clear();
+        let state = Arc::new(Mutex::new(st));
+        let mut conn = RpcConnection::new(Vec::<u8>::new());
+
+        handle_mouse_event(left_click(6, 1), &state, &mut conn)
+            .await
+            .unwrap();
+
+        assert!(!state.lock().await.show_help);
+    }
+
+    /// The wheel is free scrolling too: a long expanded subplan scrolls
+    /// continuously down to its last screenful and no further, while the cursor
+    /// keeps its row (c-1, c-2).
+    #[tokio::test]
+    async fn review_wheel_scrolls_long_subplan_to_the_bottom_without_snapping() {
+        let mut st = crate::app::test_state();
+        st.view_mode = ViewMode::Review;
+        st.last_frame_area = Rect::new(0, 0, 100, 30);
+        st.review.view_height = 20;
+        st.review.rendered_lines = 500;
+        st.review.selected_index = 0;
+        st.review.scroll = 0;
+
+        let state = Arc::new(Mutex::new(st));
+        let mut conn = RpcConnection::new(Vec::<u8>::new());
+
+        let down = MouseEvent {
+            kind: MouseEventKind::ScrollDown,
+            column: 50,
+            row: 10,
+            modifiers: crossterm::event::KeyModifiers::NONE,
+        };
+        handle_mouse_event(down, &state, &mut conn).await.unwrap();
+        assert_eq!(
+            state.lock().await.review.scroll,
+            MOUSE_SCROLL_STEP as u16,
+            "one notch moves the window by the shared scroll step"
+        );
+
+        // Notches past the end stop exactly at the last full screenful.
+        for _ in 0..200 {
+            handle_mouse_event(down, &state, &mut conn).await.unwrap();
+        }
+        let guard = state.lock().await;
+        assert_eq!(guard.review.scroll, 480);
+        assert_eq!(guard.review.selected_index, 0);
     }
 }

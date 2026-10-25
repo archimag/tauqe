@@ -1,14 +1,24 @@
 use serde::{Deserialize, Serialize};
 
-use crate::model::{CancelMode, ModelRef, ModelSelection};
+use crate::model::{CancelMode, ModelSelection};
 
 use super::item::{IssueStatus, ReviewIssue};
 use super::session::ReviewSession;
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ReviewStartParams {
+    /// Reviewer selection: a semantic role, an explicit model reference, or an
+    /// explicit role-list rung carrying the reasoning depth of the configured
+    /// entry the developer picked.
+    ///
+    /// The whole selection travels on the wire, so the server never re-derives
+    /// the reasoning depth by matching the model against the configured reviewer
+    /// entries. A legacy client that sends only a model reference keeps
+    /// decoding: the untagged `ModelSelection` form maps it to
+    /// `ModelSelection::Specific`, and an absent selection runs the base rung of
+    /// the reviewer role.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub model: Option<ModelRef>,
+    pub model: Option<ModelSelection>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub user_prompt: Option<String>,
     /// Optional directory or glob pattern selecting the files to review.
@@ -118,6 +128,13 @@ pub struct ReviewRefineItemParams {
 /// updated `item`, or reports a semantic block. Tagged by `status`, mirroring
 /// `PlanRefineResult`, so clients branch deterministically without inspecting
 /// free-form text.
+///
+/// The size difference between the variants is inherent to the wire contract:
+/// `Success` carries the complete decomposed finding while `Blocked` carries
+/// only a reason string. Boxing the payload would add indirection for every
+/// consumer without shrinking the serialized form, so the size lint is
+/// allowed here.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "status", rename_all = "snake_case")]
 pub enum ReviewRefineItemResult {

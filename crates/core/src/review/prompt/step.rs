@@ -161,22 +161,27 @@ pub fn format_review_step_execution_prompt(
     out.push_str(
         "2. Do NOT touch unrelated code or address other findings outside of this scope.\n",
     );
-    out.push_str("3. Treat every file listed under Protected Contracts as immutable: rely on its interfaces and invariants, but NEVER modify it.\n");
-    out.push_str("4. Keep changes minimal and coherent. Toolchain verification is handled automatically and deterministically by the harness; do NOT emit <verify> tags.\n");
+    out.push_str("3. Own the implementation (`How`) only, never the requirement (`What`): the architecture prescribed by the finding is fixed by the review. Replacing the designed data structures, rewriting the interfaces or contracts it relies on, substituting the selected components or libraries, or relaxing its constraints and invariants is strictly prohibited.\n");
+    out.push_str("4. Treat every file listed under Protected Contracts as immutable: rely on its interfaces and invariants, but NEVER modify it.\n");
+    out.push_str("5. Keep changes minimal and coherent. Toolchain verification is handled automatically and deterministically by the harness; do NOT emit <verify> tags.\n");
     out.push_str(&format!(
-        "5. When implementation and verification are complete, emit the completion tag: <success{0} summary=\"...\" />.\n",
+        "6. When implementation and verification are complete, emit the completion tag: <success{0} summary=\"...\" />.\n",
         marker_suffix
     ));
     out.push_str(&format!(
-        "6. If the finding is already resolved by earlier changes, is a false positive, or requires no code modifications, do NOT emit unnecessary edits; instead emit <skip{0} reason=\"...\">Detailed explanation</skip{0}>.\n",
+        "7. If the finding is already resolved by earlier changes, is a false positive, or requires no code modifications, do NOT emit unnecessary edits; instead emit <skip{0} reason=\"...\">Detailed explanation</skip{0}>.\n",
         marker_suffix
     ));
     out.push_str(&format!(
-        "7. Discovery Phase: If you need to inspect or edit files listed in <repo_map> that are not yet loaded in <context>, request them immediately using <context_request{0} path=\"...\" access=\"read_only|editable\" /> before writing code or explanations. Do NOT halt with conversational text if the necessary files can simply be requested.\n",
+        "8. Discovery Phase: If you need to inspect or edit files listed in <repo_map> that are not yet loaded in <context>, request them immediately using <context_request{0} path=\"...\" access=\"read_only|editable\" /> before writing code or explanations. Do NOT halt with conversational text if the necessary files can simply be requested.\n",
         marker_suffix
     ));
     out.push_str(&format!(
-        "8. If you encounter an insurmountable technical blocker, contradictory requirements, or need developer decisions, emit the terminal error tag: <error{0} message=\"...\" /> explaining the exact blocker.\n",
+        "9. If the finding cannot be resolved within the approved architectural decision, because the fix would require a different data structure, a changed interface, a substituted component, or a relaxed constraint, do NOT improvise an alternative design. Stop and emit <blocked{0} reason=\"...\" details=\"...\" /> describing the exact architectural conflict, so the harness starts a controlled replanning cycle.\n",
+        marker_suffix
+    ));
+    out.push_str(&format!(
+        "10. If you encounter an insurmountable technical blocker that is unrelated to the architectural decision, emit the terminal error tag: <error{0} message=\"...\" /> explaining the exact blocker.\n",
         marker_suffix
     ));
 
@@ -303,5 +308,91 @@ pub fn format_review_step_failure_note(reason: &str) -> String {
         format!("{} without diagnostics", REVIEW_STEP_FAILURE_NOTE_PREFIX)
     } else {
         format!("{}: {}", REVIEW_STEP_FAILURE_NOTE_PREFIX, trimmed)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tauqe_protocol::review::{IssueStatus, IssueType, ReviewIssue, ReviewItem};
+
+    /// Builds a session holding one finding with a protected contract file.
+    fn session() -> ReviewSession {
+        let issue = ReviewIssue {
+            id: 3,
+            title: "Guard the parser".to_string(),
+            model: None,
+            issue_type: IssueType::Bug,
+            status: IssueStatus::Todo,
+            description: "The parser panics on truncated input.".to_string(),
+            recommendations: vec!["Return a structured error".to_string()],
+            files: vec!["crates/x/src/parser.rs".to_string()],
+            readonly_files: vec!["crates/x/src/api.rs".to_string()],
+            plan: Vec::new(),
+            note: Some("Keep the public signature stable.".to_string()),
+        };
+        ReviewSession {
+            id: "R-1".to_string(),
+            title: "Parser hardening".to_string(),
+            items: vec![ReviewItem::from(issue)],
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn execution_prompt_carries_the_finding_context() {
+        let prompt = format_review_step_execution_prompt(&session(), 3, "").expect("prompt");
+
+        assert!(prompt.contains("# Target Review Step Execution"));
+        assert!(prompt.contains("Guard the parser"));
+        assert!(prompt.contains("The parser panics on truncated input."));
+        assert!(prompt.contains("Return a structured error"));
+        assert!(prompt.contains("crates/x/src/parser.rs"));
+        assert!(prompt.contains("Keep the public signature stable."));
+        // No decomposition was produced, so no subplan section is rendered.
+        assert!(!prompt.contains("Decomposed Subplan Steps"));
+    }
+
+    #[test]
+    fn execution_prompt_forbids_architectural_drift() {
+        let prompt = format_review_step_execution_prompt(&session(), 3, "").expect("prompt");
+
+        // The finding fixes the decision; the turn owns only its execution.
+        assert!(prompt.contains("never the requirement (`What`)"));
+        assert!(prompt.contains("Replacing the designed data structures"));
+        assert!(prompt.contains("do NOT improvise an alternative design"));
+        assert!(prompt.contains("Protected Contracts"));
+        assert!(prompt.contains("NEVER modify it"));
+    }
+
+    #[test]
+    fn execution_prompt_routes_control_tags_through_the_marker() {
+        let prompt = format_review_step_execution_prompt(&session(), 3, "_M7").expect("prompt");
+
+        for tag in [
+            "<success_M7 summary=",
+            "<skip_M7 reason=",
+            "<blocked_M7 reason=",
+            "<error_M7 message=",
+            "<context_request_M7 path=",
+        ] {
+            assert!(prompt.contains(tag), "missing {tag}");
+        }
+        assert!(!prompt.contains("<success summary="));
+    }
+
+    #[test]
+    fn execution_prompt_rejects_an_unknown_finding() {
+        assert!(format_review_step_execution_prompt(&session(), 99, "").is_err());
+    }
+
+    #[test]
+    fn retry_prompt_demands_a_protocol_operation() {
+        let prompt = format_review_step_retry_prompt("finished <edit> nothing", Some("no edits"));
+
+        assert!(prompt.starts_with(REVIEW_STEP_RETRY_PREFIX));
+        assert!(prompt.contains("&lt;edit&gt;"));
+        assert!(prompt.contains("no edits"));
+        assert!(prompt.contains("terminal success tag"));
     }
 }

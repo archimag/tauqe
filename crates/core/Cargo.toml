@@ -23,11 +23,12 @@ toml.workspace = true
 tracing.workspace = true
 anyhow.workspace = true
 thiserror.workspace = true
-async-trait = "0.1"
-getrandom = "0.2"
+async-trait.workspace = true
+getrandom.workspace = true
+uuid.workspace = true
 regex.workspace = true
 indexmap.workspace = true
-struson = { version = "0.5", features = ["serde"] }
+struson.workspace = true
 tree-sitter = "0.22"
 # Official grammars from the tree-sitter organization, pinned to the release
 # wave that shares the tree-sitter 0.22 ABI. Every grammar therefore yields the
@@ -42,11 +43,14 @@ tree-sitter-php = "0.22"
 tree-sitter-python = "0.21"
 tree-sitter-rust = "0.21"
 tree-sitter-typescript = "0.21"
-unicode-width = "0.1"
+unicode-width.workspace = true
 
 [dev-dependencies]
 # Depend on this crate's own feature so integration tests under `tests/`
 # (compiled as separate crates) can still reach `MockLlmProvider`.
 tauqe-core = { path = ".", features = ["test-support"] }
-tempfile = "3"
-wiremock = "0.6"
+tempfile.workspace = true
+wiremock.workspace = true
+# Log-capture assertions in unit tests install a test subscriber through the
+# `fmt` layer; production code keeps logging through the plain facade only.
+tracing-subscriber.workspace = true

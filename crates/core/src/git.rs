@@ -5,8 +5,7 @@ pub mod state;
 
 pub use checkpoint::{
     create_ai_commit, create_checkpoint, create_step_commit, finalize_ai_commit, is_tauqe_commit,
-    restore_checkpoint, undo_last_ai_commit, CheckpointInfo, CHECKPOINT_PREFIX, STEP_PREFIX,
-    TAUQE_CO_AUTHOR_TRAILER,
+    restore_checkpoint, CheckpointInfo, CHECKPOINT_PREFIX, STEP_PREFIX, TAUQE_CO_AUTHOR_TRAILER,
 };
 pub use cmd::run_git;
 pub use diff::{

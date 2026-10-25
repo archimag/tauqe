@@ -1,7 +1,8 @@
 //! Model, role, effort, and turn-lifecycle wire contracts.
 //!
 //! The model subsystem is decomposed into focused submodules: provider and
-//! model references (`reference`), semantic roles (`role`), reasoning effort
+//! model references (`reference`), the provider catalog of models and their
+//! display aliases (`catalog`), semantic roles (`role`), reasoning effort
 //! (`effort`), configured entries and coder tiers (`entry`), selection DTOs
 //! (`selection`), turn parameters and lifecycle events (`turn`), usage
 //! accounting (`usage`), and batch completion summaries (`batch`). Every public
@@ -12,6 +13,7 @@
 //! names onto the crate root.
 
 mod batch;
+mod catalog;
 mod effort;
 mod entry;
 mod reference;
@@ -23,6 +25,7 @@ mod usage;
 pub use batch::{
     BatchFinishStatus, BatchFinishSummary, PlanBatchFinishedEvent, ReviewBatchFinishedEvent,
 };
+pub use catalog::ModelCatalogEntry;
 pub use effort::{ModelRolesEffort, ReasoningEffort};
 pub use entry::{ArchitectTier, CoderTier, ModelEntry, ModelRolesEntries, ModelRolesSummary};
 pub use reference::{deserialize_model_ref_lenient, ModelRef, ProviderKind};
@@ -34,7 +37,9 @@ pub use turn::{
     CancelMode, ModelAskParams, ModelCancelParams, ModelConnectionRetryingEvent, ModelDeltaEvent,
     ModelErrorEvent, ModelEscalatedEvent, ModelFinishedEvent, ModelResult, ModelResultEvent,
     ModelResultProposal, ModelStartedEvent, ModelStreamResetEvent, ModelTurnPlanContext,
-    RepoMapInfoEvent, ToolchainFinishedEvent, ToolchainStartedEvent, TurnPhase, TurnPhaseEvent,
+    RepoMapInfoEvent, StructuredAbortProposal, StructuredBlockedProposal,
+    StructuredOutcomeProposal, ToolchainFinishedEvent, ToolchainStartedEvent, TurnPhase,
+    TurnPhaseEvent,
 };
 pub use usage::{
     ModelUsageEvent, ModelUsageInfo, ModelUsageTotalsEvent, UsageTotals, UsageTotalsSnapshot,

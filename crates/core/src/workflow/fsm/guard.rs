@@ -12,7 +12,7 @@ use tauqe_protocol::{EditOutcome, EditProposal, ModelResult};
 use tokio::sync::{mpsc, watch};
 
 use crate::context::ContextManager;
-use crate::git::state::{changed_worktree_paths, snapshot_worktree};
+use crate::git::state::{changed_worktree_paths, snapshot_worktree, WorktreeSnapshot};
 use crate::providers::StreamEvent;
 use crate::workflow::policy::ApplyPolicy;
 
@@ -24,7 +24,11 @@ use super::FsmTurnOutcome;
 /// that the turn was reverted, so the discrepancy must stay visible rather than
 /// being silently dropped. Returns whether the working tree was actually
 /// restored.
-pub(super) async fn rollback_or_log(policy: &mut dyn ApplyPolicy, repo_root: &Path) -> bool {
+///
+/// The helper is shared beyond the FSM: the execution-mode supervisors call it
+/// on their turn-error and escalation paths, so no rollback failure is
+/// discarded anywhere in the turn lifecycle.
+pub(crate) async fn rollback_or_log(policy: &mut dyn ApplyPolicy, repo_root: &Path) -> bool {
     match policy.rollback(repo_root).await {
         Ok(rolled_back) => rolled_back,
         Err(err) => {
@@ -49,6 +53,13 @@ pub(super) struct TransactionRollbackGuard<'a> {
     repo_root: &'a Path,
     cancel_rx: watch::Receiver<bool>,
     armed: bool,
+    /// Working-copy status captured once, at the end of the first change set
+    /// that reached the disk.
+    ///
+    /// It is the reference point for the files the turn produced outside the
+    /// proposal: a repair round, a declared post-hook, or the toolchain
+    /// rewriting a file while it verified the tree.
+    worktree_baseline: Option<WorktreeSnapshot>,
 }
 
 impl<'a> TransactionRollbackGuard<'a> {
@@ -64,6 +75,7 @@ impl<'a> TransactionRollbackGuard<'a> {
             repo_root,
             cancel_rx,
             armed: false,
+            worktree_baseline: None,
         }
     }
 
@@ -74,10 +86,10 @@ impl<'a> TransactionRollbackGuard<'a> {
     pub(super) async fn rollback(&mut self) -> bool {
         self.armed = false;
         let rolled_back = rollback_or_log(self.policy, self.repo_root).await;
-        // Clearing auto context recomputes hierarchical pinned files through
-        // disk checks, so the sweep runs off the async executor thread.
+        // The sweep only drops context paths that no longer exist on disk, so
+        // it runs off the async executor thread. The auto layer is deliberately
+        // kept: only a successful commit may shrink the context.
         crate::blocking::run_blocking(|| {
-            self.context_manager.clear_auto();
             self.context_manager.prune_missing_files();
         });
         rolled_back
@@ -117,7 +129,35 @@ impl<'a> TransactionRollbackGuard<'a> {
             }
         }
 
+        // The working copy is baselined exactly once, right after the first
+        // change set reached the disk. Every path that differs from it later on
+        // was produced by the turn itself, so capturing it once — rather than on
+        // every healing round — keeps the differential from drifting forward and
+        // silently dropping an artifact the toolchain already created.
+        if self.worktree_baseline.is_none() {
+            let repo_root = self.repo_root;
+            self.worktree_baseline = Some(crate::blocking::run_blocking(|| {
+                snapshot_worktree(repo_root)
+            }));
+        }
+
         Ok(changed_files)
+    }
+
+    /// Reports every working-copy path that changed since the transaction began.
+    ///
+    /// The differential is read from Git itself, so a file the toolchain rewrote
+    /// is detected exactly like a repair-round edit, and `.gitignore` keeps
+    /// generated artifacts out of both snapshots. The result is sorted and
+    /// de-duplicated, which makes the resulting change set deterministic across
+    /// healing rounds.
+    pub(super) fn worktree_changes(&self) -> Vec<String> {
+        let Some(baseline) = self.worktree_baseline.as_ref() else {
+            return Vec::new();
+        };
+        let repo_root = self.repo_root;
+        let after = crate::blocking::run_blocking(|| snapshot_worktree(repo_root));
+        changed_worktree_paths(baseline, &after)
     }
 
     /// Runs the declared disk-side post-hook and reports the files it produced.
@@ -226,31 +266,44 @@ pub(super) async fn finish_turn(
         && plans
             .iter()
             .any(|plan| plan.action == tauqe_protocol::DiscussionPlanAction::Save);
-    if should_apply_plans {
-        apply_turn_plans(repo_root, plans, mode).await;
-    }
+    let plan_errors = if should_apply_plans {
+        apply_turn_plans(repo_root, plans, mode).await
+    } else {
+        Vec::new()
+    };
     FsmTurnOutcome {
         assistant_text,
         result,
         is_cancelled: false,
         blocked: None,
+        abort: None,
         has_terminal_success: false,
         plan_saved,
+        plan_errors,
         skip_reason: None,
     }
 }
 
+/// Applies the turn's plan mutations and returns every rejection the storage
+/// engine reported.
+///
+/// A rejection is a diagnostic rather than a failed turn: the change set it
+/// travelled with may be valid while the plan payload is not, so the reasons
+/// travel back to the caller instead of being aborted on here. They reach the
+/// session history and the developer, so a refused mutation is never a silent
+/// journal trace the model can never learn from.
 async fn apply_turn_plans(
     repo_root: &Path,
     plans: &[tauqe_protocol::DiscussionPlanUpdate],
     mode: crate::plan::storage::PlanMutationMode,
-) {
+) -> Vec<String> {
     if plans.is_empty() {
-        return;
+        return Vec::new();
     }
     let root = repo_root.to_path_buf();
     let plans_vec = plans.to_vec();
-    if let Err(err) = crate::blocking::run_blocking_async(move || {
+    match crate::blocking::run_blocking_async(move || {
+        let mut errors = Vec::new();
         for plan_update in &plans_vec {
             let outcome = crate::plan::storage::PlanStorage::apply_discussion_plan_update_with_mode(
                 &root,
@@ -260,14 +313,25 @@ async fn apply_turn_plans(
             for err in &outcome.errors {
                 tracing::warn!("Plan update rejected: {}", err);
             }
+            errors.extend(outcome.errors);
             for plan in outcome.applied {
                 let _ = crate::plan::storage::PlanStorage::save_active_id(&root, Some(&plan.id));
             }
         }
+        errors
     })
     .await
     {
-        tracing::error!("Failed to apply turn plans: {}", err);
+        Ok(errors) => errors,
+        Err(err) => {
+            // The offload itself failed, so every mutation of this turn was
+            // left unapplied: the turn reports that as one reason instead of
+            // letting the plans disappear silently.
+            tracing::error!("Failed to apply turn plans: {}", err);
+            vec![format!(
+                "The turn's plan mutations could not be applied: {err}"
+            )]
+        }
     }
 }
 
@@ -291,10 +355,10 @@ pub(super) async fn finalize_blocked_turn(
 ) -> FsmTurnOutcome {
     tracing::warn!(reason = %reason, "bounded turn blocked");
     rollback_or_log(policy, repo_root).await;
-    // Auto-layer cleanup performs filesystem metadata checks, so the sweep
-    // runs off the async executor thread.
+    // The sweep only drops context paths that no longer exist on disk and runs
+    // off the async executor thread. A blocked step keeps the auto layer: the
+    // coder's research stays available for the controlled replanning cycle.
     crate::blocking::run_blocking(|| {
-        context_manager.clear_auto();
         context_manager.prune_missing_files();
     });
     let ctx_state = context_manager.get_state();
@@ -365,6 +429,43 @@ mod tests {
 
         assert_eq!(changed, vec!["a.rs".to_string()]);
         assert_eq!(std::fs::read_to_string(root.join("a.rs")).unwrap(), "two\n");
+    }
+
+    #[tokio::test]
+    async fn worktree_changes_join_files_produced_after_the_baseline() {
+        let (_dir, root) = setup_repo(None);
+        let mut context = ContextManager::new(root.clone());
+        context.add_file("a.rs", ContextAccess::Editable).unwrap();
+        let mut policy = GitTransactionPolicy::new();
+        let (_cancel_tx, cancel_rx) = watch::channel(false);
+        let mut guard = TransactionRollbackGuard::new(&mut policy, &mut context, &root, cancel_rx);
+
+        // Before any change set reaches the disk there is nothing to compare.
+        assert!(guard.worktree_changes().is_empty());
+
+        guard.apply_temporary(&replace_edit()).await.unwrap();
+
+        // A verification command rewrites a tracked file and produces a new one,
+        // so both must join the change set even though the model proposed
+        // neither of them.
+        std::fs::write(root.join("Cargo.lock"), "generated\n").unwrap();
+        std::fs::write(root.join("snapshot.txt"), "generated\n").unwrap();
+
+        let mut total = vec!["a.rs".to_string()];
+        for path in guard.worktree_changes() {
+            if !total.contains(&path) {
+                total.push(path);
+            }
+        }
+
+        assert_eq!(
+            total,
+            vec![
+                "a.rs".to_string(),
+                "Cargo.lock".to_string(),
+                "snapshot.txt".to_string()
+            ]
+        );
     }
 
     #[cfg(unix)]

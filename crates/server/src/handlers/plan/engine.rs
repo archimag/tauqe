@@ -22,7 +22,6 @@ use crate::handlers::common::{
 use crate::state::{AppState, OperationGuard};
 
 use super::common::{find_duplicate_item_ids, offload_plan};
-use super::horizon::resolve_architect_tier;
 pub(super) use super::horizon::{collect_plan_context_files, PlanHorizonDiagnosticsOwned};
 
 /// Unified engine for architect plan horizon synthesis.
@@ -59,17 +58,22 @@ pub(super) async fn execute_plan_horizon_synthesis(
     let (
         provider,
         architect_tier,
-        alias,
         level_up,
         repomap_budget,
         max_discovery_rounds,
         files_token_budget,
         max_parse_retries,
         include_repo_map,
+        discovery_limits,
     ) = {
         let cfg = state.config.lock().await.config.clone();
-        let (architect_tier, alias, level_up) =
-            resolve_architect_tier(&cfg, &plan, custom_model.as_ref(), diagnostics.as_ref());
+        let (architect_tier, level_up) = tauqe_core::plan::prompt::resolve_architect_tier(
+            &cfg,
+            plan.architect.as_ref(),
+            custom_model.as_ref(),
+            diagnostics.as_ref().map(|d| d.blocked_step_id.as_str()),
+            plan.last_replanned_step.as_deref(),
+        );
         let provider =
             match resolve_architect_provider(state, &cfg, architect_tier.model.provider).await {
                 Ok(p) => p,
@@ -78,13 +82,13 @@ pub(super) async fn execute_plan_horizon_synthesis(
         (
             provider,
             architect_tier,
-            alias,
             level_up,
             cfg.context.repomap_token_budget,
             cfg.context.max_discovery_rounds,
             cfg.context.files_token_budget,
             cfg.develop.max_retries,
             cfg.context.include_repo_map,
+            tauqe_core::workflow::discovery::DiscoveryLimits::from_context_config(&cfg.context),
         )
     };
     // The resolved rung is recorded with the synthesized horizon so a later
@@ -123,7 +127,7 @@ pub(super) async fn execute_plan_horizon_synthesis(
             operation_id: op_id.clone(),
             model: architect_tier.model.clone(),
             role: Some(ModelRole::Architect),
-            alias,
+            alias: None,
             effort: architect_tier.effort,
             plan_context: None,
             is_batch,
@@ -218,6 +222,7 @@ pub(super) async fn execute_plan_horizon_synthesis(
         include_repo_map,
         max_discovery_rounds,
         files_token_budget,
+        discovery_limits,
         max_parse_retries,
         // Horizon synthesis is an isolated design dialogue: its cache is keyed
         // by the plan, never by the interactive REPL session.
@@ -366,12 +371,17 @@ pub(super) async fn execute_plan_horizon_synthesis(
     let horizon_plan_id = plan.id.clone();
     let horizon_items = output.items;
     let horizon_architect = architect_tier;
+    // The step whose horizon this wave reprojects is persisted with the new
+    // horizon, so the next wave reads from disk whether this step already
+    // failed a replanning round.
+    let horizon_replanned_step = diagnostics.as_ref().map(|d| d.blocked_step_id.clone());
     let updated_plan = match offload_plan(move || {
         PlanStorage::replace_uncompleted_horizon(
             &horizon_root,
             &horizon_plan_id,
             horizon_items,
             horizon_architect,
+            horizon_replanned_step,
         )
     })
     .await

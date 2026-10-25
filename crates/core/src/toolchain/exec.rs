@@ -67,19 +67,27 @@ impl CommandLine {
 }
 
 /// Runs a command in `repo_root` and records its duration and outcome.
+///
+/// `stdin_payload` is the only input a project command ever receives: when it is
+/// present the child starts with a piped standard input and the payload is
+/// written to it, one repository-relative path per line for the verification
+/// lifecycle. Without a payload the child receives no input at all, so a command
+/// can never consume the daemon's own request stream.
 pub(super) async fn run_command(
     repo_root: &Path,
     command: &CommandLine,
     timeout_secs: u64,
+    stdin_payload: Option<&str>,
     cancel_rx: Option<&watch::Receiver<bool>>,
 ) -> ToolchainCheckResult {
     tracing::info!(
         command = %command.display(),
         timeout_secs,
+        stdin_bytes = stdin_payload.map(str::len).unwrap_or(0),
         "toolchain command started"
     );
     let started = std::time::Instant::now();
-    let result = run_command_core(repo_root, command, timeout_secs, cancel_rx).await;
+    let result = run_command_core(repo_root, command, timeout_secs, stdin_payload, cancel_rx).await;
     let duration_ms = started.elapsed().as_millis() as u64;
     log_toolchain_check_result(&result, duration_ms);
     result
@@ -89,6 +97,7 @@ async fn run_command_core(
     repo_root: &Path,
     command: &CommandLine,
     timeout_secs: u64,
+    stdin_payload: Option<&str>,
     cancel_rx: Option<&watch::Receiver<bool>>,
 ) -> ToolchainCheckResult {
     let display = command.display();
@@ -113,6 +122,13 @@ async fn run_command_core(
     let mut cmd = tokio::process::Command::new(command.program());
     cmd.args(command.args());
     cmd.current_dir(repo_root);
+    // The change set is the only thing a project command ever reads on its
+    // standard input. Without one the child gets no input at all.
+    if stdin_payload.is_some() {
+        cmd.stdin(std::process::Stdio::piped());
+    } else {
+        cmd.stdin(std::process::Stdio::null());
+    }
     cmd.stdout(std::process::Stdio::piped());
     cmd.stderr(std::process::Stdio::piped());
     cmd.kill_on_drop(true);
@@ -146,6 +162,13 @@ async fn run_command_core(
     // signal. Keeping `child` owned here keeps its PID reserved and lets the
     // whole process group (the direct child and its descendants) be torn down
     // while the child is still alive.
+    let stdin_task = stdin_payload.map(|payload| {
+        spawn_stdin_writer(
+            child.stdin.take(),
+            payload.as_bytes().to_vec(),
+            display.clone(),
+        )
+    });
     let stdout_task = spawn_pipe_reader(child.stdout.take());
     let stderr_task = spawn_pipe_reader(child.stderr.take());
 
@@ -171,6 +194,13 @@ async fn run_command_core(
 
     match outcome {
         RaceOutcome::Exited(status_res) => {
+            // The child is gone, so a pending write can only observe a closed
+            // pipe. Aborting the writer releases the turn even when a lingering
+            // descendant inherited the pipe, and a command that never read its
+            // standard input stays a diagnostic instead of an error.
+            if let Some(task) = stdin_task.as_ref() {
+                task.abort();
+            }
             let stdout_bytes = stdout_task.await.unwrap_or_default();
             let stderr_bytes = stderr_task.await.unwrap_or_default();
             match status_res {
@@ -215,6 +245,9 @@ async fn run_command_core(
         }
         RaceOutcome::TimedOut => {
             kill_and_reap(&mut child, child_pid).await;
+            if let Some(task) = stdin_task.as_ref() {
+                task.abort();
+            }
             stdout_task.abort();
             stderr_task.abort();
             ToolchainCheckResult {
@@ -229,6 +262,9 @@ async fn run_command_core(
         }
         RaceOutcome::Cancelled => {
             kill_and_reap(&mut child, child_pid).await;
+            if let Some(task) = stdin_task.as_ref() {
+                task.abort();
+            }
             stdout_task.abort();
             stderr_task.abort();
             cancelled_result(&display)
@@ -364,7 +400,11 @@ pub(super) async fn run_streaming_command(
     // The input is written on its own task: a command that produces a large
     // output before it consumed its whole input would otherwise deadlock the
     // caller against a full stdin pipe.
-    let stdin_task = spawn_pipe_writer(child.stdin.take(), input.as_bytes().to_vec());
+    let stdin_task = spawn_stdin_writer(
+        child.stdin.take(),
+        input.as_bytes().to_vec(),
+        command.display(),
+    );
     let stdout_task = spawn_pipe_reader(child.stdout.take());
     let stderr_task = spawn_pipe_reader(child.stderr.take());
 
@@ -451,18 +491,29 @@ fn cancelled_streaming_result() -> StreamingOutcome {
 
 /// Feeds a child pipe from a buffer on a dedicated task.
 ///
-/// Writing the input independently of `Child::wait` keeps a formatter that
+/// Writing the input independently of `Child::wait` keeps a command that
 /// produces output before it consumed its whole input from deadlocking the
-/// caller, and it lets the caller abort the write once the child is gone.
-fn spawn_pipe_writer(
+/// caller, and it lets the caller abort the write once the child is gone. A
+/// command may legitimately ignore its standard input and exit at once; the
+/// resulting broken pipe is recorded as a diagnostic, never as a turn failure.
+fn spawn_stdin_writer(
     pipe: Option<tokio::process::ChildStdin>,
     data: Vec<u8>,
+    command: String,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
-        if let Some(mut pipe) = pipe {
-            let _ = pipe.write_all(&data).await;
-            let _ = pipe.flush().await;
+        let Some(mut pipe) = pipe else {
+            return;
+        };
+        if let Err(err) = pipe.write_all(&data).await {
+            tracing::warn!(
+                command = %command,
+                reason = %err,
+                "the project command closed its standard input before the whole payload was delivered"
+            );
+            return;
         }
+        let _ = pipe.flush().await;
     })
 }
 
@@ -634,9 +685,22 @@ mod tests {
         );
         let dir = tempdir().unwrap();
         let runtime = tokio::runtime::Runtime::new().unwrap();
-        let result = runtime.block_on(run_command(dir.path(), &command, 10, None));
+        let result = runtime.block_on(run_command(dir.path(), &command, 10, None, None));
         assert!(result.success, "command failed: {}", result.combined_output);
         assert_eq!(result.stdout, "[src/a b;rm -rf.rs]");
+    }
+
+    #[tokio::test]
+    async fn test_a_command_that_ignores_its_stdin_still_completes() {
+        let dir = tempdir().unwrap();
+        let command = CommandLine::tokenized("git --version");
+
+        // A command is free to exit without reading the change set; the broken
+        // pipe must stay a diagnostic instead of failing or hanging the turn.
+        let result = run_command(dir.path(), &command, 10, Some("a.rs\ngenerated.rs\n"), None).await;
+
+        assert!(result.success, "command failed: {}", result.combined_output);
+        assert!(result.stdout.contains("git version"));
     }
 
     #[tokio::test]

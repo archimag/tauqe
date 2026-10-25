@@ -11,7 +11,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use tauqe_core::providers::{format_session_id, SESSION_PREFIX_REVIEW};
-use tauqe_core::review::prompt::ReviewStepFailure;
+use tauqe_core::review::prompt::{apply_finding_architectural_context, ReviewStepFailure};
 use tauqe_core::review::ReviewStorage;
 use tauqe_protocol::{
     IssueStatus, ModelRole, ModelSelection, Plan, PlanItemStatus, PlanScopeEvaluation, ReviewItem,
@@ -20,11 +20,12 @@ use tauqe_protocol::{
 
 use crate::handlers::model::{execute_model_turn, StepTurnOptions};
 use crate::handlers::plan::preload_step_files;
-use crate::state::{next_operation_id, AppState, OperationGuard};
+use crate::state::{AppState, OperationGuard};
 
 use super::super::common::{
-    append_model_comment, clear_auto_context, offload_review, publish_review, report_item_failure,
-    set_item_status, turn_applied_edits,
+    append_model_comment, clear_auto_context, offload_review, persist_finding_update,
+    publish_review, report_item_failure, set_item_status, set_item_status_checked,
+    turn_applied_edits,
 };
 
 /// Renders why a review subplan scope cannot be executed right now.
@@ -105,6 +106,10 @@ pub(super) const SUBPLAN_INTERRUPTED_NOTE_PREFIX: &str = "Subplan interrupted be
 /// final comment are preserved in `resolution_notes`, and the finding becomes
 /// `Skipped` so the developer can inspect the cause and decide how to proceed
 /// without losing finished work.
+///
+/// Returns `Err` when the interruption cannot be persisted, so the caller
+/// reports an infrastructure failure instead of letting the walk claim a skip
+/// the durable record does not hold.
 async fn finish_subplan_interrupted(
     state: &Arc<AppState>,
     repo_root: &Path,
@@ -113,7 +118,7 @@ async fn finish_subplan_interrupted(
     plan: &mut Plan,
     assistant_text: &str,
     reason: &str,
-) {
+) -> Result<(), String> {
     plan.refresh_parent_statuses();
     let subplan = plan.items.clone();
     let notes = append_model_comment(
@@ -121,17 +126,19 @@ async fn finish_subplan_interrupted(
         assistant_text,
     );
 
-    let save_root = repo_root.to_path_buf();
-    let review_id_owned = review_id.to_string();
-    let _ = offload_review(move || {
-        ReviewStorage::update_session_item(&save_root, &review_id_owned, item_id, move |it| {
+    persist_finding_update(
+        state,
+        repo_root,
+        review_id,
+        item_id,
+        "Skipped interruption record",
+        move |it| {
             it.status = IssueStatus::Skipped;
             it.plan = subplan;
             it.note = Some(notes);
-        })
-    })
-    .await;
-    publish_review(state, repo_root, review_id).await;
+        },
+    )
+    .await
 }
 
 /// Executes the embedded subplan of a review finding one leaf sub-step at a time.
@@ -198,6 +205,9 @@ pub(super) async fn run_review_subplan(
         items: item.subplan.clone(),
         ..Default::default()
     };
+    // The subplan must inherit the architectural decision of its finding, so the
+    // step prompt renders the rationale and the contract the reviewer fixed.
+    apply_finding_architectural_context(&mut plan, item);
 
     // Resolve the leaf sub-steps this call executes through the shared scope
     // evaluator, so dependency ordering and terminal states are derived exactly
@@ -262,7 +272,7 @@ pub(super) async fn run_review_subplan(
             Ok(p) => p,
             Err(err) => {
                 plan.update_item_status(current_step_id, PlanItemStatus::Todo);
-                finish_subplan_interrupted(
+                let interrupt = finish_subplan_interrupted(
                     state,
                     repo_root,
                     review_id,
@@ -272,7 +282,12 @@ pub(super) async fn run_review_subplan(
                     &err,
                 )
                 .await;
-                return Err(ReviewStepFailure::infrastructure(err));
+                return Err(match interrupt {
+                    Ok(()) => ReviewStepFailure::infrastructure(err),
+                    Err(storage_err) => ReviewStepFailure::infrastructure(format!(
+                        "{err}; additionally, the subplan interruption could not be persisted: {storage_err}"
+                    )),
+                });
             }
         };
         append_developer_directives(&mut prompt, instructions.as_deref());
@@ -306,7 +321,7 @@ pub(super) async fn run_review_subplan(
 
             let turn = match turn_result {
                 Ok(turn) => turn,
-                Err(err) => break Err(ReviewStepFailure::infrastructure(err.message)),
+                Err(err) => break Err(ReviewStepFailure::infrastructure(err.error.message)),
             };
 
             step_assistant_text = turn.assistant_text.clone();
@@ -393,9 +408,11 @@ pub(super) async fn run_review_subplan(
                 plan.update_item_status(current_step_id, PlanItemStatus::Todo);
                 let failure = failure.with_step(current_step_id.as_str());
                 let reason = failure.reason().to_string();
-                let op_id = format!("op-{}", next_operation_id());
+                // The failed sub-step is reported under the operation that runs
+                // this subplan, so the failure is attributable to its batch.
+                let op_id = format!("op-{}", operation.id());
                 report_item_failure(state, &op_id, &reason);
-                finish_subplan_interrupted(
+                let interrupt = finish_subplan_interrupted(
                     state,
                     repo_root,
                     review_id,
@@ -405,33 +422,180 @@ pub(super) async fn run_review_subplan(
                     &reason,
                 )
                 .await;
-                return Err(failure);
+                match interrupt {
+                    Ok(()) => return Err(failure),
+                    // The Skipped record could not be persisted, so the walk
+                    // must not report the finding as skipped: the storage
+                    // failure becomes the outcome and the batch stops instead
+                    // of advancing past a finding the durable record still
+                    // shows as InProgress.
+                    Err(storage_err) => {
+                        report_item_failure(state, &op_id, &storage_err);
+                        return Err(ReviewStepFailure::infrastructure(storage_err));
+                    }
+                }
             }
         }
     }
     clear_auto_context(state).await;
 
     // #c-2: a finding is Fixed only when every remaining leaf sub-step is Done.
+    // Both terminal writes are part of the walk's success contract: a write
+    // that cannot be persisted is reported as an infrastructure failure, so
+    // the batch outcome never diverges from the durable record.
     let (total, done) = plan.count_stats();
-    if total > 0 && done == total {
+    let persisted = if total > 0 && done == total {
         let notes = format!(
             "Subplan completed: all {} sub-step(s) applied successfully",
             total
         );
-        let save_root = repo_root.to_path_buf();
-        let review_id_owned = review_id.to_string();
-        let _ = offload_review(move || {
-            ReviewStorage::update_session_item(&save_root, &review_id_owned, item_id, move |it| {
+        persist_finding_update(
+            state,
+            repo_root,
+            review_id,
+            item_id,
+            "Fixed status",
+            move |it| {
                 it.status = IssueStatus::Fixed;
                 if it.note.is_none() {
                     it.note = Some(notes);
                 }
-            })
-        })
-        .await;
-        publish_review(state, repo_root, review_id).await;
+            },
+        )
+        .await
     } else {
-        set_item_status(state, repo_root, review_id, item_id, IssueStatus::Todo).await;
+        set_item_status_checked(state, repo_root, review_id, item_id, IssueStatus::Todo).await
+    };
+    if let Err(err) = persisted {
+        let op_id = format!("op-{}", operation.id());
+        report_item_failure(state, &op_id, &err);
+        return Err(ReviewStepFailure::infrastructure(err));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Builds a finding whose embedded subplan carries one executable sub-step.
+    fn finding_with_subplan(body: &str) -> ReviewItem {
+        let mut item = ReviewItem::from(tauqe_protocol::review::ReviewIssue {
+            id: 7,
+            title: "Guard the parser".to_string(),
+            model: None,
+            issue_type: tauqe_protocol::review::IssueType::Bug,
+            status: IssueStatus::Todo,
+            description: body.to_string(),
+            recommendations: vec!["Keep it lazy".to_string()],
+            files: Vec::new(),
+            readonly_files: Vec::new(),
+            plan: Vec::new(),
+            note: None,
+        });
+        item.subplan = vec![tauqe_protocol::plan::PlanItem {
+            id: "1".to_string(),
+            title: "Return a structured error".to_string(),
+            details: Some("Reuse the existing scanner.".to_string()),
+            status: PlanItemStatus::Todo,
+            files: vec!["crates/x/src/parser.rs".to_string()],
+            readonly_files: vec!["crates/x/src/api.rs".to_string()],
+            concept_refs: Vec::new(),
+            depends_on: Vec::new(),
+            children: Vec::new(),
+        }];
+        item
+    }
+
+    /// An interrupted subplan whose `Skipped` record cannot be persisted must
+    /// surface the storage failure instead of silently claiming the finding
+    /// was skipped.
+    #[tokio::test]
+    async fn finish_subplan_interrupted_surfaces_persistence_failure() {
+        // Same hermetic fixture contract as the sibling review-persistence
+        // test: this test corrupts its own session file, so the directory is
+        // process-unique and cleared before use rather than inherited from an
+        // interrupted earlier run.
+        let root = std::env::temp_dir().join(format!(
+            "tauqe-subplan-interrupt-{}-{}",
+            std::process::id(),
+            crate::state::next_operation_id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let (out, _rx) = crate::transport::OutChannel::new();
+        let (history_sender, _history_rx) = tokio::sync::mpsc::unbounded_channel();
+        let state = AppState::new(
+            tauqe_core::config::AppConfig::default(),
+            root.clone(),
+            history_sender,
+            out,
+        );
+
+        let item = finding_with_subplan("The parser panics on truncated input.");
+        let session = tauqe_protocol::ReviewSession {
+            id: "rev-interrupt".to_string(),
+            title: "Interrupt Audit".to_string(),
+            created_at: 100,
+            model: tauqe_protocol::ModelRef::openrouter("test-model"),
+            description: None,
+            user_prompt: None,
+            target_files: vec![],
+            items: vec![item.clone()],
+            raw_markdown: String::new(),
+        };
+        ReviewStorage::save_session(&root, &session).unwrap();
+
+        let mut plan = Plan {
+            id: "rev-interrupt".to_string(),
+            title: "Interrupt Audit".to_string(),
+            items: item.subplan.clone(),
+            ..Default::default()
+        };
+
+        // A healthy write persists the interruption record.
+        finish_subplan_interrupted(
+            &state,
+            &root,
+            "rev-interrupt",
+            7,
+            &mut plan,
+            "I stopped after the second hunk failed.",
+            "sub-step failed",
+        )
+        .await
+        .expect("healthy interruption write succeeds");
+        let stored = ReviewStorage::load_review(&root, "rev-interrupt")
+            .unwrap()
+            .unwrap();
+        let issue = stored.issues().into_iter().next().unwrap();
+        assert_eq!(issue.status, IssueStatus::Skipped);
+        assert!(issue
+            .note
+            .as_deref()
+            .is_some_and(|note| note.starts_with(SUBPLAN_INTERRUPTED_NOTE_PREFIX)));
+
+        // A corrupted session file makes the session unresolvable, so the next
+        // interruption write cannot land on disk: the failure must be
+        // returned, not discarded. Review storage skips an unparseable session
+        // file and reports the session as missing, so the surfaced diagnostic
+        // is the not-persisted message rather than a raw parse error.
+        let review_file = ReviewStorage::reviews_dir(&root).join("rev-interrupt.json");
+        std::fs::write(&review_file, b"{ not a review session }").unwrap();
+        let err = finish_subplan_interrupted(
+            &state,
+            &root,
+            "rev-interrupt",
+            7,
+            &mut plan,
+            "",
+            "sub-step failed",
+        )
+        .await
+        .expect_err("persistence failure must surface");
+        assert!(err.contains("was not persisted"));
+        assert!(err.contains("rev-interrupt"));
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
 }

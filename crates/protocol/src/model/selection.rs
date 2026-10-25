@@ -1,15 +1,26 @@
 use serde::{Deserialize, Serialize};
 
+use super::effort::ReasoningEffort;
 use super::entry::ModelRolesSummary;
 use super::reference::ModelRef;
 use super::role::ModelRole;
 
-/// Target model selection: either an abstract semantic role or an explicit model reference.
+/// Target model selection: an abstract semantic role, an explicit model
+/// reference, or an explicit role-list rung carrying the reasoning depth of
+/// the configured entry the developer picked.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum ModelSelection {
     Role(ModelRole),
     Specific(ModelRef),
+    /// Explicit rung of a role list: the model together with the reasoning
+    /// effort of the configured entry, so no consumer re-derives the depth by
+    /// matching the model against the configured role lists.
+    Tier {
+        model: ModelRef,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        effort: Option<ReasoningEffort>,
+    },
 }
 
 impl std::fmt::Display for ModelSelection {
@@ -17,6 +28,10 @@ impl std::fmt::Display for ModelSelection {
         match self {
             ModelSelection::Role(role) => write!(f, "{}", role),
             ModelSelection::Specific(model) => write!(f, "{}", model),
+            ModelSelection::Tier { model, effort } => match effort {
+                Some(effort) => write!(f, "{} [{}]", model, effort),
+                None => write!(f, "{}", model),
+            },
         }
     }
 }
@@ -123,5 +138,55 @@ mod tests {
             ModelSelection::default(),
             ModelSelection::Role(ModelRole::Primary)
         );
+    }
+
+    #[test]
+    fn test_model_selection_tier_serde_display_and_hash() {
+        // A tier carrying a reasoning depth round-trips through the untagged
+        // wire form: both coordinates of the picked role entry travel together.
+        let tier = ModelSelection::Tier {
+            model: ModelRef::openrouter("anthropic/claude-3.5-sonnet"),
+            effort: Some(ReasoningEffort::High),
+        };
+        let json = serde_json::to_string(&tier).unwrap();
+        assert!(json.contains("\"effort\":\"high\""), "got: {json}");
+        let de: ModelSelection = serde_json::from_str(&json).unwrap();
+        assert_eq!(de, tier);
+
+        // A tier without a depth serializes compactly and reads back with no
+        // effort.
+        let bare = ModelSelection::Tier {
+            model: ModelRef::openrouter("google/gemini-flash-latest"),
+            effort: None,
+        };
+        let bare_json = serde_json::to_string(&bare).unwrap();
+        assert!(!bare_json.contains("effort"), "got: {bare_json}");
+        let de_bare: ModelSelection = serde_json::from_str(&bare_json).unwrap();
+        assert_eq!(de_bare, bare);
+
+        // The established forms keep decoding unchanged: a role string and a
+        // structured model reference never collide with the tier shape.
+        assert_eq!(
+            serde_json::from_str::<ModelSelection>("\"coder\"").unwrap(),
+            ModelSelection::Role(ModelRole::Coder)
+        );
+        let specific_json =
+            serde_json::to_string(&ModelSelection::Specific(ModelRef::openrouter("a/b"))).unwrap();
+        assert_eq!(
+            serde_json::from_str::<ModelSelection>(&specific_json).unwrap(),
+            ModelSelection::Specific(ModelRef::openrouter("a/b"))
+        );
+
+        // Display renders the model plus the bracketed depth, mirroring the
+        // single interface label rule.
+        assert_eq!(tier.to_string(), "openrouter:anthropic/claude-3.5-sonnet [high]");
+        assert_eq!(bare.to_string(), "openrouter:google/gemini-flash-latest");
+
+        // Equality and hashing distinguish tiers by both coordinates.
+        let mut tiers = std::collections::HashSet::new();
+        tiers.insert(tier.clone());
+        assert!(!tiers.insert(tier), "an equal tier is already present");
+        tiers.insert(bare);
+        assert_eq!(tiers.len(), 2);
     }
 }

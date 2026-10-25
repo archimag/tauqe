@@ -104,6 +104,12 @@ pub(super) async fn publish_plan(
 /// `PlanStorage` serializes through a process-global mutex and writes to disk,
 /// so persisting and reloading the plan must run on the blocking pool rather
 /// than on an async worker.
+///
+/// Best-effort variant: a persistence failure is journaled inside
+/// [`set_step_status_checked`] and swallowed, which suits the `InProgress`
+/// publication and the `Todo` reverts that accompany an already-reported
+/// failure. Terminal transitions whose outcome must match the durable record
+/// call the checked variant instead.
 pub(super) async fn set_step_status(
     state: &Arc<AppState>,
     repo_root: &Path,
@@ -111,6 +117,24 @@ pub(super) async fn set_step_status(
     step_id: &str,
     status: PlanItemStatus,
 ) {
+    // This wrapper is the single sanctioned best-effort boundary: the failure
+    // is already journaled by the checked variant, so discarding the result
+    // here keeps the write observable without inventing a fresh operation id.
+    let _ = set_step_status_checked(state, repo_root, plan_id, step_id, status).await;
+}
+
+/// Persists a terminal plan step status and publishes the change.
+///
+/// Returns `Err` when the write does not land on disk — the storage error, or a
+/// not-found diagnostic — so the caller reports the step as failed instead of
+/// letting the batch outcome diverge from the persisted state.
+pub(super) async fn set_step_status_checked(
+    state: &Arc<AppState>,
+    repo_root: &Path,
+    plan_id: &str,
+    step_id: &str,
+    status: PlanItemStatus,
+) -> Result<(), String> {
     let update_root = repo_root.to_path_buf();
     let plan_id_owned = plan_id.to_string();
     let step_id_owned = step_id.to_string();
@@ -119,8 +143,35 @@ pub(super) async fn set_step_status(
     })
     .await;
 
-    if let Ok(Some(plan)) = updated {
-        publish_plan(state, repo_root, plan, plan_id).await;
+    match updated {
+        Ok(Some(plan)) => {
+            publish_plan(state, repo_root, plan, plan_id).await;
+            Ok(())
+        }
+        Ok(None) => {
+            let message = format!(
+                "Step '{}' not found in plan '{}'; status '{}' was not persisted",
+                step_id, plan_id, status
+            );
+            tracing::warn!(
+                plan_id = plan_id,
+                step_id = step_id,
+                status = %status,
+                "{}",
+                message
+            );
+            Err(message)
+        }
+        Err(err) => {
+            tracing::warn!(
+                plan_id = plan_id,
+                step_id = step_id,
+                status = %status,
+                error = %err,
+                "plan step status was not persisted"
+            );
+            Err(err)
+        }
     }
 }
 
@@ -147,4 +198,59 @@ pub(super) fn unmet_dependencies(plan: &Plan, item: &PlanItem) -> Vec<String> {
         })
         .map(|dep| format!("#{}", dep))
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tauqe_core::config::AppConfig;
+
+    /// A terminal plan-step status write must surface a persistence failure
+    /// instead of discarding it, so the batch outcome can never claim a `Done`
+    /// step the durable record does not hold.
+    #[tokio::test]
+    async fn checked_step_status_surfaces_persistence_failure() {
+        let root = std::env::temp_dir().join(format!(
+            "tauqe-plan-persist-{}",
+            crate::state::next_operation_id()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let (out, _rx) = crate::transport::OutChannel::new();
+        let (history_sender, _history_rx) = tokio::sync::mpsc::unbounded_channel();
+        let state = AppState::new(AppConfig::default(), root.clone(), history_sender, out);
+
+        let plan = Plan {
+            id: "persist-plan".to_string(),
+            title: "Persistence".to_string(),
+            items: vec![PlanItem {
+                id: "1".to_string(),
+                title: "Step".to_string(),
+                status: PlanItemStatus::Todo,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        PlanStorage::save_plan(&root, &plan).unwrap();
+
+        // A healthy terminal write persists the status and reports success.
+        set_step_status_checked(&state, &root, "persist-plan", "1", PlanItemStatus::Done)
+            .await
+            .expect("healthy write succeeds");
+        let stored = PlanStorage::load_plan(&root, "persist-plan")
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.find_item("1").unwrap().status, PlanItemStatus::Done);
+
+        // A corrupted plan file makes the next status write fail: the failure
+        // must be returned so the caller reports a failed batch step instead
+        // of a silent success.
+        let plan_file = PlanStorage::plans_dir(&root).join("persist-plan.json");
+        std::fs::write(&plan_file, b"{ not a valid plan }").unwrap();
+        let err = set_step_status_checked(&state, &root, "persist-plan", "1", PlanItemStatus::Todo)
+            .await
+            .expect_err("persistence failure must surface");
+        assert!(err.contains("Failed to parse plan JSON"));
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
 }

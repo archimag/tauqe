@@ -53,6 +53,12 @@ the end of the turn.
 6. **Order is deterministic.** Files render in insertion order, never in
    alphabetical order, because the context block is the cached prefix of every
    later round of the same turn.
+7. **The prompt prefix, model identity, and provider session travel together.**
+   A dialogue keeps one session while the context block stays byte-identical and
+   the target model remains unchanged. Session rotation is triggered at two
+   deterministic boundaries: when the context block shrinks (removing Auto files
+   or clearing context) and when the effective model changes. Altering reasoning
+   effort alone or reselecting the same model preserves session affinity.
 
 ---
 
@@ -96,6 +102,9 @@ before it can be touched.
 - **Revision** — a counter advanced only when layer contents actually change, so a
   no-op mutation never disturbs clients.
 - **Estimated tokens** — `size_bytes / 4`, the single estimate every budget uses.
+- **Dialogue session** — the provider-level identity an interactive dialogue
+  binds its requests to. It routes related requests to the same cache-warm node
+  and lives exactly as long as the prompt prefix it warmed.
 
 ---
 
@@ -154,6 +163,22 @@ contents merge into the live context.
 Access only moves upward in the Auto layer: a discovery request can upgrade a
 read-only entry to editable, never the reverse. A read-only request against an
 already editable file is a no-op.
+
+The layer is also the part of the prompt an interactive dialogue reuses across
+rounds, so its lifecycle is tied to the provider's session affinity. A dialogue
+keeps one session identifier while the context block stays byte-identical and
+the effective model remains unchanged, which is what lets a series of answers
+reuse the prefix cache warmed by its predecessor. Rotation occurs on two
+deterministic events: when clearing the Auto layer shrinks the context block,
+and when switching to a different effective model. Clearing the layer — from the
+Context view, through `context/clear`, or at the end of a turn that changed
+files — shrinks that block, so the same decision rotates the identifier and the
+next request opens a fresh session. The rotation follows the boolean the clear
+reports, so a repeated clear on an already empty layer leaves both the block and
+the session untouched. Switching the effective model likewise rotates the
+identifier (`maybe_rotate_session_on_model_change`), because physical KV caches
+are model-specific; modifying only reasoning effort or reselecting the identical
+model keeps the session intact.
 
 ### 2.3.4 Budgets and pattern intake
 
@@ -216,6 +241,10 @@ This keeps clients honest: a revision bump always means the visible state moved.
 - **It is not durable memory.** The Auto layer is swept at the end of the turn.
   Turn-local working memory lives in the scratchpad; session memory lives in
   history.
+- **It is not one session forever.** The provider session rotates whenever Auto
+  files are actually removed or when the effective model changes, because
+  neither a shrunken context block nor a different model can reuse the cache its
+  warm identifier points at.
 - **It does not make the Pinned layer editable.** `[context].pinned` owns those
   entries; the interface cannot add, remove, or re-permission a pinned path.
 - **It is not sorted.** Alphabetical order is never imposed, because stable

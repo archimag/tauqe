@@ -17,13 +17,16 @@ pub(crate) use fuzzy::apply_replace;
 
 use atomic::commit_staged_edits;
 
+/// Every rejection a staged change set can produce.
+///
+/// A read-only context file is deliberately not among them. The harness
+/// auto-promotes such a file to editable once a change set that touches it is
+/// applied, so auto-promotion is the single documented enforcement path and the
+/// enum never advertises a rejection the engine cannot produce.
 #[derive(Debug, Error)]
 pub enum EditError {
     #[error("File '{0}' is not in context. Only files explicitly in context can be edited.")]
     NotInContext(String),
-
-    #[error("File '{0}' is read-only. Change its access to editable before applying edits.")]
-    ReadOnly(String),
 
     #[error("File '{0}' does not exist on disk.")]
     FileNotFound(String),
@@ -45,6 +48,11 @@ pub enum EditError {
 
     #[error("In file '{path}': invalid project configuration: {message}")]
     InvalidConfig { path: String, message: String },
+
+    #[error(
+        "Path '{0}' is excluded by the repository ignore rules (.gitignore or .git/info/exclude). Choose a path the repository tracks."
+    )]
+    IgnoredByGit(String),
 }
 
 /// Cumulative in-memory state. Paths are normalized relative to the repository.
@@ -95,6 +103,73 @@ pub fn stage_and_validate_edits(
     })
 }
 
+/// Stages edits in memory and streams every staged file through the project filter.
+///
+/// Virtual staging has two halves now that formatting is a pure stream: the change
+/// set is applied to memory by [`stage_and_validate_edits`], and the content of
+/// the files this attempt staged is then passed through the declared
+/// `[project.format]` filter on standard input. What lands in
+/// [`StageEditsResult::staged_state`] is therefore already formatted, so the code
+/// that eventually reaches the working tree is the formatted code and Git never
+/// observes an unformatted intermediate.
+///
+/// The filter is resolved once per call, so a change set costs one configuration
+/// read instead of one per file. A repository that declares no filter keeps the
+/// authored content, and a filter that fails or times out does the same: a broken
+/// formatter never blocks a turn.
+pub async fn prepare_staged_edits(
+    repo_root: &Path,
+    context_manager: &ContextManager,
+    edits: &[EditOperation],
+    initial_staged: Option<&StagedEditsState>,
+) -> StageEditsResult {
+    let mut result = stage_and_validate_edits(repo_root, context_manager, edits, initial_staged);
+    format_staged_files(repo_root, &mut result).await;
+    result
+}
+
+/// Streams the files staged in this attempt through the project format filter.
+///
+/// Only paths staged in the current attempt are filtered. Content retained from an
+/// earlier attempt already passed through the formatter, and running the filter
+/// over it again would spawn a process for bytes that cannot change.
+async fn format_staged_files(repo_root: &Path, result: &mut StageEditsResult) {
+    if result.successful_paths.is_empty() {
+        return;
+    }
+
+    // The filter is a property of the repository, so the declaration is resolved
+    // once and reused for every file of the change set.
+    let project = crate::toolchain::effective_project_config(repo_root, None).await;
+
+    for path in result.successful_paths.clone() {
+        let Some(authored) = result.staged_state.staged_files.get(&path).cloned() else {
+            // A move records both sides of the rename, and only its destination
+            // holds content; a deletion holds none.
+            continue;
+        };
+        let Some(outcome) =
+            crate::toolchain::format_with_project_config(repo_root, &project, &authored, None)
+                .await
+        else {
+            // The repository declares no in-memory formatter.
+            return;
+        };
+        if outcome.formatted {
+            result
+                .staged_state
+                .staged_files
+                .insert(path, outcome.content);
+        } else if let Some(reason) = outcome.error {
+            tracing::warn!(
+                file = %path,
+                reason = %reason,
+                "in-memory formatter kept the authored content"
+            );
+        }
+    }
+}
+
 fn stage_and_validate_edits_inner(
     repo_root: &Path,
     context_manager: &ContextManager,
@@ -110,6 +185,7 @@ fn stage_and_validate_edits_inner(
     let mut file_order = Vec::new();
     let mut grouped: HashMap<String, Vec<&EditOperation>> = HashMap::new();
     let mut invalid_paths = HashSet::new();
+    let ignored_paths = ignored_target_paths(repo_root, context_manager, edits);
 
     let flush_grouped = |grouped: &mut HashMap<String, Vec<&EditOperation>>,
                          file_order: &mut Vec<String>,
@@ -182,6 +258,14 @@ fn stage_and_validate_edits_inner(
                     continue;
                 }
 
+                if ignored_paths.contains(&clean_to) {
+                    result.failed_files.push(FailedFileEdit {
+                        path: clean_to.clone(),
+                        error: EditError::IgnoredByGit(clean_to),
+                    });
+                    continue;
+                }
+
                 let in_context = context_manager.contains(&clean_from).unwrap_or(false);
                 let newly_created = !repo_root.join(&clean_from).exists()
                     && result.staged_state.staged_files.contains_key(&clean_from);
@@ -249,6 +333,20 @@ fn stage_and_validate_edits_inner(
             | EditOperation::Delete { path }
             | EditOperation::Overwrite { path, .. } => match context_manager.normalize_path(path) {
                 Ok(clean_path) => {
+                    // Git refuses to stage a path its ignore rules exclude,
+                    // so writing such a path is rejected here, while the
+                    // change set is still purely in memory.
+                    let writes_body = matches!(
+                        edit,
+                        EditOperation::Create { .. } | EditOperation::Overwrite { .. }
+                    );
+                    if writes_body && ignored_paths.contains(&clean_path) {
+                        result.failed_files.push(FailedFileEdit {
+                            path: clean_path.clone(),
+                            error: EditError::IgnoredByGit(clean_path),
+                        });
+                        continue;
+                    }
                     if !grouped.contains_key(&clean_path) {
                         file_order.push(clean_path.clone());
                     }
@@ -268,6 +366,50 @@ fn stage_and_validate_edits_inner(
 
     flush_grouped(&mut grouped, &mut file_order, &mut result);
     result
+}
+
+/// Resolves the repository paths a change set would create, rewrite, or move to.
+///
+/// A path Git refuses to stage can only be detected after the whole turn has
+/// already applied its edits, which aborts the Git transaction instead of the
+/// edit. Asking the question during staging keeps the failure inside the turn:
+/// one batched `git check-ignore` call answers for the whole change set, and a
+/// repository Git cannot inspect degrades to "nothing is ignored" rather than
+/// blocking an otherwise valid turn.
+fn ignored_target_paths(
+    repo_root: &Path,
+    context_manager: &ContextManager,
+    edits: &[EditOperation],
+) -> HashSet<String> {
+    let mut candidates: Vec<String> = edits
+        .iter()
+        .filter_map(|edit| match edit {
+            EditOperation::Create { path, .. } | EditOperation::Overwrite { path, .. } => {
+                Some(path)
+            }
+            EditOperation::Move { to, .. } => Some(to),
+            _ => None,
+        })
+        .filter_map(|path| context_manager.normalize_path(path).ok())
+        .collect();
+
+    candidates.sort();
+    candidates.dedup();
+    if candidates.is_empty() {
+        return HashSet::new();
+    }
+
+    match crate::git::state::gitignored_paths(repo_root, &candidates) {
+        Ok(ignored) => ignored.into_iter().collect(),
+        Err(err) => {
+            tracing::warn!(
+                "Failed to check repository ignore rules for {} path(s): {}",
+                candidates.len(),
+                err
+            );
+            HashSet::new()
+        }
+    }
 }
 
 /// None represents a staged deletion. Disk reads are deferred until a replace
@@ -396,39 +538,30 @@ fn validate_staged_project_config(path: &str, content: Option<&str>) -> Result<(
     })
 }
 
-/// Applies an EditProposal after validating every file in memory.
+/// Applies an EditProposal after validating and formatting every file in memory.
 ///
 /// If ANY edit fails validation, no files on disk are modified. The commit is
 /// atomic: new contents are staged in temporary sibling files and renamed into
 /// place, and a mid-commit IO failure rolls the working tree back to its
 /// pre-commit state.
-pub fn apply_edit_proposal(
+pub async fn apply_edit_proposal(
     repo_root: &Path,
     context_manager: &mut ContextManager,
     proposal: &EditProposal,
 ) -> Result<Vec<String>, EditError> {
-    // Writing the validated change set, including creating parent directories,
-    // is blocking file I/O. Run it through the blocking helper so a burst of
-    // writes never stalls an async worker thread.
-    crate::blocking::run_blocking(|| {
-        apply_edit_proposal_inner(repo_root, context_manager, proposal)
-    })
-}
-
-fn apply_edit_proposal_inner(
-    repo_root: &Path,
-    context_manager: &mut ContextManager,
-    proposal: &EditProposal,
-) -> Result<Vec<String>, EditError> {
-    let result = stage_and_validate_edits(repo_root, context_manager, &proposal.edits, None);
+    // The change set is applied and formatted purely in memory first, so the
+    // working tree only ever receives code the project filter already accepted.
+    let result = prepare_staged_edits(repo_root, context_manager, &proposal.edits, None).await;
     if let Some(failed) = result.failed_files.into_iter().next() {
         return Err(failed.error);
     }
 
-    // Commit the validated change set to disk with all-or-nothing semantics.
-    // The context layer is only touched after every file is committed, so a
-    // disk failure never leaves context and disk out of sync.
-    commit_staged_edits(repo_root, &result.staged_state, &result.successful_paths)?;
+    // Writing the validated change set, including creating parent directories,
+    // is blocking file I/O. Run it through the blocking helper so a burst of
+    // writes never stalls an async worker thread.
+    crate::blocking::run_blocking(|| {
+        commit_staged_edits(repo_root, &result.staged_state, &result.successful_paths)
+    })?;
 
     // Reconcile the context layer with the committed change set strictly after
     // the disk commit succeeds. The net transition is derived directly from the
@@ -437,22 +570,26 @@ fn apply_edit_proposal_inner(
     // ensured present and editable. Deriving the transition from the net state
     // keeps chained moves (`a -> b -> c`), moves whose source path is recreated,
     // and mixed operation sequences from desynchronizing context from disk.
-    for path in &result.staged_state.deleted_paths {
-        let _ = context_manager.remove_file(path);
-    }
-    for path in result.staged_state.staged_files.keys() {
-        if context_manager.contains(path).unwrap_or(false) {
-            let _ = context_manager.update_file_metadata(path);
-            let _ = context_manager.set_access(path, tauqe_protocol::ContextAccess::Editable);
-        } else {
-            // A path absent from context is a newly created file (or a move
-            // destination). Register it in the durable user layer rather than
-            // the transient auto layer: the turn finalizer sweeps the auto
-            // layer at turn completion and would otherwise drop the file the
-            // turn just created.
-            let _ = context_manager.add_file(path, tauqe_protocol::ContextAccess::Editable);
+    //
+    // A path already present keeps the layer that owns it, and a path the turn
+    // created joins the transient auto layer. The user layer is never widened by
+    // a turn: it holds exactly the files the developer added by hand.
+    crate::blocking::run_blocking(|| {
+        for path in &result.staged_state.deleted_paths {
+            let _ = context_manager.remove_file(path);
         }
-    }
+        for path in result.staged_state.staged_files.keys() {
+            if context_manager.contains(path).unwrap_or(false) {
+                let _ = context_manager.update_file_metadata(path);
+                let _ = context_manager.set_access(path, tauqe_protocol::ContextAccess::Editable);
+            } else {
+                // A path absent from context is a file the turn created (or a
+                // move destination), so it widens the transient auto layer only.
+                let _ =
+                    context_manager.add_auto_file(path, tauqe_protocol::ContextAccess::Editable);
+            }
+        }
+    });
     Ok(result.successful_paths)
 }
 
@@ -470,8 +607,8 @@ mod staging_tests {
         }
     }
 
-    #[test]
-    fn partial_failure_rolls_back_entire_file_and_keeps_disk_unchanged() {
+    #[tokio::test]
+    async fn partial_failure_rolls_back_entire_file_and_keeps_disk_unchanged() {
         let dir = tempdir().unwrap();
         let root = dir.path();
         std::fs::write(root.join("a.rs"), "one").unwrap();
@@ -504,7 +641,7 @@ mod staging_tests {
             summary: "test".into(),
             edits,
         };
-        assert!(apply_edit_proposal(root, &mut cm, &proposal).is_err());
+        assert!(apply_edit_proposal(root, &mut cm, &proposal).await.is_err());
         assert_eq!(std::fs::read_to_string(root.join("b.rs")).unwrap(), "two");
     }
 
@@ -536,8 +673,8 @@ mod staging_tests {
         assert_eq!(std::fs::read_to_string(root.join("a.rs")).unwrap(), "one");
     }
 
-    #[test]
-    fn create_replace_delete_and_recreate_follow_operation_order() {
+    #[tokio::test]
+    async fn create_replace_delete_and_recreate_follow_operation_order() {
         let dir = tempdir().unwrap();
         let root = dir.path();
         let mut cm = ContextManager::new(root.to_path_buf());
@@ -578,7 +715,7 @@ mod staging_tests {
             ],
         };
         assert_eq!(
-            apply_edit_proposal(root, &mut cm, &proposal).unwrap(),
+            apply_edit_proposal(root, &mut cm, &proposal).await.unwrap(),
             vec!["new.rs"]
         );
         assert_eq!(
@@ -586,16 +723,18 @@ mod staging_tests {
             "final"
         );
         assert!(cm.is_editable("new.rs").unwrap());
+        // The turn registers a created file in the transient auto layer; the
+        // user layer stays reserved for explicit manual additions.
         let state = cm.get_state();
         let new_item = state.items.iter().find(|i| i.path == "new.rs").unwrap();
-        assert_eq!(new_item.layer, ContextLayer::User);
+        assert_eq!(new_item.layer, ContextLayer::Auto);
         let deletion = EditProposal {
             summary: "delete".into(),
             edits: vec![EditOperation::Delete {
                 path: "new.rs".into(),
             }],
         };
-        apply_edit_proposal(root, &mut cm, &deletion).unwrap();
+        apply_edit_proposal(root, &mut cm, &deletion).await.unwrap();
         assert!(!root.join("new.rs").exists());
         assert!(!cm.contains("new.rs").unwrap());
     }
@@ -648,8 +787,8 @@ mod staging_tests {
         ));
     }
 
-    #[test]
-    fn readonly_file_in_context_can_be_edited_and_promoted_to_editable() {
+    #[tokio::test]
+    async fn readonly_file_in_context_can_be_edited_and_promoted_to_editable() {
         let dir = tempdir().unwrap();
         let root = dir.path();
         std::fs::write(root.join("ref.rs"), "fn original() {}").unwrap();
@@ -669,7 +808,7 @@ mod staging_tests {
             summary: "Update read-only file".into(),
             edits: vec![edit],
         };
-        let changed = apply_edit_proposal(root, &mut cm, &proposal).unwrap();
+        let changed = apply_edit_proposal(root, &mut cm, &proposal).await.unwrap();
         assert_eq!(changed, vec!["ref.rs"]);
         assert_eq!(
             std::fs::read_to_string(root.join("ref.rs")).unwrap(),
@@ -678,8 +817,8 @@ mod staging_tests {
         assert!(cm.is_editable("ref.rs").unwrap());
     }
 
-    #[test]
-    fn overwrite_replaces_existing_file_and_requires_context() {
+    #[tokio::test]
+    async fn overwrite_replaces_existing_file_and_requires_context() {
         let dir = tempdir().unwrap();
         let root = dir.path();
         std::fs::write(root.join("a.rs"), "one").unwrap();
@@ -709,15 +848,15 @@ mod staging_tests {
             summary: "overwrite".into(),
             edits: vec![op],
         };
-        apply_edit_proposal(root, &mut cm, &proposal).unwrap();
+        apply_edit_proposal(root, &mut cm, &proposal).await.unwrap();
         assert_eq!(
             std::fs::read_to_string(root.join("a.rs")).unwrap(),
             "all new"
         );
     }
 
-    #[test]
-    fn test_move_file_stages_and_applies() {
+    #[tokio::test]
+    async fn test_move_file_stages_and_applies() {
         let dir = tempdir().unwrap();
         let root = dir.path();
         std::fs::write(root.join("old.rs"), "fn hello() {}").unwrap();
@@ -738,7 +877,7 @@ mod staging_tests {
             summary: "rename".into(),
             edits: vec![move_op],
         };
-        apply_edit_proposal(root, &mut cm, &proposal).unwrap();
+        apply_edit_proposal(root, &mut cm, &proposal).await.unwrap();
         assert!(!root.join("old.rs").exists());
         assert_eq!(
             std::fs::read_to_string(root.join("new.rs")).unwrap(),
@@ -748,8 +887,8 @@ mod staging_tests {
         assert!(!cm.contains("old.rs").unwrap());
     }
 
-    #[test]
-    fn chained_moves_leave_only_the_final_destination_in_context() {
+    #[tokio::test]
+    async fn chained_moves_leave_only_the_final_destination_in_context() {
         let dir = tempdir().unwrap();
         let root = dir.path();
         std::fs::write(root.join("a.rs"), "fn hello() {}").unwrap();
@@ -769,7 +908,7 @@ mod staging_tests {
                 },
             ],
         };
-        apply_edit_proposal(root, &mut cm, &proposal).unwrap();
+        apply_edit_proposal(root, &mut cm, &proposal).await.unwrap();
 
         assert!(!root.join("a.rs").exists());
         assert!(!root.join("b.rs").exists());
@@ -782,8 +921,8 @@ mod staging_tests {
         assert!(!cm.contains("b.rs").unwrap());
     }
 
-    #[test]
-    fn move_with_recreated_source_keeps_source_and_destination_in_context() {
+    #[tokio::test]
+    async fn move_with_recreated_source_keeps_source_and_destination_in_context() {
         let dir = tempdir().unwrap();
         let root = dir.path();
         std::fs::write(root.join("a.rs"), "fn original() {}").unwrap();
@@ -803,7 +942,7 @@ mod staging_tests {
                 },
             ],
         };
-        apply_edit_proposal(root, &mut cm, &proposal).unwrap();
+        apply_edit_proposal(root, &mut cm, &proposal).await.unwrap();
 
         assert_eq!(
             std::fs::read_to_string(root.join("b.rs")).unwrap(),
@@ -834,8 +973,8 @@ mod staging_tests {
         assert!(empty.successful_edits.is_empty());
     }
 
-    #[test]
-    fn created_file_survives_the_auto_layer_sweep() {
+    #[tokio::test]
+    async fn created_file_joins_the_auto_layer_not_the_user_layer() {
         let dir = tempdir().unwrap();
         let root = dir.path();
         let mut cm = ContextManager::new(root.to_path_buf());
@@ -847,19 +986,96 @@ mod staging_tests {
                 content: "pub fn generated() {}\n".into(),
             }],
         };
-        apply_edit_proposal(root, &mut cm, &proposal).unwrap();
+        apply_edit_proposal(root, &mut cm, &proposal).await.unwrap();
         assert!(cm.contains("generated.rs").unwrap());
         assert!(cm.is_editable("generated.rs").unwrap());
 
-        // The turn finalizer clears the transient auto layer; a created file
-        // must live in the durable user layer so the end-of-turn sweep does
-        // not silently drop the file the turn just produced.
-        cm.clear_auto();
-        assert!(
-            cm.contains("generated.rs").unwrap(),
-            "a created file must survive the end-of-turn auto sweep"
+        // The turn only widens the transient auto layer: the user layer holds
+        // exactly what the developer added by hand, so a file the model created
+        // never appears there.
+        assert_eq!(cm.auto_files(), vec!["generated.rs".to_string()]);
+        let state = cm.get_state();
+        let item = state
+            .items
+            .iter()
+            .find(|item| item.path == "generated.rs")
+            .expect("created file is in context");
+        assert_eq!(item.layer, ContextLayer::Auto);
+
+        // An explicit manual addition is the only path into the user layer.
+        cm.add_file("generated.rs", ContextAccess::Editable)
+            .unwrap();
+        assert!(cm.auto_files().is_empty());
+        let state = cm.get_state();
+        let item = state
+            .items
+            .iter()
+            .find(|item| item.path == "generated.rs")
+            .expect("promoted file is in context");
+        assert_eq!(item.layer, ContextLayer::User);
+    }
+
+    #[test]
+    fn ignored_paths_are_rejected_for_create_overwrite_and_move() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        crate::git::run_git(Some(root), &["init"]).unwrap();
+        std::fs::write(root.join(".gitignore"), "target/\n*.log\n").unwrap();
+        std::fs::write(root.join("scratch.log"), "old\n").unwrap();
+        std::fs::write(root.join("source.rs"), "fn hello() {}\n").unwrap();
+        let mut cm = ContextManager::new(root.to_path_buf());
+        cm.add_file(".gitignore", ContextAccess::ReadOnly).unwrap();
+        cm.add_file("scratch.log", ContextAccess::Editable).unwrap();
+        cm.add_file("source.rs", ContextAccess::Editable).unwrap();
+
+        let rejected = vec![
+            EditOperation::Create {
+                path: "target/generated.rs".into(),
+                content: "fn generated() {}".into(),
+            },
+            EditOperation::Overwrite {
+                path: "scratch.log".into(),
+                content: "new\n".into(),
+            },
+            EditOperation::Move {
+                from: "source.rs".into(),
+                to: "target/moved.rs".into(),
+            },
+        ];
+        for operation in rejected {
+            let result =
+                stage_and_validate_edits(root, &cm, std::slice::from_ref(&operation), None);
+            assert!(
+                !result.is_success(),
+                "an ignored path must be rejected: {operation:?}"
+            );
+            assert!(matches!(
+                &result.failed_files[0].error,
+                EditError::IgnoredByGit(_)
+            ));
+            assert!(result.staged_state.staged_files.is_empty());
+            assert!(result.staged_state.deleted_paths.is_empty());
+        }
+
+        // A path no ignore rule matches stages exactly as before.
+        let allowed = EditOperation::Create {
+            path: "src/generated.rs".into(),
+            content: "fn generated() {}".into(),
+        };
+        let result = stage_and_validate_edits(root, &cm, std::slice::from_ref(&allowed), None);
+        assert!(result.is_success(), "{:?}", result.failed_files);
+        assert_eq!(
+            result.staged_state.staged_files["src/generated.rs"],
+            "fn generated() {}"
         );
-        assert!(cm.is_editable("generated.rs").unwrap());
+
+        // Nothing above reached disk.
+        assert!(!root.join("target").exists());
+        assert_eq!(
+            std::fs::read_to_string(root.join("scratch.log")).unwrap(),
+            "old\n"
+        );
+        assert!(root.join("source.rs").exists());
     }
 
     /// Valid project configuration used by the configuration-validation tests.
@@ -945,6 +1161,109 @@ mod staging_tests {
             std::fs::read_to_string(root.join("tauqe.toml")).unwrap(),
             VALID_CONFIG,
             "staging must never write the configuration to disk"
+        );
+    }
+
+    /// Declares an in-memory project formatter running `script` under `sh`.
+    #[cfg(unix)]
+    fn declare_format_filter(root: &Path, script: &str) {
+        std::fs::write(
+            root.join("tauqe.toml"),
+            format!(
+                "[project.format]\ncommand = \"sh\"\nargs = [\"-c\", \"{}\"]\n",
+                script
+            ),
+        )
+        .unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn prepare_formats_staged_content_without_touching_disk() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        std::fs::write(root.join("a.rs"), "pub fn value() -> i32 { 0 }\n").unwrap();
+        declare_format_filter(root, "tr a-z A-Z");
+        let mut cm = ContextManager::new(root.to_path_buf());
+        cm.add_file("a.rs", ContextAccess::Editable).unwrap();
+
+        let result = prepare_staged_edits(
+            root,
+            &cm,
+            &[replace(
+                "a.rs",
+                "pub fn value() -> i32 { 0 }",
+                "pub fn value() -> i32 { 42 }",
+            )],
+            None,
+        )
+        .await;
+
+        assert!(result.is_success(), "{:?}", result.failed_files);
+        assert_eq!(
+            result.staged_state.staged_files["a.rs"],
+            "PUB FN VALUE() -> I32 { 42 }\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join("a.rs")).unwrap(),
+            "pub fn value() -> i32 { 0 }\n",
+            "the staged content is formatted in memory, never on disk"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn prepare_keeps_the_authored_content_when_the_filter_fails() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        std::fs::write(root.join("a.rs"), "pub fn value() -> i32 { 0 }\n").unwrap();
+        declare_format_filter(root, "printf 'formatter failed' >&2; exit 3");
+        let mut cm = ContextManager::new(root.to_path_buf());
+        cm.add_file("a.rs", ContextAccess::Editable).unwrap();
+
+        let result = prepare_staged_edits(
+            root,
+            &cm,
+            &[replace(
+                "a.rs",
+                "pub fn value() -> i32 { 0 }",
+                "pub fn value() -> i32 { 42 }",
+            )],
+            None,
+        )
+        .await;
+
+        assert!(result.is_success(), "{:?}", result.failed_files);
+        assert_eq!(
+            result.staged_state.staged_files["a.rs"], "pub fn value() -> i32 { 42 }\n",
+            "a failed filter must fall back to the authored content"
+        );
+    }
+
+    #[tokio::test]
+    async fn prepare_keeps_the_authored_content_without_a_declared_filter() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        std::fs::write(root.join("a.rs"), "pub fn value() -> i32 { 0 }\n").unwrap();
+        let mut cm = ContextManager::new(root.to_path_buf());
+        cm.add_file("a.rs", ContextAccess::Editable).unwrap();
+
+        let result = prepare_staged_edits(
+            root,
+            &cm,
+            &[replace(
+                "a.rs",
+                "pub fn value() -> i32 { 0 }",
+                "pub fn value() -> i32 { 42 }",
+            )],
+            None,
+        )
+        .await;
+
+        assert!(result.is_success(), "{:?}", result.failed_files);
+        assert_eq!(
+            result.staged_state.staged_files["a.rs"], "pub fn value() -> i32 { 42 }\n",
+            "a repository without a filter keeps the authored content"
         );
     }
 }

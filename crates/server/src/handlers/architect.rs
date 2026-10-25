@@ -4,6 +4,11 @@
 //! multi-round discovery loop are shared by plan horizon synthesis and review
 //! finding decomposition: both are the same Architect operation, so they run on
 //! exactly one implementation here instead of a copy per subsystem.
+//!
+//! Tier resolution and the lazy level-up escalation invariant are domain policy
+//! owned by the core engine (`tauqe_core::plan::prompt::resolve_architect_tier`),
+//! so this module renders the configuration that policy hands back and never
+//! re-derives the ladder itself.
 
 mod discovery;
 mod stream;
@@ -12,7 +17,7 @@ use std::sync::Arc;
 
 use tauqe_core::config::AppConfig;
 use tauqe_core::providers::{create_provider, LlmProvider};
-use tauqe_protocol::{ArchitectTier, ModelRole};
+use tauqe_protocol::ArchitectTier;
 
 use crate::state::AppState;
 
@@ -46,17 +51,4 @@ pub(crate) fn format_architect_tier(tier: &ArchitectTier) -> String {
         Some(effort) => format!("{} ({})", tier.model, effort),
         None => tier.model.to_string(),
     }
-}
-
-/// Alias of the configured Architect entry backing a resolved rung, if any.
-///
-/// The alias is looked up by the rung's model and reasoning depth, so an
-/// escalated wave shows the label of the configuration it actually runs on
-/// instead of the base entry's label.
-pub(crate) fn architect_alias(cfg: &AppConfig, tier: &ArchitectTier) -> Option<String> {
-    cfg.models
-        .role_entries(ModelRole::Architect)
-        .into_iter()
-        .find(|entry| entry.model == tier.model && entry.effort == tier.effort)
-        .and_then(|entry| entry.alias)
 }

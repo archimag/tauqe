@@ -4,7 +4,9 @@ use tauqe_protocol::{
     ModelResult, ModelResultProposal,
 };
 
-use crate::capabilities::{CapabilityRegistry, PromptRenderContext};
+use crate::capabilities::{
+    abort_invocations, custom_tool_invocations, CapabilityRegistry, PromptRenderContext,
+};
 use crate::edits::protocol::xml::engine::strip_all_control_tags;
 use crate::edits::stream::json::decode::{balanced_object_end, strip_code_fence};
 use crate::providers::{JsonSchemaDefinition, ResponseFormat};
@@ -17,276 +19,27 @@ use super::{ContextRequest, TerminalOutcome, VerifyOnSuccess, VerifyRequest, Ver
 pub struct StructuredEditProtocol;
 
 impl StructuredEditProtocol {
-    /// Fields owned by each capability in the structured-output schema.
+    /// Returns the edit schema of the interactive REPL capability surface.
     ///
-    /// The mapping is the single source of truth for schema pruning: a field
-    /// disappears from the wire schema as soon as the capability that owns it
-    /// is disabled.
-    const CAPABILITY_FIELDS: &'static [(LlmCapability, &'static [&'static str])] = &[
-        (LlmCapability::FileEdits, &["changes"]),
-        (
-            LlmCapability::Discovery,
-            &[
-                "context_requests",
-                "repo_searches",
-                "repo_dirs",
-                "repo_maps",
-                "dir_lists",
-            ],
-        ),
-        (LlmCapability::DocRequest, &["doc_requests"]),
-        (LlmCapability::ToolchainVerify, &["verify"]),
-        (LlmCapability::Scratchpad, &["scratchpad"]),
-        (LlmCapability::Outcome, &["outcome"]),
-        (LlmCapability::Blocked, &["blocked"]),
-        (LlmCapability::UserLanguage, &["user_language"]),
-    ];
-
-    /// Returns the edit schema for the full development capability set.
+    /// The default surface is intent-oriented, never transport-specific, so the
+    /// structured contour advertises exactly what the XML contour advertises.
     pub fn schema(editable_paths: &[String]) -> serde_json::Value {
-        Self::schema_for(&CapabilitySet::develop_structured(), editable_paths)
+        Self::schema_for(&CapabilitySet::interactive_repl(), editable_paths)
     }
 
     /// Builds the edit schema for exactly the enabled capabilities.
     ///
-    /// Prompt instructions, decoding, and the wire schema are all derived from
-    /// one [`CapabilitySet`], so a disabled capability contributes neither an
-    /// instruction nor a schema field. Keeping them in step prevents the model
-    /// from proposing a field the decoder would silently drop. Because the
-    /// schema is strict, pruning a property also prunes its `required` entry.
+    /// The registry composes the schema from the same capability modules that
+    /// render the prompt instructions and scope the decoder, so a disabled
+    /// capability contributes neither an instruction nor a schema field. A
+    /// property therefore cannot drift from the rules that describe it, and the
+    /// strict `required` list is derived from the emitted properties, so a
+    /// pruned property is never left required.
     pub fn schema_for(
         capabilities: &CapabilitySet,
-        editable_paths: &[String],
+        _editable_paths: &[String],
     ) -> serde_json::Value {
-        let mut schema = Self::full_schema(editable_paths);
-
-        let mut disabled: Vec<&'static str> = Vec::new();
-        for (capability, fields) in Self::CAPABILITY_FIELDS {
-            if !capabilities.contains(*capability) {
-                disabled.extend(fields.iter().copied());
-            }
-        }
-        if disabled.is_empty() {
-            return schema;
-        }
-
-        if let Some(properties) = schema
-            .get_mut("properties")
-            .and_then(|value| value.as_object_mut())
-        {
-            for field in &disabled {
-                properties.remove(*field);
-            }
-        }
-        if let Some(required) = schema
-            .get_mut("required")
-            .and_then(|value| value.as_array_mut())
-        {
-            required.retain(|field| match field.as_str() {
-                Some(name) => !disabled.contains(&name),
-                None => true,
-            });
-        }
-        schema
-    }
-
-    /// Complete edit-mode schema before capability pruning.
-    fn full_schema(_editable_paths: &[String]) -> serde_json::Value {
-        let doc_topics: Vec<&str> = DocTopic::ALL.iter().map(DocTopic::as_str).collect();
-        serde_json::json!({
-            "type": "object",
-            "properties": {
-                "message": {
-                    "type": "string",
-                    "description": "Conversational explanation or response to the user"
-                },
-                "changes": {
-                    "type": "array",
-                    "description": "List of structured code modification operations",
-                    "items": {
-                        "type": "object",
-                        "properties": {
-                            "op": {
-                                "type": "string",
-                                "enum": ["replace", "create", "delete", "move", "overwrite"],
-                                "description": "Operation type: 'replace' for modifying existing files, 'create' for new files, 'delete' for deleting files, 'move' for moving or renaming files, 'overwrite' for replacing the entire content of an existing file"
-                            },
-                            "path": {
-                                "type": "string",
-                                "description": "Relative repository path to the target file (source file for 'move')"
-                            },
-                            "to": {
-                                "type": "string",
-                                "description": "Target repository path for 'move' operation (empty string otherwise)"
-                            },
-                            "old_text": {
-                                "type": "string",
-                                "description": "Exact text to replace in the file (required for 'replace', empty string otherwise)"
-                            },
-                            "new_text": {
-                                "type": "string",
-                                "description": "Replacement text (for 'replace', empty string otherwise)"
-                            },
-                            "content": {
-                                "type": "string",
-                                "description": "Complete file content (required for 'create' and 'overwrite', empty string otherwise)"
-                            }
-                        },
-                        "required": ["op", "path", "to", "old_text", "new_text", "content"],
-                        "additionalProperties": false
-                    }
-                },
-                "context_requests": {
-                    "type": "array",
-                    "description": "Files to add to context before editing. Each entry is a repository-relative path (read-only) or a path prefixed with 'editable:' (e.g. 'editable:src/lib.rs')",
-                    "items": {
-                        "type": "string"
-                    }
-                },
-                "repo_searches": {
-                    "type": "array",
-                    "description": "Repository search requests to find symbols or text patterns across files using Rust / ripgrep regex",
-                    "items": {
-                        "type": "object",
-                        "properties": {
-                            "path": {
-                                "type": "string",
-                                "description": "Repository-relative directory or file path to search within (use '' or '.' for repository root)"
-                            },
-                            "regex": {
-                                "type": "string",
-                                "description": "Rust / ripgrep regular expression to search for"
-                            }
-                        },
-                        "required": ["path", "regex"],
-                        "additionalProperties": false
-                    }
-                },
-                "repo_dirs": {
-                    "type": "boolean",
-                    "description": "Whether the compact repository directory tree is requested; set true only when the repository layout is still unknown"
-                },
-                "repo_maps": {
-                    "type": "array",
-                    "description": "Targeted symbol map requests for specific subsystems; each entry is a repository-relative directory or file prefix, and an empty string or '.' requests the whole repository",
-                    "items": {
-                        "type": "string"
-                    }
-                },
-                "dir_lists": {
-                    "type": "array",
-                    "description": "Directory content listing requests over the tracked repository files; each entry names a repository-relative directory prefix, and an empty string or '.' requests the repository root. The listing is shallow unless 'recursive' is true",
-                    "items": {
-                        "type": "object",
-                        "properties": {
-                            "path": {
-                                "type": "string",
-                                "description": "Repository-relative directory path, or an empty string for the repository root"
-                            },
-                            "recursive": {
-                                "type": "boolean",
-                                "description": "List every tracked file underneath the directory instead of only its direct children"
-                            }
-                        },
-                        "required": ["path", "recursive"],
-                        "additionalProperties": false
-                    }
-                },
-                "doc_requests": {
-                    "type": "array",
-                    "description": "System documentation topics to request before answering questions about identity, capabilities, concepts, or workflows",
-                    "items": {
-                        "type": "string",
-                        "enum": doc_topics
-                    }
-                },
-                "scratchpad": {
-                    "type": "string",
-                    "description": "Turn-local working memory notes holding hypotheses, verified findings, and the purpose of context still needed; empty string when there is nothing to record"
-                },
-                "outcome": {
-                    "type": "object",
-                    "description": "Terminal outcome of the turn; status 'none' while the turn continues",
-                    "properties": {
-                        "status": {
-                            "type": "string",
-                            "enum": ["none", "success", "error", "skip"],
-                            "description": "'none' while the turn continues, 'success' when it succeeds, 'error' when it fails, 'skip' when the work is already satisfied and no change is required"
-                        },
-                        "summary": {
-                            "type": "string",
-                            "description": "Success summary (empty string otherwise)"
-                        },
-                        "message": {
-                            "type": "string",
-                            "description": "Error message (empty string otherwise)"
-                        },
-                        "reason": {
-                            "type": "string",
-                            "description": "Skip reason (empty string otherwise)"
-                        }
-                    },
-                    "required": ["status", "summary", "message", "reason"],
-                    "additionalProperties": false
-                },
-                "blocked": {
-                    "type": "object",
-                    "description": "Semantic blocker reported when a precondition or assumption fails",
-                    "properties": {
-                        "is_blocked": {
-                            "type": "boolean",
-                            "description": "True only when a precondition or assumption fails"
-                        },
-                        "reason": {
-                            "type": "string",
-                            "description": "Violated precondition or assumption (empty string when not blocked)"
-                        },
-                        "details": {
-                            "type": "string",
-                            "description": "Optional expansion of the blocker (empty string otherwise)"
-                        }
-                    },
-                    "required": ["is_blocked", "reason", "details"],
-                    "additionalProperties": false
-                },
-                "verify": {
-                    "type": "object",
-                    "description": "Deterministic toolchain verification request",
-                    "properties": {
-                        "target": {
-                            "type": "string",
-                            "enum": ["none", "all", "check", "test", "clippy"],
-                            "description": "'none' when no verification is requested, otherwise the verification scope"
-                        },
-                        "on_success": {
-                            "type": "string",
-                            "enum": ["silent", "report"],
-                            "description": "'silent' reports only a concise confirmation, 'report' surfaces the full command output"
-                        }
-                    },
-                    "required": ["target", "on_success"],
-                    "additionalProperties": false
-                },
-                "user_language": {
-                    "type": "string",
-                    "description": "Detected primary natural language of the user prompt; empty string when unknown"
-                },
-                "suggested_actions": {
-                    "type": "array",
-                    "description": "Optional list of suggested follow-up options for the user",
-                    "items": {
-                        "type": "string"
-                    }
-                }
-            },
-            "required": [
-                "message", "changes", "context_requests", "repo_searches",
-                "repo_dirs", "repo_maps", "dir_lists",
-                "doc_requests", "scratchpad", "outcome", "blocked",
-                "verify", "user_language", "suggested_actions"
-            ],
-            "additionalProperties": false
-        })
+        CapabilityRegistry::global().compose_structured_schema(capabilities)
     }
 
     fn proposal_to_model_result(
@@ -428,7 +181,7 @@ impl StructuredEditProtocol {
 
     /// Returns system prompt instructions for the structured-output protocol.
     pub fn system_instructions(&self, editable_paths: &[String]) -> String {
-        self.system_instructions_for(&CapabilitySet::develop_structured(), editable_paths)
+        self.system_instructions_for(&CapabilitySet::interactive_repl(), editable_paths)
     }
 
     /// Returns system prompt instructions for an explicit capability set.
@@ -450,9 +203,7 @@ impl StructuredEditProtocol {
             &CapabilityRegistry::global()
                 .compose_structured_protocol_instructions(capabilities, &ctx),
         );
-        prompt.push_str(
-            "\n- `suggested_actions`: optional list of suggested follow-up options for the user.\n\n",
-        );
+        prompt.push_str("\n\n");
 
         if !capabilities.contains(LlmCapability::FileEdits) {
             return prompt;
@@ -483,7 +234,7 @@ impl StructuredEditProtocol {
 
     /// Returns the JSON-schema response format used to constrain generation.
     pub fn response_format(&self, editable_paths: &[String]) -> Option<ResponseFormat> {
-        self.response_format_for(&CapabilitySet::develop_structured(), editable_paths)
+        self.response_format_for(&CapabilitySet::interactive_repl(), editable_paths)
     }
 
     /// Returns the JSON-schema response format for an explicit capability set,
@@ -695,6 +446,77 @@ impl StructuredEditProtocol {
         super::xml::tags::extract_blocked(raw_text)
     }
 
+    /// Extracts a semantic abort from a structured proposal, falling back to
+    /// XML control tags when the JSON field is absent or reports no abort.
+    ///
+    /// An abort is not a blocker: it reports work the harness cannot perform at
+    /// all, so the payload carries both the concrete missing capability
+    /// (`reason`) and the exact command the developer must run
+    /// (`recommendation`). A report that states neither keeps a deterministic
+    /// default instead of stopping the turn without a cause.
+    pub fn parse_abort(&self, raw_text: &str) -> Option<(String, String)> {
+        if let Some(value) = parse_json_object(raw_text) {
+            if let Some(abort) = value.get("abort").and_then(|field| field.as_object()) {
+                let is_aborted = abort
+                    .get("is_aborted")
+                    .and_then(|field| field.as_bool())
+                    .unwrap_or(false);
+                if is_aborted {
+                    let reason = abort
+                        .get("reason")
+                        .and_then(|field| field.as_str())
+                        .map(str::trim)
+                        .filter(|reason| !reason.is_empty())
+                        .unwrap_or("Execution aborted")
+                        .to_string();
+                    let recommendation = abort
+                        .get("recommendation")
+                        .and_then(|field| field.as_str())
+                        .map(str::trim)
+                        .filter(|recommendation| !recommendation.is_empty())
+                        .unwrap_or("No recommendation was stated.")
+                        .to_string();
+                    return Some((reason, recommendation));
+                }
+            }
+        }
+        abort_invocations(raw_text).into_iter().next()
+    }
+
+    /// Extracts typed project command invocations from the structured
+    /// `custom_tools` field, falling back to `<custom_tool>` control tags.
+    ///
+    /// Each invocation names one command from the declared allowlist and carries
+    /// the typed argument object the declaration validates later in the turn.
+    /// Whether the name and its arguments are actually declared is decided by
+    /// the harness at execution time, so decoding never rejects an invocation
+    /// the project itself may accept.
+    pub fn parse_custom_tools(&self, raw_text: &str) -> Vec<(String, serde_json::Value)> {
+        if let Some(value) = parse_json_object(raw_text) {
+            if let Some(entries) = value.get("custom_tools").and_then(|field| field.as_array()) {
+                let invocations: Vec<(String, serde_json::Value)> = entries
+                    .iter()
+                    .filter_map(|entry| {
+                        let name = entry
+                            .get("name")
+                            .and_then(|field| field.as_str())
+                            .map(str::trim)
+                            .filter(|name| !name.is_empty())?;
+                        let args = entry
+                            .get("args")
+                            .cloned()
+                            .unwrap_or(serde_json::Value::Null);
+                        Some((name.to_string(), args))
+                    })
+                    .collect();
+                if !invocations.is_empty() {
+                    return invocations;
+                }
+            }
+        }
+        custom_tool_invocations(raw_text)
+    }
+
     /// Extracts a verification request from the structured `verify` field,
     /// falling back to XML control tags when the JSON field is absent or
     /// reports `none`.
@@ -750,18 +572,31 @@ impl StructuredEditProtocol {
     /// Extracts plan creation or modification payloads from the structured
     /// `plan_update` field, falling back to `<plan>` control tags when the field
     /// is absent.
-    pub fn parse_plan_updates(&self, raw_text: &str) -> Vec<tauqe_protocol::DiscussionPlanUpdate> {
-        if let Some(value) = parse_json_object(raw_text) {
-            if let Some(plan_update) = value.get("plan_update") {
-                if let Ok(update) = serde_json::from_value::<tauqe_protocol::DiscussionPlanUpdate>(
-                    plan_update.clone(),
-                ) {
-                    return vec![update];
-                }
-            }
+    ///
+    /// A `null` payload is the idle representation the strict schema declares
+    /// for a turn that leaves the plan untouched, so it yields no update. A
+    /// payload that cannot be deserialized into
+    /// [`tauqe_protocol::DiscussionPlanUpdate`] is reported as an error instead
+    /// of being silently swallowed: the caller turns it into a `ProtocolError`
+    /// command, which lets the bounded turn repeat generation with the decoding
+    /// diagnostics attached. Such a payload never falls back to control tags,
+    /// because a silent fallback would hide the very defect the retry has to
+    /// repair.
+    pub fn parse_plan_updates(
+        &self,
+        raw_text: &str,
+    ) -> Result<Vec<tauqe_protocol::DiscussionPlanUpdate>, String> {
+        let payload = parse_json_object(raw_text)
+            .and_then(|value| value.get("plan_update").cloned())
+            .filter(|plan_update| !plan_update.is_null());
+        if let Some(plan_update) = payload {
+            let decoded: Result<tauqe_protocol::DiscussionPlanUpdate, _> =
+                serde_json::from_value(plan_update);
+            let update = decoded.map_err(|error| format!("invalid plan_update: {error}"))?;
+            return Ok(vec![update]);
         }
         let (tags, _diagnostics) = super::xml::tags::parse_plan_tags_with_diagnostics(raw_text);
-        tags.into_iter().map(plan_tag_to_update).collect()
+        Ok(tags.into_iter().map(plan_tag_to_update).collect())
     }
 
     /// Cleans model output for presentation and history.
@@ -1105,11 +940,12 @@ mod tests {
     #[test]
     fn test_structured_schema_has_no_nullable_types() {
         let schema = StructuredEditProtocol::schema(&[]);
-        let text = schema.to_string();
-        assert!(!text.contains("\"null\""));
-        let required = schema["properties"]["changes"]["items"]["required"]
-            .as_array()
-            .unwrap();
+        // Only the idle representation of the plan payload is nullable; every
+        // edit field stays a concrete typed value.
+        let changes = &schema["properties"]["changes"]["items"];
+        assert!(!changes.to_string().contains("\"null\""));
+        assert_eq!(changes["additionalProperties"], serde_json::json!(false));
+        let required = changes["required"].as_array().unwrap();
         assert_eq!(required.len(), 6);
     }
 
@@ -1256,7 +1092,7 @@ mod tests {
             .iter()
             .filter_map(|field| field.as_str())
             .collect();
-        for field in ["doc_requests", "scratchpad", "outcome", "blocked"] {
+        for field in ["doc_requests", "scratchpad", "outcome", "blocked", "abort"] {
             assert!(
                 required.contains(&field),
                 "field '{field}' must be required in the schema"
@@ -1281,7 +1117,11 @@ mod tests {
             schema["properties"]["doc_requests"]["items"]["type"],
             "string"
         );
-        assert!(!schema.to_string().contains("\"null\""));
+        // The strict control objects carry no nullable type; the plan payload
+        // is the only property whose idle form is `null`.
+        assert!(!schema["properties"]["blocked"]
+            .to_string()
+            .contains("\"null\""));
     }
 
     #[test]
@@ -1386,6 +1226,98 @@ mod tests {
             "blocked": {"is_blocked": false, "reason": "", "details": ""}
         }"#;
         assert_eq!(proto.parse_blocked(clear), None);
+    }
+
+    #[test]
+    fn test_structured_protocol_parse_abort() {
+        let proto = StructuredEditProtocol;
+
+        let abort = r#"{
+            "message": "Cannot continue",
+            "changes": [],
+            "abort": {
+                "is_aborted": true,
+                "reason": "Native build approval required",
+                "recommendation": "pnpm approve-builds"
+            }
+        }"#;
+        assert_eq!(
+            proto.parse_abort(abort),
+            Some((
+                "Native build approval required".to_string(),
+                "pnpm approve-builds".to_string()
+            ))
+        );
+
+        let clear = r#"{
+            "message": "Fine",
+            "changes": [],
+            "abort": {"is_aborted": false, "reason": "", "recommendation": ""}
+        }"#;
+        assert_eq!(proto.parse_abort(clear), None);
+
+        // A report that states no reason still stops the turn, with a
+        // deterministic payload instead of an empty one.
+        let bare = r#"{
+            "message": "x",
+            "changes": [],
+            "abort": {"is_aborted": true, "reason": "  ", "recommendation": ""}
+        }"#;
+        assert_eq!(
+            proto.parse_abort(bare),
+            Some((
+                "Execution aborted".to_string(),
+                "No recommendation was stated.".to_string()
+            ))
+        );
+
+        // Control-tag fallback keeps both transports decoding one payload.
+        let xml = "{\"message\":\"Working\",\"changes\":[]}\n\
+<abort reason=\"Toolchain missing\">Install the SDK, then rerun the step.</abort>";
+        assert_eq!(
+            proto.parse_abort(xml),
+            Some((
+                "Toolchain missing".to_string(),
+                "Install the SDK, then rerun the step.".to_string()
+            ))
+        );
+        assert_eq!(
+            proto.parse_abort("{\"message\":\"x\",\"changes\":[]}"),
+            None
+        );
+    }
+
+    #[test]
+    fn test_structured_protocol_parse_custom_tools() {
+        let proto = StructuredEditProtocol;
+
+        let json = r#"{
+            "message": "Running the declared commands",
+            "changes": [],
+            "custom_tools": [
+                {"name": "probe", "args": {"n": "10"}},
+                {"name": "check", "args": {}}
+            ]
+        }"#;
+        assert_eq!(
+            proto.parse_custom_tools(json),
+            vec![
+                ("probe".to_string(), serde_json::json!({ "n": "10" })),
+                ("check".to_string(), serde_json::json!({})),
+            ]
+        );
+
+        // An idle invocation array requests no execution.
+        let idle = r#"{"message":"x","changes":[],"custom_tools":[]}"#;
+        assert!(proto.parse_custom_tools(idle).is_empty());
+
+        // Control-tag fallback decodes the same invocation shape.
+        let xml = "{\"message\":\"Working\",\"changes\":[]}\n\
+<custom_tool name=\"probe\" n=\"10\" />";
+        assert_eq!(
+            proto.parse_custom_tools(xml),
+            vec![("probe".to_string(), serde_json::json!({ "n": "10" }))]
+        );
     }
 
     #[test]
@@ -1529,7 +1461,7 @@ mod tests {
             "changes": [],
             "plan_update": {"action": "update", "id": "p-1", "title": "Refined"}
         }"#;
-        let updates = proto.parse_plan_updates(json);
+        let updates = proto.parse_plan_updates(json).expect("plan update");
         assert_eq!(updates.len(), 1);
         assert_eq!(updates[0].id.as_deref(), Some("p-1"));
         assert_eq!(
@@ -1538,13 +1470,46 @@ mod tests {
         );
 
         let xml = "Working\n<plan action=\"save\" id=\"p-2\" title=\"P2\"><concept><concept_item id=\"c-1\" title=\"C\" /></concept><item id=\"1\" title=\"Step\" /></plan>";
-        let updates = proto.parse_plan_updates(xml);
+        let updates = proto.parse_plan_updates(xml).expect("plan tag");
         assert_eq!(updates.len(), 1);
         assert_eq!(updates[0].id.as_deref(), Some("p-2"));
         assert_eq!(
             updates[0].action,
             tauqe_protocol::DiscussionPlanAction::Save
         );
+    }
+
+    #[test]
+    fn test_structured_protocol_plan_update_failure_is_reported() {
+        let proto = StructuredEditProtocol;
+
+        // A declared `plan_update` whose payload the DTO cannot hold must
+        // surface as an error instead of being silently dropped, so the bounded
+        // turn can repeat generation with the diagnostics attached.
+        let malformed = r#"{
+            "message": "Refine",
+            "changes": [],
+            "plan_update": {"action": "save", "items": "not-a-list"}
+        }"#;
+        let error = proto
+            .parse_plan_updates(malformed)
+            .expect_err("an undecodable plan_update must fail");
+        assert!(error.contains("plan_update"), "{error}");
+
+        // A control tag never rescues a malformed structured payload: a silent
+        // fallback would hide the defect the retry has to repair.
+        let rescuing = r#"{
+            "message": "Refine",
+            "changes": [],
+            "plan_update": {"items": "not-a-list"}
+        }
+<plan action="save" id="p-1" title="P1" />"#;
+        assert!(proto.parse_plan_updates(rescuing).is_err());
+
+        // `null` is the idle representation of the field the strict schema
+        // requires, so it stays a normal "no plan update" answer.
+        let idle = r#"{"message":"x","changes":[],"plan_update":null}"#;
+        assert_eq!(proto.parse_plan_updates(idle), Ok(Vec::new()));
     }
 
     #[test]
@@ -1566,7 +1531,9 @@ mod tests {
             assert!(targets.iter().any(|value| value == target));
         }
         assert_eq!(schema["properties"]["user_language"]["type"], "string");
-        assert!(!schema.to_string().contains("\"null\""));
+        assert!(!schema["properties"]["verify"]
+            .to_string()
+            .contains("\"null\""));
     }
 
     #[test]
@@ -1585,15 +1552,19 @@ mod tests {
             "scratchpad",
             "outcome",
             "blocked",
+            "abort",
             "verify",
             "user_language",
-            "suggested_actions",
         ] {
             assert!(
                 full_properties.contains_key(field),
                 "the development schema must declare '{field}'"
             );
         }
+
+        // `suggested_actions` belongs to no capability, so the registry never
+        // emits it: the schema advertises only the enabled protocol surface.
+        assert!(!full_properties.contains_key("suggested_actions"));
         assert_eq!(
             full["required"].as_array().map(|required| required.len()),
             Some(full_properties.len()),
@@ -1619,8 +1590,11 @@ mod tests {
             "scratchpad",
             "outcome",
             "blocked",
+            "abort",
             "verify",
             "user_language",
+            "plan_update",
+            "custom_tools",
         ] {
             assert!(
                 !properties.contains_key(field),

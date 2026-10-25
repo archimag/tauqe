@@ -17,11 +17,13 @@ use tauqe_core::providers::{
 use tauqe_core::workflow::{ExecutionMode, SingleExecution};
 use tauqe_protocol::model::{UsageTotals, UsageTotalsSnapshot};
 use tauqe_protocol::{
-    events, EditFileDoneEvent, EditFileRetryingEvent, EditFileStartedEvent, EditFinishedEvent,
-    EditHunkEvent, EditOutcome, EditStartedEvent, Event, GitCommitCreatedEvent, ModelResultEvent,
-    ModelStartedEvent, ReasoningEffort, ResponseError, TurnIntent,
+    events, DiscussionTarget, EditFileDoneEvent, EditFileRetryingEvent, EditFileStartedEvent,
+    EditFinishedEvent, EditHunkEvent, EditOutcome, EditStartedEvent, Event, GitCommitCreatedEvent,
+    LlmCapability, ModelResultEvent, ModelRole, ModelStartedEvent, ReasoningEffort, ResponseError,
+    TurnIntent,
 };
 
+use crate::handlers::common::withdraw_streamed_attempt;
 use crate::handlers::offload;
 use crate::state::{next_operation_id, AppState, OperationGuard};
 use crate::transport::OutChannel;
@@ -39,6 +41,10 @@ pub struct ModelTurnResult {
     /// Coder's block report when the turn ended with a semantic `<blocked>`
     /// signal. Preserved so plan and review supervisors can react accordingly.
     pub blocked: Option<String>,
+    /// Coder's abort report when the turn ended with a semantic `<abort>`
+    /// signal. Preserved so a supervisor can stop its queue without architect
+    /// escalation while the developer receives the exact action to perform.
+    pub abort: Option<tauqe_core::workflow::fsm::AbortReport>,
 }
 
 impl ModelTurnResult {
@@ -48,8 +54,11 @@ impl ModelTurnResult {
     /// 1. The turn was not cancelled and encountered no unhandled errors.
     /// 2. Code edits were verified and applied (`Edit` with `applied: true`).
     /// 3. Or an explicit terminal success tag was emitted (`<success ... />`).
+    ///
+    /// A turn that reported an unconditional `<abort>` never succeeded: the
+    /// requested work needs an action only the developer can perform.
     pub fn is_success(&self) -> bool {
-        if self.is_cancelled || self.error.is_some() {
+        if self.is_cancelled || self.error.is_some() || self.abort.is_some() {
             return false;
         }
         match &self.result {
@@ -60,6 +69,36 @@ impl ModelTurnResult {
             }
             Some(tauqe_protocol::ModelResult::Answer { .. }) => self.has_terminal_success,
             _ => false,
+        }
+    }
+}
+
+/// A programmatic bounded turn that could not be started.
+///
+/// The operation identity travels with the failure, so a supervisor publishes
+/// its failure event under the operation that actually produced it instead of
+/// minting an identifier that matches no registered operation. The identity is
+/// absent only when the turn was refused before any operation existed — for
+/// example because another operation already held the slot.
+#[derive(Debug)]
+pub struct TurnError {
+    /// Identifier of the operation the failed turn belonged to.
+    pub operation_id: Option<String>,
+    /// The failure reported to the client.
+    ///
+    /// The payload is boxed because a bare [`ResponseError`] already fills the
+    /// error channel of every `Result` in this subsystem; carrying a second
+    /// copy of it inline would make each failed turn hand a large `Err`
+    /// variant to every caller. Callers keep reading `error.message` through
+    /// the box.
+    pub error: Box<ResponseError>,
+}
+
+impl From<ResponseError> for TurnError {
+    fn from(error: ResponseError) -> Self {
+        Self {
+            operation_id: None,
+            error: Box::new(error),
         }
     }
 }
@@ -191,20 +230,30 @@ async fn prepare_turn(
     let role = match &selection {
         tauqe_protocol::ModelSelection::Role(r) => Some(*r),
         tauqe_protocol::ModelSelection::Specific(_) => None,
+        tauqe_protocol::ModelSelection::Tier { .. } => None,
     };
-    // Report the running model as structured data: the configured alias (when
-    // present) and the effective reasoning effort, so the client can render the
-    // active role and model without re-deriving them from configuration.
-    let entry = resolve_model_entry(&app_config, &selection);
-    let alias = entry.as_ref().and_then(|entry| entry.alias.clone());
-    let effort = reasoning_effort.or_else(|| entry.as_ref().and_then(|entry| entry.effort));
+    // Report the running model as structured data: the effective reasoning
+    // effort, the role coordinates, and the catalog display alias, so the client
+    // renders the active model without re-deriving any of them from
+    // configuration. The reasoning depth is a runtime parameter of a role, so it
+    // is resolved by the configuration resolver against the role that owns the
+    // selection instead of by scanning the configured role lists; an explicit
+    // model carries no role of its own and resolves against the mandatory base
+    // role.
+    let effort = reasoning_effort.or_else(|| {
+        app_config.resolve_selection_effort(role.unwrap_or(ModelRole::Primary), &selection)
+    });
+    // A display alias is catalog metadata of the model itself, so it is resolved
+    // from the centralized provider catalog of the configuration rather than
+    // from any role slot.
+    let alias = app_config.model_alias(&model).map(str::to_string);
 
     tracing::info!(
         operation_id = %op_id,
         model = %model,
         role = ?role,
-        alias = alias.as_deref().unwrap_or("none"),
         effort = ?effort,
+        alias = alias.as_deref().unwrap_or("none"),
         intent = ?intent,
         is_batch,
         session = session_id.as_deref().unwrap_or("none"),
@@ -254,30 +303,57 @@ async fn prepare_turn(
 /// toolchain-verification capabilities of the configured protocol instead of
 /// collapsing into the text-only discussion schema.
 ///
+/// The configured transport chooses the encoding only, never the capability
+/// surface: a `structured` project and an `xml` project advertise the same
+/// operational surface for the same intent, so the format changes how commands
+/// are serialized and nothing else. The two-contour `mixed` mode keeps the XML
+/// transport for code editing, while a plan discussion still answers with the
+/// discussion JSON Schema.
+///
+/// The plan permissions matrix is a property of the dialogue, never of the
+/// transport: a user may ask for a plan at any moment of an interactive turn,
+/// so plan authorship already belongs to the interactive profile, while
+/// modifying an existing plan requires the dialogue to be anchored on one.
+/// `plan_focused` carries that anchor, and an interactive turn whose focus is a
+/// plan mixes plan mutation into the chosen protocol's capability set. The mix
+/// runs through `with_capability_set`, so both encodings advertise and decode
+/// the very same mutation, and the harness keeps validating the mutation itself
+/// after decoding.
+///
 /// The active turn marker is bound onto the chosen protocol when its wire format
 /// supports it; the structured discussion protocol encodes its structure in JSON
 /// Schema and therefore declines the marker.
 pub(super) fn resolve_turn_protocol(
     intent: TurnIntent,
     develop_protocol: tauqe_protocol::EditProtocolKind,
+    plan_focused: bool,
     marker: Option<&str>,
 ) -> Box<dyn PromptProtocol> {
+    // The declared intent, not the transport, decides what the turn may do:
+    // `PromptAssembly::effective_capabilities` narrows the rendered prompt and
+    // the FSM narrows the decoder of an isolated step, both through the
+    // intent-oriented profiles. Selecting a profile here by wire format would
+    // make XML and Structured Output disagree about the very same turn.
     let base_protocol: Box<dyn PromptProtocol> = if intent.is_readonly_discussion() {
         Box::new(JsonPromptProtocol::discussion())
-    } else if intent.is_isolated_step() {
-        match develop_protocol {
-            tauqe_protocol::EditProtocolKind::Structured => JsonPromptProtocol::with_capabilities(
-                tauqe_protocol::CapabilitySet::isolated_step_structured(),
-            ),
-            tauqe_protocol::EditProtocolKind::Xml => XmlPromptProtocol::with_capabilities(
-                tauqe_protocol::CapabilitySet::isolated_step_xml(),
-            ),
-        }
     } else {
         match develop_protocol {
-            tauqe_protocol::EditProtocolKind::Structured => Box::new(JsonPromptProtocol::default()),
-            tauqe_protocol::EditProtocolKind::Xml => Box::new(XmlPromptProtocol),
+            tauqe_protocol::EditProtocolKind::Structured => Box::new(JsonPromptProtocol::edits()),
+            tauqe_protocol::EditProtocolKind::Xml | tauqe_protocol::EditProtocolKind::Mixed => {
+                Box::new(XmlPromptProtocol)
+            }
         }
+    };
+    // Plan mutation follows the dialogue focus rather than the wire format: an
+    // isolated step owns no plan permission at all, and a focused interactive
+    // turn gains exactly the mutation capability the anchor grants.
+    let base_protocol = if plan_focused && intent.is_interactive_repl() {
+        let capabilities = base_protocol
+            .capability_set()
+            .with(LlmCapability::PlanUpdate);
+        base_protocol.with_capability_set(capabilities)
+    } else {
+        base_protocol
     };
     match marker {
         Some(marker) => base_protocol
@@ -326,13 +402,25 @@ async fn run_prepared_turn(
 
     let (tx, mut rx) = tokio::sync::mpsc::channel::<StreamEvent>(100);
 
-    let protocol = resolve_turn_protocol(intent, app_config.develop.protocol, marker.as_deref());
+    // The dialogue focus is snapshotted before the turn starts, so a concurrent
+    // focus change can never alter the protocol of a turn that is already
+    // running.
+    let plan_focused = matches!(
+        state.discussion_focus().await.target(),
+        Some(DiscussionTarget::Plan { .. })
+    );
+    let protocol = resolve_turn_protocol(
+        intent,
+        app_config.develop.protocol,
+        plan_focused,
+        marker.as_deref(),
+    );
 
     let mut workflow_opts = tauqe_core::workflow::WorkflowOptions::from_app_config(&app_config);
-    workflow_opts.reasoning_effort = reasoning_effort.or_else(|| match &selection {
-        tauqe_protocol::ModelSelection::Role(role) => app_config.models.resolve_effort(*role),
-        tauqe_protocol::ModelSelection::Specific(_) => None,
-    });
+    // The prepared effort already carries the role-resolved reasoning depth, so
+    // the workflow receives exactly the depth the turn reports instead of
+    // resolving it a second time.
+    workflow_opts.reasoning_effort = reasoning_effort;
     workflow_opts.initial_selection = Some(selection);
     workflow_opts.session_id = session_id;
     let execution = SingleExecution::new(workflow_opts);
@@ -370,7 +458,7 @@ async fn run_prepared_turn(
         res
     };
 
-    let wf_task = tokio::spawn(workflow_future);
+    let mut wf_task = tokio::spawn(workflow_future);
     operation.set_abort_handle(wf_task.abort_handle());
 
     let mut raw_streamed_text = String::new();
@@ -598,16 +686,9 @@ async fn run_prepared_turn(
             StreamEvent::ResetStream => {
                 // The provider broke after partial output: everything streamed
                 // so far belongs to the aborted attempt, so the client discards
-                // it and this turn stops carrying it as assistant text.
-                raw_streamed_text.clear();
-                state.out.send_event(&Event {
-                    method: events::MODEL_STREAM_RESET.to_string(),
-                    params: serde_json::to_value(tauqe_protocol::ModelStreamResetEvent {
-                        operation_id: op_id.clone(),
-                        reason: "connection interrupted mid-stream".to_string(),
-                    })
-                    .ok(),
-                });
+                // it and this turn stops carrying it as assistant text. The
+                // withdrawal itself is shared with every other stream contour.
+                withdraw_streamed_attempt(&state.out, &op_id, || raw_streamed_text.clear());
             }
             StreamEvent::Done => {}
             StreamEvent::Cancelled => {
@@ -651,29 +732,59 @@ async fn run_prepared_turn(
 
     if is_cancelled || is_error {
         // Cooperative cancellation is the primary path: the workflow observes
-        // the cancel signal and unwinds its own transaction. Force-aborting is a
-        // last resort with a generous grace period, and it is skipped while a
-        // git transaction is still open, because an abort lands at the next
-        // `.await` and could otherwise strand a half-finished checkpoint or step
-        // commit until startup crash recovery runs.
-        let abort_handle = wf_task.abort_handle();
-        let stalled = tokio::time::timeout(CANCEL_UNWIND_GRACE, wf_task)
-            .await
-            .is_err();
-        if stalled {
-            if state.git_transaction_active.load(Ordering::SeqCst) {
+        // the cancel signal and unwinds its own transaction. The handle is
+        // polled by reference, so the grace wait never consumes the join result
+        // and the task stays owned while this turn decides what happens next.
+        let unwind = tokio::time::timeout(CANCEL_UNWIND_GRACE, &mut wf_task).await;
+        let mut unwound_error = None;
+        match unwind {
+            Ok(Ok(Err(err))) => {
+                // The workflow unwound on its own but reported a failure: the
+                // detail belongs to the turn instead of a discarded join.
+                unwound_error = Some(err.to_string());
+            }
+            Ok(Ok(Ok(_))) => {
+                tracing::info!(
+                    operation_id = %op_id,
+                    "Cancelled turn finished its workflow before the grace period elapsed",
+                );
+            }
+            Ok(Err(join_err)) => {
                 tracing::warn!(
                     operation_id = %op_id,
-                    grace_secs = CANCEL_UNWIND_GRACE.as_secs(),
-                    "Turn did not unwind within the grace period; deferring abort while a git transaction is open",
+                    error = %join_err,
+                    "Cancelled turn's workflow task did not join cleanly",
                 );
-            } else {
-                tracing::warn!(
-                    operation_id = %op_id,
-                    grace_secs = CANCEL_UNWIND_GRACE.as_secs(),
-                    "Turn did not unwind within the grace period; aborting workflow task",
-                );
-                abort_handle.abort();
+            }
+            Err(_elapsed) => {
+                // Force-aborting is a last resort with a generous grace period,
+                // and it is deferred while a git transaction is still open,
+                // because an abort lands at the next `.await` and could
+                // otherwise strand a half-finished checkpoint or step commit
+                // until startup crash recovery runs.
+                if state.git_transaction_active.load(Ordering::SeqCst) {
+                    tracing::warn!(
+                        operation_id = %op_id,
+                        grace_secs = CANCEL_UNWIND_GRACE.as_secs(),
+                        "Turn did not unwind within the grace period; deferring abort while a git transaction is open",
+                    );
+                    // The task and this turn's operation registration move into
+                    // the watchdog together, so the slot is released only once
+                    // the task has truly exited. Returning here would hand a
+                    // half-unwound workflow back to the client.
+                    state.defer_abort_owning_operation(Arc::clone(&operation), wf_task);
+                } else {
+                    tracing::warn!(
+                        operation_id = %op_id,
+                        grace_secs = CANCEL_UNWIND_GRACE.as_secs(),
+                        "Turn did not unwind within the grace period; aborting workflow task",
+                    );
+                    wf_task.abort();
+                    // Wait, bounded, for the abort to land: returning while the
+                    // task may still sit between abort landing points would
+                    // release the slot under a live task.
+                    let _ = tokio::time::timeout(CANCEL_UNWIND_GRACE, wf_task).await;
+                }
             }
         }
 
@@ -683,10 +794,17 @@ async fn run_prepared_turn(
         let snapshot = flush_usage(state, &mut usage_guard).await;
         emit_legacy_usage_event(state, &op_id).await;
 
-        let error = if is_cancelled {
+        let reason = if is_cancelled {
             Some("Operation cancelled".to_string())
         } else {
             stream_error_msg
+        };
+        // A workflow that unwound with its own failure keeps that detail: the
+        // cancellation reason alone would hide why the transaction failed.
+        let error = match (reason, unwound_error) {
+            (Some(reason), Some(detail)) => Some(format!("{}: {}", reason, detail)),
+            (None, detail) => detail,
+            (reason, None) => reason,
         };
 
         let status = if is_cancelled { "cancelled" } else { "error" };
@@ -707,6 +825,7 @@ async fn run_prepared_turn(
             error,
             has_terminal_success: false,
             blocked: None,
+            abort: None,
         });
     }
 
@@ -717,6 +836,19 @@ async fn run_prepared_turn(
             let snapshot = flush_usage(state, &mut usage_guard).await;
             emit_legacy_usage_event(state, &op_id).await;
             let operation_totals = snapshot.prev.clone();
+
+            // A plan mutation the storage engine refused is a diagnostic, not a
+            // failed turn: the reasons travel to the developer through the turn
+            // stream and the session history, and the daemon records them once
+            // per turn so the refusal stays reconstructible from the journal.
+            if !wf_result.plan_errors.is_empty() {
+                tracing::warn!(
+                    operation_id = %op_id,
+                    rejected = wf_result.plan_errors.len(),
+                    reasons = %wf_result.plan_errors.join(" | "),
+                    "plan mutations were rejected during the turn",
+                );
+            }
 
             if let tauqe_protocol::ModelResult::Edit {
                 ref summary,
@@ -839,6 +971,21 @@ async fn run_prepared_turn(
                 })),
             });
 
+            // An interactive turn that applied code edits swept the transient
+            // auto context layer away inside the FSM, so the stable prompt
+            // prefix those files warmed no longer exists. The dialogue starts a
+            // fresh provider session instead of being routed to a node holding
+            // a stale prefix cache. An isolated step owns no dialogue session,
+            // so it never rotates the interactive one.
+            if intent.is_interactive_repl()
+                && matches!(
+                    &wf_result.result,
+                    tauqe_protocol::ModelResult::Edit { outcome, .. } if outcome.applied
+                )
+            {
+                state.reset_session_uuid().await;
+            }
+
             let has_terminal_success =
                 tauqe_core::edits::protocol::xml::extract_success(&raw_streamed_text).is_some()
                     || tauqe_core::edits::protocol::xml::extract_success(&wf_result.assistant_text)
@@ -860,6 +1007,7 @@ async fn run_prepared_turn(
                     error: turn_error,
                     has_terminal_success,
                     blocked: wf_result.blocked,
+                    abort: wf_result.abort,
                 },
                 operation_totals,
             )
@@ -887,6 +1035,7 @@ async fn run_prepared_turn(
                     error: Some(err.to_string()),
                     has_terminal_success: false,
                     blocked: None,
+                    abort: None,
                 },
                 snapshot.prev,
             )
@@ -918,6 +1067,7 @@ async fn run_prepared_turn(
                     error: Some(join_err.to_string()),
                     has_terminal_success: false,
                     blocked: None,
+                    abort: None,
                 },
                 snapshot.prev,
             )
@@ -999,13 +1149,15 @@ pub struct StepTurnOptions {
 /// enabling server-side step orchestration to inspect step success
 /// deterministically. Turns started here always execute inside a batch
 /// supervisor, so they are marked as batch members to let clients suppress
-/// per-step signals.
+/// per-step signals. A failure carries the identity of the operation the turn
+/// belonged to, so the caller reports it under a registered operation instead of
+/// an invented one.
 pub async fn execute_model_turn(
     state: &Arc<AppState>,
     prompt: String,
     policy: Box<dyn tauqe_core::workflow::policy::ApplyPolicy>,
     options: StepTurnOptions,
-) -> Result<ModelTurnResult, ResponseError> {
+) -> Result<ModelTurnResult, TurnError> {
     let StepTurnOptions {
         intent,
         custom_selection,
@@ -1015,6 +1167,12 @@ pub async fn execute_model_turn(
         session_id,
         shared_operation,
     } = options;
+    // A batch step borrows the batch-level registration, so the operation
+    // identity exists before the turn can fail for any reason, including a
+    // failure to construct the provider.
+    let operation_id = shared_operation
+        .as_ref()
+        .map(|operation| format!("op-{}", operation.id()));
     let prepared = prepare_turn(
         state,
         intent,
@@ -1026,35 +1184,14 @@ pub async fn execute_model_turn(
         session_id,
         shared_operation,
     )
-    .await?;
-    run_prepared_turn(state, prompt, prepared, policy).await
-}
-
-/// Resolves the configured role entry backing a turn's model selection.
-///
-/// A role selection maps to the base entry of that role's list. An explicit
-/// selection (such as a coder escalation rung) carries no role of its own, so
-/// its entry is recovered by matching the resolved model against the configured
-/// role lists, which is where escalation rungs come from.
-fn resolve_model_entry(
-    config: &tauqe_core::config::AppConfig,
-    selection: &tauqe_protocol::ModelSelection,
-) -> Option<tauqe_protocol::ModelEntry> {
-    match selection {
-        tauqe_protocol::ModelSelection::Role(role) => {
-            config.models.role_entries(*role).into_iter().next()
-        }
-        tauqe_protocol::ModelSelection::Specific(model) => [
-            tauqe_protocol::ModelRole::Primary,
-            tauqe_protocol::ModelRole::Coder,
-            tauqe_protocol::ModelRole::Architect,
-            tauqe_protocol::ModelRole::Reviewer,
-            tauqe_protocol::ModelRole::Scribe,
-        ]
-        .into_iter()
-        .flat_map(|role| config.models.role_entries(role))
-        .find(|entry| &entry.model == model),
-    }
+    .await
+    .map_err(|error| TurnError {
+        operation_id,
+        error: Box::new(error),
+    })?;
+    run_prepared_turn(state, prompt, prepared, policy)
+        .await
+        .map_err(TurnError::from)
 }
 
 /// Classifies a completed turn into a stable status label for the journal.

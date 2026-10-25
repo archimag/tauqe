@@ -7,32 +7,24 @@
 //! over it: a protocol narrowed to a [`CapabilitySet`] neither advertises nor
 //! decodes a disabled capability.
 
+use std::sync::OnceLock;
+
 use crate::capabilities::CapabilityRegistry;
 use crate::edits::protocol::xml::is_valid_turn_marker;
 use crate::edits::protocol::XmlEditProtocol;
 use crate::edits::stream::XmlStreamFilter;
-use tauqe_protocol::{CapabilitySet, LlmCapability, LlmCommand};
+use tauqe_protocol::{CapabilitySet, EditProtocolKind, LlmCapability, LlmCommand};
 
 use super::protocol::PromptProtocol;
 
-/// Capability set advertised by the unbound XML protocol.
+/// Capability surface advertised by the unbound XML protocol.
 ///
-/// The order matches [`LlmCapability::ALL`], so the capability set derived from
-/// it equals [`CapabilitySet::develop_xml`].
-const XML_DEVELOP_CAPABILITIES: &[LlmCapability] = &[
-    LlmCapability::TextMessage,
-    LlmCapability::FileEdits,
-    LlmCapability::Discovery,
-    LlmCapability::DocRequest,
-    LlmCapability::ToolchainVerify,
-    LlmCapability::PlanCreation,
-    LlmCapability::PlanUpdate,
-    LlmCapability::Scratchpad,
-    LlmCapability::Outcome,
-    LlmCapability::Blocked,
-    LlmCapability::UserLanguage,
-    LlmCapability::CustomTools,
-];
+/// The XML transport contributes the encoding only: the surface is the
+/// intent-oriented interactive REPL profile, so choosing between XML and
+/// Structured Output never changes what a turn of the same intent may do.
+fn base_capabilities() -> CapabilitySet {
+    CapabilitySet::interactive_repl()
+}
 
 /// XML wire-format implementation of [`PromptProtocol`].
 #[derive(Debug, Default, Clone)]
@@ -50,16 +42,21 @@ impl PromptProtocol for XmlPromptProtocol {
         "xml"
     }
 
+    fn kind(&self) -> EditProtocolKind {
+        EditProtocolKind::Xml
+    }
+
     fn capabilities(&self) -> &[LlmCapability] {
-        XML_DEVELOP_CAPABILITIES
+        static BASE: OnceLock<CapabilitySet> = OnceLock::new();
+        BASE.get_or_init(base_capabilities).as_slice()
     }
 
     fn with_capability_set(&self, capabilities: CapabilitySet) -> Box<dyn PromptProtocol> {
         Self::with_capabilities(capabilities)
     }
 
-    fn decode(&self, raw_text: &str) -> Vec<LlmCommand> {
-        decode_with_capabilities(raw_text, None, &self.capability_set())
+    fn decode(&self, raw_text: &str, context_paths: &[String]) -> Vec<LlmCommand> {
+        decode_with_capabilities(raw_text, None, &self.capability_set(), context_paths)
     }
 
     fn system_instructions(&self, editable_paths: &[String], has_eager_repo_map: bool) -> String {
@@ -117,6 +114,10 @@ impl PromptProtocol for ScopedXmlPromptProtocol {
         "xml"
     }
 
+    fn kind(&self) -> EditProtocolKind {
+        EditProtocolKind::Xml
+    }
+
     fn capabilities(&self) -> &[LlmCapability] {
         self.capabilities.as_slice()
     }
@@ -129,8 +130,13 @@ impl PromptProtocol for ScopedXmlPromptProtocol {
         Self::boxed(capabilities, self.marker.clone())
     }
 
-    fn decode(&self, raw_text: &str) -> Vec<LlmCommand> {
-        decode_with_capabilities(raw_text, self.marker.as_deref(), &self.capabilities)
+    fn decode(&self, raw_text: &str, context_paths: &[String]) -> Vec<LlmCommand> {
+        decode_with_capabilities(
+            raw_text,
+            self.marker.as_deref(),
+            &self.capabilities,
+            context_paths,
+        )
     }
 
     fn system_instructions(&self, editable_paths: &[String], has_eager_repo_map: bool) -> String {
@@ -167,20 +173,25 @@ impl PromptProtocol for ScopedXmlPromptProtocol {
 /// Decodes model output through the capability registry for `capabilities`.
 ///
 /// Only the capabilities present in the set are decoded, so a narrowed protocol
-/// can never emit a command it does not advertise.
+/// can never emit a command it does not advertise. `context_paths` is forwarded
+/// unchanged to the parser, so a decoded edit carries the same resolved path the
+/// streaming filter already reported.
 fn decode_with_capabilities(
     raw_text: &str,
     marker: Option<&str>,
     capabilities: &CapabilitySet,
+    context_paths: &[String],
 ) -> Vec<LlmCommand> {
-    CapabilityRegistry::global().decode_xml_commands(capabilities, raw_text, marker, &[])
+    CapabilityRegistry::global().decode_xml_commands(capabilities, raw_text, marker, context_paths)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::edits::stream::EditStreamFilter;
     use tauqe_protocol::{
-        ContextAccess, DocTopic, EditOperation, LlmOutcome, VerifyOnSuccess, VerifyTarget,
+        ContextAccess, DocTopic, EditFileStatus, EditOperation, LlmOutcome, VerifyOnSuccess,
+        VerifyTarget,
     };
 
     #[test]
@@ -194,16 +205,20 @@ mod tests {
             LlmCapability::DocRequest,
             LlmCapability::ToolchainVerify,
             LlmCapability::PlanCreation,
-            LlmCapability::PlanUpdate,
             LlmCapability::Scratchpad,
             LlmCapability::Outcome,
             LlmCapability::Blocked,
+            LlmCapability::Abort,
             LlmCapability::UserLanguage,
             LlmCapability::CustomTools,
         ] {
             assert!(protocol.supports(capability));
         }
-        assert_eq!(protocol.capability_set(), CapabilitySet::develop_xml());
+        // Plan mutation is a matter of the active plan focus, never of the
+        // wire format, so the interactive profile omits it here exactly as the
+        // Structured Output profile does.
+        assert!(!protocol.supports(LlmCapability::PlanUpdate));
+        assert_eq!(protocol.capability_set(), CapabilitySet::interactive_repl());
     }
 
     #[test]
@@ -214,7 +229,7 @@ mod tests {
         assert!(proto.with_turn_marker("has-dash").is_none());
         assert!(proto.with_turn_marker("Valid123").is_some());
 
-        let scoped = XmlPromptProtocol::with_capabilities(CapabilitySet::develop_xml());
+        let scoped = XmlPromptProtocol::with_capabilities(CapabilitySet::interactive_repl());
         assert!(scoped.with_turn_marker("").is_none());
         assert!(scoped.with_turn_marker("Valid123").is_some());
     }
@@ -233,7 +248,7 @@ mod tests {
 
         let raw =
             "Working.\n<context_request path=\"src/a.rs\" />\n<scratchpad>notes</scratchpad>\n";
-        let commands = narrowed.decode(raw);
+        let commands = narrowed.decode(raw, &[]);
         assert!(!commands
             .iter()
             .any(|command| matches!(command, LlmCommand::ContextRequest { .. })));
@@ -248,7 +263,7 @@ mod tests {
     #[test]
     fn test_decode_text_only() {
         let protocol = XmlPromptProtocol;
-        let commands = protocol.decode("Here is my explanation.");
+        let commands = protocol.decode("Here is my explanation.", &[]);
         assert_eq!(
             commands,
             vec![LlmCommand::Text {
@@ -262,7 +277,7 @@ mod tests {
         let protocol = XmlPromptProtocol;
         let output = concat!(
             "I fixed the bug.\n\n",
-            "<tauqe_edits summary=\"Fix bug\">\n",
+            "<edits summary=\"Fix bug\">\n",
             "  <edit path=\"src/lib.rs\">\n",
             "    <search>\n",
             "old();\n",
@@ -271,9 +286,9 @@ mod tests {
             "new();\n",
             "    </replace>\n",
             "  </edit>\n",
-            "</tauqe_edits>\n",
+            "</edits>\n",
         );
-        let commands = protocol.decode(output);
+        let commands = protocol.decode(output, &[]);
 
         assert!(commands.contains(&LlmCommand::Text {
             content: "I fixed the bug.".to_string(),
@@ -301,6 +316,38 @@ mod tests {
     }
 
     #[test]
+    fn test_decode_legacy_edit_container_alias() {
+        let protocol = XmlPromptProtocol;
+        let output = concat!(
+            "Fixed it.\n\n",
+            "<tauqe_edits summary=\"Fix bug\">\n",
+            "  <edit path=\"src/lib.rs\">\n",
+            "    <search>\nold();\n    </search>\n",
+            "    <replace>\nnew();\n    </replace>\n",
+            "  </edit>\n",
+            "</tauqe_edits>\n",
+        );
+
+        // The pre-canonical container spelling stays decodable.
+        let commands = protocol.decode(output, &[]);
+        assert!(commands.iter().any(|command| matches!(
+            command,
+            LlmCommand::Edit {
+                operation: EditOperation::Replace { path, .. }
+            } if path == "src/lib.rs"
+        )));
+
+        // It is cleaned from conversational text exactly like the canonical
+        // spelling, so a legacy transcript renders the same prose.
+        let cleaned = CapabilityRegistry::global().clean_text(
+            &CapabilitySet::interactive_repl(),
+            output,
+            None,
+        );
+        assert_eq!(cleaned, "Fixed it.");
+    }
+
+    #[test]
     fn test_decode_control_tags() {
         let protocol = XmlPromptProtocol;
         let output = concat!(
@@ -313,7 +360,7 @@ mod tests {
             "<user_language>Russian</user_language>\n",
             "<success summary=\"All checks pass\" />\n",
         );
-        let commands = protocol.decode(output);
+        let commands = protocol.decode(output, &[]);
 
         assert!(commands.contains(&LlmCommand::Text {
             content: "Working on it.".to_string(),
@@ -351,11 +398,11 @@ mod tests {
         let protocol = XmlPromptProtocol;
         let output = concat!(
             "Here are my changes:\n",
-            "<tauqe_edits summary=\"Broken\">\n",
+            "<edits summary=\"Broken\">\n",
             "  <edit path=\"src/lib.rs\">\n",
             "    <search>\nfoo\n",
         );
-        let commands = protocol.decode(output);
+        let commands = protocol.decode(output, &[]);
         let has_error = commands
             .iter()
             .any(|cmd| matches!(cmd, LlmCommand::ProtocolError { .. }));
@@ -376,7 +423,7 @@ mod tests {
             "  <item id=\"1\" title=\"Step\" status=\"todo\" />\n",
             "</plan>",
         );
-        let update = plan_update_from(&protocol.decode(output));
+        let update = plan_update_from(&protocol.decode(output, &[]));
         assert_eq!(update.action, tauqe_protocol::DiscussionPlanAction::Save);
         assert_eq!(update.id.as_deref(), Some("p1"));
         assert_eq!(update.concept.len(), 1);
@@ -385,17 +432,24 @@ mod tests {
 
     #[test]
     fn test_decode_plan_update_action() {
-        let protocol = XmlPromptProtocol;
+        // Plan mutation follows the plan focus, not the transport, so the
+        // interactive profile omits it and the discussion profile carries it.
         let output = "<plan action=\"update\" id=\"p1\"><item id=\"1\" status=\"done\" /></plan>";
-        let update = plan_update_from(&protocol.decode(output));
+        let protocol = XmlPromptProtocol::with_capabilities(CapabilitySet::discussion());
+        let update = plan_update_from(&protocol.decode(output, &[]));
         assert_eq!(update.action, tauqe_protocol::DiscussionPlanAction::Update);
         assert_eq!(update.id.as_deref(), Some("p1"));
+
+        assert!(XmlPromptProtocol
+            .decode(output, &[])
+            .iter()
+            .all(|command| !matches!(command, LlmCommand::Plan { .. })));
     }
 
     #[test]
     fn test_decode_terminal_error_outcome() {
         let protocol = XmlPromptProtocol;
-        let commands = protocol.decode("Blocked.\n<error message=\"Missing dependency\" />");
+        let commands = protocol.decode("Blocked.\n<error message=\"Missing dependency\" />", &[]);
         assert!(commands.contains(&LlmCommand::Outcome {
             outcome: LlmOutcome::Error {
                 message: "Missing dependency".to_string(),
@@ -408,11 +462,67 @@ mod tests {
         let protocol = XmlPromptProtocol;
         let commands = protocol.decode(
             "Blocked.\n<blocked reason=\"Precondition failed\" details=\"Missing file x.rs\" />",
+            &[],
         );
         assert!(commands.contains(&LlmCommand::Blocked {
             reason: "Precondition failed".to_string(),
             details: Some("Missing file x.rs".to_string()),
         }));
+    }
+
+    #[test]
+    fn test_stream_and_decode_resolve_the_same_edit_path() {
+        let context_paths = vec!["crates/core/src/lib.rs".to_string()];
+        let output = concat!(
+            "Editing.\n\n",
+            "<edits summary=\"Touch lib\">\n",
+            "  <edit path=\"lib.rs\">\n",
+            "    <search>\nold();\n    </search>\n",
+            "    <replace>\nnew();\n    </replace>\n",
+            "  </edit>\n",
+            "</edits>\n",
+        );
+
+        // The decoded command resolves the short suffix against the context
+        // list instead of carrying the raw path the model emitted.
+        let decoded_path = XmlPromptProtocol
+            .decode(output, &context_paths)
+            .into_iter()
+            .find_map(|command| match command {
+                LlmCommand::Edit {
+                    operation: EditOperation::Replace { path, .. },
+                } => Some(path),
+                _ => None,
+            })
+            .expect("decoded edit");
+
+        // The streaming preview receives the identical list, so the file it
+        // certifies as edited is the file the engine stages.
+        let mut filter = XmlStreamFilter::new(context_paths.clone(), std::env::temp_dir())
+            .with_staged_contents(std::collections::HashMap::from([(
+                "crates/core/src/lib.rs".to_string(),
+                "old();\n".to_string(),
+            )]));
+        let mut events = filter.push_chunk(output);
+        events.extend(Box::new(filter).finish());
+
+        let streamed_path = events
+            .iter()
+            .find_map(|event| match event {
+                crate::providers::StreamEvent::EditFileStarted { path, .. } => Some(path.clone()),
+                _ => None,
+            })
+            .expect("streamed file start");
+
+        assert_eq!(decoded_path, "crates/core/src/lib.rs");
+        assert_eq!(streamed_path, decoded_path);
+        assert!(events.iter().any(|event| matches!(
+            event,
+            crate::providers::StreamEvent::EditFileDone {
+                status: EditFileStatus::Ok,
+                ..
+            }
+        )));
     }
 
     fn plan_update_from(commands: &[LlmCommand]) -> tauqe_protocol::DiscussionPlanUpdate {

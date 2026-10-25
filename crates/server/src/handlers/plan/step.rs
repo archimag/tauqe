@@ -20,7 +20,7 @@ use crate::state::{AppState, OperationGuard};
 
 use super::common::{
     clear_auto_context, emit, offload_plan, report_step_failure, set_step_status,
-    turn_applied_edits, unmet_dependencies, with_context_mutation,
+    set_step_status_checked, turn_applied_edits, unmet_dependencies, with_context_mutation,
 };
 
 /// Loads the declared target and reference files of a step into the auto context
@@ -231,9 +231,15 @@ async fn run_plan_step_inner(
             Ok(turn) => turn,
             Err(err) => {
                 set_step_status(state, repo_root, plan_id, step_id, PlanItemStatus::Todo).await;
-                let op_id = format!("op-{}", crate::state::next_operation_id());
-                report_step_failure(state, &op_id, &err.message);
-                return BatchStepOutcome::failed(err.message);
+                // The failed turn names the operation it belonged to, so the
+                // failure event is attributable to this batch instead of a fresh
+                // identifier that matches no registered operation.
+                let op_id = err
+                    .operation_id
+                    .clone()
+                    .unwrap_or_else(|| format!("op-{}", operation.id()));
+                report_step_failure(state, &op_id, &err.error.message);
+                return BatchStepOutcome::failed(err.error.message);
             }
         };
 
@@ -248,10 +254,40 @@ async fn run_plan_step_inner(
             return BatchStepOutcome::blocked(reason);
         }
 
+        // Unconditional abort: the coder reports that the harness cannot
+        // perform the work at all and the developer must act in the host
+        // environment first. Unlike a semantic block, an abort never starts an
+        // architect replanning cycle, so the step returns to TODO, no coder
+        // escalation is attempted, and the supervisor stops its queue. The
+        // failure carries the recommendation so the developer receives the exact
+        // command to run.
+        if let Some(abort) = turn.abort.clone() {
+            set_step_status(state, repo_root, plan_id, step_id, PlanItemStatus::Todo).await;
+            let message = abort.to_message();
+            tracing::warn!(
+                plan_id = plan_id,
+                step_id = step_id,
+                reason = %abort.reason,
+                "plan step aborted; developer action in the host environment is required"
+            );
+            report_step_failure(state, &turn.operation_id, &message);
+            return BatchStepOutcome::failed(message);
+        }
+
         let applied = turn_applied_edits(&turn);
 
         if turn.is_success() && applied {
-            set_step_status(state, repo_root, plan_id, step_id, PlanItemStatus::Done).await;
+            // The DONE transition is part of the success contract: when the
+            // write cannot be persisted the step is reported as failed, so a
+            // dependent step that re-reads the plan from disk never stalls on
+            // a prerequisite the durable record still shows as InProgress.
+            let done =
+                set_step_status_checked(state, repo_root, plan_id, step_id, PlanItemStatus::Done)
+                    .await;
+            if let Err(err) = done {
+                report_step_failure(state, &turn.operation_id, &err);
+                return BatchStepOutcome::failed(err);
+            }
             return BatchStepOutcome::succeeded();
         }
 

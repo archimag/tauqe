@@ -6,6 +6,7 @@ use tauqe_core::providers::{ChatMessage, LlmProvider, ResponseFormat, StreamEven
 use tauqe_protocol::{events, Event, ModelDeltaEvent, ModelErrorEvent};
 use tokio::sync::mpsc;
 
+use crate::handlers::common::withdraw_streamed_attempt;
 use crate::state::{AppState, OperationGuard};
 use crate::usage::UsageGuard;
 
@@ -145,6 +146,21 @@ pub(super) async fn run_architect_stream(
             StreamEvent::Error(err) => {
                 failure = Some(err);
                 break;
+            }
+            // The retry decorator withdrew the previous attempt because it broke
+            // after partial output. Its explanation fragments belong to an answer
+            // the retry regenerates from its beginning, so they are discarded
+            // together with the raw payload they were decoded from; keeping
+            // either would parse the aborted prefix as part of the retried
+            // response and burn the round's parse budget.
+            StreamEvent::ResetStream => {
+                withdraw_streamed_attempt(&state.out, op_id, || {
+                    raw_text.clear();
+                    passthrough = None;
+                    explanation_cursor =
+                        tauqe_core::edits::stream::json::decode::StringFieldCursor::new();
+                    streamed_explanation_bytes = 0;
+                });
             }
             _ => {}
         }

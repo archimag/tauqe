@@ -7,7 +7,7 @@
 //! pipeline therefore operates purely on normalized semantics and stays
 //! independent of any single protocol format.
 
-use tauqe_protocol::{CapabilitySet, LlmCapability, LlmCommand};
+use tauqe_protocol::{CapabilitySet, EditProtocolKind, LlmCapability, LlmCommand};
 
 /// Decodes raw model output into normalized core commands.
 ///
@@ -19,6 +19,14 @@ use tauqe_protocol::{CapabilitySet, LlmCapability, LlmCommand};
 pub trait PromptProtocol: Send + Sync {
     /// Identifier name of the protocol (for example `"xml"` or `"structured"`).
     fn name(&self) -> &'static str;
+
+    /// Typed wire format this protocol serializes.
+    ///
+    /// The format is a transport fact, never a capability decision: prompt
+    /// composition reads it only to keep the rendered contract free of the
+    /// other contour's spellings, so a structured prompt advertises no control
+    /// tag while an XML prompt advertises no JSON field.
+    fn kind(&self) -> EditProtocolKind;
 
     /// Declarative set of interaction capabilities this protocol enables.
     ///
@@ -48,16 +56,34 @@ pub trait PromptProtocol: Send + Sync {
 
     /// Decodes raw model output into normalized core commands.
     ///
+    /// `context_paths` lists the files an edit may address this turn: every file
+    /// present in `<context>`, because a file marked read-only becomes editable
+    /// as soon as an edit proposes a change to it. Resolution therefore happens
+    /// at the decode boundary against the same list the streaming filter
+    /// received, so a preview and its decoded command never name different
+    /// files.
+    ///
     /// Only commands corresponding to advertised capabilities are produced.
-    fn decode(&self, raw_text: &str) -> Vec<LlmCommand>;
+    fn decode(&self, raw_text: &str, context_paths: &[String]) -> Vec<LlmCommand>;
 
     /// Renders protocol-specific instructions appended to the system prompt.
     ///
     /// The active protocol renders its own guidance directly, so prompt assembly
-    /// never reconstructs a protocol from its name. `has_eager_repo_map` reports
-    /// whether the prompt already carries the rendered repository symbol map, so
-    /// the guidance never advertises an on-demand map request for contours the
-    /// model can already read.
+    /// never reconstructs a protocol from its name and never renders mode
+    /// instructions of its own.
+    ///
+    /// An implementor renders the instructions of the wire surface its narrowed
+    /// capability set selects: the edit reference when
+    /// [`LlmCapability::FileEdits`] is enabled, and the read-only discussion
+    /// schema otherwise. The narrowed [`CapabilitySet`] is the single typed
+    /// input carrying that decision — the caller narrows through
+    /// `TurnIntent::narrow_capabilities` and [`PromptProtocol::with_capability_set`]
+    /// before calling — so no parallel intent channel exists on this trait and
+    /// a second source of truth cannot appear.
+    ///
+    /// `has_eager_repo_map` reports whether the prompt already carries the
+    /// rendered repository symbol map, so the guidance never advertises an
+    /// on-demand map request for contours the model can already read.
     fn system_instructions(&self, editable_paths: &[String], has_eager_repo_map: bool) -> String;
 
     /// Returns the active per-turn marker bound to this protocol, if any.
@@ -112,11 +138,15 @@ mod tests {
             "text-only"
         }
 
+        fn kind(&self) -> EditProtocolKind {
+            EditProtocolKind::Structured
+        }
+
         fn capabilities(&self) -> &[LlmCapability] {
             &[LlmCapability::TextMessage, LlmCapability::UserLanguage]
         }
 
-        fn decode(&self, raw_text: &str) -> Vec<LlmCommand> {
+        fn decode(&self, raw_text: &str, _context_paths: &[String]) -> Vec<LlmCommand> {
             vec![LlmCommand::Text {
                 content: raw_text.to_string(),
             }]
@@ -161,7 +191,7 @@ mod tests {
     #[test]
     fn test_prompt_protocol_decodes_commands() {
         let protocol = TextOnlyProtocol;
-        let commands = protocol.decode("Hello");
+        let commands = protocol.decode("Hello", &[]);
         assert_eq!(
             commands,
             vec![LlmCommand::Text {

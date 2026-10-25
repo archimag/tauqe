@@ -114,6 +114,28 @@ async fn test_state_with_provider(
     state
 }
 
+/// `review/get` parses strictly through the typed DTO while keeping the empty
+/// object as the canonical "active session" request.
+#[tokio::test]
+async fn test_handle_review_get_parses_payload_strictly() {
+    let dir = TestDir::new();
+    let state = test_state(&dir);
+    let make_req = |id: u64, params: Option<serde_json::Value>| Request {
+        id: tauqe_protocol::RequestId::Number(id),
+        method: tauqe_protocol::methods::REVIEW_GET.to_string(),
+        params,
+    };
+
+    // The empty object still resolves through the active-session fallback.
+    let res = handle_review_get(make_req(1, Some(serde_json::json!({}))), &state).await;
+    assert!(res.error.is_none());
+
+    // A non-string id answers INVALID_PARAMS instead of silently resolving
+    // through the active session.
+    let res = handle_review_get(make_req(2, Some(serde_json::json!({ "id": 123 }))), &state).await;
+    assert_eq!(res.error.unwrap().code, "INVALID_PARAMS");
+}
+
 #[tokio::test]
 async fn test_handle_review_start_defaults_to_reviewer_role() {
     let dir = TestDir::new();
@@ -652,8 +674,12 @@ async fn test_review_execute_blocked_by_failed_preflight() {
         ],
     );
     ReviewStorage::save_session(dir.path(), &session).unwrap();
-    // A malformed manifest makes the deterministic toolchain pipeline fail.
-    std::fs::write(dir.path().join("Cargo.toml"), "[package\n").unwrap();
+    // A failing verification command makes the deterministic pipeline fail.
+    std::fs::write(
+        dir.path().join("tauqe.toml"),
+        "[project.verify]\ncommand = \"false\"\n",
+    )
+    .unwrap();
     let state = test_state(&dir);
 
     let req = Request {
@@ -699,6 +725,7 @@ fn test_turn_applied_edits_requires_applied_change() {
         error: None,
         has_terminal_success: false,
         blocked: None,
+        abort: None,
     };
     assert!(applied.is_success());
     assert!(turn_applied_edits(&applied));
@@ -715,6 +742,7 @@ fn test_turn_applied_edits_requires_applied_change() {
         error: None,
         has_terminal_success: true,
         blocked: None,
+        abort: None,
     };
     assert!(answer.is_success());
     assert!(!turn_applied_edits(&answer));
@@ -737,6 +765,7 @@ fn test_turn_applied_edits_requires_applied_change() {
         error: Some("compiler error".to_string()),
         has_terminal_success: false,
         blocked: None,
+        abort: None,
     };
     assert!(!turn_applied_edits(&failed));
 }
@@ -1461,6 +1490,145 @@ async fn test_review_start_with_path_pattern_preserves_user_context() {
     assert!(!ctx.contains("src/b.rs").unwrap());
 }
 
+/// The pattern expansion honors `context.max_pattern_batch`: only the first
+/// batch of sorted matches is loaded, and the started event reports the rest
+/// so a truncated audit is never silent.
+#[tokio::test]
+async fn test_review_start_pattern_batch_cap_limits_and_reports_omissions() {
+    let dir = TestDir::new();
+    init_repo_with_file(&dir, "src/a.rs");
+    for name in ["src/b.rs", "src/c.rs"] {
+        std::fs::write(dir.path().join(name), "pub fn extra() {}\n").unwrap();
+    }
+    let extra_paths = ["src/b.rs".to_string(), "src/c.rs".to_string()];
+    tauqe_core::git::cmd::stage_files(dir.path(), &extra_paths).unwrap();
+    tauqe_core::git::cmd::commit_with_developer_author(dir.path(), "Add b and c", false).unwrap();
+
+    let payload = r#"{"summary":"Reviewed pattern files.","findings":[]}"#;
+    let provider: Arc<dyn LlmProvider> =
+        Arc::new(MockLlmProvider::scripted([MockResponse::text(payload)]));
+
+    let mut config = test_config();
+    config.context.max_pattern_batch = 2;
+
+    let (out, mut rx) = OutChannel::new();
+    let (hist_tx, _hist_rx) = tokio::sync::mpsc::unbounded_channel();
+    let state = AppState::new(config, dir.path().to_path_buf(), hist_tx, out);
+    *state.provider_override.lock().await = Some(provider);
+
+    let req = Request {
+        id: tauqe_protocol::RequestId::Number(1),
+        method: tauqe_protocol::methods::REVIEW_START.to_string(),
+        params: Some(serde_json::json!({ "path_pattern": "src/*.rs" })),
+    };
+    let res = handle_review_start(req, &state).await;
+    assert!(res.error.is_none(), "review start must succeed");
+
+    let mut started_omitted = None;
+    while let Ok(Some(line)) =
+        tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv()).await
+    {
+        let Ok(val) = serde_json::from_str::<serde_json::Value>(&line) else {
+            continue;
+        };
+        match val.get("method").and_then(|m| m.as_str()) {
+            Some(events::REVIEW_STARTED) => {
+                started_omitted = val
+                    .pointer("/params/omitted_files")
+                    .and_then(|v| v.as_u64());
+            }
+            Some(events::REVIEW_FINISHED) | Some(events::REVIEW_ERROR) => break,
+            _ => {}
+        }
+    }
+
+    let session = ReviewStorage::load_latest(dir.path())
+        .unwrap()
+        .expect("review session must be saved");
+    assert!(session.target_files.contains(&"src/a.rs".to_string()));
+    assert!(session.target_files.contains(&"src/b.rs".to_string()));
+    assert!(
+        !session.target_files.contains(&"src/c.rs".to_string()),
+        "the batch cap must keep the third sorted match out of the audit"
+    );
+    assert_eq!(
+        started_omitted,
+        Some(1),
+        "the started event must report the batch-capped match"
+    );
+}
+
+/// The pattern expansion honors `context.files_token_budget`: the first file
+/// that would breach the budget stops the expansion and is reported as
+/// omitted instead of silently enlarging the audit window.
+#[tokio::test]
+async fn test_review_start_pattern_token_budget_caps_expansion() {
+    let dir = TestDir::new();
+    init_repo_with_file(&dir, "src/aaa.rs");
+    std::fs::write(
+        dir.path().join("src/zzz.rs"),
+        "pub fn big() {}\n".repeat(600),
+    )
+    .unwrap();
+    tauqe_core::git::cmd::stage_files(dir.path(), &["src/zzz.rs".to_string()]).unwrap();
+    tauqe_core::git::cmd::commit_with_developer_author(dir.path(), "Add zzz", false).unwrap();
+
+    let payload = r#"{"summary":"Reviewed pattern files.","findings":[]}"#;
+    let provider: Arc<dyn LlmProvider> =
+        Arc::new(MockLlmProvider::scripted([MockResponse::text(payload)]));
+
+    let mut config = test_config();
+    // Roughly 100 tokens of headroom: the tiny `aaa.rs` fits, while the large
+    // `zzz.rs` (about 2400 estimated tokens) breaches the budget and is
+    // omitted together with the rest of the expansion.
+    config.context.files_token_budget = 100;
+
+    let (out, mut rx) = OutChannel::new();
+    let (hist_tx, _hist_rx) = tokio::sync::mpsc::unbounded_channel();
+    let state = AppState::new(config, dir.path().to_path_buf(), hist_tx, out);
+    *state.provider_override.lock().await = Some(provider);
+
+    let req = Request {
+        id: tauqe_protocol::RequestId::Number(1),
+        method: tauqe_protocol::methods::REVIEW_START.to_string(),
+        params: Some(serde_json::json!({ "path_pattern": "src/*.rs" })),
+    };
+    let res = handle_review_start(req, &state).await;
+    assert!(res.error.is_none(), "review start must succeed");
+
+    let mut started_omitted = None;
+    while let Ok(Some(line)) =
+        tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv()).await
+    {
+        let Ok(val) = serde_json::from_str::<serde_json::Value>(&line) else {
+            continue;
+        };
+        match val.get("method").and_then(|m| m.as_str()) {
+            Some(events::REVIEW_STARTED) => {
+                started_omitted = val
+                    .pointer("/params/omitted_files")
+                    .and_then(|v| v.as_u64());
+            }
+            Some(events::REVIEW_FINISHED) | Some(events::REVIEW_ERROR) => break,
+            _ => {}
+        }
+    }
+
+    let session = ReviewStorage::load_latest(dir.path())
+        .unwrap()
+        .expect("review session must be saved");
+    assert!(session.target_files.contains(&"src/aaa.rs".to_string()));
+    assert!(
+        !session.target_files.contains(&"src/zzz.rs".to_string()),
+        "the token budget must keep the oversized match out of the audit"
+    );
+    assert_eq!(
+        started_omitted,
+        Some(1),
+        "the started event must report the token-capped match"
+    );
+}
+
 #[tokio::test]
 async fn test_review_step_execution_records_resolution_notes_on_fixed() {
     let dir = TestDir::new();
@@ -1964,12 +2132,12 @@ async fn test_review_subplan_replans_remaining_horizon_after_failed_step() {
 async fn test_review_batch_skips_finding_on_verification_failure_and_continues() {
     let dir = TestDir::new();
     tauqe_core::git::init_repository(Some(dir.path()), true).unwrap();
-    // A failing check command makes toolchain verification fail deterministically
-    // without compiling a fixture project, so a verification failure is a domain
-    // failure that must be confined to the current finding.
+    // A failing verification command makes the declared lifecycle fail
+    // deterministically without compiling a fixture project, so a verification
+    // failure is a domain failure that must be confined to the current finding.
     std::fs::write(
         dir.path().join("tauqe.toml"),
-        "[toolchain]\ncheck_command = \"false\"\n",
+        "[project.verify]\ncommand = \"false\"\n",
     )
     .unwrap();
     std::fs::create_dir_all(dir.path().join("src")).unwrap();
@@ -2242,6 +2410,282 @@ async fn test_review_start_surfaces_stream_cancelled_event() {
     assert!(
         !saw_error,
         "cancellation must not be misreported as a review error"
+    );
+}
+
+/// Provider whose first attempt streams a prefix of its answer and then breaks
+/// at the transport layer, while every later attempt replays a complete payload.
+///
+/// It reproduces the mid-stream interruption the retry decorator heals, so a
+/// test can assert that the aborted attempt is withdrawn instead of being
+/// spliced onto the retried one.
+struct InterruptedAttemptProvider {
+    /// Payload streamed by the interrupted attempt.
+    partial: String,
+    /// Payload replayed by every later attempt.
+    complete: String,
+    /// Number of attempts started so far.
+    attempts: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl InterruptedAttemptProvider {
+    fn new(partial: &str, complete: &str) -> Self {
+        Self {
+            partial: partial.to_string(),
+            complete: complete.to_string(),
+            attempts: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        }
+    }
+
+    /// Wraps the provider in the retry decorator a real transport uses.
+    fn retrying(self) -> Arc<dyn LlmProvider> {
+        Arc::new(tauqe_core::providers::RetryingProvider::new(
+            Box::new(self),
+            tauqe_core::providers::RetryConfig {
+                max_attempts: 3,
+                base_delay_ms: 1,
+                max_delay_ms: 1,
+            },
+        ))
+    }
+}
+
+#[async_trait::async_trait]
+impl LlmProvider for InterruptedAttemptProvider {
+    fn kind(&self) -> tauqe_protocol::ProviderKind {
+        tauqe_protocol::ProviderKind::OpenRouter
+    }
+
+    async fn stream_chat(
+        &self,
+        _model: &str,
+        _messages: Vec<ChatMessage>,
+        _response_format: Option<ResponseFormat>,
+        tx: mpsc::Sender<StreamEvent>,
+        _cancel_rx: watch::Receiver<bool>,
+    ) -> anyhow::Result<()> {
+        let attempt = self
+            .attempts
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        if attempt == 0 {
+            let _ = tx.send(StreamEvent::TextDelta(self.partial.clone())).await;
+            return Err(anyhow::anyhow!(
+                "OpenRouter stream read error: connection reset by peer"
+            ));
+        }
+        let _ = tx.send(StreamEvent::TextDelta(self.complete.clone())).await;
+        let _ = tx.send(StreamEvent::Done).await;
+        Ok(())
+    }
+}
+
+/// A mid-stream transport break must withdraw the aborted review synthesis
+/// attempt instead of splicing the retried summary onto its prefix.
+#[tokio::test]
+async fn test_review_start_withdraws_the_aborted_attempt_before_the_retry() {
+    let dir = TestDir::new();
+    std::fs::write(dir.path().join("file.rs"), "fn foo() {}\n").unwrap();
+
+    let provider = InterruptedAttemptProvider::new(
+        r#"{"summary":"The architecture is sound"#,
+        r#"{"summary":"The architecture is sound, but locking is racy.","findings":[]}"#,
+    )
+    .retrying();
+
+    let (out, mut rx) = OutChannel::new();
+    let (hist_tx, _hist_rx) = tokio::sync::mpsc::unbounded_channel();
+    let state = AppState::new(
+        tauqe_core::config::AppConfig::default(),
+        dir.path().to_path_buf(),
+        hist_tx,
+        out,
+    );
+    *state.provider_override.lock().await = Some(provider);
+
+    state
+        .context
+        .write()
+        .await
+        .add_file("file.rs", ContextAccess::ReadOnly)
+        .unwrap();
+
+    let req = Request {
+        id: tauqe_protocol::RequestId::Number(1),
+        method: tauqe_protocol::methods::REVIEW_START.to_string(),
+        params: None,
+    };
+    let res = handle_review_start(req, &state).await;
+    assert!(
+        res.error.is_none(),
+        "review start must acknowledge the operation"
+    );
+
+    // The client mirrors the daemon: a withdrawn attempt is dropped, so the
+    // summary it renders is exactly the retried payload and never the aborted
+    // prefix with the retried document concatenated behind it.
+    let mut summary = String::new();
+    let mut resets = 0usize;
+    let mut finished = false;
+    while let Ok(Some(line)) =
+        tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv()).await
+    {
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(&line) else {
+            continue;
+        };
+        match value.get("method").and_then(|m| m.as_str()) {
+            Some(events::REVIEW_CONTENT_DELTA) => {
+                if let Some(delta) = value.pointer("/params/delta").and_then(|d| d.as_str()) {
+                    summary.push_str(delta);
+                }
+            }
+            Some(events::MODEL_STREAM_RESET) => {
+                resets += 1;
+                summary.clear();
+            }
+            Some(events::REVIEW_FINISHED) => {
+                finished = true;
+                break;
+            }
+            Some(events::REVIEW_ERROR) => break,
+            _ => {}
+        }
+    }
+
+    assert!(
+        finished,
+        "the retried payload must parse instead of failing as a corrupted document"
+    );
+    assert_eq!(
+        resets, 1,
+        "the withdrawn attempt must be announced exactly once"
+    );
+    assert_eq!(summary, "The architecture is sound, but locking is racy.");
+
+    let session = ReviewStorage::load_latest(dir.path())
+        .unwrap()
+        .expect("review session must be saved");
+    assert_eq!(
+        session.description.as_deref(),
+        Some("The architecture is sound, but locking is racy.")
+    );
+}
+
+/// A mid-stream transport break must withdraw the aborted Architect attempt
+/// instead of feeding its prefix into the structured parse.
+#[tokio::test]
+async fn test_review_refine_withdraws_the_aborted_architect_attempt() {
+    let dir = TestDir::new();
+    std::fs::write(dir.path().join("file.rs"), "fn foo() {}\n").unwrap();
+
+    let session = test_session(
+        "rev-refine-interrupted",
+        vec![test_item(1, IssueStatus::Todo, "file.rs")],
+    );
+    ReviewStorage::save_session(dir.path(), &session).unwrap();
+
+    let complete = serde_json::json!({
+        "status": "success",
+        "explanation": "Split into two sub-steps",
+        "reason": null,
+        "context_requests": [],
+        "items": [
+            {
+                "id": "1.1",
+                "title": "First",
+                "status": "todo",
+                "files": ["file.rs"],
+                "readonly_files": [],
+                "concept_refs": [],
+                "depends_on": [],
+                "children": []
+            },
+            {
+                "id": "1.2",
+                "title": "Second",
+                "status": "todo",
+                "files": ["file.rs"],
+                "readonly_files": [],
+                "concept_refs": [],
+                "depends_on": ["1.1"],
+                "children": []
+            }
+        ]
+    })
+    .to_string();
+    let provider = InterruptedAttemptProvider::new(
+        r#"{"status":"success","explanation":"Split into two sub"#,
+        &complete,
+    )
+    .retrying();
+
+    let (out, mut rx) = OutChannel::new();
+    let (hist_tx, _hist_rx) = tokio::sync::mpsc::unbounded_channel();
+    let state = AppState::new(
+        tauqe_core::config::AppConfig::default(),
+        dir.path().to_path_buf(),
+        hist_tx,
+        out,
+    );
+    *state.provider_override.lock().await = Some(provider);
+
+    state
+        .context
+        .write()
+        .await
+        .add_file("file.rs", ContextAccess::ReadOnly)
+        .unwrap();
+
+    let req = Request {
+        id: tauqe_protocol::RequestId::Number(1),
+        method: tauqe_protocol::methods::REVIEW_REFINE_ITEM.to_string(),
+        params: Some(serde_json::json!({
+            "review_id": "rev-refine-interrupted",
+            "item_id": 1
+        })),
+    };
+    let res = handle_review_refine_item(req, &state).await;
+    assert!(res.error.is_none(), "refine failed: {:?}", res.error);
+
+    // The explanation of the withdrawn attempt is never replayed in front of
+    // the retried one: a client that honours the reset renders it once.
+    let mut explanation = String::new();
+    let mut resets = 0usize;
+    while let Ok(line) = rx.try_recv() {
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(&line) else {
+            continue;
+        };
+        match value.get("method").and_then(|m| m.as_str()) {
+            Some(events::MODEL_TEXT_DELTA) => {
+                if let Some(delta) = value.pointer("/params/delta").and_then(|d| d.as_str()) {
+                    explanation.push_str(delta);
+                }
+            }
+            Some(events::MODEL_STREAM_RESET) => {
+                resets += 1;
+                explanation.clear();
+            }
+            _ => {}
+        }
+    }
+    assert_eq!(
+        resets, 1,
+        "the withdrawn attempt must be announced exactly once"
+    );
+    assert_eq!(
+        explanation, "Split into two sub-steps",
+        "the explanation must be streamed exactly once"
+    );
+
+    // The retried document parses on its first attempt, so the synthesized
+    // horizon is persisted instead of being lost to an exhausted parse budget.
+    let reloaded = ReviewStorage::load_review(dir.path(), "rev-refine-interrupted")
+        .unwrap()
+        .unwrap();
+    let issue = ReviewIssue::from(reloaded.find_item(1).unwrap().clone());
+    assert_eq!(
+        issue.plan.len(),
+        2,
+        "the retried payload must parse without a regenerated round"
     );
 }
 
@@ -2855,4 +3299,359 @@ async fn test_validate_step_target_blocks_composite_container_dependency_when_un
         .expect("an unfinished composite prerequisite must block the sub-step");
     assert_eq!(err.code, "STEP_BLOCKED_BY_DEPENDENCIES");
     assert!(err.message.contains("#1.2"), "message: {}", err.message);
+}
+
+#[tokio::test]
+async fn test_review_batch_abort_marks_skipped_and_continues() {
+    let dir = TestDir::new();
+    init_repo_with_file(&dir, "src/target.rs");
+
+    let session = test_session(
+        "rev-abort",
+        vec![
+            test_item(1, IssueStatus::Todo, "src/target.rs"),
+            test_item(2, IssueStatus::Todo, "src/target.rs"),
+        ],
+    );
+    ReviewStorage::save_session(dir.path(), &session).unwrap();
+
+    let abort_response = "The native module cannot be built in this environment.\n<abort reason=\"Native build approval required\" recommendation=\"pnpm approve-builds\" />";
+    let provider = Arc::new(MockLlmProvider::scripted([
+        MockResponse::text(abort_response),
+        MockResponse::text(abort_response),
+    ]));
+
+    // A retry budget is available, so the abort must short-circuit the turn
+    // instead of consuming a corrective attempt or escalating the Coder.
+    let mut config = test_config();
+    config.develop.max_retries = 1;
+    let state = test_state_with_provider(&dir, config, provider.clone()).await;
+
+    let operation = Arc::new(
+        state
+            .try_begin_operation()
+            .expect("register batch operation"),
+    );
+    let outcome = run_review_batch(
+        &state,
+        "rev-abort",
+        make_tasks("rev-abort", &[1, 2]),
+        operation,
+    )
+    .await;
+    assert!(
+        matches!(outcome, BatchOutcome::Completed { items: 2 }),
+        "an abort must skip the finding and let the batch continue, got {outcome:?}"
+    );
+
+    // Exactly one request per finding: the abort ends the turn before the retry
+    // loop and never engages an Architect decomposition or replanning round.
+    assert_eq!(provider.requests().len(), 2);
+
+    let updated = ReviewStorage::load_review(dir.path(), "rev-abort")
+        .unwrap()
+        .unwrap();
+    for id in [1u32, 2] {
+        let issue = ReviewIssue::from(updated.find_item(id).unwrap().clone());
+        assert_eq!(
+            issue.status,
+            IssueStatus::Skipped,
+            "finding {id} must be skipped instead of retried or escalated"
+        );
+        let notes = issue.note.as_deref().unwrap_or("");
+        assert!(
+            notes.contains("Native build approval required"),
+            "finding {id} notes: {notes}"
+        );
+        assert!(
+            notes.contains("pnpm approve-builds"),
+            "finding {id} notes: {notes}"
+        );
+    }
+}
+
+/// The terminal batch event must name the operation the execute acknowledgement
+/// returned, so a client can attribute `review/batch_finished` to the request it
+/// sent instead of correlating an unregistered identifier.
+#[tokio::test]
+async fn test_review_batch_finished_carries_the_registered_operation_id() {
+    let dir = TestDir::new();
+    let session = test_session("rev-op-id", vec![test_item(1, IssueStatus::Todo, "foo.rs")]);
+    ReviewStorage::save_session(dir.path(), &session).unwrap();
+
+    let (out, mut rx) = OutChannel::new();
+    let (hist_tx, _hist_rx) = tokio::sync::mpsc::unbounded_channel();
+    let state = AppState::new(
+        tauqe_core::config::AppConfig::default(),
+        dir.path().to_path_buf(),
+        hist_tx,
+        out,
+    );
+
+    let req = Request {
+        id: tauqe_protocol::RequestId::Number(1),
+        method: tauqe_protocol::methods::REVIEW_EXECUTE.to_string(),
+        params: Some(serde_json::json!({ "review_id": "rev-op-id" })),
+    };
+    let res = handle_review_execute(req, &state).await;
+    let val: serde_json::Value = res.result.expect("the batch must be acknowledged");
+    let acknowledged_id = val["operation_id"]
+        .as_str()
+        .expect("the acknowledgement carries the batch operation id")
+        .to_string();
+
+    // Without an API key the first turn cannot start, so the batch terminates
+    // immediately and publishes its single completion event.
+    let mut finished = None;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while finished.is_none() && std::time::Instant::now() < deadline {
+        while let Ok(raw) = rx.try_recv() {
+            if raw.contains(events::REVIEW_BATCH_FINISHED) {
+                finished = Some(raw);
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    let finished = finished.expect("review/batch_finished must be emitted");
+    let event: serde_json::Value = serde_json::from_str(&finished).expect("event is valid JSON");
+    assert_eq!(
+        event["params"]["operation_id"], acknowledged_id,
+        "the terminal event must name the operation the acknowledgement returned"
+    );
+}
+
+/// A finished, rejected, or untriaged finding cannot be decomposed: the gate
+/// answers a typed error before the operation slot is taken and leaves the
+/// persisted status untouched, mirroring `handle_plan_replan`'s immutability
+/// guard.
+#[tokio::test]
+async fn test_handle_review_refine_item_refuses_terminal_and_untriaged_findings() {
+    let dir = TestDir::new();
+    let session = test_session(
+        "rev-refine-gate",
+        vec![
+            test_item(1, IssueStatus::Fixed, "foo.rs"),
+            test_item(2, IssueStatus::Rejected, "foo.rs"),
+            test_item(3, IssueStatus::Discussion, "foo.rs"),
+        ],
+    );
+    ReviewStorage::save_session(dir.path(), &session).unwrap();
+    let state = test_state(&dir);
+
+    let cases = [
+        (1u32, "STEP_IMMUTABLE"),
+        (2, "ITEM_REJECTED"),
+        (3, "ITEM_IN_DISCUSSION"),
+    ];
+    for (index, (item_id, code)) in cases.iter().enumerate() {
+        let req = Request {
+            id: tauqe_protocol::RequestId::Number(10 + index as u64),
+            method: tauqe_protocol::methods::REVIEW_REFINE_ITEM.to_string(),
+            params: Some(serde_json::json!({
+                "review_id": "rev-refine-gate",
+                "item_id": *item_id,
+            })),
+        };
+        let res = handle_review_refine_item(req, &state).await;
+        let err = match res.error {
+            Some(err) => err,
+            None => panic!("finding {item_id} must be refused"),
+        };
+        assert_eq!(err.code, *code, "finding {item_id}");
+        // The refusal is decided before the operation slot is claimed.
+        assert!(!state.is_operation_active());
+    }
+
+    // Refusing the round never touches the persisted lifecycle.
+    let reloaded = ReviewStorage::load_review(dir.path(), "rev-refine-gate")
+        .unwrap()
+        .unwrap();
+    assert_eq!(reloaded.find_item(1).unwrap().status, IssueStatus::Fixed);
+    assert_eq!(reloaded.find_item(2).unwrap().status, IssueStatus::Rejected);
+    assert_eq!(
+        reloaded.find_item(3).unwrap().status,
+        IssueStatus::Discussion
+    );
+}
+
+/// A finding whose subplan stalled is `Skipped`; the developer may still ask the
+/// Architect to decompose it again, and a successful round returns it to the
+/// executable queue instead of leaving it finished by accident.
+#[tokio::test]
+async fn test_handle_review_refine_item_admits_a_skipped_finding_for_recovery() {
+    let dir = TestDir::new();
+    let session = test_session(
+        "rev-refine-skipped",
+        vec![test_item(1, IssueStatus::Skipped, "foo.rs")],
+    );
+    ReviewStorage::save_session(dir.path(), &session).unwrap();
+
+    let refine_output = serde_json::json!({
+        "status": "success",
+        "explanation": "Reprojected the stalled finding",
+        "reason": null,
+        "context_requests": [],
+        "items": [{
+            "id": "1.1",
+            "title": "Recovered step",
+            "status": "todo",
+            "files": ["foo.rs"],
+            "readonly_files": [],
+            "concept_refs": [],
+            "depends_on": [],
+            "children": []
+        }]
+    });
+    let provider = Arc::new(MockLlmProvider::scripted([MockResponse::text(
+        refine_output.to_string(),
+    )]));
+    let state = test_state_with_provider(&dir, test_config(), provider).await;
+
+    let req = Request {
+        id: tauqe_protocol::RequestId::Number(1),
+        method: tauqe_protocol::methods::REVIEW_REFINE_ITEM.to_string(),
+        params: Some(serde_json::json!({
+            "review_id": "rev-refine-skipped",
+            "item_id": 1
+        })),
+    };
+    let res = handle_review_refine_item(req, &state).await;
+    assert!(
+        res.error.is_none(),
+        "a skipped finding must stay recoverable: {:?}",
+        res.error
+    );
+
+    let reloaded = ReviewStorage::load_review(dir.path(), "rev-refine-skipped")
+        .unwrap()
+        .unwrap();
+    let issue = ReviewIssue::from(reloaded.find_item(1).unwrap().clone());
+    assert_eq!(issue.plan.len(), 1);
+    // Planning settles the recovered finding back into the executable queue.
+    assert_eq!(issue.status, IssueStatus::Todo);
+}
+
+/// Deleting the anchored review session releases the discussion focus with it.
+///
+/// Mirrors the plan-delete invariant: a focus anchor may never address a
+/// non-existent entity, so a session deletion releases a focus bound to the
+/// removed session, and the release is broadcast so every client drops the
+/// dead anchor instead of rendering it. A focus anchored on a surviving
+/// session is untouched by another deletion.
+#[tokio::test]
+async fn test_handle_review_delete_clears_focus_anchored_on_the_deleted_review() {
+    let dir = TestDir::new();
+    for id in ["focus-del", "focus-keep", "focus-other"] {
+        let session = test_session(id, vec![test_item(1, IssueStatus::Todo, "foo.rs")]);
+        ReviewStorage::save_session(dir.path(), &session).unwrap();
+    }
+
+    let (out, mut rx) = OutChannel::new();
+    let (hist_tx, _hist_rx) = tokio::sync::mpsc::unbounded_channel();
+    let state = AppState::new(
+        tauqe_core::config::AppConfig::default(),
+        dir.path().to_path_buf(),
+        hist_tx,
+        out,
+    );
+
+    let delete_request = |id: u64, review_id: &str| Request {
+        id: tauqe_protocol::RequestId::Number(id),
+        method: tauqe_protocol::methods::REVIEW_DELETE.to_string(),
+        params: Some(serde_json::json!({ "id": review_id })),
+    };
+
+    // A focus anchored on the deleted session is released with it.
+    state
+        .set_discussion_focus(tauqe_protocol::DiscussionFocus::review("focus-del", vec![]))
+        .await;
+    let res = handle_review_delete(delete_request(1, "focus-del"), &state).await;
+    assert!(res.error.is_none(), "delete failed: {:?}", res.error);
+    assert!(
+        state.discussion_focus().await.is_none(),
+        "a focus anchored on a deleted review must be dropped"
+    );
+
+    // The release is broadcast so every client drops the dead anchor.
+    let mut emitted = Vec::new();
+    while let Ok(raw) = rx.try_recv() {
+        emitted.push(raw);
+    }
+    assert!(
+        emitted
+            .iter()
+            .any(|e| e.contains(events::DISCUSSION_FOCUS_CHANGED)),
+        "the focus release must be broadcast to clients"
+    );
+
+    // A focus anchored on a surviving session is untouched by another deletion.
+    state
+        .set_discussion_focus(tauqe_protocol::DiscussionFocus::review(
+            "focus-keep",
+            vec![],
+        ))
+        .await;
+    let res = handle_review_delete(delete_request(2, "focus-other"), &state).await;
+    assert!(res.error.is_none(), "delete failed: {:?}", res.error);
+    assert_eq!(
+        state.discussion_focus().await,
+        tauqe_protocol::DiscussionFocus::review("focus-keep", vec![])
+    );
+}
+
+/// Deleting the anchored session releases the anchor as a typed payload.
+///
+/// The release must travel as `DiscussionFocus::None` inside the broadcast
+/// event, not merely as an absent focus: every client reconstructs its anchor
+/// from that payload and would otherwise keep rendering a dead one.
+#[tokio::test]
+async fn test_handle_review_delete_broadcasts_typed_focus_release() {
+    let dir = TestDir::new();
+    let session = test_session(
+        "typed-focus",
+        vec![test_item(1, IssueStatus::Todo, "foo.rs")],
+    );
+    ReviewStorage::save_session(dir.path(), &session).unwrap();
+
+    let (out, mut rx) = OutChannel::new();
+    let (hist_tx, _hist_rx) = tokio::sync::mpsc::unbounded_channel();
+    let state = AppState::new(
+        tauqe_core::config::AppConfig::default(),
+        dir.path().to_path_buf(),
+        hist_tx,
+        out,
+    );
+
+    state
+        .set_discussion_focus(tauqe_protocol::DiscussionFocus::review(
+            "typed-focus",
+            vec!["1".to_string()],
+        ))
+        .await;
+    assert!(state.discussion_focus().await.is_active());
+    // The focus set itself broadcasts a change event; only the release that
+    // accompanies the deletion is under test here.
+    while rx.try_recv().is_ok() {}
+
+    let req = Request {
+        id: tauqe_protocol::RequestId::Number(1),
+        method: tauqe_protocol::methods::REVIEW_DELETE.to_string(),
+        params: Some(serde_json::json!({ "id": "typed-focus" })),
+    };
+    let res = handle_review_delete(req, &state).await;
+    assert!(res.error.is_none(), "delete failed: {:?}", res.error);
+
+    let mut release = None;
+    while let Ok(raw) = rx.try_recv() {
+        if raw.contains(events::DISCUSSION_FOCUS_CHANGED) {
+            release = Some(raw);
+        }
+    }
+    let release = release.expect("the focus release must be broadcast");
+    assert!(
+        release.contains("\"kind\":\"none\""),
+        "the release must carry an explicit detached focus: {release}"
+    );
+
+    assert!(state.discussion_focus().await.is_none());
 }

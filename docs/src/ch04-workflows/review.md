@@ -46,14 +46,17 @@ into the Architect role.
    ranges.
 5. **A finding is resolved only in a verified bounded turn.** Marking `Fixed` is tied
    to the verified result of the turn, not to an opinion.
-6. **Human triage gates autonomous execution.** A finding under discussion is never
+6. **The audit fixes *what*; the fix owns *how*.** A resolving turn never re-audits
+   the finding. Substituting the designed structure, the interfaces the finding
+   relies on, or an invariant it states is not part of resolving it.
+7. **Human triage gates autonomous execution.** A finding under discussion is never
    executed.
-7. **An undecomposed *what* is never executed.** A finding awaiting decomposition is
+8. **An undecomposed *what* is never executed.** A finding awaiting decomposition is
    refused, not guessed at.
-8. **Status is developer-owned.** A discussion explains a proposed change; it never
+9. **Status is developer-owned.** A discussion explains a proposed change; it never
    rewrites persisted review state.
-9. **Verification precedes execution.** A repository that does not build is refused
-   before any token is spent.
+10. **Verification precedes execution.** A repository that does not build is refused
+    before any token is spent.
 
 ---
 
@@ -162,6 +165,14 @@ rewritten: a scoped audit can cover code never explicitly added, while control o
 the working set stays untouched. Because matched files are read from the working
 tree, the audit always inspects current source.
 
+Pattern expansion is bounded by the same context budgets that govern discovery: at
+most `context.max_pattern_batch` matched files are loaded per audit, and the
+expansion stops at the first file that would push the loaded total past
+`context.files_token_budget`. Matches beyond either cap are not inspected. The
+`review/started` event reports how many matched files were omitted, the daemon
+records a warning, and the interface raises one, so a silently narrow audit is
+impossible.
+
 ### 3.2 Isolation
 
 The reviewer receives the pure content of the selected files — no Develop history and
@@ -224,6 +235,23 @@ editable auto context, formats the isolated execution prompt, and runs one bound
 turn with the toolchain gate. **Completion contract:** the finding becomes `Fixed`
 only if the turn succeeds *and* actually applies verified changes; the turn's edit
 summary is recorded in `note` when the finding has none.
+
+The prompt fixes the decision on two levels. The `IsolatedStep` system contract
+states that the resolving turn owns the implementation only, and the execution
+prompt restates it beside the finding: the designed data structures, the interfaces
+and contracts the finding relies on, and the components it selected are not the
+turn's to replace, while every path in `readonly_files` is a protected contract that
+is read and never modified.
+
+**A blocked finding.** A turn that cannot resolve the finding inside that decision —
+because the fix would need a different data structure, a changed interface, a
+substituted component, or a relaxed invariant — reports the conflict with the
+blocked outcome instead of improvising one. The review lifecycle has no separate
+blocked status, so the outcome follows the domain-failure path: the finding becomes
+`Skipped` with the blocker recorded in `note`, and the queue advances. A finding
+that carries a subplan is different: a failed sub-step first triggers a replanning
+wave bounded by `develop.max_replans`, and only an exhausted budget or a blocked
+Architect leaves the finding `Skipped`.
 
 **Managed skip.** When the model determines that the defect was already addressed by
 earlier work or is not reproducible, it emits the typed skip outcome with a reason.
@@ -305,12 +333,18 @@ turns an undecomposed *what* into executable *how* steps and returns the finding
 `TODO`.
 
 Each decomposition records its Architect configuration on the finding and renders it
-as a compact badge. When a sub-step later fails with a domain failure, the replanning
-round reads that record and asks the `architect` ladder for the next rung, so the
-reprojected horizon is synthesized by a stronger Architect than the one whose horizon
-already failed. The new rung is recorded in turn, escalation saturates on the last
-rung, and a configuration absent from project configuration restarts from the base
-rung.
+as a compact badge. Escalation follows the same lazy rule as implementation plans, so
+both workflows stay symmetric: the first replan of a failing sub-step keeps the
+current architect configuration, and only a repeated failure of the sub-step recorded
+in `subplan_last_replanned_step` advances the `architect` ladder and writes the new
+rung onto the finding. Escalation saturates on the last rung, and a configuration
+absent from project configuration restarts from the base rung.
+
+The marker is persisted with the finding together with the synthesized horizon, so a
+decomposition or replan started manually from the interface behaves exactly like an
+automated one. Parity is intentional rather than incidental: finding decomposition
+and plan refinement both ask the Architect for a horizon, and they must not answer
+the same repeated failure with two different escalation policies.
 
 ### 3.11 Execution of an embedded plan
 
@@ -318,6 +352,12 @@ A finding carrying a plan expands each leaf sub-step into its own bounded turn, 
 files preloaded as editable and the same completion contract and escalation behavior
 as a single finding. A sub-step that applies cleanly is persisted as `Done`
 immediately, so finished work survives any later interruption.
+
+Each sub-step prompt is built from the finding rather than from the subplan alone.
+The finding body becomes the plan description, its recommendations become concept
+nodes beside an invariant node restating the decision the audit fixed, and the whole
+tree is rendered in the prompt. A sub-step therefore reads the reviewer's rationale
+and the contract it must not break, instead of an orphaned list of file paths.
 
 If a sub-step fails, blocks, or the turn is cancelled:
 
@@ -381,6 +421,9 @@ compile failure is a *how* problem.
   purpose.
 - **It is not a shortcut past decomposition.** A `REFINE` finding is a *what* without
   *how* and is refused until the Architect decomposes it.
+- **It is not a re-audit by the fixer.** The finding states what must hold; the
+  resolving turn implements it and reports a conflict through the blocked outcome
+  rather than redefining the finding.
 - **It is not a status mutator.** Discussions explain proposed changes; the developer
   applies them.
 - **It is not a way to weaken verification.** Pre-flight and per-finding gates come

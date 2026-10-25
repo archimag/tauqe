@@ -1,163 +1,85 @@
 //! Conversational-text extraction for the XML edit protocol.
 //!
 //! [`extract_conversational_text`] removes every edit block and control tag
-//! from model output so history and the UI display only the model's prose.
+//! from model output so history and the UI display only the model's prose. The
+//! edit block names it strips are resolved from the capability registry, so the
+//! cleaner never re-declares a tag spelling of its own.
 
 use super::engine::strip_all_control_tags;
-use super::parser::find_base_tag_start;
+use super::parser::{file_edit_tags, find_base_tag_start};
 
 /// Extracts conversational text from model output by stripping edit tags
-/// (<tauqe_edits>, <edit>, <create>, <delete>, etc.) and cleaning up extra whitespace.
+/// (the edit container, its file blocks, and every control tag) and cleaning up
+/// extra whitespace.
 pub fn extract_conversational_text(raw_text: &str) -> String {
+    let tags = file_edit_tags();
     let mut text = raw_text.to_string();
 
-    // 1. Remove ```tauqe_edit ... ``` JSON fenced blocks if present
-    while let Some(start_idx) = text.find("```tauqe_edit") {
-        let after_start = start_idx + "```tauqe_edit".len();
-        if let Some(end_idx) = text[after_start..].find("```") {
-            let total_end = after_start + end_idx + 3;
-            text.replace_range(start_idx..total_end, "");
-        } else {
-            text.replace_range(start_idx.., "");
-            break;
-        }
+    // 1. Remove code fences labelled with an edit tag name.
+    for name in tags.opening_names() {
+        strip_fenced_edit_blocks(&mut text, name);
     }
 
-    // 2. Remove <tauqe_edits>...</tauqe_edits> blocks (and enclosing fences if any)
-    while let Some((start, tag_name)) = find_base_tag_start(&text, "tauqe_edits") {
-        let close_tag = format!("</{}>", tag_name);
-        if let Some(close_offset) = text[start..].find(&close_tag) {
-            let end = start + close_offset + close_tag.len();
-            let (exp_start, exp_end) = expand_fence_bounds(&text, start, end);
-            text.replace_range(exp_start..exp_end, "");
-        } else if let Some(gt_offset) = text[start..].find('>') {
-            let header = &text[start..start + gt_offset + 1];
-            if header.trim_end().ends_with("/>") {
-                let end = start + gt_offset + 1;
-                let (exp_start, exp_end) = expand_fence_bounds(&text, start, end);
-                text.replace_range(exp_start..exp_end, "");
-            } else {
-                let end = start + gt_offset + 1;
-                text.replace_range(start..end, "");
-            }
-        } else {
-            text.replace_range(start.., "");
-            break;
-        }
+    // 2. Remove every edit container, then every standalone file block.
+    for container in &tags.containers {
+        strip_edit_block(&mut text, container, false);
     }
-
-    // 3. Remove standalone <edit ...>...</edit>
-    while let Some((start, tag_name)) = find_base_tag_start(&text, "edit") {
-        let close_tag = format!("</{}>", tag_name);
-        if let Some(close_offset) = text[start..].find(&close_tag) {
-            let end = start + close_offset + close_tag.len();
-            let (exp_start, exp_end) = expand_fence_bounds(&text, start, end);
-            text.replace_range(exp_start..exp_end, "");
-        } else if let Some(gt_offset) = text[start..].find('>') {
-            let end = start + gt_offset + 1;
-            text.replace_range(start..end, "");
-        } else {
-            text.replace_range(start.., "");
-            break;
-        }
-    }
-
-    // 4. Remove standalone <create ...>...</create>
-    while let Some((start, tag_name)) = find_base_tag_start(&text, "create") {
-        let close_tag = format!("</{}>", tag_name);
-        if let Some(close_offset) = text[start..].find(&close_tag) {
-            let end = start + close_offset + close_tag.len();
-            let (exp_start, exp_end) = expand_fence_bounds(&text, start, end);
-            text.replace_range(exp_start..exp_end, "");
-        } else if let Some(gt_offset) = text[start..].find('>') {
-            let end = start + gt_offset + 1;
-            text.replace_range(start..end, "");
-        } else {
-            text.replace_range(start.., "");
-            break;
-        }
-    }
-
-    // 4b. Remove standalone <overwrite ...>...</overwrite>
-    while let Some((start, tag_name)) = find_base_tag_start(&text, "overwrite") {
-        let close_tag = format!("</{}>", tag_name);
-        if let Some(close_offset) = text[start..].find(&close_tag) {
-            let end = start + close_offset + close_tag.len();
-            let (exp_start, exp_end) = expand_fence_bounds(&text, start, end);
-            text.replace_range(exp_start..exp_end, "");
-        } else if let Some(gt_offset) = text[start..].find('>') {
-            let end = start + gt_offset + 1;
-            text.replace_range(start..end, "");
-        } else {
-            text.replace_range(start.., "");
-            break;
-        }
-    }
-
-    // 5. Remove standalone <delete .../> or <delete ...>...</delete>
-    while let Some((start, tag_name)) = find_base_tag_start(&text, "delete") {
-        let close_tag = format!("</{}>", tag_name);
-        if let Some(gt_offset) = text[start..].find('>') {
-            let tag_open_end = start + gt_offset + 1;
-            let header = &text[start..tag_open_end];
-            if header.trim_end().ends_with("/>") {
-                let (exp_start, exp_end) = expand_fence_bounds(&text, start, tag_open_end);
-                text.replace_range(exp_start..exp_end, "");
-            } else if let Some(close_offset) = text[start..].find(&close_tag) {
-                let end = start + close_offset + close_tag.len();
-                let (exp_start, exp_end) = expand_fence_bounds(&text, start, end);
-                text.replace_range(exp_start..exp_end, "");
-            } else {
-                let (exp_start, exp_end) = expand_fence_bounds(&text, start, tag_open_end);
-                text.replace_range(exp_start..exp_end, "");
-            }
-        } else {
-            text.replace_range(start.., "");
-            break;
-        }
-    }
-
-    // 5b. Remove standalone <move .../> or <move ...>...</move>
-    while let Some((start, tag_name)) = find_base_tag_start(&text, "move") {
-        let close_tag = format!("</{}>", tag_name);
-        if let Some(gt_offset) = text[start..].find('>') {
-            let tag_open_end = start + gt_offset + 1;
-            let header = &text[start..tag_open_end];
-            if header.trim_end().ends_with("/>") {
-                let (exp_start, exp_end) = expand_fence_bounds(&text, start, tag_open_end);
-                text.replace_range(exp_start..exp_end, "");
-            } else if let Some(close_offset) = text[start..].find(&close_tag) {
-                let end = start + close_offset + close_tag.len();
-                let (exp_start, exp_end) = expand_fence_bounds(&text, start, end);
-                text.replace_range(exp_start..exp_end, "");
-            } else {
-                let (exp_start, exp_end) = expand_fence_bounds(&text, start, tag_open_end);
-                text.replace_range(exp_start..exp_end, "");
-            }
-        } else {
-            text.replace_range(start.., "");
-            break;
-        }
-    }
-
-    // 6. Remove standalone <replace path="...">...</replace> if any
-    while let Some((start, tag_name)) = find_base_tag_start(&text, "replace") {
-        if let Some(gt_offset) = text[start..].find('>') {
-            let header = &text[start..start + gt_offset + 1];
-            if header.contains("path") {
-                let close_tag = format!("</{}>", tag_name);
-                if let Some(close_offset) = text[start..].find(&close_tag) {
-                    let end = start + close_offset + close_tag.len();
-                    let (exp_start, exp_end) = expand_fence_bounds(&text, start, end);
-                    text.replace_range(exp_start..exp_end, "");
-                    continue;
-                }
-            }
-        }
-        break;
+    for block in &tags.file_blocks {
+        strip_edit_block(&mut text, block.name, block.requires_target);
     }
 
     clean_conversational_lines(&strip_all_control_tags(&text))
+}
+
+/// Removes code fences labelled with an edit tag name.
+fn strip_fenced_edit_blocks(text: &mut String, base: &str) {
+    let opening = format!("```{}", base);
+    while let Some(start) = text.find(&opening) {
+        let after_start = start + opening.len();
+        if let Some(end_idx) = text[after_start..].find("```") {
+            text.replace_range(start..after_start + end_idx + 3, "");
+        } else {
+            text.replace_range(start.., "");
+            break;
+        }
+    }
+}
+
+/// Removes every occurrence of the named edit block from `text`.
+///
+/// A block is removed together with its closing tag, or up to its opening
+/// header when it is self-closing or unterminated; an enclosing code fence is
+/// removed as well. When `requires_target` is set, only a block whose header
+/// names a target path is removed, so a spelling shared with a hunk block
+/// leaves prose mentions untouched.
+fn strip_edit_block(text: &mut String, base: &str, requires_target: bool) {
+    while let Some((start, tag_name)) = find_base_tag_start(text, base) {
+        let Some(gt_offset) = text[start..].find('>') else {
+            text.replace_range(start.., "");
+            break;
+        };
+        let tag_open_end = start + gt_offset + 1;
+        if requires_target && !text[start..tag_open_end].contains("path") {
+            break;
+        }
+
+        let self_closing = text[start..tag_open_end].trim_end().ends_with("/>");
+        let close_tag = format!("</{}>", tag_name);
+        let end = if self_closing {
+            None
+        } else {
+            text[start..]
+                .find(&close_tag)
+                .map(|offset| start + offset + close_tag.len())
+        };
+
+        let (exp_start, exp_end) = match end {
+            Some(end) => expand_fence_bounds(text, start, end),
+            None if self_closing => expand_fence_bounds(text, start, tag_open_end),
+            None => (start, tag_open_end),
+        };
+        text.replace_range(exp_start..exp_end, "");
+    }
 }
 
 fn expand_fence_bounds(text: &str, start: usize, end: usize) -> (usize, usize) {

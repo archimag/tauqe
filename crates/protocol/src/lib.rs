@@ -38,8 +38,8 @@ pub mod review;
 // instead of a silently ambiguous glob re-export. Module paths remain public,
 // so both `tauqe_protocol::Item` and `tauqe_protocol::module::Item` resolve.
 pub use command::{
-    CapabilityPhase, CapabilitySet, DocTopic, LlmCapability, LlmCommand, LlmOutcome,
-    VerifyOnSuccess, VerifyTarget,
+    CapabilityDelivery, CapabilityPhase, CapabilitySet, DocTopic, LlmCapability, LlmCommand,
+    LlmOutcome, VerifyOnSuccess, VerifyTarget,
 };
 pub use config::{
     ConfigCreateParams, ConfigSetParams, ConfigState, CredentialsSaveParams, EditProtocolKind,
@@ -75,13 +75,13 @@ pub use errors::{
     PREFLIGHT_VERIFICATION_FAILED, REMOVE_FAILED, REPOSITORY_STATE_FAILED, REVIEW_DELETE_FAILED,
     REVIEW_GET_FAILED, REVIEW_LIST_FAILED, REVIEW_LOAD_FAILED, REVIEW_UPDATE_FAILED, SCHEMA_ERROR,
     SET_ACCESS_FAILED, SQUASH_FAILED, SQUASH_PREVIEW_FAILED, STEP_BLOCKED,
-    STEP_BLOCKED_BY_DEPENDENCIES, STEP_CANCELLED, STEP_IMMUTABLE, STEP_IN_DISCUSSION, UNDO_FAILED,
+    STEP_BLOCKED_BY_DEPENDENCIES, STEP_CANCELLED, STEP_IMMUTABLE, STEP_IN_DISCUSSION,
     UNEXPECTED_STATUS,
 };
 pub use git::{
     GitCommitCreatedEvent, GitDiffParams, GitDiffResult, GitSquashApplyParams,
     GitSquashApplyResult, GitSquashCommitItem, GitSquashFileDiff, GitSquashGenerateMessageParams,
-    GitSquashGenerateMessageResult, GitSquashPreviewParams, GitSquashPreviewResult, GitUndoResult,
+    GitSquashGenerateMessageResult, GitSquashPreviewParams, GitSquashPreviewResult,
     RepositoryInitParams, RepositoryInitResult, RepositoryListFilesResult, RepositoryState,
 };
 pub use glob::{matches_glob_pattern, GlobPattern};
@@ -97,14 +97,15 @@ pub use message::{
 };
 pub use model::{
     deserialize_model_ref_lenient, ArchitectTier, BatchFinishStatus, BatchFinishSummary,
-    CancelMode, CoderTier, ModelAskParams, ModelCancelParams, ModelChangedEvent,
+    CancelMode, CoderTier, ModelAskParams, ModelCancelParams, ModelCatalogEntry, ModelChangedEvent,
     ModelConnectionRetryingEvent, ModelCurrentResult, ModelDeltaEvent, ModelEntry, ModelErrorEvent,
     ModelEscalatedEvent, ModelFinishedEvent, ModelRef, ModelResult, ModelResultEvent,
     ModelResultProposal, ModelRole, ModelRolesEffort, ModelRolesEntries, ModelRolesSummary,
     ModelSelectParams, ModelSelectResult, ModelSelection, ModelStartedEvent, ModelStreamResetEvent,
     ModelTurnPlanContext, ModelUsageEvent, ModelUsageInfo, ModelUsageTotalsEvent,
     PlanBatchFinishedEvent, ProviderKind, ReasoningEffort, RepoMapInfoEvent,
-    ReviewBatchFinishedEvent, ToolchainFinishedEvent, ToolchainStartedEvent, TurnPhase,
+    ReviewBatchFinishedEvent, StructuredAbortProposal, StructuredBlockedProposal,
+    StructuredOutcomeProposal, ToolchainFinishedEvent, ToolchainStartedEvent, TurnPhase,
     TurnPhaseEvent, UsageTotals, UsageTotalsSnapshot,
 };
 pub use plan::{
@@ -120,8 +121,8 @@ pub use project::{
     ProjectCheckRequest, ProjectCheckResponse, ProjectCheckStepSpec, ProjectCheckSuiteSpec,
     ProjectCommandSpec, ProjectConfig, ProjectConfigError, ProjectFormatRequest,
     ProjectFormatResponse, ProjectFormatterSpec, ProjectHookOutcome, ProjectManifest,
-    ProjectPostHookRequest, ProjectPostHookResponse, ProjectPostHookSpec, ProjectRequest,
-    ProjectResponse, ProjectStepResult, ResolvedProjectCommand, TaskRunnerKind,
+    ProjectParameterSpec, ProjectPostHookRequest, ProjectPostHookResponse, ProjectPostHookSpec,
+    ProjectRequest, ProjectResponse, ProjectStepResult, ResolvedProjectCommand, TaskRunnerKind,
 };
 pub use review::{
     IssueStatus, IssueType, ReviewCancelParams, ReviewContentDeltaEvent, ReviewDeleteParams,
@@ -161,6 +162,7 @@ mod wire_contract_tracking {
     /// - `IssueStatus`: `done`
     /// - `ReviewUpdateItemParams`: `resolution_notes`
     /// - `PlanReplanParams`: `id`, `item_id`
+    /// - `PlanRefineParams`: `id`
     #[test]
     fn legacy_aliases_must_be_removed_by_0_2_0() {
         let mut parts = env!("CARGO_PKG_VERSION").split('.');
@@ -171,8 +173,8 @@ mod wire_contract_tracking {
             "Crate version {}. The legacy aliases (DocTopic `plans`; WorkflowKind \
              `single`/`direct`; EditProtocolKind `structured_output`/`json_schema`/\
              `json`; IssueStatus `done`; ReviewUpdateItemParams `resolution_notes`; \
-             PlanReplanParams `id`/`item_id`) were scheduled for removal in 0.2.0. \
-             Remove them and delete this test.",
+             PlanReplanParams `id`/`item_id`; PlanRefineParams `id`) were scheduled \
+             for removal in 0.2.0. Remove them and delete this test.",
             PROTOCOL_VERSION
         );
     }

@@ -1,19 +1,30 @@
 use super::item::{ConceptItem, PlanItem, PlanItemStatus};
 use super::node::Plan;
 
+/// Collapses a rendered value onto a single line.
+///
+/// Hand-edited or imported plan JSON can carry line breaks and surrounding
+/// whitespace in any interpolated field: the plan title, a concept or step id,
+/// a step title, or a metadata entry. A raw interpolation would split the
+/// document — breaking the `# Plan:` heading into several headings and shifting
+/// a `#id` marker off its line. Folding `\r` and `\n` into spaces and trimming
+/// keeps exactly one heading line and one line per concept or step entry.
+fn single_line(value: &str) -> String {
+    value.replace(['\r', '\n'], " ").trim().to_string()
+}
+
 /// Joins plan metadata entries into a single markdown line body.
 ///
 /// Every metadata key must occupy exactly one indented line. Entries that come
 /// from hand-edited or imported plan JSON may still carry surrounding
 /// whitespace, embedded line breaks, or be empty, and a raw `join` would either
-/// split the line or leave a dangling separator. Trimming, collapsing line
-/// breaks into spaces, and dropping empty entries keeps the rendered document
+/// split the line or leave a dangling separator. Collapsing each entry onto a
+/// single line and dropping empty ones keeps the rendered document
 /// structurally stable.
 fn inline_list(entries: &[String]) -> String {
     entries
         .iter()
-        .map(|entry| entry.replace(['\r', '\n'], " "))
-        .map(|entry| entry.trim().to_string())
+        .map(|entry| single_line(entry))
         .filter(|entry| !entry.is_empty())
         .collect::<Vec<String>>()
         .join(", ")
@@ -21,7 +32,7 @@ fn inline_list(entries: &[String]) -> String {
 
 impl Plan {
     pub fn to_markdown(&self) -> String {
-        let mut out = format!("# Plan: {}\n", self.title);
+        let mut out = format!("# Plan: {}\n", single_line(&self.title));
         if let Some(desc) = &self.description {
             let trimmed = desc.trim();
             if !trimmed.is_empty() {
@@ -36,8 +47,13 @@ impl Plan {
             fn write_concept(items: &[ConceptItem], depth: usize, out: &mut String) {
                 for item in items {
                     let indent = "  ".repeat(depth);
-                    let clean_title = item.title.replace(['\r', '\n'], " ").trim().to_string();
-                    out.push_str(&format!("{}- #{}: {}\n", indent, item.id, clean_title));
+                    let clean_title = single_line(&item.title);
+                    out.push_str(&format!(
+                        "{}- #{}: {}\n",
+                        indent,
+                        single_line(&item.id),
+                        clean_title
+                    ));
                     if let Some(details) = &item.details {
                         let trimmed = details.trim();
                         if !trimmed.is_empty() {
@@ -68,10 +84,14 @@ impl Plan {
                     PlanItemStatus::Discussion => "[?]",
                     PlanItemStatus::Todo => "[ ]",
                 };
-                let clean_title = item.title.replace(['\r', '\n'], " ").trim().to_string();
+                let clean_title = single_line(&item.title);
                 out.push_str(&format!(
                     "{}- {} {} #{}: {}\n",
-                    indent, check, item.status, item.id, clean_title
+                    indent,
+                    check,
+                    item.status,
+                    single_line(&item.id),
+                    clean_title
                 ));
                 // A key whose entries are all empty renders no line at all, so the
                 // emptiness check runs on the normalized body, not the raw list.

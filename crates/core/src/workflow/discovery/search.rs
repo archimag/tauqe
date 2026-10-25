@@ -7,11 +7,7 @@ use crate::blocking::run_blocking;
 use crate::context::path::verify_path_within_repo;
 use crate::escape::escape_xml_attr;
 
-/// Maximum number of repository search queries allowed in a single discovery round.
-pub const MAX_SEARCH_REQUESTS_PER_ROUND: usize = 5;
-
-/// Maximum number of matching files reported for a single search query.
-pub const MAX_MATCHED_FILES_PER_SEARCH: usize = 50;
+use super::DiscoveryLimits;
 
 /// Maximum file size eligible for regex scanning (2 MiB).
 pub const MAX_SEARCHABLE_FILE_SIZE: u64 = 2 * 1024 * 1024;
@@ -140,6 +136,7 @@ fn execute_repo_search_sync(
     repo_root: &Path,
     query: &RepoSearchRequest,
     available_files: &[String],
+    limits: DiscoveryLimits,
 ) -> RepoSearchResult {
     let normalized_path = match normalize_search_path(repo_root, &query.path) {
         Ok(p) => p,
@@ -226,9 +223,9 @@ fn execute_repo_search_sync(
 
     let total_matched_files = matches.len();
     let total_matches: usize = matches.iter().map(|m| m.count).sum();
-    let omitted_files = total_matched_files.saturating_sub(MAX_MATCHED_FILES_PER_SEARCH);
+    let omitted_files = total_matched_files.saturating_sub(limits.max_matched_files_per_search);
 
-    matches.truncate(MAX_MATCHED_FILES_PER_SEARCH);
+    matches.truncate(limits.max_matched_files_per_search);
 
     RepoSearchResult {
         query: query.clone(),
@@ -241,12 +238,17 @@ fn execute_repo_search_sync(
 }
 
 /// Executes a single repository search, offloading blocking file I/O via [`run_blocking`].
+///
+/// The number of reported matching files is bounded by the project's
+/// `[context].max_matched_files_per_search`, so a project tunes how much of a
+/// broad match set reaches the model instead of recompiling the engine.
 pub fn execute_repo_search(
     repo_root: &Path,
     query: &RepoSearchRequest,
     available_files: &[String],
+    limits: DiscoveryLimits,
 ) -> RepoSearchResult {
-    run_blocking(|| execute_repo_search_sync(repo_root, query, available_files))
+    run_blocking(|| execute_repo_search_sync(repo_root, query, available_files, limits))
 }
 
 /// Executes multiple repository searches with round limits and offloaded blocking I/O.
@@ -254,13 +256,14 @@ pub fn execute_repo_searches(
     repo_root: &Path,
     queries: &[RepoSearchRequest],
     available_files: &[String],
+    limits: DiscoveryLimits,
 ) -> Vec<RepoSearchResult> {
     run_blocking(|| {
         queries
             .iter()
             .enumerate()
             .map(|(idx, query)| {
-                if idx >= MAX_SEARCH_REQUESTS_PER_ROUND {
+                if idx >= limits.max_search_requests_per_round {
                     RepoSearchResult {
                         query: query.clone(),
                         matches: Vec::new(),
@@ -269,11 +272,11 @@ pub fn execute_repo_searches(
                         omitted_files: 0,
                         error: Some(format!(
                             "Search query limit exceeded (maximum {} queries per round allowed)",
-                            MAX_SEARCH_REQUESTS_PER_ROUND
+                            limits.max_search_requests_per_round
                         )),
                     }
                 } else {
-                    execute_repo_search_sync(repo_root, query, available_files)
+                    execute_repo_search_sync(repo_root, query, available_files, limits)
                 }
             })
             .collect()
@@ -393,10 +396,11 @@ mod tests {
         .unwrap();
 
         let available = vec!["root.rs".to_string(), "src/lib.rs".to_string()];
+        let limits = DiscoveryLimits::default();
 
         // Search from root: finds both
         let query_root = RepoSearchRequest::new(".", r"pub fn \w+");
-        let res_root = execute_repo_search(root, &query_root, &available);
+        let res_root = execute_repo_search(root, &query_root, &available, limits);
         assert!(res_root.error.is_none());
         assert_eq!(res_root.total_matched_files, 2);
         assert_eq!(res_root.matches[0].path, "src/lib.rs");
@@ -406,7 +410,7 @@ mod tests {
 
         // Search inside 'src': finds only 'src/lib.rs'
         let query_src = RepoSearchRequest::new("src", r"pub fn \w+");
-        let res_src = execute_repo_search(root, &query_src, &available);
+        let res_src = execute_repo_search(root, &query_src, &available, limits);
         assert!(res_src.error.is_none());
         assert_eq!(res_src.total_matched_files, 1);
         assert_eq!(res_src.matches[0].path, "src/lib.rs");
@@ -440,7 +444,7 @@ mod tests {
         ];
 
         let query = RepoSearchRequest::new("", r"\w+");
-        let res = execute_repo_search(root, &query, &available);
+        let res = execute_repo_search(root, &query, &available, DiscoveryLimits::default());
         assert_eq!(res.total_matched_files, 0);
         assert!(res.matches.is_empty());
     }
@@ -464,7 +468,7 @@ mod tests {
         ];
 
         let query = RepoSearchRequest::new(".", "hello|data");
-        let res = execute_repo_search(root, &query, &available);
+        let res = execute_repo_search(root, &query, &available, DiscoveryLimits::default());
         assert_eq!(res.total_matched_files, 1);
         assert_eq!(res.matches[0].path, "ok.txt");
     }
@@ -482,14 +486,29 @@ mod tests {
         }
 
         let query = RepoSearchRequest::new("", "needle");
-        let res = execute_repo_search(root, &query, &available);
+        let limits = DiscoveryLimits {
+            max_matched_files_per_search: 50,
+            ..DiscoveryLimits::default()
+        };
+        let res = execute_repo_search(root, &query, &available, limits);
         assert_eq!(res.total_matched_files, 60);
-        assert_eq!(res.matches.len(), MAX_MATCHED_FILES_PER_SEARCH);
+        assert_eq!(res.matches.len(), 50);
         assert_eq!(res.omitted_files, 10);
 
         let feedback = format_single_search_feedback(&res);
         assert!(feedback.contains("[10 more matching files omitted]"));
         assert!(feedback.contains("file_00.txt: 1 match"));
+
+        // The cap is configuration-driven, so a project narrows how much of a
+        // broad match set reaches the model without recompiling.
+        let narrow = DiscoveryLimits {
+            max_matched_files_per_search: 3,
+            ..DiscoveryLimits::default()
+        };
+        let res_narrow = execute_repo_search(root, &query, &available, narrow);
+        assert_eq!(res_narrow.total_matched_files, 60);
+        assert_eq!(res_narrow.matches.len(), 3);
+        assert_eq!(res_narrow.omitted_files, 57);
     }
 
     #[test]
@@ -499,13 +518,13 @@ mod tests {
 
         // Unsupported lookaround assertion
         let query_lookaround = RepoSearchRequest::new("", r"(?=pattern)");
-        let res = execute_repo_search(root, &query_lookaround, &[]);
+        let res = execute_repo_search(root, &query_lookaround, &[], DiscoveryLimits::default());
         let err = res.error.expect("Expected syntax error");
         assert!(err.contains("Lookaround assertions are not supported"));
 
         // General invalid regex
         let query_broken = RepoSearchRequest::new("", r"([a-z");
-        let res_broken = execute_repo_search(root, &query_broken, &[]);
+        let res_broken = execute_repo_search(root, &query_broken, &[], DiscoveryLimits::default());
         let err_broken = res_broken.error.expect("Expected syntax error");
         assert!(err_broken.contains("Regex syntax error"));
     }
@@ -515,18 +534,23 @@ mod tests {
         let dir = tempdir().unwrap();
         let root = dir.path();
 
-        let queries = (0..7)
+        let queries = (0..5)
             .map(|i| RepoSearchRequest::new("", format!("query_{}", i)))
             .collect::<Vec<_>>();
 
-        let results = execute_repo_searches(root, &queries, &[]);
-        assert_eq!(results.len(), 7);
-        for res in results.iter().take(MAX_SEARCH_REQUESTS_PER_ROUND) {
+        let limits = DiscoveryLimits {
+            max_search_requests_per_round: 2,
+            ..DiscoveryLimits::default()
+        };
+        let results = execute_repo_searches(root, &queries, &[], limits);
+        assert_eq!(results.len(), 5);
+        for res in results.iter().take(2) {
             assert!(res.error.is_none());
         }
-        for res in results.iter().skip(MAX_SEARCH_REQUESTS_PER_ROUND) {
+        for res in results.iter().skip(2) {
             let err = res.error.as_ref().expect("Expected limit error");
             assert!(err.contains("Search query limit exceeded"));
+            assert!(err.contains("maximum 2 queries"));
         }
     }
 

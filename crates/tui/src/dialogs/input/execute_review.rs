@@ -181,7 +181,7 @@ mod tests {
     use tauqe_protocol::{IssueStatus, IssueType, ModelEntry, ModelRef, ReviewIssue};
 
     fn coder(name: &str) -> ModelEntry {
-        ModelEntry::new(ModelRef::openrouter(name), None, None)
+        ModelEntry::new(ModelRef::openrouter(name), None)
     }
 
     fn finding(id: u32) -> ReviewIssue {

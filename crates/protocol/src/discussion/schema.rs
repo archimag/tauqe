@@ -19,11 +19,245 @@
 
 use std::sync::OnceLock;
 
+use crate::plan::PlanItemStatus;
+
 /// Process-wide cache of the assembled discussion schema.
 ///
 /// The schema is immutable and depends only on compile-time structure, so it is
 /// assembled once and cloned per call rather than rebuilt on every request.
 static DISCUSSION_RESPONSE_SCHEMA: OnceLock<serde_json::Value> = OnceLock::new();
+
+/// Process-wide cache of the structured plan payload property.
+static PLAN_UPDATE_SCHEMA: OnceLock<serde_json::Value> = OnceLock::new();
+
+/// Process-wide cache of the shared definitions the plan payload references.
+static PLAN_SCHEMA_DEFINITIONS: OnceLock<serde_json::Value> = OnceLock::new();
+
+/// Generates the structured plan payload property of the plan contract.
+///
+/// The plan shape is declared here once, beside the Rust plan model it mirrors,
+/// and every contour that can author a plan composes this builder: the
+/// discussion contract embeds it as its `plan_update` property and the
+/// code-modification contract re-exports it verbatim. A code-modification turn
+/// and a discussion turn therefore describe one identical plan, and no consumer
+/// re-declares the shape.
+///
+/// The property admits `null` because a turn that leaves the plan untouched
+/// carries no payload at all, which is the idle representation of a property a
+/// strict schema still requires.
+pub fn plan_update_schema() -> serde_json::Value {
+    PLAN_UPDATE_SCHEMA
+        .get_or_init(|| {
+            serde_json::json!({
+                "anyOf": [
+                    {
+                        "type": "object",
+                        "description": "Modifications or creation/deletion of plan items. Must be null unless the user explicitly requested to update or modify the plan.",
+                        "properties": {
+                            "action": {
+                                "type": "string",
+                                "enum": ["update", "save", "delete"],
+                                "description": "Action to perform: 'save' to create a plan or to replace its entire implementation tree (every step already in 'done' status must be reproduced verbatim, otherwise the completed-step immutability check rejects the mutation); 'update' to patch existing steps and concept nodes by ID and to append new leaf steps to the plan root; 'delete' to remove the plan"
+                            },
+                            "id": {
+                                "anyOf": [
+                                    { "type": "string" },
+                                    { "type": "null" }
+                                ],
+                                "description": "Target plan identifier"
+                            },
+                            "title": {
+                                "anyOf": [
+                                    { "type": "string" },
+                                    { "type": "null" }
+                                ],
+                                "description": "Plan title"
+                            },
+                            "description": {
+                                "anyOf": [
+                                    { "type": "string" },
+                                    { "type": "null" }
+                                ],
+                                "description": "Plan description and architectural rationale"
+                            },
+                            "concept": {
+                                "type": "array",
+                                "description": "Hierarchical architectural concept items (requirements, invariants, decisions). Mandatory when action is 'save' to establish the conceptual foundation.",
+                                "items": {
+                                    "$ref": "#/$defs/ConceptItem"
+                                }
+                            },
+                            "items": {
+                                "type": "array",
+                                "description": "Hierarchical implementation plan items or steps; an 'update' action may add leaf steps only",
+                                "items": {
+                                    "$ref": "#/$defs/PlanItem"
+                                }
+                            }
+                        },
+                        "required": ["action", "id", "title", "description", "concept", "items"],
+                        "additionalProperties": false
+                    },
+                    {
+                        "type": "null"
+                    }
+                ],
+                "description": "Optional plan update or creation to be applied at the end of the turn"
+            })
+        })
+        .clone()
+}
+
+/// Generates the shared definitions [`plan_update_schema`] references.
+///
+/// A plan is a tree: concept nodes and implementation steps nest their own kind,
+/// so neither shape can be inlined into the payload without the payload
+/// containing itself. The definitions travel beside the payload, and a consumer
+/// lifts them to the root of its composed schema, which is where the
+/// `#/$defs/<Name>` references resolve.
+///
+/// `children` is declared on both definitions and points back to the definition
+/// that owns it, so a nested tree of any depth validates against the very same
+/// contract as its root. Every field of `ConceptItem` and `PlanItem` appears
+/// exactly once, and the `status` enum is generated from [`PlanItemStatus`], so
+/// a new variant cannot be forgotten here.
+pub fn plan_schema_definitions() -> serde_json::Value {
+    PLAN_SCHEMA_DEFINITIONS
+        .get_or_init(|| {
+            serde_json::json!({
+                "ConceptItem": {
+                    "type": "object",
+                    "description": "An architectural concept item or requirement",
+                    "properties": {
+                        "id": {
+                            "type": "string",
+                            "description": "Concept item identifier (e.g. 'c-1', '1.1')"
+                        },
+                        "title": {
+                            "type": "string",
+                            "description": "Short title or thesis of the concept item"
+                        },
+                        "details": {
+                            "anyOf": [
+                                { "type": "string" },
+                                { "type": "null" }
+                            ],
+                            "description": "Detailed explanation, rationale, or invariant"
+                        },
+                        "children": {
+                            "type": "array",
+                            "description": "Sub-items or nested concept requirements",
+                            "items": {
+                                "$ref": "#/$defs/ConceptItem"
+                            }
+                        }
+                    },
+                    "required": ["id", "title", "details", "children"],
+                    "additionalProperties": false
+                },
+                "PlanItem": {
+                    "type": "object",
+                    "description": "An item or step within a plan",
+                    "properties": {
+                        "id": {
+                            "type": "string",
+                            "description": "Step identifier (e.g. '1', '1.1')"
+                        },
+                        "title": {
+                            "type": "string",
+                            "description": "Short title of the step in the same language as the plan description and user request"
+                        },
+                        "details": {
+                            "anyOf": [
+                                { "type": "string" },
+                                { "type": "null" }
+                            ],
+                            "description": "Detailed description, requirements, or execution criteria in the same language as the plan description"
+                        },
+                        "status": {
+                            "type": "string",
+                            "enum": plan_item_status_enum(),
+                            "description": "Status of the plan step"
+                        },
+                        "files": {
+                            "type": "array",
+                            "description": "Target repository-relative file paths for this implementation step",
+                            "items": {
+                                "type": "string"
+                            }
+                        },
+                        "readonly_files": {
+                            "type": "array",
+                            "description": "Repository-relative file paths for read-only reference context (subsystem conventions, interface contracts, protocol types)",
+                            "items": {
+                                "type": "string"
+                            }
+                        },
+                        "concept_refs": {
+                            "type": "array",
+                            "description": "IDs of referenced concept items",
+                            "items": {
+                                "type": "string"
+                            }
+                        },
+                        "depends_on": {
+                            "type": "array",
+                            "description": "IDs of prerequisite steps that must reach DONE status before this step executes",
+                            "items": {
+                                "type": "string"
+                            }
+                        },
+                        "children": {
+                            "type": "array",
+                            "description": "Sub-items or nested steps",
+                            "items": {
+                                "$ref": "#/$defs/PlanItem"
+                            }
+                        }
+                    },
+                    "required": ["id", "title", "details", "status", "files", "readonly_files", "concept_refs", "depends_on", "children"],
+                    "additionalProperties": false
+                }
+            })
+        })
+        .clone()
+}
+
+/// Builds the `status` enum of the plan item definition from [`PlanItemStatus`].
+fn plan_item_status_enum() -> serde_json::Value {
+    const STATUSES: &[PlanItemStatus] = &[
+        PlanItemStatus::Discussion,
+        PlanItemStatus::Todo,
+        PlanItemStatus::InProgress,
+        PlanItemStatus::Done,
+        PlanItemStatus::Blocked,
+        PlanItemStatus::Cancelled,
+    ];
+    serde_json::Value::Array(
+        STATUSES
+            .iter()
+            .map(|status| serde_json::Value::String(plan_item_status_wire(*status).to_string()))
+            .collect(),
+    )
+}
+
+/// Wire spelling of every [`PlanItemStatus`] variant.
+///
+/// The match is exhaustive, so adding a variant fails compilation until its
+/// spelling is declared here; that is what keeps the schema enum in lockstep
+/// with the Rust model instead of a hand-copied list. The spelling itself is
+/// pinned to the serde representation by a test, because only serde decides what
+/// actually travels on the wire.
+fn plan_item_status_wire(status: PlanItemStatus) -> &'static str {
+    match status {
+        PlanItemStatus::Discussion => "discussion",
+        PlanItemStatus::Todo => "todo",
+        PlanItemStatus::InProgress => "in_progress",
+        PlanItemStatus::Done => "done",
+        PlanItemStatus::Blocked => "blocked",
+        PlanItemStatus::Cancelled => "cancelled",
+    }
+}
 
 /// Generates a strict JSON Schema representing `DiscussionResponse`.
 ///
@@ -41,62 +275,7 @@ pub fn discussion_response_schema() -> serde_json::Value {
                         "type": "string",
                         "description": "Conversational response, reasoning, and answers formatted in Markdown. This field is streamed immediately to the user interface."
                     },
-                    "plan_update": {
-                        "anyOf": [
-                            {
-                                "type": "object",
-                                "description": "Modifications or creation/deletion of plan items. Must be null unless the user explicitly requested to update or modify the plan.",
-                                "properties": {
-                                    "action": {
-                                        "type": "string",
-                                        "enum": ["update", "save", "delete"],
-                                        "description": "Action to perform: 'save' to create or completely overwrite/replace the entire plan and step tree, 'update' to modify individual existing items by ID, or 'delete' to remove the plan"
-                                    },
-                                    "id": {
-                                        "anyOf": [
-                                            { "type": "string" },
-                                            { "type": "null" }
-                                        ],
-                                        "description": "Target plan identifier"
-                                    },
-                                    "title": {
-                                        "anyOf": [
-                                            { "type": "string" },
-                                            { "type": "null" }
-                                        ],
-                                        "description": "Plan title"
-                                    },
-                                    "description": {
-                                        "anyOf": [
-                                            { "type": "string" },
-                                            { "type": "null" }
-                                        ],
-                                        "description": "Plan description and architectural rationale"
-                                    },
-                                    "concept": {
-                                        "type": "array",
-                                        "description": "Hierarchical architectural concept items (requirements, invariants, decisions). Mandatory when action is 'save' to establish the conceptual foundation.",
-                                        "items": {
-                                            "$ref": "#/$defs/ConceptItem"
-                                        }
-                                    },
-                                    "items": {
-                                        "type": "array",
-                                        "description": "Hierarchical implementation plan items or steps",
-                                        "items": {
-                                            "$ref": "#/$defs/PlanItem"
-                                        }
-                                    }
-                                },
-                                "required": ["action", "id", "title", "description", "concept", "items"],
-                                "additionalProperties": false
-                            },
-                            {
-                                "type": "null"
-                            }
-                        ],
-                        "description": "Optional plan update or creation to be applied at the end of the turn"
-                    },
+                    "plan_update": plan_update_schema(),
                     "context_requests": {
                         "type": "array",
                         "description": "Files to request into context for inspection or editable access",
@@ -179,101 +358,7 @@ pub fn discussion_response_schema() -> serde_json::Value {
                 },
                 "required": ["message", "plan_update", "context_requests", "repo_searches", "repo_dirs", "repo_maps", "dir_lists", "user_language"],
                 "additionalProperties": false,
-                "$defs": {
-                    "ConceptItem": {
-                        "type": "object",
-                        "description": "An architectural concept item or requirement",
-                        "properties": {
-                            "id": {
-                                "type": "string",
-                                "description": "Concept item identifier (e.g. 'c-1', '1.1')"
-                            },
-                            "title": {
-                                "type": "string",
-                                "description": "Short title or thesis of the concept item"
-                            },
-                            "details": {
-                                "anyOf": [
-                                    { "type": "string" },
-                                    { "type": "null" }
-                                ],
-                                "description": "Detailed explanation, rationale, or invariant"
-                            },
-                            "children": {
-                                "type": "array",
-                                "description": "Sub-items or nested concept requirements",
-                                "items": {
-                                    "$ref": "#/$defs/ConceptItem"
-                                }
-                            }
-                        },
-                        "required": ["id", "title", "details", "children"],
-                        "additionalProperties": false
-                    },
-                    "PlanItem": {
-                        "type": "object",
-                        "description": "An item or step within a plan",
-                        "properties": {
-                            "id": {
-                                "type": "string",
-                                "description": "Step identifier (e.g. '1', '1.1')"
-                            },
-                            "title": {
-                                "type": "string",
-                                "description": "Short title of the step in the same language as the plan description and user request"
-                            },
-                            "details": {
-                                "anyOf": [
-                                    { "type": "string" },
-                                    { "type": "null" }
-                                ],
-                                "description": "Detailed description, requirements, or execution criteria in the same language as the plan description"
-                            },
-                            "status": {
-                                "type": "string",
-                                "enum": ["discussion", "todo", "in_progress", "done", "blocked", "cancelled"],
-                                "description": "Status of the plan step"
-                            },
-                            "files": {
-                                "type": "array",
-                                "description": "Target repository-relative file paths for this implementation step",
-                                "items": {
-                                    "type": "string"
-                                }
-                            },
-                            "readonly_files": {
-                                "type": "array",
-                                "description": "Repository-relative file paths for read-only reference context (subsystem conventions, interface contracts, protocol types)",
-                                "items": {
-                                    "type": "string"
-                                }
-                            },
-                            "concept_refs": {
-                                "type": "array",
-                                "description": "IDs of referenced concept items",
-                                "items": {
-                                    "type": "string"
-                                }
-                            },
-                            "depends_on": {
-                                "type": "array",
-                                "description": "IDs of prerequisite steps that must reach DONE status before this step executes",
-                                "items": {
-                                    "type": "string"
-                                }
-                            },
-                            "children": {
-                                "type": "array",
-                                "description": "Sub-items or nested steps",
-                                "items": {
-                                    "$ref": "#/$defs/PlanItem"
-                                }
-                            }
-                        },
-                        "required": ["id", "title", "details", "status", "files", "readonly_files", "concept_refs", "depends_on", "children"],
-                        "additionalProperties": false
-                    }
-                }
+                "$defs": plan_schema_definitions()
             })
         })
         .clone()
@@ -319,7 +404,10 @@ pub fn custom_tool_call_schema() -> serde_json::Value {
 
 #[cfg(test)]
 mod tests {
-    use super::{discussion_response_schema, discussion_response_schema_definition};
+    use super::{
+        discussion_response_schema, discussion_response_schema_definition, plan_item_status_wire,
+        plan_schema_definitions, plan_update_schema,
+    };
     use crate::context::ContextAccess;
     use crate::discussion::{
         DirListRequest, DiscussionContextRequest, DiscussionPlanAction, DiscussionPlanUpdate,
@@ -389,6 +477,121 @@ mod tests {
         assert!(dirs_idx < maps_idx);
         assert!(maps_idx < lists_idx);
         assert!(lists_idx < lang_idx);
+    }
+
+    /// Collects the property names a schema object declares.
+    fn declared_fields(node: &serde_json::Value) -> std::collections::BTreeSet<String> {
+        node["properties"]
+            .as_object()
+            .map(|properties| properties.keys().cloned().collect())
+            .unwrap_or_default()
+    }
+
+    /// Collects the property names a schema object requires.
+    fn required_fields(node: &serde_json::Value) -> std::collections::BTreeSet<String> {
+        node["required"]
+            .as_array()
+            .map(|required| {
+                required
+                    .iter()
+                    .filter_map(|field| field.as_str().map(String::from))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// A plan is authored by two contours, so its payload is generated once.
+    ///
+    /// The discussion contract embeds the authoritative builders verbatim, and
+    /// the code-modification contract re-exports them, which is what makes one
+    /// definition of the plan shape serve both.
+    #[test]
+    fn test_plan_payload_is_generated_once() {
+        let schema = discussion_response_schema();
+        assert_eq!(schema["properties"]["plan_update"], plan_update_schema());
+        assert_eq!(schema["$defs"], plan_schema_definitions());
+
+        let payload = plan_update_schema();
+        let variants = payload["anyOf"]
+            .as_array()
+            .expect("the plan payload is a nullable union");
+        assert_eq!(variants.len(), 2);
+        assert_eq!(variants[1]["type"], "null");
+
+        let object = &variants[0];
+        assert_eq!(object["type"], "object");
+        assert_eq!(object["additionalProperties"], serde_json::json!(false));
+        assert_eq!(
+            declared_fields(object),
+            required_fields(object),
+            "the payload requires exactly the fields it declares"
+        );
+        assert_eq!(
+            object["properties"]["concept"]["items"]["$ref"],
+            "#/$defs/ConceptItem"
+        );
+        assert_eq!(
+            object["properties"]["items"]["items"]["$ref"],
+            "#/$defs/PlanItem"
+        );
+    }
+
+    /// The definitions mirror `ConceptItem` and `PlanItem`, including `children`.
+    ///
+    /// Each definition requires exactly the fields it declares and nests its own
+    /// kind through `children`, so a tree of any depth validates against the
+    /// contract of its root. The `status` enum is generated from the Rust model,
+    /// and its spellings are the spellings serde actually emits.
+    #[test]
+    fn test_plan_definitions_mirror_the_plan_model() {
+        let definitions = plan_schema_definitions();
+        let names: Vec<String> = definitions
+            .as_object()
+            .map(|definitions| definitions.keys().cloned().collect())
+            .unwrap_or_default();
+        assert_eq!(
+            names,
+            vec!["ConceptItem".to_string(), "PlanItem".to_string()]
+        );
+
+        for name in ["ConceptItem", "PlanItem"] {
+            let node = &definitions[name];
+            assert_eq!(node["type"], "object", "{name}");
+            assert_eq!(node["additionalProperties"], serde_json::json!(false));
+            assert_eq!(
+                declared_fields(node),
+                required_fields(node),
+                "{name} requires exactly the fields it declares"
+            );
+            assert_eq!(node["properties"]["children"]["type"], "array", "{name}");
+            assert_eq!(
+                node["properties"]["children"]["items"]["$ref"],
+                serde_json::json!(format!("#/$defs/{name}"))
+            );
+        }
+
+        let statuses = [
+            PlanItemStatus::Discussion,
+            PlanItemStatus::Todo,
+            PlanItemStatus::InProgress,
+            PlanItemStatus::Done,
+            PlanItemStatus::Blocked,
+            PlanItemStatus::Cancelled,
+        ];
+        let published: Vec<&str> = definitions["PlanItem"]["properties"]["status"]["enum"]
+            .as_array()
+            .expect("the status enum is an array")
+            .iter()
+            .filter_map(|status| status.as_str())
+            .collect();
+        let expected: Vec<&str> = statuses.into_iter().map(plan_item_status_wire).collect();
+        assert_eq!(published, expected);
+        for status in statuses {
+            assert_eq!(
+                serde_json::to_value(status).unwrap(),
+                serde_json::Value::String(plan_item_status_wire(status).to_string())
+            );
+        }
     }
 
     #[test]
@@ -587,7 +790,7 @@ mod tests {
             let wire = serde_json::to_value(access).unwrap();
             let wire = wire.as_str().unwrap();
             assert!(
-                access_enum.contains(wire),
+                access_enum.contains(&*wire.to_string()),
                 "context_requests.access enum is missing variant {wire}"
             );
         }

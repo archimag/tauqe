@@ -589,17 +589,65 @@ pub fn render_confirm_execute_pipeline_popup(frame: &mut ratatui::Frame, state: 
     }
 }
 
-/// Presentation parameters for the plan-deletion confirmation.
-pub fn delete_plan_params<'a>(state: &'a AppState, plan_id: &str) -> ConfirmModalParams<'a> {
-    let engine = current_engine();
-    let palette = engine.palette();
-    let plan_title = state
+/// Number of implementation leaves of a plan that are not `Done`.
+///
+/// The metric is the authoritative leaf accounting of `Plan::count_stats`, which
+/// already excludes cancelled leaves from the total, so a plan whose leaves are
+/// all completed or cancelled needs no escalation (c-1).
+pub(crate) fn plan_unfinished_steps(plan: &tauqe_protocol::Plan) -> usize {
+    let (total, completed) = plan.count_stats();
+    total.saturating_sub(completed)
+}
+
+/// Width of the single-tier plan-deletion confirmation.
+const DELETE_PLAN_WIDTH: u16 = 58;
+/// Width of the two-tier plan-deletion confirmation.
+const DELETE_PLAN_FINAL_WIDTH: u16 = 64;
+
+/// Title of the plan a dialog targets, resolved from the loaded plans.
+///
+/// The lookup falls back to the raw identifier so the dialog always names its
+/// target even when the plan list has not been refreshed (c-2).
+fn plan_display_title(state: &AppState, plan_id: &str) -> String {
+    state
         .plans_view
         .plans
         .iter()
         .find(|p| p.id == plan_id)
         .map(|p| p.title.clone())
-        .unwrap_or_else(|| plan_id.to_string());
+        .unwrap_or_else(|| plan_id.to_string())
+}
+
+/// Plan field shared by both plan-deletion confirmations:
+/// `Plan: <title> (<id>)`.
+fn delete_plan_line(state: &AppState, plan_id: &str) -> Line<'static> {
+    let engine = current_engine();
+    let palette = engine.palette();
+    Line::from(vec![
+        Span::raw(active_t("dialog.delete_plan.plan_label")),
+        Span::styled(
+            format!("{} ({})", plan_display_title(state, plan_id), plan_id),
+            engine.fg(palette.status_info).bold(),
+        ),
+    ])
+}
+
+/// Presentation parameters for the first tier of the plan-deletion confirmation.
+///
+/// The dialog states the derived plan status together with how much unfinished
+/// work the deletion would discard, so the cost is visible before confirming.
+/// The safe `Cancel` button holds the default focus (Conventions §5.4, c-1).
+pub fn delete_plan_params<'a>(state: &'a AppState, plan_id: &str) -> ConfirmModalParams<'a> {
+    let engine = current_engine();
+    let palette = engine.palette();
+    let plan = state.plans_view.plans.iter().find(|p| p.id == plan_id);
+    let status = plan.map(|p| p.status()).unwrap_or_default();
+    let unfinished = plan.map(plan_unfinished_steps).unwrap_or(0);
+    let remaining = if unfinished == 0 {
+        active_t("dialog.delete_plan.all_completed")
+    } else {
+        active_t("dialog.delete_plan.unfinished_count").replacen("{}", &unfinished.to_string(), 1)
+    };
 
     let body_lines = vec![
         Line::raw(""),
@@ -608,11 +656,26 @@ pub fn delete_plan_params<'a>(state: &'a AppState, plan_id: &str) -> ConfirmModa
             engine.fg(palette.status_warning).bold(),
         )),
         Line::raw(""),
+        delete_plan_line(state, plan_id),
         Line::from(vec![
-            Span::raw(active_t("dialog.delete_plan.plan_label")),
             Span::styled(
-                format!("{} ({})", plan_title, plan_id),
-                engine.fg(palette.status_info).bold(),
+                active_t("dialog.delete_plan.status_label"),
+                engine.fg(palette.text_muted),
+            ),
+            Span::styled(status.to_string(), engine.fg(palette.status_info).bold()),
+        ]),
+        Line::from(vec![
+            Span::styled(
+                active_t("dialog.delete_plan.unfinished_label"),
+                engine.fg(palette.text_muted),
+            ),
+            Span::styled(
+                remaining,
+                if unfinished == 0 {
+                    engine.fg(palette.text_secondary)
+                } else {
+                    engine.fg(palette.status_warning).bold()
+                },
             ),
         ]),
         Line::from(Span::styled(
@@ -629,7 +692,58 @@ pub fn delete_plan_params<'a>(state: &'a AppState, plan_id: &str) -> ConfirmModa
         cancel_label: active_t("modal.cancel"),
         confirm_button: state.confirm_button,
         destructive: true,
-        width: 58,
+        width: DELETE_PLAN_WIDTH,
+    }
+}
+
+/// Presentation parameters for the second tier of the plan-deletion
+/// confirmation.
+///
+/// A plan whose leaves are still pending, in progress, or blocked carries task
+/// context that no Git commit restores, so the second tier names the remaining
+/// work explicitly and warns that the recorded progress is lost for good (c-1).
+pub fn delete_plan_final_params<'a>(state: &'a AppState, plan_id: &str) -> ConfirmModalParams<'a> {
+    let engine = current_engine();
+    let palette = engine.palette();
+    let plan = state.plans_view.plans.iter().find(|p| p.id == plan_id);
+    let (total, completed) = plan.map(|p| p.count_stats()).unwrap_or((0, 0));
+    let unfinished = total.saturating_sub(completed);
+
+    let body_lines = vec![
+        Line::raw(""),
+        Line::from(Span::styled(
+            active_t("dialog.delete_plan_final.question"),
+            engine.fg(palette.status_error).bold(),
+        )),
+        Line::raw(""),
+        delete_plan_line(state, plan_id),
+        Line::from(vec![
+            Span::styled(
+                active_t("dialog.delete_plan.unfinished_label"),
+                engine.fg(palette.text_muted),
+            ),
+            Span::styled(
+                active_t("dialog.delete_plan_final.progress")
+                    .replacen("{}", &unfinished.to_string(), 1)
+                    .replacen("{}", &total.to_string(), 1),
+                engine.fg(palette.status_error).bold(),
+            ),
+        ]),
+        Line::from(Span::styled(
+            active_t("dialog.delete_plan_final.note"),
+            engine.fg(palette.text_secondary),
+        )),
+    ];
+
+    ConfirmModalParams {
+        title: active_t("dialog.delete_plan_final.title"),
+        tone: ModalTone::Dangerous,
+        body_lines,
+        confirm_label: active_t("dialog.button.permanently_delete"),
+        cancel_label: active_t("modal.cancel"),
+        confirm_button: state.confirm_button,
+        destructive: true,
+        width: DELETE_PLAN_FINAL_WIDTH,
     }
 }
 
@@ -639,6 +753,14 @@ pub fn render_confirm_delete_plan_popup(
     state: &AppState,
 ) {
     render_modal_confirm(frame, delete_plan_params(state, plan_id));
+}
+
+pub fn render_confirm_delete_plan_final_popup(
+    frame: &mut ratatui::Frame,
+    plan_id: &str,
+    state: &AppState,
+) {
+    render_modal_confirm(frame, delete_plan_final_params(state, plan_id));
 }
 
 /// Presentation parameters for the review-deletion confirmation.
@@ -842,22 +964,8 @@ const CLEAR_HORIZON_WIDTH: u16 = 62;
 /// Width of the two-tier clear-horizon confirmation.
 const CLEAR_HORIZON_FINAL_WIDTH: u16 = 64;
 
-/// Title of the plan the confirmation targets, resolved from the loaded plans.
-///
-/// The lookup falls back to the raw identifier so the dialog always names its
-/// target even when the plan list has not been refreshed (c-2).
-fn plan_display_title(state: &AppState, plan_id: &str) -> String {
-    state
-        .plans_view
-        .plans
-        .iter()
-        .find(|p| p.id == plan_id)
-        .map(|p| p.title.clone())
-        .unwrap_or_else(|| plan_id.to_string())
-}
-
 /// Plan field of both clear-horizon confirmations: `Plan: <title> (<id>)`.
-fn clear_horizon_plan_line<'a>(state: &AppState, plan_id: &str) -> Line<'a> {
+fn clear_horizon_plan_line(state: &AppState, plan_id: &str) -> Line<'static> {
     let engine = current_engine();
     let palette = engine.palette();
     Line::from(vec![
@@ -965,6 +1073,35 @@ mod tests {
     use ratatui::layout::Rect;
     use ratatui::Terminal;
 
+    fn plan_item(
+        id: &str,
+        title: &str,
+        status: tauqe_protocol::PlanItemStatus,
+    ) -> tauqe_protocol::PlanItem {
+        tauqe_protocol::PlanItem {
+            id: id.to_string(),
+            title: title.to_string(),
+            status,
+            ..Default::default()
+        }
+    }
+
+    fn review_issue(id: u32, issue_type: tauqe_protocol::IssueType) -> tauqe_protocol::ReviewIssue {
+        tauqe_protocol::ReviewIssue {
+            id,
+            title: format!("Finding {id}"),
+            model: None,
+            issue_type,
+            status: tauqe_protocol::IssueStatus::Todo,
+            description: String::new(),
+            recommendations: Vec::new(),
+            files: Vec::new(),
+            readonly_files: Vec::new(),
+            plan: Vec::new(),
+            note: None,
+        }
+    }
+
     /// The geometry used for mouse hit-testing must land exactly on the drawn
     /// action buttons, regardless of label length or body line count.
     #[test]
@@ -1023,32 +1160,8 @@ mod tests {
             None,
             None,
             vec![
-                tauqe_protocol::ReviewIssue {
-                    id: 1,
-                    title: "First".to_string(),
-                    model: None,
-                    issue_type: tauqe_protocol::IssueType::Bug,
-                    status: tauqe_protocol::IssueStatus::Todo,
-                    description: String::new(),
-                    recommendations: Vec::new(),
-                    files: Vec::new(),
-                    readonly_files: Vec::new(),
-                    plan: Vec::new(),
-                    note: None,
-                },
-                tauqe_protocol::ReviewIssue {
-                    id: 2,
-                    title: "Second".to_string(),
-                    model: None,
-                    issue_type: tauqe_protocol::IssueType::Quality,
-                    status: tauqe_protocol::IssueStatus::Todo,
-                    description: String::new(),
-                    recommendations: Vec::new(),
-                    files: Vec::new(),
-                    readonly_files: Vec::new(),
-                    plan: Vec::new(),
-                    note: None,
-                },
+                review_issue(1, tauqe_protocol::IssueType::Bug),
+                review_issue(2, tauqe_protocol::IssueType::Quality),
             ],
             Vec::new(),
         ));
@@ -1067,8 +1180,145 @@ mod tests {
         assert!(texts.iter().any(|t| t.contains("2 finding(s) to resolve")));
     }
 
-    /// The first tier keeps the safe defaults: warning tone, `Cancel` focused,
-    /// and the concept-preservation note in the body.
+    /// The first tier of plan deletion reports the derived status and the
+    /// amount of unfinished work, and keeps the safe `Cancel` default (c-1).
+    #[test]
+    fn test_delete_plan_params_report_unfinished_work() {
+        let mut st = crate::app::test_state();
+        st.plans_view.plans = vec![tauqe_protocol::Plan {
+            id: "plan-open".to_string(),
+            title: "Open Plan".to_string(),
+            items: vec![
+                plan_item("1", "Done step", tauqe_protocol::PlanItemStatus::Done),
+                plan_item("2", "Todo step", tauqe_protocol::PlanItemStatus::Todo),
+            ],
+            ..Default::default()
+        }];
+
+        let params = delete_plan_params(&st, "plan-open");
+        assert_eq!(params.title, "Delete Plan");
+        assert_eq!(params.confirm_label, "Confirm Delete");
+        assert_eq!(
+            params.confirm_button,
+            crate::app::ConfirmDialogButton::Cancel
+        );
+        assert!(params.destructive);
+        assert_eq!(params.width, DELETE_PLAN_WIDTH);
+        let texts: Vec<String> = params.body_lines.iter().map(|l| l.to_string()).collect();
+        assert!(texts.iter().any(|t| t.contains("Open Plan (plan-open)")));
+        assert!(texts.iter().any(|t| t.contains("IN_PROGRESS")));
+        assert!(texts.iter().any(|t| t.contains("1 step(s)")), "{texts:?}");
+
+        // A finished plan needs no escalation and states it.
+        if let Some(plan) = st.plans_view.plans.first_mut() {
+            plan.items[1].status = tauqe_protocol::PlanItemStatus::Done;
+        }
+        let done_params = delete_plan_params(&st, "plan-open");
+        let done_texts: Vec<String> = done_params
+            .body_lines
+            .iter()
+            .map(|l| l.to_string())
+            .collect();
+        assert!(done_texts.iter().any(|t| t.contains("all steps completed")));
+    }
+
+    /// The second tier escalates to the error tone and names the remaining work
+    /// before the plan can be deleted (c-1).
+    #[test]
+    fn test_delete_plan_final_params_are_dangerous() {
+        let mut st = crate::app::test_state();
+        st.plans_view.plans = vec![tauqe_protocol::Plan {
+            id: "plan-wip".to_string(),
+            title: "Work In Progress".to_string(),
+            items: vec![
+                plan_item("1", "Done step", tauqe_protocol::PlanItemStatus::Done),
+                plan_item(
+                    "2",
+                    "In progress step",
+                    tauqe_protocol::PlanItemStatus::InProgress,
+                ),
+            ],
+            ..Default::default()
+        }];
+
+        let params = delete_plan_final_params(&st, "plan-wip");
+        assert_eq!(params.title, "Confirm Deleting Active Plan");
+        assert_eq!(params.tone, ModalTone::Dangerous);
+        assert_eq!(params.confirm_label, "Permanently Delete");
+        assert_eq!(
+            params.confirm_button,
+            crate::app::ConfirmDialogButton::Cancel
+        );
+        assert!(params.destructive);
+        assert_eq!(params.width, DELETE_PLAN_FINAL_WIDTH);
+
+        let texts: Vec<String> = params.body_lines.iter().map(|l| l.to_string()).collect();
+        assert!(texts.iter().any(|t| t.contains("Work In Progress")));
+        assert!(
+            texts
+                .iter()
+                .any(|t| t.contains("1 of 2 step(s) unfinished")),
+            "{texts:?}"
+        );
+        assert!(texts.iter().any(|t| t.contains("NOT undone")));
+    }
+
+    /// The two-tier deletion dialogs must render their buttons exactly where the
+    /// mouse hit-tester computes them (Conventions §6, §7).
+    #[test]
+    fn delete_plan_buttons_match_hit_geometry() {
+        let term = Rect::new(0, 0, 100, 40);
+        let mut st = crate::app::test_state();
+        st.plans_view.plans = vec![tauqe_protocol::Plan {
+            id: "plan-geom".to_string(),
+            title: "Geometry Plan".to_string(),
+            items: vec![plan_item(
+                "1",
+                "Todo step",
+                tauqe_protocol::PlanItemStatus::Todo,
+            )],
+            ..Default::default()
+        }];
+
+        let cases = [
+            (delete_plan_params(&st, "plan-geom"), DELETE_PLAN_WIDTH),
+            (
+                delete_plan_final_params(&st, "plan-geom"),
+                DELETE_PLAN_FINAL_WIDTH,
+            ),
+        ];
+
+        for (params, width) in cases {
+            let confirm_label = params.confirm_label.clone();
+            let cancel_label = params.cancel_label.clone();
+            let body_count = params.body_lines.len();
+            let mut terminal = Terminal::new(TestBackend::new(term.width, term.height)).unwrap();
+            terminal.draw(|f| render_modal_confirm(f, params)).unwrap();
+
+            let geom = crate::components::confirm::confirm_modal_geometry(
+                term,
+                width,
+                body_count,
+                &confirm_label,
+                &cancel_label,
+            );
+            let buffer = terminal.backend().buffer();
+            let read = |rect: Rect| -> String {
+                (rect.x..rect.x + rect.width)
+                    .map(|x| buffer[(x, rect.y)].symbol())
+                    .collect()
+            };
+
+            let confirm_row = read(geom.confirm_button);
+            assert!(
+                confirm_row.contains(confirm_label.as_str()),
+                "confirm row for '{confirm_label}': {confirm_row:?}"
+            );
+            let cancel_row = read(geom.cancel_button);
+            assert!(cancel_row.contains("Cancel"), "{cancel_row:?}");
+        }
+    }
+
     #[test]
     fn test_clear_horizon_params_are_warning_and_safe() {
         let st = crate::app::test_state();

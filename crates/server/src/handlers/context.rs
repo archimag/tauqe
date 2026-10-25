@@ -260,17 +260,26 @@ pub async fn handle_context_clear(req: Request, state: &Arc<AppState>) -> Respon
     }
 
     // Clearing recomputes hierarchical pinned files, which stats the disk, so it
-    // runs on the blocking pool like every other context mutation.
-    let ctx_state = match super::with_context_mutation(state, move |ctx| {
-        match params.layer {
-            Some(ContextLayer::Auto) => ctx.clear_auto(),
-            Some(ContextLayer::User) => ctx.clear_user(),
-            _ => ctx.clear(),
+    // runs on the blocking pool like every other context mutation. Clearing the
+    // Auto layer or the whole context really shrinks the stable prompt prefix,
+    // so those two paths go through the shared `AppState` facade, which rotates
+    // the dialogue session exactly when files were removed. A user-layer clear
+    // leaves the Auto layer intact, so it keeps the warm session and stays a
+    // plain context mutation.
+    let cleared = match params.layer {
+        Some(ContextLayer::Auto) => state.clear_auto_context().await,
+        Some(ContextLayer::User) => {
+            super::with_context_mutation(state, |ctx| {
+                ctx.clear_user();
+                ctx.get_state()
+            })
+            .await
         }
-        ctx.get_state()
-    })
-    .await
-    {
+        // The Pinned layer is refused above, so nothing else remains to clear.
+        _ => state.clear_all_context().await,
+    };
+
+    let ctx_state = match cleared {
         Ok(state) => state,
         Err(err) => return Response::err(req.id, errors::INTERNAL_ERROR, err),
     };
@@ -570,6 +579,8 @@ mod tests {
             .unwrap();
         assert_eq!(state.context.read().await.get_state().items.len(), 2);
 
+        let warm_session = state.session_uuid().await;
+
         // Clear Auto only
         let auto_clear = serde_json::to_value(ContextClearParams {
             layer: Some(ContextLayer::Auto),
@@ -581,6 +592,11 @@ mod tests {
             serde_json::from_value(res.result.unwrap()).unwrap();
         assert_eq!(ctx_state.items.len(), 1);
         assert_eq!(ctx_state.items[0].path, "user.rs");
+        assert_ne!(
+            warm_session,
+            state.session_uuid().await,
+            "removing auto files must rotate the provider session identifier"
+        );
 
         // Repopulate auto
         state
@@ -591,6 +607,7 @@ mod tests {
             .unwrap();
 
         // Clear User only
+        let user_session = state.session_uuid().await;
         let user_clear = serde_json::to_value(ContextClearParams {
             layer: Some(ContextLayer::User),
         })
@@ -601,6 +618,11 @@ mod tests {
             serde_json::from_value(res.result.unwrap()).unwrap();
         assert_eq!(ctx_state.items.len(), 1);
         assert_eq!(ctx_state.items[0].path, "auto.rs");
+        assert_eq!(
+            user_session,
+            state.session_uuid().await,
+            "clearing the user layer alone leaves the auto layer and its warm session intact"
+        );
 
         // Clear all (None)
         let res = handle_context_clear(make_req(5, None), &state).await;
@@ -608,6 +630,11 @@ mod tests {
         let ctx_state: tauqe_protocol::ContextState =
             serde_json::from_value(res.result.unwrap()).unwrap();
         assert!(ctx_state.items.is_empty());
+        assert_ne!(
+            user_session,
+            state.session_uuid().await,
+            "a full context reset must rotate the provider session identifier"
+        );
 
         let mut events = Vec::new();
         while let Ok(evt) = rx.try_recv() {

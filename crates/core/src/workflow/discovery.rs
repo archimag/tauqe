@@ -9,15 +9,51 @@ use tauqe_protocol::{
 };
 
 use crate::blocking::{run_blocking, run_blocking_async};
+use crate::config::ContextConfig;
 use crate::context::ContextManager;
 use crate::edits::protocol::ContextRequest;
 
 pub use search::{
     execute_repo_search, execute_repo_searches, format_search_feedback,
     format_single_search_feedback, normalize_search_path, FileSearchMatch, RepoSearchResult,
-    MAX_MATCHED_FILES_PER_SEARCH, MAX_SEARCHABLE_FILE_SIZE, MAX_SEARCH_REQUESTS_PER_ROUND,
-    REGEX_DFA_SIZE_LIMIT, REGEX_SIZE_LIMIT,
+    MAX_SEARCHABLE_FILE_SIZE, REGEX_DFA_SIZE_LIMIT, REGEX_SIZE_LIMIT,
 };
+
+/// Operational caps applied to one Discovery round.
+///
+/// Every cap that bounds how much material a round may report is resolved from
+/// the project's `[context]` section, so a project that routinely works with
+/// wider searches or larger listings raises the ceilings in `tauqe.toml`
+/// instead of recompiling the engine.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DiscoveryLimits {
+    /// Repository search queries honored in one round.
+    pub max_search_requests_per_round: usize,
+    /// Matching files reported for a single search query.
+    pub max_matched_files_per_search: usize,
+    /// Entries rendered by a single directory listing.
+    pub max_dir_list_entries: usize,
+    /// Distinct targeted map requests honored in one round.
+    pub max_repo_map_requests_per_round: usize,
+}
+
+impl Default for DiscoveryLimits {
+    fn default() -> Self {
+        Self::from_context_config(&ContextConfig::default())
+    }
+}
+
+impl DiscoveryLimits {
+    /// Reads the Discovery caps declared by the project configuration.
+    pub fn from_context_config(config: &ContextConfig) -> Self {
+        Self {
+            max_search_requests_per_round: config.max_search_requests_per_round,
+            max_matched_files_per_search: config.max_matched_files_per_search,
+            max_dir_list_entries: config.max_dir_list_entries,
+            max_repo_map_requests_per_round: config.max_repo_map_requests_per_round,
+        }
+    }
+}
 
 pub(crate) fn access_satisfies(current: Option<ContextAccess>, requested: ContextAccess) -> bool {
     match current {
@@ -174,6 +210,8 @@ pub struct DiscoveryRoundContext<'a> {
     pub files_token_budget: usize,
     /// Token budget for a targeted repository map rendered this round.
     pub repomap_token_budget: usize,
+    /// Operational caps resolved from the project configuration.
+    pub limits: DiscoveryLimits,
     /// Whether a request already satisfied by the context counts as progress.
     pub allow_already_satisfied_feedback: bool,
 }
@@ -438,7 +476,12 @@ impl DiscoveryCapabilityHandler for RepoSearchHandler {
             return;
         }
 
-        let results = execute_repo_searches(round.repo_root, &queries, round.available_files);
+        let results = execute_repo_searches(
+            round.repo_root,
+            &queries,
+            round.available_files,
+            round.limits,
+        );
         if !results.is_empty() {
             outcome
                 .feedback_blocks
@@ -495,19 +538,6 @@ impl DiscoveryCapabilityHandler for RepoDirsHandler {
     }
 }
 
-/// Maximum number of entries rendered by a single directory listing.
-///
-/// A listing is a navigation aid, not a file dump: a recursive request over a
-/// wide tree can name thousands of files and consume the whole context budget.
-pub const MAX_DIR_LIST_ENTRIES: usize = 100;
-
-/// Maximum number of distinct targeted map requests honored in one round.
-///
-/// A targeted outline costs a Tree-sitter pass over the requested subtree, so an
-/// unbounded set of requests would turn one discovery round into a full
-/// repository re-index.
-pub const MAX_REPO_MAP_REQUESTS_PER_ROUND: usize = 3;
-
 /// Renders the targeted symbol map of a requested subdirectory.
 struct RepoMapRequestHandler;
 
@@ -527,6 +557,7 @@ impl DiscoveryCapabilityHandler for RepoMapRequestHandler {
         _context_manager: &mut ContextManager,
         outcome: &mut DiscoveryRoundOutcome,
     ) {
+        let max_requests = round.limits.max_repo_map_requests_per_round;
         let mut requested: Vec<String> = Vec::new();
         for command in commands {
             let LlmCommand::RepoMap { path } = command else {
@@ -536,9 +567,9 @@ impl DiscoveryCapabilityHandler for RepoMapRequestHandler {
             if requested.contains(&target) {
                 continue;
             }
-            if requested.len() >= MAX_REPO_MAP_REQUESTS_PER_ROUND {
+            if requested.len() >= max_requests {
                 tracing::warn!(
-                    limit = MAX_REPO_MAP_REQUESTS_PER_ROUND,
+                    limit = max_requests,
                     "targeted repository map request limit reached; ignoring the rest"
                 );
                 break;
@@ -607,6 +638,7 @@ impl DiscoveryCapabilityHandler for DirListHandler {
         _context_manager: &mut ContextManager,
         outcome: &mut DiscoveryRoundOutcome,
     ) {
+        let max_entries = round.limits.max_dir_list_entries;
         let mut requested: Vec<DirListRequest> = Vec::new();
         for command in commands {
             let LlmCommand::DirList { path, recursive } = command else {
@@ -641,10 +673,10 @@ impl DiscoveryCapabilityHandler for DirListHandler {
                 render_dir_listing(round.available_files, &request.path, request.recursive);
             // A listing is a navigation aid, not a file dump: a recursive
             // request over a wide tree would otherwise consume the whole context
-            // budget, so the cap is applied and reported explicitly.
-            let omitted = entries.len().saturating_sub(MAX_DIR_LIST_ENTRIES);
+            // budget, so the configured cap is applied and reported explicitly.
+            let omitted = entries.len().saturating_sub(max_entries);
             if omitted > 0 {
-                entries.truncate(MAX_DIR_LIST_ENTRIES);
+                entries.truncate(max_entries);
             }
             let mut body = if entries.is_empty() {
                 format!(
@@ -657,7 +689,7 @@ impl DiscoveryCapabilityHandler for DirListHandler {
             if omitted > 0 {
                 body.push_str(&format!(
                     "\n[{} more entries omitted: a listing is capped at {} entries]",
-                    omitted, MAX_DIR_LIST_ENTRIES
+                    omitted, max_entries
                 ));
             }
             outcome.feedback_blocks.push(format!(
@@ -767,7 +799,9 @@ pub fn discovery_handlers() -> &'static [&'static dyn DiscoveryCapabilityHandler
 ///
 /// This is the core the asynchronous facade and the server architect loop call
 /// from inside `run_blocking` / `with_context_mutation`, so no handler ever
-/// blocks an async worker thread.
+/// blocks an async worker thread. The `limits` caps travel with the call, so a
+/// round applies exactly the bounds the project declared.
+#[allow(clippy::too_many_arguments)]
 pub fn execute_discovery_commands_sync(
     context_manager: &mut ContextManager,
     repo_root: &Path,
@@ -775,6 +809,7 @@ pub fn execute_discovery_commands_sync(
     commands: &[LlmCommand],
     files_token_budget: usize,
     repomap_token_budget: usize,
+    limits: DiscoveryLimits,
     allow_already_satisfied_feedback: bool,
 ) -> DiscoveryRoundOutcome {
     let round = DiscoveryRoundContext {
@@ -782,6 +817,7 @@ pub fn execute_discovery_commands_sync(
         available_files,
         files_token_budget,
         repomap_token_budget,
+        limits,
         allow_already_satisfied_feedback,
     };
     let mut outcome = DiscoveryRoundOutcome::default();
@@ -806,11 +842,54 @@ pub fn execute_discovery_commands_sync(
         && !outcome.already_satisfied_files.is_empty()
     {
         outcome.feedback_blocks.push(format!(
-            "<context_feedback>\nThe following files are already loaded in context: [{}]\nYou may proceed with inspecting them and refining the plan.\n</context_feedback>",
+            "<context_feedback>\nThe following files are already loaded in context: [{}]\nYou may proceed with inspecting them and refining the plan. Do not request those paths again: answer the task from the material you already hold, and write your analysis or conclusion in plain conversational text unless the code itself must change.\n</context_feedback>",
             outcome.already_satisfied_files.join(", ")
         ));
     }
 
+    outcome
+}
+
+/// Resolves the tracked repository file list off the async executor thread.
+///
+/// Every failure — a `git` invocation that cannot run and a panicked or
+/// cancelled offloaded task alike — is recorded before the caller degrades,
+/// so an uninspectable repository stays distinguishable from an empty one.
+/// Returns `None` when the list could not be resolved.
+pub async fn resolve_repository_files(repo_root: &Path) -> Option<Vec<String>> {
+    let root = repo_root.to_path_buf();
+    match run_blocking_async(move || crate::git::list_repository_files(Some(&root))).await {
+        Ok(Ok(files)) => Some(files),
+        Ok(Err(error)) => {
+            tracing::warn!(
+                error = %error,
+                "failed to list repository files; the repository is treated as uninspectable"
+            );
+            None
+        }
+        Err(join_error) => {
+            crate::blocking::log_join_error(&join_error, "repository file listing");
+            None
+        }
+    }
+}
+
+/// Round outcome returned when the tracked repository file list could not be
+/// resolved.
+///
+/// The round must not dispatch handlers against an invented empty repository:
+/// every requested file would otherwise surface to the model as missing. The
+/// feedback block names the inspection failure instead, and the warn record
+/// of [`resolve_repository_files`] keeps the degradation observable.
+fn uninspectable_repository_outcome() -> DiscoveryRoundOutcome {
+    let mut outcome = DiscoveryRoundOutcome::default();
+    outcome.feedback_blocks.push(
+        "<context_feedback>\nThe repository could not be inspected, so the tracked \
+         file list and repository searches are unavailable for this round. Do not \
+         conclude that requested files are missing: proceed with the material \
+         already loaded in context.\n</context_feedback>"
+            .to_string(),
+    );
     outcome
 }
 
@@ -819,13 +898,16 @@ pub fn execute_discovery_commands_sync(
 ///
 /// The repository file list is read once per round, and every handler runs
 /// inside `run_blocking`, so path canonicalization, file metadata reads, and
-/// regex scans never stall a Tokio worker.
+/// regex scans never stall a Tokio worker. A repository that cannot be
+/// inspected ends the round with an inspection-failure feedback block instead
+/// of reporting every requested file as missing.
 pub async fn execute_discovery_commands(
     context_manager: &mut ContextManager,
     repo_root: &Path,
     commands: &[LlmCommand],
     files_token_budget: usize,
     repomap_token_budget: usize,
+    limits: DiscoveryLimits,
     allow_already_satisfied_feedback: bool,
 ) -> DiscoveryRoundOutcome {
     if commands.is_empty() {
@@ -843,12 +925,14 @@ pub async fn execute_discovery_commands(
         )
     });
     let available_files = if needs_file_list {
-        let root = repo_root.to_path_buf();
-        run_blocking_async(move || {
-            crate::git::list_repository_files(Some(&root)).unwrap_or_default()
-        })
-        .await
-        .unwrap_or_default()
+        match resolve_repository_files(repo_root).await {
+            Some(files) => files,
+            // A repository that could not be inspected must not surface every
+            // requested file as missing: the round reports the inspection
+            // failure instead of dispatching handlers against an invented
+            // empty repository.
+            None => return uninspectable_repository_outcome(),
+        }
     } else {
         Vec::new()
     };
@@ -861,6 +945,7 @@ pub async fn execute_discovery_commands(
             commands,
             files_token_budget,
             repomap_token_budget,
+            limits,
             allow_already_satisfied_feedback,
         )
     })
@@ -869,6 +954,11 @@ pub async fn execute_discovery_commands(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Discovery caps applied by tests that do not exercise a specific limit.
+    fn default_limits() -> DiscoveryLimits {
+        DiscoveryLimits::default()
+    }
 
     #[test]
     fn test_apply_context_requests_adds_existing_files_to_auto_layer() {
@@ -1044,6 +1134,7 @@ mod tests {
             &commands,
             300_000,
             300_000,
+            default_limits(),
             false,
         );
 
@@ -1089,6 +1180,7 @@ mod tests {
             &commands,
             1,
             300_000,
+            default_limits(),
             false,
         );
 
@@ -1122,6 +1214,7 @@ mod tests {
             &commands,
             300_000,
             300_000,
+            default_limits(),
             false,
         );
         assert_eq!(outcome.already_satisfied_files, vec!["a.rs".to_string()]);
@@ -1135,6 +1228,7 @@ mod tests {
             &commands,
             300_000,
             300_000,
+            default_limits(),
             true,
         );
         assert!(outcome.has_progress(true));
@@ -1161,6 +1255,7 @@ mod tests {
             &commands,
             300_000,
             300_000,
+            default_limits(),
             false,
         );
 
@@ -1198,6 +1293,7 @@ mod tests {
             &commands,
             300_000,
             300_000,
+            default_limits(),
             false,
         );
         assert_eq!(outcome.dir_lists_loaded, 1);
@@ -1224,12 +1320,49 @@ mod tests {
             &commands,
             300_000,
             300_000,
+            default_limits(),
             false,
         );
         let feedback = outcome.combined_feedback();
         assert!(feedback.contains("<dir_list_feedback path=\"src\" recursive=\"true\">"));
         assert!(feedback.contains("main.rs"));
         assert!(feedback.contains("nested/module.rs"));
+    }
+
+    #[test]
+    fn test_execute_discovery_commands_caps_a_listing_at_the_configured_bound() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        let mut cm = ContextManager::new(dir.path().to_path_buf());
+        let available: Vec<String> = (0..5).map(|index| format!("src/file_{index}.rs")).collect();
+
+        // The listing cap is configuration-driven, so a project raises or
+        // narrows it in `tauqe.toml` instead of recompiling the engine.
+        let limits = DiscoveryLimits {
+            max_dir_list_entries: 2,
+            ..default_limits()
+        };
+        let commands = vec![LlmCommand::DirList {
+            path: "src".to_string(),
+            recursive: true,
+        }];
+        let outcome = execute_discovery_commands_sync(
+            &mut cm,
+            dir.path(),
+            &available,
+            &commands,
+            300_000,
+            300_000,
+            limits,
+            false,
+        );
+
+        assert_eq!(outcome.dir_lists_loaded, 1);
+        let feedback = outcome.combined_feedback();
+        assert!(feedback.contains("file_0.rs"));
+        assert!(feedback.contains("file_1.rs"));
+        assert!(!feedback.contains("file_2.rs"));
+        assert!(feedback.contains("[3 more entries omitted: a listing is capped at 2 entries]"));
     }
 
     #[test]
@@ -1247,6 +1380,7 @@ mod tests {
             &commands,
             300_000,
             300_000,
+            default_limits(),
             true,
         );
 
@@ -1285,6 +1419,7 @@ mod tests {
             &commands,
             300_000,
             300_000,
+            default_limits(),
             false,
         );
 
@@ -1321,6 +1456,7 @@ mod tests {
             &commands,
             300_000,
             300_000,
+            default_limits(),
             false,
         );
 
@@ -1328,5 +1464,97 @@ mod tests {
         let feedback = outcome.combined_feedback();
         assert!(feedback.contains("<repomap_feedback path=\"docs\">"));
         assert!(feedback.contains("No tracked source files under `docs`"));
+    }
+
+    #[test]
+    fn test_execute_discovery_commands_caps_targeted_repo_maps_per_round() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut available = Vec::new();
+        for index in 0..5 {
+            let subdirectory = format!("module{index}");
+            std::fs::create_dir_all(dir.path().join(&subdirectory)).unwrap();
+            let file = format!("{subdirectory}/lib.rs");
+            std::fs::write(
+                dir.path().join(&file),
+                format!("pub fn function_{index}() {{}}\n"),
+            )
+            .unwrap();
+            available.push(file);
+        }
+        let mut cm = ContextManager::new(dir.path().to_path_buf());
+
+        let commands: Vec<LlmCommand> = (0..5)
+            .map(|index| LlmCommand::RepoMap {
+                path: format!("module{index}"),
+            })
+            .collect();
+
+        // The per-round request cap is configuration-driven: the shared handler
+        // owns it, so an untrusted list of requested contours can never turn one
+        // round into a full repository re-index.
+        let limits = DiscoveryLimits {
+            max_repo_map_requests_per_round: 2,
+            ..default_limits()
+        };
+        let outcome = execute_discovery_commands_sync(
+            &mut cm,
+            dir.path(),
+            &available,
+            &commands,
+            300_000,
+            300_000,
+            limits,
+            false,
+        );
+
+        assert_eq!(outcome.repo_maps_loaded, 2);
+        let feedback = outcome.combined_feedback();
+        assert_eq!(feedback.matches("<repomap_feedback path=").count(), 2);
+        assert!(feedback.contains("pub fn function_0"));
+        assert!(feedback.contains("pub fn function_1"));
+        assert!(!feedback.contains("pub fn function_2"));
+    }
+
+    /// A repository whose tracked file list cannot be resolved must not lie to
+    /// the model: the round reports the inspection failure as a feedback
+    /// block, never as a list of "missing" files, and the degradation leaves
+    /// a warn record.
+    #[tokio::test]
+    async fn uninspectable_repository_reports_feedback_instead_of_missing_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing_root = dir.path().join("no-such-repository");
+        let mut cm = ContextManager::new(dir.path().to_path_buf());
+        let commands = vec![LlmCommand::ContextRequest {
+            path: "a.rs".to_string(),
+            access: ContextAccess::ReadOnly,
+        }];
+
+        let (buffer, _guard) = crate::blocking::log_capture::install();
+        let outcome = execute_discovery_commands(
+            &mut cm,
+            &missing_root,
+            &commands,
+            300_000,
+            300_000,
+            default_limits(),
+            false,
+        )
+        .await;
+
+        assert!(outcome.added_files.is_empty());
+        assert!(
+            outcome.missing_files.is_empty(),
+            "an uninspectable repository must not report requested files as missing"
+        );
+        assert!(!outcome.has_progress(false));
+        let feedback = outcome.combined_feedback();
+        assert!(feedback.contains("The repository could not be inspected"));
+        assert!(feedback.contains("Do not conclude that requested files are missing"));
+
+        let logs = crate::blocking::log_capture::contents(&buffer);
+        assert!(
+            logs.contains("failed to list repository files"),
+            "the degradation must be observable: {logs}"
+        );
     }
 }

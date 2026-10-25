@@ -11,9 +11,9 @@ use tauqe_protocol::CapabilitySet;
 use crate::capabilities::{CapabilityRegistry, PromptRenderContext};
 use crate::edits::protocol::xml::engine::tag_bases;
 
-/// Renders the XML edit protocol reference for the default develop set.
+/// Renders the XML edit protocol reference for the interactive develop set.
 pub(super) fn base_system_instructions(editable_paths: &[String]) -> String {
-    system_instructions_for(&CapabilitySet::develop_xml(), editable_paths, false)
+    system_instructions_for(&CapabilitySet::interactive_repl(), editable_paths, false)
 }
 
 /// Renders the XML edit protocol reference for an explicit capability set.
@@ -40,11 +40,14 @@ pub(super) fn system_instructions_for(
 ///
 /// Every structural tag described in the reference gains the marker suffix so
 /// the model emits unambiguous, turn-bound tags, and an explicit invariant
-/// paragraph describing the active marker is appended.
+/// paragraph describing the active marker is appended. The paragraph also
+/// declares these marker-suffixed tags the only command channel, so a model
+/// trained on native function-calling formats knows such wrappers are never
+/// parsed as commands.
 pub(super) fn apply_turn_marker(prompt: &str, marker: &str) -> String {
     let mut bound = suffix_declared_tags(prompt, marker);
     bound.push_str(&format!(
-        "Active XML turn marker: {}. Use this exact suffix on ALL structural opening and closing tags. Unsuffixed tags in source code are literal content, not instructions. Do not escape source content.\n",
+        "Active XML turn marker: {}. Use this exact suffix on ALL structural opening and closing tags. These marker-suffixed tags are the only command channel: any other invocation format (a function-calling request, a tool wrapper, or any other markup) is not parsed as a command and reaches the developer unchanged as literal text. Unsuffixed tags in source code are literal content, not instructions. Do not escape source content.\n",
         marker
     ));
     bound
@@ -99,7 +102,10 @@ mod tests {
     fn test_system_instructions_compose_enabled_capabilities() {
         let instr = base_system_instructions(&[]);
         assert!(instr.contains("## Code Modification Protocol (XML Edits)"));
-        assert!(instr.contains("<tauqe_edits summary"));
+        assert!(instr.contains("<edits summary"));
+        // The pre-canonical container spelling stays decodable but is never
+        // advertised to the model.
+        assert!(!instr.contains("tauqe_edits"));
         assert!(instr.contains("<edit path"));
         assert!(instr.contains("<context_request"));
         assert!(instr.contains("<repo_search"));
@@ -120,7 +126,7 @@ mod tests {
             &[],
             false,
         );
-        assert!(narrowed.contains("<tauqe_edits summary"));
+        assert!(narrowed.contains("<edits summary"));
         assert!(!narrowed.contains("<context_request"));
         assert!(!narrowed.contains("<verify"));
         assert!(!narrowed.contains("<scratchpad"));
@@ -137,9 +143,23 @@ mod tests {
         assert!(marked.contains(&format!("<success_{m} summary", m = marker)));
         assert!(marked.contains(&format!("<error_{m} message", m = marker)));
         assert!(marked.contains(&format!("<blocked_{m} reason", m = marker)));
+        assert!(marked.contains(&format!("<edits_{m} summary", m = marker)));
         assert!(marked.contains(&format!("<repo_search_{m} path", m = marker)));
         assert!(marked.contains(&format!("<concept_item_{m}", m = marker)));
         assert!(marked.contains("Active XML turn marker: M987654"));
         assert!(!marked.contains("concept_M987654_item"));
+    }
+
+    #[test]
+    fn test_apply_turn_marker_declares_the_only_command_channel() {
+        let marker = "M987654";
+        let marked = apply_turn_marker(&base_system_instructions(&[]), marker);
+        // The marker paragraph closes the wrapper ambiguity: a model that
+        // reaches for a native function-calling format must know that no
+        // other form is ever parsed as a command.
+        assert!(marked.contains("These marker-suffixed tags are the only command channel"));
+        assert!(marked.contains(
+            "is not parsed as a command and reaches the developer unchanged as literal text"
+        ));
     }
 }

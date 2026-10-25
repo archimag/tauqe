@@ -4,9 +4,7 @@ use async_trait::async_trait;
 use tauqe_protocol::{EditOperation, EditProposal};
 
 use crate::context::ContextManager;
-use crate::edits::{
-    apply_edit_proposal, stage_and_validate_edits, StageEditsResult, StagedEditsState,
-};
+use crate::edits::{apply_edit_proposal, prepare_staged_edits, StageEditsResult, StagedEditsState};
 
 /// Phased strategy that governs how validated edits reach the working tree.
 ///
@@ -69,7 +67,7 @@ impl ApplyPolicy for DirectApplyPolicy {
         edits: &[EditOperation],
         staged_state: Option<&StagedEditsState>,
     ) -> StageEditsResult {
-        stage_and_validate_edits(repo_root, context_manager, edits, staged_state)
+        prepare_staged_edits(repo_root, context_manager, edits, staged_state).await
     }
 
     async fn apply_temporary(
@@ -78,7 +76,7 @@ impl ApplyPolicy for DirectApplyPolicy {
         context_manager: &mut ContextManager,
         proposal: &EditProposal,
     ) -> anyhow::Result<Vec<String>> {
-        let changed_files = apply_edit_proposal(repo_root, context_manager, proposal)?;
+        let changed_files = apply_edit_proposal(repo_root, context_manager, proposal).await?;
         Ok(changed_files)
     }
 

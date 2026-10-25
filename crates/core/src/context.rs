@@ -304,23 +304,20 @@ impl ContextManager {
         self.add_file_to_layer(relative_path, access, ContextLayer::Auto)
     }
 
-    pub fn promote_auto_to_user(&mut self, relative_path: &str) -> Result<bool> {
-        let clean_path = self.normalize_path(relative_path)?;
-        if let Some(mut item) = self.auto.shift_remove(&clean_path) {
-            item.layer = ContextLayer::User;
-            self.user.insert(clean_path, item);
-            self.revision += 1;
-            Ok(true)
-        } else {
-            Ok(false)
-        }
-    }
-
-    pub fn clear_auto(&mut self) {
+    /// Drops every file of the auto context layer.
+    ///
+    /// Returns `true` only when the layer actually held files, so callers can
+    /// treat the removal as a deterministic signal that the stable prefix of
+    /// the prompt shrank. A repeated clear on an already empty layer reports
+    /// `false` instead of a change that did not happen.
+    pub fn clear_auto(&mut self) -> bool {
         if !self.auto.is_empty() {
             self.auto.clear();
             self.recompute_pinned();
             self.revision += 1;
+            true
+        } else {
+            false
         }
     }
 
@@ -541,13 +538,21 @@ impl ContextManager {
         Ok(false)
     }
 
-    pub fn clear(&mut self) {
+    /// Drops every file of the mutable user and auto context layers.
+    ///
+    /// Returns `true` only when at least one layer actually held files, so a
+    /// clear that removed nothing is distinguishable from a clear that shrank
+    /// the prompt prefix.
+    pub fn clear(&mut self) -> bool {
         let had_items = !self.user.is_empty() || !self.auto.is_empty();
         if had_items {
             self.user.clear();
             self.auto.clear();
             self.recompute_pinned();
             self.revision += 1;
+            true
+        } else {
+            false
         }
     }
 
@@ -743,11 +748,13 @@ mod tests {
         cm.add_file("pinned.rs", ContextAccess::Editable).unwrap();
         assert!(cm.is_editable("pinned.rs").unwrap());
 
-        // Promoting auto file to user
-        assert!(cm.promote_auto_to_user("auto.rs").unwrap());
+        // Only an explicit manual addition moves a file into the user layer: it
+        // evicts the auto entry so the path is never owned by two layers at once.
+        cm.add_file("auto.rs", ContextAccess::ReadOnly).unwrap();
+        assert!(cm.auto_files().is_empty());
         let state = cm.get_state();
-        let auto_item = state.items.iter().find(|i| i.path == "auto.rs").unwrap();
-        assert_eq!(auto_item.layer, ContextLayer::User);
+        let promoted = state.items.iter().find(|i| i.path == "auto.rs").unwrap();
+        assert_eq!(promoted.layer, ContextLayer::User);
     }
 
     #[test]
@@ -947,6 +954,61 @@ mod tests {
         assert!(cm.contains("pinned.rs").unwrap());
         assert!(cm.contains("auto.rs").unwrap());
         assert!(cm.get_state().revision > rev_before);
+    }
+
+    #[test]
+    fn test_clear_auto_reports_whether_files_were_removed() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        std::fs::write(root.join("auto.rs"), "fn auto() {}").unwrap();
+
+        let mut cm = ContextManager::new(root);
+        assert!(
+            !cm.clear_auto(),
+            "clearing an empty auto layer must report no change"
+        );
+
+        cm.add_auto_file("auto.rs", ContextAccess::ReadOnly)
+            .unwrap();
+        assert!(
+            cm.clear_auto(),
+            "removing an auto file must report a change"
+        );
+        assert!(
+            !cm.clear_auto(),
+            "a repeated clear on an empty layer must report no change"
+        );
+    }
+
+    #[test]
+    fn test_clear_reports_whether_files_were_removed() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        std::fs::write(root.join("user.rs"), "fn user() {}").unwrap();
+        std::fs::write(root.join("auto.rs"), "fn auto() {}").unwrap();
+
+        let mut cm = ContextManager::new(root);
+        assert!(
+            !cm.clear(),
+            "clearing an empty context must report no change"
+        );
+
+        cm.add_file("user.rs", ContextAccess::Editable).unwrap();
+        assert!(
+            cm.clear(),
+            "removing a user file must report a change"
+        );
+        assert!(
+            !cm.clear(),
+            "a repeated clear on an empty context must report no change"
+        );
+
+        cm.add_auto_file("auto.rs", ContextAccess::ReadOnly)
+            .unwrap();
+        assert!(
+            cm.clear(),
+            "removing an auto-only file must report a change"
+        );
     }
 
     #[test]

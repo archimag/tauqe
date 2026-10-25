@@ -1,19 +1,22 @@
-//! Deterministic project toolchain execution.
+//! Deterministic project command execution.
 //!
 //! The harness carries no knowledge of a language, a compiler, or a build
 //! system: every technology-specific operation is declared in `tauqe.toml` and
 //! runs as an ordinary project process in the repository root.
 //!
 //! - `[project.verify]` is the mandatory verification lifecycle. Its command
-//!   line runs in its own process group with a wall-clock budget, and its output
-//!   is parsed into typed diagnostics.
+//!   line runs in its own process group with a wall-clock budget, receives the
+//!   turn's change set on standard input, and its output is parsed into typed
+//!   diagnostics.
 //! - `[project.format]` is the in-memory filter that rewrites staged content
-//!   through standard input and output before any byte reaches disk.
+//!   through standard input and output before any byte reaches disk. When the
+//!   entry is omitted, the `format` recipe the declared task runner exports
+//!   fills the role; a declaration always keeps precedence over that export.
 //! - `[project.post_hook]` is the disk-side step that runs strictly after the
 //!   change set is written and before verification.
 //!
-//! Legacy `[toolchain]` settings remain harness policy: budgets, the auto-verify
-//! gate, and the deterministic resolution an unmigrated repository keeps.
+//! Nothing is detected here: a repository either declares the commands it runs
+//! or runs nothing at all.
 
 mod commands;
 mod diagnostics;
@@ -22,29 +25,26 @@ mod fmt;
 mod report;
 pub mod runner;
 
+use std::collections::BTreeMap;
 use std::path::Path;
 
-use serde::{Deserialize, Serialize};
-use tauqe_protocol::{Diagnostic, ProjectConfig, ProjectHookOutcome, ProjectPostHookResponse};
+use tauqe_protocol::{
+    Diagnostic, ProjectConfig, ProjectHookOutcome, ProjectParameterSpec, ProjectPostHookResponse,
+};
 use tokio::sync::watch;
 
-use crate::edits::protocol::xml::VerifyTarget;
-
-pub use commands::detect_toolchain;
-pub use fmt::{format_staged_content, run_formatters, FormatterRunResult, InMemoryFormatOutcome};
+pub(crate) use fmt::format_with_project_config;
+pub use fmt::{format_staged_content, InMemoryFormatOutcome};
 pub use runner::merge_manifest;
 
-/// The build and validation toolchain detected from the project files.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub enum ToolchainKind {
-    Cargo,
-    Npm,
-    Go,
-    Custom(String),
-    None,
-}
+/// Wall-clock budget of a single project command, in seconds.
+///
+/// Applied whenever the executed entry declares no `timeout_secs` of its own. A
+/// real test suite routinely needs more than a minute, which is why the fallback
+/// is generous.
+pub const DEFAULT_PROJECT_TIMEOUT_SECS: u64 = 600;
 
-/// Outcome of a single toolchain command.
+/// Outcome of a single project command.
 #[derive(Debug, Clone)]
 pub struct ToolchainCheckResult {
     pub success: bool,
@@ -58,61 +58,76 @@ pub struct ToolchainCheckResult {
     pub diagnostics: Vec<Diagnostic>,
 }
 
-/// Runs the project verification lifecycle for `target`, stopping on the first failure.
-///
-/// `[project.verify]` is authoritative, so it runs for every target; a
-/// repository that declares no verification command keeps the legacy
-/// deterministic resolution. The configuration is read off the async executor
-/// thread, and the output of a failing command is parsed into typed diagnostics
-/// so a healing round reasons about locations instead of a transcript.
 /// Resolves the effective project configuration, merging any declared task runner.
 ///
-/// If a task runner is declared (e.g. `runner = "just"`), its exported manifest
-/// is loaded and merged into the configuration from `tauqe.toml`. Declared entries
-/// in `tauqe.toml` always take precedence over runner recipes.
+/// If a task runner is declared in `[project]`, its exported manifest is loaded
+/// and merged into the declared configuration. Declared entries in `tauqe.toml`
+/// always take precedence over runner recipes, and a runner that is missing,
+/// fails, or answers with an unreadable dump leaves the declared configuration
+/// untouched instead of contributing a partially trusted command list.
 pub async fn effective_project_config(
     repo_root: &Path,
     cancel_rx: Option<&watch::Receiver<bool>>,
-) -> (ProjectConfig, crate::config::ToolchainConfig) {
+) -> ProjectConfig {
     let root = repo_root.to_path_buf();
-    let (mut project, config) = crate::blocking::run_blocking(|| {
-        let project = crate::config::load_section::<ProjectConfig>(root.as_path(), "project");
-        let config = crate::config::load_toolchain_config(root.as_path());
-        (project, config)
+    // Reading `tauqe.toml` is blocking filesystem work, so it runs off the async
+    // executor thread.
+    let mut project = crate::blocking::run_blocking(|| {
+        crate::config::load_section::<ProjectConfig>(root.as_path(), "project")
     });
 
-    if let Some(runner) = runner::task_runner(project.runner) {
-        let timeout_secs = config.effective_timeout_secs();
-        match runner::load_manifest(runner, repo_root, timeout_secs, cancel_rx).await {
-            Ok(manifest) => {
-                runner::merge_manifest(&mut project, manifest);
-            }
-            Err(err) => {
-                tracing::warn!(
-                    runner = %project.runner,
-                    reason = %err,
-                    "failed to load task runner manifest; using declared project configuration"
-                );
-            }
+    let Some(runner) = runner::task_runner(project.runner) else {
+        return project;
+    };
+
+    match runner::load_manifest(runner, repo_root, DEFAULT_PROJECT_TIMEOUT_SECS, cancel_rx).await {
+        Ok(manifest) => runner::merge_manifest(&mut project, manifest),
+        Err(err) => {
+            tracing::warn!(
+                runner = %project.runner,
+                reason = %err,
+                "failed to load task runner manifest; using declared project configuration"
+            );
         }
     }
 
-    (project, config)
+    project
 }
 
+/// Runs the declared verification lifecycle, stopping at the first failure.
+///
+/// `[project.verify]` is the single authority on how the repository verifies, so
+/// its command line is the whole pipeline: the harness runs it once with its own
+/// wall-clock budget and takes the exit status as the verdict. A repository that
+/// declares no verification command resolves no step at all and reports a clean
+/// empty run instead of running an unintended program. A failing command's
+/// output is parsed into typed diagnostics, so a healing round reasons about
+/// locations instead of a transcript.
+/// The turn's authoritative change set reaches the command on its standard
+/// input, one path per line, so a project dispatcher selects the checks from the
+/// files the turn actually touched. The command never derives that list itself:
+/// while the transaction is open the working copy also holds post-hook artifacts
+/// and the developer's uncommitted work. An empty change set sends no input at
+/// all, so the command conservatively runs its full suite.
 pub async fn run_verification_pipeline(
     repo_root: &Path,
-    target: &VerifyTarget,
+    changed_files: &[String],
     cancel_rx: Option<&watch::Receiver<bool>>,
 ) -> (bool, Vec<ToolchainCheckResult>) {
-    let (project, config) = effective_project_config(repo_root, cancel_rx).await;
-    let steps =
-        commands::resolve_verification_plan_with_config(repo_root, target, &project, &config);
+    let project = effective_project_config(repo_root, cancel_rx).await;
+    let steps = commands::resolve_verification_plan(&project);
     let mut results = Vec::new();
+    let change_set = change_set_payload(changed_files);
 
     for step in steps {
-        let mut result =
-            exec::run_command(repo_root, &step.command, step.timeout_secs, cancel_rx).await;
+        let mut result = exec::run_command(
+            repo_root,
+            &step.command,
+            step.timeout_secs,
+            change_set.as_deref(),
+            cancel_rx,
+        )
+        .await;
         if !result.success && !result.is_cancelled {
             result.diagnostics = diagnostics::parse_diagnostics(&result.combined_output);
         }
@@ -126,18 +141,27 @@ pub async fn run_verification_pipeline(
     (true, results)
 }
 
-/// Executes a toolchain verification command with the default wall-clock timeout.
-pub async fn run_toolchain_check(repo_root: &Path, command_str: &str) -> ToolchainCheckResult {
-    run_toolchain_check_with_timeout(
-        repo_root,
-        command_str,
-        crate::config::DEFAULT_TOOLCHAIN_TIMEOUT_SECS,
-        None,
-    )
-    .await
+/// Renders the turn's authoritative change set as a command's standard input.
+///
+/// One repository-relative path per line, so a project dispatcher reads the list
+/// with a plain line loop. An empty change set produces no input at all: the
+/// command then runs its full suite instead of an empty selection.
+fn change_set_payload(changed_files: &[String]) -> Option<String> {
+    if changed_files.is_empty() {
+        return None;
+    }
+    let mut payload = changed_files.join("\n");
+    payload.push('\n');
+    Some(payload)
 }
 
-/// Executes a toolchain verification command in repo root with a wall-clock timeout and cancellation.
+/// Executes a project command with the default wall-clock timeout.
+pub async fn run_toolchain_check(repo_root: &Path, command_str: &str) -> ToolchainCheckResult {
+    run_toolchain_check_with_timeout(repo_root, command_str, DEFAULT_PROJECT_TIMEOUT_SECS, None)
+        .await
+}
+
+/// Executes a project command in repo root with a wall-clock timeout and cancellation.
 ///
 /// The command string is tokenized with shell-style quoting so arguments that
 /// contain spaces survive intact. On Unix platforms, the child process is launched
@@ -145,7 +169,7 @@ pub async fn run_toolchain_check(repo_root: &Path, command_str: &str) -> Toolcha
 /// cancellations terminate the entire process hierarchy (e.g. `rustc` and test binaries).
 ///
 /// The wall-clock duration and outcome are recorded as a single structured log
-/// record so verification timing is observable without duplicating orchestration.
+/// record so execution timing is observable without duplicating orchestration.
 pub async fn run_toolchain_check_with_timeout(
     repo_root: &Path,
     command_str: &str,
@@ -153,7 +177,7 @@ pub async fn run_toolchain_check_with_timeout(
     cancel_rx: Option<&watch::Receiver<bool>>,
 ) -> ToolchainCheckResult {
     let command = exec::CommandLine::tokenized(command_str);
-    exec::run_command(repo_root, &command, timeout_secs, cancel_rx).await
+    exec::run_command(repo_root, &command, timeout_secs, None, cancel_rx).await
 }
 
 /// Runs the disk-side post-hook declared by `[project.post_hook]`.
@@ -167,12 +191,7 @@ pub async fn run_post_hooks(
     repo_root: &Path,
     cancel_rx: Option<&watch::Receiver<bool>>,
 ) -> Result<ProjectPostHookResponse, String> {
-    let (project, config) = crate::blocking::run_blocking(|| {
-        (
-            crate::config::load_section::<ProjectConfig>(repo_root, "project"),
-            crate::config::load_toolchain_config(repo_root),
-        )
-    });
+    let project = effective_project_config(repo_root, cancel_rx).await;
 
     let Some(spec) = project.post_hook.as_ref() else {
         return Ok(ProjectPostHookResponse {
@@ -188,9 +207,9 @@ pub async fn run_post_hooks(
     let timeout_secs = resolved
         .timeout_secs
         .filter(|secs| *secs > 0)
-        .unwrap_or_else(|| config.effective_timeout_secs());
+        .unwrap_or(DEFAULT_PROJECT_TIMEOUT_SECS);
     let command = exec::CommandLine::new(resolved.command, resolved.args);
-    let outcome = exec::run_command(repo_root, &command, timeout_secs, cancel_rx).await;
+    let outcome = exec::run_command(repo_root, &command, timeout_secs, None, cancel_rx).await;
 
     if outcome.is_cancelled {
         return Err("the project post-hook was cancelled".to_string());
@@ -216,13 +235,17 @@ pub async fn run_post_hooks(
 ///
 /// The `[project.commands]` declaration is the only authority on what may run,
 /// so the name must be declared and its reference chain must resolve before a
-/// process is spawned. A declaration is a closed command line: it names its own
-/// literal arguments, so an invocation adds none and no shell ever interprets
-/// them. The command runs in its own process group, so a timeout or a client
-/// cancellation tears down the whole descendant tree.
+/// process is spawned. The declaration also owns the parameter contract: an
+/// invocation supplies named values, which are checked against the declared
+/// parameters, filled from their defaults, and appended to the command line in
+/// declaration order. No value is ever split, expanded, or interpreted, so the
+/// process still receives literal arguments and no shell ever sees them. The
+/// command runs in its own process group, so a timeout or a client cancellation
+/// tears down the whole descendant tree.
 pub async fn run_project_command(
     repo_root: &Path,
     name: &str,
+    arguments: &BTreeMap<String, String>,
     cancel_rx: Option<&watch::Receiver<bool>>,
 ) -> Result<ToolchainCheckResult, String> {
     let name = name.trim();
@@ -230,9 +253,7 @@ pub async fn run_project_command(
         return Err("the invocation names no project command".to_string());
     }
 
-    // Reading `tauqe.toml` is blocking filesystem work, so it runs off the async
-    // executor thread.
-    let (project, config) = effective_project_config(repo_root, cancel_rx).await;
+    let project = effective_project_config(repo_root, cancel_rx).await;
 
     let Some(spec) = project.commands.get(name) else {
         return Err(format!(
@@ -253,10 +274,64 @@ pub async fn run_project_command(
     let timeout_secs = resolved
         .timeout_secs
         .filter(|secs| *secs > 0)
-        .unwrap_or_else(|| config.effective_timeout_secs());
+        .unwrap_or(DEFAULT_PROJECT_TIMEOUT_SECS);
 
-    let command = exec::CommandLine::new(resolved.command, resolved.args);
-    Ok(exec::run_command(repo_root, &command, timeout_secs, cancel_rx).await)
+    let mut args = resolved.args;
+    args.extend(bind_parameters(name, &resolved.parameters, arguments)?);
+    let command = exec::CommandLine::new(resolved.command, args);
+    Ok(exec::run_command(repo_root, &command, timeout_secs, None, cancel_rx).await)
+}
+
+/// Binds one invocation onto the declared parameter contract.
+///
+/// The declaration is the whole contract: a name it does not carry is refused
+/// instead of being forwarded to a process, and a declared parameter that the
+/// caller left out takes its default. A parameter with neither a supplied value
+/// nor a default cannot be bound, so it is reported instead of silently shifting
+/// the positional arguments that follow it. The result keeps declaration order,
+/// which is exactly how a task runner binds positional arguments, and every value
+/// stays one literal argument: it is never split, expanded, or interpreted.
+fn bind_parameters(
+    name: &str,
+    parameters: &[ProjectParameterSpec],
+    arguments: &BTreeMap<String, String>,
+) -> Result<Vec<String>, String> {
+    for supplied in arguments.keys() {
+        if !parameters.iter().any(|parameter| parameter.name == *supplied) {
+            let declared = parameters
+                .iter()
+                .map(|parameter| parameter.name.as_str())
+                .collect::<Vec<_>>()
+                .join(", ");
+            return Err(format!(
+                "the command `{name}` declares no parameter `{supplied}`; declared parameters: [{declared}]"
+            ));
+        }
+    }
+
+    let mut bound = Vec::with_capacity(parameters.len());
+    for parameter in parameters {
+        let value = match arguments.get(&parameter.name) {
+            Some(value) => value.clone(),
+            None => match parameter.default.as_deref() {
+                Some(default) => default.to_string(),
+                None => {
+                    return Err(format!(
+                        "the command `{name}` requires the parameter `{}`; supply it as a named argument",
+                        parameter.name
+                    ));
+                }
+            },
+        };
+        if value.contains('\0') {
+            return Err(format!(
+                "the parameter `{}` carries a value that cannot reach a process",
+                parameter.name
+            ));
+        }
+        bound.push(value);
+    }
+    Ok(bound)
 }
 
 /// Collapses a failed command into one compact report line.
@@ -285,6 +360,16 @@ mod tests {
             std::fs::write(dir.path().join("tauqe.toml"), config).unwrap();
         }
         dir
+    }
+
+    #[tokio::test]
+    async fn test_a_project_without_a_verification_declaration_runs_no_step() {
+        let dir = repo(None);
+
+        let (ok, results) = run_verification_pipeline(dir.path(), &[], None).await;
+
+        assert!(ok, "a repository that declares nothing verifies cleanly");
+        assert!(results.is_empty(), "no command may be invented");
     }
 
     #[tokio::test]
@@ -323,5 +408,77 @@ mod tests {
         let err = run_post_hooks(dir.path(), None).await.unwrap_err();
 
         assert!(err.contains("missing"), "unexpected reason: {err}");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_project_command_binds_declared_parameters_and_defaults() {
+        let dir = repo(Some(
+            "[project.commands.greet]\ncommand = \"printf\"\nargs = [\"[%s] [%s]\"]\n\
+             parameters = [{ name = \"who\" }, { name = \"count\", default = \"1\" }]\n",
+        ));
+        let arguments = BTreeMap::from([("who".to_string(), "tauqe".to_string())]);
+
+        let result = run_project_command(dir.path(), "greet", &arguments, None)
+            .await
+            .expect("the declared parameters bind");
+
+        assert!(result.success, "command failed: {}", result.combined_output);
+        // Declaration order decides the positional arguments, and the omitted
+        // parameter arrives as its declared default.
+        assert_eq!(result.stdout, "[tauqe] [1]");
+    }
+
+    #[tokio::test]
+    async fn test_project_command_rejects_an_undeclared_parameter() {
+        let dir = repo(Some(
+            "[project.commands.greet]\ncommand = \"printf\"\nargs = [\"hi\"]\n\
+             parameters = [{ name = \"who\" }]\n",
+        ));
+        let arguments = BTreeMap::from([("path".to_string(), "../escape".to_string())]);
+
+        let err = run_project_command(dir.path(), "greet", &arguments, None)
+            .await
+            .expect_err("an undeclared parameter never reaches a process");
+
+        assert!(err.contains("declares no parameter `path`"), "error: {err}");
+        assert!(err.contains("who"), "error names the declaration: {err}");
+    }
+
+    #[tokio::test]
+    async fn test_project_command_requires_a_parameter_without_a_default() {
+        let dir = repo(Some(
+            "[project.commands.greet]\ncommand = \"printf\"\nparameters = [{ name = \"who\" }]\n",
+        ));
+
+        let err = run_project_command(dir.path(), "greet", &BTreeMap::new(), None)
+            .await
+            .expect_err("a required parameter cannot be invented");
+
+        assert!(err.contains("requires the parameter `who`"), "error: {err}");
+    }
+
+    #[test]
+    fn test_bind_parameters_rejects_a_value_that_cannot_reach_a_process() {
+        let parameters = [ProjectParameterSpec {
+            name: "n".to_string(),
+            default: None,
+            doc: None,
+        }];
+        let arguments = BTreeMap::from([("n".to_string(), "a\u{0}b".to_string())]);
+
+        let err = bind_parameters("log-tail", &parameters, &arguments)
+            .expect_err("a NUL byte never reaches a process");
+
+        assert!(err.contains("cannot reach a process"), "error: {err}");
+    }
+
+    #[test]
+    fn test_change_set_payload_renders_one_path_per_line() {
+        assert_eq!(change_set_payload(&[]), None);
+        assert_eq!(
+            change_set_payload(&["src/lib.rs".to_string(), "generated.rs".to_string()]),
+            Some("src/lib.rs\ngenerated.rs\n".to_string())
+        );
     }
 }

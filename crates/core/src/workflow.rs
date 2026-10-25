@@ -38,10 +38,19 @@ pub struct WorkflowExecutionResult {
     /// signal. Preserved so a review supervisor can mark the finding as
     /// skipped instead of failing it.
     pub skip_reason: Option<String>,
+    /// Coder's abort report when the turn ended with a semantic `<abort>`
+    /// signal. Preserved so a supervisor can stop its queue without architect
+    /// escalation while the developer receives the exact action to perform.
+    pub abort: Option<fsm::AbortReport>,
     /// Whether the turn applied a plan `save` action that created or fully
     /// replaced a plan. Propagated to the `plan/updated` event so clients can
     /// focus a freshly created plan instead of an incremental update.
     pub plan_saved: bool,
+    /// Plan mutations the storage engine refused during the turn.
+    ///
+    /// A rejection never fails the turn, but it is carried to the caller so the
+    /// daemon records it instead of leaving it in the engine journal only.
+    pub plan_errors: Vec<String>,
 }
 
 /// Factory responsible for reporting and validating the supported workflow names.

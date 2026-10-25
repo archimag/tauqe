@@ -1,14 +1,21 @@
+# The provider catalog is the single source of truth for the models this project
+# exposes and for the names they are displayed under. An entry is either a bare
+# model string or a `{ model = "...", alias = "..." }` table; the alias describes
+# the model itself, so the picker, the headers, and the role summaries all resolve
+# a display name from this one declaration:
+#   { model = "~google/gemini-flash-latest", alias = "Gemini Flash" }
 [providers.openrouter]
 models = [
-  "~google/gemini-flash-latest",
-  "google/gemini-4-argon",
-  "~openai/gpt-luna-latest",
-  "~openai/gpt-sol-latest",
-  "~anthropic/claude-opus-latest",
-  "~anthropic/claude-sonnet-latest",
-  "~anthropic/claude-haiku-latest",
-  "~deepseek/deepseek-flash-latest",
-  "qwen/qwen3-coder-next"
+  { model = "~google/gemini-flash-latest", alias = "Gemini Flash" },
+  { model = "google/gemini-4-argon", alias = "Gemini Argon" },
+  { model = "~openai/gpt-luna-latest", alias = "GPT Luna" },
+  { model = "~openai/gpt-sol-latest", alias = "GPT Sol" },
+  { model = "~anthropic/claude-opus-latest", alias = "Claude Opus" },
+  { model = "~anthropic/claude-sonnet-latest", alias = "Claude Sonnet" },
+  { model = "~anthropic/claude-haiku-latest", alias = "Claude Haiku" },
+  { model = "~deepseek/deepseek-flash-latest", alias = "DeepSeek Flash" },
+  { model = "~z-ai/glm-latest", alias = "GLM"  },
+  { model = "~z-ai/glm-flash-latest", alias = "GLM Flash" }
 ]
 
 [models]
@@ -17,31 +24,34 @@ models = [
 # active model in the idle state and the deterministic default for the other roles.
 # If coder, architect or reviewer are omitted, they inherit the entire primary list.
 # `scribe` is a single utility model and defaults to the first primary model.
-# Every entry accepts either a bare model string ("~provider/model") or a table
-# ({ model = "...", effort = "high", alias = "Alias" }). An optional `alias`
-# replaces the raw model name in the model picker; `effort` sets the reasoning
-# depth ("low", "medium", "high", "xhigh", "max") for that entry.
+# Every entry names a model either by its provider identifier ("~provider/model")
+# or by an alias registered in `[providers.openrouter].models`, and carries the
+# runtime parameters of that slot: an optional `effort` ("low", "medium", "high",
+# "xhigh", "max"). A display alias is not a role field — it describes the model
+# itself and lives in the catalog entry, so the same model is never labelled in
+# two places.
 primary = [
-  "~google/gemini-flash-latest",
-  "~deepseek/deepseek-flash-latest"
+  "Gemini Flash",
+  { model = "GLM", effort = "high" }
 ]
-scribe = "~anthropic/claude-haiku-latest"    # history compaction, git squash commit messages, diff summarization
+scribe = "Claude Haiku"    # history compaction, git squash commit messages, diff summarization
 # The coder list is the natural escalation ladder (level up): on verification
 # healing stalls or exhausted retries the turn advances to the next coder entry,
 # saturating on the last one. Escalation stays strictly within the Coder role and
 # never switches to Architect, preserving the What vs How role isolation.
 coder = [
-  { model = "~deepseek/deepseek-flash-latest", effort = "high" },
-  { model = "~deepseek/deepseek-flash-latest", effort = "max" },
-  "~google/gemini-flash-latest"
+  "DeepSeek Flash",
+  { model = "GLM", effort = "high" }
 ]
 architect = [
-  { model = "~google/gemini-flash-latest", effort = "high" },
-  { model = "google/gemini-4-argon", alias = "Gemini Argon" },
-]    # conceptual design, plan refinement, blocked-step replanning
+  "GLM"
+]
+# conceptual design, plan refinement, blocked-step replanning
 reviewer = [
-  { model = "~google/gemini-flash-latest", effort = "high" },
-  "google/gemini-4-argon",
+  "GLM",
+  "Gemini Argon",
+  "Claude Sonnet",
+  "Claude Opus"
 ]   # automated code review of active context files
 
 # Automatically escalate the Coder along its ladder when verification healing stalls,
@@ -52,112 +62,71 @@ reviewer = [
 auto_level_up = true
 
 [develop]
-# Retry budget for failed edit staging and for the plan step reprompt loop
-# (corrective re-runs of a step turn that produced no verified edits and no terminal
-# success tag).
+# Retry budget for failed edit staging, for the verification healing loop, and for the
+# plan step reprompt loop (corrective re-runs of a step turn that produced no verified
+# edits and no terminal success tag).
 max_retries = 5
 # Maximum automated replanning cycles triggered by a blocked coder step before
 # requiring manual developer intervention (default: 2).
 # max_replans = 2
 # workflow = "git"   # edit workflow: "git", "naive" (default: "git")
-# protocol = "xml"   # active edit protocol: "xml" (default: "xml")
-
-[toolchain]
-# Harness-level policy for verification: how the verification pipeline behaves and how
-# the legacy per-phase overrides apply. The project's own commands are declared in the
-# `[project]` section below.
-#
-# check_command = ""   # legacy project-wide verification command (default: auto-detect)
-# max_retries = 5      # maximum retry attempts for compiler/linter self-healing
-# auto_heal = true     # automatically trigger the verification healing loop on check failures (default: true)
-# timeout_secs = 600   # wall-clock timeout in seconds for each verification command (default: 600)
-# auto_verify = true   # automatically run toolchain verification on turns with applied edits (default: true)
-# target = "all"       # default verification target when omitted: "all", "check", "clippy", "test" (default: "all")
-#
-# The legacy phases below stay supported as harness-level overrides of deterministic
-# auto-detection, so an existing configuration keeps verifying unchanged. A phase that
-# names no command keeps project auto-detection, so declaring a section never disables
-# it.
-# [toolchain.check]
-# command = "cargo"
-# args = ["check", "--all-targets"]
-# timeout_secs = 600      # phase-local override of the global timeout
-# enabled = true          # set false to drop the phase without deleting it
-#
-# [toolchain.lint]
-# command = "cargo"
-# args = ["clippy", "--all-targets", "--", "-D", "warnings"]
-#
-# [toolchain.test]
-# command = "cargo"
-# args = ["test", "--workspace"]
-#
-# [toolchain.fmt.<name>] entries run over the changed files their extension filter
-# claims. `extensions` is mandatory — an entry without it selects no file, so a monorepo
-# registers one formatter per language without touching the others. Arguments are
-# passed to the process literally (never through a shell), so a path with spaces or
-# metacharacters is safe.
-#
-# [toolchain.fmt.rustfmt]
-# command = "rustfmt"
-# extensions = ["rs"]
-# timeout_secs = 60
+# Active edit protocol. `structured` is the default and drives strict JSON-Schema
+# structured output, `xml` drives marker-protected XML tags, and `mixed` (legacy
+# alias `auto`) pairs both contours: XML for code edits, structured output for
+# discussions, commit messages, and history compaction. The format changes only the
+# transport, the token cost and the prefix caching — the capabilities of a turn
+# follow from its intent.
+# protocol = "structured"
 
 [project]
 # The `[project]` section is the single surface that declares what the harness may run
 # for this repository. Every entry is a plain command line executed as a process with
 # literal arguments — never through a shell — so a project command cannot widen into
 # arbitrary command execution. An entry may reuse a declared command by writing
-# `@<name>` as its executable.
+# `@<name>` as its executable. A reference names the command that runs, so it
+# carries no `args`, `description`, or `parameters` of its own; `timeout_secs` is
+# the exception, because it bounds one invocation instead of defining the command
+# line. The outermost declared budget wins along a reference chain, and a reference
+# that declares none inherits the budget of the command it names.
 #
-# An optional task runner (`runner = "just"`) delegates project commands to recipes
-# marked with `[group('tauqe')]`. When declared, exported recipes fill the command
-# allowlist and a `verify` recipe provides the verification lifecycle. Declared
-# entries in this section always take precedence over runner recipes.
+# A declared task runner (`runner = "just"`) delegates the project lifecycle to the
+# recipes carrying `[group('tauqe')]` in `Justfile`: `verify` fills the mandatory
+# verification gate, `format` fills the in-memory format filter, `post-hook` fills the
+# disk-side hook, and every other exported recipe becomes a typed custom tool. The
+# technology-specific command lines therefore live in `Justfile`, while this file keeps
+# only the harness policies. This repository declares the runner alone.
 #
-# This repository dogfoods the integration: the declared runner exports the
-# `[group('tauqe')]` recipes of `Justfile` (`test`, `clippy`, `fmt`, and the others
-# not declared below), while the explicit entries below override the exported
-# `verify` and `check` recipes. `lint` has no recipe at all, so it stays purely
-# declarative.
-runner = "just"
+# A declaration in this section always takes precedence over the runner, so a stage may
+# be pinned here without touching the runner. Each entry is a plain command line with
+# literal arguments, and `verify` stays mandatory: a change set the harness cannot
+# verify is never accepted.
 #
-# `verify` is mandatory: a change set the harness cannot verify is never accepted, so a
-# missing or blank `verify` invalidates the whole configuration unless provided by a runner.
-[project.verify]
-command = "cargo"
-args = ["test", "--workspace"]
-timeout_secs = 600
-
-# In-memory formatter: reads the staged file content from standard input and writes the
-# rewritten content to standard output, so no byte reaches disk before the change set
-# verifies. Omit the entry to keep every file exactly as authored.
-[project.format]
-command = "rustfmt"
-args = ["--emit", "stdout", "--edition", "2021"]
-timeout_secs = 120
-
-# Disk post-hook: runs strictly after the change set reaches disk and before `verify`, so
-# generated sources and refreshed manifests exist when verification runs. Artifacts it
-# creates are captured through Git and join the same atomic commit.
+# [project.verify]
+# command = "cargo"
+# args = ["test", "--workspace"]
+# timeout_secs = 600
+#
+# # In-memory formatter: staged content arrives on standard input and the rewritten
+# # content leaves on standard output, so the change set is formatted while it still
+# # lives in staging and no unformatted byte ever reaches disk.
+# [project.format]
+# command = "rustfmt"
+# args = ["--emit", "stdout"]
+# timeout_secs = 120
+#
+# # Disk post-hook: runs strictly after the change set is written and before `verify`,
+# # so generated sources and refreshed manifests exist when verification runs. Artifacts
+# # it creates are captured through Git and join the same atomic commit.
 # [project.post_hook]
 # command = "cargo"
 # args = ["generate-lockfile"]
-
-# Named project commands, published to the model as typed custom tools. Each entry is an
-# allowlisted process with literal arguments and an optional timeout; the harness never
-# accepts a free-form command line from the model. The build and lint passes that the
-# mandatory `verify` lifecycle does not run on its own stay available to the model as
-# explicit tools.
-[project.commands.check]
-command = "cargo"
-args = ["check", "--all-targets"]
-timeout_secs = 600
-
-[project.commands.lint]
-command = "cargo"
-args = ["clippy", "--all-targets", "--", "-D", "warnings"]
-timeout_secs = 600
+#
+# # Named project command, published to the model as a typed custom tool.
+# [project.commands.check]
+# command = "cargo"
+# args = ["check", "--all-targets"]
+# timeout_secs = 600
+runner = "just"
 
 [git]
 # upstream = "origin/master"  # base upstream branch for calculating diffs (auto-detected by default)
@@ -173,25 +142,14 @@ files_token_budget = 500000  # token budget for files in active context (default
 repomap_token_budget = 40000  # token budget for the repository map (default: 4000)
 include_repo_map = true  # include the Tree-sitter repository map in turn prompts (default: true, false for on-demand)
 # max_pattern_batch = 150  # maximum files added per glob pattern request (default: 150)
+# max_search_requests_per_round = 5    # repository search queries honored per Discovery round (default: 5)
+# max_matched_files_per_search = 50    # matching files reported for one search query (default: 50)
+# max_dir_list_entries = 100           # entries rendered by one directory listing (default: 100)
+# max_repo_map_requests_per_round = 3  # targeted repository maps rendered per Discovery round (default: 3)
+# max_feedback_chars = 4000            # characters of one project command stream reported back to the model (default: 4000)
+# max_scratchpad_chars = 4000          # characters of a turn scratchpad block kept before truncation (default: 4000)
 pinned = [
     "Conventions.md",
     "Vision.md",
     "docs/src/SUMMARY.md"
 ]
-
-# ---------------------------------------------------------------------------
-# Terminal appearance (themes) is a personal workstation preference and lives
-# in the user configuration, never in this project file (see Conventions.md,
-# section 7.2). Built-in presets are selected in $XDG_CONFIG_HOME/tauqe/tui.toml:
-#
-#   [theme]
-#   # Named preset; it takes precedence over `mode` when set:
-#   #   "tauqe-dark" (default) | "tauqe-light" | "catppuccin" |
-#   #   "gruvbox" | "solarized-dark"
-#   # name = "tauqe-dark"
-#   # Legacy light/dark fallback, used when `name` is unset:
-#   # mode = "auto"
-#   # Color depth: "auto" (detected) | "truecolor" | "ansi256" | "ansi16"
-#   # color_depth = "auto"
-#
-# See docs/src/ch05-system/tui-ux.md for the semantic design system.

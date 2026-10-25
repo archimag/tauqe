@@ -48,9 +48,14 @@ token is generated:
 - `IsolatedStep` — execution of one plan step or one review finding.
 
 The intent is derived from typed request parameters, never from prompt text. It
-selects the wire protocol, narrows the capability set, chooses the plan mutation
-mode, and decides whether the turn enters session history. Nodefault value exists,
-so a forgotten argument cannot silently substitute a mode.
+narrows the capability set, chooses the plan mutation mode, and decides whether
+the turn enters session history. The transport is declared separately from the
+intent: a specialised plan discussion pins the structured discussion transport,
+while a develop or step turn keeps the transport configured in `tauqe.toml` —
+`structured` by default, `xml`, or `mixed`. The transport changes the encoding
+only, never the capability surface: an XML turn and a structured turn advertise
+and decode the very same operational commands. No default value exists, so a
+forgotten argument cannot silently substitute a mode.
 
 ### 3.2.2 TurnPhase
 
@@ -72,9 +77,20 @@ per applied proposal.
 
 A protocol declares what it supports as a set of capabilities — text message, file
 edits, discovery, documentation requests, toolchain verification, plan creation,
-plan update, scratchpad, outcome, blocked, user language. A capability set is the
+plan update, scratchpad, outcome, blocked, abort, user language, project custom
+tools. A capability set is the
 profile mask naming the capabilities enabled for one role or mode, and role and
 mode profiles are the only sanctioned way to narrow a protocol.
+
+The `abort` capability closes a turn unconditionally when the remaining work
+needs an action only the developer can perform on the host system, such as
+installing a package or starting a service. The coder ladder never retries such a
+turn, because no stronger tier can supply a capability the host lacks.
+
+The tags named in this chapter and in the tool category table below are the
+spellings of the XML contour. The structured contour expresses the very same
+commands as fields of its JSON Schema, so the capability surface never depends on
+the configured encoding.
 
 Each capability belongs to a phase (`Discovery`, `Execution`, `Verification`,
 `Outcome`). Model output is decoded into a normalized command list — text, edit,
@@ -82,12 +98,26 @@ context request, repository search, documentation request, verification, plan,
 scratchpad, outcome, blocked, user language, protocol error — so no consumer ever
 inspects raw markup.
 
-Capabilities are implemented as modules. One module owns the tag schema it
-recognizes, the prompt fragments it contributes, the decoder that produces its
-commands, and the sanitizer that removes its tags from conversational text. Because
-the same module supplies the tag, the instruction, and the decoder, the prompt can
-never advertise a command the decoder rejects, and a disabled capability leaves no
-trace in either the prompt or the command stream.
+Capabilities are implemented as modules. One module owns the canonical tag it
+publishes, the aliases it still accepts, the prompt fragments it contributes, the
+decoder that produces its commands, and the sanitizer that removes its tags from
+conversational text. Because the same module supplies the tag, the instruction, and
+the decoder, the prompt can never advertise a command the decoder rejects, and a
+disabled capability leaves no trace in either the prompt or the command stream.
+
+Each capability also declares how its output reaches the harness. `LiveStreaming`
+marks the contours consumed while tokens arrive — conversational text and file
+edits, which the interface renders as the model generates. `RoundDeferred` marks
+everything that only becomes meaningful once the round finishes — discovery,
+documentation, verification, plans, scratchpad, outcome, blockers, language, and
+project tool payloads. Streaming scanners and round-level decoders read that
+declared property instead of matching capability names, so delivery stays
+orthogonal to phase: the execution phase carries both.
+
+The code modification contour publishes the canonical `edits` container; the older
+`tauqe_edits` spelling remains a declared alias, so transcripts, sessions, and
+model output written before the rename stream and decode exactly like the
+canonical tag.
 
 ### 3.2.4 Tool Categories: Terminal vs. Diagnostic Inspection
 
@@ -98,7 +128,7 @@ functional categories that govern their lifecycle within the bounded turn:
 | --- | --- | --- | --- |
 | **Perception (Discovery)** | `<context_request>`, `<repo_search>`, `<doc_request>`, `<dir_list>`, `<repo_dirs>` | Widens context or provides authoritative reference | **No.** Triggers next Discovery round. |
 | **Inspection (Diagnostic Execution)** | Declared project commands (`CustomTool`, e.g. integration tests, linters, benchmarks) | Executes isolated CLI process; streams stdout/stderr back into the turn journal | **No.** Triggers next Proposal round for model reasoning. |
-| **Mutation (Terminal Outcome)** | `<tauqe_edits>`, `<success>`, `<error>`, `<blocked>`, `<skip>` | Commits patches to virtual staging or signals turn conclusion | **Yes.** Closes the turn upon verification and Git commit. |
+| **Mutation (Terminal Outcome)** | `<edits>`, `<success>`, `<error>`, `<blocked>`, `<skip>` | Commits patches to virtual staging or signals turn conclusion | **Yes.** Closes the turn upon verification and Git commit. |
 
 Calling an inspection tool (such as running full integration tests) is an
 exploratory, diagnostic act: it implies that the turn is **not finished**. The model
@@ -218,6 +248,18 @@ A file that is present but read-only may still be modified when the task genuine
 requires it: the patch is applied and the file's access is promoted in place, which
 keeps the declared permission a knowledge hint rather than a silent refusal. Files
 absent from context cannot be edited at all — the model must request them first.
+
+Clear, compact, and indivisible work is executed right here: the answer carries its
+edit block and the turn moves on to staging. A broad request — one that touches
+several independent subsystems or contracts, decomposes into dependent stages, or
+needs those stages verified separately — is not patched on the spot in Develop.
+Such a round explains instead why decomposition is warranted and offers the
+developer a choice between drafting a plan and performing the whole change at once.
+That offer is text only: an edit block and a plan payload may not share the answer,
+because a proposal that mutated storage would settle a question the developer has
+not answered yet. The round still closes with its terminal success tag, so an
+accepted or declined offer is a completed turn rather than an unfinished one, and
+the plan itself is written only after explicit confirmation (*Local Plans*).
 
 ### 3.3.3 Project Command Execution & Feedback Loop
 
@@ -432,6 +474,9 @@ learns what to decompose instead of watching a turn fail anonymously.
   terminal state.
 - **It does not infer the mode from text.** Intent is a typed value; a prompt that
   merely resembles an internal heading cannot change the regime.
+- **It does not create a plan on its own initiative.** A broad request produces an
+  offer inside the answer, never a plan document; storage changes only after the
+  developer confirms.
 - **It does not hide failure.** An exhausted budget, a blocked step, and a rolled
   back turn are all reported as distinct, named outcomes.
 - **It does not keep an uncommitted prompt in the model context.** A turn that

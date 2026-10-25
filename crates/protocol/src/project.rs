@@ -43,7 +43,8 @@ pub use manifest::{
 // The `[project]` declaration of `tauqe.toml` is re-exported through the facade
 // for the same reason: callers reach it without knowing the submodule layout.
 pub use config::{
-    ProjectCommandSpec, ProjectConfig, ProjectConfigError, ResolvedProjectCommand, TaskRunnerKind,
+    ProjectCommandSpec, ProjectConfig, ProjectConfigError, ProjectParameterSpec,
+    ResolvedProjectCommand, TaskRunnerKind,
 };
 
 /// Severity of a [`Diagnostic`] reported by a project driver.

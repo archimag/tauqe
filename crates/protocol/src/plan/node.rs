@@ -104,6 +104,14 @@ pub struct Plan {
     /// escalate along the architect ladder when a wave must be reprojected.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub architect: Option<ArchitectTier>,
+    /// Identifier of the step whose horizon was most recently reprojected.
+    ///
+    /// The harness persists it with every horizon replacement so the decision
+    /// whether a repeated failure deserves an Architect escalation is derived
+    /// from disk state rather than from in-memory supervisor state, and manual
+    /// replans dispatched through the UI or RPC are accounted for identically.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_replanned_step: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub concept: Vec<ConceptItem>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -575,14 +583,15 @@ impl Plan {
                     walk_refs(&item.children, seen_concepts, seen_items, dep_graph, errors);
 
                 if !item_key.is_empty() {
-                    // A container becomes `Done` exactly when all of its
-                    // descendant leaves are `Done`, so it implicitly depends on
-                    // them. Recording those edges lets the cycle detector expose
-                    // a leaf that depends on its own ancestor: the ancestor can
-                    // never finish without the leaf, and the leaf can never start
-                    // without the ancestor. Only the derived status of a
-                    // container is meaningful, so the implicit edges are added
-                    // for non-leaf items only.
+                    // A container becomes `Done` once all of its non-cancelled
+                    // descendant leaves are `Done` (see `StatusSummary`), so it
+                    // implicitly depends on exactly those leaves. Recording those
+                    // edges lets the cycle detector expose an active leaf that
+                    // depends on its own ancestor: the ancestor can never finish
+                    // without the leaf, and the leaf can never start without the
+                    // ancestor. Only the derived status of a container is
+                    // meaningful, so the implicit edges are added for non-leaf
+                    // items only.
                     if !item.is_leaf() {
                         deps_for_item.extend(child_leaf_keys.iter().cloned());
                     }
@@ -590,7 +599,14 @@ impl Plan {
                 }
 
                 if item.is_leaf() {
-                    if !item_key.is_empty() {
+                    // A `Cancelled` leaf never gates an ancestor's completion:
+                    // the container becomes `Done` as soon as every
+                    // non-cancelled descendant leaf is `Done`, so reporting a
+                    // cancelled leaf here would fabricate an implicit
+                    // container-to-leaf edge. A leftover `depends_on` naming that
+                    // ancestor would then surface a deadlock that can never occur
+                    // at runtime.
+                    if !item_key.is_empty() && item.status != PlanItemStatus::Cancelled {
                         leaf_keys.push(item_key);
                     }
                 } else {

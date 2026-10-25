@@ -117,6 +117,7 @@ mod tests {
             created_at: 10,
             updated_at: 10,
             architect: None,
+            last_replanned_step: None,
             concept: vec![],
             items: vec![
                 PlanItem {
@@ -143,6 +144,7 @@ mod tests {
             created_at: 10,
             updated_at: 20,
             architect: None,
+            last_replanned_step: None,
             concept: vec![],
             items: vec![PlanItem {
                 id: "2".to_string(),
@@ -167,6 +169,7 @@ mod tests {
             created_at: 10,
             updated_at: 10,
             architect: None,
+            last_replanned_step: None,
             concept: vec![],
             items: vec![PlanItem {
                 id: "1".to_string(),

@@ -46,6 +46,48 @@ impl fmt::Display for CapabilityPhase {
     }
 }
 
+/// How a capability's protocol output reaches the harness.
+///
+/// Some capabilities are consumed incrementally while the model is still
+/// generating: conversational text and file edits feed the live stream, so the
+/// harness can render an answer or a diff as tokens arrive. Every other
+/// capability only becomes meaningful once its payload is complete, so it is
+/// decoded after the round finishes.
+///
+/// Declaring the delivery mode beside the capability keeps a single source of
+/// truth. A streaming scanner or a round-level decoder reads this property
+/// instead of special-casing capability names, which keeps the engine free of
+/// string literals that would silently drift from the capability declaration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CapabilityDelivery {
+    /// Consumed incrementally as tokens arrive from the provider.
+    LiveStreaming,
+    /// Consumed as a complete payload after the round has finished.
+    RoundDeferred,
+}
+
+impl CapabilityDelivery {
+    /// Canonical lower-case identifier used on the wire.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::LiveStreaming => "live_streaming",
+            Self::RoundDeferred => "round_deferred",
+        }
+    }
+
+    /// Reports whether the capability is consumed during generation.
+    pub const fn is_live(self) -> bool {
+        matches!(self, Self::LiveStreaming)
+    }
+}
+
+impl fmt::Display for CapabilityDelivery {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 /// Declarative set of interaction capabilities a prompt protocol may enable.
 ///
 /// Capabilities decouple the concrete protocol syntax (XML markers, JSON schema)
@@ -76,6 +118,8 @@ pub enum LlmCapability {
     Outcome,
     /// Explicit semantic blocker emitted when preconditions or assumptions are violated.
     Blocked,
+    /// Explicit unconditional abort emitted when external host environment actions or developer intervention is required.
+    Abort,
     /// Detected primary natural language of the user prompt.
     UserLanguage,
     /// Invocation of a project-declared custom tool.
@@ -107,6 +151,7 @@ impl LlmCapability {
         Self::Scratchpad,
         Self::Outcome,
         Self::Blocked,
+        Self::Abort,
         Self::UserLanguage,
         Self::CustomTools,
     ];
@@ -124,6 +169,7 @@ impl LlmCapability {
             Self::Scratchpad => "scratchpad",
             Self::Outcome => "outcome",
             Self::Blocked => "blocked",
+            Self::Abort => "abort",
             Self::UserLanguage => "user_language",
             Self::CustomTools => "custom_tools",
         }
@@ -141,7 +187,30 @@ impl LlmCapability {
             | Self::UserLanguage
             | Self::CustomTools => CapabilityPhase::Execution,
             Self::ToolchainVerify => CapabilityPhase::Verification,
-            Self::Outcome | Self::Blocked => CapabilityPhase::Outcome,
+            Self::Outcome | Self::Blocked | Self::Abort => CapabilityPhase::Outcome,
+        }
+    }
+
+    /// How this capability's protocol output is delivered to the harness.
+    ///
+    /// Delivery is orthogonal to [`LlmCapability::phase`]: the execution phase
+    /// emits both streamed text and edits, which are consumed on the fly, and
+    /// round-deferred payloads such as scratchpad notes, plan updates, and
+    /// custom tool invocations, which are only read once generation completes.
+    pub const fn delivery(self) -> CapabilityDelivery {
+        match self {
+            Self::TextMessage | Self::FileEdits => CapabilityDelivery::LiveStreaming,
+            Self::Discovery
+            | Self::DocRequest
+            | Self::ToolchainVerify
+            | Self::PlanCreation
+            | Self::PlanUpdate
+            | Self::Scratchpad
+            | Self::Outcome
+            | Self::Blocked
+            | Self::Abort
+            | Self::UserLanguage
+            | Self::CustomTools => CapabilityDelivery::RoundDeferred,
         }
     }
 }
@@ -243,71 +312,30 @@ impl CapabilitySet {
         }
     }
 
-    /// Full interactive XML development capability set.
-    pub fn develop_xml() -> Self {
-        Self::from_slice(LlmCapability::ALL)
+    /// Format-independent capability set for a free interactive REPL dialogue.
+    ///
+    /// The profile names a turn regime, not a wire format: the XML and the
+    /// structured transports decode this very surface, so switching the
+    /// protocol changes only the encoding. It is the full advertised surface
+    /// minus plan mutation, because a user may ask for a plan at any moment of
+    /// a dialogue while modifying an existing plan requires an active plan
+    /// focus (`discussion_focus`).
+    pub fn interactive_repl() -> Self {
+        Self::from_slice(LlmCapability::ALL).without(LlmCapability::PlanUpdate)
     }
 
-    /// XML capability set for executing one isolated plan step.
+    /// Format-independent capability set for executing one isolated step.
     ///
     /// Plan creation and modification are excluded: while an isolated step
     /// runs the plan is immutable and progress is recorded deterministically
     /// by the harness, never by the model.
     ///
-    /// Toolchain verification stays advertised here because this profile
-    /// removes plan authoring from the development set and nothing else. The
-    /// harness owns verification for a step, so `TurnIntent::IsolatedStep`
-    /// strips it inside `TurnIntent::narrow_capabilities`; removing it here as
-    /// well would duplicate that decision in two places.
-    ///
-    /// The project custom tool tag stays advertised for the same reason: the
-    /// XML contour registers and decodes it, and the harness validates every
-    /// invocation against the declared command allowlist before anything runs.
-    pub fn isolated_step_xml() -> Self {
-        Self::from_slice(&[
-            LlmCapability::TextMessage,
-            LlmCapability::FileEdits,
-            LlmCapability::Discovery,
-            LlmCapability::DocRequest,
-            LlmCapability::ToolchainVerify,
-            LlmCapability::Scratchpad,
-            LlmCapability::Outcome,
-            LlmCapability::Blocked,
-            LlmCapability::UserLanguage,
-            LlmCapability::CustomTools,
-        ])
-    }
-
-    /// Structured-output development capability set.
-    ///
-    /// Structured output transports the same operational surface as the XML
-    /// development set, minus plan authoring: documentation requests,
-    /// scratchpad notes, terminal outcomes, and semantic blockers travel as
-    /// dedicated schema fields instead of control tags. Only plan creation and
-    /// plan modification remain XML-exclusive, because a JSON edit proposal is
-    /// not a planning channel.
-    pub fn develop_structured() -> Self {
-        Self::from_slice(&[
-            LlmCapability::TextMessage,
-            LlmCapability::FileEdits,
-            LlmCapability::Discovery,
-            LlmCapability::DocRequest,
-            LlmCapability::ToolchainVerify,
-            LlmCapability::Scratchpad,
-            LlmCapability::Outcome,
-            LlmCapability::Blocked,
-            LlmCapability::UserLanguage,
-        ])
-    }
-
-    /// Structured-output capability set for executing one isolated plan step.
-    ///
-    /// Plan creation and modification are excluded: while an isolated step runs
-    /// the plan is immutable and progress is recorded deterministically by the
-    /// harness, never by the model. The resulting set therefore matches
-    /// [`CapabilitySet::develop_structured`].
-    pub fn isolated_step_structured() -> Self {
-        Self::develop_structured()
+    /// Toolchain verification stays declared in the profile and is stripped by
+    /// the turn-intent narrowing, so the decision that the harness owns
+    /// verification for a step lives in exactly one place instead of being
+    /// duplicated across this profile and the narrowing rule.
+    pub fn isolated_step() -> Self {
+        Self::interactive_repl().without(LlmCapability::PlanCreation)
     }
 
     /// Discussion and planning capability set.
@@ -518,6 +546,11 @@ pub enum LlmCommand {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         details: Option<String>,
     },
+    /// Explicit unconditional abort emitted when external host environment actions or developer intervention is required.
+    Abort {
+        reason: String,
+        recommendation: String,
+    },
     /// Detected primary natural language of the user prompt.
     UserLanguage { language: String },
     /// A typed invocation of one project-declared custom tool.
@@ -558,6 +591,7 @@ impl LlmCommand {
             Self::Scratchpad { .. } => Some(LlmCapability::Scratchpad),
             Self::Outcome { .. } => Some(LlmCapability::Outcome),
             Self::Blocked { .. } => Some(LlmCapability::Blocked),
+            Self::Abort { .. } => Some(LlmCapability::Abort),
             Self::UserLanguage { .. } => Some(LlmCapability::UserLanguage),
             Self::CustomTool { .. } => Some(LlmCapability::CustomTools),
             Self::ProtocolError { .. } => None,
@@ -624,6 +658,7 @@ mod tests {
             (LlmCapability::Scratchpad, "\"scratchpad\""),
             (LlmCapability::Outcome, "\"outcome\""),
             (LlmCapability::Blocked, "\"blocked\""),
+            (LlmCapability::Abort, "\"abort\""),
             (LlmCapability::UserLanguage, "\"user_language\""),
             (LlmCapability::CustomTools, "\"custom_tools\""),
         ];
@@ -887,6 +922,19 @@ mod tests {
     }
 
     #[test]
+    fn test_llm_command_abort_serde_roundtrip() {
+        let abort = LlmCommand::Abort {
+            reason: "Approval required".to_string(),
+            recommendation: "Run pnpm approve-builds".to_string(),
+        };
+        let json = serde_json::to_string(&abort).unwrap();
+        assert!(json.contains("\"type\":\"abort\""));
+        assert!(json.contains("\"reason\":\"Approval required\""));
+        assert!(json.contains("\"recommendation\":\"Run pnpm approve-builds\""));
+        assert_eq!(serde_json::from_str::<LlmCommand>(&json).unwrap(), abort);
+    }
+
+    #[test]
     fn test_capability_phase_serde_and_display() {
         let cases = [
             (CapabilityPhase::Discovery, "\"discovery\""),
@@ -905,7 +953,7 @@ mod tests {
 
     #[test]
     fn test_llm_capability_as_str_and_phase() {
-        assert_eq!(LlmCapability::ALL.len(), 12);
+        assert_eq!(LlmCapability::ALL.len(), 13);
         for capability in LlmCapability::ALL {
             let encoded = format!("\"{}\"", capability.as_str());
             assert_eq!(serde_json::to_string(capability).unwrap(), encoded);
@@ -931,9 +979,59 @@ mod tests {
             ),
             (LlmCapability::Outcome, CapabilityPhase::Outcome),
             (LlmCapability::Blocked, CapabilityPhase::Outcome),
+            (LlmCapability::Abort, CapabilityPhase::Outcome),
         ];
         for (capability, phase) in expectations {
             assert_eq!(capability.phase(), phase);
+        }
+    }
+
+    #[test]
+    fn test_capability_delivery_serde_and_display() {
+        let cases = [
+            (CapabilityDelivery::LiveStreaming, "\"live_streaming\""),
+            (CapabilityDelivery::RoundDeferred, "\"round_deferred\""),
+        ];
+        for (delivery, encoded) in cases {
+            assert_eq!(serde_json::to_string(&delivery).unwrap(), encoded);
+            let decoded: CapabilityDelivery = serde_json::from_str(encoded).unwrap();
+            assert_eq!(decoded, delivery);
+            assert_eq!(delivery.as_str(), encoded.trim_matches('"'));
+            assert_eq!(delivery.to_string(), encoded.trim_matches('"'));
+        }
+        assert!(CapabilityDelivery::LiveStreaming.is_live());
+        assert!(!CapabilityDelivery::RoundDeferred.is_live());
+    }
+
+    #[test]
+    fn test_capability_delivery_is_declared_per_capability() {
+        for capability in LlmCapability::ALL {
+            let expected = match capability {
+                LlmCapability::TextMessage | LlmCapability::FileEdits => {
+                    CapabilityDelivery::LiveStreaming
+                }
+                _ => CapabilityDelivery::RoundDeferred,
+            };
+            assert_eq!(capability.delivery(), expected);
+        }
+
+        // Delivery is orthogonal to phase: the execution phase mixes streamed
+        // text and edits with round-deferred plan, scratchpad, and tool
+        // payloads, so neither property may be derived from the other.
+        let advertised = CapabilitySet::from_slice(LlmCapability::ALL);
+        let execution = advertised.by_phase(CapabilityPhase::Execution);
+        assert!(execution.iter().any(|c| c.delivery().is_live()));
+        assert!(execution.iter().any(|c| !c.delivery().is_live()));
+
+        // Discovery, verification, and outcome capabilities are never streamed.
+        for phase in [
+            CapabilityPhase::Discovery,
+            CapabilityPhase::Verification,
+            CapabilityPhase::Outcome,
+        ] {
+            for capability in advertised.by_phase(phase).iter() {
+                assert_eq!(capability.delivery(), CapabilityDelivery::RoundDeferred);
+            }
         }
     }
 
@@ -974,64 +1072,90 @@ mod tests {
 
     #[test]
     fn test_capability_set_profiles() {
-        let develop_xml = CapabilitySet::develop_xml();
-        assert_eq!(develop_xml.as_slice(), LlmCapability::ALL);
-
-        let isolated_xml = CapabilitySet::isolated_step_xml();
-        assert!(isolated_xml.contains(LlmCapability::FileEdits));
-        assert!(isolated_xml.contains(LlmCapability::Blocked));
-        assert!(isolated_xml.contains(LlmCapability::ToolchainVerify));
-        assert!(!isolated_xml.contains(LlmCapability::PlanCreation));
-        assert!(!isolated_xml.contains(LlmCapability::PlanUpdate));
-        assert!(isolated_xml.contains(LlmCapability::CustomTools));
-
-        let develop_structured = CapabilitySet::develop_structured();
-        let isolated_structured = CapabilitySet::isolated_step_structured();
-        assert_eq!(develop_structured, isolated_structured);
-        assert!(develop_structured.contains(LlmCapability::FileEdits));
-        assert!(develop_structured.contains(LlmCapability::DocRequest));
-        assert!(develop_structured.contains(LlmCapability::Scratchpad));
-        assert!(develop_structured.contains(LlmCapability::Outcome));
-        assert!(develop_structured.contains(LlmCapability::Blocked));
-        assert!(!develop_structured.contains(LlmCapability::PlanCreation));
-        assert!(!develop_structured.contains(LlmCapability::PlanUpdate));
-        // The structured and isolated-step XML profiles share one operational
-        // surface apart from the project tool tag, which only the XML contour
-        // registers: plan authoring is the other distinguishing axis.
-        assert_eq!(
-            develop_structured.as_slice(),
-            isolated_xml.without(LlmCapability::CustomTools).as_slice()
-        );
-
+        // Profiles name a turn regime, never a wire format: both transports
+        // decode the same capability surface, so format-specific profile
+        // factories no longer exist.
         let discussion = CapabilitySet::discussion();
+        assert!(discussion.contains(LlmCapability::TextMessage));
+        assert!(discussion.contains(LlmCapability::Discovery));
         assert!(discussion.contains(LlmCapability::PlanCreation));
         assert!(discussion.contains(LlmCapability::PlanUpdate));
+        // A read-only discussion implements nothing, so it advertises no abort
+        // surface at all.
+        assert!(!discussion.contains(LlmCapability::Abort));
         assert!(!discussion.contains(LlmCapability::FileEdits));
         assert!(!discussion.contains(LlmCapability::ToolchainVerify));
+        assert!(!discussion.contains(LlmCapability::CustomTools));
 
         let architect = CapabilitySet::architect_discovery();
         assert!(architect.contains(LlmCapability::DocRequest));
         assert!(architect.contains(LlmCapability::PlanCreation));
+        assert!(architect.contains(LlmCapability::Scratchpad));
         assert!(!architect.contains(LlmCapability::FileEdits));
         assert!(!architect.contains(LlmCapability::ToolchainVerify));
+        assert!(!architect.contains(LlmCapability::CustomTools));
+    }
 
-        // The custom tool surface is advertised by the XML profiles, which
-        // register and decode the `custom_tool` tag. The structured, discussion,
-        // and architect profiles leave it out because their schema carries no
-        // `custom_tools` field to decode an invocation from.
-        assert!(develop_xml.contains(LlmCapability::CustomTools));
-        assert!(isolated_xml.contains(LlmCapability::CustomTools));
-        for profile in [
-            CapabilitySet::develop_structured(),
-            CapabilitySet::isolated_step_structured(),
-            CapabilitySet::discussion(),
-            CapabilitySet::architect_discovery(),
+    #[test]
+    fn test_plan_permission_matrix() {
+        // A user may ask for a plan at any moment of a dialogue, but changing
+        // an existing plan requires an active plan focus, which the base REPL
+        // profile does not assume.
+        let repl = CapabilitySet::interactive_repl();
+        assert!(repl.contains(LlmCapability::PlanCreation));
+        assert!(!repl.contains(LlmCapability::PlanUpdate));
+
+        // A dedicated plan discussion owns both permissions.
+        let discussion = CapabilitySet::discussion();
+        assert!(discussion.contains(LlmCapability::PlanCreation));
+        assert!(discussion.contains(LlmCapability::PlanUpdate));
+
+        // A plan is immutable while an isolated step runs.
+        let step = CapabilitySet::isolated_step();
+        assert!(!step.contains(LlmCapability::PlanCreation));
+        assert!(!step.contains(LlmCapability::PlanUpdate));
+    }
+
+    #[test]
+    fn test_interactive_repl_and_isolated_step_composition() {
+        let repl = CapabilitySet::interactive_repl();
+        for capability in [
+            LlmCapability::TextMessage,
+            LlmCapability::FileEdits,
+            LlmCapability::Discovery,
+            LlmCapability::DocRequest,
+            LlmCapability::ToolchainVerify,
+            LlmCapability::PlanCreation,
+            LlmCapability::Scratchpad,
+            LlmCapability::Outcome,
+            LlmCapability::Blocked,
+            LlmCapability::Abort,
+            LlmCapability::UserLanguage,
+            LlmCapability::CustomTools,
         ] {
             assert!(
-                !profile.contains(LlmCapability::CustomTools),
-                "only the XML profiles advertise the custom tool surface"
+                repl.contains(capability),
+                "interactive_repl must carry {capability}"
             );
         }
+
+        // The profile is the advertised surface minus plan mutation, so the two
+        // definitions cannot drift apart when a capability is added.
+        let expected =
+            CapabilitySet::from_slice(LlmCapability::ALL).without(LlmCapability::PlanUpdate);
+        assert_eq!(repl.as_slice(), expected.as_slice());
+
+        // A step keeps the operational surface of a dialogue except plan
+        // authoring; toolchain verification stays declared in the profile and
+        // is removed by the turn-intent narrowing.
+        let step = CapabilitySet::isolated_step();
+        assert_eq!(
+            step.as_slice(),
+            repl.without(LlmCapability::PlanCreation).as_slice()
+        );
+        assert!(step.contains(LlmCapability::ToolchainVerify));
+        assert!(step.contains(LlmCapability::Blocked));
+        assert!(step.contains(LlmCapability::Abort));
     }
 
     #[test]
@@ -1128,6 +1252,13 @@ mod tests {
             details: None,
         };
         assert_eq!(blocked.capability(), Some(LlmCapability::Blocked));
+
+        let abort = LlmCommand::Abort {
+            reason: "blocked by host".to_string(),
+            recommendation: "run script".to_string(),
+        };
+        assert_eq!(abort.capability(), Some(LlmCapability::Abort));
+        assert_eq!(abort.phase(), Some(CapabilityPhase::Outcome));
 
         let language = LlmCommand::UserLanguage {
             language: "Russian".to_string(),

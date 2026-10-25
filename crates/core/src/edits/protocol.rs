@@ -23,7 +23,11 @@ pub struct EditProtocolFactory;
 impl EditProtocolFactory {
     /// Returns the list of standard supported edit protocol kinds.
     pub fn available_protocols() -> Vec<EditProtocolKind> {
-        vec![EditProtocolKind::Xml, EditProtocolKind::Structured]
+        vec![
+            EditProtocolKind::Xml,
+            EditProtocolKind::Structured,
+            EditProtocolKind::Mixed,
+        ]
     }
 
     /// Validates whether an edit protocol name is recognized.
@@ -41,6 +45,11 @@ impl EditProtocolFactory {
     ///
     /// The factory returns the unified prompt protocol contract, so callers
     /// never depend on a separate edit-protocol hierarchy.
+    ///
+    /// `Mixed` resolves to the XML contour, because code edits never travel
+    /// through the structured contour in that mode; the structured transport of
+    /// the mode is reserved for discussions, commit messages, and history
+    /// compaction, which are resolved by the workflows that own them.
     pub fn create_protocol(
         kind: EditProtocolKind,
     ) -> Box<dyn crate::prompt::protocol::PromptProtocol> {
@@ -48,7 +57,9 @@ impl EditProtocolFactory {
             EditProtocolKind::Structured => {
                 Box::new(crate::prompt::json::JsonPromptProtocol::edits())
             }
-            EditProtocolKind::Xml => Box::new(crate::prompt::xml::XmlPromptProtocol),
+            EditProtocolKind::Xml | EditProtocolKind::Mixed => {
+                Box::new(crate::prompt::xml::XmlPromptProtocol)
+            }
         }
     }
 }
@@ -64,6 +75,10 @@ mod tests {
 
         let xml = EditProtocolFactory::create_protocol(EditProtocolKind::Xml);
         assert_eq!(xml.name(), "xml");
+
+        // The two-contour mode edits code through the XML transport.
+        let mixed = EditProtocolFactory::create_protocol(EditProtocolKind::Mixed);
+        assert_eq!(mixed.name(), "xml");
     }
 
     #[test]
@@ -76,10 +91,22 @@ mod tests {
             EditProtocolFactory::canonical_name("xml"),
             Some(EditProtocolKind::Xml)
         );
+        assert_eq!(
+            EditProtocolFactory::canonical_name("mixed"),
+            Some(EditProtocolKind::Mixed)
+        );
+        assert_eq!(
+            EditProtocolFactory::canonical_name("auto"),
+            Some(EditProtocolKind::Mixed)
+        );
         assert_eq!(EditProtocolFactory::canonical_name("tool_call"), None);
         assert_eq!(
             EditProtocolFactory::available_protocols(),
-            vec![EditProtocolKind::Xml, EditProtocolKind::Structured]
+            vec![
+                EditProtocolKind::Xml,
+                EditProtocolKind::Structured,
+                EditProtocolKind::Mixed
+            ]
         );
     }
 }

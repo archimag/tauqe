@@ -5,19 +5,36 @@ use tauqe_core::config::{load_config_with_options, AppConfig, ConfigLoadOptions}
 use tauqe_core::edits::EditProtocolFactory;
 use tauqe_core::workflow::WorkflowFactory;
 use tauqe_protocol::{
-    errors, events, ConfigSetParams, ConfigState, CredentialsSaveParams, Event, ModelRole,
-    ModelRolesEffort, ModelRolesEntries, ModelRolesSummary, ModelSelection, Request, Response,
-    SystemStatusResult,
+    errors, events, ConfigSetParams, ConfigState, CredentialsSaveParams, Event, ModelCatalogEntry,
+    ModelRole, ModelRolesEffort, ModelRolesEntries, ModelRolesSummary, ModelSelection, Request,
+    Response, SystemStatusResult,
 };
 
 use crate::state::AppState;
 
+/// Returns the provider catalog as carried by a role summary.
+///
+/// A model's display alias is declared once, in the provider catalog, so the
+/// client receives that declaration instead of deriving a display name from the
+/// model string. An empty catalog is reported as absent, so a summary of a
+/// project without a declared catalog adds no field to the wire.
+fn provider_catalog(cfg: &AppConfig) -> Option<Vec<ModelCatalogEntry>> {
+    let catalog = cfg.model_catalog();
+    if catalog.is_empty() {
+        None
+    } else {
+        Some(catalog.to_vec())
+    }
+}
+
 /// Builds the client-facing role summary, enriching each role's effective
-/// concrete model with the reasoning effort resolved from its role list.
+/// concrete model with the reasoning effort resolved from its role list and
+/// with the provider catalog that declares the models' display aliases.
 ///
 /// Every role-bearing response and event carries this summary so a client can
 /// render each semantic role and its reasoning depth without re-reading the
-/// configuration.
+/// configuration, and resolve a display name from the single catalog
+/// declaration instead of stating an alias of its own.
 pub(crate) fn effective_roles_summary(cfg: &AppConfig) -> ModelRolesSummary {
     let mut summary = cfg.roles_summary();
     summary.efforts = Some(ModelRolesEffort {
@@ -33,6 +50,7 @@ pub(crate) fn effective_roles_summary(cfg: &AppConfig) -> ModelRolesSummary {
         architect: cfg.models.role_entries(ModelRole::Architect),
         primary: cfg.models.role_entries(ModelRole::Primary),
         reviewer: cfg.models.role_entries(ModelRole::Reviewer),
+        catalog: provider_catalog(cfg),
     });
     summary
 }
@@ -227,8 +245,12 @@ pub async fn handle_config_set(req: Request, state: &Arc<AppState>) -> Response 
         }
     };
 
-    let updated_state = {
+    let (updated_state, previous_model) = {
         let mut guard = state.config.lock().await;
+        // The model that was effective before the change decides whether the
+        // dialogue session stays warm: a provider's prompt prefix cache belongs
+        // to one concrete model, so only a real model change invalidates it.
+        let previous_model = guard.config.resolve_model(&guard.selection);
 
         // Validate every requested field into local candidates before mutating
         // shared state, so a single invalid field cannot leave the config
@@ -310,8 +332,15 @@ pub async fn handle_config_set(req: Request, state: &Arc<AppState>) -> Response 
         guard.config.develop.workflow = new_workflow;
         guard.config.develop.protocol = new_protocol;
 
-        config_state(&guard.config, Some(&guard.selection))
+        (
+            config_state(&guard.config, Some(&guard.selection)),
+            previous_model,
+        )
     };
+
+    state
+        .maybe_rotate_session_on_model_change(&previous_model, &updated_state.model)
+        .await;
 
     state.out.send_event(&Event {
         method: events::CONFIG_CHANGED.to_string(),
@@ -352,13 +381,18 @@ pub async fn handle_config_reload(req: Request, state: &Arc<AppState>) -> Respon
     let repo_opt = repo_root.as_deref();
 
     let new_cfg = reload_config_with_overrides(state, repo_opt).await;
-    let (updated_state, cur_sel_val) = {
+    let (updated_state, previous_model, cur_sel_val) = {
         let mut guard = state.config.lock().await;
+        let previous_model = guard.config.resolve_model(&guard.selection);
         guard.selection = new_cfg.default_selection();
         guard.config = new_cfg;
         let st = config_state(&guard.config, Some(&guard.selection));
-        (st, guard.selection.clone())
+        (st, previous_model, guard.selection.clone())
     };
+
+    state
+        .maybe_rotate_session_on_model_change(&previous_model, &updated_state.model)
+        .await;
 
     state.out.send_event(&Event {
         method: events::CONFIG_CHANGED.to_string(),
@@ -403,13 +437,18 @@ pub async fn handle_config_create(req: Request, state: &Arc<AppState>) -> Respon
     }
 
     let new_cfg = reload_config_with_overrides(state, repo_opt).await;
-    let (updated_state, cur_sel_val) = {
+    let (updated_state, previous_model, cur_sel_val) = {
         let mut guard = state.config.lock().await;
+        let previous_model = guard.config.resolve_model(&guard.selection);
         guard.selection = new_cfg.default_selection();
         guard.config = new_cfg;
         let st = config_state(&guard.config, Some(&guard.selection));
-        (st, guard.selection.clone())
+        (st, previous_model, guard.selection.clone())
     };
+
+    state
+        .maybe_rotate_session_on_model_change(&previous_model, &updated_state.model)
+        .await;
 
     state.out.send_event(&Event {
         method: events::CONFIG_CHANGED.to_string(),
@@ -567,7 +606,7 @@ pub async fn handle_credentials_create_stub(req: Request, state: &Arc<AppState>)
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tauqe_protocol::{EditProtocolKind, ModelRef, ModelRole, WorkflowKind};
+    use tauqe_protocol::{EditProtocolKind, ModelRef, WorkflowKind};
 
     #[tokio::test]
     async fn test_config_state_roles_and_scribe_history() {
@@ -611,6 +650,41 @@ mod tests {
             roles.reviewer,
             ModelRef::openrouter("anthropic/claude-3.7-sonnet")
         );
+    }
+
+    /// The role summary is the single carrier of the provider catalog toward the
+    /// client, so a declared alias reaches every surface that prints a model
+    /// name and an undeclared catalog adds nothing to the wire.
+    #[test]
+    fn test_effective_roles_summary_carries_the_provider_catalog() {
+        let mut cfg = AppConfig::default();
+        cfg.providers.openrouter = Some(tauqe_core::config::OpenRouterConfig {
+            api_key: None,
+            models: vec![ModelCatalogEntry {
+                model: ModelRef::openrouter("deepseek/deepseek-chat"),
+                alias: Some("Deep".to_string()),
+            }],
+        });
+
+        let summary = effective_roles_summary(&cfg);
+        let catalog = summary
+            .entries
+            .and_then(|entries| entries.catalog)
+            .expect("a declared catalog must be carried by the summary");
+        assert_eq!(catalog.len(), 1);
+        assert_eq!(
+            catalog[0].model,
+            ModelRef::openrouter("deepseek/deepseek-chat")
+        );
+        assert_eq!(catalog[0].alias.as_deref(), Some("Deep"));
+
+        // A project without a declared catalog never ships an empty list.
+        let empty = effective_roles_summary(&AppConfig::default());
+        assert!(empty
+            .entries
+            .expect("entries are always present")
+            .catalog
+            .is_none());
     }
 
     #[tokio::test]
@@ -722,5 +796,148 @@ mod tests {
         let resp = handle_credentials_create_stub(req, &state).await;
         let err = resp.error.expect("stub creation must be rejected");
         assert_eq!(err.code, errors::OPERATION_IN_PROGRESS);
+    }
+
+    /// Creates an isolated temporary repository directory for tests that need a
+    /// `tauqe.toml` on disk.
+    fn unique_repo_dir(tag: &str) -> PathBuf {
+        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let index = COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let dir = std::env::temp_dir().join(format!(
+            "tauqe-config-{}-{}-{}",
+            tag,
+            std::process::id(),
+            index
+        ));
+        let _ = std::fs::create_dir_all(&dir);
+        dir
+    }
+
+    /// Builds a `config/set` request switching to `selection`.
+    fn config_set_request(selection: ModelSelection) -> Request {
+        Request {
+            id: tauqe_protocol::RequestId::Number(1),
+            method: "config/set".to_string(),
+            params: Some(
+                serde_json::to_value(ConfigSetParams {
+                    workflow: None,
+                    edit_protocol: None,
+                    model: None,
+                    selection: Some(selection),
+                    history_model: None,
+                })
+                .unwrap(),
+            ),
+        }
+    }
+
+    /// Builds a `config/reload` request.
+    fn config_reload_request() -> Request {
+        Request {
+            id: tauqe_protocol::RequestId::Number(2),
+            method: "config/reload".to_string(),
+            params: None,
+        }
+    }
+
+    /// A model switch through `config/set` invalidates the provider session,
+    /// because a prefix cache belongs to one concrete model.
+    #[tokio::test]
+    async fn test_handle_config_set_rotates_the_session_on_a_model_change() {
+        let mut cfg = AppConfig::default();
+        cfg.models.primary = vec![
+            ModelRef::openrouter("alpha/model").into(),
+            ModelRef::openrouter("beta/model").into(),
+        ];
+
+        let (out, _rx) = crate::transport::OutChannel::new();
+        let (history_sender, _hrx) = tokio::sync::mpsc::unbounded_channel();
+        let state = AppState::new(cfg, std::env::temp_dir(), history_sender, out);
+
+        let warm = state.session_uuid().await;
+        let resp = handle_config_set(
+            config_set_request(ModelSelection::Specific(ModelRef::openrouter("beta/model"))),
+            &state,
+        )
+        .await;
+        assert!(resp.error.is_none(), "the switch must succeed");
+
+        assert_ne!(
+            warm,
+            state.session_uuid().await,
+            "switching the effective model must rotate the session"
+        );
+    }
+
+    /// Reselecting the model that is already effective keeps the warm session:
+    /// the cached prefix is still valid.
+    #[tokio::test]
+    async fn test_handle_config_set_keeps_the_session_when_the_model_is_unchanged() {
+        let mut cfg = AppConfig::default();
+        cfg.models.primary = vec![
+            ModelRef::openrouter("alpha/model").into(),
+            ModelRef::openrouter("beta/model").into(),
+        ];
+
+        let (out, _rx) = crate::transport::OutChannel::new();
+        let (history_sender, _hrx) = tokio::sync::mpsc::unbounded_channel();
+        let state = AppState::new(cfg, std::env::temp_dir(), history_sender, out);
+
+        let warm = state.session_uuid().await;
+        let resp = handle_config_set(
+            config_set_request(ModelSelection::Specific(ModelRef::openrouter("alpha/model"))),
+            &state,
+        )
+        .await;
+        assert!(resp.error.is_none(), "the reselection must succeed");
+
+        assert_eq!(
+            warm,
+            state.session_uuid().await,
+            "an unchanged effective model must keep the session"
+        );
+    }
+
+    /// Reloading a configuration that resolves another model invalidates the
+    /// session once, and a repeated reload of the same file keeps it warm.
+    #[tokio::test]
+    async fn test_handle_config_reload_rotates_the_session_on_a_model_change() {
+        let root = unique_repo_dir("reload");
+        std::fs::write(
+            root.join("tauqe.toml"),
+            "[models]\nprimary = [\"openrouter:deepseek/deepseek-chat\"]\n",
+        )
+        .unwrap();
+
+        let (out, _rx) = crate::transport::OutChannel::new();
+        let (history_sender, _hrx) = tokio::sync::mpsc::unbounded_channel();
+        let state = AppState::new(AppConfig::default(), root.clone(), history_sender, out);
+
+        let warm = state.session_uuid().await;
+        let resp = handle_config_reload(config_reload_request(), &state).await;
+        assert!(resp.error.is_none(), "the reload must succeed");
+
+        let status: SystemStatusResult = serde_json::from_value(resp.result.unwrap()).unwrap();
+        assert_eq!(
+            status.model,
+            ModelRef::openrouter("deepseek/deepseek-chat"),
+            "the reload must adopt the configured model"
+        );
+        assert_ne!(
+            warm,
+            state.session_uuid().await,
+            "a reloaded effective model must rotate the session"
+        );
+
+        let stable = state.session_uuid().await;
+        let resp = handle_config_reload(config_reload_request(), &state).await;
+        assert!(resp.error.is_none(), "the repeated reload must succeed");
+        assert_eq!(
+            stable,
+            state.session_uuid().await,
+            "an unchanged effective model must keep the session"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

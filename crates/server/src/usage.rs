@@ -12,8 +12,11 @@
 //! each provider call returns through [`UsageGuard::observe`], and closes the
 //! window with [`UsageGuard::flush`], which folds the operation into the
 //! session totals together with the duration the harness measured itself.
-//! Every transition publishes a `model/usageTotals` event, so a client renders
-//! one consistent snapshot instead of stitching counters together.
+//! While the window is open, a per-second heartbeat republishes the snapshot
+//! with the live in-flight duration, so a client renders a running clock for
+//! the current operation instead of a dash. Every transition publishes a
+//! `model/usageTotals` event, so a client renders one consistent snapshot
+//! instead of stitching counters together.
 //!
 //! The project lifetime scope outlives the process. It accumulates every
 //! completed operation and is persisted in `<repo_root>/.tauqe/usage.json`,
@@ -25,7 +28,9 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::Duration;
+
+use tokio::time::Instant;
 
 use tauqe_protocol::model::{
     ModelUsageInfo, ModelUsageTotalsEvent, UsageTotals, UsageTotalsSnapshot,
@@ -148,29 +153,98 @@ async fn persist_lifetime(state: &Arc<AppState>, lifetime: &UsageTotals, operati
     }
 }
 
+/// Encodes one snapshot publication for the wire.
+fn snapshot_event_params(
+    operation_id: &str,
+    snapshot: &UsageTotalsSnapshot,
+) -> Option<serde_json::Value> {
+    serde_json::to_value(ModelUsageTotalsEvent {
+        operation_id: operation_id.to_string(),
+        snapshot: snapshot.clone(),
+    })
+    .ok()
+}
+
 /// Publishes the current snapshot to the client.
 async fn publish_snapshot(state: &AppState, operation_id: &str) {
     let snapshot = state.usage.lock().await.clone();
     state.out.send_event(&Event {
         method: events::MODEL_USAGE_TOTALS.to_string(),
-        params: serde_json::to_value(ModelUsageTotalsEvent {
-            operation_id: operation_id.to_string(),
-            snapshot,
-        })
-        .ok(),
+        params: snapshot_event_params(operation_id, &snapshot),
     });
 }
+
+/// Cadence of the live in-flight duration heartbeat.
+///
+/// While an accounting window is open, its heartbeat republishes the snapshot
+/// once per tick with the duration measured so far. The daemon owns the clock,
+/// so a client only mirrors the published value instead of running a timer of
+/// its own, mirroring the reconnect countdown contract.
+const LIVE_DURATION_TICK: Duration = Duration::from_secs(1);
 
 /// Open accounting window for one operation.
 ///
 /// The window starts when the operation begins and closes on
 /// [`UsageGuard::flush`]. Dropping it without flushing abandons the window; the
 /// next [`AppState::begin_usage`] discards the abandoned totals, so a failed
-/// operation can never leave a permanently in-flight window behind.
+/// operation can never leave a permanently in-flight window behind. While the
+/// window is open, its heartbeat republishes the snapshot with the live
+/// in-flight duration, so a client renders a running clock for the current
+/// operation instead of a dash.
 pub struct UsageGuard {
     state: Arc<AppState>,
     operation_id: String,
     started: Instant,
+    /// Live duration heartbeat of this window, silenced on flush and on drop.
+    ticker: tokio::task::JoinHandle<()>,
+}
+
+impl Drop for UsageGuard {
+    fn drop(&mut self) {
+        // The heartbeat belongs to the window: an abandoned guard silences its
+        // own heartbeat, so a dropped window never keeps publishing a running
+        // clock for an operation that is no longer executing.
+        self.ticker.abort();
+    }
+}
+
+/// Spawns the live duration heartbeat of one accounting window.
+///
+/// The published duration is derived, never stored: the authoritative
+/// `cur.duration_ms` stays zero until [`UsageGuard::flush`] folds in the final
+/// measurement, so a heartbeat can never leak into the session totals. The
+/// heartbeat holds the accounting lock across its synchronous send, which
+/// keeps it strictly ordered against flush: once flush has taken the window
+/// away under the same lock, the next heartbeat observes the absent window
+/// and exits, so no stale "still running" snapshot can be published after the
+/// final one.
+fn spawn_live_duration_ticker(
+    state: &Arc<AppState>,
+    operation_id: &str,
+    started: Instant,
+) -> tokio::task::JoinHandle<()> {
+    let state = Arc::clone(state);
+    let operation_id = operation_id.to_string();
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(LIVE_DURATION_TICK).await;
+            // The lock is held across the send because the send is
+            // synchronous: the heartbeat stays strictly ordered against
+            // flush without ever awaiting on a locked window.
+            let usage = state.usage.lock().await;
+            if usage.cur.is_none() {
+                break;
+            }
+            let mut live = usage.clone();
+            if let Some(cur) = live.cur.as_mut() {
+                cur.duration_ms = started.elapsed().as_millis() as u64;
+            }
+            state.out.send_event(&Event {
+                method: events::MODEL_USAGE_TOTALS.to_string(),
+                params: snapshot_event_params(&operation_id, &live),
+            });
+        }
+    })
 }
 
 impl AppState {
@@ -185,10 +259,13 @@ impl AppState {
             let mut snapshot = self.usage.lock().await;
             snapshot.cur = Some(UsageTotals::default());
         }
+        let started = Instant::now();
+        let ticker = spawn_live_duration_ticker(self, &operation_id, started);
         let guard = UsageGuard {
             state: Arc::clone(self),
             operation_id,
-            started: Instant::now(),
+            started,
+            ticker,
         };
         guard.publish().await;
         guard
@@ -269,8 +346,11 @@ impl UsageGuard {
     /// provider, so it reflects how long the operation actually held the
     /// developer's turn. The project lifetime is accumulated under the same
     /// lock as the session totals, so the two scopes can never disagree about
-    /// the operation that just finished.
+    /// the operation that just finished. The heartbeat is silenced first, so
+    /// the final publish below is the last snapshot this operation can ever
+    /// produce.
     pub async fn flush(self) {
+        self.ticker.abort();
         let elapsed_ms = self.started.elapsed().as_millis() as u64;
         let (lifetime, lifetime_operations) = {
             let mut snapshot = self.state.usage.lock().await;
@@ -343,6 +423,18 @@ mod tests {
         serde_json::from_str(&raw).expect("telemetry file is valid JSON")
     }
 
+    /// Decodes a `model/usageTotals` event line from the test transport,
+    /// returning `None` for every other event.
+    fn decode_usage_event(raw: &str) -> Option<ModelUsageTotalsEvent> {
+        let value: serde_json::Value = serde_json::from_str(raw).ok()?;
+        if value.get("method").and_then(|method| method.as_str())
+            != Some(events::MODEL_USAGE_TOTALS)
+        {
+            return None;
+        }
+        serde_json::from_value(value.get("params")?.clone()).ok()
+    }
+
     /// Every flushed operation folds into the session totals, and the previous
     /// operation keeps its own totals so the footer can show both.
     #[tokio::test]
@@ -367,10 +459,23 @@ mod tests {
         assert_eq!(snapshot.prev.total_tokens, 20);
         assert!(snapshot.cur.is_none(), "a flushed window leaves no residue");
 
-        // Each begin, observe, and flush publishes the snapshot: 3 + 4.
+        // Each begin, observe, and flush publishes the snapshot: 3 + 4. The
+        // live-duration heartbeat may add its own publications on a slow
+        // runner, so the count is restricted to the transition events: their
+        // in-flight window still carries the zero stored duration, while a
+        // heartbeat always reports a whole tick or more.
         let mut published = 0;
-        while rx.try_recv().is_ok() {
-            published += 1;
+        while let Ok(raw) = rx.try_recv() {
+            if let Some(event) = decode_usage_event(&raw) {
+                let is_heartbeat = event
+                    .snapshot
+                    .cur
+                    .as_ref()
+                    .is_some_and(|cur| cur.duration_ms > 0);
+                if !is_heartbeat {
+                    published += 1;
+                }
+            }
         }
         assert_eq!(published, 7, "every transition publishes the snapshot");
 
@@ -394,6 +499,80 @@ mod tests {
         assert!(flushed.cur.is_none());
         assert_eq!(flushed.session.total_tokens, 5);
         assert_eq!(flushed.prev.total_tokens, 5);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// While the window is open, the heartbeat republishes the snapshot once
+    /// per tick with the live in-flight duration; flush silences it and folds
+    /// the full measured duration into the session and lifetime totals.
+    ///
+    /// The heartbeat runs on the real clock: one tick is one second, so the
+    /// test polls the transport until at least one live publication arrives
+    /// instead of relying on a paused tokio clock, which would require the
+    /// `test-util` feature the workspace does not enable.
+    #[tokio::test]
+    async fn live_duration_heartbeat_publishes_and_is_silenced_by_flush() {
+        let (state, mut rx, root) = test_state();
+
+        let guard = state.begin_usage().await;
+        guard.observe(&usage(3, 2)).await;
+
+        // Poll the transport until a heartbeat publishes the live duration.
+        // Each publication re-reports the observed tokens with a growing
+        // live duration, while the stored window keeps its zero duration
+        // until flush.
+        let mut max_live_ms = 0u64;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(4);
+        while max_live_ms == 0 && std::time::Instant::now() < deadline {
+            while let Ok(raw) = rx.try_recv() {
+                let Some(event) = decode_usage_event(&raw) else {
+                    continue;
+                };
+                let Some(cur) = event.snapshot.cur.as_ref() else {
+                    continue;
+                };
+                if cur.duration_ms > 0 {
+                    assert_eq!(
+                        cur.total_tokens, 5,
+                        "the heartbeat re-reports the observed tokens"
+                    );
+                    max_live_ms = max_live_ms.max(cur.duration_ms);
+                }
+            }
+            if max_live_ms == 0 {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        }
+        assert!(
+            max_live_ms > 0,
+            "the heartbeat must publish a live in-flight duration"
+        );
+
+        // The stored window was never touched by the heartbeat: flush folds
+        // the full measured duration, never the heartbeat's derived one on
+        // top of it.
+        guard.flush().await;
+        let snapshot = state.usage.lock().await.clone();
+        assert!(snapshot.cur.is_none());
+        assert_eq!(snapshot.prev.total_tokens, 5);
+        assert!(
+            snapshot.prev.duration_ms >= max_live_ms,
+            "flush records the whole window duration"
+        );
+        assert_eq!(snapshot.session.duration_ms, snapshot.prev.duration_ms);
+        assert_eq!(snapshot.lifetime.duration_ms, snapshot.prev.duration_ms);
+
+        // Drain everything published so far, then let a whole tick pass:
+        // the queue must stay empty because the heartbeat was silenced with
+        // the window and no stale "still running" snapshot can arrive after
+        // the final publish.
+        while rx.try_recv().is_ok() {}
+        tokio::time::sleep(LIVE_DURATION_TICK + Duration::from_millis(200)).await;
+        assert!(
+            rx.try_recv().is_err(),
+            "no heartbeat may outlive the flushed window"
+        );
 
         let _ = std::fs::remove_dir_all(&root);
     }

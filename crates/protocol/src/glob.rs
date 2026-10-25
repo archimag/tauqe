@@ -1,3 +1,56 @@
+//! Glob matching for repository-relative paths.
+//!
+//! # Anti-NIH exemption (Conventions §1.6)
+//!
+//! Conventions §1.6 requires an established primitive — glob matching is named
+//! there explicitly — to come from the de-facto standard ecosystem crate, and
+//! permits a local implementation only when the crate cannot enter the build
+//! graph for a documented reason. That reason applies here: `crates/protocol`
+//! is a leaf crate restricted to `serde` and `serde_json` (Conventions §2 and
+//! §12.4), so `glob` or `globset` cannot be added to its dependencies and the
+//! matcher is implemented in this crate instead.
+//!
+//! The exemption is scoped to matching one pattern against one relative path.
+//! It is not a licence to grow this module into a general glob engine:
+//! filesystem walking, ignore-file handling and pattern negation stay outside
+//! its remit.
+//!
+//! # Deliberate deviations from `glob` and `globset`
+//!
+//! Because the matcher is local, it is not compatible with the standard crates
+//! character for character. The differences below are intentional, are relied
+//! upon by callers such as pattern-based context addition and review path
+//! selection, and are pinned by the tests in this module. Read them as the
+//! contract of this module rather than as drift to be corrected:
+//!
+//! - A wildcard pattern without `/` matches the basename at any depth, so
+//!   `*.rs` matches `src/lib.rs`. Standard matchers match only the path they
+//!   are handed, which leaves depth selection to the caller.
+//! - A trailing `/` turns any pattern, literal or wildcard, into a recursive
+//!   directory prefix: `src/` and `build*/` match every path beneath a
+//!   matching directory and never the directory entry itself. Standard
+//!   matchers select the directory entry, not its contents.
+//! - `**` matches zero or more whole path segments, so `src/**/*.rs` matches
+//!   `src/lib.rs`. The empty expansion is accepted unconditionally here, while
+//!   the standard crates decide it per configuration, so callers must not
+//!   assume identical behavior at the zero-segment boundary.
+//! - A non-wildcard pattern matches itself or acts as a directory prefix, so
+//!   `build` matches `build/x.o`. Standard matchers compare the whole path
+//!   literally.
+//! - Patterns and paths are normalized before matching (backslashes become
+//!   `/`, empty and interior `.` segments are dropped), a lone `]` is literal,
+//!   and an unterminated character class degrades to a literal `[` instead of
+//!   failing the match.
+//!
+//! If matching must ever align exactly with the standard semantics, the
+//! compilation and matching logic relocates to a crate that can depend on
+//! `globset`, and `protocol` keeps carrying pattern strings only.
+//!
+//! # Usage
+//!
+//! [`matches_glob_pattern`] is the convenience wrapper for a single match.
+//! [`GlobPattern`] is the same matcher pre-compiled for repeated use.
+
 /// Matches a relative path against a glob pattern.
 ///
 /// Supported syntax:
@@ -50,12 +103,13 @@ impl GlobPattern {
         let has_slash = clean.contains('/');
         let prefix = format!("{clean}/");
         let segments = collapse_double_stars(clean.split('/').map(String::from).collect());
-        let dir_segments = collapse_double_stars(
-            format!("{clean}/*/**")
-                .split('/')
-                .map(String::from)
-                .collect(),
-        );
+        // Only a slash-terminated wildcard matches by directory segments, so
+        // every other shape skips building and storing the extra list.
+        let dir_segments = if trailing_slash && has_meta {
+            directory_segments(&segments)
+        } else {
+            Vec::new()
+        };
 
         Self {
             clean,
@@ -144,6 +198,21 @@ fn collapse_double_stars(parts: Vec<String>) -> Vec<String> {
         collapsed.push(part);
     }
     collapsed
+}
+
+/// Builds the segment list that matches every path beneath a directory pattern.
+///
+/// A trailing-slash pattern selects paths *inside* a matching directory, never
+/// the directory entry itself, so it is matched as the pattern followed by one
+/// concrete segment and any remaining segments (`<pattern>/*/**`). Appending to
+/// the already-collapsed [`GlobPattern`] segments avoids re-normalizing and
+/// re-collapsing the pattern string a second time.
+fn directory_segments(segments: &[String]) -> Vec<String> {
+    let mut dir_segments = Vec::with_capacity(segments.len() + 2);
+    dir_segments.extend_from_slice(segments);
+    dir_segments.push("*".to_string());
+    dir_segments.push("**".to_string());
+    dir_segments
 }
 
 fn match_segments(pat: &[String], path: &[&str]) -> bool {
@@ -486,6 +555,23 @@ mod tests {
         assert!(pattern.matches("src/lib.rs"));
         assert!(pattern.matches("src/a/b/lib.rs"));
         assert!(!pattern.matches("docs/lib.rs"));
+    }
+
+    #[test]
+    fn test_dir_segments_built_only_for_trailing_slash_wildcards() {
+        assert!(GlobPattern::new("src/*.rs").dir_segments.is_empty());
+        assert!(GlobPattern::new("src/lib.rs").dir_segments.is_empty());
+        assert!(GlobPattern::new("crates/**").dir_segments.is_empty());
+        assert!(GlobPattern::new("src/").dir_segments.is_empty());
+        assert_eq!(
+            GlobPattern::new("crates/*/").dir_segments,
+            vec![
+                "crates".to_string(),
+                "*".to_string(),
+                "*".to_string(),
+                "**".to_string()
+            ]
+        );
     }
 
     #[test]

@@ -21,7 +21,7 @@ use tauqe_protocol::{IssueStatus, ModelSelection, PlanItem, ReviewItem, ReviewSe
 use crate::state::{AppState, OperationGuard};
 
 use super::super::common::{offload_review, publish_review, skip_finding_with_diagnostic};
-use super::super::refine::{refine_finding_with_architect, RefineOutcome};
+use super::super::refine::{refine_finding_with_architect, RefineAdmission, RefineOutcome};
 use super::subplan::{run_review_subplan, SUBPLAN_INTERRUPTED_NOTE_PREFIX};
 
 /// Reloads the review session and the target finding from disk.
@@ -198,14 +198,22 @@ pub(super) async fn run_review_subplan_with_replans(
                 failure_reason: Some(failure.reason()),
             }),
             &operation,
+            RefineAdmission::Harness,
         )
         .await
         {
             Ok(RefineOutcome::Success { .. }) => {}
             Ok(RefineOutcome::Blocked { reason }) => {
-                skip_finding_with_diagnostic(state, repo_root, review_id, item.id, "", &reason)
-                    .await;
-                return Err(ReviewStepFailure::domain(reason));
+                return Err(
+                    match skip_finding_with_diagnostic(
+                        state, repo_root, review_id, item.id, "", &reason,
+                    )
+                    .await
+                    {
+                        Ok(()) => ReviewStepFailure::domain(reason),
+                        Err(storage_err) => ReviewStepFailure::infrastructure(storage_err),
+                    },
+                );
             }
             Err(err) => return Err(ReviewStepFailure::infrastructure(err.message)),
         }

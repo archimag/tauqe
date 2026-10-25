@@ -98,9 +98,10 @@ impl RetryConfig {
     /// Backoff pause after the given attempt.
     ///
     /// The pause doubles with every attempt up to [`Self::max_delay_ms`] and
-    /// carries equal jitter: half of it is fixed, the other half is random, so
-    /// concurrent clients never retry in lockstep against a struggling
-    /// upstream.
+    /// carries equal jitter: half of it is fixed, the other half is drawn per
+    /// call from the operating system CSPRNG, so neither concurrent clients nor
+    /// the successive retries of one client repeat in lockstep against a
+    /// struggling upstream.
     fn delay_for(&self, attempt: u32) -> Duration {
         let exponent = attempt.saturating_sub(1).min(MAX_BACKOFF_EXPONENT);
         let ceiling = self.max_delay_ms.max(1);
@@ -573,17 +574,50 @@ fn http_status(message: &str) -> Option<u16> {
     digits.parse().ok()
 }
 
-/// Returns a uniformly distributed `u64` without pulling in an entropy crate.
+/// Returns a uniformly distributed `u64` drawn afresh on every call.
 ///
-/// [`std::collections::hash_map::RandomState`] is seeded from the operating
-/// system once per process, so a fresh hasher yields a value that concurrent
-/// clients do not share.
+/// A per-thread value is not enough: the jitter exists so that a client's
+/// successive retries never repeat in lockstep, which requires two calls made
+/// from the same thread to differ. A `RandomState` hasher cannot provide that,
+/// because the type reuses one thread-local key set and hashing a constant
+/// yields the same result on every call. The value is therefore drawn from the
+/// operating system CSPRNG, and the fallback mixes a process-wide counter
+/// instead of repeating one constant.
 fn random_u64() -> u64 {
-    use std::hash::{BuildHasher, Hasher};
+    let mut bytes = [0u8; 8];
+    match getrandom::getrandom(&mut bytes) {
+        Ok(()) => u64::from_be_bytes(bytes),
+        Err(err) => {
+            // CSPRNG failure is not expected on supported platforms; keep the
+            // backoff running with a weaker, yet still per-call, source.
+            tracing::warn!(
+                "OS random number generator unavailable ({}); falling back to a counter-seeded backoff jitter",
+                err
+            );
+            counter_jitter()
+        }
+    }
+}
 
-    let mut hasher = std::collections::hash_map::RandomState::new().build_hasher();
-    hasher.write_u64(0x9E37_79B9_7F4A_7C15);
-    hasher.finish()
+/// Produces a distinct value for every call from a process-wide counter.
+///
+/// Used only when the OS CSPRNG is unavailable. Consecutive values differ, so
+/// the backoff pauses of one client still vary; the source is weaker than the
+/// CSPRNG, which is why it is a fallback rather than the primary path.
+fn counter_jitter() -> u64 {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::OnceLock;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    static COUNTER: OnceLock<AtomicU64> = OnceLock::new();
+    let counter = COUNTER.get_or_init(|| {
+        let seed = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos() as u64;
+        AtomicU64::new(seed)
+    });
+    counter.fetch_add(1, Ordering::Relaxed)
 }
 
 /// Truncates a failure description for the client and the journal.
@@ -1570,5 +1604,39 @@ mod tests {
                 "attempt {attempt} produced an out-of-range pause of {delay} ms"
             );
         }
+    }
+
+    #[test]
+    fn jitter_varies_between_calls_on_the_same_thread() {
+        let samples: Vec<u64> = (0..32).map(|_| random_u64()).collect();
+
+        assert!(
+            samples.windows(2).any(|pair| pair[0] != pair[1]),
+            "the jitter source must differ between calls: {samples:?}"
+        );
+    }
+
+    #[test]
+    fn backoff_pauses_of_one_client_stay_within_the_jitter_range() {
+        let config = RetryConfig {
+            max_attempts: 4,
+            base_delay_ms: 1_000,
+            max_delay_ms: 1_000,
+        };
+
+        let pauses: Vec<u64> = (0..32)
+            .map(|_| config.delay_for(1).as_millis() as u64)
+            .collect();
+
+        for pause in &pauses {
+            assert!(
+                (500..=1_000).contains(pause),
+                "a pause of {pause} ms leaves the equal-jitter range"
+            );
+        }
+        assert!(
+            pauses.windows(2).any(|pair| pair[0] != pair[1]),
+            "successive retries of one client must not share a pause姐夫: {pauses:?}"
+        );
     }
 }

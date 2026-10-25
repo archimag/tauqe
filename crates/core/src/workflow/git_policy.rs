@@ -9,9 +9,7 @@ use tauqe_protocol::{EditOperation, EditProposal};
 
 use super::policy::ApplyPolicy;
 use crate::context::ContextManager;
-use crate::edits::{
-    apply_edit_proposal, stage_and_validate_edits, StageEditsResult, StagedEditsState,
-};
+use crate::edits::{apply_edit_proposal, prepare_staged_edits, StageEditsResult, StagedEditsState};
 use crate::git::{
     create_ai_commit, create_checkpoint, create_step_commit, finalize_ai_commit,
     restore_checkpoint, CheckpointInfo,
@@ -75,7 +73,7 @@ impl ApplyPolicy for GitTransactionPolicy {
         edits: &[EditOperation],
         staged_state: Option<&StagedEditsState>,
     ) -> StageEditsResult {
-        stage_and_validate_edits(repo_root, context_manager, edits, staged_state)
+        prepare_staged_edits(repo_root, context_manager, edits, staged_state).await
     }
 
     async fn apply_temporary(
@@ -97,7 +95,7 @@ impl ApplyPolicy for GitTransactionPolicy {
         }
         self.publish_transaction_state();
 
-        let changed_files = apply_edit_proposal(repo_root, context_manager, proposal)?;
+        let changed_files = apply_edit_proposal(repo_root, context_manager, proposal).await?;
 
         if !changed_files.is_empty() {
             let root = repo_root.to_path_buf();

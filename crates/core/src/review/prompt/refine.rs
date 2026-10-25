@@ -62,6 +62,7 @@ pub fn build_review_finding_refine_system_prompt() -> String {
 
     out.push_str("7. Output Format:\n");
     out.push_str("   - Output strictly according to the specified JSON schema.\n");
+    out.push_str("   - Final Content Invariant: every text field (explanation, titles, details, reason) carries only the final distilled result. The reasoning process itself is never plan content: do not record deliberation, self-questioning, exploratory analysis, or intermediate reasoning steps in any field.\n");
     out
 }
 
@@ -235,7 +236,7 @@ pub fn build_review_finding_refine_user_prompt(
     }
 
     out.push_str("## Architect Instructions:\n");
-    out.push_str("1. Analyze the review finding and determine the necessary refactorings and code changes.\n");
+    out.push_str("1. Determine the refactorings and code changes the finding requires.\n");
     out.push_str("2. Synthesize a decomposed, dependency-ordered subplan of leaf steps with `status: \"todo\"`.\n");
     out.push_str("3. For each leaf step, declare `files`, `readonly_files`, and `depends_on`. Ensure each step leaves the codebase in a compiling state.\n");
     out.push_str("4. If the finding is blocked or cannot be implemented, report `status: \"blocked\"` with `reason`.\n");
@@ -283,6 +284,7 @@ mod tests {
             items: vec![ReviewItem {
                 id: 42,
                 title: "Decompose this issue".to_string(),
+                subplan_last_replanned_step: None,
                 model: None,
                 issue_type: IssueType::Bug,
                 severity: ReviewSeverity::Critical,
@@ -333,5 +335,27 @@ mod tests {
         assert!(with_dirs.contains("## Repository Directories (<repo_dirs>):"));
         assert!(with_dirs.contains("crate\n  src"));
         assert!(!with_dirs.contains("## Codebase Symbol Contours"));
+    }
+
+    #[test]
+    fn test_review_refine_contract_demands_distilled_content() {
+        let sys = build_review_finding_refine_system_prompt();
+        assert!(sys.contains("Final Content Invariant"));
+        assert!(sys.contains("reasoning process itself is never plan content"));
+
+        // The user prompt orders the outcome, not an analytical narrative.
+        let session = sample_session();
+        let item = &session.items[0];
+        let user = build_review_finding_refine_user_prompt(
+            &session,
+            item,
+            &[],
+            None,
+            None,
+            None,
+            None,
+        );
+        assert!(!user.contains("Analyze the review finding"));
+        assert!(user.contains("Determine the refactorings"));
     }
 }

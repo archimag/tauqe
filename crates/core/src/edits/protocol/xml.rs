@@ -30,7 +30,7 @@ pub(crate) use marker::{
     normalize_marked_xml, normalize_marked_xml_incremental, restore_xml_literals,
 };
 pub use parser::has_xml_edit_tags;
-pub(crate) use parser::{extract_attribute, find_base_tag_start};
+pub(crate) use parser::{extract_attribute, file_edit_tags, find_base_tag_start, FileBlockTag};
 pub use tags::{
     extract_blocked, extract_error, extract_scratchpad, extract_skip, extract_success,
     extract_terminal_outcome, extract_user_language, extract_verify_request, strip_blocked_tags,

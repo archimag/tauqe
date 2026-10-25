@@ -1,32 +1,34 @@
 use serde::{Deserialize, Serialize};
 
+use super::catalog::ModelCatalogEntry;
 use super::effort::{parse_effort_opt, ModelRolesEffort, ReasoningEffort};
 use super::reference::ModelRef;
 
-/// A model entry configured with optional reasoning depth and human-readable alias.
+/// A model entry configured for a semantic role.
+///
+/// Pairs the model a role slot runs on with the runtime parameters of that
+/// slot. A display alias is not a role parameter: it describes the model itself
+/// and is declared once in the provider catalog (`ModelCatalogEntry`), so the
+/// same model is never labelled in two places and every surface resolves a
+/// display name from a single source.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ModelEntry {
     pub model: ModelRef,
     pub effort: Option<ReasoningEffort>,
-    pub alias: Option<String>,
 }
 
 impl ModelEntry {
-    pub fn new(model: ModelRef, effort: Option<ReasoningEffort>, alias: Option<String>) -> Self {
-        Self {
-            model,
-            effort,
-            alias: normalize_alias(alias),
-        }
+    /// Creates a role entry from a model and an optional reasoning depth.
+    pub fn new(model: ModelRef, effort: Option<ReasoningEffort>) -> Self {
+        Self { model, effort }
     }
 
+    /// Renders the entry as the canonical model specification, with the
+    /// configured reasoning depth appended when one is set.
     pub fn display_label(&self) -> String {
-        if let Some(alias) = &self.alias {
-            alias.clone()
-        } else if let Some(effort) = self.effort {
-            format!("{}:{} [{}]", self.model.provider, self.model.name, effort)
-        } else {
-            self.model.to_string()
+        match self.effort {
+            Some(effort) => format!("{} [{}]", self.model.to_spec(), effort),
+            None => self.model.to_spec(),
         }
     }
 }
@@ -36,51 +38,16 @@ impl From<ModelRef> for ModelEntry {
         Self {
             model,
             effort: None,
-            alias: None,
         }
     }
 }
 
-/// Normalizes an optional alias by trimming surrounding whitespace and
-/// collapsing an empty result to `None`.
-///
-/// Both deserialization and [`ModelEntry::new`] route aliases through this
-/// helper, so an entry built by hand carries exactly the same alias as one
-/// decoded from configuration and a blank alias is never stored as `Some("")`.
-fn normalize_alias(alias: Option<String>) -> Option<String> {
-    alias.and_then(|a| {
-        let trimmed = a.trim();
-        if trimmed.is_empty() {
-            None
-        } else {
-            Some(trimmed.to_string())
-        }
-    })
-}
-
-/// Builds the `unknown field` diagnostic for a rejected table key.
-///
-/// The expected-field list reflects whether `alias` is valid for the entry kind
-/// being decoded, so the message names only the fields that kind actually
-/// accepts.
-fn unknown_field_error<E: serde::de::Error>(field: &str, allow_alias: bool) -> E {
-    let expected = if allow_alias {
-        "`model`, `effort` or `alias`"
-    } else {
-        "`model` or `effort`"
-    };
-    E::custom(format_args!(
-        "unknown field `{}`, expected {}",
-        field, expected
-    ))
-}
-
-/// Shared polymorphic specification for a configured model entry.
+/// Shared polymorphic specification for a configured model role entry.
 ///
 /// A configured entry is either a bare model string or a table with a mandatory
-/// `model` field and an optional `effort` field; `alias` is accepted only for
-/// entry kinds that carry one. Both `ModelEntry` and `CoderTier` deserialize
-/// through this single type.
+/// `model` field and an optional `effort` field. `ModelEntry`, `CoderTier`, and
+/// `ArchitectTier` all deserialize through this single type, so the three kinds
+/// cannot drift apart.
 ///
 /// The value is dispatched on its runtime shape with a visitor rather than an
 /// untagged enum. An untagged enum reports every malformed field as the opaque
@@ -90,36 +57,30 @@ fn unknown_field_error<E: serde::de::Error>(field: &str, allow_alias: bool) -> E
 struct ModelEntrySpec {
     model: ModelRef,
     effort: Option<ReasoningEffort>,
-    alias: Option<String>,
 }
 
 impl ModelEntrySpec {
-    /// Decodes a model entry, rejecting unknown keys.
+    /// Decodes a role entry, rejecting unknown keys.
     ///
-    /// `allow_alias` gates the optional `alias` field: `ModelEntry` accepts it,
-    /// while `CoderTier` does not carry one and therefore rejects it instead of
-    /// silently dropping the value. Every other unrecognized key is reported as
-    /// an `unknown field` error rather than discarded, so a typo such as `efort`
-    /// surfaces immediately instead of leaving the entry without the intended
-    /// reasoning depth. A repeated key is reported as a `duplicate field` error
-    /// rather than letting the last value silently win.
-    fn deserialize_with<'de, D>(deserializer: D, allow_alias: bool) -> Result<Self, D::Error>
+    /// Every unrecognized key is reported as an `unknown field` error rather
+    /// than discarded, so a typo such as `efort` surfaces immediately instead
+    /// of leaving the entry without the intended reasoning depth. A display
+    /// alias belongs to the provider catalog entry of a model, so a role slot
+    /// that carries one is rejected as well instead of quietly reinstating a
+    /// second source of truth for the same label. A repeated key is reported as
+    /// a `duplicate field` error rather than letting the last value silently
+    /// win.
+    fn deserialize<'de, D>(deserializer: D) -> Result<Self, D::Error>
     where
         D: serde::Deserializer<'de>,
     {
-        struct SpecVisitor {
-            allow_alias: bool,
-        }
+        struct SpecVisitor;
 
         impl<'de> serde::de::Visitor<'de> for SpecVisitor {
             type Value = ModelEntrySpec;
 
             fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-                if self.allow_alias {
-                    f.write_str("a model string or a { model, effort, alias } table")
-                } else {
-                    f.write_str("a model string or a { model, effort } table")
-                }
+                f.write_str("a model string or a { model, effort } table")
             }
 
             fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
@@ -130,7 +91,6 @@ impl ModelEntrySpec {
                     Ok(model) => Ok(ModelEntrySpec {
                         model,
                         effort: None,
-                        alias: None,
                     }),
                     Err(err) => Err(E::custom(err)),
                 }
@@ -143,8 +103,6 @@ impl ModelEntrySpec {
                 let mut model: Option<String> = None;
                 let mut effort: Option<ReasoningEffort> = None;
                 let mut effort_seen = false;
-                let mut alias: Option<String> = None;
-                let mut alias_seen = false;
 
                 while let Some(key) = map.next_key::<String>()? {
                     match key.as_str() {
@@ -164,16 +122,12 @@ impl ModelEntrySpec {
                                 Err(err) => return Err(serde::de::Error::custom(err)),
                             };
                         }
-                        "alias" if self.allow_alias => {
-                            if alias_seen {
-                                return Err(serde::de::Error::duplicate_field("alias"));
-                            }
-                            alias_seen = true;
-                            // Read as `Option<String>` so an explicit `null`
-                            // means "no alias" instead of failing the entry.
-                            alias = map.next_value()?;
+                        other => {
+                            return Err(serde::de::Error::unknown_field(
+                                other,
+                                &["model", "effort"],
+                            ))
                         }
-                        other => return Err(unknown_field_error(other, self.allow_alias)),
                     }
                 }
 
@@ -186,15 +140,11 @@ impl ModelEntrySpec {
                     Err(err) => return Err(serde::de::Error::custom(err)),
                 };
 
-                Ok(ModelEntrySpec {
-                    model,
-                    effort,
-                    alias: normalize_alias(alias),
-                })
+                Ok(ModelEntrySpec { model, effort })
             }
         }
 
-        deserializer.deserialize_any(SpecVisitor { allow_alias })
+        deserializer.deserialize_any(SpecVisitor)
     }
 }
 
@@ -203,8 +153,8 @@ impl<'de> Deserialize<'de> for ModelEntry {
     where
         D: serde::Deserializer<'de>,
     {
-        let spec = ModelEntrySpec::deserialize_with(deserializer, true)?;
-        Ok(ModelEntry::new(spec.model, spec.effort, spec.alias))
+        let spec = ModelEntrySpec::deserialize(deserializer)?;
+        Ok(ModelEntry::new(spec.model, spec.effort))
     }
 }
 
@@ -213,26 +163,15 @@ impl Serialize for ModelEntry {
     where
         S: serde::Serializer,
     {
-        if self.effort.is_none() && self.alias.is_none() {
-            serializer.serialize_str(&self.model.to_spec())
-        } else {
-            use serde::ser::SerializeStruct;
-            let mut count = 1;
-            if self.effort.is_some() {
-                count += 1;
+        match self.effort {
+            Some(effort) => {
+                use serde::ser::SerializeStruct;
+                let mut state = serializer.serialize_struct("ModelEntry", 2)?;
+                state.serialize_field("model", &self.model.to_spec())?;
+                state.serialize_field("effort", &effort)?;
+                state.end()
             }
-            if self.alias.is_some() {
-                count += 1;
-            }
-            let mut state = serializer.serialize_struct("ModelEntry", count)?;
-            state.serialize_field("model", &self.model.to_spec())?;
-            if let Some(effort) = &self.effort {
-                state.serialize_field("effort", effort)?;
-            }
-            if let Some(alias) = &self.alias {
-                state.serialize_field("alias", alias)?;
-            }
-            state.end()
+            None => serializer.serialize_str(&self.model.to_spec()),
         }
     }
 }
@@ -298,8 +237,7 @@ where
 /// document itself.
 ///
 /// Deserializes from either a bare model string or a `{ model, effort }` table
-/// through the shared entry spec, and carries no alias, exactly like
-/// [`CoderTier`].
+/// through the shared entry spec, exactly like [`CoderTier`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ArchitectTier {
     pub model: ModelRef,
@@ -328,7 +266,7 @@ impl<'de> Deserialize<'de> for CoderTier {
     where
         D: serde::Deserializer<'de>,
     {
-        let spec = ModelEntrySpec::deserialize_with(deserializer, false)?;
+        let spec = ModelEntrySpec::deserialize(deserializer)?;
         Ok(CoderTier::new(spec.model, spec.effort))
     }
 }
@@ -347,7 +285,7 @@ impl<'de> Deserialize<'de> for ArchitectTier {
     where
         D: serde::Deserializer<'de>,
     {
-        let spec = ModelEntrySpec::deserialize_with(deserializer, false)?;
+        let spec = ModelEntrySpec::deserialize(deserializer)?;
         Ok(ArchitectTier::new(spec.model, spec.effort))
     }
 }
@@ -374,6 +312,17 @@ pub struct ModelRolesEntries {
     pub primary: Vec<ModelEntry>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub reviewer: Vec<ModelEntry>,
+    /// Provider catalog backing client-side display names.
+    ///
+    /// The catalog is the single source of truth for a model's display alias, so
+    /// a client renders a name from that declaration instead of deriving one
+    /// from the model string. The catalog travels with the role summary because
+    /// the summary already reaches every client surface that prints a model
+    /// name, so no second request is issued for the same declaration. An absent
+    /// or empty catalog is omitted from the wire rather than sent as an empty
+    /// list.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub catalog: Option<Vec<ModelCatalogEntry>>,
 }
 
 /// Summary of effective concrete models assigned to each semantic role.
@@ -402,11 +351,10 @@ mod tests {
         let entry_str: ModelEntry = serde_json::from_str("\"openrouter:openai/gpt-4o\"").unwrap();
         assert_eq!(entry_str.model, ModelRef::openrouter("openai/gpt-4o"));
         assert_eq!(entry_str.effort, None);
-        assert_eq!(entry_str.alias, None);
         assert_eq!(entry_str.display_label(), "openrouter:openai/gpt-4o");
 
         let entry_table: ModelEntry = serde_json::from_str(
-            r#"{"model":"openrouter:anthropic/claude-sonnet","effort":"high","alias":"Sonnet High"}"#,
+            r#"{"model":"openrouter:anthropic/claude-sonnet","effort":"high"}"#,
         )
         .unwrap();
         assert_eq!(
@@ -414,14 +362,19 @@ mod tests {
             ModelRef::openrouter("anthropic/claude-sonnet")
         );
         assert_eq!(entry_table.effort, Some(ReasoningEffort::High));
-        assert_eq!(entry_table.alias, Some("Sonnet High".to_string()));
-        assert_eq!(entry_table.display_label(), "Sonnet High");
+        assert_eq!(
+            entry_table.display_label(),
+            "openrouter:anthropic/claude-sonnet [high]"
+        );
 
         let serialized_str = serde_json::to_string(&entry_str).unwrap();
         assert_eq!(serialized_str, "\"openrouter:openai/gpt-4o\"");
 
         let serialized_table = serde_json::to_string(&entry_table).unwrap();
-        assert!(serialized_table.contains("\"alias\":\"Sonnet High\""));
+        assert_eq!(
+            serialized_table,
+            "{\"model\":\"openrouter:anthropic/claude-sonnet\",\"effort\":\"high\"}"
+        );
     }
 
     #[test]
@@ -516,16 +469,6 @@ mod tests {
         .unwrap_err()
         .to_string();
         assert!(err.contains("Unknown reasoning effort"), "got: {err}");
-
-        // The Architect rung carries no alias, exactly like the Coder rung; a
-        // supplied one is rejected instead of being silently dropped.
-        let err = serde_json::from_str::<ArchitectTier>(
-            r#"{"model":"openrouter:planner/model","alias":"Planner"}"#,
-        )
-        .unwrap_err()
-        .to_string();
-        assert!(err.contains("unknown field"), "got: {err}");
-        assert!(err.contains("alias"), "got: {err}");
     }
 
     #[test]
@@ -542,27 +485,26 @@ mod tests {
     }
 
     #[test]
-    fn test_coder_tier_rejects_alias() {
-        // `CoderTier` carries no alias; a supplied one is rejected instead of
-        // being accepted and silently dropped.
-        let err = serde_json::from_str::<CoderTier>(
-            r#"{"model":"openrouter:strong/model","alias":"Strong"}"#,
-        )
-        .unwrap_err()
-        .to_string();
-        assert!(err.contains("unknown field"), "got: {err}");
-        assert!(err.contains("alias"), "got: {err}");
-    }
-
-    #[test]
-    fn test_model_entry_tolerates_null_alias() {
-        // An explicit `null` alias means "no alias", mirroring an absent field,
-        // so a null-tolerant producer never makes the entry unreadable.
-        let entry: ModelEntry =
-            serde_json::from_str(r#"{"model":"openrouter:anthropic/claude-sonnet","alias":null}"#)
-                .unwrap();
-        assert_eq!(entry.model, ModelRef::openrouter("anthropic/claude-sonnet"));
-        assert_eq!(entry.alias, None);
+    fn test_role_entries_reject_a_display_alias() {
+        // A display alias belongs to the provider catalog entry of a model, so a
+        // role slot that carries one is rejected instead of reinstating a second
+        // source of truth for the same label.
+        for err in [
+            serde_json::from_str::<ModelEntry>(r#"{"model":"openrouter:a/b","alias":"Fast"}"#)
+                .unwrap_err()
+                .to_string(),
+            serde_json::from_str::<CoderTier>(r#"{"model":"openrouter:a/b","alias":"Fast"}"#)
+                .unwrap_err()
+                .to_string(),
+            serde_json::from_str::<ArchitectTier>(
+                r#"{"model":"openrouter:a/b","alias":"Planner"}"#,
+            )
+            .unwrap_err()
+            .to_string(),
+        ] {
+            assert!(err.contains("unknown field"), "got: {err}");
+            assert!(err.contains("alias"), "got: {err}");
+        }
     }
 
     #[test]
@@ -583,13 +525,6 @@ mod tests {
         .to_string();
         assert!(err.contains("duplicate field"), "got: {err}");
 
-        let err = serde_json::from_str::<ModelEntry>(
-            r#"{"model":"openrouter:a/b","alias":"x","alias":"y"}"#,
-        )
-        .unwrap_err()
-        .to_string();
-        assert!(err.contains("duplicate field"), "got: {err}");
-
         // `CoderTier` shares the same spec, so it rejects duplicates too.
         let err = serde_json::from_str::<CoderTier>(
             r#"{"model":"openrouter:a/b","model":"openrouter:c/d"}"#,
@@ -600,26 +535,36 @@ mod tests {
     }
 
     #[test]
-    fn test_model_entry_new_normalizes_blank_alias() {
-        let model = || ModelRef::openrouter("base/model");
+    fn test_model_entry_new_keeps_the_model_and_effort_only() {
+        let model = ModelRef::openrouter("base/model");
 
-        // An empty or whitespace-only alias collapses to `None`, matching the
-        // behavior of deserialization.
-        assert_eq!(
-            ModelEntry::new(model(), None, Some(String::new())).alias,
-            None
-        );
-        assert_eq!(
-            ModelEntry::new(model(), None, Some("   ".to_string())).alias,
-            None
-        );
+        let entry = ModelEntry::new(model.clone(), Some(ReasoningEffort::Low));
+        assert_eq!(entry.model, model);
+        assert_eq!(entry.effort, Some(ReasoningEffort::Low));
+        assert_eq!(entry.display_label(), "openrouter:base/model [low]");
+    }
 
-        // A meaningful alias is trimmed but preserved.
-        assert_eq!(
-            ModelEntry::new(model(), None, Some("  Sonnet  ".to_string()))
-                .alias
-                .as_deref(),
-            Some("Sonnet")
-        );
+    #[test]
+    fn test_roles_entries_omit_an_absent_catalog() {
+        // A summary without a declared catalog carries no extra field on the
+        // wire, so a client never distinguishes "absent" from "empty".
+        let empty = ModelRolesEntries::default();
+        let json = serde_json::to_string(&empty).unwrap();
+        assert!(!json.contains("catalog"), "got: {json}");
+
+        let with_catalog = ModelRolesEntries {
+            catalog: Some(vec![ModelCatalogEntry {
+                model: ModelRef::openrouter("deepseek/deepseek-chat"),
+                alias: Some("Deep".to_string()),
+            }]),
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&with_catalog).unwrap();
+        assert!(json.contains("\"catalog\""), "got: {json}");
+
+        // The declaration round-trips unchanged, so the alias reaches the client
+        // exactly as configuration stated it.
+        let restored: ModelRolesEntries = serde_json::from_str(&json).unwrap();
+        assert_eq!(restored, with_catalog);
     }
 }

@@ -71,6 +71,12 @@ follow:
 8. **Nothing runs that resolution refused.** A blank command, an unusable reference,
    an undeclared target, or a reference cycle invalidates the declaration before a
    process is spawned.
+9. **The change set is harness-owned.** The turn's authoritative changed paths reach
+   the verification command on its standard input, one path per line. The command
+   never derives that list from Git itself.
+10. **Selection narrows work, never the gate.** A dispatcher may route the change set
+    to fewer checks, but an empty list, a terminal on standard input, or a path no
+    rule recognizes selects the complete suite.
 
 ---
 
@@ -92,6 +98,11 @@ follow:
   written.
 - **Verification command** — the mandatory command whose exit status decides whether
   the change set is accepted.
+- **Change set** — the turn's authoritative changed paths: the model's edits, the
+  post-hook artifacts, the files a repair round touched, and the working-copy
+  differential of the transaction.
+- **Change-set delivery** — the change set written to the verification command's
+  standard input, one repository-relative path per line.
 - **Named command** — an entry of the allowlist the model may address as a typed
   tool.
 - **Task runner** — an external tool that exports the project's commands from its
@@ -127,30 +138,34 @@ A reference carries no arguments of its own, and an entry that lists `args`
 together with a reference is rejected: the arguments belong to the command that
 runs, so an entry can never silently drop the arguments it lists.
 
+`timeout_secs` is the one field a reference may declare, because it bounds a single
+invocation instead of defining the command line. The outermost declared budget wins
+along a reference chain, and a reference that declares none inherits the budget of
+the command it names, so a stage can tighten a shared command without restating it.
+
 ### 2.3 Phases and moments
 
 | Phase | Invocation shape | Moment | Failure contract |
 | --- | --- | --- | --- |
 | **Format** | staged text on stdin, rewritten text on stdout | before any byte reaches disk | the authored content is kept |
 | **Post-hook** | a plain process on the working copy | after the write, before verification | the change set is aborted |
-| **Verify** | a plain process with a declared timeout | after every phase above | typed diagnostics feed the healing loop |
+| **Verify** | a plain process with a declared timeout, the change set on stdin | after every phase above | typed diagnostics feed the healing loop |
 
 The order is not negotiable: a formatter that ran after the write would create
 diffs nobody proposed, a generator that ran before the write would read stale
 input, and verification that ran before the generator would judge a tree that is
 not final.
 
-### 2.4 Verification targets and the legacy chain
+### 2.4 Verification targets
 
 A verification request names a target: all, check, test, or lint. The declared
 `[project.verify]` command is authoritative for every target, because the
-repository described its own lifecycle. A repository that declares nothing keeps
-the deterministic chain:
+repository described its own lifecycle; the target is a label for the interface,
+never a command selector.
 
-1. the typed section of a phase (`[toolchain.check]`, `[toolchain.lint]`,
-   `[toolchain.test]`) when it names a command;
-2. the legacy project-wide `check_command`;
-3. auto-detection from the build manifests the repository carries.
+The harness keeps no legacy chain and no manifest auto-detection: a repository
+that declares no verification command resolves no step, so the change set is
+reported as unverified instead of running a command nobody declared.
 
 ### 2.5 The explicit runner choice
 
@@ -176,11 +191,13 @@ surface:
   Shell* invariant applied to a task runner.
 - **The mapping is declarative.** `[doc('...')]` (or the recipe's doc comment) becomes
   the tool description, `metadata('timeout=...')` becomes the invocation's
-  `timeout_secs`, and a recipe that cannot be invoked by name — a private one — is
-  skipped so the published list never advertises a command the harness cannot run.
-- **One recipe fills the lifecycle.** A recipe named `verify` becomes the verification
-  command; every other admitted recipe becomes a typed custom tool invoked as
-  `just <recipe>`.
+  `timeout_secs`, and the parameters a recipe declares become its typed contract, so
+  the harness knows which named values a command accepts. A recipe that cannot be
+  invoked by name — a private one — is skipped so the published list never advertises
+  a command the harness cannot run.
+- **Two recipes fill the lifecycle.** A recipe named `verify` becomes the
+  verification command and a recipe named `format` fills the in-memory filter; every
+  other admitted recipe becomes a typed custom tool invoked as `just <recipe>`.
 
 ### 2.6 Configuration over exports
 
@@ -189,6 +206,25 @@ named recipe exported by Just fills a slot only when `tauqe.toml` leaves that sl
 empty. An explicit `[project.verify]`, or an explicit entry in `[project.commands]`
 with the same name, always wins, so a recipe added to the justfile can never silently
 replace a command the build owner declared.
+
+### 2.7 Who decides which checks run
+
+The harness owns exactly one list of changed paths and delivers it to the
+verification command; what that list *means* belongs to the project. This
+repository delegates the decision to a dispatcher: the declared `verify` recipe
+reads the paths from standard input and composes the checks the change requires —
+the workspace build for Rust sources and workspace manifests, the markdown filter
+for documentation, both when the set mixes them or carries a path no rule
+recognizes, and the complete suite when the list is empty or the script was
+started from a terminal.
+
+The composition happens entirely inside the project. The dispatcher reads no Git
+state of its own, because the working copy also holds post-hook artifacts and the
+developer's uncommitted work while the transaction is open; and it duplicates no
+command line, because it only invokes declared recipes. The recipes behind it stay
+internal — they carry no allowlist group — so the model can narrow the work of the
+mandatory gate but can never address a second, lighter verification channel
+beside it.
 
 ---
 
@@ -217,9 +253,19 @@ instead of orphaning the compiler or test binary the command started. Nothing is
 passed through a shell: a path containing a space, a semicolon, or a glob character
 reaches the process exactly as written.
 
+The verification invocation additionally receives the turn's authoritative change
+set on its standard input, one repository-relative path per line. The list is the
+harness's, not the command's: it spans the model's edits, the post-hook artifacts,
+the files a repair round touched, and the working-copy differential of the
+transaction, so a command that read Git instead would judge work the turn never
+proposed. An empty change set sends no input at all, and a dispatcher that meets an
+empty list, a terminal on standard input, or an unrecognized path falls back to the
+complete suite. A child process that never reads its standard input is harmless:
+the broken pipe is reported as a diagnostic, never as a failed turn.
+
 The wall-clock budget comes from the entry's `timeout_secs` and falls back to the
-harness budget (`[toolchain].timeout_secs`, 600 seconds by default). A real test
-suite routinely exceeds a minute, which is why the default is generous.
+harness default of 600 seconds. A real test suite routinely exceeds a minute,
+which is why the default is generous.
 
 ### 3.3 Exit status and typed diagnostics
 
@@ -263,9 +309,9 @@ to rewrite, because keeping the authored text is safer than erasing code.
 ### 3.6 The post-hook contract
 
 The declared post-hook runs on the working copy strictly after the change set is
-written and before verification. It receives no file list: the declaration names its
-own literal arguments, and the harness captures whatever the hook produced through
-Git.
+written and before verification. It receives no file list — the standard-input
+delivery belongs to verification alone — so the declaration names its own literal
+arguments and the harness captures whatever the hook produced through Git.
 
 The working copy is snapshotted immediately before the hook starts and once more
 after it exits successfully, so the difference is exactly the set of files the hook
@@ -282,6 +328,10 @@ generator failed would record artifacts nobody can reproduce.
 the model as typed tools. An invocation addresses one command by name; it cannot
 compose, chain, extend, or redirect a command line, and it adds no arguments of its
 own, because the declaration already names them.
+
+A named command receives no change set either: standard input carries a file list
+only for the verification lifecycle, so one delivery channel exists instead of a
+second one the model could address.
 
 The invocation is answered with the real result: its exit status and the head of its
 output join the turn journal, so the next round reasons about what the command
@@ -311,6 +361,9 @@ command list. Merging then follows one rule — *configuration wins*:
 
 - A declared `[project.verify]` already fills the verification lifecycle, so the
   runner's `verify` recipe is ignored.
+- A declared `[project.format]` already fills the in-memory filter — the single
+  formatting surface of the staging contour — so the runner's `format` recipe is
+  ignored.
 - A declared entry in `[project.commands]` keeps its slot, so a recipe exported under
   the same name is ignored.
 - Every remaining admitted recipe joins the named allowlist.
@@ -333,8 +386,8 @@ prompt bytes stay stable across turns.
   session state, so a format request, a post-hook, and a verification are three
   independent processes.
 - **It is not a build-system parser in the core.** The engine runs a declared
-  command; it never infers flags from `Cargo.toml`, `package.json`, or `go.mod`
-  unless deterministic auto-detection is the only thing left to do.
+  command; it never reads `Cargo.toml`, `package.json`, or `go.mod`, and it never
+  detects a toolchain from them.
 - **It is not a second manifest.** One file declares both harness policy and project
   commands; a separate engineering manifest would reintroduce two owners, two review
   cadences, and a second place to look.
@@ -349,6 +402,12 @@ prompt bytes stay stable across turns.
 - **It does not trust the declaration blindly.** Every invocation is bounded by a
   timeout, isolated in a process group, validated against the declaration, and
   answered with its real exit status.
+- **It is not the owner of the change set.** The harness delivers the turn's changed
+  paths on standard input; a command that read Git instead would also see post-hook
+  artifacts and the developer's uncommitted work.
+- **It is not a second verification channel.** The internal checks a dispatcher
+  composes stay unpublished, so the mandatory gate can be made cheaper but never
+  swapped for a lighter one.
 
 ---
 

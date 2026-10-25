@@ -9,7 +9,7 @@ This document specifies mandatory architectural and operational conventions for 
 The interaction protocol between Tauqe and large language models is strictly divided into two orthogonal operational contours:
 
 ### 1.1. Code Modification Contour (Develop & Step Execution)
-- **Protocol:** Strict XML marker protocol (`<tauqe_edits_...>`, `<context_request_...>`, `<repo_search_...>`, `<verify_...>`, `<plan_...>`, etc.).
+- **Protocol:** Strict XML marker protocol (`<edits_...>`, `<context_request_...>`, `<repo_search_...>`, `<verify_...>`, `<plan_...>`, etc.).
 - **Purpose:** Virtual in-memory staging, atomic search/replace patch application, toolchain verification healing, and deterministic Git transactions.
 - **Scope:** Used exclusively when the model is tasked with creating, editing, renaming, or deleting codebase files.
 
@@ -29,9 +29,11 @@ The interaction protocol between Tauqe and large language models is strictly div
   - Decouples cognitive reasoning and conversational workflows from file-patching machinery.
 
 ### 1.3. Turn-Marker Tag Protection Invariant (Unified XML Defense)
-- **Unified Registration SSOT:** Every structural XML control tag emitted by the model (`<tauqe_edits>`, `<edit>`, `<search>`, `<replace>`, `<create>`, `<overwrite>`, `<delete>`, `<move>`, `<context_request>`, `<repo_search>`, `<doc_request>`, `<plan>`, `<verify>`, `<scratchpad>`, `<success>`, `<error>`, `<blocked>`, `<user_language>`) MUST participate in the unified turn-marker protection mechanism. A tag is declared exactly once as an `XmlTagSpec` in `XML_TAG_SPECS` (`crates/core/src/edits/protocol/xml/engine.rs`), and the capability modules in `crates/core/src/capabilities` resolve those specs by base name for their own prompt text, decoding, and sanitization. The protected base names, the marker tolerance, the accepted unmarked children, and the stream-suppression flags are all derived from that single registry. Introducing a control tag anywhere else — or reviving a parallel `XML_TAG_BASES` list — is strictly prohibited.
+- **Unified Registration SSOT:** Every structural XML control tag emitted by the model (`<edits>`, `<edit>`, `<search>`, `<replace>`, `<create>`, `<overwrite>`, `<delete>`, `<move>`, `<context_request>`, `<repo_search>`, `<doc_request>`, `<plan>`, `<verify>`, `<scratchpad>`, `<success>`, `<error>`, `<blocked>`, `<user_language>`) MUST participate in the unified turn-marker protection mechanism. A tag is declared exactly once as an `XmlTagSpec` in `XML_TAG_SPECS` (`crates/core/src/edits/protocol/xml/engine.rs`), and the capability modules in `crates/core/src/capabilities` resolve those specs by base name for their own prompt text, decoding, and sanitization. The protected base names, the marker tolerance, the accepted unmarked children, and the stream-suppression flags are all derived from that single registry. Introducing a control tag anywhere else — or reviving a parallel `XML_TAG_BASES` list — is strictly prohibited.
 - **Parametric Tag Machinery:** Boundary scanning (`find_next_tag`), attribute reading (`XmlTagMatch::attr`), stripping (`strip_tag_by_spec`), and safe streaming truncation (`compute_safe_stream_emit_len`) are implemented once and parametrized by the spec. A tag therefore cannot drift between its scanner, its stripper, and its stream suppressor, and hand-written per-tag scanners in `tags/*.rs` must never be reintroduced.
-- **Capability Modules Own Their Tags:** Each capability module (`TextMessageModule`, `FileEditsModule`, `DiscoveryModule`, `DocRequestModule`, `ToolchainVerifyModule`, `PlanCreationModule`, `PlanUpdateModule`, `ScratchpadModule`, `OutcomeModule`, `BlockedModule`, `UserLanguageModule`) declares the tags it recognizes, renders its prompt fragments, and decodes its own commands. Registering a new capability means adding one module to `CapabilityRegistry`, never editing a shared scanner or a monolithic prompt template.
+- **Capability Modules Own Their Tags:** Each capability module (`TextMessageModule`, `FileEditsModule`, `DiscoveryModule`, `DocRequestModule`, `ToolchainVerifyModule`, `PlanCreationModule`, `PlanUpdateModule`, `ScratchpadModule`, `OutcomeModule`, `BlockedModule`, `UserLanguageModule`, `CustomToolsModule`) declares the canonical tag it owns, the aliases it still accepts, the tag specifications it resolves, its delivery mode, the prompt fragments it contributes, and the decoder that produces its commands. Registering a new capability means adding one module to `CapabilityRegistry`, never editing a shared scanner or a monolithic prompt template.
+- **Canonical Tag with Declared Aliases:** A capability publishes exactly one canonical name and, where history requires it, the spellings an earlier revision emitted. Suppression, cleaning, and decoding resolve through the canonical specification, so an alias reproduces canonical behavior instead of surviving as a second code path. The edit container publishes the canonical name `edits`, while `tauqe_edits` stays a declared alias, so transcripts, sessions, and model output written before the rename keep decoding identically. A spelling that is neither the canonical name nor a declared alias is prohibited.
+- **Declared Delivery Mode:** Each capability states how its output reaches the harness — `LiveStreaming` for the contours consumed while tokens arrive (conversational text and file edits), `RoundDeferred` for the payloads decoded once a round finishes (discovery, documentation, verification, plans, scratchpad, outcome, blockers, language, project tools). Streaming scanners and round-level decoders read that declared property rather than a capability name or tag literal, so delivery stays orthogonal to capability phase.
 - **Cryptographic Turn Binding:** For each bounded turn, the engine generates an unpredictable alphanumeric turn marker (`generate_turn_marker`). System prompt instructions append this marker suffix to every control tag (`<{base}_{marker}>`).
 - **Strict Normalization and Injection Defense:** Active execution parsers (`MarkedXmlEditProtocol`) strictly decode only marker-suffixed tags via `normalize_marked_xml`. Unsuffixed tags occurring in source code, diffs, conversational text, or documentation are protected as literals (`restore_xml_literals`) and must NEVER trigger commands, context mutations, repository searches, plan changes, or patch staging.
 - **Streaming Suppression:** Stream filters (`XmlStreamFilter`, `find_next_control_tag`) detect marker-suffixed tags during generation and suppress them from leaking into the user-facing `TextDelta` stream.
@@ -55,13 +57,19 @@ The interaction protocol between Tauqe and large language models is strictly div
    - A disabled capability therefore contributes no rule, no instruction, and no tag, so the prompt can never advertise a command the decoder would reject. Prompt text and decoding derive from the same `CapabilitySet`.
    - **Contract Rule Composition:** The core system contract is assembled as an ordered sequence of typed `ContractRule { title, body }` values and rendered by one loop with monotonic numbering `1..N`. Rule numbers are never written into string literals, so enabling or disabling a capability (`doc_request`, `scratchpad`, `file_edits`) leaves neither gaps nor lettered surrogates such as `1a.` or `10a.`.
    - Rule placement is decided by typed inputs (`TurnIntent` and `CapabilitySet`), never by text. The prohibition on heuristic intent analysis itself is stated once in the root `Conventions.md` (§1, *Typed Intent over Textual Inference*) and is not repeated here.
+   - **Contour Dictionary Dualism:** Every contract rule and every protocol instruction is rendered in the vocabulary of the active contour. The XML contour names its marker tags; the structured contour names the fields of its JSON Schema (`plan_update`, `repo_searches`, `outcome`, `blocked`, `abort`, `custom_tools`). A rule never mentions the vocabulary of the other contour.
+   - **Single Sanctioned Exception:** The prompt side — the `<context>` block, the `access` attribute, and the `<system_documentation>` block — is described identically in both contours, because it is payload the model reads rather than a command channel it emits.
+   - **Typed Branch Input:** The contour travels as typed knowledge, not as inferred text. Its input is `ContractContext.protocol` (`EditProtocolKind`) and its predicate is `ctx.protocol == EditProtocolKind::Xml`. `Mixed` never reaches the contract, because assembly hands over the kind of the concrete protocol; a `Mixed` project therefore renders XML rules for code editing and structured rules for every non-code contour.
 5. **Capability-Set-Scoped Decoding:**
    - `CapabilityRegistry::decode_xml_commands` runs only the modules enabled by the active `CapabilitySet` and then retains only commands whose capability is enabled. `XmlPromptProtocol::with_capabilities` and `with_turn_marker` produce such scoped protocols.
-   - Role and mode profiles (`develop_xml`, `isolated_step_xml`, `develop_structured`, `isolated_step_structured`, `discussion`, `architect_discovery`) are the only sanctioned way to narrow a protocol. Decoding must never be narrowed by ad-hoc tag filtering outside the registry.
+   - Role and regime profiles (`interactive_repl`, `isolated_step`, `discussion`, `architect_discovery`) are the only sanctioned way to narrow a protocol. A profile names a turn regime, never a wire format: both transports decode the same capability surface, so format-specific profile factories must not be reintroduced. Decoding must never be narrowed by ad-hoc tag filtering outside the registry.
 6. **Polymorphic Discovery Dispatch:**
    - Discovery phase execution must dispatch through registered handlers implementing `DiscoveryCapabilityHandler` (`crates/core/src/workflow/discovery.rs`) instead of branching on command variants. Each handler owns the validation, disk work, and feedback text of its own capability.
    - The dispatcher resolves repository facts once per round, folds every handler's findings into a single `DiscoveryRoundOutcome`, and halts the round as soon as the files token budget would be breached, so no later capability runs against a context that was never widened.
    - Findings that are not repository files — search reports, directory listings, targeted outlines, and documentation chapters — never enter the `<context>` block. They accumulate in the turn-scoped `TurnDiscoveryJournal` (`crates/core/src/workflow/discovery/journal.rs`), an append-only, de-duplicated tail of the user message that survives the whole turn, so Staging retries and Verification Healing rounds keep the knowledge Discovery already paid for. `TurnDiscoveryJournal::compose_user_prompt` expresses the message order exactly once — task, journal, phase diagnostics — and the phase executors must obtain their round prompts through it instead of concatenating fragments themselves.
+7. **Delivery Declared by Capability, Not by Tag Literal:**
+   - `CapabilityDelivery` is a property of the capability itself, declared beside it in `crates/protocol`: `LiveStreaming` for the contours consumed while tokens arrive, `RoundDeferred` for the payloads decoded once the round finishes.
+   - A protocol advertises a capability set and the harness reads each capability's declared delivery, so protocols stay interchangeable and a future wire format inherits the same streaming and round-decoding behavior without touching a scanner.
 
 ---
 
@@ -86,6 +94,10 @@ The interaction protocol between Tauqe and large language models is strictly div
    - If an artifact can be resolved from Git, Tree-sitter, project manifests, or compiler output, resolve it through deterministic Rust routines, never LLM generation.
 2. **Fail-Fast on Verification Failure:**
    - Autonomous execution pipelines must abort immediately upon encountering compiler errors or test failures, rolling back dirty working trees to the pre-turn Git checkpoint.
+3. **Fail-Fast on Ignored Paths:**
+   - A patch that would create, overwrite, or move onto a path excluded by `.gitignore` or `.git/info/exclude` is rejected during in-memory staging with `EditError::IgnoredByGit`, before any byte reaches disk and before `git add` runs. Writing such a path would otherwise surface only after the whole change set is applied, where a refused `git add` aborts the Git transaction instead of the edit.
+   - The check is batched through `git check-ignore`, so one subprocess answers for the whole change set and a repository Git cannot inspect degrades to "nothing is ignored" rather than blocking an otherwise valid turn.
+   - Post-hook artifacts are exempt by construction: they are discovered through a Git status differential that honors the same ignore rules, so a generated build file is absent from the change set instead of breaking the transaction. The separation of responsibility is deliberate — the model may not write ignored paths, while a declared external generator may produce them freely.
 
 ---
 
@@ -194,10 +206,91 @@ The interaction protocol between Tauqe and large language models is strictly div
      failures) travel as append-only extensions of the user message.
    - Nothing volatile is ever injected into an earlier block, because an early
      insertion invalidates every cached token that follows it.
-6. **Rationale (Why):**
+6. **Dialogue Session Boundary:**
+   - An interactive turn binds its provider requests to a dialogue session
+     identifier, which is what a provider uses to route consecutive requests to
+     the same cache-warm node.
+   - While the context block stays byte-for-byte identical and the target model
+     remains unchanged, the identifier stays too: a series of REPL answers that
+     only reads context keeps one session, so every round reuses the prefix
+     cache warmed by its predecessor.
+   - Session invalidation and rotation occur at exactly two deterministic
+     boundaries:
+     1. When shrinking or clearing the context block (clearing the Auto layer
+        via `AppState::clear_auto_context` or resetting context via
+        `AppState::clear_all_context`). A fresh session opens a prefix no earlier
+        request warmed; keeping the old identifier would address a node whose
+        cached prefix the dialogue no longer sends. The rotation follows the
+        boolean reported by `ContextManager::clear_auto` or `clear`, so a
+        no-op clear preserves the warm session.
+     2. When the effective model changes (`maybe_rotate_session_on_model_change`).
+        Provider KV caches and routing affinities are physically model-specific.
+        Reusing a session identifier across different models produces guaranteed
+        cache misses or affinity routing conflicts. Changing only reasoning
+        effort or reselecting the identical model preserves session affinity.
+7. **Rationale (Why):**
    - A bounded turn issues several requests per turn: discovery rounds, the
      proposal, staging retries, and verification healing. Reusing the
      provider's cached prefix across those requests removes the dominant
      repeated cost and keeps multi-round turns economically viable.
    - The invariant is only effective when it holds byte-for-byte, so any
      dynamic content or reordering silently defeats it.
+   - A session identifier that outlives its prefix or target model is worse than
+     a cold one: it asks the provider to reuse a node cache the next request can
+     never match, which is why rotation is bound strictly to context shrinking
+     and model changes rather than to a timer or a round counter.
+
+---
+
+## 10. Model Catalog as the Single Source of Truth for Model Names
+
+1. **Catalog Owns Identity and Alias:**
+   - Every model a project exposes is declared once in the provider catalog
+     (`[providers.openrouter].models`), as either a bare model specification or a
+     `{ model, alias }` table. The optional `alias` is metadata of the model
+     itself, so every consumer — the picker, the headers, the telegraphy of role
+     summaries — resolves a display name through that one declaration.
+2. **Role Entries Carry Runtime Parameters Only:**
+   - A role entry (`ModelEntry`) names a model by provider identifier or by
+     catalog alias and adds only the runtime parameters of that slot, such as the
+     reasoning `effort`. `alias` is not a role field: a role entry that carries
+     one is rejected instead of reinstating a second source of truth for the same
+     label.
+3. **Deterministic Bidirectional Resolution:**
+   - Resolution runs only after the whole configuration file has been decoded, so
+     a role may reference an alias declared in the same file. Both reference forms
+     normalize to a concrete `ModelRef` before any consumer observes them, and an
+     unresolvable reference is reported as a configuration diagnostic that names
+     the offending role.
+4. **Rationale (Why):**
+   - A display name is a property of the model, not of the role that model happens
+     to fill. Declaring it once keeps one model from appearing under different
+     labels across roles and lets a project rename a model everywhere by editing a
+     single line.
+
+---
+
+## 11. Single In-Memory Formatting Contour
+
+1. **One Formatting Surface:**
+   - Formatting is declared once — by `[project.format]` in `tauqe.toml`, or by the
+     `format` recipe the declared task runner exports when that entry is omitted —
+     and it runs exclusively while the change set lives in virtual staging.
+   - The filter receives the staged text of one file on standard input and returns
+     the rewritten text on standard output, so the file is formatted before any byte
+     reaches disk and before Git observes the change set.
+2. **No Disk Formatting Stage:**
+   - Nothing reformats a verified working tree: there is no formatting stage after
+     the change set is written, and no compensation layer that would restore
+     formatter modifications afterwards. A formatter that ran later would introduce
+     a diff the turn never proposed.
+3. **Fail-Safe Outcome:**
+   - A non-zero exit status, a timeout, a cancellation, an unresolvable declaration,
+     or a filter that emits nothing while the staged text was not empty keeps the
+     authored content and reports a compact reason. The turn continues, and the
+     failure never re-prompts the model.
+4. **Rationale (Why):**
+   - Formatting improves the shape of a change; it never proves its correctness. It
+     therefore cannot sit on the verification gate, and confining it to staging
+     keeps one set of bytes — the formatted ones — travelling into verification and
+     into the atomic commit.

@@ -43,6 +43,79 @@ const MIN_TERM_HEIGHT: u16 = 12;
 /// are dropped so the main area keeps enough rows to stay usable.
 const COMPACT_TERM_HEIGHT: u16 = 20;
 
+/// A typed intention the developer expresses by clicking an interactive region.
+///
+/// A component declares the rectangle it has just drawn together with one of
+/// these actions, so adding, moving, or removing an interactive element touches
+/// only the component that renders it and never the input dispatcher (c-1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UiAction {
+    /// Switch the active tab to another view mode.
+    SwitchView(ViewMode),
+    /// Open the primary model picker.
+    OpenModelSelect,
+    /// Toggle the Help modal.
+    ToggleHelp,
+    /// Copy the source of a rendered code block.
+    CopyCodeBlock {
+        /// History item owning the block; `None` for the Develop response.
+        item: Option<u64>,
+        /// Index of the block inside its owning surface.
+        block: usize,
+    },
+    /// A click landed inside a rendered code block, outside its copy button.
+    CodeBlockBody,
+}
+
+/// One interactive rectangle declared by the component that draws it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HitRegion {
+    /// Screen rectangle that receives the pointer.
+    pub rect: Rect,
+    /// Action dispatched when the rectangle is clicked.
+    pub action: UiAction,
+}
+
+/// Frame-scoped registry of the interactive regions declared while drawing.
+///
+/// The registry lives strictly inside one frame: [`render_ui`] empties it before
+/// the components declare the new regions, so a hidden or covered surface
+/// physically cannot leave a stale clickable area behind (c-3).
+#[derive(Debug, Clone, Default)]
+pub struct HitRegistry {
+    regions: Vec<HitRegion>,
+}
+
+impl HitRegistry {
+    /// Releases every region of the finished frame.
+    pub fn clear(&mut self) {
+        self.regions.clear();
+    }
+
+    /// Records a rectangle a component has just drawn, bound to its action.
+    pub fn register(&mut self, rect: Rect, action: UiAction) {
+        self.regions.push(HitRegion { rect, action });
+    }
+
+    /// Resolves a pointer position to the action of the top-most region.
+    ///
+    /// Regions are consulted in reverse registration order, so a surface drawn
+    /// later — a dialog over a view — wins over whatever it covers.
+    pub fn action_at(&self, column: u16, row: u16) -> Option<UiAction> {
+        self.regions
+            .iter()
+            .rev()
+            .find(|region| crate::input::mouse::rect_contains(region.rect, column, row))
+            .map(|region| region.action)
+    }
+
+    /// Regions declared by the components of the current frame, in draw order.
+    #[cfg(test)]
+    pub fn regions(&self) -> &[HitRegion] {
+        &self.regions
+    }
+}
+
 /// Solid background filler that unconditionally sets symbol and background color
 /// for every grid cell, preventing unstyled gaps and terminal default background leakage.
 struct CanvasBackground(ratatui::style::Color);
@@ -89,6 +162,16 @@ fn render_terminal_too_small(frame: &mut ratatui::Frame) {
 pub fn render_ui(frame: &mut ratatui::Frame, state: &mut AppState) {
     let area = frame.area();
     state.last_frame_area = area;
+    // The registry lives strictly inside one frame: every interactive region is
+    // declared by the component that draws it, and a stale region of a hidden or
+    // resized surface can never survive into the next frame (c-3).
+    state.hit_regions.clear();
+    // Publish the provider catalog and the resolved role entries the single
+    // model-name printer reads. This is the only update point of the display
+    // state, and it runs before the body of the frame is drawn, so every label
+    // of this frame reflects the configuration reported with it instead of the
+    // previous one (c-1, c-3).
+    crate::model_display::install_snapshot(state.model_choice.roles.as_ref());
     if area.width < MIN_TERM_WIDTH || area.height < MIN_TERM_HEIGHT {
         render_terminal_too_small(frame);
         return;
@@ -213,6 +296,13 @@ pub fn render_ui(frame: &mut ratatui::Frame, state: &mut AppState) {
                 render_confirm_delete_plan_popup(frame, plan_id, state);
             }
         }
+        Some(ActiveModal::DeletePlanFinal) => {
+            if let Some(plan_id) = &state.confirm_delete_plan_final {
+                crate::dialogs::render::render_confirm_delete_plan_final_popup(
+                    frame, plan_id, state,
+                );
+            }
+        }
         Some(ActiveModal::DeleteReview) => {
             if let Some(session_id) = &state.confirm_delete_review {
                 render_confirm_delete_review_popup(frame, session_id, state);
@@ -285,5 +375,60 @@ pub fn render_ui(frame: &mut ratatui::Frame, state: &mut AppState) {
             );
         }
         None => {}
+    }
+}
+
+#[cfg(test)]
+mod hit_tests {
+    use super::*;
+
+    #[test]
+    fn later_regions_win_over_the_surfaces_they_cover() {
+        let mut registry = HitRegistry::default();
+        registry.register(
+            Rect::new(0, 0, 10, 2),
+            UiAction::SwitchView(ViewMode::Plans),
+        );
+        registry.register(Rect::new(4, 0, 3, 2), UiAction::ToggleHelp);
+
+        assert_eq!(registry.action_at(5, 1), Some(UiAction::ToggleHelp));
+        assert_eq!(
+            registry.action_at(1, 1),
+            Some(UiAction::SwitchView(ViewMode::Plans))
+        );
+        // The right and bottom edges are exclusive, and empty space resolves to
+        // no action at all instead of the nearest region.
+        assert_eq!(registry.action_at(10, 1), None);
+        assert_eq!(registry.action_at(20, 1), None);
+    }
+
+    #[test]
+    fn clearing_the_registry_drops_every_region_of_the_finished_frame() {
+        let mut registry = HitRegistry::default();
+        registry.register(Rect::new(0, 0, 10, 2), UiAction::OpenModelSelect);
+        assert_eq!(registry.action_at(0, 0), Some(UiAction::OpenModelSelect));
+
+        registry.clear();
+        assert_eq!(registry.action_at(0, 0), None);
+    }
+
+    #[test]
+    fn code_block_action_separates_history_blocks_from_the_response() {
+        let mut registry = HitRegistry::default();
+        registry.register(
+            Rect::new(2, 5, 8, 1),
+            UiAction::CopyCodeBlock {
+                item: Some(7),
+                block: 3,
+            },
+        );
+
+        assert_eq!(
+            registry.action_at(3, 5),
+            Some(UiAction::CopyCodeBlock {
+                item: Some(7),
+                block: 3,
+            })
+        );
     }
 }

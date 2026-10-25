@@ -9,7 +9,8 @@ use std::sync::Arc;
 use tauqe_core::history::HistoryMutation;
 use tauqe_protocol::{
     errors, events, methods, Event, HistoryCompactedEvent, HistoryEntryAddedEvent,
-    HistoryEntryRolledBackEvent, Request, RequestId, Response, SHUTDOWN_DRAIN_BUDGET,
+    HistoryEntryRolledBackEvent, Request, RequestId, Response, CLIENT_SHUTDOWN_WAIT,
+    SHUTDOWN_DRAIN_BUDGET,
 };
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
@@ -366,6 +367,17 @@ async fn shutdown_signal() -> ShutdownReason {
 /// Poll cadence while waiting for in-flight work to unwind during shutdown.
 const SHUTDOWN_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(50);
 
+/// Window the final force-abort may spend waiting for an open Git transaction to
+/// close.
+///
+/// It is exactly the headroom the shared lifecycle contract grants the daemon on
+/// top of [`SHUTDOWN_DRAIN_BUDGET`]: the client keeps waiting for that long after
+/// the daemon's own deadline, so the abort can be deferred over an open
+/// transaction without the client killing the process inside the very cleanup
+/// the deferral protects.
+const FORCE_ABORT_BUDGET: std::time::Duration =
+    CLIENT_SHUTDOWN_WAIT.saturating_sub(SHUTDOWN_DRAIN_BUDGET);
+
 /// Methods whose handlers block on long-running work — an LLM turn, a
 /// repository lifecycle request that reloads configuration and rebuilds the
 /// history manager from disk, a Git history rewrite, or the deterministic
@@ -398,14 +410,32 @@ fn is_long_running(method: &str) -> bool {
 /// A running turn holds the single operation slot for its whole duration and
 /// rolls its Git transaction back before releasing it, so an empty slot is a
 /// reliable "work finished" signal. Offloaded long-running handlers are drained
-/// as well. The deadline is the shared `SHUTDOWN_DRAIN_BUDGET` from the
-/// protocol contract, so a wedged provider cannot block shutdown forever while
-/// the client that spawned the daemon waits for that same budget; anything
-/// still running when it expires is aborted, and startup crash recovery covers
-/// any residue.
+/// as well. The deadline is the shared `SHUTDOWN_DRAIN_BUDGET` from the protocol
+/// contract, so a wedged provider cannot block shutdown forever while the client
+/// that spawned the daemon waits for that same budget.
+///
+/// Two different things are still running at that point, and they need two
+/// different aborts. The join set holds the request handlers, while the work
+/// those handlers started — a batch supervisor or a model turn — was spawned by
+/// them and is tracked only through the operation slot's abort handle. When the
+/// deadline expires both are torn down: the handlers are aborted directly, and
+/// the registered operation is force-aborted through the slot, deferring over an
+/// open Git transaction for exactly the headroom the client grants on top of the
+/// drain budget. Startup crash recovery covers whatever residue remains.
 async fn drain_in_flight(state: &Arc<AppState>, offloaded: &mut tokio::task::JoinSet<()>) {
+    drain_in_flight_with_budget(state, offloaded, SHUTDOWN_DRAIN_BUDGET, FORCE_ABORT_BUDGET).await
+}
+
+/// Implements [`drain_in_flight`] with explicit deadlines, so a deterministic
+/// test can exercise the timeout path without spending the real budget.
+async fn drain_in_flight_with_budget(
+    state: &Arc<AppState>,
+    offloaded: &mut tokio::task::JoinSet<()>,
+    drain_budget: std::time::Duration,
+    abort_budget: std::time::Duration,
+) {
     tracing::info!("Draining in-flight work before shutdown");
-    let deadline = tokio::time::Instant::now() + SHUTDOWN_DRAIN_BUDGET;
+    let deadline = tokio::time::Instant::now() + drain_budget;
     loop {
         // Re-signal on every pass so an operation that registers while we wait
         // is cancelled too.
@@ -417,7 +447,7 @@ async fn drain_in_flight(state: &Arc<AppState>, offloaded: &mut tokio::task::Joi
         }
         if tokio::time::Instant::now() >= deadline {
             tracing::warn!(
-                timeout_secs = SHUTDOWN_DRAIN_BUDGET.as_secs(),
+                timeout_ms = drain_budget.as_millis() as u64,
                 "Shutdown drain timed out; aborting remaining work",
             );
             break;
@@ -435,8 +465,18 @@ async fn drain_in_flight(state: &Arc<AppState>, offloaded: &mut tokio::task::Joi
 
     let remaining = offloaded.len();
     offloaded.abort_all();
-    tracing::warn!(remaining, "Force-aborting in-flight tasks at shutdown");
+    tracing::warn!(
+        remaining,
+        "Force-aborting in-flight handler tasks at shutdown"
+    );
     while offloaded.join_next().await.is_some() {}
+
+    // The handler task is not where the work lives: a long-running request
+    // spawns its turn or batch and returns, so the join set is usually empty
+    // while the operation slot still holds the task that really runs. Reaching
+    // through the slot is the only way to abort it, and dropping the runtime
+    // instead would strand a Git transaction mid-write.
+    state.force_abort_active_operation(abort_budget).await;
 }
 
 /// Renders a compact, secret-free summary of RPC parameters for the journal.
@@ -559,5 +599,91 @@ mod tests {
             outcome.is_err(),
             "the shutdown watch fired without a signal"
         );
+    }
+
+    /// Monotonic suffix keeping the scratch repositories of this module apart.
+    static SCRATCH_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+    /// Builds a daemon state bound to its own scratch repository.
+    fn test_state(label: &str) -> (Arc<AppState>, PathBuf) {
+        let unique = SCRATCH_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let root = std::env::temp_dir().join(format!(
+            "tauqe-drain-{}-{}-{}",
+            std::process::id(),
+            label,
+            unique
+        ));
+        let _ = std::fs::create_dir_all(&root);
+        let (out, _out_rx) = OutChannel::new();
+        let (history_sender, _history_rx) = tokio::sync::mpsc::unbounded_channel();
+        (
+            AppState::new(
+                tauqe_core::config::AppConfig::default(),
+                root.clone(),
+                history_sender,
+                out,
+            ),
+            root,
+        )
+    }
+
+    /// Flips a flag when the owning task future is dropped, so the test can prove
+    /// that a force-aborted operation really stopped running instead of lingering
+    /// detached.
+    struct ExitMarker(Arc<std::sync::atomic::AtomicBool>);
+
+    impl Drop for ExitMarker {
+        fn drop(&mut self) {
+            self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    /// A long-running request returns immediately after spawning its batch or
+    /// turn, so the drain's join set is empty while the operation slot still
+    /// holds the task that really runs. Expiring the drain deadline must abort
+    /// that task through the slot, not merely re-signal it: a cooperative cancel
+    /// can be ignored, and leaving the task running drops the runtime
+    /// mid-transaction on process exit.
+    #[tokio::test]
+    async fn drain_deadline_force_aborts_the_registered_operation() {
+        let (state, root) = test_state("force-abort");
+
+        let exited = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let guard = Arc::new(state.try_begin_operation().expect("the slot is free"));
+        let task = {
+            let guard = Arc::clone(&guard);
+            let marker = ExitMarker(Arc::clone(&exited));
+            tokio::spawn(async move {
+                let _guard = guard;
+                let _marker = marker;
+                // An operation that ignores the cooperative cancel signal, as a
+                // wedged provider round or a wedged toolchain step does.
+                std::future::pending::<()>().await
+            })
+        };
+        guard.set_abort_handle(task.abort_handle());
+        drop(guard);
+
+        // The handler task set is empty exactly as it is in production, where a
+        // long-running request returns right after spawning its batch or turn.
+        let mut offloaded = tokio::task::JoinSet::new();
+        drain_in_flight_with_budget(
+            &state,
+            &mut offloaded,
+            std::time::Duration::from_millis(20),
+            std::time::Duration::from_millis(500),
+        )
+        .await;
+
+        assert!(
+            exited.load(std::sync::atomic::Ordering::SeqCst),
+            "the stalled operation must be force-aborted, not merely signalled"
+        );
+        assert!(
+            !state.is_operation_active(),
+            "the aborted operation must release its registration"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

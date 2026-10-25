@@ -15,6 +15,9 @@
 //! Coder.
 //! A caller may target a single leaf sub-step by `step_id` and supply a Coder
 //! model override plus developer directives.
+//! A finding that reports an unconditional abort (`<abort>`) is skipped with its
+//! host recommendation recorded, because the remediation lies outside the
+//! repository; the Architect is never engaged for it and the queue continues.
 
 use std::path::Path;
 use std::sync::Arc;
@@ -32,7 +35,7 @@ use tauqe_protocol::{
 };
 use tokio::sync::{mpsc, watch};
 
-use crate::state::{next_operation_id, AppState, OperationGuard};
+use crate::state::{AppState, OperationGuard};
 
 use super::common::{clear_auto_context, emit, offload_review};
 use super::step::run_review_step;
@@ -222,7 +225,10 @@ impl BatchStepExecutor for ReviewItemExecutor<'_> {
                 if failure.is_domain() {
                     // The finding is already marked `Skipped` with diagnostics.
                     // Report the step as successful so the supervisor advances
-                    // to the next finding instead of aborting the queue.
+                    // to the next finding instead of aborting the queue. An
+                    // unconditional abort travels this same path: its
+                    // recommendation is stored on the finding and no Architect
+                    // replanning is engaged for it.
                     Ok(BatchStepOutcome::succeeded())
                 } else {
                     Ok(BatchStepOutcome::failed(failure.into_reason()))
@@ -364,7 +370,7 @@ pub(super) async fn run_review_batch_with_options(
         &state.out,
         events::REVIEW_BATCH_FINISHED,
         serde_json::to_value(ReviewBatchFinishedEvent {
-            operation_id: format!("op-{}", next_operation_id()),
+            operation_id: format!("op-{}", operation.id()),
             summary: BatchFinishSummary {
                 owner_id: owner_id.to_string(),
                 status,
@@ -597,9 +603,16 @@ pub async fn handle_review_execute(req: Request, state: &Arc<AppState>) -> Respo
     let item_ids: Vec<u32> = tasks.iter().map(|(_, id)| *id).collect();
     let model_selection = params.model.clone();
     let developer_instructions = params.instructions.clone();
+    // The registered operation runs the whole batch, so its identity travels
+    // with the acknowledgement and every event of the run, including the
+    // terminal `review/batch_finished`, carries the same identifier.
     let response = Response::ok(
         req.id,
-        serde_json::json!({ "review_id": params.review_id, "item_ids": item_ids }),
+        serde_json::json!({
+            "review_id": params.review_id,
+            "item_ids": item_ids,
+            "operation_id": format!("op-{}", operation.id()),
+        }),
     );
 
     let state = Arc::clone(state);

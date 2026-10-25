@@ -7,6 +7,8 @@ use tauqe_protocol::{
 
 use crate::app::AppState;
 use crate::components::model_selector::ModelSelector;
+use crate::markdown::MarkdownBodyCache;
+use crate::views::recenter::RecenterState;
 
 pub mod input;
 pub mod render;
@@ -210,7 +212,7 @@ pub fn architect_entries(st: &AppState) -> Vec<ModelEntry> {
                 .as_ref()
                 .and_then(|roles| roles.efforts.as_ref())
                 .and_then(|efforts| efforts.architect);
-            vec![ModelEntry::new(fallback_model, fallback_effort, None)]
+            vec![ModelEntry::new(fallback_model, fallback_effort)]
         })
 }
 
@@ -232,6 +234,12 @@ pub struct PlansViewState {
     pub view_height: u16,
     pub content_width: usize,
     pub rendered_lines: usize,
+    /// Rendered Markdown bodies of the expanded descriptions, keyed by the item
+    /// that owns the description. The cache keeps a parsed body alive across
+    /// frames, so moving the cursor or scrolling never re-parses the Markdown of
+    /// the tree, and a changed description, indent, width, or palette drops only
+    /// the body it invalidated (c-1, c-3).
+    pub markdown_cache: MarkdownBodyCache,
     pub status_message: Option<String>,
     pub refining: bool,
     pub refining_plan_id: Option<String>,
@@ -241,6 +249,7 @@ pub struct PlansViewState {
     /// Active discussion focus mirrored from the server, used to render the
     /// `[FOCUS]` indicator. Synced from `AppState::discussion_focus` on render.
     pub discussion_focus: DiscussionFocus,
+    pub recenter_state: RecenterState,
 }
 
 impl PlansViewState {
@@ -511,13 +520,76 @@ impl PlansViewState {
         }
     }
 
+    /// Number of concept rows one concept subtree contributes to the tree.
+    ///
+    /// Counts the item itself plus, while it is expanded, the subtrees of its
+    /// children, mirroring `flatten_concept_recursive` branch for branch.
+    fn count_concept_rows(&self, plan_id: &str, item: &ConceptItem) -> usize {
+        let mut count = 1;
+        if !item.children.is_empty() && self.is_concept_item_expanded(plan_id, &item.id) {
+            for child in &item.children {
+                count += self.count_concept_rows(plan_id, child);
+            }
+        }
+        count
+    }
+
+    /// Number of step rows one step subtree contributes to the tree.
+    ///
+    /// Counts the step itself plus, while it is expanded, the subtrees of its
+    /// children, mirroring `flatten_item_recursive` branch for branch.
+    fn count_item_rows(&self, plan_id: &str, item: &PlanItem) -> usize {
+        let mut count = 1;
+        if !item.children.is_empty() && self.is_item_expanded(plan_id, &item.id) {
+            for child in &item.children {
+                count += self.count_item_rows(plan_id, child);
+            }
+        }
+        count
+    }
+
+    /// Number of rows the tree currently exposes, computed without allocating
+    /// the row list.
+    ///
+    /// Selection and viewport bounds only need the count, so they read it here
+    /// instead of building every owned row projection just to call `len()`. The
+    /// walk mirrors `flatten_rows` branch for branch, and the regression tests
+    /// pin the two to the same value in every fold state (c-2).
+    pub fn row_count(&self) -> usize {
+        let mut count = 0;
+        for plan in &self.plans {
+            count += 1; // The plan header.
+            if self.is_plan_expanded(&plan.id) {
+                if plan.concept.is_empty() {
+                    for item in &plan.items {
+                        count += self.count_item_rows(&plan.id, item);
+                    }
+                } else {
+                    count += 1; // The concept section header.
+                    if self.is_concept_section_expanded(&plan.id) {
+                        for item in &plan.concept {
+                            count += self.count_concept_rows(&plan.id, item);
+                        }
+                    }
+                    count += 1; // The implementation section header.
+                    if self.is_impl_section_expanded(&plan.id) {
+                        for item in &plan.items {
+                            count += self.count_item_rows(&plan.id, item);
+                        }
+                    }
+                }
+            }
+        }
+        count
+    }
+
     pub fn selected_row(&self) -> Option<VisiblePlanRow> {
         let rows = self.flatten_rows();
         rows.get(self.selected_index).cloned()
     }
 
     pub fn clamp_selection(&mut self) {
-        let count = self.flatten_rows().len();
+        let count = self.row_count();
         if count == 0 {
             self.selected_index = 0;
         } else if self.selected_index >= count {
@@ -533,8 +605,13 @@ impl PlansViewState {
         let sel = self.selected_index.min(rows.len() - 1);
         self.selected_index = sel;
 
-        let (lines, offsets) =
-            compute_unified_plan_lines(&rows, sel, self.content_width.max(10), self.theme_mode);
+        let (lines, offsets) = compute_unified_plan_lines(
+            &rows,
+            sel,
+            self.content_width.max(10),
+            self.theme_mode,
+            &mut self.markdown_cache,
+        );
         let height = self.view_height as usize;
         let start = offsets.get(sel).copied().unwrap_or(0);
         let end = offsets.get(sel + 1).copied().unwrap_or(lines.len());
@@ -550,6 +627,30 @@ impl PlansViewState {
             scroll
         };
         self.scroll = new_scroll as u16;
+    }
+
+    /// Positions the viewport around the selected plan row using the three-beat
+    /// Emacs `recenter-top-bottom` cycle (center -> top -> bottom).
+    pub fn recenter_selected(&mut self) {
+        let rows = self.flatten_rows();
+        if rows.is_empty() || self.view_height == 0 {
+            return;
+        }
+        let sel = self.selected_index.min(rows.len().saturating_sub(1));
+        self.selected_index = sel;
+
+        let (lines, offsets) = compute_unified_plan_lines(
+            &rows,
+            sel,
+            self.content_width.max(10),
+            self.theme_mode,
+            &mut self.markdown_cache,
+        );
+        let start = offsets.get(sel).copied().unwrap_or(0);
+        let end = offsets.get(sel + 1).copied().unwrap_or(lines.len());
+        self.scroll = self
+            .recenter_state
+            .recenter(sel, start, end, lines.len(), self.view_height);
     }
 
     /// Collapses every previously opened plan except `plan_id`, expands the
@@ -939,6 +1040,7 @@ mod tests {
         let mut view = PlansViewState::default();
         let plan = Plan {
             id: "test-plan".to_string(),
+            last_replanned_step: None,
             title: "Test Plan".to_string(),
             description: None,
             created_at: 0,
@@ -993,6 +1095,7 @@ mod tests {
         let mut view = PlansViewState::default();
         let plan = Plan {
             id: "auth-feature".to_string(),
+            last_replanned_step: None,
             title: "Authentication".to_string(),
             description: None,
             created_at: 0,
@@ -1064,6 +1167,7 @@ mod tests {
         let mut view = PlansViewState::default();
         let plan = Plan {
             id: "nested-plan".to_string(),
+            last_replanned_step: None,
             title: "Nested Plan".to_string(),
             description: None,
             created_at: 0,
@@ -1360,6 +1464,7 @@ mod tests {
         let mut view = PlansViewState::default();
         let plan = Plan {
             id: "focus-plan".to_string(),
+            last_replanned_step: None,
             title: "Focus Plan".to_string(),
             description: None,
             created_at: 0,
@@ -1426,5 +1531,262 @@ mod tests {
         // Nothing changes: an unknown plan is ignored.
         assert!(view.is_plan_expanded("plan-a"));
         assert_eq!(view.selected_index, 0);
+    }
+
+    /// A plan whose concept section, implementation section, and nested items all
+    /// carry expansion state, so every branch of the row walk is exercised.
+    fn row_count_fixture() -> PlansViewState {
+        PlansViewState {
+            plans: vec![Plan {
+                id: "count-plan".to_string(),
+                title: "Count Plan".to_string(),
+                description: Some("Plan description.".to_string()),
+                concept: vec![ConceptItem {
+                    id: "c-1".to_string(),
+                    title: "Invariant".to_string(),
+                    details: Some("Tokens must be signed.".to_string()),
+                    children: vec![concept_leaf("c-1.1", "Nested Invariant")],
+                }],
+                items: vec![parent_item(
+                    "1",
+                    "Parent Step",
+                    vec![leaf_item("1.1", "Leaf Step")],
+                )],
+                ..Default::default()
+            }],
+            ..Default::default()
+        }
+    }
+
+    fn assert_row_count_matches(view: &PlansViewState, state: &str) {
+        assert_eq!(
+            view.row_count(),
+            view.flatten_rows().len(),
+            "row_count must match the flattened rows while {state}"
+        );
+    }
+
+    #[test]
+    fn test_row_count_matches_flattened_rows_across_fold_states() {
+        let mut view = row_count_fixture();
+        assert_row_count_matches(&view, "the plan is collapsed");
+
+        view.toggle_plan_expanded("count-plan");
+        assert_row_count_matches(&view, "the plan is expanded");
+
+        view.toggle_concept_section_expanded("count-plan");
+        assert_row_count_matches(&view, "the concept section is folded");
+        view.toggle_concept_section_expanded("count-plan");
+        assert_row_count_matches(&view, "the concept section is unfolded");
+
+        view.toggle_impl_section_expanded("count-plan");
+        assert_row_count_matches(&view, "the implementation section is folded");
+        view.toggle_impl_section_expanded("count-plan");
+        assert_row_count_matches(&view, "the implementation section is unfolded");
+
+        view.toggle_concept_item_expanded("count-plan", "c-1");
+        assert_row_count_matches(&view, "the concept item is expanded");
+        view.toggle_concept_item_expanded("count-plan", "c-1");
+        assert_row_count_matches(&view, "the concept item is folded");
+
+        view.toggle_item_expanded("count-plan", "1");
+        assert_row_count_matches(&view, "the parent step is expanded");
+
+        view.expand_all();
+        assert_row_count_matches(&view, "every row is expanded");
+
+        view.collapse_all();
+        assert_row_count_matches(&view, "every row is collapsed");
+    }
+
+    #[test]
+    fn test_clamp_selection_clamps_against_the_row_count() {
+        let mut view = PlansViewState {
+            plans: vec![Plan {
+                id: "clamp-plan".to_string(),
+                title: "Clamp Plan".to_string(),
+                items: vec![leaf_item("1", "Step")],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+
+        // A collapsed plan exposes only its header, so a cursor past the last row
+        // clamps back to it.
+        assert_eq!(view.row_count(), 1);
+        view.selected_index = 7;
+        view.clamp_selection();
+        assert_eq!(view.selected_index, 0);
+
+        // Expanding the plan reveals its header and its single step.
+        view.toggle_plan_expanded("clamp-plan");
+        assert_eq!(view.row_count(), 2);
+        view.selected_index = 7;
+        view.clamp_selection();
+        assert_eq!(view.selected_index, 1);
+
+        // Collapsing the plan again re-clamps the cursor to the only row.
+        view.toggle_plan_expanded("clamp-plan");
+        view.selected_index = 1;
+        view.clamp_selection();
+        assert_eq!(view.selected_index, 0);
+    }
+
+    /// Expected `Center`, `Top`, and `Bottom` viewport offsets for a row that
+    /// spans `start..end` inside a `height`-row viewport (Conventions §5.2).
+    fn recenter_beats(start: usize, end: usize, total: usize, height: u16) -> [u16; 3] {
+        let height = height as usize;
+        let max_scroll = total.saturating_sub(height);
+        let clamp = |value: usize| u16::try_from(value.min(max_scroll)).unwrap_or(u16::MAX);
+        [
+            clamp(
+                start
+                    .saturating_add(end.saturating_sub(start) / 2)
+                    .saturating_sub(height / 2),
+            ),
+            clamp(start),
+            clamp(end.saturating_sub(height)),
+        ]
+    }
+
+    /// Expected beats for the row at `index`, derived from the same layout
+    /// offsets the view uses to position its viewport.
+    fn plan_recenter_beats(view: &mut PlansViewState, index: usize) -> [u16; 3] {
+        let rows = view.flatten_rows();
+        let (lines, offsets) = compute_unified_plan_lines(
+            &rows,
+            index,
+            view.content_width.max(10),
+            view.theme_mode,
+            &mut view.markdown_cache,
+        );
+        let start = offsets.get(index).copied().unwrap_or(0);
+        let end = offsets.get(index + 1).copied().unwrap_or(lines.len());
+        recenter_beats(start, end, lines.len(), view.view_height)
+    }
+
+    fn recenter_plans_fixture(selected: usize) -> PlansViewState {
+        PlansViewState {
+            plans: (1..=20)
+                .map(|i| Plan {
+                    id: format!("plan-{i}"),
+                    title: format!("Plan {i}"),
+                    ..Default::default()
+                })
+                .collect(),
+            selected_index: selected,
+            view_height: 8,
+            content_width: 80,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn test_recenter_selected_walks_the_center_top_bottom_cycle() {
+        let mut view = recenter_plans_fixture(12);
+
+        let index = view.selected_index;
+        let [center, top, bottom] = plan_recenter_beats(&mut view, index);
+        assert_ne!(center, top, "the center and top beats must differ");
+        assert_ne!(top, bottom, "the top and bottom beats must differ");
+        assert_ne!(center, bottom, "the center and bottom beats must differ");
+
+        view.recenter_selected();
+        assert_eq!(view.scroll, center, "the first press centers the row");
+        view.recenter_selected();
+        assert_eq!(
+            view.scroll, top,
+            "the second press aligns the row to the top"
+        );
+        view.recenter_selected();
+        assert_eq!(
+            view.scroll, bottom,
+            "the third press aligns the row to the bottom"
+        );
+        view.recenter_selected();
+        assert_eq!(
+            view.scroll, center,
+            "the fourth press wraps back to the center"
+        );
+    }
+
+    #[test]
+    fn test_recenter_selected_restarts_the_cycle_on_cursor_move() {
+        let mut view = recenter_plans_fixture(12);
+
+        // Walk to the top beat of the first row, so a continuation would land on
+        // the bottom beat instead of starting over.
+        view.recenter_selected();
+        view.recenter_selected();
+
+        view.selected_index = 5;
+        let index = view.selected_index;
+        let [center, top, bottom] = plan_recenter_beats(&mut view, index);
+        assert_ne!(center, bottom, "the first and third beats must differ");
+
+        view.recenter_selected();
+        assert_eq!(
+            view.scroll, center,
+            "a new cursor position starts over on the center beat"
+        );
+        view.recenter_selected();
+        assert_eq!(view.scroll, top, "the new row keeps its own cycle");
+        view.recenter_selected();
+        assert_eq!(view.scroll, bottom);
+    }
+
+    /// The recenter command is declared on both the abstract primary chord and
+    /// the raw `Ctrl+L` chord, and no other binding claims the same key event
+    /// under either modifier configuration (c-2).
+    #[test]
+    fn test_recenter_chord_is_declared_and_unambiguous() {
+        use super::input::PlansAction;
+        use crate::config::{InputConfig, MetaModifier, PrimaryModifier};
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+        // The abstract `C-l` chord and the raw `Ctrl+L` chord deliberately name
+        // the same intent, so under the default primary assignment both of them
+        // match a single key event. The resolved intents are deduplicated, since
+        // the invariant under test is which action the key reaches, not how many
+        // spellings declare it (c-2).
+        fn claims(input: &InputConfig, code: KeyCode, modifiers: KeyModifiers) -> Vec<PlansAction> {
+            let mut actions = Vec::new();
+            for spec in PLANS_COMMAND_MAP.specs() {
+                let matched = spec
+                    .chord
+                    .matches(KeyEvent::new(code, modifiers), input, false);
+                if matched && !actions.contains(&spec.action) {
+                    actions.push(spec.action);
+                }
+            }
+            actions
+        }
+
+        let ctrl_primary = InputConfig {
+            primary_modifier: PrimaryModifier::Ctrl,
+            meta_modifier: MetaModifier::Alt,
+            ..InputConfig::default()
+        };
+        let alt_primary = InputConfig {
+            primary_modifier: PrimaryModifier::Alt,
+            meta_modifier: MetaModifier::Ctrl,
+            ..InputConfig::default()
+        };
+
+        assert_eq!(
+            claims(&ctrl_primary, KeyCode::Char('l'), KeyModifiers::CONTROL),
+            vec![PlansAction::Recenter],
+            "C-l must recenter under the default primary modifier"
+        );
+        assert_eq!(
+            claims(&alt_primary, KeyCode::Char('l'), KeyModifiers::ALT),
+            vec![PlansAction::Recenter],
+            "the abstract C-l chord must follow a remapped primary modifier"
+        );
+        assert_eq!(
+            claims(&alt_primary, KeyCode::Char('l'), KeyModifiers::CONTROL),
+            vec![PlansAction::Recenter],
+            "a raw Ctrl+L must still recenter when the primary modifier is Alt"
+        );
     }
 }

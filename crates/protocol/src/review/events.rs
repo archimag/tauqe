@@ -11,6 +11,11 @@ pub struct ReviewStartedEvent {
     pub model: ModelRef,
     pub files_count: usize,
     pub estimated_tokens: usize,
+    /// Pattern-matched candidate files that were not loaded because the
+    /// configured context batch or token budget stopped the expansion.
+    /// Zero unless a `path_pattern` widened the audit beyond its limits.
+    #[serde(default)]
+    pub omitted_files: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

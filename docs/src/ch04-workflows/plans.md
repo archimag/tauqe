@@ -52,9 +52,14 @@ Roles and the Coder Ladder* owns that boundary. A plan is where it becomes visib
    daemon, not to a client that can disconnect.
 8. **A plan refuses to guess.** An unsatisfiable precondition is reported as a
    blocker, never repaired by silently weakening the requirement.
-9. **Verification is not model-configurable.** A scope is gated before its first
-   turn, and each turn is verified by the project toolchain, not by a model's
-   opinion.
+9. **A step never renegotiates its decision.** The Architect fixed *what* the step
+   must achieve; the executing Coder owns only *how*. Replacing the chosen
+   structure, the selected library, the designed interface, or a concept invariant
+   is not a step's decision to make, and a step that cannot proceed inside the
+   approved design reports the conflict.
+10. **Verification is not model-configurable.** A scope is gated before its first
+    turn, and each turn is verified by the project toolchain, not by a model's
+    opinion.
 
 ---
 
@@ -141,6 +146,28 @@ payload is still arriving. A discussion touches a plan only when the developer
 explicitly asks for a change; the payload carries the intent, so nothing is inferred
 from the wording of a prompt.
 
+### 2.6 The two mutation actions
+
+A `plan_update` payload reaches storage under one of two contracts, and the
+distinction is deliberate:
+
+- **`save` replaces.** It writes the document as a whole: identity, description, the
+  concept tree, and the implementation tree. Because the replacement is total, every
+  step that already stands at `Done` must be reproduced verbatim — its status, title,
+  details, files, readonly_files, concept_refs, and depends_on — or the
+  completed-step immutability check rejects the mutation. A text-contour save that
+  carries the concept tree alone keeps the established steps instead of erasing them.
+- **`update` patches.** It addresses nodes by identifier: an existing step or concept
+  node is amended, an unknown concept node is appended, and an unknown step is
+  appended to the plan root as a leaf. Adding a leaf is the delta counterpart of the
+  concept upsert, which lets one `update` both refine established work and extend the
+  horizon. Restructuring — introducing containers, moving a subtree, changing the
+  hierarchy — remains the exclusive province of `save`.
+
+Neither action bypasses the guards: the merged document is validated as a whole, so a
+repeated identifier, a dependency that does not exist, an unknown concept reference,
+or a cycle refuses the mutation instead of persisting a partially merged plan.
+
 ---
 
 ## 3. Mechanics & Lifecycle ("How it behaves")
@@ -153,6 +180,35 @@ discusses a specific node with `d`, and the model answers with rationale plus a
 cheap to redefine. A plan whose concept tree is stable and whose implementation tree
 is still empty is a complete, valid artifact: it declares *what* without committing
 to *how*.
+
+Planning is two phases, and the harness keeps them apart.
+
+**Phase one — the proposal.** A broad request arrives in Develop: work that touches
+several independent subsystems or contracts, that decomposes into dependent stages,
+or whose stages must be verified separately. The turn answers in plain text, states
+briefly why decomposition is warranted, and offers the developer a choice between
+drafting a plan and performing the whole change at once. The proposal is text only —
+no plan document reaches storage, and no edit block is emitted in the same answer.
+The turn still closes with its terminal success tag, so the offer is a completed
+turn rather than an abandoned one.
+
+**Phase two — the creation.** The document is written only after the developer
+confirms the offer or asks for a plan explicitly. That answer arrives through the
+`plan_update` payload described above and reaches disk as an ordinary plan save. A
+declined offer is equally binding: if the developer asks for the whole task instead,
+the model executes it completely and never repeats the proposal.
+
+Mechanical and localized work never enters this fork. A cross-cutting rename, a
+signature update, or one focused bug fix is compact and indivisible, so it is
+executed immediately instead of being proposed for decomposition.
+
+**Applying the payload.** Whatever the action, the merged document is validated as a
+whole before it reaches disk. A refusal is a diagnostic rather than a journal trace:
+its reason is recorded in the session history and reported in the interface, so the
+next request carries the diagnostic and the payload can be corrected. The harness
+never repairs that payload on the model's behalf — an automatic corrective round
+would rewrite a developer-owned document nobody asked it to touch — while a
+successful mutation publishes `plan/updated` exactly as before.
 
 ### 3.2 Horizon synthesis (deep refinement)
 
@@ -235,6 +291,14 @@ For each scheduled leaf the server:
    tag. A prose-only answer without edits and without a terminal tag does not close
    the step.
 
+Injecting the whole concept tree is what makes the decision explicit to the
+executing model, and it is backed by two independent statements. The step prompt
+names the structures, libraries, interfaces, and concept invariants the step must
+not replace, and requires a blocked outcome when the step cannot be implemented
+inside them. The `IsolatedStep` system contract states the same prohibition as a
+rule of the environment, so the constraint does not depend on the step prompt
+remaining intact.
+
 When every child of a container is `Done`, the container is recalculated to `Done`.
 While a scope runs, the REPL shows a compact Plan Stepper: the plan title and one
 title-only row per step in scope with a short status. It never expands diffs or
@@ -275,7 +339,9 @@ contradictory, an interface does not exist, or a third-party dependency is broke
 the correct answer is a blocker, not speculative drift. The model emits the blocked
 tag, the harness intercepts it immediately, rolls the working tree back to the
 pre-turn checkpoint, skips patch retry and healing entirely, and records the step as
-`Blocked`.
+`Blocked`. This is the Decision Immutability protocol rather than a failure path: a
+blocked step is never retried on the same prompt, never escalated along the coder
+ladder, and never repaired by relaxing the requirement it could not satisfy.
 
 Repairing the horizon is deliberately *not* local subtree grafting. A failed
 assumption at step *N* also invalidates the steps designed around it, so retaining
@@ -303,13 +369,26 @@ Automated recovery is bounded by `develop.max_replans`. Once consecutive waves
 exceed that budget the batch halts with the step still `Blocked` and asks for the
 developer.
 
-**Architect ladder escalation.** A replanning wave must not retry the configuration
-whose horizon already failed. The wave reads the provenance recorded on the plan and
-asks the `architect` ladder for the next rung, so recovery first deepens the
-reasoning depth on the same model and only then promotes to a stronger one. The rung
-actually used is written back onto the plan, escalation saturates on the last rung,
-and a recorded configuration that no longer exists in configuration restarts from
-the base rung instead of guessing a position.
+**Lazy architect ladder escalation.** A replanning wave must not retry a
+configuration whose horizon already produced the failing step, but it also must not
+escalate on the first sign of trouble. Every horizon replacement therefore persists
+the identity of the step whose failure triggered it as `last_replanned_step` on the
+plan, and the wave compares that record with the blocked step:
+
+- **a different step, or no record at all** — this is the first replan of this
+  failure. The current architect configuration runs unchanged, so ordinary
+  replanning never consumes a rung.
+- **the same step again** — the step failed again after it was already reprojected.
+  Only then does the wave read the provenance recorded on the plan and ask the
+  `architect` ladder for the next rung, so recovery first deepens the reasoning
+  depth on the same model and only then promotes to a stronger one.
+
+The marker lives on the document rather than in the batch supervisor's memory, so a
+manual replan started from the interface or through RPC follows exactly the same
+rule as an automated wave, and a daemon restart cannot reset the position on the
+ladder. Escalation saturates on the last rung, and a recorded configuration that no
+longer exists in configuration restarts from the base rung instead of guessing a
+position.
 
 **Coder ladder escalation** is the parallel, intra-role mechanism for execution
 failures (*Model Roles and the Coder Ladder*). With `models.auto_level_up` enabled,
@@ -390,17 +469,52 @@ verification, and commit before the queue halts; a hard stop aborts it immediate
 | `Delete` | delete the plan, with confirmation |
 | `Ctrl+H` / `?` | open contextual help |
 
+### 3.12 Safe plan deletion
+
+Deleting a plan destroys task context that no Git commit restores: the concept
+tree, the horizon, the recorded statuses, and the provenance of the current
+decomposition exist only in `.tauqe/plans/`. `Delete` is therefore guarded by a
+confirmation whose default focus is `Cancel`, and the strength of that guard
+follows the work the plan still carries.
+
+The tier is chosen before the dialog opens:
+
+- **every leaf finished or nothing left to do** — all executable leaves are `Done`
+  or `Cancelled`, or the plan is still concept-only and has no horizon at all. One
+  confirmation names the plan, its derived status, and states that every step is
+  completed.
+- **any leaf uncompleted** — at least one leaf is `Todo`, `InProgress`, or
+  `Blocked`. A second tier restates the remaining count against the total, switches
+  to the dangerous tone, and warns that the recorded progress is lost for good.
+
+The switch is the authoritative leaf accounting of `Plan::count_stats`, not the
+derived status of a container. That metric already excludes cancelled leaves, so a
+plan that was finished and then partially cancelled is not treated as unfinished
+work, while a `Blocked` leaf — the one status that explicitly asks for developer
+triage — always escalates.
+
+Deletion is a daemon mutation: the client dispatches `plan/delete` and rebuilds its
+plan cache from `plan/listChanged` instead of patching the list in place. Deleting
+the plan a discussion is anchored on also releases that anchor, so no interface
+keeps naming a plan that no longer exists (*Discussion Focus* §3.4).
+
 ---
 
 ## 4. Boundaries & Anti-Patterns ("What it is NOT")
 
 - **It is not a repository artifact.** Plans are local, ignored, and never
   committed; durable project intent belongs in documentation.
+- **It is not created by the proposal that suggests it.** Offering to plan and
+  writing the plan are separate phases; the document reaches storage only after the
+  developer authorizes it explicitly.
 - **It is not a conversation transcript.** A plan is a structured document that
   survives compaction, so an instruction that must persist belongs in the plan, not
   in the chat.
 - **It is not a graph the client schedules.** The daemon owns statuses and
   advancement; the interface only starts a scope and renders events.
+- **It is not deleted silently.** A plan that still carries uncompleted steps
+  leaves only through the two-tier confirmation, and both tiers default to
+  `Cancel`.
 - **It is not a place to regress finished work.** `Done` is immutable through every
   path except the explicit horizon clear, and the picker's cycle order is not a
   permission model.
@@ -409,10 +523,16 @@ verification, and commit before the queue halts; a hard stop aborts it immediate
   assumption in place.
 - **It is not an endless retry machine.** Retries, replans, and both escalation
   ladders are finite and configured.
+- **It is not a design negotiation.** The architecture of a step is fixed by the
+  plan. The executing turn owns the implementation and reports a conflict through
+  the blocked outcome instead of substituting another design.
 - **It is not a place to trade requirements for compiling code.** A blocker is the
   correct answer when a precondition cannot be satisfied.
 - **It is not verified by the model.** Pre-flight and per-step verification come from
   the project toolchain, not from a model's claim of success.
+- **It is not silently refused.** A mutation that fails validation names its reason in
+  the session history and in the interface, and the dialogue — not a hidden retry —
+  produces the corrected payload.
 
 ---
 

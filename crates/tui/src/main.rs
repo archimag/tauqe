@@ -13,6 +13,7 @@ pub mod editor;
 pub mod i18n;
 pub mod input;
 pub mod markdown;
+pub mod model_display;
 pub mod rpc;
 pub mod terminal;
 pub mod theme;
@@ -59,16 +60,12 @@ async fn main() -> anyhow::Result<()> {
         vec![
             tauqe_protocol::EditProtocolKind::Xml,
             tauqe_protocol::EditProtocolKind::Structured,
+            tauqe_protocol::EditProtocolKind::Mixed,
         ]
     } else {
         handshake.available_edit_protocols
     };
     let active_model = handshake.model;
-    let available_models = if handshake.available_models.is_empty() {
-        vec![active_model.clone()]
-    } else {
-        handshake.available_models
-    };
 
     let (tui_config, tui_config_error) = match config::TuiConfig::load_checked() {
         Ok(cfg) => (cfg, None),
@@ -92,7 +89,6 @@ async fn main() -> anyhow::Result<()> {
         available_workflows,
         available_edit_protocols,
         active_model,
-        available_models,
         context: init.context,
         onboarding: init.onboarding,
         input_editor,

@@ -92,8 +92,13 @@ pub(super) async fn handle_prompt_modal(
 }
 
 /// Resolves the modal target, formats the discussion prompt and dispatches the
-/// model request. The modal is restored when the comment is empty or the target
-/// cannot be found so the user can correct the input.
+/// model request.
+///
+/// The launch is optimistic: it clears the previous answer buffers, arms the
+/// batch flag, and rewrites the discussion anchor before the request leaves the
+/// transport. Everything that transition destroys is captured first, so a
+/// failed write restores the previous answer, the batch flag, and the anchor,
+/// and hands the submitted comment back to its modal instead of losing it.
 pub(crate) async fn submit_prompt_modal(
     mut st: MutexGuard<'_, AppState>,
     dialog: PromptModalState,
@@ -143,19 +148,30 @@ pub(crate) async fn submit_prompt_modal(
         }
     };
 
-    super::begin_repl_turn(&mut st);
-    st.discussion_focus = focus;
-    drop(st);
     let params = ModelAskParams::Discussion(DiscussionRequest {
         target,
         focused_items,
         comment: user_comment,
     });
-    send_request(
-        server_writer,
-        methods::MODEL_ASK,
-        serde_json::to_value(params)?,
-    )
-    .await?;
+    // Serializing the typed payload cannot touch the interface, so it runs
+    // before the optimistic transition: a serialization failure leaves the
+    // modal and the Develop view exactly as the developer left them.
+    let payload = serde_json::to_value(params)?;
+
+    // The launch transition opens a new turn and rewrites the discussion
+    // anchor, so the whole launch state is captured and restored when the
+    // request never reaches the transport.
+    let snapshot = super::TurnLaunchSnapshot::capture(&st);
+    super::begin_repl_turn(&mut st);
+    st.discussion_focus = focus;
+
+    if let Err(err) = send_request(server_writer, methods::MODEL_ASK, payload).await {
+        snapshot.restore(&mut st);
+        st.prompt_modal = Some(dialog);
+        st.notify_error(
+            crate::i18n::active_t("notify.prompt_send_failed").replace("{}", &err.to_string()),
+        );
+    }
+
     Ok(Some(InputResult::Continue))
 }

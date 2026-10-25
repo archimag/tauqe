@@ -37,6 +37,12 @@ This document specifies mandatory engineering and architectural conventions for 
    - The canonical example is the bounded turn: its mode is declared by `TurnIntent` and is never derived from the body of a prompt.
    - This is the operational form of the harness invariant *"Never guess what is deterministically known"*.
    - Subsystem conventions do not duplicate this rule; they reference it instead.
+6. **Anti-NIH: Standard Primitives Come from Ecosystem Crates:**
+   - Never write a private implementation of an established specification, format, or primitive. Widely standardized artifacts — RFC identifiers (UUID, ULID, URI), cryptographic hashes and algorithms, character encodings and codecs, compression and serialization formats, calendar and time arithmetic, glob and regular-expression matching — are consumed from the de-facto standard Rust crate and never re-derived inside this repository.
+   - The trigger is a published specification together with a mature, maintained crate that implements it. When both exist, hand-writing the algorithm is a defect, not a stylistic option: a conforming implementation must reproduce every edge the specification defines — bit layout, endianness, timestamp epochs, version and variant fields, validation and canonical-text rules — and an in-repo re-derivation almost always misses some of them.
+   - Adopting the ecosystem crate also protects pretraining alignment. A language model writes code against the API it saw most often during training, so a mainstream crate yields correct calls on the first attempt, while a local invention forces every later modification to reverse-engineer an unfamiliar API. The rationale is the same one that governs dependency selection in §12.1.
+   - A local implementation is permitted only when no maintained crate covers the requirement, when the crate cannot enter the build graph for a documented reason (licensing, unsupported target, or the dependency purity of a leaf crate), or when the local code is the deliberate subject of the work. The exemption must be stated next to the code it excuses, never assumed.
+   - Rationale (Why): a homegrown primitive is a permanent maintenance liability with an invisible blast radius. It drifts from the standard without any compiler or linter noticing, fails on inputs nobody thought to test, and every downstream consumer inherits the divergence as if it were correct behavior.
 
 ---
 
@@ -241,3 +247,70 @@ Subsystem conventions are resolved and included in the Pinned context layer auto
    - The daemon installs a custom panic hook at startup that records the source location, the textual payload, and — when `RUST_BACKTRACE` enables it — the backtrace as a single `error`-level record with `target = "panic"` before the process unwinds.
 5. **Subsystem Instrumentation:**
    - Domain-side instrumentation rules for the engine are specified in `crates/core/Conventions.md`.
+
+---
+
+## 12. Workspace Dependency Management
+
+1. **Pretraining Alignment over Novelty:**
+   - A dependency version is chosen for the depth of its representation in the
+     corpus a language model was trained on, not for its novelty. The model
+     writes code against the API it has seen most often, so a version that is
+     barely represented in that corpus turns every generated call into a guess.
+   - Established, widely represented versions are therefore kept as long as they
+     remain maintained and stable: `ratatui` 0.29, `crossterm` 0.28,
+     `tree-sitter` 0.22, `thiserror` 1.0, and `toml` 0.8.
+   - A major upgrade that changes paradigms, signatures, or error idioms is a
+     deliberate, isolated decision with its own migration and its own
+     verification. It is never a side effect of a routine dependency pass, a
+     version bump found by a tool, or a desire for the newest release.
+   - Rationale (Why): the engine is largely authored by models inside the
+     harness. A familiar API keeps generated code compiling on the first
+     attempt, while an unfamiliar one multiplies patch-retry rounds and
+     verification-healing cycles — the two most expensive paths in a turn.
+
+2. **No Split Versions (One Shared Dependency, One Version):**
+   - A shared dependency resolves to exactly one version across the entire
+     workspace. Two semver-incompatible versions of the same crate in the build
+     graph are forbidden: they duplicate compilation, inflate the binary, and
+     produce types that look identical but cannot be exchanged across crates.
+   - When a member needs a newer version, the workspace entry moves and every
+     call site is adjusted in the same change, so the graph never carries both
+     resolutions at once.
+   - A dual resolution is permitted only for a dependency that a single member
+     genuinely cannot align, and only with an explicit justification recorded in
+     that manifest.
+   - Rationale (Why): a split version is invisible until a value crosses a crate
+     boundary, where it surfaces as a confusing type error that no generated
+     patch can resolve locally.
+
+3. **Single Source of Truth for Dependency Selection:**
+   - Every external dependency shared by two or more crates — runtime or
+     test-only — is declared exactly once in `[workspace.dependencies]` of the
+     root `Cargo.toml`, including the feature list it requires.
+   - Members consume those entries exclusively through `.workspace = true`. A
+     member manifest never restates a version, a path, or a feature set that the
+     workspace already declares.
+   - A dependency used by exactly one crate may stay in that crate's manifest,
+     but it must never introduce a second version of a crate the workspace
+     already declares. The pinned Tree-sitter grammars owned by `crates/core`
+     are the canonical example of such a single-consumer entry.
+   - Features that Cargo unifies across the whole workspace — such as
+     `serde_json`'s `preserve_order` — are declared on the workspace entry, not
+     on individual members, so a member can never observe a partially enabled
+     feature set.
+   - Workspace-level lint policy (`[workspace.lints.clippy]`) is declared once at
+     the root and adopted by each member through `[lints] workspace = true`.
+   - Rationale (Why): one declaration keeps every crate on the same version, the
+     same feature set, and the same lint strictness. Drifting declarations are
+     how split versions appear in the first place.
+
+4. **Protocol Crate Purity:**
+   - `crates/protocol` remains a lightweight leaf crate. It declares only
+     `serde` and `serde_json`, carries no workspace dependency, and pulls in no
+     file-system, process, network, or async runtime crate.
+   - Introducing any dependency that performs I/O into `crates/protocol` is
+     forbidden; such work belongs to `core` or `server`.
+   - Rationale (Why): the wire contract must stay the cheapest crate to compile
+     and the fastest to load, because every other crate depends on it and the
+     client frontend links it directly.

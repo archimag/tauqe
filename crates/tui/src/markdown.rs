@@ -5,10 +5,12 @@ use unicode_width::UnicodeWidthStr;
 
 use crate::theme::color::RgbColor;
 
+mod cache;
 mod code;
 mod latex;
 mod table;
 
+pub use cache::MarkdownBodyCache;
 pub use latex::convert_latex_to_unicode;
 
 use code::render_code_block;
@@ -70,7 +72,7 @@ pub fn copy_button_span(lang: &str) -> (u16, u16) {
     (start, end)
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct MarkdownTheme {
     pub text_style: Style,
     pub bold_style: Style,

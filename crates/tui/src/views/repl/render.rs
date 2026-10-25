@@ -8,7 +8,8 @@ use crate::app::AppState;
 use crate::i18n::active_t;
 use crate::theme::color::RgbColor;
 use crate::theme::engine::{current_engine, ThemeEngine};
-use crate::ui::wrap_line;
+use crate::ui::geometry;
+use crate::ui::{wrap_line, UiAction};
 
 use super::state::ReplFocus;
 
@@ -327,7 +328,6 @@ fn render_model_pane(frame: &mut ratatui::Frame, state: &mut AppState, area: Rec
     let content_height = inner.height;
     let content_width = (inner.width as usize).max(10);
     state.last_model_height = content_height;
-    state.model.content_rect = (inner.x, inner.y, inner.width, content_height);
 
     if state.model.content_width != content_width {
         state.model.content_width = content_width;
@@ -387,6 +387,43 @@ fn render_model_pane(frame: &mut ratatui::Frame, state: &mut AppState, area: Rec
     let max_scroll = total_lines.saturating_sub(content_height);
     if state.model.auto_scroll || state.model.scroll > max_scroll {
         state.model.scroll = max_scroll;
+    }
+
+    // Every code block the viewport just laid out declares its own clickable
+    // regions: the informational body first, then the copy button of its header
+    // row, because a later registration wins over the surface it covers. The
+    // viewport therefore owns its Markdown geometry and the pointer dispatcher
+    // never recomputes a column or a scroll offset (c-1, c-2).
+    let mut block_regions: Vec<(Rect, UiAction)> = Vec::new();
+    for block in &state.model.code_blocks {
+        if let Some(rect) = geometry::code_block_body_rect(
+            inner,
+            block.visual_start_line,
+            block.visual_end_line,
+            state.model.scroll,
+            content_height,
+        ) {
+            block_regions.push((rect, UiAction::CodeBlockBody));
+        }
+        if let Some(rect) = geometry::code_copy_button_rect(
+            inner,
+            0,
+            &block.lang,
+            block.visual_start_line,
+            state.model.scroll,
+            content_height,
+        ) {
+            block_regions.push((
+                rect,
+                UiAction::CopyCodeBlock {
+                    item: None,
+                    block: block.id,
+                },
+            ));
+        }
+    }
+    for (rect, action) in block_regions {
+        state.hit_regions.register(rect, action);
     }
 
     let scroll_start = state.model.scroll as usize;

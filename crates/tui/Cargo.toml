@@ -20,10 +20,17 @@ ratatui.workspace = true
 crossterm.workspace = true
 tokio.workspace = true
 anyhow.workspace = true
-pulldown-cmark = { version = "0.12", default-features = false }
-syntect = { version = "5.2", default-features = false, features = ["default-syntaxes", "default-themes", "parsing", "regex-fancy"] }
-similar = "2.6"
-arboard = "3.4"
-unicode-width = "0.2"
+pulldown-cmark.workspace = true
+syntect.workspace = true
+similar.workspace = true
+arboard.workspace = true
+unicode-width.workspace = true
 toml.workspace = true
-toml_edit = "0.22"
+toml_edit.workspace = true
+# Standard Base64 for the OSC 52 clipboard payload. Only `crates/tui` consumes
+# it, so it stays in this manifest and reuses the version the build graph
+# already resolves (Conventions §1.6, §12.3).
+base64 = "0.22"
+# Shared with `crates/server`, so the workspace entry carries the version and
+# the feature set (Conventions §12.3).
+time.workspace = true

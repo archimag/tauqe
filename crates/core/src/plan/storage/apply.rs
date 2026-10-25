@@ -147,6 +147,7 @@ impl PlanStorage {
                         created_at: now,
                         updated_at: now,
                         architect: None,
+                        last_replanned_step: None,
                         concept: Vec::new(),
                         items: Vec::new(),
                     });
@@ -279,25 +280,56 @@ impl PlanStorage {
                             false
                         }
 
-                        let mut missing_items = Vec::new();
+                        // A delta `update` mirrors the concept-node upsert: an
+                        // identifier that is not found is appended to the plan root
+                        // instead of failing the whole mutation, so one `update`
+                        // both patches established steps and adds new ones.
+                        let errors_before = errors.len();
+                        let mut added_items: Vec<PlanItem> = Vec::new();
                         for update_item in &tag.items {
-                            if !update_single(&mut plan.items, update_item) {
-                                missing_items.push(update_item.id.clone());
+                            if update_single(&mut plan.items, update_item) {
+                                continue;
                             }
+                            // Only executable leaves are added this way: creating or
+                            // moving containers restructures the plan and stays the
+                            // sole province of `save`.
+                            if !update_item.children.is_empty() {
+                                errors.push(format!(
+                                    "Cannot add step '{}' to plan '{}': update may add leaf steps only, use save to restructure the plan",
+                                    update_item.id, plan.id
+                                ));
+                                continue;
+                            }
+                            added_items.push(update_item.clone().into_plan_item());
                         }
-                        if !missing_items.is_empty() {
-                            errors.push(format!(
-                                "Item(s) {} not found in plan '{}'",
-                                missing_items
-                                    .iter()
-                                    .map(|id| format!("'{id}'"))
-                                    .collect::<Vec<_>>()
-                                    .join(", "),
-                                plan.id
-                            ));
+                        plan.items.append(&mut added_items);
+
+                        // A rejected entry leaves the stored plan untouched, so the
+                        // caller repairs the payload instead of persisting a partial
+                        // merge.
+                        if errors.len() > errors_before {
+                            continue;
                         }
 
+                        plan.normalize_leaf_files();
                         plan.refresh_parent_statuses();
+                        // The merged plan is validated as a whole before it reaches
+                        // disk: a repeated identifier, a dependency that does not
+                        // exist, or an unknown concept reference fails the mutation
+                        // instead of being written.
+                        if let Err(plan_errors) = plan.validate() {
+                            errors.push(format!(
+                                "Cannot apply update to plan '{}': {}",
+                                plan.id,
+                                plan_errors
+                                    .iter()
+                                    .map(|e| e.to_string())
+                                    .collect::<Vec<_>>()
+                                    .join("; ")
+                            ));
+                            continue;
+                        }
+
                         plan.updated_at = now;
                         match Self::save_plan_unlocked(repo_root, &plan) {
                             Ok(()) => {
@@ -528,6 +560,7 @@ Step 1 is done:
         // 3. Non-existent item on update
         let valid_plan = Plan {
             id: "my-plan".to_string(),
+            last_replanned_step: None,
             title: "P".to_string(),
             description: None,
             created_at: 1,
@@ -552,8 +585,166 @@ Step 1 is done:
             "<plan action=\"update\" id=\"my-plan\"><item id=\"99\" status=\"done\" /></plan>";
         let res_item = PlanStorage::apply_plan_tags(root, update_item_missing);
         assert_eq!(res_item.applied.len(), 1);
-        assert_eq!(res_item.errors.len(), 1);
-        assert!(res_item.errors[0].contains("Item(s) '99' not found in plan 'my-plan'"));
+        assert!(res_item.errors.is_empty(), "Errors: {:?}", res_item.errors);
+        let reloaded = PlanStorage::load_plan(root, "my-plan").unwrap().unwrap();
+        let added = reloaded
+            .find_item("99")
+            .expect("an unknown step must be added by update");
+        assert_eq!(added.status, PlanItemStatus::Done);
+    }
+
+    #[test]
+    fn test_update_patches_existing_step_and_adds_new_leaf() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+
+        let initial = r#"
+<plan action="save" id="upsert-plan" title="Upsert">
+  <concept>
+    <concept_item id="c-1" title="Invariant" />
+  </concept>
+  <item id="1" title="Step 1" status="in_progress" />
+</plan>
+"#;
+        let seeded = PlanStorage::apply_plan_tags(root, initial);
+        assert!(seeded.errors.is_empty(), "Errors: {:?}", seeded.errors);
+        assert_eq!(seeded.applied.len(), 1);
+
+        let update = r#"
+<plan action="update" id="upsert-plan">
+  <item id="1" title="Step 1 refined" concept="c-1" />
+  <item id="2" title="Step 2" status="todo" deps="1" />
+</plan>
+"#;
+        let applied = PlanStorage::apply_plan_tags(root, update);
+        assert!(applied.errors.is_empty(), "Errors: {:?}", applied.errors);
+        assert_eq!(applied.applied.len(), 1);
+
+        let reloaded = PlanStorage::load_plan(root, "upsert-plan")
+            .unwrap()
+            .unwrap();
+        assert_eq!(reloaded.items.len(), 2);
+
+        let step1 = reloaded.find_item("1").expect("step 1 must exist");
+        assert_eq!(step1.title, "Step 1 refined");
+        assert_eq!(step1.concept_refs, vec!["c-1"]);
+        // A partial patch keeps the status the step already carried.
+        assert_eq!(step1.status, PlanItemStatus::InProgress);
+
+        let step2 = reloaded.find_item("2").expect("step 2 must be added");
+        assert_eq!(step2.depends_on, vec!["1"]);
+    }
+
+    #[test]
+    fn test_discussion_update_adds_new_leaf_step() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+
+        let seed = DiscussionPlanUpdate {
+            action: DiscussionPlanAction::Save,
+            id: Some("structured-upsert".to_string()),
+            title: Some("Structured Upsert".to_string()),
+            description: None,
+            concept: vec![tauqe_protocol::ConceptItem {
+                id: "c-1".to_string(),
+                title: "Invariant".to_string(),
+                details: None,
+                children: vec![],
+            }],
+            items: vec![PlanItem {
+                id: "1".to_string(),
+                title: "Step 1".to_string(),
+                status: PlanItemStatus::Todo,
+                ..Default::default()
+            }],
+        };
+        let seeded = PlanStorage::apply_discussion_plan_update(root, &seed);
+        assert!(seeded.errors.is_empty(), "Errors: {:?}", seeded.errors);
+
+        let update = DiscussionPlanUpdate {
+            action: DiscussionPlanAction::Update,
+            id: Some("structured-upsert".to_string()),
+            title: None,
+            description: None,
+            concept: vec![],
+            items: vec![PlanItem {
+                id: "2".to_string(),
+                title: "Step 2".to_string(),
+                status: PlanItemStatus::Todo,
+                depends_on: vec!["1".to_string()],
+                ..Default::default()
+            }],
+        };
+        let applied = PlanStorage::apply_discussion_plan_update(root, &update);
+        assert!(applied.errors.is_empty(), "Errors: {:?}", applied.errors);
+        assert_eq!(applied.applied.len(), 1);
+        assert_eq!(applied.applied[0].items.len(), 2);
+
+        let reloaded = PlanStorage::load_plan(root, "structured-upsert")
+            .unwrap()
+            .unwrap();
+        assert!(reloaded.find_item("2").is_some());
+    }
+
+    #[test]
+    fn test_update_rejects_invalid_new_steps() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+
+        let initial = r#"
+<plan action="save" id="validation-plan" title="Validation">
+  <concept>
+    <concept_item id="c-1" title="Invariant" />
+  </concept>
+  <item id="1" title="Step 1" status="todo" />
+</plan>
+"#;
+        let seeded = PlanStorage::apply_plan_tags(root, initial);
+        assert!(seeded.errors.is_empty(), "Errors: {:?}", seeded.errors);
+
+        // Duplicate identifiers inside the added batch.
+        let duplicates = r#"
+<plan action="update" id="validation-plan">
+  <item id="2" title="First" status="todo" />
+  <item id="2" title="Second" status="todo" />
+</plan>
+"#;
+        let dup_res = PlanStorage::apply_plan_tags(root, duplicates);
+        assert!(dup_res.applied.is_empty());
+        assert_eq!(dup_res.errors.len(), 1);
+        assert!(dup_res.errors[0].contains("Cannot apply update to plan 'validation-plan'"));
+        assert!(dup_res.errors[0].contains("Duplicate step ID: '2'"));
+
+        // A new step naming a dependency that does not exist.
+        let dangling = r#"
+<plan action="update" id="validation-plan">
+  <item id="3" title="Step 3" status="todo" deps="99" />
+</plan>
+"#;
+        let dangling_res = PlanStorage::apply_plan_tags(root, dangling);
+        assert!(dangling_res.applied.is_empty());
+        assert_eq!(dangling_res.errors.len(), 1);
+        assert!(dangling_res.errors[0].contains("Cannot apply update to plan 'validation-plan'"));
+        assert!(dangling_res.errors[0].contains("references non-existent dependency '99'"));
+
+        // Restructuring the tree is not a delta update operation.
+        let container = r#"
+<plan action="update" id="validation-plan">
+  <item id="4" title="Container">
+    <item id="4.1" title="Child" status="todo" />
+  </item>
+</plan>
+"#;
+        let container_res = PlanStorage::apply_plan_tags(root, container);
+        assert!(container_res.applied.is_empty());
+        assert_eq!(container_res.errors.len(), 1);
+        assert!(container_res.errors[0].contains("update may add leaf steps only"));
+
+        // Nothing reached disk.
+        let reloaded = PlanStorage::load_plan(root, "validation-plan")
+            .unwrap()
+            .unwrap();
+        assert_eq!(reloaded.items.len(), 1);
     }
 
     #[test]
@@ -628,6 +819,7 @@ Step 1 is done:
 
         let plan = Plan {
             id: "test-plan".to_string(),
+            last_replanned_step: None,
             title: "Test".to_string(),
             description: Some("Desc".to_string()),
             created_at: 100,
@@ -906,7 +1098,7 @@ Step 1 is done:
                     title: "Step 1".to_string(),
                     status: PlanItemStatus::InProgress,
                     readonly_files: vec!["crates/core/src/lib.rs".to_string()],
-                    depends_on: vec!["0".to_string()],
+                    depends_on: vec!["2".to_string()],
                     ..Default::default()
                 },
                 PlanItem {
@@ -936,7 +1128,7 @@ Step 1 is done:
         assert_eq!(plan.items[0].title, "Step 1 Updated");
         assert_eq!(plan.items[0].status, PlanItemStatus::InProgress);
         assert_eq!(plan.items[0].readonly_files, vec!["crates/core/src/lib.rs"]);
-        assert_eq!(plan.items[0].depends_on, vec!["0"]);
+        assert_eq!(plan.items[0].depends_on, vec!["2"]);
         assert_eq!(plan.items[1].status, PlanItemStatus::Blocked);
 
         // 2. Update with explicit readonly_files and depends_on

@@ -123,14 +123,25 @@ const fn container_spec(
 /// Order matters only for prefix overlap: a longer base name that starts with a
 /// shorter one must be declared after it so the shorter name is tried first.
 pub(crate) const XML_TAG_SPECS: &[XmlTagSpec] = &[
-    // Code-modification tags.
+    // Code-modification tags. The canonical edit container starts with the
+    // shorter `edit` block name, so the block is declared first: the boundary
+    // check then tries the shorter spelling before the longer one.
+    container_spec("edit", &["search", "replace", "with"], false, true),
+    container_spec(
+        "edits",
+        &["edit", "create", "overwrite", "delete", "move"],
+        false,
+        true,
+    ),
+    // Pre-canonical spelling of the edit container. It stays declared so marker
+    // normalization, stream suppression, and text cleaning keep recognizing
+    // transcripts and model output that still carry it.
     container_spec(
         "tauqe_edits",
         &["edit", "create", "overwrite", "delete", "move"],
         false,
         true,
     ),
-    container_spec("edit", &["search", "replace", "with"], false, true),
     spec("search", TagCloseMode::Control, false),
     spec("replace", TagCloseMode::Control, false),
     spec("with", TagCloseMode::Control, false),
@@ -209,6 +220,18 @@ pub(crate) const XML_TAG_SPECS: &[XmlTagSpec] = &[
     control_spec(
         "blocked",
         LlmCapability::Blocked,
+        TagCloseMode::Control,
+        MarkerPolicy::Strict,
+    ),
+    // Unconditional abort. A blocker reports a failed precondition and starts a
+    // controlled replanning cycle; an abort reports work the harness cannot
+    // perform at all — approving a native build, installing a package, starting
+    // a daemon — so it stops the turn instead of replanning. The paired form is
+    // declared because the recommendation may be a multi-line instruction for
+    // the developer rather than a single short attribute value.
+    control_spec(
+        "abort",
+        LlmCapability::Abort,
         TagCloseMode::Control,
         MarkerPolicy::Strict,
     ),
@@ -687,6 +710,76 @@ mod tests {
         );
         assert_eq!(spec_of("custom_tool").close_mode, TagCloseMode::Simple);
         assert!(spec_of("custom_tool").is_control());
+
+        assert_eq!(spec_of("abort").capability, Some(LlmCapability::Abort));
+        assert_eq!(spec_of("abort").close_mode, TagCloseMode::Control);
+        assert!(spec_of("abort").is_control());
+        assert!(!allows_unmarked_fallback("abort"));
+    }
+
+    #[test]
+    fn abort_tag_reads_the_reason_and_the_recommendation() {
+        // The self-closing form carries both payloads as attributes.
+        let self_closing =
+            "<abort reason=\"Native build approval required\" recommendation=\"pnpm approve-builds\" />";
+        let found = match find_next_tag(self_closing, spec_of("abort")) {
+            Some(found) => found,
+            None => panic!("abort tag not found"),
+        };
+        assert_eq!(
+            found.attr("reason").as_deref(),
+            Some("Native build approval required")
+        );
+        assert_eq!(
+            found.attr_or_body(&["recommendation"]).as_deref(),
+            Some("pnpm approve-builds")
+        );
+
+        // The paired form puts a longer instruction in the body, and the body
+        // is what the recommendation reader falls back to.
+        let paired = "<abort reason=\"Toolchain missing\">Install the SDK, then rerun.</abort>";
+        let found = match find_next_tag(paired, spec_of("abort")) {
+            Some(found) => found,
+            None => panic!("abort tag not found"),
+        };
+        assert_eq!(found.attr("reason").as_deref(), Some("Toolchain missing"));
+        assert_eq!(found.body, Some("Install the SDK, then rerun."));
+        assert_eq!(
+            found.attr_or_body(&["recommendation"]).as_deref(),
+            Some("Install the SDK, then rerun.")
+        );
+
+        // An explicit recommendation attribute wins over the body, so a model
+        // never has to choose between the two forms.
+        let both = "<abort reason=\"Blocked\" recommendation=\"Run: make setup\">ignored body</abort>";
+        let found = match find_next_tag(both, spec_of("abort")) {
+            Some(found) => found,
+            None => panic!("abort tag not found"),
+        };
+        assert_eq!(
+            found.attr_or_body(&["recommendation"]).as_deref(),
+            Some("Run: make setup")
+        );
+    }
+
+    #[test]
+    fn registry_declares_the_legacy_edit_container_alias() {
+        let canonical = spec_of("edits");
+        let legacy = spec_of("tauqe_edits");
+
+        // Both spellings are declared as the same container, so a legacy
+        // transcript behaves exactly like a canonical one.
+        assert_eq!(canonical.close_mode, TagCloseMode::Container);
+        assert_eq!(legacy.close_mode, TagCloseMode::Container);
+        assert_eq!(canonical.child_tags, legacy.child_tags);
+        assert!(!canonical.is_control());
+        assert!(!legacy.is_control());
+
+        // The canonical container starts with the shorter `edit` block name, so
+        // the boundary check keeps the two spellings apart.
+        let edits = "<edits summary=\"Fix\">\n</edits>";
+        assert!(find_next_tag_bounds(edits, canonical).is_some());
+        assert!(find_next_tag_bounds(edits, spec_of("edit")).is_none());
     }
 
     #[test]

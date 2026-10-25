@@ -11,6 +11,7 @@ use ratatui::style::{Style, Stylize};
 use ratatui::text::{Line, Span};
 use tauqe_protocol::{ArchitectTier, PlanItemStatus};
 
+use crate::markdown::MarkdownBodyCache;
 use crate::theme::engine::current_engine;
 use crate::ui::wrap_lines;
 
@@ -48,6 +49,20 @@ fn plan_body_indent(level: usize) -> String {
     format!(" {}", plan_indent(level))
 }
 
+/// Cache key of the body of the concept item `item_id` in `plan_id`.
+///
+/// The `c:` prefix keeps a concept body apart from a step body that reuses the
+/// same identifier, mirroring the expanded-item keys the view state already
+/// carries (c-1).
+fn concept_body_key(plan_id: &str, item_id: &str) -> String {
+    format!("c:{}:{}", plan_id, item_id)
+}
+
+/// Cache key of the body of the step `item_id` in `plan_id` (c-1).
+fn step_body_key(plan_id: &str, item_id: &str) -> String {
+    format!("{}:{}", plan_id, item_id)
+}
+
 /// Filled badge style for a step lifecycle status.
 pub(crate) fn status_style(status: PlanItemStatus) -> Style {
     let engine = current_engine();
@@ -80,18 +95,18 @@ fn focus_badge() -> Span<'static> {
 /// decomposition.
 ///
 /// A plan and a review finding both record which Architect model, at which
-/// reasoning depth, decomposed them. The badge renders that provenance
-/// verbatim — model identifiers and effort names are technical artifacts, not
-/// localizable text — so the *What* role stays accountable for every
-/// decomposition in the tree (Vision.md §1.2). Plans and Review share this one
-/// helper so the two surfaces can never name the provenance differently.
+/// reasoning depth, decomposed them. The badge marks the provenance kind and
+/// prints the model through the single interface formatter, so the alias, or
+/// the provider name without its transport prefix, and the reasoning depth are
+/// never re-derived here (c-1, c-2). Plans and Review share this one helper so
+/// the two surfaces can never name the provenance differently.
 pub(crate) fn architect_badge(tier: &ArchitectTier) -> Span<'static> {
     let engine = current_engine();
     let palette = engine.palette();
-    let label = match tier.effort {
-        Some(effort) => format!(" [ARC {} {}]", tier.model, effort),
-        None => format!(" [ARC {}]", tier.model),
-    };
+    let label = format!(
+        " [ARC] {}",
+        crate::model_display::model_label(&tier.model, tier.effort)
+    );
     Span::styled(label, engine.fg(palette.status_error))
 }
 
@@ -110,7 +125,7 @@ fn pad_line_to_width(mut line: Line<'static>, width: usize, fill_style: Style) -
 /// The first line keeps its original indentation, while every following line
 /// sheds the smallest common leading indent, so a block quoted from a document
 /// renders flush instead of drifting to the right.
-fn prepare_plan_markdown(raw: &str) -> String {
+pub(crate) fn prepare_plan_markdown(raw: &str) -> String {
     let trimmed = raw.trim();
     if trimmed.is_empty() {
         return String::new();
@@ -157,11 +172,18 @@ fn prepare_plan_markdown(raw: &str) -> String {
 /// that renders at the level of its children. The returned offsets map a row
 /// index onto its first rendered line, so scrolling and selection stay aligned
 /// with the wrapping of a variable-height tree.
+///
+/// The Markdown detail blocks of concepts and steps come from `cache` instead of
+/// being parsed afresh: a frame that only moved the cursor or scrolled reuses the
+/// lines already rendered for the unchanged description, while a changed
+/// description, indent, width, or palette re-renders exactly that one body
+/// (c-1, c-3).
 pub(crate) fn compute_unified_plan_lines(
     rows: &[VisiblePlanRow],
     selected_idx: usize,
     width: usize,
     theme_mode: crate::config::ThemeMode,
+    cache: &mut MarkdownBodyCache,
 ) -> (Vec<Line<'static>>, Vec<usize>) {
     let engine = current_engine();
     let palette = engine.palette();
@@ -201,7 +223,9 @@ pub(crate) fn compute_unified_plan_lines(
                 }
 
                 let fold_icon = if *is_expanded { "▼ " } else { "▶ " };
-                let stats_str = format!("{}/{} done", completed, total);
+                let stats_str = crate::i18n::active_t("plans.done_progress")
+                    .replacen("{}", &completed.to_string(), 1)
+                    .replacen("{}", &total.to_string(), 1);
 
                 let mut spans = vec![
                     gutter,
@@ -296,7 +320,14 @@ pub(crate) fn compute_unified_plan_lines(
                         engine.fg(palette.text_primary).bold(),
                     ),
                     Span::styled(
-                        format!(" ({} item{})", count, if *count == 1 { "" } else { "s" }),
+                        format!(
+                            " ({})",
+                            crate::i18n::active_t("plans.concept_item_count").replacen(
+                                "{}",
+                                &count.to_string(),
+                                1
+                            )
+                        ),
                         if is_selected {
                             engine.fg(palette.text_primary)
                         } else {
@@ -311,6 +342,7 @@ pub(crate) fn compute_unified_plan_lines(
                 all_lines.extend(wrap_lines(vec![line], width));
             }
             VisiblePlanRow::ConceptItem {
+                plan_id,
                 item_id,
                 title,
                 details,
@@ -359,7 +391,7 @@ pub(crate) fn compute_unified_plan_lines(
                 if is_selected {
                     row_line = pad_line_to_width(row_line, width, row_style);
                 }
-                let mut row_lines = vec![row_line];
+                let mut row_lines = wrap_lines(vec![row_line], width);
 
                 if *is_expanded {
                     if let Some(det) = details {
@@ -374,14 +406,14 @@ pub(crate) fn compute_unified_plan_lines(
                                 format!("{}│ ", plan_body_indent(*depth + 1)),
                                 engine.fg(palette.text_muted),
                             ));
-                            let md = crate::markdown::render_markdown(&prepared, &theme);
-                            if !md.is_empty() {
-                                row_lines.extend(md);
-                            }
+                            let key = concept_body_key(plan_id, item_id);
+                            let body =
+                                cache.lines_for(&key, &prepared, &theme, Some(width), theme_mode);
+                            row_lines.extend(body.iter().cloned());
                         }
                     }
                 }
-                all_lines.extend(wrap_lines(row_lines, width));
+                all_lines.extend(row_lines);
             }
             VisiblePlanRow::ImplementationHeader {
                 total,
@@ -390,7 +422,9 @@ pub(crate) fn compute_unified_plan_lines(
                 ..
             } => {
                 let fold_icon = if *is_expanded { "▼ " } else { "▶ " };
-                let stats_str = format!("{}/{} done", completed, total);
+                let stats_str = crate::i18n::active_t("plans.done_progress")
+                    .replacen("{}", &completed.to_string(), 1)
+                    .replacen("{}", &total.to_string(), 1);
                 let spans = vec![
                     gutter,
                     Span::raw(plan_indent(PLAN_SECTION_LEVEL)),
@@ -426,6 +460,7 @@ pub(crate) fn compute_unified_plan_lines(
                 all_lines.extend(wrap_lines(vec![line], width));
             }
             VisiblePlanRow::PlanItem {
+                plan_id,
                 item_id,
                 title,
                 details,
@@ -492,14 +527,18 @@ pub(crate) fn compute_unified_plan_lines(
                 if !*has_children && (!files.is_empty() || !readonly_files.is_empty()) {
                     let mut badge_parts = Vec::new();
                     if !files.is_empty() {
-                        badge_parts.push(format!(
-                            "{} file{}",
-                            files.len(),
-                            if files.len() == 1 { "" } else { "s" }
+                        badge_parts.push(crate::i18n::active_t("plans.file_count").replacen(
+                            "{}",
+                            &files.len().to_string(),
+                            1,
                         ));
                     }
                     if !readonly_files.is_empty() {
-                        badge_parts.push(format!("{} ref", readonly_files.len()));
+                        badge_parts.push(crate::i18n::active_t("plans.ref_count").replacen(
+                            "{}",
+                            &readonly_files.len().to_string(),
+                            1,
+                        ));
                     }
                     spans.push(Span::styled(
                         format!(" [{}]", badge_parts.join(" + ")),
@@ -515,26 +554,39 @@ pub(crate) fn compute_unified_plan_lines(
                     row_line = pad_line_to_width(row_line, width, row_style);
                 }
                 let mut row_lines = vec![row_line];
+                // A cached Markdown body arrives already wrapped, so it is
+                // collected apart and appended after the row summary and its
+                // metadata, which are short and wrapped every frame (c-1).
+                let mut detail_lines: Vec<Line<'static>> = Vec::new();
 
                 if *is_expanded {
                     if !*has_children && !files.is_empty() {
                         row_lines.push(Line::from(vec![
                             Span::styled(body_prefix.clone(), engine.fg(palette.text_muted)),
-                            Span::styled("files: ", engine.fg(palette.text_muted)),
+                            Span::styled(
+                                format!("{} ", crate::i18n::active_t("plans.files_prefix")),
+                                engine.fg(palette.text_muted),
+                            ),
                             Span::styled(files.join(", "), engine.fg(palette.status_info)),
                         ]));
                     }
                     if !*has_children && !readonly_files.is_empty() {
                         row_lines.push(Line::from(vec![
                             Span::styled(body_prefix.clone(), engine.fg(palette.text_muted)),
-                            Span::styled("ref: ", engine.fg(palette.text_muted)),
+                            Span::styled(
+                                format!("{} ", crate::i18n::active_t("plans.ref_prefix")),
+                                engine.fg(palette.text_muted),
+                            ),
                             Span::styled(readonly_files.join(", "), engine.fg(palette.status_info)),
                         ]));
                     }
                     if !concept_refs.is_empty() {
                         row_lines.push(Line::from(vec![
                             Span::styled(body_prefix.clone(), engine.fg(palette.text_muted)),
-                            Span::styled("concept: ", engine.fg(palette.text_muted)),
+                            Span::styled(
+                                crate::i18n::active_t("plans.concept_prefix"),
+                                engine.fg(palette.text_muted),
+                            ),
                             Span::styled(
                                 concept_refs.join(", "),
                                 engine.fg(palette.button_active_bg),
@@ -553,15 +605,17 @@ pub(crate) fn compute_unified_plan_lines(
                                 body_prefix.clone(),
                                 engine.fg(palette.text_muted),
                             ));
-                            let md = crate::markdown::render_markdown(&prepared, &theme);
-                            if !md.is_empty() {
-                                row_lines.extend(md);
-                            }
+                            let key = step_body_key(plan_id, item_id);
+                            let body =
+                                cache.lines_for(&key, &prepared, &theme, Some(width), theme_mode);
+                            detail_lines.extend(body.iter().cloned());
                         }
                     }
                 }
 
-                all_lines.extend(wrap_lines(row_lines, width));
+                let mut rendered = wrap_lines(row_lines, width);
+                rendered.extend(detail_lines);
+                all_lines.extend(rendered);
             }
         }
     }
@@ -650,6 +704,148 @@ mod tests {
             .join("\n")
     }
 
+    /// Renders the tree the way the view does, against the view's own body
+    /// cache, and returns the lines with their row offsets.
+    fn render_view(
+        view: &mut PlansViewState,
+        selected: usize,
+        width: usize,
+    ) -> (Vec<Line<'static>>, Vec<usize>) {
+        let rows = view.flatten_rows();
+        compute_unified_plan_lines(
+            &rows,
+            selected,
+            width,
+            view.theme_mode,
+            &mut view.markdown_cache,
+        )
+    }
+
+    /// Body lines of a rendered tree: the detail block lines that carry the `│`
+    /// body prefix, as opposed to the summary line of a row.
+    fn body_lines(lines: &[Line<'static>]) -> Vec<Line<'static>> {
+        lines
+            .iter()
+            .filter(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>()
+                    .contains('│')
+            })
+            .cloned()
+            .collect()
+    }
+
+    /// Fixture with one expanded concept body and one expanded step body.
+    fn cached_bodies_fixture(step_details: &str, concept_details: &str) -> PlansViewState {
+        let mut view = PlansViewState {
+            plans: vec![Plan {
+                id: "cache-plan".to_string(),
+                title: "Cache Plan".to_string(),
+                description: None,
+                concept: vec![ConceptItem {
+                    details: Some(concept_details.to_string()),
+                    ..concept_leaf("c-1", "Invariant")
+                }],
+                items: vec![PlanItem {
+                    details: Some(step_details.to_string()),
+                    ..leaf_item("1", "Step")
+                }],
+                ..Default::default()
+            }],
+            content_width: 200,
+            ..Default::default()
+        };
+        view.expand_all();
+        view
+    }
+
+    #[test]
+    fn test_navigation_reuses_cached_bodies_and_keeps_their_lines() {
+        let mut view = cached_bodies_fixture("Implement the signer.", "Tokens must be signed.");
+        let step_row = view
+            .flatten_rows()
+            .iter()
+            .position(|row| matches!(row, VisiblePlanRow::PlanItem { .. }))
+            .expect("the step row is visible");
+
+        let (first, _) = render_view(&mut view, 0, 200);
+        let first_text = joined_text(&first);
+        assert!(
+            first_text.contains("Tokens must be signed."),
+            "the concept body must render: {first_text}"
+        );
+        assert!(
+            first_text.contains("Implement the signer."),
+            "the step body must render: {first_text}"
+        );
+        assert_eq!(
+            view.markdown_cache.len(),
+            2,
+            "one cached body per rendered description"
+        );
+
+        // Moving the cursor re-renders every row but must reuse both bodies.
+        let (second, _) = render_view(&mut view, step_row, 200);
+        assert_eq!(
+            view.markdown_cache.len(),
+            2,
+            "navigation must neither add nor drop a cached body"
+        );
+        assert_eq!(
+            body_lines(&second),
+            body_lines(&first),
+            "navigation must not change a rendered body"
+        );
+    }
+
+    #[test]
+    fn test_width_change_rerenders_the_cached_bodies() {
+        let mut view = cached_bodies_fixture(
+            "Implement the signer over a rotating key so verification stays deterministic.",
+            "Tokens must be signed.",
+        );
+
+        let (wide, _) = render_view(&mut view, usize::MAX, 200);
+        let (narrow, _) = render_view(&mut view, usize::MAX, 40);
+        assert_eq!(
+            view.markdown_cache.len(),
+            2,
+            "a new wrap width drops and re-renders both bodies"
+        );
+        assert!(
+            body_lines(&narrow).len() > body_lines(&wide).len(),
+            "the narrow body must wrap into more lines"
+        );
+
+        // Returning to the original width re-renders the identical lines.
+        let (wide_again, _) = render_view(&mut view, usize::MAX, 200);
+        assert_eq!(body_lines(&wide_again), body_lines(&wide));
+    }
+
+    #[test]
+    fn test_rewritten_description_rerenders_its_own_body() {
+        let mut view = cached_bodies_fixture("First wording.", "Tokens must be signed.");
+
+        let (before, _) = render_view(&mut view, usize::MAX, 200);
+        assert!(joined_text(&before).contains("First wording."));
+
+        let plan = view.plans.first_mut().expect("the fixture plan is present");
+        let step = plan.items.first_mut().expect("the fixture step is present");
+        step.details = Some("Second wording.".to_string());
+
+        let (after, _) = render_view(&mut view, usize::MAX, 200);
+        let text = joined_text(&after);
+        assert!(text.contains("Second wording."), "{text}");
+        assert!(!text.contains("First wording."), "{text}");
+        assert_eq!(
+            view.markdown_cache.len(),
+            2,
+            "a rewritten description replaces its own body"
+        );
+    }
+
     #[test]
     fn test_file_badges_render_only_for_leaf_items() {
         let mut view = PlansViewState::default();
@@ -660,6 +856,7 @@ mod tests {
             created_at: 0,
             updated_at: 0,
             architect: None,
+            last_replanned_step: None,
             concept: vec![],
             items: vec![PlanItem {
                 id: "1".to_string(),
@@ -686,9 +883,7 @@ mod tests {
         view.plans = vec![plan];
         view.expand_all();
 
-        let rows = view.flatten_rows();
-        let (lines, _) =
-            compute_unified_plan_lines(&rows, usize::MAX, 200, crate::config::ThemeMode::Auto);
+        let (lines, _) = render_view(&mut view, usize::MAX, 200);
         let text = joined_text(&lines);
 
         assert!(
@@ -699,7 +894,7 @@ mod tests {
         // Exactly one file badge: the leaf task. The parent phase carries a
         // non-empty `files` list in memory but must never render a badge.
         assert_eq!(
-            text.matches("file]").count(),
+            text.matches("file(s)]").count(),
             1,
             "only leaf rows may show file badges: {}",
             text
@@ -716,6 +911,7 @@ mod tests {
             created_at: 0,
             updated_at: 0,
             architect: None,
+            last_replanned_step: None,
             concept: vec![],
             items: vec![PlanItem {
                 id: "1".to_string(),
@@ -735,13 +931,11 @@ mod tests {
         view.plans = vec![plan];
         view.expand_all();
 
-        let rows = view.flatten_rows();
-        let (lines, _) =
-            compute_unified_plan_lines(&rows, usize::MAX, 200, crate::config::ThemeMode::Auto);
+        let (lines, _) = render_view(&mut view, usize::MAX, 200);
         let text = joined_text(&lines);
 
         assert!(
-            text.contains("[1 file + 2 ref]"),
+            text.contains("[1 file(s) + 2 ref(s)]"),
             "badge should count target and reference files: {}",
             text
         );
@@ -777,6 +971,7 @@ mod tests {
             created_at: 0,
             updated_at: 0,
             architect: None,
+            last_replanned_step: None,
             concept: vec![],
             items: vec![PlanItem {
                 id: "1".to_string(),
@@ -805,8 +1000,7 @@ mod tests {
             VisiblePlanRow::PlanItem { item_id, focused: true, .. } if item_id == "1"
         )));
 
-        let (lines, _) =
-            compute_unified_plan_lines(&rows, usize::MAX, 200, crate::config::ThemeMode::Auto);
+        let (lines, _) = render_view(&mut view, usize::MAX, 200);
         let text = joined_text(&lines);
         assert!(
             text.contains("[FOCUS]"),
@@ -817,7 +1011,7 @@ mod tests {
 
     #[test]
     fn test_plan_header_renders_the_architect_provenance() {
-        let view = PlansViewState {
+        let mut view = PlansViewState {
             plans: vec![Plan {
                 id: "arch-plan".to_string(),
                 title: "Arch Plan".to_string(),
@@ -839,11 +1033,10 @@ mod tests {
             }
         ));
 
-        let (lines, _) =
-            compute_unified_plan_lines(&rows, usize::MAX, 200, crate::config::ThemeMode::Auto);
+        let (lines, _) = render_view(&mut view, usize::MAX, 200);
         let rendered = joined_text(&lines);
         assert!(
-            rendered.contains("[ARC openrouter:planner/model high]"),
+            rendered.contains("[ARC] planner/model [high]"),
             "the header must name the Architect model and depth: {rendered}"
         );
     }
@@ -871,9 +1064,7 @@ mod tests {
         };
         view.expand_all();
 
-        let rows = view.flatten_rows();
-        let (lines, _) =
-            compute_unified_plan_lines(&rows, usize::MAX, 200, crate::config::ThemeMode::Auto);
+        let (lines, _) = render_view(&mut view, usize::MAX, 200);
 
         let header = leading_indent(&lines[find_line(&lines, "[indent-plan]")]);
         let concept_section = leading_indent(&lines[find_line(&lines, "Architectural Intent")]);
@@ -952,8 +1143,7 @@ mod tests {
         // A collapsed plan exposes only its header, anchored at the root level.
         let rows = view.flatten_rows();
         assert_eq!(rows.len(), 1, "a collapsed plan exposes only its header");
-        let (lines, _) =
-            compute_unified_plan_lines(&rows, usize::MAX, 200, crate::config::ThemeMode::Auto);
+        let (lines, _) = render_view(&mut view, usize::MAX, 200);
         let rendered = joined_text(&lines);
         assert!(
             !rendered.contains("Invariant"),
@@ -968,9 +1158,7 @@ mod tests {
         view.toggle_plan_expanded("state-plan");
         view.toggle_concept_section_expanded("state-plan");
         view.toggle_impl_section_expanded("state-plan");
-        let rows = view.flatten_rows();
-        let (lines, _) =
-            compute_unified_plan_lines(&rows, usize::MAX, 200, crate::config::ThemeMode::Auto);
+        let (lines, _) = render_view(&mut view, usize::MAX, 200);
         let header = leading_indent(&lines[find_line(&lines, "[state-plan]")]);
         let concept_section = leading_indent(&lines[find_line(&lines, "Architectural Intent")]);
         let impl_section = leading_indent(&lines[find_line(&lines, "Execution Blueprint")]);
@@ -992,9 +1180,7 @@ mod tests {
         // Fully expanding the tree keeps every child strictly deeper than its
         // parent and every node body at the level of its children.
         view.expand_all();
-        let rows = view.flatten_rows();
-        let (lines, _) =
-            compute_unified_plan_lines(&rows, usize::MAX, 200, crate::config::ThemeMode::Auto);
+        let (lines, _) = render_view(&mut view, usize::MAX, 200);
         let header = leading_indent(&lines[find_line(&lines, "[state-plan]")]);
         let concept_section = leading_indent(&lines[find_line(&lines, "Architectural Intent")]);
         let concept = leading_indent(&lines[find_line(&lines, "#c-1 Invariant")]);

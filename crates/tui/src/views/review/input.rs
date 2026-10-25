@@ -35,6 +35,7 @@ pub enum ReviewAction {
     AccordionNext,
     SelectFirst,
     SelectLast,
+    Recenter,
     PageUp,
     PageDown,
     FoldToggle,
@@ -265,6 +266,18 @@ pub static REVIEW_COMMAND_MAP: CommandMap<ReviewAction> = CommandMap::new(&[
         ReviewAction::SelectLast,
         Interface,
         "cmd.review.select_last",
+    ),
+    CommandSpec::new(
+        KeyChord::Primary(KeyCode::Char('l')),
+        ReviewAction::Recenter,
+        Interface,
+        "cmd.review.recenter",
+    ),
+    CommandSpec::new(
+        KeyChord::Ctrl(KeyCode::Char('l')),
+        ReviewAction::Recenter,
+        Interface,
+        "cmd.review.recenter",
     ),
     CommandSpec::new(
         KeyChord::Bare(KeyCode::PageUp),
@@ -755,12 +768,20 @@ pub async fn handle_review_key(
                 st.review.scroll_to_selected();
             }
         }
+        // Paging is free scrolling: it moves the window inside the rendered
+        // document without touching the cursor, so a long expanded subplan can
+        // be read continuously down to its last line and the viewport is never
+        // re-anchored on the selected row (c-1, c-2).
         ReviewAction::PageUp => {
-            st.review.scroll = st.review.scroll.saturating_sub(page);
+            let max = st.review.max_scroll();
+            st.review.scroll = st.review.scroll.saturating_sub(page).min(max);
         }
         ReviewAction::PageDown => {
-            let max = (st.review.rendered_lines as u16).saturating_sub(st.review.view_height);
+            let max = st.review.max_scroll();
             st.review.scroll = st.review.scroll.saturating_add(page).min(max);
+        }
+        ReviewAction::Recenter => {
+            st.review.recenter_selected();
         }
         ReviewAction::FoldToggle => {
             let sel_row = st.review.selected_row();
@@ -1123,7 +1144,6 @@ pub async fn handle_review_key(
                         vec![tauqe_protocol::ModelEntry::new(
                             fallback_model,
                             fallback_effort,
-                            None,
                         )]
                     });
                 let files_count = st.context.items.len();
@@ -1195,11 +1215,8 @@ mod tests {
         });
 
         let rev_model = ModelRef::openrouter("anthropic/claude-3.5-sonnet");
-        let rev_entry = tauqe_protocol::ModelEntry::new(
-            rev_model.clone(),
-            Some(ReasoningEffort::High),
-            Some("Claude Auditor".to_string()),
-        );
+        let rev_entry =
+            tauqe_protocol::ModelEntry::new(rev_model.clone(), Some(ReasoningEffort::High));
         st.model_choice.roles = Some(ModelRolesSummary {
             architect: ModelRef::openrouter("test-arch"),
             coder: ModelRef::openrouter("test-coder"),
@@ -1233,7 +1250,6 @@ mod tests {
         let selected = dialog.selected_entry().expect("entry must exist");
         assert_eq!(selected.model, rev_model);
         assert_eq!(selected.effort, Some(ReasoningEffort::High));
-        assert_eq!(selected.alias.as_deref(), Some("Claude Auditor"));
     }
 
     #[test]
@@ -1527,6 +1543,29 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_ctrl_l_recenters_review() {
+        let mut st = crate::app::test_state();
+        st.view_mode = ViewMode::Review;
+        st.review.sessions = (1..=15)
+            .map(|i| todo_session(&format!("rev-{i}"), i))
+            .collect();
+        st.review.selected_index = 8;
+        st.review.view_height = 5;
+        st.review.content_width = 80;
+
+        let state = Arc::new(Mutex::new(st));
+        let mut conn = RpcConnection::new(Vec::<u8>::new());
+        let key = KeyEvent::new(KeyCode::Char('l'), crossterm::event::KeyModifiers::CONTROL);
+        handle_review_key(key, &state, &mut conn).await.unwrap();
+
+        let scroll_first = state.lock().await.review.scroll;
+        handle_review_key(key, &state, &mut conn).await.unwrap();
+        let scroll_second = state.lock().await.review.scroll;
+
+        assert_ne!(scroll_first, scroll_second, "C-l must cycle recenter positions in review view");
+    }
+
+    #[tokio::test]
     async fn test_handle_review_key_capital_x_triggers_batch_execute() {
         use tauqe_protocol::{IssueStatus, IssueType, ReviewIssue, ReviewSession};
 
@@ -1708,5 +1747,49 @@ mod tests {
             st.active_notification().map(|n| n.text.as_str()),
             Some("No findings require architectural decomposition")
         );
+    }
+
+    /// Paging is free scrolling over the rendered document: it reaches the last
+    /// screenful of a long expanded subplan, never scrolls past it, and never
+    /// re-anchors the window on the cursor row (c-1, c-2).
+    #[tokio::test]
+    async fn test_paging_scrolls_the_viewport_without_snapping_to_the_cursor() {
+        let mut st = crate::app::test_state();
+        st.view_mode = ViewMode::Review;
+        st.review.sessions = vec![todo_session("rev-scroll", 1)];
+        st.review.view_height = 20;
+        st.review.rendered_lines = 500;
+        // The cursor rests on the finding while the developer pages away from
+        // it, so paging must never pull the viewport back to this row.
+        st.review.selected_index = 1;
+        st.review.scroll = 0;
+
+        let state = Arc::new(Mutex::new(st));
+        let mut conn = RpcConnection::new(Vec::<u8>::new());
+
+        let down = KeyEvent::new(KeyCode::PageDown, crossterm::event::KeyModifiers::NONE);
+        let up = KeyEvent::new(KeyCode::PageUp, crossterm::event::KeyModifiers::NONE);
+
+        // One page is the viewport height minus the two reserved rows.
+        handle_review_key(down, &state, &mut conn).await.unwrap();
+        assert_eq!(state.lock().await.review.scroll, 18);
+
+        // Paging to the end stops exactly at the last full screenful instead of
+        // running past the document.
+        for _ in 0..100 {
+            handle_review_key(down, &state, &mut conn).await.unwrap();
+        }
+        {
+            let guard = state.lock().await;
+            assert_eq!(guard.review.scroll, 480);
+            assert_eq!(
+                guard.review.selected_index, 1,
+                "paging must neither move nor re-anchor the cursor"
+            );
+        }
+
+        // Paging back up returns one page without snapping to the cursor.
+        handle_review_key(up, &state, &mut conn).await.unwrap();
+        assert_eq!(state.lock().await.review.scroll, 462);
     }
 }

@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::SystemTime;
 
 use anyhow::Result;
@@ -19,7 +19,7 @@ use languages::{language_for_path, LanguageSupport};
 struct CachedSymbols {
     modified: Option<SystemTime>,
     size: u64,
-    symbols: Option<RepoFileSymbols>,
+    symbols: Option<Arc<RepoFileSymbols>>,
 }
 
 /// Reusable parser and the symbol cache it fills.
@@ -35,6 +35,11 @@ struct ExtractorState {
 /// re-parse every file outside that context on each round; the cache turns
 /// those passes into lookups for files whose modification time and size are
 /// unchanged.
+///
+/// Production callers resolve the process-wide shared instance through
+/// [`shared_extractor`], so parsed symbols stay warm across turns, discovery
+/// rounds, and targeted map requests instead of being discarded with a
+/// per-call extractor.
 #[derive(Clone)]
 pub struct TreeSitterExtractor {
     state: Arc<Mutex<ExtractorState>>,
@@ -65,8 +70,26 @@ impl TreeSitterExtractor {
     }
 }
 
+/// Process-wide shared extractor instance.
+///
+/// Repository-map generation runs once per bounded turn and once per targeted
+/// `<repo_map>` request, so building a fresh extractor per call would discard
+/// the mtime/size cache before it could ever record a cross-invocation hit.
+/// The shared instance keeps parsed symbols warm for the whole process, and
+/// cache keys are absolute paths, so entries never collide across repositories.
+static SHARED_EXTRACTOR: OnceLock<TreeSitterExtractor> = OnceLock::new();
+
+/// Returns the process-wide shared Tree-sitter extractor.
+pub fn shared_extractor() -> &'static TreeSitterExtractor {
+    SHARED_EXTRACTOR.get_or_init(TreeSitterExtractor::new)
+}
+
 impl SymbolExtractor for TreeSitterExtractor {
-    fn extract_symbols(&self, repo_root: &Path, files: &[String]) -> Result<Vec<RepoFileSymbols>> {
+    fn extract_symbols(
+        &self,
+        repo_root: &Path,
+        files: &[String],
+    ) -> Result<Vec<Arc<RepoFileSymbols>>> {
         crate::blocking::run_blocking(|| {
             Ok(extract_treesitter_symbols(&self.state, repo_root, files))
         })
@@ -78,13 +101,22 @@ fn extract_treesitter_symbols(
     state_lock: &Mutex<ExtractorState>,
     repo_root: &Path,
     files: &[String],
-) -> Vec<RepoFileSymbols> {
+) -> Vec<Arc<RepoFileSymbols>> {
     let mut result = Vec::new();
     for rel_path in files {
         let full_path = repo_root.join(rel_path);
         let metadata = match std::fs::metadata(&full_path) {
             Ok(metadata) => metadata,
-            Err(_) => continue,
+            Err(_) => {
+                // The file no longer exists: drop any stale entry so deleted
+                // files do not accumulate in the shared, process-wide cache.
+                let mut state = match state_lock.lock() {
+                    Ok(guard) => guard,
+                    Err(poisoned) => poisoned.into_inner(),
+                };
+                state.cache.remove(&full_path);
+                continue;
+            }
         };
         let modified = metadata.modified().ok();
         let size = metadata.len();
@@ -134,9 +166,10 @@ fn extract_treesitter_symbols(
         }
 
         let symbols = extract_symbols_with_support(&mut state.parser, support, rel_path, &source)
-            .filter(|file| !file.symbols.is_empty());
+            .filter(|file| !file.symbols.is_empty())
+            .map(Arc::new);
         if let Some(symbols) = &symbols {
-            result.push(symbols.clone());
+            result.push(Arc::clone(symbols));
         }
         state.cache.insert(
             full_path,
@@ -790,5 +823,100 @@ function build_service(int $retries): Service
         }
 
         assert_eq!(extractor.state.lock().unwrap().cache.len(), 10);
+    }
+
+    #[test]
+    fn test_shared_extractor_serves_two_generations_without_reparse() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        std::fs::write(
+            root.join("shared_a.rs"),
+            "pub fn shared_alpha() -> i32 { 1 }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("shared_b.rs"),
+            "pub fn shared_beta() -> i32 { 2 }\n",
+        )
+        .unwrap();
+        let files = vec!["shared_a.rs".to_string(), "shared_b.rs".to_string()];
+
+        let first = shared_extractor().extract_symbols(&root, &files).unwrap();
+        assert_eq!(first.len(), 2);
+        let entry_before = {
+            let state = shared_extractor().state.lock().unwrap();
+            state
+                .cache
+                .get(&root.join("shared_a.rs"))
+                .and_then(|cached| cached.symbols.clone())
+                .expect("generation registers the parsed file")
+        };
+
+        // A second generation over the unchanged repository must be served from
+        // the persistent cache: the entry keeps its identity, proving that no
+        // file was re-parsed and no symbol payload was rebuilt.
+        let second = shared_extractor().extract_symbols(&root, &files).unwrap();
+        assert_eq!(second, first);
+        let entry_after = {
+            let state = shared_extractor().state.lock().unwrap();
+            state
+                .cache
+                .get(&root.join("shared_a.rs"))
+                .and_then(|cached| cached.symbols.clone())
+                .expect("the cached entry survives the second generation")
+        };
+        assert!(
+            Arc::ptr_eq(&entry_before, &entry_after),
+            "an unchanged file must be served from the shared cache without a re-parse"
+        );
+
+        // A deleted file evicts its entry instead of leaving stale state in
+        // the process-wide cache.
+        std::fs::remove_file(root.join("shared_a.rs")).unwrap();
+        let third = shared_extractor().extract_symbols(&root, &files).unwrap();
+        assert_eq!(third.len(), 1);
+        let stale_entry_present = {
+            let state = shared_extractor().state.lock().unwrap();
+            state.cache.contains_key(&root.join("shared_a.rs"))
+        };
+        assert!(!stale_entry_present, "a missing file must evict its entry");
+    }
+
+    #[test]
+    fn test_generate_repo_map_reuses_the_shared_extractor() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        std::fs::write(root.join("shared_map.rs"), "pub fn shared_map_fn() {}\n").unwrap();
+        let files = vec!["shared_map.rs".to_string()];
+
+        // The public map-generation path resolves through the process-wide
+        // extractor, so its parse lands in the shared cache.
+        let first = crate::repomap::generate_repo_map(&root, &files, &[], 1000).unwrap();
+        assert!(first.contains("pub fn shared_map_fn"));
+        let entry_before = {
+            let state = shared_extractor().state.lock().unwrap();
+            state
+                .cache
+                .get(&root.join("shared_map.rs"))
+                .and_then(|cached| cached.symbols.clone())
+                .expect("map generation shares the process-wide extractor")
+        };
+
+        // The second generation over the unchanged repository reuses the cached
+        // parse instead of re-running the Tree-sitter pass.
+        let second = crate::repomap::generate_repo_map(&root, &files, &[], 1000).unwrap();
+        assert_eq!(second, first);
+        let entry_after = {
+            let state = shared_extractor().state.lock().unwrap();
+            state
+                .cache
+                .get(&root.join("shared_map.rs"))
+                .and_then(|cached| cached.symbols.clone())
+                .expect("the cached entry survives the second generation")
+        };
+        assert!(
+            Arc::ptr_eq(&entry_before, &entry_after),
+            "the second map generation must reuse the cached parse"
+        );
     }
 }

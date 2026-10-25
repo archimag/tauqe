@@ -165,10 +165,16 @@ pub(crate) async fn submit_refine_dialog(
     } else {
         Some(instructions_raw)
     };
+    // The selected architect rung travels whole: the model together with the
+    // reasoning depth it was configured with, so the architect the developer
+    // picked is the architect that runs.
     let selected_model = dialog
         .selector
         .selected_entry()
-        .map(|entry| tauqe_protocol::ModelSelection::Specific(entry.model.clone()));
+        .map(|entry| tauqe_protocol::ModelSelection::Tier {
+            model: entry.model.clone(),
+            effort: entry.effort,
+        });
 
     let params = tauqe_protocol::PlanRefineParams {
         plan_id: dialog.plan_id.clone(),
@@ -290,6 +296,7 @@ mod tests {
             created_at: 0,
             updated_at: 0,
             architect: None,
+            last_replanned_step: None,
             concept: vec![],
             items: vec![],
         }];

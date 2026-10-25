@@ -1,11 +1,14 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 
 use ratatui::style::{Style, Stylize};
 use ratatui::text::{Line, Span};
 use tauqe_protocol::{HistoryEntryStatus, UiHistoryItem, UiHistoryKind};
 
+use crate::clipboard::CopyResult;
 use crate::i18n::active_t;
+use crate::markdown::MarkdownBodyCache;
 use crate::ui::wrap_lines;
+use crate::views::recenter::RecenterState;
 
 pub mod input;
 pub mod render;
@@ -15,11 +18,19 @@ pub use self::render::render_history_view;
 
 const COLLAPSED_PREVIEW_LINES: usize = 3;
 
+/// Columns every rendered History body line is prefixed with.
+///
+/// The Markdown theme paints the prefix and the copy-button geometry offsets by
+/// the same constant, so a drawn button and its hit region share one source of
+/// truth (c-1).
+pub(crate) const LINE_PREFIX: &str = "  ";
+
 /// Saturating conversion for scroll arithmetic; avoids wrap-around on very long histories.
 fn clamp_u16(n: usize) -> u16 {
     u16::try_from(n).unwrap_or(u16::MAX)
 }
 
+/// A fenced code block placed in the rendered document, addressed by owner.
 #[derive(Debug, Clone)]
 pub struct HistoryCodeBlock {
     pub item_id: u64,
@@ -30,87 +41,18 @@ pub struct HistoryCodeBlock {
     pub visual_end_line: usize,
 }
 
-/// Code block position relative to the start of a cached item body.
+/// A fenced code block located inside one item body.
+///
+/// `start` and `end` are inclusive indices into the body lines, so the layout
+/// places the copy button over the exact rows the cache painted without parsing
+/// the Markdown a second time (c-1).
 #[derive(Debug, Clone)]
-struct CachedCodeBlock {
+struct BodyCodeBlock {
     block_id: usize,
     lang: String,
     code: String,
     start: usize,
     end: usize,
-}
-
-/// Wrapped, highlighted body lines of one history item (everything below its header).
-#[derive(Debug, Clone)]
-struct CachedBody {
-    text_len: usize,
-    files_len: usize,
-    status: HistoryEntryStatus,
-    lines: Vec<Line<'static>>,
-    blocks: Vec<CachedCodeBlock>,
-}
-
-/// Caches expensive per-item rendering (markdown, syntax highlighting, wrapping),
-/// keyed by `(item id, expanded)` and invalidated whenever the wrap width, the
-/// active light/dark mode, or the record's lifecycle status changes.
-#[derive(Debug, Clone)]
-pub(crate) struct HistoryBodyCache {
-    width: Option<usize>,
-    theme_mode: crate::config::ThemeMode,
-    entries: HashMap<(u64, bool), CachedBody>,
-}
-
-impl Default for HistoryBodyCache {
-    fn default() -> Self {
-        Self {
-            width: None,
-            theme_mode: crate::config::ThemeMode::Auto,
-            entries: HashMap::new(),
-        }
-    }
-}
-
-impl HistoryBodyCache {
-    fn prepare(
-        &mut self,
-        max_width: Option<usize>,
-        theme_mode: crate::config::ThemeMode,
-        items: &[UiHistoryItem],
-    ) {
-        if self.width != max_width || self.theme_mode != theme_mode {
-            self.entries.clear();
-            self.width = max_width;
-            self.theme_mode = theme_mode;
-        }
-        if self.entries.len() > items.len() * 2 {
-            let live: HashSet<u64> = items.iter().map(|it| it.id).collect();
-            self.entries.retain(|(id, _), _| live.contains(id));
-        }
-    }
-
-    fn body_for(
-        &mut self,
-        item: &UiHistoryItem,
-        is_expanded: bool,
-        max_width: Option<usize>,
-    ) -> &CachedBody {
-        let key = (item.id, is_expanded);
-        let theme_mode = self.theme_mode;
-        // The lifecycle status is part of the rendered body: an in-flight record
-        // that later rolls back gains its status badge and restore hint, so a
-        // body cached under the previous status must be recomputed, never reused.
-        let stale = self.entries.get(&key).is_some_and(|body| {
-            body.text_len != item.text.len()
-                || body.files_len != item.files.len()
-                || body.status != item.status
-        });
-        if stale {
-            self.entries.remove(&key);
-        }
-        self.entries
-            .entry(key)
-            .or_insert_with(|| build_item_body(item, is_expanded, max_width, theme_mode, None))
-    }
 }
 
 #[derive(Debug, Clone)]
@@ -125,16 +67,20 @@ pub struct HistoryViewState {
     pub rendered_lines_count: usize,
     pub pending_before_id: Option<u64>,
     pub select_prev_after_load: bool,
-    pub recenter_cycle: u8,
-    pub last_recenter_index: Option<usize>,
+    pub recenter_state: RecenterState,
     pub selected_item_index: usize,
     pub content_width: usize,
     pub expanded_items: HashSet<u64>,
     pub code_blocks: Vec<HistoryCodeBlock>,
-    pub content_rect: (u16, u16, u16, u16),
     pub copy_flash: Option<((u64, usize), std::time::Instant)>,
     pub theme_mode: crate::config::ThemeMode,
-    pub(crate) body_cache: HistoryBodyCache,
+    /// Rendered Markdown bodies of expanded answers, owned by the shared cache.
+    ///
+    /// The cache tracks the wrap width, the theme mode, and the color depth
+    /// itself, so the view keeps no second invalidation rule of its own: a
+    /// cursor move or a scroll serves the retained body, while a resize or a new
+    /// palette drops it (c-1, c-3).
+    pub(crate) body_cache: MarkdownBodyCache<u64>,
 }
 
 impl Default for HistoryViewState {
@@ -150,16 +96,14 @@ impl Default for HistoryViewState {
             rendered_lines_count: 0,
             pending_before_id: None,
             select_prev_after_load: false,
-            recenter_cycle: 0,
-            last_recenter_index: None,
+            recenter_state: RecenterState::default(),
             selected_item_index: 0,
             content_width: 80,
             expanded_items: HashSet::new(),
             code_blocks: Vec::new(),
-            content_rect: (0, 0, 0, 0),
             copy_flash: None,
             theme_mode: crate::config::ThemeMode::Auto,
-            body_cache: HistoryBodyCache::default(),
+            body_cache: MarkdownBodyCache::new(),
         }
     }
 }
@@ -177,11 +121,11 @@ impl HistoryViewState {
         }
     }
 
-    /// Invalidates the cached item bodies so the next render re-parses every
-    /// visible entry under the newly active theme. Called on hot theme reloads,
-    /// where the light/dark mode is unchanged but the palette is not.
+    /// Invalidates the cached Markdown bodies so the next render re-parses every
+    /// visible entry under the newly active palette. Called on hot theme
+    /// reloads, where the light/dark mode is unchanged but the palette is not.
     pub fn refresh_theme(&mut self) {
-        self.body_cache = HistoryBodyCache::default();
+        self.body_cache.clear();
     }
 
     pub fn get_estimated_tokens(&self) -> u64 {
@@ -219,12 +163,13 @@ impl HistoryViewState {
         self.total_count = total_count;
         self.estimated_tokens = estimated_tokens;
 
-        // Fold state and cached bodies of the removed head entries are stale.
+        // Fold state and cached bodies of the removed head entries are stale. The
+        // shared cache owns no per-key eviction, so the structural replacement
+        // drops every body and the retained tail renders once on the next frame
+        // (c-3).
         let live: HashSet<u64> = self.items.iter().map(|it| it.id).collect();
         self.expanded_items.retain(|id| live.contains(id));
-        self.body_cache
-            .entries
-            .retain(|(id, _), _| live.contains(id));
+        self.body_cache.clear();
 
         // Recompute geometry against the new item set and re-anchor the viewport.
         let max_width = Some(self.content_width);
@@ -308,41 +253,17 @@ impl HistoryViewState {
             .min(self.items.len().saturating_sub(1));
         self.selected_item_index = sel;
         let (total_lines, offsets) = self.layout_offsets(max_width, Some(sel));
-        let max_scroll = clamp_u16(total_lines).saturating_sub(view_height);
 
         if let Some(&start_offset) = offsets.get(sel) {
             let next_offset = offsets.get(sel + 1).copied().unwrap_or(total_lines);
-            let item_height = next_offset.saturating_sub(start_offset);
-
-            if self.last_recenter_index == Some(sel) {
-                self.recenter_cycle = (self.recenter_cycle + 1) % 3;
-            } else {
-                self.recenter_cycle = 0;
-                self.last_recenter_index = Some(sel);
-            }
-
             self.auto_scroll = false;
-            match self.recenter_cycle {
-                0 => {
-                    // Center in window
-                    let center_scroll = (start_offset as isize + (item_height as isize / 2)
-                        - (view_height as isize / 2))
-                        .clamp(0, max_scroll as isize)
-                        as u16;
-                    self.scroll = center_scroll;
-                }
-                1 => {
-                    // Align to top
-                    self.scroll = clamp_u16(start_offset).min(max_scroll);
-                }
-                _ => {
-                    // Align to bottom
-                    let bottom_scroll = (next_offset as isize - view_height as isize)
-                        .clamp(0, max_scroll as isize)
-                        as u16;
-                    self.scroll = bottom_scroll;
-                }
-            }
+            self.scroll = self.recenter_state.recenter(
+                sel,
+                start_offset,
+                next_offset,
+                total_lines,
+                view_height,
+            );
         }
     }
 
@@ -366,6 +287,30 @@ impl HistoryViewState {
             }
         }
         self.selected_item_index = selected.min(self.items.len().saturating_sub(1));
+    }
+
+    /// Copies the rendered code block `(item_id, block_id)` and flashes it.
+    ///
+    /// The view owns the blocks it drew, so it resolves the action to the exact
+    /// source it rendered and arms the flash badge; the pointer dispatcher
+    /// receives only the typed action and the reported outcome (c-1, c-2).
+    /// `None` means the block no longer exists and nothing happens.
+    pub fn copy_code_block(
+        &mut self,
+        item_id: u64,
+        block_id: usize,
+    ) -> Option<(CopyResult, usize)> {
+        let code = self
+            .code_blocks
+            .iter()
+            .find(|block| block.item_id == item_id && block.block_id == block_id)
+            .map(|block| block.code.clone())?;
+        let lines = code.lines().count().max(1);
+        let result = crate::clipboard::copy_to_clipboard(&code);
+        if result.is_success() {
+            self.copy_flash = Some(((item_id, block_id), std::time::Instant::now()));
+        }
+        Some((result, lines))
     }
 }
 
@@ -405,7 +350,7 @@ pub fn compute_history_lines_full(
     expanded_items: Option<&HashSet<u64>>,
     flashing_block: Option<(u64, usize)>,
 ) -> (Vec<Line<'static>>, Vec<usize>, Vec<HistoryCodeBlock>) {
-    let mut cache = HistoryBodyCache::default();
+    let mut cache = MarkdownBodyCache::new();
     layout_history(
         items,
         max_width,
@@ -448,38 +393,29 @@ fn build_item_header(
 
     let badge = match item.kind {
         UiHistoryKind::User => Span::styled(
-            " [USER] ",
+            format!(" [{}] ", active_t("history.badge.user")),
             engine
                 .bg(palette.status_info)
                 .fg(engine.color(palette.text_inverse))
                 .bold(),
         ),
         UiHistoryKind::Assistant => Span::styled(
-            " [ASSISTANT] ",
+            format!(" [{}] ", active_t("history.badge.assistant")),
             engine
                 .bg(palette.status_success)
                 .fg(engine.color(palette.text_inverse))
                 .bold(),
         ),
-        UiHistoryKind::System => {
-            if item.commit_hash.is_some() && item.text.to_lowercase().contains("undid") {
-                Span::styled(
-                    " [UNDO] ",
-                    engine
-                        .bg(palette.status_warning)
-                        .fg(engine.color(palette.text_inverse))
-                        .bold(),
-                )
-            } else {
-                Span::styled(
-                    " [SYSTEM] ",
-                    engine
-                        .bg(palette.text_muted)
-                        .fg(engine.color(palette.text_inverse))
-                        .bold(),
-                )
-            }
-        }
+        // The undo-commit command was removed, so a System record is
+        // classified exclusively by its typed kind and never by
+        // keyword-searching the server-generated prose (Conventions §1.5).
+        UiHistoryKind::System => Span::styled(
+            format!(" [{}] ", active_t("history.badge.system")),
+            engine
+                .bg(palette.text_muted)
+                .fg(engine.color(palette.text_inverse))
+                .bold(),
+        ),
     };
 
     let id_span = Span::styled(
@@ -522,7 +458,10 @@ fn build_item_header(
     if let Some(hash) = &item.commit_hash {
         header_spans.push(Span::raw(" "));
         header_spans.push(Span::styled(
-            format!("[COMMIT: {}]", hash),
+            format!(
+                "[{}]",
+                active_t("history.badge.commit").replacen("{}", hash.as_str(), 1)
+            ),
             engine.fg(palette.status_info).bold(),
         ));
     }
@@ -533,14 +472,23 @@ fn build_item_header(
     Line::from(header_spans)
 }
 
-/// Builds the wrapped body of one item. Independent of selection, so it can be cached.
+/// Builds the rendered body of one item: everything below its header.
+///
+/// Only the Markdown answer of an expanded assistant record is expensive to
+/// produce, so the shared [`MarkdownBodyCache`] owns it and returns the wrapped
+/// lines together with the fenced blocks they contain. The bands around it —
+/// the collapsed preview, the modified-file list, the restore hint — are
+/// assembled from typed fields on every frame and need no cache of their own,
+/// which is also why a lifecycle status change never invalidates a body (c-1,
+/// c-3).
 fn build_item_body(
     item: &UiHistoryItem,
     is_expanded: bool,
     max_width: Option<usize>,
     theme_mode: crate::config::ThemeMode,
+    cache: &mut MarkdownBodyCache<u64>,
     flash_id: Option<usize>,
-) -> CachedBody {
+) -> (Vec<Line<'static>>, Vec<BodyCodeBlock>) {
     let engine = crate::theme::engine::active_engine(theme_mode);
     let palette = engine.palette();
     let text_style = match item.kind {
@@ -549,43 +497,70 @@ fn build_item_body(
         UiHistoryKind::System => engine.fg(palette.status_warning),
     };
 
-    let mut raw_lines: Vec<Line<'static>> = Vec::new();
-    let mut extracted_blocks = Vec::new();
-    let mut md_start_idx = 0;
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    let mut blocks: Vec<BodyCodeBlock> = Vec::new();
 
     if is_expanded {
         if item.kind == UiHistoryKind::Assistant {
             let mut history_theme = crate::markdown::MarkdownTheme::answer_themed(theme_mode);
-            history_theme.line_prefix = Some(Span::raw("  "));
+            history_theme.line_prefix = Some(Span::raw(LINE_PREFIX));
             if let Some(w) = max_width {
                 history_theme.max_width = Some(w.saturating_sub(2));
             }
-            let (md_lines, blocks) =
-                crate::markdown::render_markdown_with_blocks(&item.text, &history_theme, flash_id);
-            md_start_idx = raw_lines.len();
-            extracted_blocks = blocks;
+            // The Markdown body leads the item body, so its block positions are
+            // shifted by the lines already emitted above it instead of being
+            // re-derived from a second parse (c-1).
+            let md_offset = lines.len();
+            let (md_lines, md_blocks) = cache.lines_and_blocks_for(
+                &item.id,
+                &item.text,
+                &history_theme,
+                max_width,
+                theme_mode,
+                flash_id,
+            );
             if md_lines.is_empty() {
                 for line in item.text.lines() {
-                    raw_lines.push(Line::from(Span::styled(format!("  {}", line), text_style)));
+                    lines.extend(wrap_one(
+                        Line::from(Span::styled(format!("  {}", line), text_style)),
+                        max_width,
+                    ));
                 }
             } else {
-                raw_lines.extend(md_lines);
+                lines.extend(md_lines.iter().cloned());
+                blocks.extend(md_blocks.iter().map(|block| BodyCodeBlock {
+                    block_id: block.id,
+                    lang: block.lang.clone(),
+                    code: block.content.clone(),
+                    start: md_offset + block.start,
+                    end: md_offset + block.end,
+                }));
             }
         } else {
             for line in item.text.lines() {
-                raw_lines.push(Line::from(Span::styled(format!("  {}", line), text_style)));
+                lines.extend(wrap_one(
+                    Line::from(Span::styled(format!("  {}", line), text_style)),
+                    max_width,
+                ));
             }
         }
 
         if !item.files.is_empty() {
             if item.kind == UiHistoryKind::Assistant {
-                raw_lines.push(Line::from(vec![
-                    Span::raw("  "),
-                    Span::styled(
-                        format!("Modified files ({}):", item.files.len()),
-                        engine.fg(palette.status_info).bold(),
-                    ),
-                ]));
+                lines.extend(wrap_one(
+                    Line::from(vec![
+                        Span::raw("  "),
+                        Span::styled(
+                            active_t("history.modified_files_label").replacen(
+                                "{}",
+                                &item.files.len().to_string(),
+                                1,
+                            ),
+                            engine.fg(palette.status_info).bold(),
+                        ),
+                    ]),
+                    max_width,
+                ));
                 for file_entry in &item.files {
                     let (op_label, op_style, path) =
                         if let Some(p) = file_entry.strip_prefix("[NEW] ") {
@@ -606,20 +581,26 @@ fn build_item_body(
                             )
                         };
 
-                    raw_lines.push(Line::from(vec![
-                        Span::raw("    "),
-                        Span::styled(op_label, op_style),
-                        Span::styled(path.to_string(), engine.fg(palette.text_primary)),
-                    ]));
+                    lines.extend(wrap_one(
+                        Line::from(vec![
+                            Span::raw("    "),
+                            Span::styled(op_label, op_style),
+                            Span::styled(path.to_string(), engine.fg(palette.text_primary)),
+                        ]),
+                        max_width,
+                    ));
                 }
             } else {
                 let mut file_spans = vec![
                     Span::raw("  "),
-                    Span::styled("Context: ", engine.fg(palette.text_muted).bold()),
+                    Span::styled(
+                        active_t("history.context_label"),
+                        engine.fg(palette.text_muted).bold(),
+                    ),
                 ];
                 let files_joined = item.files.join(", ");
                 file_spans.push(Span::styled(files_joined, engine.fg(palette.text_muted)));
-                raw_lines.push(Line::from(file_spans));
+                lines.extend(wrap_one(Line::from(file_spans), max_width));
             }
         }
     } else {
@@ -629,10 +610,10 @@ fn build_item_body(
         let preview_slice = &all_raw_lines[..total_text_lines.min(COLLAPSED_PREVIEW_LINES)];
 
         for line in preview_slice {
-            raw_lines.push(Line::from(Span::styled(
-                format!("    {}", line),
-                text_style,
-            )));
+            lines.extend(wrap_one(
+                Line::from(Span::styled(format!("    {}", line), text_style)),
+                max_width,
+            ));
         }
 
         let extra_lines = total_text_lines.saturating_sub(COLLAPSED_PREVIEW_LINES);
@@ -640,61 +621,46 @@ fn build_item_body(
 
         let mut notes = Vec::new();
         if extra_lines > 0 {
-            notes.push(format!("+{} more lines", extra_lines));
+            notes.push(active_t("history.more_lines_note").replacen(
+                "{}",
+                &extra_lines.to_string(),
+                1,
+            ));
         }
         if files_count > 0 {
-            notes.push(format!("{} modified files", files_count));
+            notes.push(active_t("history.modified_files_note").replacen(
+                "{}",
+                &files_count.to_string(),
+                1,
+            ));
         }
 
         if !notes.is_empty() {
             let note_str = format!("    ... [{}]", notes.join(", "));
-            raw_lines.push(Line::from(Span::styled(
-                note_str,
-                engine.fg(palette.text_muted).italic(),
-            )));
+            lines.extend(wrap_one(
+                Line::from(Span::styled(
+                    note_str,
+                    engine.fg(palette.text_muted).italic(),
+                )),
+                max_width,
+            ));
         }
     }
 
     // A rolled back record explains why it never reached the model context and
-    // how the developer can recover the prompt without retyping it.
+    // how the developer can recover the prompt without retyping it. The hint is
+    // derived from the typed status, so it needs no cache invalidation.
     if item.status == HistoryEntryStatus::RolledBack {
-        raw_lines.push(Line::from(Span::styled(
-            format!("    {}", active_t("history.rolled_back_hint")),
-            engine.fg(palette.status_warning).italic(),
-        )));
+        lines.extend(wrap_one(
+            Line::from(Span::styled(
+                format!("    {}", active_t("history.rolled_back_hint")),
+                engine.fg(palette.status_warning).italic(),
+            )),
+            max_width,
+        ));
     }
 
-    let mut lines: Vec<Line<'static>> = Vec::new();
-    let mut raw_to_visual = Vec::with_capacity(raw_lines.len());
-    for line in raw_lines {
-        let line_start = lines.len();
-        lines.extend(wrap_one(line, max_width));
-        raw_to_visual.push((line_start, lines.len().saturating_sub(1)));
-    }
-
-    let mut blocks = Vec::new();
-    for block in extracted_blocks {
-        let raw_start = md_start_idx + block.start_line;
-        let raw_end = md_start_idx + block.end_line;
-        if let (Some(start), Some(end)) = (raw_to_visual.get(raw_start), raw_to_visual.get(raw_end))
-        {
-            blocks.push(CachedCodeBlock {
-                block_id: block.id,
-                lang: block.lang,
-                code: block.content,
-                start: start.0,
-                end: end.1,
-            });
-        }
-    }
-
-    CachedBody {
-        text_len: item.text.len(),
-        files_len: item.files.len(),
-        status: item.status,
-        lines,
-        blocks,
-    }
+    (lines, blocks)
 }
 
 fn layout_history(
@@ -704,7 +670,7 @@ fn layout_history(
     expanded_items: Option<&HashSet<u64>>,
     flashing_block: Option<(u64, usize)>,
     theme_mode: crate::config::ThemeMode,
-    cache: &mut HistoryBodyCache,
+    cache: &mut MarkdownBodyCache<u64>,
 ) -> (Vec<Line<'static>>, Vec<usize>, Vec<HistoryCodeBlock>) {
     let engine = crate::theme::engine::active_engine(theme_mode);
     let palette = engine.palette();
@@ -712,8 +678,6 @@ fn layout_history(
     let mut offsets = Vec::with_capacity(items.len());
     let mut code_blocks = Vec::new();
     let div_width = max_width.unwrap_or(80).max(10);
-
-    cache.prepare(max_width, theme_mode, items);
 
     for (idx, item) in items.iter().enumerate() {
         if idx > 0 {
@@ -735,33 +699,20 @@ fn layout_history(
             max_width,
         ));
 
-        let flash_id = flashing_block.and_then(
-            |(i_id, b_id)| {
-                if i_id == item.id {
-                    Some(b_id)
-                } else {
-                    None
-                }
-            },
-        );
-
-        // Items with an active copy flash are rendered fresh so the cache never stores flash styling.
-        let uncached;
-        let body: &CachedBody = if flash_id.is_some() {
-            uncached = build_item_body(item, is_expanded, max_width, theme_mode, flash_id);
-            &uncached
-        } else {
-            cache.body_for(item, is_expanded, max_width)
-        };
+        // The flash rides in the cache as part of the rendering variant, so a
+        // highlighted body never needs a rendering path of its own.
+        let flash_id = flashing_block.and_then(|(i_id, b_id)| (i_id == item.id).then_some(b_id));
 
         let body_base = all_lines.len();
-        all_lines.extend(body.lines.iter().cloned());
-        for block in &body.blocks {
+        let (body_lines, body_blocks) =
+            build_item_body(item, is_expanded, max_width, theme_mode, cache, flash_id);
+        all_lines.extend(body_lines);
+        for block in body_blocks {
             code_blocks.push(HistoryCodeBlock {
                 item_id: item.id,
                 block_id: block.block_id,
-                lang: block.lang.clone(),
-                code: block.code.clone(),
+                lang: block.lang,
+                code: block.code,
                 visual_start_line: body_base + block.start,
                 visual_end_line: body_base + block.end,
             });
@@ -774,37 +725,82 @@ fn layout_history(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tauqe_protocol::HistoryEntryStatus;
 
-    #[test]
-    fn test_compute_history_lines_assistant_modified_files() {
-        let item = UiHistoryItem {
-            id: 2,
-            kind: UiHistoryKind::Assistant,
-            text: "Updated codebase".to_string(),
-            summary: Some("Refactoring".to_string()),
-            commit_hash: Some("abcdef1".to_string()),
-            status: HistoryEntryStatus::Committed,
-            files: vec![
-                "[EDIT] src/main.rs".to_string(),
-                "[NEW] src/util.rs".to_string(),
-                "[DEL] src/old.rs".to_string(),
-                "[MOVE] src/prev.rs -> src/next.rs".to_string(),
-            ],
-        };
-        let mut expanded = HashSet::new();
-        expanded.insert(2);
-        let lines = compute_history_lines(&[item], None, None, Some(&expanded));
-        let rendered: Vec<String> = lines
+    /// Plain text of every rendered line, joined from its spans.
+    ///
+    /// The active palette is process-wide state, so two layouts produced inside
+    /// the same test may carry different colors. The cache contract covers the
+    /// rendered text and the geometry, so both are compared by content instead of
+    /// by resolved style.
+    fn rendered_text(lines: &[Line<'static>]) -> Vec<String> {
+        lines
             .iter()
-            .map(|l| {
-                l.spans
+            .map(|line| {
+                line.spans
                     .iter()
-                    .map(|s| s.content.as_ref())
+                    .map(|span| span.content.as_ref())
                     .collect::<Vec<_>>()
                     .join("")
             })
-            .collect();
+            .collect()
+    }
+
+    /// Collapses every whitespace run into a single space.
+    ///
+    /// The body renderer wraps long sentences at the item width, so a phrase
+    /// that was written on one line is drawn on several. Normalizing both the
+    /// rendered body and the expected phrase makes the comparison independent
+    /// of where the terminal width broke the line.
+    fn normalize_whitespace(text: &str) -> String {
+        text.split_whitespace().collect::<Vec<_>>().join(" ")
+    }
+
+    fn history_item(id: u64, kind: UiHistoryKind, text: &str) -> UiHistoryItem {
+        UiHistoryItem {
+            id,
+            kind,
+            text: text.to_string(),
+            summary: None,
+            commit_hash: None,
+            files: Vec::new(),
+            status: HistoryEntryStatus::Committed,
+        }
+    }
+
+    /// Expanded assistant record carrying a fenced code block.
+    fn assistant_item(id: u64, text: &str) -> UiHistoryItem {
+        history_item(id, UiHistoryKind::Assistant, text)
+    }
+
+    /// History view holding one expanded answer followed by a user prompt.
+    fn cached_history_fixture() -> HistoryViewState {
+        let mut st = HistoryViewState {
+            content_width: 60,
+            items: vec![
+                assistant_item(1, "Intro.\n\n```rust\nfn main() {}\n```\n\nOutro."),
+                history_item(2, UiHistoryKind::User, "Explain the change"),
+            ],
+            ..Default::default()
+        };
+        st.expanded_items.insert(1);
+        st
+    }
+
+    #[test]
+    fn test_compute_history_lines_assistant_modified_files() {
+        let mut item = assistant_item(2, "Updated codebase");
+        item.summary = Some("Refactoring".to_string());
+        item.commit_hash = Some("abcdef1".to_string());
+        item.files = vec![
+            "[EDIT] src/main.rs".to_string(),
+            "[NEW] src/util.rs".to_string(),
+            "[DEL] src/old.rs".to_string(),
+            "[MOVE] src/prev.rs -> src/next.rs".to_string(),
+        ];
+        let mut expanded = HashSet::new();
+        expanded.insert(2);
+        let lines = compute_history_lines(&[item], None, None, Some(&expanded));
+        let rendered = rendered_text(&lines);
 
         assert!(rendered
             .iter()
@@ -832,27 +828,14 @@ mod tests {
 
     #[test]
     fn test_compute_history_lines_collapsed_by_default() {
-        let item = UiHistoryItem {
-            id: 2,
-            kind: UiHistoryKind::Assistant,
-            text: "Line 1\nLine 2\nLine 3\nLine 4\nLine 5".to_string(),
-            summary: Some("Overview".to_string()),
-            commit_hash: Some("abcdef1".to_string()),
-            status: HistoryEntryStatus::Committed,
-            files: vec!["[EDIT] src/lib.rs".to_string()],
-        };
+        let mut item = assistant_item(2, "Line 1\nLine 2\nLine 3\nLine 4\nLine 5");
+        item.summary = Some("Overview".to_string());
+        item.commit_hash = Some("abcdef1".to_string());
+        item.files = vec!["[EDIT] src/lib.rs".to_string()];
+
         // By default without expanded set: collapsed
         let lines = compute_history_lines(&[item], None, None, None);
-        let rendered: Vec<String> = lines
-            .iter()
-            .map(|l| {
-                l.spans
-                    .iter()
-                    .map(|s| s.content.as_ref())
-                    .collect::<Vec<_>>()
-                    .join("")
-            })
-            .collect();
+        let rendered = rendered_text(&lines);
 
         assert!(rendered
             .iter()
@@ -869,15 +852,7 @@ mod tests {
     #[test]
     fn test_compute_history_lines_wrapping() {
         let long_text = "This is a very long line of text that should definitely be wrapped across multiple lines when rendered in the history view widget with a constrained width constraint.".to_string();
-        let item = UiHistoryItem {
-            id: 1,
-            kind: UiHistoryKind::User,
-            text: long_text,
-            summary: None,
-            commit_hash: None,
-            files: Vec::new(),
-            status: HistoryEntryStatus::Committed,
-        };
+        let item = history_item(1, UiHistoryKind::User, &long_text);
 
         let unwrapped = compute_history_lines(std::slice::from_ref(&item), None, None, None);
         let wrapped = compute_history_lines(std::slice::from_ref(&item), Some(40), None, None);
@@ -894,105 +869,53 @@ mod tests {
 
     #[test]
     fn test_compute_history_lines_selection_indicator() {
-        let item1 = UiHistoryItem {
-            id: 1,
-            kind: UiHistoryKind::User,
-            text: "Hello".to_string(),
-            summary: None,
-            commit_hash: None,
-            files: Vec::new(),
-            status: HistoryEntryStatus::Committed,
-        };
-        let item2 = UiHistoryItem {
-            id: 2,
-            kind: UiHistoryKind::Assistant,
-            text: "World".to_string(),
-            summary: None,
-            commit_hash: None,
-            files: Vec::new(),
-            status: HistoryEntryStatus::Committed,
-        };
+        let item1 = history_item(1, UiHistoryKind::User, "Hello");
+        let item2 = assistant_item(2, "World");
         let lines = compute_history_lines(&[item1, item2], None, Some(1), None);
-        let rendered: Vec<String> = lines
-            .iter()
-            .map(|l| {
-                l.spans
-                    .iter()
-                    .map(|s| s.content.as_ref())
-                    .collect::<Vec<_>>()
-                    .join("")
-            })
-            .collect();
+        let rendered = rendered_text(&lines);
 
         assert!(rendered.iter().any(|l| l.contains("● ▶  [ASSISTANT]  #2")));
         assert!(rendered.iter().any(|l| l.contains("  ▶  [USER]  #1")));
     }
 
     #[test]
-    fn test_body_cache_matches_uncached_layout_and_resets_on_width_change() {
-        let items = vec![
-            UiHistoryItem {
-                id: 1,
-                kind: UiHistoryKind::User,
-                text: "Hello there".to_string(),
-                summary: None,
-                commit_hash: None,
-                files: Vec::new(),
-                status: HistoryEntryStatus::Committed,
-            },
-            UiHistoryItem {
-                id: 2,
-                kind: UiHistoryKind::Assistant,
-                text: "```rust\nfn main() {}\n```\nDone".to_string(),
-                summary: None,
-                commit_hash: None,
-                files: Vec::new(),
-                status: HistoryEntryStatus::Committed,
-            },
-        ];
-        let mut expanded = HashSet::new();
-        expanded.insert(2);
+    fn test_cached_layout_matches_a_cold_render() {
+        let mut st = cached_history_fixture();
+        let width = Some(st.content_width);
 
-        let mut cache = HistoryBodyCache::default();
         let _ = layout_history(
-            &items,
-            Some(60),
+            &st.items,
+            width,
             Some(0),
-            Some(&expanded),
+            Some(&st.expanded_items),
             None,
-            crate::config::ThemeMode::Auto,
-            &mut cache,
+            st.theme_mode,
+            &mut st.body_cache,
         );
-        assert_eq!(cache.entries.len(), 2);
+        assert_eq!(
+            st.body_cache.len(),
+            1,
+            "only the expanded Markdown body is worth caching"
+        );
+        assert_eq!(st.body_cache.render_count(), 1);
 
         let (cached_lines, cached_offsets, cached_blocks) = layout_history(
-            &items,
-            Some(60),
+            &st.items,
+            width,
             Some(1),
-            Some(&expanded),
+            Some(&st.expanded_items),
             None,
-            crate::config::ThemeMode::Auto,
-            &mut cache,
+            st.theme_mode,
+            &mut st.body_cache,
         );
-        let (fresh_lines, fresh_offsets, fresh_blocks) =
-            compute_history_lines_full(&items, Some(60), Some(1), Some(&expanded), None);
+        assert_eq!(
+            st.body_cache.render_count(),
+            1,
+            "the second layout reuses the rendered body"
+        );
 
-        // The active palette is process-wide state, so two layouts produced
-        // inside the same test may carry different colors. The cache contract
-        // covers the rendered text and the geometry, so both are compared by
-        // content instead of by resolved style.
-        fn rendered_text(lines: &[Line<'static>]) -> Vec<String> {
-            lines
-                .iter()
-                .map(|line| {
-                    line.spans
-                        .iter()
-                        .map(|span| span.content.as_ref())
-                        .collect::<Vec<_>>()
-                        .join("")
-                })
-                .collect()
-        }
+        let (fresh_lines, fresh_offsets, fresh_blocks) =
+            compute_history_lines_full(&st.items, width, Some(1), Some(&st.expanded_items), None);
 
         assert_eq!(
             rendered_text(&cached_lines),
@@ -1001,42 +924,80 @@ mod tests {
         );
         assert_eq!(cached_offsets, fresh_offsets);
         assert_eq!(cached_blocks.len(), fresh_blocks.len());
+        assert_eq!(cached_blocks.len(), 1, "the fenced block is reported once");
+    }
 
-        let _ = layout_history(
-            &items,
-            Some(30),
-            Some(1),
-            Some(&expanded),
-            None,
-            crate::config::ThemeMode::Auto,
-            &mut cache,
+    #[test]
+    fn test_navigation_never_reparses_a_cached_markdown_body() {
+        let mut st = cached_history_fixture();
+        let width = Some(st.content_width);
+        let height = 20u16;
+
+        st.scroll_to_selected_item(height, width);
+        assert_eq!(
+            st.body_cache.render_count(),
+            1,
+            "the expanded answer renders its Markdown once"
         );
-        assert_eq!(cache.width, Some(30));
+
+        st.selected_item_index = 1;
+        st.scroll_to_selected_item(height, width);
+        st.selected_item_index = 0;
+        st.recenter_selected_item(height, width);
+        st.scroll_to_selected_item(height, width);
+        st.update_selected_item_from_scroll(height, width);
+
+        assert_eq!(
+            st.body_cache.render_count(),
+            1,
+            "cursor moves and scrolls must serve the cached body"
+        );
+    }
+
+    #[test]
+    fn test_theme_change_and_resize_reset_the_markdown_cache() {
+        let mut st = cached_history_fixture();
+        let width = Some(st.content_width);
+
+        st.scroll_to_selected_item(20, width);
+        let renders = st.body_cache.render_count();
+        assert_eq!(renders, 1);
+
+        st.theme_mode = crate::config::ThemeMode::Dark;
+        st.scroll_to_selected_item(20, width);
+        let after_theme = st.body_cache.render_count();
+        assert!(
+            after_theme > renders,
+            "a new theme mode invalidates every cached body"
+        );
+
+        st.content_width = 40;
+        st.scroll_to_selected_item(20, Some(40));
+        assert!(
+            st.body_cache.render_count() > after_theme,
+            "a resize invalidates every cached body"
+        );
+        assert_eq!(
+            st.body_cache.len(),
+            1,
+            "the retained entry is re-rendered, never duplicated"
+        );
     }
 
     fn status_item(id: u64, status: HistoryEntryStatus, summary: Option<&str>) -> UiHistoryItem {
-        UiHistoryItem {
-            id,
-            kind: UiHistoryKind::User,
-            text: "Implement the change".to_string(),
-            summary: summary.map(str::to_string),
-            commit_hash: None,
-            files: Vec::new(),
-            status,
-        }
+        let mut item = history_item(id, UiHistoryKind::User, "Implement the change");
+        item.summary = summary.map(str::to_string);
+        item.status = status;
+        item
     }
 
     fn render_item(item: &UiHistoryItem) -> Vec<String> {
-        compute_history_lines(std::slice::from_ref(item), None, None, None)
-            .iter()
-            .map(|line| {
-                line.spans
-                    .iter()
-                    .map(|span| span.content.as_ref())
-                    .collect::<Vec<_>>()
-                    .join("")
-            })
-            .collect()
+        rendered_text(&compute_history_lines(
+            std::slice::from_ref(item),
+            None,
+            None,
+            None,
+        ))
     }
 
     #[test]
@@ -1073,38 +1034,289 @@ mod tests {
         );
     }
 
+    /// The undo-commit command is gone, so a System record is badged purely by
+    /// its typed kind: legacy prose containing the old undo keyword must never
+    /// re-derive a removed feature from entry text (Conventions §1.5).
     #[test]
-    fn test_body_cache_is_invalidated_when_the_status_changes() {
-        let mut active = status_item(1, HistoryEntryStatus::Active, None);
-        let mut cache = HistoryBodyCache::default();
+    fn test_system_entry_with_undo_keyword_renders_system_badge() {
+        let mut item = history_item(3, UiHistoryKind::System, "Undid commit abc1234.");
+        item.summary = Some("Legacy undo record".to_string());
+        item.commit_hash = Some("abc1234".to_string());
+        let rendered = render_item(&item);
 
-        let cached = cache.body_for(&active, false, None).clone();
-        active.status = HistoryEntryStatus::RolledBack;
+        assert!(rendered.iter().any(|line| line.contains("[SYSTEM]")));
+        assert!(!rendered.iter().any(|line| line.contains("[UNDO]")));
+    }
 
-        let recomputed = cache.body_for(&active, false, None).clone();
-        assert!(
-            recomputed.lines.len() > cached.lines.len(),
-            "the restore hint must appear after the status changes"
+    /// A lifecycle status change only alters the per-frame bands, so the cached
+    /// Markdown body survives it while the restore hint still appears (c-3).
+    #[test]
+    fn test_status_change_updates_the_body_without_reparsing_markdown() {
+        let mut st = cached_history_fixture();
+        let width = Some(st.content_width);
+        st.scroll_to_selected_item(20, width);
+        let renders = st.body_cache.render_count();
+
+        // The restore hint is a full sentence, so the body renderer wraps it at
+        // the fixture width. The comparison collapses whitespace on both sides
+        // instead of assuming the phrase stays inside a single rendered line.
+        let hint = active_t("history.rolled_back_hint").to_string();
+        let needle = normalize_whitespace(&hint);
+        assert!(!needle.is_empty(), "the restore hint is localizable text");
+
+        for status in [HistoryEntryStatus::Active, HistoryEntryStatus::RolledBack] {
+            st.items[0].status = status;
+            let (lines, _, _) = layout_history(
+                &st.items,
+                width,
+                Some(0),
+                Some(&st.expanded_items),
+                None,
+                st.theme_mode,
+                &mut st.body_cache,
+            );
+            let text = normalize_whitespace(&rendered_text(&lines).join("\n"));
+            let expects_hint = status == HistoryEntryStatus::RolledBack;
+            assert_eq!(
+                text.contains(&needle),
+                expects_hint,
+                "the restore hint follows the typed status only"
+            );
+        }
+
+        assert_eq!(
+            st.body_cache.render_count(),
+            renders,
+            "a lifecycle badge never re-parses the Markdown"
         );
-        assert_eq!(recomputed.status, HistoryEntryStatus::RolledBack);
+    }
+
+    /// A copy flash is a rendering variant of the same body: it is rendered
+    /// once, reused while it lasts, and restored once it expires.
+    #[test]
+    fn test_copy_flash_renders_its_own_body_and_expires() {
+        let mut st = cached_history_fixture();
+        let width = Some(st.content_width);
+
+        let (_, _, blocks) = layout_history(
+            &st.items,
+            width,
+            Some(0),
+            Some(&st.expanded_items),
+            None,
+            st.theme_mode,
+            &mut st.body_cache,
+        );
+        let Some(block) = blocks.first().cloned() else {
+            panic!("the expanded answer carries one fenced code block");
+        };
+        let renders = st.body_cache.render_count();
+
+        let _ = layout_history(
+            &st.items,
+            width,
+            Some(0),
+            Some(&st.expanded_items),
+            Some((block.item_id, block.block_id)),
+            st.theme_mode,
+            &mut st.body_cache,
+        );
+        assert_eq!(
+            st.body_cache.render_count(),
+            renders + 1,
+            "the flash renders the highlighted body once"
+        );
+
+        let _ = layout_history(
+            &st.items,
+            width,
+            Some(0),
+            Some(&st.expanded_items),
+            Some((block.item_id, block.block_id)),
+            st.theme_mode,
+            &mut st.body_cache,
+        );
+        assert_eq!(
+            st.body_cache.render_count(),
+            renders + 1,
+            "the highlighted body is reused while it lasts"
+        );
+
+        let _ = layout_history(
+            &st.items,
+            width,
+            Some(0),
+            Some(&st.expanded_items),
+            None,
+            st.theme_mode,
+            &mut st.body_cache,
+        );
+        assert_eq!(
+            st.body_cache.render_count(),
+            renders + 2,
+            "the plain body is restored once the flash expires"
+        );
+    }
+
+    /// Screen range `(start, end, total_lines)` that `recenter_selected_item`
+    /// lays out for the selected entry.
+    fn selected_range(st: &mut HistoryViewState, width: Option<usize>) -> (usize, usize, usize) {
+        let sel = st.selected_item_index;
+        let (total_lines, offsets) = st.layout_offsets(width, Some(sel));
+        let start = offsets.get(sel).copied().unwrap_or(0);
+        let end = offsets.get(sel + 1).copied().unwrap_or(total_lines);
+        (start, end, total_lines)
+    }
+
+    /// Expected `Center`, `Top`, and `Bottom` viewport offsets for an entry that
+    /// spans `start..end` inside a `height`-row viewport (Conventions §5.2).
+    fn recenter_beats(start: usize, end: usize, total: usize, height: u16) -> [u16; 3] {
+        let height = height as usize;
+        let max_scroll = total.saturating_sub(height);
+        let clamp = |value: usize| u16::try_from(value.min(max_scroll)).unwrap_or(u16::MAX);
+        [
+            clamp(
+                start
+                    .saturating_add(end.saturating_sub(start) / 2)
+                    .saturating_sub(height / 2),
+            ),
+            clamp(start),
+            clamp(end.saturating_sub(height)),
+        ]
+    }
+
+    fn recenter_history_fixture(selected: usize) -> HistoryViewState {
+        HistoryViewState {
+            items: (1u64..=20)
+                .map(|i| history_item(i, UiHistoryKind::User, "test item content"))
+                .collect(),
+            selected_item_index: selected,
+            content_width: 80,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn test_recenter_selected_item_walks_the_center_top_bottom_cycle() {
+        let height = 5u16;
+        let width = Some(80usize);
+        let mut st = recenter_history_fixture(8);
+
+        let (start, end, total) = selected_range(&mut st, width);
+        let [center, top, bottom] = recenter_beats(start, end, total, height);
+        assert_ne!(center, top, "the center and top beats must differ");
+        assert_ne!(top, bottom, "the top and bottom beats must differ");
+        assert_ne!(center, bottom, "the center and bottom beats must differ");
+
+        st.recenter_selected_item(height, width);
+        assert_eq!(st.scroll, center, "the first press centers the entry");
+        st.recenter_selected_item(height, width);
+        assert_eq!(
+            st.scroll, top,
+            "the second press aligns the entry to the top"
+        );
+        st.recenter_selected_item(height, width);
+        assert_eq!(
+            st.scroll, bottom,
+            "the third press aligns the entry to the bottom"
+        );
+        st.recenter_selected_item(height, width);
+        assert_eq!(
+            st.scroll, center,
+            "the fourth press wraps back to the center"
+        );
+    }
+
+    #[test]
+    fn test_recenter_selected_item_restarts_the_cycle_on_cursor_move() {
+        let height = 5u16;
+        let width = Some(80usize);
+        let mut st = recenter_history_fixture(8);
+
+        // Walk to the top beat of the first entry, so a continuation would
+        // land on the bottom beat instead of starting over.
+        st.recenter_selected_item(height, width);
+        st.recenter_selected_item(height, width);
+
+        st.selected_item_index = 12;
+        let (start, end, total) = selected_range(&mut st, width);
+        let [center, top, bottom] = recenter_beats(start, end, total, height);
+        assert_ne!(center, bottom, "the first and third beats must differ");
+
+        st.recenter_selected_item(height, width);
+        assert_eq!(
+            st.scroll, center,
+            "a new cursor position starts over on the center beat"
+        );
+        st.recenter_selected_item(height, width);
+        assert_eq!(st.scroll, top, "the new entry keeps its own cycle");
+        st.recenter_selected_item(height, width);
+        assert_eq!(st.scroll, bottom);
+    }
+
+    /// The recenter command is declared on both the abstract primary chord and
+    /// the raw `Ctrl+L` chord, and no other binding claims the same key event
+    /// under either modifier configuration (c-2).
+    #[test]
+    fn test_recenter_chord_is_declared_and_unambiguous() {
+        use super::input::HistoryAction;
+        use crate::config::{InputConfig, MetaModifier, PrimaryModifier};
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+        // The abstract `C-l` chord and the raw `Ctrl+L` chord deliberately name
+        // the same intent, so under the default primary assignment both of them
+        // match a single key event. The resolved intents are deduplicated, since
+        // the invariant under test is which action the key reaches, not how many
+        // spellings declare it (c-2).
+        fn claims(
+            input: &InputConfig,
+            code: KeyCode,
+            modifiers: KeyModifiers,
+        ) -> Vec<HistoryAction> {
+            let mut actions = Vec::new();
+            for spec in HISTORY_COMMAND_MAP.specs() {
+                let matched = spec
+                    .chord
+                    .matches(KeyEvent::new(code, modifiers), input, false);
+                if matched && !actions.contains(&spec.action) {
+                    actions.push(spec.action);
+                }
+            }
+            actions
+        }
+
+        let ctrl_primary = InputConfig {
+            primary_modifier: PrimaryModifier::Ctrl,
+            meta_modifier: MetaModifier::Alt,
+            ..InputConfig::default()
+        };
+        let alt_primary = InputConfig {
+            primary_modifier: PrimaryModifier::Alt,
+            meta_modifier: MetaModifier::Ctrl,
+            ..InputConfig::default()
+        };
+
+        assert_eq!(
+            claims(&ctrl_primary, KeyCode::Char('l'), KeyModifiers::CONTROL),
+            vec![HistoryAction::Recenter],
+            "C-l must recenter under the default primary modifier"
+        );
+        assert_eq!(
+            claims(&alt_primary, KeyCode::Char('l'), KeyModifiers::ALT),
+            vec![HistoryAction::Recenter],
+            "the abstract C-l chord must follow a remapped primary modifier"
+        );
+        assert_eq!(
+            claims(&alt_primary, KeyCode::Char('l'), KeyModifiers::CONTROL),
+            vec![HistoryAction::Recenter],
+            "a raw Ctrl+L must still recenter when the primary modifier is Alt"
+        );
     }
 
     #[test]
     fn test_clamp_u16_saturates() {
         assert_eq!(clamp_u16(10), 10);
         assert_eq!(clamp_u16(70_000), u16::MAX);
-    }
-
-    fn history_item(id: u64, kind: UiHistoryKind, text: &str) -> UiHistoryItem {
-        UiHistoryItem {
-            id,
-            kind,
-            text: text.to_string(),
-            summary: None,
-            commit_hash: None,
-            files: Vec::new(),
-            status: HistoryEntryStatus::Committed,
-        }
     }
 
     #[test]
@@ -1115,11 +1327,13 @@ mod tests {
             scroll: 0,
             items: vec![
                 history_item(1, UiHistoryKind::User, "q1"),
-                history_item(2, UiHistoryKind::Assistant, "a1"),
+                assistant_item(2, "a1"),
                 history_item(3, UiHistoryKind::User, "q2"),
-                history_item(4, UiHistoryKind::Assistant, "a2"),
+                assistant_item(4, "a2"),
                 history_item(5, UiHistoryKind::User, "q3"),
             ],
+            // The expanded answers at indices 1 and 3 are what the shared cache
+            // retains across the structural replacement.
             total_count: 5,
             has_more: true,
             ..Default::default()
@@ -1127,11 +1341,14 @@ mod tests {
         st.expanded_items.insert(2);
         st.expanded_items.insert(4);
 
-        // Populate the body cache so head invalidation is observable.
+        // Populate the Markdown cache so the structural reset is observable.
         let width = st.content_width;
         st.layout_offsets(Some(width), None);
-        assert!(st.body_cache.entries.keys().any(|(id, _)| *id == 2));
-        assert!(st.body_cache.entries.keys().any(|(id, _)| *id == 4));
+        assert_eq!(
+            st.body_cache.len(),
+            2,
+            "both expanded answers keep a rendered body"
+        );
 
         st.apply_compaction(
             history_item(3, UiHistoryKind::System, "Session compacted"),
@@ -1151,9 +1368,10 @@ mod tests {
             "head fold state is dropped"
         );
         assert!(st.expanded_items.contains(&4), "tail fold state survives");
-        assert!(
-            !st.body_cache.entries.keys().any(|(id, _)| *id == 2),
-            "head body cache is invalidated"
+        assert_eq!(
+            st.body_cache.len(),
+            1,
+            "the head body is dropped and only the retained answer is cached"
         );
         assert_eq!(st.selected_item_index, st.items.len() - 1);
 

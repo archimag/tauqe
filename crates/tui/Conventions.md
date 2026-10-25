@@ -135,7 +135,6 @@ This document specifies mandatory architectural and UX invariants for the Tauqe 
    - The AltGr / compose chord (`Ctrl+Alt`) belongs to neither modifier, so typing composed characters or `AltGr` digits never triggers an application command.
    - Standard bindings:
      - `C-Enter` — send prompt / confirm message editor;
-     - `C-Z` — undo last AI commit;
      - `C-S` / `M-S` — open squash commits dialog;
      - `C-W` — kill word backward;
      - `M-B`, `M-F` — move word backward / forward;
@@ -162,10 +161,10 @@ This document specifies mandatory architectural and UX invariants for the Tauqe 
    - `Alt+Enter` and `Ctrl+J` serve as universal fallbacks for newline insertion in legacy terminals lacking `Shift+Enter`.
 
 4. **Explicit Confirmation for Destructive and Long-Running Actions:**
-   - Any modal dialog that initiates a destructive action (such as `git undo`, delete plan, clear history, or cancel generation) or a long-running, autonomous execution workflow (such as executing a plan step, plan batch, or review finding batch) MUST feature interactive `[ Confirm ] / [ Cancel ]` buttons with default focus on safe cancellation (`Cancel`).
+   - Any modal dialog that initiates a destructive action (such as delete plan, clear history, or cancel generation) or a long-running, autonomous execution workflow (such as executing a plan step, plan batch, or review finding batch) MUST feature interactive `[ Confirm ] / [ Cancel ]` buttons with default focus on safe cancellation (`Cancel`).
    - Pressing `Enter` or `Esc` defaults to safe cancellation.
    - Quick confirmation is permitted via direct `y` or `Y` keypress.
-   - Actions like `git undo` must verify that an undoable entity exists before prompting the user, emitting an informative notification otherwise.
+   - A destructive action must verify that a valid target exists before prompting the user, emitting an informative notification otherwise.
 
 5. **Canonical Keyboard-Quit (`C-g`):**
    - `C-g` (ASCII BEL, `0x07`) is the universal abort chord inherited from Emacs. It is normalized once, before any view or modal handler runs, to `Esc`, so every surface reacts identically without a per-handler binding.
@@ -310,3 +309,26 @@ This document specifies mandatory architectural and UX invariants for the Tauqe 
      - Model and provider identifiers (e.g. `anthropic/claude-3.7-sonnet`);
      - Technical chrome and non-verbal syntax separators (`/`, `•`, ` : `, `[+]`, `[-]`, `...`, borders);
      - Key chord notation rendered by `KeyChord::display()` (e.g. `C-`, `M-`, `Tab`).
+
+---
+
+## 10. Declarative Hit-Testing Registry (Single Source of Truth for Pointer Regions)
+
+1. **Components Declare Their Own Interactive Geometry:**
+   - Every interactive visual element registers the rectangle it has just drawn together with a typed `UiAction` by calling `HitRegistry::register` while the frame is being drawn.
+   - Adding, moving, resizing, or removing an interactive element therefore touches only the component that draws it. The pointer routing never changes because a new clickable region appears.
+   - Keeping a per-widget coordinate struct (the `*ClickAreas` family) beside a renderer, and matching it inside the pointer handler, is forbidden. The drawn geometry and the clickable geometry would become two independent sources of truth that drift apart on the first layout change, and the click that looks correct on screen would silently land elsewhere.
+
+2. **The Dispatcher Knows No Widgets:**
+   - `crates/tui/src/input/mouse.rs` resolves a pointer coordinate with a single spatial lookup in the flat registry of the current frame and forwards the found `UiAction` to one dispatcher match.
+   - The dispatcher maps an action to a state transition. It never contains a widget name, a field of a view struct, or a coordinate computation, so it holds no knowledge of where anything is drawn.
+   - A component that introduces a new action touches its own renderer and the dispatcher match, never the pointer routing itself. Inline geometry checks inside the pointer handler are an architectural defect.
+
+3. **Frame-Scoped Lifecycle and Absence of Phantom Clicks:**
+   - The registry lives strictly inside one frame: `render_ui` clears it before the components declare the new regions, and only what was actually drawn in this frame is registered.
+   - A hidden, collapsed, or covered surface registers nothing, so it physically cannot receive a click. A modal drawn over a view wins over the regions it covers, because resolution consults the regions in reverse draw order and an active modal takes the click before the registry is consulted.
+   - Because hit-testing and rendering read the same declaration, they cannot desynchronize (§6.6). The dialog vertical air and horizontal margin (§6.7, §6.8) are part of that same declaration, so spacing is corrected in one place.
+
+4. **Mandatory Regression Coverage:**
+   - Registry resolution (top-most region wins, edges exclusive, empty space resolves to nothing, a cleared registry drops every region) and the dispatcher transitions are covered by unit tests in `crates/tui/src/ui.rs` and `crates/tui/src/input/mouse.rs`.
+   - A change that reintroduces a widget-specific coordinate check inside the pointer handler, or lets a covered surface keep a clickable region, must break these tests rather than pass silently.

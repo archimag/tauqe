@@ -71,11 +71,18 @@ impl PlanStorage {
     /// `architect` is the configuration that actually produced the synthesized
     /// horizon. It is recorded on the plan so a later replanning wave can
     /// reproduce or escalate that configuration instead of re-deriving one.
+    ///
+    /// `last_replanned_step` names the step whose horizon this wave reprojects.
+    /// It is recorded with the horizon on disk, so the decision whether a
+    /// repeated failure deserves an Architect escalation is derived from the
+    /// stored plan rather than from in-memory supervisor state. An initial
+    /// synthesis passes `None`.
     pub fn replace_uncompleted_horizon(
         repo_root: &Path,
         plan_id: &str,
         new_horizon_items: Vec<PlanItem>,
         architect: ArchitectTier,
+        last_replanned_step: Option<String>,
     ) -> Result<Plan> {
         // The lock wait, the plan read, and the atomic rewrite of the synthesized
         // horizon run off the async executor thread, so a slow disk never stalls
@@ -87,6 +94,7 @@ impl PlanStorage {
                 plan_id,
                 new_horizon_items,
                 architect,
+                last_replanned_step,
             )
         })
     }
@@ -98,6 +106,7 @@ impl PlanStorage {
         plan_id: &str,
         new_horizon_items: Vec<PlanItem>,
         architect: ArchitectTier,
+        last_replanned_step: Option<String>,
     ) -> Result<Plan> {
         let mut plan = match Self::load_plan_unlocked(repo_root, plan_id)? {
             Some(p) => p,
@@ -108,6 +117,9 @@ impl PlanStorage {
         // Planning is the "What" role's output, so the persisted plan records
         // which Architect configuration produced this horizon.
         plan.architect = Some(architect);
+        // The reprojected step is persisted with the horizon, so the next wave
+        // reads from disk whether this step already failed a replanning round.
+        plan.last_replanned_step = last_replanned_step;
         plan.updated_at = SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)
             .unwrap_or_default()
@@ -150,8 +162,10 @@ impl PlanStorage {
 
         plan.items.clear();
         // The cleared horizon leaves no synthesized decomposition behind, so the
-        // Architect configuration recorded for it is dropped with it.
+        // Architect configuration recorded for it is dropped with it, and no
+        // step remains recorded as reprojected.
         plan.architect = None;
+        plan.last_replanned_step = None;
         plan.updated_at = SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)
             .unwrap_or_default()
@@ -388,6 +402,7 @@ mod tests {
             "horizon-plan",
             new_horizon,
             architect.clone(),
+            Some("2".to_string()),
         )
         .unwrap();
 
@@ -401,6 +416,14 @@ mod tests {
         // The Architect configuration that produced the horizon is recorded on
         // the stored plan, so a later wave can reproduce or escalate it.
         assert_eq!(updated.architect, Some(architect));
+        // The reprojected step is recorded with the horizon...
+        assert_eq!(updated.last_replanned_step.as_deref(), Some("2"));
+        // ...and survives a reload, so the next wave derives escalation from
+        // disk state instead of in-memory supervisor state.
+        let reloaded = PlanStorage::load_plan(root, "horizon-plan")
+            .unwrap()
+            .unwrap();
+        assert_eq!(reloaded.last_replanned_step.as_deref(), Some("2"));
     }
 
     #[test]
@@ -427,11 +450,14 @@ mod tests {
             "empty-plan",
             new_horizon,
             test_architect(),
+            None,
         )
         .unwrap();
         assert_eq!(updated.items.len(), 1);
         assert_eq!(updated.items[0].id, "1");
         assert_eq!(updated.items[0].status, PlanItemStatus::Todo);
+        // An initial synthesis reprojects no blocked step.
+        assert!(updated.last_replanned_step.is_none());
     }
 
     #[test]
@@ -473,6 +499,7 @@ mod tests {
             "collision-plan",
             new_horizon,
             test_architect(),
+            None,
         )
         .unwrap();
 
@@ -528,6 +555,7 @@ mod tests {
             "hoist-plan",
             new_horizon,
             test_architect(),
+            None,
         )
         .unwrap();
 
@@ -573,6 +601,7 @@ mod tests {
             "cycle-plan",
             new_horizon,
             test_architect(),
+            Some("a".to_string()),
         )
         .unwrap_err();
         assert!(err
@@ -583,6 +612,7 @@ mod tests {
         let stored = PlanStorage::load_plan(root, "cycle-plan").unwrap().unwrap();
         assert!(stored.items.is_empty());
         assert!(stored.architect.is_none());
+        assert!(stored.last_replanned_step.is_none());
     }
 
     #[test]
@@ -593,6 +623,7 @@ mod tests {
             "ghost",
             Vec::new(),
             test_architect(),
+            None,
         )
         .unwrap_err();
         assert!(err.to_string().contains("not found"));
@@ -608,6 +639,7 @@ mod tests {
             title: "Clear Plan".to_string(),
             updated_at: 10,
             architect: Some(test_architect()),
+            last_replanned_step: Some("1".to_string()),
             concept: vec![tauqe_protocol::ConceptItem {
                 id: "c-1".to_string(),
                 title: "Invariant".to_string(),
@@ -636,6 +668,7 @@ mod tests {
         // The synthesized decomposition is gone, so its Architect provenance is
         // gone with it.
         assert!(cleared.architect.is_none());
+        assert!(cleared.last_replanned_step.is_none());
         assert!(cleared.updated_at >= 10);
 
         // The persisted plan is the cleared one, not the previous state.
@@ -643,6 +676,7 @@ mod tests {
         assert!(stored.items.is_empty());
         assert_eq!(stored.concept.len(), 1);
         assert!(stored.architect.is_none());
+        assert!(stored.last_replanned_step.is_none());
     }
 
     #[test]

@@ -17,6 +17,11 @@
 //! arbitrary command execution. An entry may reuse another declared command by
 //! writing `@<name>` as its executable. The reference chain is validated here,
 //! so a missing target or a cycle is rejected before anything runs.
+//!
+//! An entry also declares the contract of the command it runs: a human-readable
+//! `description` and the named `parameters` callers may supply. Both travel with
+//! the resolved command line, so the harness renders the signature a command
+//! actually accepts instead of letting a caller guess it.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
@@ -58,6 +63,25 @@ impl fmt::Display for TaskRunnerKind {
     }
 }
 
+/// One named parameter a project command accepts.
+///
+/// Parameters are the typed contract of a command: a declared name lets a
+/// caller supply a value without widening the command line into free-form
+/// arguments, and the optional default removes the need to supply anything at
+/// all. `doc` carries the author's description, so the harness can publish the
+/// signature instead of leaving a caller to guess it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProjectParameterSpec {
+    /// Name callers address the parameter by.
+    pub name: String,
+    /// Value used when a caller supplies nothing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default: Option<String>,
+    /// Human-readable description of the parameter.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub doc: Option<String>,
+}
+
 /// One command the harness runs as a process with literal arguments.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct ProjectCommandSpec {
@@ -69,6 +93,12 @@ pub struct ProjectCommandSpec {
     /// Wall-clock budget of a single invocation, in seconds.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timeout_secs: Option<u64>,
+    /// Human-readable purpose of the command.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    /// Named parameters a caller may supply, in declaration order.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub parameters: Vec<ProjectParameterSpec>,
 }
 
 /// A fully resolved command line, ready to be spawned without a shell.
@@ -82,6 +112,12 @@ pub struct ResolvedProjectCommand {
     /// Wall-clock budget of a single invocation, in seconds.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timeout_secs: Option<u64>,
+    /// Human-readable purpose of the command, carried from the declaration.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    /// Named parameters the command accepts, carried from the declaration.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub parameters: Vec<ProjectParameterSpec>,
 }
 
 /// Rejection reason of an invalid `[project]` declaration.
@@ -99,6 +135,12 @@ pub enum ProjectConfigError {
     CyclicCommand { operation: String, name: String },
     /// An entry declares an argument that cannot reach a process.
     InvalidArgument { operation: String },
+    /// A parameter carries a name a caller could not address.
+    InvalidParameterName { operation: String, name: String },
+    /// A command declares the same parameter more than once.
+    DuplicateParameter { operation: String, name: String },
+    /// An entry refers to a command while redeclaring what that command owns.
+    InvalidReference { operation: String },
 }
 
 impl fmt::Display for ProjectConfigError {
@@ -127,6 +169,25 @@ impl fmt::Display for ProjectConfigError {
                 write!(
                     f,
                     "`{operation}` declares an argument that cannot reach a process"
+                )
+            }
+            Self::InvalidParameterName { operation, name } => {
+                write!(
+                    f,
+                    "`{operation}` declares an unusable parameter name `{name}`"
+                )
+            }
+            Self::DuplicateParameter { operation, name } => {
+                write!(
+                    f,
+                    "`{operation}` declares the parameter `{name}` more than once"
+                )
+            }
+            Self::InvalidReference { operation } => {
+                write!(
+                    f,
+                    "`{operation}` refers to a declared command and must not redeclare \
+                     its arguments, description, or parameters"
                 )
             }
         }
@@ -184,7 +245,12 @@ impl ProjectConfig {
     /// refers to a declared command is followed to the end of the chain, so the
     /// caller always receives a concrete command line. A blank executable, an
     /// unusable reference, an undeclared target, and a cycle are rejected
-    /// instead of being run or silently ignored.
+    /// instead of being run or silently ignored. The description and the
+    /// parameter contract travel with the command line, so a caller learns what
+    /// runs and which values it accepts from one place. A reference may also
+    /// declare `timeout_secs`, which bounds one invocation rather than defining
+    /// the command line it names: the outermost declared budget overrides the
+    /// target's, and the target's budget is the fallback.
     pub fn resolve(
         &self,
         operation: &str,
@@ -192,6 +258,10 @@ impl ProjectConfig {
     ) -> Result<ResolvedProjectCommand, ProjectConfigError> {
         let mut visited: BTreeSet<String> = BTreeSet::new();
         let mut current = spec;
+        // The budget bounds one invocation, so it is not part of the command line
+        // the referred command owns. The outermost declaration wins, and the
+        // terminal target's budget stays the fallback.
+        let mut timeout_override: Option<u64> = None;
 
         loop {
             let command = current.command.trim();
@@ -202,7 +272,11 @@ impl ProjectConfig {
             }
 
             let Some(target) = command.strip_prefix(REFERENCE_PREFIX) else {
-                return check_executable(operation, current);
+                let mut resolved = check_executable(operation, current)?;
+                if let Some(timeout) = timeout_override {
+                    resolved.timeout_secs = Some(timeout);
+                }
+                return Ok(resolved);
             };
 
             let target = target.trim();
@@ -212,13 +286,20 @@ impl ProjectConfig {
                     name: command.to_string(),
                 });
             }
-            if !current.args.is_empty() {
-                // Arguments belong to the command that runs; a reference carries
-                // none, so an entry cannot silently drop the arguments it lists.
-                return Err(ProjectConfigError::InvalidArgument {
+            if !current.args.is_empty()
+                || current.description.is_some()
+                || !current.parameters.is_empty()
+            {
+                // The referenced command owns its command line and its contract.
+                // A reference only names it, so redeclaring either here would
+                // silently drop or contradict what actually runs.
+                return Err(ProjectConfigError::InvalidReference {
                     operation: operation.to_string(),
                 });
             }
+            // The entry now names a command, so a budget declared here is the
+            // outermost one the chain carries.
+            timeout_override = timeout_override.or(current.timeout_secs);
             if !visited.insert(target.to_string()) {
                 return Err(ProjectConfigError::CyclicCommand {
                     operation: operation.to_string(),
@@ -238,8 +319,9 @@ impl ProjectConfig {
     /// Validates the whole declaration.
     ///
     /// Verification is mandatory, and every declared entry must resolve to a
-    /// runnable command line, so an invalid declaration is rejected as a whole
-    /// instead of degrading into an unverified turn.
+    /// runnable command line with an addressable parameter contract, so an
+    /// invalid declaration is rejected as a whole instead of degrading into an
+    /// unverified turn.
     pub fn validate(&self) -> Result<(), ProjectConfigError> {
         if self.runner.is_none() {
             self.verify_command()?;
@@ -268,7 +350,8 @@ impl ProjectConfig {
     }
 }
 
-/// Rejects an executable or an argument that cannot reach a process.
+/// Rejects an executable, an argument, or a parameter contract that cannot
+/// reach a process intact.
 fn check_executable(
     operation: &str,
     spec: &ProjectCommandSpec,
@@ -278,11 +361,71 @@ fn check_executable(
             operation: operation.to_string(),
         });
     }
+    validate_parameters(operation, &spec.parameters)?;
+
     Ok(ResolvedProjectCommand {
         command: spec.command.trim().to_string(),
         args: spec.args.clone(),
         timeout_secs: spec.timeout_secs,
+        description: spec
+            .description
+            .as_deref()
+            .map(str::trim)
+            .filter(|description| !description.is_empty())
+            .map(str::to_string),
+        parameters: spec.parameters.clone(),
     })
+}
+
+/// Rejects a parameter contract a caller could not address unambiguously.
+///
+/// A name must be usable as an XML attribute name, because that is exactly how a
+/// caller supplies a value, so it starts with a letter or an underscore and
+/// continues with letters, digits, dashes, or underscores. A default value must
+/// survive the trip to a process, and a duplicated name would bind one value to
+/// two parameters, so both are rejected instead of being repaired silently.
+fn validate_parameters(
+    operation: &str,
+    parameters: &[ProjectParameterSpec],
+) -> Result<(), ProjectConfigError> {
+    let mut seen: BTreeSet<&str> = BTreeSet::new();
+    for parameter in parameters {
+        let name = parameter.name.trim();
+        if !is_valid_parameter_name(name) {
+            return Err(ProjectConfigError::InvalidParameterName {
+                operation: operation.to_string(),
+                name: parameter.name.clone(),
+            });
+        }
+        if parameter
+            .default
+            .as_deref()
+            .is_some_and(|default| default.contains('\0'))
+        {
+            return Err(ProjectConfigError::InvalidArgument {
+                operation: operation.to_string(),
+            });
+        }
+        if !seen.insert(name) {
+            return Err(ProjectConfigError::DuplicateParameter {
+                operation: operation.to_string(),
+                name: name.to_string(),
+            });
+        }
+    }
+    Ok(())
+}
+
+/// Reports whether `name` is an addressable parameter name.
+fn is_valid_parameter_name(name: &str) -> bool {
+    let mut chars = name.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    if !(first.is_ascii_alphabetic() || first == '_') {
+        return false;
+    }
+    chars.all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
 }
 
 #[cfg(test)]
@@ -317,6 +460,54 @@ mod tests {
         assert!(config.validate().is_ok());
 
         let encoded = serde_json::to_string(&config).expect("the section encodes");
+        assert_eq!(parse(&encoded), config);
+    }
+
+    #[test]
+    fn test_project_config_parses_description_and_parameters() {
+        let config = parse(
+            r#"{
+                "commands": {
+                    "log-tail": {
+                        "command": "just",
+                        "args": ["log-tail"],
+                        "description": "Print the last N lines of the server journal.",
+                        "parameters": [
+                            { "name": "n", "default": "50", "doc": "Line count" },
+                            { "name": "follow" }
+                        ]
+                    }
+                }
+            }"#,
+        );
+
+        let declared = config
+            .commands
+            .get("log-tail")
+            .expect("the command is declared");
+        assert_eq!(
+            declared.description.as_deref(),
+            Some("Print the last N lines of the server journal.")
+        );
+        assert_eq!(declared.parameters.len(), 2);
+        assert_eq!(declared.parameters[0].name, "n");
+        assert_eq!(declared.parameters[0].default.as_deref(), Some("50"));
+        assert_eq!(declared.parameters[0].doc.as_deref(), Some("Line count"));
+        assert!(declared.parameters[1].default.is_none());
+        assert!(declared.parameters[1].doc.is_none());
+
+        // The resolved command line carries the same contract to its caller.
+        let resolved = config
+            .resolve("commands.log-tail", declared)
+            .expect("the command resolves");
+        assert_eq!(resolved.command, "just");
+        assert_eq!(resolved.args, ["log-tail"]);
+        assert_eq!(resolved.description, declared.description);
+        assert_eq!(resolved.parameters, declared.parameters);
+
+        // Absent optional fields stay absent on the wire.
+        let encoded = serde_json::to_string(&config).expect("the section encodes");
+        assert!(!encoded.contains("null"), "unexpected null: {encoded}");
         assert_eq!(parse(&encoded), config);
     }
 
@@ -401,19 +592,188 @@ mod tests {
             Err(ProjectConfigError::InvalidArgument { .. })
         ));
 
-        let referenced_with_args = parse(
-            r#"{"verify":{"command":"@ci","args":["--fast"]},"commands":{"ci":{"command":"cargo"}}}"#,
-        );
-        assert!(matches!(
-            referenced_with_args.validate(),
-            Err(ProjectConfigError::InvalidArgument { .. })
-        ));
-
         let unnamed_command =
             parse(r#"{"verify":{"command":"cargo"},"commands":{"  ":{"command":"make"}}}"#);
         assert!(matches!(
             unnamed_command.validate(),
             Err(ProjectConfigError::InvalidName { .. })
+        ));
+    }
+
+    #[test]
+    fn test_a_reference_does_not_redeclare_the_target() {
+        // A reference naming a command with a parameter contract is valid: the
+        // target owns both the command line and the contract.
+        let chained = parse(
+            r#"{
+                "verify": { "command": "@ci" },
+                "commands": {
+                    "ci": {
+                        "command": "just",
+                        "args": ["check"],
+                        "description": "Type-check the workspace",
+                        "parameters": [{ "name": "n" }]
+                    }
+                }
+            }"#,
+        );
+        assert!(chained.validate().is_ok());
+        let resolved = chained.verify_command().expect("verify resolves");
+        assert_eq!(resolved.command, "just");
+        assert_eq!(
+            resolved.description.as_deref(),
+            Some("Type-check the workspace")
+        );
+        assert_eq!(resolved.parameters.len(), 1);
+
+        // Redeclaring what the target owns would silently drop it.
+        for redeclaration in [
+            r#"{"command":"@ci","args":["--fast"]}"#,
+            r#"{"command":"@ci","description":"alias"}"#,
+            r#"{"command":"@ci","parameters":[{"name":"n"}]}"#,
+        ] {
+            let config = parse(&format!(
+                r#"{{"verify":{redeclaration},"commands":{{"ci":{{"command":"cargo"}}}}}}"#
+            ));
+            assert!(
+                matches!(
+                    config.validate(),
+                    Err(ProjectConfigError::InvalidReference { .. })
+                ),
+                "redeclaration {redeclaration} was accepted"
+            );
+        }
+    }
+
+    #[test]
+    fn test_a_reference_timeout_bounds_the_invocation() {
+        // A reference declares only the budget of one invocation, so it overrides
+        // the budget of the command it names.
+        let overriding = parse(
+            r#"{
+                "verify": { "command": "@ci", "timeout_secs": 30 },
+                "commands": {
+                    "ci": {
+                        "command": "cargo",
+                        "args": ["test"],
+                        "timeout_secs": 600
+                    }
+                }
+            }"#,
+        );
+        assert!(overriding.validate().is_ok());
+        let resolved = overriding.verify_command().expect("verify resolves");
+        assert_eq!(resolved.command, "cargo");
+        assert_eq!(resolved.args, ["test"]);
+        assert_eq!(resolved.timeout_secs, Some(30));
+
+        // A reference that declares no budget inherits the target's budget.
+        let inherited = parse(
+            r#"{
+                "verify": { "command": "@ci" },
+                "commands": { "ci": { "command": "cargo", "timeout_secs": 600 } }
+            }"#,
+        );
+        assert!(inherited.validate().is_ok());
+        let resolved = inherited.verify_command().expect("verify resolves");
+        assert_eq!(resolved.timeout_secs, Some(600));
+
+        // The outermost declaration wins along a chain of references.
+        let outermost = parse(
+            r#"{
+                "verify": { "command": "@outer", "timeout_secs": 30 },
+                "commands": {
+                    "outer": { "command": "@inner" },
+                    "inner": { "command": "cargo", "timeout_secs": 600 }
+                }
+            }"#,
+        );
+        assert!(outermost.validate().is_ok());
+        let resolved = outermost.verify_command().expect("verify resolves");
+        assert_eq!(resolved.command, "cargo");
+        assert_eq!(resolved.timeout_secs, Some(30));
+
+        // A budget declared in the middle of a chain still applies.
+        let middle = parse(
+            r#"{
+                "verify": { "command": "@outer" },
+                "commands": {
+                    "outer": { "command": "@inner", "timeout_secs": 45 },
+                    "inner": { "command": "cargo", "timeout_secs": 600 }
+                }
+            }"#,
+        );
+        assert!(middle.validate().is_ok());
+        let resolved = middle.verify_command().expect("verify resolves");
+        assert_eq!(resolved.timeout_secs, Some(45));
+    }
+
+    #[test]
+    fn test_parameter_names_are_validated() {
+        let accepted = parse(
+            r#"{
+                "verify": { "command": "cargo" },
+                "commands": {
+                    "docs": {
+                        "command": "just",
+                        "args": ["docs"],
+                        "parameters": [
+                            { "name": "_n" },
+                            { "name": "dry-run" },
+                            { "name": "level2" }
+                        ]
+                    }
+                }
+            }"#,
+        );
+        assert!(accepted.validate().is_ok());
+
+        for name in ["", "  ", "1n", "with space", "n=1", "dotted.name"] {
+            let config = parse(&format!(
+                r#"{{"verify":{{"command":"cargo"}},"commands":{{"docs":{{"command":"just","parameters":[{{"name":"{name}"}}]}}}}}}"#
+            ));
+            assert!(
+                matches!(
+                    config.validate(),
+                    Err(ProjectConfigError::InvalidParameterName { .. })
+                ),
+                "parameter name {name:?} was accepted"
+            );
+        }
+    }
+
+    #[test]
+    fn test_duplicate_and_unusable_parameter_values_are_rejected() {
+        let duplicated = parse(
+            r#"{
+                "verify": { "command": "cargo" },
+                "commands": {
+                    "docs": {
+                        "command": "just",
+                        "parameters": [{ "name": "n" }, { "name": " n " }]
+                    }
+                }
+            }"#,
+        );
+        assert!(matches!(
+            duplicated.validate(),
+            Err(ProjectConfigError::DuplicateParameter { .. })
+        ));
+
+        let nul_default = parse(
+            r#"{
+                "verify": { "command": "cargo" },
+                "commands": {
+                    "docs": {
+                        "command": "just",
+                        "parameters": [{ "name": "n", "default": "a\u0000b" }]
+                    }
+                }
+            }"#,
+        );
+        assert!(matches!(
+            nul_default.validate(),
+            Err(ProjectConfigError::InvalidArgument { .. })
         ));
     }
 
@@ -464,5 +824,24 @@ mod tests {
         let rendered = undefined.to_string();
         assert!(rendered.contains("verify"));
         assert!(rendered.contains("ci"));
+
+        let unusable = ProjectConfigError::InvalidParameterName {
+            operation: "commands.log-tail".to_string(),
+            name: "1n".to_string(),
+        };
+        let rendered = unusable.to_string();
+        assert!(rendered.contains("commands.log-tail"));
+        assert!(rendered.contains("1n"));
+
+        let duplicated = ProjectConfigError::DuplicateParameter {
+            operation: "commands.docs".to_string(),
+            name: "n".to_string(),
+        };
+        assert!(duplicated.to_string().contains("commands.docs"));
+
+        let reference = ProjectConfigError::InvalidReference {
+            operation: "verify".to_string(),
+        };
+        assert!(reference.to_string().contains("verify"));
     }
 }

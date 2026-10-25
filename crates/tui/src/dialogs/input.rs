@@ -1,7 +1,8 @@
 use std::sync::Arc;
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-use tauqe_protocol::{methods, DiscussionFocus};
+use ratatui::text::Line;
+use tauqe_protocol::{methods, DiscussionFocus, ModelResult};
 use tokio::sync::{Mutex, MutexGuard};
 
 use crate::app::{ActiveModal, AppState, BatchCancelButton, HelpTab, ViewMode};
@@ -9,7 +10,9 @@ use crate::command::dialog::{DialogCommand, DIALOG_COMMAND_MAP};
 use crate::input::{squash, InputResult};
 use crate::rpc::{send_request, RpcConnection};
 use crate::views::history::HistoryViewState;
-use crate::views::repl::{ReplView, TurnStatus};
+use crate::views::repl::{
+    ModelCodeBlock, ReasoningState, ReplView, StreamingFileEdit, ToolchainState, TurnStatus,
+};
 
 mod confirm;
 mod execute_review;
@@ -73,11 +76,15 @@ fn begin_review_execution_turn(st: &mut AppState) {
     st.notify_info(crate::i18n::active_t("notify.review_execution_started"));
 }
 
-/// Snapshot of the optimistic UI state applied when a turn is launched.
+/// Snapshot of everything a launch transition overwrites.
 ///
 /// It is captured before the local transition runs and restored if the request
-/// cannot be written to the server, so a failed launch never leaves the Develop
-/// view or a Review session stuck in a busy state no event can clear.
+/// cannot be written to the server. The snapshot covers the turn coordinates
+/// (status, timestamp, review flag, view mode, refining flags) and the payload
+/// the transition destroys: the previous answer buffers, the batch flag, and
+/// the discussion anchor. Restoring only the coordinates would leave a failed
+/// launch showing an empty turn, arming a batch no supervisor owns, and
+/// dropping the local anchor the daemon still holds.
 struct TurnLaunchSnapshot {
     develop_status: TurnStatus,
     turn_started_at: Option<std::time::Instant>,
@@ -85,27 +92,87 @@ struct TurnLaunchSnapshot {
     view_mode: ViewMode,
     plan_refining: bool,
     plan_refining_id: Option<String>,
+    discussion_focus: DiscussionFocus,
+    is_batch: bool,
+    reasoning: ReasoningState,
+    text: String,
+    markdown_lines: Vec<Line<'static>>,
+    code_blocks: Vec<ModelCodeBlock>,
+    files: Vec<StreamingFileEdit>,
+    selected_file_index: usize,
+    edits_active: bool,
+    edit_final_applied: Option<bool>,
+    edit_final_error: Option<String>,
+    last_commit_hash: Option<String>,
+    last_commit_summary: Option<String>,
+    toolchain: Option<ToolchainState>,
+    error: Option<String>,
+    result: Option<ModelResult>,
+    copy_flash: Option<(usize, std::time::Instant)>,
+    scroll: u16,
+    auto_scroll: bool,
 }
 
 impl TurnLaunchSnapshot {
     fn capture(st: &AppState) -> Self {
+        let model = &st.model;
         Self {
-            develop_status: st.model.status,
+            develop_status: model.status,
             turn_started_at: st.turn_started_at,
             review_running: st.review.running,
             view_mode: st.view_mode,
             plan_refining: st.plans_view.refining,
             plan_refining_id: st.plans_view.refining_plan_id.clone(),
+            discussion_focus: st.discussion_focus.clone(),
+            is_batch: model.is_batch,
+            reasoning: model.reasoning.clone(),
+            text: model.text.clone(),
+            markdown_lines: model.markdown_lines.clone(),
+            code_blocks: model.code_blocks.clone(),
+            files: model.files.clone(),
+            selected_file_index: model.selected_file_index,
+            edits_active: model.edits_active,
+            edit_final_applied: model.edit_final_applied,
+            edit_final_error: model.edit_final_error.clone(),
+            last_commit_hash: model.last_commit_hash.clone(),
+            last_commit_summary: model.last_commit_summary.clone(),
+            toolchain: model.toolchain.clone(),
+            error: model.error.clone(),
+            result: model.result.clone(),
+            copy_flash: model.copy_flash,
+            scroll: model.scroll,
+            auto_scroll: model.auto_scroll,
         }
     }
 
     fn restore(self, st: &mut AppState) {
-        st.model.status = self.develop_status;
         st.turn_started_at = self.turn_started_at;
         st.review.running = self.review_running;
         st.view_mode = self.view_mode;
         st.plans_view.refining = self.plan_refining;
         st.plans_view.refining_plan_id = self.plan_refining_id;
+        st.discussion_focus = self.discussion_focus;
+
+        let model = &mut st.model;
+        model.status = self.develop_status;
+        model.is_batch = self.is_batch;
+        model.reasoning = self.reasoning;
+        model.text = self.text;
+        model.markdown_lines = self.markdown_lines;
+        model.code_blocks = self.code_blocks;
+        model.files = self.files;
+        model.selected_file_index = self.selected_file_index;
+        model.edits_active = self.edits_active;
+        model.edit_final_applied = self.edit_final_applied;
+        model.edit_final_error = self.edit_final_error;
+        model.last_commit_hash = self.last_commit_hash;
+        model.last_commit_summary = self.last_commit_summary;
+        model.toolchain = self.toolchain;
+        model.error = self.error;
+        model.result = self.result;
+        model.copy_flash = self.copy_flash;
+        model.scroll = self.scroll;
+        model.auto_scroll = self.auto_scroll;
     }
 }
 
@@ -224,10 +291,16 @@ pub(crate) async fn confirm_execute_review(
             None
         }
     };
+    // The selected Coder rung travels whole: the model together with the
+    // reasoning depth it was configured with, so the coder the developer picked
+    // is the coder that runs.
     let model = if single {
         target
             .selected_entry()
-            .map(|entry| tauqe_protocol::ModelSelection::Specific(entry.model.clone()))
+            .map(|entry| tauqe_protocol::ModelSelection::Tier {
+                model: entry.model.clone(),
+                effort: entry.effort,
+            })
     } else {
         None
     };
@@ -367,6 +440,22 @@ pub(crate) async fn delete_plan(
     send_request(server_writer, methods::PLAN_LIST, serde_json::json!({})).await?;
     send_request(server_writer, methods::PLAN_GET, serde_json::json!({})).await?;
     Ok(())
+}
+
+/// Reports whether deleting the plan would discard unfinished implementation
+/// work.
+///
+/// The count comes from the authoritative leaf metric (`Plan::count_stats`), so
+/// completed and cancelled leaves never escalate the confirmation while pending,
+/// in-progress, blocked, and discussion leaves do. A plan the client no longer
+/// holds exposes no progress and is deleted through the first tier, exactly as
+/// before (c-1).
+pub(crate) fn plan_delete_needs_escalation(st: &AppState, plan_id: &str) -> bool {
+    st.plans_view
+        .plans
+        .iter()
+        .find(|plan| plan.id == plan_id)
+        .is_some_and(|plan| crate::dialogs::render::plan_unfinished_steps(plan) > 0)
 }
 
 pub(crate) async fn delete_review(
@@ -794,6 +883,33 @@ pub(crate) async fn handle_dialog_event(
                     ConfirmOutcome::Toggled => st.confirm_delete_plan = Some(plan_id),
                     ConfirmOutcome::Dismissed => {}
                     ConfirmOutcome::Accepted => {
+                        // A plan that still carries unfinished work escalates to
+                        // the second tier instead of discarding progress
+                        // silently; a fully finished plan is deleted directly
+                        // (c-1).
+                        if plan_delete_needs_escalation(&st, &plan_id) {
+                            st.confirm_button = crate::app::ConfirmDialogButton::Cancel;
+                            st.confirm_delete_plan_final = Some(plan_id);
+                        } else {
+                            drop(st);
+                            delete_plan(server_writer, plan_id).await?;
+                        }
+                    }
+                }
+            }
+            return Ok(Some(InputResult::Continue));
+        }
+        Some(ActiveModal::DeletePlanFinal) => {
+            if let Some(plan_id) = st.confirm_delete_plan_final.take() {
+                match resolve_confirm(&mut st, key) {
+                    ConfirmOutcome::Toggled => st.confirm_delete_plan_final = Some(plan_id),
+                    ConfirmOutcome::Dismissed => {
+                        st.confirm_button = crate::app::ConfirmDialogButton::Cancel;
+                    }
+                    ConfirmOutcome::Accepted => {
+                        st.confirm_button = crate::app::ConfirmDialogButton::Cancel;
+                        // The deletion is a daemon mutation; the plan cache is
+                        // refreshed from the response handlers.
                         drop(st);
                         delete_plan(server_writer, plan_id).await?;
                     }
@@ -1055,6 +1171,15 @@ mod tests {
     use super::*;
     use crate::app::{ConfirmDialogButton, ConfirmExecuteReviewState};
 
+    fn plan_item(id: &str, status: tauqe_protocol::PlanItemStatus) -> tauqe_protocol::PlanItem {
+        tauqe_protocol::PlanItem {
+            id: id.to_string(),
+            title: format!("Step {}", id),
+            status,
+            ..Default::default()
+        }
+    }
+
     fn review_issue(id: u32) -> ReviewIssue {
         ReviewIssue {
             id,
@@ -1205,6 +1330,199 @@ mod tests {
 
         let guard = state.lock().await;
         assert!(guard.confirm_clear_horizon_final.is_none());
+    }
+
+    /// Confirming the first tier on a plan with unfinished work must escalate to
+    /// the second tier instead of sending the delete request (c-1).
+    #[tokio::test]
+    async fn delete_plan_escalates_when_unfinished_work_remains() {
+        let mut st = crate::app::test_state();
+        st.plans_view.plans = vec![tauqe_protocol::Plan {
+            id: "plan-open".to_string(),
+            title: "Open Plan".to_string(),
+            items: vec![tauqe_protocol::PlanItem {
+                id: "1".to_string(),
+                title: "Todo step".to_string(),
+                status: tauqe_protocol::PlanItemStatus::Todo,
+                ..Default::default()
+            }],
+            ..Default::default()
+        }];
+        st.confirm_delete_plan = Some("plan-open".to_string());
+        st.confirm_button = ConfirmDialogButton::Confirm;
+
+        let state = Arc::new(Mutex::new(st));
+        let mut conn = RpcConnection::new(Vec::<u8>::new());
+        handle_dialog_event(
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            &state,
+            &mut conn,
+        )
+        .await
+        .expect("in-memory dispatch never fails");
+
+        let guard = state.lock().await;
+        assert!(guard.confirm_delete_plan.is_none());
+        assert_eq!(
+            guard.confirm_delete_plan_final.as_deref(),
+            Some("plan-open")
+        );
+        assert_eq!(guard.confirm_button, ConfirmDialogButton::Cancel);
+        drop(guard);
+        assert!(
+            conn.written().is_empty(),
+            "the first tier never deletes on its own"
+        );
+    }
+
+    /// A `Blocked` or `InProgress` leaf is uncompleted work the developer has not
+    /// finished, so the first confirmation hands over to the terminal tier and
+    /// restores the safe `Cancel` default instead of deleting the plan (c-1).
+    #[tokio::test]
+    async fn delete_plan_escalates_for_blocked_and_in_progress_steps() {
+        for status in [
+            tauqe_protocol::PlanItemStatus::Blocked,
+            tauqe_protocol::PlanItemStatus::InProgress,
+        ] {
+            let mut st = crate::app::test_state();
+            st.plans_view.plans = vec![tauqe_protocol::Plan {
+                id: "plan-wip".to_string(),
+                title: "Work In Progress".to_string(),
+                items: vec![
+                    plan_item("1", tauqe_protocol::PlanItemStatus::Done),
+                    plan_item("2", status),
+                ],
+                ..Default::default()
+            }];
+            st.confirm_delete_plan = Some("plan-wip".to_string());
+            st.confirm_button = ConfirmDialogButton::Confirm;
+
+            let state = Arc::new(Mutex::new(st));
+            let mut conn = RpcConnection::new(Vec::<u8>::new());
+            handle_dialog_event(
+                KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+                &state,
+                &mut conn,
+            )
+            .await
+            .expect("in-memory dispatch never fails");
+
+            let guard = state.lock().await;
+            assert!(guard.confirm_delete_plan.is_none());
+            assert_eq!(
+                guard.confirm_delete_plan_final.as_deref(),
+                Some("plan-wip"),
+                "{status} must escalate the deletion"
+            );
+            assert_eq!(guard.confirm_button, ConfirmDialogButton::Cancel);
+            drop(guard);
+            assert!(
+                conn.written().is_empty(),
+                "the escalated tier never deletes on its own"
+            );
+        }
+    }
+
+    /// The escalation switch is the authoritative leaf metric, not the derived
+    /// container status: cancelled leaves and a concept-only plan still delete
+    /// from the first tier, while a `Blocked` leaf always escalates (c-1).
+    #[test]
+    fn plan_delete_escalation_follows_the_leaf_metric() {
+        let mut st = crate::app::test_state();
+        st.plans_view.plans = vec![
+            tauqe_protocol::Plan {
+                id: "open".to_string(),
+                title: "Open".to_string(),
+                items: vec![
+                    plan_item("1", tauqe_protocol::PlanItemStatus::Done),
+                    plan_item("2", tauqe_protocol::PlanItemStatus::Blocked),
+                ],
+                ..Default::default()
+            },
+            tauqe_protocol::Plan {
+                id: "closed".to_string(),
+                title: "Closed".to_string(),
+                items: vec![
+                    plan_item("1", tauqe_protocol::PlanItemStatus::Done),
+                    plan_item("2", tauqe_protocol::PlanItemStatus::Cancelled),
+                ],
+                ..Default::default()
+            },
+            tauqe_protocol::Plan {
+                id: "concept-only".to_string(),
+                title: "Concept Only".to_string(),
+                ..Default::default()
+            },
+        ];
+
+        assert!(plan_delete_needs_escalation(&st, "open"));
+        assert!(!plan_delete_needs_escalation(&st, "closed"));
+        assert!(!plan_delete_needs_escalation(&st, "concept-only"));
+        // A plan the client no longer holds exposes no progress.
+        assert!(!plan_delete_needs_escalation(&st, "missing"));
+    }
+
+    /// A plan whose every step is finished is deleted through the single-tier
+    /// confirmation, preserving the previous behaviour (c-1).
+    #[tokio::test]
+    async fn delete_plan_sends_request_when_all_steps_finished() {
+        let mut st = crate::app::test_state();
+        st.plans_view.plans = vec![tauqe_protocol::Plan {
+            id: "plan-done".to_string(),
+            title: "Done Plan".to_string(),
+            items: vec![tauqe_protocol::PlanItem {
+                id: "1".to_string(),
+                title: "Done step".to_string(),
+                status: tauqe_protocol::PlanItemStatus::Done,
+                ..Default::default()
+            }],
+            ..Default::default()
+        }];
+        st.confirm_delete_plan = Some("plan-done".to_string());
+        st.confirm_button = ConfirmDialogButton::Confirm;
+
+        let state = Arc::new(Mutex::new(st));
+        let mut conn = RpcConnection::new(Vec::<u8>::new());
+        handle_dialog_event(
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            &state,
+            &mut conn,
+        )
+        .await
+        .expect("in-memory dispatch never fails");
+
+        let payload = String::from_utf8(conn.written().to_vec()).expect("utf-8 payload");
+        assert!(payload.contains("plan/delete"), "{payload}");
+        assert!(payload.contains("plan-done"), "{payload}");
+
+        let guard = state.lock().await;
+        assert!(guard.confirm_delete_plan.is_none());
+        assert!(guard.confirm_delete_plan_final.is_none());
+    }
+
+    /// Confirming the second tier dispatches the same typed delete request.
+    #[tokio::test]
+    async fn delete_plan_final_confirm_sends_request() {
+        let mut st = crate::app::test_state();
+        st.confirm_delete_plan_final = Some("plan-open".to_string());
+        st.confirm_button = ConfirmDialogButton::Confirm;
+
+        let state = Arc::new(Mutex::new(st));
+        let mut conn = RpcConnection::new(Vec::<u8>::new());
+        handle_dialog_event(
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            &state,
+            &mut conn,
+        )
+        .await
+        .expect("in-memory dispatch never fails");
+
+        let payload = String::from_utf8(conn.written().to_vec()).expect("utf-8 payload");
+        assert!(payload.contains("plan/delete"), "{payload}");
+        assert!(payload.contains("plan-open"), "{payload}");
+
+        let guard = state.lock().await;
+        assert!(guard.confirm_delete_plan_final.is_none());
     }
 
     /// Confirming the pipeline modal dispatches the typed
@@ -1501,5 +1819,145 @@ mod tests {
             "a bare lowercase key never reaches the server"
         );
         assert!(state.lock().await.usage_summary.is_some());
+    }
+
+    /// Async sink whose every write fails, standing in for a server pipe that
+    /// closed before the turn request reached it.
+    struct FailingWriter;
+
+    impl tokio::io::AsyncWrite for FailingWriter {
+        fn poll_write(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+            _buf: &[u8],
+        ) -> std::task::Poll<std::io::Result<usize>> {
+            std::task::Poll::Ready(Err(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "server pipe closed",
+            )))
+        }
+
+        fn poll_flush(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
+    /// A launch whose request never reaches the transport must restore the
+    /// previous answer, the batch flag, and the discussion anchor instead of
+    /// leaving the interface showing an empty turn no event can settle.
+    #[tokio::test]
+    async fn failed_review_launch_restores_the_previous_answer_and_anchor() {
+        let mut st = crate::app::test_state();
+        st.view_mode = ViewMode::Review;
+        st.model.text = "previous answer".to_string();
+        st.model.update_markdown();
+        st.model.reasoning.append_delta("previous reasoning");
+        st.model.last_commit_hash = Some("abc1234".to_string());
+        st.model.scroll = 7;
+        st.model.auto_scroll = false;
+        st.discussion_focus = DiscussionFocus::review("rev-1", vec!["2".to_string()]);
+        st.confirm_execute_review = Some(execute_review_target());
+        st.confirm_button = ConfirmDialogButton::Confirm;
+
+        let state = Arc::new(Mutex::new(st));
+        let mut conn = RpcConnection::new(FailingWriter);
+        handle_dialog_event(
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            &state,
+            &mut conn,
+        )
+        .await
+        .expect("a failed write is reported in the interface, not as a dispatch error");
+
+        let guard = state.lock().await;
+        assert_eq!(
+            guard.view_mode,
+            ViewMode::Review,
+            "the failed launch returns to the view it started from"
+        );
+        assert_eq!(guard.model.text, "previous answer");
+        assert!(
+            !guard.model.markdown_lines.is_empty(),
+            "the rendered answer survives the failed launch"
+        );
+        assert_eq!(guard.model.reasoning.text, "previous reasoning");
+        assert_eq!(guard.model.last_commit_hash.as_deref(), Some("abc1234"));
+        assert_eq!(guard.model.scroll, 7);
+        assert!(!guard.model.auto_scroll);
+        assert!(
+            !guard.model.is_batch,
+            "a failed launch must never arm a batch no supervisor owns"
+        );
+        assert_eq!(
+            guard.discussion_focus.target(),
+            Some(&tauqe_protocol::DiscussionTarget::Review {
+                id: "rev-1".to_string()
+            }),
+            "the local anchor stays in sync with the daemon"
+        );
+        assert_eq!(
+            guard.active_notification().map(|n| n.level),
+            Some(crate::app::NotificationLevel::Error)
+        );
+    }
+
+    /// A discussion comment lost to a closed transport keeps its text: the
+    /// modal returns with the submitted comment, the Develop buffers survive,
+    /// and the previous discussion anchor is left untouched.
+    #[tokio::test]
+    async fn failed_discussion_write_restores_the_prompt_modal() {
+        let mut st = crate::app::test_state();
+        st.view_mode = ViewMode::Plans;
+        st.model.text = "previous answer".to_string();
+        st.model.update_markdown();
+        st.discussion_focus = DiscussionFocus::plan("plan-old", Vec::new());
+        let mut modal = crate::app::PromptModalState::new(crate::app::PromptModalTarget::Plan {
+            plan_id: "plan-1".to_string(),
+            plan_title: "Plan 1".to_string(),
+            focused_items: Vec::new(),
+        });
+        modal.prompt_editor.insert_str("split the first step");
+        st.prompt_modal = Some(modal);
+
+        let state = Arc::new(Mutex::new(st));
+        let mut conn = RpcConnection::new(FailingWriter);
+        handle_dialog_event(
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            &state,
+            &mut conn,
+        )
+        .await
+        .expect("a failed write is reported in the interface, not as a dispatch error");
+
+        let guard = state.lock().await;
+        let restored = guard
+            .prompt_modal
+            .as_ref()
+            .expect("the failed launch returns the comment to its modal");
+        assert_eq!(restored.prompt_editor.get_text(), "split the first step");
+        assert_eq!(guard.view_mode, ViewMode::Plans);
+        assert_eq!(guard.model.text, "previous answer");
+        assert!(!guard.model.markdown_lines.is_empty());
+        assert_eq!(
+            guard.discussion_focus.target(),
+            Some(&tauqe_protocol::DiscussionTarget::Plan {
+                id: "plan-old".to_string()
+            }),
+            "a failed discussion write keeps the previous anchor"
+        );
+        assert_eq!(
+            guard.active_notification().map(|n| n.level),
+            Some(crate::app::NotificationLevel::Error)
+        );
     }
 }

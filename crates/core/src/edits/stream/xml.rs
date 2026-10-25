@@ -5,14 +5,15 @@ use tauqe_protocol::{EditFileOp, EditFileStatus};
 
 use super::{normalize_hunk, resolve_path, EditStreamFilter, StagingSimulator};
 use crate::edits::protocol::xml::engine::OpenTag;
-use crate::edits::protocol::xml::is_valid_turn_marker;
+use crate::edits::protocol::xml::{is_valid_turn_marker, FileBlockTag};
 use crate::providers::StreamEvent;
 
 mod scanner;
 
 use scanner::{
-    activate_unmarked_hidden_tags, extract_attr, find_any_edit_start, find_file_tag_start,
-    find_next_control_tag, find_next_hunk, safe_text_emit_len,
+    activate_unmarked_hidden_tags, extract_attr, find_any_edit_start, find_container_close,
+    find_file_tag_start, find_next_control_tag, find_next_hunk, safe_text_emit_len,
+    starts_with_edit_container,
 };
 
 /// State-machine streaming parser for XML edits.
@@ -33,7 +34,8 @@ pub struct XmlStreamFilter {
 
 struct CurrentStreamingFile {
     path: String,
-    op_type: EditFileOp,
+    /// File block that opened the file, naming its closing tag and operation.
+    block: &'static FileBlockTag,
 }
 
 impl XmlStreamFilter {
@@ -144,7 +146,7 @@ impl XmlStreamFilter {
                         self.buffer.drain(..tag_idx);
                     }
 
-                    if self.buffer.starts_with("<tauqe_edits") {
+                    if starts_with_edit_container(&self.buffer) {
                         if let Some(close_tag_bracket) = self.buffer.find('>') {
                             self.buffer.drain(..=close_tag_bracket);
                             self.in_edits_block = true;
@@ -170,23 +172,23 @@ impl XmlStreamFilter {
 
             if self.current_file.is_none() {
                 let next_file = find_file_tag_start(&self.buffer);
-                if let Some(close_wb) = self.buffer.find("</tauqe_edits>") {
+                if let Some((close_start, close_len)) = find_container_close(&self.buffer) {
                     if next_file
                         .as_ref()
-                        .is_none_or(|(_, start)| close_wb < *start)
+                        .is_none_or(|(_, start)| close_start < *start)
                     {
-                        self.buffer.drain(..close_wb + "</tauqe_edits>".len());
+                        self.buffer.drain(..close_start + close_len);
                         self.in_edits_block = false;
                         continue;
                     }
                 }
 
-                if let Some((tag_name, tag_start)) = next_file {
+                if let Some((block, tag_start)) = next_file {
                     if let Some(close_bracket) = self.buffer[tag_start..].find('>') {
                         let header = &self.buffer[tag_start..tag_start + close_bracket + 1];
                         let is_self_closing = header.ends_with("/>");
 
-                        if tag_name == "move" {
+                        if block.op == EditFileOp::Move {
                             let from_attr = extract_attr(header, "from")
                                 .or_else(|| extract_attr(header, "path"));
                             let to_attr = extract_attr(header, "to");
@@ -207,51 +209,43 @@ impl XmlStreamFilter {
                                     error: None,
                                     hunks_count: 0,
                                 });
-                                continue;
                             } else {
                                 self.buffer.drain(..tag_start + close_bracket + 1);
-                                continue;
                             }
+                            continue;
                         }
 
                         if let Some(path_attr) = extract_attr(header, "path") {
-                            let is_create = tag_name == "create";
+                            let is_create = block.op == EditFileOp::Create;
                             let resolved =
                                 resolve_path(&path_attr, &self.editable_paths, is_create);
-                            let op_type = match tag_name.as_str() {
-                                "create" => EditFileOp::Create,
-                                "overwrite" => EditFileOp::Overwrite,
-                                "delete" => EditFileOp::Delete,
-                                _ => EditFileOp::Replace,
-                            };
 
                             events.push(StreamEvent::EditFileStarted {
                                 path: resolved.clone(),
-                                op_type,
+                                op_type: block.op,
                             });
 
                             self.buffer.drain(..tag_start + close_bracket + 1);
                             self.file_hunks_count = 0;
 
-                            if is_self_closing || tag_name == "delete" {
+                            if is_self_closing || block.op == EditFileOp::Delete {
                                 events.push(StreamEvent::EditFileDone {
                                     path: resolved,
                                     status: EditFileStatus::Ok,
                                     error: None,
                                     hunks_count: 0,
                                 });
-                                continue;
                             } else {
                                 self.current_file = Some(CurrentStreamingFile {
                                     path: resolved,
-                                    op_type,
+                                    block,
                                 });
-                                continue;
                             }
-                        } else {
-                            self.buffer.drain(..tag_start + close_bracket + 1);
                             continue;
                         }
+
+                        self.buffer.drain(..tag_start + close_bracket + 1);
+                        continue;
                     } else {
                         break;
                     }
@@ -260,25 +254,21 @@ impl XmlStreamFilter {
                 }
             }
 
-            if let Some((curr_path, curr_op_type)) = self
+            if let Some((curr_path, curr_block)) = self
                 .current_file
                 .as_ref()
-                .map(|c| (c.path.clone(), c.op_type))
+                .map(|current| (current.path.clone(), current.block))
             {
-                let close_tag = match curr_op_type {
-                    EditFileOp::Create => "</create>",
-                    EditFileOp::Overwrite => "</overwrite>",
-                    _ => "</edit>",
-                };
+                let close_tag = format!("</{}>", curr_block.name);
 
-                if curr_op_type == EditFileOp::Create || curr_op_type == EditFileOp::Overwrite {
-                    if let Some(close_pos) = self.buffer.find(close_tag) {
+                if curr_block.op != EditFileOp::Replace {
+                    if let Some(close_pos) = self.buffer.find(&close_tag) {
                         let content = self.buffer[..close_pos].to_string();
                         self.buffer.drain(..close_pos + close_tag.len());
 
                         let norm_content = self.restore_content(&normalize_hunk(&content));
 
-                        let old_text = if curr_op_type == EditFileOp::Overwrite {
+                        let old_text = if curr_block.op == EditFileOp::Overwrite {
                             match self.staging.current_content(&curr_path) {
                                 Ok(text) => text,
                                 Err(err_msg) => {
@@ -348,7 +338,7 @@ impl XmlStreamFilter {
                         continue;
                     }
 
-                    if let Some(close_pos) = self.buffer.find(close_tag) {
+                    if let Some(close_pos) = self.buffer.find(&close_tag) {
                         self.buffer.drain(..close_pos + close_tag.len());
                         events.push(StreamEvent::EditFileDone {
                             path: curr_path,

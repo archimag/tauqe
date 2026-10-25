@@ -32,9 +32,12 @@ use just::JUST;
 pub struct RunnerCommand {
     /// Name the runner addresses the command by.
     pub name: String,
-    /// Semantic description declared by the runner, when it declares one.
-    pub description: Option<String>,
-    /// Concrete command line the harness executes.
+    /// Concrete command line the harness executes together with the contract
+    /// the runner declares for it.
+    ///
+    /// The description and the parameter contract travel inside the command
+    /// line itself, so a merged command carries one authoritative declaration
+    /// of what it does and which values it accepts.
     pub spec: ProjectCommandSpec,
 }
 
@@ -43,6 +46,11 @@ pub struct RunnerCommand {
 pub struct RunnerManifest {
     /// Command bound to the verification lifecycle, when the runner exports one.
     pub verify: Option<RunnerCommand>,
+    /// Command bound to the in-memory formatting filter, when the runner
+    /// exports one.
+    pub format: Option<RunnerCommand>,
+    /// Command bound to the disk-side post-hook, when the runner exports one.
+    pub post_hook: Option<RunnerCommand>,
     /// Remaining commands, in name order, published as typed custom tools.
     pub commands: Vec<RunnerCommand>,
 }
@@ -50,19 +58,35 @@ pub struct RunnerManifest {
 impl RunnerManifest {
     /// Reports whether the runner exported no command at all.
     pub fn is_empty(&self) -> bool {
-        self.verify.is_none() && self.commands.is_empty()
+        self.verify.is_none()
+            && self.format.is_none()
+            && self.post_hook.is_none()
+            && self.commands.is_empty()
     }
 }
 
 /// Merges the exported runner manifest into the project configuration.
 ///
-/// The declared configuration takes precedence over every runner export:
-/// a declared `verify` command or a declared named command always wins over
-/// a recipe exported with the same name.
+/// The declared configuration takes precedence over every runner export: a
+/// declared `verify` command, formatting filter, post-hook, or named command
+/// always wins over a recipe exported for the same role, so a project can pin
+/// one stage in `tauqe.toml` and let the runner provide the rest. A merged
+/// command keeps the description and the parameter contract the runner declares
+/// for it, because both travel inside the exported command line itself.
 pub fn merge_manifest(project: &mut tauqe_protocol::ProjectConfig, manifest: RunnerManifest) {
     if project.verify.is_none() {
         if let Some(verify) = manifest.verify {
             project.verify = Some(verify.spec);
+        }
+    }
+    if project.format.is_none() {
+        if let Some(format) = manifest.format {
+            project.format = Some(format.spec);
+        }
+    }
+    if project.post_hook.is_none() {
+        if let Some(post_hook) = manifest.post_hook {
+            project.post_hook = Some(post_hook.spec);
         }
     }
     for command in manifest.commands {
@@ -152,7 +176,9 @@ pub async fn load_manifest(
     cancel_rx: Option<&watch::Receiver<bool>>,
 ) -> Result<RunnerManifest, RunnerManifestError> {
     let command = super::exec::CommandLine::new(runner.program(), runner.dump_args());
-    let outcome = super::exec::run_command(repo_root, &command, timeout_secs, cancel_rx).await;
+    // The change-set contract belongs to the verification lifecycle alone, so
+    // the runner dump receives no input at all.
+    let outcome = super::exec::run_command(repo_root, &command, timeout_secs, None, cancel_rx).await;
 
     if outcome.is_cancelled {
         return Err(RunnerManifestError::Cancelled);
@@ -262,20 +288,28 @@ mod tests {
 
     #[test]
     fn test_merge_manifest_preserves_declarations_over_exports() {
-        use tauqe_protocol::ProjectConfig;
+        use tauqe_protocol::{ProjectCommandSpec, ProjectConfig, ProjectParameterSpec};
 
+        let declared_parameter = ProjectParameterSpec {
+            name: "target".to_string(),
+            default: None,
+            doc: None,
+        };
         let mut project = ProjectConfig {
-            verify: Some(tauqe_protocol::ProjectCommandSpec {
+            verify: Some(ProjectCommandSpec {
                 command: "cargo".to_string(),
                 args: vec!["test".to_string()],
                 timeout_secs: Some(300),
+                ..Default::default()
             }),
             commands: [(
                 "check".to_string(),
-                tauqe_protocol::ProjectCommandSpec {
+                ProjectCommandSpec {
                     command: "cargo".to_string(),
                     args: vec!["check".to_string()],
                     timeout_secs: None,
+                    description: Some("Type-check the workspace".to_string()),
+                    parameters: vec![declared_parameter.clone()],
                 },
             )]
             .into_iter()
@@ -286,40 +320,115 @@ mod tests {
         let manifest = RunnerManifest {
             verify: Some(RunnerCommand {
                 name: "verify".to_string(),
-                description: None,
-                spec: tauqe_protocol::ProjectCommandSpec {
+                spec: ProjectCommandSpec {
                     command: "just".to_string(),
                     args: vec!["verify".to_string()],
                     timeout_secs: Some(600),
+                    ..Default::default()
                 },
             }),
             commands: vec![
                 RunnerCommand {
                     name: "check".to_string(),
-                    description: None,
-                    spec: tauqe_protocol::ProjectCommandSpec {
+                    spec: ProjectCommandSpec {
                         command: "just".to_string(),
                         args: vec!["check".to_string()],
                         timeout_secs: None,
+                        ..Default::default()
                     },
                 },
                 RunnerCommand {
                     name: "lint".to_string(),
-                    description: None,
-                    spec: tauqe_protocol::ProjectCommandSpec {
+                    spec: ProjectCommandSpec {
                         command: "just".to_string(),
                         args: vec!["lint".to_string()],
                         timeout_secs: None,
+                        description: Some("Lint the workspace".to_string()),
+                        parameters: vec![ProjectParameterSpec {
+                            name: "deny".to_string(),
+                            default: Some("warnings".to_string()),
+                            doc: None,
+                        }],
                     },
                 },
             ],
+            ..RunnerManifest::default()
         };
 
         merge_manifest(&mut project, manifest);
 
         assert_eq!(project.verify.unwrap().command, "cargo");
-        assert_eq!(project.commands.get("check").unwrap().command, "cargo");
-        assert_eq!(project.commands.get("lint").unwrap().command, "just");
+
+        // The declared entry keeps its slot and its whole contract; the
+        // exported recipe of the same name is ignored.
+        let check = project.commands.get("check").expect("check is declared");
+        assert_eq!(check.command, "cargo");
+        assert_eq!(
+            check.description.as_deref(),
+            Some("Type-check the workspace")
+        );
+        assert_eq!(check.parameters, [declared_parameter]);
+
+        // An exported recipe the declaration does not name reaches the project
+        // together with the documentation and the parameters it declares.
+        let lint = project.commands.get("lint").expect("lint is exported");
+        assert_eq!(lint.command, "just");
+        assert_eq!(lint.description.as_deref(), Some("Lint the workspace"));
+        assert_eq!(lint.parameters.len(), 1);
+        assert_eq!(lint.parameters[0].name, "deny");
+        assert_eq!(lint.parameters[0].default.as_deref(), Some("warnings"));
+    }
+
+    #[test]
+    fn test_merge_manifest_fills_format_and_post_hook() {
+        use tauqe_protocol::ProjectConfig;
+
+        let format_spec = tauqe_protocol::ProjectCommandSpec {
+            command: "just".to_string(),
+            args: vec!["--quiet".to_string(), "format".to_string()],
+            timeout_secs: None,
+            ..Default::default()
+        };
+        let post_hook_spec = tauqe_protocol::ProjectCommandSpec {
+            command: "just".to_string(),
+            args: vec!["post-hook".to_string()],
+            timeout_secs: None,
+            ..Default::default()
+        };
+
+        let manifest = RunnerManifest {
+            format: Some(RunnerCommand {
+                name: "format".to_string(),
+                spec: format_spec.clone(),
+            }),
+            post_hook: Some(RunnerCommand {
+                name: "post-hook".to_string(),
+                spec: post_hook_spec.clone(),
+            }),
+            ..RunnerManifest::default()
+        };
+
+        // An undeclared stage is filled from the runner.
+        let mut project = ProjectConfig::default();
+        merge_manifest(&mut project, manifest.clone());
+        assert_eq!(project.format, Some(format_spec));
+        assert_eq!(project.post_hook, Some(post_hook_spec.clone()));
+        assert!(project.commands.is_empty());
+
+        // A declared stage wins over the export of the same role.
+        let declared = tauqe_protocol::ProjectCommandSpec {
+            command: "rustfmt".to_string(),
+            args: Vec::new(),
+            timeout_secs: Some(30),
+            ..Default::default()
+        };
+        let mut project = ProjectConfig {
+            format: Some(declared.clone()),
+            ..ProjectConfig::default()
+        };
+        merge_manifest(&mut project, manifest);
+        assert_eq!(project.format, Some(declared));
+        assert_eq!(project.post_hook, Some(post_hook_spec));
     }
 
     #[tokio::test]

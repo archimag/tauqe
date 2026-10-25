@@ -8,7 +8,7 @@
 //! directly and stays independent of any single wire format.
 
 mod cache;
-mod guard;
+pub(crate) mod guard;
 mod healing;
 mod proposal;
 mod staging;
@@ -35,7 +35,9 @@ use crate::workflow::WorkflowOptions;
 use cache::TurnInputCache;
 use guard::{finalize_blocked_turn, finish_turn, rollback_or_log};
 use healing::run_apply_and_verify_phase;
-use proposal::{extract_error_message, log_fsm_phase, run_proposal_step, ProposalStep, TurnState};
+use proposal::{
+    extract_error_message, log_fsm_phase, merge_text, run_proposal_step, ProposalStep, TurnState,
+};
 use staging::{
     reask_after_empty_round, run_discovery_phase, run_staging_phase, DiscoveryPhase,
     EmptyStepRetry, StagingPhase, EMPTY_STEP_REMINDER, MAX_EMPTY_STEP_RETRIES,
@@ -68,6 +70,15 @@ pub struct FsmTurnOutcome {
     /// replaced a plan. Propagated to the workflow result so the server can
     /// mark the emitted `plan/updated` event as a creation.
     pub plan_saved: bool,
+    /// Mutations the plan storage engine refused during this turn, in the order
+    /// it reported them.
+    ///
+    /// A rejected mutation never fails the turn — the code change it travelled
+    /// with may be valid while the plan payload is not — but it is never silent
+    /// either: the reasons are recorded in session history, so the next round's
+    /// prompt carries them, and the orchestration reports them to the
+    /// developer.
+    pub plan_errors: Vec<String>,
     /// The model's skip report when the turn ended with a semantic skip
     /// signal.
     ///
@@ -76,6 +87,45 @@ pub struct FsmTurnOutcome {
     /// review supervisor mark the finding as skipped instead of treating the
     /// empty turn as an unverified reply.
     pub skip_reason: Option<String>,
+    /// The model's abort report when the turn ended with a semantic abort
+    /// signal.
+    ///
+    /// An abort is neither a blocker nor a failure: the model asserts that the
+    /// requested work needs an action only the developer can perform —
+    /// approving a native build, installing a package, starting a daemon.
+    /// Carrying the report lets a supervisor stop its queue without architect
+    /// escalation while the developer receives the exact command to run.
+    pub abort: Option<AbortReport>,
+}
+
+/// Developer-facing report of a semantic `<abort>` outcome.
+///
+/// The report carries two human-facing payloads: `reason` names what blocked
+/// the work in the host environment, and `recommendation` holds the exact
+/// command or instruction the developer must run. It travels on
+/// [`FsmTurnOutcome`] so a supervisor can tell an abort from a `blocked`
+/// outcome, which instead starts a controlled replanning cycle.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AbortReport {
+    /// What blocked the work in the host environment.
+    pub reason: String,
+    /// The exact command or instruction the developer must run.
+    pub recommendation: String,
+}
+
+impl AbortReport {
+    /// Renders the report as a developer-facing message.
+    ///
+    /// The recommendation keeps its own paragraph, so a multi-line instruction
+    /// or command stays readable and copyable instead of being folded into the
+    /// reason.
+    pub fn to_message(&self) -> String {
+        format!(
+            "Execution aborted: {}\n\nRecommended action:\n{}",
+            self.reason.trim(),
+            self.recommendation.trim()
+        )
+    }
 }
 
 impl FsmTurnOutcome {
@@ -89,6 +139,29 @@ impl FsmTurnOutcome {
         matches!(self.result, ModelResult::Answer { .. })
             && !self.has_terminal_success
             && self.skip_reason.is_none()
+    }
+
+    /// Renders the plan mutations the storage engine refused, if any.
+    ///
+    /// The notice is compact by construction: each line is the storage engine's
+    /// own reason, which already names the plan identifier and the action, so no
+    /// payload is ever echoed back. A turn whose plan payload was accepted
+    /// produces no notice at all.
+    pub fn plan_rejection_notice(&self) -> Option<String> {
+        if self.plan_errors.is_empty() {
+            return None;
+        }
+        let header = if self.plan_errors.len() == 1 {
+            "Plan mutation rejected:"
+        } else {
+            "Plan mutations rejected:"
+        };
+        let mut notice = String::from(header);
+        for error in &self.plan_errors {
+            notice.push_str("\n- ");
+            notice.push_str(error);
+        }
+        Some(notice)
     }
 }
 
@@ -232,10 +305,10 @@ pub async fn run_fsm_turn(
         Ok(outcome) => outcome,
         Err(err) => {
             rollback_or_log(policy, context_manager.repo_root()).await;
-            // Auto-layer cleanup recomputes pinned ancestors and walks every
-            // context path, so the sweep runs off the async executor thread.
+            // The sweep only drops context paths that no longer exist on disk.
+            // The auto layer is never cleared here: a failed turn must not
+            // discard the files discovery already gathered.
             crate::blocking::run_blocking(|| {
-                context_manager.clear_auto();
                 context_manager.prune_missing_files();
             });
             if let Some(id) = turn_id {
@@ -312,7 +385,8 @@ pub(super) async fn begin_session_turn(
 /// Records the completed turn outcome in session history.
 ///
 /// Cancelled turns are skipped by the caller, so a partial turn never leaves a
-/// response entry behind.
+/// response entry behind. Plan mutations the storage engine refused are appended
+/// afterwards as one diagnostic record.
 pub(super) fn record_session_response(
     history_manager: &mut HistoryManager,
     outcome: &FsmTurnOutcome,
@@ -323,6 +397,31 @@ pub(super) fn record_session_response(
         &outcome.assistant_text,
         Vec::new(),
     );
+    record_plan_rejections(history_manager, outcome);
+}
+
+/// Records the plan mutations the storage engine refused as one diagnostic.
+///
+/// A rejected mutation leaves the turn's answer intact, so without this record
+/// neither the developer nor the model ever learns why the plan payload was
+/// dropped. The reasons are aggregated into a single history entry — one per
+/// turn, never one per rejection — so the next round's `<history>` block carries
+/// the exact cause the model must repair in its next explicit plan payload.
+fn record_plan_rejections(history_manager: &mut HistoryManager, outcome: &FsmTurnOutcome) {
+    let Some(notice) = outcome.plan_rejection_notice() else {
+        return;
+    };
+    if let Err(err) = history_manager.record_response(
+        notice,
+        None,
+        Some("Plan mutation rejected".to_string()),
+        Vec::new(),
+    ) {
+        tracing::warn!(
+            "Failed to record the rejected plan mutation in session history: {}",
+            err
+        );
+    }
 }
 
 /// Returns the capability set of an isolated step, narrowed from `protocol`.
@@ -437,8 +536,10 @@ pub(super) async fn run_fsm_turn_body(
             },
             is_cancelled: true,
             blocked: None,
+            abort: None,
             has_terminal_success: false,
             plan_saved: false,
+            plan_errors: Vec::new(),
             skip_reason: None,
         });
     }
@@ -482,6 +583,10 @@ pub(super) async fn run_fsm_turn_body(
         accumulated_text,
     };
 
+    if let Some(outcome) = finish_on_abort_outcome(&mut ctx).await {
+        return Ok(outcome);
+    }
+
     let mut pending = step;
     let mut empty_retries = 0;
     // Corrective reminders accumulate across the empty rounds of the turn. The
@@ -494,6 +599,9 @@ pub(super) async fn run_fsm_turn_body(
             DiscoveryPhase::Terminate(outcome) => return Ok(*outcome),
             DiscoveryPhase::Continue(step) => *step,
         };
+        if let Some(outcome) = finish_on_abort_outcome(&mut ctx).await {
+            return Ok(outcome);
+        }
         if let Some(outcome) = finish_on_error_outcome(&mut ctx).await {
             return Ok(outcome);
         }
@@ -543,6 +651,25 @@ pub(super) async fn run_fsm_turn_body(
         };
     };
 
+    // A turn that closes its investigation owes a readable answer: the
+    // guarantee runs once, before anything is staged or recorded, so a review
+    // of an already-visible context never ends as a blank conclusion.
+    let proposes_code = !step.edits().is_empty() || !step.protocol_errors().is_empty();
+    let step = if proposes_code {
+        step
+    } else {
+        match ensure_written_answer(&mut ctx, step).await? {
+            WrittenAnswer::Ready(step) => *step,
+            WrittenAnswer::Terminate(outcome) => return Ok(*outcome),
+        }
+    };
+
+    // An abort collected by any preceding round asserts that no proposed change
+    // can complete the work, so nothing is staged and nothing reaches disk.
+    if let Some(outcome) = finish_on_abort_outcome(&mut ctx).await {
+        return Ok(outcome);
+    }
+
     let current_edits = step.edits();
     let current_protocol_errors = step.protocol_errors();
     if current_edits.is_empty() && current_protocol_errors.is_empty() {
@@ -552,6 +679,9 @@ pub(super) async fn run_fsm_turn_body(
     match run_staging_phase(&mut ctx, &step).await? {
         StagingPhase::Terminate(outcome) => Ok(*outcome),
         StagingPhase::Ready(staging) => {
+            if let Some(outcome) = finish_on_abort_outcome(&mut ctx).await {
+                return Ok(outcome);
+            }
             if let Some(outcome) = finish_on_error_outcome(&mut ctx).await {
                 return Ok(outcome);
             }
@@ -592,10 +722,10 @@ async fn finish_on_error_outcome(ctx: &mut PhaseContext<'_>) -> Option<FsmTurnOu
         "bounded turn terminated by an error outcome"
     );
     rollback_or_log(ctx.policy, ctx.repo_root).await;
-    // Auto-layer cleanup recomputes pinned ancestors and walks every context
-    // path, so the sweep runs off the async executor thread.
+    // The sweep only drops context paths that no longer exist on disk. The
+    // accumulated auto layer survives the error outcome, so the research a
+    // later turn already paid for stays available.
     crate::blocking::run_blocking(|| {
-        ctx.context_manager.clear_auto();
         ctx.context_manager.prune_missing_files();
     });
     let ctx_state = ctx.context_manager.get_state();
@@ -627,6 +757,69 @@ async fn finish_on_error_outcome(ctx: &mut PhaseContext<'_>) -> Option<FsmTurnOu
     )
 }
 
+/// Finalizes the turn when the model emitted a semantic `<abort>` signal.
+///
+/// An abort is not a blocker: a blocker reports a failed precondition the
+/// harness can replan around, while an abort reports work the harness cannot
+/// perform at all. The turn is rolled back, the developer receives the exact
+/// command to run, and the report rides on the outcome so a supervisor stops
+/// its queue without architect escalation. Returns `None` when no abort is
+/// present so the caller can continue.
+async fn finish_on_abort_outcome(ctx: &mut PhaseContext<'_>) -> Option<FsmTurnOutcome> {
+    let abort = ctx.state.abort.clone()?;
+    Some(finish_aborted_turn(ctx, abort).await)
+}
+
+/// Rolls the open transaction back and packages an aborted turn.
+///
+/// The remediation the model reported is unconditional: no code change can
+/// satisfy it, so the working tree returns to its pre-turn checkpoint. The auto
+/// context keeps the material the turn already gathered, because the developer
+/// resumes the work after performing the requested host action.
+async fn finish_aborted_turn(ctx: &mut PhaseContext<'_>, abort: AbortReport) -> FsmTurnOutcome {
+    let message = abort.to_message();
+    tracing::error!(
+        workflow = ctx.workflow_name,
+        model = %ctx.model,
+        isolated_step = ctx.intent.is_isolated_step(),
+        reason = %abort.reason,
+        "bounded turn terminated by an abort outcome"
+    );
+    let notice = format!("\n\n---\n⛔ **[Execution Aborted]**\n\n{}\n\n", message);
+    let _ = ctx.stream_tx.send(StreamEvent::TextDelta(notice)).await;
+    rollback_or_log(ctx.policy, ctx.repo_root).await;
+    crate::blocking::run_blocking(|| {
+        ctx.context_manager.prune_missing_files();
+    });
+    let ctx_state = ctx.context_manager.get_state();
+    let _ = ctx
+        .stream_tx
+        .send(StreamEvent::ContextChanged(ctx_state))
+        .await;
+    let _ = ctx.stream_tx.send(StreamEvent::Done).await;
+    let result = ModelResult::Edit {
+        summary: "Execution aborted".to_string(),
+        edits: Vec::new(),
+        proposal: None,
+        outcome: EditOutcome {
+            applied: false,
+            error: Some(message),
+            changed_files: Vec::new(),
+            commit_hash: None,
+        },
+    };
+    let mut outcome = finish_turn(
+        std::mem::take(&mut ctx.accumulated_text),
+        result,
+        ctx.repo_root,
+        &ctx.state.plans,
+        ctx.plan_mode,
+    )
+    .await;
+    outcome.abort = Some(abort);
+    outcome
+}
+
 /// Finalizes a turn that produced conversational text without edits.
 ///
 /// When the model also requested toolchain verification, the verification
@@ -646,8 +839,11 @@ async fn finish_answer_without_edits(ctx: &mut PhaseContext<'_>) -> FsmTurnOutco
     };
     let mut answer_text = std::mem::take(&mut ctx.accumulated_text);
     if let Some(request) = ctx.state.verify_request.clone() {
+        // An answer without edits touches no file, so the project command
+        // receives no change set and runs its full suite.
         let outcome = run_workflow_verification(
             ctx.repo_root,
+            &[],
             &request,
             ctx.stream_tx,
             true,
@@ -663,8 +859,10 @@ async fn finish_answer_without_edits(ctx: &mut PhaseContext<'_>) -> FsmTurnOutco
                 },
                 is_cancelled: true,
                 blocked: None,
+                abort: None,
                 has_terminal_success: false,
                 plan_saved: false,
+                plan_errors: Vec::new(),
                 skip_reason: None,
             };
         }
@@ -699,6 +897,161 @@ async fn finish_answer_without_edits(ctx: &mut PhaseContext<'_>) -> FsmTurnOutco
     outcome
 }
 
+/// Number of corrective rounds granted to a turn that finished investigating
+/// without leaving any readable text.
+const MAX_WRITTEN_ANSWER_RETRIES: usize = 1;
+
+/// Reminder appended to the request when the turn holds no readable answer.
+///
+/// It names plain conversational text as the expected outcome and states that
+/// the material already gathered is all this turn will hold, so a model that
+/// finished its investigation answers the task instead of asking for the same
+/// context once more. The wording covers both reasons an investigation closes:
+/// a request the context already satisfied and a discovery round limit that
+/// will load nothing further.
+const MISSING_ANSWER_REMINDER: &str = "\n\nYour investigation for this turn is complete: no further repository material will be loaded into the context. Answer the task now: write the analysis or the conclusion in plain conversational text, using the material you already hold. Do not request additional context, and do not emit file edits unless the code itself must change.";
+
+/// Outcome of guaranteeing a readable answer before the turn closes.
+enum WrittenAnswer {
+    /// The turn carries readable text or a fresh proposal to interpret.
+    Ready(Box<ProposalStep>),
+    /// The turn must terminate immediately with the carried outcome.
+    Terminate(Box<FsmTurnOutcome>),
+}
+
+/// Guarantees that a turn closing its investigation ends with readable text.
+///
+/// A round that only repeated requests the context already satisfied, or that
+/// kept asking for repository material until the discovery round limit was
+/// spent, leaves nothing to stage and no prose behind. Closing the turn there
+/// would record a blank or truncated answer, so the model is asked once more
+/// with the accumulated journal and an explicit answer directive in view.
+///
+/// Only prose the model itself authored closes the guarantee. The accumulated
+/// turn text is deliberately not consulted: it also carries the harness banners
+/// (round headers, patch-retry notices, the discovery-limit warning), so its
+/// presence proves that the turn ran, never that the model concluded. A turn
+/// that declared a terminal outcome, or that answered with a concrete proposal,
+/// is returned unchanged.
+async fn ensure_written_answer(
+    ctx: &mut PhaseContext<'_>,
+    step: ProposalStep,
+) -> anyhow::Result<WrittenAnswer> {
+    if !step.text().trim().is_empty()
+        || ctx.state.terminal_outcome.is_some()
+        || ctx.state.abort.is_some()
+    {
+        return Ok(WrittenAnswer::Ready(Box::new(step)));
+    }
+
+    tracing::info!(
+        workflow = ctx.workflow_name,
+        model = %ctx.model,
+        isolated_step = ctx.intent.is_isolated_step(),
+        "investigation closed without a readable answer; requesting the analysis"
+    );
+
+    let banner = format!(
+        "\n\n---\n**[Answer Requested 1/{}]** The investigation gathered context but produced no written conclusion; requesting the analysis...\n\n",
+        MAX_WRITTEN_ANSWER_RETRIES
+    );
+    let _ = ctx
+        .stream_tx
+        .send(StreamEvent::TextDelta(banner.clone()))
+        .await;
+    log_fsm_phase(
+        ctx.workflow_name,
+        ctx.model,
+        ctx.intent.is_isolated_step(),
+        tauqe_protocol::TurnPhase::Proposal,
+        Some(MAX_WRITTEN_ANSWER_RETRIES),
+        Some(MAX_WRITTEN_ANSWER_RETRIES),
+    );
+    let _ = ctx
+        .stream_tx
+        .send(StreamEvent::TurnPhase {
+            phase: tauqe_protocol::TurnPhase::Proposal,
+            round: Some(MAX_WRITTEN_ANSWER_RETRIES),
+            max_rounds: Some(MAX_WRITTEN_ANSWER_RETRIES),
+            detail: Some("Answer requested".to_string()),
+        })
+        .await;
+
+    // The answer request keeps the knowledge the turn already paid for: the
+    // task first, the accumulated journal next, the answer directive last.
+    let answer_prompt = ctx
+        .journal
+        .compose_user_prompt(ctx.prompt, Some(MISSING_ANSWER_REMINDER));
+    let next = propose(
+        ctx.provider,
+        ctx.model,
+        ctx.protocol,
+        ctx.history_manager,
+        &*ctx.context_manager,
+        ctx.workflow_name,
+        ctx.stream_tx,
+        ctx.cancel_rx,
+        ctx.options,
+        &mut *ctx.input_cache,
+        ctx.state,
+        ctx.intent,
+        &answer_prompt,
+        None,
+    )
+    .await?;
+
+    if next.is_cancelled {
+        let _ = ctx.stream_tx.send(StreamEvent::Done).await;
+        return Ok(WrittenAnswer::Terminate(Box::new(FsmTurnOutcome {
+            assistant_text: std::mem::take(&mut ctx.accumulated_text),
+            result: ModelResult::Answer {
+                text: String::new(),
+            },
+            is_cancelled: true,
+            blocked: None,
+            abort: None,
+            has_terminal_success: false,
+            plan_saved: false,
+            plan_errors: Vec::new(),
+            skip_reason: None,
+        })));
+    }
+
+    ctx.state.absorb(&next);
+    ctx.accumulated_text = merge_text(
+        std::mem::take(&mut ctx.accumulated_text),
+        &banner,
+        next.text(),
+    );
+
+    if let Some(reason) = ctx.state.blocked.clone() {
+        let accumulated = std::mem::take(&mut ctx.accumulated_text);
+        let outcome = finalize_blocked_turn(
+            ctx.policy,
+            ctx.context_manager,
+            ctx.stream_tx,
+            ctx.repo_root,
+            reason,
+            accumulated,
+            &ctx.state.plans,
+            ctx.plan_mode,
+        )
+        .await;
+        return Ok(WrittenAnswer::Terminate(Box::new(outcome)));
+    }
+
+    // A model that stays silent after the explicit answer request closed the
+    // turn with nothing at all: that is a genuine non-answer rather than a dead
+    // end, so the turn fails instead of recording a blank conclusion.
+    if next.is_empty_step() {
+        return Ok(WrittenAnswer::Terminate(Box::new(
+            finish_empty_step(ctx).await,
+        )));
+    }
+
+    Ok(WrittenAnswer::Ready(Box::new(next)))
+}
+
 /// Finalizes the turn when patch application failed after every retry.
 async fn finish_patch_failure(
     ctx: &mut PhaseContext<'_>,
@@ -730,7 +1083,6 @@ async fn finish_patch_failure(
         err_lines.join("\n")
     );
     crate::blocking::run_blocking(|| {
-        ctx.context_manager.clear_auto();
         ctx.context_manager.prune_missing_files();
     });
     let _ = ctx.stream_tx.send(StreamEvent::Done).await;
@@ -764,7 +1116,6 @@ async fn finish_no_edits(ctx: &mut PhaseContext<'_>) -> FsmTurnOutcome {
         "no edits were successfully staged"
     );
     crate::blocking::run_blocking(|| {
-        ctx.context_manager.clear_auto();
         ctx.context_manager.prune_missing_files();
     });
     let _ = ctx.stream_tx.send(StreamEvent::Done).await;
@@ -805,7 +1156,6 @@ async fn finish_empty_step(ctx: &mut PhaseContext<'_>) -> FsmTurnOutcome {
         "model produced an empty response after every retry"
     );
     crate::blocking::run_blocking(|| {
-        ctx.context_manager.clear_auto();
         ctx.context_manager.prune_missing_files();
     });
     let _ = ctx.stream_tx.send(StreamEvent::Done).await;
@@ -997,11 +1347,27 @@ mod tests {
         .unwrap();
 
         assert!(matches!(outcome.result, ModelResult::Answer { .. }));
+        assert!(
+            outcome.plan_errors.is_empty(),
+            "an accepted plan mutation must not raise a diagnostic: {:?}",
+            outcome.plan_errors
+        );
+        assert!(
+            outcome.plan_rejection_notice().is_none(),
+            "an accepted plan mutation must produce no notice"
+        );
         let loaded = crate::plan::storage::PlanStorage::load_plan(&root, "test-fsm-plan").unwrap();
         assert!(loaded.is_some());
         let plan = loaded.unwrap();
         assert_eq!(plan.title, "FSM Plan");
         assert_eq!(plan.items.len(), 1);
+        // The turn prompt and the answer are the only recorded entries: a
+        // successful mutation adds no diagnostic record to the history.
+        assert_eq!(
+            history.get_entries().unwrap().len(),
+            2,
+            "an accepted plan mutation must not append a diagnostic record"
+        );
     }
 
     #[tokio::test]
@@ -1225,20 +1591,18 @@ mod tests {
 
     #[test]
     fn isolated_step_capabilities_are_protocol_agnostic() {
+        // Both transports advertise one intent-oriented surface, so the
+        // narrowing an isolated step applies is identical for each of them and
+        // equals the intent profile.
         let xml = isolated_step_capabilities(&XmlPromptProtocol);
-        assert_eq!(xml, tauqe_protocol::CapabilitySet::isolated_step_xml());
+        assert_eq!(xml, tauqe_protocol::CapabilitySet::isolated_step());
         assert!(!xml.contains(tauqe_protocol::LlmCapability::PlanCreation));
         assert!(!xml.contains(tauqe_protocol::LlmCapability::PlanUpdate));
         assert!(xml.contains(tauqe_protocol::LlmCapability::FileEdits));
 
         let structured =
             isolated_step_capabilities(&crate::prompt::json::JsonPromptProtocol::edits());
-        assert_eq!(
-            structured,
-            tauqe_protocol::CapabilitySet::isolated_step_structured()
-        );
-        assert!(!structured.contains(tauqe_protocol::LlmCapability::PlanCreation));
-        assert!(!structured.contains(tauqe_protocol::LlmCapability::PlanUpdate));
+        assert_eq!(structured, xml);
         assert!(structured.contains(tauqe_protocol::LlmCapability::FileEdits));
     }
 
@@ -1315,6 +1679,7 @@ mod tests {
             created_at: 1,
             updated_at: 1,
             architect: None,
+            last_replanned_step: None,
             concept: vec![],
             items: vec![tauqe_protocol::PlanItem {
                 id: "1".to_string(),

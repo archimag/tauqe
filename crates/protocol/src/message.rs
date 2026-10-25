@@ -26,11 +26,27 @@ fn is_sensitive_method(method: &str) -> bool {
     method == crate::methods::CREDENTIALS_SAVE || method.starts_with("credentials/")
 }
 
+/// Usage-metric keys that must stay readable in observability output.
+///
+/// The list is an exact allowlist on purpose. Matching by suffix would let a
+/// plural credential key such as `access_tokens` or `refresh_tokens` pass as a
+/// usage metric and print in plaintext, so only these known metric names are
+/// exempt from redaction.
+const TOKEN_METRIC_KEYS: &[&str] = &[
+    "tokens",
+    "prompttokens",
+    "completiontokens",
+    "totaltokens",
+    "reasoningtokens",
+    "cachedtokens",
+    "estimatedtokens",
+    "addedtokens",
+    "tokencount",
+    "tokencounts",
+];
+
 fn is_token_metric_key(normalized: &str) -> bool {
-    normalized == "tokens"
-        || normalized.ends_with("tokens")
-        || normalized.ends_with("tokencount")
-        || normalized.ends_with("tokencounts")
+    TOKEN_METRIC_KEYS.contains(&normalized)
 }
 
 /// Reports whether a JSON object key names a secret and must be redacted.
@@ -55,6 +71,7 @@ fn is_sensitive_key(key: &str) -> bool {
     }
 
     normalized.ends_with("key")
+        || normalized.ends_with("keys")
         || normalized.contains("token")
         || normalized.contains("secret")
         || normalized.contains("password")
@@ -618,6 +635,11 @@ mod tests {
             "credentials",
             "authorization",
             "bearer",
+            "api_keys",
+            "ssh_keys",
+            "access_tokens",
+            "refresh_tokens",
+            "id_tokens",
         ] {
             assert!(is_sensitive_key(key), "{key} must be treated as sensitive");
         }
@@ -730,5 +752,38 @@ mod tests {
         }
         assert!(rendered.contains("visible_value"));
         assert!(rendered.contains("<redacted>"));
+    }
+
+    #[test]
+    fn test_debug_redacts_plural_credential_keys() {
+        let req = Request {
+            id: RequestId::Number(6),
+            method: "custom/echo".to_string(),
+            params: Some(serde_json::json!({
+                "access_tokens": "access-token-value",
+                "refresh_tokens": "refresh-token-value",
+                "id_tokens": "id-token-value",
+                "api_keys": "api-key-value",
+                "ssh_keys": "ssh-key-value",
+                "estimated_tokens": 2048
+            })),
+        };
+
+        let rendered = format!("{req:?}");
+        for secret in [
+            "access-token-value",
+            "refresh-token-value",
+            "id-token-value",
+            "api-key-value",
+            "ssh-key-value",
+        ] {
+            assert!(!rendered.contains(secret), "{secret} leaked into Debug");
+        }
+        assert!(rendered.contains("<redacted>"));
+
+        // An allowlisted usage metric stays visible so the journal remains
+        // analytically useful.
+        assert!(rendered.contains("2048"));
+        assert!(rendered.contains("estimated_tokens"));
     }
 }

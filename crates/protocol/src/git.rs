@@ -44,14 +44,6 @@ pub struct GitDiffResult {
     pub diff: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct GitUndoResult {
-    pub undone_commit: String,
-    pub restored_checkpoint: bool,
-    pub new_head: String,
-    pub message: String,
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct GitSquashPreviewParams {
     #[serde(default)]

@@ -40,6 +40,24 @@ edition = \"2021\"
 /// step.
 const HEAL_LIB: &str = "pub fn alpha() -> i32 { \"alpha\" }\npub fn beta() -> i32 { \"beta\" }\n";
 
+/// Project declaration that makes a healing fixture verify with the compiler.
+///
+/// The harness carries no knowledge of a compiler, so a fixture that expects a
+/// verification failure must declare its lifecycle explicitly. `cargo check`
+/// reports the mismatched return types of the broken library, and `--quiet`
+/// keeps the report free of build progress noise.
+const VERIFY_DECLARATION: &str = "\
+[project.verify]
+command = \"cargo\"
+args = [\"check\", \"--quiet\"]
+";
+
+/// Writes the verification declaration into a healing fixture.
+fn declare_verification(repo_root: &Path) {
+    std::fs::write(repo_root.join("tauqe.toml"), VERIFY_DECLARATION)
+        .expect("write the project verification declaration");
+}
+
 /// Builds a single-edit XML response carrying one search/replace hunk.
 fn edit_block(summary: &str, path: &str, search: &str, replace: &str) -> String {
     format!(
@@ -718,7 +736,8 @@ async fn git_workflow_heals_compiler_failure() {
     std::fs::write(repo_root.join("Cargo.toml"), HEAL_MANIFEST).expect("write manifest");
     std::fs::create_dir_all(repo_root.join("src")).expect("create src directory");
     std::fs::write(repo_root.join("src/lib.rs"), HEAL_LIB).expect("write broken library");
-    commit_fixture(&repo_root, &["Cargo.toml", "src/lib.rs"]);
+    declare_verification(&repo_root);
+    commit_fixture(&repo_root, &["Cargo.toml", "src/lib.rs", "tauqe.toml"]);
 
     let mut context = ContextManager::new(repo_root.clone());
     context
@@ -797,7 +816,8 @@ async fn git_workflow_verifies_and_heals_when_verify_tag_omitted_by_model() {
     std::fs::write(repo_root.join("Cargo.toml"), HEAL_MANIFEST).expect("write manifest");
     std::fs::create_dir_all(repo_root.join("src")).expect("create src directory");
     std::fs::write(repo_root.join("src/lib.rs"), HEAL_LIB).expect("write broken library");
-    commit_fixture(&repo_root, &["Cargo.toml", "src/lib.rs"]);
+    declare_verification(&repo_root);
+    commit_fixture(&repo_root, &["Cargo.toml", "src/lib.rs", "tauqe.toml"]);
 
     let mut context = ContextManager::new(repo_root.clone());
     context
@@ -875,17 +895,12 @@ async fn git_workflow_verifies_and_heals_when_verify_tag_omitted_by_model() {
 }
 
 #[tokio::test]
-async fn git_workflow_skips_verification_when_auto_verify_disabled() {
+async fn git_workflow_runs_no_compiler_without_a_verification_declaration() {
     let (_dir, repo_root) = init_repo();
     std::fs::write(repo_root.join("Cargo.toml"), HEAL_MANIFEST).expect("write manifest");
     std::fs::create_dir_all(repo_root.join("src")).expect("create src directory");
     std::fs::write(repo_root.join("src/lib.rs"), HEAL_LIB).expect("write broken library");
-    std::fs::write(
-        repo_root.join("tauqe.toml"),
-        "[toolchain]\nauto_verify = false\n",
-    )
-    .expect("write config");
-    commit_fixture(&repo_root, &["Cargo.toml", "src/lib.rs", "tauqe.toml"]);
+    commit_fixture(&repo_root, &["Cargo.toml", "src/lib.rs"]);
 
     let mut context = ContextManager::new(repo_root.clone());
     context
@@ -893,13 +908,16 @@ async fn git_workflow_skips_verification_when_auto_verify_disabled() {
         .expect("add library to context");
     let mut history = HistoryManager::new(repo_root.clone());
 
-    let fix_alpha_no_verify = edit_block(
+    // The repository carries a build manifest but declares no `[project.verify]`
+    // command, so the harness must not infer a compiler from the manifest: the
+    // change set stays unverified and the turn commits it without a healing run.
+    let fix_alpha = edit_block(
         "Repair alpha only",
         "src/lib.rs",
         "pub fn alpha() -> i32 { \"alpha\" }",
         "pub fn alpha() -> i32 { 1 }",
     );
-    let provider = MockLlmProvider::scripted([MockResponse::text(fix_alpha_no_verify)]);
+    let provider = MockLlmProvider::scripted([MockResponse::text(fix_alpha)]);
     let model = ModelRef::openrouter("mock/model");
     let protocol = tauqe_core::prompt::xml::XmlPromptProtocol;
     let protocol = protocol.with_turn_marker(MARKER).unwrap();
@@ -928,7 +946,7 @@ async fn git_workflow_skips_verification_when_auto_verify_disabled() {
             assert!(outcome.error.is_none());
             assert!(
                 outcome.applied,
-                "edits should be applied directly when auto_verify is disabled"
+                "an undeclared repository applies its edits without guessing a compiler"
             );
         }
         other => panic!("expected applied edits, got {other:?}"),
@@ -937,7 +955,7 @@ async fn git_workflow_skips_verification_when_auto_verify_disabled() {
     assert_eq!(
         provider.requests().len(),
         1,
-        "must not trigger verification healing when auto_verify is disabled"
+        "an undeclared verification lifecycle must not trigger a healing round"
     );
 }
 
@@ -947,7 +965,8 @@ async fn git_workflow_heals_when_verification_response_has_text_only() {
     std::fs::write(repo_root.join("Cargo.toml"), HEAL_MANIFEST).expect("write manifest");
     std::fs::create_dir_all(repo_root.join("src")).expect("create src directory");
     std::fs::write(repo_root.join("src/lib.rs"), HEAL_LIB).expect("write broken library");
-    commit_fixture(&repo_root, &["Cargo.toml", "src/lib.rs"]);
+    declare_verification(&repo_root);
+    commit_fixture(&repo_root, &["Cargo.toml", "src/lib.rs", "tauqe.toml"]);
 
     let mut context = ContextManager::new(repo_root.clone());
     context
@@ -1038,7 +1057,11 @@ async fn scratchpad_from_discovery_reaches_verification_healing() {
     std::fs::write(repo_root.join("src/lib.rs"), HEAL_LIB).expect("write broken library");
     std::fs::write(repo_root.join("helper.rs"), "pub const ANSWER: i32 = 42;\n")
         .expect("write helper fixture");
-    commit_fixture(&repo_root, &["Cargo.toml", "src/lib.rs", "helper.rs"]);
+    declare_verification(&repo_root);
+    commit_fixture(
+        &repo_root,
+        &["Cargo.toml", "src/lib.rs", "helper.rs", "tauqe.toml"],
+    );
 
     let mut context = ContextManager::new(repo_root.clone());
     context
@@ -1639,8 +1662,12 @@ async fn plan_semantic_recovery_lifecycle_end_to_end() {
             tauqe_protocol::ModelRef::openrouter("test/architect"),
             None,
         ),
+        Some("2".to_string()),
     )
     .expect("replace uncompleted horizon over blocked step");
+
+    // The reprojected step is persisted with the horizon.
+    assert_eq!(recovered.last_replanned_step.as_deref(), Some("2"));
 
     assert_eq!(recovered.items.len(), 4);
     assert_eq!(recovered.items[0].id, "1");
@@ -2559,20 +2586,25 @@ async fn run_format_turn(repo_root: &std::path::Path) -> (ModelResult, usize) {
     (execution.result, provider.requests().len())
 }
 
-/// A formatter that fails must leave the verified working tree untouched: its
-/// output is discarded, the failure stays out of the model loop, and the
-/// verified code is committed.
+/// A failing in-memory formatter keeps the authored content, so the declared
+/// verification gate still passes, the failure never re-prompts the model, and the
+/// verified code reaches the single turn commit.
 #[cfg(unix)]
 #[tokio::test]
 async fn git_workflow_discards_formatter_failure_and_commits_verified_code() {
-    let (_dir, repo_root) = format_fixture(
+    let declaration = format!(
         r#"
-[toolchain.fmt.corruptor]
+[project.verify]
+command = "grep"
+args = ["-q", "{repair}", "src/lib.rs"]
+
+[project.format]
 command = "sh"
-args = ['-c', 'printf "garbage\n" > "$0"; exit 1']
-extensions = ["rs"]
+args = ["-c", "printf garbage; exit 1"]
 "#,
+        repair = FORMAT_REPLACE
     );
+    let (_dir, repo_root) = format_fixture(&declaration);
 
     let (result, requests) = run_format_turn(&repo_root).await;
 
@@ -2606,19 +2638,24 @@ extensions = ["rs"]
     );
 }
 
-/// A formatter that succeeds rewrites the changed file, and its output reaches
-/// the Git commit.
+/// A successful in-memory formatter rewrites the staged content exactly once, and
+/// both the verified repair and the rewritten text reach the single Git commit.
 #[cfg(unix)]
 #[tokio::test]
-async fn git_workflow_commits_successful_formatter_output() {
-    let (_dir, repo_root) = format_fixture(
+async fn git_workflow_commits_in_memory_formatter_output() {
+    let declaration = format!(
         r#"
-[toolchain.fmt.appender]
+[project.verify]
+command = "grep"
+args = ["-q", "{repair}", "src/lib.rs"]
+
+[project.format]
 command = "sh"
-args = ['-c', 'printf "// formatted\n" >> "$0"']
-extensions = ["rs"]
+args = ["-c", "cat; echo '// formatted'"]
 "#,
+        repair = FORMAT_REPLACE
     );
+    let (_dir, repo_root) = format_fixture(&declaration);
 
     let (result, requests) = run_format_turn(&repo_root).await;
 
@@ -2643,6 +2680,11 @@ extensions = ["rs"]
     assert!(
         formatted.trim_end().ends_with("// formatted"),
         "the formatter output must be committed: {formatted:?}"
+    );
+    assert_eq!(
+        formatted.matches("// formatted").count(),
+        1,
+        "formatting must run once, on the staging contour: {formatted:?}"
     );
 }
 
@@ -3291,7 +3333,8 @@ async fn discovery_findings_reach_verification_healing() {
     std::fs::write(repo_root.join("Cargo.toml"), HEAL_MANIFEST).expect("write manifest");
     std::fs::create_dir_all(repo_root.join("src")).expect("create src directory");
     std::fs::write(repo_root.join("src/lib.rs"), HEAL_LIB).expect("write broken library");
-    commit_fixture(&repo_root, &["Cargo.toml", "src/lib.rs"]);
+    declare_verification(&repo_root);
+    commit_fixture(&repo_root, &["Cargo.toml", "src/lib.rs", "tauqe.toml"]);
 
     let mut context = ContextManager::new(repo_root.clone());
     context
@@ -3574,12 +3617,8 @@ async fn project_verification_reports_structured_diagnostics_for_healing() {
     );
     commit_fixture(&repo_root, &["src.rs", "tauqe.toml"]);
 
-    let (ok, results) = tauqe_core::toolchain::run_verification_pipeline(
-        &repo_root,
-        &tauqe_core::edits::protocol::VerifyTarget::All,
-        None,
-    )
-    .await;
+    let (ok, results) =
+        tauqe_core::toolchain::run_verification_pipeline(&repo_root, &[], None).await;
 
     assert!(!ok, "the failing verification must report a failure");
     assert_eq!(results.len(), 1);
@@ -3818,6 +3857,122 @@ async fn post_hook_artifacts_survive_healing_into_one_commit() {
     );
 }
 
+/// A verification command that refreshes a companion artifact while it checks
+/// the tree leaves that path inside the turn's single atomic commit, and the
+/// working copy is clean afterwards.
+///
+/// A real project check behaves exactly like this: it regenerates a lock file or
+/// a snapshot while it verifies, and the artifact it produced must be committed
+/// with the edit instead of surviving as untracked residue.
+#[cfg(unix)]
+#[tokio::test]
+async fn verification_generated_lock_file_joins_the_single_turn_commit() {
+    let (_dir, repo_root) = init_repo();
+    std::fs::create_dir_all(repo_root.join("src")).expect("create src directory");
+    std::fs::write(
+        repo_root.join("src/lib.rs"),
+        "pub fn compute() -> i32 { \"compute\" }\n",
+    )
+    .expect("write broken library");
+    write_project_config(
+        &repo_root,
+        concat!(
+            "[project.verify]\n",
+            "command = \"sh\"\n",
+            "args = ['-c', 'echo lockfile > Cargo.lock; grep -q \"pub fn compute() -> i32 { 7 }\" src/lib.rs']\n",
+        ),
+    );
+    commit_fixture(&repo_root, &["src/lib.rs", "tauqe.toml"]);
+
+    let mut context = ContextManager::new(repo_root.clone());
+    context
+        .add_file("src/lib.rs", ContextAccess::Editable)
+        .expect("add library to context");
+    let mut history = HistoryManager::new(repo_root.clone());
+
+    let repair = format!(
+        "{edits}\n<verify_{MARKER} target=\"check\" on_success=\"silent\" />",
+        edits = edit_block(
+            "Repair compute return type",
+            "src/lib.rs",
+            "pub fn compute() -> i32 { \"compute\" }",
+            "pub fn compute() -> i32 { 7 }",
+        ),
+    );
+    let provider = MockLlmProvider::scripted([MockResponse::text(repair)]);
+    let model = ModelRef::openrouter("mock/model");
+    let protocol = tauqe_core::prompt::xml::XmlPromptProtocol
+        .with_turn_marker(MARKER)
+        .expect("marker-bound protocol");
+    let (stream_tx, cancel_rx) = event_channel();
+
+    let baseline = commit_count(&repo_root);
+    let mut policy = GitTransactionPolicy::new();
+    let exec = SingleExecution::new(WorkflowOptions::default());
+    let execution = exec
+        .execute(
+            &mut policy,
+            "Repair the mismatched return type in src/lib.rs",
+            tauqe_protocol::TurnIntent::InteractiveRepl,
+            &provider,
+            &model,
+            &mut context,
+            &mut history,
+            protocol.as_ref(),
+            stream_tx,
+            cancel_rx,
+        )
+        .await
+        .expect("workflow execution succeeds");
+
+    match execution.result {
+        ModelResult::Edit { outcome, .. } => {
+            assert!(
+                outcome.error.is_none(),
+                "unexpected error: {:?}",
+                outcome.error
+            );
+            assert!(outcome.applied, "the verified change set must be committed");
+            let mut changed = outcome.changed_files.clone();
+            changed.sort();
+            assert_eq!(
+                changed,
+                vec!["Cargo.lock".to_string(), "src/lib.rs".to_string()],
+                "the artifact produced by verification must join the change set"
+            );
+        }
+        other => panic!("expected applied edits, got {other:?}"),
+    }
+    assert_eq!(
+        provider.requests().len(),
+        1,
+        "the declared verification must pass on the first attempt"
+    );
+
+    let mut paths = commit_paths(&repo_root);
+    paths.sort();
+    assert_eq!(
+        paths,
+        vec!["Cargo.lock".to_string(), "src/lib.rs".to_string()],
+        "the verification artifact must land in the same commit as the edit"
+    );
+    assert_eq!(
+        commit_count(&repo_root),
+        baseline + 1,
+        "the turn must produce exactly one commit"
+    );
+    assert_eq!(
+        tauqe_core::git::cmd::run_git(Some(&repo_root), &["show", "HEAD:Cargo.lock"])
+            .expect("read the committed lock file"),
+        "lockfile\n"
+    );
+    let status = worktree_status(&repo_root);
+    assert!(
+        status.is_empty(),
+        "the turn must not leave unaccounted files behind: {status:?}"
+    );
+}
+
 /// `tauqe.toml` declaration of the `probe` diagnostic command shared by the
 /// project-command tests.
 ///
@@ -3865,7 +4020,8 @@ async fn diagnostic_command_feedback_reaches_the_next_rounds_and_is_committed() 
         .expect("add target to context");
     let mut history = HistoryManager::new(repo_root.clone());
 
-    let probe = format!("Inspecting the project diagnostics.\n<custom_tool_{MARKER} name=\"probe\" />");
+    let probe =
+        format!("Inspecting the project diagnostics.\n<custom_tool_{MARKER} name=\"probe\" />");
     let discovery = format!(
         "Requesting the constant definition.\n<context_request_{MARKER} path=\"helper.rs\" access=\"read_only\" />"
     );
@@ -3935,7 +4091,9 @@ async fn diagnostic_command_feedback_reaches_the_next_rounds_and_is_committed() 
     let task_at = after_probe
         .find("Use the helper constant")
         .expect("task statement");
-    let journal_at = after_probe.find("<discovery_journal>").expect("journal tail");
+    let journal_at = after_probe
+        .find("<discovery_journal>")
+        .expect("journal tail");
     assert!(task_at < journal_at);
     assert!(after_probe.contains("<project_command_feedback name=\"probe\" success=\"true\">"));
     assert!(after_probe.contains("stdout:"));
@@ -4055,7 +4213,8 @@ async fn empty_reply_after_a_diagnostic_round_keeps_the_command_feedback() {
         .expect("add target to context");
     let mut history = HistoryManager::new(repo_root.clone());
 
-    let probe = format!("Inspecting the project diagnostics.\n<custom_tool_{MARKER} name=\"probe\" />");
+    let probe =
+        format!("Inspecting the project diagnostics.\n<custom_tool_{MARKER} name=\"probe\" />");
     let edit = edit_block(
         "Use the helper constant",
         "target.rs",
@@ -4115,4 +4274,427 @@ async fn empty_reply_after_a_diagnostic_round_keeps_the_command_feedback() {
         .expect("corrective reminder");
     assert!(task_at < journal_at);
     assert!(journal_at < reminder_at);
+}
+
+/// Returns the context layer that currently owns `path`.
+fn context_layer(context: &ContextManager, path: &str) -> Option<tauqe_protocol::ContextLayer> {
+    context
+        .get_state()
+        .items
+        .into_iter()
+        .find(|item| item.path == path)
+        .map(|item| item.layer)
+}
+
+/// Collects the paths currently held by the developer-owned user layer.
+fn user_layer_paths(context: &ContextManager) -> Vec<String> {
+    context
+        .get_state()
+        .items
+        .into_iter()
+        .filter(|item| item.layer == tauqe_protocol::ContextLayer::User)
+        .map(|item| item.path)
+        .collect()
+}
+
+/// A conversational turn ends without touching the accumulated research: the
+/// file discovery gathered keeps the transient auto layer, and the
+/// developer-owned file keeps the user layer.
+#[tokio::test]
+async fn auto_context_survives_a_text_answer_turn() {
+    let (_dir, repo_root) = init_repo();
+    std::fs::write(
+        repo_root.join("target.rs"),
+        "pub fn compute() -> i32 { 0 }\n",
+    )
+    .expect("write target fixture");
+    std::fs::write(repo_root.join("helper.rs"), "pub const ANSWER: i32 = 42;\n")
+        .expect("write helper fixture");
+    commit_fixture(&repo_root, &["target.rs", "helper.rs"]);
+
+    let mut context = ContextManager::new(repo_root.clone());
+    context
+        .add_file("target.rs", ContextAccess::Editable)
+        .expect("add target to context");
+    let mut history = HistoryManager::new(repo_root.clone());
+
+    let discovery = format!(
+        "I need the constant definitions.\n<context_request_{MARKER} path=\"helper.rs\" access=\"read_only\" />"
+    );
+    let answer = "The helper module declares ANSWER as 42, so the task needs no code change.";
+    let provider =
+        MockLlmProvider::scripted([MockResponse::text(discovery), MockResponse::text(answer)]);
+    let model = ModelRef::openrouter("mock/model");
+    let protocol = tauqe_core::prompt::xml::XmlPromptProtocol
+        .with_turn_marker(MARKER)
+        .expect("marker-bound protocol");
+    let mut policy = tauqe_core::workflow::policy::DirectApplyPolicy::new();
+    let options = WorkflowOptions::default();
+    let (stream_tx, cancel_rx) = event_channel();
+
+    let output = {
+        let mut env = build_env(
+            &provider,
+            &model,
+            &mut context,
+            &mut history,
+            protocol.as_ref(),
+            &mut policy,
+            stream_tx,
+            cancel_rx,
+            &options,
+        );
+        AnswerEditLoop::new("Explain the helper constant")
+            .execute(&mut env)
+            .await
+            .expect("answer/edit loop executes")
+    };
+
+    assert!(matches!(output.result, ModelResult::Answer { .. }));
+    assert_eq!(provider.requests().len(), 2);
+
+    // A text answer closes the turn without discarding the research it paid
+    // for: the discovered file keeps the auto layer it was added to.
+    assert_eq!(
+        context_layer(&context, "helper.rs"),
+        Some(tauqe_protocol::ContextLayer::Auto)
+    );
+    assert_eq!(context.auto_files(), vec!["helper.rs".to_string()]);
+
+    // The developer-owned file keeps the user layer it was added to.
+    assert_eq!(
+        context_layer(&context, "target.rs"),
+        Some(tauqe_protocol::ContextLayer::User)
+    );
+}
+
+/// A turn whose change set never matches leaves the accumulated research in
+/// place: the auto layer survives the patch-retry failure untouched and the
+/// working tree stays clean.
+#[tokio::test]
+async fn auto_context_survives_an_unapplied_patch_failure() {
+    let (_dir, repo_root) = init_repo();
+    std::fs::write(
+        repo_root.join("target.rs"),
+        "pub fn compute() -> i32 { 0 }\n",
+    )
+    .expect("write target fixture");
+    std::fs::write(repo_root.join("helper.rs"), "pub const ANSWER: i32 = 42;\n")
+        .expect("write helper fixture");
+    commit_fixture(&repo_root, &["target.rs", "helper.rs"]);
+
+    let mut context = ContextManager::new(repo_root.clone());
+    context
+        .add_file("target.rs", ContextAccess::Editable)
+        .expect("add target to context");
+    let mut history = HistoryManager::new(repo_root.clone());
+
+    let discovery = format!(
+        "I need the constant definitions.\n<context_request_{MARKER} path=\"helper.rs\" access=\"read_only\" />"
+    );
+    let broken = edit_block(
+        "Broken attempt",
+        "target.rs",
+        "this text does not exist in the file",
+        "irrelevant replacement",
+    );
+    let broken_retry = edit_block(
+        "Broken retry",
+        "target.rs",
+        "this text still does not exist in the file",
+        "irrelevant replacement",
+    );
+    let provider = MockLlmProvider::scripted([
+        MockResponse::text(discovery),
+        MockResponse::text(broken),
+        MockResponse::text(broken_retry),
+    ]);
+    let model = ModelRef::openrouter("mock/model");
+    let protocol = tauqe_core::prompt::xml::XmlPromptProtocol
+        .with_turn_marker(MARKER)
+        .expect("marker-bound protocol");
+    let mut policy = tauqe_core::workflow::policy::DirectApplyPolicy::new();
+    let options = WorkflowOptions {
+        max_retries: 1,
+        ..WorkflowOptions::default()
+    };
+    let (stream_tx, cancel_rx) = event_channel();
+
+    let output = {
+        let mut env = build_env(
+            &provider,
+            &model,
+            &mut context,
+            &mut history,
+            protocol.as_ref(),
+            &mut policy,
+            stream_tx,
+            cancel_rx,
+            &options,
+        );
+        AnswerEditLoop::new("Use the helper constant")
+            .execute(&mut env)
+            .await
+            .expect("answer/edit loop executes")
+    };
+
+    match &output.result {
+        ModelResult::Edit { outcome, edits, .. } => {
+            assert!(!outcome.applied, "an unmatched change set must not apply");
+            assert!(edits.is_empty());
+            assert!(outcome
+                .error
+                .as_deref()
+                .unwrap_or_default()
+                .contains("Failed to apply edits after 1 retries"));
+        }
+        other => panic!("expected a failed change set, got {other:?}"),
+    }
+    assert_eq!(provider.requests().len(), 3);
+
+    assert_eq!(
+        context_layer(&context, "helper.rs"),
+        Some(tauqe_protocol::ContextLayer::Auto)
+    );
+    assert_eq!(
+        std::fs::read_to_string(repo_root.join("target.rs")).expect("read target fixture"),
+        "pub fn compute() -> i32 { 0 }\n"
+    );
+}
+
+/// A verification failure rolls the working tree back but keeps the context:
+/// the files discovery gathered stay available for the next attempt.
+#[cfg(unix)]
+#[tokio::test]
+async fn auto_context_survives_a_failed_verification() {
+    let (_dir, repo_root) = init_repo();
+    std::fs::write(
+        repo_root.join("target.rs"),
+        "pub fn compute() -> i32 { 0 }\n",
+    )
+    .expect("write target fixture");
+    std::fs::write(repo_root.join("helper.rs"), "pub const ANSWER: i32 = 42;\n")
+        .expect("write helper fixture");
+    std::fs::write(
+        repo_root.join("tauqe.toml"),
+        "[project.verify]\ncommand = \"sh\"\nargs = ['-c', 'exit 1']\n",
+    )
+    .expect("write the project verification declaration");
+    commit_fixture(&repo_root, &["target.rs", "helper.rs", "tauqe.toml"]);
+
+    let mut context = ContextManager::new(repo_root.clone());
+    context
+        .add_file("target.rs", ContextAccess::Editable)
+        .expect("add target to context");
+    let mut history = HistoryManager::new(repo_root.clone());
+
+    let discovery = format!(
+        "I need the constant definitions.\n<context_request_{MARKER} path=\"helper.rs\" access=\"read_only\" />"
+    );
+    let edit = format!(
+        "{edits}\n<verify_{MARKER} target=\"check\" on_success=\"silent\" />",
+        edits = edit_block(
+            "Use the helper constant",
+            "target.rs",
+            "pub fn compute() -> i32 { 0 }",
+            "pub fn compute() -> i32 { 42 }",
+        ),
+    );
+    let provider =
+        MockLlmProvider::scripted([MockResponse::text(discovery), MockResponse::text(edit)]);
+    let model = ModelRef::openrouter("mock/model");
+    let protocol = tauqe_core::prompt::xml::XmlPromptProtocol
+        .with_turn_marker(MARKER)
+        .expect("marker-bound protocol");
+    let mut policy = GitTransactionPolicy::new();
+    let options = WorkflowOptions {
+        max_retries: 0,
+        ..WorkflowOptions::default()
+    };
+    let (stream_tx, cancel_rx) = event_channel();
+
+    let output = {
+        let mut env = build_env(
+            &provider,
+            &model,
+            &mut context,
+            &mut history,
+            protocol.as_ref(),
+            &mut policy,
+            stream_tx,
+            cancel_rx,
+            &options,
+        );
+        AnswerEditLoop::new("Use the helper constant")
+            .execute(&mut env)
+            .await
+            .expect("answer/edit loop executes")
+    };
+
+    match &output.result {
+        ModelResult::Edit { outcome, .. } => {
+            assert!(!outcome.applied, "a failed verification must not commit");
+            assert!(outcome
+                .error
+                .as_deref()
+                .unwrap_or_default()
+                .contains("Code verification failed"));
+        }
+        other => panic!("expected a failed verification, got {other:?}"),
+    }
+    assert_eq!(provider.requests().len(), 2);
+
+    // The rolled-back working tree is restored, and the research survives.
+    assert_eq!(
+        std::fs::read_to_string(repo_root.join("target.rs")).expect("read target fixture"),
+        "pub fn compute() -> i32 { 0 }\n"
+    );
+    assert_eq!(
+        context_layer(&context, "helper.rs"),
+        Some(tauqe_protocol::ContextLayer::Auto)
+    );
+}
+
+/// A committed change set clears the transient auto layer while the
+/// developer-owned user layer keeps its files.
+#[tokio::test]
+async fn successful_commit_clears_the_auto_layer() {
+    let (_dir, repo_root) = init_repo();
+    std::fs::write(
+        repo_root.join("target.rs"),
+        "pub fn compute() -> i32 { 0 }\n",
+    )
+    .expect("write target fixture");
+    std::fs::write(repo_root.join("helper.rs"), "pub const ANSWER: i32 = 42;\n")
+        .expect("write helper fixture");
+    commit_fixture(&repo_root, &["target.rs", "helper.rs"]);
+
+    let mut context = ContextManager::new(repo_root.clone());
+    context
+        .add_file("target.rs", ContextAccess::Editable)
+        .expect("add target to context");
+    let mut history = HistoryManager::new(repo_root.clone());
+
+    let discovery = format!(
+        "I need the constant definitions.\n<context_request_{MARKER} path=\"helper.rs\" access=\"read_only\" />"
+    );
+    let edit = edit_block(
+        "Use the helper constant",
+        "target.rs",
+        "pub fn compute() -> i32 { 0 }",
+        "pub fn compute() -> i32 { 42 }",
+    );
+    let provider =
+        MockLlmProvider::scripted([MockResponse::text(discovery), MockResponse::text(edit)]);
+    let model = ModelRef::openrouter("mock/model");
+    let protocol = tauqe_core::prompt::xml::XmlPromptProtocol
+        .with_turn_marker(MARKER)
+        .expect("marker-bound protocol");
+    let mut policy = tauqe_core::workflow::policy::DirectApplyPolicy::new();
+    let options = WorkflowOptions::default();
+    let (stream_tx, cancel_rx) = event_channel();
+
+    let output = {
+        let mut env = build_env(
+            &provider,
+            &model,
+            &mut context,
+            &mut history,
+            protocol.as_ref(),
+            &mut policy,
+            stream_tx,
+            cancel_rx,
+            &options,
+        );
+        AnswerEditLoop::new("Use the helper constant")
+            .execute(&mut env)
+            .await
+            .expect("answer/edit loop executes")
+    };
+
+    assert!(matches!(
+        &output.result,
+        ModelResult::Edit { outcome, .. } if outcome.applied
+    ));
+    assert_eq!(provider.requests().len(), 2);
+
+    // A successful change set is the only event that shrinks the context.
+    assert!(
+        !context.contains("helper.rs").unwrap_or(true),
+        "the committed turn must drop the transient auto layer"
+    );
+    assert!(context.auto_files().is_empty());
+    assert_eq!(user_layer_paths(&context), vec!["target.rs".to_string()]);
+}
+
+/// Editing a discovered file never promotes it into the user layer: after the
+/// turn commits, the user layer still holds exactly what the developer added.
+#[tokio::test]
+async fn a_turn_never_widens_the_user_layer() {
+    let (_dir, repo_root) = init_repo();
+    std::fs::write(
+        repo_root.join("target.rs"),
+        "pub fn compute() -> i32 { 0 }\n",
+    )
+    .expect("write target fixture");
+    std::fs::write(repo_root.join("helper.rs"), "pub const ANSWER: i32 = 42;\n")
+        .expect("write helper fixture");
+    commit_fixture(&repo_root, &["target.rs", "helper.rs"]);
+
+    let mut context = ContextManager::new(repo_root.clone());
+    context
+        .add_file("target.rs", ContextAccess::Editable)
+        .expect("add target to context");
+    let mut history = HistoryManager::new(repo_root.clone());
+
+    let discovery = format!(
+        "I need to change the constant.\n<context_request_{MARKER} path=\"helper.rs\" access=\"editable\" />"
+    );
+    let edit = edit_block(
+        "Raise the constant",
+        "helper.rs",
+        "pub const ANSWER: i32 = 42;",
+        "pub const ANSWER: i32 = 43;",
+    );
+    let provider =
+        MockLlmProvider::scripted([MockResponse::text(discovery), MockResponse::text(edit)]);
+    let model = ModelRef::openrouter("mock/model");
+    let protocol = tauqe_core::prompt::xml::XmlPromptProtocol
+        .with_turn_marker(MARKER)
+        .expect("marker-bound protocol");
+    let mut policy = tauqe_core::workflow::policy::DirectApplyPolicy::new();
+    let options = WorkflowOptions::default();
+    let (stream_tx, cancel_rx) = event_channel();
+
+    let output = {
+        let mut env = build_env(
+            &provider,
+            &model,
+            &mut context,
+            &mut history,
+            protocol.as_ref(),
+            &mut policy,
+            stream_tx,
+            cancel_rx,
+            &options,
+        );
+        AnswerEditLoop::new("Raise the helper constant")
+            .execute(&mut env)
+            .await
+            .expect("answer/edit loop executes")
+    };
+
+    assert!(matches!(
+        &output.result,
+        ModelResult::Edit { outcome, .. } if outcome.applied
+    ));
+    assert_eq!(
+        std::fs::read_to_string(repo_root.join("helper.rs")).expect("read helper fixture"),
+        "pub const ANSWER: i32 = 43;\n"
+    );
+
+    // The edited file was discovered during the turn, so it belongs to the
+    // transient auto layer and never to the developer-owned user layer.
+    assert_eq!(user_layer_paths(&context), vec!["target.rs".to_string()]);
+    assert!(context.auto_files().is_empty());
 }

@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 use tauqe_protocol::{
-    ArchitectTier, ModelEntry, ModelRef, ModelRole, ModelRolesSummary, ModelSelection,
-    ReasoningEffort,
+    ArchitectTier, ModelCatalogEntry, ModelEntry, ModelRef, ModelRole, ModelRolesSummary,
+    ModelSelection, ReasoningEffort,
 };
 
 pub const BUILTIN_DEFAULT_SCRIBE_MODEL: &str = "~anthropic/claude-haiku-latest";
@@ -11,45 +11,201 @@ pub const BUILTIN_DEFAULT_PRIMARY_MODEL: &str = "~google/gemini-flash-latest";
 pub const BUILTIN_DEFAULT_REVIEWER_MODEL: &str = "~anthropic/claude-sonnet-latest";
 pub const BUILTIN_DEFAULT_MODEL: &str = BUILTIN_DEFAULT_PRIMARY_MODEL;
 
-pub fn parse_model_ref(s: &str) -> Result<ModelRef, String> {
-    s.parse()
-}
-
-pub fn deserialize_model_ref_opt<'de, D>(deserializer: D) -> Result<Option<ModelRef>, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    #[derive(Deserialize)]
-    #[serde(untagged)]
-    enum ModelRefRaw {
-        Str(String),
-        Struct(ModelRef),
-    }
-
-    match Option::<ModelRefRaw>::deserialize(deserializer)? {
-        None => Ok(None),
-        Some(ModelRefRaw::Str(s)) => {
-            let trimmed = s.trim();
-            if trimmed.is_empty() {
-                Ok(None)
-            } else {
-                parse_model_ref(trimmed)
-                    .map(Some)
-                    .map_err(serde::de::Error::custom)
-            }
-        }
-        Some(ModelRefRaw::Struct(m)) => Ok(Some(m)),
-    }
-}
-
+/// Serializes an optional model reference in its canonical `provider:name` form.
+///
+/// A [`ModelRef`] serializes as a structured `{ provider, name }` table by
+/// default, while configuration writes the terse specification string. Keeping
+/// the terse form on the way out lets a written configuration round-trip
+/// through the same reader that produced it.
 pub fn serialize_model_ref_opt<S>(opt: &Option<ModelRef>, serializer: S) -> Result<S::Ok, S::Error>
 where
     S: serde::Serializer,
 {
     match opt {
-        Some(m) => serializer.serialize_str(&m.to_string()),
+        Some(model) => serializer.serialize_str(&model.to_spec()),
         None => serializer.serialize_none(),
     }
+}
+
+/// A model reference exactly as written in configuration.
+///
+/// Holds the raw text the developer wrote: either a provider model
+/// specification or an alias registered in the provider catalog. Resolution
+/// happens only after the whole configuration file has been decoded, because an
+/// alias is declared in `[providers]` and is still unknown while `[models]` is
+/// being read.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ModelReference(String);
+
+impl ModelReference {
+    /// Trims and validates a written model reference.
+    fn parse_text<E>(value: &str) -> Result<Self, E>
+    where
+        E: serde::de::Error,
+    {
+        let trimmed = value.trim();
+        if trimmed.is_empty() {
+            return Err(E::custom("Model specification cannot be empty"));
+        }
+        Ok(ModelReference(trimmed.to_string()))
+    }
+
+    /// Resolves the written reference against the provider catalog.
+    fn resolve(&self, catalog: &[ModelCatalogEntry]) -> Result<ModelRef, String> {
+        ModelsConfig::resolve_model_spec(catalog, &self.0)
+    }
+}
+
+impl<'de> Deserialize<'de> for ModelReference {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct ReferenceVisitor;
+
+        impl<'de> serde::de::Visitor<'de> for ReferenceVisitor {
+            type Value = ModelReference;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("a model specification or a { provider, name } table")
+            }
+
+            fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                ModelReference::parse_text(value)
+            }
+
+            fn visit_map<A>(self, map: A) -> Result<Self::Value, A::Error>
+            where
+                A: serde::de::MapAccess<'de>,
+            {
+                // The structured form is delegated to `ModelRef`, so its
+                // provider and name fields keep their own precise diagnostics.
+                let model =
+                    ModelRef::deserialize(serde::de::value::MapAccessDeserializer::new(map))?;
+                Ok(ModelReference(model.to_spec()))
+            }
+        }
+
+        deserializer.deserialize_any(ReferenceVisitor)
+    }
+}
+
+/// A role entry as written in configuration.
+///
+/// Pairs the written model reference with the reasoning depth of that role
+/// slot. A display alias is not a role parameter: it describes the model itself
+/// and is declared once in the provider catalog, so a role entry that carries
+/// one is rejected instead of quietly reinstating a second source of truth for
+/// the same label.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RoleModelSpec {
+    reference: ModelReference,
+    effort: Option<ReasoningEffort>,
+}
+
+impl<'de> Deserialize<'de> for RoleModelSpec {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct SpecVisitor;
+
+        impl<'de> serde::de::Visitor<'de> for SpecVisitor {
+            type Value = RoleModelSpec;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("a model string or a { model, effort } table")
+            }
+
+            fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                Ok(RoleModelSpec {
+                    reference: ModelReference::parse_text(value)?,
+                    effort: None,
+                })
+            }
+
+            fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+            where
+                A: serde::de::MapAccess<'de>,
+            {
+                let mut reference: Option<ModelReference> = None;
+                let mut effort: Option<ReasoningEffort> = None;
+                let mut effort_seen = false;
+
+                while let Some(key) = map.next_key::<String>()? {
+                    match key.as_str() {
+                        "model" => {
+                            if reference.is_some() {
+                                return Err(serde::de::Error::duplicate_field("model"));
+                            }
+                            reference = Some(map.next_value()?);
+                        }
+                        "effort" => {
+                            if effort_seen {
+                                return Err(serde::de::Error::duplicate_field("effort"));
+                            }
+                            effort_seen = true;
+                            // Read as a string so a blank value means "no
+                            // effort" and a malformed one keeps the precise
+                            // reasoning-effort diagnostic.
+                            effort = match map.next_value::<Option<String>>()? {
+                                Some(raw) if !raw.trim().is_empty() => Some(
+                                    raw.trim()
+                                        .parse::<ReasoningEffort>()
+                                        .map_err(serde::de::Error::custom)?,
+                                ),
+                                _ => None,
+                            };
+                        }
+                        other => {
+                            return Err(serde::de::Error::unknown_field(
+                                other,
+                                &["model", "effort"],
+                            ))
+                        }
+                    }
+                }
+
+                let reference = match reference {
+                    Some(reference) => reference,
+                    None => return Err(serde::de::Error::missing_field("model")),
+                };
+
+                Ok(RoleModelSpec { reference, effort })
+            }
+        }
+
+        deserializer.deserialize_any(SpecVisitor)
+    }
+}
+
+/// Role model lists as written in configuration, before catalog resolution.
+///
+/// A role entry may name a model by a catalog alias, and an alias is only
+/// resolvable against a catalog that has already been read. Configuration is
+/// therefore decoded into this proxy first and resolved through
+/// [`ModelsConfig::resolve`], so no role can resolve against a half-read
+/// catalog.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub(crate) struct ModelsConfigRaw {
+    #[serde(default)]
+    primary: Vec<RoleModelSpec>,
+    #[serde(default)]
+    coder: Option<Vec<RoleModelSpec>>,
+    #[serde(default)]
+    architect: Option<Vec<RoleModelSpec>>,
+    #[serde(default)]
+    reviewer: Option<Vec<RoleModelSpec>>,
+    #[serde(default)]
+    scribe: Option<ModelReference>,
+    #[serde(default)]
+    auto_level_up: bool,
 }
 
 /// Role model lists and the coder escalation ladder (`[models]`).
@@ -63,27 +219,111 @@ where
 /// a time and saturates on the last. `scribe` is a single utility model used for
 /// history compaction and commit message synthesis; it defaults to the first
 /// `primary` entry.
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+///
+/// Every reference is already resolved against the provider catalog, so a role
+/// never stores an alias and every consumer reads a concrete model.
+#[derive(Debug, Clone, Serialize, Default)]
 pub struct ModelsConfig {
     pub primary: Vec<ModelEntry>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub coder: Option<Vec<ModelEntry>>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub architect: Option<Vec<ModelEntry>>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub reviewer: Option<Vec<ModelEntry>>,
     #[serde(
-        default,
         skip_serializing_if = "Option::is_none",
-        deserialize_with = "deserialize_model_ref_opt",
         serialize_with = "serialize_model_ref_opt"
     )]
     pub scribe: Option<ModelRef>,
-    #[serde(default)]
     pub auto_level_up: bool,
 }
 
 impl ModelsConfig {
+    /// Resolves a model reference written in configuration.
+    ///
+    /// A reference is either an alias registered in the provider catalog or a
+    /// provider model specification. A registered alias wins, so a project may
+    /// name a model the way the catalog declares it without restating the
+    /// provider identifier.
+    pub fn resolve_model_spec(
+        catalog: &[ModelCatalogEntry],
+        spec: &str,
+    ) -> Result<ModelRef, String> {
+        let trimmed = spec.trim();
+        if trimmed.is_empty() {
+            return Err("Model specification cannot be empty".to_string());
+        }
+        if let Some(entry) = catalog
+            .iter()
+            .find(|entry| entry.alias.as_deref() == Some(trimmed))
+        {
+            return Ok(entry.model.clone());
+        }
+        trimmed.parse::<ModelRef>()
+    }
+
+    /// Returns the alias registered for a model in the provider catalog.
+    pub fn model_alias<'a>(catalog: &'a [ModelCatalogEntry], model: &ModelRef) -> Option<&'a str> {
+        catalog
+            .iter()
+            .find(|entry| &entry.model == model)
+            .and_then(|entry| entry.alias.as_deref())
+    }
+
+    /// Resolves the configured role lists against the provider catalog.
+    ///
+    /// Every role entry names a model either by its provider specification or by
+    /// an alias registered in the catalog; both forms normalize to a concrete
+    /// [`ModelRef`] here, so nothing downstream ever handles an unresolved
+    /// reference.
+    pub(crate) fn resolve(
+        raw: ModelsConfigRaw,
+        catalog: &[ModelCatalogEntry],
+    ) -> Result<Self, String> {
+        fn resolve_role(
+            role: &str,
+            entries: Vec<RoleModelSpec>,
+            catalog: &[ModelCatalogEntry],
+        ) -> Result<Vec<ModelEntry>, String> {
+            entries
+                .into_iter()
+                .map(|spec| {
+                    let model = spec
+                        .reference
+                        .resolve(catalog)
+                        .map_err(|err| format!("[models] {}: {}", role, err))?;
+                    Ok(ModelEntry::new(model, spec.effort))
+                })
+                .collect()
+        }
+
+        Ok(ModelsConfig {
+            primary: resolve_role("primary", raw.primary, catalog)?,
+            coder: raw
+                .coder
+                .map(|entries| resolve_role("coder", entries, catalog))
+                .transpose()?,
+            architect: raw
+                .architect
+                .map(|entries| resolve_role("architect", entries, catalog))
+                .transpose()?,
+            reviewer: raw
+                .reviewer
+                .map(|entries| resolve_role("reviewer", entries, catalog))
+                .transpose()?,
+            scribe: raw
+                .scribe
+                .map(|reference| {
+                    reference
+                        .resolve(catalog)
+                        .map_err(|err| format!("[models] scribe: {}", err))
+                })
+                .transpose()?,
+            auto_level_up: raw.auto_level_up,
+        })
+    }
+
     /// Validates that `primary` is present and non-empty and that no populated
     /// role list is empty.
     ///
@@ -201,7 +441,10 @@ impl ModelsConfig {
     /// If the selection specifies a concrete model, looks for that model among the
     /// entries configured for `role` first, then falls back to `primary`, returning
     /// that entry's configured effort. If the model is not in either list or has no
-    /// effort specified, returns `None`.
+    /// effort specified, returns `None`. A tier selection names the exact
+    /// role-list entry the developer picked, so its effort is read from the
+    /// DTO itself and is never re-derived by matching the model against the
+    /// configured entries.
     pub fn resolve_selection_effort(
         &self,
         role: ModelRole,
@@ -219,6 +462,10 @@ impl ModelsConfig {
                     }
                 })
                 .and_then(|entry| entry.effort),
+            // A tier names the exact role-list entry the developer picked, so
+            // its reasoning depth travels inside the DTO and is never
+            // re-derived by matching the model against the configured entries.
+            ModelSelection::Tier { effort, .. } => *effort,
         }
     }
 
@@ -227,6 +474,7 @@ impl ModelsConfig {
         match selection {
             ModelSelection::Role(role) => self.resolve_role(*role),
             ModelSelection::Specific(model) => model.clone(),
+            ModelSelection::Tier { model, .. } => model.clone(),
         }
     }
 
@@ -356,6 +604,15 @@ fn default_model_for_role(role: ModelRole) -> &'static str {
 mod tests {
     use super::*;
 
+    fn parse_models(raw: &str) -> ModelsConfig {
+        parse_models_with_catalog(raw, &[])
+    }
+
+    fn parse_models_with_catalog(raw: &str, catalog: &[ModelCatalogEntry]) -> ModelsConfig {
+        let raw: ModelsConfigRaw = toml::from_str(raw).expect("parse models config");
+        ModelsConfig::resolve(raw, catalog).expect("resolve models config")
+    }
+
     #[test]
     fn test_resolve_effort_defaults_to_none() {
         let config = ModelsConfig::default();
@@ -372,7 +629,7 @@ mod tests {
 
     #[test]
     fn test_resolve_effort_reads_base_entry() {
-        let config: ModelsConfig = toml::from_str(
+        let config = parse_models(
             r#"
 primary = ["openrouter:base/primary"]
 coder = [
@@ -382,8 +639,7 @@ coder = [
 architect = [{ model = "openrouter:anthropic/claude-sonnet-latest", effort = "high" }]
 reviewer = ["openrouter:google/gemini-flash-latest"]
 "#,
-        )
-        .expect("parse models config");
+        );
 
         // Effort is read from the base (first) entry of the role list.
         assert_eq!(
@@ -402,13 +658,12 @@ reviewer = ["openrouter:google/gemini-flash-latest"]
 
     #[test]
     fn test_coder_single_string_yields_one_rung() {
-        let config: ModelsConfig = toml::from_str(
+        let config = parse_models(
             r#"
 primary = ["openrouter:base/primary"]
 coder = ["openrouter:anthropic/claude-3.7-sonnet"]
 "#,
-        )
-        .expect("parse coder string");
+        );
         let ladder = config.coder_ladder();
         assert_eq!(ladder.len(), 1);
         assert_eq!(
@@ -423,13 +678,12 @@ coder = ["openrouter:anthropic/claude-3.7-sonnet"]
 
     #[test]
     fn test_coder_single_table_carries_effort() {
-        let config: ModelsConfig = toml::from_str(
+        let config = parse_models(
             r#"
 primary = ["openrouter:base/primary"]
 coder = [{ model = "openrouter:deepseek/deepseek-chat", effort = "high" }]
 "#,
-        )
-        .expect("parse coder table");
+        );
         let ladder = config.coder_ladder();
         assert_eq!(ladder.len(), 1);
         assert_eq!(
@@ -446,7 +700,7 @@ coder = [{ model = "openrouter:deepseek/deepseek-chat", effort = "high" }]
 
     #[test]
     fn test_coder_array_builds_ordered_ladder() {
-        let config: ModelsConfig = toml::from_str(
+        let config = parse_models(
             r#"
 primary = ["openrouter:base/primary"]
 coder = [
@@ -454,8 +708,7 @@ coder = [
     { model = "openrouter:strong/model", effort = "xhigh" },
 ]
 "#,
-        )
-        .expect("parse coder array");
+        );
         let ladder = config.coder_ladder();
         assert_eq!(ladder.len(), 2);
         assert_eq!(ladder[0].model, ModelRef::openrouter("base/model"));
@@ -479,13 +732,12 @@ coder = [
 
     #[test]
     fn test_coder_absent_inherits_primary_ladder() {
-        let config: ModelsConfig = toml::from_str(
+        let config = parse_models(
             r#"
 primary = ["openrouter:only/primary", "openrouter:second/primary"]
 architect = ["openrouter:only/architect"]
 "#,
-        )
-        .expect("parse models config");
+        );
         let ladder = config.coder_ladder();
         assert_eq!(ladder.len(), 2);
         assert_eq!(ladder[0].model, ModelRef::openrouter("only/primary"));
@@ -496,7 +748,7 @@ architect = ["openrouter:only/architect"]
 
     #[test]
     fn test_architect_ladder_derives_from_role_list() {
-        let config: ModelsConfig = toml::from_str(
+        let config = parse_models(
             r#"
 primary = ["openrouter:base/primary"]
 architect = [
@@ -504,8 +756,7 @@ architect = [
     { model = "openrouter:planner/two", effort = "xhigh" },
 ]
 "#,
-        )
-        .expect("parse models config");
+        );
 
         let ladder = config.architect_ladder();
         assert_eq!(ladder.len(), 2);
@@ -533,13 +784,12 @@ architect = [
 
     #[test]
     fn test_architect_ladder_restarts_when_recorded_rung_is_unknown() {
-        let config: ModelsConfig = toml::from_str(
+        let config = parse_models(
             r#"
 primary = ["openrouter:base/primary"]
 architect = ["openrouter:planner/one"]
 "#,
-        )
-        .expect("parse models config");
+        );
 
         let unknown = ArchitectTier::new(ModelRef::openrouter("planner/retired"), None);
         assert_eq!(config.architect_tier_index(Some(&unknown)), None);
@@ -553,7 +803,7 @@ architect = ["openrouter:planner/one"]
 
     #[test]
     fn test_resolve_selection_effort_picks_matching_model_entry() {
-        let config: ModelsConfig = toml::from_str(
+        let config = parse_models(
             r#"
 primary = ["openrouter:base/primary"]
 architect = [
@@ -562,8 +812,7 @@ architect = [
     "openrouter:google/gemini-argon",
 ]
 "#,
-        )
-        .expect("parse models config");
+        );
 
         // Role selection returns base effort (max)
         assert_eq!(
@@ -603,8 +852,42 @@ architect = [
     }
 
     #[test]
+    fn test_resolve_selection_effort_tier_reads_effort_from_the_dto() {
+        let config = parse_models(
+            r#"
+primary = ["openrouter:base/primary"]
+architect = [
+    { model = "openrouter:deepseek/flash", effort = "max" },
+    { model = "openrouter:google/gemini-flash", effort = "high" },
+]
+"#,
+        );
+
+        // A tier selection carries the full role-list coordinate, so the
+        // resolver reads its depth straight from the DTO: the configured
+        // `high` effort of the same model never leaks into the answer.
+        let tier = ModelSelection::Tier {
+            model: ModelRef::openrouter("google/gemini-flash"),
+            effort: Some(ReasoningEffort::XHigh),
+        };
+        assert_eq!(
+            config.resolve_selection_effort(ModelRole::Architect, &tier),
+            Some(ReasoningEffort::XHigh)
+        );
+        assert_eq!(config.resolve_model(&tier), ModelRef::openrouter("google/gemini-flash"));
+
+        // A tier without a depth resolves to no effort instead of inheriting
+        // the first entry's configured one.
+        let bare = ModelSelection::Tier {
+            model: ModelRef::openrouter("google/gemini-flash"),
+            effort: None,
+        };
+        assert_eq!(config.resolve_selection_effort(ModelRole::Architect, &bare), None);
+    }
+
+    #[test]
     fn test_architect_tier_index_falls_back_to_model_matching_on_effort_discrepancy() {
-        let config: ModelsConfig = toml::from_str(
+        let config = parse_models(
             r#"
 primary = ["openrouter:base/primary"]
 architect = [
@@ -613,8 +896,7 @@ architect = [
     "openrouter:google/gemini-argon",
 ]
 "#,
-        )
-        .expect("parse models config");
+        );
 
         // Recorded tier has mismatched effort (Max instead of High)
         let mismatched = ArchitectTier::new(
@@ -632,36 +914,86 @@ architect = [
     }
 
     #[test]
-    fn test_model_entry_polymorphic_parsing_with_alias_and_effort() {
-        let config: ModelsConfig = toml::from_str(
+    fn test_model_entry_polymorphic_parsing_with_effort() {
+        let config = parse_models(
             r#"
 primary = ["openrouter:base/primary"]
 coder = [
     "openrouter:plain/model",
-    { model = "openrouter:aliased/model", effort = "high", alias = "Fast Coder" },
+    { model = "openrouter:detailed/model", effort = "high" },
 ]
 "#,
-        )
-        .expect("parse models config");
+        );
         let ladder = config.coder_ladder();
         assert_eq!(ladder.len(), 2);
         assert_eq!(ladder[0].model, ModelRef::openrouter("plain/model"));
-        assert_eq!(ladder[0].alias, None);
-        assert_eq!(ladder[1].model, ModelRef::openrouter("aliased/model"));
+        assert_eq!(ladder[0].effort, None);
+        assert_eq!(ladder[1].model, ModelRef::openrouter("detailed/model"));
         assert_eq!(ladder[1].effort, Some(ReasoningEffort::High));
-        assert_eq!(ladder[1].alias, Some("Fast Coder".to_string()));
+    }
+
+    #[test]
+    fn test_role_entry_rejects_a_display_alias() {
+        // A display alias describes the model itself and is declared in the
+        // provider catalog, so a role slot that carries one is rejected instead
+        // of quietly reinstating a second source of truth for the same label.
+        let err = toml::from_str::<ModelsConfigRaw>(
+            r#"
+primary = [{ model = "openrouter:base/primary", alias = "Fast" }]
+"#,
+        )
+        .expect_err("a role entry carrying an alias must be rejected")
+        .to_string();
+        assert!(err.contains("alias"), "got: {err}");
+    }
+
+    #[test]
+    fn test_role_entry_reports_precise_field_errors() {
+        // An unrecognized effort surfaces the reasoning-effort diagnostic
+        // instead of an opaque "data did not match any variant".
+        let err = toml::from_str::<ModelsConfigRaw>(
+            r#"
+primary = [{ model = "openrouter:base/primary", effort = "extreme" }]
+"#,
+        )
+        .expect_err("an unknown reasoning effort must be rejected")
+        .to_string();
+        assert!(err.contains("Unknown reasoning effort"), "got: {err}");
+
+        // A repeated key is rejected instead of letting the last value win.
+        // TOML refuses a duplicated key inside an inline table while parsing,
+        // before the role entry visitor runs, so the diagnostic is the parser's
+        // `duplicate key` report and it still names the offending key.
+        let err = toml::from_str::<ModelsConfigRaw>(
+            r#"
+primary = [{ model = "openrouter:a/b", model = "openrouter:c/d" }]
+"#,
+        )
+        .expect_err("a duplicated model key must be rejected")
+        .to_string();
+        assert!(err.contains("duplicate key"), "got: {err}");
+        assert!(err.contains("model"), "got: {err}");
+
+        // A table without a model reference is rejected.
+        let err = toml::from_str::<ModelsConfigRaw>(
+            r#"
+primary = [{ effort = "high" }]
+"#,
+        )
+        .expect_err("a table without a model must be rejected")
+        .to_string();
+        assert!(err.contains("missing field"), "got: {err}");
     }
 
     #[test]
     fn test_role_slice_mirrors_role_entries_for_stored_roles() {
-        let config: ModelsConfig = toml::from_str(
+        let config = parse_models(
             r#"
 primary = ["openrouter:base/primary", "openrouter:second/primary"]
 coder = ["openrouter:only/coder"]
 architect = [{ model = "openrouter:only/architect", effort = "high" }]
 "#,
-        )
-        .expect("parse models config");
+        );
 
         for role in [
             ModelRole::Primary,
@@ -677,5 +1009,259 @@ architect = [{ model = "openrouter:only/architect", effort = "high" }]
 
         // Scribe is a derived single-entry role and never exposes a stored list.
         assert!(config.role_slice(ModelRole::Scribe).is_none());
+    }
+
+    #[test]
+    fn test_role_reference_resolves_catalog_alias() {
+        let catalog = [
+            ModelCatalogEntry {
+                model: ModelRef::openrouter("deepseek/deepseek-chat"),
+                alias: Some("Deep".to_string()),
+            },
+            ModelCatalogEntry {
+                model: ModelRef::openrouter("google/gemini-flash-latest"),
+                alias: None,
+            },
+        ];
+        let config = parse_models_with_catalog(
+            r#"
+primary = ["Deep"]
+coder = [{ model = "Deep", effort = "max" }]
+scribe = "Deep"
+"#,
+            &catalog,
+        );
+
+        let deep = ModelRef::openrouter("deepseek/deepseek-chat");
+        assert_eq!(config.resolve_role(ModelRole::Primary), deep);
+        assert_eq!(config.scribe, Some(deep.clone()));
+        assert_eq!(config.coder_tier(0).model, deep);
+        assert_eq!(config.coder_tier(0).effort, Some(ReasoningEffort::Max));
+
+        // A provider specification still resolves without an alias.
+        assert_eq!(
+            ModelsConfig::resolve_model_spec(&catalog, "google/gemini-flash-latest").unwrap(),
+            ModelRef::openrouter("google/gemini-flash-latest")
+        );
+        assert_eq!(ModelsConfig::model_alias(&catalog, &deep), Some("Deep"));
+        assert_eq!(
+            ModelsConfig::model_alias(
+                &catalog,
+                &ModelRef::openrouter("google/gemini-flash-latest")
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn test_unresolvable_role_reference_reports_the_role() {
+        let raw: ModelsConfigRaw =
+            toml::from_str(r#"primary = ["anthropc:claude"]"#).expect("parse models config");
+        let err = ModelsConfig::resolve(raw, &[])
+            .expect_err("a mistyped provider prefix must fail resolution");
+        assert!(err.contains("primary"), "got: {err}");
+        assert!(err.contains("anthropc:claude"), "got: {err}");
+    }
+
+    #[test]
+    fn test_resolve_selection_effort_distinguishes_tiers_of_the_same_model() {
+        let config = parse_models(
+            r#"
+primary = ["openrouter:base/primary"]
+architect = [
+    { model = "openrouter:google/gemini-flash", effort = "low" },
+    { model = "openrouter:google/gemini-flash", effort = "high" },
+    { model = "openrouter:google/gemini-flash", effort = "max" },
+]
+"#,
+        );
+
+        let model = ModelRef::openrouter("google/gemini-flash");
+
+        // The same model may occupy several rungs of a role list, each with its
+        // own reasoning depth. A tier names exactly one of them, so its depth
+        // is read from the DTO and never from the first matching entry.
+        for effort in [
+            ReasoningEffort::Low,
+            ReasoningEffort::High,
+            ReasoningEffort::Max,
+        ] {
+            let tier = ModelSelection::Tier {
+                model: model.clone(),
+                effort: Some(effort),
+            };
+            let resolved = config.resolve_selection_effort(ModelRole::Architect, &tier);
+            assert_eq!(resolved, Some(effort));
+            assert_eq!(config.resolve_model(&tier), model);
+        }
+
+        // A tier without a recorded depth resolves to no effort instead of
+        // borrowing the depth of the first configured entry of the same model.
+        let bare = ModelSelection::Tier {
+            model: model.clone(),
+            effort: None,
+        };
+        assert_eq!(config.resolve_selection_effort(ModelRole::Architect, &bare), None);
+
+        // A bare model reference names no entry, so it keeps the established
+        // behavior and reads the depth of the first matching entry.
+        let specific = ModelSelection::Specific(model.clone());
+        assert_eq!(
+            config.resolve_selection_effort(ModelRole::Architect, &specific),
+            Some(ReasoningEffort::Low)
+        );
+    }
+
+    /// Three rows of one model stay distinguishable end to end: the picker keeps
+    /// every rung, the confirmed row travels as a `Tier`, and the resolver
+    /// applies exactly the depth printed on that row (c-1).
+    #[test]
+    fn test_picker_rows_of_one_model_reach_the_resolver_with_their_own_effort() {
+        let config = parse_models(
+            r#"
+primary = [
+    { model = "openrouter:google/gemini-flash", effort = "low" },
+    { model = "openrouter:google/gemini-flash", effort = "high" },
+    { model = "openrouter:google/gemini-flash", effort = "max" },
+]
+"#,
+        );
+        let model = ModelRef::openrouter("google/gemini-flash");
+
+        // The role list keeps all three rungs of the same model, so the picker
+        // presents rows that differ only by their reasoning depth.
+        let rows = config.role_entries(ModelRole::Primary);
+        assert_eq!(rows.len(), 3);
+        assert_eq!(
+            rows.iter().map(|row| row.effort).collect::<Vec<_>>(),
+            vec![
+                Some(ReasoningEffort::Low),
+                Some(ReasoningEffort::High),
+                Some(ReasoningEffort::Max),
+            ]
+        );
+        for row in &rows {
+            assert_eq!(row.model, model);
+        }
+
+        // Reopening the picker reproduces the confirmed rung: matching by both
+        // coordinates distinguishes the three rows, while matching only the
+        // model always lands on the first rung.
+        for (index, row) in rows.iter().enumerate() {
+            let exact = |candidate: &ModelEntry| {
+                candidate.model == row.model && candidate.effort == row.effort
+            };
+            let same_model = |candidate: &ModelEntry| candidate.model == row.model;
+            assert_eq!(rows.iter().position(exact), Some(index));
+            // Every rung shares the model, so a search that compares only the
+            // model collapses all of them onto the first entry: the depth of
+            // the confirmed rung survives only in the `(model, effort)` pair.
+            assert_eq!(
+                rows.iter().position(same_model),
+                Some(0),
+                "a model-only search must land on the first rung"
+            );
+        }
+
+        // Activating a row sends the rung whole, so the depth on screen is the
+        // depth the resolver applies.
+        for row in &rows {
+            let tier = ModelSelection::Tier {
+                model: row.model.clone(),
+                effort: row.effort,
+            };
+            assert_eq!(
+                config.resolve_selection_effort(ModelRole::Primary, &tier),
+                row.effort
+            );
+            assert_eq!(config.resolve_model(&tier), model);
+        }
+
+        // Collapsing a row to `Specific` drops the depth and falls back to the
+        // first rung of the same model, which is the defect the tier form
+        // removes.
+        let collapsed = ModelSelection::Specific(model.clone());
+        assert_eq!(
+            config.resolve_selection_effort(ModelRole::Primary, &collapsed),
+            Some(ReasoningEffort::Low)
+        );
+    }
+
+    /// Every role-driven RPC carries the confirmed rung whole, so the server
+    /// never re-derives the reasoning depth by matching the model against the
+    /// configured role list (c-3).
+    #[test]
+    fn test_role_rpc_tier_reaches_the_server_resolver() {
+        let config = parse_models(
+            r#"
+primary = ["openrouter:base/primary"]
+
+reviewer = [
+    { model = "openrouter:shared/reviewer", effort = "low" },
+    { model = "openrouter:shared/reviewer", effort = "xhigh" },
+]
+
+architect = [
+    { model = "openrouter:shared/architect", effort = "medium" },
+    { model = "openrouter:shared/architect", effort = "max" },
+]
+
+coder = [
+    { model = "openrouter:shared/coder", effort = "low" },
+    { model = "openrouter:shared/coder", effort = "high" },
+]
+"#,
+        );
+
+        for (role, model, first, second) in [
+            (
+                ModelRole::Reviewer,
+                ModelRef::openrouter("shared/reviewer"),
+                Some(ReasoningEffort::Low),
+                Some(ReasoningEffort::XHigh),
+            ),
+            (
+                ModelRole::Architect,
+                ModelRef::openrouter("shared/architect"),
+                Some(ReasoningEffort::Medium),
+                Some(ReasoningEffort::Max),
+            ),
+            (
+                ModelRole::Coder,
+                ModelRef::openrouter("shared/coder"),
+                Some(ReasoningEffort::Low),
+                Some(ReasoningEffort::High),
+            ),
+        ] {
+            // Both rungs of the same model stay reachable in the role dialog.
+            let rows = config.role_entries(role);
+            assert_eq!(rows.len(), 2, "{role}: every rung stays reachable");
+            assert_eq!(rows[0].effort, first, "{role}");
+            assert_eq!(rows[1].effort, second, "{role}");
+            assert_eq!(rows[1].model, model, "{role}");
+
+            // The second rung is the one the developer confirmed, and it
+            // reaches the resolver with its own depth instead of the depth of
+            // the first entry of the same model.
+            let tier = ModelSelection::Tier {
+                model: rows[1].model.clone(),
+                effort: rows[1].effort,
+            };
+            assert_eq!(
+                config.resolve_selection_effort(role, &tier),
+                second,
+                "{role}: the confirmed rung keeps its depth"
+            );
+            assert_eq!(config.resolve_model(&tier), model, "{role}");
+
+            // A legacy client that names only the model reference keeps the
+            // established decoding: the first matching entry supplies the depth.
+            let legacy = ModelSelection::Specific(model.clone());
+            assert_eq!(
+                config.resolve_selection_effort(role, &legacy),
+                first,
+                "{role}: the legacy form decodes unchanged"
+            );
+        }
     }
 }

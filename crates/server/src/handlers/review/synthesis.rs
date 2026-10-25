@@ -20,13 +20,14 @@ use tauqe_core::review::{
     parse_review_output, review_findings_response_format, uuid::generate_uuid_v7, ReviewStorage,
 };
 use tauqe_protocol::{
-    errors, events, ContextAccess, ModelRole, ModelUsageEvent, ModelUsageInfo, Request, Response,
-    ReviewCancelParams, ReviewContentDeltaEvent, ReviewFinishedEvent, ReviewItem,
-    ReviewListChangedEvent, ReviewReasoningDeltaEvent, ReviewSession, ReviewStartParams,
-    ReviewStartedEvent, ReviewUpdatedEvent,
+    errors, events, ContextAccess, ModelRole, ModelSelection, ModelUsageEvent, ModelUsageInfo,
+    Request, Response, ReviewCancelParams, ReviewContentDeltaEvent, ReviewFinishedEvent,
+    ReviewItem, ReviewListChangedEvent, ReviewReasoningDeltaEvent, ReviewSession,
+    ReviewStartParams, ReviewStartedEvent, ReviewUpdatedEvent,
 };
 use tokio::sync::mpsc;
 
+use crate::handlers::common::withdraw_streamed_attempt;
 use crate::state::{next_operation_id, AppState};
 
 use super::common::{emit, emit_error, offload_review};
@@ -46,25 +47,22 @@ pub async fn handle_review_start(req: Request, state: &Arc<AppState>) -> Respons
         None => ReviewStartParams::default(),
     };
 
-    let (provider, model, reasoning_effort) = {
+    let (provider, model, reasoning_effort, max_pattern_batch, files_token_budget) = {
         let cfg = state.config.lock().await.config.clone();
-        // The reviewer role list is the single source for the audit model and
-        // its reasoning depth; an explicit model override replaces only the
-        // model and leaves the role's reasoning effort in place.
-        let reviewer_entries = cfg.models.role_entries(ModelRole::Reviewer);
-        let reviewer_entry = reviewer_entries
-            .iter()
-            .find(|entry| params.model.as_ref().is_none_or(|m| &entry.model == m))
-            .cloned()
-            .or_else(|| reviewer_entries.into_iter().next());
-        let model = match params.model.clone() {
-            Some(m) => m,
-            None => reviewer_entry
-                .as_ref()
-                .map(|entry| entry.model.clone())
-                .unwrap_or_else(|| cfg.resolve_role(ModelRole::Reviewer)),
-        };
-        let reasoning_effort = reviewer_entry.and_then(|entry| entry.effort);
+        // The request carries the whole reviewer selection — the model together
+        // with the reasoning depth of the configured entry the developer picked
+        // — so the depth is read straight from the DTO instead of being
+        // re-derived by matching the model against the configured entries,
+        // which could never distinguish two rungs of the same model. An absent
+        // selection runs the base rung of the reviewer role.
+        let selection = params
+            .model
+            .clone()
+            .unwrap_or(ModelSelection::Role(ModelRole::Reviewer));
+        let model = cfg.resolve_model(&selection);
+        let reasoning_effort = cfg
+            .models
+            .resolve_selection_effort(ModelRole::Reviewer, &selection);
         // Deterministic unit tests inject a scripted provider through the
         // state's test seam; production builds construct a real network
         // provider from configuration.
@@ -83,7 +81,16 @@ pub async fn handle_review_start(req: Request, state: &Arc<AppState>) -> Respons
             Err(err) => return Response::err(req.id, errors::NO_API_KEY, err.to_string()),
         };
 
-        (provider, model, reasoning_effort)
+        // The pattern expansion is bounded by the same context budgets
+        // that govern discovery, so one wide glob cannot drag an unbounded
+        // file set into the audit window.
+        (
+            provider,
+            model,
+            reasoning_effort,
+            cfg.context.max_pattern_batch,
+            cfg.context.files_token_budget,
+        )
     };
 
     let (repo_root, ctx_snapshot, mut estimated_tokens) = {
@@ -104,6 +111,10 @@ pub async fn handle_review_start(req: Request, state: &Arc<AppState>) -> Respons
         }
     };
 
+    // Pattern-matched files the configured budgets kept out of the audit.
+    // Reported on the started event so a truncated expansion is never silent.
+    let mut omitted_files = 0usize;
+
     if let Some(pattern) = params
         .path_pattern
         .as_deref()
@@ -115,7 +126,7 @@ pub async fn handle_review_start(req: Request, state: &Arc<AppState>) -> Respons
         let root = repo_root.clone();
         // Listing the repository and reading every matched file is blocking git
         // and filesystem work, so it is offloaded off the async worker thread.
-        let matched_files = crate::handlers::offload(move || {
+        let (matched_reads, total_matched) = crate::handlers::offload(move || {
             let available_files =
                 tauqe_core::git::list_repository_files(Some(&root)).unwrap_or_default();
             let compiled = tauqe_protocol::GlobPattern::new(&pattern);
@@ -124,6 +135,10 @@ pub async fn handle_review_start(req: Request, state: &Arc<AppState>) -> Respons
                 .filter(|path| !existing_paths.contains(path) && compiled.matches(path))
                 .collect();
             matched.sort();
+            let total_matched = matched.len();
+            // One wide glob may match the whole tree, so the batch is cut at
+            // the configured pattern limit before any file is read.
+            matched.truncate(max_pattern_batch);
 
             let mut read = Vec::new();
             for path in matched {
@@ -135,20 +150,36 @@ pub async fn handle_review_start(req: Request, state: &Arc<AppState>) -> Respons
                     read.push((path, content));
                 }
             }
-            read
+            (read, total_matched)
         })
         .await
         .unwrap_or_default();
 
-        for (path, content) in matched_files {
+        let mut added = 0usize;
+        for (path, content) in matched_reads {
             let tokens =
                 tauqe_core::prompt::estimate_tokens_from_bytes(content.len() as u64) as usize;
+            // The expansion shares the discovery files token budget, so it
+            // stops at the first file that would push the audit window past
+            // the configured limit.
+            if estimated_tokens + tokens > files_token_budget {
+                break;
+            }
             estimated_tokens += tokens;
             files.push(tauqe_core::context::ContextFileContent {
                 path,
                 access: ContextAccess::ReadOnly,
                 content,
             });
+            added += 1;
+        }
+        omitted_files = total_matched.saturating_sub(added);
+        if omitted_files > 0 {
+            tracing::warn!(
+                omitted = omitted_files,
+                matched = total_matched,
+                "path pattern expansion reached the configured batch or token budget; remaining matched files were not loaded"
+            );
         }
     }
 
@@ -191,6 +222,7 @@ pub async fn handle_review_start(req: Request, state: &Arc<AppState>) -> Respons
             model: model.clone(),
             files_count: files.len(),
             estimated_tokens,
+            omitted_files,
         })
         .ok(),
     );
@@ -287,6 +319,17 @@ pub async fn handle_review_start(req: Request, state: &Arc<AppState>) -> Respons
                 StreamEvent::Error(err) => {
                     failure = Some(err);
                     break;
+                }
+                // The retry decorator withdrew the previous attempt because it
+                // broke after partial output: the filter holds a prefix of a
+                // document the retry regenerates from its beginning, so it is
+                // restarted instead of accumulating both payloads into one
+                // unparsable body, and the client drops the partial summary it
+                // already rendered.
+                StreamEvent::ResetStream => {
+                    withdraw_streamed_attempt(&state.out, &op_id, || {
+                        filter = JsonFieldStreamFilter::<ReviewFindingsOutput>::new("summary");
+                    });
                 }
                 _ => {}
             }

@@ -142,8 +142,16 @@ pub use crate::components::editor::is_char_typing;
 /// (Emacs `keyboard-quit`, ASCII BEL 0x07). The TUI treats it exactly like
 /// `Esc`, so one chord always aborts the running operation or closes the active
 /// surface without intercepting the system `SIGINT` signal.
+///
+/// The AltGr / compose chord (`CONTROL | ALT`) is excluded, mirroring every
+/// other command chord in the codebase: terminals without the kitty keyboard
+/// protocol report a composed character as `Ctrl+Alt`, so that spelling must
+/// never be rewritten to `Esc` and silently dismiss a surface (Conventions
+/// §5.2).
 pub fn is_keyboard_quit(key: &KeyEvent) -> bool {
-    key.code == KeyCode::Char('g') && key.modifiers.contains(KeyModifiers::CONTROL)
+    key.code == KeyCode::Char('g')
+        && key.modifiers.contains(KeyModifiers::CONTROL)
+        && !key.modifiers.contains(KeyModifiers::ALT)
 }
 
 /// Helper to remove the last word from a simple string buffer (equivalent to Ctrl+W).
@@ -328,7 +336,12 @@ pub async fn handle_terminal_event(
                 key = KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
             }
 
-            if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('q') {
+            // `Ctrl+Q` is a raw quit chord, so it excludes the AltGr / compose
+            // spelling (`CONTROL | ALT`) exactly like `C-g` above.
+            if key.modifiers.contains(KeyModifiers::CONTROL)
+                && !key.modifiers.contains(KeyModifiers::ALT)
+                && key.code == KeyCode::Char('q')
+            {
                 let mut st = state.lock().await;
                 if st.confirm_quit {
                     return Ok(InputResult::Exit);
@@ -553,6 +566,12 @@ mod tests {
             KeyCode::Char('x'),
             KeyModifiers::CONTROL
         )));
+        // The AltGr / compose spelling of `g` (`CONTROL | ALT`) is a composed
+        // character, never the raw `C-g` abort chord.
+        assert!(!is_keyboard_quit(&KeyEvent::new(
+            KeyCode::Char('g'),
+            KeyModifiers::CONTROL | KeyModifiers::ALT
+        )));
     }
 
     /// The squash dialog advertises its generate-message chord as the meta chord
@@ -615,6 +634,53 @@ mod tests {
         assert_eq!(dialog.focus, SquashDialogFocus::FileList);
         drop(guard);
         assert!(conn.written().is_empty());
+    }
+
+    /// The AltGr / compose spelling of `g` (`CONTROL | ALT`) must never be
+    /// normalized to `Esc`: the dialog neither dismisses nor issues a request.
+    #[tokio::test]
+    async fn squash_dialog_altgr_chord_never_quits_or_dismisses() {
+        let mut st = test_state();
+        st.squash_dialog = Some(SquashDialogState {
+            loading: false,
+            focus: SquashDialogFocus::MessageEditor,
+            ..Default::default()
+        });
+        let state = Arc::new(Mutex::new(st));
+        let mut conn = RpcConnection::new(Vec::<u8>::new());
+
+        let key = KeyEvent::new(
+            KeyCode::Char('g'),
+            KeyModifiers::CONTROL | KeyModifiers::ALT,
+        );
+        handle_terminal_event(crossterm::event::Event::Key(key), &state, &mut conn)
+            .await
+            .expect("in-memory dispatch never fails");
+
+        let guard = state.lock().await;
+        let dialog = guard.squash_dialog.as_ref().expect("dialog stays open");
+        assert!(!dialog.generating_message);
+        assert_eq!(dialog.focus, SquashDialogFocus::MessageEditor);
+        drop(guard);
+        assert!(conn.written().is_empty());
+    }
+
+    /// The AltGr / compose spelling of `q` (`CONTROL | ALT`) is a composed
+    /// character, so it never arms the quit confirmation and never exits.
+    #[tokio::test]
+    async fn test_altgr_q_never_arms_the_quit_gate() {
+        let state = Arc::new(Mutex::new(test_state()));
+        let mut conn = RpcConnection::new(Vec::<u8>::new());
+
+        let key = KeyEvent::new(
+            KeyCode::Char('q'),
+            KeyModifiers::CONTROL | KeyModifiers::ALT,
+        );
+        let res = handle_terminal_event(crossterm::event::Event::Key(key), &state, &mut conn)
+            .await
+            .unwrap();
+        assert_eq!(res, InputResult::Continue);
+        assert!(!state.lock().await.confirm_quit);
     }
 
     #[tokio::test]
@@ -798,7 +864,6 @@ mod tests {
             100,
             vec![tauqe_protocol::ModelEntry::new(
                 ModelRef::openrouter("test-model"),
-                None,
                 None,
             )],
         );

@@ -17,7 +17,6 @@
 use std::path::Path;
 use std::sync::Arc;
 
-use tauqe_core::config::AppConfig;
 use tauqe_core::context::ContextFileContent;
 use tauqe_core::providers::{
     format_session_id, JsonSchemaDefinition, ResponseFormat, SESSION_PREFIX_REVIEW,
@@ -25,15 +24,14 @@ use tauqe_core::providers::{
 use tauqe_core::review::prompt::refine::ReviewRefineDiagnostics;
 use tauqe_core::review::ReviewStorage;
 use tauqe_protocol::{
-    errors, events, ArchitectTier, IssueStatus, ModelDeltaEvent, ModelRole, ModelSelection,
-    ModelStartedEvent, Request, Response, ResponseError, ReviewIssue, ReviewItem,
-    ReviewRefineItemParams, ReviewRefineItemResult, ReviewSession,
+    errors, events, IssueStatus, ModelDeltaEvent, ModelRole, ModelSelection, ModelStartedEvent,
+    Request, Response, ResponseError, ReviewIssue, ReviewItem, ReviewRefineItemParams,
+    ReviewRefineItemResult, ReviewSession,
 };
 
 use crate::handlers::architect::{
-    architect_alias, format_architect_tier, resolve_architect_provider,
-    run_architect_discovery_loop, ArchitectDiscoveryError, ArchitectDiscoveryOutcome,
-    ArchitectDiscoveryRequest,
+    format_architect_tier, resolve_architect_provider, run_architect_discovery_loop,
+    ArchitectDiscoveryError, ArchitectDiscoveryOutcome, ArchitectDiscoveryRequest,
 };
 use crate::handlers::common::record_synthesis_history;
 use crate::handlers::plan::find_duplicate_item_ids;
@@ -46,6 +44,71 @@ use super::common::{
 
 /// Operation title used for finding decomposition telemetry and history.
 const OPERATION_TITLE: &str = "Review Finding Decomposition";
+
+/// Admission rule of a decomposition round, declared by its caller.
+///
+/// Decomposition is reachable from three places — the `review/refineItem` RPC
+/// handler, the autonomous decomposition that runs before a finding is coded,
+/// and the replanning loop that reprojects a stalled horizon — so the status
+/// lifecycle is declared once as a typed rule here instead of being re-derived
+/// by each entry point. Every neighbouring mutation guards the same transition:
+/// `handle_plan_replan` refuses a `Done` step, and `review/execute` refuses
+/// finished, rejected, and untriaged findings.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum RefineAdmission {
+    /// A developer-initiated request through `review/refineItem`.
+    ///
+    /// An untriaged finding is refused: human triage gates autonomous work, and
+    /// a decomposition fixes the architecture of the finding, so it cannot
+    /// precede triage. A `Skipped` finding stays admissible, because that is the
+    /// recovery path for a subplan that stalled.
+    Developer,
+    /// A harness-driven round: the autonomous decomposition before coding, and
+    /// the replanning that reprojects a failed sub-step.
+    ///
+    /// Both callers have already established that the finding is executable —
+    /// `review/execute` refuses untriaged findings before the queue starts, and
+    /// the replanning loop owns the finding it has just interrupted — so only
+    /// the immutable terminal statuses are refused here.
+    Harness,
+}
+
+impl RefineAdmission {
+    /// Validates that `item` may be decomposed under this admission rule.
+    ///
+    /// The decision is made before any status is published, so a refused round
+    /// leaves the persisted finding exactly as it was.
+    fn admit(self, item: &ReviewItem) -> Result<(), ResponseError> {
+        match item.status {
+            // Finished work is immutable under the decision-immutability
+            // invariant, exactly as `handle_plan_replan` guards a `Done` step.
+            IssueStatus::Fixed => Err(refine_error(
+                errors::STEP_IMMUTABLE,
+                format!(
+                    "Review item #{} is FIXED and immutable; a completed finding cannot be decomposed",
+                    item.id
+                ),
+            )),
+            IssueStatus::Rejected => Err(refine_error(
+                errors::ITEM_REJECTED,
+                format!(
+                    "Review item #{} is REJECTED and cannot be decomposed",
+                    item.id
+                ),
+            )),
+            // A developer request on an untriaged finding would fix an
+            // architectural decision that triage has not approved yet.
+            IssueStatus::Discussion if self == Self::Developer => Err(refine_error(
+                errors::ITEM_IN_DISCUSSION,
+                format!(
+                    "Review item #{} is in DISCUSSION status and cannot be decomposed until it is triaged (change status to TODO first)",
+                    item.id
+                ),
+            )),
+            _ => Ok(()),
+        }
+    }
+}
 
 /// Handles an Architect-driven decomposition of a single review finding into an
 /// embedded subplan carried by `ReviewItem::subplan`.
@@ -116,6 +179,17 @@ pub async fn handle_review_refine_item(req: Request, state: &Arc<AppState>) -> R
         }
     };
 
+    // The status lifecycle is validated before the operation slot is taken, so a
+    // finished, rejected, or untriaged finding is refused deterministically and
+    // its persisted status is never touched.
+    if let Err(err) = RefineAdmission::Developer.admit(&item) {
+        return Response {
+            id: req.id,
+            result: None,
+            error: Some(err),
+        };
+    }
+
     let operation = match state.try_begin_operation() {
         Ok(guard) => guard,
         Err(()) => {
@@ -136,6 +210,7 @@ pub async fn handle_review_refine_item(req: Request, state: &Arc<AppState>) -> R
         params.instructions,
         None,
         &operation,
+        RefineAdmission::Developer,
     )
     .await
     {
@@ -158,6 +233,14 @@ pub async fn handle_review_refine_item(req: Request, state: &Arc<AppState>) -> R
 }
 
 /// Typed outcome of an Architect-driven finding decomposition.
+///
+/// The size difference between the variants is inherent to the outcome: the
+/// success arm carries the complete decomposed finding while the blocked arm
+/// carries only a reason string. The value feeds the wire result
+/// [`ReviewRefineItemResult`], which documents the same allowance, so boxing
+/// the payload would only add indirection through every consumer of the
+/// outcome; the size lint is therefore allowed here.
+#[allow(clippy::large_enum_variant)]
 pub(super) enum RefineOutcome {
     /// The finding was decomposed and persisted with an embedded subplan.
     Success {
@@ -192,6 +275,10 @@ pub(super) enum RefineOutcome {
 /// is published as `InProgress` for the whole synthesis, and a round that yields
 /// no horizon returns the finding to the status it held before planning started,
 /// so a failed or blocked round never leaves a stuck `InProgress`.
+///
+/// `admission` declares the lifecycle states this caller may decompose, so the
+/// status gate runs before any status is published and no entry point can
+/// regress a finished finding.
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn refine_finding_with_architect(
     state: &Arc<AppState>,
@@ -202,7 +289,12 @@ pub(super) async fn refine_finding_with_architect(
     instructions: Option<String>,
     diagnostics: Option<ReviewRefineDiagnostics<'_>>,
     operation: &OperationGuard,
+    admission: RefineAdmission,
 ) -> Result<RefineOutcome, ResponseError> {
+    // The gate runs before anything is published: a refused round must leave the
+    // stored finding exactly as it was.
+    admission.admit(item)?;
+
     // Planning is visible in the finding lifecycle. Publishing `InProgress`
     // before the first generation round lets the interface show planning
     // instead of an idle finding, and a successful synthesis settles it on
@@ -259,33 +351,6 @@ fn status_after_failed_planning(previous: IssueStatus) -> IssueStatus {
     }
 }
 
-/// Resolves the Architect configuration for one finding decomposition round.
-///
-/// An explicit developer selection overrides the ladder. Otherwise a replanning
-/// round reads the configuration recorded on the finding and asks the ladder for
-/// the next rung, so a reprojected horizon is synthesized by a stronger Architect
-/// than the one that already failed; the initial decomposition of a finding
-/// starts from the base rung. The returned former configuration is `Some` only
-/// for a replanning round, and is `None` when no configuration was recorded.
-fn resolve_finding_architect_tier(
-    cfg: &AppConfig,
-    recorded: Option<&ArchitectTier>,
-    custom_model: Option<&ModelSelection>,
-    replanning: bool,
-) -> (ArchitectTier, Option<ArchitectTier>) {
-    match custom_model {
-        Some(selection) => {
-            let model = cfg.resolve_model(selection);
-            let effort = cfg
-                .models
-                .resolve_selection_effort(ModelRole::Architect, selection);
-            (ArchitectTier::new(model, effort), None)
-        }
-        None if replanning => (cfg.models.next_architect_tier(recorded), recorded.cloned()),
-        None => (cfg.models.architect_tier(0), None),
-    }
-}
-
 /// Runs the Architect synthesis of a finding horizon.
 ///
 /// See [`refine_finding_with_architect`] for the lifecycle contract. This
@@ -304,22 +369,25 @@ async fn refine_finding_with_architect_inner(
     let (
         provider,
         architect_tier,
-        alias,
-        escalated_from,
+        level_up,
         repomap_budget,
         max_discovery_rounds,
         files_token_budget,
         max_parse_retries,
         include_repo_map,
+        discovery_limits,
     ) = {
         let cfg = state.config.lock().await.config.clone();
-        let (architect_tier, escalated_from) = resolve_finding_architect_tier(
+        // Tier resolution and the lazy level-up invariant are core-owned domain
+        // policy shared with plan horizon synthesis, so the server never
+        // re-derives the ladder locally.
+        let (architect_tier, level_up) = tauqe_core::plan::prompt::resolve_architect_tier(
             &cfg,
             item.subplan_architect.as_ref(),
             custom_model.as_ref(),
-            diagnostics.is_some(),
+            diagnostics.as_ref().map(|d| d.failed_step_id),
+            item.subplan_last_replanned_step.as_deref(),
         );
-        let alias = architect_alias(&cfg, &architect_tier);
         let provider =
             match resolve_architect_provider(state, &cfg, architect_tier.model.provider).await {
                 Ok(p) => p,
@@ -328,30 +396,46 @@ async fn refine_finding_with_architect_inner(
         (
             provider,
             architect_tier,
-            alias,
-            escalated_from,
+            level_up,
             cfg.context.repomap_token_budget,
             cfg.context.max_discovery_rounds,
             cfg.context.files_token_budget,
             cfg.develop.max_retries,
             cfg.context.include_repo_map,
+            tauqe_core::workflow::discovery::DiscoveryLimits::from_context_config(&cfg.context),
         )
     };
     let model = architect_tier.model.clone();
     let reasoning_effort = architect_tier.effort;
 
-    // A replanning round runs on the escalated rung and records it with the
-    // reprojected horizon, so the next wave continues up the ladder instead of
-    // restarting from the configuration that already failed.
-    if diagnostics.is_some() {
+    // A repeated failure of the same sub-step runs on the escalated rung and
+    // records it with the reprojected horizon, so the next wave continues up the
+    // ladder instead of restarting from the configuration that already failed.
+    if let Some(level) = &level_up {
         tracing::warn!(
             review_id = %session.id,
             item_id = item.id,
-            from_tier = ?escalated_from,
-            to_tier = ?architect_tier,
+            from_tier = ?level.from,
+            to_tier = ?level.to,
             "review finding architect level up"
         );
     }
+
+    let level_up_note = level_up
+        .as_ref()
+        .map(|level| {
+            let from = level
+                .from
+                .as_ref()
+                .map(format_architect_tier)
+                .unwrap_or_else(|| "not recorded".to_string());
+            format!(
+                "\n> Architect level up: {} → {}",
+                from,
+                format_architect_tier(&level.to)
+            )
+        })
+        .unwrap_or_default();
 
     clear_auto_context(state).await;
 
@@ -369,7 +453,7 @@ async fn refine_finding_with_architect_inner(
             operation_id: op_id.clone(),
             model: model.clone(),
             role: Some(ModelRole::Architect),
-            alias,
+            alias: None,
             effort: reasoning_effort,
             plan_context: None,
             is_batch: false,
@@ -377,19 +461,6 @@ async fn refine_finding_with_architect_inner(
         .ok(),
     );
 
-    let level_up_note = if diagnostics.is_some() {
-        let from = escalated_from
-            .as_ref()
-            .map(format_architect_tier)
-            .unwrap_or_else(|| "not recorded".to_string());
-        format!(
-            "\n> Architect level up: {} → {}",
-            from,
-            format_architect_tier(&architect_tier)
-        )
-    } else {
-        String::new()
-    };
     let intro_header = match &diagnostics {
         Some(diag) => format!(
             "# {}: [{}#{}] {}\n*Replanning the finding horizon around failed sub-step `{}`...*{}\n\n---\n\n",
@@ -445,7 +516,8 @@ async fn refine_finding_with_architect_inner(
             Err(err) => return Err(refine_error(errors::SCHEMA_ERROR, err.to_string())),
         }
     };
-    let system_prompt = tauqe_core::review::prompt::build_review_finding_refine_system_prompt();
+    let system_prompt =
+        tauqe_core::review::prompt::refine::build_review_finding_refine_system_prompt();
     let discovery = ArchitectDiscoveryRequest {
         repo_root,
         op_id: &op_id,
@@ -458,6 +530,7 @@ async fn refine_finding_with_architect_inner(
         include_repo_map,
         max_discovery_rounds,
         files_token_budget,
+        discovery_limits,
         max_parse_retries,
         // Decomposition is an isolated design dialogue of one review session:
         // its cache is keyed by the audit, never by the interactive REPL.
@@ -470,7 +543,7 @@ async fn refine_finding_with_architect_inner(
                 failed_step_id: d.failed_step_id,
                 failure_reason: d.failure_reason,
             });
-            tauqe_core::review::prompt::build_review_finding_refine_user_prompt(
+            tauqe_core::review::prompt::refine::build_review_finding_refine_user_prompt(
                 session,
                 item,
                 context_files,
@@ -570,7 +643,7 @@ async fn refine_finding_with_architect_inner(
     if output.items.is_empty() {
         return Err(refine_error(
             errors::EMPTY_ITEMS,
-            "Model returned success status but an empty items array",
+            "Model returned success status but an empty items array".to_string(),
         ));
     }
 
@@ -594,6 +667,10 @@ async fn refine_finding_with_architect_inner(
     let save_root = repo_root.to_path_buf();
     let save_review_id = review_id.clone();
     let subplan_architect = architect_tier;
+    // The sub-step whose horizon this wave reprojects is persisted with the new
+    // subplan, so the next wave reads from disk whether this sub-step already
+    // failed a replanning round.
+    let subplan_replanned_step = diagnostics.map(|d| d.failed_step_id.to_string());
     let updated = match offload_review(move || {
         ReviewStorage::replace_uncompleted_subplan(
             &save_root,
@@ -601,6 +678,7 @@ async fn refine_finding_with_architect_inner(
             item_id,
             new_subplan,
             subplan_architect,
+            subplan_replanned_step,
         )
     })
     .await
@@ -648,18 +726,14 @@ async fn refine_finding_with_architect_inner(
 }
 
 /// Builds a typed error for the decomposition helper, mirroring `Response::err`.
-fn refine_error(code: &'static str, message: impl Into<String>) -> ResponseError {
-    ResponseError {
-        code: code.to_string(),
-        message: message.into(),
-        data: None,
-    }
+fn refine_error(code: &'static str, message: String) -> ResponseError {
+    ResponseError::new(code, message)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tauqe_protocol::model::{ModelEntry, ModelRef, ReasoningEffort};
+    use tauqe_protocol::{ArchitectTier, ModelRef, ReasoningEffort};
 
     #[test]
     fn architect_tier_banner_renders_its_reasoning_depth() {
@@ -692,8 +766,8 @@ mod tests {
             status_after_failed_planning(IssueStatus::Refine),
             IssueStatus::Refine
         );
-        // A finding left `Skipped` by an interrupted subplan keeps its
-        // interruption diagnostic instead of losing it to the planning round.
+        // A finding interrupted mid-subplan keeps its diagnostic instead of
+        // losing it to the planning round.
         assert_eq!(
             status_after_failed_planning(IssueStatus::Skipped),
             IssueStatus::Skipped
@@ -709,31 +783,79 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_resolve_finding_architect_tier_custom_model_uses_its_own_effort() {
-        let cfg = AppConfig {
-            models: tauqe_core::config::ModelsConfig {
-                primary: vec![ModelRef::openrouter("base/primary").into()],
-                architect: Some(vec![
-                    ModelEntry::new(
-                        ModelRef::openrouter("deepseek/deepseek-flash"),
-                        Some(ReasoningEffort::Max),
-                        None,
-                    ),
-                    ModelEntry::new(
-                        ModelRef::openrouter("google/gemini-flash"),
-                        Some(ReasoningEffort::High),
-                        None,
-                    ),
-                ]),
-                ..Default::default()
-            },
-            ..Default::default()
-        };
+    /// Builds a finding in the given lifecycle state.
+    fn finding_in(status: IssueStatus) -> ReviewItem {
+        ReviewItem::from(ReviewIssue {
+            id: 12,
+            title: "Guard the parser".to_string(),
+            model: None,
+            issue_type: tauqe_protocol::IssueType::Bug,
+            status,
+            description: String::new(),
+            recommendations: Vec::new(),
+            files: Vec::new(),
+            readonly_files: Vec::new(),
+            plan: Vec::new(),
+            note: None,
+        })
+    }
 
-        let selection = ModelSelection::Specific(ModelRef::openrouter("google/gemini-flash"));
-        let (tier, _) = resolve_finding_architect_tier(&cfg, None, Some(&selection), false);
-        assert_eq!(tier.model, ModelRef::openrouter("google/gemini-flash"));
-        assert_eq!(tier.effort, Some(ReasoningEffort::High));
+    #[test]
+    fn developer_decomposition_refuses_untriaged_and_terminal_findings() {
+        // Finished work is immutable, exactly as a `Done` plan step is.
+        let err = RefineAdmission::Developer
+            .admit(&finding_in(IssueStatus::Fixed))
+            .expect_err("a fixed finding must be refused");
+        assert_eq!(err.code, errors::STEP_IMMUTABLE);
+
+        let err = RefineAdmission::Developer
+            .admit(&finding_in(IssueStatus::Rejected))
+            .expect_err("a rejected finding must be refused");
+        assert_eq!(err.code, errors::ITEM_REJECTED);
+
+        // Human triage gates autonomous work, so an untriaged finding cannot be
+        // turned into an executable horizon yet.
+        let err = RefineAdmission::Developer
+            .admit(&finding_in(IssueStatus::Discussion))
+            .expect_err("an untriaged finding must be refused");
+        assert_eq!(err.code, errors::ITEM_IN_DISCUSSION);
+    }
+
+    #[test]
+    fn developer_decomposition_admits_recoverable_findings() {
+        for status in [
+            IssueStatus::Todo,
+            IssueStatus::InProgress,
+            IssueStatus::Refine,
+            // A stalled subplan leaves the finding skipped; asking the Architect
+            // to reproject it stays a legitimate recovery path.
+            IssueStatus::Skipped,
+        ] {
+            assert!(
+                RefineAdmission::Developer
+                    .admit(&finding_in(status))
+                    .is_ok(),
+                "{status} must stay decomposable"
+            );
+        }
+    }
+
+    #[test]
+    fn harness_decomposition_refuses_only_immutable_statuses() {
+        for status in [IssueStatus::Fixed, IssueStatus::Rejected] {
+            assert!(
+                RefineAdmission::Harness.admit(&finding_in(status)).is_err(),
+                "{status} is immutable and must be refused"
+            );
+        }
+
+        // The replanning loop reprojects a finding it has just interrupted, so
+        // `Skipped` must stay admitted on the harness path.
+        for status in [IssueStatus::Skipped, IssueStatus::Refine, IssueStatus::Todo] {
+            assert!(
+                RefineAdmission::Harness.admit(&finding_in(status)).is_ok(),
+                "{status} must stay decomposable by the harness"
+            );
+        }
     }
 }

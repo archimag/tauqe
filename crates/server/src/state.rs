@@ -6,8 +6,8 @@ use tauqe_core::config::AppConfig;
 use tauqe_core::context::ContextManager;
 use tauqe_core::history::{HistoryManager, HistoryMutation};
 use tauqe_protocol::{
-    events, DiscussionFocus, DiscussionFocusChangedEvent, Event, ModelSelection,
-    UsageTotalsSnapshot,
+    events, ContextState, DiscussionFocus, DiscussionFocusChangedEvent, Event, ModelRef,
+    ModelSelection, UsageTotalsSnapshot,
 };
 use tokio::sync::{watch, Mutex};
 
@@ -46,6 +46,16 @@ pub struct OperationGuard {
 }
 
 impl OperationGuard {
+    /// Returns the identifier of the registered operation.
+    ///
+    /// Every lifecycle event a supervisor publishes — a replanning phase, a
+    /// step failure, and the terminal batch completion — carries this
+    /// identifier, so a client can attribute each of them to the operation its
+    /// request started instead of correlating an unregistered counter.
+    pub fn id(&self) -> u64 {
+        self.id
+    }
+
     /// Returns a receiver that observes this operation's cancellation signal.
     pub fn cancel_receiver(&self) -> watch::Receiver<bool> {
         self.cancel_rx.clone()
@@ -340,6 +350,109 @@ impl AppState {
         }
     }
 
+    /// Force-aborts the registered operation at the very end of the shutdown
+    /// drain.
+    ///
+    /// The long-running work of this daemon does not live in the request
+    /// handler: `model/ask`, `plan/execute`, `plan/executePipeline`, and
+    /// `review/execute` spawn their turn or batch and return, so the handler
+    /// task set is typically empty while the operation slot still holds the task
+    /// that really runs. The slot is the only place that task is tracked —
+    /// through the abort handle a running turn installs — so a stalled drain
+    /// must reach through it instead of relying on the cooperative cancel
+    /// signal alone, which such a task may ignore indefinitely.
+    ///
+    /// Dropping the runtime at process exit is not a substitute: it abandons a
+    /// half-finished checkpoint or step commit instead of unwinding it. The
+    /// abort is therefore deferred, but never dropped, while a git transaction
+    /// is still open, and `budget` bounds that deferral because this runs inside
+    /// the daemon's own shutdown window. The slot is then polled, still within
+    /// the same budget, until the aborted task has really exited, so the caller
+    /// never returns while the task is mid-unwind.
+    pub async fn force_abort_active_operation(&self, budget: std::time::Duration) {
+        let deadline = tokio::time::Instant::now() + budget;
+
+        while self.git_transaction_active.load(Ordering::SeqCst)
+            && tokio::time::Instant::now() < deadline
+        {
+            tokio::time::sleep(HARD_CANCEL_POLL_INTERVAL).await;
+        }
+
+        let (op_id, handle) = {
+            let slot = self.lock_active_operation();
+            match slot.as_ref() {
+                Some(op) => (Some(op.id), op.abort_handle.clone()),
+                None => (None, None),
+            }
+        };
+        let Some(op_id) = op_id else {
+            return;
+        };
+        let Some(handle) = handle else {
+            tracing::warn!(
+                operation_slot_id = op_id,
+                "Shutdown drain expired with an operation still registered but no abort handle installed",
+            );
+            return;
+        };
+
+        tracing::warn!(
+            operation_slot_id = op_id,
+            "Shutdown drain expired; force-aborting the registered operation",
+        );
+        handle.abort();
+
+        // The abort lands at the task's next suspension point. Waiting for the
+        // slot to clear keeps the runtime alive until that task has dropped, so
+        // an open transaction is unwound instead of abandoned by process exit.
+        while self.is_operation_active() && tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(HARD_CANCEL_POLL_INTERVAL).await;
+        }
+    }
+
+    /// Reaps a workflow task that outlived its turn's cooperative cancel grace
+    /// period while a git transaction was still open.
+    ///
+    /// The caller hands over the still-running task together with the operation
+    /// registration it owns, so the operation slot stays registered until the
+    /// task has truly exited. Releasing it earlier — which is exactly what
+    /// happens when a turn returns with the task detached — would let a client
+    /// start `config/set`, `git/undo`, or a new turn against a half-unwound
+    /// workflow, and the next turn would then block on the session lock with no
+    /// registered operation left to cancel.
+    ///
+    /// The deferral is bounded by [`HARD_CANCEL_TRANSACTION_DEFER_LIMIT`]: a
+    /// transaction open that long means the turn is wedged, so the task is
+    /// force-aborted regardless and the slot is released once it exits.
+    pub fn defer_abort_owning_operation<T>(
+        self: &Arc<Self>,
+        operation: Arc<OperationGuard>,
+        task: tokio::task::JoinHandle<T>,
+    ) where
+        T: Send + 'static,
+    {
+        let state = Arc::clone(self);
+        tokio::spawn(async move {
+            let deadline = tokio::time::Instant::now() + HARD_CANCEL_TRANSACTION_DEFER_LIMIT;
+            while state.git_transaction_active.load(Ordering::SeqCst)
+                && tokio::time::Instant::now() < deadline
+            {
+                tokio::time::sleep(HARD_CANCEL_POLL_INTERVAL).await;
+            }
+            if !task.is_finished() {
+                tracing::warn!(
+                    operation_slot_id = operation.id,
+                    "Deferred cancel grace elapsed; aborting stalled workflow task",
+                );
+                task.abort();
+            }
+            // Awaiting the task is what keeps the slot honest: the guard is
+            // dropped only after the task has stopped running.
+            let _ = task.await;
+            drop(operation);
+        });
+    }
+
     /// Delivers a cancellation signal to the active operation without clearing
     /// its registration, so callers can still observe when the operation
     /// finishes and unwinds its transaction.
@@ -497,6 +610,74 @@ impl AppState {
         fresh
     }
 
+    /// Rotates the dialogue session identifier when the effective model changes.
+    ///
+    /// A provider keeps its prompt prefix cache bound to one concrete model: the
+    /// cached prefix was produced by another set of weights and tokenization,
+    /// so reusing the identifier across models addresses a cache the next
+    /// request can never match. The rotation therefore happens exactly when the
+    /// effective model differs, while reselecting the same model or changing
+    /// only a reasoning depth keeps the warm session.
+    pub async fn maybe_rotate_session_on_model_change(
+        &self,
+        old_model: &ModelRef,
+        new_model: &ModelRef,
+    ) -> bool {
+        if old_model == new_model {
+            return false;
+        }
+        let fresh = self.reset_session_uuid().await;
+        tracing::info!(
+            previous_model = %old_model,
+            model = %new_model,
+            session_id = %fresh,
+            "Rotated the dialogue session identifier after a model change",
+        );
+        true
+    }
+
+    /// Clears the transient auto context layer and starts a fresh dialogue
+    /// session when files were actually removed.
+    ///
+    /// The Auto layer is the volatile part of the prompt prefix: while it is
+    /// preserved across the rounds of one dialogue, the provider reuses the
+    /// cached prefix. Removing its files shrinks that prefix, so the dialogue
+    /// session identifier is rotated exactly when the layer really changed,
+    /// while a repeated clear on an already empty layer keeps the warm session.
+    pub async fn clear_auto_context(self: &Arc<Self>) -> Result<ContextState, String> {
+        self.clear_context(|ctx| ctx.clear_auto()).await
+    }
+
+    /// Clears every mutable context layer and starts a fresh dialogue session
+    /// when files were actually removed.
+    pub async fn clear_all_context(self: &Arc<Self>) -> Result<ContextState, String> {
+        self.clear_context(|ctx| ctx.clear()).await
+    }
+
+    /// Applies one context-clearing mutation and rotates the dialogue session
+    /// identifier only when the mutation reports that files were really removed.
+    ///
+    /// Both clearing paths share it, so the rotation decision lives in exactly
+    /// one place: a clear that removed nothing leaves the cached prompt prefix
+    /// intact and therefore keeps the current session warm. The resulting
+    /// context snapshot is returned so the caller publishes one consistent
+    /// state instead of re-reading the manager.
+    async fn clear_context<T>(self: &Arc<Self>, clear: T) -> Result<ContextState, String>
+    where
+        T: FnOnce(&mut ContextManager) -> bool + Send + 'static,
+    {
+        let (removed, snapshot) = self
+            .mutate_context(move |ctx| {
+                let removed = clear(ctx);
+                (removed, ctx.get_state())
+            })
+            .await?;
+        if removed {
+            self.reset_session_uuid().await;
+        }
+        Ok(snapshot)
+    }
+
     /// Returns the turn marker for the current turn, or `None` when markers are
     /// disabled.
     ///
@@ -626,6 +807,100 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    /// Clearing an Auto layer that really held files starts a fresh dialogue
+    /// session, because the prompt prefix those files warmed is gone.
+    #[tokio::test]
+    async fn clear_auto_context_rotates_the_session_when_files_were_removed() {
+        let root = std::env::temp_dir().join(format!("tauqe-state-clear-{}", next_operation_id()));
+        let _ = std::fs::create_dir_all(&root);
+        std::fs::write(root.join("auto.rs"), "fn auto() {}\n").unwrap();
+
+        let (out, _rx) = OutChannel::new();
+        let (history_sender, _history_rx) = tokio::sync::mpsc::unbounded_channel();
+        let state = AppState::new(AppConfig::default(), root.clone(), history_sender, out);
+
+        state
+            .context
+            .write()
+            .await
+            .add_auto_file("auto.rs", ContextAccess::ReadOnly)
+            .unwrap();
+        let warm_session = state.session_uuid().await;
+
+        let snapshot = state.clear_auto_context().await.expect("clear runs");
+
+        assert!(
+            snapshot.items.iter().all(|item| item.path != "auto.rs"),
+            "the auto file must leave the context"
+        );
+        assert_ne!(
+            warm_session,
+            state.session_uuid().await,
+            "removing auto files must start a fresh dialogue session"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Clearing an already empty Auto layer removes nothing, so the cached
+    /// prompt prefix is intact and the warm session must be preserved.
+    #[tokio::test]
+    async fn clear_auto_context_keeps_the_session_when_the_layer_is_empty() {
+        let root = std::env::temp_dir().join(format!("tauqe-state-clear-{}", next_operation_id()));
+        let _ = std::fs::create_dir_all(&root);
+
+        let (out, _rx) = OutChannel::new();
+        let (history_sender, _history_rx) = tokio::sync::mpsc::unbounded_channel();
+        let state = AppState::new(AppConfig::default(), root.clone(), history_sender, out);
+
+        let warm_session = state.session_uuid().await;
+        let snapshot = state.clear_auto_context().await.expect("clear runs");
+
+        assert!(snapshot.items.is_empty(), "nothing was loaded to clear");
+        assert_eq!(
+            warm_session,
+            state.session_uuid().await,
+            "an empty auto layer must not rotate the session"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A full reset drops the mutable layers, so it starts a fresh dialogue
+    /// session for exactly the same reason the auto-layer clear does.
+    #[tokio::test]
+    async fn clear_all_context_rotates_the_session_when_files_were_removed() {
+        let root = std::env::temp_dir().join(format!("tauqe-state-clear-{}", next_operation_id()));
+        let _ = std::fs::create_dir_all(&root);
+        std::fs::write(root.join("user.rs"), "fn user() {}\n").unwrap();
+
+        let (out, _rx) = OutChannel::new();
+        let (history_sender, _history_rx) = tokio::sync::mpsc::unbounded_channel();
+        let state = AppState::new(AppConfig::default(), root.clone(), history_sender, out);
+
+        state
+            .context
+            .write()
+            .await
+            .add_file("user.rs", ContextAccess::Editable)
+            .unwrap();
+        let warm_session = state.session_uuid().await;
+
+        let snapshot = state.clear_all_context().await.expect("clear runs");
+
+        assert!(
+            snapshot.items.is_empty(),
+            "every mutable layer must be gone"
+        );
+        assert_ne!(
+            warm_session,
+            state.session_uuid().await,
+            "a full reset must start a fresh dialogue session"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     /// A finished streaming round must leave no abort handle behind, or a later
     /// hard-cancel would abort a completed task instead of the work in flight.
     #[tokio::test]
@@ -661,6 +936,116 @@ mod tests {
         task.abort();
         let _ = task.await;
         drop(guard);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Flips a flag when the owning task future is dropped, so a test can prove
+    /// that a force-aborted task really stopped running instead of lingering
+    /// detached.
+    struct ExitMarker(Arc<AtomicBool>);
+
+    impl Drop for ExitMarker {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+
+    /// A workflow task that outlived the cancel grace period is handed to the
+    /// deferred watchdog together with the operation registration it owns: the
+    /// slot must stay registered until the task has truly exited, so a client
+    /// can never start `config/set`, `git/undo`, or a new turn against a
+    /// half-unwound workflow.
+    #[tokio::test]
+    async fn deferred_abort_holds_the_slot_until_the_task_exits() {
+        let root = std::env::temp_dir().join(format!("tauqe-state-defer-{}", next_operation_id()));
+        let _ = std::fs::create_dir_all(&root);
+
+        let (out, _rx) = OutChannel::new();
+        let (history_sender, _history_rx) = tokio::sync::mpsc::unbounded_channel();
+        let state = AppState::new(AppConfig::default(), root.clone(), history_sender, out);
+
+        let guard = state.try_begin_operation().expect("slot is free");
+        let exited = Arc::new(AtomicBool::new(false));
+        let marker = ExitMarker(Arc::clone(&exited));
+        let task = tokio::spawn(async move {
+            let _marker = marker;
+            std::future::pending::<()>().await
+        });
+
+        state.git_transaction_active.store(true, Ordering::SeqCst);
+        state.defer_abort_owning_operation(Arc::new(guard), task);
+
+        // While the transaction stays open the stalled task is never aborted,
+        // so the slot stays registered and a second operation is refused.
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        assert!(
+            state.is_operation_active(),
+            "the slot must stay registered while the stalled task is deferred"
+        );
+        assert!(
+            state.try_begin_operation().is_err(),
+            "a second operation must be refused while the slot is registered"
+        );
+        assert!(
+            !exited.load(Ordering::SeqCst),
+            "the deferred task must still be running"
+        );
+
+        // Releasing the transaction lets the watchdog force-abort the task and
+        // release the slot, and only after the task has really exited.
+        state.git_transaction_active.store(false, Ordering::SeqCst);
+        let mut released = false;
+        for _ in 0..300 {
+            if !state.is_operation_active() {
+                released = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(
+            released,
+            "the watchdog must release the slot once the task exits"
+        );
+        assert!(
+            exited.load(Ordering::SeqCst),
+            "the aborted task must really have stopped running"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A provider prefix cache belongs to one model, so switching the effective
+    /// model starts a fresh dialogue session while reselecting the same model
+    /// keeps the warm one.
+    #[tokio::test]
+    async fn maybe_rotate_session_on_model_change_tracks_the_effective_model() {
+        let root = std::env::temp_dir().join(format!("tauqe-state-model-{}", next_operation_id()));
+        let _ = std::fs::create_dir_all(&root);
+
+        let (out, _rx) = OutChannel::new();
+        let (history_sender, _history_rx) = tokio::sync::mpsc::unbounded_channel();
+        let state = AppState::new(AppConfig::default(), root.clone(), history_sender, out);
+
+        let alpha = ModelRef::openrouter("alpha/model");
+        let beta = ModelRef::openrouter("beta/model");
+        let warm = state.session_uuid().await;
+
+        assert!(
+            !state
+                .maybe_rotate_session_on_model_change(&alpha, &alpha)
+                .await,
+            "an unchanged model must not rotate the session"
+        );
+        assert_eq!(warm, state.session_uuid().await);
+
+        assert!(
+            state
+                .maybe_rotate_session_on_model_change(&alpha, &beta)
+                .await,
+            "a model change must rotate the session"
+        );
+        assert_ne!(warm, state.session_uuid().await);
+
         let _ = std::fs::remove_dir_all(&root);
     }
 }

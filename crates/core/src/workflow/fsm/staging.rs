@@ -34,18 +34,35 @@ pub(super) enum DiscoveryPhase {
     Terminate(Box<FsmTurnOutcome>),
 }
 
+/// Reports whether discovery stopped only because the round limit was spent.
+///
+/// The loop leaves for several reasons; only an exhausted limit deserves a
+/// warning, and only when the model still asked for repository material that
+/// will never arrive. A round that carries edits or protocol errors is a
+/// proposal the harness can act upon, not a truncated investigation.
+fn discovery_limit_reached(ctx: &PhaseContext<'_>, step: &ProposalStep) -> bool {
+    ctx.rounds_used >= ctx.options.max_discovery_rounds
+        && step.edits().is_empty()
+        && step.protocol_errors().is_empty()
+        && step.has_discovery_commands()
+}
+
 /// Runs the discovery phase: resolves context and documentation requests.
 ///
 /// Each round folds the model's requested files into the auto context layer and
 /// injects requested documentation before re-asking the provider for a proposal,
-/// feeding back the list of missing paths. The phase returns the last proposal
-/// round so the caller can stage its edits. A breached file token budget, a
-/// cancellation, or a semantic block terminates the turn instead.
+/// feeding back the list of missing paths. A round that only repeats requests the
+/// context already satisfies is not a dead end: it delivers the aggregate hint
+/// and one bounded round asks the model for the analysis it owes. The phase
+/// returns the last proposal round so the caller can stage its edits. A breached
+/// file token budget, a cancellation, or a semantic block terminates the turn
+/// instead.
 pub(super) async fn run_discovery_phase(
     ctx: &mut PhaseContext<'_>,
     initial: ProposalStep,
 ) -> anyhow::Result<DiscoveryPhase> {
     let mut step = initial;
+    let mut satisfied_rounds = 0usize;
 
     while ctx.rounds_used < ctx.options.max_discovery_rounds
         && step.edits().is_empty()
@@ -67,7 +84,12 @@ pub(super) async fn run_discovery_phase(
             step.commands(),
             ctx.options.files_token_budget,
             ctx.options.repomap_token_budget,
-            false,
+            ctx.options.discovery_limits,
+            // A repeated request that the context already satisfies still
+            // teaches the model something: the aggregate note explains that the
+            // files are visible, so such a round can be answered instead of
+            // being mistaken for a dead end.
+            true,
         )
         .await;
 
@@ -90,14 +112,35 @@ pub(super) async fn run_discovery_phase(
                 result: ModelResult::Answer { text: warn },
                 is_cancelled: false,
                 blocked: None,
+                abort: None,
                 has_terminal_success: false,
                 plan_saved: false,
+                plan_errors: Vec::new(),
                 skip_reason: None,
             })));
         }
 
-        if !outcome.has_progress(false) {
+        let widened = outcome.has_progress(false);
+        // Repeating a request the context already satisfies widens nothing, yet
+        // the model still deserves the explanation that those files are visible.
+        // The round is only answered when it left no readable text: a model that
+        // already wrote its analysis has concluded, and buying another provider
+        // round trip for it would spend the turn on a repeated conclusion.
+        let hint_only = !widened
+            && !outcome.already_satisfied_files.is_empty()
+            && step.text().trim().is_empty()
+            && ctx.accumulated_text.trim().is_empty();
+        if !widened && !hint_only {
             break;
+        }
+        if hint_only {
+            // One explanation is enough to deliver the hint, so a later
+            // repetition of the same requests closes the phase and leaves the
+            // written answer to the turn itself.
+            if satisfied_rounds >= MAX_SATISFIED_DISCOVERY_ROUNDS {
+                break;
+            }
+            satisfied_rounds += 1;
         }
 
         ctx.rounds_used += 1;
@@ -135,6 +178,12 @@ pub(super) async fn run_discovery_phase(
         // message, instead of being folded into the context that the patching
         // phase reads.
         ctx.journal.record_outcome(&outcome);
+        if hint_only {
+            // The repeated request leaves nothing new to inspect, so the next
+            // round owes an answer. The directive joins the journal, where it
+            // stays visible for the remaining rounds of the turn.
+            ctx.journal.push_block(ALREADY_SATISFIED_DIRECTIVE);
+        }
 
         let ctx_state = ctx.context_manager.get_state();
         let _ = ctx
@@ -199,8 +248,10 @@ pub(super) async fn run_discovery_phase(
                 },
                 is_cancelled: true,
                 blocked: None,
+                abort: None,
                 has_terminal_success: false,
                 plan_saved: false,
+                plan_errors: Vec::new(),
                 skip_reason: None,
             })));
         }
@@ -230,6 +281,29 @@ pub(super) async fn run_discovery_phase(
         }
     }
 
+    if discovery_limit_reached(ctx, &step) {
+        let warn = format!(
+            "Discovery round limit reached (max_discovery_rounds = {}). The model asked for more repository material, but no further files, searches, listings, or documentation will be loaded in this turn.",
+            ctx.options.max_discovery_rounds
+        );
+        tracing::warn!(
+            workflow = ctx.workflow_name,
+            model = %ctx.model,
+            rounds_used = ctx.rounds_used,
+            max_discovery_rounds = ctx.options.max_discovery_rounds,
+            "discovery round limit reached; no further material will be loaded"
+        );
+        let banner = format!("\n\n---\n⚠️ {}\n\n", warn);
+        let _ = ctx
+            .stream_tx
+            .send(StreamEvent::TextDelta(banner.clone()))
+            .await;
+        ctx.accumulated_text = merge_text(std::mem::take(&mut ctx.accumulated_text), &banner, "");
+        // The directive is what the following rounds read: it closes the phase
+        // with an answer contract instead of leaving the request unanswered.
+        ctx.journal.push_block(DISCOVERY_LIMIT_DIRECTIVE);
+    }
+
     Ok(DiscoveryPhase::Continue(Box::new(step)))
 }
 
@@ -237,12 +311,37 @@ pub(super) async fn run_discovery_phase(
 /// empty round: no text, no edits, and no protocol command.
 pub(super) const MAX_EMPTY_STEP_RETRIES: usize = 2;
 
-/// Corrective suffix appended to the request after an empty proposal round.
+/// Maximum number of Discovery rounds granted to a proposal that only repeated
+/// requests the context already satisfied.
+///
+/// Such a round widens nothing, but the model still deserves the explanation
+/// that the files are visible. One round is enough to deliver it: repeating the
+/// hint would spend provider round trips without teaching the model anything new.
+pub(super) const MAX_SATISFIED_DISCOVERY_ROUNDS: usize = 1;
+
+/// Directive appended to the journal when a round only repeated requests the
+/// context already satisfied.
+///
+/// It turns a dead-end repetition into an explicit answer contract, so the next
+/// proposal round concludes with prose instead of asking for the same files again.
+pub(super) const ALREADY_SATISFIED_DIRECTIVE: &str = "<response_directive>\nEvery file you requested is already loaded in <context>. Do not request those paths again: answer the task from the material you already hold. Write the analysis or the conclusion in plain conversational text, and emit file edits only when the code itself must change.\n</response_directive>";
+
+/// Directive appended to the journal when the discovery round limit is
+/// exhausted while the model still asked for more repository material.
+///
+/// It turns the stop condition into an explicit answer contract: the next
+/// proposal round must conclude from the material already gathered instead of
+/// requesting paths the harness will no longer load.
+pub(super) const DISCOVERY_LIMIT_DIRECTIVE: &str = "<response_directive>\nThe discovery round limit is exhausted: no further files, repository searches, directory listings, or documentation will be loaded in this turn. Your investigation for this turn is complete. Do not request additional paths. Answer the task from the material you already hold, stating the conclusions or emitting the file edits the gathered context supports.\n</response_directive>";
+
+/// Corrective suffix appended to the request after an empty proposal round.</search_47DD627A7A91FC1C>
 ///
 /// The suffix extends the previous request instead of replacing it, so the
 /// corrective round keeps the provider-cached prompt prefix and the model keeps
-/// the original task statement in view.
-pub(super) const EMPTY_STEP_REMINDER: &str = "\n\nYour previous reply was empty: it carried no text, no file edits, and no protocol command, so nothing could be acted upon. Respond again with a concrete proposal: state your findings in plain text, emit the file edits, request the missing context, or declare an explicit terminal outcome.";
+/// the original task statement in view. It names the plain-text analysis as a
+/// valid conclusion, so a model that has finished its investigation answers the
+/// task instead of believing that only file edits count as a result.
+pub(super) const EMPTY_STEP_REMINDER: &str = "\n\nYour previous reply was empty: it carried no text, no file edits, and no protocol command, so nothing could be acted upon. Respond again with a concrete result: when the context you already hold answers the task, write the analysis or the conclusion in plain conversational text; when the code must change, emit the file edits; otherwise declare an explicit terminal outcome.";
 
 /// Outcome of the corrective proposal round requested after an empty round.
 pub(super) enum EmptyStepRetry {
@@ -329,8 +428,10 @@ pub(super) async fn reask_after_empty_round(
             },
             is_cancelled: true,
             blocked: None,
+            abort: None,
             has_terminal_success: false,
             plan_saved: false,
+            plan_errors: Vec::new(),
             skip_reason: None,
         })));
     }
@@ -557,8 +658,10 @@ pub(super) async fn run_staging_phase(
                 },
                 is_cancelled: true,
                 blocked: None,
+                abort: None,
                 has_terminal_success: false,
                 plan_saved: false,
+                plan_errors: Vec::new(),
                 skip_reason: None,
             })));
         }
@@ -1671,6 +1774,382 @@ mod tests {
         assert!(user.content.trim_end().ends_with("</discovery_journal>"));
     }
 
-    #[allow(dead_code)]
-    fn _unused_stream_event(_event: StreamEvent) {}
+    #[tokio::test]
+    async fn patch_retry_reports_an_ignored_path_and_applies_the_alternative() {
+        let (_dir, root) = setup_repo(&[("a.rs", TARGET), (".gitignore", "target/\n")]);
+        let mut context = context_with_target(&root);
+        let mut history = HistoryManager::new(root.clone());
+
+        // The first round tries to generate a file inside an ignored directory,
+        // which virtual staging rejects before any byte reaches disk.
+        let ignored_create = concat!(
+            "<tauqe_edits summary=\"Generate helper\">\n",
+            "<create path=\"target/generated.rs\">\n",
+            "pub fn generated() {}\n",
+            "</create>\n",
+            "</tauqe_edits>",
+        );
+        let corrected = edit_block(
+            "pub fn compute() -> i32 { 0 }",
+            "pub fn compute() -> i32 { 42 }",
+        );
+        let provider = MockLlmProvider::scripted([
+            MockResponse::text(ignored_create),
+            MockResponse::text(corrected),
+        ]);
+        let model = ModelRef::openrouter("mock/model");
+        let protocol = XmlPromptProtocol;
+        let mut policy = DirectApplyPolicy::new();
+        let options = WorkflowOptions::default();
+        let (stream_tx, rx) = mpsc::channel(256);
+        drop(rx);
+        let (_cancel_tx, cancel_rx) = watch::channel(false);
+
+        let outcome = run_fsm_turn(
+            "Change compute to 42",
+            &provider,
+            &model,
+            &mut context,
+            &mut history,
+            &protocol,
+            &mut policy,
+            "git",
+            stream_tx,
+            cancel_rx,
+            &options,
+        )
+        .await
+        .unwrap();
+
+        assert!(matches!(
+            outcome.result,
+            ModelResult::Edit { outcome, .. } if outcome.applied
+        ));
+        assert!(outcome.assistant_text.contains("Patch Retry"));
+        assert_eq!(provider.requests().len(), 2);
+
+        // The retry prompt names the rejected path and explains why it cannot
+        // be written, so the model can pick a tracked destination.
+        let retry_request = &provider.requests()[1];
+        assert!(retry_request
+            .messages
+            .iter()
+            .any(|message| message.content.contains("target/generated.rs")));
+        assert!(retry_request.messages.iter().any(|message| message
+            .content
+            .contains("excluded by the repository ignore rules")));
+
+        assert!(
+            !root.join("target/generated.rs").exists(),
+            "an ignored path must never reach the working tree"
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join("a.rs")).unwrap(),
+            "pub fn compute() -> i32 { 42 }\n"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn post_hook_artifact_in_a_gitignored_directory_still_finalizes_the_commit() {
+        let (_dir, root) = setup_repo(&[
+            ("a.rs", TARGET),
+            (".gitignore", "target/\n"),
+            (
+                "tauqe.toml",
+                r#"[project.post_hook]
+command = "sh"
+args = ['-c', 'mkdir -p target && printf "artifact\n" > target/artifact.txt']
+"#,
+            ),
+        ]);
+        let mut context = context_with_target(&root);
+        let mut history = HistoryManager::new(root.clone());
+
+        let provider = MockLlmProvider::scripted([MockResponse::text(edit_block(
+            "pub fn compute() -> i32 { 0 }",
+            "pub fn compute() -> i32 { 42 }",
+        ))]);
+        let model = ModelRef::openrouter("mock/model");
+        let protocol = XmlPromptProtocol;
+        let mut policy = crate::workflow::git_policy::GitTransactionPolicy::new();
+        let options = WorkflowOptions::default();
+        let (stream_tx, rx) = mpsc::channel(256);
+        drop(rx);
+        let (_cancel_tx, cancel_rx) = watch::channel(false);
+
+        let outcome = run_fsm_turn(
+            "Change compute to 42",
+            &provider,
+            &model,
+            &mut context,
+            &mut history,
+            &protocol,
+            &mut policy,
+            "git",
+            stream_tx,
+            cancel_rx,
+            &options,
+        )
+        .await
+        .unwrap();
+
+        match outcome.result {
+            ModelResult::Edit { outcome, .. } => {
+                assert!(
+                    outcome.error.is_none(),
+                    "unexpected error: {:?}",
+                    outcome.error
+                );
+                assert!(outcome.applied, "the verified change set must be committed");
+                assert!(
+                    outcome.commit_hash.is_some(),
+                    "an ignored post-hook artifact must not abort the transaction"
+                );
+                assert_eq!(
+                    outcome.changed_files,
+                    vec!["a.rs".to_string()],
+                    "an ignored artifact never joins the change set"
+                );
+            }
+            other => panic!("expected applied edits, got {other:?}"),
+        }
+
+        // The hook really ran, and its ignored output stays out of Git.
+        assert_eq!(
+            std::fs::read_to_string(root.join("target/artifact.txt")).unwrap(),
+            "artifact\n"
+        );
+        let status = crate::git::cmd::run_git(Some(&root), &["status", "--porcelain"]).unwrap();
+        assert!(
+            status.trim().is_empty(),
+            "the ignored artifact must never dirty the working copy: {status}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn formats_staged_content_before_the_change_set_reaches_disk() {
+        let (_dir, root) = setup_repo(&[
+            ("a.rs", TARGET),
+            (
+                "tauqe.toml",
+                r#"[project.format]
+command = "sh"
+args = ["-c", "tr a-z A-Z"]
+"#,
+            ),
+        ]);
+        let mut context = context_with_target(&root);
+        let mut history = HistoryManager::new(root.clone());
+
+        let provider = MockLlmProvider::scripted([MockResponse::text(edit_block(
+            "pub fn compute() -> i32 { 0 }",
+            "pub fn compute() -> i32 { 42 }",
+        ))]);
+        let model = ModelRef::openrouter("mock/model");
+        let protocol = XmlPromptProtocol;
+        let mut policy = DirectApplyPolicy::new();
+        let options = WorkflowOptions::default();
+        let (stream_tx, rx) = mpsc::channel(256);
+        drop(rx);
+        let (_cancel_tx, cancel_rx) = watch::channel(false);
+
+        let outcome = run_fsm_turn(
+            "Change compute to 42",
+            &provider,
+            &model,
+            &mut context,
+            &mut history,
+            &protocol,
+            &mut policy,
+            "git",
+            stream_tx,
+            cancel_rx,
+            &options,
+        )
+        .await
+        .unwrap();
+
+        assert!(matches!(
+            outcome.result,
+            ModelResult::Edit { outcome, .. } if outcome.applied
+        ));
+        // The filter rewrote the staged content in memory, so the formatted text
+        // is what reached the working tree; the authored text never did.
+        assert_eq!(
+            std::fs::read_to_string(root.join("a.rs")).unwrap(),
+            "PUB FN COMPUTE() -> I32 { 42 }\n"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn keeps_the_authored_content_when_the_in_memory_formatter_fails() {
+        let (_dir, root) = setup_repo(&[
+            ("a.rs", TARGET),
+            (
+                "tauqe.toml",
+                r#"[project.format]
+command = "sh"
+args = ["-c", "printf 'formatter failed' >&2; exit 3"]
+"#,
+            ),
+        ]);
+        let mut context = context_with_target(&root);
+        let mut history = HistoryManager::new(root.clone());
+
+        let provider = MockLlmProvider::scripted([MockResponse::text(edit_block(
+            "pub fn compute() -> i32 { 0 }",
+            "pub fn compute() -> i32 { 42 }",
+        ))]);
+        let model = ModelRef::openrouter("mock/model");
+        let protocol = XmlPromptProtocol;
+        let mut policy = DirectApplyPolicy::new();
+        let options = WorkflowOptions::default();
+        let (stream_tx, rx) = mpsc::channel(256);
+        drop(rx);
+        let (_cancel_tx, cancel_rx) = watch::channel(false);
+
+        let outcome = run_fsm_turn(
+            "Change compute to 42",
+            &provider,
+            &model,
+            &mut context,
+            &mut history,
+            &protocol,
+            &mut policy,
+            "git",
+            stream_tx,
+            cancel_rx,
+            &options,
+        )
+        .await
+        .unwrap();
+
+        assert!(matches!(
+            outcome.result,
+            ModelResult::Edit { outcome, .. } if outcome.applied
+        ));
+        // A failing filter is fail-safe: the authored content is committed and
+        // the turn still succeeds.
+        assert_eq!(
+            std::fs::read_to_string(root.join("a.rs")).unwrap(),
+            "pub fn compute() -> i32 { 42 }\n"
+        );
+    }
+
+    /// A model that keeps requesting repository material until the discovery
+    /// round limit is exhausted must be warned, handed the limit directive, and
+    /// asked for a concluding answer built from the material already gathered.
+    ///
+    /// The scenario pins the three invariants of the limit: the developer sees
+    /// an explicit banner instead of a silently truncated investigation, the
+    /// concluding request carries the directive that no further material will
+    /// arrive, and the turn still closes as a written `ModelResult::Answer`
+    /// with the accumulated auto context intact.
+    #[tokio::test]
+    async fn discovery_limit_warns_and_requests_a_concluding_answer() {
+        let (_dir, root) = setup_repo(&[
+            ("a.rs", TARGET),
+            ("helper1.rs", "pub const ONE: i32 = 1;\n"),
+            ("helper2.rs", "pub const TWO: i32 = 2;\n"),
+            ("helper3.rs", "pub const THREE: i32 = 3;\n"),
+        ]);
+        let mut context = context_with_target(&root);
+        let mut history = HistoryManager::new(root.clone());
+
+        // Every round requests one more file and never writes a conclusion, so
+        // the investigation only stops because the round budget is spent.
+        let provider = MockLlmProvider::scripted([
+            MockResponse::text("<context_request path=\"helper1.rs\" access=\"read_only\" />"),
+            MockResponse::text("<context_request path=\"helper2.rs\" access=\"read_only\" />"),
+            MockResponse::text("<context_request path=\"helper3.rs\" access=\"read_only\" />"),
+            MockResponse::text("No further files are needed: ONE is 1 and TWO is 2."),
+        ]);
+        let model = ModelRef::openrouter("mock/model");
+        let protocol = XmlPromptProtocol;
+        let mut policy = DirectApplyPolicy::new();
+        let options = WorkflowOptions {
+            max_discovery_rounds: 2,
+            ..WorkflowOptions::default()
+        };
+        // The receiver stays open for the whole turn, so the warning banner is
+        // delivered instead of being dropped with a closed channel.
+        let (stream_tx, mut stream_rx) = mpsc::channel(1024);
+        let (_cancel_tx, cancel_rx) = watch::channel(false);
+
+        let outcome = run_fsm_turn(
+            "Summarize the constants",
+            &provider,
+            &model,
+            &mut context,
+            &mut history,
+            &protocol,
+            &mut policy,
+            "git",
+            stream_tx,
+            cancel_rx,
+            &options,
+        )
+        .await
+        .unwrap();
+
+        // The turn concludes with a written answer instead of dying at the
+        // limit, and the accumulated text carries the reason it stopped.
+        match &outcome.result {
+            ModelResult::Answer { text } => {
+                assert!(
+                    text.contains("No further files are needed"),
+                    "the turn must record the model's conclusion: {text:?}"
+                );
+            }
+            other => panic!("expected a written answer, got {other:?}"),
+        }
+        assert!(outcome
+            .assistant_text
+            .contains("Discovery round limit reached"));
+
+        // Two discovery rounds and one concluding answer request.
+        assert_eq!(provider.requests().len(), 4);
+
+        // The developer-facing stream explains why the investigation stopped.
+        let mut streamed = String::new();
+        while let Ok(event) = stream_rx.try_recv() {
+            if let StreamEvent::TextDelta(delta) = event {
+                streamed.push_str(&delta);
+            }
+        }
+        assert!(
+            streamed.contains("Discovery round limit reached"),
+            "the stream must explain the exhausted round budget: {streamed:?}"
+        );
+        assert!(streamed.contains("max_discovery_rounds = 2"));
+
+        // The concluding request carries the limit directive and the answer
+        // reminder, and the gathered material is still visible in the context.
+        let concluding = &provider.requests()[3].messages[1].content;
+        assert!(concluding.contains("<response_directive>"));
+        assert!(concluding.contains("The discovery round limit is exhausted"));
+        assert!(concluding.contains("Your investigation for this turn is complete"));
+        assert!(provider.requests()[3].messages[0]
+            .content
+            .contains("pub const ONE: i32 = 1;"));
+
+        // The accumulated auto context survives the truncated investigation.
+        let mut auto_files = context.auto_files();
+        auto_files.sort();
+        assert_eq!(
+            auto_files,
+            vec!["helper1.rs".to_string(), "helper2.rs".to_string()],
+            "the files discovery already gathered must stay available"
+        );
+
+        // The turn neither edited nor committed anything.
+        assert_eq!(
+            std::fs::read_to_string(root.join("a.rs")).unwrap(),
+            TARGET,
+            "a turn without edits must leave the working tree untouched"
+        );
+    }
 }

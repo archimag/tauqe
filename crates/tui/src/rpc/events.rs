@@ -152,9 +152,6 @@ pub async fn handle_event(ev: Event, state: &Arc<Mutex<AppState>>, is_reasoning:
                 if let Ok(cfg) = serde_json::from_value::<ConfigState>(params) {
                     st.workflow = cfg.workflow;
                     st.active_model = cfg.model;
-                    if !cfg.available_models.is_empty() {
-                        st.available_models = cfg.available_models;
-                    }
                     st.edit_protocol = cfg.edit_protocol;
                     if !cfg.available_workflows.is_empty() {
                         st.available_workflows = cfg.available_workflows;
@@ -211,10 +208,13 @@ pub async fn handle_event(ev: Event, state: &Arc<Mutex<AppState>>, is_reasoning:
                 .get_or_insert_with(std::time::Instant::now);
             if let Some(params) = ev.params {
                 if let Ok(data) = serde_json::from_value::<ModelStartedEvent>(params) {
+                    // The display alias is never carried through the turn
+                    // state: it is resolved from the provider catalog published
+                    // once per frame, so two carriers of one value cannot drift
+                    // apart after a configuration change (c-1).
                     st.running_model = Some(RunningModel {
                         model: data.model.clone(),
                         role: data.role,
-                        alias: data.alias.clone(),
                         effort: data.effort,
                     });
                     st.model.operation_id = Some(data.operation_id);
@@ -238,11 +238,11 @@ pub async fn handle_event(ev: Event, state: &Arc<Mutex<AppState>>, is_reasoning:
                     // Escalation promotes the turn inside the same role, so
                     // only the tier coordinates change: the header swaps the
                     // running model in place instead of waiting for the turn
-                    // to settle.
+                    // to settle. The event's own alias is ignored; the label is
+                    // resolved from the published provider catalog (c-1).
                     st.running_model = Some(RunningModel {
                         model: data.model,
                         role: data.role,
-                        alias: data.alias,
                         effort: data.effort,
                     });
                 }
@@ -713,6 +713,19 @@ pub async fn handle_event(ev: Event, state: &Arc<Mutex<AppState>>, is_reasoning:
             if let Some(params) = ev.params {
                 if let Ok(data) = serde_json::from_value::<ReviewStartedEvent>(params) {
                     begin_review_turn(&mut st.model, &data);
+                    // A truncated pattern expansion is never silent: the
+                    // daemon reports how many matched files its budgets kept
+                    // out of the audit, and the interface warns so the
+                    // developer knows the coverage boundary.
+                    if data.omitted_files > 0 {
+                        st.notify_warning(
+                            active_t("notify.review_pattern_files_omitted").replacen(
+                                "{}",
+                                &data.omitted_files.to_string(),
+                                1,
+                            ),
+                        );
+                    }
                 }
             }
         }
@@ -823,6 +836,21 @@ pub async fn handle_event(ev: Event, state: &Arc<Mutex<AppState>>, is_reasoning:
                 if let Ok(data) =
                     serde_json::from_value::<tauqe_protocol::PlanListChangedEvent>(params)
                 {
+                    // The focus may never anchor a plan that no longer exists:
+                    // the daemon clears its own focus on deletion and
+                    // broadcasts the change, so this local reconciliation
+                    // covers a list update that arrives before (or without)
+                    // that event and keeps the header and the REPL from
+                    // naming a dead plan (c-2).
+                    let focus_is_dead = match st.discussion_focus.target() {
+                        Some(tauqe_protocol::DiscussionTarget::Plan { id }) => {
+                            !data.plans.iter().any(|plan| &plan.id == id)
+                        }
+                        _ => false,
+                    };
+                    if focus_is_dead {
+                        st.discussion_focus = tauqe_protocol::DiscussionFocus::None;
+                    }
                     st.plans_view.plans = data.plans;
                     st.plans_view.clamp_selection();
                 }
@@ -1061,7 +1089,8 @@ fn format_elapsed(seconds: u64) -> String {
 mod tests {
     use super::*;
     use tauqe_protocol::{
-        HistoryEntryStatus, ModelRef, ModelRole, ReasoningEffort, UiHistoryItem, UiHistoryKind,
+        HistoryEntryStatus, ModelCatalogEntry, ModelRef, ModelRole, ModelRolesEntries,
+        ModelRolesSummary, ReasoningEffort, UiHistoryItem, UiHistoryKind,
     };
 
     fn batch_summary(
@@ -1117,6 +1146,7 @@ mod tests {
             model: ModelRef::openrouter("reviewer"),
             files_count: 2,
             estimated_tokens: 128,
+            omitted_files: 0,
         }
     }
 
@@ -1149,6 +1179,38 @@ mod tests {
         assert!(model.files.is_empty());
         assert!(!model.edits_active);
         assert!(model.auto_scroll);
+    }
+
+    #[tokio::test]
+    async fn test_review_started_warns_when_pattern_files_were_omitted() {
+        let state = Arc::new(Mutex::new(crate::app::test_state()));
+        let mut is_reasoning = false;
+        let ev = Event {
+            method: events::REVIEW_STARTED.to_string(),
+            params: Some(
+                serde_json::to_value(ReviewStartedEvent {
+                    operation_id: "rev-op-1".to_string(),
+                    model: ModelRef::openrouter("reviewer"),
+                    files_count: 2,
+                    estimated_tokens: 128,
+                    omitted_files: 3,
+                })
+                .unwrap(),
+            ),
+        };
+
+        handle_event(ev, &state, &mut is_reasoning).await;
+
+        let guard = state.lock().await;
+        let notif = guard
+            .active_notification()
+            .expect("an omitted-files warning must be raised");
+        assert_eq!(notif.level, crate::app::NotificationLevel::Warning);
+        assert!(
+            notif.text.contains('3'),
+            "the warning must name the omitted count: {}",
+            notif.text
+        );
     }
 
     #[test]
@@ -1291,6 +1353,27 @@ mod tests {
     async fn test_model_escalated_updates_the_running_model() {
         let state = Arc::new(Mutex::new(crate::app::test_state()));
         let mut is_reasoning = false;
+
+        // The alias is provider-catalog metadata: it reaches the label through
+        // the published snapshot, never through the escalation event itself
+        // (c-1).
+        let summary = ModelRolesSummary {
+            scribe: ModelRef::openrouter("scribe"),
+            coder: ModelRef::openrouter("stronger-coder"),
+            architect: ModelRef::openrouter("architect"),
+            primary: ModelRef::openrouter("primary"),
+            reviewer: ModelRef::openrouter("reviewer"),
+            efforts: None,
+            entries: Some(ModelRolesEntries {
+                catalog: Some(vec![ModelCatalogEntry {
+                    model: ModelRef::openrouter("stronger-coder"),
+                    alias: Some("deep".to_string()),
+                }]),
+                ..Default::default()
+            }),
+        };
+        crate::model_display::install_snapshot(Some(&summary));
+
         let ev = Event {
             method: events::MODEL_ESCALATED.to_string(),
             params: Some(
@@ -1298,7 +1381,7 @@ mod tests {
                     operation_id: "op-escalate".to_string(),
                     model: ModelRef::openrouter("stronger-coder"),
                     role: Some(ModelRole::Coder),
-                    alias: Some("deep".to_string()),
+                    alias: Some("ignored-by-the-client".to_string()),
                     effort: Some(ReasoningEffort::High),
                     tier: 1,
                 })
@@ -1315,7 +1398,11 @@ mod tests {
             .expect("the escalated model stays current until the turn settles");
         assert_eq!(running.model, ModelRef::openrouter("stronger-coder"));
         assert!(matches!(running.role, Some(ModelRole::Coder)));
-        assert_eq!(running.label(), "deep");
+        assert_eq!(
+            running.label(),
+            "deep [high]",
+            "the label comes from the catalog alias plus the reasoning depth"
+        );
     }
 
     #[tokio::test]
@@ -1655,6 +1742,107 @@ mod tests {
         assert!(
             guard.plans_view.is_plan_expanded("plan-x"),
             "a saved plan must be expanded so its header is visible"
+        );
+    }
+
+    fn plan_with_id(id: &str) -> tauqe_protocol::Plan {
+        tauqe_protocol::Plan {
+            id: id.to_string(),
+            title: format!("Plan {}", id),
+            ..Default::default()
+        }
+    }
+
+    fn plan_list_changed_event(plans: Vec<tauqe_protocol::Plan>) -> Event {
+        Event {
+            method: events::PLAN_LIST_CHANGED.to_string(),
+            params: Some(
+                serde_json::to_value(tauqe_protocol::PlanListChangedEvent {
+                    plans,
+                    active_id: None,
+                })
+                .unwrap(),
+            ),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_plan_list_changed_clears_a_focus_on_a_deleted_plan() {
+        let mut st = crate::app::test_state();
+        st.discussion_focus = tauqe_protocol::DiscussionFocus::plan("plan-gone", Vec::new());
+        assert!(st.discussion_focus.is_active());
+
+        let state = Arc::new(Mutex::new(st));
+        let mut is_reasoning = false;
+        handle_event(
+            plan_list_changed_event(vec![plan_with_id("plan-kept")]),
+            &state,
+            &mut is_reasoning,
+        )
+        .await;
+
+        let guard = state.lock().await;
+        assert!(
+            guard.discussion_focus.is_none(),
+            "a focus anchored on a deleted plan must be dropped locally"
+        );
+        assert_eq!(
+            guard.plans_view.plans.len(),
+            1,
+            "the refreshed list still replaces the mirrored one"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_plan_list_changed_keeps_a_focus_on_a_surviving_plan() {
+        let mut st = crate::app::test_state();
+        st.discussion_focus =
+            tauqe_protocol::DiscussionFocus::plan("plan-kept", vec!["1".to_string()]);
+
+        let state = Arc::new(Mutex::new(st));
+        let mut is_reasoning = false;
+        handle_event(
+            plan_list_changed_event(vec![plan_with_id("plan-kept")]),
+            &state,
+            &mut is_reasoning,
+        )
+        .await;
+
+        let guard = state.lock().await;
+        assert_eq!(
+            guard.discussion_focus.target(),
+            Some(&tauqe_protocol::DiscussionTarget::Plan {
+                id: "plan-kept".to_string()
+            }),
+            "a surviving plan keeps its anchor"
+        );
+        assert_eq!(
+            guard.discussion_focus.focused_items(),
+            ["1".to_string()].as_slice()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_plan_list_changed_leaves_a_review_focus_untouched() {
+        let mut st = crate::app::test_state();
+        st.discussion_focus = tauqe_protocol::DiscussionFocus::review("rev-1", Vec::new());
+
+        let state = Arc::new(Mutex::new(st));
+        let mut is_reasoning = false;
+        handle_event(
+            plan_list_changed_event(Vec::new()),
+            &state,
+            &mut is_reasoning,
+        )
+        .await;
+
+        let guard = state.lock().await;
+        assert_eq!(
+            guard.discussion_focus.target(),
+            Some(&tauqe_protocol::DiscussionTarget::Review {
+                id: "rev-1".to_string()
+            }),
+            "a plan list refresh never touches a review anchor"
         );
     }
 

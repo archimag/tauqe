@@ -1,6 +1,6 @@
 use super::*;
 
-use crate::model::{CancelMode, ModelRef, ModelSelection};
+use crate::model::{ArchitectTier, CancelMode, ModelRef, ModelSelection, ReasoningEffort};
 use crate::plan::PlanItem;
 
 #[test]
@@ -261,7 +261,15 @@ fn test_review_start_params_path_pattern_backward_compatible() {
         serde_json::from_str(r#"{"model":{"provider":"openrouter","name":"openai/gpt-4o"}}"#)
             .unwrap();
     assert!(legacy.path_pattern.is_none());
-    assert_eq!(legacy.model, Some(ModelRef::openrouter("openai/gpt-4o")));
+    // A legacy client that names only a model keeps decoding: the untagged
+    // selection form maps the model reference to an explicit `Specific`
+    // selection, so no reasoning depth is implied.
+    assert_eq!(
+        legacy.model,
+        Some(ModelSelection::Specific(ModelRef::openrouter(
+            "openai/gpt-4o"
+        )))
+    );
 
     let with_pattern = ReviewStartParams {
         path_pattern: Some("crates/core/src/**/*.rs".to_string()),
@@ -276,6 +284,23 @@ fn test_review_start_params_path_pattern_backward_compatible() {
         serde_json::to_string(&ReviewStartParams::default()).unwrap(),
         "{}"
     );
+
+    // A configured role rung travels as one value: the model together with the
+    // reasoning depth of the entry the developer picked, so the server reads the
+    // depth straight from the request instead of re-deriving it from the
+    // configured reviewer entries.
+    let tier = ReviewStartParams {
+        model: Some(ModelSelection::Tier {
+            model: ModelRef::openrouter("openai/gpt-4o"),
+            effort: Some(ReasoningEffort::High),
+        }),
+        ..Default::default()
+    };
+    let json = serde_json::to_string(&tier).unwrap();
+    assert!(json.contains("\"effort\":\"high\""), "got: {json}");
+    assert!(json.contains("\"name\":\"openai/gpt-4o\""), "got: {json}");
+    let de_tier: ReviewStartParams = serde_json::from_str(&json).unwrap();
+    assert_eq!(de_tier.model, tier.model);
 }
 
 #[test]
@@ -554,6 +579,7 @@ fn finding(id: u32, status: IssueStatus) -> ReviewItem {
         readonly_files: Vec::new(),
         subplan: Vec::new(),
         subplan_architect: None,
+        subplan_last_replanned_step: None,
         resolution_notes: None,
         body: String::new(),
     }
@@ -711,4 +737,81 @@ fn test_review_item_accepts_legacy_category_spellings() {
     assert_eq!(session.items[3].severity, ReviewSeverity::Suggestion);
     assert_eq!(session.items[4].severity, ReviewSeverity::Critical);
     assert_eq!(session.items[6].severity, ReviewSeverity::Critical);
+}
+
+#[test]
+fn test_review_item_subplan_last_replanned_step_serde_and_backward_compatibility() {
+    // The sub-step whose horizon was reprojected most recently is persisted with
+    // the finding, mirroring `Plan::last_replanned_step`, so a repeated failure
+    // of the same sub-step escalates the Architect exactly once per failed step.
+    let mut item = finding(1, IssueStatus::Todo);
+    item.subplan_last_replanned_step = Some("1.1".to_string());
+    let json = serde_json::to_string(&item).unwrap();
+    assert!(json.contains("\"subplan_last_replanned_step\":\"1.1\""));
+    let de: ReviewItem = serde_json::from_str(&json).unwrap();
+    assert_eq!(de.subplan_last_replanned_step.as_deref(), Some("1.1"));
+    // The category is the persisted classification; the derived severity is
+    // recomputed on read and can never disagree with it.
+    assert_eq!(de.issue_type, IssueType::Bug);
+    assert_eq!(de.severity, ReviewSeverity::Critical);
+
+    // A finding written before the field existed stays readable.
+    let legacy = r#"{
+        "id": 7,
+        "title": "Legacy finding",
+        "type": "architecture",
+        "status": "todo",
+        "body": "Body"
+    }"#;
+    let legacy_item: ReviewItem = serde_json::from_str(legacy).unwrap();
+    assert!(legacy_item.subplan_last_replanned_step.is_none());
+
+    // An unset marker stays absent from the wire form.
+    let fresh = finding(2, IssueStatus::Todo);
+    let fresh_json = serde_json::to_string(&fresh).unwrap();
+    assert!(!fresh_json.contains("subplan_last_replanned_step"));
+}
+
+#[test]
+fn test_review_issue_projection_drops_architect_provenance() {
+    // `ReviewIssue` is the analytical view of a finding: it carries the plan
+    // the Architect produced, never the configuration that produced it. The
+    // reverse conversion therefore drops both escalation markers, so a caller
+    // that persists a finding rebuilt from this view has to decide what
+    // provenance it keeps instead of silently inheriting stale escalation
+    // state.
+    let architect = ArchitectTier::new(ModelRef::openrouter("test/architect"), None);
+    let mut item = finding(1, IssueStatus::Todo);
+    item.subplan = vec![PlanItem {
+        id: "1.1".to_string(),
+        title: "Step".to_string(),
+        status: crate::plan::PlanItemStatus::Todo,
+        ..Default::default()
+    }];
+    item.subplan_architect = Some(architect);
+    item.subplan_last_replanned_step = Some("1.1".to_string());
+
+    let issue = ReviewIssue::from(item.clone());
+    // The plan itself survives the projection; only its provenance does not.
+    assert_eq!(issue.plan, item.subplan);
+
+    let restored = ReviewItem::from(issue);
+    assert!(
+        restored.subplan_architect.is_none(),
+        "the analytical view carries no Architect provenance"
+    );
+    assert!(
+        restored.subplan_last_replanned_step.is_none(),
+        "the analytical view carries no reprojected sub-step marker"
+    );
+
+    // Everything the view does model round-trips unchanged, so the drop above
+    // is exactly the provenance and nothing else.
+    assert_eq!(restored.id, item.id);
+    assert_eq!(restored.title, item.title);
+    assert_eq!(restored.issue_type, item.issue_type);
+    assert_eq!(restored.severity, item.severity);
+    assert_eq!(restored.status, item.status);
+    assert_eq!(restored.subplan, item.subplan);
+    assert_eq!(restored.body, item.body);
 }

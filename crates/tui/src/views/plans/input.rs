@@ -23,6 +23,7 @@ pub enum PlansAction {
     NavNext,
     SelectFirst,
     SelectLast,
+    Recenter,
     PageUp,
     PageDown,
     FoldToggle,
@@ -234,6 +235,18 @@ pub static PLANS_COMMAND_MAP: CommandMap<PlansAction> = CommandMap::new(&[
         PlansAction::SelectLast,
         Interface,
         "cmd.plans.select_last",
+    ),
+    CommandSpec::new(
+        KeyChord::Primary(KeyCode::Char('l')),
+        PlansAction::Recenter,
+        Interface,
+        "cmd.plans.recenter",
+    ),
+    CommandSpec::new(
+        KeyChord::Ctrl(KeyCode::Char('l')),
+        PlansAction::Recenter,
+        Interface,
+        "cmd.plans.recenter",
     ),
     CommandSpec::new(
         KeyChord::Bare(KeyCode::Tab),
@@ -511,6 +524,9 @@ pub async fn handle_plans_key(
             let max =
                 (st.plans_view.rendered_lines as u16).saturating_sub(st.plans_view.view_height);
             st.plans_view.scroll = st.plans_view.scroll.saturating_add(page).min(max);
+        }
+        PlansAction::Recenter => {
+            st.plans_view.recenter_selected();
         }
         PlansAction::FoldToggle => {
             let sel_row = st.plans_view.selected_row();
@@ -796,6 +812,10 @@ pub async fn handle_plans_key(
         PlansAction::DeletePlan => {
             let sel_row = st.plans_view.selected_row();
             if let Some(row) = sel_row {
+                // Only the first tier is armed here: the second tier is raised
+                // after this confirmation reveals unfinished work, so a stale
+                // target of a previously selected plan can never resurface (c-1).
+                st.confirm_delete_plan_final = None;
                 st.confirm_delete_plan = Some(row.plan_id().to_string());
                 st.confirm_button = crate::app::ConfirmDialogButton::Cancel;
             }
@@ -1008,6 +1028,33 @@ mod tests {
             "seed: {text}"
         );
         assert!(text.contains("#1 Failing step"), "seed: {text}");
+    }
+
+    #[tokio::test]
+    async fn test_ctrl_l_recenters_plans() {
+        let mut st = crate::app::test_state();
+        st.view_mode = ViewMode::Plans;
+        st.plans_view.plans = (1..=15)
+            .map(|i| tauqe_protocol::Plan {
+                id: format!("plan-{i}"),
+                title: format!("Plan {i}"),
+                ..Default::default()
+            })
+            .collect();
+        st.plans_view.selected_index = 8;
+        st.plans_view.view_height = 5;
+        st.plans_view.content_width = 80;
+
+        let state = Arc::new(Mutex::new(st));
+        let mut conn = RpcConnection::new(Vec::<u8>::new());
+        let key = KeyEvent::new(KeyCode::Char('l'), crossterm::event::KeyModifiers::CONTROL);
+        handle_plans_key(key, &state, &mut conn).await.unwrap();
+
+        let scroll_first = state.lock().await.plans_view.scroll;
+        handle_plans_key(key, &state, &mut conn).await.unwrap();
+        let scroll_second = state.lock().await.plans_view.scroll;
+
+        assert_ne!(scroll_first, scroll_second, "C-l must cycle recenter positions in plans view");
     }
 
     #[tokio::test]

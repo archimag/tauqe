@@ -65,17 +65,26 @@ impl FromStr for WorkflowKind {
 
 /// Discrete edit protocol used to decode model output for a turn.
 ///
-/// Replaces the former free-form protocol string. `Xml` is the default
-/// marker-tag edit protocol. `Structured` drives JSON-schema structured output
-/// and is also known as the structured-output or JSON-schema mode.
+/// Replaces the former free-form protocol string. `Structured` is the default
+/// and drives JSON-schema structured output, also known as the
+/// structured-output or JSON-schema mode. `Xml` drives the marker-tag edit
+/// protocol. `Mixed` is a two-contour mode that pairs both transports: XML for
+/// code edits, structured output for discussions, commit messages, and history
+/// compaction.
+///
+/// The choice is a transport decision only. The capabilities a turn exposes
+/// follow from its intent and the active discussion focus, never from the
+/// protocol, so both wire formats decode the same semantic command vocabulary.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", try_from = "String")]
 pub enum EditProtocolKind {
-    /// Marker-tag XML edit protocol (default).
-    #[default]
+    /// Marker-tag XML edit protocol.
     Xml,
-    /// JSON-schema structured output protocol.
+    /// JSON-schema structured output protocol (default).
+    #[default]
     Structured,
+    /// Two-contour mode: XML for code edits, structured output elsewhere.
+    Mixed,
 }
 
 impl std::convert::TryFrom<String> for EditProtocolKind {
@@ -92,6 +101,7 @@ impl EditProtocolKind {
         match self {
             Self::Xml => "xml",
             Self::Structured => "structured",
+            Self::Mixed => "mixed",
         }
     }
 }
@@ -112,8 +122,13 @@ impl FromStr for EditProtocolKind {
             // for the structured protocol; scheduled for removal in 0.2.0 and
             // tracked by the wire-contract test in `lib.rs`.
             "structured" | "structured_output" | "json_schema" | "json" => Ok(Self::Structured),
+            // `auto` is the historical name of the two-contour mode. It stays a
+            // permanent compatibility alias, so a configuration written before
+            // the rename keeps resolving to the same behavior instead of fading
+            // into a second code path.
+            "mixed" | "auto" => Ok(Self::Mixed),
             other => Err(format!(
-                "Unknown edit protocol '{}'. Expected 'xml' or 'structured'",
+                "Unknown edit protocol '{}'. Expected 'xml', 'structured' or 'mixed'",
                 other
             )),
         }
@@ -309,6 +324,10 @@ mod tests {
             serde_json::to_string(&EditProtocolKind::Structured).unwrap(),
             "\"structured\""
         );
+        assert_eq!(
+            serde_json::to_string(&EditProtocolKind::Mixed).unwrap(),
+            "\"mixed\""
+        );
 
         assert_eq!(
             serde_json::from_str::<EditProtocolKind>("\"xml\"").unwrap(),
@@ -327,6 +346,18 @@ mod tests {
             EditProtocolKind::Structured
         );
         assert_eq!(
+            serde_json::from_str::<EditProtocolKind>("\"mixed\"").unwrap(),
+            EditProtocolKind::Mixed
+        );
+        assert_eq!(
+            serde_json::from_str::<EditProtocolKind>("\"auto\"").unwrap(),
+            EditProtocolKind::Mixed
+        );
+        assert_eq!(
+            serde_json::from_str::<EditProtocolKind>("\" AUTO \"").unwrap(),
+            EditProtocolKind::Mixed
+        );
+        assert_eq!(
             serde_json::from_str::<EditProtocolKind>("\" XML \"").unwrap(),
             EditProtocolKind::Xml
         );
@@ -339,9 +370,10 @@ mod tests {
 
     #[test]
     fn test_edit_protocol_kind_default_display_and_parsing() {
-        assert_eq!(EditProtocolKind::default(), EditProtocolKind::Xml);
+        assert_eq!(EditProtocolKind::default(), EditProtocolKind::Structured);
         assert_eq!(EditProtocolKind::Xml.as_str(), "xml");
         assert_eq!(EditProtocolKind::Structured.to_string(), "structured");
+        assert_eq!(EditProtocolKind::Mixed.to_string(), "mixed");
         assert_eq!(
             "STRUCTURED".parse::<EditProtocolKind>().unwrap(),
             EditProtocolKind::Structured
@@ -349,6 +381,22 @@ mod tests {
         assert_eq!(
             "json".parse::<EditProtocolKind>().unwrap(),
             EditProtocolKind::Structured
+        );
+        assert_eq!(
+            "mixed".parse::<EditProtocolKind>().unwrap(),
+            EditProtocolKind::Mixed
+        );
+        assert_eq!(
+            " MIXED ".parse::<EditProtocolKind>().unwrap(),
+            EditProtocolKind::Mixed
+        );
+        assert_eq!(
+            "auto".parse::<EditProtocolKind>().unwrap(),
+            EditProtocolKind::Mixed
+        );
+        assert_eq!(
+            " AUTO ".parse::<EditProtocolKind>().unwrap(),
+            EditProtocolKind::Mixed
         );
         assert!("".parse::<EditProtocolKind>().is_err());
     }

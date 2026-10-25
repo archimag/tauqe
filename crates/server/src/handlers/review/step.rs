@@ -27,6 +27,12 @@
 //!   `max_replans` times: the Architect reprojects the remaining horizon from the
 //!   immutable `Done` foundation and the failure diagnostics, and the finding is
 //!   resumed from the synthesized horizon instead of being abandoned.
+//!
+//! An unconditional abort (`<abort>`) is a domain outcome rather than a failure:
+//! the host environment needs a developer action — approving a native build,
+//! installing a package, starting a daemon. A single-finding turn that reports it
+//! is skipped with the exact recommendation recorded and never engages the
+//! Architect, so the batch advances to the next independent finding.
 
 mod replan;
 mod subplan;
@@ -36,19 +42,18 @@ use std::sync::Arc;
 
 use tauqe_core::providers::{format_session_id, SESSION_PREFIX_REVIEW};
 use tauqe_core::review::prompt::ReviewStepFailure;
-use tauqe_core::review::ReviewStorage;
 use tauqe_protocol::{IssueStatus, IssueType, ModelRole, ModelSelection, TurnIntent};
 
 use crate::handlers::model::{execute_model_turn, StepTurnOptions};
-use crate::state::{next_operation_id, AppState, OperationGuard};
+use crate::state::{AppState, OperationGuard};
 
 use self::replan::{reload_finding, run_review_subplan_with_replans};
 use self::subplan::append_developer_directives;
 use super::common::{
-    clear_auto_context, offload_review, preload_item_files, publish_review, report_item_failure,
-    set_item_status, skip_finding_with_diagnostic, turn_applied_edits,
+    clear_auto_context, persist_finding_update, preload_item_files, report_item_failure,
+    set_item_status, set_item_status_checked, skip_finding_with_diagnostic, turn_applied_edits,
 };
-use super::refine::{refine_finding_with_architect, RefineOutcome};
+use super::refine::{refine_finding_with_architect, RefineAdmission, RefineOutcome};
 
 /// Executes one finding in an isolated turn.
 ///
@@ -144,7 +149,15 @@ async fn run_review_step_inner(
             "autonomous architect decomposition before coding"
         );
         match refine_finding_with_architect(
-            state, repo_root, &session, &item, None, None, None, &operation,
+            state,
+            repo_root,
+            &session,
+            &item,
+            None,
+            None,
+            None,
+            &operation,
+            RefineAdmission::Harness,
         )
         .await
         {
@@ -157,9 +170,19 @@ async fn run_review_step_inner(
                 );
             }
             Ok(RefineOutcome::Blocked { reason }) => {
-                skip_finding_with_diagnostic(state, repo_root, review_id, item_id, "", &reason)
-                    .await;
-                return Err(ReviewStepFailure::domain(reason));
+                // When the skip record cannot be persisted, the storage failure
+                // becomes the outcome so the batch never advances past a finding
+                // the durable record still shows as InProgress.
+                return Err(
+                    match skip_finding_with_diagnostic(
+                        state, repo_root, review_id, item_id, "", &reason,
+                    )
+                    .await
+                    {
+                        Ok(()) => ReviewStepFailure::domain(reason),
+                        Err(storage_err) => ReviewStepFailure::infrastructure(storage_err),
+                    },
+                );
             }
             Err(err) => return Err(ReviewStepFailure::infrastructure(err.message)),
         }
@@ -267,28 +290,76 @@ async fn run_review_step_inner(
                 // Infrastructure failure: the turn could not even start (missing
                 // credentials, operation slot busy, ...). Fatal to the batch.
                 set_item_status(state, repo_root, review_id, item_id, IssueStatus::Todo).await;
-                let op_id = format!("op-{}", next_operation_id());
-                report_item_failure(state, &op_id, &err.message);
-                return Err(ReviewStepFailure::infrastructure(err.message));
+                // The failed turn names the operation it belonged to, so the
+                // failure event is attributable to this batch instead of a fresh
+                // identifier that matches no registered operation.
+                let op_id = err
+                    .operation_id
+                    .clone()
+                    .unwrap_or_else(|| format!("op-{}", operation.id()));
+                report_item_failure(state, &op_id, &err.error.message);
+                return Err(ReviewStepFailure::infrastructure(err.error.message));
             }
         };
 
         // Semantic block: the coder reports that the finding preconditions
         // cannot be satisfied as stated. This is a domain failure: the finding
         // is skipped with diagnostics and the batch continues without a retry
-        // cycle.
+        // cycle. When the skip record cannot be persisted, the storage failure
+        // becomes the outcome so the batch never advances past a finding the
+        // durable record still shows as InProgress.
         if let Some(reason) = turn.blocked.clone() {
             report_item_failure(state, &turn.operation_id, &reason);
-            skip_finding_with_diagnostic(
-                state,
-                repo_root,
-                review_id,
-                item_id,
-                &turn.assistant_text,
-                &reason,
-            )
-            .await;
-            return Err(ReviewStepFailure::domain(reason));
+            return Err(
+                match skip_finding_with_diagnostic(
+                    state,
+                    repo_root,
+                    review_id,
+                    item_id,
+                    &turn.assistant_text,
+                    &reason,
+                )
+                .await
+                {
+                    Ok(()) => ReviewStepFailure::domain(reason),
+                    Err(storage_err) => ReviewStepFailure::infrastructure(storage_err),
+                },
+            );
+        }
+
+        // Unconditional abort: the work cannot be performed by the harness at
+        // all — the host environment needs a developer action first, such as
+        // approving a native build, installing a package, or starting a daemon.
+        // Unlike a semantic block, an abort never starts an Architect replanning
+        // cycle: the finding is skipped with the exact recommendation recorded,
+        // and the queue advances to the next independent finding. When the skip
+        // record cannot be persisted, the storage failure becomes the outcome
+        // so the batch never advances past a finding the durable record still
+        // shows as InProgress.
+        if let Some(abort) = turn.abort.clone() {
+            let message = abort.to_message();
+            tracing::warn!(
+                review_id = review_id,
+                item_id = item_id,
+                reason = %abort.reason,
+                "review finding aborted; developer action in the host environment is required"
+            );
+            report_item_failure(state, &turn.operation_id, &message);
+            return Err(
+                match skip_finding_with_diagnostic(
+                    state,
+                    repo_root,
+                    review_id,
+                    item_id,
+                    &turn.assistant_text,
+                    &message,
+                )
+                .await
+                {
+                    Ok(()) => ReviewStepFailure::domain(message),
+                    Err(storage_err) => ReviewStepFailure::infrastructure(storage_err),
+                },
+            );
         }
 
         let applied = turn_applied_edits(&turn);
@@ -302,27 +373,41 @@ async fn run_review_step_inner(
                 }
                 _ => None,
             };
-            if let Some(notes) = notes {
-                let save_root = repo_root.to_path_buf();
-                let review_id_owned = review_id.to_string();
-                let notes_clone = notes.clone();
-                let _ = offload_review(move || {
-                    ReviewStorage::update_session_item(
-                        &save_root,
-                        &review_id_owned,
+            // The FIXED transition is part of the success contract: when the
+            // write cannot be persisted the finding is reported as an
+            // infrastructure failure, so the batch outcome never claims a
+            // resolution the durable record does not hold.
+            let persisted = match notes {
+                Some(notes) => {
+                    persist_finding_update(
+                        state,
+                        repo_root,
+                        review_id,
                         item_id,
-                        |it| {
+                        "Fixed status",
+                        move |it| {
                             it.status = IssueStatus::Fixed;
                             if it.note.is_none() {
-                                it.note = Some(notes_clone);
+                                it.note = Some(notes);
                             }
                         },
                     )
-                })
-                .await;
-                publish_review(state, repo_root, review_id).await;
-            } else {
-                set_item_status(state, repo_root, review_id, item_id, IssueStatus::Fixed).await;
+                    .await
+                }
+                None => {
+                    set_item_status_checked(
+                        state,
+                        repo_root,
+                        review_id,
+                        item_id,
+                        IssueStatus::Fixed,
+                    )
+                    .await
+                }
+            };
+            if let Err(err) = persisted {
+                report_item_failure(state, &turn.operation_id, &err);
+                return Err(ReviewStepFailure::infrastructure(err));
             }
             return Ok(());
         }
@@ -330,26 +415,29 @@ async fn run_review_step_inner(
         if !applied && turn.error.is_none() && !turn.is_cancelled {
             // The registry-bound skip parser is the single source of truth for
             // the `<skip>` tag, so the finding is skipped through the typed
-            // protocol outcome instead of a second ad-hoc scanner.
+            // protocol outcome instead of a second ad-hoc scanner. A skip that
+            // cannot be persisted is an infrastructure failure, so the queue
+            // never advances past a finding the durable record still shows as
+            // InProgress.
             if let Some(skip_reason) =
                 tauqe_core::edits::protocol::xml::extract_skip(&turn.assistant_text)
             {
-                let save_root = repo_root.to_path_buf();
-                let review_id_owned = review_id.to_string();
-                let skip_clone = skip_reason.clone();
-                let _ = offload_review(move || {
-                    ReviewStorage::update_session_item(
-                        &save_root,
-                        &review_id_owned,
-                        item_id,
-                        |it| {
-                            it.status = IssueStatus::Skipped;
-                            it.note = Some(skip_clone);
-                        },
-                    )
-                })
+                let persisted = persist_finding_update(
+                    state,
+                    repo_root,
+                    review_id,
+                    item_id,
+                    "Skipped status",
+                    move |it| {
+                        it.status = IssueStatus::Skipped;
+                        it.note = Some(skip_reason);
+                    },
+                )
                 .await;
-                publish_review(state, repo_root, review_id).await;
+                if let Err(err) = persisted {
+                    report_item_failure(state, &turn.operation_id, &err);
+                    return Err(ReviewStepFailure::infrastructure(err));
+                }
                 return Ok(());
             }
         }
@@ -378,21 +466,29 @@ async fn run_review_step_inner(
 
         // Domain failure: the turn produced a result but did not resolve the
         // finding. Retry within the attempt budget, then skip the finding with
-        // diagnostics so the queue advances to the next one.
+        // diagnostics so the queue advances to the next one. When the skip
+        // record cannot be persisted, the storage failure becomes the outcome
+        // so the batch never advances past a finding the durable record still
+        // shows as InProgress.
         if attempt >= max_retries {
             if turn.error.is_none() {
                 report_item_failure(state, &turn.operation_id, &reason);
             }
-            skip_finding_with_diagnostic(
-                state,
-                repo_root,
-                review_id,
-                item_id,
-                &turn.assistant_text,
-                &reason,
-            )
-            .await;
-            return Err(ReviewStepFailure::domain(reason));
+            return Err(
+                match skip_finding_with_diagnostic(
+                    state,
+                    repo_root,
+                    review_id,
+                    item_id,
+                    &turn.assistant_text,
+                    &reason,
+                )
+                .await
+                {
+                    Ok(()) => ReviewStepFailure::domain(reason),
+                    Err(storage_err) => ReviewStepFailure::infrastructure(storage_err),
+                },
+            );
         }
 
         // Reset to a clean, deterministic basis before the corrective attempt.

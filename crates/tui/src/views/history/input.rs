@@ -165,13 +165,13 @@ pub static HISTORY_COMMAND_MAP: CommandMap<HistoryAction> = CommandMap::new(&[
         "cmd.history.nav_next",
     ),
     CommandSpec::new(
-        KeyChord::Bare(KeyCode::Char('l')),
+        KeyChord::Primary(KeyCode::Char('l')),
         HistoryAction::Recenter,
         Interface,
         "cmd.history.recenter",
     ),
     CommandSpec::new(
-        KeyChord::Bare(KeyCode::Char('L')),
+        KeyChord::Ctrl(KeyCode::Char('l')),
         HistoryAction::Recenter,
         Interface,
         "cmd.history.recenter",

@@ -542,6 +542,7 @@ mod tests {
 
         let plan = Plan {
             id: "auth-flow".to_string(),
+            last_replanned_step: None,
             title: "Authentication Flow".to_string(),
             description: Some("OAuth2 + JWT".to_string()),
             created_at: 100,
@@ -628,6 +629,7 @@ mod tests {
 
         let plan = Plan {
             id: "arch-plan".to_string(),
+            last_replanned_step: None,
             title: "Arch Plan".to_string(),
             description: None,
             created_at: 100,
@@ -664,6 +666,7 @@ mod tests {
 
         let plan = Plan {
             id: "leaf-only".to_string(),
+            last_replanned_step: None,
             title: "Leaf Only".to_string(),
             description: None,
             created_at: 1,

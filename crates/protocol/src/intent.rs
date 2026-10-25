@@ -78,16 +78,19 @@ impl TurnIntent {
     ///
     /// - [`TurnIntent::InteractiveRepl`] keeps the protocol's own surface.
     /// - [`TurnIntent::ReadonlyDiscussion`] keeps only the discussion profile.
-    /// - [`TurnIntent::IsolatedStep`] drops plan authoring and toolchain
-    ///   verification, because the harness owns both deterministically.
+    /// - [`TurnIntent::IsolatedStep`] keeps the isolated-step profile and drops
+    ///   toolchain verification, because the harness owns verification for a
+    ///   step deterministically.
+    ///
+    /// The narrowing always intersects with a regime profile, never with a
+    /// wire-format profile, so both transports converge on the same capability
+    /// surface for a given intent.
     pub fn narrow_capabilities(self, capabilities: &CapabilitySet) -> CapabilitySet {
         match self {
             Self::InteractiveRepl => capabilities.clone(),
             Self::ReadonlyDiscussion => Self::intersect(capabilities, &CapabilitySet::discussion()),
-            Self::IsolatedStep => {
-                Self::intersect(capabilities, &CapabilitySet::isolated_step_xml())
-                    .without(LlmCapability::ToolchainVerify)
-            }
+            Self::IsolatedStep => Self::intersect(capabilities, &CapabilitySet::isolated_step())
+                .without(LlmCapability::ToolchainVerify),
         }
     }
 
@@ -151,17 +154,17 @@ mod tests {
 
     #[test]
     fn test_narrow_capabilities_is_identity_for_interactive_repl() {
-        let develop = CapabilitySet::develop_xml();
+        let advertised = CapabilitySet::from_slice(LlmCapability::ALL);
         assert_eq!(
-            TurnIntent::InteractiveRepl.narrow_capabilities(&develop),
-            develop
+            TurnIntent::InteractiveRepl.narrow_capabilities(&advertised),
+            advertised
         );
     }
 
     #[test]
     fn test_narrow_capabilities_makes_discussion_read_only() {
-        let narrowed =
-            TurnIntent::ReadonlyDiscussion.narrow_capabilities(&CapabilitySet::develop_xml());
+        let advertised = CapabilitySet::from_slice(LlmCapability::ALL);
+        let narrowed = TurnIntent::ReadonlyDiscussion.narrow_capabilities(&advertised);
 
         assert!(narrowed.contains(LlmCapability::TextMessage));
         assert!(narrowed.contains(LlmCapability::Discovery));
@@ -177,7 +180,8 @@ mod tests {
 
     #[test]
     fn test_narrow_capabilities_isolated_step_drops_plan_and_verification() {
-        let narrowed = TurnIntent::IsolatedStep.narrow_capabilities(&CapabilitySet::develop_xml());
+        let advertised = CapabilitySet::from_slice(LlmCapability::ALL);
+        let narrowed = TurnIntent::IsolatedStep.narrow_capabilities(&advertised);
 
         assert!(narrowed.contains(LlmCapability::FileEdits));
         assert!(narrowed.contains(LlmCapability::Discovery));
@@ -185,12 +189,75 @@ mod tests {
         assert!(!narrowed.contains(LlmCapability::PlanCreation));
         assert!(!narrowed.contains(LlmCapability::PlanUpdate));
         assert!(!narrowed.contains(LlmCapability::ToolchainVerify));
+    }
 
-        // The structured profile narrows to the same operational surface.
-        let structured = CapabilitySet::develop_structured();
-        assert_eq!(
-            TurnIntent::IsolatedStep.narrow_capabilities(&structured),
-            structured.without(LlmCapability::ToolchainVerify)
-        );
+    #[test]
+    fn test_narrow_capabilities_isolated_step_retains_the_abort_surface() {
+        // An isolated step runs unattended, so narrowing the advertised
+        // surface must keep the escape hatch that lets the model demand a host
+        // action instead of improvising a surrogate change or misreporting a
+        // `blocked` outcome.
+        let advertised = CapabilitySet::from_slice(LlmCapability::ALL);
+        let step = TurnIntent::IsolatedStep.narrow_capabilities(&advertised);
+        assert!(step.contains(LlmCapability::Abort));
+
+        // A read-only discussion implements nothing, so the narrowing removes
+        // the abort surface it never carried.
+        let discussion = TurnIntent::ReadonlyDiscussion.narrow_capabilities(&advertised);
+        assert!(!discussion.contains(LlmCapability::Abort));
+    }
+
+    #[test]
+    fn test_narrow_capabilities_isolated_step_carries_no_plan_permission() {
+        // Whichever base the turn was narrowed from, an isolated step never
+        // authorizes a plan change: the plan is immutable while the step runs.
+        for base in [
+            CapabilitySet::from_slice(LlmCapability::ALL),
+            CapabilitySet::interactive_repl(),
+            CapabilitySet::discussion(),
+        ] {
+            let narrowed = TurnIntent::IsolatedStep.narrow_capabilities(&base);
+            assert!(!narrowed.contains(LlmCapability::PlanCreation));
+            assert!(!narrowed.contains(LlmCapability::PlanUpdate));
+        }
+
+        // Every base that carries the execution surface keeps it after the
+        // narrowing; a discussion profile implements nothing, so it contributes
+        // no file-edit capability in the first place.
+        for base in [
+            CapabilitySet::from_slice(LlmCapability::ALL),
+            CapabilitySet::interactive_repl(),
+        ] {
+            let narrowed = TurnIntent::IsolatedStep.narrow_capabilities(&base);
+            assert!(narrowed.contains(LlmCapability::FileEdits));
+            assert!(narrowed.contains(LlmCapability::Discovery));
+        }
+    }
+
+    #[test]
+    fn test_narrow_capabilities_discussion_owns_both_plan_permissions() {
+        let advertised = CapabilitySet::from_slice(LlmCapability::ALL);
+        let narrowed = TurnIntent::ReadonlyDiscussion.narrow_capabilities(&advertised);
+        assert!(narrowed.contains(LlmCapability::PlanCreation));
+        assert!(narrowed.contains(LlmCapability::PlanUpdate));
+    }
+
+    #[test]
+    fn test_narrow_capabilities_isolated_step_matches_the_step_profile() {
+        // The narrowing is an intersection with the regime profile followed by
+        // the single harness-owned removal. A base carrying the whole advertised
+        // surface therefore reaches exactly the step profile minus toolchain
+        // verification, while a narrower base reaches a subset of it.
+        let expected = CapabilitySet::isolated_step().without(LlmCapability::ToolchainVerify);
+        let advertised = CapabilitySet::from_slice(LlmCapability::ALL);
+        let full = TurnIntent::IsolatedStep.narrow_capabilities(&advertised);
+        assert_eq!(full.as_slice(), expected.as_slice());
+
+        // A narrower base reaches a subset of the step profile.
+        let repl = TurnIntent::IsolatedStep.narrow_capabilities(&CapabilitySet::interactive_repl());
+        for capability in repl.iter() {
+            assert!(expected.contains(*capability));
+        }
+        assert!(repl.contains(LlmCapability::FileEdits));
     }
 }

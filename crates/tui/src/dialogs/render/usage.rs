@@ -266,23 +266,32 @@ fn usage_summary_lines(
         if map_tokens.is_none() {
             push_divider(&mut lines, table_width, engine);
         }
+        // Cost and duration are both facts of the finished operation, so the
+        // note reports them together instead of letting one crowd out the
+        // other: the duration of the last operation is exactly the number the
+        // developer waits on while the next one runs.
+        let mut facts: Vec<String> = Vec::new();
+        if snapshot.prev.cost > 0.0 {
+            facts.push(format_money(snapshot.prev.cost));
+        }
+        if snapshot.prev.duration_ms > 0 {
+            facts.push(format_duration(snapshot.prev.duration_ms));
+        }
+        let note = if facts.is_empty() {
+            format!("{} tokens", format_tokens(snapshot.prev.total_tokens))
+        } else {
+            format!(
+                "{} tokens ({})",
+                format_tokens(snapshot.prev.total_tokens),
+                facts.join(" · ")
+            )
+        };
         lines.push(Line::from(vec![
             Span::styled(
                 format!("  {}: ", active_t("dialog.usage.last")),
                 engine.fg(palette.text_secondary),
             ),
-            Span::styled(
-                format!(
-                    "{} tokens ({})",
-                    format_tokens(snapshot.prev.total_tokens),
-                    if snapshot.prev.cost > 0.0 {
-                        format_money(snapshot.prev.cost)
-                    } else {
-                        format_duration(snapshot.prev.duration_ms)
-                    }
-                ),
-                engine.fg(palette.text_primary),
-            ),
+            Span::styled(note, engine.fg(palette.text_primary)),
         ]));
     }
 
@@ -558,6 +567,25 @@ mod tests {
         assert!(text.contains("Repository Map"), "{text}");
         assert!(text.contains("64"), "{text}");
         assert!(!text.contains("No usage recorded"), "{text}");
+    }
+
+    #[test]
+    fn compact_note_pairs_cost_with_duration() {
+        let text = rendered_text(&three_slot_snapshot());
+
+        // The previous operation carries 500 tokens, $0.0060, and 12.0s: the
+        // note reports money and time together instead of one crowding out
+        // the other while the next operation runs.
+        assert!(text.contains("500 tokens ($0.0060 · 12.0s)"), "{text}");
+    }
+
+    #[test]
+    fn compact_note_falls_back_to_duration_without_cost() {
+        let mut snapshot = three_slot_snapshot();
+        snapshot.prev.cost = 0.0;
+        let text = rendered_text(&snapshot);
+
+        assert!(text.contains("500 tokens (12.0s)"), "{text}");
     }
 
     #[test]

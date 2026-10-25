@@ -383,10 +383,6 @@ pub fn default_tui_config_path() -> PathBuf {
     }
 }
 
-pub fn save_tui_config(layout: LayoutPreset, langmap: Option<String>) -> std::io::Result<PathBuf> {
-    save_tui_config_full(layout, langmap, PrimaryModifier::Ctrl, MetaModifier::Alt)
-}
-
 /// Template seeded into a fresh `tui.toml`. It documents the default values and
 /// the optional keys so a first-time user can discover them without opening the
 /// documentation.

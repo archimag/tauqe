@@ -26,6 +26,7 @@ use crate::providers::{LlmProvider, StreamEvent};
 use crate::workflow::WorkflowOptions;
 
 use super::cache::TurnInputCache;
+use super::AbortReport;
 
 /// Normalized proposal returned by a single model interaction.
 ///
@@ -47,6 +48,7 @@ pub(super) struct ProposalStep {
     verify_request: Option<EditVerifyRequest>,
     terminal_outcome: Option<LlmOutcome>,
     blocked: Option<String>,
+    abort: Option<AbortReport>,
     scratchpad: Option<String>,
     language: Option<String>,
     plans: Vec<tauqe_protocol::DiscussionPlanUpdate>,
@@ -129,6 +131,19 @@ impl ProposalStep {
                 // executed by the harness against the declared allowlist before
                 // anything is staged.
                 LlmCommand::CustomTool { .. } => step.custom_tools.push(command.clone()),
+                // An abort is an unconditional stop, so the first one carried by
+                // a round is retained and later ones add nothing.
+                LlmCommand::Abort {
+                    reason,
+                    recommendation,
+                } => {
+                    if step.abort.is_none() {
+                        step.abort = Some(AbortReport {
+                            reason: reason.clone(),
+                            recommendation: recommendation.clone(),
+                        });
+                    }
+                }
                 LlmCommand::ProtocolError { message } => step.protocol_errors.push(message.clone()),
             }
         }
@@ -201,6 +216,11 @@ impl ProposalStep {
         self.blocked.as_deref()
     }
 
+    /// Unconditional abort report carried by the proposal, if any.
+    fn abort(&self) -> Option<&AbortReport> {
+        self.abort.as_ref()
+    }
+
     /// Ephemeral working-memory notes carried by the proposal, if any.
     fn scratchpad(&self) -> Option<&str> {
         self.scratchpad.as_deref()
@@ -263,6 +283,7 @@ impl ProposalStep {
             && self.verify_request.is_none()
             && self.terminal_outcome.is_none()
             && self.blocked.is_none()
+            && self.abort.is_none()
             && self.custom_tools.is_empty()
             && !self.has_discovery_commands()
     }
@@ -276,6 +297,7 @@ pub(super) struct TurnState {
     pub(super) verify_request: Option<EditVerifyRequest>,
     pub(super) terminal_outcome: Option<LlmOutcome>,
     pub(super) blocked: Option<String>,
+    pub(super) abort: Option<AbortReport>,
     pub(super) plans: Vec<tauqe_protocol::DiscussionPlanUpdate>,
     pub(super) repo_searches: Vec<RepoSearchRequest>,
 }
@@ -297,6 +319,9 @@ impl TurnState {
         }
         if let Some(reason) = step.blocked_reason() {
             self.blocked = Some(reason.to_string());
+        }
+        if let Some(abort) = step.abort() {
+            self.abort = Some(abort.clone());
         }
         self.plans.extend(step.plans().iter().cloned());
         self.repo_searches
@@ -446,8 +471,13 @@ pub(super) async fn run_proposal_step(
         context_files.retain(|file| !staged.deleted_paths.contains(&file.path));
     }
 
-    let targetable_paths: Vec<String> =
-        context_files.iter().map(|file| file.path.clone()).collect();
+    // Every file an edit may address this turn: the whole context block, not
+    // only the editable layer, because a file marked read-only becomes editable
+    // as soon as an edit proposes a change to it. One list feeds the streaming
+    // filter, the response schema, and the decoder, so the path a preview
+    // reports while streaming is byte-identical to the path carried by the
+    // decoded command.
+    let context_paths: Vec<String> = context_files.iter().map(|file| file.path.clone()).collect();
 
     // The cache freezes the map on the first round of the turn, so later rounds
     // receive the identical string even after discovery widened the context.
@@ -456,7 +486,7 @@ pub(super) async fn run_proposal_step(
     // never both, so exactly one outline enters the prompt.
     let (repo_map, repo_dirs) = if options.include_repo_map {
         let map = cache
-            .repo_map(&repo_root, &targetable_paths, options.repomap_token_budget)
+            .repo_map(&repo_root, &context_paths, options.repomap_token_budget)
             .await;
         (map, None)
     } else {
@@ -492,7 +522,7 @@ pub(super) async fn run_proposal_step(
         ctx_state.revision,
         context_files,
         workflow_name,
-        protocol.name(),
+        protocol.kind(),
         history_tag,
         repo_map,
     )
@@ -501,6 +531,7 @@ pub(super) async fn run_proposal_step(
     assembly.target_language = target_language.map(|language| language.to_string());
     assembly.intent = intent;
     assembly.turn_scratchpad = turn_scratchpad.map(|notes| notes.to_string());
+    assembly.max_scratchpad_chars = options.max_scratchpad_chars;
 
     // The declared turn intent narrows the protocol once, so the rendered
     // instructions, the structured response schema, the stream filter, and the
@@ -510,7 +541,7 @@ pub(super) async fn run_proposal_step(
     let protocol: &dyn PromptProtocol = scoped_protocol.as_ref();
 
     let messages = assembly.assemble_chat_messages(prompt, protocol);
-    let response_format = protocol.response_format(&targetable_paths);
+    let response_format = protocol.response_format(&context_paths);
 
     let (llm_tx, mut llm_rx) = mpsc::channel::<StreamEvent>(100);
     // A session identifier pins the proposal round to one provider backend and
@@ -530,8 +561,10 @@ pub(super) async fn run_proposal_step(
     let staged_for_filter = staged_state
         .map(|staged| staged.staged_files.clone())
         .unwrap_or_default();
+    // The streaming preview receives the same context list as the decoder, so a
+    // reported edit and the staged edit always name the same file.
     let mut stream_filter =
-        protocol.create_stream_filter(targetable_paths, repo_root, staged_for_filter);
+        protocol.create_stream_filter(context_paths.clone(), repo_root, staged_for_filter);
     let forward_stream_tx = stream_tx.clone();
 
     let forward_task = tokio::spawn(async move {
@@ -617,7 +650,10 @@ pub(super) async fn run_proposal_step(
         anyhow::bail!("LLM stream closed unexpectedly without completion");
     }
 
-    let commands = protocol.decode(&assistant_text);
+    // The decoder resolves edit paths against the identical context list the
+    // stream filter received, so a decoded edit names the file the preview
+    // already certified as edited.
+    let commands = protocol.decode(&assistant_text, &context_paths);
 
     Ok(ProposalStep::from_commands(commands))
 }

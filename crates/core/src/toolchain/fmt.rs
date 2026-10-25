@@ -1,27 +1,19 @@
-//! In-memory project formatting and best-effort formatter execution.
+//! In-memory project formatting.
 //!
-//! Formatting has two contours, and neither lets a half-authored change set
-//! escape verification:
-//!
-//! * `[project.format]` declares one stream filter. It receives the staged text
-//!   of a file on standard input and returns the rewritten text on standard
-//!   output, so the change set is formatted while it still lives in virtual
-//!   staging. The filter runs in its own process group, and a non-zero exit
-//!   status, a timeout, or a cancellation keeps the authored content.
-//! * `[toolchain.fmt.<name>]` entries run after a verified build over the
-//!   changed files whose extension the entry lists, and receive those paths as
-//!   literal process arguments. That phase stays best-effort: a formatter
-//!   failure is reported and never aborts the turn or invalidates verified code.
+//! Formatting has exactly one contour: `[project.format]` declares one stream
+//! filter that receives the staged text of a file on standard input and returns
+//! the rewritten text on standard output, so the change set is formatted while
+//! it still lives in virtual staging. The filter runs in its own process group,
+//! and a non-zero exit status, a timeout, or a cancellation keeps the authored
+//! content.
 
-use std::collections::BTreeMap;
 use std::path::Path;
 
 use tauqe_protocol::ProjectConfig;
 use tokio::sync::watch;
 
-use super::exec::{run_command, run_streaming_command, CommandLine, StreamingOutcome};
-use super::ToolchainCheckResult;
-use crate::config::{FormatterConfig, DEFAULT_TOOLCHAIN_TIMEOUT_SECS};
+use super::exec::{run_streaming_command, CommandLine, StreamingOutcome};
+use super::DEFAULT_PROJECT_TIMEOUT_SECS;
 
 /// Outcome of streaming one file's staged content through `[project.format]`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -39,7 +31,13 @@ pub struct InMemoryFormatOutcome {
     pub error: Option<String>,
 }
 
-/// Streams `content` through the declared `[project.format]` command.
+/// Streams `content` through the in-memory formatter of the project.
+///
+/// The filter comes from the effective project configuration: a declared
+/// `[project.format]` entry, or the `format` recipe the declared task runner
+/// exports when the entry is omitted. A declaration always keeps precedence over
+/// the export of the same role, so a project can pin the filter in `tauqe.toml`
+/// or delegate it to its justfile without changing the bounded turn.
 ///
 /// The command receives the staged text on standard input and returns the
 /// rewritten text on standard output, so the file is formatted while its change
@@ -47,7 +45,7 @@ pub struct InMemoryFormatOutcome {
 /// never touch the working tree. The child leads its own process group, so a
 /// timeout or a cancellation tears down every process the formatter spawned.
 ///
-/// Returns `None` when the repository declares no in-memory formatter, so the
+/// Returns `None` when the repository provides no in-memory formatter, so the
 /// caller keeps its own formatting path. A non-zero exit status, a timeout, a
 /// configuration that cannot be resolved, or a cancelled invocation keeps the
 /// authored content and reports why.
@@ -56,12 +54,24 @@ pub async fn format_staged_content(
     content: &str,
     cancel_rx: Option<&watch::Receiver<bool>>,
 ) -> Option<InMemoryFormatOutcome> {
-    // The `[project]` section is read from `tauqe.toml`, so the load runs off
-    // the async executor thread.
-    let config_root = repo_root.to_path_buf();
-    let project = crate::blocking::run_blocking(|| {
-        crate::config::load_section::<ProjectConfig>(&config_root, "project")
-    });
+    // The effective configuration merges the `[project]` section with the
+    // manifest the declared task runner exports, so resolving it also runs that
+    // runner's dump; the load therefore stays off the async executor thread.
+    let project = super::effective_project_config(repo_root, cancel_rx).await;
+    format_with_project_config(repo_root, &project, content, cancel_rx).await
+}
+
+/// Streams `content` through the filter a resolved project configuration names.
+///
+/// Kept separate from the configuration load so a caller — and a test — can
+/// supply a project whose `format` command was filled from a runner manifest
+/// instead of from `tauqe.toml`.
+pub(crate) async fn format_with_project_config(
+    repo_root: &Path,
+    project: &ProjectConfig,
+    content: &str,
+    cancel_rx: Option<&watch::Receiver<bool>>,
+) -> Option<InMemoryFormatOutcome> {
     let spec = project.format.as_ref()?;
 
     let resolved = match project.resolve("format", spec) {
@@ -86,7 +96,7 @@ pub async fn format_staged_content(
     let timeout_secs = resolved
         .timeout_secs
         .filter(|secs| *secs > 0)
-        .unwrap_or(DEFAULT_TOOLCHAIN_TIMEOUT_SECS);
+        .unwrap_or(DEFAULT_PROJECT_TIMEOUT_SECS);
     let outcome =
         run_streaming_command(repo_root, &command, content, timeout_secs, cancel_rx).await;
 
@@ -163,277 +173,9 @@ fn compact(text: &str) -> String {
     text.split_whitespace().collect::<Vec<&str>>().join(" ")
 }
 
-/// Outcome of one configured formatter invocation.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct FormatterRunResult {
-    /// Name of the `[toolchain.fmt.<name>]` entry.
-    pub formatter: String,
-    /// Command line that was executed.
-    pub command: String,
-    /// Changed files handed to the formatter.
-    pub files: Vec<String>,
-    /// Whether the formatter completed successfully.
-    pub success: bool,
-    /// Whether the invocation was cancelled before it finished.
-    pub is_cancelled: bool,
-    /// Trimmed command output, or the failure reason.
-    pub message: String,
-}
-
-/// One formatter invocation prepared from the registry.
-struct FormatterInvocation {
-    name: String,
-    command: CommandLine,
-    files: Vec<String>,
-    timeout_secs: u64,
-}
-
-/// Runs every configured formatter over the changed files it applies to.
-///
-/// Returns one result per executed formatter in registry order. A missing
-/// registry, an empty change set, or a set of changed files no formatter claims
-/// yields an empty list. A cancelled invocation terminates the sequence and is
-/// reported with `is_cancelled`.
-pub async fn run_formatters(
-    repo_root: &Path,
-    changed_files: &[String],
-    cancel_rx: Option<&watch::Receiver<bool>>,
-) -> Vec<FormatterRunResult> {
-    // The formatter registry is read from `tauqe.toml`, so it is loaded off the
-    // async executor thread.
-    let config_root = repo_root.to_path_buf();
-    let registry =
-        crate::blocking::run_blocking(|| crate::config::load_toolchain_config(&config_root).fmt);
-
-    let mut results = Vec::new();
-    for invocation in plan_invocations(&registry, changed_files) {
-        tracing::info!(
-            formatter = %invocation.name,
-            command = %invocation.command.display(),
-            files = invocation.files.len(),
-            "formatter started"
-        );
-        let outcome = run_command(
-            repo_root,
-            &invocation.command,
-            invocation.timeout_secs,
-            cancel_rx,
-        )
-        .await;
-        if !outcome.success && !outcome.is_cancelled {
-            tracing::warn!(
-                formatter = %invocation.name,
-                command = %outcome.command,
-                "formatter failed; keeping verified code"
-            );
-        }
-        results.push(FormatterRunResult {
-            formatter: invocation.name,
-            command: outcome.command.clone(),
-            files: invocation.files,
-            success: outcome.success,
-            is_cancelled: outcome.is_cancelled,
-            message: outcome_message(&outcome),
-        });
-        if outcome.is_cancelled {
-            break;
-        }
-    }
-
-    results
-}
-
-/// Turns a command outcome into a short report message.
-fn outcome_message(outcome: &ToolchainCheckResult) -> String {
-    let output = outcome.combined_output.trim();
-    if !output.is_empty() {
-        return output.to_string();
-    }
-    let stderr = outcome.stderr.trim();
-    if !stderr.is_empty() {
-        return stderr.to_string();
-    }
-    if outcome.success {
-        String::new()
-    } else {
-        format!("`{}` exited with a failure status", outcome.command)
-    }
-}
-
-/// Prepares one invocation per usable formatter that claims at least one changed file.
-fn plan_invocations(
-    registry: &BTreeMap<String, FormatterConfig>,
-    changed_files: &[String],
-) -> Vec<FormatterInvocation> {
-    let mut invocations = Vec::new();
-    for (name, formatter) in registry {
-        let Some((program, mut args)) = formatter.command_line() else {
-            continue;
-        };
-        let mut files: Vec<String> = Vec::new();
-        for file in changed_files {
-            let file = file.trim();
-            if file.is_empty() || files.iter().any(|existing| existing == file) {
-                continue;
-            }
-            if formatter.matches_path(Path::new(file)) {
-                files.push(file.to_string());
-            }
-        }
-        if files.is_empty() {
-            continue;
-        }
-        // Configured arguments come first; file paths follow as literal arguments.
-        args.extend(files.iter().cloned());
-        invocations.push(FormatterInvocation {
-            name: name.clone(),
-            command: CommandLine::new(program, args),
-            files,
-            timeout_secs: formatter.effective_timeout_secs(),
-        });
-    }
-    invocations
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// Creates a temporary repository with a `tauqe.toml` formatter registry.
-    fn repo_with_formatters(config: &str) -> tempfile::TempDir {
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("tauqe.toml"), config).unwrap();
-        dir
-    }
-
-    #[test]
-    fn test_plan_invocations_filters_extensions_and_appends_paths() {
-        let mut registry = BTreeMap::new();
-        registry.insert(
-            "probe".to_string(),
-            FormatterConfig {
-                command: Some("printf".to_string()),
-                args: vec!["[%s]".to_string()],
-                extensions: vec!["rs".to_string(), ".TS".to_string()],
-                timeout_secs: Some(45),
-            },
-        );
-        let changed = vec![
-            "src/a b;rm.rs".to_string(),
-            "src/c.ts".to_string(),
-            " notes.txt ".to_string(),
-            "src/a b;rm.rs".to_string(),
-        ];
-
-        let invocations = plan_invocations(&registry, &changed);
-        assert_eq!(invocations.len(), 1);
-        assert_eq!(
-            invocations[0].files,
-            vec!["src/a b;rm.rs".to_string(), "src/c.ts".to_string()]
-        );
-        assert_eq!(
-            invocations[0].command.args(),
-            [
-                "[%s]".to_string(),
-                "src/a b;rm.rs".to_string(),
-                "src/c.ts".to_string(),
-            ]
-        );
-        assert_eq!(invocations[0].timeout_secs, 45);
-    }
-
-    #[test]
-    fn test_plan_invocations_skips_unclaimed_or_unusable_entries() {
-        let mut registry = BTreeMap::new();
-        registry.insert(
-            "go_only".to_string(),
-            FormatterConfig {
-                command: Some("gofmt".to_string()),
-                args: Vec::new(),
-                extensions: vec!["go".to_string()],
-                timeout_secs: None,
-            },
-        );
-        registry.insert(
-            "no_command".to_string(),
-            FormatterConfig {
-                command: None,
-                args: Vec::new(),
-                extensions: vec!["rs".to_string()],
-                timeout_secs: None,
-            },
-        );
-
-        let invocations = plan_invocations(&registry, &["src/lib.rs".to_string()]);
-        assert!(invocations.is_empty());
-    }
-
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn test_run_formatters_passes_literal_paths_without_shell() {
-        let dir = repo_with_formatters(
-            r#"
-[toolchain.fmt.probe]
-command = "printf"
-args = ["[%s]"]
-extensions = ["rs", "ts"]
-"#,
-        );
-        let changed = vec![
-            "src/a b;rm -rf.rs".to_string(),
-            "src/c.ts".to_string(),
-            "notes.txt".to_string(),
-        ];
-
-        let results = run_formatters(dir.path(), &changed, None).await;
-        assert_eq!(results.len(), 1);
-        let result = &results[0];
-        assert_eq!(result.formatter, "probe");
-        assert!(result.success, "message: {}", result.message);
-        assert!(!result.is_cancelled);
-        assert_eq!(
-            result.files,
-            vec!["src/a b;rm -rf.rs".to_string(), "src/c.ts".to_string()]
-        );
-        assert_eq!(result.message, "[src/a b;rm -rf.rs][src/c.ts]");
-    }
-
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn test_run_formatters_reports_failure_and_keeps_going() {
-        let dir = repo_with_formatters(
-            r#"
-[toolchain.fmt.aaa_probe]
-command = "printf"
-args = ["ok:%s"]
-extensions = ["rs"]
-
-[toolchain.fmt.zzz_broken]
-command = "sh"
-args = ["-c", "exit 3"]
-extensions = ["rs"]
-"#,
-        );
-
-        let results = run_formatters(dir.path(), &["src/lib.rs".to_string()], None).await;
-        assert_eq!(results.len(), 2);
-
-        assert_eq!(results[0].formatter, "aaa_probe");
-        assert!(results[0].success);
-        assert_eq!(results[0].message, "ok:src/lib.rs");
-
-        assert_eq!(results[1].formatter, "zzz_broken");
-        assert!(!results[1].success);
-        assert!(!results[1].is_cancelled);
-    }
-
-    #[tokio::test]
-    async fn test_run_formatters_without_registry_does_nothing() {
-        let dir = tempfile::tempdir().unwrap();
-
-        let results = run_formatters(dir.path(), &["src/lib.rs".to_string()], None).await;
-        assert!(results.is_empty());
-    }
 
     /// Creates a temporary repository declaring an in-memory project formatter.
     fn repo_with_project_formatter(config: &str) -> tempfile::TempDir {
@@ -454,15 +196,74 @@ extensions = ["rs"]
 
         std::fs::write(
             dir.path().join("tauqe.toml"),
-            "[toolchain]\nauto_verify = true\n",
+            "[project.verify]\ncommand = \"cargo\"\nargs = [\"test\"]\n",
         )
         .unwrap();
         assert!(
             format_staged_content(dir.path(), "fn main() {}\n", None)
                 .await
                 .is_none(),
-            "the disk formatter registry is not an in-memory project formatter"
+            "a project that declares no in-memory formatter has none"
         );
+    }
+
+    /// Builds the manifest a task runner exports for the in-memory filter.
+    #[cfg(unix)]
+    fn runner_format_manifest(script: &str) -> crate::toolchain::runner::RunnerManifest {
+        crate::toolchain::runner::RunnerManifest {
+            format: Some(crate::toolchain::runner::RunnerCommand {
+                name: "format".to_string(),
+                spec: tauqe_protocol::ProjectCommandSpec {
+                    command: "sh".to_string(),
+                    args: vec!["-c".to_string(), script.to_string()],
+                    timeout_secs: None,
+                    ..Default::default()
+                },
+            }),
+            ..Default::default()
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_format_staged_content_uses_the_filter_a_task_runner_exports() {
+        let dir = tempfile::tempdir().unwrap();
+        // The repository declares nothing: the task runner supplies the filter.
+        let mut project = ProjectConfig::default();
+        crate::toolchain::merge_manifest(&mut project, runner_format_manifest("tr a-z A-Z"));
+
+        let authored = "pub fn value() -> i32 {0}\n";
+        let outcome = format_with_project_config(dir.path(), &project, authored, None)
+            .await
+            .expect("the runner exports an in-memory formatter");
+
+        assert!(outcome.formatted, "error: {:?}", outcome.error);
+        assert_eq!(outcome.content, "PUB FN VALUE() -> I32 {0}\n");
+        assert_eq!(outcome.command, "sh -c tr a-z A-Z");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_declared_project_formatter_overrides_the_runner_recipe() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut project = ProjectConfig {
+            format: Some(tauqe_protocol::ProjectCommandSpec {
+                command: "sh".to_string(),
+                args: vec!["-c".to_string(), "tr a-z A-Z".to_string()],
+                timeout_secs: None,
+                ..Default::default()
+            }),
+            ..ProjectConfig::default()
+        };
+        // The exported recipe would erase the stream; the declaration must win.
+        crate::toolchain::merge_manifest(&mut project, runner_format_manifest("cat > /dev/null"));
+
+        let outcome = format_with_project_config(dir.path(), &project, "pub fn value() {}\n", None)
+            .await
+            .expect("the declared formatter is used");
+
+        assert!(outcome.formatted, "error: {:?}", outcome.error);
+        assert_eq!(outcome.content, "PUB FN VALUE() {}\n");
     }
 
     #[cfg(unix)]

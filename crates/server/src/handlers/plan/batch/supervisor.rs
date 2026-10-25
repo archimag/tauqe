@@ -56,8 +56,13 @@ pub(in crate::handlers::plan) enum BatchOutcome {
 /// funnels its terminal state through this emitter, so a client that opened a
 /// batch-mode turn always receives exactly one finish notification carrying the
 /// aggregate status, step counters, elapsed time, and optional error.
+// Each parameter is one published field of the terminal report, so grouping
+// them into a struct would only restate the same values without removing a
+// single argument.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn emit_plan_batch_finished(
     state: &Arc<AppState>,
+    operation_id: &str,
     owner_id: &str,
     status: BatchFinishStatus,
     executed_count: usize,
@@ -69,7 +74,7 @@ pub(super) fn emit_plan_batch_finished(
         &state.out,
         events::PLAN_BATCH_FINISHED,
         serde_json::to_value(PlanBatchFinishedEvent {
-            operation_id: format!("op-{}", crate::state::next_operation_id()),
+            operation_id: operation_id.to_string(),
             summary: BatchFinishSummary {
                 owner_id: owner_id.to_string(),
                 status,
@@ -93,6 +98,7 @@ pub(super) fn emit_plan_batch_finished(
 /// duplicating the event payload at each of them.
 fn reject_batch(
     state: &Arc<AppState>,
+    operation_id: &str,
     plan_id: &str,
     started_at: std::time::Instant,
     scheduled: usize,
@@ -100,6 +106,7 @@ fn reject_batch(
 ) -> BatchOutcome {
     emit_plan_batch_finished(
         state,
+        operation_id,
         plan_id,
         BatchFinishStatus::Failed,
         0,
@@ -153,6 +160,11 @@ pub(super) async fn run_plan_batch_with(
     }
     clear_auto_context(state).await;
 
+    // Every lifecycle event of this batch — its replanning rounds and its
+    // terminal completion — is published under the registered operation that
+    // runs it, so a client can attribute all of them to the request it sent.
+    let operation_id = format!("op-{}", operation.id());
+
     tracing::info!(
         plan_id = plan_id,
         scheduled = current_step_ids.len(),
@@ -203,6 +215,7 @@ pub(super) async fn run_plan_batch_with(
                     clear_auto_context(state).await;
                     return reject_batch(
                         state,
+                        &operation_id,
                         plan_id,
                         started_at,
                         total_scheduled,
@@ -211,7 +224,14 @@ pub(super) async fn run_plan_batch_with(
                 }
                 Err(err) => {
                     clear_auto_context(state).await;
-                    return reject_batch(state, plan_id, started_at, total_scheduled, err);
+                    return reject_batch(
+                        state,
+                        &operation_id,
+                        plan_id,
+                        started_at,
+                        total_scheduled,
+                        err,
+                    );
                 }
             };
 
@@ -247,6 +267,7 @@ pub(super) async fn run_plan_batch_with(
                     clear_auto_context(state).await;
                     return reject_batch(
                         state,
+                        &operation_id,
                         plan_id,
                         started_at,
                         total_scheduled,
@@ -280,13 +301,21 @@ pub(super) async fn run_plan_batch_with(
                             let msg =
                                 format!("Just-in-time horizon cannot be executed: {:?}", other);
                             clear_auto_context(state).await;
-                            return reject_batch(state, plan_id, started_at, total_scheduled, msg);
+                            return reject_batch(
+                                state,
+                                &operation_id,
+                                plan_id,
+                                started_at,
+                                total_scheduled,
+                                msg,
+                            );
                         }
                     },
                     Some(PlanRefineResult::Blocked { reason }) => {
                         clear_auto_context(state).await;
                         return reject_batch(
                             state,
+                            &operation_id,
                             plan_id,
                             started_at,
                             total_scheduled,
@@ -300,6 +329,7 @@ pub(super) async fn run_plan_batch_with(
                         clear_auto_context(state).await;
                         return reject_batch(
                             state,
+                            &operation_id,
                             plan_id,
                             started_at,
                             total_scheduled,
@@ -361,6 +391,18 @@ pub(super) async fn run_plan_batch_with(
             BatchStop::Failed { step_id } => {
                 total_completed += run_executed.saturating_sub(1);
                 last_error = report.executed.last().and_then(|r| r.outcome.error.clone());
+                // A failed step ends the queue immediately and never engages the
+                // Architect: replanning is reserved for a semantic block, which
+                // signals a failed precondition the Architect can re-scope. An
+                // unconditional abort travels exactly this path, because the
+                // executor reports it as a failure carrying the developer's
+                // recommendation, so no replanning cycle is started for it.
+                tracing::warn!(
+                    plan_id = plan_id,
+                    step_id = step_id.as_str(),
+                    reason = last_error.as_deref().unwrap_or("no diagnostics"),
+                    "plan batch stopped on a failed step; no replanning is engaged"
+                );
                 final_stop = BatchStop::Failed { step_id };
                 break;
             }
@@ -383,7 +425,7 @@ pub(super) async fn run_plan_batch_with(
                         &state.out,
                         events::TURN_PHASE,
                         serde_json::to_value(TurnPhaseEvent {
-                            operation_id: format!("op-{}", crate::state::next_operation_id()),
+                            operation_id: operation_id.clone(),
                             phase: TurnPhase::Proposal,
                             round: Some(replans_count),
                             max_rounds: Some(max_replans),
@@ -627,6 +669,7 @@ pub(super) async fn run_plan_batch_with(
 
     emit_plan_batch_finished(
         state,
+        &operation_id,
         plan_id,
         status,
         total_executed_count,

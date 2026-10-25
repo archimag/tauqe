@@ -11,6 +11,7 @@ use crate::editor::InputEditor;
 use crate::i18n::{active_t, I18nEngine};
 use crate::theme::presets::ThemePreset;
 use crate::theme::selector::ThemeSelectorState;
+use crate::ui::HitRegistry;
 use crate::views::context::ContextViewState;
 use crate::views::history::HistoryViewState;
 use crate::views::plans::{PlansViewState, RefineDialogFocus};
@@ -95,6 +96,8 @@ pub enum ActiveModal {
     /// Second tier, raised when completed or in-progress work exists.
     ClearHorizonFinal,
     DeletePlan,
+    /// Second tier, raised when the plan still carries unfinished work.
+    DeletePlanFinal,
     DeleteReview,
     ExecuteReview,
     ExecutePipeline,
@@ -230,6 +233,7 @@ impl ModelChoice {
     pub fn resolve(&self, selection: &ModelSelection) -> Option<ModelRef> {
         match selection {
             ModelSelection::Specific(model) => Some(model.clone()),
+            ModelSelection::Tier { model, .. } => Some(model.clone()),
             ModelSelection::Role(role) => self.roles.as_ref().map(|roles| match role {
                 ModelRole::Scribe => roles.scribe.clone(),
                 ModelRole::Coder => roles.coder.clone(),
@@ -244,64 +248,29 @@ impl ModelChoice {
 /// Structured identity of the model currently executing a turn.
 ///
 /// Populated from the `model/started` event so the header can render the live
-/// model together with its semantic role while a turn owns the interface, and
-/// cleared once the turn settles. This keeps "what runs right now" in the
-/// header (an action surface) without duplicating server-side state.
+/// model while a turn owns the interface, and cleared once the turn settles.
+/// The semantic role is provenance only: it selects the model and is never part
+/// of the printed name, so every surface renders the label through
+/// [`crate::model_display::model_label`] (c-2).
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct RunningModel {
     /// Wire model reference.
     pub model: ModelRef,
     /// Semantic role that launched the turn, when it was role-driven.
     pub role: Option<ModelRole>,
-    /// Configured human-readable alias, when one exists.
-    pub alias: Option<String>,
     /// Effective reasoning effort, when one was requested.
     pub effort: Option<ReasoningEffort>,
 }
 
 impl RunningModel {
-    /// Human-readable label for the header.
+    /// Display label of the running model through the single printing rule.
     ///
-    /// The configured alias wins; otherwise the redundant `provider:` prefix is
-    /// dropped and the reasoning effort is appended when set (`name [effort]`).
+    /// The alias comes from the provider catalog published once per frame, so a
+    /// model configured with a human-readable name is never presented by its
+    /// provider identifier, and the reasoning depth is appended when set
+    /// (`name [effort]`) exactly like a configured role entry (c-1, c-2).
     pub fn label(&self) -> String {
-        if let Some(alias) = self.alias.as_deref() {
-            let trimmed = alias.trim();
-            if !trimmed.is_empty() {
-                return trimmed.to_string();
-            }
-        }
-        let short = compact_model_name(&self.model);
-        match self.effort {
-            Some(effort) => format!("{} [{}]", short, effort),
-            None => short.to_string(),
-        }
-    }
-}
-
-/// Compact display name of a concrete model, dropping the redundant
-/// `provider:` prefix so the pickers and the header share one formatting rule.
-pub fn compact_model_name(model: &ModelRef) -> &str {
-    &model.name
-}
-
-pub fn role_title(role: ModelRole) -> &'static str {
-    match role {
-        ModelRole::Scribe => "Scribe",
-        ModelRole::Coder => "Coder",
-        ModelRole::Architect => "Architect",
-        ModelRole::Primary => "Primary",
-        ModelRole::Reviewer => "Reviewer",
-    }
-}
-
-pub fn role_badge(role: ModelRole) -> &'static str {
-    match role {
-        ModelRole::Scribe => "[Scr]",
-        ModelRole::Coder => "[Cod]",
-        ModelRole::Architect => "[Arc]",
-        ModelRole::Primary => "[Pri]",
-        ModelRole::Reviewer => "[Rev]",
+        crate::model_display::model_label(&self.model, self.effort)
     }
 }
 
@@ -317,79 +286,22 @@ pub fn help_open_hint(primary: crate::config::PrimaryModifier) -> String {
     HELP_OPEN_CHORD.replace("C-", primary.emacs_prefix())
 }
 
-/// Compact label for a model entry, preferring its alias when configured
-/// and falling back to `name [effort]` or bare `name`.
-pub fn compact_entry_label(entry: &tauqe_protocol::ModelEntry) -> String {
-    if let Some(alias) = entry.alias.as_deref() {
-        let trimmed = alias.trim();
-        if !trimmed.is_empty() {
-            return trimmed.to_string();
-        }
-    }
-    let short = compact_model_name(&entry.model);
-    match entry.effort {
-        Some(effort) => format!("{} [{}]", short, effort),
-        None => short.to_string(),
-    }
-}
-
-/// Numbered row label for the embedded model lists: `[N] <label>`, where the
-/// label follows the shared model presentation (alias when configured,
-/// otherwise `provider:model`) with the reasoning effort appended.
+/// State of the primary model picker (`C-m`).
 ///
-/// The reusable [`crate::components::model_selector::ModelSelector`] list and
-/// the primary model picker share this one numbering rule so their rows cannot
-/// drift apart.
-pub fn numbered_entry_label(index: usize, entry: &tauqe_protocol::ModelEntry) -> String {
-    let mut label = format!("[{}] {}", index + 1, entry.display_label());
-    let aliased = entry
-        .alias
-        .as_deref()
-        .is_some_and(|alias| !alias.trim().is_empty());
-    if aliased {
-        if let Some(effort) = entry.effort {
-            label.push_str(&format!(" [{}]", effort));
-        }
-    }
-    label
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SelectionDialogKind {
-    /// List of models configured for the Primary role.
-    PrimaryModels,
-    /// Full list of available models.
-    ModelCatalog,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum SelectionItem {
-    Primary(tauqe_protocol::ModelEntry),
-    Model(ModelRef),
-    /// Pseudo-entry appended to the primary picker that opens the full model
-    /// catalog, so configured primary models never lock the developer out of
-    /// the complete provider list.
-    Catalog,
-}
-
+/// The picker is a thin shell over [`ModelSelector`]: the configured primary
+/// rungs, the highlighted one, the cyclic navigation, the digit quick-select,
+/// the scroll arithmetic, and the row rendering all live in the single model
+/// selection component. The dialog therefore stores nothing but that selector,
+/// so it cannot drift from the four role dialogs that share it (c-1).
 #[derive(Debug, Clone)]
 pub struct SelectionDialogState {
-    pub kind: SelectionDialogKind,
-    pub items: Vec<SelectionItem>,
-    pub selector: ListSelector,
+    pub selector: ModelSelector,
 }
 
 impl SelectionDialogState {
-    pub fn new(
-        kind: SelectionDialogKind,
-        items: Vec<SelectionItem>,
-        selected_index: usize,
-    ) -> Self {
-        let selector = ListSelector::new(items.len(), selected_index);
+    pub fn new(entries: Vec<tauqe_protocol::ModelEntry>, selected_index: usize) -> Self {
         Self {
-            kind,
-            items,
-            selector,
+            selector: ModelSelector::new(ModelRole::Primary, entries, selected_index),
         }
     }
 }
@@ -834,7 +746,14 @@ impl ReviewDialogState {
         let prompt = self.prompt_editor.get_text().trim().to_string();
         let pattern = self.path_editor.get_text().trim().to_string();
         ReviewStartParams {
-            model: self.selected_entry().map(|entry| entry.model.clone()),
+            // The selected reviewer rung travels whole — the model together
+            // with the reasoning depth it was configured with — so the reviewer
+            // the developer sees on screen is the reviewer that actually runs
+            // and no consumer re-derives the depth from the configured entries.
+            model: self.selected_entry().map(|entry| ModelSelection::Tier {
+                model: entry.model.clone(),
+                effort: entry.effort,
+            }),
             user_prompt: if prompt.is_empty() {
                 None
             } else {
@@ -1004,19 +923,6 @@ impl OnboardingState {
     }
 }
 
-#[derive(Debug, Clone, Copy, Default)]
-pub struct HeaderClickAreas {
-    pub row: u16,
-    pub repl_tab: (u16, u16),
-    pub context_tab: (u16, u16),
-    pub review_tab: (u16, u16),
-    pub plans_tab: (u16, u16),
-    pub history_tab: (u16, u16),
-    pub model_select: (u16, u16),
-    pub squash_button: (u16, u16),
-    pub help_button: (u16, u16),
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum SquashBaseMode {
     #[default]
@@ -1111,7 +1017,6 @@ pub struct AppInit {
     pub workflow: tauqe_protocol::WorkflowKind,
     pub edit_protocol: tauqe_protocol::EditProtocolKind,
     pub active_model: ModelRef,
-    pub available_models: Vec<ModelRef>,
     pub available_workflows: Vec<tauqe_protocol::WorkflowKind>,
     pub available_edit_protocols: Vec<tauqe_protocol::EditProtocolKind>,
     pub context: ContextState,
@@ -1130,7 +1035,6 @@ pub struct AppState {
     pub workflow: tauqe_protocol::WorkflowKind,
     pub edit_protocol: tauqe_protocol::EditProtocolKind,
     pub active_model: ModelRef,
-    pub available_models: Vec<ModelRef>,
     pub available_workflows: Vec<tauqe_protocol::WorkflowKind>,
     pub available_edit_protocols: Vec<tauqe_protocol::EditProtocolKind>,
     pub model: ReplView,
@@ -1162,6 +1066,9 @@ pub struct AppState {
     pub confirm_clear_horizon_final: Option<String>,
     pub confirm_clear_history: bool,
     pub confirm_delete_plan: Option<String>,
+    /// Plan whose deletion escalated to the second tier because unfinished work
+    /// would be discarded.
+    pub confirm_delete_plan_final: Option<String>,
     pub confirm_delete_review: Option<String>,
     pub confirm_execute_scope: Option<ConfirmExecuteScopeState>,
     pub confirm_execute_pipeline: Option<ConfirmExecutePipelineState>,
@@ -1178,7 +1085,13 @@ pub struct AppState {
     pub server_log_path: std::path::PathBuf,
     pub last_model_height: u16,
     pub last_frame_area: Rect,
-    pub header_clicks: HeaderClickAreas,
+    /// Interactive regions declared by the components of the current frame.
+    ///
+    /// The registry is emptied before every frame and filled exclusively by the
+    /// components that draw, so pointer dispatch never depends on a hard-coded
+    /// coordinate table and no stale region outlives the frame that declared it
+    /// (c-1, c-3).
+    pub hit_regions: HitRegistry,
     pub terminal_focused: bool,
     pub shift_tip_shown: bool,
     pub model_choice: ModelChoice,
@@ -1219,7 +1132,6 @@ impl AppState {
             workflow: init.workflow,
             edit_protocol: init.edit_protocol,
             active_model: init.active_model,
-            available_models: init.available_models,
             available_workflows: init.available_workflows,
             available_edit_protocols: init.available_edit_protocols,
             model: ReplView::default(),
@@ -1244,6 +1156,7 @@ impl AppState {
             confirm_clear_horizon_final: None,
             confirm_clear_history: false,
             confirm_delete_plan: None,
+            confirm_delete_plan_final: None,
             confirm_delete_review: None,
             confirm_execute_scope: None,
             confirm_execute_pipeline: None,
@@ -1260,7 +1173,7 @@ impl AppState {
             server_log_path: init.server_log_path,
             last_model_height: 10,
             last_frame_area: Rect::new(0, 0, 80, 24),
-            header_clicks: HeaderClickAreas::default(),
+            hit_regions: HitRegistry::default(),
             terminal_focused: true,
             shift_tip_shown: false,
             model_choice: ModelChoice::default(),
@@ -1334,8 +1247,13 @@ impl AppState {
     }
 
     /// Opens the primary model picker presenting models configured under
-    /// `[models.primary]`. Falls back to the full model catalog when no primary
-    /// entries are configured.
+    /// `[models.primary]`.
+    ///
+    /// The picker presents strictly the configured primary tiers: `primary` is
+    /// mandatory in the configuration contract, so an empty list means the role
+    /// summary has not reached the client yet. The picker then stays closed and
+    /// reports that condition instead of offering an alternative model source
+    /// (c-2).
     pub fn open_model_dialog(&mut self) -> bool {
         let entries = self
             .model_choice
@@ -1346,52 +1264,30 @@ impl AppState {
             .unwrap_or_default();
 
         if entries.is_empty() {
-            return self.open_model_catalog();
-        }
-
-        let selected = match &self.model_choice.selection {
-            ModelSelection::Specific(m) => entries.iter().position(|e| &e.model == m).unwrap_or(0),
-            ModelSelection::Role(ModelRole::Primary) => 0,
-            _ => 0,
-        };
-
-        let mut items: Vec<SelectionItem> =
-            entries.into_iter().map(SelectionItem::Primary).collect();
-        // The catalog escape hatch keeps every available provider model reachable
-        // even when primary models are configured. It is omitted only when the
-        // catalog is empty, which would otherwise produce an inert row.
-        if !self.available_models.is_empty() {
-            items.push(SelectionItem::Catalog);
-        }
-        self.selection_dialog = Some(SelectionDialogState::new(
-            SelectionDialogKind::PrimaryModels,
-            items,
-            selected,
-        ));
-        true
-    }
-
-    /// Opens the full list of available models. Returns false when the list is empty.
-    pub fn open_model_catalog(&mut self) -> bool {
-        if self.available_models.is_empty() {
+            self.notify_warning(active_t("notify.model_select_empty"));
             return false;
         }
-        let selected = self
-            .available_models
-            .iter()
-            .position(|m| m == &self.active_model)
-            .unwrap_or(0);
-        let items = self
-            .available_models
-            .iter()
-            .cloned()
-            .map(SelectionItem::Model)
-            .collect();
-        self.selection_dialog = Some(SelectionDialogState::new(
-            SelectionDialogKind::ModelCatalog,
-            items,
-            selected,
-        ));
+
+        // A tier is highlighted by both of its coordinates: the same model may
+        // be configured twice at different reasoning depths, so matching only
+        // the model would re-open the picker on the first rung and hide the
+        // depth the developer actually picked. When the exact rung has left the
+        // configuration, the first entry of the same model is the closest
+        // surviving highlight (c-2).
+        let selected = match &self.model_choice.selection {
+            ModelSelection::Tier { model, effort } => entries
+                .iter()
+                .position(|entry| &entry.model == model && &entry.effort == effort)
+                .or_else(|| entries.iter().position(|entry| &entry.model == model))
+                .unwrap_or(0),
+            ModelSelection::Specific(model) => entries
+                .iter()
+                .position(|entry| &entry.model == model)
+                .unwrap_or(0),
+            ModelSelection::Role(_) => 0,
+        };
+
+        self.selection_dialog = Some(SelectionDialogState::new(entries, selected));
         true
     }
 
@@ -1422,7 +1318,6 @@ impl AppState {
                 vec![tauqe_protocol::ModelEntry::new(
                     fallback_model,
                     fallback_effort,
-                    None,
                 )]
             })
     }
@@ -1468,6 +1363,11 @@ impl AppState {
         }
         if self.confirm_clear_horizon.is_some() {
             return Some(ActiveModal::ClearHorizon);
+        }
+        // The stricter second tier outranks the first tier, so a plan whose
+        // deletion would discard unfinished work always owns the keyboard.
+        if self.confirm_delete_plan_final.is_some() {
+            return Some(ActiveModal::DeletePlanFinal);
         }
         if self.confirm_delete_plan.is_some() {
             return Some(ActiveModal::DeletePlan);
@@ -1695,7 +1595,6 @@ pub(crate) fn test_state() -> AppState {
         workflow: tauqe_protocol::WorkflowKind::Git,
         edit_protocol: tauqe_protocol::EditProtocolKind::Xml,
         active_model: ModelRef::openrouter("test-model"),
-        available_models: Vec::new(),
         available_workflows: Vec::new(),
         available_edit_protocols: Vec::new(),
         context: ContextState::default(),
@@ -1939,41 +1838,39 @@ mod tests {
     }
 
     #[test]
-    fn test_selection_dialog_scrolling_and_bounds() {
-        let items: Vec<SelectionItem> = (0..20)
-            .map(|i| SelectionItem::Model(ModelRef::openrouter(format!("model-{}", i))))
+    fn test_selection_dialog_navigation_keeps_the_highlighted_rung_visible() {
+        let entries: Vec<tauqe_protocol::ModelEntry> = (0..20)
+            .map(|i| {
+                tauqe_protocol::ModelEntry::new(ModelRef::openrouter(format!("model-{}", i)), None)
+            })
             .collect();
-        let mut dialog = SelectionDialogState::new(SelectionDialogKind::ModelCatalog, items, 0);
+        let mut dialog = SelectionDialogState::new(entries, 0);
         let visible_height = 5;
 
         assert_eq!(dialog.selector.selected_index(), 0);
-        assert_eq!(dialog.selector.scroll_offset(), 0);
+        assert_eq!(dialog.selector.visible_start(visible_height), 0);
 
         for _ in 0..4 {
-            dialog.selector.select_next(visible_height);
+            dialog.selector.select_next();
         }
         assert_eq!(dialog.selector.selected_index(), 4);
-        assert_eq!(dialog.selector.scroll_offset(), 0);
+        assert_eq!(dialog.selector.visible_start(visible_height), 0);
 
-        dialog.selector.select_next(visible_height);
+        dialog.selector.select_next();
         assert_eq!(dialog.selector.selected_index(), 5);
-        assert_eq!(dialog.selector.scroll_offset(), 1);
+        assert_eq!(dialog.selector.visible_start(visible_height), 1);
 
-        for _ in 0..20 {
-            dialog.selector.select_next(visible_height);
-        }
+        // Past the last rung the highlight wraps to the first one and the window
+        // follows it, exactly as in the role dialogs (c-1).
+        dialog.selector.select_index(19);
+        assert_eq!(dialog.selector.visible_start(visible_height), 15);
+        dialog.selector.select_next();
+        assert_eq!(dialog.selector.selected_index(), 0);
+        assert_eq!(dialog.selector.visible_start(visible_height), 0);
+
+        dialog.selector.select_prev();
         assert_eq!(dialog.selector.selected_index(), 19);
-        assert_eq!(dialog.selector.scroll_offset(), 15);
-
-        dialog.selector.select_prev(visible_height);
-        assert_eq!(dialog.selector.selected_index(), 18);
-        assert_eq!(dialog.selector.scroll_offset(), 15);
-
-        for _ in 0..5 {
-            dialog.selector.select_prev(visible_height);
-        }
-        assert_eq!(dialog.selector.selected_index(), 13);
-        assert_eq!(dialog.selector.scroll_offset(), 13);
+        assert_eq!(dialog.selector.visible_start(visible_height), 15);
     }
 
     #[test]
@@ -2016,11 +1913,8 @@ mod tests {
     #[test]
     fn test_open_model_dialog_presents_primary_entries() {
         let mut state = test_state();
-        let primary_entry = tauqe_protocol::ModelEntry::new(
-            ModelRef::openrouter("primary-model"),
-            None,
-            Some("Primary Alias".to_string()),
-        );
+        let primary_entry =
+            tauqe_protocol::ModelEntry::new(ModelRef::openrouter("primary-model"), None);
         state.model_choice = ModelChoice {
             selection: ModelSelection::Role(ModelRole::Primary),
             roles: Some(ModelRolesSummary {
@@ -2039,40 +1933,140 @@ mod tests {
 
         assert!(state.open_model_dialog());
         let dialog = state.selection_dialog.expect("dialog should be opened");
-        assert_eq!(dialog.kind, SelectionDialogKind::PrimaryModels);
-        assert_eq!(dialog.items.len(), 1);
-        assert_eq!(dialog.items[0], SelectionItem::Primary(primary_entry));
+        assert_eq!(dialog.selector.len(), 1);
+        assert_eq!(dialog.selector.selected_entry(), Some(&primary_entry));
         assert_eq!(dialog.selector.selected_index(), 0);
     }
 
+    /// The picker is built strictly from `[models.primary]`: entries configured
+    /// for another role never leak in, and no provider-catalog rung exists to
+    /// widen the list beyond the configured ladder (c-1, c-2).
     #[test]
-    fn test_open_model_dialog_appends_catalog_escape_hatch() {
+    fn test_open_model_dialog_presents_only_the_primary_ladder() {
+        let primary = vec![
+            tauqe_protocol::ModelEntry::new(ModelRef::openrouter("primary-a"), None),
+            tauqe_protocol::ModelEntry::new(
+                ModelRef::openrouter("primary-b"),
+                Some(ReasoningEffort::High),
+            ),
+        ];
         let mut state = test_state();
-        let primary_entry =
-            tauqe_protocol::ModelEntry::new(ModelRef::openrouter("primary-model"), None, None);
-        state.available_models = vec![ModelRef::openrouter("catalog-model")];
         state.model_choice = ModelChoice {
             selection: ModelSelection::Role(ModelRole::Primary),
             roles: Some(ModelRolesSummary {
                 scribe: ModelRef::openrouter("scribe-model"),
                 coder: ModelRef::openrouter("coder-model"),
                 architect: ModelRef::openrouter("architect-model"),
-                primary: ModelRef::openrouter("primary-model"),
+                primary: ModelRef::openrouter("primary-a"),
                 reviewer: ModelRef::openrouter("reviewer-model"),
                 efforts: None,
                 entries: Some(tauqe_protocol::ModelRolesEntries {
-                    primary: vec![primary_entry.clone()],
+                    primary: primary.clone(),
+                    coder: vec![tauqe_protocol::ModelEntry::new(
+                        ModelRef::openrouter("coder-model"),
+                        None,
+                    )],
                     ..Default::default()
                 }),
             }),
         };
 
         assert!(state.open_model_dialog());
-        let dialog = state.selection_dialog.expect("dialog should be opened");
-        assert_eq!(dialog.kind, SelectionDialogKind::PrimaryModels);
-        assert_eq!(dialog.items.len(), 2);
-        assert_eq!(dialog.items[0], SelectionItem::Primary(primary_entry));
-        assert_eq!(dialog.items[1], SelectionItem::Catalog);
+        let mut dialog = state.selection_dialog.expect("dialog should be opened");
+
+        // Exactly the primary rungs are selectable: the coder entry configured
+        // alongside them is not a picker row.
+        assert_eq!(dialog.selector.len(), primary.len());
+        for (index, entry) in primary.iter().enumerate() {
+            dialog.selector.select_index(index);
+            assert_eq!(dialog.selector.selected_entry(), Some(entry));
+        }
+    }
+
+    /// The picker presents strictly the configured primary tiers: an empty list
+    /// keeps it closed and reports the condition instead of offering an
+    /// alternative model source (c-2).
+    #[test]
+    fn test_open_model_dialog_reports_an_empty_primary_list() {
+        let mut state = test_state();
+
+        assert!(!state.open_model_dialog());
+        assert!(
+            state.selection_dialog.is_none(),
+            "the picker must not open without configured primary tiers"
+        );
+        let notif = state
+            .active_notification()
+            .expect("the closed picker explains why");
+        assert_eq!(notif.level, NotificationLevel::Warning);
+        assert!(notif.text.contains("[models.primary]"));
+    }
+
+    /// Reopening the picker highlights the rung the developer picked, not the
+    /// first entry that happens to share its model (c-2).
+    #[test]
+    fn test_open_model_dialog_highlights_the_selected_tier() {
+        let model = ModelRef::openrouter("primary-model");
+        let weak = tauqe_protocol::ModelEntry::new(model.clone(), Some(ReasoningEffort::Low));
+        let strong = tauqe_protocol::ModelEntry::new(model.clone(), Some(ReasoningEffort::High));
+
+        let mut state = test_state();
+        state.model_choice = ModelChoice {
+            selection: ModelSelection::Role(ModelRole::Primary),
+            roles: Some(ModelRolesSummary {
+                scribe: ModelRef::openrouter("scribe-model"),
+                coder: ModelRef::openrouter("coder-model"),
+                architect: ModelRef::openrouter("architect-model"),
+                primary: model.clone(),
+                reviewer: ModelRef::openrouter("reviewer-model"),
+                efforts: None,
+                entries: Some(tauqe_protocol::ModelRolesEntries {
+                    primary: vec![weak.clone(), strong.clone()],
+                    ..Default::default()
+                }),
+            }),
+        };
+
+        // The second rung of the same model owns the highlight, so the depth on
+        // screen never disagrees with the depth that will be sent.
+        state.model_choice.selection = ModelSelection::Tier {
+            model: model.clone(),
+            effort: Some(ReasoningEffort::High),
+        };
+        assert!(state.open_model_dialog());
+        let dialog = state
+            .selection_dialog
+            .clone()
+            .expect("dialog should be opened");
+        assert_eq!(dialog.selector.selected_index(), 1);
+        assert_eq!(dialog.selector.selected_entry(), Some(&strong));
+
+        // The first rung stays reachable for the same resolved model.
+        state.model_choice.selection = ModelSelection::Tier {
+            model: model.clone(),
+            effort: Some(ReasoningEffort::Low),
+        };
+        assert!(state.open_model_dialog());
+        let dialog = state
+            .selection_dialog
+            .clone()
+            .expect("dialog should be opened");
+        assert_eq!(dialog.selector.selected_index(), 0);
+        assert_eq!(dialog.selector.selected_entry(), Some(&weak));
+
+        // A rung whose depth left the configuration still highlights its model
+        // instead of falling back to an unrelated entry.
+        state.model_choice.selection = ModelSelection::Tier {
+            model: model.clone(),
+            effort: Some(ReasoningEffort::Max),
+        };
+        assert!(state.open_model_dialog());
+        let dialog = state
+            .selection_dialog
+            .clone()
+            .expect("dialog should be opened");
+        assert_eq!(dialog.selector.selected_index(), 0);
+        assert_eq!(dialog.selector.selected_entry(), Some(&weak));
     }
 
     #[test]
@@ -2147,6 +2141,26 @@ mod tests {
         assert_eq!(st.active_modal(), Some(ActiveModal::ClearHorizonFinal));
 
         st.confirm_clear_horizon_final = None;
+        assert_eq!(st.active_modal(), None);
+    }
+
+    /// Destructive plan deletion keeps the two-tier model: the escalated target
+    /// outranks the first tier, so the stricter confirmation always owns the
+    /// keyboard (c-1).
+    #[test]
+    fn test_delete_plan_final_modal_priority() {
+        let mut st = test_state();
+
+        st.confirm_delete_plan = Some("plan-1".to_string());
+        assert_eq!(st.active_modal(), Some(ActiveModal::DeletePlan));
+
+        st.confirm_delete_plan_final = Some("plan-1".to_string());
+        assert_eq!(st.active_modal(), Some(ActiveModal::DeletePlanFinal));
+
+        st.confirm_delete_plan = None;
+        assert_eq!(st.active_modal(), Some(ActiveModal::DeletePlanFinal));
+
+        st.confirm_delete_plan_final = None;
         assert_eq!(st.active_modal(), None);
     }
 

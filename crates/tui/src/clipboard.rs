@@ -5,6 +5,9 @@ use std::sync::mpsc;
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
+use base64::engine::general_purpose::STANDARD;
+use base64::Engine;
+
 /// Upper bound (250 ms) for a single native clipboard operation.
 ///
 /// `arboard` talks to an external X11/Wayland/OS clipboard process that can
@@ -358,16 +361,16 @@ pub fn copy_to_clipboard(text: &str) -> CopyResult {
 
     let should_send_osc52 = !native_ok || in_ssh;
     let mut osc52_ok = false;
-    if should_send_osc52 && clean_text.len() <= MAX_OSC52_BYTES {
-        let b64 = base64_encode(clean_text.as_bytes());
-        let osc52 = format!("\x1b]52;c;{b64}\x07\x1b]52;p;{b64}\x07");
-        // Wrap in a DCS passthrough frame so `tmux` forwards the OSC 52 sequence
-        // to the host terminal; unwrapped, the multiplexer discards it and an
-        // SSH session loses its only clipboard mechanism.
-        let payload = crate::terminal::wrap_osc_payload(&osc52);
-        let mut out = std::io::stdout();
-        if out.write_all(&payload).is_ok() && out.flush().is_ok() {
-            osc52_ok = true;
+    if should_send_osc52 {
+        if let Some(osc52) = osc52_sequences(clean_text) {
+            // Wrap in a DCS passthrough frame so `tmux` forwards the OSC 52
+            // sequence to the host terminal; unwrapped, the multiplexer discards
+            // it and an SSH session loses its only clipboard mechanism.
+            let payload = crate::terminal::wrap_osc_payload(&osc52);
+            let mut out = std::io::stdout();
+            if out.write_all(&payload).is_ok() && out.flush().is_ok() {
+                osc52_ok = true;
+            }
         }
     }
 
@@ -393,6 +396,20 @@ pub fn copy_to_clipboard(text: &str) -> CopyResult {
         update_tracker_on_write(clean_text);
     }
     result
+}
+
+/// Builds the OSC 52 sequences that set the system and primary selections to
+/// `text`, or `None` when the payload would exceed [`MAX_OSC52_BYTES`].
+///
+/// The payload is encoded with the standard Base64 alphabet by the ecosystem
+/// codec, so the encoding of a terminal clipboard sequence is never re-derived
+/// here (Conventions §1.6).
+fn osc52_sequences(text: &str) -> Option<String> {
+    if text.len() > MAX_OSC52_BYTES {
+        return None;
+    }
+    let encoded = STANDARD.encode(text.as_bytes());
+    Some(format!("\x1b]52;c;{encoded}\x07\x1b]52;p;{encoded}\x07"))
 }
 
 /// Writes `text` to the native OS clipboard, re-initializing the shared handle
@@ -454,29 +471,6 @@ fn mirror_into_primary(clipboard: &mut arboard::Clipboard, text: &str) {
     not(target_os = "emscripten")
 )))]
 fn mirror_into_primary(_clipboard: &mut arboard::Clipboard, _text: &str) {}
-
-fn base64_encode(data: &[u8]) -> String {
-    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
-    for chunk in data.chunks(3) {
-        let b0 = chunk[0];
-        let b1 = chunk.get(1).copied().unwrap_or(0);
-        let b2 = chunk.get(2).copied().unwrap_or(0);
-        out.push(TABLE[(b0 >> 2) as usize] as char);
-        out.push(TABLE[(((b0 & 0x03) << 4) | (b1 >> 4)) as usize] as char);
-        if chunk.len() > 1 {
-            out.push(TABLE[(((b1 & 0x0F) << 2) | (b2 >> 6)) as usize] as char);
-        } else {
-            out.push('=');
-        }
-        if chunk.len() > 2 {
-            out.push(TABLE[(b2 & 0x3F) as usize] as char);
-        } else {
-            out.push('=');
-        }
-    }
-    out
-}
 
 #[cfg(test)]
 mod tests {
@@ -639,12 +633,30 @@ mod tests {
         );
     }
 
+    /// The OSC 52 payload carries the standard Base64 alphabet, padding
+    /// included, because that is what a terminal decodes (Conventions §1.6).
     #[test]
-    fn test_base64_encode() {
-        assert_eq!(base64_encode(b""), "");
-        assert_eq!(base64_encode(b"f"), "Zg==");
-        assert_eq!(base64_encode(b"fo"), "Zm8=");
-        assert_eq!(base64_encode(b"foo"), "Zm9v");
-        assert_eq!(base64_encode(b"Hello, World!"), "SGVsbG8sIFdvcmxkIQ==");
+    fn test_osc52_sequences_encode_with_standard_base64() {
+        for (text, encoded) in [
+            ("", ""),
+            ("f", "Zg=="),
+            ("fo", "Zm8="),
+            ("foo", "Zm9v"),
+            ("Hello, World!", "SGVsbG8sIFdvcmxkIQ=="),
+        ] {
+            assert_eq!(
+                osc52_sequences(text),
+                Some(format!("\x1b]52;c;{encoded}\x07\x1b]52;p;{encoded}\x07")),
+                "the OSC 52 payload for {text:?} must use standard Base64"
+            );
+        }
+    }
+
+    /// A payload above the terminal size bound is skipped instead of being
+    /// truncated into an invalid escape sequence.
+    #[test]
+    fn test_osc52_sequences_skip_oversized_payloads() {
+        assert!(osc52_sequences(&"a".repeat(MAX_OSC52_BYTES)).is_some());
+        assert!(osc52_sequences(&"a".repeat(MAX_OSC52_BYTES + 1)).is_none());
     }
 }

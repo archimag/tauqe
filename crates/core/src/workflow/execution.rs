@@ -22,6 +22,8 @@ use crate::providers::{LlmProvider, StreamEvent};
 use crate::workflow::policy::ApplyPolicy;
 
 use super::WorkflowExecutionResult;
+use crate::workflow::discovery::DiscoveryLimits;
+use crate::workflow::fsm::guard::rollback_or_log;
 use crate::workflow::fsm::{begin_session_turn, record_session_response, run_fsm_turn_body};
 
 /// Execution options and token budgets for edit workflows.
@@ -38,6 +40,12 @@ pub struct WorkflowOptions {
     /// When disabled, the prompt carries the compact directory outline instead,
     /// so the model still knows where subsystems live without a full map.
     pub include_repo_map: bool,
+    /// Operational caps the Discovery phase applies to one round.
+    pub discovery_limits: DiscoveryLimits,
+    /// Maximum characters of one project command stream reported back to the model.
+    pub max_feedback_chars: usize,
+    /// Maximum characters of a turn scratchpad block before safe truncation.
+    pub max_scratchpad_chars: usize,
     pub history_model: ModelRef,
     pub auto_level_up: bool,
     pub models_config: crate::config::ModelsConfig,
@@ -66,6 +74,9 @@ impl Default for WorkflowOptions {
             history_tail_turns: crate::history::DEFAULT_TAIL_TURNS_COUNT,
             repomap_token_budget: crate::repomap::DEFAULT_REPOMAP_TOKEN_BUDGET,
             include_repo_map: true,
+            discovery_limits: DiscoveryLimits::default(),
+            max_feedback_chars: crate::config::DEFAULT_MAX_FEEDBACK_CHARS,
+            max_scratchpad_chars: crate::config::DEFAULT_MAX_SCRATCHPAD_CHARS,
             history_model: ModelRef::openrouter(crate::config::BUILTIN_DEFAULT_SCRIBE_MODEL),
             auto_level_up: false,
             models_config: crate::config::ModelsConfig::default(),
@@ -80,10 +91,7 @@ impl Default for WorkflowOptions {
 impl WorkflowOptions {
     /// Constructs workflow options from the unified application configuration.
     pub fn from_app_config(config: &crate::config::AppConfig) -> Self {
-        let max_retries = config
-            .toolchain
-            .max_retries
-            .unwrap_or(config.develop.max_retries);
+        let max_retries = config.develop.max_retries;
         Self {
             max_retries,
             max_discovery_rounds: config.context.max_discovery_rounds,
@@ -92,6 +100,9 @@ impl WorkflowOptions {
             history_tail_turns: config.history.tail_turns,
             repomap_token_budget: config.context.repomap_token_budget,
             include_repo_map: config.context.include_repo_map,
+            discovery_limits: DiscoveryLimits::from_context_config(&config.context),
+            max_feedback_chars: config.context.max_feedback_chars,
+            max_scratchpad_chars: config.context.max_scratchpad_chars,
             history_model: config.history_model(),
             auto_level_up: config.models.auto_level_up,
             models_config: config.models.clone(),
@@ -235,11 +246,11 @@ impl ExecutionMode for SingleExecution {
             let turn = match turn_res {
                 Ok(turn) => turn,
                 Err(err) => {
-                    let _ = policy.rollback(context_manager.repo_root()).await;
-                    // Auto-layer cleanup performs filesystem metadata checks, so
-                    // the sweep runs off the async executor thread.
+                    rollback_or_log(policy, context_manager.repo_root()).await;
+                    // The sweep only drops context paths that no longer exist on
+                    // disk and runs off the async executor thread. The auto layer
+                    // survives a failed attempt so escalation inherits it.
                     crate::blocking::run_blocking(|| {
-                        context_manager.clear_auto();
                         context_manager.prune_missing_files();
                     });
                     if let Some(id) = turn_id {
@@ -308,7 +319,20 @@ impl ExecutionMode for SingleExecution {
                     let provider_ready =
                         next_m.provider == current_model.provider || new_provider.is_some();
                     if provider_ready {
-                        let _ = policy.rollback(context_manager.repo_root()).await;
+                        // A failed rollback must stay observable: the next
+                        // attempt starts from a tree that may still hold the
+                        // failed writes, so the developer is warned before the
+                        // stronger tier begins.
+                        if !rollback_or_log(policy, context_manager.repo_root()).await {
+                            let notice = concat!(
+                                "\n\n> ⚠️ **Rollback Failed:** ",
+                                "The failed attempt could not be reverted; ",
+                                "the working tree may still hold its writes. ",
+                                "Escalating anyway...\n\n"
+                            )
+                            .to_string();
+                            let _ = stream_tx.send(StreamEvent::TextDelta(notice)).await;
+                        }
                         // Pruning missing files performs filesystem metadata
                         // checks, so it runs off the async executor thread.
                         crate::blocking::run_blocking(|| context_manager.prune_missing_files());
@@ -345,7 +369,7 @@ impl ExecutionMode for SingleExecution {
                             .send(StreamEvent::ModelEscalated {
                                 model: next_m.clone(),
                                 role: current_role,
-                                alias: next_tier.alias.clone(),
+                                alias: None,
                                 effort: next_tier.effort,
                                 tier: next_idx,
                             })
@@ -375,12 +399,27 @@ impl ExecutionMode for SingleExecution {
             } else {
                 record_session_response(history_manager, &turn);
             }
+            // A plan mutation the storage engine refused never fails the turn,
+            // but it is a protocol-level rejection the developer must see: the
+            // reason is streamed as a warning banner, and the history record
+            // written above hands it to the model's next explicit round.
+            if let Some(notice) = turn.plan_rejection_notice() {
+                tracing::warn!("{}", notice);
+                let _ = stream_tx
+                    .send(StreamEvent::TextDelta(format!(
+                        "\n\n---\n\u{26a0}\u{fe0f} {}\n\n",
+                        notice
+                    )))
+                    .await;
+            }
             return Ok(WorkflowExecutionResult {
                 result: turn.result,
                 assistant_text: turn.assistant_text,
                 blocked: turn.blocked,
                 skip_reason: turn.skip_reason,
+                abort: turn.abort,
                 plan_saved: turn.plan_saved,
+                plan_errors: turn.plan_errors,
             });
         }
     }
@@ -388,15 +427,20 @@ impl ExecutionMode for SingleExecution {
 
 #[cfg(test)]
 mod tests {
-    use tauqe_protocol::{ContextAccess, ModelRef, ModelResult, ProviderKind, ReasoningEffort};
+    use std::path::Path;
+    use tauqe_protocol::{
+        ContextAccess, EditOperation, EditProposal, ModelRef, ModelResult, ProviderKind,
+        ReasoningEffort,
+    };
     use tokio::sync::{mpsc, watch};
 
     use crate::context::ContextManager;
+    use crate::edits::{StageEditsResult, StagedEditsState};
     use crate::history::HistoryManager;
     use crate::prompt::protocol::PromptProtocol;
     use crate::providers::mock::{MockLlmProvider, MockResponse};
     use crate::providers::{ChatMessage, LlmProvider, ResponseFormat, StreamEvent};
-    use crate::workflow::policy::DirectApplyPolicy;
+    use crate::workflow::policy::{ApplyPolicy, DirectApplyPolicy};
     use crate::workflow::WorkflowOptions;
 
     use super::{next_coder_tier, ExecutionMode, SingleExecution};
@@ -446,8 +490,11 @@ mod tests {
 
     #[test]
     fn next_coder_tier_deepens_effort_then_model_and_saturates() {
-        let config: crate::config::ModelsConfig = toml::from_str(
+        // Role lists are decoded through the application configuration, so the
+        // test exercises the same catalog resolution a project config uses.
+        let config: crate::config::AppConfig = toml::from_str(
             r#"
+[models]
 primary = ["openrouter:base/primary"]
 coder = [
     "openrouter:base/model",
@@ -457,6 +504,7 @@ coder = [
 "#,
         )
         .expect("parse coder ladder");
+        let config = config.models;
 
         let (first_idx, first) = next_coder_tier(&config, 0).expect("deepen reasoning first");
         assert_eq!(first_idx, 1);
@@ -556,8 +604,12 @@ coder = [
     }
 
     fn coder_ladder_options() -> WorkflowOptions {
-        let models_config: crate::config::ModelsConfig = toml::from_str(
+        // A role list resolves through the application configuration, exactly
+        // like a project `tauqe.toml`, so the fixture keeps the real decoding
+        // path instead of hand-building the resolved struct.
+        let config: crate::config::AppConfig = toml::from_str(
             r#"
+[models]
 primary = ["openrouter:base/primary"]
 coder = [
     "openrouter:base/model",
@@ -566,6 +618,7 @@ coder = [
 "#,
         )
         .expect("parse coder ladder");
+        let models_config = config.models;
         WorkflowOptions {
             auto_level_up: true,
             initial_selection: Some(tauqe_protocol::ModelSelection::Role(
@@ -573,6 +626,54 @@ coder = [
             )),
             models_config,
             ..WorkflowOptions::default()
+        }
+    }
+
+    /// Policy delegating every phase to the direct policy while its rollback
+    /// always fails, to exercise the durability seam of the escalation path.
+    #[derive(Default)]
+    struct FailingRollbackPolicy {
+        inner: DirectApplyPolicy,
+    }
+
+    #[async_trait::async_trait]
+    impl ApplyPolicy for FailingRollbackPolicy {
+        async fn staging(
+            &mut self,
+            repo_root: &Path,
+            context_manager: &ContextManager,
+            edits: &[EditOperation],
+            staged_state: Option<&StagedEditsState>,
+        ) -> StageEditsResult {
+            self.inner
+                .staging(repo_root, context_manager, edits, staged_state)
+                .await
+        }
+
+        async fn apply_temporary(
+            &mut self,
+            repo_root: &Path,
+            context_manager: &mut ContextManager,
+            proposal: &EditProposal,
+        ) -> anyhow::Result<Vec<String>> {
+            self.inner
+                .apply_temporary(repo_root, context_manager, proposal)
+                .await
+        }
+
+        async fn apply_final(
+            &mut self,
+            repo_root: &Path,
+            changed_files: &[String],
+            summary: &str,
+        ) -> anyhow::Result<Option<String>> {
+            self.inner
+                .apply_final(repo_root, changed_files, summary)
+                .await
+        }
+
+        async fn rollback(&mut self, _repo_root: &Path) -> anyhow::Result<bool> {
+            Err(anyhow::anyhow!("simulated rollback failure"))
         }
     }
 
@@ -632,6 +733,119 @@ coder = [
         assert_eq!(
             std::fs::read_to_string(repo_root.join("target.rs")).unwrap(),
             "pub fn compute() -> i32 { 42 }\n"
+        );
+    }
+
+    /// A plan mutation the storage engine refuses is a diagnostic, not a silent
+    /// journal trace: the reason reaches the recorded history (so the next
+    /// round's prompt carries it), the developer-facing turn stream, and the turn
+    /// result. The accepted mutation above proves the diagnostic stays absent
+    /// when the payload is valid.
+    #[tokio::test]
+    async fn rejected_plan_mutation_reaches_the_history_and_the_turn_stream() {
+        let (_dir, repo_root) = repo_with_target();
+        let mut context = ContextManager::new(repo_root.clone());
+        context
+            .add_file("target.rs", ContextAccess::Editable)
+            .expect("add target to context");
+        let mut history = HistoryManager::new(repo_root.clone());
+
+        let protocol = crate::prompt::xml::XmlPromptProtocol;
+        // An established plan is protected from Develop-mode mutation: only the
+        // Discussion mode may modify it, so the storage engine refuses this
+        // payload and its refusal must stay visible to the model and to the
+        // developer.
+        let existing = tauqe_protocol::Plan {
+            id: "existing-plan".to_string(),
+            title: "Existing Plan".to_string(),
+            ..Default::default()
+        };
+        crate::plan::storage::PlanStorage::save_plan(&repo_root, &existing)
+            .expect("seed the established plan");
+
+        let rejected = concat!(
+            "Drafting the plan.\n",
+            "<plan action=\"save\" id=\"existing-plan\" title=\"Rewritten\">\n",
+            "  <concept>\n",
+            "    <concept_item id=\"c-1\" title=\"Invariant\" />\n",
+            "  </concept>\n",
+            "  <item id=\"1\" title=\"First step\" />\n",
+            "</plan>",
+        );
+        let provider = MockLlmProvider::scripted([MockResponse::text(rejected)]);
+        let model = ModelRef::openrouter("mock/model");
+        let (tx, mut rx) = mpsc::channel(256);
+        let (_cancel_tx, cancel_rx) = watch::channel(false);
+        let mut policy = DirectApplyPolicy::new();
+
+        // Drain concurrently: the turn drops the sender as it settles.
+        let collector = tokio::spawn(async move {
+            let mut streamed = String::new();
+            while let Some(event) = rx.recv().await {
+                if let StreamEvent::TextDelta(delta) = event {
+                    streamed.push_str(&delta);
+                }
+            }
+            streamed
+        });
+
+        let exec = SingleExecution::new(WorkflowOptions::default());
+        let execution = exec
+            .execute(
+                &mut policy,
+                "Plan the work",
+                tauqe_protocol::TurnIntent::InteractiveRepl,
+                &provider,
+                &model,
+                &mut context,
+                &mut history,
+                &protocol,
+                tx,
+                cancel_rx,
+            )
+            .await
+            .expect("the turn executes");
+
+        assert_eq!(
+            execution.plan_errors.len(),
+            1,
+            "{:?}",
+            execution.plan_errors
+        );
+        assert!(
+            execution.plan_errors[0].contains("Develop mode"),
+            "the reason must be carried on the turn result: {:?}",
+            execution.plan_errors
+        );
+
+        let streamed = collector.await.expect("the collector joins");
+        assert!(
+            streamed.contains("Plan mutation rejected"),
+            "the developer must see the rejection in the turn stream: {streamed:?}"
+        );
+
+        let messages: Vec<String> = history
+            .get_entries()
+            .expect("the history reads")
+            .iter()
+            .filter_map(|entry| match entry {
+                crate::history::HistoryEntry::Response { message, .. } => Some(message.clone()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            messages
+                .iter()
+                .any(|message| message.contains("Plan mutation rejected")
+                    && message.contains("Develop mode")),
+            "the rejection must reach the recorded history: {messages:?}"
+        );
+        assert!(
+            history
+                .format_history_tag()
+                .expect("the history tag renders")
+                .contains("Plan mutation rejected"),
+            "the next round's prompt must carry the rejection"
         );
     }
 
@@ -763,6 +977,84 @@ coder = [
             provider.requests().len(),
             1,
             "a terminal success must not trigger escalation"
+        );
+    }
+
+    #[tokio::test]
+    async fn escalation_surfaces_a_failed_rollback_in_the_stream() {
+        let (_dir, repo_root) = repo_with_target();
+        let mut context = ContextManager::new(repo_root.clone());
+        context
+            .add_file("target.rs", ContextAccess::Editable)
+            .expect("add target to context");
+        let mut history = HistoryManager::new(repo_root.clone());
+
+        let protocol = crate::prompt::xml::XmlPromptProtocol;
+        let protocol = protocol.with_turn_marker(MARKER).unwrap();
+
+        let edit = format!(
+            "<tauqe_edits_{MARKER} summary=\"Set compute to 42\">\n<edit_{MARKER} path=\"target.rs\">\n<search_{MARKER}>\npub fn compute() -> i32 {{ 0 }}\n</search_{MARKER}>\n<replace_{MARKER}>\npub fn compute() -> i32 {{ 42 }}\n</replace_{MARKER}>\n</edit_{MARKER}>\n</tauqe_edits_{MARKER}>"
+        );
+        // The first reply is a bare answer, so the ladder escalates — and the
+        // rollback that precedes the retry fails.
+        let provider = MockLlmProvider::scripted([
+            MockResponse::text("I need more information before changing the code."),
+            MockResponse::text(edit),
+        ]);
+        let model = ModelRef::openrouter("base/model");
+        let (tx, mut rx) = mpsc::channel(256);
+        let (_cancel_tx, cancel_rx) = watch::channel(false);
+        let mut policy = FailingRollbackPolicy::default();
+
+        // Drain the stream concurrently: the sender is dropped with the turn, so
+        // collecting only afterwards would race the channel shutdown.
+        let collector = tokio::spawn(async move {
+            let mut events = Vec::new();
+            while let Some(event) = rx.recv().await {
+                events.push(event);
+            }
+            events
+        });
+
+        let exec = SingleExecution::new(coder_ladder_options());
+        let execution = exec
+            .execute(
+                &mut policy,
+                "Set compute to return 42",
+                tauqe_protocol::TurnIntent::InteractiveRepl,
+                &provider,
+                &model,
+                &mut context,
+                &mut history,
+                protocol.as_ref(),
+                tx,
+                cancel_rx,
+            )
+            .await
+            .expect("escalation survives a failed rollback");
+
+        match execution.result {
+            ModelResult::Edit { outcome, .. } => {
+                assert!(outcome.applied, "the escalated attempt must still apply");
+            }
+            other => panic!("expected applied edits after a failed rollback, got {other:?}"),
+        }
+        let events = collector.await.expect("event collector joins");
+        let streamed: String = events
+            .iter()
+            .filter_map(|event| match event {
+                StreamEvent::TextDelta(text) => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            streamed.contains("Rollback Failed"),
+            "a failed rollback must surface in the streamed diagnostics: {streamed}"
+        );
+        assert_eq!(
+            provider.requests().len(),
+            2,
+            "the escalation must still run the stronger tier after the rollback failure"
         );
     }
 }

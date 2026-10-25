@@ -31,6 +31,7 @@ fn test_plan_refine_types_serde_and_helpers() {
         created_at: 10,
         updated_at: 20,
         architect: None,
+        last_replanned_step: None,
         concept: vec![],
         items: vec![],
     };
@@ -62,6 +63,40 @@ fn test_plan_refine_types_serde_and_helpers() {
     assert!(json_blocked.contains("Contradiction in requirements"));
     let de_blocked: PlanRefineResult = serde_json::from_str(&json_blocked).unwrap();
     assert_eq!(de_blocked, blocked_res);
+}
+
+/// The legacy `id` spelling of `plan/refine` lives on the DTO, so the wire
+/// contract stays the single parser for every accepted field name, and a
+/// malformed field fails the typed parse instead of being dropped by a
+/// call-site fallback.
+#[test]
+fn test_plan_refine_params_accepts_legacy_id_alias() {
+    let params: PlanRefineParams = serde_json::from_value(serde_json::json!({
+        "id": "legacy-plan",
+        "model": "architect",
+        "instructions": "Decompose"
+    }))
+    .unwrap();
+    assert_eq!(params.plan_id, "legacy-plan");
+    assert_eq!(
+        params.model,
+        Some(ModelSelection::Role(ModelRole::Architect))
+    );
+    assert_eq!(params.instructions.as_deref(), Some("Decompose"));
+
+    assert!(
+        serde_json::from_value::<PlanRefineParams>(serde_json::json!({ "plan_id": 123 })).is_err()
+    );
+}
+
+/// The client requests the active plan with an empty object, so the DTO —
+/// not a server-side fallback — defines the empty payload as "no target id",
+/// while a malformed id still fails the typed parse.
+#[test]
+fn test_plan_get_params_defaults_the_absent_id() {
+    let params: PlanGetParams = serde_json::from_value(serde_json::json!({})).unwrap();
+    assert_eq!(params.id, "");
+    assert!(serde_json::from_value::<PlanGetParams>(serde_json::json!({ "id": 123 })).is_err());
 }
 
 #[test]
@@ -108,6 +143,7 @@ fn test_concept_item_and_two_section_plan_serde() {
         created_at: 100,
         updated_at: 200,
         architect: None,
+        last_replanned_step: None,
         concept,
         items: vec![step],
     };
@@ -198,6 +234,7 @@ fn test_plan_stats_and_summary() {
         created_at: 1700000000,
         updated_at: 1700000010,
         architect: None,
+        last_replanned_step: None,
         concept: vec![],
         items: vec![
             item(
@@ -233,6 +270,7 @@ fn test_count_stats_reports_only_leaves() {
         created_at: 1,
         updated_at: 1,
         architect: None,
+        last_replanned_step: None,
         concept: vec![],
         items: vec![
             item(
@@ -265,6 +303,7 @@ fn test_count_stats_excludes_cancelled_leaves_and_agrees_with_done_status() {
         created_at: 1,
         updated_at: 1,
         architect: None,
+        last_replanned_step: None,
         concept: vec![],
         items: vec![
             item("1", "Done step", PlanItemStatus::Done, vec![]),
@@ -293,6 +332,7 @@ fn test_count_stats_excludes_cancelled_leaves_in_mixed_plan() {
         created_at: 1,
         updated_at: 1,
         architect: None,
+        last_replanned_step: None,
         concept: vec![],
         items: vec![
             item("1", "Done step", PlanItemStatus::Done, vec![]),
@@ -317,6 +357,7 @@ fn test_count_stats_all_cancelled_reports_zero_and_cancelled_status() {
         created_at: 1,
         updated_at: 1,
         architect: None,
+        last_replanned_step: None,
         concept: vec![],
         items: vec![
             item("1", "Cancelled A", PlanItemStatus::Cancelled, vec![]),
@@ -340,6 +381,7 @@ fn test_evaluate_scope_reports_only_leaves_for_discussion() {
         created_at: 1,
         updated_at: 1,
         architect: None,
+        last_replanned_step: None,
         concept: vec![],
         items: vec![item(
             "1",
@@ -389,6 +431,7 @@ fn test_evaluate_scope_dependency_uses_derived_container_status() {
         created_at: 1,
         updated_at: 1,
         architect: None,
+        last_replanned_step: None,
         concept: vec![],
         items: vec![
             item(
@@ -422,6 +465,7 @@ fn test_plan_status_computation() {
         created_at: 1,
         updated_at: 1,
         architect: None,
+        last_replanned_step: None,
         concept: vec![],
         items: vec![
             item("1", "Step 1", PlanItemStatus::Todo, vec![]),
@@ -466,6 +510,7 @@ fn test_plan_item_leaf_and_refresh_parent_statuses() {
         created_at: 1,
         updated_at: 1,
         architect: None,
+        last_replanned_step: None,
         concept: vec![],
         items: vec![item(
             "parent",
@@ -538,6 +583,7 @@ fn test_plan_normalize_leaf_files() {
         created_at: 1,
         updated_at: 1,
         architect: None,
+        last_replanned_step: None,
         concept: vec![],
         items: vec![top, leaf],
     };
@@ -592,6 +638,7 @@ fn test_normalize_leaf_files_dedups_readonly_by_canonical_path() {
         created_at: 1,
         updated_at: 1,
         architect: None,
+        last_replanned_step: None,
         concept: vec![],
         items: vec![leaf],
     };
@@ -611,6 +658,7 @@ fn test_plan_evaluate_scope() {
         created_at: 1,
         updated_at: 1,
         architect: None,
+        last_replanned_step: None,
         concept: vec![],
         items: vec![
             item(
@@ -691,6 +739,7 @@ fn test_plan_evaluate_scope_dependencies() {
         created_at: 1,
         updated_at: 1,
         architect: None,
+        last_replanned_step: None,
         concept: vec![],
         items: vec![first, second, third],
     };
@@ -734,6 +783,7 @@ fn test_plan_evaluate_scope_surfaces_blocked_leaves() {
         created_at: 1,
         updated_at: 1,
         architect: None,
+        last_replanned_step: None,
         concept: vec![],
         items: vec![
             item("1", "Stuck A", PlanItemStatus::Blocked, vec![]),
@@ -758,6 +808,7 @@ fn test_plan_evaluate_scope_surfaces_blocked_leaves() {
         created_at: 1,
         updated_at: 1,
         architect: None,
+        last_replanned_step: None,
         concept: vec![],
         items: vec![
             item("1", "Ready", PlanItemStatus::Todo, vec![]),
@@ -780,6 +831,7 @@ fn test_plan_evaluate_scope_surfaces_blocked_leaves() {
         created_at: 1,
         updated_at: 1,
         architect: None,
+        last_replanned_step: None,
         concept: vec![],
         items: vec![item(
             "g",
@@ -809,6 +861,7 @@ fn test_plan_update_item_status_matches_ids_case_insensitively() {
         created_at: 1,
         updated_at: 1,
         architect: None,
+        last_replanned_step: None,
         concept: vec![],
         items: vec![item("Step-1", "Step", PlanItemStatus::Todo, vec![])],
     };
@@ -831,6 +884,7 @@ fn test_plan_update_item_status_rejects_container_targets() {
         created_at: 1,
         updated_at: 1,
         architect: None,
+        last_replanned_step: None,
         concept: vec![],
         items: vec![item(
             "g",
@@ -865,6 +919,7 @@ fn test_plan_has_started_or_completed_steps() {
             created_at: 1,
             updated_at: 1,
             architect: None,
+            last_replanned_step: None,
             concept,
             items,
         }
@@ -957,6 +1012,7 @@ fn test_plan_to_markdown() {
         created_at: 1700000000,
         updated_at: 1700000010,
         architect: None,
+        last_replanned_step: None,
         concept: vec![],
         items: vec![models, endpoint],
     };
@@ -1196,6 +1252,7 @@ fn test_identifier_normalization_is_consistent_across_validation_lookup_and_read
         created_at: 1,
         updated_at: 1,
         architect: None,
+        last_replanned_step: None,
         concept: vec![],
         items: vec![
             item(" 1 ", "Producer", PlanItemStatus::Done, vec![]),
@@ -1314,6 +1371,39 @@ fn test_plan_validate_detects_container_cycle_through_dependent_leaf() {
 }
 
 #[test]
+fn test_plan_validate_ignores_cancelled_leaf_naming_its_ancestor() {
+    // A `Cancelled` leaf never gates its ancestor's completion: the container is
+    // `Done` once all of its non-cancelled descendant leaves are `Done`. A
+    // leftover `depends_on` naming the ancestor therefore creates no runtime
+    // deadlock, so validation must accept the plan instead of reporting a
+    // `CyclicDependency` the derived status can never trigger.
+    let mut cancelled = item("1.1", "Cancelled child", PlanItemStatus::Cancelled, vec![]);
+    cancelled.depends_on = vec!["1".to_string()];
+
+    let mut plan = Plan {
+        id: "cancelled-ancestor-dep".to_string(),
+        title: "Cancelled Ancestor Dep".to_string(),
+        items: vec![item("1", "Group", PlanItemStatus::Todo, vec![cancelled])],
+        ..Default::default()
+    };
+    assert!(plan.validate().is_ok());
+
+    // Flipping the leaf back to an active status restores the genuine deadlock:
+    // the container can only finish once the leaf is `Done`, and the leaf cannot
+    // start before the container.
+    assert!(plan.update_item_status("1.1", PlanItemStatus::Todo));
+    let errs = plan.validate().unwrap_err();
+    assert_eq!(errs.len(), 1);
+    match &errs[0] {
+        PlanValidationError::CyclicDependency(cycle) => {
+            assert!(cycle.contains(&"1".to_string()));
+            assert!(cycle.contains(&"1.1".to_string()));
+        }
+        other => panic!("Expected CyclicDependency, got {:?}", other),
+    }
+}
+
+#[test]
 fn test_compute_direct_status_aggregation_edge_cases() {
     use super::node::compute_direct_status;
 
@@ -1383,6 +1473,7 @@ fn test_refresh_parent_statuses_and_scope_on_deep_hierarchy() {
         created_at: 1,
         updated_at: 1,
         architect: None,
+        last_replanned_step: None,
         concept: vec![],
         items: vec![item(
             "1",
@@ -1468,6 +1559,7 @@ fn test_plan_to_markdown_keeps_metadata_on_single_lines() {
         created_at: 1,
         updated_at: 1,
         architect: None,
+        last_replanned_step: None,
         concept: vec![],
         items: vec![step],
     };
@@ -1476,6 +1568,94 @@ fn test_plan_to_markdown_keeps_metadata_on_single_lines() {
     assert!(md.contains("    files: src/a.rs, src/b .rs\n"));
     assert!(!md.contains("readonly_files"));
     assert!(md.contains("    depends_on: 0\n"));
+    // No carriage return survives into the rendered document.
+    assert!(!md.contains('\r'));
+}
+
+#[test]
+fn test_plan_last_replanned_step_serde_and_backward_compatibility() {
+    // The step whose horizon was reprojected most recently is persisted with
+    // the plan, so a repeated failure of the same step is recognized from disk
+    // state instead of in-memory supervisor state, and a manual replan
+    // dispatched through the UI or RPC is accounted for identically.
+    let plan = Plan {
+        id: "replanned".to_string(),
+        title: "Replanned".to_string(),
+        last_replanned_step: Some("2".to_string()),
+        ..Default::default()
+    };
+    let json = serde_json::to_string(&plan).unwrap();
+    assert!(json.contains("\"last_replanned_step\":\"2\""));
+    let de: Plan = serde_json::from_str(&json).unwrap();
+    assert_eq!(de.last_replanned_step.as_deref(), Some("2"));
+
+    // A record written before the field existed stays readable: the absent
+    // marker simply reports that no step has been reprojected yet.
+    let legacy = r#"{"id":"legacy","title":"Legacy","created_at":1,"updated_at":2,"items":[]}"#;
+    let legacy_plan: Plan = serde_json::from_str(legacy).unwrap();
+    assert!(legacy_plan.last_replanned_step.is_none());
+
+    // An unset marker stays absent from the wire form, so a plan that was never
+    // replanned keeps its compact representation.
+    let fresh = Plan {
+        id: "fresh".to_string(),
+        title: "Fresh".to_string(),
+        ..Default::default()
+    };
+    let fresh_json = serde_json::to_string(&fresh).unwrap();
+    assert!(!fresh_json.contains("last_replanned_step"));
+}
+
+#[test]
+fn test_plan_to_markdown_collapses_line_breaks_in_title_and_ids() {
+    // A hand-edited or model-authored plan can carry line breaks in any
+    // interpolated field. The renderer must keep exactly one heading line and
+    // one line per concept and step entry instead of emitting extra lines and
+    // shifting the `#id` marker off its line.
+    let plan = Plan {
+        id: "line-breaks".to_string(),
+        title: "Plan\nTitle\rHere".to_string(),
+        description: None,
+        created_at: 1,
+        updated_at: 1,
+        architect: None,
+        last_replanned_step: None,
+        concept: vec![ConceptItem {
+            id: "c-1\nx".to_string(),
+            title: "Concept\rTitle".to_string(),
+            details: None,
+            children: vec![],
+        }],
+        items: vec![item("1\n2", "Step\rTitle", PlanItemStatus::Todo, vec![])],
+    };
+
+    let md = plan.to_markdown();
+    let lines: Vec<&str> = md.lines().collect();
+
+    // The heading gains no extra lines: the title collapses onto one line.
+    assert_eq!(lines.first().copied(), Some("# Plan: Plan Title Here"));
+    assert_eq!(
+        lines
+            .iter()
+            .filter(|line| line.starts_with("# Plan:"))
+            .count(),
+        1
+    );
+
+    // The concept id marker stays on the concept line.
+    let concept_line = lines
+        .iter()
+        .find(|line| line.ends_with("#c-1 x: Concept Title"))
+        .expect("concept line must keep its id marker");
+    assert!(concept_line.starts_with("- #"));
+
+    // The step id marker stays on the step line.
+    let step_line = lines
+        .iter()
+        .find(|line| line.ends_with("#1 2: Step Title"))
+        .expect("step line must keep its id marker");
+    assert!(step_line.starts_with("- [ ] "));
+
     // No carriage return survives into the rendered document.
     assert!(!md.contains('\r'));
 }

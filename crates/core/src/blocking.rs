@@ -89,6 +89,22 @@ where
     }
 }
 
+/// Records a failed [`run_blocking_async`] result in the semantic journal.
+///
+/// A panicked or cancelled offloaded task degrades into a fallback value at
+/// several call sites; without this record the degradation would be
+/// indistinguishable from a legitimately empty result. Every call site that
+/// downgrades a failed offload to a fallback must route the `JoinError`
+/// through here first, so the failure point leaves an observable trace.
+pub fn log_join_error(error: &JoinError, operation: &str) {
+    tracing::warn!(
+        operation = operation,
+        error = %error,
+        panicked = error.is_panic(),
+        "offloaded blocking task failed"
+    );
+}
+
 /// Clears the thread-local blocking flag when the guarded scope ends, including
 /// during unwinding, so a failed call never leaves the thread marked as blocking.
 struct ResetBlockingFlag;
@@ -99,9 +115,68 @@ impl Drop for ResetBlockingFlag {
     }
 }
 
+/// Thread-local log capture for unit tests asserting semantic log records.
+///
+/// `install` returns the shared capture buffer together with the default
+/// subscriber guard, which keeps the capture active for its scope. The
+/// subscriber is thread-local: it observes records emitted on the installing
+/// thread, which is where every failure arm this helper pins runs — after the
+/// offloaded task has been awaited.
+#[cfg(test)]
+pub(crate) mod log_capture {
+    use std::sync::{Arc, Mutex};
+
+    #[derive(Clone)]
+    struct SharedWriter {
+        buffer: Arc<Mutex<Vec<u8>>>,
+    }
+
+    impl std::io::Write for SharedWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.buffer
+                .lock()
+                .expect("log capture lock")
+                .extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for SharedWriter {
+        type Writer = SharedWriter;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    /// Installs a thread-local subscriber capturing `warn` and `error` records.
+    pub(crate) fn install() -> (Arc<Mutex<Vec<u8>>>, tracing::subscriber::DefaultGuard) {
+        let buffer = Arc::new(Mutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::WARN)
+            .with_ansi(false)
+            .with_writer(SharedWriter {
+                buffer: Arc::clone(&buffer),
+            })
+            .finish();
+        let guard = tracing::subscriber::set_default(subscriber);
+        (buffer, guard)
+    }
+
+    /// Returns the captured records as text.
+    pub(crate) fn contents(buffer: &Arc<Mutex<Vec<u8>>>) -> String {
+        let bytes = buffer.lock().expect("log capture lock").clone();
+        String::from_utf8_lossy(&bytes).into_owned()
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{run_blocking, run_blocking_async};
+    use super::{log_join_error, run_blocking, run_blocking_async};
 
     #[test]
     fn runs_outside_a_runtime() {
@@ -162,5 +237,27 @@ mod tests {
         .await;
         assert!(result.is_err());
         assert!(result.unwrap_err().is_panic());
+    }
+
+    /// A failed offload must never degrade silently: the record emitted by
+    /// `log_join_error` keeps the degradation observable in the journal.
+    #[tokio::test]
+    async fn log_join_error_records_the_failed_operation() {
+        let (buffer, _guard) = crate::blocking::log_capture::install();
+
+        let error = run_blocking_async(|| {
+            panic!("intentional panic for test");
+        })
+        .await
+        .expect_err("a panicking offloaded closure becomes a JoinError");
+        log_join_error(&error, "test offload");
+
+        let logged = crate::blocking::log_capture::contents(&buffer);
+        assert!(
+            logged.contains("offloaded blocking task failed"),
+            "the degradation must be observable: {logged}"
+        );
+        assert!(logged.contains("test offload"));
+        assert!(logged.contains("panicked"));
     }
 }

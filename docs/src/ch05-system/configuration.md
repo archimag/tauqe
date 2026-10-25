@@ -101,8 +101,10 @@ it runs a declared command line and reads its exit status.
   onboarding create action; it is also the living reference.
 - **Role** — a semantic responsibility (`primary`, `scribe`, `coder`, `architect`,
   `reviewer`) resolved to a concrete model by the server.
-- **Entry** — one model reference with an optional reasoning `effort` and an optional
-  `alias`.
+- **Entry** — one model reference with an optional reasoning `effort`; a role slot
+  never carries a display alias.
+- **Catalog entry** — a model registered in `[providers.openrouter].models`, with an
+  optional `alias` that is the single source of truth for its display name.
 - **Ladder rung** — one entry of an ordered role list, consumed for intra-role
   escalation.
 - **Phase** — one verification stage: `check`, `lint`, or `test`.
@@ -125,11 +127,23 @@ it runs a declared command line and reads its exit status.
 | --- | --- |
 | `[providers.openrouter]` | the native model catalog the picker may offer |
 | `[models]` | semantic roles, their entries, and `auto_level_up` |
-| `[develop]` | edit retries, replan budget, workflow mode, edit protocol |
-| `[toolchain]` | verification policy, legacy phase overrides, and the disk formatter registry |
+| `[develop]` | edit retries, verification healing budget, replan budget, workflow mode, edit protocol |
 | `[git]` | upstream base and hook bypass |
 | `[history]` | token budget and uncompressed tail length |
 | `[context]` | discovery rounds, file and outline budgets, pattern cap, pinned patterns |
+
+The `[develop]` section also selects the wire format of the model exchange through
+its `protocol` key. The value is `structured` (the default), `xml`, or `mixed`; the
+legacy alias `auto` still parses and resolves to `mixed`. The format never changes
+the capabilities a turn exposes — its intent and the active discussion focus decide
+those — so the three modes are interchangeable by design and differ only in
+transport, token cost, and prefix caching.
+
+| `protocol` | Transport |
+| --- | --- |
+| `structured` | strict JSON-Schema structured output for every turn |
+| `xml` | marker-protected XML tags for every turn |
+| `mixed` | two contours: XML for code edits, structured output for discussions, commit messages, and history compaction |
 
 `providers.openrouter.api_key` is deliberately skipped on deserialization: a key
 pasted into `tauqe.toml` is ignored rather than honored, so the mistake cannot become
@@ -189,10 +203,9 @@ The workstation file is resolved separately, in `$XDG_CONFIG_HOME/tauqe/tui.toml
 | `context.max_pattern_batch` | 150 | files admitted by one glob request |
 | `history.budget_tokens` | 20,000 | session history before compaction |
 | `history.tail_turns` | 10 | turns kept uncompressed |
-| `develop.max_retries` | 5 | staging retries and corrective step re-runs |
+| `develop.max_retries` | 5 | staging retries, verification healing rounds, and corrective step re-runs |
 | `develop.max_replans` | 2 | automated replans after a blocked step |
-| `toolchain.timeout_secs` | 600 | one verification or post-hook invocation |
-| `toolchain.max_retries` | 5 | verification healing rounds |
+| project entry `timeout_secs` | 600 | one verification, format, post-hook, or named-command invocation |
 
 A project entry's own `timeout_secs` overrides the harness budget for that entry
 alone. A repository may override any documented default, and this repository does
@@ -238,11 +251,18 @@ first `primary` entry. `coder`, `architect`, and `reviewer` are ordered lists, a
 omitted list inherits the entire `primary` list, so a project never loses access to a
 configured model merely because it did not repeat it.
 
-Every entry accepts a bare string or a table with `model`, an optional `effort`
-(`low`, `medium`, `high`, `xhigh`, `max`), and an optional `alias`. A single string
-yields a one-rung ladder; an ordered array yields an explicit ladder whose rungs
-differ by model or by reasoning depth, so the same model can run shallowly in one
-role and deeply in another without a duplicate catalog entry.
+The provider catalog declares each model once. A catalog entry is either a bare
+model specification or a `{ model, alias }` table, so a display name is written
+beside the model itself instead of on every role slot that selects it. A role entry
+then names a model either by its provider identifier or by that catalog alias and
+adds only the runtime parameters of the slot — an optional `effort` (`low`,
+`medium`, `high`, `xhigh`, `max`). Both reference forms normalize to the same
+concrete model before a turn starts, and an entry that repeats an `alias` is
+rejected, because two sources of truth for one label drift apart.
+
+A single string yields a one-rung ladder; an ordered array yields an explicit ladder
+whose rungs differ by model or by reasoning depth, so the same model can run
+shallowly in one role and deeply in another without a duplicate catalog entry.
 
 Two ladders exist and they never cross. `coder` answers a failed *how* and is consumed
 by staging retries, verification healing, and corrective step re-runs; `architect`
@@ -251,43 +271,32 @@ enables the coder ladder; without it, a failing turn rolls back and reports inst
 escalating. The escalation rules themselves belong to *Model Roles and the Coder
 Ladder*; this chapter declares only where the rungs live.
 
-### 3.3 Verification policy: from a declaration to an invocation
+### 3.3 Verification: one declared lifecycle
 
-`[project.verify]` is the mandatory verification lifecycle. Its command line runs for
-every verification target — all, check, test, lint — because the repository described
-its own lifecycle, and an entry-local `timeout_secs` overrides the harness budget for
-that invocation alone.
+`[project.verify]` is the verification lifecycle, and it is mandatory: a configuration
+that declares neither a verification command nor a task runner exporting one is
+rejected as a whole (section 3.5), because a change set the harness cannot verify is
+never accepted.
 
-`[toolchain]` holds the surrounding policy, never a language: the wall-clock budget,
-whether verification runs at all (`auto_verify`), whether healing starts
-automatically (`auto_heal`), the default target (`all`, `check`, `clippy`, `test`),
-the retry budget, and a legacy project-wide `check_command`.
+The declaration *is* the pipeline. The harness carries no knowledge of a compiler or a
+build system, so it runs the declared command line once per change set and nothing
+else: there is no switch that disables verification, no automatic-healing toggle, no
+verification target that selects a different set of commands, and no manifest
+auto-detection. A repository that declares no command — or whose reference chain is
+broken — resolves no step, and the change set is reported as unverified instead of
+running an unintended program.
 
-A repository that declares no verification command keeps the deterministic legacy
-resolution. Phases run in a fixed order — check, then lint, then test — and the
-pipeline stops at the first failing phase, because a later phase would run on top of a
-change set the earlier one already rejected. Each phase resolves its command in turn:
+The wall-clock budget comes from the entry's `timeout_secs`, and the fallback is 600
+seconds, which a real test suite routinely needs. Healing is bounded by the edit retry
+budget (`develop.max_retries`), so a verification failure receives the same number of
+repair rounds as a failed patch.
 
-1. its own section (`[toolchain.check]`, `[toolchain.lint]`, `[toolchain.test]`),
-   when that section names a `command`;
-2. the legacy `check_command`;
-3. deterministic auto-detection from the project manifests.
-
-A phase that names no command keeps auto-detection, so declaring a section never
-disables a phase by accident. `enabled = false` drops a phase without deleting it, and
-`timeout_secs` overrides the global budget for that phase alone.
-
-Every invocation is one process in its own process group with a wall-clock budget, so
-a timeout or a cancellation tears down the compiler and every binary it spawned. The
-exit status is the verdict; a failing command's output is parsed into typed
-diagnostics — file, line, column, severity, code, and message — instead of a
-transcript. *The Three-Phase Modification Lifecycle* owns the order in which the
-phases run, and *Structured Diagnostics and Verification Healing* owns what a failing
-phase produces.
-
-Formatters and phase sections declared under `[toolchain]` keep working. A
-`[toolchain.fmt.NAME]` entry remains a best-effort pass over the changed files its
-extension filter claims, after verification and before the commit.
+Every invocation is one process in its own process group with that budget, so a timeout
+or a cancellation tears down the compiler and every binary it spawned. The exit status
+is the verdict; a failing command's output is parsed into typed diagnostics — file,
+line, column, severity, code, and message — instead of a transcript. *The Three-Phase
+Modification Lifecycle* owns the order in which the phases run, and *Structured
+Diagnostics and Verification Healing* owns what a failing phase produces.
 
 ### 3.4 The task runner and project commands
 
@@ -461,8 +470,8 @@ Localization* owns the interface language.
 - **It is not guessed.** Parameters and defaults are answered from this chapter, never
   inferred from a partial memory of the source tree.
 - **It is not parsed by the harness as a build system.** The harness runs a declared
-  command line; it never reads `Cargo.toml` or `package.json` to invent flags unless
-  deterministic auto-detection is the only thing left to do.
+  command line; it never reads `Cargo.toml` or `package.json`, and it never detects a
+  toolchain from them.
 - **It is not a description of the build.** `tauqe.toml` holds harness policy and the
   declared command lines; it does not describe the pipeline those commands run.
 - **It is not a shell entry point.** A declared command has literal arguments and no

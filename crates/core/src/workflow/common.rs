@@ -446,7 +446,15 @@ mod tests {
         );
 
         // Round 2: Prompt assembly injects scratchpad into next round
-        let mut assembly = PromptAssembly::new(None, 1, vec![], "git", "xml", None, None);
+        let mut assembly = PromptAssembly::new(
+            None,
+            1,
+            vec![],
+            "git",
+            tauqe_protocol::EditProtocolKind::Xml,
+            None,
+            None,
+        );
         assembly.turn_scratchpad = pad1;
         let messages =
             assembly.assemble_chat_messages("Continue", &crate::prompt::xml::XmlPromptProtocol);

@@ -233,28 +233,6 @@ impl HistoryManager {
         Ok(entry)
     }
 
-    /// Records a deterministic undo of the most recent AI commit.
-    pub fn record_undo(
-        &mut self,
-        undone_commit: &str,
-        restored_checkpoint: bool,
-    ) -> Result<HistoryEntry> {
-        let message = if restored_checkpoint {
-            format!(
-                "Undid commit {} and restored the pre-turn checkpoint.",
-                undone_commit
-            )
-        } else {
-            format!("Undid commit {}.", undone_commit)
-        };
-        self.record_response(
-            message,
-            Some(undone_commit.to_string()),
-            Some("Undo".to_string()),
-            Vec::new(),
-        )
-    }
-
     pub fn get_entries(&self) -> Result<Vec<HistoryEntry>> {
         self.storage.read_entries()
     }
@@ -451,40 +429,6 @@ mod tests {
             }
             _ => panic!("Expected summary entry first"),
         }
-    }
-
-    #[test]
-    fn test_record_undo_entry() {
-        let dir = tempdir().unwrap();
-        let root = dir.path().to_path_buf();
-        let mut hm = HistoryManager::new(root);
-
-        let entry = hm.record_undo("abc1234", true).unwrap();
-        match &entry {
-            HistoryEntry::Response {
-                message,
-                commit,
-                summary,
-                ..
-            } => {
-                assert!(message.contains("abc1234"));
-                assert!(message.contains("checkpoint"));
-                assert_eq!(commit.as_deref(), Some("abc1234"));
-                assert_eq!(summary.as_deref(), Some("Undo"));
-            }
-            other => panic!("Expected an undo response entry, got {:?}", other),
-        }
-
-        // A plain undo without a checkpoint must not claim one was restored.
-        let plain = hm.record_undo("def5678", false).unwrap();
-        match &plain {
-            HistoryEntry::Response { message, .. } => {
-                assert!(!message.contains("checkpoint"));
-            }
-            other => panic!("Expected an undo response entry, got {:?}", other),
-        }
-
-        assert_eq!(hm.get_entries().unwrap().len(), 2);
     }
 
     #[test]

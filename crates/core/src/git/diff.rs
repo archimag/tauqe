@@ -113,7 +113,49 @@ pub fn get_diff_stat(dir: &Path, base_ref: &str) -> Result<String> {
     Ok(last_line)
 }
 
+/// Lists the paths changed between `base_ref` and HEAD exactly as they exist on
+/// disk.
+///
+/// `--name-only -z` terminates each path with a NUL and disables Git's C-style
+/// path quoting, so a non-ASCII name, an embedded double quote, or a backslash
+/// survives instead of arriving as an escaped string. Git emits these entries in
+/// the same order as the patch blocks of the same revision range, which is what
+/// lets the per-file diffs be paired with an unquoted name.
+fn get_cumulative_paths(dir: &Path, base_ref: &str) -> Result<Vec<String>> {
+    let rev_range = format!("{}..HEAD", base_ref.trim());
+    let output = run_git(Some(dir), &["diff", "--name-only", "-z", &rev_range])?;
+    Ok(output
+        .split('\0')
+        .filter(|path| !path.is_empty())
+        .map(|path| path.to_string())
+        .collect())
+}
+
+/// Extracts the destination path from a `diff --git a/<old> b/<new>` header.
+///
+/// This is a degraded fallback, used only when the NUL-separated listing and the
+/// patch disagree on the number of files: a header may still carry Git's
+/// C-style quoting, so the listing is always preferred when it is available.
+fn header_path(rest: &str) -> Option<String> {
+    if let Some(idx) = rest.rfind(" b/") {
+        return Some(rest[idx + 3..].trim_matches('"').to_string());
+    }
+    let parts: Vec<&str> = rest.split_whitespace().collect();
+    let candidate = parts.get(1)?;
+    Some(
+        candidate
+            .strip_prefix("b/")
+            .unwrap_or(candidate)
+            .trim_matches('"')
+            .to_string(),
+    )
+}
+
 /// Parses cumulative diff into structured per-file diff blocks.
+///
+/// Paths are taken from the NUL-separated `--name-only` listing rather than from
+/// the block headers, so a file whose name Git would escape under the default
+/// `core.quotePath=true` is reported under its real on-disk name.
 pub fn get_cumulative_file_diffs(
     dir: &Path,
     base_ref: &str,
@@ -124,43 +166,30 @@ pub fn get_cumulative_file_diffs(
         return Ok(files);
     }
 
-    let mut current_path = String::new();
-    let mut current_diff = String::new();
+    let paths = get_cumulative_paths(dir, base_ref)?;
+    let mut next_path = 0;
 
     for line in raw_diff.lines() {
         if let Some(rest) = line.strip_prefix("diff --git ") {
-            if !current_path.is_empty() {
-                files.push(tauqe_protocol::GitSquashFileDiff {
-                    path: current_path,
-                    diff: current_diff,
-                });
-                current_diff = String::new();
-            }
-            if let Some(idx) = rest.rfind(" b/") {
-                let b_path = &rest[idx + 3..];
-                current_path = b_path.trim_matches('"').to_string();
-            } else {
-                let parts: Vec<&str> = rest.split_whitespace().collect();
-                if parts.len() >= 2 {
-                    let b_path = parts[1].strip_prefix("b/").unwrap_or(parts[1]);
-                    current_path = b_path.trim_matches('"').to_string();
-                } else {
-                    current_path = "unknown".to_string();
+            let path = match paths.get(next_path) {
+                Some(path) => path.clone(),
+                None => {
+                    tracing::warn!(
+                        "git diff reported more file blocks than paths; falling back to the block header"
+                    );
+                    header_path(rest).unwrap_or_else(|| "unknown".to_string())
                 }
-            }
-            current_diff.push_str(line);
-            current_diff.push('\n');
-        } else {
-            current_diff.push_str(line);
-            current_diff.push('\n');
+            };
+            next_path += 1;
+            files.push(tauqe_protocol::GitSquashFileDiff {
+                path,
+                diff: String::new(),
+            });
         }
-    }
-
-    if !current_path.is_empty() {
-        files.push(tauqe_protocol::GitSquashFileDiff {
-            path: current_path,
-            diff: current_diff,
-        });
+        if let Some(block) = files.last_mut() {
+            block.diff.push_str(line);
+            block.diff.push('\n');
+        }
     }
 
     Ok(files)
@@ -212,6 +241,56 @@ pub fn get_diff(dir: &Path, target_path: Option<&str>) -> Result<String> {
                 fallback_args.push(path);
             }
             run_git(Some(dir), &fallback_args)
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::git::cmd::commit_with_developer_author;
+
+    #[test]
+    fn test_cumulative_file_diffs_report_paths_verbatim() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        run_git(Some(root), &["init", "-b", "master"]).unwrap();
+        run_git(Some(root), &["config", "user.name", "Test"]).unwrap();
+        run_git(Some(root), &["config", "user.email", "test@test.com"]).unwrap();
+        std::fs::write(root.join("base.txt"), "base\n").unwrap();
+        run_git(Some(root), &["add", "base.txt"]).unwrap();
+        commit_with_developer_author(root, "chore: init", false).unwrap();
+        let base = run_git(Some(root), &["rev-parse", "HEAD"])
+            .unwrap()
+            .trim()
+            .to_string();
+
+        // Names Git escapes under the default `core.quotePath=true`, listed in
+        // the byte order Git reports them.
+        let names = ["back\\slash.rs", "quote\"d.rs", "отчёт.rs"];
+        for name in names {
+            std::fs::write(root.join(name), "content\n").unwrap();
+        }
+        run_git(Some(root), &["add", "-A"]).unwrap();
+        commit_with_developer_author(root, "feat: add names", false).unwrap();
+
+        let files = get_cumulative_file_diffs(root, &base).unwrap();
+        let reported: Vec<&str> = files.iter().map(|file| file.path.as_str()).collect();
+        assert_eq!(
+            reported, names,
+            "each block must carry the path Git listed for it"
+        );
+        for file in &files {
+            assert!(
+                file.diff.starts_with("diff --git "),
+                "the block keeps its header: {}",
+                file.diff
+            );
+            assert!(
+                file.diff.contains("+content"),
+                "the block keeps its body: {}",
+                file.diff
+            );
         }
     }
 }

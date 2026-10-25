@@ -247,6 +247,15 @@ pub fn canonical_catalog() -> Vec<LocaleCatalogItem> {
         item("dialog.delete_plan.question", "Are you sure you want to delete this plan?", "Delete-plan dialog question line", None),
         item("dialog.delete_plan.plan_label", "Plan: ", "Delete-plan plan field label", None),
         item("dialog.delete_plan.note", "The plan file in .tauqe/plans/ will be permanently removed.", "Delete-plan note about removing the file", None),
+        item("dialog.delete_plan.status_label", "Status: ", "Delete-plan plan status field label", None),
+        item("dialog.delete_plan.unfinished_label", "Unfinished: ", "Delete-plan unfinished work field label", None),
+        item("dialog.delete_plan.unfinished_count", "{} step(s)", "Delete-plan styled count of unfinished implementation steps", None),
+        item("dialog.delete_plan.all_completed", "all steps completed", "Delete-plan value when every implementation step is finished", None),
+        item("dialog.delete_plan_final.title", "Confirm Deleting Active Plan", "Title for the two-tier confirmation deleting a plan with unfinished work", None),
+        item("dialog.delete_plan_final.question", "Are you sure you want to delete a plan that still has unfinished work?", "Question in the two-tier plan deletion confirmation dialog", None),
+        item("dialog.delete_plan_final.progress", "{} of {} step(s) unfinished", "Two-tier delete confirmation progress naming the unfinished and total steps", None),
+        item("dialog.delete_plan_final.note", "Every recorded step and its progress will be permanently removed. Git commits already made for this plan are NOT undone.", "Warning note in the two-tier plan deletion confirmation dialog", None),
+        item("dialog.button.permanently_delete", "Permanently Delete", "Button confirming deletion of a plan with unfinished work", Some(18)),
 
         item("dialog.delete_review.question", "Are you sure you want to delete this review session?", "Delete-review dialog question line", None),
         item("dialog.delete_review.review_label", "Review: ", "Delete-review review field label", None),
@@ -434,7 +443,7 @@ pub fn canonical_catalog() -> Vec<LocaleCatalogItem> {
         // ------------------------------------------------------------------
         item("onboarding.gatekeeper_badge", "Warning: API Key Missing", "Onboarding step badge replacing the credentials step when the API key is missing", Some(28)),
         item("onboarding.info_title", "Information", "Onboarding information panel title", Some(16)),
-        item("onboarding.info.git", "Tauqe relies on Git for checkpoints, atomic step commits, and safe undo.", "Onboarding information line for the Git step", None),
+        item("onboarding.info.git", "Tauqe relies on Git for checkpoints, atomic step commits, and safe rollback.", "Onboarding information line for the Git step", None),
         item("onboarding.info.config", "Create default tauqe.toml or skip to use built-in defaults.", "Onboarding information line for the configuration step", None),
         item("onboarding.info.credentials", "Secure credential storage: created with 0600 file permissions (owner-only read/write).", "Onboarding information line for the credentials step", None),
         item("onboarding.info.workstation", "Workstation configuration: personal settings stored in ~/.config/tauqe/tui.toml.", "Onboarding information line for the workstation step", None),
@@ -557,6 +566,7 @@ pub fn canonical_catalog() -> Vec<LocaleCatalogItem> {
         item("cmd.plans.nav_prev", "Select the previous row", "Plans command description", None),
         item("cmd.plans.select_first", "Select the first row", "Plans command description", None),
         item("cmd.plans.select_last", "Select the last row", "Plans command description", None),
+        item("cmd.plans.recenter", "Recenter the selected plan row (center, top, bottom)", "Plans command description", None),
         item("cmd.plans.fold_toggle", "Fold or unfold the selected plan, section, or step", "Plans command description", None),
         item("cmd.plans.fold_all", "Toggle fold or unfold for all plans, sections, and items", "Plans command description", None),
         item("cmd.plans.page_up", "Scroll the plan view up a page", "Plans command description", None),
@@ -587,6 +597,7 @@ pub fn canonical_catalog() -> Vec<LocaleCatalogItem> {
         item("cmd.review.accordion_prev", "Inspect the previous finding (accordion walk)", "Review command description", None),
         item("cmd.review.select_first", "Select the first row", "Review command description", None),
         item("cmd.review.select_last", "Select the last row", "Review command description", None),
+        item("cmd.review.recenter", "Recenter the selected review row (center, top, bottom)", "Review command description", None),
         item("cmd.review.page_up", "Scroll the review view up one page", "Review command description", None),
         item("cmd.review.page_down", "Scroll the review view down one page", "Review command description", None),
         item("cmd.review.fold_toggle", "Fold or unfold the session, summary, or finding details", "Review command description", None),
@@ -702,6 +713,7 @@ pub fn canonical_catalog() -> Vec<LocaleCatalogItem> {
         item("notify.review_focus_set", "Discussion focus set to review '{}'", "Review notification confirming a session focus change", None),
         item("notify.review_focus_item_set", "Discussion focus set to {} in review '{}'", "Review notification confirming a finding focus change", None),
         item("notify.review_cannot_start_busy", "Cannot start a review while the model is generating", "Review notification rejecting a review while busy", None),
+        item("notify.review_pattern_files_omitted", "Pattern matched {} file(s) beyond the configured batch or token limit; they were not added to the audit", "Review notification when a target pattern expansion is truncated by the configured context budgets", None),
         item("notify.review_context_empty", "Context is empty: add files in the Context tab (Ctrl+2) first", "Review notification requiring context files", None),
         item("notify.review_copied", "Review findings copied to clipboard", "Review notification after copying findings", None),
         item("notify.review_copied_osc52", "Review findings sent to terminal clipboard (OSC 52)", "Review notification after an OSC 52 copy", None),
@@ -861,15 +873,13 @@ pub fn canonical_catalog() -> Vec<LocaleCatalogItem> {
         item("dialog.review_launch.hint_fields", "{}Enter start • Tab focus • {} model • Esc cancel", "Review launch dialog footer hint while a field has focus", None),
 
         // ------------------------------------------------------------------
-        // Model selection dialog.
+        // Model selection dialog. The picker presents strictly the configured
+        // primary tiers, so it carries one title, one intro, and one footer
+        // instead of a per-source set (c-2).
         // ------------------------------------------------------------------
         item("dialog.model_select.title_primary", "Select Primary Model", "Model picker title when choosing a configured primary entry", None),
-        item("dialog.model_select.title_catalog", "Select Model ({}/{})", "Model picker title while browsing the full catalog", None),
         item("dialog.model_select.intro_primary", " Models configured under [models.primary] in tauqe.toml", "Model picker intro for the configured primary entries", None),
-        item("dialog.model_select.intro_catalog", " All available models", "Model picker intro while browsing the full catalog", None),
-        item("dialog.model_select.catalog_row", "[{}] Others... (full model catalog)", "Model picker escape-hatch row opening the full catalog", None),
-        item("dialog.model_select.footer_primary", "1-9 quick select • n / p navigate • Enter select • Esc dismiss", "Model picker footer hint for the configured primary entries", None),
-        item("dialog.model_select.footer_catalog", "n / p navigate • Enter select • Esc dismiss", "Model picker footer hint while browsing the full catalog", None),
+        item("dialog.model_select.footer_primary", "1-9 quick select • ↑ / ↓ navigate • PgUp / PgDn page • Enter select • Esc dismiss", "Model picker footer hint for the configured primary entries", None),
 
         // ------------------------------------------------------------------
         // Squash commits dialog: base selection, diff inspection, message
@@ -967,7 +977,7 @@ pub fn canonical_catalog() -> Vec<LocaleCatalogItem> {
         // ------------------------------------------------------------------
         item("onboarding.git.body_not_repo", "The current working directory is not a Git repository.", "Onboarding Git step body: directory is not a repository", None),
         item("onboarding.git.body_requires", "Tauqe strictly requires Git: isolated pre-edit checkpoints, atomic turn commits,", "Onboarding Git step body: first rationale line", None),
-        item("onboarding.git.body_rollback", "instant rollback (undo), and feature commit squashing.", "Onboarding Git step body: rationale completion line", None),
+        item("onboarding.git.body_rollback", "instant rollback, and feature commit squashing.", "Onboarding Git step body: rationale completion line", None),
         item("onboarding.git.select_prompt", "Select an action (arrows ↑/↓, then Enter):", "Onboarding action-selection prompt", None),
         item("onboarding.git.option_init", "Initialize Git repository (git init)", "Onboarding Git option: init a repository", None),
         item("onboarding.git.option_init_commit", "Initialize and create initial commit (git init && git commit)", "Onboarding Git option: init and first commit", None),
@@ -993,10 +1003,10 @@ pub fn canonical_catalog() -> Vec<LocaleCatalogItem> {
         item("onboarding.workstation.option_custom", "Custom Langmap (Input custom character mapping: e.g. Greek, Hebrew, etc.)", "Onboarding workstation option: custom langmap", None),
         item("onboarding.workstation.option_skip", "Skip (Use defaults without creating tui.toml)", "Onboarding workstation option: skip", None),
         item("onboarding.modifier.body_input", "In text input mode (prompt buffer, commit message editor), every regular key types text.", "Onboarding modifier body: text input mode", None),
-        item("onboarding.modifier.body_commands", "Functional commands (send prompt, undo, squash, model picker, tabs) use the primary modifier.", "Onboarding modifier body: command modifier", None),
+        item("onboarding.modifier.body_commands", "Functional commands (send prompt, squash, model picker, tabs) use the primary modifier.", "Onboarding modifier body: command modifier", None),
         item("onboarding.modifier.select_prompt", "Select primary command modifier (arrows ↑/↓, then Enter):", "Onboarding modifier selection prompt", None),
-        item("onboarding.modifier.option_ctrl", "Ctrl (Default — standard Emacs C- shortcuts: Ctrl+Enter, Ctrl+Z, Ctrl+S, Ctrl+M)", "Onboarding modifier option: Ctrl", None),
-        item("onboarding.modifier.option_alt", "Alt (Meta modifier — Alt+Enter, Alt+Z, Alt+S, Alt+M; robust on macOS and legacy terminals)", "Onboarding modifier option: Alt", None),
+        item("onboarding.modifier.option_ctrl", "Ctrl (Default — standard Emacs C- shortcuts: Ctrl+Enter, Ctrl+S, Ctrl+M)", "Onboarding modifier option: Ctrl", None),
+        item("onboarding.modifier.option_alt", "Alt (Meta modifier — Alt+Enter, Alt+B, Alt+S, Alt+M; robust on macOS and legacy terminals)", "Onboarding modifier option: Alt", None),
         item("onboarding.gatekeeper.body_no_key", "Language model calls cannot proceed without an OpenRouter API key.", "Onboarding gatekeeper body: key required", None),
         item("onboarding.gatekeeper.body_options", "You can input the key now, create credentials.toml, or export:", "Onboarding gatekeeper body: options intro", None),
         item("onboarding.gatekeeper.body_export", "export OPENROUTER_API_KEY=\"sk-or-v1-...\"", "Onboarding gatekeeper body: export example", None),
@@ -1053,6 +1063,7 @@ pub fn canonical_catalog() -> Vec<LocaleCatalogItem> {
         item("notify.locale_reset_unsaved", "Interface language reset to English, but the saved locale could not be removed: {}", "Locale notification when reset to English fails to delete file", None),
         item("notify.config_reload_error", "{}; keeping previous TUI settings", "Notification when config reload encounters error", None),
         item("notify.model_select_busy", "Cannot change model while model is generating", "Notification when model selection attempted while busy", None),
+        item("notify.model_select_empty", "No primary models are configured; declare at least one entry under [models.primary]", "Notification when the model picker is requested before the configured primary tiers reach the client", None),
         item("notify.quit_hint", "Press Ctrl+Q to quit TAUQE, or ? for help", "Notification hint for quitting tauqe or opening help", None),
         item("dialog.squash.status_checking_base", "Checking base '{}'...", "Squash dialog status message when checking base commit", None),
         item("dialog.squash.status_no_session_base", "Session base commit not available (no AI commits in session).", "Squash dialog status message when session base unavailable", None),
@@ -1119,6 +1130,67 @@ pub fn canonical_catalog() -> Vec<LocaleCatalogItem> {
         item("review.readonly_label", "Readonly (do not modify): ", "Review detail label prefixing a finding's protected read-only contracts", None),
         item("review.description_label", "Description:", "Review detail label for a finding's technical description", None),
         item("review.recommendations_label", "Recommendations:", "Review detail label for a finding's remediation strategy", None),
+
+        // ------------------------------------------------------------------
+        // Develop response and staged-edit surfaces (views/repl/render).
+        // ------------------------------------------------------------------
+        item("repl.error_label", "Error: ", "Develop label prefixing a failed turn error message", None),
+        item("repl.toolchain_badge_running", " [{}] TOOLCHAIN ", "Develop badge naming the running verification command", None),
+        item("repl.toolchain_running", "Running `{}`...", "Develop status naming the running verification command", None),
+        item("repl.toolchain_badge_passed", " [TOOLCHAIN: OK] ", "Develop badge after the verification command passes", None),
+        item("repl.toolchain_passed", "`{}` passed", "Develop status naming the passed verification command", None),
+        item("repl.toolchain_badge_failed", " [TOOLCHAIN: FAILED] ", "Develop badge after the verification command fails", None),
+        item("repl.toolchain_failed", "`{}` failed", "Develop status naming the failed verification command", None),
+        item("repl.edits_badge_committed", " [COMMITTED: {}] ", "Develop badge naming the commit that recorded the edits", None),
+        item("repl.edits_badge_applied", " [APPLIED] ", "Develop badge after edits are applied without a commit", None),
+        item("repl.edits_badge_rejected", " [REJECTED] ", "Develop badge after edits fail verification", None),
+        item("repl.edits_badge_modifying", " [{}] Modifying ", "Develop badge while edits stream into staging", None),
+        item("repl.edits_files_progress", "({}/{} files)", "Develop label counting validated files of the staged edit set", None),
+        item("repl.edits_summary_label", "Summary: ", "Develop label prefixing the recorded commit summary", None),
+        item("repl.edits_retry_label", "(Retrying {})", "Develop label counting the retry attempt of a failed file", None),
+        item("repl.hunk_renamed", "renamed", "Develop label describing a moved file", None),
+        item("repl.hunk_rewritten", "rewritten", "Develop label describing an overwritten file", None),
+        item("repl.hunk_deleted", "deleted", "Develop label describing a deleted file", None),
+        item("repl.hunk_line_count", "{} line(s)", "Develop label counting the lines of a created file", None),
+        item("repl.hunk_count", "{} hunk(s)", "Develop label counting the patches applied to a file", None),
+
+        // ------------------------------------------------------------------
+        // History record badges and body labels (views/history.rs).
+        // ------------------------------------------------------------------
+        item("history.badge.user", "USER", "History badge marking a developer prompt record", Some(12)),
+        item("history.badge.assistant", "ASSISTANT", "History badge marking a model answer record", Some(12)),
+        item("history.badge.system", "SYSTEM", "History badge marking a harness-generated system record", Some(12)),
+        item("history.badge.commit", "COMMIT: {}", "History badge naming the commit that recorded a turn", None),
+        item("history.modified_files_label", "Modified files ({}):", "History label prefixing the files a turn changed", None),
+        item("history.context_label", "Context: ", "History label prefixing the context files of a user record", None),
+        item("history.more_lines_note", "+{} more lines", "History note counting folded body lines of a collapsed record", None),
+        item("history.modified_files_note", "{} modified files", "History note counting files changed by a collapsed record", None),
+
+        // ------------------------------------------------------------------
+        // Plans info strip and tree-renderer labels (views/plans).
+        // ------------------------------------------------------------------
+        item("plans.stats_summary", "{} plan(s), {} item(s) ({} done)", "Plans info strip counting plans, items, and completed items", None),
+        item("plans.done_progress", "{}/{} done", "Plans tree label counting completed steps of a plan or section", None),
+        item("plans.concept_item_count", "{} item(s)", "Plans concept section header counting concept items", None),
+        item("plans.file_count", "{} file(s)", "Tree badge counting target files of a leaf step", None),
+        item("plans.ref_count", "{} ref(s)", "Tree badge counting reference files of a leaf step", None),
+        item("plans.concept_prefix", "concept: ", "Plans tree label prefixing concept references of a step", None),
+
+        // ------------------------------------------------------------------
+        // Review info strip and tree-renderer labels (views/review).
+        // ------------------------------------------------------------------
+        item("review.stats_summary", "{} session(s), {} finding(s) ({} fixed, {} skipped)", "Review info strip counting sessions, findings, and resolved findings", None),
+        item("review.stats_breakdown", "{}/{} fixed ({} todo, {} prog, {} disc, {} skip, {} rej)", "Review session header statistic breakdown", None),
+        item("review.folded_suffix", " (folded)", "Review session summary suffix marking a folded summary", None),
+        item("review.step_label", "step #{}", "Review subplan step label naming a step identifier", None),
+        item("review.readonly_count", "{} readonly", "Review finding badge counting protected read-only files", None),
+        item("review.steps_count", "{}/{} steps", "Review finding badge counting completed subplan steps", None),
+        item("review.depends_on_label", "depends_on: ", "Review subplan label prefixing step dependencies", None),
+
+        // ------------------------------------------------------------------
+        // Shared info-strip row counter (Plans and Review).
+        // ------------------------------------------------------------------
+        item("ui.row_counter", "[Row {}/{}]", "Info strip counter naming the selected row and the total", None),
     ]
 }
 
@@ -1241,6 +1313,27 @@ mod tests {
         }
     }
 
+    /// The picker offers strictly the configured primary tiers: no key may
+    /// advertise an escape hatch into the full provider catalog, and the empty
+    /// list reports itself through its own notification (c-2).
+    #[test]
+    fn test_model_picker_keys_offer_no_catalog_escape_hatch() {
+        let catalog = canonical_catalog();
+        for item in &catalog {
+            assert!(
+                !item.key.ends_with("_catalog") && item.key != "dialog.model_select.catalog_row",
+                "the picker must not ship the removed catalog surface: {}",
+                item.key
+            );
+        }
+        assert!(
+            catalog
+                .iter()
+                .any(|item| item.key == "notify.model_select_empty"),
+            "a closed picker needs its own explanation"
+        );
+    }
+
     #[test]
     fn test_canonical_catalog_keys_use_stable_dot_notation() {
         for item in canonical_catalog() {
@@ -1266,6 +1359,99 @@ mod tests {
                 "catalog key '{}' must be lowercase dot notation",
                 item.key
             );
+        }
+    }
+
+    /// No audited renderer may keep hardcoding a user-facing phrase that the
+    /// catalog owns: every phrase below moved into `canonical_catalog`, so
+    /// the production halves of the audited view files must resolve it through
+    /// `active_t` instead (Conventions §9).
+    #[test]
+    fn test_view_renderers_resolve_phrases_through_the_catalog() {
+        let sources: &[(&str, &str)] = &[
+            (
+                "views/repl/render/model.rs",
+                include_str!("../views/repl/render/model.rs"),
+            ),
+            ("views/history.rs", include_str!("../views/history.rs")),
+            (
+                "views/plans/render.rs",
+                include_str!("../views/plans/render.rs"),
+            ),
+            (
+                "views/review/render.rs",
+                include_str!("../views/review/render.rs"),
+            ),
+            (
+                "views/plans/tree.rs",
+                include_str!("../views/plans/tree.rs"),
+            ),
+            (
+                "views/review/tree.rs",
+                include_str!("../views/review/tree.rs"),
+            ),
+        ];
+
+        let forbidden: &[&str] = &[
+            // Develop toolchain, edit badges, and staged-file labels.
+            "Error: ",
+            " [{}] TOOLCHAIN ",
+            "[TOOLCHAIN: OK]",
+            "[TOOLCHAIN: FAILED]",
+            "Running `{}`...",
+            "`{}` passed",
+            "`{}` failed",
+            "[COMMITTED: {}]",
+            "[APPLIED]",
+            "[REJECTED]",
+            "[{}] Modifying",
+            "({}/{} files)",
+            "Summary: ",
+            "(Retrying {})",
+            "\"renamed\"",
+            "\"rewritten\"",
+            "\"deleted\"",
+            "1 line",
+            "{} lines",
+            "1 hunk",
+            "{} hunks",
+            // History record badges and body labels.
+            "[USER]",
+            "[ASSISTANT]",
+            "[SYSTEM]",
+            "[COMMIT: {}]",
+            "Modified files (",
+            "Context: ",
+            "+{} more lines",
+            "{} modified files",
+            // Plans and Review info strips.
+            "{} plan(s), {} item(s) ({} done)",
+            "{} session(s), {} finding(s) ({} fixed, {} skipped)",
+            "[Row {}/{}]",
+            // Plans and Review tree renderers.
+            "{}/{} done",
+            "{} item{}",
+            "{} file{}",
+            "{} ref",
+            " [{} readonly]",
+            "{}/{} steps",
+            "{}/{} fixed ({} todo, {} prog, {} disc, {} skip, {} rej)",
+            " (folded)",
+            "step #{}",
+            "concept: ",
+            "depends_on: ",
+            "files: ",
+            "ref: ",
+        ];
+
+        for (name, source) in sources {
+            let production = source.split("#[cfg(test)]").next().unwrap_or_default();
+            for &fragment in forbidden {
+                assert!(
+                    !production.contains(fragment),
+                    "{name} hardcodes the catalog phrase {fragment:?}"
+                );
+            }
         }
     }
 }

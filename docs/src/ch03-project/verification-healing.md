@@ -47,6 +47,9 @@ deterministically. A transcript can only be truncated.
    enabled, the target comes from configuration, not from the model.
 8. **A blocked outcome bypasses healing.** A semantic refusal is not a compiler
    error to retry.
+9. **Selection narrows work, never the gate.** The project may route the change set
+   to cheaper checks, but an empty or unrecognized change set selects the complete
+   suite.
 
 ---
 
@@ -77,18 +80,21 @@ order, so the most actionable findings appear first.
 An unreadable or absent severity resolves to `error`, never to a note. A
 malformed record must not downgrade a real failure.
 
-### 2.3 Verification target and phases
+### 2.3 The declared verification lifecycle
 
-A request names a target:
+The repository declares one verification command in `[project.verify]`, and that
+command line *is* the pipeline: the harness knows no compiler, so it runs the
+declared process once and takes its exit status as the verdict.
 
-- **all** — check, then lint, then test;
-- **check** — the build only;
-- **test** — the test suite only;
-- **clippy / lint** — the lint pass only.
+A verification request still names a target — all, check, test, or lint — but the
+target travels as a label for the interface, never as a command selector. Because
+the repository described its own lifecycle, the model cannot narrow the gate by
+asking for a lighter target, and a repository that declares no command has nothing
+to verify instead of a guessed toolchain.
 
-The target decides which phases run, in which order, and the pipeline stops at
-the first failing phase. A repository without a detected toolchain skips the gate
-transparently instead of failing the turn.
+The declared command may itself be a dispatcher that reads the delivered change set
+and routes the work, but the harness never composes, narrows, or rewrites the
+command line: it spawns what the declaration names and reads the exit status.
 
 ### 2.4 The healing round
 
@@ -104,20 +110,54 @@ present in the tracked file list and not yet editable is added to the editable
 auto context layer, so the next healing round can patch it without a discovery
 round. The paths are extracted by a deterministic scan, never guessed by a model.
 
+### 2.6 The change set and the selected checks
+
+The turn owns exactly one authoritative list of changed paths, and the harness
+delivers it to the verification command on standard input, one repository-relative
+path per line. The command never derives that list from Git itself: while the
+transaction is open, the working copy also holds the post-hook artifacts and the
+developer's uncommitted work, which the turn did not propose.
+
+What the list *means* is decided by the project, not by the harness. This
+repository delegates the decision to a dispatcher script, which selects the
+declared recipes a change requires: the workspace build for Rust sources and
+workspace manifests, the markdown filter for documentation, both when the set mixes
+them or carries a path no rule recognizes, and the complete suite when the list is
+empty or the script was started from a terminal. The engine runs one declared
+command line and never learns which suffix belongs to which technology.
+
+Selection narrows the amount of work, never the gate. Whatever the dispatcher
+chooses, the exit status of the declared verification command remains the only
+verdict, and failing it still returns the tree to its pre-turn checkpoint.
+
 ---
 
 ## 3. Mechanics & Lifecycle ("How it behaves")
 
 ### 3.1 Running a check
 
-The pipeline resolves its phases from configuration, runs each command with its
-own wall-clock budget, and stops at the first failure. On Unix the command runs
-in an isolated process group, so a timeout or a cancellation tears down the
-compiler and every binary it spawned.
+The pipeline runs the declared `[project.verify]` command line with its own
+wall-clock budget and stops at its exit status. On Unix the command runs in an
+isolated process group, so a timeout or a cancellation tears down the compiler
+and every binary it spawned.
+
+The command also receives the turn's authoritative change set on standard input,
+one repository-relative path per line, so a project dispatcher selects the checks
+the change requires. An empty change set writes nothing and the command runs its
+complete suite, because a narrowed list may reduce work but can never switch a
+check off. When the change set touches only documentation, this repository runs the
+markdown filter and never starts the workspace build, so a one-line fix does not pay
+for a full compile.
 
 The result carries the command, its output, and the typed diagnostics parsed by
 the harness. A command that reports only raw text still yields a result; the
 difference is that its findings are not typed.
+
+A selected documentation check is one of those typed results: the markdown filter
+prints `path:line: error: message` for each finding and exits non-zero, and the
+harness parses those lines into located `error`-severity diagnostics. The offending
+documentation enters the editable context through the same deterministic path scan
+as a compiler error, so the healing round can repair it without a discovery round.
 
 ### 3.2 Rendering the report
 
@@ -164,24 +204,21 @@ Two variants keep the loop honest:
 
 | Guard | Effect |
 | --- | --- |
-| `auto_verify` | when enabled, the configured target is authoritative; a model request can only choose the success report mode |
-| `auto_heal` | gates the repair loop; disabled means one failed check ends the turn |
-| retry budget | bounds the number of healing rounds |
+| mandatory verification | the declared lifecycle runs after every change set; no flag turns it off |
+| report mode | a model request chooses only whether a passing run is reported |
+| retry budget | bounds the number of healing rounds (`develop.max_retries`) |
 | cancellation | stops verification and rolls the turn back immediately |
 | blocked outcome | bypasses healing entirely and rolls the tree back |
 
 In an isolated step or a batch, verification is strictly determined by project
 configuration. The model has no authority to configure, weaken, or skip it.
 
-### 3.5 Clean build, missing toolchain, exhausted budget
+### 3.5 Clean build, missing declaration, exhausted budget
 
-- **Clean build** — the turn is finalized as one isolated commit. A configured
-  best-effort formatter registry runs first over the changed files, and a
-  formatter failure restores the verified content rather than blocking the
-  commit.
-- **No toolchain** — verification succeeds with an explicit note that no build or
-  test toolchain was detected. The turn is not failed for a repository that has
-  nothing to build.
+- **Clean build** — the turn is finalized as one isolated commit.
+- **No declared command** — verification reports that the project declares no
+  verification command, so the change set stays unverified. The turn is not failed
+  for a declaration the configuration gate would already have rejected.
 - **Exhausted budget** — the working tree is restored to the pre-turn checkpoint,
   the error report is returned, and no commit is created.
 
@@ -211,6 +248,9 @@ architect role is not a repair mechanism for a compile failure.
   never in a partial commit.
 - **It is not a reason to hide failure.** An exhausted budget, a blocked step, and
   a rolled-back turn remain distinct, named outcomes.
+- **It is not a fixed check list.** Which commands run for a change set is decided
+  by the project dispatcher; the harness runs what the declaration names and reads
+  the exit status.
 
 ---
 

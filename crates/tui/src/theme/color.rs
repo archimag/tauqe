@@ -7,6 +7,9 @@
 //! slots, which can render a semantic role invisible or illegible under palettes
 //! such as Solarized.
 
+use std::collections::HashMap;
+use std::sync::{LazyLock, Mutex};
+
 use ratatui::style::{Color, Modifier, Style};
 
 /// The six channel levels of the xterm 6x6x6 color cube.
@@ -18,8 +21,16 @@ const CUBE_LEVELS: [u8; 6] = [0, 95, 135, 175, 215, 255];
 /// projection is confined to 16..=255.
 const SAFE_ANSI256_START: u8 = 16;
 
+/// Process-wide memo of nearest safe xterm 256-color indices.
+///
+/// Projection is deterministic and pure, so each distinct color scans the
+/// 240 safe candidates at most once per process; the per-span projections
+/// of every rendered frame reuse the cached index instead of rescanning.
+static ANSI256_NEAREST: LazyLock<Mutex<HashMap<RgbColor, u8>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
 /// A 24-bit sRGB color authored in a theme palette.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct RgbColor {
     /// Red channel.
     pub r: u8,
@@ -39,8 +50,21 @@ impl RgbColor {
     ///
     /// The search covers the 6x6x6 cube and the grayscale ramp (indices
     /// 16..=255) and never the remappable system slots 0..=15, so the result is
-    /// stable regardless of the terminal's host palette.
+    /// stable regardless of the terminal's host palette. Results are memoized
+    /// process-wide through [`ANSI256_NEAREST`]: every distinct color scans at
+    /// most once, and the repeated per-span projections of a streamed frame
+    /// reuse the cached index instead of rescanning.
     pub fn to_ansi256(self) -> u8 {
+        match ANSI256_NEAREST.lock() {
+            Ok(mut cache) => *cache.entry(self).or_insert_with(|| self.scan_ansi256()),
+            // A poisoned guard cannot be recovered here; degrade to a
+            // direct, uncached scan so the projection stays correct.
+            Err(_) => self.scan_ansi256(),
+        }
+    }
+
+    /// Scans every safe xterm index for the nearest match to this color.
+    fn scan_ansi256(self) -> u8 {
         (SAFE_ANSI256_START..=u8::MAX)
             .min_by_key(|&index| self.distance_squared(ansi256_to_rgb(index)))
             .unwrap_or(SAFE_ANSI256_START)
@@ -215,6 +239,20 @@ mod tests {
         for index in SAFE_ANSI256_START..=u8::MAX {
             let rgb = ansi256_to_rgb(index);
             assert_eq!(rgb.to_ansi256(), index, "index {index} did not round-trip");
+        }
+    }
+
+    #[test]
+    fn memoized_projection_is_byte_identical_to_a_direct_scan() {
+        // The first projection populates the memo and later ones read it;
+        // every path must equal an uncached scan of the same candidates.
+        for color in SAMPLE_COLORS {
+            let memoized = color.to_ansi256();
+            assert_eq!(
+                memoized,
+                color.scan_ansi256(),
+                "{color:?} memoized to a different index than a direct scan"
+            );
         }
     }
 

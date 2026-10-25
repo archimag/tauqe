@@ -4,155 +4,87 @@
 //! random v4 value. The 48-bit millisecond Unix timestamp occupies the
 //! leading bytes, so identifier strings sort chronologically and a
 //! directory listing of `.tauqe/reviews/{uuid7}.json` follows creation
-//! order without touching file metadata. The version and variant nibbles
-//! mark the identifier as RFC 9562 v7, and every remaining bit comes
-//! from the operating system CSPRNG, which makes collisions and file-name
-//! races practically impossible.
+//! order without touching file metadata.
+//!
+//! Bit layout, entropy, version and variant stamping, and text rendering
+//! all belong to the `uuid` crate. This module only narrows that crate to
+//! the contract the rest of the workspace relies on: a canonical
+//! hyphenated string out, the same canonical spelling recognized on the
+//! way back in, and the millisecond timestamp behind an identifier.
 
-use std::time::{SystemTime, UNIX_EPOCH};
-
-/// Length of a canonical hyphenated UUID string.
-const UUID_TEXT_LEN: usize = 36;
-
-/// Mask selecting the 48-bit timestamp field of a UUIDv7.
-const TIMESTAMP_MASK: u64 = 0x0000_ffff_ffff_ffff;
+use uuid::{Uuid, Variant};
 
 /// Generates a new UUIDv7 identifier in canonical hyphenated form.
 ///
 /// The leading 48 bits carry the current Unix time in milliseconds, so
 /// the lexicographic order of generated values matches creation order.
-/// The version field is set to 7 and the variant field to the RFC 4122
-/// `0b10` pattern. All remaining bits are filled from the system CSPRNG.
+/// The crate stamps the version and variant fields and fills every
+/// remaining bit from the operating system CSPRNG.
 pub fn generate_uuid_v7() -> String {
-    generate_uuid_v7_at(current_unix_millis())
+    Uuid::now_v7().to_string()
 }
 
 /// Validates that `value` is a well-formed UUIDv7 string.
 ///
-/// The check enforces the canonical 36-character layout, the hyphen
-/// positions, hexadecimal digits, version `7`, and the RFC 4122 variant
-/// bits. Hexadecimal digits may be upper or lower case.
+/// Only the canonical hyphenated spelling is accepted: the parser also
+/// accepts the compact, braced, and URN spellings, so the identifier is
+/// rendered back and compared with the input before it qualifies.
+/// Hexadecimal digits may be upper or lower case.
 pub fn is_valid_uuid_v7(value: &str) -> bool {
-    let bytes = value.as_bytes();
-    if bytes.len() != UUID_TEXT_LEN {
-        return false;
-    }
-    for (index, byte) in bytes.iter().enumerate() {
-        if matches!(index, 8 | 13 | 18 | 23) {
-            if *byte != b'-' {
-                return false;
-            }
-        } else if hex_nibble(*byte).is_none() {
-            return false;
-        }
-    }
-    // Version nibble: first hex digit of the third group.
-    if hex_nibble(bytes[14]) != Some(7) {
-        return false;
-    }
-    // Variant nibble: first hex digit of the fourth group, must be 0b10xx.
-    matches!(bytes[19], b'8' | b'9' | b'a' | b'b' | b'A' | b'B')
+    parse_canonical_v7(value).is_some()
 }
 
 /// Extracts the 48-bit millisecond Unix timestamp from a UUIDv7 string.
 ///
-/// Returns `None` when `value` is not a valid UUIDv7. The timestamp is
-/// the value stored in the leading 48 bits: the Unix time in milliseconds
-/// at which the identifier was generated.
+/// Returns `None` when `value` is not a valid UUIDv7. The timestamp is the
+/// value stored in the leading 48 bits: the Unix time in milliseconds at
+/// which the identifier was generated.
 pub fn parse_uuid_v7_timestamp(value: &str) -> Option<u64> {
-    if !is_valid_uuid_v7(value) {
+    let uuid = parse_canonical_v7(value)?;
+    let (seconds, nanos) = uuid.get_timestamp()?.to_unix();
+    Some(seconds.saturating_mul(1000) + u64::from(nanos) / 1_000_000)
+}
+
+/// Parses `value` as a canonical hyphenated UUIDv7.
+///
+/// Returns `None` for a malformed spelling, a different version, or a
+/// variant other than the RFC 4122 `0b10` pattern.
+fn parse_canonical_v7(value: &str) -> Option<Uuid> {
+    let uuid = Uuid::parse_str(value).ok()?;
+    if !uuid.to_string().eq_ignore_ascii_case(value) {
         return None;
     }
-    let mut millis: u64 = 0;
-    let mut digits = 0;
-    for byte in value.bytes() {
-        if byte == b'-' {
-            continue;
-        }
-        // `is_valid_uuid_v7` guarantees a hexadecimal digit here.
-        millis = (millis << 4) | u64::from(hex_nibble(byte)?);
-        digits += 1;
-        if digits == 12 {
-            break;
-        }
+    if uuid.get_version_num() != 7 || uuid.get_variant() != Variant::RFC4122 {
+        return None;
     }
-    Some(millis)
-}
-
-/// Generates a UUIDv7 for an explicit millisecond timestamp.
-///
-/// The timestamp is truncated to its low 48 bits. The version, variant,
-/// and random fields are stamped exactly as in [`generate_uuid_v7`].
-fn generate_uuid_v7_at(millis: u64) -> String {
-    let millis = millis & TIMESTAMP_MASK;
-    let mut bytes = [0u8; 16];
-    bytes[0] = (millis >> 40) as u8;
-    bytes[1] = (millis >> 32) as u8;
-    bytes[2] = (millis >> 24) as u8;
-    bytes[3] = (millis >> 16) as u8;
-    bytes[4] = (millis >> 8) as u8;
-    bytes[5] = millis as u8;
-    fill_random(&mut bytes[6..]);
-    // Stamp version 7 into the high nibble of the seventh byte.
-    bytes[6] = (bytes[6] & 0x0f) | 0x70;
-    // Stamp the RFC 4122 variant into the high two bits of the ninth byte.
-    bytes[8] = (bytes[8] & 0x3f) | 0x80;
-    format_uuid(&bytes)
-}
-
-/// Formats 16 UUID bytes as a canonical lowercase hyphenated string.
-fn format_uuid(bytes: &[u8; 16]) -> String {
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    let mut out = String::with_capacity(UUID_TEXT_LEN);
-    for (index, byte) in bytes.iter().enumerate() {
-        if matches!(index, 4 | 6 | 8 | 10) {
-            out.push('-');
-        }
-        out.push(HEX[usize::from(byte >> 4)] as char);
-        out.push(HEX[usize::from(byte & 0x0f)] as char);
-    }
-    out
-}
-
-/// Fills `buf` with cryptographically secure random bytes.
-///
-/// When the OS entropy source is momentarily unavailable the buffer is
-/// filled from a time-seeded sequence instead, so an entropy failure
-/// never aborts a review turn.
-fn fill_random(buf: &mut [u8]) {
-    if getrandom::getrandom(buf).is_ok() {
-        return;
-    }
-    let mut seed = current_unix_millis();
-    for slot in buf.iter_mut() {
-        seed = seed
-            .wrapping_mul(6_364_136_223_846_793_005)
-            .wrapping_add(1_442_695_040_888_963_407);
-        *slot = (seed >> 33) as u8;
-    }
-}
-
-/// Returns the current Unix time in milliseconds, or 0 before the epoch.
-fn current_unix_millis() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_millis() as u64)
-        .unwrap_or(0)
-}
-
-/// Decodes a single hexadecimal digit.
-fn hex_nibble(byte: u8) -> Option<u8> {
-    match byte {
-        b'0'..=b'9' => Some(byte - b'0'),
-        b'a'..=b'f' => Some(byte - b'a' + 10),
-        b'A'..=b'F' => Some(byte - b'A' + 10),
-        _ => None,
-    }
+    Some(uuid)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use uuid::timestamp::context;
+    use uuid::Timestamp;
+
+    /// Length of a canonical hyphenated UUID string.
+    const UUID_TEXT_LEN: usize = 36;
+
+    /// Mask selecting the 48-bit timestamp field of a UUIDv7.
+    const TIMESTAMP_MASK: u64 = 0x0000_ffff_ffff_ffff;
+
+    /// Builds a UUIDv7 for an explicit millisecond timestamp.
+    ///
+    /// The timestamp is truncated to its low 48 bits, so the round-trip and
+    /// ordering checks can reach the top of the field.
+    fn generate_uuid_v7_at(millis: u64) -> String {
+        let millis = millis & TIMESTAMP_MASK;
+        let timestamp = Timestamp::from_unix(
+            context::NoContext,
+            millis / 1000,
+            ((millis % 1000) * 1_000_000) as u32,
+        );
+        Uuid::new_v7(timestamp).to_string()
+    }
 
     #[test]
     fn generated_identifier_has_canonical_shape() {
@@ -176,12 +108,9 @@ mod tests {
     fn version_and_variant_are_stamped() {
         for _ in 0..64 {
             let value = generate_uuid_v7();
-            let bytes = value.as_bytes();
-            assert_eq!(hex_nibble(bytes[14]), Some(7), "version: {value}");
-            assert!(
-                matches!(bytes[19], b'8' | b'9' | b'a' | b'b'),
-                "variant: {value}"
-            );
+            let uuid = Uuid::parse_str(&value).expect("generated identifier parses");
+            assert_eq!(uuid.get_version_num(), 7, "version: {value}");
+            assert_eq!(uuid.get_variant(), Variant::RFC4122, "variant: {value}");
         }
     }
 
@@ -225,13 +154,25 @@ mod tests {
     fn rejects_malformed_identifiers() {
         assert!(!is_valid_uuid_v7(""));
         assert!(!is_valid_uuid_v7("not-a-uuid"));
+        // The compact spelling without hyphens is not the canonical form.
         assert!(!is_valid_uuid_v7("018f9c1e6b3a7c1e8b3a000000000000"));
+        // The braced and URN spellings are parsed by the crate but rejected here.
+        assert!(!is_valid_uuid_v7("{018f9c1e-6b3a-7c1e-8b3a-000000000000}"));
+        assert!(!is_valid_uuid_v7("urn:uuid:018f9c1e-6b3a-7c1e-8b3a-000000000000"));
         // Wrong version nibble (6 instead of 7).
         assert!(!is_valid_uuid_v7("018f9c1e-6b3a-6c1e-8b3a-000000000000"));
         // Wrong variant nibble (0 instead of 0b10xx).
         assert!(!is_valid_uuid_v7("018f9c1e-6b3a-7c1e-0b3a-000000000000"));
         // Non-hexadecimal character.
         assert!(!is_valid_uuid_v7("018f9c1e-6b3a-7c1e-8b3a-00000000000g"));
+    }
+
+    #[test]
+    fn accepts_uppercase_canonical_spelling() {
+        let value = generate_uuid_v7_at(1_700_000_000_000);
+        let uppercase = value.to_uppercase();
+        assert!(is_valid_uuid_v7(&uppercase), "uppercase must validate");
+        assert_eq!(parse_uuid_v7_timestamp(&uppercase), Some(1_700_000_000_000));
     }
 
     #[test]

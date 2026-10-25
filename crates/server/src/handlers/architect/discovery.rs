@@ -49,6 +49,9 @@ pub(crate) struct ArchitectDiscoveryRequest<'a> {
     pub(crate) include_repo_map: bool,
     pub(crate) max_discovery_rounds: usize,
     pub(crate) files_token_budget: usize,
+    /// Operational caps applied to the repository searches, directory listings,
+    /// and targeted contours of one discovery round.
+    pub(crate) discovery_limits: tauqe_core::workflow::discovery::DiscoveryLimits,
     /// Retry budget for a generation round whose structured response could not
     /// be parsed.
     ///
@@ -153,6 +156,7 @@ where
         include_repo_map,
         max_discovery_rounds,
         files_token_budget,
+        discovery_limits,
         max_parse_retries,
         session_id,
     } = request;
@@ -441,6 +445,7 @@ where
                         &s_root,
                         &searches,
                         &available_files,
+                        discovery_limits,
                     )
                 })
                 .await
@@ -451,7 +456,10 @@ where
 
             // Targeted contour requests run through the same Discovery handler
             // as every other map request, so the loop never duplicates the
-            // rendering rules or the per-round request cap.
+            // rendering rules or the per-round request cap. The configured file
+            // budget travels with the call for the same reason: the dispatcher
+            // sees the budgets the turn itself enforces instead of a bypass
+            // literal that would exempt this branch from them.
             let map_outcome = if repo_map_requests.is_empty() {
                 tauqe_core::workflow::discovery::DiscoveryRoundOutcome::default()
             } else {
@@ -470,8 +478,9 @@ where
                         &m_root,
                         &available_files,
                         &commands,
-                        usize::MAX,
+                        files_token_budget,
                         map_budget,
+                        discovery_limits,
                         false,
                     )
                 })

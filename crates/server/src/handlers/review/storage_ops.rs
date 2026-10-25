@@ -8,12 +8,14 @@
 use std::sync::Arc;
 
 use tauqe_core::review::ReviewStorage;
+use tauqe_protocol::discussion::DiscussionTarget;
 use tauqe_protocol::{
     errors, events, Request, Response, ReviewDeleteParams, ReviewDeleteResult, ReviewGetParams,
     ReviewGetResult, ReviewListChangedEvent, ReviewListResult, ReviewUpdateItemParams,
     ReviewUpdateItemResult, ReviewUpdatedEvent,
 };
 
+use crate::handlers::common::release_focus_anchored_on;
 use crate::state::AppState;
 
 use super::common::{emit, offload_review};
@@ -34,23 +36,23 @@ pub async fn handle_review_list(req: Request, state: &Arc<AppState>) -> Response
 }
 
 pub async fn handle_review_get(req: Request, state: &Arc<AppState>) -> Response {
-    let target_id = req.params.and_then(|p| {
-        if let Ok(params) = serde_json::from_value::<ReviewGetParams>(p.clone()) {
-            if let Some(id) = params.id {
-                if !id.trim().is_empty() {
-                    return Some(id);
-                }
+    // Strict wire-contract parse: a present payload must decode through the
+    // typed DTO, so a malformed `id` answers INVALID_PARAMS instead of
+    // silently resolving through the active session (Conventions §2.5). An
+    // absent payload or an empty id still means "the active session".
+    let target_id = match req.params {
+        None => None,
+        Some(payload) => match serde_json::from_value::<ReviewGetParams>(payload) {
+            Ok(params) => params.id.filter(|id| !id.trim().is_empty()),
+            Err(err) => {
+                return Response::err(
+                    req.id,
+                    errors::INVALID_PARAMS,
+                    format!("Invalid review get parameters: {}", err),
+                );
             }
-        }
-        if let Ok(val) = serde_json::from_value::<serde_json::Value>(p) {
-            if let Some(id_str) = val.get("id").and_then(|v| v.as_str()) {
-                if !id_str.trim().is_empty() {
-                    return Some(id_str.to_string());
-                }
-            }
-        }
-        None
-    });
+        },
+    };
 
     let repo_root = state.context.read().await.repo_root().to_path_buf();
 
@@ -124,6 +126,19 @@ pub async fn handle_review_delete(req: Request, state: &Arc<AppState>) -> Respon
     match offload_review(move || ReviewStorage::delete_review(&delete_root, &review_id)).await {
         Ok(deleted) => {
             if deleted {
+                // Discussion Focus invariant: an anchor may never address a
+                // deleted entity. A focus bound to the removed session is
+                // released together with it through the shared release helper,
+                // which broadcasts the release so every client drops the dead
+                // anchor instead of rendering it.
+                release_focus_anchored_on(
+                    state,
+                    &DiscussionTarget::Review {
+                        id: params.id.clone(),
+                    },
+                )
+                .await;
+
                 let list_root = repo_root.clone();
                 if let Ok(reviews) =
                     offload_review(move || ReviewStorage::load_all(&list_root)).await

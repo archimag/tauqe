@@ -122,7 +122,18 @@ pub async fn handle_plan_execute_pipeline(req: Request, state: &Arc<AppState>) -
         .iter()
         .map(|(plan_id, _)| plan_id.clone())
         .collect();
-    let response = Response::ok(req.id, serde_json::json!({ "plan_ids": plan_ids }));
+    // The registered operation runs the whole queue, so its identity travels
+    // with the acknowledgement instead of being minted at emission time: a
+    // client can attribute every lifecycle event of the pipeline — each plan's
+    // terminal `plan/batch_finished` and its replanning phases included — to
+    // the request it just sent.
+    let response = Response::ok(
+        req.id,
+        serde_json::json!({
+            "plan_ids": plan_ids,
+            "operation_id": format!("op-{}", operation.id()),
+        }),
+    );
 
     let state = Arc::clone(state);
     tokio::spawn(async move {

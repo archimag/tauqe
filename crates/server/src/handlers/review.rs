@@ -5,8 +5,9 @@
 //! (`synthesis`), Architect-driven finding decomposition (`refine`), per-finding
 //! bounded-turn execution (`step`), and the batch supervisor (`batch`). Every RPC
 //! handler keeps its public name and signature so the dispatcher stays unchanged,
-//! and the concurrency invariants — parallel-mutation rejection, cancellation
-//! handling, and the `ITEM_IN_REFINE` gate — are preserved across the split.
+//! and the lifecycle and concurrency invariants — parallel-mutation rejection,
+//! cancellation handling, and the decomposition status gate that refuses a
+//! finished, rejected, or untriaged finding — are preserved across the split.
 
 mod batch;
 mod common;

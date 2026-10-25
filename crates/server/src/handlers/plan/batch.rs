@@ -147,9 +147,18 @@ pub async fn handle_plan_execute(req: Request, state: &Arc<AppState>) -> Respons
     state.clear_discussion_focus().await;
 
     let step_ids: Vec<String> = steps.iter().map(|s| s.id.clone()).collect();
+    // The identity of the registered operation travels with the acknowledgement,
+    // so a client can attribute every lifecycle event of the batch — the
+    // replanning rounds and the terminal `plan/batch_finished` included — to the
+    // request it just sent.
+    let operation_id = format!("op-{}", operation.id());
     let response = Response::ok(
         req.id,
-        serde_json::json!({ "plan_id": plan.id, "step_ids": step_ids }),
+        serde_json::json!({
+            "plan_id": plan.id,
+            "step_ids": step_ids,
+            "operation_id": operation_id,
+        }),
     );
 
     let state = Arc::clone(state);
@@ -206,39 +215,27 @@ pub async fn handle_plan_execute(req: Request, state: &Arc<AppState>) -> Respons
 }
 
 pub async fn handle_plan_refine(req: Request, state: &Arc<AppState>) -> Response {
+    // Strict wire-contract parse: the typed DTO — which declares the legacy
+    // `id` alias — is the single parser, so a malformed field answers
+    // INVALID_PARAMS instead of degrading to a silent active-plan fallback
+    // or dropping the model selection (Conventions §2.5).
     let (plan_id, custom_model, instructions) = match req.params {
-        Some(val) => {
-            if let Ok(params) = serde_json::from_value::<PlanRefineParams>(val.clone()) {
-                (params.plan_id, params.model, params.instructions)
-            } else if let Some(obj) = val.as_object() {
-                let id = obj
-                    .get("plan_id")
-                    .or_else(|| obj.get("id"))
-                    .and_then(|v| v.as_str())
-                    .unwrap_or_default()
-                    .to_string();
-                let model = obj
-                    .get("model")
-                    .and_then(|v| serde_json::from_value(v.clone()).ok());
-                let instructions = obj
-                    .get("instructions")
-                    .and_then(|v| v.as_str())
-                    .map(String::from);
-                (id, model, instructions)
-            } else {
+        Some(val) => match serde_json::from_value::<PlanRefineParams>(val) {
+            Ok(params) => (params.plan_id, params.model, params.instructions),
+            Err(err) => {
                 return Response::err(
                     req.id,
                     errors::INVALID_PARAMS,
-                    "Invalid plan refine parameters",
+                    format!("Invalid plan refine parameters: {}", err),
                 );
             }
-        }
+        },
         None => {
             return Response::err(
                 req.id,
                 errors::INVALID_PARAMS,
                 "Missing plan refine parameters",
-            )
+            );
         }
     };
 
@@ -309,8 +306,12 @@ pub async fn handle_plan_refine(req: Request, state: &Arc<AppState>) -> Response
 /// blocked step, preserving the completed (DONE) foundation and updating the plan
 /// atomically via `execute_plan_horizon_synthesis`.
 pub async fn handle_plan_replan(req: Request, state: &Arc<AppState>) -> Response {
+    // Strict wire-contract parse: the typed DTO — which already declares the
+    // legacy `id`/`item_id` aliases — is the single parser, so a malformed
+    // field answers INVALID_PARAMS instead of degrading to empty identifiers
+    // or dropping the model selection (Conventions §2.5).
     let (plan_id, step_id, blocked_reason, custom_model, instructions) = match req.params {
-        Some(val) => match serde_json::from_value::<PlanReplanParams>(val.clone()) {
+        Some(val) => match serde_json::from_value::<PlanReplanParams>(val) {
             Ok(params) => (
                 params.plan_id,
                 params.step_id,
@@ -318,46 +319,20 @@ pub async fn handle_plan_replan(req: Request, state: &Arc<AppState>) -> Response
                 params.model,
                 params.instructions,
             ),
-            Err(_) => match val.as_object() {
-                Some(obj) => {
-                    let plan_id = obj
-                        .get("plan_id")
-                        .or_else(|| obj.get("id"))
-                        .and_then(|v| v.as_str())
-                        .unwrap_or_default()
-                        .to_string();
-                    let step_id = obj
-                        .get("step_id")
-                        .or_else(|| obj.get("item_id"))
-                        .and_then(|v| v.as_str())
-                        .unwrap_or_default()
-                        .to_string();
-                    let blocked_reason =
-                        obj.get("reason").and_then(|v| v.as_str()).map(String::from);
-                    let custom_model = obj
-                        .get("model")
-                        .and_then(|v| serde_json::from_value(v.clone()).ok());
-                    let instructions = obj
-                        .get("instructions")
-                        .and_then(|v| v.as_str())
-                        .map(String::from);
-                    (plan_id, step_id, blocked_reason, custom_model, instructions)
-                }
-                None => {
-                    return Response::err(
-                        req.id,
-                        errors::INVALID_PARAMS,
-                        "Invalid plan replan parameters",
-                    )
-                }
-            },
+            Err(err) => {
+                return Response::err(
+                    req.id,
+                    errors::INVALID_PARAMS,
+                    format!("Invalid plan replan parameters: {}", err),
+                );
+            }
         },
         None => {
             return Response::err(
                 req.id,
                 errors::INVALID_PARAMS,
                 "Missing plan replan parameters",
-            )
+            );
         }
     };
 

@@ -267,7 +267,6 @@ pub struct ReplView {
     pub rendered_lines_count: usize,
     pub copy_flash: Option<(usize, std::time::Instant)>,
     pub code_blocks: Vec<ModelCodeBlock>,
-    pub content_rect: (u16, u16, u16, u16),
     pub content_width: usize,
     /// Vertical scroll offset of the prompt editor, retained across frames so
     /// the cursor keeps its position instead of sticking to the bottom row.
@@ -319,7 +318,6 @@ impl Default for ReplView {
             rendered_lines_count: 0,
             copy_flash: None,
             code_blocks: Vec::new(),
-            content_rect: (0, 0, 0, 0),
             content_width: 0,
             input_scroll: 0,
             esc_clear_armed: None,

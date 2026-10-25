@@ -10,7 +10,9 @@ use crate::edits::protocol::structured::StructuredEditProtocol;
 use crate::edits::protocol::TerminalOutcome;
 use crate::edits::stream::discussion::DiscussionStreamFilter;
 use crate::edits::stream::JsonStreamFilter;
-use tauqe_protocol::{CapabilitySet, LlmCapability, LlmCommand, LlmOutcome, ModelResult};
+use tauqe_protocol::{
+    CapabilitySet, EditProtocolKind, LlmCapability, LlmCommand, LlmOutcome, ModelResult,
+};
 
 use crate::capabilities::{map_verify_on_success, map_verify_target};
 
@@ -50,10 +52,14 @@ impl JsonPromptProtocol {
     }
 
     /// Creates a structured protocol configured for file editing.
+    ///
+    /// The transport contributes the encoding only: the advertised surface is
+    /// the intent-oriented interactive REPL profile, so a `structured` project
+    /// and an `xml` project advertise the very same operational surface.
     pub fn edits() -> Self {
         Self {
             mode: JsonPromptMode::Edits,
-            capabilities: CapabilitySet::develop_structured(),
+            capabilities: CapabilitySet::interactive_repl(),
         }
     }
 
@@ -114,6 +120,10 @@ impl PromptProtocol for JsonPromptProtocol {
         "structured"
     }
 
+    fn kind(&self) -> EditProtocolKind {
+        EditProtocolKind::Structured
+    }
+
     fn capabilities(&self) -> &[LlmCapability] {
         self.capabilities.as_slice()
     }
@@ -127,7 +137,7 @@ impl PromptProtocol for JsonPromptProtocol {
         Box::new(Self { mode, capabilities })
     }
 
-    fn decode(&self, raw_text: &str) -> Vec<LlmCommand> {
+    fn decode(&self, raw_text: &str, context_paths: &[String]) -> Vec<LlmCommand> {
         let structured = StructuredEditProtocol;
         let mut commands = Vec::new();
 
@@ -139,7 +149,7 @@ impl PromptProtocol for JsonPromptProtocol {
         }
 
         // File edit operations decoded from the structured `changes` array.
-        match structured.parse_output(raw_text, &[]) {
+        match structured.parse_output(raw_text, context_paths) {
             ModelResult::Edit { edits, outcome, .. } => {
                 if let Some(message) = outcome.error {
                     commands.push(LlmCommand::ProtocolError { message });
@@ -235,10 +245,33 @@ impl PromptProtocol for JsonPromptProtocol {
             commands.push(LlmCommand::Blocked { reason, details });
         }
 
+        // Unconditional abort decoded from the structured `abort` field,
+        // falling back to `<abort>` control tags.
+        if let Some((reason, recommendation)) = structured.parse_abort(raw_text) {
+            commands.push(LlmCommand::Abort {
+                reason,
+                recommendation,
+            });
+        }
+
         // Plan creation or modification decoded from the structured `plan_update`
-        // field, falling back to `<plan>` control tags.
-        for update in structured.parse_plan_updates(raw_text) {
-            commands.push(LlmCommand::Plan { update });
+        // field, falling back to `<plan>` control tags when the field is absent.
+        // A payload the DTO cannot hold is reported as a protocol error instead
+        // of being silently dropped, so the bounded turn can repeat generation
+        // with the decoding diagnostics attached.
+        match structured.parse_plan_updates(raw_text) {
+            Ok(updates) => {
+                for update in updates {
+                    commands.push(LlmCommand::Plan { update });
+                }
+            }
+            Err(message) => commands.push(LlmCommand::ProtocolError { message }),
+        }
+
+        // Typed project command invocations decoded from the structured
+        // `custom_tools` field, falling back to `<custom_tool>` control tags.
+        for (name, args) in structured.parse_custom_tools(raw_text) {
+            commands.push(LlmCommand::CustomTool { name, args });
         }
 
         // Narrowing the capability set must also block decoding, so a disabled
@@ -259,13 +292,13 @@ impl PromptProtocol for JsonPromptProtocol {
             }
             JsonPromptMode::Discussion { stream_field } => {
                 if stream_field == "message" {
-                    "You are operating in Structured Discussion mode. Formulate all responses as a valid JSON object matching the discussion_response schema:\n\
+                    "## Mode: Structured Discussion\nYou are operating in Structured Discussion mode. Formulate all responses as a valid JSON object matching the discussion_response schema:\n\
                     - message: Conversational Markdown explanation, reasoning, and answers. This field is streamed directly to the user interface.\n\
                     - plan_update: null (unless the user explicitly instructed to create or modify a plan)\n\
                     - context_requests: list of { path, access } files to add to context\n\
                     - repo_searches: list of { path, regex } search queries using Rust / ripgrep regex syntax (supports \\b, \\w, \\d, (?:...), (?i); no lookarounds or backreferences)\n\
                     - user_language: detected primary natural language of user prompt (e.g. Russian, English)\n\
-                    Output ONLY raw valid JSON matching this schema, without any outer markdown fences or markdown wrapping."
+                    Output ONLY raw valid JSON matching this schema, without any outer markdown fences or markdown wrapping.\n"
                         .to_string()
                 } else {
                     format!(
@@ -344,22 +377,27 @@ mod tests {
             LlmCapability::Discovery,
             LlmCapability::DocRequest,
             LlmCapability::ToolchainVerify,
+            LlmCapability::PlanCreation,
             LlmCapability::Scratchpad,
             LlmCapability::Outcome,
             LlmCapability::Blocked,
+            LlmCapability::Abort,
             LlmCapability::UserLanguage,
+            LlmCapability::CustomTools,
         ] {
             assert!(protocol.supports(capability));
         }
-        assert!(!protocol.supports(LlmCapability::PlanCreation));
+        // Plan mutation stays a matter of the plan focus, never of the
+        // transport, so it is absent exactly as in the XML profile.
         assert!(!protocol.supports(LlmCapability::PlanUpdate));
+        assert_eq!(protocol.capability_set(), CapabilitySet::interactive_repl());
     }
 
     #[test]
     fn test_decode_answer_without_changes() {
         let protocol = JsonPromptProtocol::default();
         let output = r#"{"message":"Hello there! How can I help you?","changes":[],"context_requests":[],"context_drops":[],"suggested_actions":[]}"#;
-        let commands = protocol.decode(output);
+        let commands = protocol.decode(output, &[]);
         assert_eq!(
             commands,
             vec![LlmCommand::Text {
@@ -386,7 +424,7 @@ mod tests {
             "context_requests": [],
             "suggested_actions": []
         }"#;
-        let commands = protocol.decode(output);
+        let commands = protocol.decode(output, &[]);
         let has_error = commands
             .iter()
             .any(|cmd| matches!(cmd, LlmCommand::ProtocolError { .. }));
@@ -415,7 +453,7 @@ mod tests {
             "context_drops": [],
             "suggested_actions": []
         }"#;
-        let commands = protocol.decode(output);
+        let commands = protocol.decode(output, &[]);
 
         assert!(commands.contains(&LlmCommand::Text {
             content: "Fix the bug".to_string(),
@@ -452,7 +490,7 @@ mod tests {
             "repo_maps":["./crates/core/","."],
             "suggested_actions":[]
         }"#;
-        let commands = protocol.decode(output);
+        let commands = protocol.decode(output, &[]);
 
         assert!(commands.contains(&LlmCommand::RepoDirs));
         assert!(commands.contains(&LlmCommand::RepoMap {
@@ -464,7 +502,7 @@ mod tests {
 
         // An idle outline request decodes into no outline command at all.
         let idle = r#"{"message":"x","changes":[],"repo_dirs":false,"repo_maps":[]}"#;
-        let commands = protocol.decode(idle);
+        let commands = protocol.decode(idle, &[]);
         assert!(!commands
             .iter()
             .any(|command| matches!(command, LlmCommand::RepoDirs | LlmCommand::RepoMap { .. })));
@@ -478,7 +516,7 @@ mod tests {
             "changes":[],
             "dir_lists":[{"path":"./crates/core/","recursive":false},{"path":".","recursive":true}]
         }"#;
-        let commands = protocol.decode(output);
+        let commands = protocol.decode(output, &[]);
 
         assert!(commands.contains(&LlmCommand::DirList {
             path: "crates/core".to_string(),
@@ -492,7 +530,7 @@ mod tests {
         // An idle listing request decodes into no directory command at all.
         let idle = r#"{"message":"x","changes":[],"dir_lists":[]}"#;
         assert!(!protocol
-            .decode(idle)
+            .decode(idle, &[])
             .iter()
             .any(|command| matches!(command, LlmCommand::DirList { .. })));
     }
@@ -502,7 +540,7 @@ mod tests {
         let protocol = JsonPromptProtocol::default();
         let output = "{\"message\":\"Working\",\"changes\":[]}\n\
 <dir_list path=\"crates/core\" recursive=\"true\" />";
-        let commands = protocol.decode(output);
+        let commands = protocol.decode(output, &[]);
         assert!(commands.contains(&LlmCommand::DirList {
             path: "crates/core".to_string(),
             recursive: true,
@@ -519,7 +557,7 @@ mod tests {
             "repo_searches":[{"path":"crates/core","regex":"fn execute"}],
             "suggested_actions":[]
         }"#;
-        let commands = protocol.decode(output);
+        let commands = protocol.decode(output, &[]);
 
         assert!(commands.contains(&LlmCommand::ContextRequest {
             path: "src/a.rs".to_string(),
@@ -542,7 +580,7 @@ mod tests {
             "{\"message\":\"Done.\",\"changes\":[],\"context_requests\":[],\"context_drops\":[],\"suggested_actions\":[]}\n",
             "<user_language>Russian</user_language>\n",
         );
-        let commands = protocol.decode(output);
+        let commands = protocol.decode(output, &[]);
         assert!(commands.contains(&LlmCommand::UserLanguage {
             language: "Russian".to_string(),
         }));
@@ -555,7 +593,7 @@ mod tests {
             "{\"message\":\"Done.\",\"changes\":[],\"context_requests\":[],\"suggested_actions\":[]}\n",
             "<verify target=\"test\" on_success=\"silent\" />\n",
         );
-        let commands = protocol.decode(output);
+        let commands = protocol.decode(output, &[]);
         assert!(commands.iter().any(|cmd| matches!(
             cmd,
             LlmCommand::Verify {
@@ -575,7 +613,7 @@ mod tests {
         );
 
         let output = r#"{"message":"Need context","changes":[{"op":"create","path":"src/a.rs","to":"","old_text":"","new_text":"","content":"x"}],"context_requests":["src/b.rs"],"suggested_actions":[]}"#;
-        let commands = protocol.decode(output);
+        let commands = protocol.decode(output, &[]);
         assert!(!commands.is_empty());
         assert!(commands
             .iter()
@@ -593,6 +631,21 @@ mod tests {
         assert!(protocol.supports(LlmCapability::UserLanguage));
         assert!(!protocol.supports(LlmCapability::FileEdits));
         assert!(!protocol.supports(LlmCapability::ToolchainVerify));
+    }
+
+    #[test]
+    fn test_discussion_instructions_own_the_mode_section() {
+        let protocol = JsonPromptProtocol::discussion();
+        let instructions = protocol.system_instructions(&[], false);
+
+        // The protocol renders the discussion section itself, with the same
+        // `##`-section structure the edit reference uses.
+        assert!(instructions.starts_with("## Mode: Structured Discussion\n"));
+        assert!(instructions.contains("matching the discussion_response schema"));
+        assert!(instructions.contains("- message: Conversational Markdown explanation"));
+        assert!(instructions.contains("- plan_update: null"));
+        assert!(instructions.ends_with("markdown wrapping.\n"));
+        assert!(!instructions.contains("Code Modification Protocol"));
     }
 
     #[test]
@@ -623,7 +676,7 @@ mod tests {
             "user_language": "Russian"
         }"#;
 
-        let commands = protocol.decode(output);
+        let commands = protocol.decode(output, &[]);
         assert!(commands.contains(&LlmCommand::Text {
             content: "Let us refine the concept.".to_string(),
         }));
@@ -690,7 +743,7 @@ mod tests {
             "outcome": {"status": "success", "summary": "All checks passed", "message": ""},
             "blocked": {"is_blocked": false, "reason": "", "details": ""}
         }"#;
-        let commands = protocol.decode(output);
+        let commands = protocol.decode(output, &[]);
 
         assert!(commands.contains(&LlmCommand::DocRequest {
             topic: tauqe_protocol::DocTopic::Git,
@@ -709,13 +762,85 @@ mod tests {
     }
 
     #[test]
+    fn test_decode_abort_from_structured_json_and_xml_fallback() {
+        let protocol = JsonPromptProtocol::edits();
+        let output = r#"{
+            "message": "The native build needs approval.",
+            "changes": [],
+            "abort": {
+                "is_aborted": true,
+                "reason": "Native build approval required",
+                "recommendation": "pnpm approve-builds"
+            }
+        }"#;
+        assert!(protocol.decode(output, &[]).contains(&LlmCommand::Abort {
+            reason: "Native build approval required".to_string(),
+            recommendation: "pnpm approve-builds".to_string(),
+        }));
+
+        // An idle abort field reports nothing at all.
+        let idle = r#"{
+            "message": "x",
+            "changes": [],
+            "abort": {"is_aborted": false, "reason": "", "recommendation": ""}
+        }"#;
+        assert!(!protocol
+            .decode(idle, &[])
+            .iter()
+            .any(|command| matches!(command, LlmCommand::Abort { .. })));
+
+        // Control-tag fallback keeps both transports decoding one payload.
+        let fallback = "{\"message\":\"Working\",\"changes\":[]}\n\
+<abort reason=\"Toolchain missing\" recommendation=\"rustup component add clippy\" />";
+        assert!(protocol.decode(fallback, &[]).contains(&LlmCommand::Abort {
+            reason: "Toolchain missing".to_string(),
+            recommendation: "rustup component add clippy".to_string(),
+        }));
+    }
+
+    #[test]
+    fn test_decode_custom_tool_from_structured_json_and_xml_fallback() {
+        let protocol =
+            JsonPromptProtocol::edits().with_capability_set(CapabilitySet::from_slice(&[
+                LlmCapability::TextMessage,
+                LlmCapability::CustomTools,
+            ]));
+        let output = r#"{
+            "message": "Running the declared probe.",
+            "custom_tools": [{"name": "probe", "args": {"n": "10"}}]
+        }"#;
+        assert!(protocol
+            .decode(output, &[])
+            .contains(&LlmCommand::CustomTool {
+                name: "probe".to_string(),
+                args: serde_json::json!({ "n": "10" }),
+            }));
+
+        // An empty array requests no execution.
+        let idle = r#"{"message": "x", "custom_tools": []}"#;
+        assert!(!protocol
+            .decode(idle, &[])
+            .iter()
+            .any(|command| matches!(command, LlmCommand::CustomTool { .. })));
+
+        // Control-tag fallback decodes the same invocation shape.
+        let fallback = "{\"message\":\"Working\"}\n<custom_tool name=\"probe\" n=\"10\" />";
+        assert!(protocol
+            .decode(fallback, &[])
+            .contains(&LlmCommand::CustomTool {
+                name: "probe".to_string(),
+                args: serde_json::json!({ "n": "10" }),
+            }));
+    }
+
+    #[test]
     fn test_decode_control_fields_from_xml_fallback() {
         let protocol = JsonPromptProtocol::edits();
         let output = "{\"message\":\"Working\",\"changes\":[]}\n\
 <doc_request topic=\"plan\" />\n\
 <scratchpad>Inspect decoder</scratchpad>\n\
 <blocked reason=\"Missing table\" details=\"users table absent\" />";
-        let commands = protocol.decode(output);
+        let commands = protocol.decode(output, &[]);
 
         assert!(commands.contains(&LlmCommand::DocRequest {
             topic: tauqe_protocol::DocTopic::Plan,
@@ -753,7 +878,7 @@ mod tests {
             "outcome": {"status": "success", "summary": "done", "message": ""},
             "blocked": {"is_blocked": true, "reason": "blocked", "details": ""}
         }"#;
-        let commands = protocol.decode(output);
+        let commands = protocol.decode(output, &[]);
         assert!(!commands.is_empty());
         assert!(commands
             .iter()
@@ -762,12 +887,12 @@ mod tests {
 
     #[test]
     fn test_with_capabilities_derives_mode_from_file_edits() {
-        let with_edits = JsonPromptProtocol::with_capabilities(CapabilitySet::develop_structured());
+        let with_edits = JsonPromptProtocol::with_capabilities(CapabilitySet::interactive_repl());
         assert_eq!(with_edits.name(), "structured");
         assert!(with_edits.supports(LlmCapability::FileEdits));
         assert_eq!(
             with_edits.capability_set(),
-            CapabilitySet::develop_structured()
+            CapabilitySet::interactive_repl()
         );
 
         let no_edits = JsonPromptProtocol::with_capabilities(CapabilitySet::from_slice(&[
@@ -795,7 +920,7 @@ mod tests {
             "verify": {"target": "test", "on_success": "silent"},
             "user_language": "Russian"
         }"#;
-        let commands = protocol.decode(output);
+        let commands = protocol.decode(output, &[]);
         assert!(commands.contains(&LlmCommand::Verify {
             target: tauqe_protocol::VerifyTarget::Test,
             on_success: tauqe_protocol::VerifyOnSuccess::Silent,
@@ -806,13 +931,53 @@ mod tests {
     }
 
     #[test]
+    fn test_decode_uses_the_context_paths_for_resolution_and_membership() {
+        let protocol = JsonPromptProtocol::edits();
+        let context_paths = vec!["crates/core/src/lib.rs".to_string()];
+
+        // A unique suffix of a context file resolves to the context path.
+        let suffix = r#"{
+            "message": "Touch lib",
+            "changes": [{"op": "replace", "path": "lib.rs", "to": "", "old_text": "old();", "new_text": "new();", "content": ""}]
+        }"#;
+        let operation = protocol
+            .decode(suffix, &context_paths)
+            .into_iter()
+            .find_map(|command| match command {
+                LlmCommand::Edit { operation } => Some(operation),
+                _ => None,
+            })
+            .expect("decoded edit");
+        match operation {
+            EditOperation::Replace { path, .. } => {
+                assert_eq!(path, "crates/core/src/lib.rs");
+            }
+            other => panic!("unexpected operation: {other:?}"),
+        }
+
+        // A path outside the context is rejected at the decode boundary instead
+        // of being deferred to staging.
+        let outside = r#"{
+            "message": "Touch other",
+            "changes": [{"op": "replace", "path": "crates/core/src/other.rs", "to": "", "old_text": "a", "new_text": "b", "content": ""}]
+        }"#;
+        let commands = protocol.decode(outside, &context_paths);
+        assert!(commands
+            .iter()
+            .any(|command| matches!(command, LlmCommand::ProtocolError { .. })));
+        assert!(!commands
+            .iter()
+            .any(|command| matches!(command, LlmCommand::Edit { .. })));
+    }
+
+    #[test]
     fn test_decode_plan_update_from_structured_json() {
         let protocol = JsonPromptProtocol::discussion();
         let output = r#"{
             "message": "Plan refined",
             "plan_update": {"action": "save", "id": "p-9", "title": "P9"}
         }"#;
-        let commands = protocol.decode(output);
+        let commands = protocol.decode(output, &[]);
         let plan = commands
             .iter()
             .find_map(|command| match command {
@@ -822,6 +987,27 @@ mod tests {
             .expect("plan command");
         assert_eq!(plan.id.as_deref(), Some("p-9"));
         assert_eq!(plan.action, tauqe_protocol::DiscussionPlanAction::Save);
+    }
+
+    #[test]
+    fn test_decode_malformed_plan_update_emits_protocol_error() {
+        let protocol = JsonPromptProtocol::edits();
+        let output = r#"{
+            "message": "Refining",
+            "changes": [],
+            "plan_update": {"action": "save", "items": "not-a-list"}
+        }"#;
+        let commands = protocol.decode(output, &[]);
+
+        // The decoding boundary reports the defect as a protocol error, which is
+        // what lets the bounded turn repeat generation instead of silently
+        // recording an answer whose plan update vanished.
+        assert!(commands
+            .iter()
+            .any(|command| matches!(command, LlmCommand::ProtocolError { .. })));
+        assert!(!commands
+            .iter()
+            .any(|command| matches!(command, LlmCommand::Plan { .. })));
     }
 
     #[test]
@@ -836,7 +1022,7 @@ mod tests {
             "changes": [{"op": "create", "path": "a.rs", "to": "", "old_text": "", "new_text": "", "content": "fn x() {}"}],
             "verify": {"target": "check", "on_success": "report"}
         }"#;
-        let commands = protocol.decode(output);
+        let commands = protocol.decode(output, &[]);
         assert!(commands
             .iter()
             .any(|c| matches!(c, LlmCommand::Verify { .. })));

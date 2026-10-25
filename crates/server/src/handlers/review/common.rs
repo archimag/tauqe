@@ -14,7 +14,7 @@ use tauqe_core::review::prompt::format_review_step_failure_note;
 use tauqe_core::review::ReviewStorage;
 use tauqe_core::workflow::common::apply_context_requests_detailed;
 use tauqe_protocol::{
-    events, ContextAccess, IssueStatus, ReviewErrorEvent, ReviewListChangedEvent,
+    events, ContextAccess, IssueStatus, ReviewErrorEvent, ReviewIssue, ReviewListChangedEvent,
     ReviewUpdatedEvent,
 };
 
@@ -83,7 +83,65 @@ pub(super) async fn publish_review(state: &Arc<AppState>, repo_root: &Path, revi
     }
 }
 
+/// Persists a terminal review finding update and publishes the change.
+///
+/// Returns `Err` when the write does not land on disk — the storage error, or
+/// a not-found diagnostic — so terminal `Fixed`/`Skipped` transitions surface
+/// to the caller instead of letting the batch outcome diverge from the
+/// persisted record. The failure is journaled here; the caller reports the
+/// client-facing error under the operation it already owns, so no fresh
+/// operation id is invented.
+///
+/// `what` names the transition for the failure diagnostic.
+pub(super) async fn persist_finding_update<F>(
+    state: &Arc<AppState>,
+    repo_root: &Path,
+    review_id: &str,
+    item_id: u32,
+    what: &str,
+    update: F,
+) -> Result<(), String>
+where
+    F: FnOnce(&mut ReviewIssue) + Send + 'static,
+{
+    let save_root = repo_root.to_path_buf();
+    let review_id_owned = review_id.to_string();
+    let updated = offload_review(move || {
+        ReviewStorage::update_session_item(&save_root, &review_id_owned, item_id, update)
+    })
+    .await;
+
+    match updated {
+        Ok(Some(_)) => {
+            publish_review(state, repo_root, review_id).await;
+            Ok(())
+        }
+        Ok(None) => {
+            let message = format!(
+                "Review item #{item_id} not found in review '{review_id}'; the {what} was not persisted"
+            );
+            tracing::warn!(review_id = review_id, item_id = item_id, "{}", message);
+            Err(message)
+        }
+        Err(err) => {
+            tracing::warn!(
+                review_id = review_id,
+                item_id = item_id,
+                error = %err,
+                "review finding update was not persisted"
+            );
+            Err(err)
+        }
+    }
+}
+
 /// Persists a new status for a review finding and publishes the change.
+///
+/// Best-effort variant: a persistence failure is journaled inside
+/// [`set_item_status_checked`] and swallowed, which suits the `InProgress`
+/// publication and the `Todo` reverts that accompany an already-reported
+/// failure. Terminal transitions whose outcome must match the durable record
+/// call the checked variant instead.
 pub(super) async fn set_item_status(
     state: &Arc<AppState>,
     repo_root: &Path,
@@ -91,16 +149,32 @@ pub(super) async fn set_item_status(
     item_id: u32,
     status: IssueStatus,
 ) {
-    let update_root = repo_root.to_path_buf();
-    let review_id_owned = review_id.to_string();
-    let updated = offload_review(move || {
-        ReviewStorage::update_session_item_status(&update_root, &review_id_owned, item_id, status)
-    })
-    .await;
+    // This wrapper is the single sanctioned best-effort boundary: the failure
+    // is already journaled by the checked variant, so discarding the result
+    // here keeps the write observable without inventing a fresh operation id.
+    let _ = set_item_status_checked(state, repo_root, review_id, item_id, status).await;
+}
 
-    if let Ok(Some(_)) = updated {
-        publish_review(state, repo_root, review_id).await;
-    }
+/// Persists a terminal review finding status and publishes the change.
+///
+/// Returns `Err` when the write does not land on disk, so the caller reports
+/// the finding as failed instead of letting the batch outcome diverge from the
+/// persisted state.
+pub(super) async fn set_item_status_checked(
+    state: &Arc<AppState>,
+    repo_root: &Path,
+    review_id: &str,
+    item_id: u32,
+    status: IssueStatus,
+) -> Result<(), String> {
+    // `update_session_item_status` is `update_session_item` with a status
+    // closure, so routing through the shared terminal-write helper keeps one
+    // publication and failure-reporting path.
+    let what = format!("'{status}' status update");
+    persist_finding_update(state, repo_root, review_id, item_id, &what, move |it| {
+        it.status = status;
+    })
+    .await
 }
 
 /// Maximum number of Unicode scalar values retained from the model's final
@@ -151,28 +225,32 @@ pub(super) async fn skip_finding_with_diagnostic(
     item_id: u32,
     assistant_text: &str,
     reason: &str,
-) {
+) -> Result<(), String> {
+    // Terminal skip write: the caller must observe a persistence failure so
+    // the batch outcome never diverges from the durable record.
     let notes = build_skip_note(assistant_text, reason);
-    let update_root = repo_root.to_path_buf();
-    let review_id_owned = review_id.to_string();
-    let notes_clone = notes.clone();
-    let updated = offload_review(move || {
-        ReviewStorage::update_session_item(&update_root, &review_id_owned, item_id, move |it| {
+    let persisted = persist_finding_update(
+        state,
+        repo_root,
+        review_id,
+        item_id,
+        "Skipped status",
+        move |it| {
             it.status = IssueStatus::Skipped;
-            it.note = Some(notes_clone);
-        })
-    })
+            it.note = Some(notes);
+        },
+    )
     .await;
 
-    if let Ok(Some(_)) = updated {
+    if persisted.is_ok() {
         tracing::warn!(
             review_id = %review_id,
             item_id,
             reason = %reason.trim(),
             "review finding skipped after domain failure; batch continues"
         );
-        publish_review(state, repo_root, review_id).await;
     }
+    persisted
 }
 
 /// Emits a `model/error` event for a failed review finding.
@@ -292,5 +370,91 @@ mod tests {
             .expect("ellipsis suffix present");
         assert_eq!(trailing.chars().count(), SKIP_COMMENT_MAX_CHARS);
         assert!(trailing.chars().all(|c| c == 'я'));
+    }
+
+    /// Terminal finding writes must surface persistence failures: a skip whose
+    /// `Skipped` record cannot be persisted returns `Err`, so the batch reports
+    /// an infrastructure failure instead of advancing past a finding the
+    /// durable record still shows as `InProgress`.
+    #[tokio::test]
+    async fn terminal_finding_writes_surface_persistence_failures() {
+        // The fixture is process-unique and cleared before use: the test
+        // corrupts its own session file, so a directory left behind by an
+        // interrupted earlier run must never make `save_session` refuse the
+        // session it is about to write.
+        let root = std::env::temp_dir().join(format!(
+            "tauqe-review-persist-{}-{}",
+            std::process::id(),
+            crate::state::next_operation_id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let (out, _rx) = crate::transport::OutChannel::new();
+        let (history_sender, _history_rx) = tokio::sync::mpsc::unbounded_channel();
+        let state = AppState::new(
+            tauqe_core::config::AppConfig::default(),
+            root.clone(),
+            history_sender,
+            out,
+        );
+
+        let session = tauqe_protocol::ReviewSession {
+            id: "rev-persist".to_string(),
+            title: "Persistence Audit".to_string(),
+            created_at: 100,
+            model: tauqe_protocol::ModelRef::openrouter("test-model"),
+            description: None,
+            user_prompt: None,
+            target_files: vec![],
+            items: vec![tauqe_protocol::ReviewItem {
+                id: 1,
+                title: "Finding".to_string(),
+                subplan_last_replanned_step: None,
+                model: None,
+                issue_type: tauqe_protocol::review::IssueType::Quality,
+                severity: tauqe_protocol::review::ReviewSeverity::Suggestion,
+                status: IssueStatus::InProgress,
+                recommendations: vec![],
+                files: vec![],
+                readonly_files: vec![],
+                subplan: Vec::new(),
+                subplan_architect: None,
+                resolution_notes: None,
+                body: String::new(),
+            }],
+            raw_markdown: String::new(),
+        };
+        ReviewStorage::save_session(&root, &session).unwrap();
+
+        // A healthy terminal write persists the skip and reports success.
+        skip_finding_with_diagnostic(
+            &state,
+            &root,
+            "rev-persist",
+            1,
+            "I could not patch the file safely.",
+            "retry budget exhausted",
+        )
+        .await
+        .expect("healthy skip write succeeds");
+        let stored = ReviewStorage::load_review(&root, "rev-persist")
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.find_item(1).unwrap().status, IssueStatus::Skipped);
+
+        // A corrupted session file makes the session unresolvable, so the next
+        // terminal write cannot land on disk: the failure must be returned,
+        // not discarded. Review storage skips an unparseable session file and
+        // reports the session as missing, so the surfaced diagnostic is the
+        // not-persisted message rather than a raw parse error.
+        let review_file = ReviewStorage::reviews_dir(&root).join("rev-persist.json");
+        std::fs::write(&review_file, b"{ not a review session }").unwrap();
+        let err = set_item_status_checked(&state, &root, "rev-persist", 1, IssueStatus::Todo)
+            .await
+            .expect_err("persistence failure must surface");
+        assert!(err.contains("was not persisted"));
+        assert!(err.contains("rev-persist"));
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

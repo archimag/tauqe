@@ -70,8 +70,8 @@ so a capability cannot drift from its validation or its explanation.
 
 Findings return as delimited blocks:
 
-- `<context_feedback>` — missing files, and an explanation when requested files are
-  already loaded.
+- `<context_feedback>` — missing files, an explanation when requested files are
+  already loaded, and a notice when the repository could not be inspected.
 - `<search_feedback path="..." regex="...">` — per-file hit counts, an omission
   count, or a syntax diagnostic.
 - `<repo_dirs_feedback>` — the compact folder outline.
@@ -107,7 +107,8 @@ de-duplicated tail of the user message.
 
 1. The model emits discovery commands, with or without surrounding text.
 2. The dispatcher resolves the tracked file list once, off the async executor
-   thread, and only when a command needs it.
+   thread, and only when a command needs it. A failed resolution ends the round
+   with an inspection-failure feedback block.
 3. Every registered handler that owns at least one command executes in dispatch
    order and folds its findings into one outcome.
 4. A files token breach stops the dispatcher immediately: later handlers are not
@@ -202,6 +203,9 @@ diagnostic and lets the model correct itself:
 - an invalid search path names the traversal or absolute-path rule;
 - an empty targeted outline names the requested prefix;
 - a breached budget names the three token amounts;
+- an uninspectable repository returns a feedback block stating that repository
+  facts are unavailable instead of reporting every requested file as missing,
+  and the failed listing leaves a warn record;
 - a listing over the cap states how many entries were omitted.
 
 The phase terminates when the model stops requesting, a round makes no progress,

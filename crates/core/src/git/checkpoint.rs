@@ -3,6 +3,7 @@ use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
 use super::cmd::{commit_with_developer_author, run_git, stage_files};
+use crate::atomic_write::{staging_backup_original_name, staging_temp_original_name};
 
 pub const TAUQE_CO_AUTHOR_TRAILER: &str = "Co-authored-by: Tauqe AI <noreply@tauqe.dev>";
 pub const CHECKPOINT_PREFIX: &str = "tauqe-checkpoint:";
@@ -128,17 +129,14 @@ pub fn cleanup_orphaned_staging_files(root: &Path) -> usize {
             } else if file_type.is_file() {
                 let file_name = entry.file_name();
                 let name_str = file_name.to_string_lossy();
-                if name_str.ends_with(".tauqe-tmp") {
+                // A sibling name carries a process id and a sequence number, so
+                // matching the marker rather than the exact file name keeps
+                // recovery working for both the current and the earlier naming.
+                if staging_temp_original_name(&name_str).is_some() {
                     if std::fs::remove_file(&path).is_ok() {
                         cleaned += 1;
                     }
-                } else if let Some(orig_name) = name_str.strip_suffix(".tauqe-bak") {
-                    if orig_name.is_empty() {
-                        if std::fs::remove_file(&path).is_ok() {
-                            cleaned += 1;
-                        }
-                        continue;
-                    }
+                } else if let Some(orig_name) = staging_backup_original_name(&name_str) {
                     let target = current_dir.join(orig_name);
                     if !target.exists() {
                         if std::fs::rename(&path, &target).is_ok() {
@@ -300,8 +298,8 @@ pub fn ensure_tauqe_ignored(dir: &Path) -> Result<()> {
                 ".tauqe",
                 "credentials.toml",
                 ".credentials.toml",
-                "*.tauqe-tmp",
-                "*.tauqe-bak",
+                "*.tauqe-tmp*",
+                "*.tauqe-bak*",
             ];
             let mut to_append = Vec::new();
             for pat in patterns {
@@ -404,101 +402,6 @@ pub fn restore_checkpoint(dir: &Path, checkpoint: &CheckpointInfo) -> Result<()>
     Ok(())
 }
 
-/// Reverts the most recent Tauqe commit, returning the repository to its
-/// pre-turn state.
-///
-/// HEAD must be a Tauqe commit; a hand-written commit is refused so developer
-/// history is never rewritten. The commit is unwound with a mixed reset and
-/// only the files it touched are reverted, so unrelated working-tree changes
-/// survive. When the undone commit sits on top of a temporary checkpoint, that
-/// checkpoint is unwound as well, which returns the developer's uncommitted
-/// work to the working tree.
-pub fn undo_last_ai_commit(dir: &Path) -> Result<tauqe_protocol::GitUndoResult> {
-    let meta = run_git(
-        Some(dir),
-        &[
-            "log",
-            "-1",
-            "--format=%h\x1f%s\x1f%an <%ae>\x1f%(trailers:key=Co-authored-by)\x1f%b",
-        ],
-    )
-    .context("Failed to read the HEAD commit metadata")?;
-
-    let mut parts = meta.splitn(5, '\x1f');
-    let short_hash = parts.next().unwrap_or_default().trim().to_string();
-    let subject = parts.next().unwrap_or_default().trim().to_string();
-    let author = parts.next().unwrap_or_default().trim().to_string();
-    let trailers = parts.next().unwrap_or_default().trim().to_string();
-    let body = parts.next().unwrap_or_default().trim().to_string();
-
-    if short_hash.is_empty() {
-        bail!("Cannot undo: the repository has no commit at HEAD");
-    }
-    if !is_tauqe_commit(&subject, &body, &author, &trailers) {
-        bail!(
-            "Refusing to undo {}: HEAD does not look like a Tauqe AI commit",
-            short_hash
-        );
-    }
-    if run_git(Some(dir), &["rev-parse", "--verify", "HEAD~1"]).is_err() {
-        bail!("Cannot undo {}: it has no parent commit", short_hash);
-    }
-
-    let touched: Vec<String> = run_git(
-        Some(dir),
-        &["diff-tree", "--no-commit-id", "--name-only", "-r", "HEAD"],
-    )
-    .unwrap_or_default()
-    .lines()
-    .map(|line| line.trim().to_string())
-    .filter(|line| !line.is_empty())
-    .collect();
-
-    run_git(Some(dir), &["reset", "--mixed", "HEAD~1"])
-        .context("Failed to unwind the AI commit")?;
-
-    for file in &touched {
-        if run_git(Some(dir), &["checkout", "HEAD", "--", file.as_str()]).is_err() {
-            // The file did not exist before the commit, so the commit created
-            // it; removing it restores the previous working tree.
-            let path = dir.join(file);
-            if path.is_file() {
-                let _ = std::fs::remove_file(&path);
-            }
-        }
-    }
-
-    let parent_subject = run_git(Some(dir), &["log", "-1", "--format=%s"])
-        .unwrap_or_default()
-        .trim()
-        .to_string();
-    let restored_checkpoint = parent_subject.starts_with(CHECKPOINT_PREFIX);
-    if restored_checkpoint {
-        run_git(Some(dir), &["reset", "HEAD~1"])
-            .context("Failed to unwind the pre-turn checkpoint commit")?;
-    }
-
-    clear_transaction_marker(dir);
-
-    let new_head = run_git(Some(dir), &["rev-parse", "--short", "HEAD"])
-        .unwrap_or_default()
-        .trim()
-        .to_string();
-
-    let message = if restored_checkpoint {
-        format!("Undid {} and restored the pre-turn checkpoint.", short_hash)
-    } else {
-        format!("Undid {}.", short_hash)
-    };
-
-    Ok(tauqe_protocol::GitUndoResult {
-        undone_commit: short_hash,
-        restored_checkpoint,
-        new_head,
-        message,
-    })
-}
-
 /// Creates an intermediate step commit during edit execution or verification auto-healing.
 pub fn create_step_commit(dir: &Path, changed_files: &[String], step_name: &str) -> Result<String> {
     if changed_files.is_empty() {
@@ -589,73 +492,6 @@ mod tests {
     use std::fs;
 
     #[test]
-    fn test_undo_last_ai_commit_restores_checkpoint() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path();
-        crate::git::state::init_repository(Some(path), true).unwrap();
-
-        // The developer's uncommitted work is captured by the checkpoint.
-        fs::write(path.join("user.txt"), "developer work").unwrap();
-        let checkpoint = create_checkpoint(path).unwrap();
-        assert!(checkpoint.created_checkpoint_commit);
-
-        // The turn modifies that file and leaves a step commit on top of the
-        // checkpoint, which is the state an interrupted transaction would have.
-        fs::write(path.join("user.txt"), "developer work\nai edit").unwrap();
-        create_step_commit(path, &["user.txt".to_string()], "apply ai step").unwrap();
-
-        let undo = undo_last_ai_commit(path).unwrap();
-        assert!(undo.restored_checkpoint);
-        assert!(!undo.undone_commit.is_empty());
-
-        let log = run_git(Some(path), &["log", "--format=%s"]).unwrap();
-        assert!(!log.contains(STEP_PREFIX));
-        assert!(!log.contains(CHECKPOINT_PREFIX));
-
-        // The developer's uncommitted work returns to the working tree.
-        assert_eq!(
-            fs::read_to_string(path.join("user.txt")).unwrap(),
-            "developer work"
-        );
-    }
-
-    #[test]
-    fn test_undo_last_ai_commit_without_checkpoint() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path();
-        crate::git::state::init_repository(Some(path), true).unwrap();
-
-        fs::write(path.join("feature.txt"), "new feature").unwrap();
-        create_ai_commit(path, &["feature.txt".to_string()], "feat: add feature").unwrap();
-        let head_before = run_git(Some(path), &["rev-parse", "HEAD"]).unwrap();
-
-        let undo = undo_last_ai_commit(path).unwrap();
-        assert!(!undo.restored_checkpoint);
-        assert!(!path.join("feature.txt").exists());
-
-        let head_after = run_git(Some(path), &["rev-parse", "HEAD"]).unwrap();
-        assert_ne!(head_before.trim(), head_after.trim());
-        let short_head = run_git(Some(path), &["rev-parse", "--short", "HEAD"]).unwrap();
-        assert_eq!(undo.new_head, short_head.trim());
-    }
-
-    #[test]
-    fn test_undo_last_ai_commit_refuses_foreign_commit() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path();
-        crate::git::state::init_repository(Some(path), true).unwrap();
-
-        fs::write(path.join("manual.txt"), "manual work").unwrap();
-        run_git(Some(path), &["add", "manual.txt"]).unwrap();
-        crate::git::cmd::commit_with_developer_author(path, "fix: developer commit", false)
-            .unwrap();
-
-        let err = undo_last_ai_commit(path).unwrap_err();
-        assert!(err.to_string().contains("Refusing to undo"));
-        assert!(path.join("manual.txt").exists());
-    }
-
-    #[test]
     fn test_recover_interrupted_workflow_clean_repo() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path();
@@ -691,8 +527,18 @@ mod tests {
         let git_tmp = git_dir.join("internal.tauqe-tmp");
         fs::write(&git_tmp, "do not touch").unwrap();
 
+        // The current naming policy appends a process id and a sequence number,
+        // so recovery has to match the marker instead of the exact name.
+        let sequenced_tmp = path.join(format!("sequenced.rs.tauqe-tmp.{}.3", std::process::id()));
+        fs::write(&sequenced_tmp, "sequenced temporary").unwrap();
+        let sequenced_bak = path.join(format!(
+            "sequenced_restore.rs.tauqe-bak.{}.4",
+            std::process::id()
+        ));
+        fs::write(&sequenced_bak, "sequenced original content").unwrap();
+
         let cleaned = cleanup_orphaned_staging_files(path);
-        assert_eq!(cleaned, 4);
+        assert_eq!(cleaned, 6);
 
         assert!(!tmp_file.exists());
         assert!(!existing_bak.exists());
@@ -707,6 +553,12 @@ mod tests {
         );
         assert!(!sub_tmp.exists());
         assert!(git_tmp.exists());
+        assert!(!sequenced_tmp.exists());
+        assert!(!sequenced_bak.exists());
+        assert_eq!(
+            fs::read_to_string(path.join("sequenced_restore.rs")).unwrap(),
+            "sequenced original content"
+        );
     }
 
     #[test]

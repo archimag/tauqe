@@ -58,9 +58,6 @@ pub(crate) fn apply_system_status_response(
     if let Some(roles) = status.roles.clone() {
         st.model_choice.roles = Some(roles);
     }
-    if !status.available_models.is_empty() {
-        st.available_models = status.available_models.clone();
-    }
 
     st.onboarding.apply_status(status);
 
@@ -432,9 +429,6 @@ pub async fn handle_response(
                     if cfg.roles.is_some() {
                         st.model_choice.roles = cfg.roles;
                     }
-                    if !cfg.available_models.is_empty() {
-                        st.available_models = cfg.available_models;
-                    }
                     st.edit_protocol = cfg.edit_protocol;
                     if !cfg.available_workflows.is_empty() {
                         st.available_workflows = cfg.available_workflows;
@@ -451,9 +445,6 @@ pub async fn handle_response(
                         selection: res.selection,
                         roles: res.roles,
                     };
-                    if !res.available_models.is_empty() {
-                        st.available_models = res.available_models;
-                    }
                 }
             }
             methods::MODEL_SELECT => {

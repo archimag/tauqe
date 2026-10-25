@@ -1,6 +1,9 @@
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
-use tauqe_protocol::{ModelRef, ModelRole, ModelRolesSummary, ModelSelection, ProjectConfig};
+use tauqe_protocol::{
+    ModelCatalogEntry, ModelRef, ModelRole, ModelRolesSummary, ModelSelection, ProjectConfig,
+    ReasoningEffort,
+};
 
 mod context;
 mod credentials;
@@ -10,21 +13,24 @@ mod history;
 mod models;
 mod paths;
 mod providers;
-mod toolchain;
 
 pub use context::{
     ContextConfig, DEFAULT_FILES_TOKEN_BUDGET, DEFAULT_INCLUDE_REPO_MAP,
-    DEFAULT_MAX_DISCOVERY_ROUNDS,
+    DEFAULT_MAX_DIR_LIST_ENTRIES, DEFAULT_MAX_DISCOVERY_ROUNDS, DEFAULT_MAX_FEEDBACK_CHARS,
+    DEFAULT_MAX_MATCHED_FILES_PER_SEARCH, DEFAULT_MAX_REPO_MAP_REQUESTS_PER_ROUND,
+    DEFAULT_MAX_SCRATCHPAD_CHARS, DEFAULT_MAX_SEARCH_REQUESTS_PER_ROUND,
 };
 pub use credentials::default_credentials_path;
 pub use develop::{DevelopConfig, EditConfig};
 pub use git::GitConfig;
 pub use history::HistoryConfig;
 pub use models::{
-    deserialize_model_ref_opt, parse_model_ref, serialize_model_ref_opt, ModelsConfig,
-    BUILTIN_DEFAULT_ARCHITECT_MODEL, BUILTIN_DEFAULT_CODER_MODEL, BUILTIN_DEFAULT_MODEL,
-    BUILTIN_DEFAULT_PRIMARY_MODEL, BUILTIN_DEFAULT_REVIEWER_MODEL, BUILTIN_DEFAULT_SCRIBE_MODEL,
+    serialize_model_ref_opt, ModelsConfig, BUILTIN_DEFAULT_ARCHITECT_MODEL,
+    BUILTIN_DEFAULT_CODER_MODEL, BUILTIN_DEFAULT_MODEL, BUILTIN_DEFAULT_PRIMARY_MODEL,
+    BUILTIN_DEFAULT_REVIEWER_MODEL, BUILTIN_DEFAULT_SCRIBE_MODEL,
 };
+
+use models::ModelsConfigRaw;
 pub use paths::{
     cli_arg_value_from, config_candidates, default_config_path, find_config_file,
     write_default_config, write_default_conventions, DEFAULT_CONFIG_TEMPLATE,
@@ -34,20 +40,13 @@ pub use providers::{
     read_credentials_file, write_credentials_file, write_credentials_stub, Credentials,
     OpenRouterConfig, OpenRouterCredentials, ProvidersConfig,
 };
-pub use toolchain::{
-    FormatterConfig, ToolchainConfig, ToolchainPhaseConfig, DEFAULT_TOOLCHAIN_TIMEOUT_SECS,
-};
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(try_from = "AppConfigRaw")]
 pub struct AppConfig {
-    #[serde(default)]
     pub providers: ProvidersConfig,
-    #[serde(default)]
     pub models: ModelsConfig,
-    #[serde(default, alias = "edit")]
     pub develop: DevelopConfig,
-    #[serde(default)]
-    pub toolchain: ToolchainConfig,
     /// The `[project]` section: the commands this repository declares.
     ///
     /// It is the single surface that tells the harness how to verify, format,
@@ -55,13 +54,9 @@ pub struct AppConfig {
     /// as typed custom tools. An empty section declares nothing and is rejected
     /// by [`AppConfig::validate`], because a turn that cannot verify its own
     /// result must not run.
-    #[serde(default)]
     pub project: ProjectConfig,
-    #[serde(default)]
     pub context: ContextConfig,
-    #[serde(default)]
     pub git: GitConfig,
-    #[serde(default)]
     pub history: HistoryConfig,
     /// Explicit configuration file path supplied on the command line.
     ///
@@ -89,49 +84,113 @@ pub struct AppConfig {
     pub config_error: Option<String>,
 }
 
-impl AppConfig {
-    /// Models from provider sections, trimmed and de-duplicated.
-    pub fn configured_models(&self) -> Vec<ModelRef> {
-        let names = self
-            .providers
-            .openrouter
-            .iter()
-            .flat_map(|c| c.models.iter());
+/// Raw configuration shape decoded before the provider catalog is applied.
+///
+/// A role list may name a model by a catalog alias, and an alias is only
+/// resolvable against a catalog that has already been read. The configuration
+/// is therefore decoded into this proxy first and then resolved through
+/// [`AppConfig::try_from`], so no role can resolve against a half-read catalog.
+#[derive(Deserialize)]
+struct AppConfigRaw {
+    #[serde(default)]
+    providers: ProvidersConfig,
+    #[serde(default)]
+    models: ModelsConfigRaw,
+    #[serde(default, alias = "edit")]
+    develop: DevelopConfig,
+    #[serde(default)]
+    project: ProjectConfig,
+    #[serde(default)]
+    context: ContextConfig,
+    #[serde(default)]
+    git: GitConfig,
+    #[serde(default)]
+    history: HistoryConfig,
+}
 
+impl TryFrom<AppConfigRaw> for AppConfig {
+    type Error = String;
+
+    fn try_from(raw: AppConfigRaw) -> Result<Self, Self::Error> {
+        let AppConfigRaw {
+            providers,
+            models,
+            develop,
+            project,
+            context,
+            git,
+            history,
+        } = raw;
+
+        Ok(AppConfig {
+            models: ModelsConfig::resolve(models, providers.catalog())?,
+            providers,
+            develop,
+            project,
+            context,
+            git,
+            history,
+            explicit_config_path: None,
+            explicit_credentials_path: None,
+            config_error: None,
+        })
+    }
+}
+
+impl AppConfig {
+    /// Models registered in the provider catalog, in declaration order.
+    pub fn model_catalog(&self) -> &[ModelCatalogEntry] {
+        self.providers.catalog()
+    }
+
+    /// Resolves a model reference written in configuration.
+    ///
+    /// The reference is either a registered catalog alias or a provider model
+    /// specification, so a role can name a model the way the project does
+    /// without restating a display name.
+    pub fn resolve_model_spec(&self, spec: &str) -> Result<ModelRef, String> {
+        ModelsConfig::resolve_model_spec(self.model_catalog(), spec)
+    }
+
+    /// Returns the catalog alias registered for a model, if any.
+    pub fn model_alias(&self, model: &ModelRef) -> Option<&str> {
+        ModelsConfig::model_alias(self.model_catalog(), model)
+    }
+
+    /// Models registered in the provider catalog, de-duplicated.
+    pub fn configured_models(&self) -> Vec<ModelRef> {
         let mut models = Vec::new();
-        for name in names {
-            let name = name.trim();
-            if name.is_empty() {
-                continue;
-            }
-            let model = ModelRef::openrouter(name);
-            if !models.contains(&model) {
-                models.push(model);
+        for entry in self.model_catalog() {
+            if !models.contains(&entry.model) {
+                models.push(entry.model.clone());
             }
         }
         models
     }
 
-    /// Resolves a ModelRole to a concrete ModelRef using the deterministic fallback chain.
+    /// Resolves a [`ModelRole`] to a concrete [`ModelRef`] using the
+    /// deterministic fallback chain.
     pub fn resolve_role(&self, role: ModelRole) -> ModelRef {
         let fallback = self.configured_models().into_iter().next();
         self.models.resolve_role_with_fallback(role, fallback)
     }
 
-    /// Resolves a ModelSelection to a concrete ModelRef.
+    /// Resolves a [`ModelSelection`] to a concrete [`ModelRef`].
     pub fn resolve_model(&self, selection: &ModelSelection) -> ModelRef {
         match selection {
             ModelSelection::Role(role) => self.resolve_role(*role),
             ModelSelection::Specific(model) => model.clone(),
+            ModelSelection::Tier { model, .. } => model.clone(),
         }
     }
 
-    /// Resolves the reasoning effort for a model selection within the context of a specific role.
+    /// Resolves the reasoning effort for a model selection within the context of
+    /// a specific role.
     pub fn resolve_selection_effort(
         &self,
         role: ModelRole,
         selection: &ModelSelection,
-    ) -> Option<tauqe_protocol::ReasoningEffort> {
+    ) -> Option<ReasoningEffort> {
         self.models.resolve_selection_effort(role, selection)
     }
 
@@ -306,13 +365,6 @@ pub fn load_git_config(repo_root: &Path) -> GitConfig {
     load_section(repo_root, "git")
 }
 
-/// Resolves repository-local `[toolchain]` settings for a repository root.
-///
-/// Mirrors [`load_git_config`]: only the `[toolchain]` table is parsed.
-pub fn load_toolchain_config(repo_root: &Path) -> ToolchainConfig {
-    load_section(repo_root, "toolchain")
-}
-
 /// Resolves repository-local `[context]` settings for a repository root.
 ///
 /// Mirrors [`load_git_config`]: only the `[context]` table is parsed.
@@ -423,11 +475,11 @@ reviewer = ["openrouter:google/gemini-flash-latest"]
         let config: AppConfig = toml::from_str(toml_str).expect("parse config");
         assert_eq!(
             config.models.resolve_effort(ModelRole::Architect),
-            Some(tauqe_protocol::ReasoningEffort::High)
+            Some(ReasoningEffort::High)
         );
         assert_eq!(
             config.models.resolve_effort(ModelRole::Coder),
-            Some(tauqe_protocol::ReasoningEffort::Medium)
+            Some(ReasoningEffort::Medium)
         );
         assert_eq!(config.models.resolve_effort(ModelRole::Reviewer), None);
         assert_eq!(config.models.resolve_effort(ModelRole::Primary), None);
@@ -626,19 +678,145 @@ files_token_budget = 150000
     }
 
     #[test]
+    fn test_discovery_and_feedback_limits_defaults_and_overrides() {
+        // Every operational cap that shapes model context carries a documented
+        // default, so an omitted key never silently disables the bound.
+        let defaults = ContextConfig::default();
+        assert_eq!(
+            defaults.max_search_requests_per_round,
+            DEFAULT_MAX_SEARCH_REQUESTS_PER_ROUND
+        );
+        assert_eq!(
+            defaults.max_matched_files_per_search,
+            DEFAULT_MAX_MATCHED_FILES_PER_SEARCH
+        );
+        assert_eq!(defaults.max_dir_list_entries, DEFAULT_MAX_DIR_LIST_ENTRIES);
+        assert_eq!(
+            defaults.max_repo_map_requests_per_round,
+            DEFAULT_MAX_REPO_MAP_REQUESTS_PER_ROUND
+        );
+        assert_eq!(defaults.max_feedback_chars, DEFAULT_MAX_FEEDBACK_CHARS);
+        assert_eq!(defaults.max_scratchpad_chars, DEFAULT_MAX_SCRATCHPAD_CHARS);
+        assert_eq!(defaults.max_search_requests_per_round, 5);
+        assert_eq!(defaults.max_matched_files_per_search, 50);
+        assert_eq!(defaults.max_dir_list_entries, 100);
+        assert_eq!(defaults.max_repo_map_requests_per_round, 3);
+        assert_eq!(defaults.max_feedback_chars, 4_000);
+        assert_eq!(defaults.max_scratchpad_chars, 4_000);
+
+        // A project that routinely needs wider searches, larger listings, or
+        // roomier tool-output reporting raises the ceilings in `tauqe.toml`.
+        let overridden: AppConfig = toml::from_str(
+            r#"
+[context]
+max_search_requests_per_round = 9
+max_matched_files_per_search = 12
+max_dir_list_entries = 40
+max_repo_map_requests_per_round = 1
+max_feedback_chars = 800
+max_scratchpad_chars = 1500
+"#,
+        )
+        .expect("parse config");
+        assert_eq!(overridden.context.max_search_requests_per_round, 9);
+        assert_eq!(overridden.context.max_matched_files_per_search, 12);
+        assert_eq!(overridden.context.max_dir_list_entries, 40);
+        assert_eq!(overridden.context.max_repo_map_requests_per_round, 1);
+        assert_eq!(overridden.context.max_feedback_chars, 800);
+        assert_eq!(overridden.context.max_scratchpad_chars, 1500);
+
+        // A partially declared section keeps the defaults of omitted keys.
+        let partial: AppConfig =
+            toml::from_str("[context]\nmax_dir_list_entries = 7\n").expect("parse config");
+        assert_eq!(partial.context.max_dir_list_entries, 7);
+        assert_eq!(
+            partial.context.max_search_requests_per_round,
+            DEFAULT_MAX_SEARCH_REQUESTS_PER_ROUND
+        );
+    }
+
+    #[test]
     fn test_typed_provider_models_config() {
         let toml_str = r#"
 [models]
 primary = ["openrouter:openai/gpt-4o"]
 
 [providers.openrouter]
-models = ["deepseek/deepseek-chat", " ", "openai/gpt-4o"]
+models = ["deepseek/deepseek-chat", "openai/gpt-4o"]
 "#;
         let config: AppConfig = toml::from_str(toml_str).expect("Failed to parse config");
         assert_eq!(config.active_model(), ModelRef::openrouter("openai/gpt-4o"));
         let available = config.available_models();
         assert!(available.contains(&ModelRef::openrouter("deepseek/deepseek-chat")));
         assert!(available.contains(&ModelRef::openrouter("openai/gpt-4o")));
+
+        // A catalog entry must name a real model: a blank declaration is a
+        // project error, not an entry to silently skip.
+        let blank = toml_str.replace("\"deepseek/deepseek-chat\", ", "\" \", ");
+        assert!(toml::from_str::<AppConfig>(&blank).is_err());
+    }
+
+    #[test]
+    fn test_catalog_alias_resolves_roles_and_display_name() {
+        let toml_str = r#"
+[providers.openrouter]
+models = [
+    "google/gemini-flash-latest",
+    { model = "deepseek/deepseek-chat", alias = "Deep" },
+]
+
+[models]
+primary = ["Deep"]
+scribe = "Deep"
+coder = [{ model = "Deep", effort = "high" }]
+"#;
+        let config: AppConfig = toml::from_str(toml_str).expect("Failed to parse config");
+        let deep = ModelRef::openrouter("deepseek/deepseek-chat");
+
+        // A role names a model by its catalog alias instead of restating the
+        // provider identifier, and the catalog resolves it deterministically.
+        assert_eq!(config.active_model(), deep);
+        assert_eq!(config.history_model(), deep);
+        let coder = config.models.coder_ladder();
+        assert_eq!(coder[0].model, deep);
+        assert_eq!(coder[0].effort, Some(ReasoningEffort::High));
+
+        // The display name lives only in the catalog and is looked up on demand.
+        assert_eq!(config.model_alias(&deep), Some("Deep"));
+        assert_eq!(
+            config.model_alias(&ModelRef::openrouter("google/gemini-flash-latest")),
+            None
+        );
+        assert_eq!(config.resolve_model_spec("Deep").unwrap(), deep);
+        assert_eq!(
+            config
+                .resolve_model_spec("openrouter:google/gemini-flash-latest")
+                .unwrap(),
+            ModelRef::openrouter("google/gemini-flash-latest")
+        );
+        assert!(config.resolve_model_spec("anthropc:claude").is_err());
+    }
+
+    #[test]
+    fn test_unresolvable_role_reference_surfaces_diagnostic() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            temp_dir.path().join("tauqe.toml"),
+            r#"
+[providers.openrouter]
+models = ["deepseek/deepseek-chat"]
+
+[models]
+primary = ["anthropc:claude"]
+"#,
+        )
+        .unwrap();
+
+        let config = load_config(Some(temp_dir.path()));
+        let err = config
+            .config_error
+            .expect("an unresolvable role reference must be reported");
+        assert!(err.contains("anthropc:claude"), "got: {err}");
     }
 
     #[test]
@@ -649,10 +827,9 @@ models = ["deepseek/deepseek-chat", " ", "openai/gpt-4o"]
             ModelRef::openrouter(BUILTIN_DEFAULT_PRIMARY_MODEL)
         );
         assert_eq!(config.develop.workflow, WorkflowKind::Git);
-        assert_eq!(config.develop.protocol, EditProtocolKind::Xml);
+        assert_eq!(config.develop.protocol, EditProtocolKind::Structured);
         assert_eq!(config.develop.max_retries, 3);
         assert!(config.providers.openrouter.is_none());
-        assert!(config.toolchain.check_command.is_none());
     }
 
     #[test]
@@ -718,29 +895,6 @@ models = ["deepseek/deepseek-chat", " ", "openai/gpt-4o"]
                 .and_then(|o| o.api_key.as_deref()),
             Some("sk-explicit-creds")
         );
-    }
-
-    #[test]
-    fn test_load_toolchain_config_reads_custom_command_and_timeout() {
-        let temp_dir = tempfile::tempdir().unwrap();
-        std::fs::write(
-            temp_dir.path().join("tauqe.toml"),
-            "[toolchain]\ncheck_command = \"make verify\"\nauto_heal = false\ntimeout_secs = 42\n",
-        )
-        .unwrap();
-
-        let cfg = load_toolchain_config(temp_dir.path());
-        assert_eq!(cfg.check_command.as_deref(), Some("make verify"));
-        assert_eq!(cfg.auto_heal, Some(false));
-        assert_eq!(cfg.effective_timeout_secs(), 42);
-    }
-
-    #[test]
-    fn test_load_toolchain_config_defaults_when_absent() {
-        let temp_dir = tempfile::tempdir().unwrap();
-        let cfg = load_toolchain_config(temp_dir.path());
-        assert!(cfg.check_command.is_none());
-        assert_eq!(cfg.effective_timeout_secs(), DEFAULT_TOOLCHAIN_TIMEOUT_SECS);
     }
 
     #[test]
@@ -884,7 +1038,7 @@ args = ["check", "--all-targets"]
             tauqe_protocol::ResolvedProjectCommand {
                 command: "cargo".to_string(),
                 args: vec!["check".to_string(), "--all-targets".to_string()],
-                timeout_secs: None,
+                ..Default::default()
             }
         );
     }

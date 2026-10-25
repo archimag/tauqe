@@ -6,6 +6,10 @@ use crate::model::ModelSelection;
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct PlanGetParams {
+    /// Absent id means "the active plan": the client requests the current
+    /// plan with an empty object, so the DTO — not a server-side fallback —
+    /// defines the empty payload.
+    #[serde(default)]
     pub id: String,
 }
 
@@ -80,6 +84,10 @@ pub struct PlanExecuteParams {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct PlanRefineParams {
+    // The `id` alias is a legacy wire name retained so older clients keep
+    // working; scheduled for removal in 0.2.0 and tracked by the
+    // wire-contract test in `lib.rs`.
+    #[serde(alias = "id")]
     pub plan_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<ModelSelection>,

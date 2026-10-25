@@ -11,6 +11,7 @@ use std::sync::Arc;
 
 use tauqe_core::edits::protocol::ContextRequest;
 use tauqe_core::workflow::common::apply_context_requests_detailed;
+use tauqe_protocol::discussion::DiscussionTarget;
 use tauqe_protocol::{events, ContextAccess, Event};
 
 use crate::state::AppState;
@@ -22,6 +23,39 @@ pub(crate) fn emit(out: &OutChannel, method: &str, params: Option<serde_json::Va
         method: method.to_string(),
         params,
     });
+}
+
+/// Reason published with every withdrawal of an aborted stream attempt.
+const STREAM_RESET_REASON: &str = "connection interrupted mid-stream";
+
+/// Withdraws every fragment an aborted provider attempt already streamed.
+///
+/// A retrying provider re-issues a request that broke mid-stream, and the retry
+/// re-generates the answer from its beginning. The fragments of the aborted
+/// attempt are therefore void: they must not survive in the contour's own
+/// buffer, and they must not survive in the client, or the retried payload is
+/// concatenated onto a prefix that belongs to a different attempt.
+///
+/// Each relaying contour owns the buffers it accumulated, so it passes their
+/// clearing here as `discard`; the single reset event published afterwards is
+/// what makes the client drop its own copy. Expressing the withdrawal once keeps
+/// the interactive turn, the Architect stream, and the review synthesis from
+/// drifting apart.
+pub(crate) fn withdraw_streamed_attempt(
+    out: &OutChannel,
+    operation_id: &str,
+    discard: impl FnOnce(),
+) {
+    discard();
+    emit(
+        out,
+        events::MODEL_STREAM_RESET,
+        serde_json::to_value(tauqe_protocol::ModelStreamResetEvent {
+            operation_id: operation_id.to_string(),
+            reason: STREAM_RESET_REASON.to_string(),
+        })
+        .ok(),
+    );
 }
 
 /// Whether a completed turn actually applied code edits to disk.
@@ -38,16 +72,35 @@ pub(crate) fn turn_applied_edits(turn: &crate::handlers::model::ModelTurnResult)
     }
 }
 
+/// Releases the active discussion focus when it anchors the deleted entity.
+///
+/// A focus anchor may never address a non-existent entity, so deleting a plan
+/// or a review session releases a focus bound to the removed target together
+/// with it. The release goes through the shared [`AppState`] facade, which
+/// broadcasts `DISCUSSION_FOCUS_CHANGED`, so every client drops the dead
+/// anchor instead of rendering it. A focus anchored on any other entity is
+/// left untouched. The single shared implementation keeps plan and review
+/// deletions from drifting apart.
+pub(crate) async fn release_focus_anchored_on(state: &Arc<AppState>, anchor: &DiscussionTarget) {
+    if state.discussion_focus().await.target() == Some(anchor) {
+        state.clear_discussion_focus().await;
+        tracing::info!(
+            anchor = ?anchor,
+            "Cleared the discussion focus anchored on the deleted entity"
+        );
+    }
+}
+
 /// Clears the transient auto context layer so a retried attempt starts from a
 /// clean, deterministic basis, then notifies clients of the new snapshot.
+///
+/// The clear goes through the shared [`AppState`] facade, so removing files from
+/// the transient layer also rotates the provider session identifier when the
+/// layer really held files: the stable prompt prefix those files warmed no
+/// longer exists, and the next round must not be routed to a node holding a
+/// stale copy of it.
 pub(crate) async fn clear_auto_context(state: &Arc<AppState>) {
-    let cleared = crate::handlers::with_context_mutation(state, |ctx| {
-        ctx.clear_auto();
-        ctx.get_state()
-    })
-    .await;
-
-    if let Ok(new_ctx_state) = cleared {
+    if let Ok(new_ctx_state) = state.clear_auto_context().await {
         emit(
             &state.out,
             events::CONTEXT_CHANGED,

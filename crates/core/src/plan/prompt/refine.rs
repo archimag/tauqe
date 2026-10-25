@@ -196,7 +196,7 @@ pub fn plan_refine_response_schema() -> serde_json::Value {
             },
             "explanation": {
                 "type": "string",
-                "description": "Architectural breakdown, decomposition strategy, dependency analysis, and technical rationale strictly in the same language as the plan description."
+                "description": "Concise summary of the decomposition strategy and its key trade-offs, strictly in the same language as the plan description. Final distilled content only: no chain-of-thought, deliberation, or intermediate reasoning steps."
             },
             "reason": {
                 "anyOf": [
@@ -323,6 +323,7 @@ pub fn build_plan_horizon_system_prompt() -> String {
     out.push_str("   - When all required context files are loaded and verified, set `status: \"success\"` (or `status: \"blocked\"` if blockers found), set `context_requests: []`, `repo_searches: []`, `repo_maps: []`, and provide the synthesized `items`.\n\n");
     out.push_str("7. Output Format:\n");
     out.push_str("   - Output strictly according to the specified JSON schema.\n");
+    out.push_str("   - Final Content Invariant: every text field (explanation, titles, details, reason) carries only the final distilled result. The reasoning process itself is never plan content: do not record deliberation, self-questioning, exploratory analysis, or intermediate reasoning steps in any field.\n");
     out
 }
 
@@ -653,5 +654,20 @@ mod tests {
             .unwrap()
             .repo_maps
             .is_empty());
+    }
+
+    #[test]
+    fn test_plan_refine_contract_demands_distilled_content() {
+        // The shared schema orders a distilled summary, not a reasoning essay.
+        let schema = plan_refine_response_schema();
+        let description = schema["properties"]["explanation"]["description"]
+            .as_str()
+            .expect("explanation description must exist");
+        assert!(description.contains("Final distilled content only"));
+        assert!(!description.contains("dependency analysis"));
+
+        let sys = build_plan_horizon_system_prompt();
+        assert!(sys.contains("Final Content Invariant"));
+        assert!(sys.contains("reasoning process itself is never plan content"));
     }
 }

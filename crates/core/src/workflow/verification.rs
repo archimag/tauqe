@@ -38,8 +38,15 @@ fn log_verification_outcome(target: &str, duration_ms: u64, outcome: &Verificati
 }
 
 /// Executes project verification pipeline according to model's `<verify .../>` request.
+///
+/// `changed_files` is the authoritative change set of the turn: the model's
+/// edits, the post-hook artifacts, the files a repair round touched, and the
+/// working-copy differential of the transaction. It reaches the project command
+/// on standard input, one path per line, so a project dispatcher can narrow the
+/// checks to the affected technologies while the mandatory gate stays in force.
 pub async fn run_workflow_verification(
     repo_root: &Path,
+    changed_files: &[String],
     verify_req: &VerifyRequest,
     stream_tx: &mpsc::Sender<StreamEvent>,
     stream_output: bool,
@@ -66,16 +73,16 @@ pub async fn run_workflow_verification(
     }
 
     let (ok, results) =
-        crate::toolchain::run_verification_pipeline(repo_root, &verify_req.target, cancel_rx).await;
+        crate::toolchain::run_verification_pipeline(repo_root, changed_files, cancel_rx).await;
 
     if results.is_empty() {
-        let note =
-            "⚠️ No build/test toolchain detected in repository for verification.\n".to_string();
+        let note = "⚠️ The project declares no verification command, so the change set was not verified.\n"
+            .to_string();
         let _ = stream_tx
             .send(StreamEvent::ToolchainFinished {
                 command: target_str.to_string(),
                 success: true,
-                message: Some("No build/test toolchain detected".to_string()),
+                message: Some("No project verification command declared".to_string()),
             })
             .await;
         if stream_output || verify_req.on_success == VerifyOnSuccess::Report {
@@ -189,22 +196,27 @@ mod verification_outcome_tests {
     use super::*;
 
     #[tokio::test]
-    async fn test_run_workflow_verification_no_toolchain_detected() {
+    async fn test_run_workflow_verification_without_a_declared_command() {
         let dir = tempfile::tempdir().unwrap();
         let (tx, mut rx) = mpsc::channel(10);
         let req = VerifyRequest {
             target: VerifyTarget::All,
             on_success: VerifyOnSuccess::Silent,
         };
-        let outcome = run_workflow_verification(dir.path(), &req, &tx, false, None).await;
+        let outcome = run_workflow_verification(dir.path(), &[], &req, &tx, false, None).await;
         assert!(outcome.success);
         assert!(!outcome.is_cancelled);
-        assert!(outcome.report.contains("No build/test toolchain detected"));
+        assert!(outcome
+            .report
+            .contains("The project declares no verification command"));
 
         let mut saw_finished = false;
         while let Ok(event) = rx.try_recv() {
             if let StreamEvent::ToolchainFinished { message, .. } = event {
-                assert_eq!(message.as_deref(), Some("No build/test toolchain detected"));
+                assert_eq!(
+                    message.as_deref(),
+                    Some("No project verification command declared")
+                );
                 saw_finished = true;
             }
         }
@@ -226,7 +238,7 @@ mod verification_outcome_tests {
             target: VerifyTarget::All,
             on_success: VerifyOnSuccess::Silent,
         };
-        let outcome = run_workflow_verification(dir.path(), &req, &tx, false, None).await;
+        let outcome = run_workflow_verification(dir.path(), &[], &req, &tx, false, None).await;
 
         assert!(!outcome.success);
         assert!(!outcome.is_cancelled);
@@ -238,6 +250,32 @@ mod verification_outcome_tests {
             outcome.report
         );
         assert!(!outcome.report.contains('\u{1b}'));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_run_workflow_verification_delivers_the_change_set_on_stdin() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("tauqe.toml"),
+            "[project.verify]\ncommand = \"sh\"\nargs = ['-c', 'cat']\n",
+        )
+        .unwrap();
+
+        let (tx, _rx) = mpsc::channel(10);
+        let req = VerifyRequest {
+            target: VerifyTarget::All,
+            on_success: VerifyOnSuccess::Report,
+        };
+        let changed = vec!["src/lib.rs".to_string(), "generated.rs".to_string()];
+        let outcome = run_workflow_verification(dir.path(), &changed, &req, &tx, false, None).await;
+
+        assert!(outcome.success);
+        assert!(
+            outcome.report.contains("src/lib.rs\ngenerated.rs"),
+            "the command must read the change set on its standard input: {}",
+            outcome.report
+        );
     }
 }
 

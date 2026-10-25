@@ -89,12 +89,12 @@ pub fn handle_modal_scroll(st: &mut AppState, mouse: MouseEvent, term_rect: Rect
     }
 
     if let Some(dialog) = st.selection_dialog.as_mut() {
-        let area = crate::dialogs::render::selection_dialog_area(term_rect, dialog.items.len());
-        let visible_height = crate::dialogs::render::selection_dialog_visible_height(area);
+        // The shared selector owns the scroll window, so the wheel moves the
+        // highlight exactly like the keyboard and the role dialogs (c-1).
         if up {
-            dialog.selector.select_prev(visible_height);
+            dialog.selector.select_prev();
         } else {
-            dialog.selector.select_next(visible_height);
+            dialog.selector.select_next();
         }
         return true;
     }
@@ -578,11 +578,39 @@ pub async fn handle_modal_click(
                     ModalHit::Confirm => {
                         st.confirm_delete_plan = None;
                         st.confirm_button = crate::app::ConfirmDialogButton::Cancel;
+                        // A plan that still carries unfinished work escalates to
+                        // the second tier exactly as pressing `Enter` does, so a
+                        // click can never discard progress silently (c-1).
+                        if crate::dialogs::input::plan_delete_needs_escalation(&st, &plan_id) {
+                            st.confirm_delete_plan_final = Some(plan_id);
+                        } else {
+                            drop(st);
+                            crate::dialogs::input::delete_plan(server_writer, plan_id).await?;
+                        }
+                    }
+                    ModalHit::Cancel | ModalHit::Outside => {
+                        st.confirm_delete_plan = None;
+                        st.confirm_button = crate::app::ConfirmDialogButton::Cancel;
+                    }
+                    ModalHit::InsideBody => {}
+                }
+            }
+        }
+        Some(ActiveModal::DeletePlanFinal) => {
+            if let Some(plan_id) = st.confirm_delete_plan_final.clone() {
+                let geom = geometry_of(
+                    term_rect,
+                    &crate::dialogs::render::delete_plan_final_params(&st, &plan_id),
+                );
+                match check_confirm_hit(&geom, mouse.column, mouse.row) {
+                    ModalHit::Confirm => {
+                        st.confirm_delete_plan_final = None;
+                        st.confirm_button = crate::app::ConfirmDialogButton::Cancel;
                         drop(st);
                         crate::dialogs::input::delete_plan(server_writer, plan_id).await?;
                     }
                     ModalHit::Cancel | ModalHit::Outside => {
-                        st.confirm_delete_plan = None;
+                        st.confirm_delete_plan_final = None;
                         st.confirm_button = crate::app::ConfirmDialogButton::Cancel;
                     }
                     ModalHit::InsideBody => {}
@@ -895,48 +923,63 @@ pub async fn handle_modal_click(
             }
         }
         Some(ActiveModal::Selection) => {
-            if let Some(dialog) = st.selection_dialog.as_ref() {
-                let item_count = dialog.items.len();
-                let area = crate::dialogs::render::selection_dialog_area(term_rect, item_count);
-                let (select_btn, cancel_btn) =
-                    crate::dialogs::render::selection::selection_dialog_buttons(
-                        term_rect, item_count,
-                    );
+            let item_count = st
+                .selection_dialog
+                .as_ref()
+                .map(|dialog| dialog.selector.len())
+                .unwrap_or(0);
+            let area = crate::dialogs::render::selection_dialog_area(term_rect, item_count);
+            let (select_btn, cancel_btn) =
+                crate::dialogs::render::selection::selection_dialog_buttons(term_rect, item_count);
 
-                // Action footer: Select activates the highlighted row, Cancel
-                // dismisses.
-                if rect_contains(select_btn, mouse.column, mouse.row) {
-                    let selected = dialog.items.get(dialog.selector.selected_index()).cloned();
-                    if let Some(item) = selected {
-                        crate::dialogs::input::activate_selection_item(st, item, server_writer)
-                            .await?;
+            // Action footer: Select activates the highlighted rung, Cancel
+            // dismisses.
+            if rect_contains(select_btn, mouse.column, mouse.row) {
+                let selected = st
+                    .selection_dialog
+                    .as_ref()
+                    .and_then(|dialog| dialog.selector.selected_entry())
+                    .cloned();
+                if let Some(entry) = selected {
+                    crate::dialogs::input::activate_selection_item(st, entry, server_writer)
+                        .await?;
+                }
+                return Ok(InputResult::Continue);
+            }
+            if rect_contains(cancel_btn, mouse.column, mouse.row) {
+                st.selection_dialog = None;
+                return Ok(InputResult::Continue);
+            }
+
+            if !rect_contains(area, mouse.column, mouse.row) {
+                st.selection_dialog = None;
+                return Ok(InputResult::Continue);
+            }
+
+            // Rows resolve through the same list rectangle the renderer draws,
+            // so the air above the first rung and below the last one never
+            // activates a model (Conventions §6.6, §6.7, c-3).
+            let list_area = crate::dialogs::render::selection::selection_dialog_list_area(
+                term_rect, item_count,
+            );
+            if rect_contains(list_area, mouse.column, mouse.row) {
+                let clicked_visible = (mouse.row - list_area.y) as usize;
+                // The click is translated with the selector's own scroll
+                // arithmetic, so hit-testing and the drawn window cannot drift
+                // apart (c-1).
+                let clicked = st.selection_dialog.as_mut().and_then(|dialog| {
+                    let visible_height = list_area.height.max(1) as usize;
+                    let index = dialog.selector.visible_start(visible_height) + clicked_visible;
+                    if index < dialog.selector.len() {
+                        dialog.selector.select_index(index);
+                        dialog.selector.selected_entry().cloned()
+                    } else {
+                        None
                     }
-                    return Ok(InputResult::Continue);
-                }
-                if rect_contains(cancel_btn, mouse.column, mouse.row) {
-                    st.selection_dialog = None;
-                    return Ok(InputResult::Continue);
-                }
-
-                if !rect_contains(area, mouse.column, mouse.row) {
-                    st.selection_dialog = None;
-                    return Ok(InputResult::Continue);
-                }
-
-                // Rows resolve through the same list rectangle the renderer
-                // draws, so the air above the first row and below the last one
-                // never activates an item (Conventions §6.6, §6.7, c-3).
-                let list_area = crate::dialogs::render::selection::selection_dialog_list_area(
-                    term_rect, item_count,
-                );
-                if rect_contains(list_area, mouse.column, mouse.row) {
-                    let clicked_visible = (mouse.row - list_area.y) as usize;
-                    let clicked_idx = dialog.selector.scroll_offset() + clicked_visible;
-                    let clicked = dialog.items.get(clicked_idx).cloned();
-                    if let Some(item) = clicked {
-                        crate::dialogs::input::activate_selection_item(st, item, server_writer)
-                            .await?;
-                    }
+                });
+                if let Some(entry) = clicked {
+                    crate::dialogs::input::activate_selection_item(st, entry, server_writer)
+                        .await?;
                 }
             }
         }

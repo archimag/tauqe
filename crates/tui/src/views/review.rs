@@ -6,6 +6,8 @@ use tauqe_protocol::{
 };
 
 use crate::components::model_selector::ModelSelector;
+use crate::markdown::MarkdownBodyCache;
+use crate::views::recenter::RecenterState;
 
 pub mod input;
 pub mod render;
@@ -86,6 +88,11 @@ pub enum VisibleReviewRow {
         readonly_files: Vec<String>,
         depends_on: Vec<String>,
         depth: usize,
+        /// Whether the step owns nested child steps.
+        ///
+        /// A container step delegates its target files to its leaves, so it
+        /// never repeats their file lists and inflates the rendered height.
+        has_children: bool,
         is_expandable: bool,
         is_expanded: bool,
     },
@@ -195,6 +202,15 @@ pub struct ReviewViewState {
     pub refine_queue: VecDeque<RefineTarget>,
     /// Architect decomposition dialog for the selected finding, when open.
     pub refine_dialog: Option<ReviewRefineDialogState>,
+    /// Rendered Markdown bodies of the expanded finding descriptions and
+    /// subplan step details, keyed by the item that owns the description.
+    ///
+    /// The cache keeps a parsed body alive across frames, so moving the cursor
+    /// or scrolling never re-parses the Markdown of the tree, and a changed
+    /// description, indent, width, or palette drops only the body it
+    /// invalidated (c-1, c-3).
+    pub markdown_cache: MarkdownBodyCache,
+    pub recenter_state: RecenterState,
 }
 
 impl ReviewViewState {
@@ -631,6 +647,7 @@ impl ReviewViewState {
                 readonly_files: step.readonly_files.clone(),
                 depends_on: step.depends_on.clone(),
                 depth,
+                has_children,
                 is_expandable: has_children || has_details || has_meta,
                 is_expanded,
             });
@@ -641,13 +658,86 @@ impl ReviewViewState {
         }
     }
 
+    /// Number of subplan step rows an embedded plan contributes to the tree.
+    ///
+    /// Counts every step plus, while a container step is expanded, the steps of
+    /// its children, mirroring `flatten_subplan_rows` branch for branch.
+    fn count_subplan_rows(&self, session_id: &str, item_id: u32, steps: &[PlanItem]) -> usize {
+        let mut count = 0;
+        for step in steps {
+            count += 1;
+            if !step.children.is_empty()
+                && self.is_subplan_item_expanded(session_id, item_id, &step.id)
+            {
+                count += self.count_subplan_rows(session_id, item_id, &step.children);
+            }
+        }
+        count
+    }
+
+    /// Number of rows one session contributes at its current fold state.
+    ///
+    /// Mirrors the per-session branch of `flatten_rows`: the session header, its
+    /// Executive Summary row while the description is non-empty, and every
+    /// visible finding with its expanded subplan.
+    fn count_session_rows(&self, session: &ReviewSession) -> usize {
+        let mut count = 1; // The session header.
+        if !self.is_session_expanded(&session.id) {
+            return count;
+        }
+        let has_summary = session
+            .description
+            .as_deref()
+            .map(|description| !description.trim().is_empty())
+            .unwrap_or(false);
+        if has_summary {
+            count += 1; // The Executive Summary row.
+        }
+        for item in &session.items {
+            if self.hide_closed
+                && matches!(
+                    item.status,
+                    IssueStatus::Fixed | IssueStatus::Skipped | IssueStatus::Rejected
+                )
+            {
+                continue;
+            }
+            count += 1; // The finding row.
+            if self.is_item_expanded(&session.id, item.id) {
+                count += self.count_subplan_rows(&session.id, item.id, &item.subplan);
+            }
+        }
+        count
+    }
+
+    /// Number of rows the tree currently exposes, computed without allocating
+    /// the row list.
+    ///
+    /// Selection and viewport bounds only need the count, so they read it here
+    /// instead of building every owned row projection just to call `len()`. The
+    /// walk mirrors `flatten_rows` branch for branch, and the regression tests
+    /// pin the two to the same value in every fold state (c-2).
+    pub fn row_count(&self) -> usize {
+        if self.sessions.is_empty() {
+            match self.session.as_ref() {
+                Some(session) => self.count_session_rows(session),
+                None => 0,
+            }
+        } else {
+            self.sessions
+                .iter()
+                .map(|session| self.count_session_rows(session))
+                .sum()
+        }
+    }
+
     pub fn selected_row(&self) -> Option<VisibleReviewRow> {
         let rows = self.flatten_rows();
         rows.get(self.selected_index).cloned()
     }
 
     pub fn clamp_selection(&mut self) {
-        let count = self.flatten_rows().len();
+        let count = self.row_count();
         if count == 0 {
             self.selected_index = 0;
         } else if self.selected_index >= count {
@@ -655,6 +745,29 @@ impl ReviewViewState {
         }
     }
 
+    /// Maximum valid viewport offset for the document last rendered.
+    ///
+    /// Paging and the wheel are free scrolling: they move the window without
+    /// moving the cursor, so they need exactly the upper bound the renderer
+    /// applies and must never re-anchor on the selected row (c-1). The bound is
+    /// computed in `usize` and only then reduced to the `u16` viewport unit, so
+    /// a document longer than 65535 lines saturates instead of wrapping around
+    /// and trapping the viewport short of its end (c-2).
+    pub fn max_scroll(&self) -> u16 {
+        let max = self
+            .rendered_lines
+            .saturating_sub(self.view_height as usize);
+        u16::try_from(max).unwrap_or(u16::MAX)
+    }
+
+    /// Scrolls the viewport just enough to reveal the selected row.
+    ///
+    /// This is the only place that moves the viewport because of the cursor:
+    /// free scrolling (wheel, paging) belongs to the developer and is never
+    /// re-anchored on a redraw (c-1). A row that fits on one screen is revealed
+    /// in full from its top edge, and a row taller than the viewport keeps any
+    /// position already resting inside it, so its lower lines stay reachable
+    /// instead of being pinned to the first screenful (c-2).
     pub fn scroll_to_selected(&mut self) {
         let rows = self.flatten_rows();
         if rows.is_empty() || self.view_height == 0 {
@@ -663,23 +776,59 @@ impl ReviewViewState {
         let sel = self.selected_index.min(rows.len() - 1);
         self.selected_index = sel;
 
-        let (lines, offsets) =
-            compute_unified_review_lines(&rows, sel, self.content_width.max(10), self.theme_mode);
+        let (lines, offsets) = compute_unified_review_lines(
+            &rows,
+            sel,
+            self.content_width.max(10),
+            self.theme_mode,
+            &mut self.markdown_cache,
+        );
         let height = self.view_height as usize;
         let start = offsets.get(sel).copied().unwrap_or(0);
         let end = offsets.get(sel + 1).copied().unwrap_or(lines.len());
         let scroll = self.scroll as usize;
 
-        let new_scroll = if sel == 0 {
-            0
-        } else if start < scroll {
-            start
-        } else if end > scroll + height {
-            end.saturating_sub(height).min(start)
+        let new_scroll = if end.saturating_sub(start) <= height {
+            // The row fits: reveal it fully, preferring its top edge so it is
+            // read from the beginning.
+            if scroll >= start && scroll + height >= end {
+                scroll
+            } else {
+                start
+            }
         } else {
-            scroll
+            // The row is taller than the viewport, so every offset in
+            // `[start, end - height]` reveals a part of it. A viewport already
+            // resting inside that range keeps its position, and one arriving
+            // from above or below moves to the nearest edge instead of being
+            // pinned to the row's first screenful (c-2).
+            scroll.clamp(start, end.saturating_sub(height))
         };
         self.scroll = new_scroll as u16;
+    }
+
+    /// Positions the viewport around the selected review row using the three-beat
+    /// Emacs `recenter-top-bottom` cycle (center -> top -> bottom).
+    pub fn recenter_selected(&mut self) {
+        let rows = self.flatten_rows();
+        if rows.is_empty() || self.view_height == 0 {
+            return;
+        }
+        let sel = self.selected_index.min(rows.len().saturating_sub(1));
+        self.selected_index = sel;
+
+        let (lines, offsets) = compute_unified_review_lines(
+            &rows,
+            sel,
+            self.content_width.max(10),
+            self.theme_mode,
+            &mut self.markdown_cache,
+        );
+        let start = offsets.get(sel).copied().unwrap_or(0);
+        let end = offsets.get(sel + 1).copied().unwrap_or(lines.len());
+        self.scroll = self
+            .recenter_state
+            .recenter(sel, start, end, lines.len(), self.view_height);
     }
 
     /// Accordion-style navigation: moves to the next or previous finding,
@@ -899,6 +1048,103 @@ mod tests {
         }
     }
 
+    /// A session whose summary, findings, and subplan steps all carry expansion
+    /// state, so every branch of the row walk is exercised.
+    fn row_count_fixture() -> ReviewViewState {
+        let mut session = make_session("rev-count", &[1, 2]);
+        session.description = Some("Executive summary body.".to_string());
+        session.items[0] = ReviewItem::from(ReviewIssue {
+            plan: vec![PlanItem {
+                children: vec![subplan_step("1.1", "Leaf step", PlanItemStatus::Todo)],
+                ..subplan_step("1", "Container step", PlanItemStatus::Todo)
+            }],
+            ..make_item(1)
+        });
+        session.items[1] = ReviewItem::from(ReviewIssue {
+            status: IssueStatus::Fixed,
+            ..make_item(2)
+        });
+        ReviewViewState {
+            sessions: vec![session],
+            ..Default::default()
+        }
+    }
+
+    fn assert_row_count_matches(view: &ReviewViewState, state: &str) {
+        assert_eq!(
+            view.row_count(),
+            view.flatten_rows().len(),
+            "row_count must match the flattened rows while {state}"
+        );
+    }
+
+    #[test]
+    fn test_row_count_matches_flattened_rows_across_fold_states() {
+        let mut view = row_count_fixture();
+        assert_row_count_matches(&view, "the session is expanded");
+
+        view.toggle_item_expanded("rev-count", 1);
+        assert_row_count_matches(&view, "the finding is expanded");
+
+        view.toggle_subplan_item_expanded("rev-count", 1, "1");
+        assert_row_count_matches(&view, "the container step is expanded");
+        view.toggle_subplan_item_expanded("rev-count", 1, "1");
+        assert_row_count_matches(&view, "the container step is folded");
+
+        view.toggle_summary_expanded("rev-count");
+        assert_row_count_matches(&view, "the Executive Summary is folded");
+
+        view.toggle_hide_closed();
+        assert_row_count_matches(&view, "closed findings are filtered out");
+
+        view.toggle_session_expanded("rev-count");
+        assert_row_count_matches(&view, "the session is collapsed");
+
+        view.expand_all();
+        assert_row_count_matches(&view, "every row is expanded");
+
+        view.collapse_all();
+        assert_row_count_matches(&view, "every row is collapsed");
+    }
+
+    #[test]
+    fn test_row_count_matches_flattened_rows_for_the_single_active_session() {
+        let mut session = make_session("rev-active", &[1]);
+        session.description = Some("Summary body.".to_string());
+        let view = ReviewViewState {
+            session: Some(session),
+            ..Default::default()
+        };
+
+        assert_eq!(view.row_count(), view.flatten_rows().len());
+        assert_eq!(
+            view.row_count(),
+            3,
+            "a header, its summary, and one finding"
+        );
+    }
+
+    #[test]
+    fn test_clamp_selection_clamps_against_the_row_count() {
+        let mut view = ReviewViewState {
+            sessions: vec![make_session("rev-clamp", &[1, 2])],
+            ..Default::default()
+        };
+
+        // A header and two findings: a cursor past the last row clamps to it.
+        assert_eq!(view.row_count(), 3);
+        view.selected_index = 9;
+        view.clamp_selection();
+        assert_eq!(view.selected_index, 2);
+
+        // Collapsing the session leaves its header as the only row.
+        view.toggle_session_expanded("rev-clamp");
+        assert_eq!(view.row_count(), 1);
+        view.selected_index = 2;
+        view.clamp_selection();
+        assert_eq!(view.selected_index, 0);
+    }
+
     #[test]
     fn test_status_updates_are_scoped_by_review_id() {
         let mut view = ReviewViewState {
@@ -967,6 +1213,70 @@ mod tests {
         assert!(view.is_session_expanded("rev-2"));
     }
 
+    #[test]
+    fn test_scroll_to_selected_keeps_free_scroll_inside_a_tall_row() {
+        let long_description = (0..120)
+            .map(|line| format!("Detail line {line}."))
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        let mut session = make_session("rev-tall", &[1, 2]);
+        session.items[0] = ReviewItem::from(ReviewIssue {
+            description: long_description,
+            ..make_item(1)
+        });
+        let mut view = ReviewViewState {
+            sessions: vec![session],
+            ..Default::default()
+        };
+        view.view_height = 10;
+        view.content_width = 80;
+        view.toggle_item_expanded("rev-tall", 1);
+
+        // The first row is revealed normally: the unconditional reset that used
+        // to exist for row zero is gone, but a row at the top needs no scroll.
+        view.selected_index = 0;
+        view.scroll_to_selected();
+        assert_eq!(view.scroll, 0);
+
+        // Moving down into the tall finding reveals its top edge.
+        view.selected_index = 1;
+        view.scroll_to_selected();
+        let start = view.scroll as usize;
+        assert!(start > 0, "the tall finding must be scrolled into view");
+
+        let rows = view.flatten_rows();
+        let (lines, offsets) =
+            compute_unified_review_lines(&rows, 1, 80, view.theme_mode, &mut view.markdown_cache);
+        let end = offsets.get(2).copied().unwrap_or(lines.len());
+        let height = view.view_height as usize;
+        let max_start = end - height;
+        assert!(
+            max_start > start + 20,
+            "the finding must be taller than the viewport: {start}..{end}"
+        );
+
+        // A viewport already resting inside the tall row keeps its position
+        // instead of snapping back to the first screenful (c-2).
+        view.scroll = (start + 20) as u16;
+        view.scroll_to_selected();
+        assert_eq!(view.scroll as usize, start + 20);
+
+        // Arriving from below reveals the bottom of the same row.
+        view.selected_index = 2;
+        view.scroll_to_selected();
+        assert_eq!(
+            view.scroll as usize, end,
+            "the next row must be revealed at the top of the viewport"
+        );
+
+        view.selected_index = 1;
+        view.scroll_to_selected();
+        assert_eq!(
+            view.scroll as usize, max_start,
+            "moving up into a tall row must reveal its bottom edge"
+        );
+    }
+
     fn subplan_step(id: &str, title: &str, status: PlanItemStatus) -> PlanItem {
         PlanItem {
             id: id.to_string(),
@@ -1020,5 +1330,273 @@ mod tests {
             view.selected_row(),
             Some(VisibleReviewRow::SubplanItem { ref step_id, .. }) if step_id == "1.1"
         ));
+    }
+
+    #[test]
+    fn test_max_scroll_bounds_the_viewport_without_wrapping() {
+        let mut view = ReviewViewState {
+            rendered_lines: 500,
+            view_height: 20,
+            ..Default::default()
+        };
+        assert_eq!(
+            view.max_scroll(),
+            480,
+            "the bound is the last full screenful of the document"
+        );
+
+        // A document shorter than the viewport has no scroll range at all.
+        view.rendered_lines = 10;
+        assert_eq!(view.max_scroll(), 0);
+
+        // A document longer than the u16 viewport unit saturates at the largest
+        // representable offset instead of wrapping around and trapping the
+        // viewport before its end (c-2).
+        view.rendered_lines = 70_000;
+        view.view_height = 10;
+        assert_eq!(view.max_scroll(), u16::MAX);
+    }
+
+    /// Expected `Center`, `Top`, and `Bottom` viewport offsets for a row that
+    /// spans `start..end` inside a `height`-row viewport (Conventions §5.2).
+    fn recenter_beats(start: usize, end: usize, total: usize, height: u16) -> [u16; 3] {
+        let height = height as usize;
+        let max_scroll = total.saturating_sub(height);
+        let clamp = |value: usize| u16::try_from(value.min(max_scroll)).unwrap_or(u16::MAX);
+        [
+            clamp(
+                start
+                    .saturating_add(end.saturating_sub(start) / 2)
+                    .saturating_sub(height / 2),
+            ),
+            clamp(start),
+            clamp(end.saturating_sub(height)),
+        ]
+    }
+
+    /// Expected beats for the row at `index`, derived from the same layout
+    /// offsets the view uses to position its viewport.
+    fn review_recenter_beats(view: &ReviewViewState, index: usize) -> [u16; 3] {
+        let rows = view.flatten_rows();
+        // A scratch cache is enough here: the beats depend on the rendered line
+        // count, never on cache reuse.
+        let mut cache = MarkdownBodyCache::new();
+        let (lines, offsets) = compute_unified_review_lines(
+            &rows,
+            index,
+            view.content_width.max(10),
+            view.theme_mode,
+            &mut cache,
+        );
+        let start = offsets.get(index).copied().unwrap_or(0);
+        let end = offsets.get(index + 1).copied().unwrap_or(lines.len());
+        recenter_beats(start, end, lines.len(), view.view_height)
+    }
+
+    fn recenter_review_fixture(selected: usize) -> ReviewViewState {
+        ReviewViewState {
+            sessions: (1..=12)
+                .map(|i| make_session(&format!("rev-{i}"), &[i as u32]))
+                .collect(),
+            selected_index: selected,
+            view_height: 8,
+            content_width: 80,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn test_recenter_selected_walks_the_center_top_bottom_cycle() {
+        let mut view = recenter_review_fixture(16);
+
+        let [center, top, bottom] = review_recenter_beats(&view, view.selected_index);
+        assert_ne!(center, top, "the center and top beats must differ");
+        assert_ne!(top, bottom, "the top and bottom beats must differ");
+        assert_ne!(center, bottom, "the center and bottom beats must differ");
+
+        view.recenter_selected();
+        assert_eq!(view.scroll, center, "the first press centers the row");
+        view.recenter_selected();
+        assert_eq!(
+            view.scroll, top,
+            "the second press aligns the row to the top"
+        );
+        view.recenter_selected();
+        assert_eq!(
+            view.scroll, bottom,
+            "the third press aligns the row to the bottom"
+        );
+        view.recenter_selected();
+        assert_eq!(
+            view.scroll, center,
+            "the fourth press wraps back to the center"
+        );
+    }
+
+    #[test]
+    fn test_recenter_selected_restarts_the_cycle_on_cursor_move() {
+        let mut view = recenter_review_fixture(16);
+
+        // Walk to the top beat of the first row, so a continuation would land on
+        // the bottom beat instead of starting over.
+        view.recenter_selected();
+        view.recenter_selected();
+
+        view.selected_index = 6;
+        let [center, top, bottom] = review_recenter_beats(&view, view.selected_index);
+        assert_ne!(center, bottom, "the first and third beats must differ");
+
+        view.recenter_selected();
+        assert_eq!(
+            view.scroll, center,
+            "a new cursor position starts over on the center beat"
+        );
+        view.recenter_selected();
+        assert_eq!(view.scroll, top, "the new row keeps its own cycle");
+        view.recenter_selected();
+        assert_eq!(view.scroll, bottom);
+    }
+
+    /// The recenter command is declared on both the abstract primary chord and
+    /// the raw `Ctrl+L` chord, and no other binding claims the same key event
+    /// under either modifier configuration (c-2).
+    #[test]
+    fn test_recenter_chord_is_declared_and_unambiguous() {
+        use super::input::ReviewAction;
+        use crate::config::{InputConfig, MetaModifier, PrimaryModifier};
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+        // The abstract `C-l` chord and the raw `Ctrl+L` chord deliberately name
+        // the same intent, so under the default primary assignment both of them
+        // match a single key event. The resolved intents are deduplicated, since
+        // the invariant under test is which action the key reaches, not how many
+        // spellings declare it (c-2).
+        fn claims(
+            input: &InputConfig,
+            code: KeyCode,
+            modifiers: KeyModifiers,
+        ) -> Vec<ReviewAction> {
+            let mut actions = Vec::new();
+            for spec in REVIEW_COMMAND_MAP.specs() {
+                let matched = spec
+                    .chord
+                    .matches(KeyEvent::new(code, modifiers), input, false);
+                if matched && !actions.contains(&spec.action) {
+                    actions.push(spec.action);
+                }
+            }
+            actions
+        }
+
+        let ctrl_primary = InputConfig {
+            primary_modifier: PrimaryModifier::Ctrl,
+            meta_modifier: MetaModifier::Alt,
+            ..InputConfig::default()
+        };
+        let alt_primary = InputConfig {
+            primary_modifier: PrimaryModifier::Alt,
+            meta_modifier: MetaModifier::Ctrl,
+            ..InputConfig::default()
+        };
+
+        assert_eq!(
+            claims(&ctrl_primary, KeyCode::Char('l'), KeyModifiers::CONTROL),
+            vec![ReviewAction::Recenter],
+            "C-l must recenter under the default primary modifier"
+        );
+        assert_eq!(
+            claims(&alt_primary, KeyCode::Char('l'), KeyModifiers::ALT),
+            vec![ReviewAction::Recenter],
+            "the abstract C-l chord must follow a remapped primary modifier"
+        );
+        assert_eq!(
+            claims(&alt_primary, KeyCode::Char('l'), KeyModifiers::CONTROL),
+            vec![ReviewAction::Recenter],
+            "a raw Ctrl+L must still recenter when the primary modifier is Alt"
+        );
+    }
+
+    /// An expanded subplan step taller than the viewport must be readable down
+    /// to its last line: selecting it reveals its top edge, and free scrolling
+    /// then reaches the bottom without snapping back to the first screenful
+    /// (c-2).
+    #[test]
+    fn test_tall_expanded_subplan_step_scrolls_to_its_final_line() {
+        let long_details = (0..80)
+            .map(|line| format!("Invariant line {line}."))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let mut session = make_session("rev-tall-step", &[1]);
+        session.items[0] = ReviewItem::from(ReviewIssue {
+            plan: vec![PlanItem {
+                details: Some(long_details),
+                ..subplan_step("1.1", "Tall step", PlanItemStatus::Todo)
+            }],
+            ..make_item(1)
+        });
+        let mut view = ReviewViewState {
+            sessions: vec![session],
+            ..Default::default()
+        };
+        view.view_height = 20;
+        view.content_width = 80;
+        view.toggle_item_expanded("rev-tall-step", 1);
+        view.toggle_subplan_item_expanded("rev-tall-step", 1, "1.1");
+
+        let rows = view.flatten_rows();
+        let step_row = rows
+            .iter()
+            .position(|row| {
+                matches!(
+                    row,
+                    VisibleReviewRow::SubplanItem { step_id, .. } if step_id == "1.1"
+                )
+            })
+            .expect("the tall step row must be visible once expanded");
+        let (lines, offsets) = compute_unified_review_lines(
+            &rows,
+            usize::MAX,
+            80,
+            view.theme_mode,
+            &mut view.markdown_cache,
+        );
+        view.rendered_lines = lines.len();
+
+        let start = offsets[step_row];
+        let end = offsets.get(step_row + 1).copied().unwrap_or(lines.len());
+        let height = view.view_height as usize;
+        assert!(
+            end.saturating_sub(start) > height,
+            "the step must be taller than the viewport: {start}..{end}"
+        );
+
+        // Arriving from above reveals the top edge of the tall step.
+        view.scroll = 0;
+        view.selected_index = step_row;
+        view.scroll_to_selected();
+        assert_eq!(view.scroll as usize, start);
+
+        // Free scrolling walks down to the last full screenful, where the final
+        // invariant line is on screen, and never snaps back to the top edge.
+        let max = view.max_scroll() as usize;
+        assert_eq!(max, lines.len() - height);
+        assert!(
+            max > start,
+            "the viewport must be able to leave the step's top edge"
+        );
+        view.scroll = u16::try_from(max).expect("the viewport offset fits in u16");
+        view.scroll_to_selected();
+        assert_eq!(
+            view.scroll as usize, max,
+            "free scrolling down must never snap back to the step's first screenful"
+        );
+        let last = lines
+            .last()
+            .map(|line| line.to_string())
+            .unwrap_or_default();
+        assert!(
+            last.contains("Invariant line 79."),
+            "the last line of the tall step must be reachable: {last}"
+        );
     }
 }

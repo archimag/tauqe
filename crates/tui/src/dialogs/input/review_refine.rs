@@ -164,9 +164,15 @@ pub(crate) async fn submit_review_refine_dialog(
     } else {
         Some(instructions_raw)
     };
+    // The selected architect rung travels whole: the model together with the
+    // reasoning depth it was configured with, so the architect the developer
+    // picked is the architect that runs.
     let selected_model = dialog
         .selected_entry()
-        .map(|entry| tauqe_protocol::ModelSelection::Specific(entry.model.clone()));
+        .map(|entry| tauqe_protocol::ModelSelection::Tier {
+            model: entry.model.clone(),
+            effort: entry.effort,
+        });
 
     let params = tauqe_protocol::ReviewRefineItemParams {
         review_id: Some(dialog.review_id.clone()),
@@ -212,7 +218,7 @@ mod tests {
     use tauqe_protocol::{ModelEntry, ModelRef};
 
     fn architect(name: &str) -> ModelEntry {
-        ModelEntry::new(ModelRef::openrouter(name), None, None)
+        ModelEntry::new(ModelRef::openrouter(name), None)
     }
 
     fn state_with_dialog() -> AppState {

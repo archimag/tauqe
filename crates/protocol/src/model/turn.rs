@@ -193,6 +193,21 @@ pub struct StructuredBlockedProposal {
     pub details: Option<String>,
 }
 
+/// Unconditional abort declared through a structured proposal.
+///
+/// Mirrors the `<abort>` protocol tag: `is_abort` is the explicit flag the
+/// model sets when external environment or host action is required,
+/// `reason` names the blocker, and `recommendation` provides actionable guidance for the developer.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct StructuredAbortProposal {
+    #[serde(default)]
+    pub is_abort: bool,
+    #[serde(default)]
+    pub reason: String,
+    #[serde(default)]
+    pub recommendation: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct ModelResultProposal {
     #[serde(default)]
@@ -224,6 +239,8 @@ pub struct ModelResultProposal {
     pub outcome: Option<StructuredOutcomeProposal>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub blocked: Option<StructuredBlockedProposal>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub abort: Option<StructuredAbortProposal>,
     #[serde(default)]
     pub context_drops: Vec<String>,
     #[serde(default)]
@@ -623,6 +640,35 @@ mod tests {
         assert!(minimal.scratchpad.is_none());
         assert!(minimal.outcome.is_none());
         assert!(minimal.blocked.is_none());
+        assert!(minimal.abort.is_none());
+    }
+
+    #[test]
+    fn test_model_result_proposal_abort_and_null_tolerance() {
+        let raw = r#"{
+            "message": "Need developer action",
+            "changes": [],
+            "abort": {
+                "is_abort": true,
+                "reason": "Approval required",
+                "recommendation": "Run pnpm approve-builds"
+            }
+        }"#;
+        let proposal: ModelResultProposal = serde_json::from_str(raw).unwrap();
+        let abort = proposal.abort.as_ref().expect("abort proposal");
+        assert!(abort.is_abort);
+        assert_eq!(abort.reason, "Approval required");
+        assert_eq!(abort.recommendation, "Run pnpm approve-builds");
+
+        let json = serde_json::to_string(&proposal).unwrap();
+        assert!(json.contains("\"abort\""));
+        assert!(json.contains("\"is_abort\":true"));
+        assert!(json.contains("\"reason\":\"Approval required\""));
+        assert!(json.contains("\"recommendation\":\"Run pnpm approve-builds\""));
+        assert_eq!(
+            serde_json::from_str::<ModelResultProposal>(&json).unwrap(),
+            proposal
+        );
     }
 
     #[test]

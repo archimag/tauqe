@@ -8,13 +8,12 @@ use crate::context::ContextFileContent;
 use crate::edits::stream::json::decode::first_json_object_str;
 use crate::prompt::protocol::PromptProtocol;
 use crate::providers::{ChatMessage, JsonSchemaDefinition, ResponseFormat};
-use tauqe_protocol::{CapabilitySet, ContextAccess, ModelRole, Plan, RepositoryState, TurnIntent};
+use tauqe_protocol::{
+    CapabilitySet, ContextAccess, EditProtocolKind, ModelRole, Plan, RepositoryState, TurnIntent,
+};
 
 /// Default model role used for squash commit message synthesis.
 pub const SQUASH_COMMIT_ROLE: ModelRole = ModelRole::Scribe;
-
-/// Maximum characters allowed in a turn scratchpad block before safe truncation.
-pub const MAX_SCRATCHPAD_CHARS: usize = 4_000;
 
 pub fn build_squash_commit_prompt(
     commits: &[crate::git::CommitSummary],
@@ -236,7 +235,13 @@ pub struct PromptAssembly {
     pub context_revision: u64,
     pub context_files: Vec<ContextFileContent>,
     pub workflow: String,
-    pub edit_protocol: String,
+    /// Typed wire format of the active protocol.
+    ///
+    /// The format is a transport fact, so the assembly stores it as a typed
+    /// value instead of the protocol's display name. It is rendered in the
+    /// project metadata and handed to the contract composer, which keeps a
+    /// structured prompt free of control-tag spellings.
+    pub edit_protocol: EditProtocolKind,
     pub history_tag: Option<String>,
     pub repo_map: Option<String>,
     /// Compact directory-tree outline of the repository.
@@ -249,6 +254,11 @@ pub struct PromptAssembly {
     /// Declared intent of this turn, which decides the advertised capability set.
     pub intent: TurnIntent,
     pub turn_scratchpad: Option<String>,
+    /// Maximum characters of a turn scratchpad block kept before truncation.
+    ///
+    /// The bound is resolved from the project's `[context]` section, so a turn
+    /// never truncates working memory at a compile-time ceiling.
+    pub max_scratchpad_chars: usize,
     pub project: Option<tauqe_protocol::ProjectConfig>,
 }
 
@@ -258,7 +268,7 @@ impl PromptAssembly {
         context_revision: u64,
         context_files: Vec<ContextFileContent>,
         workflow: impl Into<String>,
-        edit_protocol: impl Into<String>,
+        edit_protocol: EditProtocolKind,
         history_tag: Option<String>,
         repo_map: Option<String>,
     ) -> Self {
@@ -267,7 +277,7 @@ impl PromptAssembly {
             context_revision,
             context_files,
             workflow: workflow.into(),
-            edit_protocol: edit_protocol.into(),
+            edit_protocol,
             history_tag,
             repo_map,
             repo_dirs: None,
@@ -275,6 +285,7 @@ impl PromptAssembly {
             active_plan: None,
             intent: TurnIntent::InteractiveRepl,
             turn_scratchpad: None,
+            max_scratchpad_chars: crate::config::DEFAULT_MAX_SCRATCHPAD_CHARS,
             project: None,
         }
     }
@@ -313,7 +324,7 @@ impl PromptAssembly {
         let render_ctx = PromptRenderContext::new(&[], effective_protocol.turn_marker())
             .with_eager_repo_map(has_eager_repo_map)
             .with_project(self.project.as_ref());
-        let contract_ctx = ContractContext::new(self.intent, render_ctx)
+        let contract_ctx = ContractContext::new(self.intent, protocol.kind(), render_ctx)
             .with_target_language(self.target_language.as_deref());
         prompt.push_str("## Core System Contract\n");
         prompt.push_str(
@@ -321,23 +332,18 @@ impl PromptAssembly {
         );
         prompt.push('\n');
 
-        if !self.intent.is_readonly_discussion() {
-            let editable_paths: Vec<String> = self
-                .context_files
-                .iter()
-                .filter(|f| f.access == ContextAccess::Editable)
-                .map(|f| f.path.clone())
-                .collect();
-
-            // Delegate edit protocol specific instructions
-            prompt.push_str(
-                &effective_protocol.system_instructions(&editable_paths, has_eager_repo_map),
-            );
-        } else {
-            prompt.push_str("## Mode: Structured Discussion\n");
-            prompt.push_str("You are participating in an architectural discussion. Code modifications are strictly prohibited. You cannot edit, create, or delete code files. Focus on conceptual comprehension of the objective ('What'), clarifying requirements, evaluating trade-offs, establishing key design decisions, and formulating or refining plans via structured fields.\n");
-            prompt.push_str("Output MUST be a JSON object conforming to the discussion schema with `message`, `plan_update`, `context_requests`, `repo_searches`, and `user_language`.\n\n");
-        }
+        // The capability set narrowed by the declared `TurnIntent` decides which
+        // mode the active protocol renders, so the assembly owns no wire-format
+        // knowledge: a discussion turn receives exactly the instructions of the
+        // concrete protocol whose decoder will parse its output.
+        let editable_paths: Vec<String> = self
+            .context_files
+            .iter()
+            .filter(|f| f.access == ContextAccess::Editable)
+            .map(|f| f.path.clone())
+            .collect();
+        prompt
+            .push_str(&effective_protocol.system_instructions(&editable_paths, has_eager_repo_map));
 
         prompt.push_str("## Project Metadata\n");
         if let Some(repo) = &self.repo_state {
@@ -457,8 +463,9 @@ impl PromptAssembly {
             if trimmed.is_empty() {
                 None
             } else {
-                let text = if trimmed.chars().count() > MAX_SCRATCHPAD_CHARS {
-                    let truncated: String = trimmed.chars().take(MAX_SCRATCHPAD_CHARS).collect();
+                let text = if trimmed.chars().count() > self.max_scratchpad_chars {
+                    let truncated: String =
+                        trimmed.chars().take(self.max_scratchpad_chars).collect();
                     format!("{}\n... [scratchpad truncated for length] ...", truncated)
                 } else {
                     trimmed.to_string()
@@ -593,7 +600,8 @@ mod tests {
 
     #[test]
     fn test_prompt_assembly_with_target_language() {
-        let mut assembly = PromptAssembly::new(None, 1, vec![], "git", "xml", None, None);
+        let mut assembly =
+            PromptAssembly::new(None, 1, vec![], "git", EditProtocolKind::Xml, None, None);
         assembly.target_language = Some("Russian".to_string());
         let proto = XmlPromptProtocol;
         let messages = assembly.assemble_chat_messages("Привет", &proto);
@@ -616,7 +624,15 @@ mod tests {
         let history =
             Some("<history>\n{\"type\":\"summary\",\"text\":\"Initial\"}\n</history>".to_string());
         let repo_map = Some("crates/core/src/git.rs\n  pub fn get_repository_state()".to_string());
-        let assembly = PromptAssembly::new(None, 1, files, "git", "xml", history, repo_map);
+        let assembly = PromptAssembly::new(
+            None,
+            1,
+            files,
+            "git",
+            EditProtocolKind::Xml,
+            history,
+            repo_map,
+        );
         let proto = XmlPromptProtocol;
         let messages = assembly.assemble_chat_messages("Explain this code", &proto);
 
@@ -643,20 +659,126 @@ mod tests {
             access: ContextAccess::Editable,
             content: "fn main() {}\n".to_string(),
         }];
-        let mut assembly = PromptAssembly::new(None, 1, files, "git", "xml", None, None);
+        let mut assembly =
+            PromptAssembly::new(None, 1, files, "git", EditProtocolKind::Xml, None, None);
         assembly.intent = TurnIntent::ReadonlyDiscussion;
         let proto = XmlPromptProtocol;
         let messages = assembly.assemble_chat_messages("Let's discuss architecture", &proto);
         let sys = &messages[0].content;
 
         assert!(sys.contains("Discussion Mode Scope"));
-        assert!(sys.contains("Mode: Structured Discussion"));
+        assert!(sys.contains("architectural discussion"));
         assert!(sys.contains("<context>"));
         assert!(sys.contains("access=\"read_only\""));
         assert!(!sys.contains("access=\"editable\""));
         assert!(!sys.contains("<editable_files>"));
         assert!(!sys.contains("<read_only_files>"));
-        assert!(!sys.contains("Code Modification Protocol"));
+
+        // The answer obligation is owned by the enabled capability modules: a
+        // discussion that gathered its material owes the analysis in `message`
+        // instead of closing the turn silently.
+        assert!(sys.contains("Never conclude a discussion with an empty `message`"));
+
+        // The XML protocol renders its own discovery, plan, and language surface
+        // for a discussion turn narrowed to the discussion capability profile.
+        assert!(sys.contains("<context_request"));
+        assert!(sys.contains("<plan action"));
+        assert!(sys.contains("<user_language>"));
+
+        // The assembly contributes no wire-format knowledge of its own.
+        assert!(!sys.contains("Mode: Structured Discussion"));
+        assert!(!sys.contains("conforming to the discussion schema"));
+        assert!(!sys.contains("discussion_response schema"));
+        assert!(!sys.contains(
+            "with `message`, `plan_update`, `context_requests`, `repo_searches`, and `user_language`"
+        ));
+    }
+
+    #[test]
+    fn test_discussion_renders_stub_protocol_instructions_without_json_schema() {
+        use crate::prompt::protocol::PromptProtocol;
+        use tauqe_protocol::{CapabilitySet, LlmCapability, LlmCommand};
+
+        /// Protocol stub whose only mode text is its own heading.
+        struct StubWireProtocol;
+
+        impl PromptProtocol for StubWireProtocol {
+            fn name(&self) -> &'static str {
+                "stub-wire"
+            }
+
+            fn kind(&self) -> EditProtocolKind {
+                EditProtocolKind::Structured
+            }
+
+            fn capabilities(&self) -> &[LlmCapability] {
+                &[LlmCapability::TextMessage, LlmCapability::UserLanguage]
+            }
+
+            fn decode(&self, raw_text: &str, _context_paths: &[String]) -> Vec<LlmCommand> {
+                vec![LlmCommand::Text {
+                    content: raw_text.to_string(),
+                }]
+            }
+
+            fn system_instructions(
+                &self,
+                _editable_paths: &[String],
+                _has_eager_repo_map: bool,
+            ) -> String {
+                "## Mode: Stub Wire\nAnswer in the stub wire format.\n".to_string()
+            }
+
+            fn with_capability_set(&self, _capabilities: CapabilitySet) -> Box<dyn PromptProtocol> {
+                Box::new(StubWireProtocol)
+            }
+
+            fn create_stream_filter(
+                &self,
+                editable_paths: Vec<String>,
+                repo_root: std::path::PathBuf,
+                staged_contents: std::collections::HashMap<String, String>,
+            ) -> Box<dyn crate::edits::stream::EditStreamFilter> {
+                Box::new(
+                    crate::edits::stream::XmlStreamFilter::new(editable_paths, repo_root)
+                        .with_staged_contents(staged_contents),
+                )
+            }
+        }
+
+        let mut assembly =
+            PromptAssembly::new(None, 1, vec![], "git", EditProtocolKind::Xml, None, None);
+        assembly.intent = TurnIntent::ReadonlyDiscussion;
+        let prompt = assembly.build_system_prompt(&StubWireProtocol);
+
+        assert!(prompt.contains("## Mode: Stub Wire"));
+        assert!(!prompt.contains("Mode: Structured Discussion"));
+        assert!(!prompt.contains("conforming to the discussion schema"));
+        assert!(!prompt.contains("discussion_response schema"));
+        assert!(!prompt.contains("Output MUST be a JSON object"));
+        assert!(!prompt.contains(
+            "with `message`, `plan_update`, `context_requests`, `repo_searches`, and `user_language`"
+        ));
+    }
+
+    #[test]
+    fn test_discussion_instructions_render_once_from_the_json_protocol() {
+        let assembly = {
+            let mut assembly =
+                PromptAssembly::new(None, 1, vec![], "git", EditProtocolKind::Xml, None, None);
+            assembly.intent = TurnIntent::ReadonlyDiscussion;
+            assembly
+        };
+        let protocol = crate::prompt::json::JsonPromptProtocol::discussion();
+        let prompt = assembly.build_system_prompt(&protocol);
+
+        assert!(prompt.contains("## Mode: Structured Discussion"));
+        assert_eq!(prompt.matches("discussion_response schema").count(), 1);
+        assert!(prompt.contains("- message: Conversational Markdown explanation"));
+        assert!(!prompt.contains("conforming to the discussion schema"));
+        assert!(!prompt.contains(
+            "with `message`, `plan_update`, `context_requests`, `repo_searches`, and `user_language`"
+        ));
     }
 
     #[test]
@@ -672,7 +794,7 @@ mod tests {
             7,
             vec![file("src/a.rs", ContextAccess::ReadOnly)],
             "git",
-            "xml",
+            EditProtocolKind::Xml,
             None,
             None,
         );
@@ -711,13 +833,14 @@ mod tests {
             1,
             files,
             "git",
-            "xml",
+            EditProtocolKind::Xml,
             Some("<history>\n</history>".to_string()),
             Some("crate\n  fn main".to_string()),
         );
         assembly.turn_scratchpad = Some("- verified: prefix is stable".to_string());
         assembly.active_plan = Some(Plan {
             id: "prefix-plan".to_string(),
+            last_replanned_step: None,
             title: "Prefix Plan".to_string(),
             description: None,
             created_at: 0,
@@ -754,7 +877,8 @@ mod tests {
 
     #[test]
     fn test_repository_outline_is_map_or_directories_never_both() {
-        let base = || PromptAssembly::new(None, 1, vec![], "git", "xml", None, None);
+        let base =
+            || PromptAssembly::new(None, 1, vec![], "git", EditProtocolKind::Xml, None, None);
 
         // The rendered outline block, as opposed to the bare `<repo_dirs>` tag
         // name that the protocol instructions advertise in every turn.
@@ -792,7 +916,8 @@ mod tests {
 
     #[test]
     fn test_eager_repo_map_flag_tracks_the_rendered_block() {
-        let mut assembly = PromptAssembly::new(None, 1, vec![], "git", "xml", None, None);
+        let mut assembly =
+            PromptAssembly::new(None, 1, vec![], "git", EditProtocolKind::Xml, None, None);
         assert!(!assembly.has_eager_repo_map());
         assert!(assembly.format_repo_map_block().is_none());
 
@@ -813,7 +938,7 @@ mod tests {
             1,
             vec![],
             "git",
-            "xml",
+            EditProtocolKind::Xml,
             None,
             Some("crates/core/src/prompt.rs\n  pub fn estimate_tokens".to_string()),
         );
@@ -837,7 +962,8 @@ mod tests {
 
     #[test]
     fn test_on_demand_repo_map_instructions_carry_an_explicit_example() {
-        let assembly = PromptAssembly::new(None, 1, vec![], "git", "xml", None, None);
+        let assembly =
+            PromptAssembly::new(None, 1, vec![], "git", EditProtocolKind::Xml, None, None);
         assert!(!assembly.has_eager_repo_map());
 
         let messages = assembly.assemble_chat_messages("Go", &XmlPromptProtocol);
@@ -865,10 +991,12 @@ mod tests {
     #[test]
     fn test_prompt_assembly_isolated_step() {
         let proto = XmlPromptProtocol;
-        let mut assembly = PromptAssembly::new(None, 1, vec![], "git", "xml", None, None);
+        let mut assembly =
+            PromptAssembly::new(None, 1, vec![], "git", EditProtocolKind::Xml, None, None);
         assembly.intent = TurnIntent::IsolatedStep;
         assembly.active_plan = Some(Plan {
             id: "plan-test".to_string(),
+            last_replanned_step: None,
             title: "Test Plan".to_string(),
             description: None,
             created_at: 0,
@@ -893,7 +1021,8 @@ mod tests {
         let proto = XmlPromptProtocol;
 
         // Develop mode
-        let dev_assembly = PromptAssembly::new(None, 1, vec![], "git", "xml", None, None);
+        let dev_assembly =
+            PromptAssembly::new(None, 1, vec![], "git", EditProtocolKind::Xml, None, None);
         let dev_prompt = dev_assembly.build_system_prompt(&proto);
         assert!(dev_prompt.contains("Conceptual Foundation Invariant"));
         assert!(dev_prompt.contains("<concept_item"));
@@ -905,7 +1034,8 @@ mod tests {
         assert!(dev_prompt.contains("readonly"));
 
         // Discussion mode
-        let mut disc_assembly = PromptAssembly::new(None, 1, vec![], "git", "xml", None, None);
+        let mut disc_assembly =
+            PromptAssembly::new(None, 1, vec![], "git", EditProtocolKind::Xml, None, None);
         disc_assembly.intent = TurnIntent::ReadonlyDiscussion;
         let disc_prompt = disc_assembly.build_system_prompt(&proto);
         assert!(disc_prompt.contains("Conceptual Foundation Invariant"));
@@ -918,7 +1048,8 @@ mod tests {
     fn test_prompt_assembly_discovery_instructions() {
         let proto = XmlPromptProtocol;
 
-        let assembly = PromptAssembly::new(None, 1, vec![], "git", "xml", None, None);
+        let assembly =
+            PromptAssembly::new(None, 1, vec![], "git", EditProtocolKind::Xml, None, None);
         let prompt = assembly.build_system_prompt(&proto);
         assert!(!prompt.contains("<context_drop"));
         assert!(!prompt.contains("Incremental Strategy"));
@@ -935,7 +1066,8 @@ mod tests {
     fn test_system_prompt_anchors_project_configuration() {
         use tauqe_protocol::LlmCapability;
 
-        let assembly = PromptAssembly::new(None, 1, vec![], "git", "xml", None, None);
+        let assembly =
+            PromptAssembly::new(None, 1, vec![], "git", EditProtocolKind::Xml, None, None);
         let full = assembly.build_system_prompt(&XmlPromptProtocol);
 
         // The configuration anchor belongs to the static introduction, and the
@@ -955,7 +1087,8 @@ mod tests {
         assert!(!narrowed.contains("<doc_request"));
 
         // Discussion mode renders the same authoritative anchor.
-        let mut discussion = PromptAssembly::new(None, 1, vec![], "git", "xml", None, None);
+        let mut discussion =
+            PromptAssembly::new(None, 1, vec![], "git", EditProtocolKind::Xml, None, None);
         discussion.intent = TurnIntent::ReadonlyDiscussion;
         let prompt = discussion.build_system_prompt(&XmlPromptProtocol);
         assert!(prompt.contains("tauqe.toml"));
@@ -964,7 +1097,8 @@ mod tests {
     #[test]
     fn test_prompt_assembly_with_turn_scratchpad() {
         let proto = XmlPromptProtocol;
-        let mut assembly = PromptAssembly::new(None, 1, vec![], "git", "xml", None, None);
+        let mut assembly =
+            PromptAssembly::new(None, 1, vec![], "git", EditProtocolKind::Xml, None, None);
         assert!(assembly.format_scratchpad_block().is_none());
 
         assembly.turn_scratchpad = Some("   ".to_string());
@@ -987,9 +1121,10 @@ mod tests {
     #[test]
     fn test_turn_scratchpad_truncation_utf8_safety() {
         let multi_byte_text = "Рабочая гипотеза и детали проверки UTF-8 символов. ".repeat(200);
-        assert!(multi_byte_text.len() > MAX_SCRATCHPAD_CHARS);
+        assert!(multi_byte_text.len() > crate::config::DEFAULT_MAX_SCRATCHPAD_CHARS);
 
-        let mut assembly = PromptAssembly::new(None, 1, vec![], "git", "xml", None, None);
+        let mut assembly =
+            PromptAssembly::new(None, 1, vec![], "git", EditProtocolKind::Xml, None, None);
         assembly.turn_scratchpad = Some(multi_byte_text);
         let block = assembly.format_scratchpad_block().unwrap();
         assert!(block.contains("... [scratchpad truncated for length] ..."));
@@ -1000,14 +1135,15 @@ mod tests {
         use crate::prompt::protocol::PromptProtocol;
         use tauqe_protocol::{LlmCapability, LlmCommand};
 
-        let assembly = PromptAssembly::new(None, 1, vec![], "git", "xml", None, None);
+        let assembly =
+            PromptAssembly::new(None, 1, vec![], "git", EditProtocolKind::Xml, None, None);
         let narrowed = XmlPromptProtocol::with_capabilities(CapabilitySet::from_slice(&[
             LlmCapability::TextMessage,
             LlmCapability::FileEdits,
         ]));
         let prompt = assembly.build_system_prompt(&*narrowed);
 
-        assert!(prompt.contains("<tauqe_edits summary"));
+        assert!(prompt.contains("<edits summary"));
         assert!(!prompt.contains("<context_request>"));
         assert!(!prompt.contains("<verify"));
         assert!(!prompt.contains("<scratchpad"));
@@ -1019,11 +1155,11 @@ mod tests {
         // the execution pipeline.
         let raw =
             "Working.\n<context_request path=\"src/a.rs\" />\n<scratchpad>notes</scratchpad>\n";
-        let full = XmlPromptProtocol.decode(raw);
+        let full = XmlPromptProtocol.decode(raw, &[]);
         assert!(full
             .iter()
             .any(|command| matches!(command, LlmCommand::ContextRequest { .. })));
-        let filtered = narrowed.decode(raw);
+        let filtered = narrowed.decode(raw, &[]);
         assert!(!filtered
             .iter()
             .any(|command| matches!(command, LlmCommand::ContextRequest { .. })));
@@ -1041,7 +1177,8 @@ mod tests {
             access: ContextAccess::Editable,
             content: "fn main() {}\n".to_string(),
         }];
-        let assembly = PromptAssembly::new(None, 1, files, "git", "xml", None, None);
+        let assembly =
+            PromptAssembly::new(None, 1, files, "git", EditProtocolKind::Xml, None, None);
 
         // Each protocol renders its own edit reference directly instead of being
         // reconstructed from its name.
@@ -1062,7 +1199,8 @@ mod tests {
 
     #[test]
     fn test_prompt_assembly_preserves_turn_marker() {
-        let assembly = PromptAssembly::new(None, 1, vec![], "git", "xml", None, None);
+        let assembly =
+            PromptAssembly::new(None, 1, vec![], "git", EditProtocolKind::Xml, None, None);
         let marked = XmlPromptProtocol
             .with_turn_marker("M12345")
             .expect("marker-bound protocol");
@@ -1084,20 +1222,24 @@ mod tests {
         let proto = XmlPromptProtocol;
 
         // Interactive develop turn: changes require an explicit user request or clear unambiguous task.
-        let assembly = PromptAssembly::new(None, 1, vec![], "git", "xml", None, None);
+        let assembly =
+            PromptAssembly::new(None, 1, vec![], "git", EditProtocolKind::Xml, None, None);
         let prompt = assembly.build_system_prompt(&proto);
         assert!(prompt.contains("Action Authorization"));
-        assert!(prompt.contains("When the required change is clear"));
+        assert!(prompt.contains("Default to discussion"));
+        assert!(prompt.contains("when the required change is clear"));
 
         // An isolated step turn is itself the explicit instruction, so the rule
         // is deliberately omitted there instead of contradicting the step scope.
-        let mut isolated = PromptAssembly::new(None, 1, vec![], "git", "xml", None, None);
+        let mut isolated =
+            PromptAssembly::new(None, 1, vec![], "git", EditProtocolKind::Xml, None, None);
         isolated.intent = TurnIntent::IsolatedStep;
         let isolated_prompt = isolated.build_system_prompt(&proto);
         assert!(!isolated_prompt.contains("Action Authorization"));
 
         // Discussion mode is read-only and never edits files at all.
-        let mut discussion = PromptAssembly::new(None, 1, vec![], "git", "xml", None, None);
+        let mut discussion =
+            PromptAssembly::new(None, 1, vec![], "git", EditProtocolKind::Xml, None, None);
         discussion.intent = TurnIntent::ReadonlyDiscussion;
         let discussion_prompt = discussion.build_system_prompt(&proto);
         assert!(!discussion_prompt.contains("Action Authorization"));
@@ -1186,7 +1328,8 @@ mod tests {
             TurnIntent::ReadonlyDiscussion,
             TurnIntent::IsolatedStep,
         ] {
-            let mut assembly = PromptAssembly::new(None, 1, vec![], "git", "xml", None, None);
+            let mut assembly =
+                PromptAssembly::new(None, 1, vec![], "git", EditProtocolKind::Xml, None, None);
             assembly.intent = intent;
             let prompt = assembly.build_system_prompt(&proto);
             let section = contract_section(&prompt);
@@ -1207,7 +1350,8 @@ mod tests {
             TurnIntent::ReadonlyDiscussion,
             TurnIntent::IsolatedStep,
         ] {
-            let mut assembly = PromptAssembly::new(None, 1, vec![], "git", "xml", None, None);
+            let mut assembly =
+                PromptAssembly::new(None, 1, vec![], "git", EditProtocolKind::Xml, None, None);
             assembly.intent = intent;
             let prompt = assembly.build_system_prompt(&proto);
             let section = contract_section(&prompt);
@@ -1217,6 +1361,33 @@ mod tests {
                     "surrogate {surrogate} present for {intent:?}"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn test_transport_never_changes_the_capability_surface_of_a_turn() {
+        use crate::prompt::json::JsonPromptProtocol;
+
+        // Both transports advertise one intent-oriented surface, so switching
+        // the wire format changes the encoding only.
+        assert_eq!(
+            XmlPromptProtocol.capability_set(),
+            JsonPromptProtocol::edits().capability_set()
+        );
+
+        // Whatever the declared intent, the narrowed surface a turn renders and
+        // decodes is identical for both transports.
+        for intent in [
+            TurnIntent::InteractiveRepl,
+            TurnIntent::ReadonlyDiscussion,
+            TurnIntent::IsolatedStep,
+        ] {
+            let assembly =
+                PromptAssembly::new(None, 1, vec![], "git", EditProtocolKind::Xml, None, None)
+                    .with_intent(intent);
+            let xml = assembly.effective_capabilities(&XmlPromptProtocol);
+            let structured = assembly.effective_capabilities(&JsonPromptProtocol::edits());
+            assert_eq!(xml, structured, "surface diverged for {intent:?}");
         }
     }
 }

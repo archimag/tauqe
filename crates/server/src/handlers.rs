@@ -13,7 +13,6 @@ use std::path::Path;
 use std::sync::Arc;
 
 use tauqe_core::context::ContextManager;
-use tauqe_core::edits::protocol::VerifyTarget;
 use tauqe_core::edits::EditProtocolFactory;
 use tauqe_core::history::HistoryManager;
 use tauqe_core::workflow::WorkflowFactory;
@@ -122,13 +121,6 @@ pub(crate) fn reject_if_operation_active(
     }
 }
 
-/// Deterministic pre-flight verification shared by server-driven batches.
-///
-/// Runs the exact same toolchain pipeline (`VerifyTarget::All`) that the core executes
-/// after each autonomous workflow step. When the repository does not build or tests fail,
-/// the batch is blocked synchronously before any LLM request or status change, so a broken
-/// tree never triggers a wasted self-healing loop. Repositories without a detected
-/// toolchain pass transparently.
 /// Executes a blocking closure on the Tokio blocking pool.
 ///
 /// Repository handlers perform synchronous git subprocess and file I/O. Running
@@ -180,9 +172,18 @@ where
     state.mutate_history(mutate).await
 }
 
+/// Deterministic pre-flight verification shared by server-driven batches.
+///
+/// Runs the exact same project verification pipeline that the core executes after
+/// each autonomous workflow step. When the repository does not build or its tests
+/// fail, the batch is blocked synchronously before any LLM request or status change,
+/// so a broken tree never triggers a wasted self-healing loop. A repository that
+/// declares no verification command passes transparently.
 pub(crate) async fn run_preflight_verification(repo_root: &Path) -> Result<(), String> {
+    // A pre-flight gate runs before a turn exists, so it has no change set and
+    // the project command conservatively runs its full suite.
     let (ok, results) =
-        tauqe_core::toolchain::run_verification_pipeline(repo_root, &VerifyTarget::All, None).await;
+        tauqe_core::toolchain::run_verification_pipeline(repo_root, &[], None).await;
     if ok {
         return Ok(());
     }

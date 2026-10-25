@@ -37,8 +37,9 @@ only wanted to inspect, and requirements drift silently.
    message is answered against the live state of the focused entity.
 5. **The developer owns status changes.** A discussion explains a proposed change;
    it never rewrites persisted review or plan state in the background.
-6. **A stale anchor degrades gracefully.** A missing entity drops the anchor and
-   answers the raw prompt instead of failing the turn.
+6. **A stale anchor degrades gracefully.** Deleting the addressed plan releases
+   its anchor explicitly, and any entity that cannot be loaded drops the anchor
+   and answers the raw prompt instead of failing the turn.
 7. **Detaching is guarded.** Releasing the anchor is an explicit, confirmed act.
 
 ---
@@ -140,6 +141,12 @@ staged, verified, and committed exactly as in an ordinary Develop turn.
 - **Stale.** If the entity cannot be loaded (for example, it was deleted
   elsewhere), the server drops the anchor, logs the failure, and answers the raw
   prompt instead of failing the turn.
+- **Deleted entity.** Deleting the addressed plan releases the anchor on the
+  server before the deletion response is written: the focus becomes `None` and the
+  `discussion/focusChanged` event carries the release to every client. A client that
+  instead observes the anchored plan disappear from a plan list refresh drops the
+  anchor locally, so the header and the REPL banner can never name a plan that no
+  longer exists. A review anchor is untouched by a plan deletion.
 - **Clear.** Detaching returns the dialogue to free mode. Clearing the
   conversation history also detaches the focus, so a fresh session never inherits a
   dangling anchor.

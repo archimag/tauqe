@@ -1,9 +1,9 @@
 use anyhow::{Context, Result};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use tauqe_protocol::RepositoryState;
 
-use super::cmd::{commit_with_developer_author, run_git};
+use super::cmd::{commit_with_developer_author, run_git, run_git_check_ignore};
 
 /// Checks whether the specified directory is inside a Git repository work tree.
 pub fn is_git_repository(dir: Option<&Path>) -> bool {
@@ -78,6 +78,67 @@ pub fn list_repository_files(dir: Option<&Path>) -> Result<Vec<String>> {
     Ok(files)
 }
 
+/// Splits a NUL-separated Git listing into its non-empty entries.
+///
+/// Git emits `-z` lists as bare path names separated by `\0`, which keeps a
+/// path containing spaces, quotes, or a newline intact.
+fn split_nul_list(output: &str) -> Vec<String> {
+    output
+        .split('\0')
+        .filter(|entry| !entry.is_empty())
+        .map(|entry| entry.to_string())
+        .collect()
+}
+
+/// Returns the supplied paths that Git resolves to a tracked index entry.
+///
+/// A tracked file stays editable even when its name matches an ignore rule:
+/// the rule governs paths Git does not track yet, while a file recorded in the
+/// index was committed deliberately. Pathspec magic is disabled with the
+/// `:(literal)` prefix, so a name containing `*`, `?`, or `[` is matched
+/// verbatim instead of being read as a pattern.
+fn tracked_paths(dir: &Path, paths: &[String]) -> Result<BTreeSet<String>> {
+    let literals: Vec<String> = paths
+        .iter()
+        .map(|path| format!(":(literal){path}"))
+        .collect();
+    let mut args = vec!["ls-files", "-z", "--"];
+    args.extend(literals.iter().map(String::as_str));
+    let output = run_git(Some(dir), &args)?;
+    Ok(split_nul_list(&output).into_iter().collect())
+}
+
+/// Collects the supplied paths that repository ignore rules exclude.
+///
+/// The probe is one batch `git check-ignore` call, so checking a whole change
+/// set costs a single Git subprocess instead of one per path. Both
+/// `.gitignore` files and `.git/info/exclude` take part, because the answer
+/// comes from Git itself rather than from a locally re-implemented matcher.
+///
+/// Paths already present in the index are subtracted: such a file is tracked,
+/// and a rule that happens to match its name does not forbid editing it. The
+/// result is sorted and de-duplicated, so callers report a stable diagnostic
+/// regardless of the order they supplied.
+pub fn gitignored_paths(dir: &Path, paths: &[String]) -> Result<Vec<String>> {
+    if paths.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let ignored = run_git_check_ignore(dir, paths)?;
+    if ignored.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let tracked = tracked_paths(dir, &ignored)?;
+    let mut result: Vec<String> = ignored
+        .into_iter()
+        .filter(|path| !tracked.contains(path))
+        .collect();
+    result.sort();
+    result.dedup();
+    Ok(result)
+}
+
 /// Working-copy changes reported by `git status --porcelain`.
 ///
 /// The map is keyed by the repository-relative path of each file and carries its
@@ -95,7 +156,7 @@ pub type WorktreeSnapshot = BTreeMap<String, String>;
 /// helper and degrades to an empty snapshot instead of aborting a turn whose
 /// repository temporarily cannot be inspected.
 pub fn snapshot_worktree(dir: &Path) -> WorktreeSnapshot {
-    match run_git(Some(dir), &["status", "--porcelain"]) {
+    match run_git(Some(dir), &["status", "--porcelain", "-z"]) {
         Ok(output) => parse_worktree_status(&output),
         Err(err) => {
             tracing::warn!("Failed to snapshot the working copy status: {}", err);
@@ -104,29 +165,44 @@ pub fn snapshot_worktree(dir: &Path) -> WorktreeSnapshot {
     }
 }
 
-/// Parses `git status --porcelain` output into a snapshot.
+/// Parses `git status --porcelain -z` output into a snapshot.
 ///
-/// Each line starts with two status characters followed by the path. A rename
-/// reports both sides, and the destination is the path that exists afterwards,
-/// so it is the one recorded here.
+/// The NUL-separated form is the machine-readable one: it disables Git's
+/// C-style path quoting entirely, so a path containing a non-ASCII character,
+/// an embedded double quote, or a backslash arrives byte-for-byte instead of as
+/// an escaped string. An escaped rendering is not a path — staging it would
+/// demand a file name that does not exist on disk — so the change set has to be
+/// built from the literal names.
+///
+/// Each record carries the two status characters, a separating space, and the
+/// path. A rename or copy appends the source path as its own record, which is
+/// skipped here: the destination is the path that exists afterwards, so it is
+/// the one the snapshot records.
 pub fn parse_worktree_status(output: &str) -> WorktreeSnapshot {
     let mut snapshot = WorktreeSnapshot::new();
+    let mut skip_source = false;
 
-    for line in output.lines() {
-        let mut chars = line.chars();
+    for record in output.split('\0') {
+        if record.is_empty() {
+            continue;
+        }
+        if skip_source {
+            skip_source = false;
+            continue;
+        }
+
+        let mut chars = record.chars();
         let status: String = chars.by_ref().take(2).collect();
-        let rest = chars.as_str().trim_start();
+        if status.chars().count() < 2 {
+            continue;
+        }
+        let rest = chars.as_str().strip_prefix(' ').unwrap_or(chars.as_str());
         if rest.is_empty() {
             continue;
         }
-        let path = match rest.split_once(" -> ") {
-            Some((_, to)) => to.trim(),
-            None => rest,
-        };
-        let path = path.trim_matches('"');
-        if !path.is_empty() {
-            snapshot.insert(path.to_string(), status.trim().to_string());
-        }
+
+        snapshot.insert(rest.to_string(), status.trim().to_string());
+        skip_source = status.starts_with('R') || status.starts_with('C');
     }
 
     snapshot
@@ -239,6 +315,45 @@ mod tests {
     }
 
     #[test]
+    fn test_gitignored_paths_excludes_tracked_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path();
+
+        std::fs::write(path.join(".gitignore"), "*.log\ntarget/\n").unwrap();
+        std::fs::write(path.join("legacy.log"), "tracked\n").unwrap();
+        std::fs::write(path.join("src.rs"), "fn main() {}\n").unwrap();
+        init_repository(Some(path), true).unwrap();
+
+        // A file whose name matches an ignore rule but is already committed
+        // stays editable.
+        run_git(Some(path), &["add", "-f", "legacy.log"]).unwrap();
+        run_git(Some(path), &["commit", "-m", "chore: track legacy log"]).unwrap();
+
+        std::fs::write(path.join("fresh.log"), "new\n").unwrap();
+        std::fs::create_dir_all(path.join("target")).unwrap();
+        std::fs::write(path.join("target/binary"), "artifact\n").unwrap();
+
+        let ignored = gitignored_paths(
+            path,
+            &[
+                "legacy.log".to_string(),
+                "src.rs".to_string(),
+                "fresh.log".to_string(),
+                "target/binary".to_string(),
+            ],
+        )
+        .unwrap();
+
+        assert_eq!(
+            ignored,
+            vec!["fresh.log".to_string(), "target/binary".to_string()]
+        );
+
+        // An empty change set probes nothing and reports nothing.
+        assert!(gitignored_paths(path, &[]).unwrap().is_empty());
+    }
+
+    #[test]
     fn test_worktree_snapshot_detects_created_modified_and_deleted_paths() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path();
@@ -273,15 +388,18 @@ mod tests {
     }
 
     #[test]
-    fn test_worktree_status_parsing_reads_renames_and_quoted_paths() {
-        // Every porcelain line starts with the two status characters, so a
-        // quoted path still carries its own status prefix.
+    fn test_worktree_status_parsing_reads_renames_and_literal_paths() {
+        // Every `-z` record starts with the two status characters and a
+        // separating space, and a rename appends its source as the next record.
         let snapshot = parse_worktree_status(concat!(
-            " M src/lib.rs\n",
-            "?? generated.rs\n",
-            "R  old.rs -> new.rs\n",
-            "?? \"sp ace.rs\"\n",
-            "R  \"old name.rs\" -> \"new name.rs\"\n",
+            " M src/lib.rs\0",
+            "?? generated.rs\0",
+            "R  new.rs\0old.rs\0",
+            "?? sp ace.rs\0",
+            "R  new name.rs\0old name.rs\0",
+            "?? привет.rs\0",
+            "?? quote\"d.rs\0",
+            "?? back\\slash.rs\0",
         ));
 
         assert_eq!(snapshot.get("src/lib.rs").map(String::as_str), Some("M"));
@@ -290,8 +408,88 @@ mod tests {
         assert!(!snapshot.contains_key("old.rs"));
         assert_eq!(snapshot.get("sp ace.rs").map(String::as_str), Some("??"));
         // A rename keeps the destination, which is the path that exists
-        // afterwards, and drops the quoted source.
+        // afterwards, and drops the source record.
         assert_eq!(snapshot.get("new name.rs").map(String::as_str), Some("R"));
         assert!(!snapshot.contains_key("old name.rs"));
+        // `-z` disables path quoting, so these names are recorded verbatim
+        // instead of as escaped octal text.
+        assert_eq!(snapshot.get("привет.rs").map(String::as_str), Some("??"));
+        assert_eq!(snapshot.get("quote\"d.rs").map(String::as_str), Some("??"));
+        assert_eq!(
+            snapshot.get("back\\slash.rs").map(String::as_str),
+            Some("??")
+        );
+    }
+
+    #[test]
+    fn test_worktree_snapshot_and_staging_preserve_quoting_sensitive_names() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path();
+
+        std::fs::write(path.join("tracked.txt"), "content\n").unwrap();
+        init_repository(Some(path), true).unwrap();
+
+        let before = snapshot_worktree(path);
+
+        // With the default `core.quotePath=true` a line-oriented listing would
+        // escape every one of these names; the NUL-separated snapshot keeps
+        // them as the paths that exist on disk.
+        let names = ["back\\slash.rs", "quote\"d.rs", "привет.rs"];
+        for name in names {
+            std::fs::write(path.join(name), "created\n").unwrap();
+        }
+
+        let after = snapshot_worktree(path);
+        let changed = changed_worktree_paths(&before, &after);
+        let mut expected: Vec<String> = names.iter().map(|name| name.to_string()).collect();
+        expected.sort();
+        assert_eq!(changed, expected);
+
+        // A path reported verbatim is a pathspec Git resolves, so the change set
+        // reaches a commit instead of failing the Git transaction.
+        crate::git::cmd::stage_files(path, &changed).unwrap();
+        crate::git::cmd::commit_with_developer_author(path, "chore: add names", false).unwrap();
+        assert!(
+            snapshot_worktree(path).is_empty(),
+            "the committed change set must leave the working copy clean"
+        );
+
+        let committed =
+            crate::git::cmd::run_git(Some(path), &["ls-tree", "-z", "--name-only", "HEAD"])
+                .unwrap();
+        let committed: Vec<&str> = committed
+            .split('\0')
+            .filter(|name| !name.is_empty())
+            .collect();
+        for name in names {
+            assert!(
+                committed.contains(&name),
+                "the commit must record {name:?}: {committed:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_gitignored_paths_honors_repository_exclude_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path();
+
+        std::fs::write(path.join("src.rs"), "fn main() {}\n").unwrap();
+        init_repository(Some(path), true).unwrap();
+
+        // `.git/info/exclude` holds the repository's private ignore rules and
+        // Git applies them exactly like `.gitignore`, so the probe must see
+        // them without a local re-implementation of the matching rules.
+        std::fs::write(path.join(".git/info/exclude"), "local-only/\n").unwrap();
+        std::fs::create_dir_all(path.join("local-only")).unwrap();
+        std::fs::write(path.join("local-only/secret.txt"), "secret\n").unwrap();
+
+        let ignored = gitignored_paths(
+            path,
+            &["src.rs".to_string(), "local-only/secret.txt".to_string()],
+        )
+        .unwrap();
+
+        assert_eq!(ignored, vec!["local-only/secret.txt".to_string()]);
     }
 }

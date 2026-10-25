@@ -12,10 +12,10 @@
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use time::macros::format_description;
 use tracing_appender::non_blocking::WorkerGuard;
-use tracing_subscriber::fmt::time::FormatTime;
+use tracing_subscriber::fmt::time::UtcTime;
 use tracing_subscriber::EnvFilter;
 
 /// Default rotation threshold: 10 MiB.
@@ -111,7 +111,15 @@ where
         .with_env_filter(filter)
         .with_ansi(false)
         .with_target(true)
-        .with_timer(Rfc3339Millis)
+        // The timestamp is rendered by the standard UTC timer, which delegates
+        // calendar arithmetic to the `time` crate (Conventions §1.6). The
+        // crate's RFC-3339 well-known format varies the subsecond width from
+        // one instant to the next, so the format description fixes it at
+        // exactly three digits: every record keeps the same byte layout and
+        // millisecond precision.
+        .with_timer(UtcTime::new(format_description!(
+            "[year]-[month]-[day]T[hour]:[minute]:[second].[subsecond digits:3]Z"
+        )))
         .with_writer(writer)
         .finish()
 }
@@ -137,63 +145,6 @@ fn capture_backtrace() -> String {
         }
         _ => "backtrace unavailable".to_string(),
     }
-}
-
-/// RFC-3339 timer rendered with millisecond precision in UTC.
-#[derive(Clone, Copy, Debug)]
-struct Rfc3339Millis;
-
-impl FormatTime for Rfc3339Millis {
-    fn format_time(
-        &self,
-        writer: &mut tracing_subscriber::fmt::format::Writer<'_>,
-    ) -> std::fmt::Result {
-        write!(writer, "{}", format_rfc3339_millis(SystemTime::now()))
-    }
-}
-
-/// Formats a system time as `YYYY-MM-DDTHH:MM:SS.sssZ` in UTC.
-fn format_rfc3339_millis(time: SystemTime) -> String {
-    let since_epoch = time.duration_since(UNIX_EPOCH).unwrap_or(Duration::ZERO);
-    let secs = since_epoch.as_secs();
-    let millis = since_epoch.subsec_millis();
-    let days = (secs / 86_400) as i64;
-    let secs_of_day = secs % 86_400;
-    let (year, month, day) = civil_from_days(days);
-    let hour = secs_of_day / 3_600;
-    let minute = (secs_of_day % 3_600) / 60;
-    let second = secs_of_day % 60;
-    format!(
-        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}.{:03}Z",
-        year, month, day, hour, minute, second, millis
-    )
-}
-
-/// Converts days since the Unix epoch into a civil `(year, month, day)` triple.
-///
-/// Uses Howard Hinnant's `civil_from_days` algorithm, which is exact across the
-/// whole representable range and needs no calendar dependency.
-fn civil_from_days(days: i64) -> (i64, u32, u32) {
-    let shifted = days + 719_468;
-    let era = (if shifted >= 0 {
-        shifted
-    } else {
-        shifted - 146_096
-    }) / 146_097;
-    let day_of_era = (shifted - era * 146_097) as u64;
-    let year_of_era =
-        (day_of_era - day_of_era / 1_460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
-    let year = year_of_era as i64 + era * 400;
-    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
-    let month_prime = (5 * day_of_year + 2) / 153;
-    let day = (day_of_year - (153 * month_prime + 2) / 5 + 1) as u32;
-    let month = (if month_prime < 10 {
-        month_prime + 3
-    } else {
-        month_prime - 9
-    }) as u32;
-    let year = if month <= 2 { year + 1 } else { year };
-    (year, month, day)
 }
 
 /// A file writer that rotates the active log into numbered archives once it
@@ -287,6 +238,10 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::{Arc, Mutex};
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+    use time::macros::format_description;
+    use time::OffsetDateTime;
 
     fn unique_temp_dir(tag: &str) -> PathBuf {
         static COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -347,21 +302,64 @@ mod tests {
         fs::remove_dir_all(&dir).ok();
     }
 
+    /// Renders an explicit instant with the journal format description.
+    ///
+    /// The timer renders the current instant only, so pinning the rendering of
+    /// known instants — the Unix epoch above all — needs the same format
+    /// description the timer carries.
+    fn render_journal_timestamp(instant: OffsetDateTime) -> String {
+        let format = format_description!(
+            "[year]-[month]-[day]T[hour]:[minute]:[second].[subsecond digits:3]Z"
+        );
+        instant
+            .format(format)
+            .expect("the journal format description is valid")
+    }
+
+    /// The journal format renders UTC instants as RFC-3339 with exactly three
+    /// subsecond digits, whatever the subsecond of the instant happens to be.
     #[test]
-    fn rfc3339_timestamp_has_millisecond_precision_in_utc() {
+    fn journal_format_renders_rfc3339_with_millisecond_precision() {
         assert_eq!(
-            format_rfc3339_millis(UNIX_EPOCH),
+            render_journal_timestamp(OffsetDateTime::UNIX_EPOCH),
             "1970-01-01T00:00:00.000Z"
         );
 
-        let sample = UNIX_EPOCH + Duration::from_millis(1_609_459_200_123);
-        assert_eq!(format_rfc3339_millis(sample), "2021-01-01T00:00:00.123Z");
+        let sample = OffsetDateTime::from(UNIX_EPOCH + Duration::from_millis(1_609_459_200_123));
+        assert_eq!(render_journal_timestamp(sample), "2021-01-01T00:00:00.123Z");
 
-        let now = format_rfc3339_millis(SystemTime::now());
+        let now = render_journal_timestamp(OffsetDateTime::now_utc());
         assert_eq!(now.len(), 24);
         assert!(now.ends_with('Z'));
         assert_eq!(now.as_bytes()[10], b'T');
         assert_eq!(now.as_bytes()[19], b'.');
+    }
+
+    /// The timer installed on the subscriber — never a test-local formatter —
+    /// writes the record's timestamp field in that same shape.
+    #[test]
+    fn journal_record_timestamp_uses_the_millisecond_format() {
+        let sink = TestMakeWriter::default();
+        let subscriber = build_subscriber(sink.clone(), EnvFilter::new("info"));
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::info!("timestamp shape");
+        });
+
+        let output = sink.contents();
+        let line = output.lines().next().expect("one record");
+        let value: serde_json::Value = serde_json::from_str(line).expect("valid json");
+        let timestamp = value["timestamp"].as_str().expect("timestamp string");
+        assert_eq!(timestamp.len(), 24, "unexpected timestamp: {timestamp}");
+        assert!(
+            timestamp.ends_with('Z'),
+            "timestamp is not UTC: {timestamp}"
+        );
+        assert_eq!(timestamp.as_bytes()[10], b'T');
+        assert_eq!(timestamp.as_bytes()[19], b'.');
+        assert!(
+            timestamp.bytes().take(4).all(|byte| byte.is_ascii_digit()),
+            "timestamp year is not numeric: {timestamp}"
+        );
     }
 
     #[test]

@@ -29,6 +29,63 @@ pub fn run_git(dir: Option<&Path>, args: &[&str]) -> Result<String> {
     })
 }
 
+/// Reports which of the supplied paths repository ignore rules exclude.
+///
+/// The candidate paths are written to `git check-ignore` through stdin in
+/// NUL-separated form. This batches a whole change set into a single Git
+/// subprocess and keeps a path containing a space, a quote, or a newline
+/// intact. Both `.gitignore` files and `.git/info/exclude` take part, because
+/// the answer comes from Git itself rather than from a locally re-implemented
+/// matcher.
+///
+/// `check-ignore` answers with exit code `1` when none of the supplied paths
+/// matches an ignore rule, which is a valid negative answer rather than a
+/// failure. Any other non-zero code signals a real failure and is reported
+/// with Git's diagnostic output.
+pub fn run_git_check_ignore(dir: &Path, paths: &[String]) -> Result<Vec<String>> {
+    if paths.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    crate::blocking::run_blocking(|| {
+        use std::io::Write;
+        use std::process::Stdio;
+
+        let mut child = Command::new("git")
+            .current_dir(dir)
+            .args(["check-ignore", "-z", "--stdin"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()?;
+
+        // Dropping the stdin handle at the end of the scope closes the pipe,
+        // so `check-ignore` observes end of input and finishes.
+        {
+            let mut stdin = child.stdin.take().context("Failed to open git stdin")?;
+            for path in paths {
+                stdin.write_all(path.as_bytes())?;
+                stdin.write_all(b"\0")?;
+            }
+        }
+
+        let output = child.wait_with_output()?;
+        let code = output.status.code().unwrap_or(-1);
+        match code {
+            0 => Ok(String::from_utf8_lossy(&output.stdout)
+                .split('\0')
+                .filter(|entry| !entry.is_empty())
+                .map(|entry| entry.to_string())
+                .collect()),
+            1 => Ok(Vec::new()),
+            other => bail!(
+                "git check-ignore failed with exit code {other}: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            ),
+        }
+    })
+}
+
 /// Stages the specified list of files into the Git index.
 pub fn stage_files(dir: &Path, files: &[String]) -> Result<()> {
     if files.is_empty() {
@@ -130,5 +187,26 @@ mod tests {
         // With the bypass disabled the hook runs and its failure blocks the
         // commit.
         assert!(commit_with_developer_author(root, "msg", false).is_err());
+    }
+
+    #[test]
+    fn check_ignore_batches_paths_and_tolerates_a_negative_answer() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        init_repo(root);
+        std::fs::write(root.join(".gitignore"), "*.log\n").unwrap();
+        run_git(Some(root), &["add", ".gitignore"]).unwrap();
+
+        let matched =
+            run_git_check_ignore(root, &["trace.log".to_string(), "file.txt".to_string()]).unwrap();
+        assert_eq!(matched, vec!["trace.log".to_string()]);
+
+        // A path no rule matches answers with exit code 1, which stays a
+        // successful call here.
+        let matched = run_git_check_ignore(root, &["file.txt".to_string()]).unwrap();
+        assert!(matched.is_empty());
+
+        // An empty change set probes nothing and reports nothing.
+        assert!(run_git_check_ignore(root, &[]).unwrap().is_empty());
     }
 }

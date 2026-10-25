@@ -35,7 +35,7 @@ pub fn render_review_view(
     let rows = state.review.flatten_rows();
     state.review.clamp_selection();
 
-    let (lines, offsets) = if rows.is_empty() {
+    let (lines, _offsets) = if rows.is_empty() {
         let empty_lines = if state.review.running {
             vec![
                 Line::raw(""),
@@ -68,29 +68,17 @@ pub fn render_review_view(
             state.review.selected_index,
             width,
             state.review.theme_mode,
+            &mut state.review.markdown_cache,
         )
     };
 
     state.review.rendered_lines = lines.len();
 
-    if !rows.is_empty() && height > 0 {
-        let sel = state.review.selected_index.min(rows.len() - 1);
-        let start = offsets.get(sel).copied().unwrap_or(0);
-        let end = offsets.get(sel + 1).copied().unwrap_or(lines.len());
-        let scroll = state.review.scroll as usize;
-
-        let new_scroll = if sel == 0 {
-            0
-        } else if start < scroll {
-            start
-        } else if end > scroll + height as usize {
-            end.saturating_sub(height as usize).min(start)
-        } else {
-            scroll
-        };
-        state.review.scroll = new_scroll as u16;
-    }
-
+    // The renderer only bounds the viewport by the document length. Free
+    // scrolling (wheel, paging) belongs to the developer, so re-anchoring the
+    // window on the cursor every frame would snap it back (c-1). Positioning
+    // the viewport is `scroll_to_selected`'s job and runs only when the
+    // selection moves (c-2).
     let max_scroll = (lines.len() as u16).saturating_sub(height);
     if state.review.scroll > max_scroll {
         state.review.scroll = max_scroll;
@@ -136,13 +124,20 @@ pub fn render_review_view(
                 engine.fg(palette.status_warning).bold(),
             ));
         }
-        if let Some(row) = state.review.selected_row() {
-            status_spans.extend(describe_review_row(&row, &engine));
+        // The tree was already flattened for this frame, so the status line
+        // reads the selected row out of that list instead of flattening and
+        // cloning the whole tree a second time (c-2).
+        if let Some(row) = rows.get(state.review.selected_index) {
+            status_spans.extend(describe_review_row(row, &engine));
         }
         status_spans.push(Span::styled(
             format!(
-                "  |  {} session(s), {} finding(s) ({} fixed, {} skipped)",
-                total_sessions, total_items, fixed_items, skipped_items
+                "  |  {}",
+                active_t("review.stats_summary")
+                    .replacen("{}", &total_sessions.to_string(), 1)
+                    .replacen("{}", &total_items.to_string(), 1)
+                    .replacen("{}", &fixed_items.to_string(), 1)
+                    .replacen("{}", &skipped_items.to_string(), 1)
             ),
             engine.fg(palette.text_muted),
         ));
@@ -161,9 +156,10 @@ pub fn render_review_view(
         if !rows.is_empty() {
             status_spans.push(Span::styled(
                 format!(
-                    " | [Row {}/{}]",
-                    state.review.selected_index + 1,
-                    rows.len()
+                    " | {}",
+                    active_t("ui.row_counter")
+                        .replacen("{}", &(state.review.selected_index + 1).to_string(), 1)
+                        .replacen("{}", &rows.len().to_string(), 1)
                 ),
                 engine.fg(palette.text_secondary),
             ));
@@ -216,8 +212,15 @@ fn describe_review_row(
                 ),
                 Span::styled(
                     format!(
-                        "  {}/{} fixed ({} todo, {} prog, {} disc, {} skip, {} rej)",
-                        fixed, total, todo, in_progress, discussion, skipped, rejected
+                        "  {}",
+                        active_t("review.stats_breakdown")
+                            .replacen("{}", &fixed.to_string(), 1)
+                            .replacen("{}", &total.to_string(), 1)
+                            .replacen("{}", &todo.to_string(), 1)
+                            .replacen("{}", &in_progress.to_string(), 1)
+                            .replacen("{}", &discussion.to_string(), 1)
+                            .replacen("{}", &skipped.to_string(), 1)
+                            .replacen("{}", &rejected.to_string(), 1)
                     ),
                     engine.fg(palette.text_secondary),
                 ),
@@ -239,7 +242,11 @@ fn describe_review_row(
                 format!(
                     " {}{}",
                     active_t("review.executive_summary"),
-                    if *is_expanded { "" } else { " (folded)" }
+                    if *is_expanded {
+                        String::new()
+                    } else {
+                        active_t("review.folded_suffix")
+                    }
                 ),
                 engine.fg(palette.status_success).bold(),
             )];
@@ -306,7 +313,10 @@ fn describe_review_row(
             let mut spans = vec![
                 Span::styled(format!(" #{} ", item_id), engine.fg(palette.text_secondary)),
                 Span::styled(
-                    format!(" step #{} ", step_id),
+                    format!(
+                        " {} ",
+                        active_t("review.step_label").replacen("{}", step_id.as_str(), 1)
+                    ),
                     engine.fg(palette.text_secondary),
                 ),
                 Span::styled(format!(" {} ", status), plan_status_style(*status)),
@@ -400,8 +410,13 @@ mod tests {
         review.set_session(session);
 
         let rows = review.flatten_rows();
-        let (lines, _offsets) =
-            compute_unified_review_lines(&rows, review.selected_index, 80, review.theme_mode);
+        let (lines, _offsets) = compute_unified_review_lines(
+            &rows,
+            review.selected_index,
+            80,
+            review.theme_mode,
+            &mut review.markdown_cache,
+        );
         let texts: Vec<String> = lines.iter().map(|line| line.to_string()).collect();
 
         assert!(
@@ -462,6 +477,152 @@ mod tests {
         assert!(
             !content.contains("Review in progress..."),
             "did not expect 'Review in progress...' when review is not running"
+        );
+    }
+
+    /// A redraw must never pull a freely scrolled viewport back to the cursor
+    /// (c-1): the renderer bounds the scroll by the document length only.
+    #[test]
+    fn render_review_view_preserves_free_scroll_across_frames() {
+        use tauqe_protocol::{IssueStatus, IssueType, ReviewIssue, ReviewItem, ReviewSession};
+
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut state = crate::app::test_state();
+        let items: Vec<ReviewItem> = (1..=40)
+            .map(|id| {
+                ReviewItem::from(ReviewIssue {
+                    id,
+                    title: format!("Finding {id}"),
+                    model: None,
+                    issue_type: IssueType::Architecture,
+                    status: IssueStatus::Todo,
+                    description: String::new(),
+                    recommendations: Vec::new(),
+                    files: Vec::new(),
+                    readonly_files: Vec::new(),
+                    plan: Vec::new(),
+                    note: None,
+                })
+            })
+            .collect();
+        state.review.sessions = vec![ReviewSession {
+            id: "rev-scroll".to_string(),
+            title: "Scroll".to_string(),
+            created_at: 0,
+            model: tauqe_protocol::ModelRef::openrouter("test-model"),
+            description: None,
+            user_prompt: None,
+            target_files: Vec::new(),
+            items,
+            raw_markdown: String::new(),
+        }];
+        // The cursor rests on the first row while the developer scrolls away.
+        state.review.selected_index = 0;
+        state.review.scroll = 5;
+
+        terminal
+            .draw(|f| {
+                let area = f.area();
+                let main_area = Rect::new(0, 0, area.width, area.height.saturating_sub(1));
+                let info_area = Rect::new(0, area.height.saturating_sub(1), area.width, 1);
+                render_review_view(f, &mut state, main_area, info_area);
+            })
+            .unwrap();
+
+        assert!(
+            state.review.rendered_lines > 24,
+            "the document must be longer than the viewport"
+        );
+        assert_eq!(
+            state.review.scroll, 5,
+            "a redraw must not snap the viewport back to the selected row"
+        );
+    }
+
+    /// The renderer bounds the viewport by the document length and nothing
+    /// else: a free scroll deep inside a tall expanded subplan survives the
+    /// redraw, and only an offset past the last screenful is clamped (c-1).
+    #[test]
+    fn render_review_view_keeps_a_deep_free_scroll_and_clamps_only_the_tail() {
+        use tauqe_protocol::{
+            IssueStatus, IssueType, PlanItem, PlanItemStatus, ReviewIssue, ReviewItem,
+            ReviewSession,
+        };
+
+        fn render_once(terminal: &mut Terminal<TestBackend>, state: &mut crate::app::AppState) {
+            terminal
+                .draw(|f| {
+                    let area = f.area();
+                    let main_area = Rect::new(0, 0, area.width, area.height.saturating_sub(1));
+                    let info_area = Rect::new(0, area.height.saturating_sub(1), area.width, 1);
+                    render_review_view(f, state, main_area, info_area);
+                })
+                .unwrap();
+        }
+
+        let long_details = (0..120)
+            .map(|line| format!("Invariant line {line}."))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        let mut state = crate::app::test_state();
+        state.review.sessions = vec![ReviewSession {
+            id: "rev-tall".to_string(),
+            title: "Tall".to_string(),
+            created_at: 0,
+            model: tauqe_protocol::ModelRef::openrouter("test-model"),
+            description: None,
+            user_prompt: None,
+            target_files: Vec::new(),
+            items: vec![ReviewItem::from(ReviewIssue {
+                id: 1,
+                title: "Finding".to_string(),
+                model: None,
+                issue_type: IssueType::Architecture,
+                status: IssueStatus::Todo,
+                description: String::new(),
+                recommendations: Vec::new(),
+                files: Vec::new(),
+                readonly_files: Vec::new(),
+                plan: vec![PlanItem {
+                    id: "1.1".to_string(),
+                    title: "Tall step".to_string(),
+                    details: Some(long_details),
+                    status: PlanItemStatus::Todo,
+                    ..Default::default()
+                }],
+                note: None,
+            })],
+            raw_markdown: String::new(),
+        }];
+        state.review.toggle_item_expanded("rev-tall", 1);
+        state
+            .review
+            .toggle_subplan_item_expanded("rev-tall", 1, "1.1");
+        // The cursor rests on the session header while the developer reads deep
+        // inside the step, so no redraw may re-anchor the viewport on row zero.
+        state.review.selected_index = 0;
+        state.review.scroll = 40;
+
+        render_once(&mut terminal, &mut state);
+        assert!(
+            state.review.rendered_lines > 40 + state.review.view_height as usize,
+            "the expanded step must extend past the free scroll offset"
+        );
+        assert_eq!(
+            state.review.scroll, 40,
+            "a redraw must not snap a deep free scroll back to the cursor"
+        );
+
+        let max = u16::try_from(state.review.rendered_lines)
+            .unwrap_or(u16::MAX)
+            .saturating_sub(state.review.view_height);
+        state.review.scroll = u16::MAX;
+        render_once(&mut terminal, &mut state);
+        assert_eq!(
+            state.review.scroll, max,
+            "the renderer clamps the viewport by the document length only"
         );
     }
 }

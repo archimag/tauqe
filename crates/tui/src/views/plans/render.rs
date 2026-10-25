@@ -51,6 +51,7 @@ pub fn render_plans_view(
             state.plans_view.selected_index,
             width,
             state.plans_view.theme_mode,
+            &mut state.plans_view.markdown_cache,
         )
     };
 
@@ -88,8 +89,11 @@ pub fn render_plans_view(
     if let Some(msg) = &state.plans_view.status_message {
         status_spans.push(Span::styled(msg.clone(), engine.fg(palette.text_secondary)));
     } else {
-        if let Some(row) = state.plans_view.selected_row() {
-            status_spans.extend(describe_plan_row(&row, &engine));
+        // The tree was already flattened for this frame, so the status line
+        // reads the selected row out of that list instead of flattening and
+        // cloning the whole tree a second time (c-2).
+        if let Some(row) = rows.get(state.plans_view.selected_index) {
+            status_spans.extend(describe_plan_row(row, &engine));
         }
         let plans_count = state.plans_view.plans.len();
         let total_items: usize = state
@@ -106,17 +110,21 @@ pub fn render_plans_view(
             .sum();
         status_spans.push(Span::styled(
             format!(
-                "  |  {} plan(s), {} item(s) ({} done)",
-                plans_count, total_items, total_completed
+                "  |  {}",
+                active_t("plans.stats_summary")
+                    .replacen("{}", &plans_count.to_string(), 1)
+                    .replacen("{}", &total_items.to_string(), 1)
+                    .replacen("{}", &total_completed.to_string(), 1)
             ),
             engine.fg(palette.text_muted),
         ));
         if !rows.is_empty() {
             status_spans.push(Span::styled(
                 format!(
-                    " | [Row {}/{}]",
-                    state.plans_view.selected_index + 1,
-                    rows.len()
+                    " | {}",
+                    active_t("ui.row_counter")
+                        .replacen("{}", &(state.plans_view.selected_index + 1).to_string(), 1)
+                        .replacen("{}", &rows.len().to_string(), 1)
                 ),
                 engine.fg(palette.text_muted),
             ));
@@ -166,7 +174,12 @@ fn describe_plan_row(
                 ),
                 Span::styled(format!(" [{}]", status), status_style(*status)),
                 Span::styled(
-                    format!("  {}/{} done", completed, total),
+                    format!(
+                        "  {}",
+                        active_t("plans.done_progress")
+                            .replacen("{}", &completed.to_string(), 1)
+                            .replacen("{}", &total.to_string(), 1)
+                    ),
                     engine.fg(palette.text_secondary),
                 ),
             ];

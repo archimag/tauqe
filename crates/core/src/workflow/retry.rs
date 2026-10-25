@@ -4,6 +4,14 @@ use tauqe_protocol::EditOperation;
 use crate::context::ContextManager;
 use crate::edits::{EditError, StagedEditsState};
 
+/// Explanation shown when the repository ignores the target path of an edit.
+///
+/// The same wording reaches the retrying event and the retry prompt, so the
+/// model receives one consistent reason instead of two diverging paraphrases.
+const IGNORED_PATH_HINT: &str =
+    "Path is excluded by the repository ignore rules (.gitignore or .git/info/exclude). \
+     Choose a path the repository tracks.";
+
 /// Formats a human-readable failure reason for `EditFileRetrying` event and prompts.
 pub fn format_patch_retry_reason(err: &EditError) -> String {
     match err {
@@ -16,6 +24,7 @@ pub fn format_patch_retry_reason(err: &EditError) -> String {
                 count
             )
         }
+        EditError::IgnoredByGit(_) => IGNORED_PATH_HINT.to_string(),
         other => other.to_string(),
     }
 }
@@ -63,6 +72,7 @@ pub fn build_patch_retry_prompt(
                         count
                     )
                 }
+                EditError::IgnoredByGit(_) => IGNORED_PATH_HINT,
                 other => &other.to_string(),
             };
             prompt.push_str(&format!("- `{}`: {}\n", path, explanation));
@@ -255,7 +265,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let cm = ContextManager::new(dir.path().to_path_buf());
         let mut failed = HashMap::new();
-        failed.insert("a.rs".to_string(), EditError::ReadOnly("a.rs".to_string()));
+        failed.insert(
+            "a.rs".to_string(),
+            EditError::NotInContext("a.rs".to_string()),
+        );
         failed.insert(
             "b.rs".to_string(),
             EditError::NoMatch {

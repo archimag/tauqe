@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
+use tauqe_protocol::ModelCatalogEntry;
 
 use super::paths::{dirs_config, dirs_home};
 use super::AppConfig;
@@ -16,9 +17,25 @@ pub struct OpenRouterConfig {
     /// Never deserialized from or serialized into tauqe.toml.
     #[serde(skip)]
     pub api_key: Option<String>,
-    /// Native OpenRouter model identifiers the user may switch between.
+    /// Provider catalog: the models this project exposes to the harness.
+    ///
+    /// This is the single source of truth for model identity and display
+    /// aliases. An entry is either a bare model specification or a
+    /// `{ model, alias }` table, so a model's display name is declared once,
+    /// beside the model itself, instead of being repeated on every role slot
+    /// that selects it.
     #[serde(default)]
-    pub models: Vec<String>,
+    pub models: Vec<ModelCatalogEntry>,
+}
+
+impl ProvidersConfig {
+    /// Models registered in the provider catalog, in declaration order.
+    pub fn catalog(&self) -> &[ModelCatalogEntry] {
+        match &self.openrouter {
+            Some(config) => &config.models,
+            None => &[],
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
@@ -395,5 +412,30 @@ models = ["deepseek/deepseek-chat"]
                 .and_then(|o| o.api_key.as_deref()),
             None
         );
+    }
+
+    #[test]
+    fn test_catalog_entries_accept_aliases() {
+        let toml_str = r#"
+[providers.openrouter]
+models = [
+    "google/gemini-flash-latest",
+    { model = "deepseek/deepseek-chat", alias = "Deep" },
+]
+"#;
+        let config: AppConfig = toml::from_str(toml_str).expect("Failed to parse config");
+        let catalog = config.providers.catalog();
+
+        assert_eq!(catalog.len(), 2);
+        assert_eq!(
+            catalog[0].model,
+            tauqe_protocol::ModelRef::openrouter("google/gemini-flash-latest")
+        );
+        assert_eq!(catalog[0].alias, None);
+        assert_eq!(
+            catalog[1].model,
+            tauqe_protocol::ModelRef::openrouter("deepseek/deepseek-chat")
+        );
+        assert_eq!(catalog[1].alias.as_deref(), Some("Deep"));
     }
 }

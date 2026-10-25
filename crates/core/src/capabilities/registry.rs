@@ -9,8 +9,8 @@
 use std::sync::OnceLock;
 
 use tauqe_protocol::{
-    CapabilityPhase, CapabilitySet, DirListRequest, DocTopic, LlmCapability, LlmCommand,
-    ModelResult, ProjectConfig, RepoSearchRequest, TurnIntent,
+    CapabilityPhase, CapabilitySet, DirListRequest, DocTopic, EditProtocolKind, LlmCapability,
+    LlmCommand, ModelResult, ProjectConfig, RepoSearchRequest, TurnIntent,
 };
 
 use crate::edits::protocol::xml::engine::{self, XmlTagSpec};
@@ -21,9 +21,9 @@ use crate::edits::protocol::{
 };
 
 use super::builtin::{
-    BlockedModule, CustomToolsModule, DiscoveryModule, DocRequestModule, FileEditsModule,
-    OutcomeModule, PlanCreationModule, PlanUpdateModule, ScratchpadModule, TextMessageModule,
-    ToolchainVerifyModule, UserLanguageModule,
+    AbortModule, BlockedModule, CustomToolsModule, DiscoveryModule, DocRequestModule,
+    FileEditsModule, OutcomeModule, PlanCreationModule, PlanUpdateModule, ScratchpadModule,
+    TextMessageModule, ToolchainVerifyModule, UserLanguageModule,
 };
 use super::regime;
 
@@ -137,6 +137,11 @@ pub struct ContractContext<'a> {
     pub render: PromptRenderContext<'a>,
     /// Declared intent of the turn this contract is rendered for.
     pub intent: TurnIntent,
+    /// Wire format the turn serializes, declared by the active protocol.
+    ///
+    /// The format is a transport fact, never a capability decision: rules read
+    /// it only to avoid advertising the other contour's spellings.
+    pub protocol: EditProtocolKind,
     /// Concrete response language, when the caller already resolved it.
     pub target_language: Option<&'a str>,
     /// Whether an eager repository symbol map is already rendered this turn.
@@ -147,16 +152,23 @@ pub struct ContractContext<'a> {
 }
 
 impl<'a> ContractContext<'a> {
-    /// Creates a contract context for the given intent and render context.
+    /// Creates a contract context for the given intent, wire format, and render
+    /// context.
     ///
-    /// The eager-map flag is inherited from the render context, so a contract
-    /// rule and a protocol instruction composed for the same turn observe one
-    /// value.
-    pub fn new(intent: TurnIntent, render: PromptRenderContext<'a>) -> Self {
+    /// The format is an explicit argument because it is a transport fact the
+    /// renderer cannot derive from the capability surface, and the eager-map
+    /// flag is inherited from the render context, so a contract rule and a
+    /// protocol instruction composed for the same turn observe one value.
+    pub fn new(
+        intent: TurnIntent,
+        protocol: EditProtocolKind,
+        render: PromptRenderContext<'a>,
+    ) -> Self {
         let has_eager_repo_map = render.has_eager_repo_map;
         Self {
             render,
             intent,
+            protocol,
             target_language: None,
             has_eager_repo_map,
         }
@@ -198,6 +210,26 @@ pub trait CapabilityModule: Send + Sync {
         self.capability().phase()
     }
 
+    /// Base name of the primary protocol tag that names this capability.
+    ///
+    /// The canonical tag is what prompts, diagnostics, and tag scanners print
+    /// for the capability, so the module stays the single source of truth for
+    /// its own spelling. A capability that owns no protocol tag, such as the
+    /// purely textual response, returns `None`.
+    fn canonical_tag(&self) -> Option<&'static str> {
+        None
+    }
+
+    /// Legacy base names accepted as an alias of [`Self::canonical_tag`].
+    ///
+    /// An alias decodes, streams, and renders exactly like the canonical tag it
+    /// stands for, so renaming a tag keeps older transcripts and sessions
+    /// reproducible. An alias never carries a spelling of its own: it resolves
+    /// strictly through the canonical name of the module that declares it.
+    fn tag_aliases(&self) -> &'static [&'static str] {
+        &[]
+    }
+
     /// Tag specs the module recognizes, or an empty slice for tag-less modules.
     fn xml_tag_specs(&self) -> &'static [&'static XmlTagSpec] {
         &[]
@@ -205,6 +237,33 @@ pub trait CapabilityModule: Send + Sync {
 
     /// Structured-output property this module populates, when it maps to one.
     fn json_property_name(&self) -> Option<&'static str> {
+        None
+    }
+
+    /// JSON-schema properties this module contributes to the structured response.
+    ///
+    /// The fragment is an object keyed by the property names the capability
+    /// owns, with the schema of each property as its value. The registry folds
+    /// the fragments of the enabled modules into one strict schema, so a
+    /// property is declared by the same module that renders its prompt
+    /// instruction and decodes it. A capability without a structured field
+    /// contributes no fragment, and a property declared by several modules is
+    /// inserted once, by the first declaring module.
+    fn json_schema_fragment(&self) -> Option<serde_json::Value> {
+        None
+    }
+
+    /// Shared JSON-schema definitions referenced by [`Self::json_schema_fragment`].
+    ///
+    /// A capability whose structured payload nests recursively — a plan is a
+    /// tree of concept nodes and implementation steps — cannot inline that
+    /// shape, because a nested object would have to contain itself. Such a
+    /// module declares the shared definitions here and references them from its
+    /// fragment with `#/$defs/<Name>`; the registry lifts them to the root of
+    /// the composed schema, which is the reference form strict structured
+    /// output accepts. A capability whose payload holds no recursion
+    /// contributes no definition.
+    fn json_schema_defs(&self) -> Option<serde_json::Value> {
         None
     }
 
@@ -391,6 +450,7 @@ static MODULES: &[&dyn CapabilityModule] = &[
     &ScratchpadModule,
     &OutcomeModule,
     &BlockedModule,
+    &AbortModule,
     &UserLanguageModule,
     &CustomToolsModule,
 ];
@@ -421,6 +481,58 @@ impl CapabilityRegistry {
             .filter(move |module| set.contains(module.capability()))
     }
 
+    /// Returns the capability that declares `base`, canonical or aliased.
+    ///
+    /// Lookup follows the module declarations, so the registry carries no tag
+    /// table of its own. When two modules share one spelling — plan creation and
+    /// plan update both own the plan container — the first declaring module wins
+    /// and both agree on the phase and the delivery mode of the shared tag.
+    pub fn capability_for_tag(&self, base: &str) -> Option<LlmCapability> {
+        self.modules.iter().copied().find_map(|module| {
+            let declared = module.canonical_tag() == Some(base)
+                || module.tag_aliases().contains(&base)
+                || module
+                    .xml_tag_specs()
+                    .iter()
+                    .any(|spec| spec.base_name == base);
+            declared.then(|| module.capability())
+        })
+    }
+
+    /// Resolves any accepted spelling of a tag to its canonical base name.
+    ///
+    /// A canonical spelling resolves to itself, a legacy alias resolves to the
+    /// canonical tag of the module that still accepts it, and a secondary tag
+    /// such as one discovery request resolves to its own name instead of
+    /// collapsing into the primary spelling of its capability. An undeclared
+    /// spelling resolves to nothing, so a scanner rejects it instead of
+    /// guessing.
+    pub fn canonical_tag(&self, base: &str) -> Option<&'static str> {
+        for module in self.modules {
+            if let Some(canonical) = module.canonical_tag() {
+                if canonical == base || module.tag_aliases().contains(&base) {
+                    return Some(canonical);
+                }
+            }
+            if let Some(spec) = module
+                .xml_tag_specs()
+                .iter()
+                .find(|spec| spec.base_name == base)
+            {
+                return Some(spec.base_name);
+            }
+        }
+        None
+    }
+
+    /// Resolves the tag specification of any accepted spelling.
+    ///
+    /// The lookup passes through the canonical name, so an alias yields the
+    /// spec of the tag it stands for rather than a spec of its own.
+    pub fn tag_spec(&self, base: &str) -> Option<&'static XmlTagSpec> {
+        engine::tag_spec(self.canonical_tag(base)?)
+    }
+
     /// Collects the control tag names the enabled modules may emit.
     ///
     /// Only control tags are returned; code-edit tags are omitted because the
@@ -448,12 +560,18 @@ impl CapabilityRegistry {
     /// operational tag rule derived from the enabled capabilities, and every
     /// enabled module's rule in registry order. The whole sequence is rendered
     /// by one loop, so rule numbers come purely from position.
+    ///
+    /// The operational-tag rule belongs to the `xml` wire format only: it
+    /// enumerates control tags, and a structured turn decodes JSON fields, so
+    /// rendering it there would advertise markup the decoder rejects.
     pub fn compose_contract_rules(&self, set: &CapabilitySet, ctx: &ContractContext<'_>) -> String {
         let mut rules = regime::regime_contract_rules(ctx, set);
-        if let Some(rule) = self.operational_tags_rule(set, ctx) {
-            // Position 0 always holds the authoritative-source rule, so the
-            // operational-tag rule becomes the second entry of the contract.
-            rules.insert(rules.len().min(1), rule);
+        if ctx.protocol == EditProtocolKind::Xml {
+            if let Some(rule) = self.operational_tags_rule(set, ctx) {
+                // Position 0 always holds the authoritative-source rule, so the
+                // operational-tag rule becomes the second entry of the contract.
+                rules.insert(rules.len().min(1), rule);
+            }
         }
         for module in self.enabled(set) {
             if let Some(rule) = module.render_contract_rule(ctx) {
@@ -514,6 +632,60 @@ impl CapabilityRegistry {
         self.compose(set, ctx, |module, render_ctx| {
             module.render_structured_instruction(render_ctx)
         })
+    }
+
+    /// Composes the strict JSON schema of the structured response.
+    ///
+    /// The properties are folded from the fragments of the enabled modules, so
+    /// the wire schema is derived from the same declaration that renders the
+    /// prompt instructions and scopes the decoder: a disabled capability
+    /// contributes no property, and a property can never drift from the rule
+    /// that describes it. `required` mirrors the emitted properties, because a
+    /// strict schema must require exactly what it declares, and
+    /// `additionalProperties` stays closed so an undeclared field is rejected
+    /// instead of silently dropped. A payload that nests recursively ships its
+    /// shared definitions through [`CapabilityModule::json_schema_defs`], and
+    /// the registry lifts them to the root of the composed schema, where the
+    /// `#/$defs/<Name>` references of that fragment resolve.
+    pub fn compose_structured_schema(&self, set: &CapabilitySet) -> serde_json::Value {
+        let mut properties = serde_json::Map::new();
+        let mut definitions = serde_json::Map::new();
+        for module in self.enabled(set) {
+            if let Some(fragment) = module.json_schema_fragment() {
+                if let Some(fields) = fragment.as_object() {
+                    for (name, schema) in fields {
+                        properties
+                            .entry(name.clone())
+                            .or_insert_with(|| schema.clone());
+                    }
+                }
+            }
+            if let Some(fragment) = module.json_schema_defs() {
+                if let Some(entries) = fragment.as_object() {
+                    for (name, schema) in entries {
+                        definitions
+                            .entry(name.clone())
+                            .or_insert_with(|| schema.clone());
+                    }
+                }
+            }
+        }
+
+        let required: Vec<serde_json::Value> = properties
+            .keys()
+            .map(|name| serde_json::Value::String(name.clone()))
+            .collect();
+
+        let mut schema = serde_json::json!({
+            "type": "object",
+            "properties": serde_json::Value::Object(properties),
+            "required": required,
+            "additionalProperties": false
+        });
+        if !definitions.is_empty() {
+            schema["$defs"] = serde_json::Value::Object(definitions);
+        }
+        schema
     }
 
     /// Decodes model output into normalized commands for the enabled capabilities.
@@ -581,6 +753,14 @@ impl CapabilityRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tauqe_protocol::CapabilityDelivery;
+
+    /// Iterates every built-in module, in registry order.
+    fn all_modules() -> impl Iterator<Item = &'static dyn CapabilityModule> {
+        LlmCapability::ALL
+            .iter()
+            .filter_map(|capability| CapabilityRegistry::global().module(*capability))
+    }
 
     /// Collects the rule numbers rendered at the start of contract lines.
     fn rule_numbers(rendered: &str) -> Vec<usize> {
@@ -597,6 +777,7 @@ mod tests {
     fn plain_context() -> ContractContext<'static> {
         ContractContext::new(
             TurnIntent::InteractiveRepl,
+            EditProtocolKind::Xml,
             PromptRenderContext::new(&[], None),
         )
     }
@@ -611,7 +792,7 @@ mod tests {
 
         // The contract context inherits the flag from the render context, so a
         // contract rule and a protocol instruction never disagree.
-        let ctx = ContractContext::new(TurnIntent::InteractiveRepl, eager);
+        let ctx = ContractContext::new(TurnIntent::InteractiveRepl, EditProtocolKind::Xml, eager);
         assert!(ctx.has_eager_repo_map);
         assert!(ctx.render.has_eager_repo_map);
 
@@ -653,7 +834,7 @@ mod tests {
     #[test]
     fn operational_xml_tags_are_filtered_and_deterministic() {
         let registry = CapabilityRegistry::global();
-        let develop = registry.operational_xml_tags(&CapabilitySet::develop_xml());
+        let develop = registry.operational_xml_tags(&CapabilitySet::interactive_repl());
         assert_eq!(
             develop,
             vec![
@@ -669,16 +850,17 @@ mod tests {
                 "success".to_string(),
                 "error".to_string(),
                 "blocked".to_string(),
+                "abort".to_string(),
                 "user_language".to_string(),
                 "custom_tool".to_string(),
             ]
         );
         assert_eq!(
-            registry.operational_xml_tags(&CapabilitySet::develop_xml()),
+            registry.operational_xml_tags(&CapabilitySet::interactive_repl()),
             develop
         );
 
-        let isolated = registry.operational_xml_tags(&CapabilitySet::isolated_step_xml());
+        let isolated = registry.operational_xml_tags(&CapabilitySet::isolated_step());
         assert!(isolated.iter().any(|tag| tag == "context_request"));
         assert!(!isolated.iter().any(|tag| tag == "plan"));
     }
@@ -688,7 +870,7 @@ mod tests {
         let registry = CapabilityRegistry::global();
         let ctx = plain_context();
 
-        let develop = registry.compose_contract_rules(&CapabilitySet::develop_xml(), &ctx);
+        let develop = registry.compose_contract_rules(&CapabilitySet::interactive_repl(), &ctx);
         assert!(develop.contains("context_request"));
         assert!(develop.contains("Minimal Coherent Change"));
         assert!(develop.contains("1. Authoritative Source: "));
@@ -735,7 +917,7 @@ mod tests {
     fn develop_contract_has_no_lettered_rule_numbers() {
         let registry = CapabilityRegistry::global();
         let rendered =
-            registry.compose_contract_rules(&CapabilitySet::develop_xml(), &plain_context());
+            registry.compose_contract_rules(&CapabilitySet::interactive_repl(), &plain_context());
 
         for surrogate in ["1a.", "2a.", "4a.", "8a.", "10a.", "11a."] {
             assert!(!rendered.contains(surrogate), "surrogate {surrogate}");
@@ -754,7 +936,7 @@ mod tests {
     #[test]
     fn contract_rules_follow_typed_inputs() {
         let registry = CapabilityRegistry::global();
-        let set = CapabilitySet::develop_xml();
+        let set = CapabilitySet::interactive_repl();
 
         let rendered = registry.compose_contract_rules(&set, &plain_context());
         assert!(rendered.contains("Language Consistency: Always formulate"));
@@ -765,6 +947,7 @@ mod tests {
 
         let discussion = ContractContext::new(
             TurnIntent::ReadonlyDiscussion,
+            EditProtocolKind::Xml,
             PromptRenderContext::new(&[], None),
         );
         let rendered = registry.compose_contract_rules(&CapabilitySet::discussion(), &discussion);
@@ -785,13 +968,42 @@ mod tests {
     }
 
     #[test]
+    fn operational_tag_rule_is_rendered_only_for_the_xml_contour() {
+        let registry = CapabilityRegistry::global();
+        let set = CapabilitySet::interactive_repl();
+
+        // The XML transport decodes control tags, so its contract enumerates
+        // them.
+        let xml = registry.compose_contract_rules(&set, &plain_context());
+        assert!(xml.contains("Operational Protocol Tags"));
+        assert!(xml.contains("All operational protocol tags"));
+
+        // Structured Output decodes JSON fields, so the rule enumerating
+        // control tags is never rendered.
+        let structured_ctx = ContractContext::new(
+            TurnIntent::InteractiveRepl,
+            EditProtocolKind::Structured,
+            PromptRenderContext::new(&[], None),
+        );
+        let structured = registry.compose_contract_rules(&set, &structured_ctx);
+        assert!(!structured.contains("Operational Protocol Tags"));
+        assert!(!structured.contains("All operational protocol tags"));
+
+        // The omitted rule leaves no gap: the remaining rules stay dense.
+        let numbers = rule_numbers(&structured);
+        assert!(!numbers.is_empty());
+        assert_eq!(numbers, (1..=numbers.len()).collect::<Vec<_>>());
+    }
+
+    #[test]
     fn contract_rules_apply_the_turn_marker() {
         let registry = CapabilityRegistry::global();
         let ctx = ContractContext::new(
             TurnIntent::InteractiveRepl,
+            EditProtocolKind::Xml,
             PromptRenderContext::new(&[], Some("M12345")),
         );
-        let rendered = registry.compose_contract_rules(&CapabilitySet::develop_xml(), &ctx);
+        let rendered = registry.compose_contract_rules(&CapabilitySet::interactive_repl(), &ctx);
         assert!(rendered.contains("<context_request_M12345 path"));
         assert!(rendered.contains("<scratchpad_M12345>"));
         assert!(rendered.contains("<plan_M12345 action"));
@@ -804,14 +1016,14 @@ mod tests {
         let marker = "M12345";
         let ctx = PromptRenderContext::new(&[], Some(marker));
         let marked =
-            registry.compose_xml_protocol_instructions(&CapabilitySet::develop_xml(), &ctx);
-        assert!(marked.contains(&format!("tauqe_edits_{marker}")));
+            registry.compose_xml_protocol_instructions(&CapabilitySet::interactive_repl(), &ctx);
+        assert!(marked.contains(&format!("edits_{marker}")));
         assert!(marked.contains(&format!("context_request_{marker}")));
 
         let plain_ctx = PromptRenderContext::new(&[], None);
-        let plain =
-            registry.compose_xml_protocol_instructions(&CapabilitySet::develop_xml(), &plain_ctx);
-        assert!(plain.contains("<tauqe_edits summary"));
+        let plain = registry
+            .compose_xml_protocol_instructions(&CapabilitySet::interactive_repl(), &plain_ctx);
+        assert!(plain.contains("<edits summary"));
     }
 
     #[test]
@@ -820,7 +1032,7 @@ mod tests {
         let ctx = PromptRenderContext::new(&[], None);
 
         let json = registry
-            .compose_structured_protocol_instructions(&CapabilitySet::develop_structured(), &ctx);
+            .compose_structured_protocol_instructions(&CapabilitySet::interactive_repl(), &ctx);
         assert!(json.contains("changes"));
         assert!(json.contains("message"));
         assert!(json.contains("`doc_requests`"));
@@ -849,6 +1061,156 @@ mod tests {
         assert!(!narrowed.contains("`blocked`"));
     }
 
+    /// Collects the property names of a composed structured schema.
+    fn schema_properties(schema: &serde_json::Value) -> Vec<String> {
+        schema["properties"]
+            .as_object()
+            .map(|properties| properties.keys().cloned().collect())
+            .unwrap_or_default()
+    }
+
+    /// Collects the `required` entries of a composed structured schema.
+    fn schema_required(schema: &serde_json::Value) -> Vec<String> {
+        schema["required"]
+            .as_array()
+            .map(|required| {
+                required
+                    .iter()
+                    .filter_map(|field| field.as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    #[test]
+    fn structured_schema_is_composed_from_the_enabled_modules() {
+        let registry = CapabilityRegistry::global();
+        let schema = registry.compose_structured_schema(&CapabilitySet::interactive_repl());
+
+        assert_eq!(schema["type"], serde_json::json!("object"));
+        assert_eq!(schema["additionalProperties"], serde_json::json!(false));
+
+        let mut properties = schema_properties(&schema);
+        properties.sort();
+        let mut expected: Vec<String> = [
+            "abort",
+            "blocked",
+            "changes",
+            "context_requests",
+            "custom_tools",
+            "dir_lists",
+            "doc_requests",
+            "message",
+            "outcome",
+            "plan_update",
+            "repo_dirs",
+            "repo_maps",
+            "repo_searches",
+            "scratchpad",
+            "user_language",
+            "verify",
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .collect();
+        expected.sort();
+        assert_eq!(properties, expected);
+
+        // A strict schema requires exactly the properties it declares, so a
+        // pruned property can never stay required.
+        assert_eq!(schema_required(&schema).len(), properties.len());
+
+        // `suggested_actions` belongs to no capability, so the registry never
+        // advertises it.
+        assert!(schema["properties"].get("suggested_actions").is_none());
+    }
+
+    #[test]
+    fn structured_schema_lifts_the_shared_definitions_of_enabled_modules() {
+        let registry = CapabilityRegistry::global();
+        let with_plans = CapabilitySet::from_slice(&[
+            LlmCapability::TextMessage,
+            LlmCapability::FileEdits,
+            LlmCapability::PlanCreation,
+        ]);
+        let schema = registry.compose_structured_schema(&with_plans);
+
+        assert!(schema_properties(&schema).contains(&"plan_update".to_string()));
+        let definitions = schema["$defs"]
+            .as_object()
+            .expect("the plan payload references shared definitions");
+        assert!(definitions.contains_key("ConceptItem"));
+        assert!(definitions.contains_key("PlanItem"));
+
+        // A surface that cannot author plans carries no nested payload, so its
+        // composed schema keeps the flat shape.
+        let plain = registry.compose_structured_schema(&CapabilitySet::from_slice(&[
+            LlmCapability::TextMessage,
+            LlmCapability::FileEdits,
+        ]));
+        assert!(plain.get("$defs").is_none());
+
+        // A plan update declares the very same property and definitions, so
+        // both plan capabilities describe one payload.
+        let updating = registry.compose_structured_schema(&CapabilitySet::from_slice(&[
+            LlmCapability::TextMessage,
+            LlmCapability::PlanUpdate,
+        ]));
+        assert!(schema_properties(&updating).contains(&"plan_update".to_string()));
+        assert!(updating["$defs"].is_object());
+    }
+
+    #[test]
+    fn structured_schema_prunes_disabled_capabilities_and_their_required_entries() {
+        let registry = CapabilityRegistry::global();
+        let narrowed =
+            CapabilitySet::from_slice(&[LlmCapability::TextMessage, LlmCapability::FileEdits]);
+        let schema = registry.compose_structured_schema(&narrowed);
+
+        let mut properties = schema_properties(&schema);
+        properties.sort();
+        assert_eq!(
+            properties,
+            vec!["changes".to_string(), "message".to_string()]
+        );
+
+        let mut required = schema_required(&schema);
+        required.sort();
+        assert_eq!(required, properties);
+
+        // The schema stays strict: no property admits an explicit null.
+        assert!(!schema.to_string().contains("\"null\""));
+    }
+
+    #[test]
+    fn json_schema_fragments_are_declared_by_the_modules_that_own_the_property() {
+        let registry = CapabilityRegistry::global();
+        for capability in LlmCapability::ALL {
+            let module = match registry.module(*capability) {
+                Some(module) => module,
+                None => panic!("missing module for {}", capability),
+            };
+            let Some(fragment) = module.json_schema_fragment() else {
+                continue;
+            };
+            let fields = fragment
+                .as_object()
+                .unwrap_or_else(|| panic!("{} returns an object fragment", capability));
+            assert!(
+                !fields.is_empty(),
+                "{} declares at least one property",
+                capability
+            );
+            if let Some(property) = module.json_property_name() {
+                assert!(
+                    fields.contains_key(property),
+                    "{} declares its own property '{property}'",
+                    capability
+                );
+            }
+        }
+    }
+
     #[test]
     fn decode_filters_commands_by_capability_set() {
         let registry = CapabilityRegistry::global();
@@ -863,7 +1225,7 @@ mod tests {
         );
 
         let develop =
-            registry.decode_xml_commands(&CapabilitySet::develop_xml(), raw, Some("AB"), &[]);
+            registry.decode_xml_commands(&CapabilitySet::interactive_repl(), raw, Some("AB"), &[]);
         assert!(develop
             .iter()
             .any(|command| matches!(command, LlmCommand::Plan { .. })));
@@ -880,7 +1242,7 @@ mod tests {
             .any(|command| matches!(command, LlmCommand::Text { .. })));
 
         let isolated =
-            registry.decode_xml_commands(&CapabilitySet::isolated_step_xml(), raw, Some("AB"), &[]);
+            registry.decode_xml_commands(&CapabilitySet::isolated_step(), raw, Some("AB"), &[]);
         assert!(!isolated
             .iter()
             .any(|command| matches!(command, LlmCommand::Plan { .. })));
@@ -896,7 +1258,7 @@ mod tests {
     fn clean_text_removes_enabled_capability_tags() {
         let registry = CapabilityRegistry::global();
         let raw = "Context gathered.\n<context_request path=\"src/a.rs\" />\n<dir_list path=\"crates/core\" />\n<scratchpad>\nnotes\n</scratchpad>\nDone.";
-        let cleaned = registry.clean_text(&CapabilitySet::develop_xml(), raw, None);
+        let cleaned = registry.clean_text(&CapabilitySet::interactive_repl(), raw, None);
         assert!(!cleaned.contains("context_request"));
         assert!(!cleaned.contains("dir_list"));
         assert!(!cleaned.contains("<scratchpad"));
@@ -946,7 +1308,7 @@ mod tests {
                 tauqe_protocol::ProjectCommandSpec {
                     command: "cargo".to_string(),
                     args: vec![(*name).to_string()],
-                    timeout_secs: None,
+                    ..Default::default()
                 },
             );
         }
@@ -956,7 +1318,7 @@ mod tests {
     /// Renders the contract for a set that exposes the custom tool surface.
     fn custom_tools_contract(project: Option<&ProjectConfig>) -> String {
         let render = PromptRenderContext::new(&[], None).with_project(project);
-        let ctx = ContractContext::new(TurnIntent::InteractiveRepl, render);
+        let ctx = ContractContext::new(TurnIntent::InteractiveRepl, EditProtocolKind::Xml, render);
         let set =
             CapabilitySet::from_slice(&[LlmCapability::TextMessage, LlmCapability::CustomTools]);
         CapabilityRegistry::global().compose_contract_rules(&set, &ctx)
@@ -974,10 +1336,10 @@ mod tests {
         let rendered = custom_tools_contract(Some(&project));
 
         assert!(rendered.contains("Project Custom Tools (No Arbitrary Shell)"));
-        assert!(rendered.contains("runs `cargo docs`"));
-        assert!(rendered.contains("runs `cargo audit`"));
+        assert!(rendered.contains("Runs `cargo docs`"));
+        assert!(rendered.contains("Runs `cargo audit`"));
         assert!(rendered.contains("no shell to fall back on"));
-        assert!(rendered.contains("leave `args` empty"));
+        assert!(rendered.contains("A declared parameter may be supplied by name"));
 
         // The allowlist renders in declaration order, so identical state
         // produces identical prompt bytes.
@@ -1030,22 +1392,18 @@ mod tests {
         let instruction = registry.compose_xml_protocol_instructions(&set, &ctx);
         assert!(instruction.contains("<custom_tool name"));
         assert!(instruction.contains("`docs`"));
-        assert!(instruction.contains("runs `cargo docs`"));
+        assert!(instruction.contains("Runs `cargo docs`"));
 
         // Without a declaration the module advertises no invocation and no
         // command line for the model to imitate.
-        let bare = registry
-            .compose_xml_protocol_instructions(&set, &PromptRenderContext::new(&[], None));
+        let bare =
+            registry.compose_xml_protocol_instructions(&set, &PromptRenderContext::new(&[], None));
         assert!(!bare.contains("<custom_tool"));
 
         // A declared invocation decodes into a typed command with no arguments,
         // because the declaration already names every literal argument.
-        let commands = registry.decode_xml_commands(
-            &set,
-            "Run it.\n<custom_tool name=\"docs\" />",
-            None,
-            &[],
-        );
+        let commands =
+            registry.decode_xml_commands(&set, "Run it.\n<custom_tool name=\"docs\" />", None, &[]);
         assert!(commands.contains(&LlmCommand::CustomTool {
             name: "docs".to_string(),
             args: serde_json::Value::Null,
@@ -1063,5 +1421,210 @@ mod tests {
             name: "docs".to_string(),
             args: serde_json::Value::Null,
         }));
+    }
+
+    #[test]
+    fn abort_module_is_registered_and_decodes_invocations() {
+        let registry = CapabilityRegistry::global();
+        let module = match registry.module(LlmCapability::Abort) {
+            Some(module) => module,
+            None => panic!("the abort capability needs a module"),
+        };
+        assert_eq!(module.canonical_tag(), Some("abort"));
+        assert_eq!(
+            registry.capability_for_tag("abort"),
+            Some(LlmCapability::Abort)
+        );
+        assert_eq!(registry.canonical_tag("abort"), Some("abort"));
+        let spec = match registry.tag_spec("abort") {
+            Some(spec) => spec,
+            None => panic!("the abort tag is declared"),
+        };
+        // A paired form is declared so the recommendation may carry a longer
+        // instruction, and the tag stays a control tag so it never leaks into
+        // conversational text.
+        assert_eq!(spec.close_mode, engine::TagCloseMode::Control);
+        assert!(spec.is_control());
+
+        let set = CapabilitySet::from_slice(&[LlmCapability::TextMessage, LlmCapability::Abort]);
+        let raw = "The native build needs approval.\n<abort reason=\"Native build approval required\" recommendation=\"pnpm approve-builds\" />";
+        let commands = registry.decode_xml_commands(&set, raw, None, &[]);
+        assert!(commands.contains(&LlmCommand::Abort {
+            reason: "Native build approval required".to_string(),
+            recommendation: "pnpm approve-builds".to_string(),
+        }));
+
+        // The body of a paired tag carries the instruction, and the turn-marker
+        // suffix protects the invocation like every other control tag.
+        let paired = "<abort_AB12 reason=\"Toolchain missing\">Install the SDK, then rerun the step.</abort_AB12>";
+        let commands = registry.decode_xml_commands(&set, paired, Some("AB12"), &[]);
+        assert!(commands.contains(&LlmCommand::Abort {
+            reason: "Toolchain missing".to_string(),
+            recommendation: "Install the SDK, then rerun the step.".to_string(),
+        }));
+
+        // Decoding is scoped to the enabled capability set, so a profile
+        // without the abort surface never stops a turn on one.
+        let narrowed = CapabilitySet::from_slice(&[LlmCapability::TextMessage]);
+        assert!(!registry
+            .decode_xml_commands(&narrowed, raw, None, &[])
+            .iter()
+            .any(|command| matches!(command, LlmCommand::Abort { .. })));
+    }
+
+    #[test]
+    fn canonical_tags_lead_the_specs_of_their_own_module() {
+        for module in all_modules() {
+            let Some(canonical) = module.canonical_tag() else {
+                assert!(
+                    module.xml_tag_specs().is_empty(),
+                    "{} declares protocol tags but no canonical tag",
+                    module.capability()
+                );
+                continue;
+            };
+            assert_eq!(
+                module.xml_tag_specs().first().map(|spec| spec.base_name),
+                Some(canonical),
+                "{} lists its canonical tag before every other tag",
+                module.capability()
+            );
+        }
+    }
+
+    #[test]
+    fn aliases_resolve_to_the_canonical_tag_of_their_module() {
+        let registry = CapabilityRegistry::global();
+        for module in all_modules() {
+            for alias in module.tag_aliases() {
+                let canonical = match module.canonical_tag() {
+                    Some(canonical) => canonical,
+                    None => panic!(
+                        "{} declares alias {alias} without a canonical tag",
+                        module.capability()
+                    ),
+                };
+                assert_ne!(
+                    *alias,
+                    canonical,
+                    "an alias never repeats the canonical name of {}",
+                    module.capability()
+                );
+                assert_eq!(registry.canonical_tag(alias), Some(canonical));
+                assert_eq!(
+                    registry.capability_for_tag(alias),
+                    Some(module.capability())
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn canonical_lookup_covers_canonical_secondary_and_unknown_spellings() {
+        let registry = CapabilityRegistry::global();
+
+        // A canonical spelling resolves to itself.
+        assert_eq!(registry.canonical_tag("edits"), Some("edits"));
+        // The pre-canonical edit container resolves through its canonical
+        // spelling instead of carrying one of its own.
+        assert_eq!(registry.canonical_tag("tauqe_edits"), Some("edits"));
+        assert_eq!(
+            registry.canonical_tag("context_request"),
+            Some("context_request")
+        );
+        assert_eq!(registry.canonical_tag("success"), Some("success"));
+        // A secondary tag of a multi-tag capability resolves to its own name
+        // instead of collapsing into the primary spelling.
+        assert_eq!(registry.canonical_tag("repo_search"), Some("repo_search"));
+        assert_eq!(registry.canonical_tag("edit"), Some("edit"));
+        assert_eq!(registry.canonical_tag("error"), Some("error"));
+        // An undeclared spelling resolves to nothing, so a scanner rejects it
+        // instead of guessing.
+        assert_eq!(registry.canonical_tag("repo"), None);
+        assert_eq!(registry.canonical_tag(""), None);
+
+        assert_eq!(
+            registry
+                .tag_spec("context_request")
+                .map(|spec| spec.base_name),
+            Some("context_request")
+        );
+        assert_eq!(
+            registry.tag_spec("repo_map").map(|spec| spec.close_mode),
+            Some(engine::TagCloseMode::Simple)
+        );
+        assert_eq!(
+            registry.tag_spec("edits").map(|spec| spec.close_mode),
+            Some(engine::TagCloseMode::Container)
+        );
+        assert_eq!(
+            registry.tag_spec("plan").map(|spec| spec.close_mode),
+            Some(engine::TagCloseMode::Container)
+        );
+        assert!(registry.tag_spec("repo").is_none());
+    }
+
+    #[test]
+    fn capability_lookup_reports_the_declaring_module() {
+        let registry = CapabilityRegistry::global();
+
+        assert_eq!(
+            registry.capability_for_tag("context_request"),
+            Some(LlmCapability::Discovery)
+        );
+        assert_eq!(
+            registry.capability_for_tag("repo_dirs"),
+            Some(LlmCapability::Discovery)
+        );
+        assert_eq!(
+            registry.capability_for_tag("edits"),
+            Some(LlmCapability::FileEdits)
+        );
+        // The legacy spelling resolves to the module that still accepts it.
+        assert_eq!(
+            registry.capability_for_tag("tauqe_edits"),
+            Some(LlmCapability::FileEdits)
+        );
+        assert_eq!(
+            registry.capability_for_tag("success"),
+            Some(LlmCapability::Outcome)
+        );
+        assert_eq!(
+            registry.capability_for_tag("custom_tool"),
+            Some(LlmCapability::CustomTools)
+        );
+        // Plan creation and plan update share one container spelling; creation
+        // is declared first and both agree on its phase and delivery.
+        assert_eq!(
+            registry.capability_for_tag("plan"),
+            Some(LlmCapability::PlanCreation)
+        );
+        assert_eq!(registry.capability_for_tag("repo"), None);
+        assert_eq!(registry.capability_for_tag(""), None);
+    }
+
+    #[test]
+    fn tag_lookup_exposes_the_declared_delivery_mode() {
+        let registry = CapabilityRegistry::global();
+        let delivery = |base: &str| {
+            registry
+                .capability_for_tag(base)
+                .map(|capability| capability.delivery())
+        };
+
+        assert_eq!(delivery("edits"), Some(CapabilityDelivery::LiveStreaming));
+        assert_eq!(
+            delivery("tauqe_edits"),
+            Some(CapabilityDelivery::LiveStreaming)
+        );
+        assert_eq!(
+            delivery("context_request"),
+            Some(CapabilityDelivery::RoundDeferred)
+        );
+        assert_eq!(
+            delivery("scratchpad"),
+            Some(CapabilityDelivery::RoundDeferred)
+        );
+        assert_eq!(delivery("repo"), None);
     }
 }

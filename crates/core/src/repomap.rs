@@ -1,5 +1,6 @@
 use std::collections::HashSet;
 use std::path::Path;
+use std::sync::Arc;
 
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
@@ -17,8 +18,14 @@ pub const DEFAULT_REPOMAP_TOKEN_BUDGET: usize = 4000;
 /// Trait defining a strategy for extracting symbols from repository files.
 ///
 /// Allows pluggable implementations (Tree-sitter, language servers, precomputed indices).
+/// Implementations return shared payloads (`Arc<RepoFileSymbols>`), so a cached
+/// parse is handed to every consumer without rebuilding the symbol vectors.
 pub trait SymbolExtractor: Send + Sync {
-    fn extract_symbols(&self, repo_root: &Path, files: &[String]) -> Result<Vec<RepoFileSymbols>>;
+    fn extract_symbols(
+        &self,
+        repo_root: &Path,
+        files: &[String],
+    ) -> Result<Vec<Arc<RepoFileSymbols>>>;
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -84,6 +91,15 @@ impl RepoFileSymbols {
     }
 }
 
+/// Reflexive projection so owned payloads and shared `Arc` payloads satisfy the
+/// same `S: AsRef<RepoFileSymbols>` rendering bound, letting map generation
+/// format cached symbols without cloning them.
+impl AsRef<RepoFileSymbols> for RepoFileSymbols {
+    fn as_ref(&self) -> &RepoFileSymbols {
+        self
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum DetailLevel {
     Full,
@@ -99,13 +115,12 @@ pub fn generate_repo_map(
     context_files: &[String],
     token_budget: usize,
 ) -> Result<String> {
-    let extractor = TreeSitterExtractor::new();
     generate_repo_map_with_extractor(
         repo_root,
         available_files,
         context_files,
         token_budget,
-        &extractor,
+        treesitter::shared_extractor(),
     )
 }
 
@@ -247,13 +262,19 @@ fn path_is_under_prefix(path: &str, prefix: &str) -> bool {
 }
 
 /// Formats repository symbols into an outline, reducing detail level if `token_budget` is exceeded.
-pub fn format_symbols_with_budget(files: &[RepoFileSymbols], token_budget: usize) -> String {
+pub fn format_symbols_with_budget<S: AsRef<RepoFileSymbols>>(
+    files: &[S],
+    token_budget: usize,
+) -> String {
     format_repo_map_with_budget(files, &[], token_budget)
 }
 
 /// Formats repository symbols and all other Git files into an outline within `token_budget`.
-pub fn format_repo_map_with_budget(
-    symbols: &[RepoFileSymbols],
+///
+/// Accepts both owned payloads and shared `Arc` payloads, so map generation
+/// formats cached symbols without cloning them.
+pub fn format_repo_map_with_budget<S: AsRef<RepoFileSymbols>>(
+    symbols: &[S],
     all_git_files: &[String],
     token_budget: usize,
 ) -> String {
@@ -278,7 +299,7 @@ pub fn format_repo_map_with_budget(
     let separator_tokens = crate::prompt::estimate_tokens("\n\n");
 
     for file in symbols {
-        let block = format_file_symbols(file, DetailLevel::TopLevelOnly);
+        let block = format_file_symbols(file.as_ref(), DetailLevel::TopLevelOnly);
         if block.is_empty() {
             continue;
         }
@@ -365,10 +386,10 @@ fn combine_outline_and_other_files(outline: &str, all_git_files: &[String]) -> S
     }
 }
 
-fn format_all_files(files: &[RepoFileSymbols], level: DetailLevel) -> String {
+fn format_all_files<S: AsRef<RepoFileSymbols>>(files: &[S], level: DetailLevel) -> String {
     let mut blocks = Vec::new();
     for file in files {
-        let block = format_file_symbols(file, level);
+        let block = format_file_symbols(file.as_ref(), level);
         if !block.is_empty() {
             blocks.push(block);
         }
@@ -739,7 +760,7 @@ mod tests {
 
     #[test]
     fn test_format_repo_map_with_budget_only_other_files() {
-        let syms = vec![];
+        let syms: Vec<RepoFileSymbols> = vec![];
         let all_files = vec!["Cargo.toml".to_string(), "tauqe.toml".to_string()];
 
         let outline = format_repo_map_with_budget(&syms, &all_files, 100);

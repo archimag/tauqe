@@ -327,6 +327,91 @@ async fn test_handle_plan_execute_validation() {
     }
 }
 
+/// `plan/refine` parses strictly through the typed DTO: a malformed field
+/// answers `INVALID_PARAMS` instead of degrading to the active-plan fallback
+/// or dropping the model selection.
+#[tokio::test]
+async fn test_handle_plan_refine_rejects_malformed_payloads() {
+    let dir = TestDir::new();
+    let state = test_state(&dir);
+    let make_req = |id: u64, params: Option<serde_json::Value>| Request {
+        id: tauqe_protocol::RequestId::Number(id),
+        method: tauqe_protocol::methods::PLAN_REFINE.to_string(),
+        params,
+    };
+
+    // A non-string plan_id never silently refines the active plan.
+    let res = handle_plan_refine(
+        make_req(1, Some(serde_json::json!({ "plan_id": 123 }))),
+        &state,
+    )
+    .await;
+    assert_eq!(res.error.unwrap().code, "INVALID_PARAMS");
+
+    // A malformed model selection is rejected instead of being dropped, so
+    // the synthesis can never run on the default architect by accident.
+    let res = handle_plan_refine(
+        make_req(
+            2,
+            Some(serde_json::json!({ "plan_id": "p", "model": { "garbage": true } })),
+        ),
+        &state,
+    )
+    .await;
+    assert_eq!(res.error.unwrap().code, "INVALID_PARAMS");
+
+    // A malformed instructions field is rejected instead of being dropped.
+    let res = handle_plan_refine(
+        make_req(
+            3,
+            Some(serde_json::json!({ "plan_id": "p", "instructions": 42 })),
+        ),
+        &state,
+    )
+    .await;
+    assert_eq!(res.error.unwrap().code, "INVALID_PARAMS");
+
+    // The legacy `id` spelling still parses through the DTO alias, so an
+    // unknown plan answers NOT_FOUND rather than falling back to the active
+    // plan.
+    let res = handle_plan_refine(
+        make_req(4, Some(serde_json::json!({ "id": "ghost" }))),
+        &state,
+    )
+    .await;
+    assert_eq!(res.error.unwrap().code, "NOT_FOUND");
+
+    // A rejected request never claims the operation slot.
+    assert!(!state.is_operation_active());
+}
+
+/// `plan/get` parses strictly through the typed DTO while keeping the empty
+/// object as the canonical "active plan" request.
+#[tokio::test]
+async fn test_handle_plan_get_parses_payload_strictly() {
+    let dir = TestDir::new();
+    let state = test_state(&dir);
+    let make_req = |id: u64, params: Option<serde_json::Value>| Request {
+        id: tauqe_protocol::RequestId::Number(id),
+        method: tauqe_protocol::methods::PLAN_GET.to_string(),
+        params,
+    };
+
+    // The empty object still resolves through the active-plan fallback.
+    let res =
+        super::storage_ops::handle_plan_get(make_req(1, Some(serde_json::json!({}))), &state).await;
+    assert!(res.error.is_none());
+
+    // A non-string id answers INVALID_PARAMS instead of silently resolving
+    // through the active plan.
+    let res = super::storage_ops::handle_plan_get(
+        make_req(2, Some(serde_json::json!({ "id": 123 }))),
+        &state,
+    )
+    .await;
+    assert_eq!(res.error.unwrap().code, "INVALID_PARAMS");
+}
+
 #[tokio::test]
 async fn test_handle_plan_refine_defaults_to_architect_role() {
     let dir = TestDir::new();
@@ -468,8 +553,12 @@ async fn test_plan_execute_blocked_by_failed_preflight() {
         ..Default::default()
     };
     PlanStorage::save_plan(dir.path(), &plan).unwrap();
-    // A malformed manifest makes the deterministic toolchain pipeline fail.
-    std::fs::write(dir.path().join("Cargo.toml"), "[package\n").unwrap();
+    // A failing verification command makes the deterministic pipeline fail.
+    std::fs::write(
+        dir.path().join("tauqe.toml"),
+        "[project.verify]\ncommand = \"false\"\n",
+    )
+    .unwrap();
     let state = test_state(&dir);
 
     let req = Request {
@@ -518,6 +607,7 @@ fn test_turn_applied_edits_requires_applied_change() {
         error: None,
         has_terminal_success: false,
         blocked: None,
+        abort: None,
     };
     assert!(applied.is_success());
     assert!(turn_applied_edits(&applied));
@@ -534,6 +624,7 @@ fn test_turn_applied_edits_requires_applied_change() {
         error: None,
         has_terminal_success: true,
         blocked: None,
+        abort: None,
     };
     assert!(answer.is_success());
     assert!(!turn_applied_edits(&answer));
@@ -556,6 +647,7 @@ fn test_turn_applied_edits_requires_applied_change() {
         error: Some("compiler error".to_string()),
         has_terminal_success: false,
         blocked: None,
+        abort: None,
     };
     assert!(!turn_applied_edits(&failed));
 }
@@ -672,6 +764,49 @@ async fn test_handle_plan_replan_validation() {
     )
     .await;
     assert_eq!(res.error.unwrap().code, "NOT_A_LEAF");
+}
+
+/// `plan/replan` parses strictly through the typed DTO: a malformed field
+/// answers `INVALID_PARAMS` while the legacy `id`/`item_id` spellings keep
+/// working through the declared aliases.
+#[tokio::test]
+async fn test_handle_plan_replan_rejects_malformed_payloads() {
+    let dir = TestDir::new();
+    let state = test_state(&dir);
+    let make_req = |id: u64, params: Option<serde_json::Value>| Request {
+        id: tauqe_protocol::RequestId::Number(id),
+        method: tauqe_protocol::methods::PLAN_REPLAN.to_string(),
+        params,
+    };
+
+    // A non-string step_id answers INVALID_PARAMS instead of degrading to an
+    // empty identifier.
+    let res = handle_plan_replan(
+        make_req(1, Some(serde_json::json!({ "plan_id": "p", "step_id": 7 }))),
+        &state,
+    )
+    .await;
+    assert_eq!(res.error.unwrap().code, "INVALID_PARAMS");
+
+    // A malformed model selection is rejected instead of being dropped.
+    let res = handle_plan_replan(
+        make_req(
+            2,
+            Some(serde_json::json!({ "plan_id": "p", "step_id": "1", "model": 3 })),
+        ),
+        &state,
+    )
+    .await;
+    assert_eq!(res.error.unwrap().code, "INVALID_PARAMS");
+
+    // The legacy `id`/`item_id` spellings parse through the DTO aliases, so
+    // an unknown plan answers NOT_FOUND rather than silently degrading.
+    let res = handle_plan_replan(
+        make_req(3, Some(serde_json::json!({ "id": "p", "item_id": "1" }))),
+        &state,
+    )
+    .await;
+    assert_eq!(res.error.unwrap().code, "NOT_FOUND");
 }
 
 #[tokio::test]
@@ -1351,6 +1486,103 @@ async fn test_plan_batch_automated_replanning_on_blocked_step() {
 }
 
 #[tokio::test]
+async fn test_plan_batch_defers_architect_escalation_until_repeated_failure() {
+    let dir = TestDir::new();
+    tauqe_core::git::init_repository(Some(dir.path()), true).unwrap();
+    std::fs::write(dir.path().join("src.rs"), "pub fn value() -> i32 { 0 }\n").unwrap();
+    tauqe_core::git::cmd::stage_files(dir.path(), &["src.rs".to_string()]).unwrap();
+    tauqe_core::git::cmd::commit_with_developer_author(dir.path(), "Initial", false).unwrap();
+
+    let mut item = test_item("1", PlanItemStatus::Todo);
+    item.title = "Step 1".to_string();
+    item.files = vec!["src.rs".to_string()];
+    let plan = Plan {
+        id: "lazy-level-up".to_string(),
+        title: "Lazy Level Up".to_string(),
+        created_at: 1,
+        updated_at: 1,
+        items: vec![item],
+        ..Default::default()
+    };
+    PlanStorage::save_plan(dir.path(), &plan).unwrap();
+
+    let marker = "LAZYUP1";
+    let blocked = format!(
+        "<blocked_{m} reason=\"Precondition missing\" />",
+        m = marker
+    );
+    // Both replanning waves restate the same step identifier, so the second
+    // failure of step 1 is a repeated failure and must escalate the Architect.
+    let replan_output = serde_json::json!({
+        "status": "success",
+        "explanation": "Restated the same step",
+        "items": [{
+            "id": "1",
+            "title": "Step 1 restated",
+            "status": "todo",
+            "files": ["src.rs"],
+            "readonly_files": [],
+            "concept_refs": [],
+            "depends_on": [],
+            "children": []
+        }]
+    });
+    let success = format!(
+        "<tauqe_edits_{m} summary=\"Fix value\">\n<edit_{m} path=\"src.rs\">\n<search_{m}>\npub fn value() -> i32 {{ 0 }}\n</search_{m}>\n<replace_{m}>\npub fn value() -> i32 {{ 7 }}\n</replace_{m}>\n</edit_{m}>\n<success_{m} summary=\"done\" />\n</tauqe_edits_{m}>",
+        m = marker
+    );
+
+    let provider = Arc::new(MockLlmProvider::scripted([
+        MockResponse::text(blocked.clone()),
+        MockResponse::text(replan_output.to_string()),
+        MockResponse::text(blocked),
+        MockResponse::text(replan_output.to_string()),
+        MockResponse::text(success),
+    ]));
+
+    let mut config = tauqe_core::config::AppConfig::default();
+    config.develop.workflow = tauqe_protocol::WorkflowKind::Naive;
+    config.develop.protocol = tauqe_protocol::EditProtocolKind::Xml;
+    config.develop.max_replans = 2;
+    config.models.auto_level_up = false;
+    config.models.primary = vec![tauqe_protocol::ModelRef::openrouter("coder/model").into()];
+    config.models.architect = Some(vec![
+        tauqe_protocol::ModelEntry::new(tauqe_protocol::ModelRef::openrouter("planner/one"), None),
+        tauqe_protocol::ModelEntry::new(tauqe_protocol::ModelRef::openrouter("planner/two"), None),
+    ]);
+
+    let state = test_state_with_provider(&dir, config, provider.clone()).await;
+    *state.marker_override.lock().await = Some(marker.to_string());
+
+    let operation = Arc::new(
+        state
+            .try_begin_operation()
+            .expect("register batch operation"),
+    );
+    let outcome = run_plan_batch(&state, "lazy-level-up", vec!["1".to_string()], operation).await;
+    assert_eq!(outcome, BatchOutcome::Completed { steps: 1 });
+
+    let requests = provider.requests();
+    assert_eq!(requests.len(), 5);
+    // The first replanning wave keeps the Architect that planned the horizon.
+    assert_eq!(requests[1].model, "planner/one");
+    // Only the repeated failure of the same step escalates one rung.
+    assert_eq!(requests[3].model, "planner/two");
+
+    let reloaded = PlanStorage::load_plan(dir.path(), "lazy-level-up")
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        reloaded.find_item("1").unwrap().status,
+        PlanItemStatus::Done
+    );
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("src.rs")).unwrap(),
+        "pub fn value() -> i32 { 7 }\n"
+    );
+}
+
+#[tokio::test]
 async fn test_plan_batch_automated_replanning_limit_exhausted() {
     let dir = TestDir::new();
     tauqe_core::git::init_repository(Some(dir.path()), true).unwrap();
@@ -1444,6 +1676,117 @@ async fn test_plan_batch_automated_replanning_limit_exhausted() {
     assert_eq!(
         reloaded.find_item("1.1").unwrap().status,
         PlanItemStatus::Blocked
+    );
+}
+
+#[tokio::test]
+async fn test_plan_batch_stops_on_abort_without_replanning() {
+    let dir = TestDir::new();
+    tauqe_core::git::init_repository(Some(dir.path()), true).unwrap();
+    std::fs::write(dir.path().join("src.rs"), "pub fn value() -> i32 { 0 }\n").unwrap();
+    tauqe_core::git::cmd::stage_files(dir.path(), &["src.rs".to_string()]).unwrap();
+    tauqe_core::git::cmd::commit_with_developer_author(dir.path(), "Initial", false).unwrap();
+
+    let mut first = test_item("1", PlanItemStatus::Todo);
+    first.title = "Step 1".to_string();
+    first.files = vec!["src.rs".to_string()];
+    let mut second = test_item("2", PlanItemStatus::Todo);
+    second.title = "Step 2".to_string();
+    second.files = vec!["src.rs".to_string()];
+    let plan = Plan {
+        id: "abort-batch".to_string(),
+        title: "Abort Batch".to_string(),
+        created_at: 1,
+        updated_at: 1,
+        items: vec![first, second],
+        ..Default::default()
+    };
+    PlanStorage::save_plan(dir.path(), &plan).unwrap();
+
+    let marker = "ABORTBATCHM1";
+    // The coder cannot proceed without a host action and reports an
+    // unconditional abort together with the command the developer must run.
+    let abort_response = format!(
+        "<abort_{m} reason=\"Native build approval required\" recommendation=\"pnpm approve-builds\" />",
+        m = marker
+    );
+    // Only one round is scripted: an architect replanning cycle would need a
+    // second generation, so an exhausted script proves it never ran.
+    let provider = Arc::new(MockLlmProvider::scripted([MockResponse::text(
+        abort_response,
+    )]));
+
+    let mut config = tauqe_core::config::AppConfig::default();
+    config.develop.workflow = tauqe_protocol::WorkflowKind::Naive;
+    config.develop.protocol = tauqe_protocol::EditProtocolKind::Xml;
+    config.develop.max_replans = 2;
+    config.models.auto_level_up = false;
+    config.models.primary = vec![tauqe_protocol::ModelRef::openrouter("coder/model").into()];
+    config.models.architect = Some(vec![tauqe_protocol::ModelEntry::new(
+        tauqe_protocol::ModelRef::openrouter("planner/one"),
+        None,
+    )]);
+
+    let state = test_state_with_provider(&dir, config, provider.clone()).await;
+    *state.marker_override.lock().await = Some(marker.to_string());
+
+    let operation = Arc::new(
+        state
+            .try_begin_operation()
+            .expect("register batch operation"),
+    );
+    let outcome = run_plan_batch(
+        &state,
+        "abort-batch",
+        vec!["1".to_string(), "2".to_string()],
+        operation,
+    )
+    .await;
+
+    match outcome {
+        BatchOutcome::Failed {
+            completed,
+            step_id,
+            reason,
+        } => {
+            assert_eq!(completed, 0);
+            assert_eq!(step_id, "1");
+            assert!(
+                reason.contains("Execution aborted"),
+                "unexpected abort reason: {}",
+                reason
+            );
+            assert!(
+                reason.contains("pnpm approve-builds"),
+                "the recommendation must reach the developer: {}",
+                reason
+            );
+        }
+        other => panic!("Expected Failed outcome on abort, got {:?}", other),
+    }
+
+    // Exactly one generation ran: the aborting coder turn. No architect round
+    // was issued and the second step was never started.
+    let requests = provider.requests();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].model, "coder/model");
+
+    // The aborted step returns to TODO and nothing runs behind it; the working
+    // tree stays exactly as it was.
+    let reloaded = PlanStorage::load_plan(dir.path(), "abort-batch")
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        reloaded.find_item("1").unwrap().status,
+        PlanItemStatus::Todo
+    );
+    assert_eq!(
+        reloaded.find_item("2").unwrap().status,
+        PlanItemStatus::Todo
+    );
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("src.rs")).unwrap(),
+        "pub fn value() -> i32 { 0 }\n"
     );
 }
 
@@ -1720,8 +2063,12 @@ async fn test_plan_pipeline_blocked_by_failed_preflight() {
         ..Default::default()
     };
     PlanStorage::save_plan(dir.path(), &plan).unwrap();
-    // A malformed manifest makes the deterministic toolchain pipeline fail.
-    std::fs::write(dir.path().join("Cargo.toml"), "[package\n").unwrap();
+    // A failing verification command makes the deterministic pipeline fail.
+    std::fs::write(
+        dir.path().join("tauqe.toml"),
+        "[project.verify]\ncommand = \"false\"\n",
+    )
+    .unwrap();
     let state = test_state(&dir);
 
     let req = Request {
@@ -2075,5 +2422,190 @@ async fn test_plan_refine_fails_after_parse_retries_are_exhausted() {
     assert_eq!(
         reloaded.find_item("1").unwrap().status,
         PlanItemStatus::Todo
+    );
+}
+
+#[tokio::test]
+async fn test_handle_plan_delete_clears_focus_anchored_on_the_deleted_plan() {
+    let dir = TestDir::new();
+    for id in ["focus-del", "focus-keep", "focus-other"] {
+        let plan = Plan {
+            id: id.to_string(),
+            title: id.to_string(),
+            created_at: 1,
+            updated_at: 1,
+            items: vec![test_item("1", PlanItemStatus::Done)],
+            ..Default::default()
+        };
+        PlanStorage::save_plan(dir.path(), &plan).unwrap();
+    }
+
+    let (out, mut rx) = OutChannel::new();
+    let (hist_tx, _hist_rx) = tokio::sync::mpsc::unbounded_channel();
+    let state = AppState::new(
+        tauqe_core::config::AppConfig::default(),
+        dir.path().to_path_buf(),
+        hist_tx,
+        out,
+    );
+
+    let delete_request = |id: u64, plan_id: &str| Request {
+        id: tauqe_protocol::RequestId::Number(id),
+        method: tauqe_protocol::methods::PLAN_DELETE.to_string(),
+        params: Some(serde_json::json!({ "id": plan_id })),
+    };
+
+    // A focus anchored on the deleted plan is released with it.
+    state
+        .set_discussion_focus(tauqe_protocol::DiscussionFocus::plan("focus-del", vec![]))
+        .await;
+    let res = super::storage_ops::handle_plan_delete(delete_request(1, "focus-del"), &state).await;
+    assert!(res.error.is_none(), "delete failed: {:?}", res.error);
+    assert!(
+        state.discussion_focus().await.is_none(),
+        "a focus anchored on a deleted plan must be dropped"
+    );
+
+    // The release is broadcast so every client drops the dead anchor.
+    let mut emitted = Vec::new();
+    while let Ok(raw) = rx.try_recv() {
+        emitted.push(raw);
+    }
+    assert!(
+        emitted
+            .iter()
+            .any(|e| e.contains(events::DISCUSSION_FOCUS_CHANGED)),
+        "the focus release must be broadcast to clients"
+    );
+
+    // A focus anchored on a surviving plan is untouched by another deletion.
+    state
+        .set_discussion_focus(tauqe_protocol::DiscussionFocus::plan("focus-keep", vec![]))
+        .await;
+    let res =
+        super::storage_ops::handle_plan_delete(delete_request(2, "focus-other"), &state).await;
+    assert!(res.error.is_none(), "delete failed: {:?}", res.error);
+    assert_eq!(
+        state.discussion_focus().await,
+        tauqe_protocol::DiscussionFocus::plan("focus-keep", vec![])
+    );
+}
+
+/// Deleting the anchored plan releases the anchor as a typed payload.
+///
+/// The invariant is that a focus can never address a non-existent entity, so the
+/// release must travel as `DiscussionFocus::None` inside the broadcast event, not
+/// merely as an absent focus: every client reconstructs its anchor from that
+/// payload and would otherwise keep rendering a dead one (c-2).
+#[tokio::test]
+async fn test_handle_plan_delete_broadcasts_typed_focus_release() {
+    let dir = TestDir::new();
+    let plan = Plan {
+        id: "typed-focus".to_string(),
+        title: "Typed Focus".to_string(),
+        created_at: 1,
+        updated_at: 1,
+        items: vec![test_item("1", PlanItemStatus::Done)],
+        ..Default::default()
+    };
+    PlanStorage::save_plan(dir.path(), &plan).unwrap();
+
+    let (out, mut rx) = OutChannel::new();
+    let (hist_tx, _hist_rx) = tokio::sync::mpsc::unbounded_channel();
+    let state = AppState::new(
+        tauqe_core::config::AppConfig::default(),
+        dir.path().to_path_buf(),
+        hist_tx,
+        out,
+    );
+
+    state
+        .set_discussion_focus(tauqe_protocol::DiscussionFocus::plan(
+            "typed-focus",
+            vec!["1".to_string()],
+        ))
+        .await;
+    assert!(state.discussion_focus().await.is_active());
+    // The focus set itself broadcasts a change event; only the release that
+    // accompanies the deletion is under test here.
+    while rx.try_recv().is_ok() {}
+
+    let req = Request {
+        id: tauqe_protocol::RequestId::Number(1),
+        method: tauqe_protocol::methods::PLAN_DELETE.to_string(),
+        params: Some(serde_json::json!({ "id": "typed-focus" })),
+    };
+    let res = super::storage_ops::handle_plan_delete(req, &state).await;
+    assert!(res.error.is_none(), "delete failed: {:?}", res.error);
+
+    let mut release = None;
+    while let Ok(raw) = rx.try_recv() {
+        if raw.contains(events::DISCUSSION_FOCUS_CHANGED) {
+            release = Some(raw);
+        }
+    }
+    let release = release.expect("the focus release must be broadcast");
+    assert!(
+        release.contains("\"kind\":\"none\""),
+        "the release must carry an explicit detached focus: {release}"
+    );
+
+    assert!(state.discussion_focus().await.is_none());
+}
+
+/// The terminal batch event must name the operation the execute acknowledgement
+/// returned, so a client can attribute `plan/batch_finished` to the request it
+/// sent instead of correlating an unregistered identifier.
+#[tokio::test]
+async fn test_plan_batch_finished_carries_the_registered_operation_id() {
+    let dir = TestDir::new();
+    let plan = Plan {
+        id: "op-id".to_string(),
+        title: "Operation Id".to_string(),
+        created_at: 1,
+        updated_at: 1,
+        items: vec![test_item("1", PlanItemStatus::Todo)],
+        ..Default::default()
+    };
+    PlanStorage::save_plan(dir.path(), &plan).unwrap();
+
+    let (out, mut rx) = OutChannel::new();
+    let (hist_tx, _hist_rx) = tokio::sync::mpsc::unbounded_channel();
+    let state = AppState::new(
+        tauqe_core::config::AppConfig::default(),
+        dir.path().to_path_buf(),
+        hist_tx,
+        out,
+    );
+
+    let req = Request {
+        id: tauqe_protocol::RequestId::Number(1),
+        method: tauqe_protocol::methods::PLAN_EXECUTE.to_string(),
+        params: Some(serde_json::json!({ "plan_id": "op-id" })),
+    };
+    let res = handle_plan_execute(req, &state).await;
+    let val: serde_json::Value = res.result.expect("the batch must be acknowledged");
+    let acknowledged_id = val["operation_id"]
+        .as_str()
+        .expect("the acknowledgement carries the batch operation id")
+        .to_string();
+
+    // Without an API key the first turn cannot start, so the batch terminates
+    // immediately and publishes its single completion event.
+    let mut finished = None;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while finished.is_none() && std::time::Instant::now() < deadline {
+        while let Ok(raw) = rx.try_recv() {
+            if raw.contains(events::PLAN_BATCH_FINISHED) {
+                finished = Some(raw);
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    let finished = finished.expect("plan/batch_finished must be emitted");
+    let event: serde_json::Value = serde_json::from_str(&finished).expect("event is valid JSON");
+    assert_eq!(
+        event["params"]["operation_id"], acknowledged_id,
+        "the terminal event must name the operation the acknowledgement returned"
     );
 }

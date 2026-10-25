@@ -12,10 +12,13 @@ use std::collections::HashSet;
 use ratatui::style::{Style, Stylize};
 use ratatui::text::{Line, Span};
 use tauqe_protocol::{IssueStatus, IssueType, ModelSelection, PlanItem, PlanItemStatus};
+use time::macros::format_description;
 
+use crate::markdown::MarkdownBodyCache;
 use crate::theme::engine::current_engine;
 use crate::ui::wrap_lines;
 use crate::views::plans::architect_badge;
+use crate::views::plans::tree::prepare_plan_markdown;
 
 use super::VisibleReviewRow;
 
@@ -51,6 +54,20 @@ pub(crate) fn subplan_all_expanded(
         expanded.contains(&subplan_key(session_id, item_id, &step.id))
             && subplan_all_expanded(expanded, session_id, item_id, &step.children)
     })
+}
+
+/// Cache key of the rendered description body of a finding.
+///
+/// The `:d` segment keeps a description body disjoint from the subplan step
+/// bodies of the same finding, so one cache serves every body of the tree
+/// without a key collision (c-1).
+fn item_body_key(session_id: &str, item_id: u32) -> String {
+    format!("{}:{}:d", session_id, item_id)
+}
+
+/// Cache key of the rendered detail body of one subplan step.
+fn step_body_key(session_id: &str, item_id: u32, step_id: &str) -> String {
+    format!("{}:{}:s:{}:d", session_id, item_id, step_id)
 }
 
 /// Indent step, in columns, of one nesting level of the Review tree.
@@ -140,27 +157,24 @@ pub(crate) fn issue_status_style(status: IssueStatus) -> Style {
 
 /// Formats a Unix timestamp (seconds) as a compact UTC calendar instant
 /// (`YYYY-MM-DD HH:MM UTC`) for the session header.
+///
+/// The instant is derived and rendered by the ecosystem calendar crate, so this
+/// repository re-derives no civil-date arithmetic (Conventions §1.6). A value
+/// outside the representable calendar range degrades to its raw epoch form: a
+/// corrupt record stays visible instead of producing a plausible but wrong
+/// instant.
 pub(crate) fn format_created_at(seconds: u64) -> String {
-    let days = (seconds / 86_400) as i64;
-    let rem = seconds % 86_400;
-    let (hour, minute) = (rem / 3_600, (rem % 3_600) / 60);
-    let z = days + 719_468;
-    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
-    let doe = z - era * 146_097;
-    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let day = doy - (153 * mp + 2) / 5 + 1;
-    let month = if mp < 10 { mp + 3 } else { mp - 9 };
-    let year = if month <= 2 {
-        yoe + era * 400 + 1
-    } else {
-        yoe + era * 400
-    };
-    format!(
-        "{:04}-{:02}-{:02} {:02}:{:02} UTC",
-        year, month, day, hour, minute
-    )
+    i64::try_from(seconds)
+        .ok()
+        .and_then(|epoch| time::OffsetDateTime::from_unix_timestamp(epoch).ok())
+        .and_then(|instant| {
+            instant
+                .format(format_description!(
+                    "[year]-[month]-[day] [hour]:[minute] UTC"
+                ))
+                .ok()
+        })
+        .unwrap_or_else(|| seconds.to_string())
 }
 
 /// Compact indicator marking the row anchored by the active discussion focus.
@@ -219,31 +233,26 @@ fn subplan_progress(items: &[PlanItem]) -> (usize, usize) {
     (completed, total)
 }
 
+/// Badge naming the concrete model behind a finding's recorded selection.
+///
+/// A role is a selection mechanism, not a property of a printed name, so a
+/// role-driven selection prints the concrete model the published role summary
+/// resolves to and names it through the single interface formatter (c-2). An
+/// unresolved role yields an empty badge instead of a partial role name.
 pub(crate) fn model_badge(selection: &ModelSelection) -> Span<'static> {
     let engine = current_engine();
     let palette = engine.palette();
-    match selection {
-        ModelSelection::Role(role) => match role {
-            tauqe_protocol::ModelRole::Scribe => {
-                Span::styled(" [Scr]", engine.fg(palette.status_success))
-            }
-            tauqe_protocol::ModelRole::Coder => {
-                Span::styled(" [Cod]", engine.fg(palette.status_warning))
-            }
-            tauqe_protocol::ModelRole::Architect => {
-                Span::styled(" [Arc]", engine.fg(palette.status_error))
-            }
-            tauqe_protocol::ModelRole::Primary => {
-                Span::styled(" [Pri]", engine.fg(palette.status_info))
-            }
-            tauqe_protocol::ModelRole::Reviewer => {
-                Span::styled(" [Rev]", engine.fg(palette.button_active_bg))
-            }
-        },
-        ModelSelection::Specific(model_ref) => Span::styled(
-            format!(" [{}]", model_ref.name),
-            engine.fg(palette.status_info),
-        ),
+    let label = match selection {
+        ModelSelection::Specific(model) => Some(crate::model_display::model_label(model, None)),
+        ModelSelection::Tier { model, effort } => {
+            Some(crate::model_display::model_label(model, *effort))
+        }
+        ModelSelection::Role(role) => crate::model_display::role_entry(*role)
+            .map(|entry| crate::model_display::entry_label(&entry)),
+    };
+    match label {
+        Some(label) => Span::styled(format!(" [{}]", label), engine.fg(palette.status_info)),
+        None => Span::raw(""),
     }
 }
 
@@ -259,11 +268,11 @@ pub(crate) fn issue_status_label(status: IssueStatus) -> &'static str {
     }
 }
 
-pub(crate) fn location(files: &[String]) -> Option<String> {
-    if files.is_empty() {
+pub(crate) fn location(paths: &[String]) -> Option<String> {
+    if paths.is_empty() {
         None
     } else {
-        Some(files.join(", "))
+        Some(paths.join(", "))
     }
 }
 
@@ -293,11 +302,19 @@ fn pad_line_to_width(mut line: Line<'static>, width: usize, fill_style: Style) -
     line
 }
 
+/// Renders the flattened Review rows into lines and their row offsets.
+///
+/// The Markdown detail blocks of findings and of their subplan steps come from
+/// `cache` instead of being parsed afresh: a frame that only moved the cursor or
+/// scrolled reuses the lines already rendered for the unchanged description,
+/// while a changed description, indent, width, or palette re-renders exactly
+/// that one body (c-1, c-3).
 pub(crate) fn compute_unified_review_lines(
     rows: &[VisibleReviewRow],
     selected_idx: usize,
     width: usize,
     theme_mode: crate::config::ThemeMode,
+    cache: &mut MarkdownBodyCache,
 ) -> (Vec<Line<'static>>, Vec<usize>) {
     let engine = current_engine();
     let palette = engine.palette();
@@ -306,6 +323,13 @@ pub(crate) fn compute_unified_review_lines(
 
     for (idx, row) in rows.iter().enumerate() {
         let is_selected = idx == selected_idx;
+        // The blank separator between sessions belongs to the gap before a
+        // header, so it is emitted before the offset of that row is recorded.
+        // Otherwise the offset anchors the gap and scrolling stops one line
+        // short of the header it is meant to reveal.
+        if idx > 0 && matches!(row, VisibleReviewRow::SessionHeader { .. }) {
+            all_lines.push(Line::raw(""));
+        }
         offsets.push(all_lines.len());
 
         let row_style = if is_selected {
@@ -337,15 +361,15 @@ pub(crate) fn compute_unified_review_lines(
                 focused,
                 ..
             } => {
-                if idx > 0 {
-                    all_lines.push(Line::raw(""));
-                }
-
                 let fold_icon = if *is_expanded { "▼ " } else { "▶ " };
-                let stats_str = format!(
-                    "{}/{} fixed ({} todo, {} prog, {} disc, {} skip, {} rej)",
-                    fixed, total, todo, in_progress, discussion, skipped, rejected
-                );
+                let stats_str = crate::i18n::active_t("review.stats_breakdown")
+                    .replacen("{}", &fixed.to_string(), 1)
+                    .replacen("{}", &total.to_string(), 1)
+                    .replacen("{}", &todo.to_string(), 1)
+                    .replacen("{}", &in_progress.to_string(), 1)
+                    .replacen("{}", &discussion.to_string(), 1)
+                    .replacen("{}", &skipped.to_string(), 1)
+                    .replacen("{}", &rejected.to_string(), 1);
 
                 let mut spans = vec![
                     gutter,
@@ -434,6 +458,7 @@ pub(crate) fn compute_unified_review_lines(
                 all_lines.extend(wrap_lines(row_lines, width));
             }
             VisibleReviewRow::ReviewItem {
+                session_id,
                 item_id,
                 title,
                 issue_type,
@@ -486,16 +511,26 @@ pub(crate) fn compute_unified_review_lines(
                 if !files.is_empty() {
                     spans.push(Span::styled(
                         format!(
-                            " [{} file{}]",
-                            files.len(),
-                            if files.len() == 1 { "" } else { "s" }
+                            " [{}]",
+                            crate::i18n::active_t("plans.file_count").replacen(
+                                "{}",
+                                &files.len().to_string(),
+                                1
+                            )
                         ),
                         engine.fg(palette.text_muted),
                     ));
                 }
                 if !readonly_files.is_empty() {
                     spans.push(Span::styled(
-                        format!(" [{} readonly]", readonly_files.len()),
+                        format!(
+                            " [{}]",
+                            crate::i18n::active_t("review.readonly_count").replacen(
+                                "{}",
+                                &readonly_files.len().to_string(),
+                                1
+                            )
+                        ),
                         engine.fg(palette.text_muted),
                     ));
                 }
@@ -503,7 +538,12 @@ pub(crate) fn compute_unified_review_lines(
                     let (done, total) = subplan_progress(plan.as_slice());
                     if total > 0 {
                         spans.push(Span::styled(
-                            format!(" [{}/{} steps]", done, total),
+                            format!(
+                                " [{}]",
+                                crate::i18n::active_t("review.steps_count")
+                                    .replacen("{}", &done.to_string(), 1)
+                                    .replacen("{}", &total.to_string(), 1)
+                            ),
                             engine.fg(palette.status_info),
                         ));
                     }
@@ -520,6 +560,11 @@ pub(crate) fn compute_unified_review_lines(
                     item_line = pad_line_to_width(item_line, width, row_style);
                 }
                 let mut row_lines = vec![item_line];
+                // A cached Markdown body arrives already wrapped, so it is
+                // collected apart and appended after the metadata lines, which
+                // are short and wrapped every frame (c-1).
+                let mut detail_lines: Vec<Line<'static>> = Vec::new();
+
                 // The finding's own detail block renders at the level of its
                 // children, never deeper (Conventions §4.8).
                 let body_indent = review_body_indent(REVIEW_ITEM_LEVEL + 1);
@@ -619,10 +664,15 @@ pub(crate) fn compute_unified_review_lines(
                             format!("{body_indent}│ "),
                             engine.fg(palette.text_muted),
                         ));
-                        let md = crate::markdown::render_markdown(description.trim(), &theme);
-                        if !md.is_empty() {
-                            row_lines.extend(md);
-                        }
+                        let key = item_body_key(session_id, *item_id);
+                        let body = cache.lines_for(
+                            &key,
+                            description.trim(),
+                            &theme,
+                            Some(width),
+                            theme_mode,
+                        );
+                        detail_lines.extend(body.iter().cloned());
                     }
 
                     if !recommendations.is_empty() {
@@ -645,9 +695,13 @@ pub(crate) fn compute_unified_review_lines(
                     }
                 }
 
-                all_lines.extend(wrap_lines(row_lines, width));
+                let mut rendered = wrap_lines(row_lines, width);
+                rendered.extend(detail_lines);
+                all_lines.extend(rendered);
             }
             VisibleReviewRow::SubplanItem {
+                session_id,
+                item_id,
                 step_id,
                 title,
                 details,
@@ -656,6 +710,7 @@ pub(crate) fn compute_unified_review_lines(
                 readonly_files,
                 depends_on,
                 depth,
+                has_children,
                 is_expandable,
                 is_expanded,
                 ..
@@ -700,17 +755,21 @@ pub(crate) fn compute_unified_review_lines(
                     Span::raw(" "),
                     Span::styled(format!("#{} {}", step_id, clean_title), title_style),
                 ];
-                if !files.is_empty() || !readonly_files.is_empty() {
+                if !*has_children && (!files.is_empty() || !readonly_files.is_empty()) {
                     let mut parts = Vec::new();
                     if !files.is_empty() {
-                        parts.push(format!(
-                            "{} file{}",
-                            files.len(),
-                            if files.len() == 1 { "" } else { "s" }
+                        parts.push(crate::i18n::active_t("plans.file_count").replacen(
+                            "{}",
+                            &files.len().to_string(),
+                            1,
                         ));
                     }
                     if !readonly_files.is_empty() {
-                        parts.push(format!("{} ref", readonly_files.len()));
+                        parts.push(crate::i18n::active_t("plans.ref_count").replacen(
+                            "{}",
+                            &readonly_files.len().to_string(),
+                            1,
+                        ));
                     }
                     spans.push(Span::styled(
                         format!(" [{}]", parts.join(" + ")),
@@ -723,32 +782,50 @@ pub(crate) fn compute_unified_review_lines(
                     row_line = pad_line_to_width(row_line, width, row_style);
                 }
                 let mut row_lines = vec![row_line];
+                // Cached detail bodies arrive already wrapped, so they are
+                // appended after the short metadata lines (c-1).
+                let mut detail_lines: Vec<Line<'static>> = Vec::new();
 
                 if *is_expanded {
-                    if !files.is_empty() {
+                    if !*has_children && !files.is_empty() {
                         row_lines.push(Line::from(vec![
                             Span::styled(meta_prefix.clone(), engine.fg(palette.text_muted)),
-                            Span::styled("files: ", engine.fg(palette.text_muted)),
+                            Span::styled(
+                                format!("{} ", crate::i18n::active_t("plans.files_prefix")),
+                                engine.fg(palette.text_muted),
+                            ),
                             Span::styled(files.join(", "), engine.fg(palette.status_info)),
                         ]));
                     }
-                    if !readonly_files.is_empty() {
+                    if !*has_children && !readonly_files.is_empty() {
                         row_lines.push(Line::from(vec![
                             Span::styled(meta_prefix.clone(), engine.fg(palette.text_muted)),
-                            Span::styled("ref: ", engine.fg(palette.text_muted)),
+                            Span::styled(
+                                format!("{} ", crate::i18n::active_t("plans.ref_prefix")),
+                                engine.fg(palette.text_muted),
+                            ),
                             Span::styled(readonly_files.join(", "), engine.fg(palette.status_info)),
                         ]));
                     }
                     if !depends_on.is_empty() {
                         row_lines.push(Line::from(vec![
                             Span::styled(meta_prefix.clone(), engine.fg(palette.text_muted)),
-                            Span::styled("depends_on: ", engine.fg(palette.text_muted)),
+                            Span::styled(
+                                crate::i18n::active_t("review.depends_on_label"),
+                                engine.fg(palette.text_muted),
+                            ),
                             Span::styled(depends_on.join(", "), engine.fg(palette.status_warning)),
                         ]));
                     }
                     if let Some(det) = details {
-                        let trimmed = det.trim();
-                        if !trimmed.is_empty() {
+                        // Model-authored detail blocks inherit the leading
+                        // indent of the payload they were written in. Left as
+                        // is, CommonMark reads those lines as an indented code
+                        // block and renders framed, padded boxes that inflate
+                        // the row height, so the shared normalizer strips the
+                        // common indent first.
+                        let prepared = prepare_plan_markdown(det);
+                        if !prepared.is_empty() {
                             let mut theme =
                                 crate::markdown::MarkdownTheme::answer_themed(theme_mode);
                             theme.text_style = engine.fg(palette.text_secondary);
@@ -756,15 +833,17 @@ pub(crate) fn compute_unified_review_lines(
                             theme.compact = true;
                             theme.line_prefix =
                                 Some(Span::styled(meta_prefix, engine.fg(palette.text_muted)));
-                            let md = crate::markdown::render_markdown(trimmed, &theme);
-                            if !md.is_empty() {
-                                row_lines.extend(md);
-                            }
+                            let key = step_body_key(session_id, *item_id, step_id);
+                            let body =
+                                cache.lines_for(&key, &prepared, &theme, Some(width), theme_mode);
+                            detail_lines.extend(body.iter().cloned());
                         }
                     }
                 }
 
-                all_lines.extend(wrap_lines(row_lines, width));
+                let mut rendered = wrap_lines(row_lines, width);
+                rendered.extend(detail_lines);
+                all_lines.extend(rendered);
             }
         }
     }
@@ -874,6 +953,33 @@ mod tests {
             .unwrap_or_else(|| panic!("missing rendered line containing {needle}"))
     }
 
+    /// Renders the tree the way the view does, against the view's own body
+    /// cache, and returns the lines with their row offsets.
+    fn render_view(
+        view: &mut ReviewViewState,
+        selected: usize,
+        width: usize,
+    ) -> (Vec<Line<'static>>, Vec<usize>) {
+        let rows = view.flatten_rows();
+        compute_unified_review_lines(
+            &rows,
+            selected,
+            width,
+            view.theme_mode,
+            &mut view.markdown_cache,
+        )
+    }
+
+    /// Body lines of a rendered tree: the detail block lines that carry the `│`
+    /// body prefix, as opposed to the summary line of a row.
+    fn body_lines(lines: &[Line<'static>]) -> Vec<Line<'static>> {
+        lines
+            .iter()
+            .filter(|line| line_text(line).contains('│'))
+            .cloned()
+            .collect()
+    }
+
     #[test]
     fn test_expanded_session_header_renders_executive_summary_block() {
         let session = make_session_with_description(
@@ -881,13 +987,11 @@ mod tests {
             "## Overview\n\nThe architecture is sound.",
             &[1],
         );
-        let view = ReviewViewState {
+        let mut view = ReviewViewState {
             sessions: vec![session],
             ..Default::default()
         };
-        let rows = view.flatten_rows();
-        let (lines, _offsets) =
-            compute_unified_review_lines(&rows, 0, 80, crate::config::ThemeMode::Dark);
+        let (lines, _offsets) = render_view(&mut view, 0, 80);
         let texts: Vec<String> = lines.iter().map(|line| line.to_string()).collect();
 
         let summary_label = format!("{}:", crate::i18n::active_t("review.executive_summary"));
@@ -915,9 +1019,7 @@ mod tests {
             ..Default::default()
         };
         view.collapsed_sessions.insert("rev-collapsed".to_string());
-        let rows = view.flatten_rows();
-        let (lines, _offsets) =
-            compute_unified_review_lines(&rows, 0, 80, crate::config::ThemeMode::Dark);
+        let (lines, _offsets) = render_view(&mut view, 0, 80);
         let texts: Vec<String> = lines.iter().map(|line| line.to_string()).collect();
 
         let summary_label = format!("{}:", crate::i18n::active_t("review.executive_summary"));
@@ -949,7 +1051,7 @@ mod tests {
             })
         ));
 
-        let (lines, _) = compute_unified_review_lines(&rows, 0, 80, crate::config::ThemeMode::Dark);
+        let (lines, _) = render_view(&mut view, 0, 80);
         let texts: Vec<String> = lines.iter().map(|line| line.to_string()).collect();
         let summary_label = format!("{}:", crate::i18n::active_t("review.executive_summary"));
         assert!(texts.iter().any(|t| t.contains(&summary_label)));
@@ -969,7 +1071,7 @@ mod tests {
                 ..
             })
         ));
-        let (lines, _) = compute_unified_review_lines(&rows, 0, 80, crate::config::ThemeMode::Dark);
+        let (lines, _) = render_view(&mut view, 0, 80);
         let texts: Vec<String> = lines.iter().map(|line| line.to_string()).collect();
         assert!(texts.iter().any(|t| t.contains(&summary_label)));
         assert!(
@@ -1013,27 +1115,23 @@ mod tests {
             "crates/core/src/review.rs".to_string(),
             "crates/protocol/src/review.rs".to_string(),
         ];
-        let view = ReviewViewState {
+        let mut view = ReviewViewState {
             sessions: vec![session],
             ..Default::default()
         };
 
         // Collapsed item shows [2 files] badge
-        let rows = view.flatten_rows();
-        let (lines, _) =
-            compute_unified_review_lines(&rows, 1, 100, crate::config::ThemeMode::Dark);
+        let (lines, _) = render_view(&mut view, 1, 100);
         let texts: Vec<String> = lines.iter().map(|l| l.to_string()).collect();
         assert!(
-            texts.iter().any(|t| t.contains("[2 files]")),
+            texts.iter().any(|t| t.contains("[2 file(s)]")),
             "collapsed finding should display file count badge, got: {texts:?}"
         );
 
         // Expanded item renders full files line
         let mut view_expanded = view;
         view_expanded.toggle_item_expanded("rev-files", 1);
-        let rows_exp = view_expanded.flatten_rows();
-        let (lines_exp, _) =
-            compute_unified_review_lines(&rows_exp, 1, 100, crate::config::ThemeMode::Dark);
+        let (lines_exp, _) = render_view(&mut view_expanded, 1, 100);
         let texts_exp: Vec<String> = lines_exp.iter().map(|l| l.to_string()).collect();
         assert!(
             texts_exp.iter().any(|t| t.contains("Files: ")
@@ -1065,9 +1163,7 @@ mod tests {
         view.toggle_item_expanded("rev-skip", 1);
         view.toggle_item_expanded("rev-skip", 2);
 
-        let rows = view.flatten_rows();
-        let (lines, _) =
-            compute_unified_review_lines(&rows, 1, 100, crate::config::ThemeMode::Dark);
+        let (lines, _) = render_view(&mut view, 1, 100);
         let texts: Vec<String> = lines.iter().map(|l| l.to_string()).collect();
 
         // 1. Badge displays compact SKIP
@@ -1111,7 +1207,7 @@ mod tests {
         session.items[5].status = IssueStatus::Skipped;
         session.items[6].status = IssueStatus::Rejected;
 
-        let view = ReviewViewState {
+        let mut view = ReviewViewState {
             sessions: vec![session],
             ..Default::default()
         };
@@ -1139,8 +1235,7 @@ mod tests {
             panic!("expected SessionHeader row");
         }
 
-        let (lines, _) =
-            compute_unified_review_lines(&rows, 0, 200, crate::config::ThemeMode::Dark);
+        let (lines, _) = render_view(&mut view, 0, 200);
         let header_text = lines[0].to_string();
         assert!(
             header_text.contains("1/7 fixed (1 todo, 1 prog, 1 disc, 2 skip, 1 rej)"),
@@ -1161,22 +1256,28 @@ mod tests {
         assert_eq!(issue_status_label(IssueStatus::InProgress), "IN_PROGRESS");
     }
 
+    /// The instant is rendered by the ecosystem calendar crate, so the test
+    /// pins the epoch instant, a regular instant, a leap day, and a value
+    /// outside the representable calendar range (Conventions §1.6).
     #[test]
     fn test_format_created_at_is_utc_and_stable() {
         assert_eq!(format_created_at(0), "1970-01-01 00:00 UTC");
         assert_eq!(format_created_at(1_700_000_000), "2023-11-14 22:13 UTC");
+        // A leap day pins the calendar arithmetic to the ecosystem crate.
+        assert_eq!(format_created_at(1_709_164_800), "2024-02-29 00:00 UTC");
+        // A value outside the representable calendar range degrades to its raw
+        // epoch form instead of a plausible but wrong instant.
+        assert_eq!(format_created_at(u64::MAX), u64::MAX.to_string());
     }
 
     #[test]
     fn test_session_header_renders_created_date() {
         let session = make_session("rev-date", &[1]);
-        let view = ReviewViewState {
+        let mut view = ReviewViewState {
             sessions: vec![session],
             ..Default::default()
         };
-        let rows = view.flatten_rows();
-        let (lines, _) =
-            compute_unified_review_lines(&rows, 0, 120, crate::config::ThemeMode::Dark);
+        let (lines, _) = render_view(&mut view, 0, 120);
         let header_text = lines[0].to_string();
         assert!(
             header_text.contains("1970-01-01 00:00 UTC"),
@@ -1194,9 +1295,7 @@ mod tests {
         };
         view.toggle_item_expanded("rev-refine-badge", 1);
 
-        let rows = view.flatten_rows();
-        let (lines, _) =
-            compute_unified_review_lines(&rows, 1, 120, crate::config::ThemeMode::Dark);
+        let (lines, _) = render_view(&mut view, 1, 120);
         let text: String = lines.iter().map(|line| line.to_string()).collect();
 
         // The authoritative category drives the badge directly.
@@ -1248,8 +1347,7 @@ mod tests {
             }
         )));
 
-        let (lines, _) =
-            compute_unified_review_lines(&rows, 1, 120, crate::config::ThemeMode::Dark);
+        let (lines, _) = render_view(&mut view, 1, 120);
         let mut text = String::new();
         for line in &lines {
             for span in &line.spans {
@@ -1342,23 +1440,19 @@ mod tests {
         view.toggle_item_expanded("rev-sub", 1);
 
         // Folded step shows only its title and the file badge.
-        let rows = view.flatten_rows();
-        let (lines, _) =
-            compute_unified_review_lines(&rows, 2, 160, crate::config::ThemeMode::Dark);
+        let (lines, _) = render_view(&mut view, 2, 160);
         let folded: String = lines
             .iter()
             .flat_map(|line| line.spans.iter().map(|span| span.content.to_string()))
             .collect();
         assert!(folded.contains("#1.1 Wire the auth guard"), "{folded}");
-        assert!(folded.contains("[1 file + 1 ref]"), "{folded}");
+        assert!(folded.contains("[1 file(s) + 1 ref(s)]"), "{folded}");
         assert!(!folded.contains("depends_on: 1"), "{folded}");
 
         // Expanded step reveals target files, references, dependencies, and the
         // formatted description block.
         view.toggle_subplan_item_expanded("rev-sub", 1, "1.1");
-        let rows = view.flatten_rows();
-        let (lines, _) =
-            compute_unified_review_lines(&rows, 2, 160, crate::config::ThemeMode::Dark);
+        let (lines, _) = render_view(&mut view, 2, 160);
         let expanded: String = lines
             .iter()
             .flat_map(|line| line.spans.iter().map(|span| span.content.to_string()))
@@ -1383,7 +1477,7 @@ mod tests {
             tauqe_protocol::ModelRef::openrouter("planner/model"),
             Some(tauqe_protocol::ReasoningEffort::XHigh),
         ));
-        let view = ReviewViewState {
+        let mut view = ReviewViewState {
             sessions: vec![session],
             ..Default::default()
         };
@@ -1397,11 +1491,10 @@ mod tests {
             }
         )));
 
-        let (lines, _) =
-            compute_unified_review_lines(&rows, 1, 160, crate::config::ThemeMode::Dark);
+        let (lines, _) = render_view(&mut view, 1, 160);
         let text = lines.iter().map(line_text).collect::<Vec<_>>().join("\n");
         assert!(
-            text.contains("[ARC openrouter:planner/model xhigh]"),
+            text.contains("[ARC] planner/model [xhigh]"),
             "the finding must name the Architect model and depth: {text}"
         );
     }
@@ -1424,9 +1517,7 @@ mod tests {
         view.toggle_item_expanded("rev-indent", 1);
         view.toggle_subplan_item_expanded("rev-indent", 1, "1");
 
-        let rows = view.flatten_rows();
-        let (lines, _offsets) =
-            compute_unified_review_lines(&rows, 0, 160, crate::config::ThemeMode::Dark);
+        let (lines, _offsets) = render_view(&mut view, 0, 160);
 
         let header = leading_indent(&lines[find_line(&lines, "[rev-indent]")]);
         let summary = leading_indent(&lines[find_line(&lines, "Executive Summary:")]);
@@ -1488,8 +1579,7 @@ mod tests {
         view.collapsed_sessions.insert("rev-state".to_string());
         let rows = view.flatten_rows();
         assert_eq!(rows.len(), 1, "a collapsed session exposes only its header");
-        let (lines, _) =
-            compute_unified_review_lines(&rows, usize::MAX, 160, crate::config::ThemeMode::Dark);
+        let (lines, _) = render_view(&mut view, usize::MAX, 160);
         let header = leading_indent(&lines[find_line(&lines, "[rev-state]")]);
         assert_eq!(header, 1, "the session header sits at the root level");
         let rendered = lines.iter().map(line_text).collect::<Vec<_>>().join("\n");
@@ -1506,9 +1596,7 @@ mod tests {
         // summary, and the finding, but no subplan rows; each nested row is
         // strictly deeper than its parent.
         view.collapsed_sessions.clear();
-        let rows = view.flatten_rows();
-        let (lines, _) =
-            compute_unified_review_lines(&rows, usize::MAX, 160, crate::config::ThemeMode::Dark);
+        let (lines, _) = render_view(&mut view, usize::MAX, 160);
         let header = leading_indent(&lines[find_line(&lines, "[rev-state]")]);
         let summary = leading_indent(&lines[find_line(&lines, "Executive Summary:")]);
         let item = leading_indent(&lines[find_line(&lines, "#1 Finding 1")]);
@@ -1524,9 +1612,7 @@ mod tests {
         // finding and keeps the finding body at the children level.
         view.toggle_item_expanded("rev-state", 1);
         view.toggle_subplan_item_expanded("rev-state", 1, "1");
-        let rows = view.flatten_rows();
-        let (lines, _) =
-            compute_unified_review_lines(&rows, usize::MAX, 160, crate::config::ThemeMode::Dark);
+        let (lines, _) = render_view(&mut view, usize::MAX, 160);
         let item = leading_indent(&lines[find_line(&lines, "#1 Finding 1")]);
         let step = leading_indent(&lines[find_line(&lines, "#1 Container step")]);
         let leaf = leading_indent(&lines[find_line(&lines, "#1.1 Leaf step")]);
@@ -1543,6 +1629,185 @@ mod tests {
             summary_body <= item,
             "the session summary body must never sit deeper than its findings: \
              {summary_body} > {item}"
+        );
+    }
+
+    /// Model-authored subplan details arrive inside an XML payload, so every
+    /// line of the block carries the same leading indent. Rendered raw,
+    /// CommonMark reads that indent as an indented code block and paints a
+    /// header-bearing, background-filled block that inflates the row height;
+    /// the shared normalizer must strip it first (c-3).
+    #[test]
+    fn test_subplan_step_details_are_normalized_before_markdown_rendering() {
+        use crate::markdown::{render_markdown, MarkdownTheme, COPY_BUTTON_LABEL};
+
+        let indented_details = concat!(
+            "    Guard must reject anonymous callers.\n",
+            "    Reuse the existing policy object.\n",
+            "\n",
+            "    Emit a structured error.",
+        );
+
+        // Guard the probe: the raw payload really would become a code block,
+        // so the assertion below cannot pass vacuously.
+        let raw = render_markdown(indented_details, &MarkdownTheme::answer());
+        let raw_text = raw
+            .iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            raw_text.contains(COPY_BUTTON_LABEL),
+            "the raw indented payload must render as a code block: {raw_text}"
+        );
+
+        let mut session = make_session("rev-details", &[1]);
+        session.items[0] = ReviewItem::from(ReviewIssue {
+            plan: vec![PlanItem {
+                details: Some(indented_details.to_string()),
+                ..subplan_step("1.1", "Wire the auth guard", PlanItemStatus::InProgress)
+            }],
+            ..make_item(1)
+        });
+        let mut view = ReviewViewState {
+            sessions: vec![session],
+            ..Default::default()
+        };
+        view.toggle_item_expanded("rev-details", 1);
+        view.toggle_subplan_item_expanded("rev-details", 1, "1.1");
+
+        let (lines, _) = render_view(&mut view, usize::MAX, 160);
+        let text = lines.iter().map(line_text).collect::<Vec<_>>().join("\n");
+
+        assert!(
+            !text.contains(COPY_BUTTON_LABEL),
+            "normalized details must never render as a code block: {text}"
+        );
+        for expected in [
+            "Guard must reject anonymous callers.",
+            "Reuse the existing policy object.",
+            "Emit a structured error.",
+        ] {
+            assert!(text.contains(expected), "missing `{expected}` in: {text}");
+        }
+        let body = &lines[find_line(&lines, "Reuse the existing policy object.")];
+        assert_eq!(
+            line_text(body).matches('│').count(),
+            1,
+            "a normalized detail line keeps exactly one prefix bar: {}",
+            line_text(body)
+        );
+    }
+
+    /// A container step delegates its target files to its leaves, so it must
+    /// neither advertise a file badge nor repeat the paths in its detail block;
+    /// otherwise one path is listed at every level and the row height grows for
+    /// nothing (c-3).
+    #[test]
+    fn test_container_subplan_step_suppresses_its_own_file_lists() {
+        let mut session = make_session("rev-container", &[1]);
+        session.items[0] = ReviewItem::from(ReviewIssue {
+            plan: vec![PlanItem {
+                details: Some("Parent owns the child scope.".to_string()),
+                files: vec!["src/parent_only.rs".to_string()],
+                readonly_files: vec!["contracts/parent_only.md".to_string()],
+                children: vec![PlanItem {
+                    files: vec!["src/auth.rs".to_string()],
+                    readonly_files: vec!["contracts/api.md".to_string()],
+                    ..subplan_step("1.1", "Leaf step", PlanItemStatus::Todo)
+                }],
+                ..subplan_step("1", "Container step", PlanItemStatus::Todo)
+            }],
+            ..make_item(1)
+        });
+        let mut view = ReviewViewState {
+            sessions: vec![session],
+            ..Default::default()
+        };
+        view.toggle_item_expanded("rev-container", 1);
+
+        // A folded container advertises no file badge at all.
+        let (lines, _) = render_view(&mut view, usize::MAX, 160);
+        let container = &lines[find_line(&lines, "#1 Container step")];
+        assert!(
+            !line_text(container).contains("file"),
+            "a container must not advertise a file badge: {}",
+            line_text(container)
+        );
+
+        // An expanded container renders its details but neither its own
+        // `files:` nor its own `ref:` line, so its paths never surface.
+        view.toggle_subplan_item_expanded("rev-container", 1, "1");
+        let (lines, _) = render_view(&mut view, usize::MAX, 160);
+        let text = lines.iter().map(line_text).collect::<Vec<_>>().join("\n");
+        assert!(text.contains("Parent owns the child scope."), "{text}");
+        assert!(!text.contains("src/parent_only.rs"), "{text}");
+        assert!(!text.contains("contracts/parent_only.md"), "{text}");
+        assert!(!text.contains("files:"), "{text}");
+        assert!(!text.contains("ref:"), "{text}");
+
+        // The leaf keeps its own contracts once it is unfolded.
+        view.toggle_subplan_item_expanded("rev-container", 1, "1.1");
+        let (lines, _) = render_view(&mut view, usize::MAX, 160);
+        let text = lines.iter().map(line_text).collect::<Vec<_>>().join("\n");
+        assert!(text.contains("files: src/auth.rs"), "{text}");
+        assert!(text.contains("ref: contracts/api.md"), "{text}");
+        assert!(!text.contains("src/parent_only.rs"), "{text}");
+    }
+
+    /// A cursor move or a scroll re-renders every row, but the Markdown bodies of
+    /// the findings and of their subplan steps must come back from the cache
+    /// unchanged instead of being parsed again (c-1).
+    #[test]
+    fn test_navigation_reuses_cached_review_bodies_and_keeps_their_lines() {
+        let mut session = make_session("rev-cache", &[1]);
+        session.items[0] = ReviewItem::from(ReviewIssue {
+            description: "The guard trusts the request header.".to_string(),
+            plan: vec![PlanItem {
+                details: Some("Validate the signature before decoding.".to_string()),
+                ..subplan_step("1.1", "Verify the token", PlanItemStatus::Todo)
+            }],
+            ..make_item(1)
+        });
+        let mut view = ReviewViewState {
+            sessions: vec![session],
+            ..Default::default()
+        };
+        view.toggle_item_expanded("rev-cache", 1);
+        view.toggle_subplan_item_expanded("rev-cache", 1, "1.1");
+        let step_row = view
+            .flatten_rows()
+            .iter()
+            .position(|row| matches!(row, VisibleReviewRow::SubplanItem { .. }))
+            .expect("the subplan step row is visible");
+
+        let (first, _) = render_view(&mut view, 1, 120);
+        let first_text = first.iter().map(line_text).collect::<Vec<_>>().join("\n");
+        assert!(
+            first_text.contains("The guard trusts the request header."),
+            "the finding body must render: {first_text}"
+        );
+        assert!(
+            first_text.contains("Validate the signature before decoding."),
+            "the step body must render: {first_text}"
+        );
+        assert_eq!(
+            view.markdown_cache.len(),
+            2,
+            "one cached body per rendered description"
+        );
+
+        // Moving the cursor re-renders every row but must reuse both bodies.
+        let (second, _) = render_view(&mut view, step_row, 120);
+        assert_eq!(
+            view.markdown_cache.len(),
+            2,
+            "navigation must neither add nor drop a cached body"
+        );
+        assert_eq!(
+            body_lines(&second),
+            body_lines(&first),
+            "navigation must not change a rendered body"
         );
     }
 }

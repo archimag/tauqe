@@ -3,12 +3,14 @@
 use std::sync::Arc;
 
 use tauqe_core::plan::storage::PlanStorage;
+use tauqe_protocol::discussion::DiscussionTarget;
 use tauqe_protocol::{
     errors, events, PlanClearHorizonParams, PlanClearHorizonResult, PlanDeleteParams,
     PlanGetParams, PlanGetResult, PlanListChangedEvent, PlanListResult, PlanSaveParams,
     PlanSetActiveParams, PlanUpdateItemParams, PlanUpdatedEvent, Request, Response,
 };
 
+use crate::handlers::common::release_focus_anchored_on;
 use crate::state::AppState;
 
 use super::common::{emit, find_duplicate_item_ids, offload_plan};
@@ -38,21 +40,25 @@ pub async fn handle_plan_list(req: Request, state: &Arc<AppState>) -> Response {
 }
 
 pub async fn handle_plan_get(req: Request, state: &Arc<AppState>) -> Response {
-    let target_id = req.params.and_then(|p| {
-        if let Ok(params) = serde_json::from_value::<PlanGetParams>(p.clone()) {
-            if !params.id.trim().is_empty() {
-                return Some(params.id);
+    // Strict wire-contract parse: a present payload must decode through the
+    // typed DTO, so a malformed `id` answers INVALID_PARAMS instead of
+    // silently resolving through the active plan (Conventions §2.5). An
+    // absent payload or an empty id still means "the active plan", which is
+    // how the client requests the current plan.
+    let target_id = match req.params {
+        None => None,
+        Some(payload) => match serde_json::from_value::<PlanGetParams>(payload) {
+            Ok(params) if !params.id.trim().is_empty() => Some(params.id),
+            Ok(_) => None,
+            Err(err) => {
+                return Response::err(
+                    req.id,
+                    errors::INVALID_PARAMS,
+                    format!("Invalid plan get parameters: {}", err),
+                );
             }
-        }
-        if let Ok(val) = serde_json::from_value::<serde_json::Value>(p) {
-            if let Some(id_str) = val.get("id").and_then(|v| v.as_str()) {
-                if !id_str.trim().is_empty() {
-                    return Some(id_str.to_string());
-                }
-            }
-        }
-        None
-    });
+        },
+    };
 
     let repo_root = state.context.read().await.repo_root().to_path_buf();
 
@@ -333,6 +339,19 @@ pub async fn handle_plan_delete(req: Request, state: &Arc<AppState>) -> Response
     match offload_plan(move || PlanStorage::delete_plan(&delete_root, &plan_id)).await {
         Ok(deleted) => {
             if deleted {
+                // Discussion Focus invariant: an anchor may never address a
+                // deleted entity. A focus bound to the removed plan is
+                // released together with it through the shared release helper,
+                // which broadcasts the release so every client drops the dead
+                // anchor instead of rendering it.
+                release_focus_anchored_on(
+                    state,
+                    &DiscussionTarget::Plan {
+                        id: params.id.clone(),
+                    },
+                )
+                .await;
+
                 let list_root = repo_root.clone();
                 if let Ok((plans, active_id)) = offload_plan(move || {
                     let plans = PlanStorage::load_all(&list_root)?;

@@ -15,7 +15,7 @@ pub fn compute_model_lines(model: &mut ReplView) -> Vec<Line<'static>> {
 
     if let Some(err) = &model.error {
         model_lines.push(Line::from(vec![
-            Span::raw("Error: "),
+            Span::raw(crate::i18n::active_t("repl.error_label")),
             Span::styled(err.clone(), engine.fg(palette.status_error)),
         ]));
     }
@@ -26,27 +26,36 @@ pub fn compute_model_lines(model: &mut ReplView) -> Vec<Line<'static>> {
                 let spin = SPINNER_FRAMES[model.spinner_frame % SPINNER_FRAMES.len()];
                 (
                     Span::styled(
-                        format!(" [{}] TOOLCHAIN ", spin),
+                        crate::i18n::active_t("repl.toolchain_badge_running")
+                            .replacen("{}", spin, 1),
                         indicator_style(&engine, palette.status_info),
                     ),
-                    format!("Running `{}`...", command),
+                    crate::i18n::active_t("repl.toolchain_running").replacen(
+                        "{}",
+                        command.as_str(),
+                        1,
+                    ),
                 )
             }
             ToolchainState::Passed { command } => (
                 Span::styled(
-                    " [TOOLCHAIN: OK] ",
+                    crate::i18n::active_t("repl.toolchain_badge_passed"),
                     indicator_style(&engine, palette.status_success),
                 ),
-                format!("`{}` passed", command),
+                crate::i18n::active_t("repl.toolchain_passed").replacen("{}", command.as_str(), 1),
             ),
             ToolchainState::Failed { command, message } => (
                 Span::styled(
-                    " [TOOLCHAIN: FAILED] ",
+                    crate::i18n::active_t("repl.toolchain_badge_failed"),
                     indicator_style(&engine, palette.status_error),
                 ),
-                message
-                    .clone()
-                    .unwrap_or_else(|| format!("`{}` failed", command)),
+                message.clone().unwrap_or_else(|| {
+                    crate::i18n::active_t("repl.toolchain_failed").replacen(
+                        "{}",
+                        command.as_str(),
+                        1,
+                    )
+                }),
             ),
         };
 
@@ -88,24 +97,28 @@ pub fn compute_model_lines(model: &mut ReplView) -> Vec<Line<'static>> {
             Some(true) => {
                 if let Some(hash) = &model.last_commit_hash {
                     Span::styled(
-                        format!(" [COMMITTED: {}] ", hash),
+                        crate::i18n::active_t("repl.edits_badge_committed").replacen(
+                            "{}",
+                            hash.as_str(),
+                            1,
+                        ),
                         indicator_style(&engine, palette.status_success),
                     )
                 } else {
                     Span::styled(
-                        " [APPLIED] ",
+                        crate::i18n::active_t("repl.edits_badge_applied"),
                         indicator_style(&engine, palette.status_success),
                     )
                 }
             }
             Some(false) => Span::styled(
-                " [REJECTED] ",
+                crate::i18n::active_t("repl.edits_badge_rejected"),
                 indicator_style(&engine, palette.status_error),
             ),
             None => {
                 let spin = SPINNER_FRAMES[model.spinner_frame % SPINNER_FRAMES.len()];
                 Span::styled(
-                    format!(" [{}] Modifying ", spin),
+                    crate::i18n::active_t("repl.edits_badge_modifying").replacen("{}", spin, 1),
                     indicator_style(&engine, palette.status_warning),
                 )
             }
@@ -116,10 +129,11 @@ pub fn compute_model_lines(model: &mut ReplView) -> Vec<Line<'static>> {
             Span::raw(" "),
             Span::styled(
                 format!(
-                    "{} ({}/{} files)",
+                    "{} {}",
                     crate::i18n::active_t("repl.proposed_edits"),
-                    ok_files,
-                    total_files
+                    crate::i18n::active_t("repl.edits_files_progress")
+                        .replacen("{}", &ok_files.to_string(), 1)
+                        .replacen("{}", &total_files.to_string(), 1)
                 ),
                 engine.fg(palette.status_info).bold(),
             ),
@@ -129,7 +143,10 @@ pub fn compute_model_lines(model: &mut ReplView) -> Vec<Line<'static>> {
 
         if let Some(summary) = &model.last_commit_summary {
             model_lines.push(Line::from(vec![
-                Span::raw("  Summary: "),
+                Span::raw(format!(
+                    "  {}",
+                    crate::i18n::active_t("repl.edits_summary_label")
+                )),
                 Span::styled(summary.clone(), Style::default().bold()),
             ]));
         }
@@ -158,28 +175,26 @@ pub fn compute_model_lines(model: &mut ReplView) -> Vec<Line<'static>> {
 
             let hunk_count = file.hunks.len();
             let hunk_label = match file.op_type {
-                EditOp::Move => "renamed".to_string(),
-                EditOp::Overwrite => "rewritten".to_string(),
-                EditOp::Delete => "deleted".to_string(),
+                EditOp::Move => crate::i18n::active_t("repl.hunk_renamed"),
+                EditOp::Overwrite => crate::i18n::active_t("repl.hunk_rewritten"),
+                EditOp::Delete => crate::i18n::active_t("repl.hunk_deleted"),
                 EditOp::Create => {
                     let line_count = file
                         .hunks
                         .first()
                         .map(|h| h.new_text.lines().count())
                         .unwrap_or(0);
-                    if line_count == 1 {
-                        "1 line".to_string()
-                    } else {
-                        format!("{} lines", line_count)
-                    }
+                    crate::i18n::active_t("repl.hunk_line_count").replacen(
+                        "{}",
+                        &line_count.to_string(),
+                        1,
+                    )
                 }
-                EditOp::Replace => {
-                    if hunk_count == 1 {
-                        "1 hunk".to_string()
-                    } else {
-                        format!("{} hunks", hunk_count)
-                    }
-                }
+                EditOp::Replace => crate::i18n::active_t("repl.hunk_count").replacen(
+                    "{}",
+                    &hunk_count.to_string(),
+                    1,
+                ),
             };
 
             let file_line_style = if is_selected {
@@ -204,7 +219,11 @@ pub fn compute_model_lines(model: &mut ReplView) -> Vec<Line<'static>> {
                 if let Some(retry) = &file.retry_info {
                     file_spans.push(Span::raw(" "));
                     file_spans.push(Span::styled(
-                        format!("(Retrying {})", retry),
+                        crate::i18n::active_t("repl.edits_retry_label").replacen(
+                            "{}",
+                            retry.as_str(),
+                            1,
+                        ),
                         engine.fg(palette.status_warning).bold(),
                     ));
                 }

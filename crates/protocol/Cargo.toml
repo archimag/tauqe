@@ -9,9 +9,7 @@ workspace = true
 
 [dependencies]
 serde.workspace = true
-# `preserve_order` keeps JSON object keys in insertion order (IndexMap instead
-# of BTreeMap). The strict discussion schema depends on it: `message` must stay
-# the first property so language models stream the conversational answer before
-# the structural fields. The feature is workspace-global through Cargo feature
-# unification, so enabling it here also affects every other crate.
-serde_json = { workspace = true, features = ["preserve_order"] }
+# `preserve_order` is declared once on the workspace entry, so every member
+# observes the same unified feature set and this crate stays free of a
+# member-level feature declaration.
+serde_json.workspace = true

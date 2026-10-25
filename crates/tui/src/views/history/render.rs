@@ -5,6 +5,8 @@ use ratatui::widgets::{Block, Padding, Paragraph};
 
 use crate::app::AppState;
 use crate::i18n::active_t;
+use crate::ui::geometry;
+use crate::ui::UiAction;
 
 use super::{clamp_u16, layout_history};
 
@@ -47,11 +49,49 @@ pub fn render_history_view(
     let total_lines = history_lines.len();
     state.history_view.rendered_lines_count = total_lines;
     state.history_view.code_blocks = code_blocks;
-    state.history_view.content_rect = (inner.x, inner.y, inner.width, content_height);
 
     let max_scroll = clamp_u16(total_lines).saturating_sub(content_height);
     if state.history_view.auto_scroll || state.history_view.scroll > max_scroll {
         state.history_view.scroll = max_scroll;
+    }
+
+    // History owns its Markdown geometry: each visible block declares its body
+    // and then the copy button of its header, because a later registration wins
+    // over the surface it covers. The dispatcher resolves a click through the
+    // shared registry instead of re-deriving the line prefix and the scroll
+    // offset (c-1, c-2).
+    let scroll = state.history_view.scroll;
+    let prefix_cols = u16::try_from(super::LINE_PREFIX.len()).unwrap_or(0);
+    let mut block_regions: Vec<(Rect, UiAction)> = Vec::new();
+    for block in &state.history_view.code_blocks {
+        if let Some(rect) = geometry::code_block_body_rect(
+            inner,
+            block.visual_start_line,
+            block.visual_end_line,
+            scroll,
+            content_height,
+        ) {
+            block_regions.push((rect, UiAction::CodeBlockBody));
+        }
+        if let Some(rect) = geometry::code_copy_button_rect(
+            inner,
+            prefix_cols,
+            &block.lang,
+            block.visual_start_line,
+            scroll,
+            content_height,
+        ) {
+            block_regions.push((
+                rect,
+                UiAction::CopyCodeBlock {
+                    item: Some(block.item_id),
+                    block: block.block_id,
+                },
+            ));
+        }
+    }
+    for (rect, action) in block_regions {
+        state.hit_regions.register(rect, action);
     }
 
     let history_paragraph = Paragraph::new(history_lines)
