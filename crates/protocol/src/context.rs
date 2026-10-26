@@ -24,6 +24,12 @@ pub struct ContextItem {
     pub estimated_tokens: u64,
     #[serde(default)]
     pub layer: ContextLayer,
+    /// Monotonic insertion watermark of the path in the context.
+    ///
+    /// A payload written before the watermark existed decodes it as `0`, so
+    /// stored context states keep loading without a migration.
+    #[serde(default)]
+    pub insertion_seq: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -90,6 +96,28 @@ pub struct ContextChangedEvent {
 mod tests {
     use super::*;
 
+    #[test]
+    fn test_context_item_insertion_seq_backward_compatible() {
+        // A payload written before the insertion watermark existed decodes it
+        // as 0 instead of rejecting the record.
+        let legacy =
+            r#"{"path":"src/lib.rs","access":"read_only","size_bytes":10,"estimated_tokens":3}"#;
+        let item: ContextItem = serde_json::from_str(legacy).unwrap();
+        assert_eq!(item.insertion_seq, 0);
+        assert_eq!(item.layer, ContextLayer::User);
+
+        // A fresh record carries the watermark through a full round-trip.
+        let fresh = ContextItem {
+            path: "src/main.rs".to_string(),
+            access: ContextAccess::Editable,
+            size_bytes: 12,
+            estimated_tokens: 4,
+            layer: ContextLayer::Auto,
+            insertion_seq: 7,
+        };
+        let json = serde_json::to_string(&fresh).unwrap();
+        assert_eq!(serde_json::from_str::<ContextItem>(&json).unwrap(), fresh);
+    }
     #[test]
     fn test_context_access_serde() {
         let ro = ContextAccess::ReadOnly;

@@ -12,7 +12,7 @@ use ratatui::widgets::{Paragraph, Wrap};
 use unicode_width::UnicodeWidthStr;
 
 use crate::components::modal::{
-    modal_geometry, render_dialog_footer, render_modal_container, ModalTone,
+    modal_geometry, render_dialog_footer, render_modal_container, verb_hint, ModalTone,
 };
 use crate::i18n::active_t;
 use crate::theme::engine::current_engine;
@@ -112,7 +112,7 @@ pub fn render_disconnected_popup(frame: &mut ratatui::Frame, message: &str) {
     render_dialog_footer(
         frame,
         geometry.hint_row,
-        &active_t("dialog.server_disconnected.footer"),
+        &verb_hint(active_t("dialog.server_disconnected.footer")),
     );
 }
 

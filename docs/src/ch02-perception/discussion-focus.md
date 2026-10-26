@@ -29,8 +29,10 @@ only wanted to inspect, and requirements drift silently.
 
 1. **The target is typed.** The mode and the addressed entity travel as typed
    request fields; nothing is inferred from the body of a prompt.
-2. **A plan discussion is read-only.** It runs on the discussion capability profile
-   with no file edits and no toolchain verification.
+2. **Edits follow a direct request.** Both dialogue contours run on the main
+   capability surface of an interactive turn, and the authorization rule — not the
+   contour — decides whether a file changes: a file is edited only when the
+   developer asks for that change directly.
 3. **A review focus stays actionable.** It keeps the interactive editing surface on
    purpose, so the same dialogue can reason about a finding and apply its fix.
 4. **The anchor survives a plain ask.** While a focus is active, every ordinary
@@ -70,18 +72,21 @@ decimal string form of finding identifiers for a review session.
 - **Quick focus** — setting the anchor from Plans or Review without leaving the
   view or typing a prompt.
 - **Stale anchor** — a focus whose entity no longer exists.
-- **Discussion profile** — the reduced capability set used by a read-only
-  discussion.
+- **Regime profile** — the two typed capability lists a regime declares: a main
+  surface rendered into the byte-stable head and shared by every dialogue, and a
+  delta rendered into the tail.
 
 ### 2.4 Intent mapping
 
 | Target | Turn intent | Capability surface |
 | --- | --- | --- |
-| `Plan { id }` | `ReadonlyDiscussion` | text, discovery, plan creation/update, user language |
-| `Review { id }` | `InteractiveRepl` | the full develop surface, including file edits |
+| `Plan { id }` | `PlanDiscussion` | the main dialogue surface plus the plan-mutation delta |
+| `Review { id }` | `InteractiveRepl` | the main dialogue surface, with an empty profile delta |
 
 The mapping is a typed decision, not a text check. It is the single place that
-decides whether a focused turn may modify code.
+decides which regime a focused dialogue runs in: both targets reach the same
+editing surface, and only the plan target adds the capability that persists a
+plan change.
 
 ---
 
@@ -104,8 +109,9 @@ developer comment, and explicit instructions.
 
 A plan discussion renders the concept tree and the implementation items inside
 `<active_plan>`, marks focused nodes, and restates two rules: never mutate the plan
-without an explicit instruction, and express plan changes through the structured
-`plan_update` payload (`save`, `update`, `delete`) with a language directive taken
+`<active_plan>`, marks focused nodes, and restates two rules: never mutate the
+plan without an explicit instruction, and express plan changes through a typed
+plan payload (`save`, `update`, `delete`) with a language directive taken
 from the plan itself.
 
 A review discussion renders findings inside `<active_review>`, including the defect
@@ -114,23 +120,26 @@ protected contracts listed in `readonly_files`. Its instructions keep the turn
 actionable: apply requested code changes directly, treat protected contracts as
 immutable, and explain status changes instead of applying them.
 
-Discussion turns always use the structured JSON protocol, whatever
-`develop.protocol` selects for ordinary turns. The discussion prompt asks for the
-discussion schema, so pairing it with an XML stream filter would leak raw JSON into
-the REPL. The response declares `message` first, which lets the interface stream the
-answer while the rest of the object is still arriving.
+A discussion turn uses the transport the project configures for ordinary turns
+(`develop.protocol`). Whatever the contour, the prompt asks for the response
+schema of the active capability profile, so the conversational message and the
+plan payload travel together and a plan change keeps one shape in every
+transport. The response declares the message first, which lets the interface
+stream the answer while the rest of the payload is still arriving.
 
 ### 3.3 Capability surface
 
-A read-only discussion narrows the active capability set to the discussion profile:
-text, discovery, plan creation, plan update, and user language. It grants no file
-edits, no toolchain verification, no scratchpad, no terminal outcome, and no
-blocked outcome. The model can reason about plan structure, propose an update, and
-request files to inspect, but it cannot touch code.
+A dialogue runs on the main capability surface of an interactive turn — text,
+discovery, documentation requests, file edits, verification, scratchpad, and the
+terminal outcomes — and each regime adds its own delta. A plan discussion adds
+the plan-mutation delta (`PlanUpdate`), which is what lets the same anchored
+dialogue refine a plan and persist the change. A review discussion adds no
+capability of its own today, so its delta is empty and its surface is exactly the
+main one.
 
-A review focus keeps the interactive surface, including file editing, because
-resolution and reasoning belong to the same anchored dialogue there. Edits are
-staged, verified, and committed exactly as in an ordinary Develop turn.
+Because the main surface carries file edits, a focused dialogue reaches exactly
+the Develop transaction: edits are staged, verified, and committed as one atomic
+turn, and a failure rolls the tree back to the pre-turn checkpoint.
 
 ### 3.4 Continuing, replacing, and dropping the anchor
 
@@ -203,8 +212,9 @@ state moves only on an explicit developer decision or a verified execution.
 - **It is not a screen switch.** Quick focus binds an entity without leaving Plans
   or Review.
 - **`Esc` is not detach.** The pause-and-clear meaning of `Esc` is preserved.
-- **A read-only discussion is not a weaker review.** It is an architectural
-  dialogue with its own capability surface, not a failed attempt to edit code.
+- **A focused dialogue is not a second editing path.** It reuses the Develop
+  transaction — staging, verification, and the Git rollback — and never opens a
+  dialogue-specific write path.
 
 ---
 

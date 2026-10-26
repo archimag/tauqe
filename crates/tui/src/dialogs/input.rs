@@ -499,20 +499,34 @@ pub(crate) async fn delete_review(
 /// finish the current member and stop before the next one. `Hard Stop` aborts
 /// the running operation immediately. The dialog always closes and returns to
 /// its safe default, so the next interruption starts from `Continue`.
+///
+/// The guard is consumed by value and owns the release decision: every local
+/// transition completes first, the lock is dropped, and only then do the
+/// cancellation requests leave the loop, mirroring [`start_turn`] and the rest
+/// of the dialog stack (c-1). A daemon that stopped draining its stdin can
+/// therefore never freeze rendering or server-message processing.
 pub(crate) async fn apply_batch_cancel(
-    st: &mut AppState,
+    mut st: MutexGuard<'_, AppState>,
     choice: BatchCancelButton,
     server_writer: &mut RpcConnection,
 ) -> anyhow::Result<()> {
     st.confirm_batch_cancel = false;
     st.batch_cancel_button = BatchCancelButton::Continue;
+    match choice {
+        BatchCancelButton::Continue => {}
+        BatchCancelButton::SoftStop => st.batch_stopping = true,
+        BatchCancelButton::HardStop => st.batch_stopping = false,
+    }
+    // A soft stop is advisory: the operation stays registered so the
+    // supervisor can finish the current member and unwind on its own. The
+    // operation shape is read here, while the state is still locked.
+    let cancel_review = st.review.running;
+    let cancel_model = st.model.is_busy();
+    drop(st);
 
     match choice {
         BatchCancelButton::Continue => {}
         BatchCancelButton::SoftStop => {
-            st.batch_stopping = true;
-            // A soft stop is advisory: the operation stays registered so the
-            // supervisor can finish the current member and unwind on its own.
             let params = tauqe_protocol::model::ModelCancelParams {
                 mode: Some(tauqe_protocol::model::CancelMode::Soft),
             };
@@ -524,9 +538,6 @@ pub(crate) async fn apply_batch_cancel(
             .await?;
         }
         BatchCancelButton::HardStop => {
-            st.batch_stopping = false;
-            let cancel_review = st.review.running;
-            let cancel_model = st.model.is_busy();
             if cancel_review {
                 let params = tauqe_protocol::ReviewCancelParams {
                     mode: Some(tauqe_protocol::model::CancelMode::Hard),
@@ -786,7 +797,7 @@ pub(crate) async fn handle_dialog_event(
                     st.batch_cancel_button = BatchCancelButton::Continue;
                 }
                 BatchCancelOutcome::Chosen(choice) => {
-                    apply_batch_cancel(&mut st, choice, server_writer).await?;
+                    apply_batch_cancel(st, choice, server_writer).await?;
                 }
             }
             return Ok(Some(InputResult::Continue));
@@ -998,7 +1009,7 @@ pub(crate) async fn handle_dialog_event(
             return review_refine::handle_review_refine_dialog(key, state, st, server_writer).await;
         }
         Some(ActiveModal::Prompt) => {
-            return prompt::handle_prompt_modal(key, st, server_writer).await;
+            return prompt::handle_prompt_modal(key, state, st, server_writer).await;
         }
         Some(ActiveModal::Locale) => {
             return locale::handle_locale_dialog(key, st, server_writer).await;
@@ -1035,13 +1046,13 @@ pub(crate) async fn handle_dialog_event(
                         let chosen = c as usize - '1' as usize;
                         st.status_dialog = Some(dialog);
                         if chosen < total_options {
-                            apply_status_dialog(&mut st, chosen, server_writer).await?;
+                            apply_status_dialog(st, chosen, server_writer).await?;
                         }
                     }
                     KeyCode::Enter | KeyCode::Char(' ') => {
                         let chosen = dialog.selector.selected_index();
                         st.status_dialog = Some(dialog);
-                        apply_status_dialog(&mut st, chosen, server_writer).await?;
+                        apply_status_dialog(st, chosen, server_writer).await?;
                     }
                     _ => {
                         st.status_dialog = Some(dialog);

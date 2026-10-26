@@ -416,8 +416,9 @@ pub async fn handle_modal_click(
 
             match choice {
                 Some(choice) => {
-                    crate::dialogs::input::apply_batch_cancel(&mut st, choice, server_writer)
-                        .await?;
+                    // The guard travels by value: the helper releases it before
+                    // the cancellation requests leave the loop (c-1).
+                    crate::dialogs::input::apply_batch_cancel(st, choice, server_writer).await?;
                 }
                 None => {
                     st.confirm_batch_cancel = false;
@@ -857,8 +858,15 @@ pub async fn handle_modal_click(
             let (confirm_btn, cancel_btn) = crate::dialogs::render::prompt_modal_buttons(term_rect);
             if rect_contains(confirm_btn, mouse.column, mouse.row) {
                 if let Some(dialog) = st.prompt_modal.take() {
-                    let _ = crate::dialogs::input::submit_prompt_modal(st, dialog, server_writer)
-                        .await?;
+                    // The guard travels by value so the launch transition can
+                    // release it before the comment is dispatched (c-1).
+                    let _ = crate::dialogs::input::submit_prompt_modal(
+                        state,
+                        st,
+                        dialog,
+                        server_writer,
+                    )
+                    .await?;
                 }
             } else if rect_contains(cancel_btn, mouse.column, mouse.row)
                 || !rect_contains(
@@ -915,8 +923,9 @@ pub async fn handle_modal_click(
                 // the dismiss path.
                 if rect_contains(apply_btn, mouse.column, mouse.row) {
                     let chosen = dialog.selector.selected_index();
-                    crate::dialogs::input::apply_status_dialog(&mut st, chosen, server_writer)
-                        .await?;
+                    // The guard travels by value: the helper releases it before
+                    // the update request leaves the loop (c-1).
+                    crate::dialogs::input::apply_status_dialog(st, chosen, server_writer).await?;
                 } else if rect_contains(cancel_btn, mouse.column, mouse.row) {
                     st.status_dialog = None;
                 } else if rect_contains(options_area, mouse.column, mouse.row) {
@@ -927,12 +936,8 @@ pub async fn handle_modal_click(
                     let clicked_row =
                         dialog.selector.scroll_offset() + (mouse.row - options_area.y) as usize;
                     if clicked_row < options_count {
-                        crate::dialogs::input::apply_status_dialog(
-                            &mut st,
-                            clicked_row,
-                            server_writer,
-                        )
-                        .await?;
+                        crate::dialogs::input::apply_status_dialog(st, clicked_row, server_writer)
+                            .await?;
                     }
                 } else if !rect_contains(area, mouse.column, mouse.row) {
                     st.status_dialog = None;

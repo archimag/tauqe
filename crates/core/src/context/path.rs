@@ -1,7 +1,99 @@
 use anyhow::{anyhow, bail, Result};
+#[cfg(unix)]
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+#[cfg(unix)]
+use std::sync::{Mutex, OnceLock};
 
 use super::ContextManager;
+
+/// Upper bound on the cached canonical repository roots.
+///
+/// A session works on one repository at a time, so a handful of entries is
+/// enough. Clearing the map on overflow keeps memory bounded without an
+/// eviction policy.
+#[cfg(unix)]
+const CANONICAL_ROOT_CACHE_LIMIT: usize = 8;
+
+/// Identity of the directory a path resolves to.
+#[cfg(unix)]
+type DirIdentity = (u64, u64);
+
+/// A canonical repository root together with the identity of the directory it
+/// described when it was resolved.
+///
+/// The identity keeps a stale entry from outliving the directory it was
+/// computed for: once the root is replaced, the identities differ and the
+/// canonical form is recomputed instead of reused.
+#[cfg(unix)]
+struct CachedCanonicalRoot {
+    canonical: PathBuf,
+    identity: DirIdentity,
+}
+
+#[cfg(unix)]
+fn cached_canonical_roots() -> &'static Mutex<HashMap<PathBuf, CachedCanonicalRoot>> {
+    static CACHE: OnceLock<Mutex<HashMap<PathBuf, CachedCanonicalRoot>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Identifies the directory `path` resolves to, or `None` when it is not an
+/// existing directory.
+#[cfg(unix)]
+fn dir_identity(path: &Path) -> Option<DirIdentity> {
+    use std::os::unix::fs::MetadataExt;
+    let metadata = std::fs::metadata(path).ok()?;
+    if !metadata.is_dir() {
+        return None;
+    }
+    Some((metadata.dev(), metadata.ino()))
+}
+
+/// Resolves the canonical form of `repo_root`, reusing a previous resolution
+/// while the directory still carries the identity it had when it was cached.
+///
+/// `canonicalize` walks every component of the path with `lstat` and resolves
+/// each symlink it meets. Verification runs for every context mutation and for
+/// every pinned candidate, so resolving the root once per repository — kept
+/// honest by one cheap `stat` — removes the dominant syscall cost of the
+/// context layer.
+fn canonical_repo_root(repo_root: &Path) -> std::io::Result<PathBuf> {
+    #[cfg(unix)]
+    {
+        let identity = dir_identity(repo_root);
+        if let (Some(identity), Ok(cache)) = (identity, cached_canonical_roots().lock()) {
+            if let Some(cached) = cache.get(repo_root) {
+                if cached.identity == identity {
+                    return Ok(cached.canonical.clone());
+                }
+            }
+        }
+
+        let canonical = repo_root.canonicalize()?;
+
+        if let Some(identity) = identity {
+            if let Ok(mut cache) = cached_canonical_roots().lock() {
+                if cache.len() >= CANONICAL_ROOT_CACHE_LIMIT {
+                    cache.clear();
+                }
+                cache.insert(
+                    repo_root.to_path_buf(),
+                    CachedCanonicalRoot {
+                        canonical: canonical.clone(),
+                        identity,
+                    },
+                );
+            }
+        }
+
+        Ok(canonical)
+    }
+
+    #[cfg(not(unix))]
+    {
+        repo_root.canonicalize()
+    }
+}
 
 /// Returns the deepest ancestor of `path` that exists on disk, or the symlink
 /// itself when it dangles.
@@ -30,7 +122,7 @@ fn deepest_existing_ancestor(path: &Path) -> &Path {
 /// dangles outside the repository is rejected instead of being silently
 /// traversed while missing parent directories are created.
 pub fn verify_path_within_repo(repo_root: &Path, relative_path: &str) -> Result<()> {
-    let Ok(canonical_root) = repo_root.canonicalize() else {
+    let Ok(canonical_root) = canonical_repo_root(repo_root) else {
         // If repo_root cannot be canonicalized (e.g. does not exist in a synthetic test),
         // we cannot inspect symlinks on disk.
         return Ok(());
@@ -236,5 +328,46 @@ mod tests {
         let internal_sym = repo_root.join("dangling_internal");
         std::os::unix::fs::symlink(&internal_target, &internal_sym).unwrap();
         assert!(cm.normalize_path("dangling_internal/file.txt").is_ok());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn canonical_root_cache_does_not_outlive_a_replaced_repository_root() {
+        let dir = tempdir().unwrap();
+        let outside = tempdir().unwrap();
+        let repo_root = dir.path().join("repo");
+        std::fs::create_dir_all(&repo_root).unwrap();
+        std::fs::write(repo_root.join("inside.rs"), "fn inside() {}").unwrap();
+
+        // Warm the canonical root cache for the original directory.
+        assert!(verify_path_within_repo(&repo_root, "inside.rs").is_ok());
+
+        // Replace the root with a symlink onto another directory, so the cached
+        // identity no longer describes what the path resolves to.
+        std::fs::rename(&repo_root, dir.path().join("moved")).unwrap();
+        std::os::unix::fs::symlink(outside.path(), &repo_root).unwrap();
+
+        let secret = outside.path().join("secret.txt");
+        std::fs::write(&secret, "super secret").unwrap();
+        std::os::unix::fs::symlink(&secret, outside.path().join("link.rs")).unwrap();
+
+        // The refreshed canonical root is the outside directory itself, so a
+        // symlink resolving inside it stays inside the boundary. A stale cached
+        // root would compare against the previous location and reject it.
+        assert!(verify_path_within_repo(&repo_root, "link.rs").is_ok());
+    }
+
+    #[test]
+    fn test_repeated_verification_is_stable() {
+        let dir = tempdir().unwrap();
+        let repo_root = dir.path().to_path_buf();
+        std::fs::create_dir_all(repo_root.join("src")).unwrap();
+        std::fs::write(repo_root.join("src/lib.rs"), "pub fn ok() {}").unwrap();
+
+        // Repeated verification against the cached root keeps the same answer.
+        for _ in 0..3 {
+            assert!(verify_path_within_repo(&repo_root, "src/lib.rs").is_ok());
+        }
+        assert!(verify_path_within_repo(&repo_root, "../escape.rs").is_err());
     }
 }

@@ -11,24 +11,32 @@ use crate::i18n::engine::active_t;
 use crate::input::InputResult;
 use crate::rpc::{send_request, RpcConnection};
 
+/// Requests the page of entries that precedes the oldest one currently held.
+///
+/// The function owns its locking: the paging flags are updated under the guard,
+/// the guard is released, and only then does the request leave the loop, so a
+/// daemon that stopped draining its stdin can never freeze the interface (c-1).
 pub async fn request_older_history(
-    st: &mut AppState,
+    state: &Arc<Mutex<AppState>>,
     server_writer: &mut RpcConnection,
     select_prev: bool,
 ) -> anyhow::Result<()> {
-    if !st.history_view.has_more || st.history_view.loading {
-        return Ok(());
-    }
-    let Some(first_item) = st.history_view.items.first() else {
-        return Ok(());
-    };
-    let before_id = first_item.id;
-    st.history_view.loading = true;
-    st.history_view.pending_before_id = Some(before_id);
-    st.history_view.select_prev_after_load = select_prev;
-    let params = HistoryGetParams {
-        limit: Some(10),
-        before_id: Some(before_id),
+    let params = {
+        let mut st = state.lock().await;
+        if !st.history_view.has_more || st.history_view.loading {
+            return Ok(());
+        }
+        let Some(first_item) = st.history_view.items.first() else {
+            return Ok(());
+        };
+        let before_id = first_item.id;
+        st.history_view.loading = true;
+        st.history_view.pending_before_id = Some(before_id);
+        st.history_view.select_prev_after_load = select_prev;
+        HistoryGetParams {
+            limit: Some(10),
+            before_id: Some(before_id),
+        }
     };
     send_request(
         server_writer,
@@ -321,7 +329,10 @@ pub async fn handle_history_key(
                     st.history_view
                         .scroll_to_selected_item(view_height, Some(content_width));
                 } else {
-                    request_older_history(&mut st, server_writer, true).await?;
+                    // Loading an older page is a transport write: the guard is
+                    // released before the request leaves the loop (c-1).
+                    drop(st);
+                    request_older_history(state, server_writer, true).await?;
                 }
             }
         }
@@ -452,7 +463,9 @@ pub async fn handle_history_key(
                 st.history_view
                     .update_selected_item_from_scroll(view_height, Some(content_width));
             } else {
-                request_older_history(&mut st, server_writer, false).await?;
+                // The page is requested after the guard is released (c-1).
+                drop(st);
+                request_older_history(state, server_writer, false).await?;
             }
         }
         HistoryAction::PageUp => {
@@ -463,7 +476,9 @@ pub async fn handle_history_key(
                 st.history_view
                     .update_selected_item_from_scroll(view_height, Some(content_width));
             } else {
-                request_older_history(&mut st, server_writer, false).await?;
+                // The page is requested after the guard is released (c-1).
+                drop(st);
+                request_older_history(state, server_writer, false).await?;
             }
         }
         HistoryAction::ScrollDown => {
@@ -490,7 +505,9 @@ pub async fn handle_history_key(
             st.history_view.scroll = 0;
             st.history_view
                 .update_selected_item_from_scroll(view_height, Some(content_width));
-            request_older_history(&mut st, server_writer, false).await?;
+            // The page is requested after the guard is released (c-1).
+            drop(st);
+            request_older_history(state, server_writer, false).await?;
         }
         HistoryAction::SelectLast => {
             st.history_view.auto_scroll = true;

@@ -1,41 +1,34 @@
 use std::collections::{HashMap, HashSet};
-use tauqe_protocol::EditOperation;
+use tauqe_protocol::{EditOperation, PatchStrategy};
 
 use crate::context::ContextManager;
+use crate::edits::strategy::StrategyProfile;
 use crate::edits::{EditError, StagedEditsState};
 
-/// Explanation shown when the repository ignores the target path of an edit.
-///
-/// The same wording reaches the retrying event and the retry prompt, so the
-/// model receives one consistent reason instead of two diverging paraphrases.
-const IGNORED_PATH_HINT: &str =
-    "Path is excluded by the repository ignore rules (.gitignore or .git/info/exclude). \
-     Choose a path the repository tracks.";
-
 /// Formats a human-readable failure reason for `EditFileRetrying` event and prompts.
-pub fn format_patch_retry_reason(err: &EditError) -> String {
-    match err {
-        EditError::NoMatch { .. } => {
-            "Search block not found (0 matches). Check indentation and line endings.".to_string()
-        }
-        EditError::AmbiguousMatch { count, .. } => {
-            format!(
-                "Search block matches {} times. Provide more unique context.",
-                count
-            )
-        }
-        EditError::IgnoredByGit(_) => IGNORED_PATH_HINT.to_string(),
-        other => other.to_string(),
-    }
+///
+/// The active patch strategy renders the wording, so the retrying event and the
+/// retry prompt state one reason in the dialect the turn actually speaks. A
+/// single renderer also keeps the two surfaces from drifting into divergent
+/// paraphrases of the same failure.
+pub fn format_patch_retry_reason(err: &EditError, patch_strategy: PatchStrategy) -> String {
+    StrategyProfile::of(patch_strategy).describe_failure(err)
 }
 
 /// Constructs a specialized prompt asking the model to fix failed edit blocks.
+///
+/// Every reason and the closing correction guidance are rendered by the active
+/// patch strategy, so a line-anchor turn is never taught the vocabulary of a
+/// search/replace turn: the prompt corrects the addresses the turn actually
+/// sent instead of asking for a field the strategy does not have.
 pub fn build_patch_retry_prompt(
     succeeded_files: &HashSet<String>,
     failed_files: &HashMap<String, EditError>,
     protocol_errors: &[String],
     target_language: Option<&str>,
+    patch_strategy: PatchStrategy,
 ) -> String {
+    let profile = StrategyProfile::of(patch_strategy);
     let mut prompt = String::new();
     prompt.push_str("Some of the proposed edits failed to apply.\n\n");
 
@@ -62,20 +55,11 @@ pub fn build_patch_retry_prompt(
         let mut failed_sorted: Vec<(&String, &EditError)> = failed_files.iter().collect();
         failed_sorted.sort_by_key(|(p, _)| *p);
         for (path, err) in failed_sorted {
-            let explanation = match err {
-                EditError::NoMatch { .. } => {
-                    "Search block not found (0 matches). Verify exact line content, indentation, and context."
-                }
-                EditError::AmbiguousMatch { count, .. } => {
-                    &format!(
-                        "Search block matches {} times. Include more surrounding lines to make the match uniquely identifiable.",
-                        count
-                    )
-                }
-                EditError::IgnoredByGit(_) => IGNORED_PATH_HINT,
-                other => &other.to_string(),
-            };
-            prompt.push_str(&format!("- `{}`: {}\n", path, explanation));
+            prompt.push_str(&format!(
+                "- `{}`: {}\n",
+                path,
+                profile.describe_failure(err)
+            ));
         }
     }
 
@@ -83,8 +67,9 @@ pub fn build_patch_retry_prompt(
         prompt.push_str("\nPlease provide corrected edit blocks strictly following the required protocol format.");
     } else {
         prompt.push_str(
-            "\nPlease provide corrected edit blocks ONLY for the failed files listed above.",
+            "\nPlease provide corrected edit blocks ONLY for the failed files listed above.\n",
         );
+        prompt.push_str(profile.retry_instruction);
     }
     if let Some(lang) = target_language {
         prompt.push_str(&format!(
@@ -107,7 +92,8 @@ pub fn retain_retried_failed_files(
             EditOperation::Replace { path, .. }
             | EditOperation::Create { path, .. }
             | EditOperation::Delete { path }
-            | EditOperation::Overwrite { path, .. } => {
+            | EditOperation::Overwrite { path, .. }
+            | EditOperation::LineAnchor { path, .. } => {
                 let clean = context_manager
                     .normalize_path(path)
                     .unwrap_or_else(|_| path.clone());
@@ -143,7 +129,8 @@ pub fn prepare_staged_for_retry(
             EditOperation::Replace { path, .. }
             | EditOperation::Create { path, .. }
             | EditOperation::Delete { path }
-            | EditOperation::Overwrite { path, .. } => {
+            | EditOperation::Overwrite { path, .. }
+            | EditOperation::LineAnchor { path, .. } => {
                 let clean = context_manager
                     .normalize_path(path)
                     .unwrap_or_else(|_| path.clone());
@@ -195,7 +182,8 @@ pub fn prepare_staged_for_retry(
         EditOperation::Replace { path, .. }
         | EditOperation::Create { path, .. }
         | EditOperation::Delete { path }
-        | EditOperation::Overwrite { path, .. } => {
+        | EditOperation::Overwrite { path, .. }
+        | EditOperation::LineAnchor { path, .. } => {
             let op_path = context_manager
                 .normalize_path(path)
                 .unwrap_or_else(|_| path.clone());
@@ -238,7 +226,13 @@ mod tests {
         );
 
         let proto_errors = vec!["Malformed XML edit block: Unclosed tag".to_string()];
-        let prompt = build_patch_retry_prompt(&succeeded, &failed, &proto_errors, Some("Russian"));
+        let prompt = build_patch_retry_prompt(
+            &succeeded,
+            &failed,
+            &proto_errors,
+            Some("Russian"),
+            PatchStrategy::SearchReplace,
+        );
 
         assert!(prompt.contains("Protocol parsing errors encountered in your edit blocks:"));
         assert!(prompt.contains("Malformed XML edit block: Unclosed tag"));
@@ -390,5 +384,49 @@ mod tests {
         assert!(!succeeded.contains("a.rs"));
         assert!(!succeeded.contains("b.rs"));
         assert!(succeeded.contains("c.rs"));
+    }
+    #[test]
+    fn line_anchor_retry_prompt_speaks_the_anchor_dialect() {
+        let failed = HashMap::from([
+            (
+                "src/lib.rs".to_string(),
+                EditError::AnchorOutOfRange {
+                    path: "src/lib.rs".to_string(),
+                    anchor: "kR7t".to_string(),
+                    lines: 12,
+                },
+            ),
+            (
+                "src/other.rs".to_string(),
+                EditError::OverlappingAnchorRanges {
+                    path: "src/other.rs".to_string(),
+                    start: "kR7t".to_string(),
+                    end: "Qw2n".to_string(),
+                    other_start: "ZbY9".to_string(),
+                    other_end: "mDgH".to_string(),
+                },
+            ),
+        ]);
+
+        let prompt = build_patch_retry_prompt(
+            &HashSet::new(),
+            &failed,
+            &[],
+            None,
+            PatchStrategy::LineAnchor,
+        );
+
+        // The anchored contour addresses lines by anchors, so the retry request
+        // must never teach the model a field it was never asked to send.
+        for foreign in ["old_text", "new_text", "Search block"] {
+            assert!(
+                !prompt.contains(foreign),
+                "the anchored retry prompt named {foreign}: {prompt}"
+            );
+        }
+        assert!(prompt.contains("`start` and `end` anchors"), "{prompt}");
+        assert!(prompt.contains("src/lib.rs"));
+        assert!(prompt.contains("names no line of the file"));
+        assert!(prompt.contains("disjoint line ranges"));
     }
 }

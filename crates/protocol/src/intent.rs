@@ -24,9 +24,8 @@
 //! conversion: every turn must name its mode, because a default value would
 //! turn a forgotten argument into a silent mode substitution.
 
+use crate::command::{CapabilityProfile, CapabilitySet, LlmCapability};
 use serde::{Deserialize, Serialize};
-
-use crate::command::{CapabilitySet, LlmCapability};
 
 /// Mode of a bounded turn, declared by the caller that starts it.
 ///
@@ -34,8 +33,7 @@ use crate::command::{CapabilitySet, LlmCapability};
 ///
 /// - [`TurnIntent::InteractiveRepl`] is a free interactive dialogue started
 ///   from the REPL, including a dialogue anchored on a review session.
-/// - [`TurnIntent::ReadonlyDiscussion`] is a read-only architectural
-///   discussion of a plan.
+/// - [`TurnIntent::PlanDiscussion`] is an architectural discussion of a plan.
 /// - [`TurnIntent::IsolatedStep`] is the isolated execution of one plan step
 ///   or one review finding.
 ///
@@ -46,8 +44,8 @@ use crate::command::{CapabilitySet, LlmCapability};
 pub enum TurnIntent {
     /// Free interactive dialogue started from the REPL.
     InteractiveRepl,
-    /// Read-only architectural discussion of a plan.
-    ReadonlyDiscussion,
+    /// Architectural discussion of a plan.
+    PlanDiscussion,
     /// Isolated execution of one plan step or one review finding.
     IsolatedStep,
 }
@@ -63,11 +61,25 @@ impl TurnIntent {
         matches!(self, Self::IsolatedStep)
     }
 
-    /// Reports whether this is a read-only plan discussion.
-    pub fn is_readonly_discussion(self) -> bool {
-        matches!(self, Self::ReadonlyDiscussion)
+    /// Reports whether this is a plan discussion.
+    pub fn is_plan_discussion(self) -> bool {
+        matches!(self, Self::PlanDiscussion)
     }
-
+    /// Returns the regime profile this intent composes.
+    ///
+    /// The mapping is the single source of truth for the pair of typed lists a
+    /// turn composes: the core surface that renders into the byte-stable head
+    /// shared by every dialogue contour, and the contour delta that renders into
+    /// the trailing user message. The review discussion inherits
+    /// [`TurnIntent::InteractiveRepl`], so it composes the shared head with an
+    /// empty delta instead of a profile of its own.
+    pub fn regime_profile(self) -> CapabilityProfile {
+        match self {
+            Self::InteractiveRepl => CapabilityProfile::interactive_repl(),
+            Self::PlanDiscussion => CapabilityProfile::discussion(),
+            Self::IsolatedStep => CapabilityProfile::isolated_step(),
+        }
+    }
     /// Narrows a protocol capability set to what this turn intent permits.
     ///
     /// This mapping is the single source of truth for the turn's capability
@@ -77,7 +89,8 @@ impl TurnIntent {
     /// accepted by the decoder while being hidden from the instructions.
     ///
     /// - [`TurnIntent::InteractiveRepl`] keeps the protocol's own surface.
-    /// - [`TurnIntent::ReadonlyDiscussion`] keeps only the discussion profile.
+    /// - [`TurnIntent::PlanDiscussion`] keeps the discussion profile: the
+    ///   dialogue head plus the plan mutation the regime authorizes.
     /// - [`TurnIntent::IsolatedStep`] keeps the isolated-step profile and drops
     ///   toolchain verification, because the harness owns verification for a
     ///   step deterministically.
@@ -88,7 +101,7 @@ impl TurnIntent {
     pub fn narrow_capabilities(self, capabilities: &CapabilitySet) -> CapabilitySet {
         match self {
             Self::InteractiveRepl => capabilities.clone(),
-            Self::ReadonlyDiscussion => Self::intersect(capabilities, &CapabilitySet::discussion()),
+            Self::PlanDiscussion => Self::intersect(capabilities, &CapabilitySet::discussion()),
             Self::IsolatedStep => Self::intersect(capabilities, &CapabilitySet::isolated_step())
                 .without(LlmCapability::ToolchainVerify),
         }
@@ -111,7 +124,7 @@ mod tests {
 
     const ALL: [TurnIntent; 3] = [
         TurnIntent::InteractiveRepl,
-        TurnIntent::ReadonlyDiscussion,
+        TurnIntent::PlanDiscussion,
         TurnIntent::IsolatedStep,
     ];
 
@@ -120,7 +133,7 @@ mod tests {
         for intent in ALL {
             let flags = [
                 intent.is_interactive_repl(),
-                intent.is_readonly_discussion(),
+                intent.is_plan_discussion(),
                 intent.is_isolated_step(),
             ];
             // Exactly one predicate holds for every variant, which is the
@@ -133,7 +146,7 @@ mod tests {
         }
 
         assert!(TurnIntent::InteractiveRepl.is_interactive_repl());
-        assert!(TurnIntent::ReadonlyDiscussion.is_readonly_discussion());
+        assert!(TurnIntent::PlanDiscussion.is_plan_discussion());
         assert!(TurnIntent::IsolatedStep.is_isolated_step());
     }
 
@@ -141,7 +154,7 @@ mod tests {
     fn test_serde_snake_case_roundtrip() {
         let cases = [
             (TurnIntent::InteractiveRepl, "\"interactive_repl\""),
-            (TurnIntent::ReadonlyDiscussion, "\"readonly_discussion\""),
+            (TurnIntent::PlanDiscussion, "\"plan_discussion\""),
             (TurnIntent::IsolatedStep, "\"isolated_step\""),
         ];
 
@@ -162,20 +175,26 @@ mod tests {
     }
 
     #[test]
-    fn test_narrow_capabilities_makes_discussion_read_only() {
+    fn test_narrow_capabilities_applies_the_discussion_profile() {
         let advertised = CapabilitySet::from_slice(LlmCapability::ALL);
-        let narrowed = TurnIntent::ReadonlyDiscussion.narrow_capabilities(&advertised);
+        let narrowed = TurnIntent::PlanDiscussion.narrow_capabilities(&advertised);
 
         assert!(narrowed.contains(LlmCapability::TextMessage));
         assert!(narrowed.contains(LlmCapability::Discovery));
+        assert!(narrowed.contains(LlmCapability::DocRequest));
         assert!(narrowed.contains(LlmCapability::PlanCreation));
         assert!(narrowed.contains(LlmCapability::PlanUpdate));
+        // A plan discussion carries the whole dialogue surface, so the developer
+        // may ask for the fix directly instead of leaving the discussion.
+        assert!(narrowed.contains(LlmCapability::FileEdits));
+        assert!(narrowed.contains(LlmCapability::ToolchainVerify));
+        assert!(narrowed.contains(LlmCapability::Scratchpad));
+        assert!(narrowed.contains(LlmCapability::Outcome));
+        assert!(narrowed.contains(LlmCapability::Blocked));
+        assert!(narrowed.contains(LlmCapability::Abort));
+        assert!(narrowed.contains(LlmCapability::CustomTools));
         assert!(narrowed.contains(LlmCapability::UserLanguage));
-        assert!(!narrowed.contains(LlmCapability::FileEdits));
-        assert!(!narrowed.contains(LlmCapability::ToolchainVerify));
-        assert!(!narrowed.contains(LlmCapability::Scratchpad));
-        assert!(!narrowed.contains(LlmCapability::Outcome));
-        assert!(!narrowed.contains(LlmCapability::Blocked));
+        assert_eq!(narrowed, CapabilitySet::discussion());
     }
 
     #[test]
@@ -201,10 +220,10 @@ mod tests {
         let step = TurnIntent::IsolatedStep.narrow_capabilities(&advertised);
         assert!(step.contains(LlmCapability::Abort));
 
-        // A read-only discussion implements nothing, so the narrowing removes
-        // the abort surface it never carried.
-        let discussion = TurnIntent::ReadonlyDiscussion.narrow_capabilities(&advertised);
-        assert!(!discussion.contains(LlmCapability::Abort));
+        // A plan discussion carries the whole dialogue surface, so it keeps the
+        // escape hatch as well.
+        let discussion = TurnIntent::PlanDiscussion.narrow_capabilities(&advertised);
+        assert!(discussion.contains(LlmCapability::Abort));
     }
 
     #[test]
@@ -237,7 +256,7 @@ mod tests {
     #[test]
     fn test_narrow_capabilities_discussion_owns_both_plan_permissions() {
         let advertised = CapabilitySet::from_slice(LlmCapability::ALL);
-        let narrowed = TurnIntent::ReadonlyDiscussion.narrow_capabilities(&advertised);
+        let narrowed = TurnIntent::PlanDiscussion.narrow_capabilities(&advertised);
         assert!(narrowed.contains(LlmCapability::PlanCreation));
         assert!(narrowed.contains(LlmCapability::PlanUpdate));
     }
@@ -259,5 +278,50 @@ mod tests {
             assert!(expected.contains(*capability));
         }
         assert!(repl.contains(LlmCapability::FileEdits));
+    }
+    #[test]
+    fn test_regime_profile_maps_every_intent() {
+        assert_eq!(
+            TurnIntent::InteractiveRepl.regime_profile(),
+            CapabilityProfile::interactive_repl()
+        );
+        assert_eq!(
+            TurnIntent::PlanDiscussion.regime_profile(),
+            CapabilityProfile::discussion()
+        );
+        assert_eq!(
+            TurnIntent::IsolatedStep.regime_profile(),
+            CapabilityProfile::isolated_step()
+        );
+    }
+
+    #[test]
+    fn test_dialogue_contours_share_one_core_list() {
+        // A review discussion runs through the interactive intent, so the shared
+        // head is the interactive core list by construction, while the delta of
+        // that contour stays empty.
+        let interactive = TurnIntent::InteractiveRepl.regime_profile();
+        assert!(interactive.delta().is_empty());
+        assert_eq!(
+            interactive.surface().as_slice(),
+            interactive.core().as_slice()
+        );
+
+        // A plan discussion reuses the very same head and carries only its own
+        // plan mutation in the delta.
+        let discussion = TurnIntent::PlanDiscussion.regime_profile();
+        assert_eq!(discussion.core().as_slice(), interactive.core().as_slice());
+        assert_eq!(discussion.delta().as_slice(), &[LlmCapability::PlanUpdate]);
+        assert!(!discussion.core().contains(LlmCapability::PlanUpdate));
+
+        // The delta list is the sanctioned extension point: a review-specific
+        // capability would join the review delta without touching the head, and
+        // none is built today.
+        assert_eq!(
+            interactive.surface().as_slice(),
+            CapabilitySet::from_slice(LlmCapability::ALL)
+                .without(LlmCapability::PlanUpdate)
+                .as_slice()
+        );
     }
 }

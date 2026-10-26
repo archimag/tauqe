@@ -10,12 +10,12 @@ use tauqe_core::config::AppConfig;
 use tauqe_core::prompt::protocol::PromptProtocol;
 use tauqe_protocol::discussion::DiscussionPlanAction;
 use tauqe_protocol::{
-    DiscussionTarget, EditProtocolKind, LlmCapability, LlmCommand, ModelRef, ModelSelection,
-    Request, TurnIntent,
+    DiscussionFocus, DiscussionRequest, DiscussionTarget, EditProtocolKind, LlmCapability,
+    LlmCommand, ModelAskParams, ModelRef, ModelSelection, Plan, Request, TurnIntent,
 };
 
 use super::handle_model_select;
-use super::prompt::intent_for_target;
+use super::prompt::{build_model_ask_prompt, intent_for_target};
 use super::turn::{resolve_session_id, resolve_turn_protocol};
 use crate::state::AppState;
 
@@ -26,7 +26,7 @@ fn plan_discussion_is_readonly() {
     let intent = intent_for_target(&DiscussionTarget::Plan {
         id: "plan-1".to_string(),
     });
-    assert!(intent.is_readonly_discussion());
+    assert!(intent.is_plan_discussion());
     assert!(!intent.is_interactive_repl());
 }
 
@@ -38,7 +38,7 @@ fn review_discussion_stays_interactive() {
         id: "review-1".to_string(),
     });
     assert!(intent.is_interactive_repl());
-    assert!(!intent.is_readonly_discussion());
+    assert!(!intent.is_plan_discussion());
 }
 
 /// An isolated step never inherits the interactive session, so it cannot reuse
@@ -56,7 +56,7 @@ fn isolated_step_carries_no_dialogue_session() {
 #[test]
 fn interactive_turn_binds_the_dialogue_session() {
     assert!(resolve_session_id(TurnIntent::InteractiveRepl, "session-1".to_string()).is_some());
-    assert!(resolve_session_id(TurnIntent::ReadonlyDiscussion, "session-1".to_string()).is_some());
+    assert!(resolve_session_id(TurnIntent::PlanDiscussion, "session-1".to_string()).is_some());
 }
 
 /// Builds a `model/select` request for the given selection.
@@ -174,6 +174,45 @@ fn plan_focus_grants_plan_update_to_an_interactive_turn() {
     );
 }
 
+/// A plan discussion is a dialogue like any other: the configured transport
+/// encodes it, and the transport never shrinks its surface. Both encodings
+/// therefore advertise the edit capability and decode the very same plan
+/// mutation, which the discussion authorizes by its regime.
+#[test]
+fn plan_discussion_follows_the_configured_transport() {
+    let xml = resolve_turn_protocol(
+        TurnIntent::PlanDiscussion,
+        EditProtocolKind::Xml,
+        false,
+        None,
+    );
+    assert_eq!(xml.kind(), EditProtocolKind::Xml);
+    assert!(xml.capability_set().contains(LlmCapability::FileEdits));
+    assert!(xml.capability_set().contains(LlmCapability::PlanUpdate));
+    assert_eq!(
+        decoded_plan_actions(xml.as_ref(), PLAN_UPDATE_XML),
+        vec![DiscussionPlanAction::Update]
+    );
+
+    let structured = resolve_turn_protocol(
+        TurnIntent::PlanDiscussion,
+        EditProtocolKind::Structured,
+        false,
+        None,
+    );
+    assert_eq!(structured.kind(), EditProtocolKind::Structured);
+    assert!(structured
+        .capability_set()
+        .contains(LlmCapability::FileEdits));
+    assert!(structured
+        .capability_set()
+        .contains(LlmCapability::PlanUpdate));
+    assert_eq!(
+        decoded_plan_actions(structured.as_ref(), PLAN_UPDATE_JSON),
+        vec![DiscussionPlanAction::Update]
+    );
+}
+
 /// Without a plan focus the mutation is filtered out, while plan authorship
 /// stays available, because a user may ask for a plan at any moment of a
 /// dialogue.
@@ -250,6 +289,199 @@ fn isolated_step_carries_no_plan_permission_under_any_focus() {
     assert_step_has_no_plan_permission(EditProtocolKind::Xml, true);
     assert_step_has_no_plan_permission(EditProtocolKind::Structured, false);
     assert_step_has_no_plan_permission(EditProtocolKind::Structured, true);
+}
+/// Constructs an [`AppState`] over a scratch repository root, isolating each
+/// focus test's stored plans and history from every other test.
+fn state_over_root(root: std::path::PathBuf) -> std::sync::Arc<AppState> {
+    let (out, _rx) = crate::transport::OutChannel::new();
+    let (history_sender, _hrx) = tokio::sync::mpsc::unbounded_channel();
+    AppState::new(AppConfig::default(), root, history_sender, out)
+}
+
+/// While a plan focus is active, a plain prompt continues the anchored
+/// discussion: the turn is enriched with the focused plan and its intent
+/// follows the anchor rather than the free-form text.
+#[tokio::test]
+async fn plain_prompt_with_active_focus_continues_the_discussion() {
+    let root = scratch_root("focus-active");
+    let plan = Plan {
+        id: "plan-1".to_string(),
+        title: "Focus Plan".to_string(),
+        ..Default::default()
+    };
+    tauqe_core::plan::storage::PlanStorage::save_plan(&root, &plan).unwrap();
+
+    let state = state_over_root(root.clone());
+    state
+        .set_discussion_focus(DiscussionFocus::plan("plan-1", vec!["1".to_string()]))
+        .await;
+
+    let (prompt, intent) = build_model_ask_prompt(
+        &state,
+        ModelAskParams::Prompt {
+            text: "keep refining".to_string(),
+        },
+    )
+    .await
+    .expect("the focused plan must load");
+
+    assert!(
+        intent.is_plan_discussion(),
+        "a plain prompt under plan focus must follow the anchored intent"
+    );
+    assert!(
+        prompt.contains("keep refining"),
+        "the plain prompt must reach the discussion prompt"
+    );
+    assert!(
+        state.discussion_focus().await.is_active(),
+        "a successful enriched turn must keep the anchor"
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// An explicit discussion target that loads replaces the focus anchor with
+/// the addressed entity and its focused items, turning one-shot comments into
+/// a continuous dialogue.
+#[tokio::test]
+async fn discussion_target_replaces_the_focus_anchor() {
+    let root = scratch_root("focus-replace");
+    let plan = Plan {
+        id: "plan-1".to_string(),
+        title: "Focus Plan".to_string(),
+        ..Default::default()
+    };
+    tauqe_core::plan::storage::PlanStorage::save_plan(&root, &plan).unwrap();
+
+    let state = state_over_root(root.clone());
+    state
+        .set_discussion_focus(DiscussionFocus::plan("other-plan", Vec::new()))
+        .await;
+
+    let (prompt, intent) = build_model_ask_prompt(
+        &state,
+        ModelAskParams::Discussion(DiscussionRequest {
+            target: DiscussionTarget::Plan {
+                id: "plan-1".to_string(),
+            },
+            focused_items: vec!["1".to_string()],
+            comment: "refine the authentication flow".to_string(),
+        }),
+    )
+    .await
+    .expect("the stored plan must load");
+
+    assert!(intent.is_plan_discussion());
+    assert!(
+        prompt.contains("refine the authentication flow"),
+        "the developer comment must reach the discussion prompt"
+    );
+
+    let focus = state.discussion_focus().await;
+    assert_eq!(
+        focus.target().cloned(),
+        Some(DiscussionTarget::Plan {
+            id: "plan-1".to_string()
+        })
+    );
+    assert_eq!(focus.focused_items(), ["1".to_string()].as_slice());
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// A plain prompt whose focus anchor references a plan that is gone falls
+/// back to the raw prompt and clears the stale anchor, so the dialogue is
+/// never routed at an entity that no longer exists.
+#[tokio::test]
+async fn plain_prompt_with_stale_focus_clears_the_anchor() {
+    let root = scratch_root("focus-stale");
+    let state = state_over_root(root.clone());
+
+    state
+        .set_discussion_focus(DiscussionFocus::plan("gone-plan", Vec::new()))
+        .await;
+
+    let (prompt, intent) = build_model_ask_prompt(
+        &state,
+        ModelAskParams::Prompt {
+            text: "just answer here".to_string(),
+        },
+    )
+    .await
+    .expect("a stale focus must not fail the plain prompt");
+
+    assert_eq!(prompt, "just answer here");
+    assert!(intent.is_interactive_repl());
+    assert!(
+        state.discussion_focus().await.is_none(),
+        "the stale anchor must be cleared instead of kept"
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// An explicit discussion target that cannot be loaded fails the turn and
+/// leaves the previous focus anchor untouched, because the anchor is replaced
+/// only after the referenced entity loads successfully.
+#[tokio::test]
+async fn missing_discussion_target_keeps_the_previous_focus() {
+    let root = scratch_root("focus-missing");
+    let state = state_over_root(root.clone());
+
+    let anchor = DiscussionFocus::plan("kept-plan", vec!["1".to_string()]);
+    state.set_discussion_focus(anchor.clone()).await;
+
+    let err = build_model_ask_prompt(
+        &state,
+        ModelAskParams::Discussion(DiscussionRequest {
+            target: DiscussionTarget::Plan {
+                id: "missing-plan".to_string(),
+            },
+            focused_items: Vec::new(),
+            comment: "where did the plan go?".to_string(),
+        }),
+    )
+    .await
+    .expect_err("a target that cannot be loaded must fail the turn");
+
+    assert_eq!(err.code, tauqe_protocol::errors::NOT_FOUND.to_string());
+    assert_eq!(
+        state.discussion_focus().await,
+        anchor,
+        "the failed discussion must not replace the previous anchor"
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// A blank free-form prompt is rejected before any focus handling, so the
+/// invalid request never mutates the focus anchor.
+#[tokio::test]
+async fn blank_prompt_is_rejected_without_touching_the_focus() {
+    let root = scratch_root("focus-blank");
+    let state = state_over_root(root.clone());
+
+    let anchor = DiscussionFocus::plan("plan-1", Vec::new());
+    state.set_discussion_focus(anchor.clone()).await;
+
+    let err = build_model_ask_prompt(
+        &state,
+        ModelAskParams::Prompt {
+            text: "   ".to_string(),
+        },
+    )
+    .await
+    .expect_err("a blank prompt must be rejected");
+
+    assert_eq!(err.code, tauqe_protocol::errors::INVALID_PARAMS.to_string());
+    assert_eq!(
+        state.discussion_focus().await,
+        anchor,
+        "a rejected prompt must leave the focus anchor untouched"
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
 }
 
 /// Creates a unique scratch repository root for a pre-flight integrity test.

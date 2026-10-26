@@ -2,6 +2,27 @@ use std::path::{Path, PathBuf};
 
 pub const DEFAULT_CONFIG_TEMPLATE: &str = include_str!("../../../../tauqe.toml");
 
+/// Repository-level configuration file names, in discovery order.
+///
+/// A repository declares its harness configuration through one of these names,
+/// and discovery prefers the first one that exists. Keeping the list here lets
+/// the loader and the staging guard resolve the same names instead of each
+/// spelling out its own copy.
+const REPO_CONFIG_FILE_NAMES: [&str; 2] = ["tauqe.toml", ".tauqe.toml"];
+
+/// Reports whether a repository-relative path names the repository
+/// configuration file under either accepted spelling.
+///
+/// The staging guard uses this answer to decide whether model-authored bytes
+/// must be parsed and semantically validated while they are still in memory, so
+/// a repository configured through `.tauqe.toml` is guarded exactly like one
+/// configured through `tauqe.toml`. Only repository-level files match: a
+/// user-level configuration resolved through [`config_candidates`] lies outside
+/// the reach of a change set and is never validated here.
+pub fn is_repo_config_path(path: &str) -> bool {
+    REPO_CONFIG_FILE_NAMES.contains(&path)
+}
+
 /// Parses a command line option value supporting both `--flag value` and `--flag=value`.
 ///
 /// A pure helper over an explicit argument iterator: the library never reads
@@ -78,11 +99,13 @@ pub(crate) fn config_candidates_internal(
     };
 
     if let Some(root) = repo_root {
-        add_candidate(root.join("tauqe.toml"));
-        add_candidate(root.join(".tauqe.toml"));
+        for name in REPO_CONFIG_FILE_NAMES {
+            add_candidate(root.join(name));
+        }
     } else if let Ok(cwd) = std::env::current_dir() {
-        add_candidate(cwd.join("tauqe.toml"));
-        add_candidate(cwd.join(".tauqe.toml"));
+        for name in REPO_CONFIG_FILE_NAMES {
+            add_candidate(cwd.join(name));
+        }
     }
 
     if let Some(cfg) = config_dir {
@@ -234,6 +257,17 @@ mod tests {
                 temp_dir.path().join(".tauqe.toml"),
             ]
         );
+    }
+
+    #[test]
+    fn test_is_repo_config_path_accepts_both_accepted_spellings_only() {
+        // Both names discovery walks are guarded, and only those names.
+        for name in REPO_CONFIG_FILE_NAMES {
+            assert!(is_repo_config_path(name));
+        }
+        assert!(!is_repo_config_path("tauqe.toml.bak"));
+        assert!(!is_repo_config_path("crates/core/tauqe.toml"));
+        assert!(!is_repo_config_path(""));
     }
 
     #[test]

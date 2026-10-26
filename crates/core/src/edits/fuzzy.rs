@@ -9,13 +9,19 @@
 use super::EditError;
 
 #[derive(Debug, Clone, Copy)]
-struct LineSpan {
-    start: usize,
-    content_end: usize,
-    end: usize,
+pub(super) struct LineSpan {
+    pub(super) start: usize,
+    pub(super) content_end: usize,
+    pub(super) end: usize,
 }
 
-fn scan_lines(text: &str) -> Vec<LineSpan> {
+/// Splits a text into the byte spans of its lines.
+///
+/// The spans describe exactly the lines a renderer emits: a line never contains
+/// its terminator, and a text that ends with a newline yields no trailing empty
+/// line. Both the fuzzy matcher and the anchored staging engine therefore agree
+/// on which line index names which bytes.
+pub(super) fn scan_lines(text: &str) -> Vec<LineSpan> {
     let mut lines = Vec::new();
     let bytes = text.as_bytes();
     let mut start = 0;
@@ -159,10 +165,8 @@ fn try_fuzzy_replace(
     effective_new: &str,
     path: &str,
 ) -> Result<Option<String>, EditError> {
-    if effective_old.trim().is_empty() {
-        return Ok(None);
-    }
-
+    // A pattern without content is rejected before the exact match runs, so
+    // every fuzzy level below matches text that names real lines.
     let file_lines = scan_lines(current);
     let pattern_lines = scan_lines(effective_old);
 
@@ -295,7 +299,15 @@ pub(crate) fn apply_replace(
     } else {
         (old_text.to_string(), new_text.to_string())
     };
-
+    // A pattern without content is a miss, not an ambiguity: the exact path
+    // would otherwise report one candidate per character boundary, so the model
+    // would receive a rejection that names no real defect and burn a retry round
+    // on it. The guard therefore runs before the exact match.
+    if effective_old.trim().is_empty() {
+        return Err(EditError::NoMatch {
+            path: path.to_string(),
+        });
+    }
     // 1. Exact match (fast path)
     let matches: Vec<(usize, &str)> = current.match_indices(&effective_old).collect();
     if matches.len() == 1 {
@@ -358,5 +370,18 @@ mod tests {
             result,
             Err(EditError::AmbiguousMatch { count: 2, .. })
         ));
+    }
+    #[test]
+    fn empty_pattern_is_a_miss_not_an_ambiguity() {
+        let current = "fn a() {\n    foo();\n}\n";
+        for empty in ["", "  \n\t "] {
+            assert!(
+                matches!(
+                    apply_replace(current, empty, "bar();", "empty.rs"),
+                    Err(EditError::NoMatch { .. })
+                ),
+                "{empty:?} must be reported as a miss"
+            );
+        }
     }
 }

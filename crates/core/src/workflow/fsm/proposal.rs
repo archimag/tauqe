@@ -514,8 +514,13 @@ pub(super) async fn run_proposal_step(
         .send(StreamEvent::RepoMapTokens(repomap_tokens))
         .await;
 
-    let history_tag = cache.history_tag(history_manager, intent).await;
+    let history = cache.history_snapshot(history_manager, intent).await;
     let project = cache.project(&repo_root, Some(&cancel_rx)).await;
+
+    // The declared patch strategy decides how the rendered context addresses the
+    // lines of every file, so it travels from the project configuration into the
+    // assembly instead of being re-derived by the prompt layer.
+    let patch_strategy = options.patch_strategy();
 
     let mut assembly = PromptAssembly::new(
         repo_state,
@@ -523,15 +528,21 @@ pub(super) async fn run_proposal_step(
         context_files,
         workflow_name,
         protocol.kind(),
-        history_tag,
+        history,
         repo_map,
     )
     .with_repo_dirs(repo_dirs)
-    .with_project(Some(project));
+    .with_project(Some(project))
+    .with_patch_strategy(patch_strategy);
     assembly.target_language = target_language.map(|language| language.to_string());
     assembly.intent = intent;
     assembly.turn_scratchpad = turn_scratchpad.map(|notes| notes.to_string());
     assembly.max_scratchpad_chars = options.max_scratchpad_chars;
+    // The layout policy resolved from the governing configuration composes the
+    // message sequence of the round: an interactive dialogue that keeps a
+    // growing history builds the chronological transcript, while every other
+    // intent keeps the semantic block order.
+    assembly.prompt_layout = options.prompt_layout(intent);
 
     // The declared turn intent narrows the protocol once, so the rendered
     // instructions, the structured response schema, the stream filter, and the
@@ -540,8 +551,12 @@ pub(super) async fn run_proposal_step(
     let scoped_protocol = protocol.with_capability_set(assembly.effective_capabilities(protocol));
     let protocol: &dyn PromptProtocol = scoped_protocol.as_ref();
 
-    let messages = assembly.assemble_chat_messages(prompt, protocol);
-    let response_format = protocol.response_format(&context_paths);
+    // The turn-scoped memo hands back the elements an earlier round already
+    // rendered, so the context block only grows at its tail and the provider
+    // keeps matching the prompt prefix it already cached.
+    let messages =
+        assembly.assemble_chat_messages_with_context_cache(prompt, protocol, cache.context_cache());
+    let response_format = protocol.response_format(&context_paths, patch_strategy);
 
     let (llm_tx, mut llm_rx) = mpsc::channel::<StreamEvent>(100);
     // A session identifier pins the proposal round to one provider backend and

@@ -255,6 +255,8 @@ pub(crate) struct SiblingCommit {
     staged: Option<PathBuf>,
     /// Set once the original was moved aside to `backup`.
     original_moved: bool,
+    /// Set once the staged content was renamed over `target`.
+    published: bool,
 }
 
 impl SiblingCommit {
@@ -283,6 +285,7 @@ impl SiblingCommit {
             backup: unique_sibling_path(target, STAGING_BACKUP_MARKER),
             staged,
             original_moved: false,
+            published: false,
         }
     }
 
@@ -302,6 +305,9 @@ impl SiblingCommit {
         }
         if let Some(staged) = &self.staged {
             std::fs::rename(staged, &self.target)?;
+            // The target now carries the staged content, so a rollback has to
+            // remove it again before restoring the original.
+            self.published = true;
         }
         sync_parent_directory(&self.target)
     }
@@ -311,9 +317,17 @@ impl SiblingCommit {
     /// Staged content that reached the target is removed, and an original moved
     /// to a backup is restored by a single rename, which preserves its
     /// permissions, timestamps and symlink target.
+    ///
+    /// A commit that fails before the staged content reaches the target leaves
+    /// the original untouched, so the target is removed only once `published`
+    /// reports that staged content is what sits there. Removing it
+    /// unconditionally would destroy the intact original on exactly the failure
+    /// path this rollback exists to protect.
     pub(crate) fn rollback(&self) {
         if let Some(staged) = &self.staged {
-            let _ = std::fs::remove_file(&self.target);
+            if self.published {
+                let _ = std::fs::remove_file(&self.target);
+            }
             let _ = std::fs::remove_file(staged);
         }
         if self.original_moved {
@@ -468,6 +482,38 @@ mod tests {
         change.rollback();
         assert_eq!(std::fs::read_to_string(&target).unwrap(), "original");
         assert!(staging_leftovers(dir.path()).is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_failed_commit_never_deletes_the_untouched_original() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempdir().unwrap();
+        let parent = dir.path().join("locked");
+        std::fs::create_dir(&parent).unwrap();
+        let target = parent.join("source.rs");
+        std::fs::write(&target, "original").unwrap();
+
+        let mut change = SiblingCommit::stage(&target, b"updated").unwrap();
+
+        // A read-only parent rejects the first rename of the commit (original
+        // to backup), so the failure happens before any staged content could
+        // reach the target and the original is still the file on disk.
+        std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o555)).unwrap();
+        let commit = change.commit();
+        std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        assert!(commit.is_err(), "the commit must observe the failed rename");
+
+        change.rollback();
+
+        assert_eq!(
+            std::fs::read_to_string(&target).unwrap(),
+            "original",
+            "a rollback must never delete an original the commit never replaced"
+        );
+        assert!(staging_leftovers(&parent).is_empty());
     }
 
     #[test]

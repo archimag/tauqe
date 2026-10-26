@@ -165,12 +165,6 @@ fn render_footer_with_engine(
                 round_str,
                 engine.fg(palette.status_info).bold(),
             ));
-        } else if let Some(round_str) = extract_current_round(&state.model.text) {
-            footer_spans.push(Span::raw(" "));
-            footer_spans.push(Span::styled(
-                format!("[{}]", round_str),
-                engine.fg(palette.status_info).bold(),
-            ));
         }
 
         // Active retrying / modifying file
@@ -336,22 +330,6 @@ pub fn render_turn_phase_pipeline(
     }
     spans.push(Span::styled("]", engine.fg(palette.text_muted)));
     spans
-}
-
-pub fn extract_current_round(text: &str) -> Option<String> {
-    let last_round = text.rfind("[Round ");
-    let last_retry = text.rfind("[Patch Retry ");
-    match (last_round, last_retry) {
-        (Some(r), Some(t)) if r >= t => extract_bracketed(&text[r..]),
-        (Some(_), Some(t)) => extract_bracketed(&text[t..]),
-        (Some(r), None) => extract_bracketed(&text[r..]),
-        (None, Some(t)) => extract_bracketed(&text[t..]),
-        (None, None) => None,
-    }
-}
-
-fn extract_bracketed(slice: &str) -> Option<String> {
-    slice.find(']').map(|end| slice[1..end].to_string())
 }
 
 /// Renders every tier of the compact usage summary, richest first.
@@ -529,19 +507,58 @@ mod tests {
     }
 
     #[test]
-    fn test_extract_current_round() {
-        assert_eq!(extract_current_round("Hello world"), None);
-        assert_eq!(
-            extract_current_round("Some text\n\n---\n**[Round 2]** Added 1 file\n\nMore text"),
-            Some("Round 2".to_string())
+    fn busy_footer_renders_the_round_badge_from_typed_state() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        let backend = TestBackend::new(140, 3);
+        let mut terminal = Terminal::new(backend).expect("terminal created");
+        let mut state = crate::app::test_state();
+        state.model.status = TurnStatus::Responding;
+        state.model.turn_round = Some(2);
+        state.model.turn_max_rounds = Some(5);
+
+        terminal
+            .draw(|frame| {
+                let area = frame.area();
+                render_footer(frame, &state, area);
+            })
+            .expect("draw succeeded");
+
+        let buffer = terminal.backend().buffer();
+        let content: String = buffer.content().iter().map(|cell| cell.symbol()).collect();
+        assert!(
+            content.contains("[Round 2/5]"),
+            "the typed round counter must drive the badge: {content:?}"
         );
-        assert_eq!(
-            extract_current_round("Text [Round 2] more text [Round 3] now"),
-            Some("Round 3".to_string())
-        );
-        assert_eq!(
-            extract_current_round("Text [Round 2] [Patch Retry 1/3] fixing"),
-            Some("Patch Retry 1/3".to_string())
+    }
+
+    #[test]
+    fn busy_footer_never_scrapes_a_round_badge_from_answer_text() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        let backend = TestBackend::new(140, 3);
+        let mut terminal = Terminal::new(backend).expect("terminal created");
+        let mut state = crate::app::test_state();
+        state.model.status = TurnStatus::Responding;
+        state.model.turn_round = None;
+        state.model.turn_max_rounds = None;
+        state.model.turn_phase_detail = None;
+        state.model.text = "Quoted log follows:\n[Round 9] unrelated prose".to_string();
+
+        terminal
+            .draw(|frame| {
+                let area = frame.area();
+                render_footer(frame, &state, area);
+            })
+            .expect("draw succeeded");
+
+        let buffer = terminal.backend().buffer();
+        let content: String = buffer.content().iter().map(|cell| cell.symbol()).collect();
+        assert!(
+            !content.contains("Round 9"),
+            "model prose must never fabricate a round badge: {content:?}"
         );
     }
 

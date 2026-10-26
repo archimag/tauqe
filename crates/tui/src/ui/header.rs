@@ -71,7 +71,12 @@ fn model_selector_parts(state: &AppState) -> (String, Option<tauqe_protocol::Rea
             .roles
             .as_ref()
             .and_then(|roles| roles.entries.as_ref())
-            .and_then(|entries| entries.primary.iter().find(|entry| &entry.model == model_ref))
+            .and_then(|entries| {
+                entries
+                    .primary
+                    .iter()
+                    .find(|entry| &entry.model == model_ref)
+            })
             .cloned(),
         // A tier selection carries the full { model, effort } coordinate of
         // the picked role-list entry, so the label is rendered straight from

@@ -885,7 +885,9 @@ mod tests {
 
         let warm = state.session_uuid().await;
         let resp = handle_config_set(
-            config_set_request(ModelSelection::Specific(ModelRef::openrouter("alpha/model"))),
+            config_set_request(ModelSelection::Specific(ModelRef::openrouter(
+                "alpha/model",
+            ))),
             &state,
         )
         .await;

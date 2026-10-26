@@ -153,6 +153,7 @@ impl SessionStorage {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tauqe_protocol::HistoryFileChange;
     use tempfile::tempdir;
 
     #[test]
@@ -167,13 +168,14 @@ mod tests {
             id: Some(1),
             prompt: "Implement auth".to_string(),
             context: vec!["auth.rs".to_string()],
+            context_watermark: None,
         };
         let entry2 = HistoryEntry::Response {
             id: Some(2),
             message: "Added token auth".to_string(),
             commit: Some("c123456".to_string()),
             summary: Some("Add token auth".to_string()),
-            files: vec!["auth.rs".to_string()],
+            files: vec![HistoryFileChange::plain("auth.rs")],
         };
 
         storage.append_entry(&entry1).unwrap();
@@ -210,11 +212,13 @@ mod tests {
             id: Some(1),
             prompt: "First turn".to_string(),
             context: vec![],
+            context_watermark: None,
         };
         let entry2 = HistoryEntry::Turn {
             id: Some(2),
             prompt: "Second turn".to_string(),
             context: vec![],
+            context_watermark: None,
         };
 
         storage.append_entry(&entry1).unwrap();
@@ -247,6 +251,7 @@ mod tests {
             id: Some(1),
             prompt: "Read history off the executor".to_string(),
             context: vec!["history/storage.rs".to_string()],
+            context_watermark: None,
         };
         storage.append_entry(&entry).unwrap();
 
@@ -255,5 +260,23 @@ mod tests {
 
         storage.clear().unwrap();
         assert!(storage.read_entries().unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_storage_roundtrips_turn_context_watermark() {
+        let dir = tempdir().unwrap();
+        let repo_root = dir.path().to_path_buf();
+        let storage = SessionStorage::new(repo_root);
+
+        let entry = HistoryEntry::Turn {
+            id: Some(1),
+            prompt: "Discover the parser".to_string(),
+            context: vec!["src/parser.rs".to_string()],
+            context_watermark: Some(42),
+        };
+        storage.append_entry(&entry).unwrap();
+
+        let entries = storage.read_entries().unwrap();
+        assert_eq!(entries, vec![entry]);
     }
 }

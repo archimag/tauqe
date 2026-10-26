@@ -564,6 +564,7 @@ pub(crate) fn compute_unified_review_lines(
                 // collected apart and appended after the metadata lines, which
                 // are short and wrapped every frame (c-1).
                 let mut detail_lines: Vec<Line<'static>> = Vec::new();
+                let mut rec_lines: Vec<Line<'static>> = Vec::new();
 
                 // The finding's own detail block renders at the level of its
                 // children, never deeper (Conventions §4.8).
@@ -676,7 +677,7 @@ pub(crate) fn compute_unified_review_lines(
                     }
 
                     if !recommendations.is_empty() {
-                        row_lines.push(Line::from(Span::styled(
+                        rec_lines.push(Line::from(Span::styled(
                             format!(
                                 "{body_indent}{}",
                                 crate::i18n::active_t("review.recommendations_label")
@@ -684,7 +685,7 @@ pub(crate) fn compute_unified_review_lines(
                             engine.fg(palette.status_success).bold(),
                         )));
                         for rec in recommendations {
-                            row_lines.push(Line::from(vec![
+                            rec_lines.push(Line::from(vec![
                                 Span::styled(
                                     format!("{body_indent}│ • "),
                                     engine.fg(palette.text_muted),
@@ -695,9 +696,11 @@ pub(crate) fn compute_unified_review_lines(
                     }
                 }
 
-                let mut rendered = wrap_lines(row_lines, width);
-                rendered.extend(detail_lines);
-                all_lines.extend(rendered);
+                all_lines.extend(wrap_lines(row_lines, width));
+                all_lines.extend(detail_lines);
+                if !rec_lines.is_empty() {
+                    all_lines.extend(wrap_lines(rec_lines, width));
+                }
             }
             VisibleReviewRow::SubplanItem {
                 session_id,
@@ -1808,6 +1811,43 @@ mod tests {
             body_lines(&second),
             body_lines(&first),
             "navigation must not change a rendered body"
+        );
+    }
+
+    #[test]
+    fn test_review_item_description_renders_before_recommendations() {
+        let mut session = make_session("rev-order", &[1]);
+        session.items[0] = ReviewItem::from(ReviewIssue {
+            description: "Detailed description of the issue.".to_string(),
+            recommendations: vec!["Step 1: Fix it.".to_string()],
+            ..make_item(1)
+        });
+        let mut view = ReviewViewState {
+            sessions: vec![session],
+            ..Default::default()
+        };
+        view.toggle_item_expanded("rev-order", 1);
+
+        let (lines, _) = render_view(&mut view, 1, 100);
+        let desc_label = crate::i18n::active_t("review.description_label");
+        let recs_label = crate::i18n::active_t("review.recommendations_label");
+
+        let desc_label_idx = find_line(&lines, &desc_label);
+        let desc_body_idx = find_line(&lines, "Detailed description of the issue.");
+        let recs_label_idx = find_line(&lines, &recs_label);
+        let rec_bullet_idx = find_line(&lines, "Step 1: Fix it.");
+
+        assert!(
+            desc_label_idx < desc_body_idx,
+            "Description header must precede description body"
+        );
+        assert!(
+            desc_body_idx < recs_label_idx,
+            "Description body must precede recommendations header: {desc_body_idx} >= {recs_label_idx}"
+        );
+        assert!(
+            recs_label_idx < rec_bullet_idx,
+            "Recommendations header must precede recommendation items"
         );
     }
 }

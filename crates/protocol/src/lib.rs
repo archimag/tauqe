@@ -43,7 +43,7 @@ pub use command::{
 };
 pub use config::{
     ConfigCreateParams, ConfigSetParams, ConfigState, CredentialsSaveParams, EditProtocolKind,
-    SystemStatusResult, WorkflowKind,
+    PatchStrategy, PromptLayoutKind, SystemStatusResult, WorkflowKind,
 };
 pub use context::{
     ContextAccess, ContextAddParams, ContextAddPatternParams, ContextAddPatternResult,
@@ -87,7 +87,7 @@ pub use git::{
 pub use glob::{matches_glob_pattern, GlobPattern};
 pub use history::{
     HistoryCompactedEvent, HistoryEntryAddedEvent, HistoryEntryRolledBackEvent, HistoryEntryStatus,
-    HistoryGetParams, HistoryGetResult, UiHistoryItem, UiHistoryKind,
+    HistoryFileChange, HistoryGetParams, HistoryGetResult, UiHistoryItem, UiHistoryKind,
 };
 pub use intent::TurnIntent;
 pub use lifecycle::{CLIENT_SHUTDOWN_WAIT, SHUTDOWN_DRAIN_BUDGET};

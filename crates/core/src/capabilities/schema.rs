@@ -14,8 +14,9 @@
 //! composed schema stays a deterministic projection of the enabled surface.
 
 use serde_json::{json, Value};
-use tauqe_protocol::DocTopic;
+use tauqe_protocol::{DocTopic, PatchStrategy};
 
+use crate::edits::strategy::StrategyProfile;
 /// Schema fragment of the conversational response property.
 pub(crate) fn message_fragment() -> Value {
     json!({
@@ -27,44 +28,91 @@ pub(crate) fn message_fragment() -> Value {
 }
 
 /// Schema fragment of the structured change-set property.
-pub(crate) fn changes_fragment() -> Value {
+///
+/// The patch strategy decides which fields address the lines a change replaces:
+/// a search-replace change echoes the replaced text, while an anchored change
+/// names the replaced range through the opaque anchors rendered beside every
+/// context line. Every other operation — create, overwrite, delete, and move —
+/// is described identically in both strategies, so only the replaced-line fields
+/// differ. That vocabulary lives in the [`StrategyProfile`] of the strategy, so
+/// the wire schema, the prompt instructions, and the decoding rules of one
+/// strategy can never disagree about the fields a change carries.
+pub(crate) fn changes_fragment(patch_strategy: PatchStrategy) -> Value {
     json!({
         "changes": {
             "type": "array",
             "description": "List of structured code modification operations",
-            "items": {
-                "type": "object",
-                "properties": {
-                    "op": {
-                        "type": "string",
-                        "enum": ["replace", "create", "delete", "move", "overwrite"],
-                        "description": "Operation type: 'replace' for modifying existing files, 'create' for new files, 'delete' for deleting files, 'move' for moving or renaming files, 'overwrite' for replacing the entire content of an existing file"
-                    },
-                    "path": {
-                        "type": "string",
-                        "description": "Relative repository path to the target file (source file for 'move')"
-                    },
-                    "to": {
-                        "type": "string",
-                        "description": "Target repository path for 'move' operation (empty string otherwise)"
-                    },
-                    "old_text": {
-                        "type": "string",
-                        "description": "Exact text to replace in the file (required for 'replace', empty string otherwise)"
-                    },
-                    "new_text": {
-                        "type": "string",
-                        "description": "Replacement text (for 'replace', empty string otherwise)"
-                    },
-                    "content": {
-                        "type": "string",
-                        "description": "Complete file content (required for 'create' and 'overwrite', empty string otherwise)"
-                    }
-                },
-                "required": ["op", "path", "to", "old_text", "new_text", "content"],
-                "additionalProperties": false
-            }
+            "items": change_entry(patch_strategy)
         }
+    })
+}
+
+/// Schema of one change entry for the active patch strategy.
+fn change_entry(patch_strategy: PatchStrategy) -> Value {
+    let profile = StrategyProfile::of(patch_strategy);
+
+    // The operation, its target, and the move destination address every
+    // strategy identically, so they are declared once, ahead of the fields the
+    // profile owns.
+    let mut properties = serde_json::Map::new();
+    properties.insert("op".to_string(), op_property());
+    properties.insert("path".to_string(), path_property());
+    properties.insert("to".to_string(), destination_property());
+    let mut required: Vec<Value> = vec![json!("op"), json!("path"), json!("to")];
+
+    // The replaced lines are addressed by the vocabulary of the strategy: the
+    // echoed text of a search-replace change or the opaque anchors of an
+    // anchored one. The property and its required entry come from the same
+    // profile field, so neither can survive without the other.
+    for field in profile.replaced_line_fields {
+        properties.insert(field.name.to_string(), string_property(field.description));
+        required.push(Value::String(field.name.to_string()));
+    }
+
+    properties.insert(
+        "content".to_string(),
+        string_property(profile.content_description),
+    );
+    required.push(json!("content"));
+
+    json!({
+        "type": "object",
+        "properties": Value::Object(properties),
+        "required": required,
+        "additionalProperties": false
+    })
+}
+
+/// Schema of one string property carrying the given description.
+fn string_property(description: &str) -> Value {
+    json!({
+        "type": "string",
+        "description": description
+    })
+}
+
+/// Schema of the declared operation selector shared by both change shapes.
+fn op_property() -> Value {
+    json!({
+        "type": "string",
+        "enum": ["replace", "create", "delete", "move", "overwrite"],
+        "description": "Operation type: 'replace' for modifying existing files, 'create' for new files, 'delete' for deleting files, 'move' for moving or renaming files, 'overwrite' for replacing the entire content of an existing file"
+    })
+}
+
+/// Schema of the target path shared by both change shapes.
+fn path_property() -> Value {
+    json!({
+        "type": "string",
+        "description": "Relative repository path to the target file (source file for 'move')"
+    })
+}
+
+/// Schema of the move destination shared by both change shapes.
+fn destination_property() -> Value {
+    json!({
+        "type": "string",
+        "description": "Target repository path for 'move' operation (empty string otherwise)"
     })
 }
 
@@ -340,7 +388,7 @@ mod tests {
     fn fragments_are_keyed_objects_without_nullable_types() {
         for fragment in [
             message_fragment(),
-            changes_fragment(),
+            changes_fragment(PatchStrategy::SearchReplace),
             discovery_fragment(),
             doc_requests_fragment(),
             verify_fragment(),
@@ -358,6 +406,45 @@ mod tests {
             );
             // The schema stays strict: no property admits an explicit null.
             assert!(!fragment.to_string().contains("\"null\""));
+        }
+    }
+
+    #[test]
+    fn the_change_set_fragment_follows_the_patch_strategy() {
+        let search_replace = changes_fragment(PatchStrategy::SearchReplace);
+        let search_fields = search_replace["changes"]["items"]["properties"]
+            .as_object()
+            .expect("the change entry declares its fields");
+        assert!(search_fields.contains_key("old_text"));
+        assert!(search_fields.contains_key("new_text"));
+        assert!(!search_fields.contains_key("start"));
+
+        // An anchored change names the replaced range instead of echoing it.
+        let anchored = changes_fragment(PatchStrategy::LineAnchor);
+        let anchor_fields = anchored["changes"]["items"]["properties"]
+            .as_object()
+            .expect("the change entry declares its fields");
+        assert!(anchor_fields.contains_key("start"));
+        assert!(anchor_fields.contains_key("end"));
+        assert!(anchor_fields.contains_key("content"));
+        assert!(!anchor_fields.contains_key("old_text"));
+        assert!(!anchor_fields.contains_key("new_text"));
+
+        // Both shapes describe the very same operation vocabulary and stay
+        // strict: a declared field is always required and no unknown field is
+        // accepted.
+        for fragment in [search_replace, anchored] {
+            let entry = &fragment["changes"]["items"];
+            assert_eq!(entry["additionalProperties"], serde_json::json!(false));
+            assert_eq!(
+                entry["required"].as_array().map(|required| required.len()),
+                entry["properties"]
+                    .as_object()
+                    .map(|properties| properties.len())
+            );
+            assert!(entry["properties"].get("op").is_some());
+            assert!(entry["properties"].get("path").is_some());
+            assert!(entry["properties"].get("to").is_some());
         }
     }
 

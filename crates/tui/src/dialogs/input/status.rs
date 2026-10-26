@@ -1,12 +1,14 @@
+use tauqe_protocol::methods;
+use tokio::sync::MutexGuard;
+
 use crate::app::AppState;
 use crate::dialogs::render::status::{PLAN_STATUS_ORDER, REVIEW_STATUS_ORDER};
 use crate::rpc::RpcConnection;
-use tauqe_protocol::methods;
 
 /// Applies the status chosen in the status dialog to a plan item or a review finding,
 /// updating local state optimistically and registering a server rollback.
 pub(crate) async fn apply_status_dialog(
-    st: &mut AppState,
+    mut st: MutexGuard<'_, AppState>,
     chosen_idx: usize,
     server_writer: &mut RpcConnection,
 ) -> anyhow::Result<()> {
@@ -48,11 +50,15 @@ pub(crate) async fn apply_status_dialog(
                     item_id,
                     status: Some(new_status),
                 };
+                let payload = serde_json::to_value(params)?;
+                // The optimistic mutation and its rollback are recorded, so the
+                // guard is released before the request leaves the loop (c-1).
+                drop(st);
                 crate::rpc::send_request_with_id(
                     server_writer,
                     req_id,
                     methods::PLAN_UPDATE_ITEM,
-                    serde_json::to_value(params)?,
+                    payload,
                 )
                 .await?;
             }
@@ -99,11 +105,15 @@ pub(crate) async fn apply_status_dialog(
                     status: Some(new_status),
                     note: None,
                 };
+                let payload = serde_json::to_value(params)?;
+                // The optimistic mutation and its rollback are recorded, so the
+                // guard is released before the request leaves the loop (c-1).
+                drop(st);
                 crate::rpc::send_request_with_id(
                     server_writer,
                     req_id,
                     methods::REVIEW_UPDATE_ITEM,
-                    serde_json::to_value(params)?,
+                    payload,
                 )
                 .await?;
             }
@@ -167,11 +177,14 @@ mod tests {
             2,
         ));
 
+        let state = std::sync::Arc::new(tokio::sync::Mutex::new(st));
         let mut conn = RpcConnection::new(Vec::<u8>::new());
-        apply_status_dialog(&mut st, 2, &mut conn).await.unwrap();
+        let guard = state.lock().await;
+        apply_status_dialog(guard, 2, &mut conn).await.unwrap();
 
         // rev-2's finding moves to InProgress; rev-1's identically numbered
         // finding, and the active session mirror, stay untouched.
+        let st = state.lock().await;
         assert_eq!(
             st.review.sessions[0].items[0].status,
             ReviewItemStatus::Todo
@@ -205,9 +218,12 @@ mod tests {
             3,
         ));
 
+        let state = std::sync::Arc::new(tokio::sync::Mutex::new(st));
         let mut conn = RpcConnection::new(Vec::<u8>::new());
-        apply_status_dialog(&mut st, 3, &mut conn).await.unwrap();
+        let guard = state.lock().await;
+        apply_status_dialog(guard, 3, &mut conn).await.unwrap();
 
+        let st = state.lock().await;
         assert_eq!(
             st.review.sessions[0].items[0].status,
             ReviewItemStatus::Refine

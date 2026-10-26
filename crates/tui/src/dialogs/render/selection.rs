@@ -4,7 +4,7 @@ use ratatui::text::Span;
 use ratatui::widgets::Paragraph;
 
 use crate::components::modal::{
-    modal_geometry, render_dialog_footer, render_modal_container_styled,
+    modal_geometry, render_dialog_footer, render_modal_container_styled, verb_hint,
 };
 use crate::i18n::active_t;
 use crate::theme::engine::current_engine;
@@ -179,7 +179,7 @@ pub fn render_selection_dialog(
     render_dialog_footer(
         frame,
         geometry.hint_row,
-        &active_t("dialog.model_select.footer_primary"),
+        &verb_hint(active_t("dialog.model_select.footer_primary")),
     );
 }
 

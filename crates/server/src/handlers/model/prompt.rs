@@ -81,7 +81,7 @@ pub(super) async fn build_model_ask_prompt(
 /// because the developer may ask the model to apply the fix directly.
 pub(super) fn intent_for_target(target: &DiscussionTarget) -> TurnIntent {
     match target {
-        DiscussionTarget::Plan { .. } => TurnIntent::ReadonlyDiscussion,
+        DiscussionTarget::Plan { .. } => TurnIntent::PlanDiscussion,
         DiscussionTarget::Review { .. } => TurnIntent::InteractiveRepl,
     }
 }

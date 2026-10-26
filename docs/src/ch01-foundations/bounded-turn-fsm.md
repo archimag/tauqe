@@ -42,9 +42,9 @@ known recovery path.
 Every turn runs in exactly one regime, declared as a typed value before the first
 token is generated:
 
-- `InteractiveRepl` — free dialogue from the REPL, including a dialogue anchored on
-  a review finding;
-- `ReadonlyDiscussion` — read-only architectural discussion of a plan;
+- `InteractiveRepl` — free interactive dialogue started from the REPL,
+  including a dialogue anchored on a review finding;
+- `PlanDiscussion` — architectural discussion of a plan;
 - `IsolatedStep` — execution of one plan step or one review finding.
 
 The intent is derived from typed request parameters, never from prompt text. It
@@ -389,26 +389,77 @@ between members, letting the current turn finish its verification and commit bef
 the queue halts. Hard cancellation wins when both are pending, and the two modes
 surface as distinct terminal statuses.
 
-### 3.3.9 Prompt layout across rounds
+### 3.3.9 Prompt layout policies across rounds
 
 Every round re-sends the whole assembled prompt, and providers cache the longest
-unchanged token prefix. The prompt is therefore an append-only document: a frozen
-head and a volatile tail.
+unchanged token prefix. Turning that prompt into a message sequence is a policy
+behind one trait, so the same rendered material can become different sequences:
 
-The head renders in a fixed order — core system contract, repository outline,
-session history, context files in insertion order, active plan, language directive.
-The repository map is generated once per turn and frozen, because a regenerated map
-would drop the files discovery just added and rewrite thousands of cached tokens.
-Context files are appended in insertion order and promotions rewrite only one access
-attribute in place.
+- `SemanticLayout` groups the material by kind: one system message carrying the
+  contract, the outline, the whole `<context>` block, the active plan, the language
+  directive, the `<history>` block, and the scratchpad.
+- `ChronologicalLayout` turns the same material into an append-only transcript: a
+  byte-stable head, one message per history record with the context files that
+  byte-stable head, one message per history record with the context files that
+  record already observed placed right after it, and a volatile tail.
 
-The tail carries everything that legitimately changes: the turn scratchpad as the
-last block of the system message, and round feedback — discovery findings, patch
-retry reports, verification diagnostics — appended to the user message. Every round
-composes one fixed shape: task first, accumulated journal next, phase diagnostics
-last. A staging retry therefore differs from its own earlier attempt only in the
-trailing diagnostics.
+Both policies place the regime delta — the contract rules that only the active
+intent states — on the user side of the sequence. Under the semantic order it is
+the leading block of the final user message; under the chronological order it is
+the first block of the trailing user message, ahead of the active plan, the
+context manifest, and the scratchpad. Round diagnostics (patch retry reports,
+verification failures) are appended after it, so a retry never cuts the cached
+prefix a second time. Inside one turn the delta is byte-stable, because the
+intent does not change between rounds.
 
+The head renders the main capability list of the intent and the shared part of
+the regime trunk, so it is byte-identical for the free REPL, the plan discussion,
+and the review discussion. What a dialogue narrows further — the plan mutation
+delta of a plan discussion, and the empty profile delta of a review discussion —
+travels in the regime delta instead. The invariant that a capability is
+advertised exactly when it is decoded survives, because head and delta are read
+from the same typed profile.
+
+| Material | Semantic | Chronological |
+| --- | --- | --- |
+| Contract, instructions, metadata | system head | system head |
+| Repository outline | system head | system head |
+| Language directive | system head | system head |
+| Context files | one `<context>` block | `<context>` groups in the transcript |
+| History | one `<history>` block | one message per record |
+| Active plan | system tail | trailing user message |
+| Regime delta | leading block of the final user message | first block of the trailing user message |
+| Context manifest | absent | trailing user message |
+| Scratchpad | system tail | trailing user message |
+
+The head carries only what is identical from round to round. The repository map is
+generated once per turn and frozen, and it stays in the head under both policies:
+exploration and planning dominate a turn, and the map is the largest block, so
+moving it into the tail would pay a full reprocessing pass on every round. The price
+is documented rather than hidden — a map regenerated between turns excludes the
+files that entered the context, so the head itself changes and the whole tail is
+invalidated.
+
+Growth inside a turn stays append-only. Discovery appends an element at the tail of
+the context block, or appends the file after the last record of the transcript, and
+a promotion rewrites a single `access` attribute in place. The chronological order
+comes from the insertion watermark every context entry carries, so a file picked up
+between two turns appears between them, and a file no record observed yet closes the
+transcript.
+
+The tail carries everything that legitimately changes: the regime delta first,
+then the active plan, the context manifest of the chronological policy — paths and
+access, never content — and the turn scratchpad, while round feedback (discovery
+findings, patch retry reports, verification diagnostics) is appended after the
+delta.
+fixed shape: task first, accumulated journal next, phase diagnostics last. A staging
+retry therefore differs from its own earlier attempt only in the trailing
+diagnostics.
+
+One typed resolution decides which policy a turn runs under: a declared layout wins,
+otherwise an interactive REPL turn takes the chronological transcript and a
+discussion or an isolated step takes the semantic order, because those turns carry
+no growing history to interleave.
 ### 3.3.10 Transport resilience and output ceiling
 
 Transport failures that say nothing about the request — a timeout, a reset

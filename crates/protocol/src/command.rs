@@ -321,7 +321,7 @@ impl CapabilitySet {
     /// a dialogue while modifying an existing plan requires an active plan
     /// focus (`discussion_focus`).
     pub fn interactive_repl() -> Self {
-        Self::from_slice(LlmCapability::ALL).without(LlmCapability::PlanUpdate)
+        CapabilityProfile::interactive_repl().surface()
     }
 
     /// Format-independent capability set for executing one isolated step.
@@ -335,18 +335,19 @@ impl CapabilitySet {
     /// verification for a step lives in exactly one place instead of being
     /// duplicated across this profile and the narrowing rule.
     pub fn isolated_step() -> Self {
-        Self::interactive_repl().without(LlmCapability::PlanCreation)
+        CapabilityProfile::isolated_step().surface()
     }
 
     /// Discussion and planning capability set.
+    ///
+    /// The set is the declared surface of [`CapabilityProfile::discussion`], so a
+    /// plan discussion carries the whole dialogue head — the very list every
+    /// dialogue contour renders into its byte-stable head — plus the plan
+    /// mutation the regime authorizes. The head and the delta therefore stay one
+    /// declaration, and a capability can never belong to the discussion without
+    /// also belonging to its profile.
     pub fn discussion() -> Self {
-        Self::from_slice(&[
-            LlmCapability::TextMessage,
-            LlmCapability::PlanCreation,
-            LlmCapability::PlanUpdate,
-            LlmCapability::Discovery,
-            LlmCapability::UserLanguage,
-        ])
+        CapabilityProfile::discussion().surface()
     }
 
     /// Architect discovery capability set.
@@ -355,17 +356,104 @@ impl CapabilitySet {
     /// or runs toolchain verification, so the file-edit and verification
     /// capabilities are excluded.
     pub fn architect_discovery() -> Self {
-        Self::from_slice(&[
-            LlmCapability::TextMessage,
-            LlmCapability::Discovery,
-            LlmCapability::DocRequest,
-            LlmCapability::PlanCreation,
-            LlmCapability::PlanUpdate,
-            LlmCapability::Scratchpad,
-            LlmCapability::Outcome,
-            LlmCapability::Blocked,
-            LlmCapability::UserLanguage,
-        ])
+        CapabilityProfile::architect_discovery().surface()
+    }
+}
+
+/// Declarative placement of one turn regime's capabilities across the prompt.
+///
+/// A regime profile is a pair of typed capability lists. The `core` list is
+/// rendered into the byte-stable head of the system prompt, which every
+/// dialogue contour shares, so switching between the REPL, a plan discussion,
+/// and a review discussion keeps the provider prefix cache warm. The `delta`
+/// list is rendered into a contour-specific block of the trailing user
+/// message, where only the capabilities of the active regime travel.
+///
+/// Placement is a property of the regime composition, never of a capability's
+/// identity: the same capability sits in the head of one regime, in the delta
+/// of another, or is absent from a third entirely.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CapabilityProfile {
+    core: CapabilitySet,
+    delta: CapabilitySet,
+}
+
+impl CapabilityProfile {
+    /// Builds a profile from its head and delta lists.
+    pub fn new(core: CapabilitySet, delta: CapabilitySet) -> Self {
+        Self { core, delta }
+    }
+
+    /// Capabilities rendered into the byte-stable head.
+    pub fn core(&self) -> &CapabilitySet {
+        &self.core
+    }
+
+    /// Capabilities rendered into the contour delta of the trailing message.
+    pub fn delta(&self) -> &CapabilitySet {
+        &self.delta
+    }
+
+    /// Union of both lists, ordered by the canonical capability declaration.
+    ///
+    /// The canonical order keeps the surface deterministic no matter how a
+    /// profile lays its two lists out, so every consumer observes the same
+    /// sequence for the same set.
+    pub fn surface(&self) -> CapabilitySet {
+        let mut surface = CapabilitySet::new();
+        for capability in LlmCapability::ALL {
+            if self.core.contains(*capability) || self.delta.contains(*capability) {
+                surface.insert(*capability);
+            }
+        }
+        surface
+    }
+
+    /// Free interactive REPL dialogue: the whole dialogue surface in the head.
+    pub fn interactive_repl() -> Self {
+        Self::new(Self::dialogue_head(), CapabilitySet::new())
+    }
+
+    /// Plan discussion: the shared head plus plan mutation in the delta.
+    ///
+    /// Plan mutation stays a delta because authorizing it depends on an active
+    /// plan focus, which is a property of the regime rather than of the head
+    /// every dialogue contour renders identically.
+    pub fn discussion() -> Self {
+        Self::new(
+            Self::dialogue_head(),
+            CapabilitySet::from_slice(&[LlmCapability::PlanUpdate]),
+        )
+    }
+
+    /// One isolated step: the REPL head minus plan authoring, no delta.
+    pub fn isolated_step() -> Self {
+        Self::new(
+            Self::dialogue_head().without(LlmCapability::PlanCreation),
+            CapabilitySet::new(),
+        )
+    }
+
+    /// Architect discovery: plan mutation moves to the delta, surface unchanged.
+    pub fn architect_discovery() -> Self {
+        Self::new(
+            CapabilitySet::from_slice(&[
+                LlmCapability::TextMessage,
+                LlmCapability::Discovery,
+                LlmCapability::DocRequest,
+                LlmCapability::PlanCreation,
+                LlmCapability::Scratchpad,
+                LlmCapability::Outcome,
+                LlmCapability::Blocked,
+                LlmCapability::UserLanguage,
+            ]),
+            CapabilitySet::from_slice(&[LlmCapability::PlanUpdate]),
+        )
+    }
+
+    /// Head shared by every dialogue contour: the REPL surface.
+    fn dialogue_head() -> CapabilitySet {
+        CapabilitySet::from_slice(LlmCapability::ALL).without(LlmCapability::PlanUpdate)
     }
 }
 
@@ -1080,12 +1168,16 @@ mod tests {
         assert!(discussion.contains(LlmCapability::Discovery));
         assert!(discussion.contains(LlmCapability::PlanCreation));
         assert!(discussion.contains(LlmCapability::PlanUpdate));
-        // A read-only discussion implements nothing, so it advertises no abort
-        // surface at all.
-        assert!(!discussion.contains(LlmCapability::Abort));
-        assert!(!discussion.contains(LlmCapability::FileEdits));
-        assert!(!discussion.contains(LlmCapability::ToolchainVerify));
-        assert!(!discussion.contains(LlmCapability::CustomTools));
+        // A plan discussion carries the full dialogue surface: the developer may
+        // ask for the fix directly, exactly as in a review discussion, so the
+        // edit, verification, abort, and tool capabilities travel with it.
+        assert!(discussion.contains(LlmCapability::FileEdits));
+        assert!(discussion.contains(LlmCapability::ToolchainVerify));
+        assert!(discussion.contains(LlmCapability::Abort));
+        assert!(discussion.contains(LlmCapability::CustomTools));
+        // The set is the surface of the regime profile, never a second list.
+        assert_eq!(discussion, CapabilityProfile::discussion().surface());
+        assert_eq!(discussion, CapabilitySet::from_slice(LlmCapability::ALL));
 
         let architect = CapabilitySet::architect_discovery();
         assert!(architect.contains(LlmCapability::DocRequest));
@@ -1321,5 +1413,120 @@ mod tests {
                 args: serde_json::Value::Null,
             }
         );
+    }
+
+    #[test]
+    fn test_capability_profile_dialogue_heads_are_shared() {
+        // Every dialogue contour renders the same head, which is what keeps the
+        // provider prefix cache warm across focus switching. The review
+        // discussion runs through the REPL profile, so its head is shared by
+        // construction rather than by coincidence.
+        let head = CapabilitySet::from_slice(LlmCapability::ALL).without(LlmCapability::PlanUpdate);
+
+        for profile in [
+            CapabilityProfile::interactive_repl(),
+            CapabilityProfile::discussion(),
+        ] {
+            assert_eq!(profile.core().as_slice(), head.as_slice());
+        }
+    }
+
+    #[test]
+    fn test_capability_profile_placement_per_regime() {
+        let discussion = CapabilityProfile::discussion();
+        assert_eq!(discussion.delta().as_slice(), &[LlmCapability::PlanUpdate]);
+        assert!(!discussion.core().contains(LlmCapability::PlanUpdate));
+        assert!(discussion.surface().contains(LlmCapability::PlanUpdate));
+
+        assert!(CapabilityProfile::interactive_repl().delta().is_empty());
+        assert!(CapabilityProfile::isolated_step().delta().is_empty());
+
+        let step = CapabilityProfile::isolated_step();
+        assert!(
+            !step.core().contains(LlmCapability::PlanCreation),
+            "an isolated step never authors a plan"
+        );
+        assert!(step.core().contains(LlmCapability::ToolchainVerify));
+    }
+
+    #[test]
+    fn test_capability_profile_architect_moves_plan_update_to_delta() {
+        let architect = CapabilityProfile::architect_discovery();
+        assert_eq!(architect.delta().as_slice(), &[LlmCapability::PlanUpdate]);
+        assert!(!architect.core().contains(LlmCapability::PlanUpdate));
+
+        // Only the placement changes: the declared surface stays identical.
+        let expected = CapabilitySet::from_slice(&[
+            LlmCapability::TextMessage,
+            LlmCapability::Discovery,
+            LlmCapability::DocRequest,
+            LlmCapability::PlanCreation,
+            LlmCapability::PlanUpdate,
+            LlmCapability::Scratchpad,
+            LlmCapability::Outcome,
+            LlmCapability::Blocked,
+            LlmCapability::UserLanguage,
+        ]);
+        assert_eq!(architect.surface(), expected);
+        assert_eq!(CapabilitySet::architect_discovery(), expected);
+    }
+
+    #[test]
+    fn test_capability_profile_surface_matches_factories() {
+        let cases = [
+            (
+                CapabilityProfile::interactive_repl(),
+                CapabilitySet::interactive_repl(),
+            ),
+            (CapabilityProfile::discussion(), CapabilitySet::discussion()),
+            (
+                CapabilityProfile::isolated_step(),
+                CapabilitySet::isolated_step(),
+            ),
+            (
+                CapabilityProfile::architect_discovery(),
+                CapabilitySet::architect_discovery(),
+            ),
+        ];
+
+        for (profile, factory) in cases {
+            let surface = profile.surface();
+            assert_eq!(surface, factory);
+
+            // The union is rendered in the canonical declaration order, so a
+            // profile cannot make the surface order depend on how it laid the
+            // head and delta lists out.
+            let mut previous = None;
+            for capability in surface.iter() {
+                let index = LlmCapability::ALL
+                    .iter()
+                    .position(|declared| declared == capability)
+                    .expect("surface carries only declared capabilities");
+                assert!(
+                    previous.is_none_or(|last| last < index),
+                    "surface is rendered in the canonical declaration order"
+                );
+                previous = Some(index);
+            }
+        }
+    }
+
+    #[test]
+    fn test_capability_profile_head_loss_is_a_configuration_defect() {
+        // A dialogue profile that drops any capability of the shared head
+        // invalidates the prefix cache of every other dialogue contour, so the
+        // head is audited as a whole rather than per capability.
+        let head = CapabilityProfile::interactive_repl().core().clone();
+        for profile in [
+            CapabilityProfile::interactive_repl(),
+            CapabilityProfile::discussion(),
+        ] {
+            for capability in head.iter() {
+                assert!(
+                    profile.core().contains(*capability),
+                    "{capability} disappeared from the shared head"
+                );
+            }
+        }
     }
 }

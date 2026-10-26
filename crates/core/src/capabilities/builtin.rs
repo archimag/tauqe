@@ -8,17 +8,42 @@ use std::sync::OnceLock;
 
 use tauqe_protocol::{
     DiscussionPlanAction, DiscussionPlanUpdate, DocTopic, EditProtocolKind, LlmCapability,
-    LlmCommand, LlmOutcome, ModelResult, ProjectConfig, ProjectParameterSpec,
+    LlmCommand, LlmOutcome, ModelResult, PatchStrategy, ProjectConfig, ProjectParameterSpec,
+    PromptLayoutKind,
 };
 
 use crate::edits::protocol::xml::engine::{self, XmlTagSpec};
 use crate::edits::protocol::xml::tags::{ParsedPlanItem, ParsedPlanTag};
-use crate::edits::protocol::{TerminalOutcome, VerifyOnSuccess, VerifyTarget};
+use crate::edits::protocol::{TerminalOutcome, VerifyOnSuccess, VerifyTarget, XmlEditProtocol};
+use crate::edits::strategy::StrategyProfile;
 
 use super::registry::{
     resolve_specs, CapabilityModule, ContractContext, ContractRule, PromptRenderContext, XmlParser,
 };
 use super::schema;
+
+/// Sentence describing the `<file>` element shared by every layout policy.
+///
+/// The element and its `access` attribute are prompt-side payload rather than a
+/// command channel the model emits, so both layouts describe them identically
+/// and only the container that delivers them differs.
+const FILE_ELEMENT_CONTRACT: &str = "Every file is rendered as a `<file path=\"...\" access=\"...\">` element, and `access` is authoritative: `access=\"read_only\"` marks reference material, `access=\"editable\"` marks a file you may modify.";
+
+/// Builds the rule describing how the context material reaches the model.
+///
+/// The rule renders in the vocabulary of the declared layout policy — the single
+/// `<context>` block of the semantic layout, or the transcript and its
+/// `<context_manifest>` tail of the chronological one — and never mixes the two.
+pub(crate) fn context_surface_rule(ctx: &ContractContext<'_>) -> ContractRule {
+    let container = match ctx.prompt_layout {
+        PromptLayoutKind::Semantic => "The project state arrives as one `<context>` block inside the system prompt: the `<file>` elements follow one another in insertion order, and a file that entered the context in a later round is appended at the end of the same block.",
+        PromptLayoutKind::Chronological => "The project state arrives as a transcript: `<file>` elements are appended as their own messages in the order they entered the context, each one after the interaction record that observed it, while a `<context_manifest>` tail lists the path and access of every file currently in context without repeating its content.",
+    };
+    ContractRule::new(
+        "Context Surface",
+        format!("{container} {FILE_ELEMENT_CONTRACT}"),
+    )
+}
 
 /// Textual conversational response.
 pub(crate) struct TextMessageModule;
@@ -39,9 +64,11 @@ impl CapabilityModule for TextMessageModule {
     fn render_contract_rule(&self, ctx: &ContractContext<'_>) -> Option<ContractRule> {
         // The duty is identical in both contours: an analytical request is
         // answered in prose within the turn that finally holds the material.
-        // Only the name of the vehicle differs, because the structured
-        // discussion schema carries the answer in `message`.
-        let body = if ctx.intent.is_readonly_discussion() {
+        // Only the name of the vehicle differs, because the composed structured
+        // schema carries the answer in `message` in every dialogue contour. The
+        // rule therefore follows the transport alone: reading the declared
+        // intent would make the byte-stable head impossible.
+        let body = if ctx.protocol != EditProtocolKind::Xml {
             "Deliver every user-facing explanation, answer, and summary as conversational text in the `message` field and in the user's language. Format it as readable Markdown: prefer short paragraphs, use bullet lists for enumerations and fenced code blocks for code or commands, and reserve headings for answers long enough to need them; never emit a dense uninterrupted wall of text. An analytical or exploratory request is answered in prose, never deferred: as soon as the files, searches, or documentation you requested are available, the same turn must carry the analysis the developer asked for. Never conclude a discussion with an empty `message`, and never let an outcome field stand in for an answer you have not written."
         } else {
             "Deliver every user-facing explanation, answer, and summary as conversational text in the user's language, formatted as readable Markdown: prefer short paragraphs, use bullet lists for enumerations and fenced code blocks for code or commands, and reserve headings for answers long enough to need them; never emit a dense uninterrupted wall of text. An analytical or exploratory request is answered in prose, never deferred: as soon as the files, searches, or documentation you requested are available, the same turn must carry the analysis the developer asked for. Never close a turn silently, and never let a terminal outcome stand in for an answer you have not written."
@@ -114,7 +141,14 @@ impl CapabilityModule for FileEditsModule {
     }
 
     fn json_schema_fragment(&self) -> Option<serde_json::Value> {
-        Some(schema::changes_fragment())
+        Some(schema::changes_fragment(PatchStrategy::SearchReplace))
+    }
+
+    /// The change set is the one surface whose fields follow the strategy that
+    /// addresses the replaced lines, so it is described for that strategy
+    /// instead of once for all of them.
+    fn json_schema_fragment_for(&self, patch_strategy: PatchStrategy) -> Option<serde_json::Value> {
+        Some(schema::changes_fragment(patch_strategy))
     }
 
     fn render_contract_rule(&self, _ctx: &ContractContext<'_>) -> Option<ContractRule> {
@@ -125,22 +159,20 @@ impl CapabilityModule for FileEditsModule {
     }
 
     fn render_xml_instruction(&self, ctx: &PromptRenderContext<'_>) -> Option<String> {
-        let edits = ctx.tag_name(self.canonical_tag()?);
-        let edit = ctx.tag_name("edit");
-        let search = ctx.tag_name("search");
-        let replace = ctx.tag_name("replace");
-        let create = ctx.tag_name("create");
-        let overwrite = ctx.tag_name("overwrite");
-        let move_tag = ctx.tag_name("move");
-        let delete_tag = ctx.tag_name("delete");
-        let instruction = format!(
-            "- Code edits: wrap operations in <{edits} summary=\"...\">...</{edits}>. Use <{edit} path=\"...\"> with a <{search}>...</{search}> block and a <{replace}>...</{replace}> block for existing files, <{create} path=\"...\">...</{create}> for new files, <{overwrite} path=\"...\">...</{overwrite}> for a full rewrite, <{move_tag} from=\"...\" to=\"...\" /> to move or rename, and <{delete_tag} path=\"...\" /> to delete.\n  - The `summary` attribute of <{edits}> is the Git commit message: imperative mood, English, lowercase, no trailing period.\n  - An <{edit}> `path` MUST match a file present in <context>; a <{create}> path MUST be a valid repository-relative path.\n  - Files inside <context> declare their status through the `access` attribute: `access=\"editable\"` files may be modified directly, while a file marked `access=\"read_only\"` is provided for reference and becomes editable automatically once you propose a change to it.\n  - A <{search}> block MUST match EXACTLY ONE location in the target file, including whitespace and line breaks, and MUST stay as concise as possible while unique.\n  - Prefer <{edit}> for local changes and <{overwrite}> with the COMPLETE new content when most of a file changes; never use <{create}> for a path that already exists.\n  - Several operations may appear inside one <{edits}> block; if no code changes are needed, answer in plain text without any XML edit tags."
-        );
-        Some(instruction)
+        // The strategy decides which vocabulary describes the change set, so the
+        // reference never advertises a field the active decoder would reject.
+        // The profile owns that vocabulary, so the instruction, the wire schema,
+        // and the diagnostics of a failed patch cannot describe different fields.
+        let profile = StrategyProfile::of(ctx.patch_strategy);
+        Some(profile.render_xml_instruction(&|base: &str| ctx.tag_name(base)))
     }
 
-    fn render_structured_instruction(&self, _ctx: &PromptRenderContext<'_>) -> Option<String> {
-        Some("- `changes`: array of edit operations with `op` ('replace'|'create'|'delete'|'move'|'overwrite') plus `path`, `to`, `old_text`, `new_text`, and `content`.".to_string())
+    fn render_structured_instruction(&self, ctx: &PromptRenderContext<'_>) -> Option<String> {
+        Some(
+            StrategyProfile::of(ctx.patch_strategy)
+                .structured_instruction
+                .to_string(),
+        )
     }
 
     fn decode_xml(
@@ -150,19 +182,29 @@ impl CapabilityModule for FileEditsModule {
         marker: Option<&str>,
         editable_paths: &[String],
     ) -> Vec<LlmCommand> {
+        let mut commands = Vec::new();
+        // The anchored vehicle carries the change set as one JSON array, so it is
+        // decoded beside the search/replace grammar and independently of it.
+        match XmlEditProtocol.parse_anchor_edits(normalized_text, editable_paths) {
+            Ok(operations) => commands.extend(
+                operations
+                    .into_iter()
+                    .map(|operation| LlmCommand::Edit { operation }),
+            ),
+            Err(message) => commands.push(LlmCommand::ProtocolError { message }),
+        }
         match XmlParser::new(marker).parse_output(normalized_text, editable_paths) {
             ModelResult::Edit { edits, outcome, .. } => {
-                let mut commands = Vec::new();
                 if let Some(message) = outcome.error {
                     commands.push(LlmCommand::ProtocolError { message });
                 }
                 for operation in edits {
                     commands.push(LlmCommand::Edit { operation });
                 }
-                commands
             }
-            ModelResult::Answer { .. } => Vec::new(),
+            ModelResult::Answer { .. } => {}
         }
+        commands
     }
 }
 
@@ -481,28 +523,59 @@ fn plan_tag_to_command(tag: ParsedPlanTag) -> LlmCommand {
 }
 
 /// Contract rule body used when plans are discussed through structured output.
-const PLAN_DISCUSSION_BODY: &str = "When formulating or updating a task plan, populate the structured `plan_update` field in your response object with `action: \"save\"|\"update\"|\"delete\"`, plan `id`, `title`, `description`, `concept`, and `items`. Conceptual Foundation Invariant: Every plan in TAUQE is a two-section document and MUST have an architectural concept tree in `concept` defining requirements, design decisions, and system invariants ('What'). When creating a new plan (`action: \"save\"`), you MUST populate `concept` with at least one concept node. Creating a plan without a concept tree is strictly prohibited. Implementation steps in `items` ('How') are either outlined with `concept_refs` pointing to concept nodes, or left empty (`items: []`) to be synthesized subsequently by deep refinement (`plan_refine`). File Attributes Contract: `files` lists target files to create or modify (loaded as editable context), while `readonly_files` lists reference or contract files (loaded as read-only context and never modified). Leaf-Only Files Invariant: `files` and `readonly_files` must be specified exclusively for executable leaf steps without children; parent container items and task groups must have an empty `files: []` and `readonly_files: []` lists. Plan Action Semantics: Use `action: \"save\"` to create or completely overwrite/replace the entire plan; use `action: \"update\"` strictly to modify specific individual nodes or items in place by ID without touching unmentioned items; use `action: \"delete\"` to remove the plan. Reins Invariant: Never mutate the plan (leave `plan_update: null`) without an explicit user instruction to modify it. Questions, analysis, trade-off reviews, and critique must be answered strictly in conversational text in `message`. Planning Objective: Collaborative planning focuses on conceptual comprehension of the objective ('What'), aligning on key architectural decisions and trade-offs, and defining a cohesive concept tree without premature low-level code churn. Step Formulation Contract: Formulate each step around an engineering objective and operational invariants; define what state must be achieved and what invariants preserved. Always provide a clear `description` explaining the overall architecture, boundaries, and rationale. Language Consistency: Formulate plan title, description, concept titles/details, and step titles/details in the same language as the plan description and user's request. In <active_plan>, items marked with [FOCUSED] are focused by the user.";
-
-/// Contract rule body used when a develop turn authors plans through structured
-/// output.
+/// Intent-independent trunk of the structured plan rule.
 ///
-/// The body mirrors every invariant of the XML formulation — the mandatory
-/// concept tree, the file attributes contract, the leaf-only file rule, the
-/// save-only develop scope, the reins and language invariants — while naming the
-/// schema fields instead of the tags and omitting the XML shape example, so the
-/// structured contour never advertises markup its decoder rejects.
-const PLAN_STRUCTURED_DEVELOP_BODY: &str = "When formulating a task plan, populate the structured `plan_update` field with `action: \"save\"`, plan `id`, `title`, `description`, `concept`, and `items`. In Develop mode, you may ONLY propose new plans (`action: \"save\"`). Updating plan statuses, closing steps, or modifying existing plans from Develop mode is strictly prohibited (step execution and completion occur strictly in isolated step turns, while plan modifications and re-scoping belong exclusively in Discussion mode). Reins Invariant: Never populate `plan_update` with a payload without an explicit user instruction or confirmation to formulate a plan. Questions, analysis, architectural reviews, or exploratory discussion must be answered strictly in conversational text in `message`. Conceptual Foundation Invariant: Every plan MUST contain an architectural concept tree in `concept` defining the core requirements, design decisions, and system invariants ('What'). Inside `concept`, define architectural nodes carrying an `id` (`c-...`), a `title`, and their `details`. Plan creation without `concept` containing at least one concept node is strictly prohibited. Implementation steps in `items` define 'How', may be included with `concept_refs` (`c-...`), `files`, and `readonly_files`, or omitted if awaiting deep refinement. File Attributes Contract: `files` lists target files to create or modify (loaded as editable context), while `readonly_files` lists reference or contract files such as subsystem conventions, protocol types, and interfaces (loaded as read-only context and never modified). Leaf-Only Files Invariant: `files` and `readonly_files` must be specified exclusively for executable leaf steps without children; parent container items and task groups must never carry files. Plan Action Semantics: use `action: \"save\"` to create the whole plan; modifying an existing plan is a Discussion-mode operation, never a Develop-mode one. Planning Objective: Plan synthesis focuses on conceptual comprehension of the objective ('What'), aligning on key architectural decisions and trade-offs, and defining a cohesive concept tree without premature low-level code churn or deep file inspection. Step Formulation Contract: Formulate each step around an engineering objective and operational invariants rather than detailed procedural micro-instructions; define what state must be achieved and what invariants preserved. Always provide a clear `description` explaining the overall architecture, boundaries, and rationale. Plan Creation Invariant: Only create a plan when explicitly instructed or confirmed by the user. Whenever you propose a new plan, you MUST precede the payload with a concise conversational explanation of the proposed plan, and you MUST populate `plan_update` in the same response, carrying both `concept` (mandatory) and optional `items`. Language Consistency: Formulate the plan title, description, concept nodes, step titles, and step details in the same language as the user's request.";
+/// It states only the invariants every plan carries — the mandatory concept
+/// tree, the file attribute contract and its leaf-only restriction, the step
+/// formulation contract, the plan creation invariant, and language consistency —
+/// so it renders byte-identically whichever dialogue regime authors the plan.
+/// The actions a regime authorizes live in the delta constants below.
+const PLAN_STRUCTURED_CORE_BODY: &str = "Every plan travels as one structured `plan_update` field carrying `action`, plan `id`, `title`, `description`, `concept`, and `items`. Conceptual Foundation Invariant: Every plan MUST contain an architectural concept tree in `concept` defining the core requirements, design decisions, and system invariants ('What'). Inside `concept`, define architectural nodes carrying an `id` (`c-...`), a `title`, and their `details`. Plan creation without `concept` containing at least one concept node is strictly prohibited. Implementation steps in `items` define 'How', may be included with `concept_refs` (`c-...`), `files`, and `readonly_files`, or omitted if awaiting deep refinement. File Attributes Contract: `files` lists target files to create or modify (loaded as editable context), while `readonly_files` lists reference or contract files such as subsystem conventions, protocol types, and interfaces (loaded as read-only context and never modified). Leaf-Only Files Invariant: `files` and `readonly_files` must be specified exclusively for executable leaf steps without children; parent container items and task groups must never carry files. Step Formulation Contract: Formulate each step around an engineering objective and operational invariants rather than detailed procedural micro-instructions; define what state must be achieved and what invariants preserved. Always provide a clear `description` explaining the overall architecture, boundaries, and rationale. Plan Creation Invariant: Only create a plan when explicitly instructed or confirmed by the user. Whenever you propose a new plan, you MUST precede the payload with a concise conversational explanation of the proposed plan, and you MUST populate `plan_update` in the same response, carrying both `concept` (mandatory) and optional `items`. Language Consistency: Formulate the plan title, description, concept nodes, step titles, and step details in the same language as the user's request.";
 
-/// Contract rule body used when plans are authored through XML edit tags.
-fn plan_xml_body(ctx: &ContractContext<'_>, plan: &str) -> String {
+/// Regime delta of the structured plan rule for a develop turn.
+///
+/// It names the only plan action a develop turn may take and the reins that
+/// guard it, together with the planning objective of that regime.
+const PLAN_STRUCTURED_DEVELOP_DELTA: &str = "In Develop mode, you may ONLY propose new plans (`action: \"save\"`). Updating plan statuses, closing steps, or modifying existing plans from Develop mode is strictly prohibited (step execution and completion occur strictly in isolated step turns, while plan modifications and re-scoping belong exclusively in Discussion mode). Reins Invariant: Never populate `plan_update` with a payload without an explicit user instruction or confirmation to formulate a plan. Questions, analysis, architectural reviews, or exploratory discussion must be answered strictly in conversational text in `message`. Planning Objective: Plan synthesis focuses on conceptual comprehension of the objective ('What'), aligning on key architectural decisions and trade-offs, and defining a cohesive concept tree without premature low-level code churn or deep file inspection.";
+
+/// Regime delta of the structured plan rule for a plan discussion.
+///
+/// It declares the whole plan action surface the Discussion mutation mode
+/// authorizes, states that direct code changes travel the ordinary transactional
+/// path, and carries the collaborative planning objective.
+const PLAN_STRUCTURED_DISCUSSION_DELTA: &str = "In plan discussion mode, populate the structured `plan_update` field with `action: \"save\"|\"update\"|\"delete\"`. Plan Action Semantics: use `action: \"save\"` to create or completely overwrite/replace the entire plan; use `action: \"update\"` strictly to modify specific individual nodes or items in place by ID without touching unmentioned items; use `action: \"delete\"` to remove the plan. Code modifications requested directly by the developer are permitted alongside the discussion, and they travel the ordinary transactional path. Reins Invariant: Never mutate the plan (leave `plan_update: null`) without an explicit user instruction to modify it. Questions, analysis, trade-off reviews, and critique must be answered strictly in conversational text in `message`. Planning Objective: Collaborative planning focuses on conceptual comprehension of the objective ('What'), aligning on key architectural decisions and trade-offs, and defining a cohesive concept tree without premature low-level code churn.";
+
+/// Intent-independent trunk of the XML plan rule.
+///
+/// The trunk states the invariants every plan carries and the shape example of
+/// the contour, so it renders identically whichever dialogue regime authors the
+/// plan. The authorized actions live in [`plan_xml_delta`].
+fn plan_xml_core(ctx: &ContractContext<'_>, plan: &str) -> String {
     let description = ctx.tag_name("description");
     let concept = ctx.tag_name("concept");
     let concept_item = ctx.tag_name("concept_item");
     let details = ctx.tag_name("details");
     let item = ctx.tag_name("item");
     format!(
-        "When formulating a task plan, wrap structured plan items in <{plan} action=\"save\" id=\"plan-id\" title=\"Plan Title\">...</{plan}>. In Develop mode, you may ONLY propose new plans (action=\"save\"). Updating plan statuses, closing steps, or modifying existing plans from Develop mode is strictly prohibited (step execution and completion occur strictly in isolated step turns, while plan modifications and re-scoping belong exclusively in Discussion mode). Reins Invariant: Never emit a plan tag without an explicit user instruction or confirmation to formulate a plan. Questions, analysis, architectural reviews, or exploratory discussion must be answered strictly in conversational text without plan tags. Conceptual Foundation Invariant: Every plan MUST contain an architectural concept tree in <{concept}>...</{concept}> defining the core requirements, design decisions, and system invariants ('What'). Inside <{concept}>, define architectural nodes using structured <{concept_item} id=\"c-...\" title=\"...\"><{details}>...</{details}></{concept_item}> tags. Plan creation without <{concept}> containing at least one <{concept_item}> is strictly prohibited. Implementation steps in <{item}> define 'How', may be included with concept_refs=\"c-...\", files=\"...\", and readonly=\"...\", or omitted if awaiting deep refinement. File Attributes Contract: the `files` attribute lists target files to create or modify (loaded as editable context), while the `readonly` attribute lists reference or contract files such as subsystem conventions, protocol types, and interfaces (loaded as read-only context and never modified). Leaf-Only Files Invariant: the `files` and `readonly` attributes must be specified exclusively for executable leaf steps without child items; parent container items and task groups must never have files. Planning Objective: Plan synthesis focuses on conceptual comprehension of the objective ('What'), aligning on key architectural decisions and trade-offs, and defining a cohesive concept tree without premature low-level code churn or deep file inspection. Step Formulation Contract: Formulate each step around an engineering objective and operational invariants rather than detailed procedural micro-instructions; define what state must be achieved and what invariants preserved. Always provide a clear <{description}> explaining the overall architecture, boundaries, and rationale. Plan Creation Invariant: Only create a plan when explicitly instructed or confirmed by the user. Whenever you propose a new plan, you MUST precede the tag with a concise conversational explanation of the proposed plan, and you MUST emit the structured <{plan} action=\"save\" ...> tag in the same response containing both <{concept}> (mandatory) and optional <{item}> elements. Language Consistency: Formulate the plan title, description, concept nodes, step titles, and step details in the same language as the user's request.\nStructured Plan XML Format:\n<{plan} action=\"save\" id=\"plan-id\" title=\"Plan Title\">\n  <{description}>Overall architecture and rationale</{description}>\n  <{concept}>\n    <{concept_item} id=\"c-1\" title=\"Core Invariant\">\n      <{details}>Design rationale and invariants</{details}>\n    </{concept_item}>\n  </{concept}>\n  <{item} id=\"1\" title=\"Step Title\" concept_refs=\"c-1\" files=\"path/to/file.rs\" readonly=\"path/to/contract.rs\">\n    <{details}>Engineering objective and verification criteria</{details}>\n  </{item}>\n</{plan}>"
+        "Every plan travels as one structured <{plan} action=\"save\" id=\"plan-id\" title=\"Plan Title\">...</{plan}> container. Conceptual Foundation Invariant: Every plan MUST contain an architectural concept tree in <{concept}>...</{concept}> defining the core requirements, design decisions, and system invariants ('What'). Inside <{concept}>, define architectural nodes using structured <{concept_item} id=\"c-...\" title=\"...\"><{details}>...</{details}></{concept_item}> tags. Plan creation without <{concept}> containing at least one <{concept_item}> is strictly prohibited. Implementation steps in <{item}> define 'How', may be included with concept_refs=\"c-...\", files=\"...\", and readonly=\"...\", or omitted if awaiting deep refinement. File Attributes Contract: the `files` attribute lists target files to create or modify (loaded as editable context), while the `readonly` attribute lists reference or contract files such as subsystem conventions, protocol types, and interfaces (loaded as read-only context and never modified). Leaf-Only Files Invariant: the `files` and `readonly` attributes must be specified exclusively for executable leaf steps without child items; parent container items and task groups must never have files. Step Formulation Contract: Formulate each step around an engineering objective and operational invariants rather than detailed procedural micro-instructions; define what state must be achieved and what invariants preserved. Always provide a clear <{description}> explaining the overall architecture, boundaries, and rationale. Plan Creation Invariant: Only create a plan when explicitly instructed or confirmed by the user. Whenever you propose a new plan, you MUST precede the tag with a concise conversational explanation of the proposed plan, and you MUST emit the structured <{plan} action=\"save\" ...> tag in the same response containing both <{concept}> (mandatory) and optional <{item}> elements. Language Consistency: Formulate the plan title, description, concept nodes, step titles, and step details in the same language as the user's request.\nStructured Plan XML Format:\n<{plan} action=\"save\" id=\"plan-id\" title=\"Plan Title\">\n  <{description}>Overall architecture and rationale</{description}>\n  <{concept}>\n    <{concept_item} id=\"c-1\" title=\"Core Invariant\">\n      <{details}>Design rationale and invariants</{details}>\n    </{concept_item}>\n  </{concept}>\n  <{item} id=\"1\" title=\"Step Title\" concept_refs=\"c-1\" files=\"path/to/file.rs\" readonly=\"path/to/contract.rs\">\n    <{details}>Engineering objective and verification criteria</{details}>\n  </{item}>\n</{plan}>"
     )
+}
+
+/// Regime delta of the XML plan rule, carrying the authorized plan actions.
+///
+/// A develop turn may only propose a new plan, while a plan discussion may also
+/// modify one in place and delete it; both variants state that the direct code
+/// changes a discussion permits travel the ordinary transactional path.
+fn plan_xml_delta(ctx: &ContractContext<'_>, plan: &str) -> String {
+    if ctx.intent.is_plan_discussion() {
+        format!(
+            "In plan discussion mode, <{plan} action=\"save\" ...> creates a plan, <{plan} action=\"update\" ...> modifies specific concept nodes or items in place by ID without touching unmentioned items, and <{plan} action=\"delete\" ...> removes the plan. Code modifications requested directly by the developer are permitted alongside the discussion, and they travel the ordinary transactional path. Reins Invariant: Never emit a plan tag without an explicit user instruction to formulate or modify a plan. Questions, analysis, trade-off reviews, and critique must be answered strictly in conversational text without plan tags. Planning Objective: Collaborative planning focuses on conceptual comprehension of the objective ('What'), aligning on key architectural decisions and trade-offs, and defining a cohesive concept tree without premature low-level code churn."
+        )
+    } else {
+        format!(
+            "In Develop mode, you may ONLY propose new plans (<{plan} action=\"save\" ...>). Updating plan statuses, closing steps, or modifying existing plans from Develop mode is strictly prohibited (step execution and completion occur strictly in isolated step turns, while plan modifications and re-scoping belong exclusively in Discussion mode). Reins Invariant: Never emit a plan tag without an explicit user instruction or confirmation to formulate a plan. Questions, analysis, architectural reviews, or exploratory discussion must be answered strictly in conversational text without plan tags. Planning Objective: Plan synthesis focuses on conceptual comprehension of the objective ('What'), aligning on key architectural decisions and trade-offs, and defining a cohesive concept tree without premature low-level code churn or deep file inspection."
+        )
+    }
 }
 
 /// Project plan creation.
@@ -537,17 +610,32 @@ impl CapabilityModule for PlanCreationModule {
         Some(schema::plan_update_definitions())
     }
 
+    /// Core rule: the invariants every plan carries, whichever regime authors it.
+    ///
+    /// The rule is deliberately free of [`ContractContext::intent`]: the head it
+    /// renders into is shared by every dialogue contour, so the plan actions a
+    /// regime authorizes are declared by [`CapabilityModule::render_delta_rule`].
     fn render_contract_rule(&self, ctx: &ContractContext<'_>) -> Option<ContractRule> {
-        // A specialized plan discussion always runs on the structured transport,
-        // so its rule never branches on the wire format.
-        Some(if ctx.intent.is_readonly_discussion() {
-            ContractRule::new("Local Engineering Plans", PLAN_DISCUSSION_BODY)
-        } else if ctx.protocol == EditProtocolKind::Xml {
-            let plan = ctx.tag_name(self.canonical_tag()?);
-            ContractRule::new("Local Engineering Plans", plan_xml_body(ctx, &plan))
+        let plan = ctx.tag_name(self.canonical_tag()?);
+        let body = if ctx.protocol == EditProtocolKind::Xml {
+            plan_xml_core(ctx, &plan)
         } else {
-            ContractRule::new("Local Engineering Plans", PLAN_STRUCTURED_DEVELOP_BODY)
-        })
+            PLAN_STRUCTURED_CORE_BODY.to_string()
+        };
+        Some(ContractRule::new("Local Engineering Plans", body))
+    }
+
+    /// Delta rule: which plan actions the declared regime authorizes.
+    fn render_delta_rule(&self, ctx: &ContractContext<'_>) -> Option<ContractRule> {
+        let plan = ctx.tag_name(self.canonical_tag()?);
+        let body = if ctx.protocol == EditProtocolKind::Xml {
+            plan_xml_delta(ctx, &plan)
+        } else if ctx.intent.is_plan_discussion() {
+            PLAN_STRUCTURED_DISCUSSION_DELTA.to_string()
+        } else {
+            PLAN_STRUCTURED_DEVELOP_DELTA.to_string()
+        };
+        Some(ContractRule::new("Local Engineering Plan Actions", body))
     }
 
     fn render_structured_instruction(&self, _ctx: &PromptRenderContext<'_>) -> Option<String> {
@@ -960,11 +1048,11 @@ impl CapabilityModule for UserLanguageModule {
             format!(
                 "The user's language is {language}. All conversational explanations, answers, and messages MUST be in {language}. Do NOT switch to English for conversational responses unless requested."
             )
-        } else if ctx.intent.is_readonly_discussion() {
-            // A specialized discussion always runs on the structured transport,
-            // so its rule never branches on the wire format.
-            "Always formulate conversational explanations and user-facing answers in `message` in the same language as the user's request. Identify the user's language in the `user_language` field (e.g. \"Russian\"). Do NOT switch to English for conversational responses unless requested.".to_string()
         } else if ctx.protocol == EditProtocolKind::Xml {
+            // The XML contour names the control tag through the active turn
+            // marker, whichever dialogue regime renders the rule: a plan
+            // discussion runs on the configured transport, so it spells its
+            // language tag exactly like the interactive dialogue.
             let language = ctx.tag_name(self.canonical_tag()?);
             format!(
                 "Always formulate conversational explanations and user-facing answers in the same language as the user's request. Identify the user's language using <{language}>language_name</{language}> (e.g. <{language}>Russian</{language}>). Do NOT switch to English for conversational responses unless requested."
@@ -1278,7 +1366,7 @@ fn header_attributes(header: &str) -> Vec<(String, String)> {
 #[cfg(test)]
 mod tests {
     use crate::capabilities::registry::CapabilityModule;
-    use tauqe_protocol::{EditProtocolKind, TurnIntent};
+    use tauqe_protocol::{EditProtocolKind, PromptLayoutKind, TurnIntent};
 
     use super::*;
 
@@ -1424,6 +1512,42 @@ mod tests {
     }
 
     #[test]
+    fn the_anchor_strategy_renders_range_fields_and_the_change_set_vehicle() {
+        let module = FileEditsModule;
+        let render =
+            PromptRenderContext::new(&[], None).with_patch_strategy(PatchStrategy::LineAnchor);
+        let ctx = ContractContext::new(TurnIntent::InteractiveRepl, EditProtocolKind::Xml, render);
+
+        let instruction = module
+            .render_xml_instruction(&ctx.render)
+            .expect("the edit module always renders an instruction");
+        assert!(instruction.contains("<file_edits>"));
+        assert!(instruction.contains("`start`"));
+        assert!(instruction.contains("`end`"));
+        assert!(instruction.contains("bottom of the file upwards"));
+        assert!(!instruction.contains("<edit path"));
+
+        let structured = module
+            .render_structured_instruction(&ctx.render)
+            .expect("the edit module always renders a structured instruction");
+        assert!(structured.contains("`start`"));
+        assert!(structured.contains("`end`"));
+        assert!(!structured.contains("`old_text`"));
+
+        // The declared schema follows the same strategy, so the advertised
+        // fields and the advertised reference never disagree.
+        let fragment = module
+            .json_schema_fragment_for(PatchStrategy::LineAnchor)
+            .expect("the change set is always declared");
+        let properties = fragment["changes"]["items"]["properties"]
+            .as_object()
+            .expect("the change entry declares its fields");
+        assert!(properties.contains_key("start"));
+        assert!(properties.contains_key("end"));
+        assert!(!properties.contains_key("old_text"));
+    }
+
+    #[test]
     fn the_abort_module_decodes_the_reason_and_the_recommendation() {
         let module = AbortModule;
 
@@ -1523,8 +1647,8 @@ mod tests {
         assert!(!rule.body.contains("`message`"));
 
         let discussion = ContractContext::new(
-            TurnIntent::ReadonlyDiscussion,
-            EditProtocolKind::Xml,
+            TurnIntent::PlanDiscussion,
+            EditProtocolKind::Structured,
             PromptRenderContext::new(&[], None),
         );
         let rule = module
@@ -1545,7 +1669,7 @@ mod tests {
 
         // The formatting duty is identical in both contours: the rendered rule
         // always obligates readable Markdown instead of a dense wall of text.
-        for intent in [TurnIntent::InteractiveRepl, TurnIntent::ReadonlyDiscussion] {
+        for intent in [TurnIntent::InteractiveRepl, TurnIntent::PlanDiscussion] {
             let ctx = ContractContext::new(
                 intent,
                 EditProtocolKind::Xml,
@@ -1576,6 +1700,142 @@ mod tests {
         module
             .render_contract_rule(&contour(protocol))
             .unwrap_or_else(|| panic!("{capability} renders a contract rule"))
+    }
+
+    /// Builds the contract context of one wire contour for a plan discussion.
+    fn discussion_contour(protocol: EditProtocolKind) -> ContractContext<'static> {
+        ContractContext::new(
+            TurnIntent::PlanDiscussion,
+            protocol,
+            PromptRenderContext::new(&[], None),
+        )
+    }
+
+    /// Renders the contract rule of `module` for a plan discussion.
+    fn discussion_rule_in(
+        module: &dyn CapabilityModule,
+        protocol: EditProtocolKind,
+    ) -> ContractRule {
+        let capability = module.capability();
+        module
+            .render_contract_rule(&discussion_contour(protocol))
+            .unwrap_or_else(|| panic!("{capability} renders a discussion contract rule"))
+    }
+
+    /// Renders the contour delta rule of `module` in the declared wire contour.
+    fn delta_in(module: &dyn CapabilityModule, protocol: EditProtocolKind) -> ContractRule {
+        let capability = module.capability();
+        module
+            .render_delta_rule(&contour(protocol))
+            .unwrap_or_else(|| panic!("{capability} renders a delta rule"))
+    }
+
+    /// Renders the contour delta rule of `module` for a plan discussion.
+    fn discussion_delta_in(
+        module: &dyn CapabilityModule,
+        protocol: EditProtocolKind,
+    ) -> ContractRule {
+        let capability = module.capability();
+        module
+            .render_delta_rule(&discussion_contour(protocol))
+            .unwrap_or_else(|| panic!("{capability} renders a discussion delta rule"))
+    }
+
+    #[test]
+    fn every_module_core_rule_is_identical_across_dialogue_intents() {
+        use crate::capabilities::registry::CapabilityRegistry;
+
+        let registry = CapabilityRegistry::global();
+        for protocol in [EditProtocolKind::Xml, EditProtocolKind::Structured] {
+            for capability in LlmCapability::ALL {
+                let module = match registry.module(*capability) {
+                    Some(module) => module,
+                    None => panic!("missing module for {capability}"),
+                };
+                let repl = module.render_contract_rule(&contour(protocol));
+                let discussion = module.render_contract_rule(&discussion_contour(protocol));
+                match (repl, discussion) {
+                    (None, None) => {}
+                    (Some(repl), Some(discussion)) => {
+                        assert_eq!(
+                            repl.title, discussion.title,
+                            "{capability} titles its core rule differently in {protocol}"
+                        );
+                        assert_eq!(
+                            repl.body, discussion.body,
+                            "{capability} conditions its core rule on the intent in {protocol}"
+                        );
+                    }
+                    (repl, discussion) => panic!(
+                        "{capability} renders a core rule in one dialogue intent only: {:?} vs {:?}",
+                        repl.map(|rule| rule.title),
+                        discussion.map(|rule| rule.title)
+                    ),
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn the_plan_action_semantics_travel_in_the_delta_rule() {
+        let module = PlanCreationModule;
+
+        let develop = delta_in(&module, EditProtocolKind::Xml);
+        assert_eq!(develop.title, "Local Engineering Plan Actions");
+        assert!(develop.body.contains("ONLY propose new plans"));
+        assert!(develop.body.contains("Reins Invariant"));
+        assert!(develop.body.contains("Planning Objective: Plan synthesis"));
+        assert!(!develop.body.contains("Conceptual Foundation Invariant"));
+        assert!(!develop.body.contains("Structured Plan XML Format"));
+
+        let discussion = discussion_delta_in(&module, EditProtocolKind::Xml);
+        assert_eq!(discussion.title, "Local Engineering Plan Actions");
+        assert!(discussion.body.contains("<plan action=\"save\" ...>"));
+        assert!(discussion.body.contains("<plan action=\"update\" ...>"));
+        assert!(discussion.body.contains("<plan action=\"delete\" ...>"));
+        assert!(discussion.body.contains("ordinary transactional path"));
+        assert!(discussion
+            .body
+            .contains("Planning Objective: Collaborative"));
+
+        let structured_develop = delta_in(&module, EditProtocolKind::Structured);
+        assert!(structured_develop.body.contains("ONLY propose new plans"));
+        assert!(!structured_develop.body.contains("<plan"));
+        assert_no_operational_tags(&structured_develop);
+
+        let structured_discussion = discussion_delta_in(&module, EditProtocolKind::Structured);
+        assert!(structured_discussion.body.contains("action: \"update\""));
+        assert!(structured_discussion
+            .body
+            .contains("ordinary transactional path"));
+        assert_no_operational_tags(&structured_discussion);
+    }
+
+    #[test]
+    fn the_context_surface_rule_renders_the_vocabulary_of_the_active_policy() {
+        let semantic = context_surface_rule(&contour(EditProtocolKind::Xml));
+        assert_eq!(semantic.title, "Context Surface");
+        assert!(semantic.body.contains("one `<context>` block"));
+        assert!(semantic
+            .body
+            .contains("`<file path=\"...\" access=\"...\">`"));
+        assert!(semantic.body.contains("access=\"read_only\""));
+        assert!(semantic.body.contains("access=\"editable\""));
+        assert!(!semantic.body.contains("<context_manifest>"));
+        assert!(semantic.body.ends_with(FILE_ELEMENT_CONTRACT));
+
+        let chronological_ctx =
+            contour(EditProtocolKind::Xml).with_prompt_layout(PromptLayoutKind::Chronological);
+        let chronological = context_surface_rule(&chronological_ctx);
+        assert_eq!(chronological.title, "Context Surface");
+        assert!(chronological.body.contains("transcript"));
+        assert!(chronological.body.contains("<context_manifest>"));
+        assert!(!chronological.body.contains("`<context>` block"));
+        assert!(chronological.body.ends_with(FILE_ELEMENT_CONTRACT));
+
+        // The two vocabularies never mix, and the shared payload description is
+        // identical in both: only the container that delivers the files differs.
+        assert_ne!(semantic.body, chronological.body);
     }
 
     /// Operational tag prefixes a structured contract must never advertise.
@@ -1725,51 +1985,57 @@ mod tests {
 
         let structured = rule_in(&module, EditProtocolKind::Structured);
         assert_eq!(structured.title, "Local Engineering Plans");
-        assert!(structured.body.contains("`plan_update` field"));
+        assert!(structured.body.contains("`plan_update`"));
         assert!(structured.body.contains("`concept`"));
         assert!(structured.body.contains("`items`"));
         assert!(structured.body.contains("`files`"));
         assert!(structured.body.contains("`readonly_files`"));
-        // Every XML invariant survives in the structured formulation.
+        // Every invariant survives in the structured formulation of the core.
         for invariant in [
             "Conceptual Foundation Invariant",
             "File Attributes Contract",
             "Leaf-Only Files Invariant",
-            "Plan Action Semantics",
-            "Planning Objective",
             "Step Formulation Contract",
             "Plan Creation Invariant",
             "Language Consistency",
         ] {
             assert!(structured.body.contains(invariant), "missing {invariant}");
         }
-        // Develop mode may only create plans, never modify them.
-        assert!(structured.body.contains("ONLY propose new plans"));
-        // The XML shape example has no structured counterpart.
+        // The regime-specific action semantics live in the delta hook instead of
+        // conditioning the shared core on the declared intent.
+        assert!(!structured.body.contains("ONLY propose new plans"));
+        assert!(!structured.body.contains("Planning Objective"));
         assert!(!structured.body.contains("Structured Plan XML Format"));
         assert_no_operational_tags(&structured);
     }
 
     #[test]
-    fn the_discussion_plan_rule_never_branches_on_the_wire_format() {
+    fn the_discussion_plan_rule_follows_the_declared_contour() {
         let module = PlanCreationModule;
-        let mut bodies = Vec::new();
-        for protocol in [EditProtocolKind::Xml, EditProtocolKind::Structured] {
-            let ctx = ContractContext::new(
-                TurnIntent::ReadonlyDiscussion,
-                protocol,
-                PromptRenderContext::new(&[], None),
-            );
-            let rule = module
-                .render_contract_rule(&ctx)
-                .expect("the discussion plan rule is always rendered");
-            assert_eq!(rule.title, "Local Engineering Plans");
-            assert!(rule.body.contains("`plan_update`"));
-            bodies.push(rule.body);
-        }
-        // A specialized plan discussion always runs on the structured transport,
-        // so its rule states one identical contract in both contours.
-        assert_eq!(bodies[0], bodies[1]);
+
+        // Both contours authorize the same plan operations, and they declare
+        // them in the delta hook while the core rule states the invariants.
+        let structured = discussion_rule_in(&module, EditProtocolKind::Structured);
+        assert_eq!(structured.title, "Local Engineering Plans");
+        assert!(structured.body.contains("`plan_update`"));
+        assert!(!structured.body.contains("<plan"));
+
+        let structured_delta = discussion_delta_in(&module, EditProtocolKind::Structured);
+        assert_eq!(structured_delta.title, "Local Engineering Plan Actions");
+        assert!(structured_delta.body.contains("action: \"update\""));
+        assert!(structured_delta
+            .body
+            .contains("ordinary transactional path"));
+
+        let xml = discussion_rule_in(&module, EditProtocolKind::Xml);
+        assert_eq!(xml.title, "Local Engineering Plans");
+        assert!(!xml.body.contains("<plan action=\"update\""));
+
+        let xml_delta = discussion_delta_in(&module, EditProtocolKind::Xml);
+        assert!(xml_delta.body.contains("<plan action=\"update\" ...>"));
+        assert!(xml_delta.body.contains("<plan action=\"delete\" ...>"));
+        assert!(xml_delta.body.contains("ordinary transactional path"));
+        assert!(!xml_delta.body.contains("`plan_update`"));
     }
 
     #[test]
@@ -1871,23 +2137,20 @@ mod tests {
     }
 
     #[test]
-    fn the_language_rule_keeps_the_discussion_branch_wire_agnostic() {
+    fn the_language_rule_follows_the_declared_contour_in_a_discussion() {
         let module = UserLanguageModule;
-        let mut bodies = Vec::new();
-        for protocol in [EditProtocolKind::Xml, EditProtocolKind::Structured] {
-            let ctx = ContractContext::new(
-                TurnIntent::ReadonlyDiscussion,
-                protocol,
-                PromptRenderContext::new(&[], None),
-            );
-            let rule = module
-                .render_contract_rule(&ctx)
-                .expect("the language rule is always rendered");
-            assert_eq!(rule.title, "Language Consistency");
-            assert!(rule.body.contains("`user_language` field"));
-            bodies.push(rule.body);
-        }
-        assert_eq!(bodies[0], bodies[1]);
+
+        let structured = discussion_rule_in(&module, EditProtocolKind::Structured);
+        assert_eq!(structured.title, "Language Consistency");
+        assert!(structured.body.contains("`user_language` field"));
+        assert!(!structured.body.contains("<user_language"));
+
+        let xml = discussion_rule_in(&module, EditProtocolKind::Xml);
+        assert_eq!(xml.title, "Language Consistency");
+        assert!(xml
+            .body
+            .contains("<user_language>language_name</user_language>"));
+        assert!(!xml.body.contains("`user_language` field"));
     }
 
     /// Asserts that rendered structured text names no operational tag.
@@ -1910,11 +2173,15 @@ mod tests {
                 Some(module) => module,
                 None => panic!("missing module for {capability}"),
             };
-            let Some(rule) = module.render_contract_rule(&contour(EditProtocolKind::Structured))
-            else {
-                continue;
-            };
-            assert_no_operational_tags(&rule);
+            // Both the core rule and the delta hook reach a structured prompt,
+            // so neither may advertise an operational control tag.
+            if let Some(rule) = module.render_contract_rule(&contour(EditProtocolKind::Structured))
+            {
+                assert_no_operational_tags(&rule);
+            }
+            if let Some(rule) = module.render_delta_rule(&contour(EditProtocolKind::Structured)) {
+                assert_no_operational_tags(&rule);
+            }
         }
     }
 
@@ -1964,7 +2231,11 @@ mod tests {
             EditProtocolKind::Structured,
             render,
         );
-        let contract = registry.compose_contract_rules(&set, &ctx);
+        let contract = registry.compose_core_contract_rules(&set, &ctx);
+        let delta = registry.compose_delta_contract_rules(&set, &ctx);
+        assert_no_operational_tag_in(&contract, "the structured core contract");
+        assert_no_operational_tag_in(&delta, "the structured delta contract");
+        assert!(!contract.contains("Operational Protocol Tags"));
         assert_no_operational_tag_in(&contract, "the structured core contract");
         assert!(!contract.contains("Operational Protocol Tags"));
 

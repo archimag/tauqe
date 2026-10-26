@@ -14,7 +14,16 @@ use crate::i18n::engine::active_t;
 use crate::input::InputResult;
 use crate::rpc::{send_request, RpcConnection};
 
-use super::ContextRow;
+use super::{ContextCandidate, ContextRow};
+
+/// The operation the picker commits when the developer presses Enter.
+///
+/// The choice is made by matching the typed [`ContextCandidate`] row, never by
+/// probing the row text (Conventions 1.5).
+enum PickerCommit {
+    Pattern(ContextAddPatternParams),
+    File(ContextAddParams),
+}
 
 /// Keyboard actions available in the Context view.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -285,17 +294,15 @@ pub async fn handle_context_key(
                 }
             }
             KeyCode::Tab => {
-                if let Some(candidate) = st
+                if let Some(ContextCandidate::File(path)) = st
                     .context_view
                     .filtered_candidates
                     .get(st.context_view.selected_candidate_index)
                     .cloned()
                 {
-                    if !candidate.starts_with("[+] Add all matching '") {
-                        st.context_view.add_input.clear();
-                        st.context_view.add_input.insert_str(&candidate);
-                        st.update_filtered_candidates();
-                    }
+                    st.context_view.add_input.clear();
+                    st.context_view.add_input.insert_str(&path);
+                    st.update_filtered_candidates();
                 }
             }
             KeyCode::Enter => {
@@ -305,46 +312,63 @@ pub async fn handle_context_key(
                     .get(st.context_view.selected_candidate_index)
                     .cloned();
 
-                let is_pattern_entry = selected_candidate
-                    .as_ref()
-                    .is_some_and(|c| c.starts_with("[+] Add all matching '"));
-
                 let raw_input = st.context_view.add_input.get_text().trim().to_string();
                 let is_glob_direct =
                     raw_input.contains('*') || raw_input.contains('?') || raw_input.ends_with('/');
 
                 let access = st.context_view.add_access;
-                if is_pattern_entry || is_glob_direct {
-                    st.context_view.adding_file = false;
-                    st.context_view.add_input.clear();
-                    drop(st);
 
-                    let params = ContextAddPatternParams {
-                        pattern: raw_input,
+                let commit = match selected_candidate {
+                    Some(ContextCandidate::BulkPattern { pattern, .. }) => {
+                        Some(PickerCommit::Pattern(ContextAddPatternParams {
+                            pattern,
+                            access,
+                        }))
+                    }
+                    Some(ContextCandidate::File(path)) => {
+                        if is_glob_direct {
+                            Some(PickerCommit::Pattern(ContextAddPatternParams {
+                                pattern: raw_input,
+                                access,
+                            }))
+                        } else {
+                            Some(PickerCommit::File(ContextAddParams {
+                                path,
+                                access,
+                                layer: Some(ContextLayer::User),
+                            }))
+                        }
+                    }
+                    None if is_glob_direct => {
+                        Some(PickerCommit::Pattern(ContextAddPatternParams {
+                            pattern: raw_input,
+                            access,
+                        }))
+                    }
+                    None if !raw_input.is_empty() => Some(PickerCommit::File(ContextAddParams {
+                        path: raw_input,
                         access,
-                    };
-                    send_request(
-                        server_writer,
-                        methods::CONTEXT_ADD_PATTERN,
-                        serde_json::to_value(params)?,
-                    )
-                    .await?;
-                } else {
-                    let target_path = if let Some(candidate) = selected_candidate {
-                        candidate
-                    } else {
-                        raw_input
-                    };
+                        layer: Some(ContextLayer::User),
+                    })),
+                    None => None,
+                };
 
-                    if !target_path.is_empty() {
+                match commit {
+                    Some(PickerCommit::Pattern(params)) => {
                         st.context_view.adding_file = false;
                         st.context_view.add_input.clear();
                         drop(st);
-                        let params = ContextAddParams {
-                            path: target_path,
-                            access,
-                            layer: Some(ContextLayer::User),
-                        };
+                        send_request(
+                            server_writer,
+                            methods::CONTEXT_ADD_PATTERN,
+                            serde_json::to_value(params)?,
+                        )
+                        .await?;
+                    }
+                    Some(PickerCommit::File(params)) => {
+                        st.context_view.adding_file = false;
+                        st.context_view.add_input.clear();
+                        drop(st);
                         send_request(
                             server_writer,
                             methods::CONTEXT_ADD,
@@ -352,6 +376,7 @@ pub async fn handle_context_key(
                         )
                         .await?;
                     }
+                    None => {}
                 }
             }
             _ => {
@@ -683,6 +708,7 @@ mod tests {
             size_bytes: 128,
             estimated_tokens: 32,
             layer,
+            insertion_seq: 0,
         }
     }
 
@@ -790,5 +816,114 @@ mod tests {
                 assert_ne!(chord, other, "duplicate key chord in CONTEXT_COMMAND_MAP");
             }
         }
+    }
+
+    fn written_text(conn: &RpcConnection) -> String {
+        String::from_utf8(conn.written().to_vec()).expect("RPC requests are UTF-8")
+    }
+
+    /// Regression for the magic-string sentinel: a repository path that
+    /// literally starts with the bulk-row wording is a plain file row, so
+    /// `Enter` adds it as one file instead of mass-adding a pattern.
+    #[tokio::test]
+    async fn enter_on_a_sentinel_prefixed_file_adds_it_as_a_single_file() {
+        let sentinel_path = "[+] Add all matching 'demo.rs' (2 files)".to_string();
+
+        let mut st = test_state();
+        st.view_mode = ViewMode::Context;
+        st.all_repo_files = vec![sentinel_path.clone()];
+        st.context_view.adding_file = true;
+        st.context_view.add_input.insert_str("demo.rs");
+        st.update_filtered_candidates();
+
+        assert_eq!(
+            st.context_view.filtered_candidates,
+            vec![ContextCandidate::File(sentinel_path.clone())]
+        );
+
+        let state = Arc::new(Mutex::new(st));
+        let mut conn = RpcConnection::new(Vec::<u8>::new());
+
+        let key = KeyEvent::new(KeyCode::Enter, crossterm::event::KeyModifiers::NONE);
+        handle_context_key(key, &state, &mut conn).await.unwrap();
+
+        assert!(!state.lock().await.context_view.adding_file);
+
+        let written = written_text(&conn);
+        // The quotes are essential: `"context/add"` is a prefix of
+        // `"context/addPattern"` only when unquoted.
+        assert!(written.contains(&format!("\"{}\"", methods::CONTEXT_ADD)));
+        assert!(written.contains(&sentinel_path));
+        assert!(!written.contains(methods::CONTEXT_ADD_PATTERN));
+    }
+
+    #[tokio::test]
+    async fn enter_on_the_typed_bulk_row_dispatches_add_pattern() {
+        let mut st = test_state();
+        st.view_mode = ViewMode::Context;
+        st.all_repo_files = vec!["a.rs".to_string(), "b.rs".to_string()];
+        st.context_view.adding_file = true;
+        st.context_view.add_input.insert_str("*.rs");
+        st.update_filtered_candidates();
+
+        // The safe default selects the first concrete file; one step up reaches
+        // the typed bulk row.
+        assert_eq!(st.context_view.selected_candidate_index, 1);
+
+        let state = Arc::new(Mutex::new(st));
+        let mut conn = RpcConnection::new(Vec::<u8>::new());
+
+        let up = KeyEvent::new(KeyCode::Up, crossterm::event::KeyModifiers::NONE);
+        handle_context_key(up, &state, &mut conn).await.unwrap();
+        assert_eq!(state.lock().await.context_view.selected_candidate_index, 0);
+
+        let enter = KeyEvent::new(KeyCode::Enter, crossterm::event::KeyModifiers::NONE);
+        handle_context_key(enter, &state, &mut conn).await.unwrap();
+
+        let request: serde_json::Value =
+            serde_json::from_slice(conn.written()).expect("a single JSON request line");
+        assert_eq!(request["method"], methods::CONTEXT_ADD_PATTERN);
+        assert_eq!(request["params"]["pattern"], "*.rs");
+    }
+
+    #[tokio::test]
+    async fn tab_completes_from_file_rows_and_skips_the_bulk_row() {
+        let mut st = test_state();
+        st.view_mode = ViewMode::Context;
+        st.all_repo_files = vec!["a.rs".to_string(), "b.rs".to_string()];
+        st.context_view.adding_file = true;
+        st.context_view.add_input.insert_str("*.rs");
+        st.update_filtered_candidates();
+
+        let state = Arc::new(Mutex::new(st));
+        let mut conn = RpcConnection::new(Vec::<u8>::new());
+
+        // Selecting the bulk row and pressing Tab never rewrites the query.
+        let up = KeyEvent::new(KeyCode::Up, crossterm::event::KeyModifiers::NONE);
+        handle_context_key(up, &state, &mut conn).await.unwrap();
+        let tab = KeyEvent::new(KeyCode::Tab, crossterm::event::KeyModifiers::NONE);
+        handle_context_key(tab, &state, &mut conn).await.unwrap();
+
+        {
+            let guard = state.lock().await;
+            assert_eq!(guard.context_view.add_input.get_text(), "*.rs");
+            assert!(matches!(
+                guard.context_view.filtered_candidates.first(),
+                Some(ContextCandidate::BulkPattern { .. })
+            ));
+        }
+
+        // Down to the first concrete file: Tab completes the query to its path.
+        let down = KeyEvent::new(KeyCode::Down, crossterm::event::KeyModifiers::NONE);
+        handle_context_key(down, &state, &mut conn).await.unwrap();
+        let tab = KeyEvent::new(KeyCode::Tab, crossterm::event::KeyModifiers::NONE);
+        handle_context_key(tab, &state, &mut conn).await.unwrap();
+
+        let guard = state.lock().await;
+        assert_eq!(guard.context_view.add_input.get_text(), "a.rs");
+        assert_eq!(
+            guard.context_view.filtered_candidates,
+            vec![ContextCandidate::File("a.rs".to_string())]
+        );
     }
 }

@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use tauqe_protocol::{
     ModelCatalogEntry, ModelRef, ModelRole, ModelRolesSummary, ModelSelection, ProjectConfig,
-    ReasoningEffort,
+    PromptLayoutKind, ReasoningEffort, TurnIntent,
 };
 
 mod context;
@@ -33,7 +33,7 @@ pub use models::{
 use models::ModelsConfigRaw;
 pub use paths::{
     cli_arg_value_from, config_candidates, default_config_path, find_config_file,
-    write_default_config, write_default_conventions, DEFAULT_CONFIG_TEMPLATE,
+    is_repo_config_path, write_default_config, write_default_conventions, DEFAULT_CONFIG_TEMPLATE,
 };
 pub use providers::{
     credentials_candidates, find_credentials_file, has_openrouter_key, load_credentials,
@@ -252,6 +252,30 @@ impl AppConfig {
             .map_err(|err| format!("[project] {}", err))?;
         Ok(())
     }
+
+    /// Resolves the prompt layout policy for a bounded turn.
+    ///
+    /// This is the single typed point that decides the layout: an explicitly
+    /// configured [`PromptLayoutKind`] wins, otherwise the turn intent decides.
+    ///
+    /// - An interactive REPL turn and a plan discussion keep a growing history
+    ///   and share one byte-stable head, so both build the chronological
+    ///   transcript: its append-only growth keeps the provider prefix cache warm
+    ///   across dialogue focus switches.
+    /// - An isolated step carries no growing history to interleave, so it keeps
+    ///   the semantic block order.
+    pub fn resolve_prompt_layout(&self, intent: TurnIntent) -> PromptLayoutKind {
+        if let Some(explicit) = self.develop.prompt_layout {
+            return explicit;
+        }
+
+        match intent {
+            TurnIntent::InteractiveRepl | TurnIntent::PlanDiscussion => {
+                PromptLayoutKind::Chronological
+            }
+            TurnIntent::IsolatedStep => PromptLayoutKind::Semantic,
+        }
+    }
 }
 
 /// Options for configuring how configuration and credentials files are resolved.
@@ -402,7 +426,7 @@ pub fn validate_project_config_on_disk(repo_root: &Path) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tauqe_protocol::{EditProtocolKind, WorkflowKind};
+    use tauqe_protocol::{EditProtocolKind, PromptLayoutKind, TurnIntent, WorkflowKind};
 
     #[test]
     fn test_models_config_and_roles_resolution() {
@@ -1126,5 +1150,43 @@ args = ["check", "--all-targets"]
                 ..Default::default()
             }
         );
+    }
+
+    #[test]
+    fn test_resolve_prompt_layout_follows_intent_and_configuration() {
+        // Without an explicit override the turn intent decides.
+        let default_cfg = AppConfig::default();
+        assert_eq!(
+            default_cfg.resolve_prompt_layout(TurnIntent::InteractiveRepl),
+            PromptLayoutKind::Chronological
+        );
+        assert_eq!(
+            default_cfg.resolve_prompt_layout(TurnIntent::PlanDiscussion),
+            PromptLayoutKind::Chronological
+        );
+        assert_eq!(
+            default_cfg.resolve_prompt_layout(TurnIntent::IsolatedStep),
+            PromptLayoutKind::Semantic
+        );
+
+        // A declared value overrides the resolution for every intent.
+        for (declared, expected) in [
+            ("semantic", PromptLayoutKind::Semantic),
+            ("chronological", PromptLayoutKind::Chronological),
+        ] {
+            let toml_str = format!("[develop]\nprompt_layout = \"{declared}\"\n");
+            let config: AppConfig = toml::from_str(&toml_str).expect("parse config");
+            for intent in [
+                TurnIntent::InteractiveRepl,
+                TurnIntent::PlanDiscussion,
+                TurnIntent::IsolatedStep,
+            ] {
+                assert_eq!(
+                    config.resolve_prompt_layout(intent),
+                    expected,
+                    "declared {declared} must apply to {intent:?}"
+                );
+            }
+        }
     }
 }

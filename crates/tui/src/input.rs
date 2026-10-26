@@ -13,32 +13,39 @@ pub mod layout;
 pub mod mouse;
 pub mod squash;
 
+/// Opens the squash dialog and requests its preview.
+///
+/// The function owns its locking: the dialog state is installed under the guard,
+/// the guard is released, and only then is the preview requested (c-1).
 pub async fn open_squash_dialog(
-    st: &mut AppState,
+    state: &Arc<Mutex<AppState>>,
     server_writer: &mut RpcConnection,
 ) -> anyhow::Result<()> {
+    let mut st = state.lock().await;
     if st.model.is_busy() {
         st.notify_warning(crate::i18n::active_t("notify.squash_busy"));
-    } else {
-        st.squash_dialog = Some(crate::app::SquashDialogState::default());
-        let params = GitSquashPreviewParams { base_ref: None };
-        send_request(
-            server_writer,
-            methods::GIT_SQUASH_PREVIEW,
-            serde_json::to_value(params)?,
-        )
-        .await?;
+        return Ok(());
     }
+    st.squash_dialog = Some(crate::app::SquashDialogState::default());
+    drop(st);
+    let params = GitSquashPreviewParams { base_ref: None };
+    send_request(
+        server_writer,
+        methods::GIT_SQUASH_PREVIEW,
+        serde_json::to_value(params)?,
+    )
+    .await?;
     Ok(())
 }
 
 /// Centralized view switching for both keyboard shortcuts and mouse clicks.
 /// Prevents accidental onboarding bypass and handles lazy History data loading.
 pub async fn switch_view(
-    st: &mut AppState,
+    state: &Arc<Mutex<AppState>>,
     target_mode: ViewMode,
     server_writer: &mut RpcConnection,
 ) -> anyhow::Result<()> {
+    let mut st = state.lock().await;
     if st.view_mode == ViewMode::Onboarding {
         st.notify_warning(crate::i18n::active_t("notify.onboarding_required"));
         return Ok(());
@@ -48,31 +55,40 @@ pub async fn switch_view(
         return Ok(());
     }
 
-    if target_mode == ViewMode::History {
+    // The local switch and its lazy-load bookkeeping complete under the guard;
+    // the resulting request is issued only after it is released, so a stalled
+    // daemon can never freeze the loop (c-1).
+    let request = if target_mode == ViewMode::History {
         st.view_mode = ViewMode::History;
         st.history_view.auto_scroll = true;
         if !st.history_view.items.is_empty() {
             st.history_view.selected_item_index = st.history_view.items.len().saturating_sub(1);
+            None
         } else if !st.history_view.loading {
             st.history_view.loading = true;
             let params = tauqe_protocol::HistoryGetParams {
                 limit: Some(20),
                 before_id: None,
             };
-            send_request(
-                server_writer,
-                methods::HISTORY_GET,
-                serde_json::to_value(params)?,
-            )
-            .await?;
+            Some((methods::HISTORY_GET, serde_json::to_value(params)?))
+        } else {
+            None
         }
     } else if target_mode == ViewMode::Review {
         st.view_mode = ViewMode::Review;
         if st.review.sessions.is_empty() {
-            send_request(server_writer, methods::REVIEW_LIST, serde_json::json!({})).await?;
+            Some((methods::REVIEW_LIST, serde_json::json!({})))
+        } else {
+            None
         }
     } else {
         st.view_mode = target_mode;
+        None
+    };
+    drop(st);
+
+    if let Some((method, params)) = request {
+        send_request(server_writer, method, params).await?;
     }
     Ok(())
 }
@@ -124,6 +140,13 @@ pub fn is_text_input_active(st: &AppState) -> bool {
                 target.is_single_target() && target.focus.is_instructions_editor()
             })
         }
+        // Plan step and scope execution expose the same Coder-directives
+        // editor, so it must also accept literal typing without layout
+        // translation (Conventions §5.1).
+        Some(ActiveModal::ExecuteScope) => st
+            .confirm_execute_scope
+            .as_ref()
+            .is_some_and(|target| target.focus.is_instructions_editor()),
         Some(_) => false,
         None => match st.view_mode {
             ViewMode::Repl => true,
@@ -238,6 +261,15 @@ pub fn handle_paste(st: &mut AppState, text: &str) {
         Some(ActiveModal::ExecuteReview) => {
             if let Some(target) = st.confirm_execute_review.as_mut() {
                 if target.is_single_target() && target.focus.is_instructions_editor() {
+                    target.instructions_editor.insert_paste(text);
+                }
+            }
+        }
+        // The plan step and scope form owns the same directives editor; pasted
+        // text lands there instead of being silently absorbed.
+        Some(ActiveModal::ExecuteScope) => {
+            if let Some(target) = st.confirm_execute_scope.as_mut() {
+                if target.focus.is_instructions_editor() {
                     target.instructions_editor.insert_paste(text);
                 }
             }
@@ -402,20 +434,29 @@ pub async fn handle_terminal_event(
 /// Reloads the TUI configuration from disk and asks the server to reload its
 /// own configuration, keeping both sides in sync. Shared by the workspace and
 /// onboarding configuration-reload shortcuts.
+///
+/// The configuration file is read before the guard is taken: a synchronous
+/// filesystem read on a slow home directory must never stall the event loop
+/// while the interface state is locked (c-1).
 async fn reload_configuration(
-    st: &mut AppState,
+    state: &Arc<Mutex<AppState>>,
     server_writer: &mut RpcConnection,
 ) -> anyhow::Result<()> {
-    match crate::config::TuiConfig::load_checked() {
-        Ok(cfg) => {
-            st.tui_config = cfg;
-            st.sync_theme_mode();
-            st.notify_info(crate::i18n::active_t("notify.config_reloading"));
-        }
-        Err(err) => {
-            st.notify_error(
-                crate::i18n::active_t("notify.config_reload_error").replace("{}", &err.to_string()),
-            );
+    let loaded = crate::config::TuiConfig::load_checked();
+    {
+        let mut st = state.lock().await;
+        match loaded {
+            Ok(cfg) => {
+                st.tui_config = cfg;
+                st.sync_theme_mode();
+                st.notify_info(crate::i18n::active_t("notify.config_reloading"));
+            }
+            Err(err) => {
+                st.notify_error(
+                    crate::i18n::active_t("notify.config_reload_error")
+                        .replace("{}", &err.to_string()),
+                );
+            }
         }
     }
     send_request(server_writer, methods::CONFIG_RELOAD, serde_json::json!({})).await?;
@@ -471,7 +512,10 @@ async fn handle_global_shortcuts(
             st.help_scroll = 0;
         }
         GlobalCommand::ReloadConfig => {
-            reload_configuration(&mut st, server_writer).await?;
+            // The configuration reload ends with a transport write, so the guard
+            // is released before the helper is awaited (c-1).
+            drop(st);
+            reload_configuration(state, server_writer).await?;
         }
         GlobalCommand::ToggleReasoning => {
             st.model.reasoning.toggle_fold();
@@ -479,10 +523,15 @@ async fn handle_global_shortcuts(
             st.model.clamp_scroll(h);
         }
         GlobalCommand::SwitchView(target_mode) => {
-            switch_view(&mut st, target_mode, server_writer).await?;
+            // Both helpers issue a transport write once their local transition
+            // is complete, so the guard is released before they are awaited
+            // (c-1).
+            drop(st);
+            switch_view(state, target_mode, server_writer).await?;
         }
         GlobalCommand::SquashCommits => {
-            open_squash_dialog(&mut st, server_writer).await?;
+            drop(st);
+            open_squash_dialog(state, server_writer).await?;
         }
         GlobalCommand::SelectTheme => {
             st.open_theme_selector();
@@ -975,14 +1024,15 @@ mod tests {
     async fn test_switch_view_blocks_leaving_onboarding() {
         let mut st = test_state();
         st.view_mode = ViewMode::Onboarding;
+        let state = Arc::new(Mutex::new(st));
         let mut conn = RpcConnection::new(Vec::<u8>::new());
 
-        switch_view(&mut st, ViewMode::Repl, &mut conn)
+        switch_view(&state, ViewMode::Repl, &mut conn)
             .await
             .unwrap();
+        let st = state.lock().await;
         assert_eq!(st.view_mode, ViewMode::Onboarding);
-        assert!(st.notification.is_some());
-        let notif = st.notification.unwrap();
+        let notif = st.notification.as_ref().expect("a warning is reported");
         assert_eq!(notif.level, NotificationLevel::Warning);
         assert_eq!(
             notif.text,
@@ -1420,5 +1470,102 @@ mod tests {
             "keep the patch minimal"
         );
         assert_eq!(st.input_editor.get_text(), "");
+    }
+
+    fn execute_scope_dialog(
+        focus: crate::views::plans::RefineDialogFocus,
+    ) -> ConfirmExecuteScopeState {
+        let mut dialog = ConfirmExecuteScopeState::new(
+            "plan-1".to_string(),
+            "Plan One".to_string(),
+            "Step One".to_string(),
+            Some("1".to_string()),
+            vec![tauqe_protocol::PlanItem {
+                id: "1".to_string(),
+                title: "Step One".to_string(),
+                status: tauqe_protocol::PlanItemStatus::Todo,
+                ..Default::default()
+            }],
+            vec![tauqe_protocol::ModelEntry::new(
+                ModelRef::openrouter("coder-model"),
+                None,
+            )],
+        );
+        dialog.focus = focus;
+        dialog
+    }
+
+    #[test]
+    fn test_is_text_input_active_in_execute_scope_dialog() {
+        let mut st = test_state();
+        st.view_mode = ViewMode::Plans;
+        assert!(!is_text_input_active(&st));
+
+        st.confirm_execute_scope = Some(execute_scope_dialog(
+            crate::views::plans::RefineDialogFocus::ModelList,
+        ));
+        assert!(!is_text_input_active(&st));
+
+        st.confirm_execute_scope = Some(execute_scope_dialog(
+            crate::views::plans::RefineDialogFocus::InstructionsEditor,
+        ));
+        assert!(is_text_input_active(&st));
+
+        st.confirm_execute_scope = Some(execute_scope_dialog(
+            crate::views::plans::RefineDialogFocus::Actions,
+        ));
+        assert!(!is_text_input_active(&st));
+    }
+
+    #[test]
+    fn test_handle_paste_into_execute_scope_instructions_editor() {
+        let mut st = test_state();
+        st.view_mode = ViewMode::Plans;
+        st.confirm_execute_scope = Some(execute_scope_dialog(
+            crate::views::plans::RefineDialogFocus::InstructionsEditor,
+        ));
+
+        handle_paste(&mut st, "keep the patch minimal");
+
+        assert_eq!(
+            st.confirm_execute_scope
+                .as_ref()
+                .expect("dialog stays open")
+                .instructions_editor
+                .get_text(),
+            "keep the patch minimal"
+        );
+        assert_eq!(st.input_editor.get_text(), "");
+    }
+
+    /// With a non-`None` layout preset the navigation-mode translator rewrites
+    /// bare characters, so the directives editor must be reported as a live
+    /// text input and receive the typed character literally.
+    #[tokio::test]
+    async fn test_execute_scope_editor_inserts_characters_without_layout_translation() {
+        let mut st = test_state();
+        st.view_mode = ViewMode::Plans;
+        st.tui_config.input.layout = crate::config::LayoutPreset::RuJcuken;
+        st.confirm_execute_scope = Some(execute_scope_dialog(
+            crate::views::plans::RefineDialogFocus::InstructionsEditor,
+        ));
+        let state = Arc::new(Mutex::new(st));
+        let mut conn = RpcConnection::new(Vec::<u8>::new());
+
+        let key = KeyEvent::new(KeyCode::Char('ф'), KeyModifiers::NONE);
+        handle_terminal_event(crossterm::event::Event::Key(key), &state, &mut conn)
+            .await
+            .expect("in-memory dispatch never fails");
+
+        let guard = state.lock().await;
+        let target = guard
+            .confirm_execute_scope
+            .as_ref()
+            .expect("dialog stays open");
+        assert_eq!(target.instructions_editor.get_text(), "ф");
+        assert_eq!(
+            target.focus,
+            crate::views::plans::RefineDialogFocus::InstructionsEditor
+        );
     }
 }

@@ -5,7 +5,7 @@ use std::path::Path;
 use crate::prompt::estimate_tokens_from_bytes;
 use tauqe_protocol::{ContextAccess, ContextItem, ContextLayer};
 
-use super::{verify_path_within_repo, ContextManager};
+use super::ContextManager;
 
 impl ContextManager {
     pub fn load_pinned_from_repo(&mut self) {
@@ -39,7 +39,13 @@ impl ContextManager {
             // 1. Root-level pinned files
             for pattern in &self.pinned_patterns {
                 if let Ok(clean_path) = self.normalize_path(pattern) {
-                    self.insert_pinned_candidate(&mut new_pinned, clean_path);
+                    insert_pinned_candidate(
+                        &self.repo_root,
+                        &self.pinned,
+                        &mut new_pinned,
+                        &mut self.insertion_counter,
+                        clean_path,
+                    );
                 }
             }
 
@@ -57,9 +63,21 @@ impl ContextManager {
                     }
                     for pattern in &self.pinned_patterns {
                         let candidate = parent.join(pattern);
+                        // A candidate that is not a file on disk can never enter
+                        // the pinned layer, so probe its existence before paying
+                        // for normalization and the component-wise symlink walk.
+                        if !self.repo_root.join(&candidate).is_file() {
+                            continue;
+                        }
                         let candidate_str = candidate.to_string_lossy().to_string();
                         if let Ok(clean_candidate) = self.normalize_path(&candidate_str) {
-                            self.insert_pinned_candidate(&mut new_pinned, clean_candidate);
+                            insert_pinned_candidate(
+                                &self.repo_root,
+                                &self.pinned,
+                                &mut new_pinned,
+                                &mut self.insertion_counter,
+                                clean_candidate,
+                            );
                         }
                     }
                     curr = parent.parent();
@@ -74,37 +92,50 @@ impl ContextManager {
             }
         })
     }
+}
 
-    fn insert_pinned_candidate(
-        &self,
-        target_map: &mut IndexMap<String, ContextItem>,
-        clean_path: String,
-    ) {
-        if target_map.contains_key(&clean_path) {
-            return;
-        }
-        if verify_path_within_repo(&self.repo_root, &clean_path).is_err() {
-            return;
-        }
-        let full_path = self.repo_root.join(&clean_path);
-        if full_path.is_file() {
-            if let Some(existing) = self.pinned.get(&clean_path) {
-                target_map.insert(clean_path, existing.clone());
-            } else if let Ok(meta) = std::fs::metadata(&full_path) {
-                let size = meta.len();
-                let tokens = estimate_tokens_from_bytes(size);
-                target_map.insert(
-                    clean_path.clone(),
-                    ContextItem {
-                        path: clean_path,
-                        access: ContextAccess::ReadOnly,
-                        size_bytes: size,
-                        estimated_tokens: tokens,
-                        layer: ContextLayer::Pinned,
-                    },
-                );
-            }
-        }
+/// Records one pinned candidate that has already been verified.
+///
+/// `clean_path` always arrives from `ContextManager::normalize_path`, which
+/// rejects absolute and repository-escaping paths and walks every symlink
+/// component. Verifying it again here would repeat the same walk for every
+/// pattern of every ancestor directory of every context file.
+///
+/// A candidate that is not yet in the pinned layer is a genuinely new entry, so
+/// it consumes the next insertion watermark. Reusing the watermark of an
+/// existing candidate keeps a recomputation from moving every pinned file to
+/// the tail of the chronological timeline.
+fn insert_pinned_candidate(
+    repo_root: &Path,
+    pinned: &IndexMap<String, ContextItem>,
+    target_map: &mut IndexMap<String, ContextItem>,
+    insertion_counter: &mut u64,
+    clean_path: String,
+) {
+    if target_map.contains_key(&clean_path) {
+        return;
+    }
+    let full_path = repo_root.join(&clean_path);
+    if !full_path.is_file() {
+        return;
+    }
+    if let Some(existing) = pinned.get(&clean_path) {
+        target_map.insert(clean_path, existing.clone());
+    } else if let Ok(meta) = std::fs::metadata(&full_path) {
+        let size = meta.len();
+        let tokens = estimate_tokens_from_bytes(size);
+        *insertion_counter += 1;
+        target_map.insert(
+            clean_path.clone(),
+            ContextItem {
+                path: clean_path,
+                access: ContextAccess::ReadOnly,
+                size_bytes: size,
+                estimated_tokens: tokens,
+                layer: ContextLayer::Pinned,
+                insertion_seq: *insertion_counter,
+            },
+        );
     }
 }
 
@@ -279,5 +310,37 @@ mod tests {
         cm.clear_user();
         assert!(cm.contains("Conventions.md").unwrap());
         assert!(!cm.contains("crates/core/Conventions.md").unwrap());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn test_hierarchical_pinned_skips_symlink_escaping_repository() {
+        let dir = tempdir().unwrap();
+        let outside = tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+
+        std::fs::create_dir_all(root.join("crates/core/src")).unwrap();
+        std::fs::write(root.join("crates/core/src/lib.rs"), "pub fn core() {}").unwrap();
+        std::fs::write(root.join("Conventions.md"), "# Root Conventions").unwrap();
+
+        let outside_file = outside.path().join("Conventions.md");
+        std::fs::write(&outside_file, "# Outside Conventions").unwrap();
+        std::os::unix::fs::symlink(&outside_file, root.join("crates/core/Conventions.md")).unwrap();
+
+        let mut cm = ContextManager::with_pinned(root, &["Conventions.md".to_string()]);
+        cm.add_file("crates/core/src/lib.rs", ContextAccess::Editable)
+            .unwrap();
+
+        // The candidate exists on disk, so it reaches the symlink verification
+        // inside normalization and is rejected there instead of being pinned.
+        let state = cm.get_state();
+        assert!(!state
+            .items
+            .iter()
+            .any(|item| item.path == "crates/core/Conventions.md"));
+        assert!(!cm
+            .read_context_files()
+            .iter()
+            .any(|file| file.path == "crates/core/Conventions.md"));
     }
 }

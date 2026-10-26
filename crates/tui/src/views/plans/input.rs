@@ -502,7 +502,9 @@ pub async fn handle_plans_key(
             }
         }
         PlansAction::NavNext => {
-            let rows_len = st.plans_view.flatten_rows().len();
+            // The cursor bounds read the row count, which mirrors the flattened
+            // tree branch for branch without building it (c-2).
+            let rows_len = st.plans_view.row_count();
             if rows_len > 0 && st.plans_view.selected_index + 1 < rows_len {
                 st.plans_view.selected_index += 1;
                 st.plans_view.scroll_to_selected();
@@ -513,7 +515,7 @@ pub async fn handle_plans_key(
             st.plans_view.scroll_to_selected();
         }
         PlansAction::SelectLast => {
-            let rows_len = st.plans_view.flatten_rows().len();
+            let rows_len = st.plans_view.row_count();
             if rows_len > 0 {
                 st.plans_view.selected_index = rows_len - 1;
                 st.plans_view.scroll_to_selected();
@@ -525,7 +527,7 @@ pub async fn handle_plans_key(
         // command (c-paging-cursor-sync).
         PlansAction::PageUp => {
             let page = usize::from(st.plans_view.view_height.saturating_sub(2).max(1));
-            let rows_len = st.plans_view.flatten_rows().len();
+            let rows_len = st.plans_view.row_count();
             if rows_len > 0 {
                 st.plans_view.selected_index = st.plans_view.selected_index.saturating_sub(page);
                 st.plans_view.scroll_to_selected();
@@ -533,7 +535,7 @@ pub async fn handle_plans_key(
         }
         PlansAction::PageDown => {
             let page = usize::from(st.plans_view.view_height.saturating_sub(2).max(1));
-            let rows_len = st.plans_view.flatten_rows().len();
+            let rows_len = st.plans_view.row_count();
             if rows_len > 0 {
                 st.plans_view.selected_index =
                     (st.plans_view.selected_index + page).min(rows_len - 1);
@@ -675,13 +677,15 @@ pub async fn handle_plans_key(
             // that carries a ready leaf horizon or only its architectural
             // concept, and the whole queue runs under one registered operation
             // (c-1, c-5).
-            let plans: Vec<tauqe_protocol::Plan> = st.plans_view.plans.clone();
+            //
+            // The queue is accumulated from the configured plans by reference, so
+            // a bulk launch never deep-clones every plan in the list (c-2).
             let mut plan_ids = Vec::new();
             let mut plan_titles = Vec::new();
             let mut steps = Vec::new();
             let mut pending_synthesis = Vec::new();
 
-            for plan in &plans {
+            for plan in &st.plans_view.plans {
                 if plan.items.is_empty() && !plan.concept.is_empty() {
                     // Concept-only plan: the batch projects its first horizon
                     // just-in-time before the queue reaches it.

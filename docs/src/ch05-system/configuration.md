@@ -108,6 +108,9 @@ it runs a declared command line and reads its exit status.
 - **Ladder rung** — one entry of an ordered role list, consumed for intra-role
   escalation.
 - **Phase** — one verification stage: `check`, `lint`, or `test`.
+- **Patch strategy** — how a change set names the lines it replaces: by the text it
+  echoes (`search_replace`) or by the opaque anchors rendered beside them
+  (`line_anchor`).
 - **Project command** — a declared command line with literal arguments and an optional
   timeout.
 - **Reference** — an executable written as `@` plus the name of another declared
@@ -127,7 +130,7 @@ it runs a declared command line and reads its exit status.
 | --- | --- |
 | `[providers.openrouter]` | the native model catalog the picker may offer |
 | `[models]` | semantic roles, their entries, and `auto_level_up` |
-| `[develop]` | edit retries, verification healing budget, replan budget, workflow mode, edit protocol |
+| `[develop]` | edit retries, verification healing budget, replan budget, workflow mode, edit protocol, patch strategy, prompt layout |
 | `[git]` | upstream base and hook bypass |
 | `[history]` | token budget and uncompressed tail length |
 | `[context]` | discovery rounds, file and outline budgets, pattern cap, pinned patterns |
@@ -144,6 +147,41 @@ transport, token cost, and prefix caching.
 | `structured` | strict JSON-Schema structured output for every turn |
 | `xml` | marker-protected XML tags for every turn |
 | `mixed` | two contours: XML for code edits, structured output for discussions, commit messages, and history compaction |
+
+The same section declares how a change set addresses the lines it replaces, through
+its `patch_strategy` key. The strategy is orthogonal to `protocol`: the protocol
+picks the encoding of an edit, the strategy picks the fields that address its
+range.
+
+| `patch_strategy` | A range is addressed by | Prompt rendering |
+| --- | --- | --- |
+| `search_replace` | the replaced lines, echoed verbatim and matched exactly | the raw text of every context line |
+| `line_anchor` | two opaque anchors naming the first and last replaced line | the opaque anchor of every context line |
+
+One declaration feeds every consumer: the prompt renders the anchors, the wire
+schema declares the fields that carry them, staging resolves the named ranges
+against one snapshot from the bottom of the file upwards, and a failed patch is
+explained in the same vocabulary. The profile module that owns that vocabulary is
+described in *The Three-Phase Modification Lifecycle*; this chapter declares only
+the key.
+
+The same section declares how the rendered prompt blocks become a message sequence,
+through its `prompt_layout` key. The policy is orthogonal to both the transport and
+the patch strategy: the transport picks the encoding of a model answer, the strategy
+picks how a change set addresses a line range, and the layout picks the order and the
+growth shape of the message sequence.
+
+| `prompt_layout` | Message sequence | Resolved default |
+| --- | --- | --- |
+| `semantic` | blocks grouped by kind: one system message carrying the contract, the outline, the whole context block, the active plan, the language directive, the history block, and the scratchpad | read-only discussion, isolated step |
+| `chronological` | a byte-stable head, an append-only transcript of history records interleaved with the context files they observed, and a volatile tail of plan, context manifest, and scratchpad | interactive REPL |
+
+An absent key keeps the resolution by turn intent: an interactive REPL turn takes the
+chronological transcript, whose append-only growth keeps the provider prefix cache
+warm from one turn to the next, while a read-only discussion and an isolated step
+carry no growing history to interleave and keep the semantic order. A declared value
+overrides that resolution for every intent, and the blocks themselves stay identical
+under both policies — only their composition differs.
 
 `providers.openrouter.api_key` is deliberately skipped on deserialization: a key
 pasted into `tauqe.toml` is ignored rather than honored, so the mistake cannot become
@@ -476,6 +514,9 @@ Localization* owns the interface language.
   declared command lines; it does not describe the pipeline those commands run.
 - **It is not a shell entry point.** A declared command has literal arguments and no
   free-form input, so the allowlist can never widen into arbitrary execution.
+- **It is not a transport choice.** `patch_strategy` says how a change set addresses
+  the lines it replaces; `protocol` says how the change set is encoded. Neither
+  implies the other.
 - **It is not static.** Both tiers reload without a restart and without cancelling
   work.
 - **It is not a substitute for documentation.** A parameter that exists but is
@@ -488,7 +529,8 @@ Localization* owns the interface language.
 - [The TauqeProjectProtocol](../ch03-project/tauqe-project-protocol.md) — the command
   contract, its declaration, and its process boundary.
 - [The Three-Phase Modification Lifecycle](../ch03-project/three-phase-lifecycle.md) —
-  where formatting, post-hooks, and verification run.
+  where formatting, post-hooks, and verification run, and where the patch-strategy
+  profile lives.
 - [Structured Diagnostics and Verification Healing](../ch03-project/verification-healing.md) —
   what a failing phase produces.
 - [Three-Tier Context Model](../ch02-perception/three-tier-model.md) — the layers these

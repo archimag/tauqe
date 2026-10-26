@@ -20,7 +20,9 @@ pub use self::render::render_plans_view;
 // Tree-line rendering lives in its own module; the facade re-exports the three
 // entry points its renderer and the Review view consume, so those callers keep
 // importing one tree vocabulary from the plans module.
-pub(crate) use self::tree::{architect_badge, compute_unified_plan_lines, status_style};
+pub(crate) use self::tree::{
+    architect_badge, compute_unified_plan_lines, plan_row_gap, status_style,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum VisiblePlanRow {
@@ -258,6 +260,19 @@ pub struct PlansViewState {
     pub recenter_state: RecenterState,
 }
 
+/// Rendered line bounds of one row of the plan tree.
+struct RowBounds {
+    /// First rendered line of the row.
+    start: usize,
+    /// First rendered line after the row. When another plan follows, it includes
+    /// the blank separator that opens that plan, exactly as the recorded offsets
+    /// of a rendered frame do.
+    end: usize,
+    /// Rendered height of the whole tree, known only when the walk measured the
+    /// rows after the selected one as well.
+    total: Option<usize>,
+}
+
 impl PlansViewState {
     pub fn is_plan_expanded(&self, plan_id: &str) -> bool {
         self.expanded_plans.contains(plan_id)
@@ -392,78 +407,121 @@ impl PlansViewState {
         }
     }
 
+    /// Collects the visible rows of the tree in render order.
+    ///
+    /// The projection is owned because callers render, filter, and reorder the
+    /// rows freely. A path that needs only one row or only the row count uses
+    /// `selected_row` or `row_count`, so the navigation hot path never builds the
+    /// whole projection (c-2).
     pub fn flatten_rows(&self) -> Vec<VisiblePlanRow> {
         let mut rows = Vec::new();
+        self.walk_rows(&mut |_, row| {
+            rows.push(row);
+            true
+        });
+        rows
+    }
+
+    /// Walks the visible rows in render order, handing each row together with its
+    /// index to `visit` and stopping as soon as `visit` returns `false`.
+    ///
+    /// This walk is the single source of row order: `flatten_rows` collects it,
+    /// `selected_row` stops at the cursor, and the viewport measurement stops once
+    /// it holds the bounds it needs. None of them can drift from another, and none
+    /// of them clones a row it does not use (c-2).
+    fn walk_rows(&self, visit: &mut dyn FnMut(usize, VisiblePlanRow) -> bool) {
+        let mut index = 0usize;
         for plan in &self.plans {
             let is_expanded = self.is_plan_expanded(&plan.id);
             let (total, completed) = plan.count_stats();
-            let status = plan.status();
 
-            rows.push(VisiblePlanRow::PlanHeader {
+            let header = VisiblePlanRow::PlanHeader {
                 plan_id: plan.id.clone(),
                 title: plan.title.clone(),
                 description: plan.description.clone(),
                 total,
                 completed,
-                status,
+                status: plan.status(),
                 is_expanded,
                 focused: self.is_plan_focused(&plan.id),
                 architect: plan.architect.clone(),
-            });
+            };
+            if !visit(index, header) {
+                return;
+            }
+            index += 1;
 
-            if is_expanded {
-                if !plan.concept.is_empty() {
-                    let concept_expanded = self.is_concept_section_expanded(&plan.id);
-                    rows.push(VisiblePlanRow::ConceptHeader {
-                        plan_id: plan.id.clone(),
-                        count: plan.concept.len(),
-                        is_expanded: concept_expanded,
-                    });
-                    if concept_expanded {
-                        for item in &plan.concept {
-                            self.flatten_concept_recursive(&plan.id, item, 2, &mut rows);
-                        }
-                    }
+            if !is_expanded {
+                continue;
+            }
 
-                    let impl_expanded = self.is_impl_section_expanded(&plan.id);
-                    rows.push(VisiblePlanRow::ImplementationHeader {
-                        plan_id: plan.id.clone(),
-                        total,
-                        completed,
-                        is_expanded: impl_expanded,
-                    });
-                    if impl_expanded {
-                        for item in &plan.items {
-                            self.flatten_item_recursive(&plan.id, item, 2, &mut rows);
-                        }
+            if plan.concept.is_empty() {
+                for item in &plan.items {
+                    if !self.walk_item(&plan.id, item, 1, &mut index, visit) {
+                        return;
                     }
-                } else {
-                    for item in &plan.items {
-                        self.flatten_item_recursive(&plan.id, item, 1, &mut rows);
+                }
+                continue;
+            }
+
+            let concept_expanded = self.is_concept_section_expanded(&plan.id);
+            let concept_header = VisiblePlanRow::ConceptHeader {
+                plan_id: plan.id.clone(),
+                count: plan.concept.len(),
+                is_expanded: concept_expanded,
+            };
+            if !visit(index, concept_header) {
+                return;
+            }
+            index += 1;
+            if concept_expanded {
+                for item in &plan.concept {
+                    if !self.walk_concept(&plan.id, item, 2, &mut index, visit) {
+                        return;
+                    }
+                }
+            }
+
+            let impl_expanded = self.is_impl_section_expanded(&plan.id);
+            let impl_header = VisiblePlanRow::ImplementationHeader {
+                plan_id: plan.id.clone(),
+                total,
+                completed,
+                is_expanded: impl_expanded,
+            };
+            if !visit(index, impl_header) {
+                return;
+            }
+            index += 1;
+            if impl_expanded {
+                for item in &plan.items {
+                    if !self.walk_item(&plan.id, item, 2, &mut index, visit) {
+                        return;
                     }
                 }
             }
         }
-        rows
     }
 
-    fn flatten_concept_recursive(
+    /// Hands one concept item and, while it is expanded, its visible children to
+    /// the walk visitor, mirroring `count_concept_rows` branch for branch.
+    fn walk_concept(
         &self,
         plan_id: &str,
         item: &ConceptItem,
         depth: usize,
-        out: &mut Vec<VisiblePlanRow>,
-    ) {
+        index: &mut usize,
+        visit: &mut dyn FnMut(usize, VisiblePlanRow) -> bool,
+    ) -> bool {
         let has_children = !item.children.is_empty();
         let has_details = item
             .details
             .as_deref()
             .map(|s| !s.trim().is_empty())
             .unwrap_or(false);
-        let is_expandable = has_children || has_details;
         let is_expanded = self.is_concept_item_expanded(plan_id, &item.id);
 
-        out.push(VisiblePlanRow::ConceptItem {
+        let row = VisiblePlanRow::ConceptItem {
             plan_id: plan_id.to_string(),
             item_id: item.id.clone(),
             title: item.title.clone(),
@@ -471,25 +529,35 @@ impl PlansViewState {
             depth,
             has_children,
             has_details,
-            is_expandable,
+            is_expandable: has_children || has_details,
             is_expanded,
             focused: self.is_item_focused(plan_id, &item.id),
-        });
+        };
+        if !visit(*index, row) {
+            return false;
+        }
+        *index += 1;
 
         if has_children && is_expanded {
             for child in &item.children {
-                self.flatten_concept_recursive(plan_id, child, depth + 1, out);
+                if !self.walk_concept(plan_id, child, depth + 1, index, visit) {
+                    return false;
+                }
             }
         }
+        true
     }
 
-    fn flatten_item_recursive(
+    /// Hands one step and, while it is expanded, its visible children to the walk
+    /// visitor, mirroring `count_item_rows` branch for branch.
+    fn walk_item(
         &self,
         plan_id: &str,
         item: &PlanItem,
         depth: usize,
-        out: &mut Vec<VisiblePlanRow>,
-    ) {
+        index: &mut usize,
+        visit: &mut dyn FnMut(usize, VisiblePlanRow) -> bool,
+    ) -> bool {
         let has_children = !item.children.is_empty();
         let has_details = item
             .details
@@ -504,10 +572,9 @@ impl PlansViewState {
             .as_deref()
             .map(|reason| !reason.trim().is_empty())
             .unwrap_or(false);
-        let is_expandable = has_children || has_details || has_meta || has_blocked_reason;
         let is_expanded = self.is_item_expanded(plan_id, &item.id);
 
-        out.push(VisiblePlanRow::PlanItem {
+        let row = VisiblePlanRow::PlanItem {
             plan_id: plan_id.to_string(),
             item_id: item.id.clone(),
             title: item.title.clone(),
@@ -520,16 +587,23 @@ impl PlansViewState {
             depth,
             has_children,
             has_details,
-            is_expandable,
+            is_expandable: has_children || has_details || has_meta || has_blocked_reason,
             is_expanded,
             focused: self.is_item_focused(plan_id, &item.id),
-        });
+        };
+        if !visit(*index, row) {
+            return false;
+        }
+        *index += 1;
 
         if has_children && is_expanded {
             for child in &item.children {
-                self.flatten_item_recursive(plan_id, child, depth + 1, out);
+                if !self.walk_item(plan_id, child, depth + 1, index, visit) {
+                    return false;
+                }
             }
         }
+        true
     }
 
     /// Number of concept rows one concept subtree contributes to the tree.
@@ -595,9 +669,23 @@ impl PlansViewState {
         count
     }
 
+    /// The row under the cursor, cloned on its own.
+    ///
+    /// The walk stops at the cursor instead of collecting the whole tree, so
+    /// reading the selected row costs one row rather than every visible one
+    /// (c-2).
     pub fn selected_row(&self) -> Option<VisiblePlanRow> {
-        let rows = self.flatten_rows();
-        rows.get(self.selected_index).cloned()
+        let target = self.selected_index;
+        let mut selected = None;
+        self.walk_rows(&mut |index, row| {
+            if index == target {
+                selected = Some(row);
+                false
+            } else {
+                true
+            }
+        });
+        selected
     }
 
     pub fn clamp_selection(&mut self) {
@@ -610,23 +698,17 @@ impl PlansViewState {
     }
 
     pub fn scroll_to_selected(&mut self) {
-        let rows = self.flatten_rows();
-        if rows.is_empty() || self.view_height == 0 {
+        let count = self.row_count();
+        if count == 0 || self.view_height == 0 {
             return;
         }
-        let sel = self.selected_index.min(rows.len() - 1);
+        let sel = self.selected_index.min(count - 1);
         self.selected_index = sel;
 
-        let (lines, offsets) = compute_unified_plan_lines(
-            &rows,
-            sel,
-            self.content_width.max(10),
-            self.theme_mode,
-            &mut self.markdown_cache,
-        );
+        let Some(bounds) = self.render_bounds(sel, false) else {
+            return;
+        };
         let height = self.view_height as usize;
-        let start = offsets.get(sel).copied().unwrap_or(0);
-        let end = offsets.get(sel + 1).copied().unwrap_or(lines.len());
         let scroll = self.scroll as usize;
 
         // A row taller than the viewport cannot be shown whole, so the window
@@ -634,40 +716,117 @@ impl PlansViewState {
         // aligns it to the top of the screen, while a viewport already deep
         // inside it keeps its offset instead of snapping back to the first line
         // of the row. A row that fits is revealed completely (c-scroll-visibility).
-        let new_scroll = if end.saturating_sub(start) > height {
-            scroll.clamp(start, end.saturating_sub(height))
-        } else if start < scroll {
-            start
-        } else if end > scroll + height {
-            end.saturating_sub(height)
+        let new_scroll = if bounds.end.saturating_sub(bounds.start) > height {
+            scroll.clamp(bounds.start, bounds.end.saturating_sub(height))
+        } else if bounds.start < scroll {
+            bounds.start
+        } else if bounds.end > scroll + height {
+            bounds.end.saturating_sub(height)
         } else {
             scroll
         };
-        self.scroll = new_scroll as u16;
+        self.scroll = u16::try_from(new_scroll).unwrap_or(u16::MAX);
     }
 
     /// Positions the viewport around the selected plan row using the three-beat
     /// Emacs `recenter-top-bottom` cycle (center -> top -> bottom).
     pub fn recenter_selected(&mut self) {
-        let rows = self.flatten_rows();
-        if rows.is_empty() || self.view_height == 0 {
+        let count = self.row_count();
+        if count == 0 || self.view_height == 0 {
             return;
         }
-        let sel = self.selected_index.min(rows.len().saturating_sub(1));
+        let sel = self.selected_index.min(count.saturating_sub(1));
         self.selected_index = sel;
 
-        let (lines, offsets) = compute_unified_plan_lines(
-            &rows,
-            sel,
-            self.content_width.max(10),
-            self.theme_mode,
-            &mut self.markdown_cache,
-        );
-        let start = offsets.get(sel).copied().unwrap_or(0);
-        let end = offsets.get(sel + 1).copied().unwrap_or(lines.len());
-        self.scroll = self
-            .recenter_state
-            .recenter(sel, start, end, lines.len(), self.view_height);
+        let Some(bounds) = self.render_bounds(sel, true) else {
+            return;
+        };
+        let Some(total) = bounds.total else {
+            return;
+        };
+        self.scroll =
+            self.recenter_state
+                .recenter(sel, bounds.start, bounds.end, total, self.view_height);
+    }
+
+    /// Rendered line bounds of the row at `index`, measured without materializing
+    /// the whole owned row projection.
+    ///
+    /// The tree is walked in document order and every row is measured on its own
+    /// through the frame's renderer, so the bounds can never disagree with the
+    /// lines actually drawn. The walk stops as soon as the bounds are known,
+    /// unless `measure_total` still needs the height of the whole tree so the
+    /// recenter cycle can clamp its last beat (c-2).
+    fn render_bounds(&mut self, index: usize, measure_total: bool) -> Option<RowBounds> {
+        /// Rendered height of one row, measured through the frame's renderer.
+        fn row_height(
+            row: &VisiblePlanRow,
+            is_selected: bool,
+            width: usize,
+            theme_mode: crate::config::ThemeMode,
+            cache: &mut MarkdownBodyCache,
+        ) -> usize {
+            // Selection changes the gutter glyph and the row fill, never the
+            // number of lines, so a row is measured in its own selection state.
+            let selected_idx = if is_selected { 0 } else { usize::MAX };
+            compute_unified_plan_lines(
+                std::slice::from_ref(row),
+                selected_idx,
+                width,
+                theme_mode,
+                cache,
+            )
+            .0
+            .len()
+        }
+
+        let width = self.content_width.max(10);
+        let theme_mode = self.theme_mode;
+        let mut cache = std::mem::take(&mut self.markdown_cache);
+        let mut height = 0usize;
+        let mut start = None;
+        let mut end = None;
+        let mut measured = false;
+        let mut bounds_closed = false;
+
+        self.walk_rows(&mut |row_index, row| {
+            if plan_row_gap(row_index, &row) {
+                height += 1;
+            }
+            if measured && !bounds_closed {
+                // The separator in front of this row closes the bounds of the row
+                // measured before it, exactly as the recorded frame offsets do.
+                end = Some(height);
+                bounds_closed = true;
+                if !measure_total {
+                    return false;
+                }
+            }
+            let row_start = height;
+            height += row_height(&row, row_index == index, width, theme_mode, &mut cache);
+            if row_index == index {
+                start = Some(row_start);
+                measured = true;
+            }
+            true
+        });
+
+        if measured && end.is_none() {
+            // The selected row is the last one, so the document ends with its own
+            // lines, exactly as the recorded offsets fall back to the rendered
+            // length.
+            end = Some(height);
+        }
+        self.markdown_cache = cache;
+
+        match (start, end) {
+            (Some(start), Some(end)) => Some(RowBounds {
+                start,
+                end,
+                total: measure_total.then_some(height),
+            }),
+            _ => None,
+        }
     }
 
     /// Collapses every previously opened plan except `plan_id`, expands the
@@ -2084,5 +2243,108 @@ mod tests {
             end - height,
             "an offset past the row bottom clamps to the last screenful"
         );
+    }
+
+    /// The cursor walk must yield exactly the row the collected projection holds
+    /// at the same index, so reading one row never needs the whole tree (c-2).
+    #[test]
+    fn test_selected_row_matches_the_flattened_projection_at_every_index() {
+        let mut view = row_count_fixture();
+        view.expand_all();
+
+        let rows = view.flatten_rows();
+        assert!(!rows.is_empty());
+        for index in 0..rows.len() {
+            view.selected_index = index;
+            assert_eq!(
+                view.selected_row().as_ref(),
+                rows.get(index),
+                "the cursor walk must yield the row the projection holds at {index}"
+            );
+        }
+
+        view.selected_index = rows.len() + 3;
+        assert!(
+            view.selected_row().is_none(),
+            "a cursor past the last row selects nothing"
+        );
+    }
+
+    /// The measured bounds of every row must equal the offsets the frame records
+    /// while rendering, so positioning the viewport can never disagree with the
+    /// lines actually drawn (c-2).
+    #[test]
+    fn test_render_bounds_match_the_rendered_offsets_of_every_row() {
+        let mut view = PlansViewState {
+            plans: vec![
+                Plan {
+                    id: "plan-a".to_string(),
+                    title: "Plan A".to_string(),
+                    description: Some("First plan.".to_string()),
+                    concept: vec![concept_leaf("c-1", "Invariant")],
+                    items: vec![
+                        leaf_item("1", "First step"),
+                        PlanItem {
+                            details: Some(
+                                (0..40)
+                                    .map(|line| format!("Invariant line {line}."))
+                                    .collect::<Vec<_>>()
+                                    .join("\n"),
+                            ),
+                            ..leaf_item("2", "Tall step")
+                        },
+                    ],
+                    ..Default::default()
+                },
+                Plan {
+                    id: "plan-b".to_string(),
+                    title: "Plan B".to_string(),
+                    items: vec![leaf_item("1", "Step")],
+                    ..Default::default()
+                },
+            ],
+            view_height: 8,
+            content_width: 60,
+            ..Default::default()
+        };
+        view.expand_all();
+        view.toggle_item_expanded("plan-a", "2");
+
+        let width = view.content_width;
+        let rows = view.flatten_rows();
+        assert!(!rows.is_empty());
+
+        for index in 0..rows.len() {
+            // The frame is rendered with the same row selected, so the measured
+            // bounds are compared against the identical selection state.
+            let (frame_lines, frame_offsets) = compute_unified_plan_lines(
+                &rows,
+                index,
+                width,
+                view.theme_mode,
+                &mut view.markdown_cache,
+            );
+            let bounds = view
+                .render_bounds(index, true)
+                .unwrap_or_else(|| panic!("row {index} must have bounds"));
+
+            assert_eq!(
+                bounds.start, frame_offsets[index],
+                "row {index} must start where the frame puts it"
+            );
+            assert_eq!(
+                bounds.end,
+                frame_offsets
+                    .get(index + 1)
+                    .copied()
+                    .unwrap_or(frame_lines.len()),
+                "row {index} must end where the frame puts the next row"
+            );
+            assert_eq!(
+                bounds.total,
+                Some(frame_lines.len()),
+                "row {index} must measure the whole tree"
+            );
+        }
     }
 }

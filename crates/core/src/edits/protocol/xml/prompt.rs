@@ -6,27 +6,38 @@
 //! capability set enables it. A narrowed set therefore never advertises an
 //! instruction for a capability the model cannot use.
 
-use tauqe_protocol::CapabilitySet;
+use tauqe_protocol::{CapabilitySet, PatchStrategy};
 
 use crate::capabilities::{CapabilityRegistry, PromptRenderContext};
 use crate::edits::protocol::xml::engine::tag_bases;
 
 /// Renders the XML edit protocol reference for the interactive develop set.
-pub(super) fn base_system_instructions(editable_paths: &[String]) -> String {
-    system_instructions_for(&CapabilitySet::interactive_repl(), editable_paths, false)
+pub(super) fn base_system_instructions(
+    editable_paths: &[String],
+    patch_strategy: PatchStrategy,
+) -> String {
+    system_instructions_for(
+        &CapabilitySet::interactive_repl(),
+        editable_paths,
+        false,
+        patch_strategy,
+    )
 }
 
 /// Renders the XML edit protocol reference for an explicit capability set.
 ///
 /// `has_eager_repo_map` suppresses the on-demand symbol map example whenever the
-/// prompt already carries the rendered map.
+/// prompt already carries the rendered map, and `patch_strategy` selects the
+/// vocabulary of the change set the reference describes.
 pub(super) fn system_instructions_for(
     capabilities: &CapabilitySet,
     editable_paths: &[String],
     has_eager_repo_map: bool,
+    patch_strategy: PatchStrategy,
 ) -> String {
-    let ctx =
-        PromptRenderContext::new(editable_paths, None).with_eager_repo_map(has_eager_repo_map);
+    let ctx = PromptRenderContext::new(editable_paths, None)
+        .with_eager_repo_map(has_eager_repo_map)
+        .with_patch_strategy(patch_strategy);
     let mut prompt = String::new();
     prompt.push_str("## Code Modification Protocol (XML Edits)\n");
     prompt.push_str(
@@ -100,7 +111,7 @@ mod tests {
 
     #[test]
     fn test_system_instructions_compose_enabled_capabilities() {
-        let instr = base_system_instructions(&[]);
+        let instr = base_system_instructions(&[], PatchStrategy::SearchReplace);
         assert!(instr.contains("## Code Modification Protocol (XML Edits)"));
         assert!(instr.contains("<edits summary"));
         // The pre-canonical container spelling stays decodable but is never
@@ -125,6 +136,7 @@ mod tests {
             &CapabilitySet::from_slice(&[LlmCapability::TextMessage, LlmCapability::FileEdits]),
             &[],
             false,
+            PatchStrategy::SearchReplace,
         );
         assert!(narrowed.contains("<edits summary"));
         assert!(!narrowed.contains("<context_request"));
@@ -137,7 +149,10 @@ mod tests {
     #[test]
     fn test_apply_turn_marker_binds_every_structural_tag() {
         let marker = "M987654";
-        let marked = apply_turn_marker(&base_system_instructions(&[]), marker);
+        let marked = apply_turn_marker(
+            &base_system_instructions(&[], PatchStrategy::SearchReplace),
+            marker,
+        );
         assert!(marked.contains(&format!("<scratchpad_{m}>", m = marker)));
         assert!(marked.contains(&format!("</scratchpad_{m}>", m = marker)));
         assert!(marked.contains(&format!("<success_{m} summary", m = marker)));
@@ -153,7 +168,10 @@ mod tests {
     #[test]
     fn test_apply_turn_marker_declares_the_only_command_channel() {
         let marker = "M987654";
-        let marked = apply_turn_marker(&base_system_instructions(&[]), marker);
+        let marked = apply_turn_marker(
+            &base_system_instructions(&[], PatchStrategy::SearchReplace),
+            marker,
+        );
         // The marker paragraph closes the wrapper ambiguity: a model that
         // reaches for a native function-calling format must know that no
         // other form is ever parsed as a command.

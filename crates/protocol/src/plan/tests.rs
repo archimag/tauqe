@@ -1182,6 +1182,7 @@ fn test_plan_validate_success() {
                 status: PlanItemStatus::Todo,
                 depends_on: vec!["1".to_string()],
                 concept_refs: vec!["c-1".to_string()],
+                files: vec!["src/step2.rs".to_string()],
                 ..Default::default()
             },
         ],
@@ -1193,10 +1194,12 @@ fn test_plan_validate_success() {
 #[test]
 fn test_plan_validate_item_errors() {
     // 1. Empty item ID
+    let mut empty_id_item = item("  ", "Empty", PlanItemStatus::Todo, vec![]);
+    empty_id_item.files = vec!["src/empty.rs".to_string()];
     let empty_id = Plan {
         id: "p".to_string(),
         title: "P".to_string(),
-        items: vec![item("  ", "Empty", PlanItemStatus::Todo, vec![])],
+        items: vec![empty_id_item],
         ..Default::default()
     };
     assert_eq!(
@@ -1205,13 +1208,14 @@ fn test_plan_validate_item_errors() {
     );
 
     // 2. Duplicate item ID (case-insensitive)
+    let mut first_dup = item("Step-1", "A", PlanItemStatus::Todo, vec![]);
+    first_dup.files = vec!["src/a.rs".to_string()];
+    let mut second_dup = item("step-1", "B", PlanItemStatus::Todo, vec![]);
+    second_dup.files = vec!["src/b.rs".to_string()];
     let dup_id = Plan {
         id: "p".to_string(),
         title: "P".to_string(),
-        items: vec![
-            item("Step-1", "A", PlanItemStatus::Todo, vec![]),
-            item("step-1", "B", PlanItemStatus::Todo, vec![]),
-        ],
+        items: vec![first_dup, second_dup],
         ..Default::default()
     };
     assert_eq!(
@@ -1277,6 +1281,7 @@ fn test_plan_validate_item_errors() {
             id: "1".to_string(),
             title: "Step 1".to_string(),
             concept_refs: vec!["c-missing".to_string()],
+            files: vec!["src/step1.rs".to_string()],
             ..Default::default()
         }],
         ..Default::default()
@@ -1300,6 +1305,7 @@ fn test_plan_validate_dependency_errors() {
             id: "1".to_string(),
             title: "Step 1".to_string(),
             depends_on: vec!["ghost".to_string()],
+            files: vec!["src/step1.rs".to_string()],
             ..Default::default()
         }],
         ..Default::default()
@@ -1320,6 +1326,7 @@ fn test_plan_validate_dependency_errors() {
             id: "1".to_string(),
             title: "Step 1".to_string(),
             depends_on: vec!["1".to_string()],
+            files: vec!["src/step1.rs".to_string()],
             ..Default::default()
         }],
         ..Default::default()
@@ -1338,12 +1345,14 @@ fn test_plan_validate_dependency_errors() {
                 id: "A".to_string(),
                 title: "Step A".to_string(),
                 depends_on: vec!["B".to_string()],
+                files: vec!["src/step_a.rs".to_string()],
                 ..Default::default()
             },
             PlanItem {
                 id: "B".to_string(),
                 title: "Step B".to_string(),
                 depends_on: vec!["A".to_string()],
+                files: vec!["src/step_b.rs".to_string()],
                 ..Default::default()
             },
         ],
@@ -1380,6 +1389,7 @@ fn test_identifier_normalization_is_consistent_across_validation_lookup_and_read
     // The dependency spelling differs from the stored id only by surrounding
     // whitespace; validation trims it, so readiness must resolve it too.
     dependent.depends_on = vec!["1 ".to_string()];
+    dependent.files = vec!["src/dependent.rs".to_string()];
 
     let plan = Plan {
         id: "normalized-ids".to_string(),
@@ -1422,6 +1432,7 @@ fn test_plan_validate_detects_leaf_depending_on_its_own_ancestor() {
     // the deadlock is implicit and only validation can surface it.
     let mut leaf = item("1.1", "Child", PlanItemStatus::Todo, vec![]);
     leaf.depends_on = vec!["1".to_string()];
+    leaf.files = vec!["src/child.rs".to_string()];
 
     let plan = Plan {
         id: "ancestor-dep".to_string(),
@@ -1448,6 +1459,7 @@ fn test_plan_validate_detects_transitive_ancestor_deadlock() {
     // without the deep leaf, and the deep leaf cannot start without the container.
     let mut deep = item("1.a.1", "Deep leaf", PlanItemStatus::Todo, vec![]);
     deep.depends_on = vec!["1".to_string()];
+    deep.files = vec!["src/deep.rs".to_string()];
 
     let plan = Plan {
         id: "deep-ancestor-dep".to_string(),
@@ -1477,9 +1489,11 @@ fn test_plan_validate_detects_container_cycle_through_dependent_leaf() {
     // dependent step, and the dependent step waits for the group.
     let mut child = item("1.1", "Child", PlanItemStatus::Todo, vec![]);
     child.depends_on = vec!["2".to_string()];
+    child.files = vec!["src/child.rs".to_string()];
 
     let mut dependent = item("2", "Dependent", PlanItemStatus::Todo, vec![]);
     dependent.depends_on = vec!["1".to_string()];
+    dependent.files = vec!["src/dependent.rs".to_string()];
 
     let plan = Plan {
         id: "container-cycle".to_string(),
@@ -1515,6 +1529,7 @@ fn test_plan_validate_ignores_cancelled_leaf_naming_its_ancestor() {
     // `CyclicDependency` the derived status can never trigger.
     let mut cancelled = item("1.1", "Cancelled child", PlanItemStatus::Cancelled, vec![]);
     cancelled.depends_on = vec!["1".to_string()];
+    cancelled.files = vec!["src/child.rs".to_string()];
 
     let mut plan = Plan {
         id: "cancelled-ancestor-dep".to_string(),
@@ -1794,4 +1809,66 @@ fn test_plan_to_markdown_collapses_line_breaks_in_title_and_ids() {
 
     // No carriage return survives into the rendered document.
     assert!(!md.contains('\r'));
+}
+
+/// An executable leaf must name the context it targets, while a draft, a
+/// finished step, and a cancelled step are exempt from the requirement.
+#[test]
+fn test_plan_validate_requires_target_files_for_executable_leaves() {
+    let plan_with = |status: PlanItemStatus| Plan {
+        id: "leaf-files".to_string(),
+        title: "Leaf Files".to_string(),
+        items: vec![item("1", "Step", status, vec![])],
+        ..Default::default()
+    };
+
+    // A pending leaf that declares nothing is rejected and named by its id.
+    assert_eq!(
+        plan_with(PlanItemStatus::Todo).validate().unwrap_err(),
+        vec![PlanValidationError::MissingLeafFiles {
+            item_id: "1".to_string(),
+        }]
+    );
+    assert_eq!(
+        PlanValidationError::MissingLeafFiles {
+            item_id: "1".to_string(),
+        }
+        .to_string(),
+        "Step '1' must declare a target file in 'files' or 'readonly_files'"
+    );
+
+    // The draft, the finished step, and the cancelled step are exempt.
+    assert!(plan_with(PlanItemStatus::Discussion).validate().is_ok());
+    assert!(plan_with(PlanItemStatus::Done).validate().is_ok());
+    assert!(plan_with(PlanItemStatus::Cancelled).validate().is_ok());
+
+    // Either list satisfies the requirement: a verification-only step declares
+    // its reference file, while a step that creates a file declares its path.
+    let mut reference_only = item("1", "Step", PlanItemStatus::InProgress, vec![]);
+    reference_only.readonly_files = vec!["src/contract.rs".to_string()];
+    let mut creating = item("2", "Step", PlanItemStatus::Blocked, vec![]);
+    creating.files = vec!["src/new.rs".to_string()];
+    let plan = Plan {
+        id: "leaf-files".to_string(),
+        title: "Leaf Files".to_string(),
+        items: vec![reference_only, creating],
+        ..Default::default()
+    };
+    assert!(plan.validate().is_ok());
+
+    // A blank entry names nothing, so it does not satisfy the requirement.
+    let mut blank = item("1", "Step", PlanItemStatus::Todo, vec![]);
+    blank.files = vec!["   ".to_string()];
+    let plan = Plan {
+        id: "blank-files".to_string(),
+        title: "Blank Files".to_string(),
+        items: vec![blank],
+        ..Default::default()
+    };
+    assert_eq!(
+        plan.validate().unwrap_err(),
+        vec![PlanValidationError::MissingLeafFiles {
+            item_id: "1".to_string(),
+        }]
+    );
 }

@@ -10,7 +10,8 @@ use std::sync::OnceLock;
 
 use tauqe_protocol::{
     CapabilityPhase, CapabilitySet, DirListRequest, DocTopic, EditProtocolKind, LlmCapability,
-    LlmCommand, ModelResult, ProjectConfig, RepoSearchRequest, TurnIntent,
+    LlmCommand, ModelResult, PatchStrategy, ProjectConfig, PromptLayoutKind, RepoSearchRequest,
+    TurnIntent,
 };
 
 use crate::edits::protocol::xml::engine::{self, XmlTagSpec};
@@ -21,11 +22,312 @@ use crate::edits::protocol::{
 };
 
 use super::builtin::{
-    AbortModule, BlockedModule, CustomToolsModule, DiscoveryModule, DocRequestModule,
-    FileEditsModule, OutcomeModule, PlanCreationModule, PlanUpdateModule, ScratchpadModule,
-    TextMessageModule, ToolchainVerifyModule, UserLanguageModule,
+    context_surface_rule, AbortModule, BlockedModule, CustomToolsModule, DiscoveryModule,
+    DocRequestModule, FileEditsModule, OutcomeModule, PlanCreationModule, PlanUpdateModule,
+    ScratchpadModule, TextMessageModule, ToolchainVerifyModule, UserLanguageModule,
 };
 use super::regime;
+
+/// Splitting a regime surface into the byte-stable head and the contour delta.
+///
+/// A regime profile already declares two typed lists, so the registry needs
+/// exactly two passes over them: the core pass renders what every dialogue
+/// shares, and the delta pass renders what only the active regime states. Both
+/// passes select modules through the profile lists and never through the text a
+/// module renders, and each pass numbers its own rules densely from one.
+impl CapabilityRegistry {
+    /// Iterates the modules enabled by `set` that also belong to `allowed`.
+    fn enabled_in<'a>(
+        &'a self,
+        set: &'a CapabilitySet,
+        allowed: &'a CapabilitySet,
+    ) -> impl Iterator<Item = &'static dyn CapabilityModule> + 'a {
+        self.modules.iter().copied().filter(move |module| {
+            set.contains(module.capability()) && allowed.contains(module.capability())
+        })
+    }
+
+    /// Composes the core rules that render into the byte-stable head.
+    ///
+    /// The pass opens with the shared trunk, states the context surface of the
+    /// active layout, adds the operational tag rule for the XML contour, and then
+    /// folds the core rules of the modules the regime profile places in the head.
+    /// Those rules are intent-independent by contract, so the head stays
+    /// byte-identical for the REPL, a plan discussion, and a review discussion.
+    pub fn compose_core_contract_rules(
+        &self,
+        set: &CapabilitySet,
+        ctx: &ContractContext<'_>,
+    ) -> String {
+        let profile = ctx.intent.regime_profile();
+        let mut rules = regime::shared_trunk_rules(ctx, set);
+        rules.insert(rules.len().min(1), context_surface_rule(ctx));
+        if ctx.protocol == EditProtocolKind::Xml {
+            if let Some(rule) = self.operational_tags_rule(set, ctx) {
+                rules.insert(rules.len().min(2), rule);
+            }
+        }
+        for module in self.enabled_in(set, profile.core()) {
+            if let Some(rule) = module.render_contract_rule(ctx) {
+                rules.push(rule);
+            }
+        }
+        render_contract_rules(&rules)
+    }
+
+    /// Composes the contour delta that renders into the trailing user message.
+    ///
+    /// The pass carries the intent delta of the declared regime plus the hooks of
+    /// the profile lists: a core capability states there what only its regime
+    /// authorizes, while a delta capability states the whole surface it adds to
+    /// the head. A rule therefore lands in exactly one of the two passes.
+    pub fn compose_delta_contract_rules(
+        &self,
+        set: &CapabilitySet,
+        ctx: &ContractContext<'_>,
+    ) -> String {
+        let profile = ctx.intent.regime_profile();
+        let mut rules = regime::intent_delta_rules(ctx, set);
+        for module in self.enabled_in(set, profile.core()) {
+            if let Some(rule) = module.render_delta_rule(ctx) {
+                rules.push(rule);
+            }
+        }
+        for module in self.enabled_in(set, profile.delta()) {
+            if let Some(rule) = module.render_contract_rule(ctx) {
+                rules.push(rule);
+            }
+            if let Some(rule) = module.render_delta_rule(ctx) {
+                rules.push(rule);
+            }
+        }
+        render_contract_rules(&rules)
+    }
+
+    /// Composes the delta XML instructions of the declared regime.
+    ///
+    /// Only the modules of the profile delta contribute, so the head keeps the
+    /// instruction block every dialogue shares while the tail carries the
+    /// regime-specific one.
+    pub fn compose_delta_xml_instructions(
+        &self,
+        set: &CapabilitySet,
+        ctx: &PromptRenderContext<'_>,
+        intent: TurnIntent,
+    ) -> String {
+        let profile = intent.regime_profile();
+        self.compose_in(set, profile.delta(), ctx, |module, render_ctx| {
+            module.render_xml_instruction(render_ctx)
+        })
+    }
+
+    /// Composes the delta structured-output instructions of the declared regime.
+    pub fn compose_delta_structured_protocol_instructions(
+        &self,
+        set: &CapabilitySet,
+        ctx: &PromptRenderContext<'_>,
+        intent: TurnIntent,
+    ) -> String {
+        let profile = intent.regime_profile();
+        self.compose_in(set, profile.delta(), ctx, |module, render_ctx| {
+            module.render_structured_instruction(render_ctx)
+        })
+    }
+
+    /// Folds the rendered fragments of the modules enabled by both sets.
+    fn compose_in(
+        &self,
+        set: &CapabilitySet,
+        allowed: &CapabilitySet,
+        ctx: &PromptRenderContext<'_>,
+        render: impl Fn(&dyn CapabilityModule, &PromptRenderContext<'_>) -> Option<String>,
+    ) -> String {
+        let mut blocks: Vec<String> = Vec::new();
+        for module in self.enabled_in(set, allowed) {
+            if let Some(block) = render(module, ctx) {
+                blocks.push(block);
+            }
+        }
+        blocks.join("\n")
+    }
+}
+
+#[cfg(test)]
+mod delta_tests {
+    use super::*;
+
+    /// Builds the contract context of one intent for the XML contour.
+    fn xml_context(intent: TurnIntent) -> ContractContext<'static> {
+        ContractContext::new(
+            intent,
+            EditProtocolKind::Xml,
+            PromptRenderContext::new(&[], None),
+        )
+    }
+
+    /// Collects the rule numbers rendered at the start of contract lines.
+    fn rule_numbers(rendered: &str) -> Vec<usize> {
+        rendered
+            .lines()
+            .filter_map(|line| {
+                let (prefix, rest) = line.split_once(". ")?;
+                let starts_title = rest
+                    .chars()
+                    .next()
+                    .map(|c| c.is_ascii_uppercase())
+                    .unwrap_or(false);
+                if prefix.is_empty() || !prefix.chars().all(|c| c.is_ascii_digit()) || !starts_title
+                {
+                    return None;
+                }
+                prefix.parse::<usize>().ok()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn core_rules_are_identical_for_every_dialogue_contour() {
+        let registry = CapabilityRegistry::global();
+
+        let repl = registry.compose_core_contract_rules(
+            &CapabilitySet::interactive_repl(),
+            &xml_context(TurnIntent::InteractiveRepl),
+        );
+        // A review discussion runs through the interactive intent, so its head is
+        // the very same list by construction. The plan discussion is the contour
+        // whose head must never diverge from it.
+        let discussion = registry.compose_core_contract_rules(
+            &CapabilitySet::discussion(),
+            &xml_context(TurnIntent::PlanDiscussion),
+        );
+
+        assert_eq!(repl, discussion);
+        assert!(repl.contains("Authoritative Source"));
+        assert!(repl.contains("Minimal Coherent Change"));
+        // The regime-specific plan actions belong to the delta, never to the head.
+        assert!(!repl.contains("Local Engineering Plan Actions"));
+    }
+
+    #[test]
+    fn delta_carries_only_what_the_declared_regime_adds() {
+        let registry = CapabilityRegistry::global();
+
+        let repl = registry.compose_delta_contract_rules(
+            &CapabilitySet::interactive_repl(),
+            &xml_context(TurnIntent::InteractiveRepl),
+        );
+        let discussion = registry.compose_delta_contract_rules(
+            &CapabilitySet::discussion(),
+            &xml_context(TurnIntent::PlanDiscussion),
+        );
+        let step = registry.compose_delta_contract_rules(
+            &CapabilitySet::isolated_step(),
+            &xml_context(TurnIntent::IsolatedStep),
+        );
+
+        // The plan-action rule is regime-specific in its body, so it renders
+        // into the delta of every dialogue that may author plans: a develop
+        // turn may only propose a new plan, while a plan discussion may also
+        // modify or delete an existing one. Both contours therefore carry the
+        // rule and each states only the actions its own regime authorizes.
+        assert!(repl.contains("Local Engineering Plan Actions"));
+        assert!(repl.contains("ONLY propose new plans"));
+        assert!(!repl.contains("<plan action=\"update\" ...>"));
+        assert!(discussion.contains("Local Engineering Plan Actions"));
+        assert!(discussion.contains("<plan action=\"save\" ...>"));
+        assert!(discussion.contains("<plan action=\"update\" ...>"));
+        assert!(discussion.contains("<plan action=\"delete\" ...>"));
+        // An isolated step cannot touch a plan, so its delta never carries the
+        // plan-action semantics at all.
+        assert!(!step.contains("Local Engineering Plan Actions"));
+
+        // An isolated step inherits no dialogue-only rule.
+        assert!(!step.contains("Action Authorization"));
+
+        // A delta never repeats a rule of the head it follows.
+        for delta in [&repl, &discussion, &step] {
+            assert!(!delta.contains("Minimal Coherent Change"));
+            assert!(!delta.contains("Context Surface"));
+        }
+
+        // Each pass numbers its own rules densely from one.
+        for delta in [&repl, &discussion, &step] {
+            let numbers = rule_numbers(delta);
+            assert_eq!(
+                numbers,
+                (1..=numbers.len()).collect::<Vec<_>>(),
+                "non-monotonic delta numbering: {delta}"
+            );
+        }
+    }
+
+    #[test]
+    fn core_selection_follows_the_typed_profile_lists() {
+        let registry = CapabilityRegistry::global();
+
+        let dialogue = registry.compose_core_contract_rules(
+            &CapabilitySet::interactive_repl(),
+            &xml_context(TurnIntent::InteractiveRepl),
+        );
+        let step = registry.compose_core_contract_rules(
+            &CapabilitySet::isolated_step(),
+            &xml_context(TurnIntent::IsolatedStep),
+        );
+
+        // Plan authoring belongs to the headline surface of every dialogue, and it
+        // disappears from an isolated step because the profile list omits it,
+        // never because the rule text was filtered.
+        assert!(dialogue.contains("Local Engineering Plans"));
+        assert!(!step.contains("Local Engineering Plans"));
+
+        for rendered in [&dialogue, &step] {
+            let numbers = rule_numbers(rendered);
+            assert!(!numbers.is_empty());
+            assert_eq!(numbers, (1..=numbers.len()).collect::<Vec<_>>());
+        }
+    }
+
+    #[test]
+    fn delta_instructions_follow_the_profile_delta() {
+        let registry = CapabilityRegistry::global();
+        let render = PromptRenderContext::new(&[], None);
+
+        // A plan discussion declares only plan mutation in its delta, and that
+        // capability renders no protocol instruction of its own, so the delta
+        // instruction block stays empty while the mechanism remains in place for
+        // a regime-specific capability that does render one.
+        assert!(registry
+            .compose_delta_xml_instructions(
+                &CapabilitySet::discussion(),
+                &render,
+                TurnIntent::PlanDiscussion,
+            )
+            .is_empty());
+        assert!(registry
+            .compose_delta_structured_protocol_instructions(
+                &CapabilitySet::discussion(),
+                &render,
+                TurnIntent::PlanDiscussion,
+            )
+            .is_empty());
+
+        // The REPL and the review discussion carry an empty delta list, so they
+        // inherit the head instructions only.
+        let intent = TurnIntent::InteractiveRepl;
+        let xml_delta = registry.compose_delta_xml_instructions(
+            &CapabilitySet::interactive_repl(),
+            &render,
+            intent,
+        );
+        assert!(xml_delta.is_empty());
+        let structured_delta = registry.compose_delta_structured_protocol_instructions(
+            &CapabilitySet::interactive_repl(),
+            &render,
+            intent,
+        );
+        assert!(structured_delta.is_empty());
+    }
+}
 
 /// Context handed to capability modules when they render prompt fragments.
 ///
@@ -50,6 +352,14 @@ pub struct PromptRenderContext<'a> {
     /// stays a pure projection of typed state and an identical declaration
     /// always produces identical prompt bytes.
     pub project: Option<&'a ProjectConfig>,
+    /// Strategy that decides how a change set addresses the lines it replaces.
+    ///
+    /// The strategy is orthogonal to the wire format: the transport decides how
+    /// an edit is encoded, while the strategy decides whether the replaced lines
+    /// are echoed back or named by the opaque anchors rendered in context. A
+    /// module that publishes the change set reads it from here instead of
+    /// re-deriving it, so an identical declaration renders identical bytes.
+    pub patch_strategy: PatchStrategy,
 }
 
 impl<'a> PromptRenderContext<'a> {
@@ -63,6 +373,7 @@ impl<'a> PromptRenderContext<'a> {
             marker,
             has_eager_repo_map: false,
             project: None,
+            patch_strategy: PatchStrategy::SearchReplace,
         }
     }
 
@@ -79,6 +390,12 @@ impl<'a> PromptRenderContext<'a> {
     /// rendering a prompt.
     pub fn with_project(mut self, project: Option<&'a ProjectConfig>) -> Self {
         self.project = project;
+        self
+    }
+
+    /// Declares how a rendered change set addresses the lines it replaces.
+    pub fn with_patch_strategy(mut self, patch_strategy: PatchStrategy) -> Self {
+        self.patch_strategy = patch_strategy;
         self
     }
 
@@ -142,6 +459,13 @@ pub struct ContractContext<'a> {
     /// The format is a transport fact, never a capability decision: rules read
     /// it only to avoid advertising the other contour's spellings.
     pub protocol: EditProtocolKind,
+    /// Layout policy that composes the message sequence of this turn.
+    ///
+    /// The policy decides how the context material reaches the model, so the
+    /// rule that describes that surface renders it in the vocabulary of the
+    /// active policy. A context that composes no transcript renders the
+    /// semantic vocabulary, the layout of a caller that sends one block.
+    pub prompt_layout: PromptLayoutKind,
     /// Concrete response language, when the caller already resolved it.
     pub target_language: Option<&'a str>,
     /// Whether an eager repository symbol map is already rendered this turn.
@@ -159,6 +483,9 @@ impl<'a> ContractContext<'a> {
     /// renderer cannot derive from the capability surface, and the eager-map
     /// flag is inherited from the render context, so a contract rule and a
     /// protocol instruction composed for the same turn observe one value.
+    /// The layout starts at the semantic policy — the block order of a caller
+    /// that composes no transcript — and a caller that renders a transcript
+    /// declares it through [`ContractContext::with_prompt_layout`].
     pub fn new(
         intent: TurnIntent,
         protocol: EditProtocolKind,
@@ -169,6 +496,7 @@ impl<'a> ContractContext<'a> {
             render,
             intent,
             protocol,
+            prompt_layout: PromptLayoutKind::Semantic,
             target_language: None,
             has_eager_repo_map,
         }
@@ -181,6 +509,16 @@ impl<'a> ContractContext<'a> {
     pub fn with_eager_repo_map(mut self, has_eager_repo_map: bool) -> Self {
         self.has_eager_repo_map = has_eager_repo_map;
         self.render.has_eager_repo_map = has_eager_repo_map;
+        self
+    }
+
+    /// Declares the layout policy that composes the message sequence of the turn.
+    ///
+    /// The value is typed rather than a policy name: the rule describing the
+    /// context surface matches the variant and spells only that policy's own
+    /// vocabulary, so the two dictionaries never mix.
+    pub fn with_prompt_layout(mut self, prompt_layout: PromptLayoutKind) -> Self {
+        self.prompt_layout = prompt_layout;
         self
     }
 
@@ -253,6 +591,20 @@ pub trait CapabilityModule: Send + Sync {
         None
     }
 
+    /// JSON-schema properties this module contributes under a patch strategy.
+    ///
+    /// A capability whose structured surface depends on how a change addresses
+    /// the lines it replaces overrides this method and describes the fields of
+    /// the declared strategy. The default projects
+    /// [`CapabilityModule::json_schema_fragment`], so a strategy-neutral
+    /// capability declares its fragment exactly once.
+    fn json_schema_fragment_for(
+        &self,
+        _patch_strategy: PatchStrategy,
+    ) -> Option<serde_json::Value> {
+        self.json_schema_fragment()
+    }
+
     /// Shared JSON-schema definitions referenced by [`Self::json_schema_fragment`].
     ///
     /// A capability whose structured payload nests recursively — a plan is a
@@ -267,8 +619,26 @@ pub trait CapabilityModule: Send + Sync {
         None
     }
 
-    /// Rule contributed to the `Core System Contract` section.
+    /// Rule contributed to the byte-stable head of the `Core System Contract`.
+    ///
+    /// The core rule must be intent-independent: for one capability set, one
+    /// transport, and one set of render inputs it renders byte-identically for
+    /// the interactive REPL, a plan discussion, and a review discussion, because
+    /// those three contours share the head that the provider caches. Anything
+    /// the declared regime authorizes is declared by
+    /// [`CapabilityModule::render_delta_rule`] instead.
     fn render_contract_rule(&self, _ctx: &ContractContext<'_>) -> Option<ContractRule> {
+        None
+    }
+
+    /// Rule contributed to the contour delta of the trailing user message.
+    ///
+    /// A delta rule is the sanctioned place to read
+    /// [`ContractContext::intent`]: it describes what the declared regime
+    /// authorizes rather than an invariant every dialogue states, so it renders
+    /// outside the byte-stable head. The default is no delta, because most
+    /// capabilities state the same rule in every regime that enables them.
+    fn render_delta_rule(&self, _ctx: &ContractContext<'_>) -> Option<ContractRule> {
         None
     }
 
@@ -553,34 +923,6 @@ impl CapabilityRegistry {
         tags
     }
 
-    /// Composes `Core System Contract` rules for the enabled capabilities.
-    ///
-    /// The section is assembled from typed inputs only: the regime trunk
-    /// selected by the declared turn intent and the capability surface, the
-    /// operational tag rule derived from the enabled capabilities, and every
-    /// enabled module's rule in registry order. The whole sequence is rendered
-    /// by one loop, so rule numbers come purely from position.
-    ///
-    /// The operational-tag rule belongs to the `xml` wire format only: it
-    /// enumerates control tags, and a structured turn decodes JSON fields, so
-    /// rendering it there would advertise markup the decoder rejects.
-    pub fn compose_contract_rules(&self, set: &CapabilitySet, ctx: &ContractContext<'_>) -> String {
-        let mut rules = regime::regime_contract_rules(ctx, set);
-        if ctx.protocol == EditProtocolKind::Xml {
-            if let Some(rule) = self.operational_tags_rule(set, ctx) {
-                // Position 0 always holds the authoritative-source rule, so the
-                // operational-tag rule becomes the second entry of the contract.
-                rules.insert(rules.len().min(1), rule);
-            }
-        }
-        for module in self.enabled(set) {
-            if let Some(rule) = module.render_contract_rule(ctx) {
-                rules.push(rule);
-            }
-        }
-        render_contract_rules(&rules)
-    }
-
     /// Builds the operational tag rule from the enabled capability set.
     ///
     /// The rule is skipped when the set exposes no control tags, so a narrowed
@@ -647,11 +989,15 @@ impl CapabilityRegistry {
     /// shared definitions through [`CapabilityModule::json_schema_defs`], and
     /// the registry lifts them to the root of the composed schema, where the
     /// `#/$defs/<Name>` references of that fragment resolve.
-    pub fn compose_structured_schema(&self, set: &CapabilitySet) -> serde_json::Value {
+    pub fn compose_structured_schema(
+        &self,
+        set: &CapabilitySet,
+        patch_strategy: PatchStrategy,
+    ) -> serde_json::Value {
         let mut properties = serde_json::Map::new();
         let mut definitions = serde_json::Map::new();
         for module in self.enabled(set) {
-            if let Some(fragment) = module.json_schema_fragment() {
+            if let Some(fragment) = module.json_schema_fragment_for(patch_strategy) {
                 if let Some(fields) = fragment.as_object() {
                     for (name, schema) in fields {
                         properties
@@ -753,7 +1099,7 @@ impl CapabilityRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tauqe_protocol::CapabilityDelivery;
+    use tauqe_protocol::{CapabilityDelivery, PatchStrategy};
 
     /// Iterates every built-in module, in registry order.
     fn all_modules() -> impl Iterator<Item = &'static dyn CapabilityModule> {
@@ -870,14 +1216,27 @@ mod tests {
         let registry = CapabilityRegistry::global();
         let ctx = plain_context();
 
-        let develop = registry.compose_contract_rules(&CapabilitySet::interactive_repl(), &ctx);
+        let develop =
+            registry.compose_core_contract_rules(&CapabilitySet::interactive_repl(), &ctx);
         assert!(develop.contains("context_request"));
         assert!(develop.contains("Minimal Coherent Change"));
         assert!(develop.contains("1. Authoritative Source: "));
         assert!(develop.contains("Operational Protocol Tags: "));
+        // The plan actions a regime authorizes are regime-specific, so they
+        // travel in the delta instead of conditioning the shared head.
+        assert!(!develop.contains("Local Engineering Plan Actions"));
 
-        let discussion = registry.compose_contract_rules(&CapabilitySet::discussion(), &ctx);
-        assert!(!discussion.contains("Minimal Coherent Change"));
+        let develop_delta =
+            registry.compose_delta_contract_rules(&CapabilitySet::interactive_repl(), &ctx);
+        assert!(develop_delta.contains("Local Engineering Plan Actions"));
+        assert!(!develop_delta.contains("Minimal Coherent Change"));
+
+        // A plan discussion carries the very same head: the plan mutation it
+        // authorizes is the only difference, and it travels in the delta.
+        let discussion = registry.compose_core_contract_rules(&CapabilitySet::discussion(), &ctx);
+        assert_eq!(discussion, develop);
+        assert!(discussion.contains("Minimal Coherent Change"));
+        assert!(discussion.contains("Local Engineering Plans"));
     }
 
     #[test]
@@ -897,40 +1256,97 @@ mod tests {
         let registry = CapabilityRegistry::global();
         let narrowed =
             CapabilitySet::from_slice(&[LlmCapability::TextMessage, LlmCapability::FileEdits]);
-        let rendered = registry.compose_contract_rules(&narrowed, &plain_context());
-
         // File-edit tags are not control tags, so the operational rule is
-        // skipped instead of advertising an empty protocol surface.
-        assert!(!rendered.contains("Operational Protocol Tags"));
-        assert_eq!(rule_numbers(&rendered), vec![1, 2, 3, 4, 5, 6, 7, 8]);
-        assert!(rendered.contains("1. Authoritative Source: "));
-        assert!(rendered.contains("2. Read-Only Scope: "));
-        assert!(rendered.contains("3. Editable Scope: "));
-        assert!(rendered.contains("4. No Arbitrary Shell: "));
-        assert!(rendered.contains("5. Action Authorization: "));
-        assert!(rendered.contains("6. Reasoning in English: "));
-        assert!(rendered.contains("7. Conversational Response: "));
-        assert!(rendered.contains("8. Minimal Coherent Change: "));
+        // skipped instead of advertising an empty protocol surface. The
+        // context-surface rule describes payload rather than a command, so it
+        // stays and keeps the numbering dense.
+        let core = registry.compose_core_contract_rules(&narrowed, &plain_context());
+        assert!(!core.contains("Operational Protocol Tags"));
+        assert_eq!(rule_numbers(&core), vec![1, 2, 3, 4, 5, 6]);
+        assert!(core.contains("1. Authoritative Source: "));
+        assert!(core.contains("2. Context Surface: "));
+        assert!(core.contains("3. No Arbitrary Shell: "));
+        assert!(core.contains("4. Reasoning in English: "));
+        assert!(core.contains("5. Conversational Response: "));
+        assert!(core.contains("6. Minimal Coherent Change: "));
+
+        // The intent-specific rules own their numbering, so the delta numbers
+        // densely from one independently of the head it follows.
+        let delta = registry.compose_delta_contract_rules(&narrowed, &plain_context());
+        assert_eq!(rule_numbers(&delta), vec![1, 2, 3]);
+        assert!(delta.contains("1. Read-Only Scope: "));
+        assert!(delta.contains("2. Editable Scope: "));
+        assert!(delta.contains("3. Action Authorization: "));
+        assert!(!delta.contains("Plan-First Proposal"));
+    }
+
+    #[test]
+    fn context_surface_rule_follows_the_declared_layout() {
+        let registry = CapabilityRegistry::global();
+        let set = CapabilitySet::interactive_repl();
+
+        let semantic = registry.compose_core_contract_rules(&set, &plain_context());
+        assert!(semantic.contains("2. Context Surface: "));
+        assert!(semantic.contains("one `<context>` block"));
+        assert!(!semantic.contains("<context_manifest>"));
+
+        let chronological = plain_context().with_prompt_layout(PromptLayoutKind::Chronological);
+        let rendered = registry.compose_core_contract_rules(&set, &chronological);
+        assert!(rendered.contains("2. Context Surface: "));
+        assert!(rendered.contains("<context_manifest>"));
+        assert!(!rendered.contains("one `<context>` block"));
+
+        // The `<file>` element and its `access` attribute are prompt-side
+        // payload both policies describe identically, so the shared sentence
+        // survives in either vocabulary.
+        let shared = "`<file path=\"...\" access=\"...\">`";
+        assert!(semantic.contains(shared));
+        assert!(rendered.contains(shared));
+    }
+
+    #[test]
+    fn contract_rules_stay_dense_in_every_layout() {
+        let registry = CapabilityRegistry::global();
+        for layout in [PromptLayoutKind::Semantic, PromptLayoutKind::Chronological] {
+            let ctx = plain_context().with_prompt_layout(layout);
+            let rendered =
+                registry.compose_core_contract_rules(&CapabilitySet::interactive_repl(), &ctx);
+            let numbers = rule_numbers(&rendered);
+            assert!(!numbers.is_empty());
+            assert_eq!(
+                numbers,
+                (1..=numbers.len()).collect::<Vec<_>>(),
+                "non-monotonic numbering for {layout:?}"
+            );
+        }
     }
 
     #[test]
     fn develop_contract_has_no_lettered_rule_numbers() {
         let registry = CapabilityRegistry::global();
-        let rendered =
-            registry.compose_contract_rules(&CapabilitySet::interactive_repl(), &plain_context());
+        let set = CapabilitySet::interactive_repl();
+        let core = registry.compose_core_contract_rules(&set, &plain_context());
+        let delta = registry.compose_delta_contract_rules(&set, &plain_context());
 
-        for surrogate in ["1a.", "2a.", "4a.", "8a.", "10a.", "11a."] {
-            assert!(!rendered.contains(surrogate), "surrogate {surrogate}");
+        for rendered in [&core, &delta] {
+            for surrogate in ["1a.", "2a.", "4a.", "8a.", "10a.", "11a."] {
+                assert!(!rendered.contains(surrogate), "surrogate {surrogate}");
+            }
+            let numbers = rule_numbers(rendered);
+            assert!(!numbers.is_empty());
+            assert_eq!(numbers, (1..=numbers.len()).collect::<Vec<_>>());
         }
-        let numbers = rule_numbers(&rendered);
-        assert!(numbers.len() > 5);
-        assert_eq!(numbers, (1..=numbers.len()).collect::<Vec<_>>());
-        assert!(rendered.contains("Conceptual Foundation Invariant"));
-        assert!(rendered.contains("Leaf-Only Files Invariant"));
-        assert!(rendered.contains("File Attributes Contract"));
-        assert!(rendered.contains("Planning Objective: "));
-        assert!(rendered.contains("Step Formulation Contract: "));
-        assert!(rendered.contains("Structured Plan XML Format:"));
+
+        // The plan invariants belong to the shared head, while the planning
+        // objective a regime pursues travels in its delta.
+        assert!(core.contains("Conceptual Foundation Invariant"));
+        assert!(core.contains("Leaf-Only Files Invariant"));
+        assert!(core.contains("File Attributes Contract"));
+        assert!(core.contains("Structured Plan XML Format:"));
+        assert!(core.contains("Step Formulation Contract: "));
+        assert!(!core.contains("Planning Objective: "));
+        assert!(delta.contains("Planning Objective: "));
+        assert!(!delta.contains("Step Formulation Contract: "));
     }
 
     #[test]
@@ -938,19 +1354,20 @@ mod tests {
         let registry = CapabilityRegistry::global();
         let set = CapabilitySet::interactive_repl();
 
-        let rendered = registry.compose_contract_rules(&set, &plain_context());
+        let rendered = registry.compose_core_contract_rules(&set, &plain_context());
         assert!(rendered.contains("Language Consistency: Always formulate"));
 
         let localized = plain_context().with_target_language(Some("Russian"));
-        let rendered = registry.compose_contract_rules(&set, &localized);
+        let rendered = registry.compose_core_contract_rules(&set, &localized);
         assert!(rendered.contains("Language Consistency: The user's language is Russian."));
 
         let discussion = ContractContext::new(
-            TurnIntent::ReadonlyDiscussion,
-            EditProtocolKind::Xml,
+            TurnIntent::PlanDiscussion,
+            EditProtocolKind::Structured,
             PromptRenderContext::new(&[], None),
         );
-        let rendered = registry.compose_contract_rules(&CapabilitySet::discussion(), &discussion);
+        let rendered =
+            registry.compose_core_contract_rules(&CapabilitySet::discussion(), &discussion);
         assert!(rendered.contains("Language Consistency: Always formulate"));
         assert!(rendered.contains("`user_language` field"));
     }
@@ -960,7 +1377,7 @@ mod tests {
         let registry = CapabilityRegistry::global();
         let narrowed =
             CapabilitySet::from_slice(&[LlmCapability::ToolchainVerify, LlmCapability::Outcome]);
-        let rendered = registry.compose_contract_rules(&narrowed, &plain_context());
+        let rendered = registry.compose_core_contract_rules(&narrowed, &plain_context());
 
         assert!(rendered.contains("Operational Protocol Tags"));
         assert!(rendered.contains("`<verify ...>`"));
@@ -974,7 +1391,7 @@ mod tests {
 
         // The XML transport decodes control tags, so its contract enumerates
         // them.
-        let xml = registry.compose_contract_rules(&set, &plain_context());
+        let xml = registry.compose_core_contract_rules(&set, &plain_context());
         assert!(xml.contains("Operational Protocol Tags"));
         assert!(xml.contains("All operational protocol tags"));
 
@@ -985,7 +1402,7 @@ mod tests {
             EditProtocolKind::Structured,
             PromptRenderContext::new(&[], None),
         );
-        let structured = registry.compose_contract_rules(&set, &structured_ctx);
+        let structured = registry.compose_core_contract_rules(&set, &structured_ctx);
         assert!(!structured.contains("Operational Protocol Tags"));
         assert!(!structured.contains("All operational protocol tags"));
 
@@ -1003,7 +1420,8 @@ mod tests {
             EditProtocolKind::Xml,
             PromptRenderContext::new(&[], Some("M12345")),
         );
-        let rendered = registry.compose_contract_rules(&CapabilitySet::interactive_repl(), &ctx);
+        let rendered =
+            registry.compose_core_contract_rules(&CapabilitySet::interactive_repl(), &ctx);
         assert!(rendered.contains("<context_request_M12345 path"));
         assert!(rendered.contains("<scratchpad_M12345>"));
         assert!(rendered.contains("<plan_M12345 action"));
@@ -1043,12 +1461,18 @@ mod tests {
 
         let discussion =
             registry.compose_structured_protocol_instructions(&CapabilitySet::discussion(), &ctx);
-        assert!(!discussion.contains("`changes`"));
-        assert!(discussion.contains("message"));
-        assert!(!discussion.contains("`doc_requests`"));
-        assert!(!discussion.contains("`scratchpad`"));
-        assert!(!discussion.contains("`outcome`"));
-        assert!(!discussion.contains("`blocked`"));
+        // A plan discussion advertises the whole dialogue surface, so its
+        // instructions name every field that surface permits.
+        for field in [
+            "`changes`",
+            "`doc_requests`",
+            "`scratchpad`",
+            "`outcome`",
+            "`blocked`",
+            "`verify`",
+        ] {
+            assert!(discussion.contains(field), "missing {field}");
+        }
 
         let narrowed = registry.compose_structured_protocol_instructions(
             &CapabilitySet::from_slice(&[LlmCapability::TextMessage, LlmCapability::FileEdits]),
@@ -1085,7 +1509,10 @@ mod tests {
     #[test]
     fn structured_schema_is_composed_from_the_enabled_modules() {
         let registry = CapabilityRegistry::global();
-        let schema = registry.compose_structured_schema(&CapabilitySet::interactive_repl());
+        let schema = registry.compose_structured_schema(
+            &CapabilitySet::interactive_repl(),
+            PatchStrategy::SearchReplace,
+        );
 
         assert_eq!(schema["type"], serde_json::json!("object"));
         assert_eq!(schema["additionalProperties"], serde_json::json!(false));
@@ -1133,7 +1560,7 @@ mod tests {
             LlmCapability::FileEdits,
             LlmCapability::PlanCreation,
         ]);
-        let schema = registry.compose_structured_schema(&with_plans);
+        let schema = registry.compose_structured_schema(&with_plans, PatchStrategy::SearchReplace);
 
         assert!(schema_properties(&schema).contains(&"plan_update".to_string()));
         let definitions = schema["$defs"]
@@ -1144,18 +1571,18 @@ mod tests {
 
         // A surface that cannot author plans carries no nested payload, so its
         // composed schema keeps the flat shape.
-        let plain = registry.compose_structured_schema(&CapabilitySet::from_slice(&[
-            LlmCapability::TextMessage,
-            LlmCapability::FileEdits,
-        ]));
+        let plain = registry.compose_structured_schema(
+            &CapabilitySet::from_slice(&[LlmCapability::TextMessage, LlmCapability::FileEdits]),
+            PatchStrategy::SearchReplace,
+        );
         assert!(plain.get("$defs").is_none());
 
         // A plan update declares the very same property and definitions, so
         // both plan capabilities describe one payload.
-        let updating = registry.compose_structured_schema(&CapabilitySet::from_slice(&[
-            LlmCapability::TextMessage,
-            LlmCapability::PlanUpdate,
-        ]));
+        let updating = registry.compose_structured_schema(
+            &CapabilitySet::from_slice(&[LlmCapability::TextMessage, LlmCapability::PlanUpdate]),
+            PatchStrategy::SearchReplace,
+        );
         assert!(schema_properties(&updating).contains(&"plan_update".to_string()));
         assert!(updating["$defs"].is_object());
     }
@@ -1165,7 +1592,7 @@ mod tests {
         let registry = CapabilityRegistry::global();
         let narrowed =
             CapabilitySet::from_slice(&[LlmCapability::TextMessage, LlmCapability::FileEdits]);
-        let schema = registry.compose_structured_schema(&narrowed);
+        let schema = registry.compose_structured_schema(&narrowed, PatchStrategy::SearchReplace);
 
         let mut properties = schema_properties(&schema);
         properties.sort();
@@ -1190,7 +1617,8 @@ mod tests {
                 Some(module) => module,
                 None => panic!("missing module for {}", capability),
             };
-            let Some(fragment) = module.json_schema_fragment() else {
+            let Some(fragment) = module.json_schema_fragment_for(PatchStrategy::SearchReplace)
+            else {
                 continue;
             };
             let fields = fragment
@@ -1321,7 +1749,7 @@ mod tests {
         let ctx = ContractContext::new(TurnIntent::InteractiveRepl, EditProtocolKind::Xml, render);
         let set =
             CapabilitySet::from_slice(&[LlmCapability::TextMessage, LlmCapability::CustomTools]);
-        CapabilityRegistry::global().compose_contract_rules(&set, &ctx)
+        CapabilityRegistry::global().compose_core_contract_rules(&set, &ctx)
     }
 
     #[test]
@@ -1626,5 +2054,39 @@ mod tests {
             Some(CapabilityDelivery::RoundDeferred)
         );
         assert_eq!(delivery("repo"), None);
+    }
+    #[test]
+    fn contract_rules_carry_the_module_delta_hooks() {
+        let registry = CapabilityRegistry::global();
+
+        let set = CapabilitySet::interactive_repl();
+        let core = registry.compose_core_contract_rules(&set, &plain_context());
+        assert!(core.contains("Local Engineering Plans"));
+        assert!(!core.contains("Local Engineering Plan Actions"));
+
+        let delta = registry.compose_delta_contract_rules(&set, &plain_context());
+        assert!(delta.contains("Local Engineering Plan Actions"));
+        assert!(delta.contains("ONLY propose new plans"));
+
+        // A plan discussion reaches the same core rules and swaps only the delta
+        // hook, so the actions it authorizes never leak into the head.
+        let discussion_ctx = ContractContext::new(
+            TurnIntent::PlanDiscussion,
+            EditProtocolKind::Xml,
+            PromptRenderContext::new(&[], None),
+        );
+        let discussion_core =
+            registry.compose_core_contract_rules(&CapabilitySet::discussion(), &discussion_ctx);
+        assert_eq!(discussion_core, core);
+
+        let discussion =
+            registry.compose_delta_contract_rules(&CapabilitySet::discussion(), &discussion_ctx);
+        assert!(discussion.contains("Local Engineering Plan Actions"));
+        assert!(discussion.contains("ordinary transactional path"));
+        assert!(!discussion.contains("ONLY propose new plans"));
+
+        // The delta numbers its own list densely.
+        let numbers = rule_numbers(&discussion);
+        assert_eq!(numbers, (1..=numbers.len()).collect::<Vec<_>>());
     }
 }

@@ -502,8 +502,8 @@ I have prepared the plan:
   <concept>
     <concept_item id="c-1" title="Stateless tokens" />
   </concept>
-  <item id="1" title="Model" status="todo" />
-  <item id="2" title="Handler" status="todo" />
+  <item id="1" title="Model" status="todo" files="src/model.rs" />
+  <item id="2" title="Handler" status="todo" files="src/handler.rs" />
 </plan>
 "#;
 
@@ -573,7 +573,7 @@ Step 1 is done:
                 details: None,
                 status: PlanItemStatus::Todo,
                 blocked_reason: None,
-                files: vec![],
+                files: vec!["src/t.rs".to_string()],
                 readonly_files: vec![],
                 concept_refs: vec![],
                 depends_on: vec![],
@@ -604,7 +604,7 @@ Step 1 is done:
   <concept>
     <concept_item id="c-1" title="Invariant" />
   </concept>
-  <item id="1" title="Step 1" status="in_progress" />
+  <item id="1" title="Step 1" status="in_progress" files="src/step1.rs" />
 </plan>
 "#;
         let seeded = PlanStorage::apply_plan_tags(root, initial);
@@ -614,7 +614,7 @@ Step 1 is done:
         let update = r#"
 <plan action="update" id="upsert-plan">
   <item id="1" title="Step 1 refined" concept="c-1" />
-  <item id="2" title="Step 2" status="todo" deps="1" />
+  <item id="2" title="Step 2" status="todo" deps="1" files="src/step2.rs" />
 </plan>
 "#;
         let applied = PlanStorage::apply_plan_tags(root, update);
@@ -656,6 +656,7 @@ Step 1 is done:
                 id: "1".to_string(),
                 title: "Step 1".to_string(),
                 status: PlanItemStatus::Todo,
+                files: vec!["src/step1.rs".to_string()],
                 ..Default::default()
             }],
         };
@@ -673,6 +674,7 @@ Step 1 is done:
                 title: "Step 2".to_string(),
                 status: PlanItemStatus::Todo,
                 depends_on: vec!["1".to_string()],
+                files: vec!["src/step2.rs".to_string()],
                 ..Default::default()
             }],
         };
@@ -770,7 +772,7 @@ Step 1 is done:
                 details: Some("Schemas and filters".to_string()),
                 status: PlanItemStatus::InProgress,
                 blocked_reason: None,
-                files: vec![],
+                files: vec!["src/protocol_types.rs".to_string()],
                 readonly_files: vec![],
                 concept_refs: vec![],
                 depends_on: vec![],
@@ -799,7 +801,7 @@ Step 1 is done:
                 details: Some("Updated details".to_string()),
                 status: PlanItemStatus::InProgress,
                 blocked_reason: None,
-                files: vec![],
+                files: vec!["src/protocol_types.rs".to_string()],
                 readonly_files: vec![],
                 concept_refs: vec![],
                 depends_on: vec![],
@@ -1108,6 +1110,7 @@ Step 1 is done:
                     id: "2".to_string(),
                     title: "Step 2".to_string(),
                     status: PlanItemStatus::Blocked,
+                    files: vec!["src/step2.rs".to_string()],
                     ..Default::default()
                 },
             ],

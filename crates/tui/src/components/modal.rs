@@ -67,22 +67,57 @@ pub fn button_style(engine: &ThemeEngine, bg: RgbColor, fg: RgbColor, emphasized
     style
 }
 
+/// One semantic group of the docked hint strip: the chords that reach an action
+/// and the localized verb that names it.
+///
+/// The strip draws from independent sources — the shared dialog command map and
+/// the per-dialog localizations — so those sources hand over typed groups
+/// instead of a formatted sentence. The renderer therefore never recovers the
+/// structure from text, and a verb containing a separator glyph can never split
+/// into phantom chords (Conventions §6.5).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct HintGroup {
+    /// Chords reaching the action, rendered ` / `-separated and emphasized.
+    pub chords: Vec<String>,
+    /// Localized verb naming the action, rendered as one indivisible span.
+    pub verb: String,
+}
+
+impl HintGroup {
+    /// Creates a group that names no abstract chord, only a localized sentence.
+    pub fn verb(verb: impl Into<String>) -> Self {
+        Self {
+            chords: Vec::new(),
+            verb: verb.into(),
+        }
+    }
+}
+
+/// Wraps a localized, pre-formatted hint sentence into a single verb-only group.
+///
+/// A dialog whose hint is one authored catalog sentence has no chord list to
+/// project, so the sentence reaches the strip as one indivisible span instead of
+/// being re-parsed for keys it may not contain (Conventions §6.5).
+pub fn verb_hint(sentence: impl Into<String>) -> Vec<HintGroup> {
+    vec![HintGroup::verb(sentence)]
+}
+
 /// Projects one cognitive group of the shared dialog vocabulary.
 ///
 /// Chords are listed in `actions` order and deduplicated, so a group reads
 /// `Tab / Shift+Tab` instead of mirroring the registry declaration order. Every
 /// chord is rendered through the configured `C-` / `M-` modifiers, so a footer
 /// never hardcodes a modifier string (Conventions §4, §6).
-fn dialog_hint_group(actions: &[DialogCommand], verb_key: &str) -> Option<String> {
+fn dialog_hint_group(actions: &[DialogCommand], verb_key: &str) -> Option<HintGroup> {
     let primary = active_primary_modifier();
     let meta = active_meta_modifier();
-    let mut keys: Vec<String> = Vec::new();
+    let mut chords: Vec<String> = Vec::new();
     for action in actions {
         for spec in DIALOG_COMMAND_MAP.specs() {
             if spec.action == *action {
                 let key = spec.chord.display(primary, meta);
-                if !keys.contains(&key) {
-                    keys.push(key);
+                if !chords.contains(&key) {
+                    chords.push(key);
                 }
             }
         }
@@ -90,97 +125,87 @@ fn dialog_hint_group(actions: &[DialogCommand], verb_key: &str) -> Option<String
     // The verb is resolved from the canonical catalog, so a hot-swapped locale
     // reaches every dialog footer rendered without an `&AppState` (c-1, c-5).
     let verb = active_t(verb_key);
-    (!keys.is_empty()).then(|| format!("{} {}", keys.join(" / "), verb))
+    (!chords.is_empty()).then_some(HintGroup { chords, verb })
 }
 
 /// Navigation and activation hint: focus cycling and control activation.
 ///
 /// Derived from the shared dialog command map, so the modal footers advertise
 /// exactly the chords the dialogs intercept.
-pub fn dialog_navigation_hint() -> String {
-    let focus = dialog_hint_group(
-        &[DialogCommand::FocusNext, DialogCommand::FocusPrev],
-        "dialog.action.focus",
-    );
-    let activate = dialog_hint_group(&[DialogCommand::Activate], "dialog.action.activate");
-    [focus, activate]
-        .into_iter()
-        .flatten()
-        .collect::<Vec<_>>()
-        .join(" • ")
+pub fn dialog_navigation_hint() -> Vec<HintGroup> {
+    [
+        dialog_hint_group(
+            &[DialogCommand::FocusNext, DialogCommand::FocusPrev],
+            "dialog.action.focus",
+        ),
+        dialog_hint_group(&[DialogCommand::Activate], "dialog.action.activate"),
+    ]
+    .into_iter()
+    .flatten()
+    .collect()
 }
 
 /// The standard `y` / `n` fast-select hint.
-pub fn dialog_fast_select_hint() -> String {
+pub fn dialog_fast_select_hint() -> Vec<HintGroup> {
     dialog_hint_group(
         &[DialogCommand::ConfirmFast, DialogCommand::CancelFast],
         "dialog.action.fast_select",
     )
-    .unwrap_or_default()
+    .into_iter()
+    .collect()
 }
 
 /// The dismissal hint (`Esc` / `q`).
-pub fn dialog_dismiss_hint() -> String {
-    dialog_hint_group(&[DialogCommand::Dismiss], "dialog.action.dismiss").unwrap_or_default()
+pub fn dialog_dismiss_hint() -> Vec<HintGroup> {
+    dialog_hint_group(&[DialogCommand::Dismiss], "dialog.action.dismiss")
+        .into_iter()
+        .collect()
 }
 
-/// The full universal dialog footer hint, used when a dialog supplies no text
-/// of its own.
-pub fn dialog_footer_hint() -> String {
-    [
-        dialog_navigation_hint(),
-        dialog_fast_select_hint(),
-        dialog_dismiss_hint(),
-    ]
-    .into_iter()
-    .filter(|group| !group.is_empty())
-    .collect::<Vec<_>>()
-    .join(" • ")
+/// The universal dialog footer vocabulary, used when a dialog supplies no hint
+/// of its own: focus cycling, activation, fast selection, and dismissal.
+pub fn dialog_footer_hint() -> Vec<HintGroup> {
+    let mut groups = dialog_navigation_hint();
+    groups.extend(dialog_fast_select_hint());
+    groups.extend(dialog_dismiss_hint());
+    groups
 }
 
-/// Splits a dialog hint into styled spans: each chord reads as an interactive
-/// key, each group's verb as its description, and the `/` and `•` separators
-/// recede into the muted role.
+/// Builds the styled spans of a dialog hint: every chord reads as an
+/// interactive key, every verb as its description, and the ` / ` and ` • `
+/// separators recede into the muted role.
 ///
-/// The input is the footer vocabulary produced by [`dialog_footer_hint`] and the
-/// batch dialog: `•`-separated groups whose keys are ` / `-separated and which
-/// end in a verb (for example `Tab / Shift+Tab focus`).
-fn hint_spans(engine: &ThemeEngine, hint: &str) -> Vec<Span<'static>> {
-    if hint.is_empty() {
-        return Vec::new();
-    }
-
+/// The groups are consumed exactly as they are, so the styling is derived from
+/// the same structure that produced the hint and never from a re-parsed string
+/// (Conventions §6.5).
+fn hint_spans(engine: &ThemeEngine, groups: &[HintGroup]) -> Vec<Span<'static>> {
     let palette = engine.palette();
     let key_style = engine.fg(palette.text_primary).add_modifier(Modifier::BOLD);
     let verb_style = engine.fg(palette.text_secondary);
     let sep_style = engine.fg(palette.text_muted);
 
     let mut spans: Vec<Span<'static>> = Vec::new();
-    for (group_index, group) in hint.split(" • ").enumerate() {
+    for (group_index, group) in groups.iter().enumerate() {
         if group_index > 0 {
             spans.push(Span::styled(" • ", sep_style));
         }
-        // A group reads `CHORD1 / CHORD2 / ... / CHORDn VERB`: the chords are
-        // single tokens joined by `" / "` and the trailing verb is a phrase, so
-        // only the final `" / "` segment splits into its chord and the verb.
-        let parts: Vec<&str> = group.split(" / ").collect();
-        let last = parts.last().copied().unwrap_or("");
-        let (last_chord, verb) = match last.split_once(' ') {
-            Some((chord, verb)) => (chord, verb),
-            None => (last, ""),
-        };
-        let mut chords: Vec<&str> = parts[..parts.len().saturating_sub(1)].to_vec();
-        chords.push(last_chord);
-        chords.retain(|chord| !chord.is_empty());
-        for (key_index, key) in chords.iter().enumerate() {
+        for (key_index, chord) in group.chords.iter().enumerate() {
             if key_index > 0 {
                 spans.push(Span::styled(" / ", sep_style));
             }
-            spans.push(Span::styled((*key).to_string(), key_style));
+            spans.push(Span::styled(chord.clone(), key_style));
         }
-        if !verb.is_empty() {
-            spans.push(Span::styled(format!(" {}", verb), verb_style));
+        if group.verb.is_empty() {
+            continue;
         }
+        // A group without chords is a whole authored sentence, so it carries no
+        // leading space of its own.
+        let verb = if group.chords.is_empty() {
+            group.verb.clone()
+        } else {
+            format!(" {}", group.verb)
+        };
+        spans.push(Span::styled(verb, verb_style));
     }
     spans
 }
@@ -192,7 +217,7 @@ fn hint_spans(engine: &ThemeEngine, hint: &str) -> Vec<Span<'static>> {
 /// descriptions, and the separators recede into the muted role. Docking the
 /// hint to its own row separates it from the interactive controls and closes
 /// the dialog card visually (`#c-1`, `#c-2`).
-pub fn render_dialog_footer(frame: &mut ratatui::Frame, area: Rect, hint: &str) {
+pub fn render_dialog_footer(frame: &mut ratatui::Frame, area: Rect, hint: &[HintGroup]) {
     let engine = current_engine();
     let palette = engine.palette();
     let footer = Paragraph::new(Line::from(hint_spans(&engine, hint)))
@@ -331,7 +356,8 @@ pub struct ModalFrame<'a> {
     pub actions_state: ModalActionsState,
     pub is_actions_focused: bool,
     pub destructive: bool,
-    pub hint_text: Option<&'a str>,
+    /// Structured hint vocabulary; `None` renders [`dialog_footer_hint`].
+    pub hint_text: Option<&'a [HintGroup]>,
 }
 
 /// Historical alias for [`ModalFrame`] kept for existing call sites.
@@ -385,10 +411,10 @@ impl ModalFrame<'_> {
         // The navigation vocabulary is docked to the very bottom row as its own
         // strip, separated from the action buttons, so it reads as persistent
         // chrome rather than a second line of buttons.
-        let hint = match self.hint_text {
-            Some(text) => text.to_string(),
-            None => dialog_footer_hint(),
-        };
+        let hint = self
+            .hint_text
+            .map(<[HintGroup]>::to_vec)
+            .unwrap_or_else(dialog_footer_hint);
         render_dialog_footer(frame, geometry.hint_row, &hint);
     }
 }
@@ -443,12 +469,12 @@ pub fn modal_action_buttons_in(
 
 #[cfg(test)]
 mod tests {
-    use super::{hint_spans, modal_action_buttons, modal_geometry};
+    use super::{hint_spans, modal_action_buttons, modal_geometry, HintGroup};
     use crate::theme::engine::current_engine;
 
-    fn contents(hint: &str) -> Vec<String> {
+    fn contents(groups: &[HintGroup]) -> Vec<String> {
         let engine = current_engine();
-        hint_spans(&engine, hint)
+        hint_spans(&engine, groups)
             .into_iter()
             .map(|span| span.content.to_string())
             .collect()
@@ -458,16 +484,29 @@ mod tests {
     /// chord list, so the fast-select hint keeps exactly its two keys.
     #[test]
     fn hint_spans_keeps_a_multi_word_verb_with_its_group() {
-        assert_eq!(
-            contents("y / n fast select"),
-            vec!["y", " / ", "n", " fast select"],
-        );
+        let group = HintGroup {
+            chords: vec!["y".to_string(), "n".to_string()],
+            verb: "fast select".to_string(),
+        };
+
+        assert_eq!(contents(&[group]), vec!["y", " / ", "n", " fast select"]);
     }
 
     #[test]
     fn hint_spans_keeps_single_word_verbs_and_separators() {
+        let groups = [
+            HintGroup {
+                chords: vec!["Tab".to_string(), "Shift+Tab".to_string()],
+                verb: "focus".to_string(),
+            },
+            HintGroup {
+                chords: vec!["Enter".to_string()],
+                verb: "activate".to_string(),
+            },
+        ];
+
         assert_eq!(
-            contents("Tab / Shift+Tab focus • Enter activate"),
+            contents(&groups),
             vec![
                 "Tab",
                 " / ",
@@ -477,6 +516,42 @@ mod tests {
                 "Enter",
                 " activate",
             ],
+        );
+    }
+
+    /// A verb is opaque text: a separator glyph inside it must never split the
+    /// verb into phantom chords styled as keys (Conventions §6.5).
+    #[test]
+    fn hint_spans_never_parses_separator_glyphs_out_of_a_verb() {
+        assert_eq!(
+            contents(&[HintGroup::verb("j / k or ↑ / ↓ scroll")]),
+            vec!["j / k or ↑ / ↓ scroll"],
+        );
+
+        let group = HintGroup {
+            chords: vec!["Esc".to_string()],
+            verb: "cancel / dismiss • close".to_string(),
+        };
+        assert_eq!(contents(&[group]), vec!["Esc", " cancel / dismiss • close"],);
+    }
+
+    /// Every chord of a multi-chord group is its own emphasized span, so a
+    /// chord list can never collapse into a single styled token.
+    #[test]
+    fn hint_spans_keeps_every_chord_of_a_multi_chord_group() {
+        let group = HintGroup {
+            chords: vec![
+                "j".to_string(),
+                "k".to_string(),
+                "↑".to_string(),
+                "↓".to_string(),
+            ],
+            verb: "scroll".to_string(),
+        };
+
+        assert_eq!(
+            contents(&[group]),
+            vec!["j", " / ", "k", " / ", "↑", " / ", "↓", " scroll"],
         );
     }
 
@@ -559,7 +634,7 @@ mod tests {
                         actions_state: ModalActionsState::default(),
                         is_actions_focused: true,
                         destructive: false,
-                        hint_text: Some(""),
+                        hint_text: Some(&[]),
                     },
                     |_frame, _body| {},
                 );
@@ -614,7 +689,7 @@ mod tests {
                         actions_state: ModalActionsState::default(),
                         is_actions_focused: true,
                         destructive: false,
-                        hint_text: Some(""),
+                        hint_text: Some(&[]),
                     },
                     |frame, body| {
                         let filler = "X".repeat(body.width as usize);

@@ -2,7 +2,9 @@ use std::collections::HashSet;
 
 use ratatui::style::{Style, Stylize};
 use ratatui::text::{Line, Span};
-use tauqe_protocol::{HistoryEntryStatus, UiHistoryItem, UiHistoryKind};
+use tauqe_protocol::{
+    edit::EditFileOp, HistoryEntryStatus, HistoryFileChange, UiHistoryItem, UiHistoryKind,
+};
 
 use crate::clipboard::CopyResult;
 use crate::i18n::active_t;
@@ -472,6 +474,36 @@ fn build_item_header(
     Line::from(header_spans)
 }
 
+/// Badge label and style of one typed file change.
+///
+/// The operation is authored once by the producer and matched here, so the
+/// label and its color can never drift from the operation they describe.
+/// `None` marks a path that carries no operation — a context file or a plain
+/// listing — and keeps the neutral bullet (Conventions §1.5).
+fn file_change_badge(
+    op: Option<EditFileOp>,
+    theme_mode: crate::config::ThemeMode,
+) -> (&'static str, Style) {
+    let engine = crate::theme::engine::active_engine(theme_mode);
+    let palette = engine.palette();
+    match op {
+        Some(EditFileOp::Create) => ("[NEW] ", engine.fg(palette.status_success).bold()),
+        Some(EditFileOp::Delete) => ("[DEL] ", engine.fg(palette.status_error).bold()),
+        Some(EditFileOp::Overwrite) => ("[OVERWRITE] ", engine.fg(palette.status_warning).bold()),
+        Some(EditFileOp::Move) => ("[MOVE] ", engine.fg(palette.status_info).bold()),
+        Some(EditFileOp::Replace) => ("[EDIT] ", engine.fg(palette.button_active_bg).bold()),
+        None => ("• ", engine.fg(palette.status_warning).bold()),
+    }
+}
+
+/// Path half of a rendered file change: the path, or the move arrow pair.
+fn file_change_path(change: &HistoryFileChange) -> String {
+    match (change.op, change.to.as_deref()) {
+        (Some(EditFileOp::Move), Some(to)) => format!("{} -> {}", change.path, to),
+        _ => change.path.clone(),
+    }
+}
+
 /// Builds the rendered body of one item: everything below its header.
 ///
 /// Only the Markdown answer of an expanded assistant record is expensive to
@@ -561,31 +593,13 @@ fn build_item_body(
                     ]),
                     max_width,
                 ));
-                for file_entry in &item.files {
-                    let (op_label, op_style, path) =
-                        if let Some(p) = file_entry.strip_prefix("[NEW] ") {
-                            ("[NEW] ", engine.fg(palette.status_success).bold(), p)
-                        } else if let Some(p) = file_entry.strip_prefix("[DEL] ") {
-                            ("[DEL] ", engine.fg(palette.status_error).bold(), p)
-                        } else if let Some(p) = file_entry.strip_prefix("[OVERWRITE] ") {
-                            ("[OVERWRITE] ", engine.fg(palette.status_warning).bold(), p)
-                        } else if let Some(p) = file_entry.strip_prefix("[MOVE] ") {
-                            ("[MOVE] ", engine.fg(palette.status_info).bold(), p)
-                        } else if let Some(p) = file_entry.strip_prefix("[EDIT] ") {
-                            ("[EDIT] ", engine.fg(palette.button_active_bg).bold(), p)
-                        } else {
-                            (
-                                "• ",
-                                engine.fg(palette.status_warning).bold(),
-                                file_entry.as_str(),
-                            )
-                        };
-
+                for change in &item.files {
+                    let (op_label, op_style) = file_change_badge(change.op, theme_mode);
                     lines.extend(wrap_one(
                         Line::from(vec![
                             Span::raw("    "),
                             Span::styled(op_label, op_style),
-                            Span::styled(path.to_string(), engine.fg(palette.text_primary)),
+                            Span::styled(file_change_path(change), engine.fg(palette.text_primary)),
                         ]),
                         max_width,
                     ));
@@ -598,7 +612,12 @@ fn build_item_body(
                         engine.fg(palette.text_muted).bold(),
                     ),
                 ];
-                let files_joined = item.files.join(", ");
+                let files_joined = item
+                    .files
+                    .iter()
+                    .map(|change| change.path.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ");
                 file_spans.push(Span::styled(files_joined, engine.fg(palette.text_muted)));
                 lines.extend(wrap_one(Line::from(file_spans), max_width));
             }
@@ -792,10 +811,10 @@ mod tests {
         item.summary = Some("Refactoring".to_string());
         item.commit_hash = Some("abcdef1".to_string());
         item.files = vec![
-            "[EDIT] src/main.rs".to_string(),
-            "[NEW] src/util.rs".to_string(),
-            "[DEL] src/old.rs".to_string(),
-            "[MOVE] src/prev.rs -> src/next.rs".to_string(),
+            HistoryFileChange::operated(EditFileOp::Replace, "src/main.rs"),
+            HistoryFileChange::operated(EditFileOp::Create, "src/util.rs"),
+            HistoryFileChange::operated(EditFileOp::Delete, "src/old.rs"),
+            HistoryFileChange::moved("src/prev.rs", "src/next.rs"),
         ];
         let mut expanded = HashSet::new();
         expanded.insert(2);
@@ -831,7 +850,10 @@ mod tests {
         let mut item = assistant_item(2, "Line 1\nLine 2\nLine 3\nLine 4\nLine 5");
         item.summary = Some("Overview".to_string());
         item.commit_hash = Some("abcdef1".to_string());
-        item.files = vec!["[EDIT] src/lib.rs".to_string()];
+        item.files = vec![HistoryFileChange::operated(
+            EditFileOp::Replace,
+            "src/lib.rs",
+        )];
 
         // By default without expanded set: collapsed
         let lines = compute_history_lines(&[item], None, None, None);
@@ -847,6 +869,32 @@ mod tests {
         assert!(rendered
             .iter()
             .any(|line| line.contains("[+2 more lines, 1 modified files]")));
+    }
+
+    /// A path that itself begins with a retired display prefix is a plain
+    /// record, so it renders with the neutral bullet instead of a false
+    /// operation badge (Conventions §1.5).
+    #[test]
+    fn test_plain_record_with_prefix_shaped_path_keeps_the_bullet() {
+        let mut item = assistant_item(5, "Touched one file");
+        item.files = vec![HistoryFileChange::plain("[EDIT] src/lib.rs")];
+        let mut expanded = HashSet::new();
+        expanded.insert(5);
+
+        let rendered = rendered_text(&compute_history_lines(&[item], None, None, Some(&expanded)));
+        let file_line = rendered
+            .iter()
+            .find(|line| line.contains("src/lib.rs"))
+            .expect("the file record is rendered");
+
+        assert!(
+            file_line.contains("• [EDIT] src/lib.rs"),
+            "the path is kept verbatim behind the neutral bullet, got {file_line:?}"
+        );
+        assert!(
+            !file_line.trim_start().starts_with("[EDIT] "),
+            "a prefix-shaped path must never be badged as an edit"
+        );
     }
 
     #[test]

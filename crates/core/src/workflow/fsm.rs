@@ -29,6 +29,7 @@ use crate::providers::{LlmProvider, StreamEvent};
 use crate::workflow::common::{compact_history_if_needed_with_budget, record_workflow_response};
 use crate::workflow::discovery::journal::TurnDiscoveryJournal;
 use crate::workflow::policy::ApplyPolicy;
+use crate::workflow::retry::format_patch_retry_reason;
 use crate::workflow::verification::run_workflow_verification;
 use crate::workflow::WorkflowOptions;
 
@@ -499,7 +500,7 @@ pub(super) async fn run_fsm_turn_body(
 
     let plan_mode = if intent.is_isolated_step() {
         PlanMutationMode::IsolatedStep
-    } else if intent.is_readonly_discussion() {
+    } else if intent.is_plan_discussion() {
         PlanMutationMode::Discussion
     } else {
         PlanMutationMode::Develop
@@ -1077,6 +1078,10 @@ async fn ensure_written_answer(
 }
 
 /// Finalizes the turn when patch application failed after every retry.
+///
+/// Every reason is rendered by the profile of the declared patch strategy, so a
+/// rejected change set is described in the dialect the turn actually speaks: an
+/// anchored project never receives a search/replace diagnosis.
 async fn finish_patch_failure(
     ctx: &mut PhaseContext<'_>,
     cumulative_edits: Vec<EditOperation>,
@@ -1099,7 +1104,8 @@ async fn finish_patch_failure(
     let mut failed_sorted: Vec<(&String, &EditError)> = last_failed_errors.iter().collect();
     failed_sorted.sort_by_key(|(path, _)| *path);
     for (path, error) in failed_sorted {
-        err_lines.push(format!("{}: {}", path, error));
+        let reason = format_patch_retry_reason(error, ctx.options.patch_strategy());
+        err_lines.push(format!("{}: {}", path, reason));
     }
     let error_desc = format!(
         "Failed to apply edits after {} retries:\n{}",
@@ -1801,5 +1807,88 @@ mod tests {
             .unwrap();
         // The item must remain Todo because update is rejected in Develop mode
         assert_eq!(loaded.items[0].status, tauqe_protocol::PlanItemStatus::Todo);
+    }
+
+    /// Builds the workflow options a project declares through `[develop]
+    /// patch_strategy`.
+    ///
+    /// The declaration is decoded exactly as the daemon decodes `tauqe.toml`, so
+    /// the test observes the same single source of truth a project provides.
+    fn line_anchor_options() -> WorkflowOptions {
+        let config: crate::config::AppConfig =
+            toml::from_str("[develop]\npatch_strategy = \"line_anchor\"\n")
+                .expect("parse the patch strategy declaration");
+        WorkflowOptions::from_app_config(&config)
+    }
+
+    /// A rejected change set is reported in the dialect of the declared strategy:
+    /// an anchored project never receives a search/replace diagnosis, even when
+    /// the rejected payload arrived in that shape.
+    #[tokio::test]
+    async fn patch_failure_is_reported_in_the_active_strategy_dialect() {
+        let (_dir, root) = setup_repo(&[("a.rs", TARGET)]);
+        let mut context = context_with_target(&root);
+        let mut history = HistoryManager::new(root.clone());
+
+        let broken = edit_block("nonexistent text", "irrelevant");
+        let provider = MockLlmProvider::scripted([
+            MockResponse::text(broken.clone()),
+            MockResponse::text(broken),
+        ]);
+        let model = ModelRef::openrouter("mock/model");
+        let protocol = XmlPromptProtocol;
+        let mut policy = DirectApplyPolicy::new();
+        let options = WorkflowOptions {
+            max_retries: 1,
+            ..line_anchor_options()
+        };
+        let (stream_tx, rx) = mpsc::channel(256);
+        drop(rx);
+        let (_cancel_tx, cancel_rx) = watch::channel(false);
+
+        let outcome = run_fsm_turn(
+            "Change compute to 42",
+            tauqe_protocol::TurnIntent::InteractiveRepl,
+            &provider,
+            &model,
+            &mut context,
+            &mut history,
+            &protocol,
+            &mut policy,
+            "git",
+            stream_tx,
+            cancel_rx,
+            &options,
+        )
+        .await
+        .unwrap();
+
+        match outcome.result {
+            ModelResult::Edit { outcome, .. } => {
+                let error = outcome.error.unwrap_or_default();
+                assert!(
+                    error.contains("addressed no line of the file"),
+                    "the rejection must speak the anchored dialect: {error}"
+                );
+                for foreign in ["Search block", "old_text", "new_text"] {
+                    assert!(
+                        !error.contains(foreign),
+                        "the anchored diagnostic named {foreign}: {error}"
+                    );
+                }
+            }
+            other => panic!("expected a failed change set, got {other:?}"),
+        }
+
+        assert_eq!(
+            provider.requests().len(),
+            2,
+            "the retry budget must be spent on the rejected change set"
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join("a.rs")).unwrap(),
+            TARGET,
+            "a rejected change set must never reach the working tree"
+        );
     }
 }

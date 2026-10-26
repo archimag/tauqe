@@ -17,7 +17,7 @@ use ratatui::widgets::Paragraph;
 
 use crate::app::AppState;
 use crate::components::modal::{
-    modal_geometry, render_dialog_footer, render_modal_container, ModalTone,
+    modal_geometry, render_dialog_footer, render_modal_container, verb_hint, ModalTone,
 };
 use crate::components::ListSelector;
 use crate::i18n::active_t;
@@ -215,7 +215,7 @@ pub fn render_theme_selector(frame: &mut ratatui::Frame, state: &ThemeSelectorSt
     render_dialog_footer(
         frame,
         geometry.hint_row,
-        &active_t("dialog.theme_select.footer"),
+        &verb_hint(active_t("dialog.theme_select.footer")),
     );
 }
 

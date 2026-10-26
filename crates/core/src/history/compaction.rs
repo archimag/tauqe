@@ -91,6 +91,7 @@ mod tests {
                 id: None,
                 prompt: "turn 1".to_string(),
                 context: vec![],
+                context_watermark: None,
             },
             HistoryEntry::Response {
                 id: None,
@@ -103,6 +104,7 @@ mod tests {
                 id: None,
                 prompt: "turn 2".to_string(),
                 context: vec![],
+                context_watermark: None,
             },
             HistoryEntry::Response {
                 id: None,
@@ -115,6 +117,7 @@ mod tests {
                 id: None,
                 prompt: "turn 3".to_string(),
                 context: vec![],
+                context_watermark: None,
             },
             HistoryEntry::Response {
                 id: None,
@@ -127,6 +130,7 @@ mod tests {
                 id: None,
                 prompt: "turn 4".to_string(),
                 context: vec![],
+                context_watermark: None,
             },
             HistoryEntry::Response {
                 id: None,
@@ -155,6 +159,7 @@ mod tests {
             id: Some(5),
             prompt: "latest".to_string(),
             context: vec![],
+            context_watermark: None,
         }];
         let compacted = build_compacted_history(Some(1), "Summary text".to_string(), tail.clone());
         assert_eq!(compacted.len(), 2);

@@ -11,30 +11,13 @@ use crate::edits::protocol::xml::{file_edit_tags, FileBlockTag};
 use crate::edits::stream::normalize_hunk;
 
 /// Re-activates unmarked hidden control tags that normalization protected as
-/// literal text, so the stream filter can still suppress them from the
+/// literal text, so the stream filter still suppresses them from the
 /// user-facing surface when the model omits the turn-marker suffix.
 ///
-/// The set of hidden tags is derived from the tag registry: every control tag
-/// declared with `stream_suppress_unmarked` participates. Code-modification
-/// tags are excluded, so an unmarked `<edit>` quoted in conversation stays a
-/// literal and never starts an edit block. The protection prefix is produced by
-/// [`normalize_marked_xml_incremental`](crate::edits::protocol::xml::normalize_marked_xml_incremental).
-pub(super) fn activate_unmarked_hidden_tags(normalized: &str, marker: &str) -> String {
-    let protection = format!("\u{e000}{}\u{e001}", marker);
-    if !normalized.contains(&protection) {
-        return normalized.to_string();
-    }
-    let mut restored = normalized.to_string();
-    for spec in crate::edits::protocol::xml::engine::XML_TAG_SPECS
-        .iter()
-        .filter(|spec| spec.is_control() && spec.stream_suppress_unmarked)
-    {
-        let base = spec.base_name;
-        restored = restored.replace(&format!("{}/{}", protection, base), &format!("</{}", base));
-        restored = restored.replace(&format!("{}{}", protection, base), &format!("<{}", base));
-    }
-    restored
-}
+/// The implementation lives in the shared tag engine beside
+/// `strip_all_control_tags`, so the streaming contour and the final cleaner
+/// derive from one implementation and hide exactly the same tags.
+pub(super) use crate::edits::protocol::xml::engine::activate_unmarked_hidden_tags;
 
 /// Locates the earliest control tag declared by the tag registry.
 pub(super) fn find_next_control_tag(buf: &str) -> Option<(usize, usize)> {

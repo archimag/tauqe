@@ -4,6 +4,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 
 use super::{editor_lines, render_modal_frame, ModalFrameParams, ModalTone};
+use crate::components::modal::verb_hint;
 use crate::i18n::active_t;
 use crate::theme::engine::current_engine;
 use crate::ui::centered_rect;
@@ -136,11 +137,11 @@ pub fn render_prompt_modal(frame: &mut ratatui::Frame, modal: &crate::app::Promp
     // The footer vocabulary is projected through the shared semantic span
     // renderer: every group reads `CHORD / CHORD verb`, so chords are
     // emphasized, verbs read as descriptions, and separators recede.
-    let hint = if is_actions_focused {
+    let hint = verb_hint(if is_actions_focused {
         active_t("dialog.prompt.hint_actions")
     } else {
         active_t("dialog.prompt.hint_editor")
-    };
+    });
     let frame_params = ModalFrameParams {
         title: &dialog_title,
         tone,
@@ -150,7 +151,7 @@ pub fn render_prompt_modal(frame: &mut ratatui::Frame, modal: &crate::app::Promp
         actions_state: modal.actions,
         is_actions_focused,
         destructive: false,
-        hint_text: Some(&hint),
+        hint_text: Some(hint.as_slice()),
     };
 
     render_modal_frame(frame, frame_params, |f, body_area| {

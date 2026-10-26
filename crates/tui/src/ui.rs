@@ -32,7 +32,7 @@ use crate::views::plans::render_plans_view;
 use crate::views::repl::render::render_repl_view;
 use crate::views::review::render_review_view;
 
-pub use footer::{extract_current_round, render_footer};
+pub use footer::render_footer;
 pub use geometry::centered_rect;
 pub use header::render_header;
 pub use wrap::{wrap_line, wrap_lines};

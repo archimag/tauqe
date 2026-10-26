@@ -24,6 +24,13 @@ pub enum PlanValidationError {
         item_id: String,
         concept_ref: String,
     },
+    /// An executable leaf declares no target file.
+    ///
+    /// A leaf that can still be executed must name the context it targets, so
+    /// its step starts from a warm context instead of a cold discovery round.
+    MissingLeafFiles {
+        item_id: String,
+    },
 }
 
 impl fmt::Display for PlanValidationError {
@@ -57,6 +64,12 @@ impl fmt::Display for PlanValidationError {
                     "Step '{item_id}' references non-existent concept '{concept_ref}'"
                 )
             }
+            Self::MissingLeafFiles { item_id } => {
+                write!(
+                    f,
+                    "Step '{item_id}' must declare a target file in 'files' or 'readonly_files'"
+                )
+            }
         }
     }
 }
@@ -86,6 +99,33 @@ pub(super) fn id_key(id: &str) -> String {
 /// badge through a failed normalization.
 fn path_key(raw: &str) -> String {
     crate::edit::normalize_repo_path(raw).unwrap_or_else(|_| raw.trim().to_string())
+}
+
+/// Reports whether a leaf with this status must declare its target files.
+///
+/// A `Discussion` leaf is still a draft whose files are premature, a `Done`
+/// leaf has already been executed (a legacy plan without files keeps saving
+/// unchanged), and a `Cancelled` leaf is never executed at all. Every other
+/// status is executable work that must name the context it targets.
+fn requires_target_files(status: PlanItemStatus) -> bool {
+    !matches!(
+        status,
+        PlanItemStatus::Discussion | PlanItemStatus::Done | PlanItemStatus::Cancelled
+    )
+}
+
+/// Reports whether a leaf declares at least one usable target file.
+///
+/// A blank entry names nothing, so the declaration is satisfied only by an
+/// entry with non-empty trimmed text in `files` or `readonly_files`. A step
+/// that merely verifies behavior declares `readonly_files`, while a step that
+/// creates a file declares its future path in `files`; either list satisfies
+/// the requirement.
+fn declares_target_files(item: &PlanItem) -> bool {
+    item.files
+        .iter()
+        .chain(item.readonly_files.iter())
+        .any(|path| !path.trim().is_empty())
 }
 
 /// Two-section engineering plan: Concept Tree ("What") and Implementation Blueprint ("How").
@@ -519,6 +559,22 @@ impl Plan {
                     errors.push(PlanValidationError::DuplicateItemId(item.id.clone()));
                 } else {
                     id_display.insert(key, item.id.clone());
+                }
+                // An executable leaf must name the context it targets: the
+                // preload and the context collection read these lists, so a
+                // leaf without them starts its step from a cold discovery
+                // round. A draft leaf settles its files in the dialogue, a
+                // finished leaf already recorded its work, and a cancelled
+                // leaf is never executed, so all three are exempt. A container
+                // is never executed either and carries no list of its own (see
+                // [`Plan::normalize_leaf_files`]).
+                if item.is_leaf()
+                    && requires_target_files(item.status)
+                    && !declares_target_files(item)
+                {
+                    errors.push(PlanValidationError::MissingLeafFiles {
+                        item_id: item.id.clone(),
+                    });
                 }
                 walk_items(&item.children, seen, id_display, errors);
             }

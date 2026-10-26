@@ -178,7 +178,8 @@ pub async fn load_manifest(
     let command = super::exec::CommandLine::new(runner.program(), runner.dump_args());
     // The change-set contract belongs to the verification lifecycle alone, so
     // the runner dump receives no input at all.
-    let outcome = super::exec::run_command(repo_root, &command, timeout_secs, None, cancel_rx).await;
+    let outcome =
+        super::exec::run_command(repo_root, &command, timeout_secs, None, cancel_rx).await;
 
     if outcome.is_cancelled {
         return Err(RunnerManifestError::Cancelled);

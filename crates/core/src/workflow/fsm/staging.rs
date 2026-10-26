@@ -571,7 +571,7 @@ pub(super) async fn run_staging_phase(
             })
             .await;
         for (path, error) in &last_failed_errors {
-            let reason = format_patch_retry_reason(error);
+            let reason = format_patch_retry_reason(error, ctx.options.patch_strategy());
             // A rejected project configuration is a self-preservation failure
             // rather than a stale search block: the harness refuses to commit a
             // configuration it could not load on its next start, so the
@@ -620,6 +620,7 @@ pub(super) async fn run_staging_phase(
             &last_failed_errors,
             &current_protocol_errors,
             ctx.state.language.as_deref(),
+            ctx.options.patch_strategy(),
         );
         if !retry_log.is_empty() {
             retry_log.push_str("\n\n---\n\n");

@@ -697,7 +697,8 @@ mod tests {
 
         // A command is free to exit without reading the change set; the broken
         // pipe must stay a diagnostic instead of failing or hanging the turn.
-        let result = run_command(dir.path(), &command, 10, Some("a.rs\ngenerated.rs\n"), None).await;
+        let result =
+            run_command(dir.path(), &command, 10, Some("a.rs\ngenerated.rs\n"), None).await;
 
         assert!(result.success, "command failed: {}", result.combined_output);
         assert!(result.stdout.contains("git version"));

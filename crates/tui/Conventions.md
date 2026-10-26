@@ -280,7 +280,7 @@ This document specifies mandatory architectural and UX invariants for the Tauqe 
 
 5. **Projection Transparency:**
    - View code must never attempt manual ANSI downsampling, 16-color degradation branching, or separate light/dark logic branches.
-   - The `ThemeEngine` automatically projects semantic tokens through the active `ColorProjector` (`Truecolor` → `ANSI 256` → `ANSI 16` fallback with attributes), гарантируя legibility and WCAG contrast in all terminal environments.
+   - The `ThemeEngine` automatically projects semantic tokens through the active `ColorProjector` (`Truecolor` → `ANSI 256` → `ANSI 16` fallback with attributes), guaranteeing legibility and WCAG contrast in all terminal environments.
 
 ---
 

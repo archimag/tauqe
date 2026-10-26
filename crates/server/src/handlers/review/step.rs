@@ -158,6 +158,10 @@ async fn run_review_step_inner(
             None,
             &operation,
             RefineAdmission::Harness,
+            // The decomposition runs immediately before this finding's coding
+            // turn, inside the running review batch: it must never settle the
+            // shared turn on its own.
+            true,
         )
         .await
         {

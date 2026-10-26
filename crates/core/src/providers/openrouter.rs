@@ -188,8 +188,15 @@ impl OpenRouterProvider {
             // `Send`. Scope it inside an async block that drops the guard
             // before the branch body awaits, so the whole turn future stays
             // `Send`.
+            //
+            // A dropped cancellation sender surfaces as `Err`: no signal can
+            // ever arrive again, so the branch parks instead of firing and
+            // the request proceeds without a cancellation branch, applying
+            // the same closure policy as `retry::wait_with_countdown`.
             _ = async {
-                let _ = cancel_rx.wait_for(|cancelled| *cancelled).await;
+                if cancel_rx.wait_for(|cancelled| *cancelled).await.is_err() {
+                    std::future::pending::<()>().await;
+                }
             } => {
                 let _ = tx.send(StreamEvent::Cancelled).await;
                 return Ok(());
@@ -229,16 +236,30 @@ impl OpenRouterProvider {
         let mut got_done_marker = false;
         let mut generation_id: Option<String> = None;
         let mut latest_usage: Option<ModelUsageInfo> = None;
+        // Set once the cancellation sender is dropped: no further signal
+        // can ever arrive, so the cancellation branch is disabled for the
+        // rest of the stream instead of re-polling a future that stays
+        // permanently ready. This mirrors the closure policy of
+        // `retry::wait_with_countdown`.
+        let mut cancel_closed = false;
 
         while !finished {
             if tx.is_closed() {
                 return Ok(());
             }
             tokio::select! {
-                _ = cancel_rx.changed() => {
-                    if *cancel_rx.borrow() {
-                        let _ = tx.send(StreamEvent::Cancelled).await;
-                        return Ok(());
+                changed = cancel_rx.changed(), if !cancel_closed => {
+                    match changed {
+                        Ok(()) => {
+                            if *cancel_rx.borrow() {
+                                let _ = tx.send(StreamEvent::Cancelled).await;
+                                return Ok(());
+                            }
+                        }
+                        // The cancellation sender is gone, so the branch is
+                        // disabled instead of spinning on a permanently ready
+                        // future.
+                        Err(_) => cancel_closed = true,
                     }
                 }
                 chunk_res = byte_stream.next() => {
@@ -1044,6 +1065,153 @@ mod tests {
         let event = rx.recv().await.expect("expected stream event");
         assert!(matches!(event, StreamEvent::Cancelled));
         assert_eq!(mock_server.received_requests().await.unwrap().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_stream_chat_dropped_cancel_sender_before_headers_proceeds() {
+        let mock_server = MockServer::start().await;
+
+        let sse_body = "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\ndata: [DONE]\n\n";
+
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_raw(sse_body, "text/event-stream"),
+            )
+            .mount(&mock_server)
+            .await;
+
+        let provider =
+            OpenRouterProvider::new("test-api-key".to_string()).with_base_url(mock_server.uri());
+
+        let (tx, mut rx) = mpsc::channel(10);
+        let (cancel_tx, cancel_rx) = watch::channel(false);
+        // A dropped cancellation sender must disable the wait branch
+        // instead of cancelling the turn spuriously.
+        drop(cancel_tx);
+
+        let res = provider
+            .stream_text("test-model", vec![], tx, cancel_rx)
+            .await;
+        assert!(res.is_ok());
+
+        let mut text = String::new();
+        let mut saw_cancelled = false;
+        let mut got_done = false;
+        while let Some(event) = rx.recv().await {
+            match event {
+                StreamEvent::TextDelta(delta) => text.push_str(&delta),
+                StreamEvent::Cancelled => saw_cancelled = true,
+                StreamEvent::Done => got_done = true,
+                _ => {}
+            }
+        }
+        assert_eq!(text, "ok");
+        assert!(got_done);
+        assert!(
+            !saw_cancelled,
+            "a dropped cancellation sender must not cancel the turn"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_stream_chat_dropped_cancel_sender_mid_stream_completes() {
+        use std::time::Duration;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("addr");
+
+        // A minimal SSE server: it answers one event, then withholds the
+        // terminator long enough for the test to drop the cancellation
+        // sender while the stream is open, and only then finishes the body.
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("accept");
+            let mut request = Vec::new();
+            let mut chunk = [0u8; 1024];
+            // Drain the request head and JSON body so the connection is
+            // quiet before the response is streamed.
+            let head_separator = &b"\r\n\r\n"[..];
+            let head_end = loop {
+                let read = socket.read(&mut chunk).await.expect("read");
+                assert!(read > 0, "request ended before the head separator");
+                request.extend_from_slice(&chunk[..read]);
+                if let Some(pos) = request.windows(4).position(|w| w == head_separator) {
+                    break pos;
+                }
+            };
+            let head_text = String::from_utf8_lossy(&request[..head_end]).to_ascii_lowercase();
+            let content_length: usize = head_text
+                .lines()
+                .find_map(|line| line.strip_prefix("content-length:"))
+                .and_then(|value| value.trim().parse().ok())
+                .unwrap_or(0);
+            let body_start = head_end + 4;
+            while request.len() < body_start + content_length {
+                let read = socket.read(&mut chunk).await.expect("read");
+                assert!(read > 0, "request ended before the body was drained");
+                request.extend_from_slice(&chunk[..read]);
+            }
+
+            let event = "data: {\"choices\":[{\"delta\":{\"content\":\"Hi\"}}]}\n\n";
+            let done = "data: [DONE]\n\n";
+            let response = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\n\r\n",
+                event.len() + done.len()
+            );
+            socket.write_all(response.as_bytes()).await.expect("write");
+            socket.write_all(event.as_bytes()).await.expect("write");
+            socket.flush().await.expect("flush");
+            // Withhold the terminator while the test drops the sender.
+            tokio::time::sleep(Duration::from_millis(400)).await;
+            socket.write_all(done.as_bytes()).await.expect("write");
+            socket.flush().await.expect("flush");
+        });
+
+        let provider = OpenRouterProvider::new("test-key".to_string());
+        let provider = provider.with_base_url(format!("http://{addr}"));
+
+        let (tx, mut rx) = mpsc::channel(10);
+        let (cancel_tx, cancel_rx) = watch::channel(false);
+
+        let provider_task = tokio::spawn(async move {
+            provider
+                .stream_text("test-model", vec![], tx, cancel_rx)
+                .await
+        });
+
+        // Let the request reach the SSE loop and consume the first event
+        // before the cancellation sender is dropped mid-stream.
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        drop(cancel_tx);
+
+        let res = tokio::time::timeout(Duration::from_secs(5), provider_task)
+            .await
+            .expect("a dropped cancellation sender must not hot-spin the stream loop")
+            .expect("task join failed");
+        assert!(res.is_ok(), "the stream must complete: {:?}", res.err());
+
+        let mut text = String::new();
+        let mut saw_cancelled = false;
+        let mut got_done = false;
+        while let Some(event) = rx.recv().await {
+            match event {
+                StreamEvent::TextDelta(delta) => text.push_str(&delta),
+                StreamEvent::Cancelled => saw_cancelled = true,
+                StreamEvent::Done => got_done = true,
+                _ => {}
+            }
+        }
+        assert_eq!(text, "Hi");
+        assert!(got_done);
+        assert!(
+            !saw_cancelled,
+            "a dropped cancellation sender must not cancel the turn"
+        );
+        let _ = server.await;
     }
 
     #[tokio::test]

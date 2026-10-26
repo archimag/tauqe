@@ -50,9 +50,13 @@ the end of the turn.
 5. **Budgets are measured, not guessed.** File cost is estimated from size, and
    the aggregate is checked against a configured ceiling before anything is
    added.
-6. **Order is deterministic.** Files render in insertion order, never in
-   alphabetical order, because the context block is the cached prefix of every
-   later round of the same turn.
+6. **Order is deterministic and belongs to the layout policy.** Every entry carries
+   a monotonic insertion watermark, so a file's position derives from when it
+   arrived, never from its name or from hash iteration order. The semantic policy
+   renders layer order with insertion order inside a layer; the chronological
+   policy renders the global insertion order. Neither of them ever sorts
+   alphabetically, because a re-sorted prompt invalidates the cached prefix between
+   rounds.
 7. **The prompt prefix, model identity, and provider session travel together.**
    A dialogue keeps one session while the context block stays byte-identical and
    the target model remains unchanged. Session rotation is triggered at two
@@ -117,13 +121,26 @@ the first owning layer wins, and the merged effective access is applied to that
 single row. The aggregate estimated token count is summed over the emitted rows,
 and the revision advances only when something actually changed.
 
-The `<context>` block of the prompt is rendered in the same order from readable
-files inside the repository. A path that escapes the repository, has been deleted,
-or cannot be decoded as UTF-8 is skipped instead of failing the turn.
+The context files of a turn are rendered from readable files inside the repository,
+and a path that escapes the repository, has been deleted, or cannot be decoded as
+UTF-8 is skipped instead of failing the turn. The order they travel in is the
+business of the active layout policy:
 
-Insertion order is a contract, not an implementation detail. Alphabetical sorting
-would reorder the block between rounds, invalidate the provider's cached prefix,
-and make a multi-round turn pay for the whole prefix again.
+- the **semantic** policy renders one `<context>` block in layer order, with
+  insertion order inside each layer;
+- the **chronological** policy renders transcript order, which is the order of the
+  insertion watermark every entry carries.
+
+An **insertion watermark** is the monotonic counter value a path receives when it
+first enters the context and keeps for as long as it stays there, so a re-add
+upgrades its access in place instead of moving it to the tail of the timeline. The
+watermark is what lets the chronological policy place a file where it actually
+arrived rather than where its layer happens to sort it.
+
+Both orders are deterministic and both grow append-only: a file that enters the
+context mid-turn extends the sequence at its tail. Alphabetical sorting would
+reorder the prompt between rounds, invalidate the provider's cached prefix, and make
+a multi-round turn pay for the whole prefix again.
 
 ### 2.3.2 Pinned and hierarchical resolution
 

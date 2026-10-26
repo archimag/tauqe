@@ -158,7 +158,9 @@ mod tests {
         assert!(!is_valid_uuid_v7("018f9c1e6b3a7c1e8b3a000000000000"));
         // The braced and URN spellings are parsed by the crate but rejected here.
         assert!(!is_valid_uuid_v7("{018f9c1e-6b3a-7c1e-8b3a-000000000000}"));
-        assert!(!is_valid_uuid_v7("urn:uuid:018f9c1e-6b3a-7c1e-8b3a-000000000000"));
+        assert!(!is_valid_uuid_v7(
+            "urn:uuid:018f9c1e-6b3a-7c1e-8b3a-000000000000"
+        ));
         // Wrong version nibble (6 instead of 7).
         assert!(!is_valid_uuid_v7("018f9c1e-6b3a-6c1e-8b3a-000000000000"));
         // Wrong variant nibble (0 instead of 0b10xx).

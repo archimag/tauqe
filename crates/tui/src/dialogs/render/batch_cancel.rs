@@ -13,7 +13,9 @@ use ratatui::widgets::{Paragraph, Wrap};
 use unicode_width::UnicodeWidthStr;
 
 use crate::app::{AppState, BatchCancelButton};
-use crate::components::modal::modal_geometry;
+use crate::components::modal::{
+    dialog_dismiss_hint, dialog_navigation_hint, modal_geometry, render_dialog_footer, HintGroup,
+};
 use crate::i18n::active_t;
 use crate::theme::engine::current_engine;
 
@@ -116,15 +118,16 @@ pub fn batch_cancel_modal_geometry(term: Rect) -> BatchCancelModalGeometry {
 ///
 /// Navigation and dismissal are the shared dialog vocabulary, projected through
 /// the configured modifiers; the fast-select accelerators are the batch's own
-/// `Continue` / `Soft Stop` / `Hard Stop` keys, so they are named here rather
-/// than in the universal dialog map.
-fn batch_cancel_hint() -> String {
-    format!(
-        "{} • s / h / c {} • {}",
-        crate::components::modal::dialog_navigation_hint(),
-        active_t("dialog.action.fast_select"),
-        crate::components::modal::dialog_dismiss_hint(),
-    )
+/// `Continue` / `Soft Stop` / `Hard Stop` keys, so they are declared here as a
+/// structured group rather than spliced into a formatted string.
+fn batch_cancel_hint() -> Vec<HintGroup> {
+    let mut groups = dialog_navigation_hint();
+    groups.push(HintGroup {
+        chords: vec!["c".to_string(), "s".to_string(), "h".to_string()],
+        verb: active_t("dialog.action.fast_select"),
+    });
+    groups.extend(dialog_dismiss_hint());
+    groups
 }
 
 /// Renders the three-way batch-cancellation dialog.
@@ -171,7 +174,7 @@ pub fn render_confirm_batch_cancel_popup(frame: &mut ratatui::Frame, state: &App
     let actions_widget = Paragraph::new(actions_line).alignment(Alignment::Center);
     frame.render_widget(actions_widget, geometry.action_bar);
 
-    crate::components::modal::render_dialog_footer(frame, geometry.hint_row, &batch_cancel_hint());
+    render_dialog_footer(frame, geometry.hint_row, &batch_cancel_hint());
 }
 
 #[cfg(test)]

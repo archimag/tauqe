@@ -346,15 +346,8 @@ mod tests {
         // The user prompt orders the outcome, not an analytical narrative.
         let session = sample_session();
         let item = &session.items[0];
-        let user = build_review_finding_refine_user_prompt(
-            &session,
-            item,
-            &[],
-            None,
-            None,
-            None,
-            None,
-        );
+        let user =
+            build_review_finding_refine_user_prompt(&session, item, &[], None, None, None, None);
         assert!(!user.contains("Analyze the review finding"));
         assert!(user.contains("Determine the refactorings"));
     }

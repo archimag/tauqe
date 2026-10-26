@@ -11,7 +11,8 @@
 use std::path::Path;
 use tauqe_protocol::TurnIntent;
 
-use crate::history::HistoryManager;
+use crate::history::{HistoryManager, HistorySnapshot};
+use crate::prompt::ContextBlockCache;
 
 /// Per-turn memoization of deterministic proposal inputs.
 #[derive(Default)]
@@ -21,11 +22,13 @@ pub(super) struct TurnInputCache {
     /// `Some` marks the map as generated, so an empty map is frozen as well
     /// instead of being recomputed on every round.
     repo_map: Option<FrozenRepoMap>,
-    /// History block captured on the first proposal round of the turn.
+    /// History records captured on the first proposal round of the turn.
     ///
-    /// `Some` marks the history as resolved, so an absent or empty history
-    /// block is frozen as well instead of re-reading history.jsonl on each round.
-    history_tag: Option<FrozenHistoryTag>,
+    /// `Some` marks the history as resolved, so an absent or empty history is
+    /// frozen as well instead of re-reading history.jsonl on each round. The
+    /// snapshot keeps the records rather than the rendered block, so every
+    /// layout reads the same structural material.
+    history: Option<HistorySnapshot>,
     /// Directory outline captured on the first proposal round of the turn.
     ///
     /// `Some` marks the outline as rendered, so an empty tree is frozen as well
@@ -33,16 +36,18 @@ pub(super) struct TurnInputCache {
     repo_dirs: Option<FrozenRepoDirs>,
     /// Project configuration frozen on the first proposal round of the turn.
     project: Option<tauqe_protocol::ProjectConfig>,
+    /// Rendered context elements captured across the rounds of the turn.
+    ///
+    /// The memo keeps the rendering of every file that already entered the
+    /// context block byte-identical from one round to the next, so the block
+    /// only ever grows at its tail and the anchors of an unchanged file never
+    /// shift under the provider's cached prompt prefix.
+    context_block: ContextBlockCache,
 }
 
 /// Repository map frozen for the remaining rounds of a bounded turn.
 struct FrozenRepoMap {
     map: Option<String>,
-}
-
-/// Session history tag frozen for the remaining rounds of a bounded turn.
-struct FrozenHistoryTag {
-    tag: Option<String>,
 }
 
 /// Compact directory outline frozen for the remaining rounds of a bounded turn.
@@ -112,58 +117,56 @@ impl TurnInputCache {
         map
     }
 
-    /// Returns the session history block frozen at the start of the turn.
+    /// Returns the interaction records frozen at the start of the turn.
     ///
-    /// An isolated step never injects history and freezes `None`. For regular
-    /// turns, the first call reads and formats session history off the executor
-    /// thread and freezes the result. Every subsequent round reuses that exact
-    /// string without hitting disk or re-parsing JSONL records, ensuring that
-    /// the session history block in the prompt prefix remains byte-identical.
-    pub(super) async fn history_tag(
+    /// An isolated step never injects history and freezes an empty snapshot.
+    /// For regular turns the first call reads the session records off the
+    /// executor thread and freezes them; every later round reuses that exact
+    /// vector without hitting disk or re-parsing JSONL records. The freeze is
+    /// structural: the semantic layout renders the `<history>` block from it
+    /// byte for byte, and the chronological layout reads the recorded context
+    /// watermarks from the same material. Records appended while the turn runs
+    /// never reach the snapshot, so the prompt prefix stays byte-identical.
+    pub(super) async fn history_snapshot(
         &mut self,
         history_manager: &HistoryManager,
         intent: TurnIntent,
-    ) -> Option<String> {
-        if let Some(frozen) = &self.history_tag {
-            return frozen.tag.clone();
+    ) -> Option<HistorySnapshot> {
+        if self.history.is_none() {
+            self.history = Some(Self::resolve_history(history_manager, intent).await);
         }
+        self.history
+            .as_ref()
+            .filter(|snapshot| !snapshot.is_empty())
+            .cloned()
+    }
 
+    /// Reads the session records a turn freezes for its whole duration.
+    async fn resolve_history(
+        history_manager: &HistoryManager,
+        intent: TurnIntent,
+    ) -> HistorySnapshot {
         if intent.is_isolated_step() {
-            self.history_tag = Some(FrozenHistoryTag { tag: None });
-            return None;
+            return HistorySnapshot::default();
         }
 
         let hm = history_manager.clone();
-        let tag = match crate::blocking::run_blocking_async(move || {
-            hm.format_history_tag().map(|tag| {
-                let trimmed = tag.trim();
-                if trimmed.is_empty() {
-                    None
-                } else {
-                    Some(tag)
-                }
-            })
-        })
-        .await
-        {
-            Ok(Ok(tag)) => tag,
+        match crate::blocking::run_blocking_async(move || hm.snapshot()).await {
+            Ok(Ok(snapshot)) => snapshot,
             // A history that could not be read is not an empty history: the
-            // degradation is recorded before the block is treated as absent.
+            // degradation is recorded before it is treated as absent.
             Ok(Err(error)) => {
                 tracing::warn!(
                     error = %error,
-                    "failed to format the session history; the turn proceeds without it"
+                    "failed to read the session history; the turn proceeds without it"
                 );
-                None
+                HistorySnapshot::default()
             }
             Err(join_error) => {
-                crate::blocking::log_join_error(&join_error, "session history formatting");
-                None
+                crate::blocking::log_join_error(&join_error, "session history reading");
+                HistorySnapshot::default()
             }
-        };
-
-        self.history_tag = Some(FrozenHistoryTag { tag: tag.clone() });
-        tag
+        }
     }
 
     /// Returns the compact directory outline frozen at the start of the turn.
@@ -233,11 +236,67 @@ impl TurnInputCache {
         self.project = Some(project.clone());
         project
     }
+
+    /// Returns the turn-scoped memo of rendered context elements.
+    ///
+    /// The memo is owned by the turn rather than by a single prompt assembly, so
+    /// a file rendered in an earlier round is reproduced verbatim while the
+    /// rounds that widened the context render only the files they added. An
+    /// unchanged file therefore keeps the exact bytes — and the exact line
+    /// anchors — the previous round already sent to the provider.
+    pub(super) fn context_cache(&mut self) -> &mut ContextBlockCache {
+        &mut self.context_block
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The context memo is scoped to the turn: it reproduces an unchanged file
+    /// byte for byte and extends the block only at its tail when a discovery
+    /// round appends a file.
+    #[test]
+    fn context_cache_is_turn_scoped_and_extends_at_the_tail() {
+        use crate::context::ContextFileContent;
+        use crate::prompt::PromptAssembly;
+        use tauqe_protocol::{ContextAccess, EditProtocolKind, PatchStrategy};
+
+        let file = |path: &str, content: &str| ContextFileContent {
+            path: path.to_string(),
+            access: ContextAccess::Editable,
+            content: content.to_string(),
+        };
+
+        let mut cache = TurnInputCache::default();
+        let mut assembly = PromptAssembly::new(
+            None,
+            1,
+            vec![file("a.rs", "alpha\n")],
+            "git",
+            EditProtocolKind::Xml,
+            None,
+            None,
+        )
+        .with_patch_strategy(PatchStrategy::LineAnchor);
+
+        let first = assembly
+            .format_context_block_with(cache.context_cache())
+            .expect("the first round renders the block");
+        let second = assembly
+            .format_context_block_with(cache.context_cache())
+            .expect("the memo reproduces the block");
+        assert_eq!(second, first);
+
+        // A discovery round appends a file: the previous element keeps its exact
+        // bytes and the new one lands at the tail.
+        assembly.context_files.push(file("b.rs", "beta\n"));
+        let third = assembly
+            .format_context_block_with(cache.context_cache())
+            .expect("the widened round renders the block");
+        assert!(third.starts_with(&first[..first.len() - "</context>".len()]));
+        assert!(third.contains("b.rs"));
+    }
 
     /// Creates a git repository with two tracked Rust files so the tracked-file
     /// listing resolves them.
@@ -316,7 +375,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn history_tag_is_frozen_across_rounds() {
+    async fn history_snapshot_is_frozen_across_rounds() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().to_path_buf();
         let mut history_manager = HistoryManager::new(root);
@@ -326,22 +385,29 @@ mod tests {
 
         let mut cache = TurnInputCache::default();
         let first = cache
-            .history_tag(&history_manager, TurnIntent::InteractiveRepl)
+            .history_snapshot(&history_manager, TurnIntent::InteractiveRepl)
             .await
             .expect("first round resolves history");
-        assert!(first.contains("Original prompt"));
+        // The frozen records render exactly the block the live history would
+        // have produced at that moment.
+        let block = first.render_block().expect("the frozen records render");
+        assert_eq!(block, history_manager.format_history_tag().unwrap());
+        assert!(block.contains("Original prompt"));
 
-        // Simulate an external mutation or subsequent event added during the turn
+        // A record appended while the turn runs never reaches the snapshot.
         history_manager
             .record_turn("Subsequent prompt", vec!["b.rs".to_string()])
             .unwrap();
 
         let second = cache
-            .history_tag(&history_manager, TurnIntent::InteractiveRepl)
+            .history_snapshot(&history_manager, TurnIntent::InteractiveRepl)
             .await
             .expect("second round reuses frozen history");
         assert_eq!(second, first);
-        assert!(!second.contains("Subsequent prompt"));
+        assert!(!second
+            .render_block()
+            .expect("the frozen records render")
+            .contains("Subsequent prompt"));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -382,15 +448,59 @@ mod tests {
 
         let mut cache = TurnInputCache::default();
         assert!(cache
-            .history_tag(&history_manager, TurnIntent::IsolatedStep)
+            .history_snapshot(&history_manager, TurnIntent::IsolatedStep)
             .await
             .is_none());
         assert!(cache
-            .history_tag(&history_manager, TurnIntent::IsolatedStep)
+            .history_snapshot(&history_manager, TurnIntent::IsolatedStep)
             .await
             .is_none());
     }
+    /// The freeze is structural: the context watermarks the frozen turn
+    /// records observed stay readable for the whole turn, even after the live
+    /// history moved on.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn frozen_snapshot_keeps_the_recorded_turn_watermarks() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        let storage = crate::history::SessionStorage::new(root.clone());
+        storage
+            .append_entry(&crate::history::HistoryEntry::Turn {
+                id: Some(1),
+                prompt: "Original prompt".to_string(),
+                context: vec![],
+                context_watermark: Some(12),
+            })
+            .unwrap();
+        let history_manager = HistoryManager::new(root);
 
+        let mut cache = TurnInputCache::default();
+        let frozen = cache
+            .history_snapshot(&history_manager, TurnIntent::InteractiveRepl)
+            .await
+            .expect("the turn freezes its history");
+        assert_eq!(frozen.watermark(), Some(12));
+        assert!(matches!(
+            frozen.entries(),
+            [crate::history::HistoryEntry::Turn { .. }]
+        ));
+
+        // The live history keeps growing while the frozen structure stays the
+        // material this turn renders and interleaves from.
+        storage
+            .append_entry(&crate::history::HistoryEntry::Turn {
+                id: Some(2),
+                prompt: "Later prompt".to_string(),
+                context: vec![],
+                context_watermark: Some(20),
+            })
+            .unwrap();
+        let again = cache
+            .history_snapshot(&history_manager, TurnIntent::InteractiveRepl)
+            .await
+            .expect("the frozen snapshot is reused");
+        assert_eq!(again.watermark(), Some(12));
+    }
     /// A repository whose tracked file list cannot be resolved must degrade
     /// observably: the outline is frozen as absent for the rest of the turn
     /// and the failed listing leaves a warn record, so the degradation never

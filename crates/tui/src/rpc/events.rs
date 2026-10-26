@@ -4,7 +4,7 @@ use tauqe_protocol::{
     EditFileRetryingEvent, EditFileStartedEvent, EditFinishedEvent, EditHunkEvent, Event,
     GitCommitCreatedEvent, GitSquashApplyResult, HistoryCompactedEvent, HistoryEntryAddedEvent,
     HistoryEntryRolledBackEvent, ModelDeltaEvent, ModelErrorEvent, ModelEscalatedEvent,
-    ModelFinishedEvent, ModelResult, ModelResultEvent, ModelStartedEvent, ModelUsageTotalsEvent,
+    ModelResult, ModelResultEvent, ModelStartedEvent, ModelUsageTotalsEvent,
     PlanBatchFinishedEvent, RepositoryState, ReviewBatchFinishedEvent, ReviewContentDeltaEvent,
     ReviewErrorEvent, ReviewFinishedEvent, ReviewReasoningDeltaEvent, ReviewStartedEvent,
 };
@@ -673,41 +673,40 @@ pub async fn handle_event(ev: Event, state: &Arc<Mutex<AppState>>, is_reasoning:
                     );
                 }
             }
-            if let Some(params) = ev.params {
-                if let Ok(_data) = serde_json::from_value::<ModelFinishedEvent>(params) {
-                    st.model.status = TurnStatus::Done;
-                    st.model.toolchain = None;
-                    st.model.retrying = None;
-                    st.model.turn_phase = None;
-                    st.model.turn_phase_detail = None;
-                    st.model.end_in_flight_usage();
-                    if st.model.last_commit_hash.is_some()
-                        || st.model.edit_final_applied == Some(true)
-                    {
-                        for f in st.model.files.iter_mut() {
-                            f.status = FileEditStatus::Ok;
-                            f.error = None;
-                            f.retry_info = None;
-                        }
-                    } else {
-                        fail_safe_reject_edits(&mut st.model, &active_t("notify.edit_desync"));
-                    }
-                    st.model.update_markdown();
-                    let h = st.last_model_height;
-                    st.model.clamp_scroll(h);
-
-                    if st.model.edit_final_applied == Some(false) {
-                        if let Some(err) = st.model.edit_final_error.clone() {
-                            st.notify_error(err);
-                        }
-                    } else {
-                        let msg = format_turn_completion_message(
-                            st.model.last_commit_hash.as_deref(),
-                            st.model.last_commit_summary.as_deref(),
-                        );
-                        st.notify_success(msg);
-                    }
+            // The event method is the authoritative lifecycle signal, so the
+            // turn settles onto a terminal status even when the payload is
+            // absent or malformed. Gating this block on payload parsing would
+            // leave the spinner running, `is_busy()` blocking the prompt, and
+            // the cancel dialog targeting a turn that has already ended (c-2).
+            st.model.status = TurnStatus::Done;
+            st.model.toolchain = None;
+            st.model.retrying = None;
+            st.model.turn_phase = None;
+            st.model.turn_phase_detail = None;
+            st.model.end_in_flight_usage();
+            if st.model.last_commit_hash.is_some() || st.model.edit_final_applied == Some(true) {
+                for f in st.model.files.iter_mut() {
+                    f.status = FileEditStatus::Ok;
+                    f.error = None;
+                    f.retry_info = None;
                 }
+            } else {
+                fail_safe_reject_edits(&mut st.model, &active_t("notify.edit_desync"));
+            }
+            st.model.update_markdown();
+            let h = st.last_model_height;
+            st.model.clamp_scroll(h);
+
+            if st.model.edit_final_applied == Some(false) {
+                if let Some(err) = st.model.edit_final_error.clone() {
+                    st.notify_error(err);
+                }
+            } else {
+                let msg = format_turn_completion_message(
+                    st.model.last_commit_hash.as_deref(),
+                    st.model.last_commit_summary.as_deref(),
+                );
+                st.notify_success(msg);
             }
         }
         events::MODEL_CANCELLED => {
@@ -728,15 +727,21 @@ pub async fn handle_event(ev: Event, state: &Arc<Mutex<AppState>>, is_reasoning:
             st.model.clamp_scroll(h);
         }
         events::MODEL_ERROR => {
+            // The failure message is optional enrichment: the event method is
+            // the authoritative lifecycle signal, so a missing or malformed
+            // payload falls back to a localized diagnostic instead of leaving
+            // the turn busy (c-2).
+            let mut message = active_t("notify.turn_failed_no_payload");
+            if let Some(params) = ev.params {
+                if let Ok(data) = serde_json::from_value::<ModelErrorEvent>(params) {
+                    message = data.message;
+                }
+            }
             // A batch member failure is aggregated into the supervisor's
             // summary, so the member records its diagnostic without tearing
             // down the turn the whole queue shares.
             if st.model.is_batch {
-                if let Some(params) = ev.params {
-                    if let Ok(data) = serde_json::from_value::<ModelErrorEvent>(params) {
-                        st.model.error = Some(data.message);
-                    }
-                }
+                st.model.error = Some(message);
                 return;
             }
             *is_reasoning = false;
@@ -762,16 +767,12 @@ pub async fn handle_event(ev: Event, state: &Arc<Mutex<AppState>>, is_reasoning:
             st.model.retrying = None;
             st.model.turn_phase = None;
             st.model.turn_phase_detail = None;
-            if let Some(params) = ev.params {
-                if let Ok(data) = serde_json::from_value::<ModelErrorEvent>(params) {
-                    st.model.status = TurnStatus::Error;
-                    st.model.end_in_flight_usage();
-                    fail_safe_reject_edits(&mut st.model, &active_t("notify.failed_before_edits"));
-                    st.model.error = Some(data.message);
-                    let h = st.last_model_height;
-                    st.model.clamp_scroll(h);
-                }
-            }
+            st.model.status = TurnStatus::Error;
+            st.model.end_in_flight_usage();
+            fail_safe_reject_edits(&mut st.model, &active_t("notify.failed_before_edits"));
+            st.model.error = Some(message);
+            let h = st.last_model_height;
+            st.model.clamp_scroll(h);
         }
         events::REVIEW_STARTED => {
             st.review.running = true;
@@ -869,12 +870,17 @@ pub async fn handle_event(ev: Event, state: &Arc<Mutex<AppState>>, is_reasoning:
                     );
                 }
             }
+            // The event method is the authoritative lifecycle signal: a missing
+            // or malformed payload falls back to a localized diagnostic instead
+            // of leaving the review turn busy (c-2).
+            let mut message = active_t("notify.review_failed_no_payload");
             if let Some(params) = ev.params {
                 if let Ok(data) = serde_json::from_value::<ReviewErrorEvent>(params) {
-                    st.review.error = Some(data.message.clone());
-                    end_review_turn(&mut st.model, TurnStatus::Error, Some(data.message));
+                    message = data.message;
                 }
             }
+            st.review.error = Some(message.clone());
+            end_review_turn(&mut st.model, TurnStatus::Error, Some(message));
         }
         events::PLAN_UPDATED => {
             if let Some(params) = ev.params {
@@ -1155,8 +1161,8 @@ fn format_elapsed(seconds: u64) -> String {
 mod tests {
     use super::*;
     use tauqe_protocol::{
-        HistoryEntryStatus, ModelCatalogEntry, ModelRef, ModelRole, ModelRolesEntries,
-        ModelRolesSummary, ReasoningEffort, UiHistoryItem, UiHistoryKind,
+        HistoryEntryStatus, ModelCatalogEntry, ModelFinishedEvent, ModelRef, ModelRole,
+        ModelRolesEntries, ModelRolesSummary, ReasoningEffort, UiHistoryItem, UiHistoryKind,
     };
 
     fn batch_summary(
@@ -2431,5 +2437,140 @@ mod tests {
         assert_eq!(file.status, FileEditStatus::Running);
         assert!(file.error.is_none());
         assert!(file.retry_info.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_model_finished_without_payload_still_settles_the_turn() {
+        let mut st = crate::app::test_state();
+        st.model.status = TurnStatus::Verifying;
+        st.model.toolchain = Some(ToolchainState::Running {
+            command: "cargo check".to_string(),
+        });
+        st.model.turn_phase = Some(tauqe_protocol::TurnPhase::Verification);
+        st.model.turn_phase_detail = Some("verifying".to_string());
+        st.running_model = Some(RunningModel {
+            model: ModelRef::openrouter("coder"),
+            role: None,
+            effort: None,
+        });
+        st.turn_started_at = Some(std::time::Instant::now());
+
+        let state = Arc::new(Mutex::new(st));
+        let mut is_reasoning = true;
+        let ev = Event {
+            method: events::MODEL_FINISHED.to_string(),
+            params: None,
+        };
+
+        handle_event(ev, &state, &mut is_reasoning).await;
+
+        let guard = state.lock().await;
+        assert_eq!(guard.model.status, TurnStatus::Done);
+        assert!(
+            !guard.model.is_busy(),
+            "a settled turn must never keep the interface busy"
+        );
+        assert!(guard.running_model.is_none());
+        assert!(
+            guard.turn_started_at.is_none(),
+            "the cancellation surfaces no longer target the finished turn"
+        );
+        assert!(!guard.confirm_cancel);
+        assert!(!is_reasoning, "the reasoning phase ends with the turn");
+        assert!(guard.model.toolchain.is_none());
+        assert!(guard.model.turn_phase.is_none());
+        assert!(guard.model.turn_phase_detail.is_none());
+        let notif = guard
+            .active_notification()
+            .expect("the settled turn still reports its completion");
+        assert_eq!(notif.level, crate::app::NotificationLevel::Success);
+    }
+
+    #[tokio::test]
+    async fn test_model_finished_with_malformed_payload_still_settles_the_turn() {
+        let mut st = crate::app::test_state();
+        st.model.status = TurnStatus::Verifying;
+        st.model.turn_phase = Some(tauqe_protocol::TurnPhase::Verification);
+        st.turn_started_at = Some(std::time::Instant::now());
+
+        let state = Arc::new(Mutex::new(st));
+        let mut is_reasoning = false;
+        let ev = Event {
+            method: events::MODEL_FINISHED.to_string(),
+            params: Some(serde_json::Value::from("truncated frame")),
+        };
+
+        handle_event(ev, &state, &mut is_reasoning).await;
+
+        let guard = state.lock().await;
+        assert_eq!(guard.model.status, TurnStatus::Done);
+        assert!(!guard.model.is_busy());
+        assert!(guard.model.turn_phase.is_none());
+        assert!(guard.turn_started_at.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_model_error_without_payload_still_settles_the_turn() {
+        let mut st = crate::app::test_state();
+        st.model.status = TurnStatus::Responding;
+        st.model.edits_active = true;
+        st.model.files.push(StreamingFileEdit {
+            status: FileEditStatus::Running,
+            ..accepted_file("crates/tui/src/main.rs")
+        });
+        st.turn_started_at = Some(std::time::Instant::now());
+
+        let state = Arc::new(Mutex::new(st));
+        let mut is_reasoning = true;
+        let ev = Event {
+            method: events::MODEL_ERROR.to_string(),
+            params: None,
+        };
+
+        handle_event(ev, &state, &mut is_reasoning).await;
+
+        let guard = state.lock().await;
+        assert_eq!(guard.model.status, TurnStatus::Error);
+        assert!(
+            !guard.model.is_busy(),
+            "a failed turn must never keep the interface busy"
+        );
+        assert!(guard.turn_started_at.is_none());
+        assert!(!is_reasoning);
+        assert_eq!(
+            guard.model.files[0].status,
+            FileEditStatus::Error,
+            "the streamed edits are reconciled even without a payload"
+        );
+        assert_eq!(
+            guard.model.error.as_deref(),
+            Some(active_t("notify.turn_failed_no_payload").as_str())
+        );
+    }
+
+    #[tokio::test]
+    async fn test_review_error_without_payload_still_settles_the_repl() {
+        let mut st = crate::app::test_state();
+        st.review.running = true;
+        st.model.status = TurnStatus::Responding;
+        st.turn_started_at = Some(std::time::Instant::now());
+
+        let state = Arc::new(Mutex::new(st));
+        let mut is_reasoning = false;
+        let ev = Event {
+            method: events::REVIEW_ERROR.to_string(),
+            params: None,
+        };
+
+        handle_event(ev, &state, &mut is_reasoning).await;
+
+        let guard = state.lock().await;
+        assert!(!guard.review.running);
+        assert!(guard.turn_started_at.is_none());
+        assert_eq!(guard.model.status, TurnStatus::Error);
+        assert!(!guard.model.is_busy());
+        let fallback = active_t("notify.review_failed_no_payload");
+        assert_eq!(guard.review.error.as_deref(), Some(fallback.as_str()));
+        assert_eq!(guard.model.error.as_deref(), Some(fallback.as_str()));
     }
 }

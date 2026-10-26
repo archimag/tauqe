@@ -138,8 +138,16 @@ pub fn confirm_modal_geometry(
     // notes) are never clipped: `needed_height` already reserves the borders
     // (2) and the actions bar (3). The height percentage is capped at 90 so the
     // modal keeps a small margin on short terminals while still fitting.
-    let needed_height = (body_lines_count as u16).saturating_add(7).max(10);
-    let height_percent = (needed_height * 100 / term.height.max(1)).clamp(25, 90);
+    //
+    // The body length is model-controllable (an Architect refusal reason, a
+    // queue preview), so the whole computation runs in `usize` with saturating
+    // arithmetic and only then narrows back into `u16`. Neither the `* 100`
+    // scaling nor the body count can overflow, truncate, or panic on a long
+    // body (Conventions §4).
+    let needed_height = body_lines_count.saturating_add(7).max(10);
+    let term_height = usize::from(term.height).max(1);
+    let ratio = needed_height.saturating_mul(100) / term_height;
+    let height_percent = u16::try_from(ratio).unwrap_or(u16::MAX).clamp(25, 90);
     let area = centered_rect(width, height_percent, term);
 
     // Delegate to the shared modal geometry so the confirmation buttons and the
@@ -218,8 +226,9 @@ pub fn render_modal_confirm(frame: &mut ratatui::Frame, params: ConfirmModalPara
 
 #[cfg(test)]
 mod tests {
-    use super::{ConfirmDialog, ConfirmOutcome};
+    use super::{confirm_modal_geometry, ConfirmDialog, ConfirmOutcome};
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use ratatui::layout::Rect;
 
     fn key(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::NONE)
@@ -276,6 +285,28 @@ mod tests {
             dialog.handle_key(key(KeyCode::Esc)),
             ConfirmOutcome::Dismissed
         );
+    }
+
+    /// A body far longer than `u16::MAX / 100` lines is untrusted, model-sized
+    /// input: the geometry must stay inside the terminal and the arithmetic must
+    /// never overflow, truncate, or panic in a debug build (Conventions §4).
+    #[test]
+    fn large_body_geometry_stays_within_terminal() {
+        let term = Rect::new(0, 0, 100, 40);
+        for lines in [648usize, 656, 700, 10_000, 70_000] {
+            let geom = confirm_modal_geometry(term, 70, lines, " [ Confirm ] ", " [ Cancel ] ");
+            assert!(geom.area.height <= term.height, "card exceeds the terminal");
+            assert!(
+                geom.area.bottom() <= term.bottom(),
+                "card bottom is clipped"
+            );
+            assert!(
+                geom.area.height > term.height / 4,
+                "a long body must not collapse"
+            );
+            assert!(geom.confirm_button.right() <= geom.area.right());
+            assert!(geom.cancel_button.right() <= geom.area.right());
+        }
     }
 
     #[test]

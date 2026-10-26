@@ -11,7 +11,10 @@
 //! (`auto_level_up`) and cost accounting once per turn.
 
 use async_trait::async_trait;
-use tauqe_protocol::{ModelEntry, ModelRef, ModelResult, ModelRole, ReasoningEffort, TurnIntent};
+use tauqe_protocol::{
+    ModelEntry, ModelRef, ModelResult, ModelRole, PatchStrategy, PromptLayoutKind, ReasoningEffort,
+    TurnIntent,
+};
 use tokio::sync::mpsc;
 use tokio::sync::watch;
 
@@ -111,6 +114,41 @@ impl WorkflowOptions {
             reasoning_effort: None,
             session_id: None,
         }
+    }
+
+    /// Returns the patch strategy declared by the governing project configuration.
+    ///
+    /// The strategy decides how a change set addresses the lines it replaces, so
+    /// every phase that describes a change set — prompt rendering and
+    /// patch-retry diagnostics alike — reads it from this single accessor
+    /// instead of deriving its own copy from the configuration.
+    pub fn patch_strategy(&self) -> PatchStrategy {
+        self.app_config
+            .as_ref()
+            .map(|config| config.develop.patch_strategy)
+            .unwrap_or_default()
+    }
+
+    /// Returns the prompt layout policy that composes this turn's messages.
+    /// The declared `[develop]` key of the governing project configuration
+    /// wins for every turn; without one the turn intent decides: an
+    /// interactive REPL turn and a plan discussion keep a growing session
+    /// history and share one byte-stable head, so both build the chronological
+    /// transcript, while an isolated step keeps the semantic block order.
+    /// Returns the prompt layout policy that composes this turn's messages.
+    ///
+    /// The declared `[develop]` key of the governing project configuration
+    /// wins for every turn; without one the turn intent decides: an
+    /// interactive REPL turn and a plan discussion keep a growing session
+    /// history and share one byte-stable head, so both build the chronological
+    /// transcript, while an isolated step keeps the semantic block order.
+    /// Options that carry no governing configuration keep the semantic policy,
+    /// which every intent renders correctly.
+    pub fn prompt_layout(&self, intent: TurnIntent) -> PromptLayoutKind {
+        self.app_config
+            .as_ref()
+            .map(|config| config.resolve_prompt_layout(intent))
+            .unwrap_or(PromptLayoutKind::Semantic)
     }
 }
 

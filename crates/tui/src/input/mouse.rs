@@ -10,7 +10,7 @@ use std::sync::Arc;
 
 use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
 use ratatui::layout::Rect;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, MutexGuard};
 
 use crate::app::{AppState, ViewMode};
 use crate::input::InputResult;
@@ -151,7 +151,7 @@ pub async fn handle_mouse_event(
             // where (c-1, c-2). A hidden or covered surface registers nothing, so
             // it physically cannot receive the click (c-3).
             if let Some(action) = st.hit_regions.action_at(mouse.column, mouse.row) {
-                dispatch_ui_action(action, &mut st, server_writer).await?;
+                dispatch_ui_action(action, state, st, server_writer).await?;
                 return Ok(InputResult::Continue);
             }
 
@@ -179,12 +179,18 @@ pub async fn handle_mouse_event(
 /// its own renderer and this match, never the pointer routing (c-1, c-2).
 async fn dispatch_ui_action(
     action: UiAction,
-    st: &mut AppState,
+    state: &Arc<Mutex<AppState>>,
+    mut st: MutexGuard<'_, AppState>,
     server_writer: &mut RpcConnection,
 ) -> anyhow::Result<()> {
     match action {
         UiAction::SwitchView(target) => {
-            crate::input::switch_view(st, target, server_writer).await?;
+            // A tab switch may lazily request History entries or the review
+            // list, so the guard is released before the helper is awaited: the
+            // event loop keeps rendering and the disconnection banner can still
+            // appear when the daemon stops draining its stdin (c-1).
+            drop(st);
+            crate::input::switch_view(state, target, server_writer).await?;
         }
         UiAction::OpenModelSelect => {
             if st.model.is_busy() {
@@ -205,7 +211,7 @@ async fn dispatch_ui_action(
                 None => st.model.copy_code_block(block),
             };
             if let Some((result, lines)) = copied {
-                report_code_copy(st, result, lines);
+                report_code_copy(&mut st, result, lines);
             }
         }
         UiAction::CodeBlockBody => {

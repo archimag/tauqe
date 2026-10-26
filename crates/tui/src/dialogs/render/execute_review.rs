@@ -13,6 +13,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
 
 use crate::app::AppState;
+use crate::components::modal::verb_hint;
 use crate::i18n::active_t;
 use crate::theme::engine::current_engine;
 use crate::ui::header::truncate_to_width;
@@ -303,5 +304,5 @@ pub fn render_execute_review_dialog(frame: &mut ratatui::Frame, state: &AppState
                 1,
             )
     };
-    crate::components::modal::render_dialog_footer(frame, footer_area, &nav_hint);
+    crate::components::modal::render_dialog_footer(frame, footer_area, &verb_hint(nav_hint));
 }

@@ -252,8 +252,8 @@ mod tests {
   <concept>
     <concept_item id="c-1" title="Invariant" />
   </concept>
-  <item id="1" title="Step 1" status="done" />
-  <item id="2" title="Step 2" status="todo" />
+  <item id="1" title="Step 1" status="done" files="src/step1.rs" />
+  <item id="2" title="Step 2" status="todo" files="src/step2.rs" />
 </plan>
 "#;
         let initial_res = PlanStorage::apply_plan_tags(root, initial_text);

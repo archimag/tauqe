@@ -212,6 +212,9 @@ pub async fn handle_review_refine_item(req: Request, state: &Arc<AppState>) -> R
         None,
         &operation,
         RefineAdmission::Developer,
+        // A developer-driven RPC request is a standalone turn that owns its own
+        // notification, so it never claims the batch context.
+        false,
     )
     .await
     {
@@ -280,6 +283,13 @@ pub(super) enum RefineOutcome {
 /// `admission` declares the lifecycle states this caller may decompose, so the
 /// status gate runs before any status is published and no entry point can
 /// regress a finished finding.
+///
+/// `is_batch` declares the execution context of the round: `false` for a
+/// standalone turn driven by a developer RPC request, `true` for a member of a
+/// running batch. The flag is copied verbatim into the emitted
+/// `ModelStartedEvent`, so the interface freezes the shared turn and lets the
+/// batch supervisor emit the single terminal signal. Deriving it from
+/// `admission` would conflate the status lifecycle with the execution context.
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn refine_finding_with_architect(
     state: &Arc<AppState>,
@@ -291,6 +301,7 @@ pub(super) async fn refine_finding_with_architect(
     diagnostics: Option<ReviewRefineDiagnostics<'_>>,
     operation: &OperationGuard,
     admission: RefineAdmission,
+    is_batch: bool,
 ) -> Result<RefineOutcome, ResponseError> {
     // The gate runs before anything is published: a refused round must leave the
     // stored finding exactly as it was.
@@ -319,6 +330,7 @@ pub(super) async fn refine_finding_with_architect(
         instructions,
         diagnostics,
         operation,
+        is_batch,
     )
     .await;
 
@@ -366,6 +378,7 @@ async fn refine_finding_with_architect_inner(
     instructions: Option<String>,
     diagnostics: Option<ReviewRefineDiagnostics<'_>>,
     operation: &OperationGuard,
+    is_batch: bool,
 ) -> Result<RefineOutcome, ResponseError> {
     let (
         provider,
@@ -457,7 +470,9 @@ async fn refine_finding_with_architect_inner(
             alias: None,
             effort: reasoning_effort,
             plan_context: None,
-            is_batch: false,
+            // The round belongs to whatever context its caller declared, so a
+            // batch member never settles the shared turn on its own.
+            is_batch,
         })
         .ok(),
     );
@@ -899,6 +914,10 @@ mod tests {
             id: id.to_string(),
             title: format!("Step {id}"),
             status,
+            // Every executable leaf names its target context, so the fixture
+            // horizon satisfies the leaf-files invariant and each assertion
+            // exercises the dependency rule it is about.
+            files: vec![format!("src/{id}.rs")],
             ..Default::default()
         }
     }

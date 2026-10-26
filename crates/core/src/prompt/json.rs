@@ -12,6 +12,7 @@ use crate::edits::stream::discussion::DiscussionStreamFilter;
 use crate::edits::stream::JsonStreamFilter;
 use tauqe_protocol::{
     CapabilitySet, EditProtocolKind, LlmCapability, LlmCommand, LlmOutcome, ModelResult,
+    PatchStrategy,
 };
 
 use crate::capabilities::{map_verify_on_success, map_verify_target};
@@ -65,24 +66,28 @@ impl JsonPromptProtocol {
 
     /// Creates a structured protocol configured for discussion mode with the
     /// standard `"message"` streaming field.
+    ///
+    /// The operating mode is derived from the discussion capability surface
+    /// rather than declared here, so the mode is a property of the surface the
+    /// turn advertises: a surface that permits file edits runs in edit mode and
+    /// composes the registry schema, where `plan_update` is already declared.
     pub fn discussion() -> Self {
-        Self {
-            mode: JsonPromptMode::Discussion {
-                stream_field: "message".to_string(),
-            },
-            capabilities: CapabilitySet::discussion(),
-        }
+        let capabilities = CapabilitySet::discussion();
+        let mode = Self::mode_for(&capabilities);
+        Self { mode, capabilities }
     }
 
     /// Creates a structured protocol configured for discussion mode streaming
     /// an arbitrary top-level JSON string field.
+    ///
+    /// The mode follows the same surface derivation as [`Self::discussion`]: the
+    /// field names the conversational channel only while the surface carries no
+    /// file edits.
     pub fn with_stream_field(stream_field: impl Into<String>) -> Self {
-        Self {
-            mode: JsonPromptMode::Discussion {
-                stream_field: stream_field.into(),
-            },
-            capabilities: CapabilitySet::discussion(),
-        }
+        let stream_field = stream_field.into();
+        let capabilities = CapabilitySet::discussion();
+        let mode = Self::mode_for_field(&capabilities, &stream_field);
+        Self { mode, capabilities }
     }
 
     /// Creates a structured protocol narrowed to an explicit capability set.
@@ -100,11 +105,20 @@ impl JsonPromptProtocol {
     /// A set that enables [`LlmCapability::FileEdits`] uses edit mode, while a
     /// set without it streams a conversational `message` field.
     fn mode_for(capabilities: &CapabilitySet) -> JsonPromptMode {
+        Self::mode_for_field(capabilities, "message")
+    }
+
+    /// Derives the operating mode against a named conversational channel.
+    ///
+    /// The channel belongs to the conversational mode only: a surface that
+    /// permits file edits composes the edit schema, so the requested field name
+    /// never applies to it.
+    fn mode_for_field(capabilities: &CapabilitySet, stream_field: &str) -> JsonPromptMode {
         if capabilities.contains(LlmCapability::FileEdits) {
             JsonPromptMode::Edits
         } else {
             JsonPromptMode::Discussion {
-                stream_field: "message".to_string(),
+                stream_field: stream_field.to_string(),
             }
         }
     }
@@ -283,14 +297,31 @@ impl PromptProtocol for JsonPromptProtocol {
         commands
     }
 
-    fn system_instructions(&self, editable_paths: &[String], _has_eager_repo_map: bool) -> String {
+    fn system_instructions(
+        &self,
+        editable_paths: &[String],
+        _has_eager_repo_map: bool,
+        patch_strategy: PatchStrategy,
+    ) -> String {
+        // The editable paths travel through the protocol contract, so the
+        // parameter is bound explicitly here.
+        let _ = editable_paths;
         match &self.mode {
             JsonPromptMode::Edits => {
                 // Structured Output always exposes the `repo_maps` schema field,
                 // so its reference describes the field regardless of the outline.
-                StructuredEditProtocol.system_instructions_for(&self.capabilities, editable_paths)
+                StructuredEditProtocol.system_instructions_for(
+                    &self.capabilities,
+                    editable_paths,
+                    patch_strategy,
+                )
             }
             JsonPromptMode::Discussion { stream_field } => {
+                // A discussion turn edits no file, so the editable paths travel
+                // through the protocol contract without reaching a change-set
+                // reference: binding them here keeps the parameter consumed on
+                // every operating mode of the transport.
+                let _ = editable_paths;
                 if stream_field == "message" {
                     "## Mode: Structured Discussion\nYou are operating in Structured Discussion mode. Formulate all responses as a valid JSON object matching the discussion_response schema:\n\
                     - message: Conversational Markdown explanation, reasoning, and answers. This field is streamed directly to the user interface.\n\
@@ -324,10 +355,17 @@ impl PromptProtocol for JsonPromptProtocol {
     fn response_format(
         &self,
         editable_paths: &[String],
+        patch_strategy: PatchStrategy,
     ) -> Option<crate::providers::ResponseFormat> {
+        // The response schema is a projection of the enabled capability set and
+        // the declared patch strategy, never of the files a turn may address:
+        // the field names are fixed before any file enters the context, so the
+        // permitted paths travel through the protocol contract without reaching
+        // the schema or the discussion payload.
+        let _ = editable_paths;
         match &self.mode {
             JsonPromptMode::Edits => {
-                StructuredEditProtocol.response_format_for(&self.capabilities, editable_paths)
+                StructuredEditProtocol.response_format_for(&self.capabilities, patch_strategy)
             }
             JsonPromptMode::Discussion { .. } => {
                 Some(crate::providers::ResponseFormat::JsonSchema {
@@ -629,14 +667,123 @@ mod tests {
         assert!(protocol.supports(LlmCapability::PlanUpdate));
         assert!(protocol.supports(LlmCapability::Discovery));
         assert!(protocol.supports(LlmCapability::UserLanguage));
-        assert!(!protocol.supports(LlmCapability::FileEdits));
-        assert!(!protocol.supports(LlmCapability::ToolchainVerify));
+        // A plan discussion carries the full dialogue surface, so its transport
+        // derives the edit mode and composes the composite registry schema.
+        assert!(protocol.supports(LlmCapability::FileEdits));
+        assert!(protocol.supports(LlmCapability::ToolchainVerify));
+        assert_eq!(protocol.mode(), &JsonPromptMode::Edits);
+    }
+
+    #[test]
+    fn test_mode_is_derived_from_the_capability_surface() {
+        // A surface that permits file edits always runs in edit mode, so widening
+        // a discussion surface switches the transport instead of keeping a
+        // conversational schema that would reject the change set.
+        let edits = CapabilitySet::interactive_repl();
+        assert!(edits.contains(LlmCapability::FileEdits));
+        assert_eq!(JsonPromptProtocol::mode_for(&edits), JsonPromptMode::Edits);
+        assert_eq!(
+            JsonPromptProtocol::mode_for_field(&edits, "summary"),
+            JsonPromptMode::Edits
+        );
+
+        // A surface without file edits keeps the conversational channel, and a
+        // custom field name is preserved for it.
+        let text_only = CapabilitySet::from_slice(&[
+            LlmCapability::TextMessage,
+            LlmCapability::PlanUpdate,
+            LlmCapability::UserLanguage,
+        ]);
+        assert!(!text_only.contains(LlmCapability::FileEdits));
+        assert_eq!(
+            JsonPromptProtocol::mode_for(&text_only),
+            JsonPromptMode::Discussion {
+                stream_field: "message".to_string()
+            }
+        );
+        assert_eq!(
+            JsonPromptProtocol::mode_for_field(&text_only, "summary"),
+            JsonPromptMode::Discussion {
+                stream_field: "summary".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn test_discussion_constructors_derive_the_mode_from_their_surface() {
+        // The constructors no longer hardcode the conversational mode: they hand
+        // their surface to the same derivation the capability-set path uses.
+        let discussion = JsonPromptProtocol::discussion();
+        assert_eq!(discussion.capability_set(), CapabilitySet::discussion());
+        assert_eq!(
+            discussion.mode(),
+            &JsonPromptProtocol::mode_for(&CapabilitySet::discussion())
+        );
+
+        let custom = JsonPromptProtocol::with_stream_field("summary");
+        assert_eq!(custom.capability_set(), CapabilitySet::discussion());
+        assert_eq!(
+            custom.mode(),
+            &JsonPromptProtocol::mode_for_field(&CapabilitySet::discussion(), "summary")
+        );
+    }
+
+    #[test]
+    fn test_file_edits_surface_composes_the_registry_edit_schema() {
+        // The mode is a projection of the surface: a surface that permits file
+        // edits runs in edit mode, so its response schema is the registry
+        // composition, where `plan_update` is already declared and the change
+        // set carries its own property. The plan payload therefore keeps a
+        // single source of truth across both discussions.
+        let widened = JsonPromptProtocol::with_capabilities(CapabilitySet::interactive_repl());
+        let format = widened
+            .response_format(&[], PatchStrategy::SearchReplace)
+            .expect("edit mode always carries a response schema");
+        let crate::providers::ResponseFormat::JsonSchema { json_schema } = format else {
+            panic!("edit mode composes a JSON schema");
+        };
+        let schema = &json_schema.schema;
+        assert!(schema["properties"].get("changes").is_some());
+        assert!(schema["properties"].get("plan_update").is_some());
+        assert!(schema["properties"].get("context_requests").is_some());
+        assert_eq!(schema["additionalProperties"], serde_json::json!(false));
+    }
+
+    #[test]
+    fn test_conversational_surface_composes_the_discussion_schema() {
+        // The complementary branch: without file edits the derived mode streams
+        // the `message` field and answers with the discussion schema.
+        let text_only = CapabilitySet::from_slice(&[
+            LlmCapability::TextMessage,
+            LlmCapability::PlanCreation,
+            LlmCapability::PlanUpdate,
+            LlmCapability::Discovery,
+            LlmCapability::UserLanguage,
+        ]);
+        let protocol = JsonPromptProtocol::with_capabilities(text_only);
+        let format = protocol
+            .response_format(&[], PatchStrategy::SearchReplace)
+            .expect("discussion mode always carries a response schema");
+        let crate::providers::ResponseFormat::JsonSchema { json_schema } = format else {
+            panic!("discussion mode composes a JSON schema");
+        };
+        assert_eq!(json_schema.name, "discussion_response");
+        assert!(json_schema.schema["properties"].get("changes").is_none());
     }
 
     #[test]
     fn test_discussion_instructions_own_the_mode_section() {
-        let protocol = JsonPromptProtocol::discussion();
-        let instructions = protocol.system_instructions(&[], false);
+        // A structured discussion is a surface that edits no file, so it streams
+        // the conversational channel and renders the discussion section itself.
+        let conversational = CapabilitySet::from_slice(&[
+            LlmCapability::TextMessage,
+            LlmCapability::PlanCreation,
+            LlmCapability::PlanUpdate,
+            LlmCapability::Discovery,
+            LlmCapability::UserLanguage,
+        ]);
+        let protocol = JsonPromptProtocol::with_capabilities(conversational);
+        let instructions = protocol.system_instructions(&[], false, PatchStrategy::SearchReplace);
 
         // The protocol renders the discussion section itself, with the same
         // `##`-section structure the edit reference uses.
@@ -1029,5 +1176,22 @@ mod tests {
         assert!(!commands
             .iter()
             .any(|c| matches!(c, LlmCommand::Edit { .. })));
+    }
+
+    #[test]
+    fn test_decode_silent_structured_round_emits_no_text() {
+        // A round whose only conversational channel is empty must not surface
+        // its JSON scaffolding as text: the REPL streamed nothing for it, and
+        // session history must record the same nothing (plus phase banners).
+        let protocol = JsonPromptProtocol::edits();
+        let output =
+            r#"{"message":"","changes":[],"verify":{"target":"none","on_success":"silent"}}"#;
+        let commands = protocol.decode(output, &[]);
+        assert!(
+            !commands
+                .iter()
+                .any(|command| matches!(command, LlmCommand::Text { .. })),
+            "a silent structured round must never become raw JSON text"
+        );
     }
 }

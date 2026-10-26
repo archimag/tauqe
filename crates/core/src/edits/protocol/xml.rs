@@ -6,7 +6,7 @@
 //! syntax from conversational text, and [`marked`] binds the protocol to a
 //! per-turn marker. Control tags that are not code edits live in [`tags`].
 
-use tauqe_protocol::{DocTopic, EditOutcome, ModelResult};
+use tauqe_protocol::{DocTopic, EditOperation, EditOutcome, ModelResult, PatchStrategy};
 
 use super::ContextRequest;
 
@@ -75,6 +75,32 @@ impl XmlEditProtocol {
         parse_doc_request_tags(raw_text)
     }
 
+    /// Decodes the anchored change-set vehicle of the XML contour.
+    ///
+    /// The anchored vehicle carries the whole change set as one JSON array inside
+    /// `<file_edits>...</file_edits>`, so the replaced lines are
+    /// named by the opaque anchors rendered in context instead of being echoed
+    /// back. The tag name and its body alone identify the vehicle, so the
+    /// decoder reads no attribute and a legacy transcript that still declares
+    /// one keeps decoding identically. The body travels through the shared
+    /// structured-change conversion, so both transports resolve paths,
+    /// validate payloads, and build edit operations identically.
+    pub fn parse_anchor_edits(
+        &self,
+        raw_text: &str,
+        editable_paths: &[String],
+    ) -> Result<Vec<EditOperation>, String> {
+        let Some(spec) = engine::tag_spec("file_edits") else {
+            return Ok(Vec::new());
+        };
+        let mut operations = Vec::new();
+        for found in engine::iter_tags(raw_text, spec) {
+            let body = found.body.unwrap_or_default();
+            operations.extend(super::structured::parse_anchor_edits(body, editable_paths)?);
+        }
+        Ok(operations)
+    }
+
     /// Extracts a code verification request (check/clippy/test) when present.
     pub fn parse_verify_request(&self, raw_text: &str) -> Option<VerifyRequest> {
         tags::extract_verify_request(raw_text)
@@ -116,8 +142,12 @@ impl XmlEditProtocol {
     }
 
     /// Returns system prompt instructions tailored for this edit protocol.
-    pub fn system_instructions(&self, editable_paths: &[String]) -> String {
-        prompt::base_system_instructions(editable_paths)
+    pub fn system_instructions(
+        &self,
+        editable_paths: &[String],
+        patch_strategy: PatchStrategy,
+    ) -> String {
+        prompt::base_system_instructions(editable_paths, patch_strategy)
     }
 
     /// Returns system prompt instructions for an explicit capability set.
@@ -133,9 +163,14 @@ impl XmlEditProtocol {
         editable_paths: &[String],
         marker: Option<&str>,
         has_eager_repo_map: bool,
+        patch_strategy: PatchStrategy,
     ) -> String {
-        let reference =
-            prompt::system_instructions_for(capabilities, editable_paths, has_eager_repo_map);
+        let reference = prompt::system_instructions_for(
+            capabilities,
+            editable_paths,
+            has_eager_repo_map,
+            patch_strategy,
+        );
         match marker {
             Some(marker) => prompt::apply_turn_marker(&reference, marker),
             None => reference,
@@ -298,6 +333,49 @@ pub fn new_fn() {}
         let suffixed = "Hi\n<user_language_ABC123>en</user_language_ABC123>\nDone.";
         assert_eq!(extract_user_language(suffixed), Some("en".to_string()));
         assert_eq!(strip_user_language_tags(suffixed).trim(), "Hi\n\nDone.");
+    }
+
+    #[test]
+    fn test_xml_anchor_vehicle_decodes_the_json_change_set() {
+        let proto = XmlEditProtocol;
+        let editable = vec!["src/lib.rs".to_string()];
+        let text = "Rewriting the branch.\n<file_edits>[{\"op\":\"replace\",\"path\":\"src/lib.rs\",\"to\":\"\",\"start\":\"Kf9Q\",\"end\":\"Tq2W\",\"content\":\"fn replacement() {}\\n\"}]</file_edits>";
+        // A legacy transcript that still declares the historical `format`
+        // attribute keeps decoding, because the decoder reads the tag name and
+        // the body, never the attribute.
+        let legacy =
+            "<file_edits format=\"anchor\">[{\"op\":\"delete\",\"path\":\"src/lib.rs\"}]</file_edits>";
+        let legacy_ops = proto
+            .parse_anchor_edits(legacy, &editable)
+            .expect("a legacy attribute never blocks decoding");
+        assert_eq!(legacy_ops.len(), 1);
+        match proto.parse_anchor_edits(text, &editable) {
+            Ok(operations) => match operations.as_slice() {
+                [EditOperation::LineAnchor {
+                    path, start, end, ..
+                }] => {
+                    assert_eq!(path, "src/lib.rs");
+                    assert_eq!(start, "Kf9Q");
+                    assert_eq!(end, "Tq2W");
+                }
+                other => panic!("expected one anchored replacement, got {other:?}"),
+            },
+            Err(message) => panic!("unexpected decoding error: {message}"),
+        }
+
+        // A fenced example is documentation, not a command.
+        let fenced =
+            "```xml\n<file_edits>[{\"op\":\"delete\",\"path\":\"src/lib.rs\"}]</file_edits>\n```";
+        assert!(proto
+            .parse_anchor_edits(fenced, &editable)
+            .expect("a fenced example issues no change")
+            .is_empty());
+
+        // Prose that merely names the vehicle decodes nothing.
+        assert!(proto
+            .parse_anchor_edits("Use the anchored change set.", &editable)
+            .expect("plain prose issues no change")
+            .is_empty());
     }
 
     #[test]

@@ -20,6 +20,12 @@ pub use registry::{
     PromptRenderContext,
 };
 
+// The regime trunk composes as two typed lists, and an integration test must
+// prove that the dialogue contours render that trunk byte-identically. The two
+// composers are re-exported so the proof stays reachable without exposing the
+// internal module layout of the registry.
+pub use regime::{intent_delta_rules, shared_trunk_rules};
+
 // Protocol-to-command mapping helpers are owned by the capability modules that
 // define the corresponding capability. Re-exporting them keeps a single source
 // of truth for the edit-protocol-to-command conversion.

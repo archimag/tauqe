@@ -724,7 +724,10 @@ pub async fn handle_repl_key(
             }
         }
         ReplAction::OpenSquashDialog => {
-            crate::input::open_squash_dialog(&mut st, server_writer).await?;
+            // Opening the dialog ends with a preview request, so the guard is
+            // released before the helper is awaited (c-1).
+            drop(st);
+            crate::input::open_squash_dialog(state, server_writer).await?;
         }
         ReplAction::CopyModelResponse => {
             if st.model.is_busy() {

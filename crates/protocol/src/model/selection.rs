@@ -179,7 +179,10 @@ mod tests {
 
         // Display renders the model plus the bracketed depth, mirroring the
         // single interface label rule.
-        assert_eq!(tier.to_string(), "openrouter:anthropic/claude-3.5-sonnet [high]");
+        assert_eq!(
+            tier.to_string(),
+            "openrouter:anthropic/claude-3.5-sonnet [high]"
+        );
         assert_eq!(bare.to_string(), "openrouter:google/gemini-flash-latest");
 
         // Equality and hashing distinguish tiers by both coordinates.

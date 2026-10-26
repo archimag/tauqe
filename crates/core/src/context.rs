@@ -35,6 +35,13 @@ pub struct PatternAddOutcome {
 pub struct ContextManager {
     repo_root: PathBuf,
     revision: u64,
+    /// Monotonic source of `ContextItem::insertion_seq`.
+    ///
+    /// Every path that enters the context consumes one value, so the order of
+    /// the watermarks is the order in which the files actually arrived. The
+    /// counter never moves backwards, not even when a layer is cleared or a
+    /// file is pruned, so a watermark is never handed out twice.
+    insertion_counter: u64,
     pinned_patterns: Vec<String>,
     pinned: IndexMap<String, ContextItem>,
     user: IndexMap<String, ContextItem>,
@@ -68,6 +75,7 @@ impl ContextManager {
         let mut cm = Self {
             repo_root,
             revision: 1,
+            insertion_counter: 0,
             pinned_patterns: Vec::new(),
             pinned: IndexMap::new(),
             user: IndexMap::new(),
@@ -81,6 +89,7 @@ impl ContextManager {
         let mut cm = Self {
             repo_root,
             revision: 1,
+            insertion_counter: 0,
             pinned_patterns: Vec::new(),
             pinned: IndexMap::new(),
             user: IndexMap::new(),
@@ -153,15 +162,17 @@ impl ContextManager {
         }
     }
 
-    pub fn read_context_files(&self) -> Vec<ContextFileContent> {
+    /// Reads every context file together with its insertion watermark.
+    ///
+    /// Files are emitted in layer order (pinned -> user -> auto) and in each
+    /// layer's insertion order.
+    fn read_context_files_with_seq(&self) -> Vec<(u64, ContextFileContent)> {
         // Reading every context file is blocking file I/O. Run it through the
         // blocking helper so a large context never stalls an async worker.
         crate::blocking::run_blocking(|| {
-            // Files are emitted in layer order (pinned -> user -> auto) and in
-            // each layer's insertion order. The context block is the stable
-            // prefix of every later round within a turn, so an alphabetical
-            // re-sort here would shift tokens and invalidate the provider
-            // prefix cache.
+            // The context block is the stable prefix of every later round
+            // within a turn, so an alphabetical re-sort here would shift tokens
+            // and invalidate the provider prefix cache.
             let mut seen = std::collections::HashSet::new();
             let mut files = Vec::new();
             for path in self
@@ -181,15 +192,41 @@ impl ContextManager {
                     let access = self
                         .effective_access_for(path)
                         .unwrap_or(ContextAccess::ReadOnly);
-                    files.push(ContextFileContent {
-                        path: path.clone(),
-                        access,
-                        content,
-                    });
+                    let insertion_seq = self.existing_insertion_seq(path).unwrap_or(0);
+                    files.push((
+                        insertion_seq,
+                        ContextFileContent {
+                            path: path.clone(),
+                            access,
+                            content,
+                        },
+                    ));
                 }
             }
             files
         })
+    }
+
+    /// Reads the context files in semantic order: layer order (pinned -> user
+    /// -> auto) and insertion order within each layer.
+    pub fn read_context_files(&self) -> Vec<ContextFileContent> {
+        self.read_context_files_with_seq()
+            .into_iter()
+            .map(|(_, file)| file)
+            .collect()
+    }
+
+    /// Reads the context files ordered by their insertion watermark.
+    ///
+    /// The chronological layout renders its transcript by this order, so a file
+    /// appears where it actually entered the context instead of where its layer
+    /// places it. The sort is stable, so equal watermarks — concurrent additions
+    /// folded in by `merge_turn_context` — keep the semantic layer order and the
+    /// result stays deterministic.
+    pub fn read_context_files_by_insertion(&self) -> Vec<ContextFileContent> {
+        let mut files = self.read_context_files_with_seq();
+        files.sort_by_key(|(insertion_seq, _)| *insertion_seq);
+        files.into_iter().map(|(_, file)| file).collect()
     }
 
     pub fn contains(&self, relative_path: &str) -> Result<bool> {
@@ -202,6 +239,36 @@ impl ContextManager {
     pub fn is_editable(&self, relative_path: &str) -> Result<bool> {
         let clean_path = self.normalize_path(relative_path)?;
         Ok(self.effective_access_for(&clean_path) == Some(ContextAccess::Editable))
+    }
+
+    /// Returns the insertion watermark `clean_path` already carries.
+    ///
+    /// A path that lives in several layers reports the highest watermark it
+    /// ever reached, which is the max-watermark rule `merge_turn_context`
+    /// applies when it folds a turn back into the primary state.
+    fn existing_insertion_seq(&self, clean_path: &str) -> Option<u64> {
+        let mut watermark = None;
+        for layer in [&self.pinned, &self.user, &self.auto] {
+            if let Some(item) = layer.get(clean_path) {
+                let seq = item.insertion_seq;
+                watermark = Some(watermark.map_or(seq, |current: u64| current.max(seq)));
+            }
+        }
+        watermark
+    }
+
+    /// Returns the watermark an incoming item must carry.
+    ///
+    /// A path already in context keeps the watermark it was given when it first
+    /// arrived. Allocating a fresh one on every add would move the file to the
+    /// tail of the chronological timeline, and it would make an otherwise
+    /// identical re-add look like a change that bumps the revision on its own.
+    fn resolve_insertion_seq(&mut self, clean_path: &str) -> u64 {
+        if let Some(seq) = self.existing_insertion_seq(clean_path) {
+            return seq;
+        }
+        self.insertion_counter += 1;
+        self.insertion_counter
     }
 
     pub fn add_file(&mut self, relative_path: &str, access: ContextAccess) -> Result<ContextItem> {
@@ -240,12 +307,14 @@ impl ContextManager {
             let size_bytes = metadata.len();
             let estimated_tokens = estimate_tokens_from_bytes(size_bytes);
 
+            let insertion_seq = self.resolve_insertion_seq(&clean_path);
             let item = ContextItem {
                 path: clean_path.clone(),
                 access,
                 size_bytes,
                 estimated_tokens,
                 layer,
+                insertion_seq,
             };
 
             let changed = match layer {
@@ -603,7 +672,15 @@ impl ContextManager {
             let previous_auto = std::mem::take(&mut self.auto);
             for (path, item) in &turn_context.auto {
                 if !self.user.contains_key(path) {
-                    self.auto.insert(path.clone(), item.clone());
+                    // Max-watermark rule: a path present on both sides keeps the
+                    // highest watermark it ever reached, so a file the turn
+                    // re-added holds its chronological position instead of
+                    // jumping to the tail of the timeline.
+                    let mut merged = item.clone();
+                    if let Some(previous) = previous_auto.get(path) {
+                        merged.insertion_seq = previous.insertion_seq.max(item.insertion_seq);
+                    }
+                    self.auto.insert(path.clone(), merged);
                 }
             }
             changed |= previous_auto != self.auto;
@@ -625,7 +702,13 @@ impl ContextManager {
                         changed = true;
                     }
                 } else if self.repo_root.join(path).is_file() {
-                    self.user.insert(path.clone(), item.clone());
+                    // The path may have entered another layer while the turn ran,
+                    // so it keeps the higher of the two watermarks.
+                    let mut merged = item.clone();
+                    merged.insertion_seq = self
+                        .existing_insertion_seq(path)
+                        .map_or(item.insertion_seq, |seq| seq.max(item.insertion_seq));
+                    self.user.insert(path.clone(), merged);
                     changed = true;
                 }
             }
@@ -648,6 +731,13 @@ impl ContextManager {
                     }
                 }
             }
+
+            // The turn may have consumed watermarks the primary never saw, so
+            // the counter advances to the highest value either side reached and
+            // a concurrent addition can never reuse a watermark the turn already
+            // handed out. Advancing the counter alone changes no bytes, so it
+            // does not mark the merge as a change.
+            self.insertion_counter = self.insertion_counter.max(turn_context.insertion_counter);
 
             if changed {
                 self.revision += 1;
@@ -994,10 +1084,7 @@ mod tests {
         );
 
         cm.add_file("user.rs", ContextAccess::Editable).unwrap();
-        assert!(
-            cm.clear(),
-            "removing a user file must report a change"
-        );
+        assert!(cm.clear(), "removing a user file must report a change");
         assert!(
             !cm.clear(),
             "a repeated clear on an empty context must report no change"
@@ -1092,5 +1179,124 @@ mod tests {
         assert_eq!(paths, vec!["pinned.rs", "zeta.rs", "alpha.rs"]);
         let alpha = files.iter().find(|f| f.path == "alpha.rs").unwrap();
         assert_eq!(alpha.access, ContextAccess::Editable);
+    }
+
+    fn watermark_of(cm: &ContextManager, path: &str) -> u64 {
+        cm.get_state()
+            .items
+            .into_iter()
+            .find(|item| item.path == path)
+            .unwrap()
+            .insertion_seq
+    }
+
+    #[test]
+    fn test_insertion_watermarks_are_assigned_and_monotonic() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        for name in ["pinned.rs", "user.rs", "auto.rs", "later.rs"] {
+            std::fs::write(root.join(name), "fn f() {}\n").unwrap();
+        }
+
+        let mut cm = ContextManager::new(root.clone());
+        cm.load_pinned(&["pinned.rs".to_string()]);
+        cm.add_file("user.rs", ContextAccess::ReadOnly).unwrap();
+        cm.add_auto_file("auto.rs", ContextAccess::ReadOnly)
+            .unwrap();
+
+        let pinned_seq = watermark_of(&cm, "pinned.rs");
+        let user_seq = watermark_of(&cm, "user.rs");
+        let auto_seq = watermark_of(&cm, "auto.rs");
+        assert!(
+            pinned_seq > 0,
+            "a file that enters the context must carry a watermark"
+        );
+        assert!(user_seq > pinned_seq);
+        assert!(auto_seq > user_seq);
+
+        // A re-add of an existing path upgrades its access in place and keeps
+        // its watermark, so the file never jumps to the tail of the timeline.
+        cm.add_file("user.rs", ContextAccess::Editable).unwrap();
+        assert_eq!(watermark_of(&cm, "user.rs"), user_seq);
+        let readded = cm
+            .get_state()
+            .items
+            .into_iter()
+            .find(|item| item.path == "user.rs")
+            .unwrap();
+        assert_eq!(readded.access, ContextAccess::Editable);
+
+        // A file that arrives after the previous ones continues the timeline.
+        cm.add_auto_file("later.rs", ContextAccess::ReadOnly)
+            .unwrap();
+        assert!(watermark_of(&cm, "later.rs") > auto_seq);
+    }
+
+    #[test]
+    fn test_merge_turn_context_keeps_turn_watermarks_and_advances_counter() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        for name in ["base.rs", "turn_added.rs", "after_merge.rs"] {
+            std::fs::write(root.join(name), "fn f() {}\n").unwrap();
+        }
+
+        let mut primary = ContextManager::new(root.clone());
+        primary
+            .add_file("base.rs", ContextAccess::ReadOnly)
+            .unwrap();
+        let base_seq = watermark_of(&primary, "base.rs");
+
+        // The turn allocates watermarks of its own while the primary is idle.
+        let mut turn = primary.clone();
+        turn.add_auto_file("turn_added.rs", ContextAccess::ReadOnly)
+            .unwrap();
+        let turn_seq = watermark_of(&turn, "turn_added.rs");
+        assert!(turn_seq > base_seq);
+
+        primary.merge_turn_context(&turn);
+        assert_eq!(
+            watermark_of(&primary, "turn_added.rs"),
+            turn_seq,
+            "the chronology collected by the turn must survive the merge"
+        );
+        assert_eq!(watermark_of(&primary, "base.rs"), base_seq);
+
+        // The merged counter advances past every watermark the turn handed out,
+        // so the next addition can never reuse one of them.
+        primary
+            .add_auto_file("after_merge.rs", ContextAccess::ReadOnly)
+            .unwrap();
+        assert!(watermark_of(&primary, "after_merge.rs") > turn_seq);
+    }
+
+    #[test]
+    fn test_insertion_order_follows_watermarks_while_semantic_order_is_unchanged() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        for name in ["pinned.rs", "auto.rs", "user.rs"] {
+            std::fs::write(root.join(name), "fn f() {}\n").unwrap();
+        }
+
+        let mut cm = ContextManager::new(root.clone());
+        cm.load_pinned(&["pinned.rs".to_string()]);
+        // The auto file arrives first and the user file afterwards, so the
+        // chronological order deliberately contradicts the layer order.
+        cm.add_auto_file("auto.rs", ContextAccess::ReadOnly)
+            .unwrap();
+        cm.add_file("user.rs", ContextAccess::ReadOnly).unwrap();
+
+        let semantic: Vec<String> = cm
+            .read_context_files()
+            .into_iter()
+            .map(|file| file.path)
+            .collect();
+        assert_eq!(semantic, vec!["pinned.rs", "user.rs", "auto.rs"]);
+
+        let chronological: Vec<String> = cm
+            .read_context_files_by_insertion()
+            .into_iter()
+            .map(|file| file.path)
+            .collect();
+        assert_eq!(chronological, vec!["pinned.rs", "auto.rs", "user.rs"]);
     }
 }

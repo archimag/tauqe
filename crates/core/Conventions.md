@@ -167,46 +167,109 @@ The interaction protocol between Tauqe and large language models is strictly div
 
 ---
 
-## 9. Prompt Architecture and Provider Prefix Caching Invariant
+## 9. Prompt Architecture: Layout Policies and Provider Prefix Caching
 
-1. **Single Static Prefix:**
-   - Every bounded turn assembles the system prompt as one monolithic static
-     prefix that is byte-for-byte identical from one round of the turn to the
-     next.
-   - Modern LLM providers cache the shared token prefix of consecutive
-     requests. Any byte that changes inside the prefix invalidates the whole
-     cached prefix and forces a full reprocessing pass, multiplying latency
-     and cost on every discovery and healing round.
-2. **Frozen Block Order:**
-   - The blocks of the stable prefix are rendered in a fixed order: the Core
-     System Contract, the repository outline (symbol map or directory tree,
-     never both), the session history, the context files in insertion order,
-     the active plan, and the language directive.
-   - A block never moves relative to its neighbors. When a caller must render
-     an additional block, it appends that block after the existing stable
-     blocks, never between them.
-3. **Deterministic Rendering:**
-   - The prefix carries no runtime-varying content: no timestamps, no dates,
-     no random or per-request identifiers, no context revision counters, no
-     counters or latencies, and no toolchain output.
-   - Every collection rendered into the prefix keeps a deterministic order
-     (context files in insertion order, symbols and directories in their
-     generated order), so identical state produces identical bytes.
-4. **Append-Only Context:**
-   - Discovery widens the context by appending newly discovered files at the
-     end of the existing `<context>` block. Previously rendered files keep
-     their exact bytes.
+1. **Layout Policies Are Interchangeable Implementations of One Trait:**
+   - Turning a rendered `PromptAssembly` into the message sequence of a turn is a
+     policy behind one trait (`PromptLayout`, `crates/core/src/prompt/layout.rs`),
+     never a hardcoded order inside the assembly.
+   - Two implementations exist and are strictly interchangeable: `SemanticLayout`
+     groups the material into stable sections, and `ChronologicalLayout` turns the
+     same material into an append-only transcript.
+   - A caller chooses a policy exclusively through the typed `PromptLayoutKind`
+     (`Semantic` or `Chronological`) and `layout_for`. Branching on a policy name,
+     on a rendered heading, or on any other textual property is prohibited (the
+     root `Conventions.md` §1, *Typed Intent over Textual Inference*).
+   - Both policies render context files through the same layout-agnostic
+     `ContextBlockCache`, so a `<file>` element produced by one policy is
+     reproduced byte for byte by the other.
+2. **Block Order Is a Property of the Policy:**
+   - The order in which the already-rendered blocks become messages belongs to the
+     policy; it is no longer a global constant of the assembly.
+
+   | Material | `SemanticLayout` | `ChronologicalLayout` |
+   | --- | --- | --- |
+   | Core system contract, protocol instructions, project metadata | system head | system head |
+   | Repository outline (symbol map or directory tree, never both) | system head | system head |
+   | Language directive | system head | system head |
+   | Context files | one `<context>` block in the system message | `<context>` groups interleaved with the history records |
+   | Session history | one `<history>` block in the system message | one message per history record |
+    | Active plan | system message tail | trailing user message |
+    | Regime delta (intent-specific contract rules) | leading block of the final user message | first block of the trailing user message, ahead of the active plan |
+   | Context manifest (paths and access, no content) | absent | trailing user message |
+   | Turn scratchpad | system message tail | trailing user message |
+   | Current task | final user message | final user message |
+
+   - Both policies keep the same three-part shape: a byte-stable head, the
+     material that legitimately grows, and an isolated volatile tail.
+3. **Byte-Stable Head:**
+   - The head carries only blocks that are identical from one round of a turn to
+     the next: the introduction, the Core System Contract, the protocol
+     instructions, the project metadata, the repository outline, and the language
+     directive.
+   - The repository outline stays in the head under both policies. The dominant
+     regime of a turn is exploration and planning, where the outline hardly
+     changes, while the outline is also the largest block: placing it in the tail
+     would pay a full reprocessing pass on every round instead of only on the
+     turns that regenerate it.
+   - The accepted price is explicit. A regenerated outline changes the head itself
+     and therefore invalidates the whole tail, because a later turn renders an
+     outline that excludes the files which entered the context. That divergence is
+     a documented property of the outline, not an accident of the layout.
+   - Within a turn the outline is frozen (`TurnInputCache`), so no later round of
+     the same turn rewrites it even after discovery widened the context.
+4. **Contract Vocabulary Follows the Active Layout:**
+   - The Core System Contract describes the context surface in the dictionary of
+     the active policy, exactly as it selects the dictionary of the active contour
+     (§2.4). `SemanticLayout` names the `<context>` block; `ChronologicalLayout`
+     names the interleaved transcript and the tail manifest.
+   - A rule never mixes the two dictionaries. The prompt-side description of the
+     `<file>` element and of the `access` attribute is shared, because it describes
+     payload the model reads rather than a command channel it emits.
+5. **Deterministic Rendering:**
+   - The prompt carries no runtime-varying content: no timestamps, no dates, no
+     random or per-request identifiers, no context revision counters, no counters
+     or latencies, and no toolchain output.
+   - Every collection rendered into a policy keeps a deterministic order (context
+     files by insertion order or by insertion watermark, symbols and directories
+     in their generated order), so identical state produces identical bytes.
+6. **Append-Only Growth:**
+   - Discovery widens the context by appending newly discovered files. Under
+     `SemanticLayout` the new element extends the existing `<context>` block at its
+     tail; under `ChronologicalLayout` it is appended after the records already in
+     the transcript. Previously rendered elements keep their exact bytes.
    - Promoting a file from read-only to editable rewrites only that file's own
-     `access` attribute in place; it never relocates the file or reflows its
+     `access` attribute in place; it never relocates the element or reflows its
      neighbors.
-5. **Isolated Volatile Tail:**
+   - The chronological transcript is ordered by the insertion watermark every
+     context entry carries (`ContextItem::insertion_seq`). A file is placed after
+     the first history record that already observed it, so a file the dialogue
+     discovered between two turns appears between them, and a file no record
+     observed yet closes the transcript.
+7. **Isolated Volatile Tail:**
    - All genuinely round-varying content is confined to the end of the message
-     sequence: the turn scratchpad is appended after the whole stable prefix,
-     and round-specific diagnostics (patch retry reports, verification
-     failures) travel as append-only extensions of the user message.
+     sequence: the active plan, the context manifest of the chronological policy,
+     and the turn scratchpad; round-specific diagnostics (patch retry reports,
+     verification failures) travel as append-only extensions of the user message.
+   - The context manifest carries paths and effective access only, never content.
+     It compensates for the lost semantic grouping: the model keeps a complete view
+     of what is in context while no content byte moves into the tail.
    - Nothing volatile is ever injected into an earlier block, because an early
      insertion invalidates every cached token that follows it.
-6. **Dialogue Session Boundary:**
+8. **Documented Structural Invalidation Points:**
+   - Appending grows the sequence at its tail and therefore preserves the cached
+     prefix.
+   - The structural mutations that legitimately move an earlier byte are named
+     rather than discovered, and each of them bounds the invariant:
+     1. Repository outline regeneration between turns, which rewrites the head.
+     2. Access promotion, which rewrites one attribute of one element in place.
+     3. Prune and rollback, which remove an element and shift every message after
+        it; the removal is the purpose of the operation.
+     4. History compaction, which replaces the opening of the transcript and
+        rotates the dialogue session identifier together with the prefix it
+        rewrites (rule 9), because the provider must not be asked to reuse a node
+        cache whose prefix the dialogue no longer sends.
+9. **Dialogue Session Boundary:**
    - An interactive turn binds its provider requests to a dialogue session
      identifier, which is what a provider uses to route consecutive requests to
      the same cache-warm node.
@@ -228,18 +291,32 @@ The interaction protocol between Tauqe and large language models is strictly div
         Reusing a session identifier across different models produces guaranteed
         cache misses or affinity routing conflicts. Changing only reasoning
         effort or reselecting the identical model preserves session affinity.
-7. **Rationale (Why):**
-   - A bounded turn issues several requests per turn: discovery rounds, the
-     proposal, staging retries, and verification healing. Reusing the
-     provider's cached prefix across those requests removes the dominant
-     repeated cost and keeps multi-round turns economically viable.
-   - The invariant is only effective when it holds byte-for-byte, so any
-     dynamic content or reordering silently defeats it.
-   - A session identifier that outlives its prefix or target model is worse than
-     a cold one: it asks the provider to reuse a node cache the next request can
-     never match, which is why rotation is bound strictly to context shrinking
-     and model changes rather than to a timer or a round counter.
-
+   - Focus transitions never rotate the identifier. The prompt head renders the
+     main capability list and the shared trunk, so it is byte-identical for the
+     free REPL, the plan discussion, and the review discussion. Setting a focus,
+     replacing it, switching between a plan and a review target, starting a
+     dialogue from the Plans or Review view, or clearing the focus therefore
+     moves no head byte and keeps the provider session warm.
+10. **Rationale (Why):**
+    - A bounded turn issues several requests per turn: discovery rounds, the
+      proposal, staging retries, and verification healing. Reusing the provider's
+      cached prefix across those requests removes the dominant repeated cost and
+      keeps multi-round turns economically viable.
+    - The invariant is only effective when it holds byte-for-byte, so any dynamic
+      content, reordering, or unexpected relocation of a block silently defeats
+      it. A policy makes the order explicit and reviewable instead of implicit in
+      the assembly.
+    - The chronological policy exchanges the semantic grouping for a transcript
+      that grows at its tail, which is why the lost grouping is compensated by the
+      compact context manifest instead of by reloading file bodies.
+    - A session identifier that outlives its prefix or target model is worse than
+      a cold one: it asks the provider to reuse a node cache the next request can
+      never match, which is why rotation is bound strictly to context shrinking
+      and model changes rather than to a timer or a round counter.
+    - A focus transition is a non-event for the session for the same reason. One
+      head is shared by every dialogue contour, so switching the discussed entity
+      changes only the tail delta; rotating there would discard a prefix the next
+      request still sends.
 ---
 
 ## 10. Model Catalog as the Single Source of Truth for Model Names

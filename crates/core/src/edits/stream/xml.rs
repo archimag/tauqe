@@ -1,11 +1,12 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 
-use tauqe_protocol::{EditFileOp, EditFileStatus};
+use tauqe_protocol::{EditFileOp, EditFileStatus, EditOperation};
 
-use super::{normalize_hunk, resolve_path, EditStreamFilter, StagingSimulator};
+use super::{normalize_hunk, resolve_path, EditStreamFilter, OwnedAnchor, StagingSimulator};
 use crate::edits::protocol::xml::engine::OpenTag;
-use crate::edits::protocol::xml::{is_valid_turn_marker, FileBlockTag};
+use crate::edits::protocol::xml::{is_valid_turn_marker, FileBlockTag, XmlEditProtocol};
+use crate::edits::staging::AnchorEdit;
 use crate::providers::StreamEvent;
 
 mod scanner;
@@ -120,10 +121,12 @@ impl XmlStreamFilter {
                         .is_some_and(|edit_idx| edit_idx < ctl_start);
                     if !edit_first {
                         let text_part = self.buffer[..ctl_start].to_string();
+                        let control = self.buffer[ctl_start..ctl_end].to_string();
                         self.buffer.drain(..ctl_end);
                         if !text_part.is_empty() {
                             events.push(StreamEvent::TextDelta(text_part));
                         }
+                        self.preview_anchor_vehicle(&control, &mut events);
                         continue;
                     }
                 }
@@ -356,6 +359,236 @@ impl XmlStreamFilter {
         }
 
         events
+    }
+    /// Previews one anchored change set carried by the XML contour.
+    ///
+    /// The vehicle carries its whole change set as one JSON array, so it reaches
+    /// the filter only once its closing tag arrives. The decoded operations then
+    /// travel through the same event chain the structured contour produces, and
+    /// the decoder of the contour is the only authority on whether the control
+    /// tag is the vehicle at all: every other control tag decodes to no
+    /// operation and is stripped exactly as before.
+    fn preview_anchor_vehicle(&mut self, control: &str, events: &mut Vec<StreamEvent>) {
+        let operations = match XmlEditProtocol.parse_anchor_edits(control, &self.editable_paths) {
+            Ok(operations) => operations,
+            Err(message) => {
+                // A change set the authoritative decode rejects is reported by
+                // the staging engine with that diagnostic. The preview invents
+                // no file for a failure that names none.
+                tracing::warn!(%message, "anchored change set is not previewable");
+                return;
+            }
+        };
+        if operations.is_empty() {
+            return;
+        }
+
+        events.push(StreamEvent::EditStarted);
+        let mut preview = ChangeSetPreview::default();
+        for operation in operations {
+            preview.apply(operation, &mut self.staging, events);
+        }
+        preview.flush(events);
+    }
+}
+
+/// Running preview state of one completed anchored change set.
+///
+/// The vehicle delivers its whole change set at once, so the state lives only
+/// for that payload. Completion of a file is still buffered until the next file
+/// opens, which collapses several operations against one file into a single
+/// terminal event carrying the exact hunks count, exactly as the structured
+/// contour reports them.
+#[derive(Default)]
+struct ChangeSetPreview {
+    /// Key path of the file whose terminal event is still pending.
+    open_file: Option<String>,
+    /// Path the pending file reports in its terminal event.
+    open_display: String,
+    /// Hunks already emitted for each file.
+    hunk_counts: HashMap<String, usize>,
+    /// Anchored ranges each file has already addressed, in proposal order.
+    anchor_batches: HashMap<String, Vec<OwnedAnchor>>,
+}
+
+impl ChangeSetPreview {
+    /// Opens `path` as the file the following hunks belong to.
+    fn open(&mut self, path: &str, display: &str, op: EditFileOp, events: &mut Vec<StreamEvent>) {
+        if self.open_file.as_deref() == Some(path) {
+            return;
+        }
+        self.flush(events);
+        events.push(StreamEvent::EditFileStarted {
+            path: path.to_string(),
+            op_type: op,
+        });
+        self.open_file = Some(path.to_string());
+        self.open_display = display.to_string();
+    }
+
+    /// Emits the pending terminal event of the currently open file, if any.
+    fn flush(&mut self, events: &mut Vec<StreamEvent>) {
+        let Some(path) = self.open_file.take() else {
+            return;
+        };
+        let hunks_count = self.hunk_counts.remove(&path).unwrap_or(0);
+        let display = std::mem::take(&mut self.open_display);
+        events.push(StreamEvent::EditFileDone {
+            path: if display.is_empty() { path } else { display },
+            status: EditFileStatus::Ok,
+            error: None,
+            hunks_count,
+        });
+    }
+
+    /// Completes the open file with a rejection the staging engine shares.
+    ///
+    /// The preview reports exactly the entries the staging engine would refuse,
+    /// so a change set the harness accepts never fails here and the diagnostic
+    /// is the one the retrying event will show.
+    fn fail(
+        &mut self,
+        path: String,
+        message: String,
+        hunks_count: usize,
+        events: &mut Vec<StreamEvent>,
+    ) {
+        events.push(StreamEvent::EditFileDone {
+            path: path.clone(),
+            status: EditFileStatus::Error,
+            error: Some(message),
+            hunks_count,
+        });
+        self.hunk_counts.remove(&path);
+        self.open_file = None;
+        self.open_display.clear();
+    }
+
+    /// Returns the index the next hunk of `path` is reported under.
+    fn next_hunk_index(&self, path: &str) -> usize {
+        self.hunk_counts.get(path).copied().unwrap_or(0)
+    }
+
+    /// Applies one decoded operation and emits the corresponding hunk events.
+    ///
+    /// The operations reach this routine only after the authoritative converter
+    /// of the contour accepted them, so their paths are already resolved and
+    /// validated. Every rejection therefore comes from the staging engine and
+    /// carries its own diagnostic, expressed in the dialect of the anchor
+    /// strategy rather than in search/replace terms.
+    fn apply(
+        &mut self,
+        operation: EditOperation,
+        staging: &mut StagingSimulator,
+        events: &mut Vec<StreamEvent>,
+    ) {
+        match operation {
+            EditOperation::Create { path, content } => {
+                self.open(&path, &path, EditFileOp::Create, events);
+                let hunk_index = self.next_hunk_index(&path);
+                let content = normalize_hunk(&content);
+                events.push(StreamEvent::EditHunk {
+                    path: path.clone(),
+                    hunk_index,
+                    old_text: String::new(),
+                    new_text: content.clone(),
+                });
+                staging.overwrite(&path, content);
+                self.hunk_counts.insert(path, hunk_index + 1);
+            }
+            EditOperation::Overwrite { path, content } => {
+                self.open(&path, &path, EditFileOp::Overwrite, events);
+                let hunk_index = self.next_hunk_index(&path);
+                let new_content = normalize_hunk(&content);
+                match staging.current_content(&path) {
+                    Ok(old_text) => {
+                        events.push(StreamEvent::EditHunk {
+                            path: path.clone(),
+                            hunk_index,
+                            old_text,
+                            new_text: new_content.clone(),
+                        });
+                        staging.overwrite(&path, new_content);
+                        self.hunk_counts.insert(path, hunk_index + 1);
+                    }
+                    Err(message) => self.fail(path, message, hunk_index, events),
+                }
+            }
+            EditOperation::Delete { path } => {
+                self.open(&path, &path, EditFileOp::Delete, events);
+                // No hunk content; the pending terminal event reports zero hunks.
+                self.hunk_counts.entry(path).or_insert(0);
+            }
+            EditOperation::Move { from, to } => {
+                let display = format!("{} -> {}", from, to);
+                self.open(&from, &display, EditFileOp::Move, events);
+                self.open_display = display;
+                staging.apply_move(&from, &to);
+                self.hunk_counts.entry(from).or_insert(0);
+            }
+            EditOperation::Replace {
+                path,
+                old_text,
+                new_text,
+            } => {
+                self.open(&path, &path, EditFileOp::Replace, events);
+                let hunk_index = self.next_hunk_index(&path);
+                let old_text = normalize_hunk(&old_text);
+                let new_text = normalize_hunk(&new_text);
+                events.push(StreamEvent::EditHunk {
+                    path: path.clone(),
+                    hunk_index,
+                    old_text: old_text.clone(),
+                    new_text: new_text.clone(),
+                });
+                match staging.apply_hunk(&path, &old_text, &new_text) {
+                    Ok(()) => {
+                        self.hunk_counts.insert(path, hunk_index + 1);
+                    }
+                    Err(message) => self.fail(path, message, hunk_index + 1, events),
+                }
+            }
+            EditOperation::LineAnchor {
+                path,
+                start,
+                end,
+                content,
+            } => {
+                self.open(&path, &path, EditFileOp::Replace, events);
+                let hunk_index = self.next_hunk_index(&path);
+                let replacement = normalize_hunk(&content);
+                // The anchors name the lines the context block rendered, so the
+                // ranges of one file are one batch resolved against the original
+                // snapshot, exactly as the staging engine applies them.
+                let outcome = {
+                    let anchors = self.anchor_batches.entry(path.clone()).or_default();
+                    anchors.push(OwnedAnchor {
+                        start,
+                        end,
+                        content: replacement.clone(),
+                    });
+                    let batch: Vec<AnchorEdit<'_>> =
+                        anchors.iter().map(OwnedAnchor::as_edit).collect();
+                    staging.apply_anchor_batch(&path, &batch)
+                };
+                match outcome {
+                    Ok(replaced) => {
+                        // The snapshot text of the addressed range is the removed
+                        // side of the diff, so the preview shows an honest
+                        // replacement instead of a bare addition.
+                        let old_text = replaced.last().cloned().unwrap_or_default();
+                        events.push(StreamEvent::EditHunk {
+                            path: path.clone(),
+                            hunk_index,
+                            old_text,
+                            new_text: replacement,
+                        });
+                        self.hunk_counts.insert(path, hunk_index + 1);
+                    }
+                    Err(message) => self.fail(path, message, hunk_index, events),
+                }
+            }
+        }
     }
 }
 
@@ -808,5 +1041,195 @@ mod tests {
             })
             .collect();
         assert_eq!(text, "<ed");
+    }
+    /// Builds the JSON change set of the given anchored replacements.
+    fn anchored_changes(path: &str, ranges: &[(u16, u16, &str)]) -> String {
+        let changes: Vec<String> = ranges
+            .iter()
+            .map(|(start, end, content)| {
+                format!(
+                    "{{\"op\":\"replace\",\"path\":\"{path}\",\"to\":\"\",\"start\":\"{}\",\"end\":\"{}\",\"content\":\"{}\"}}",
+                    crate::edits::anchor::encode_anchor(path, *start),
+                    crate::edits::anchor::encode_anchor(path, *end),
+                    content.escape_default(),
+                )
+            })
+            .collect();
+        format!("[{}]", changes.join(","))
+    }
+
+    /// Collects every reported hunk as `(hunk_index, old_text, new_text)`.
+    fn hunks(events: &[StreamEvent]) -> Vec<(usize, String, String)> {
+        events
+            .iter()
+            .filter_map(|event| match event {
+                StreamEvent::EditHunk {
+                    hunk_index,
+                    old_text,
+                    new_text,
+                    ..
+                } => Some((*hunk_index, old_text.clone(), new_text.clone())),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Collects the terminal event of every file as `(status, hunks_count)`.
+    fn completions(events: &[StreamEvent]) -> Vec<(EditFileStatus, usize)> {
+        events
+            .iter()
+            .filter_map(|event| match event {
+                StreamEvent::EditFileDone {
+                    status,
+                    hunks_count,
+                    ..
+                } => Some((*status, *hunks_count)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Collects every forwarded conversational delta.
+    fn text_of(events: &[StreamEvent]) -> String {
+        events
+            .iter()
+            .filter_map(|event| match event {
+                StreamEvent::TextDelta(delta) => Some(delta.as_str()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn test_anchor_vehicle_previews_the_range_it_replaces() {
+        let path = "crates/foo.rs";
+        let input = format!(
+            "Rewriting the branch.\n<file_edits>{}</file_edits>\nDone.",
+            anchored_changes(path, &[(1, 1, "BETA\n")])
+        );
+        let mut filter = XmlStreamFilter::new(vec![path.to_string()], std::env::temp_dir())
+            .with_staged_contents(HashMap::from([(
+                path.to_string(),
+                "alpha\nbeta\ngamma\n".to_string(),
+            )]));
+        let mut events = Vec::new();
+        for ch in input.chars() {
+            events.extend(filter.push_chunk(&ch.to_string()));
+        }
+        events.extend(Box::new(filter).finish());
+
+        // The anchored entry names a line range, so the preview reports the
+        // snapshot text the range held instead of a search/replace miss.
+        assert_eq!(
+            hunks(&events),
+            vec![(0, "beta".to_string(), "BETA\n".to_string())]
+        );
+        assert_eq!(completions(&events), vec![(EditFileStatus::Ok, 1)]);
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, StreamEvent::EditStarted))
+                .count(),
+            1
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, StreamEvent::EditFileStarted { .. }))
+                .count(),
+            1
+        );
+        // The vehicle itself never reaches the conversational stream.
+        assert_eq!(text_of(&events), "Rewriting the branch.\n\nDone.");
+    }
+
+    #[test]
+    fn test_anchor_vehicle_entries_of_one_file_apply_as_one_batch() {
+        let path = "a.rs";
+        let input = format!(
+            "<file_edits>{}</file_edits>",
+            anchored_changes(path, &[(0, 0, "ALPHA\n"), (2, 2, "GAMMA\n")])
+        );
+        let mut filter = XmlStreamFilter::new(vec![path.to_string()], std::env::temp_dir())
+            .with_staged_contents(HashMap::from([(
+                path.to_string(),
+                "alpha\nbeta\ngamma\n".to_string(),
+            )]));
+        let mut events = filter.push_chunk(&input);
+        assert_eq!(
+            filter
+                .staging
+                .current_content(path)
+                .expect("staged content"),
+            "ALPHA\nbeta\nGAMMA\n"
+        );
+        events.extend(Box::new(filter).finish());
+
+        // Both ranges address the snapshot the context block rendered, so the
+        // later entry never overwrites the result of the earlier one.
+        assert_eq!(
+            hunks(&events),
+            vec![
+                (0, "alpha".to_string(), "ALPHA\n".to_string()),
+                (1, "gamma".to_string(), "GAMMA\n".to_string()),
+            ]
+        );
+        assert_eq!(completions(&events), vec![(EditFileStatus::Ok, 2)]);
+    }
+
+    #[test]
+    fn test_marked_anchor_vehicle_previews_the_change_set() {
+        let marker = "K7Q2ZX";
+        let path = "a.rs";
+        let input = format!(
+            "Intro.\n<file_edits_{marker}>{}</file_edits_{marker}>\nOutro.",
+            anchored_changes(path, &[(1, 1, "BETA\n")])
+        );
+        let mut filter = XmlStreamFilter::new(vec![path.to_string()], std::env::temp_dir())
+            .with_marker(Some(marker.to_string()))
+            .with_staged_contents(HashMap::from([(
+                path.to_string(),
+                "alpha\nbeta\ngamma\n".to_string(),
+            )]));
+        let mut events = Vec::new();
+        for ch in input.chars() {
+            events.extend(filter.push_chunk(&ch.to_string()));
+        }
+        events.extend(Box::new(filter).finish());
+
+        assert_eq!(
+            hunks(&events),
+            vec![(0, "beta".to_string(), "BETA\n".to_string())]
+        );
+        assert_eq!(completions(&events), vec![(EditFileStatus::Ok, 1)]);
+        assert_eq!(text_of(&events), "Intro.\n\nOutro.");
+    }
+
+    #[test]
+    fn test_anchor_vehicle_beyond_the_file_reports_the_staging_rejection() {
+        let path = "a.rs";
+        let input = format!(
+            "<file_edits>{}</file_edits>",
+            anchored_changes(path, &[(4, 4, "x\n")])
+        );
+        let mut filter = XmlStreamFilter::new(vec![path.to_string()], std::env::temp_dir())
+            .with_staged_contents(HashMap::from([(
+                path.to_string(),
+                "alpha\nbeta\n".to_string(),
+            )]));
+        let mut events = filter.push_chunk(&input);
+        events.extend(Box::new(filter).finish());
+
+        assert!(hunks(&events).is_empty());
+        let (status, error) = events
+            .iter()
+            .find_map(|event| match event {
+                StreamEvent::EditFileDone { status, error, .. } => Some((*status, error.clone())),
+                _ => None,
+            })
+            .expect("the file must be completed");
+        assert_eq!(status, EditFileStatus::Error);
+        let error = error.expect("the rejection must carry its diagnostic");
+        assert!(error.contains("names no line"), "{error}");
     }
 }

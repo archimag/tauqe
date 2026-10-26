@@ -5,15 +5,19 @@ use thiserror::Error;
 
 use crate::context::ContextManager;
 
+pub mod anchor;
 mod atomic;
 mod fuzzy;
 pub mod protocol;
+mod staging;
+pub(crate) mod strategy;
 pub mod stream;
 
 pub use protocol::{EditProtocolFactory, XmlEditProtocol};
 pub use stream::{EditStreamFilter, JsonStreamFilter, XmlStreamFilter};
 
 pub(crate) use fuzzy::apply_replace;
+pub(crate) use staging::apply_anchor_edits;
 
 use atomic::commit_staged_edits;
 
@@ -53,6 +57,45 @@ pub enum EditError {
         "Path '{0}' is excluded by the repository ignore rules (.gitignore or .git/info/exclude). Choose a path the repository tracks."
     )]
     IgnoredByGit(String),
+
+    #[error("In file '{path}': {source}")]
+    InvalidAnchor {
+        path: String,
+        #[source]
+        source: crate::edits::anchor::AnchorError,
+    },
+
+    #[error(
+        "In file '{path}': anchor '{anchor}' names no line of the file, which has {lines} line(s). Copy an anchor of this file from the <context> block."
+    )]
+    AnchorOutOfRange {
+        path: String,
+        anchor: String,
+        lines: usize,
+    },
+
+    #[error(
+        "In file '{path}': the range '{start}'..'{end}' runs backwards. The start anchor must name a line at or above the end anchor."
+    )]
+    ReversedAnchorRange {
+        path: String,
+        start: String,
+        end: String,
+    },
+
+    #[error(
+        "In file '{path}': the range '{start}'..'{end}' overlaps the range '{other_start}'..'{other_end}'. A change set must address disjoint line ranges."
+    )]
+    OverlappingAnchorRanges {
+        path: String,
+        start: String,
+        end: String,
+        other_start: String,
+        other_end: String,
+    },
+
+    #[error("In file '{path}': a 'replace' operation addressed no replacement range")]
+    ReplaceWithoutRange { path: String },
 }
 
 /// Cumulative in-memory state. Paths are normalized relative to the repository.
@@ -312,6 +355,19 @@ fn stage_and_validate_edits_inner(
                     continue;
                 }
 
+                // A move can name the configuration file as its destination,
+                // so the moved bytes pass the same validation an in-place
+                // rewrite of that file does.
+                if let Err(error) =
+                    validate_staged_project_config(&clean_to, Some(content.as_str()))
+                {
+                    result.failed_files.push(FailedFileEdit {
+                        path: clean_to,
+                        error,
+                    });
+                    continue;
+                }
+
                 result.staged_state.staged_files.remove(&clean_from);
                 result.staged_state.deleted_paths.insert(clean_from.clone());
                 result
@@ -331,36 +387,39 @@ fn stage_and_validate_edits_inner(
             EditOperation::Replace { path, .. }
             | EditOperation::Create { path, .. }
             | EditOperation::Delete { path }
-            | EditOperation::Overwrite { path, .. } => match context_manager.normalize_path(path) {
-                Ok(clean_path) => {
-                    // Git refuses to stage a path its ignore rules exclude,
-                    // so writing such a path is rejected here, while the
-                    // change set is still purely in memory.
-                    let writes_body = matches!(
-                        edit,
-                        EditOperation::Create { .. } | EditOperation::Overwrite { .. }
-                    );
-                    if writes_body && ignored_paths.contains(&clean_path) {
-                        result.failed_files.push(FailedFileEdit {
-                            path: clean_path.clone(),
-                            error: EditError::IgnoredByGit(clean_path),
-                        });
-                        continue;
+            | EditOperation::Overwrite { path, .. }
+            | EditOperation::LineAnchor { path, .. } => {
+                match context_manager.normalize_path(path) {
+                    Ok(clean_path) => {
+                        // Git refuses to stage a path its ignore rules exclude,
+                        // so writing such a path is rejected here, while the
+                        // change set is still purely in memory.
+                        let writes_body = matches!(
+                            edit,
+                            EditOperation::Create { .. } | EditOperation::Overwrite { .. }
+                        );
+                        if writes_body && ignored_paths.contains(&clean_path) {
+                            result.failed_files.push(FailedFileEdit {
+                                path: clean_path.clone(),
+                                error: EditError::IgnoredByGit(clean_path),
+                            });
+                            continue;
+                        }
+                        if !grouped.contains_key(&clean_path) {
+                            file_order.push(clean_path.clone());
+                        }
+                        grouped.entry(clean_path).or_default().push(edit);
                     }
-                    if !grouped.contains_key(&clean_path) {
-                        file_order.push(clean_path.clone());
+                    Err(err) => {
+                        if invalid_paths.insert(path.clone()) {
+                            result.failed_files.push(FailedFileEdit {
+                                path: path.clone(),
+                                error: EditError::InvalidPath(path.clone(), err.to_string()),
+                            });
+                        }
                     }
-                    grouped.entry(clean_path).or_default().push(edit);
                 }
-                Err(err) => {
-                    if invalid_paths.insert(path.clone()) {
-                        result.failed_files.push(FailedFileEdit {
-                            path: path.clone(),
-                            error: EditError::InvalidPath(path.clone(), err.to_string()),
-                        });
-                    }
-                }
-            },
+            }
         }
     }
 
@@ -436,7 +495,11 @@ fn stage_file_edits(
     // Files created in memory need not be added to context until disk commit.
     let mut newly_created = !full_path.exists() && content.is_some();
 
-    for edit in edits {
+    let mut index = 0;
+    while index < edits.len() {
+        let Some(edit) = edits.get(index) else {
+            break;
+        };
         if !in_context && !newly_created {
             match edit {
                 EditOperation::Create { .. } if !full_path.exists() => {}
@@ -445,9 +508,70 @@ fn stage_file_edits(
         }
 
         match edit {
+            EditOperation::LineAnchor {
+                start,
+                end,
+                content: replacement,
+                ..
+            } => {
+                // Anchored ranges address the lines the context block rendered,
+                // so a run of them is resolved against one snapshot and applied
+                // from the bottom of the file upwards. Replacing a lower range
+                // leaves the byte offsets of every higher range exactly where
+                // the snapshot put them, which is why no cumulative line shift
+                // is ever computed.
+                let mut batch = vec![staging::AnchorEdit {
+                    start: start.as_str(),
+                    end: end.as_str(),
+                    content: replacement.as_str(),
+                }];
+                index += 1;
+                while let Some(EditOperation::LineAnchor {
+                    start,
+                    end,
+                    content: replacement,
+                    ..
+                }) = edits.get(index)
+                {
+                    batch.push(staging::AnchorEdit {
+                        start: start.as_str(),
+                        end: end.as_str(),
+                        content: replacement.as_str(),
+                    });
+                    index += 1;
+                }
+                if !loaded {
+                    if !full_path.is_file() {
+                        return Err(EditError::FileNotFound(path.to_string()));
+                    }
+                    content = Some(
+                        std::fs::read_to_string(&full_path)
+                            .map_err(|err| EditError::Io(path.to_string(), err))?,
+                    );
+                    loaded = true;
+                }
+                let updated = {
+                    let current = content
+                        .as_deref()
+                        .ok_or_else(|| EditError::FileNotFound(path.to_string()))?;
+                    apply_anchor_edits(current, &batch, path)?
+                };
+                content = Some(updated);
+                continue;
+            }
             EditOperation::Replace {
                 old_text, new_text, ..
             } => {
+                // A replacement that echoes no text addresses no line of the
+                // file, so this is the staging end of the rejection the
+                // structured converter reports: the failure is carried as the
+                // typed rejection and the active patch strategy decides how the
+                // correction is explained.
+                if old_text.trim().is_empty() {
+                    return Err(EditError::ReplaceWithoutRange {
+                        path: path.to_string(),
+                    });
+                }
                 if !loaded {
                     if !full_path.is_file() {
                         return Err(EditError::FileNotFound(path.to_string()));
@@ -494,25 +618,26 @@ fn stage_file_edits(
                 ));
             }
         }
+        index += 1;
     }
     validate_staged_project_config(path, content.as_deref())?;
     Ok(content)
 }
 
-/// Repository-relative path of the project configuration file.
-const PROJECT_CONFIG_PATH: &str = "tauqe.toml";
-
-/// Validates the staged content of the project configuration file.
+/// Validates the staged content of the repository configuration file.
 ///
 /// The harness must never commit a configuration it could not load on its next
-/// start, so a change set that rewrites `tauqe.toml` is checked while it is
-/// still purely in memory. The validation has two levels: the TOML syntax is
-/// parsed first, and the resulting declaration is then validated semantically,
-/// so dropped model roles or a missing verification command are rejected as
-/// well. A failure surfaces as an ordinary [`EditError`], which activates the
-/// patch-retry loop instead of letting a broken file reach the working tree.
+/// start, so a change set that rewrites the repository configuration is checked
+/// while it is still purely in memory. Both accepted file names are guarded, so
+/// a repository configured through `.tauqe.toml` receives exactly the same
+/// treatment as one configured through `tauqe.toml`. The validation has two
+/// levels: the TOML syntax is parsed first, and the resulting declaration is
+/// then validated semantically, so dropped model roles or a missing
+/// verification command are rejected as well. A failure surfaces as an ordinary
+/// [`EditError`], which activates the patch-retry loop instead of letting a
+/// broken file reach the working tree.
 fn validate_staged_project_config(path: &str, content: Option<&str>) -> Result<(), EditError> {
-    if path != PROJECT_CONFIG_PATH {
+    if !crate::config::is_repo_config_path(path) {
         return Ok(());
     }
     let Some(content) = content else {
@@ -659,8 +784,6 @@ mod staging_tests {
             &[replace("a.rs", "two", "three")],
             Some(&first.staged_state),
         );
-        assert!(second.is_success());
-        assert_eq!(second.staged_state.staged_files["a.rs"], "three");
         let failed = stage_and_validate_edits(
             root,
             &cm,
@@ -692,7 +815,6 @@ mod staging_tests {
             &[replace("new.rs", "one", "two")],
             Some(&first.staged_state),
         );
-        assert!(second.is_success());
         assert_eq!(second.staged_state.staged_files["new.rs"], "two");
         let deleted = stage_and_validate_edits(
             root,
@@ -1143,6 +1265,71 @@ mod staging_tests {
     }
 
     #[test]
+    fn staged_dot_prefixed_project_config_is_validated_too() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        // The repository declares its configuration through the dot-prefixed
+        // spelling that discovery also accepts.
+        std::fs::write(root.join(".tauqe.toml"), VALID_CONFIG).unwrap();
+        let mut cm = ContextManager::new(root.to_path_buf());
+        cm.add_file(".tauqe.toml", ContextAccess::Editable).unwrap();
+
+        let broken = EditOperation::Overwrite {
+            path: ".tauqe.toml".into(),
+            content: "[models\nprimary = ]\n".into(),
+        };
+        let result = stage_and_validate_edits(root, &cm, std::slice::from_ref(&broken), None);
+        assert!(!result.is_success());
+        match &result.failed_files[0].error {
+            EditError::InvalidConfig { path, message } => {
+                assert_eq!(path, ".tauqe.toml");
+                assert!(
+                    message.contains("not valid TOML"),
+                    "a syntactic rejection must name the TOML syntax: {message}"
+                );
+            }
+            other => panic!("expected a syntactic configuration rejection, got {other:?}"),
+        }
+        assert!(
+            result.staged_state.staged_files.is_empty(),
+            "a rejected configuration must not reach the staged state"
+        );
+
+        // The semantic layer guards the second spelling as well.
+        let dropped_verify = EditOperation::Overwrite {
+            path: ".tauqe.toml".into(),
+            content: "[models]\nprimary = [\"openrouter:a/b\"]\n".into(),
+        };
+        let result =
+            stage_and_validate_edits(root, &cm, std::slice::from_ref(&dropped_verify), None);
+        assert!(!result.is_success());
+        match &result.failed_files[0].error {
+            EditError::InvalidConfig { message, .. } => {
+                assert!(
+                    message.contains("verify"),
+                    "a semantic rejection must name the missing invariant: {message}"
+                );
+            }
+            other => panic!("expected a semantic configuration rejection, got {other:?}"),
+        }
+
+        // A rewrite that preserves the invariants stages normally, and the
+        // check itself never writes the configuration to disk.
+        let extended = EditOperation::Overwrite {
+            path: ".tauqe.toml".into(),
+            content: "[models]\nprimary = [\"openrouter:a/b\"]\n\n[project.verify]\ncommand = \"cargo\"\nargs = [\"test\", \"--workspace\"]\n".into(),
+        };
+        let result = stage_and_validate_edits(root, &cm, std::slice::from_ref(&extended), None);
+        assert!(result.is_success(), "{:?}", result.failed_files);
+        assert!(result.staged_state.staged_files.contains_key(".tauqe.toml"));
+        assert_eq!(
+            std::fs::read_to_string(root.join(".tauqe.toml")).unwrap(),
+            VALID_CONFIG,
+            "staging must never write the configuration to disk"
+        );
+    }
+
+    #[test]
     fn staged_project_config_preserving_invariants_is_accepted() {
         let dir = tempdir().unwrap();
         let root = dir.path();
@@ -1265,5 +1452,226 @@ mod staging_tests {
             result.staged_state.staged_files["a.rs"], "pub fn value() -> i32 { 42 }\n",
             "a repository without a filter keeps the authored content"
         );
+    }
+
+    /// Builds an anchored replacement of an inclusive line range.
+    fn anchored_range(path: &str, start: u16, end: u16, content: &str) -> EditOperation {
+        EditOperation::LineAnchor {
+            path: path.to_string(),
+            start: anchor::encode_anchor(path, start),
+            end: anchor::encode_anchor(path, end),
+            content: content.to_string(),
+        }
+    }
+
+    #[test]
+    fn anchored_ranges_stage_bottom_to_top_without_touching_disk() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        std::fs::write(root.join("a.rs"), "alpha\nbeta\ngamma\n").unwrap();
+        let mut cm = ContextManager::new(root.to_path_buf());
+        cm.add_file("a.rs", ContextAccess::Editable).unwrap();
+
+        // The proposal names the lower range first, yet both ranges resolve
+        // against one snapshot and apply from the bottom of the file upwards.
+        let edits = vec![
+            anchored_range("a.rs", 0, 0, "ALPHA\n"),
+            anchored_range("a.rs", 2, 2, "GAMMA\n"),
+        ];
+        let result = stage_and_validate_edits(root, &cm, &edits, None);
+        assert!(result.is_success(), "{:?}", result.failed_files);
+        assert_eq!(
+            result.staged_state.staged_files["a.rs"],
+            "ALPHA\nbeta\nGAMMA\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join("a.rs")).unwrap(),
+            "alpha\nbeta\ngamma\n",
+            "staging must never write the anchored change set to disk"
+        );
+    }
+
+    #[test]
+    fn anchored_range_collapses_into_a_single_replacement() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        std::fs::write(root.join("a.rs"), "alpha\nbeta\ngamma\ndelta\n").unwrap();
+        let mut cm = ContextManager::new(root.to_path_buf());
+        cm.add_file("a.rs", ContextAccess::Editable).unwrap();
+
+        let edits = vec![anchored_range("a.rs", 1, 2, "middle\n")];
+        let result = stage_and_validate_edits(root, &cm, &edits, None);
+        assert!(result.is_success(), "{:?}", result.failed_files);
+        assert_eq!(
+            result.staged_state.staged_files["a.rs"],
+            "alpha\nmiddle\ndelta\n"
+        );
+    }
+
+    #[test]
+    fn malformed_anchor_ranges_are_reported_for_the_retry_loop() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        std::fs::write(root.join("a.rs"), "alpha\nbeta\n").unwrap();
+        let mut cm = ContextManager::new(root.to_path_buf());
+        cm.add_file("a.rs", ContextAccess::Editable).unwrap();
+
+        let beyond = vec![anchored_range("a.rs", 0, 5, "x\n")];
+        let result = stage_and_validate_edits(root, &cm, &beyond, None);
+        assert!(!result.is_success());
+        assert!(matches!(
+            &result.failed_files[0].error,
+            EditError::AnchorOutOfRange { lines: 2, .. }
+        ));
+
+        let overlapping = vec![
+            anchored_range("a.rs", 0, 1, "x\n"),
+            anchored_range("a.rs", 1, 1, "y\n"),
+        ];
+        let result = stage_and_validate_edits(root, &cm, &overlapping, None);
+        assert!(!result.is_success());
+        assert!(matches!(
+            &result.failed_files[0].error,
+            EditError::OverlappingAnchorRanges { .. }
+        ));
+        assert!(result.staged_state.staged_files.is_empty());
+        assert_eq!(
+            std::fs::read_to_string(root.join("a.rs")).unwrap(),
+            "alpha\nbeta\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn anchored_change_set_applies_to_disk_and_stays_editable() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        std::fs::write(root.join("a.rs"), "alpha\nbeta\ngamma\n").unwrap();
+        let mut cm = ContextManager::new(root.to_path_buf());
+        cm.add_file("a.rs", ContextAccess::Editable).unwrap();
+
+        let proposal = EditProposal {
+            summary: "anchored edit".into(),
+            edits: vec![anchored_range("a.rs", 1, 1, "BETA\n")],
+        };
+        let changed = apply_edit_proposal(root, &mut cm, &proposal).await.unwrap();
+        assert_eq!(changed, vec!["a.rs"]);
+        assert_eq!(
+            std::fs::read_to_string(root.join("a.rs")).unwrap(),
+            "alpha\nBETA\ngamma\n"
+        );
+        assert!(cm.is_editable("a.rs").unwrap());
+    }
+    #[test]
+    fn replace_without_a_needle_is_reported_as_a_typed_rejection() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        std::fs::write(root.join("a.rs"), "alpha\nbeta\n").unwrap();
+        let mut cm = ContextManager::new(root.to_path_buf());
+        cm.add_file("a.rs", ContextAccess::Editable).unwrap();
+
+        // A replacement that echoes no text addresses no line of the file, so
+        // the failure is carried as the typed rejection instead of a bare match
+        // miss: the active patch strategy decides how the correction is
+        // explained to the model.
+        for needle in ["", "  \n\t "] {
+            let result = stage_and_validate_edits(root, &cm, &[replace("a.rs", needle, "x")], None);
+            assert!(!result.is_success());
+            assert!(matches!(
+                &result.failed_files[0].error,
+                EditError::ReplaceWithoutRange { path } if path == "a.rs"
+            ));
+        }
+        assert_eq!(
+            std::fs::read_to_string(root.join("a.rs")).unwrap(),
+            "alpha\nbeta\n",
+            "a rejected replacement must never reach disk"
+        );
+    }
+
+    /// Every surface that reports a rejected change set speaks the dialect of
+    /// the declared patch strategy.
+    ///
+    /// A replacement that echoes no text is refused by staging as the typed
+    /// [`EditError::ReplaceWithoutRange`], so the retry reason — the text the
+    /// retrying event shows and the retry request repeats — describes it in the
+    /// vocabulary the turn actually uses. An anchored project is therefore
+    /// never told about `old_text`, while a search/replace project keeps the
+    /// field name its own instructions declare.
+    #[test]
+    fn rejected_change_set_reaches_the_model_in_the_active_strategy_dialect() {
+        use std::collections::{HashMap, HashSet};
+        use tauqe_protocol::PatchStrategy;
+
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        std::fs::write(root.join("a.rs"), "alpha\nbeta\n").unwrap();
+        let mut cm = ContextManager::new(root.to_path_buf());
+        cm.add_file("a.rs", ContextAccess::Editable).unwrap();
+
+        // A replacement that echoes no text addresses no line of the file, so
+        // the failure is the typed rejection instead of a bare match miss.
+        let result = stage_and_validate_edits(root, &cm, &[replace("a.rs", "  \n\t ", "x")], None);
+        let Some(FailedFileEdit { path, error }) = result.failed_files.into_iter().next() else {
+            panic!("a rangeless replacement must be rejected");
+        };
+        assert!(
+            matches!(&error, EditError::ReplaceWithoutRange { path: rejected } if rejected == &path),
+            "{error:?}"
+        );
+
+        let failed = HashMap::from([(path.clone(), error)]);
+        let anchored_reason = crate::workflow::retry::format_patch_retry_reason(
+            &failed[&path],
+            PatchStrategy::LineAnchor,
+        );
+        assert!(
+            anchored_reason.contains("anchors"),
+            "the anchored rejection must point at the anchors: {anchored_reason}"
+        );
+        assert!(
+            anchored_reason.contains("overwrite"),
+            "the anchored rejection must offer the full rewrite: {anchored_reason}"
+        );
+        assert!(
+            !anchored_reason.contains("old_text"),
+            "the anchored rejection named a foreign field: {anchored_reason}"
+        );
+
+        let echoed_reason = crate::workflow::retry::format_patch_retry_reason(
+            &failed[&path],
+            PatchStrategy::SearchReplace,
+        );
+        assert!(
+            echoed_reason.contains("old_text"),
+            "the search/replace rejection must keep its own field name: {echoed_reason}"
+        );
+
+        // The retry request repeats the very reason the retrying event shows.
+        let anchored_prompt = crate::workflow::retry::build_patch_retry_prompt(
+            &HashSet::new(),
+            &failed,
+            &[],
+            None,
+            PatchStrategy::LineAnchor,
+        );
+        assert!(
+            anchored_prompt.contains(&anchored_reason),
+            "{anchored_prompt}"
+        );
+        for foreign in ["old_text", "new_text", "Search block"] {
+            assert!(
+                !anchored_prompt.contains(foreign),
+                "the anchored retry request named {foreign}: {anchored_prompt}"
+            );
+        }
+
+        let echoed_prompt = crate::workflow::retry::build_patch_retry_prompt(
+            &HashSet::new(),
+            &failed,
+            &[],
+            None,
+            PatchStrategy::SearchReplace,
+        );
+        assert!(echoed_prompt.contains(&echoed_reason), "{echoed_prompt}");
     }
 }

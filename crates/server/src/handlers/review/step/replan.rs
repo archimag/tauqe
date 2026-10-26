@@ -199,6 +199,9 @@ pub(super) async fn run_review_subplan_with_replans(
             }),
             &operation,
             RefineAdmission::Harness,
+            // Replanning reprojects the horizon of a batch member, so it never
+            // ends the shared turn.
+            true,
         )
         .await
         {

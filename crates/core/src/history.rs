@@ -5,7 +5,7 @@ pub mod storage;
 use anyhow::Result;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use tauqe_protocol::{HistoryEntryStatus, UiHistoryItem, UiHistoryKind};
+use tauqe_protocol::{HistoryEntryStatus, HistoryFileChange, UiHistoryItem, UiHistoryKind};
 
 pub use compaction::{
     build_compacted_history, estimate_entries_tokens, partition_head_tail,
@@ -44,7 +44,86 @@ impl std::fmt::Debug for HistoryEntryListener {
         f.write_str("HistoryEntryListener(..)")
     }
 }
+/// Interaction records frozen at the start of a bounded turn.
+///
+/// The freeze keeps the records themselves rather than the rendered
+/// `<history>` block. The semantic layout renders that block from them through
+/// [`HistorySnapshot::render_block`], which is the same definition the live
+/// manager renders through, so the frozen block and the live block are byte
+/// for byte identical. The chronological layout reads the recorded context
+/// watermarks from the identical structure to place the context files between
+/// the turns that introduced them.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct HistorySnapshot {
+    entries: Vec<HistoryEntry>,
+}
 
+impl HistorySnapshot {
+    /// Freezes `entries` into a turn-scoped snapshot.
+    pub fn new(entries: Vec<HistoryEntry>) -> Self {
+        Self { entries }
+    }
+
+    /// Frozen records, in recording order.
+    pub fn entries(&self) -> &[HistoryEntry] {
+        &self.entries
+    }
+
+    /// Reports whether the snapshot carries no record at all.
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    /// Highest context insertion watermark its turn records observed.
+    ///
+    /// A record written before the watermark existed carries none, so a
+    /// session whose turns never captured one stays distinguishable from a
+    /// session whose turns observed an empty context.
+    pub fn watermark(&self) -> Option<u64> {
+        self.entries
+            .iter()
+            .filter_map(|entry| match entry {
+                HistoryEntry::Turn {
+                    context_watermark, ..
+                } => *context_watermark,
+                _ => None,
+            })
+            .max()
+    }
+
+    /// Renders the `<history>` block, or `None` when the snapshot is empty.
+    pub fn render_block(&self) -> Option<String> {
+        render_history_block(&self.entries)
+    }
+}
+
+/// Renders interaction records as the `<history>` prompt block.
+///
+/// The live manager and every turn-scoped snapshot render through this single
+/// definition, so a frozen snapshot reproduces byte for byte the block the
+/// live history would have produced at the same moment.
+///
+/// A record that cannot be serialized is skipped with a diagnostic instead of
+/// failing the whole block: the records around it still describe the session.
+pub fn render_history_block(entries: &[HistoryEntry]) -> Option<String> {
+    if entries.is_empty() {
+        return None;
+    }
+    let mut output = String::from("<history>\n");
+    for entry in entries {
+        match entry.to_jsonl_line() {
+            Ok(line) => {
+                output.push_str(&line);
+                output.push('\n');
+            }
+            Err(error) => {
+                tracing::warn!("Failed to serialize a history record for the prompt: {error}");
+            }
+        }
+    }
+    output.push_str("</history>");
+    Some(output)
+}
 /// Facade for persistent interaction history management.
 #[derive(Debug, Clone)]
 pub struct HistoryManager {
@@ -102,7 +181,11 @@ impl HistoryManager {
                 text: prompt.clone(),
                 summary: None,
                 commit_hash: None,
-                files: context.clone(),
+                files: context
+                    .iter()
+                    .cloned()
+                    .map(HistoryFileChange::plain)
+                    .collect(),
                 status: HistoryEntryStatus::Committed,
             },
             HistoryEntry::Response {
@@ -117,6 +200,9 @@ impl HistoryManager {
                 text: message.clone(),
                 summary: summary.clone(),
                 commit_hash: commit.clone(),
+                // The persisted record already carries the typed operation, so
+                // the producer's knowledge reaches every client unchanged and is
+                // never re-inferred from rendered text (Conventions §1.5).
                 files: files.clone(),
                 status: HistoryEntryStatus::Committed,
             },
@@ -149,7 +235,11 @@ impl HistoryManager {
                     text,
                     summary: Some(format!("Review: {} findings", findings_count)),
                     commit_hash: None,
-                    files: files.clone(),
+                    files: files
+                        .iter()
+                        .cloned()
+                        .map(HistoryFileChange::plain)
+                        .collect(),
                     status: HistoryEntryStatus::Committed,
                 }
             }
@@ -185,6 +275,7 @@ impl HistoryManager {
             id: Some(self.current_max_id),
             prompt: prompt.into(),
             context: context_files,
+            context_watermark: None,
         };
         self.storage.append_entry(&entry)?;
         self.notify_entry(&entry, HistoryEntryStatus::Active);
@@ -196,7 +287,7 @@ impl HistoryManager {
         message: impl Into<String>,
         commit: Option<String>,
         summary: Option<String>,
-        files: Vec<String>,
+        files: Vec<HistoryFileChange>,
     ) -> Result<HistoryEntry> {
         self.current_max_id += 1;
         let entry = HistoryEntry::Response {
@@ -281,22 +372,25 @@ impl HistoryManager {
     }
 
     /// Formats the session history directly inside `<history>...</history>` for LLM prompt injection.
+    /// Formats the session history directly inside `<history>...</history>` for LLM prompt injection.
+    ///
+    /// The block comes from the same renderer a turn-scoped
+    /// [`HistorySnapshot`] renders through, so a frozen snapshot reproduces the
+    /// block the live history would produce at that moment byte for byte.
     /// Returns an empty string if there are no history entries.
     pub fn format_history_tag(&self) -> Result<String> {
         let entries = self.get_entries()?;
-        if entries.is_empty() {
-            return Ok(String::new());
-        }
-
-        let mut output = String::from("<history>\n");
-        for entry in &entries {
-            output.push_str(&entry.to_jsonl_line()?);
-            output.push('\n');
-        }
-        output.push_str("</history>");
-        Ok(output)
+        Ok(render_history_block(&entries).unwrap_or_default())
     }
 
+    /// Freezes the current records into a turn-scoped [`HistorySnapshot`].
+    ///
+    /// The snapshot keeps the records themselves, so a later round renders the
+    /// semantic `<history>` block and reads the recorded context watermarks
+    /// from the identical structure.
+    pub fn snapshot(&self) -> Result<HistorySnapshot> {
+        Ok(HistorySnapshot::new(self.get_entries()?))
+    }
     /// Partitions current history into `(head, tail)` for compaction.
     pub fn prepare_compaction(
         &self,
@@ -368,6 +462,7 @@ impl HistoryManager {
 mod tests {
     use super::*;
     use std::io::Write;
+    use tauqe_protocol::edit::EditFileOp;
     use tempfile::tempdir;
 
     #[test]
@@ -384,7 +479,7 @@ mod tests {
             "Checked git status",
             Some("f1a2b3c".to_string()),
             Some("Fix status check".to_string()),
-            vec!["src/git.rs".to_string()],
+            vec![HistoryFileChange::plain("src/git.rs")],
         )
         .unwrap();
         let entries = hm.get_entries().unwrap();
@@ -519,19 +614,20 @@ mod tests {
             id: Some(2),
             prompt: "Write tests".to_string(),
             context: vec!["test.rs".to_string()],
+            context_watermark: None,
         };
         let item2 = HistoryManager::entry_to_ui_item(2, &entry2);
         assert_eq!(item2.id, 2);
         assert_eq!(item2.kind, UiHistoryKind::User);
         assert_eq!(item2.text, "Write tests");
-        assert_eq!(item2.files, vec!["test.rs"]);
+        assert_eq!(item2.files, vec![HistoryFileChange::plain("test.rs")]);
 
         let entry3 = HistoryEntry::Response {
             id: Some(3),
             message: "Done".to_string(),
             commit: Some("a1b2c3d".to_string()),
             summary: Some("Add tests".to_string()),
-            files: vec!["test.rs".to_string()],
+            files: vec![HistoryFileChange::plain("test.rs")],
         };
         let item3 = HistoryManager::entry_to_ui_item(3, &entry3);
         assert_eq!(item3.id, 3);
@@ -539,7 +635,25 @@ mod tests {
         assert_eq!(item3.text, "Done");
         assert_eq!(item3.commit_hash, Some("a1b2c3d".to_string()));
         assert_eq!(item3.summary, Some("Add tests".to_string()));
-        assert_eq!(item3.files, vec!["test.rs"]);
+        assert_eq!(item3.files, vec![HistoryFileChange::plain("test.rs")]);
+
+        // A persisted record already carries the typed operation, so the UI
+        // item passes every record through unchanged.
+        let entry5_files = vec![
+            HistoryFileChange::operated(EditFileOp::Replace, "src/lib.rs"),
+            HistoryFileChange::operated(EditFileOp::Create, "src/util.rs"),
+            HistoryFileChange::moved("src/a.rs", "src/b.rs"),
+            HistoryFileChange::plain("src/plain.rs"),
+        ];
+        let entry5 = HistoryEntry::Response {
+            id: Some(5),
+            message: "Refactored".to_string(),
+            commit: None,
+            summary: None,
+            files: entry5_files.clone(),
+        };
+        let item5 = HistoryManager::entry_to_ui_item(5, &entry5);
+        assert_eq!(item5.files, entry5_files);
 
         // A review record maps its summary into the history item text so the
         // analytical report survives the streaming turn.
@@ -558,7 +672,7 @@ mod tests {
         assert!(item4.text.contains("Focus on locking"));
         assert!(item4.text.contains("Locking is racy under load."));
         assert_eq!(item4.summary, Some("Review: 2 findings".to_string()));
-        assert_eq!(item4.files, vec!["src/lib.rs"]);
+        assert_eq!(item4.files, vec![HistoryFileChange::plain("src/lib.rs")]);
     }
 
     #[test]
@@ -605,11 +719,13 @@ mod tests {
             id: Some(10),
             prompt: "Prompt 10".to_string(),
             context: vec![],
+            context_watermark: None,
         };
         let entry2 = HistoryEntry::Turn {
             id: Some(20),
             prompt: "Prompt 20".to_string(),
             context: vec![],
+            context_watermark: None,
         };
 
         storage.append_entry(&entry1).unwrap();

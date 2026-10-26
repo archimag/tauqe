@@ -234,6 +234,15 @@ pub fn spawn_message_reader(mut reader: Lines<BufReader<ChildStdout>>) -> mpsc::
     msg_rx
 }
 
+/// Writes one request and records it as in flight.
+///
+/// # Locking invariant
+///
+/// Callers must not hold the `AppState` guard across this `await`. The event loop
+/// is the only task that locks the state, so a write parked on a daemon that
+/// stopped draining its stdin would freeze rendering and server-message
+/// processing at once. Complete the state mutation, drop the guard, and only
+/// then await this function — as `start_turn` and every dialog handler do (c-1).
 pub async fn send_request_with_id(
     conn: &mut RpcConnection,
     id: u64,
@@ -256,6 +265,10 @@ pub async fn send_request_with_id(
     Ok(())
 }
 
+/// Writes a request under a freshly allocated identifier.
+///
+/// The same locking invariant as [`send_request_with_id`] applies: the
+/// `AppState` guard must already be released when this function is awaited.
 pub async fn send_request(
     conn: &mut RpcConnection,
     method: &str,

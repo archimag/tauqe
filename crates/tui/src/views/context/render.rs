@@ -8,7 +8,7 @@ use crate::app::AppState;
 use crate::i18n::active_t;
 use crate::ui::centered_rect;
 
-use super::ContextRow;
+use super::{ContextCandidate, ContextRow};
 
 pub fn render_context_view(
     frame: &mut ratatui::Frame,
@@ -337,25 +337,13 @@ fn render_add_file_picker(frame: &mut ratatui::Frame, state: &AppState) {
         for idx in start_idx..end_idx {
             let candidate = &state.context_view.filtered_candidates[idx];
             let is_sel = idx == selected;
-            let (prefix, style) = if is_sel {
-                (
-                    " ▶ ",
-                    engine
-                        .bg(palette.overlay)
-                        .fg(engine.color(palette.text_primary))
-                        .bold(),
-                )
-            } else {
-                ("   ", engine.fg(palette.text_secondary))
-            };
+            let prefix = if is_sel { " ▶ " } else { "   " };
 
-            let is_pattern_entry = candidate.starts_with("[+] Add all matching '");
-
-            let line = if is_pattern_entry {
-                Line::from(vec![
+            let line = match candidate {
+                ContextCandidate::BulkPattern { .. } => Line::from(vec![
                     Span::styled(prefix, engine.fg(palette.status_success).bold()),
                     Span::styled(
-                        candidate,
+                        candidate.display_label(),
                         if is_sel {
                             engine
                                 .bg(palette.status_success)
@@ -365,12 +353,21 @@ fn render_add_file_picker(frame: &mut ratatui::Frame, state: &AppState) {
                             engine.fg(palette.status_success).bold()
                         },
                     ),
-                ])
-            } else {
-                Line::from(vec![
-                    Span::styled(prefix, engine.fg(palette.status_info)).bold(),
-                    Span::styled(candidate, style),
-                ])
+                ]),
+                ContextCandidate::File(path) => {
+                    let path_style = if is_sel {
+                        engine
+                            .bg(palette.overlay)
+                            .fg(engine.color(palette.text_primary))
+                            .bold()
+                    } else {
+                        engine.fg(palette.text_secondary)
+                    };
+                    Line::from(vec![
+                        Span::styled(prefix, engine.fg(palette.status_info).bold()),
+                        Span::styled(path.as_str(), path_style),
+                    ])
+                }
             };
 
             candidate_lines.push(line);

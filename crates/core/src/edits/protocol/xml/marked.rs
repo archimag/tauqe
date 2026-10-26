@@ -5,10 +5,12 @@
 //! reasoning models that drop the marker suffix by retrying unmarked tags.
 
 use crate::edits::protocol::ContextRequest;
-use tauqe_protocol::{DirListRequest, DocTopic, EditOperation, ModelResult};
+use tauqe_protocol::{DirListRequest, DocTopic, EditOperation, ModelResult, PatchStrategy};
 
 use super::clean::extract_conversational_text;
-use super::engine::allows_unmarked_fallback;
+use super::engine::{
+    activate_unmarked_hidden_tags, allows_unmarked_fallback, strip_all_control_tags,
+};
 use super::marker::{normalize_marked_xml, restore_xml_literals};
 use super::prompt;
 use super::tags::{self, TerminalOutcome, VerifyRequest};
@@ -285,6 +287,17 @@ impl MarkedXmlEditProtocol {
         self.parse_error_normalized(&normalized)
     }
 
+    /// Extracts conversational text from marker-normalized output.
+    ///
+    /// Normalization protects every unsuffixed tag as literal content, so a
+    /// control tag the model emitted without the marker suffix is re-activated
+    /// first. The cleaned record then hides the same protocol scaffolding the
+    /// streaming contour already suppresses, and no raw tag leaks into history.
+    fn extract_clean_message(&self, normalized: &str) -> String {
+        let activated = activate_unmarked_hidden_tags(normalized, &self.marker);
+        extract_conversational_text(&activated)
+    }
+
     /// Cleans model output, stripping terminal outcome and scratchpad tags.
     ///
     /// Both marker-suffixed and unmarked tags are removed (while respecting
@@ -298,13 +311,21 @@ impl MarkedXmlEditProtocol {
             return extract_conversational_text(&without_scratchpad);
         }
         let normalized = normalize_marked_xml(&without_scratchpad, &self.marker, true);
-        restore_xml_literals(&extract_conversational_text(&normalized), &self.marker)
+        restore_xml_literals(&self.extract_clean_message(&normalized), &self.marker)
     }
 
     /// Returns system prompt instructions with the turn marker applied.
-    pub fn system_instructions(&self, editable_paths: &[String]) -> String {
+    ///
+    /// `patch_strategy` selects the vocabulary of the change set the reference
+    /// describes, so a marked turn advertises exactly the fields its decoder
+    /// accepts.
+    pub fn system_instructions(
+        &self,
+        editable_paths: &[String],
+        patch_strategy: PatchStrategy,
+    ) -> String {
         prompt::apply_turn_marker(
-            &prompt::base_system_instructions(editable_paths),
+            &prompt::base_system_instructions(editable_paths, patch_strategy),
             &self.marker,
         )
     }
@@ -322,7 +343,13 @@ impl MarkedXmlEditProtocol {
     ) -> ModelResult {
         let mut result = XmlEditProtocol.parse_output(normalized, editable_paths);
         match &mut result {
-            ModelResult::Answer { text } => *text = restore_xml_literals(text, &self.marker),
+            ModelResult::Answer { text } => {
+                // The answer text is derived from the same normalized payload, so
+                // a control tag that dropped the marker suffix must be re-activated
+                // before it is stripped instead of surviving as literal markup.
+                let activated = activate_unmarked_hidden_tags(text, &self.marker);
+                *text = restore_xml_literals(&strip_all_control_tags(&activated), &self.marker);
+            }
             ModelResult::Edit {
                 summary,
                 edits,
@@ -360,10 +387,21 @@ impl MarkedXmlEditProtocol {
                             *from = restore_xml_literals(from, &self.marker);
                             *to = restore_xml_literals(to, &self.marker);
                         }
+                        EditOperation::LineAnchor {
+                            path,
+                            start,
+                            end,
+                            content,
+                        } => {
+                            *path = restore_xml_literals(path, &self.marker);
+                            *start = restore_xml_literals(start, &self.marker);
+                            *end = restore_xml_literals(end, &self.marker);
+                            *content = restore_xml_literals(content, &self.marker);
+                        }
                     }
                 }
                 let message =
-                    restore_xml_literals(&extract_conversational_text(normalized), &self.marker);
+                    restore_xml_literals(&self.extract_clean_message(normalized), &self.marker);
                 *proposal = Some(tauqe_protocol::ModelResultProposal {
                     message,
                     ..Default::default()
@@ -407,7 +445,7 @@ mod tests {
     }
 
     #[test]
-    fn test_marked_xml_clean_assistant_text_preserves_unsuffixed_plan_literals() {
+    fn test_marked_xml_clean_assistant_text_suppresses_unsuffixed_plan_tags() {
         let marker = "M12345";
         let proto = MarkedXmlEditProtocol::new(marker);
 
@@ -420,9 +458,51 @@ mod tests {
             m = marker
         );
 
+        // The stream contour suppresses an unmarked plan container, so the
+        // cleaned record must agree instead of re-materializing the tag.
         let cleaned = proto.clean_assistant_text(&output);
-        assert!(cleaned.contains("<plan action=\"update\" id=\"my-plan\">"));
+        assert_eq!(cleaned, "To update a plan, write:");
+        assert!(!cleaned.contains("<plan"));
         assert!(!cleaned.contains("real-plan"));
+    }
+
+    #[test]
+    fn test_marked_xml_strips_unmarked_control_tags_from_cleaning_and_message() {
+        let marker = "M778899";
+        let proto = MarkedXmlEditProtocol::new(marker);
+        let editable = vec!["src/lib.rs".to_string()];
+
+        let output = format!(
+            "Applying the change.\n\
+            <context_request path=\"src/lib.rs\" access=\"editable\" />\n\
+            <verify target=\"check\" on_success=\"silent\" />\n\
+            <user_language>English</user_language>\n\
+            <tauqe_edits_{m} summary=\"Update lib\">\n  \
+              <edit_{m} path=\"src/lib.rs\">\n    \
+                <search_{m}>\nold();\n</search_{m}>\n    \
+                <replace_{m}>\nnew();\n</replace_{m}>\n  \
+              </edit_{m}>\n\
+            </tauqe_edits_{m}>\n\
+            Done.",
+            m = marker
+        );
+
+        // The cleaned record hides the same scaffolding the stream filter
+        // already suppresses, even though these tags dropped the marker suffix.
+        let cleaned = proto.clean_assistant_text(&output);
+        assert_eq!(cleaned, "Applying the change.\n\nDone.");
+        assert!(!cleaned.contains("context_request"));
+        assert!(!cleaned.contains("verify"));
+        assert!(!cleaned.contains("user_language"));
+
+        // The decoded proposal message travels through the identical pipeline.
+        match proto.parse_output(&output, &editable) {
+            ModelResult::Edit { proposal, .. } => {
+                let message = proposal.map(|entry| entry.message).unwrap_or_default();
+                assert_eq!(message, "Applying the change.\n\nDone.");
+            }
+            _ => panic!("Expected ModelResult::Edit"),
+        }
     }
 
     #[test]

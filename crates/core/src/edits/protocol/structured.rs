@@ -1,13 +1,14 @@
 use tauqe_protocol::discussion::normalize_repo_map_path;
 use tauqe_protocol::{
     CapabilitySet, DirListRequest, DocTopic, EditFileOp, EditOperation, EditOutcome, LlmCapability,
-    ModelResult, ModelResultProposal,
+    ModelResult, ModelResultProposal, PatchStrategy, StructuredChangeProposal,
 };
 
 use crate::capabilities::{
     abort_invocations, custom_tool_invocations, CapabilityRegistry, PromptRenderContext,
 };
 use crate::edits::protocol::xml::engine::strip_all_control_tags;
+use crate::edits::strategy::StrategyProfile;
 use crate::edits::stream::json::decode::{balanced_object_end, strip_code_fence};
 use crate::providers::{JsonSchemaDefinition, ResponseFormat};
 
@@ -23,8 +24,8 @@ impl StructuredEditProtocol {
     ///
     /// The default surface is intent-oriented, never transport-specific, so the
     /// structured contour advertises exactly what the XML contour advertises.
-    pub fn schema(editable_paths: &[String]) -> serde_json::Value {
-        Self::schema_for(&CapabilitySet::interactive_repl(), editable_paths)
+    pub fn schema(patch_strategy: PatchStrategy) -> serde_json::Value {
+        Self::schema_for(&CapabilitySet::interactive_repl(), patch_strategy)
     }
 
     /// Builds the edit schema for exactly the enabled capabilities.
@@ -37,9 +38,9 @@ impl StructuredEditProtocol {
     /// pruned property is never left required.
     pub fn schema_for(
         capabilities: &CapabilitySet,
-        _editable_paths: &[String],
+        patch_strategy: PatchStrategy,
     ) -> serde_json::Value {
-        CapabilityRegistry::global().compose_structured_schema(capabilities)
+        CapabilityRegistry::global().compose_structured_schema(capabilities, patch_strategy)
     }
 
     fn proposal_to_model_result(
@@ -56,74 +57,7 @@ impl StructuredEditProtocol {
         let mut edits = Vec::new();
 
         for change in &proposal.changes {
-            let is_create = change.op == EditFileOp::Create;
-            let target_path =
-                match resolve_target_path_for_op(&change.path, editable_paths, is_create) {
-                    Ok(p) => p,
-                    Err(ambiguity_err) => {
-                        return ModelResult::Edit {
-                            summary: "Ambiguous file path".to_string(),
-                            edits: Vec::new(),
-                            proposal: Some(proposal),
-                            outcome: EditOutcome {
-                                applied: false,
-                                error: Some(ambiguity_err),
-                                changed_files: Vec::new(),
-                                commit_hash: None,
-                            },
-                        };
-                    }
-                };
-
-            if !editable_paths.is_empty() && !is_create && !editable_paths.contains(&target_path) {
-                return ModelResult::Edit {
-                    summary: format!("File '{}' is not in context", target_path),
-                    edits: Vec::new(),
-                    proposal: Some(proposal),
-                    outcome: EditOutcome {
-                        applied: false,
-                        error: Some(format!(
-                            "File '{}' is not present in context. To edit it, request it first via context_requests. Permitted files in context: {}",
-                            target_path,
-                            editable_paths.join(", ")
-                        )),
-                        changed_files: Vec::new(),
-                        commit_hash: None,
-                    },
-                };
-            }
-
-            // Structural conversion is delegated to the shared, validating
-            // routine: an unknown operation or a missing payload is rejected
-            // here instead of being silently coerced into a destructive edit.
-            let mut resolved = change.clone();
-            resolved.path = target_path;
-            resolved.old_text = change.old_text.as_deref().map(normalize_content);
-            resolved.new_text = change.new_text.as_deref().map(normalize_content);
-            resolved.content = change.content.as_deref().map(normalize_content);
-
-            if resolved.op == EditFileOp::Move {
-                let dest_raw = change.to.as_deref().unwrap_or_default();
-                let target_to = match resolve_target_path_for_op(dest_raw, editable_paths, true) {
-                    Ok(p) => p,
-                    Err(ambiguity_err) => {
-                        return ModelResult::Edit {
-                            summary: "Ambiguous destination file path".to_string(),
-                            edits: Vec::new(),
-                            proposal: Some(proposal),
-                            outcome: EditOutcome {
-                                applied: false,
-                                error: Some(ambiguity_err),
-                                changed_files: Vec::new(),
-                                commit_hash: None,
-                            },
-                        };
-                    }
-                };
-                resolved.to = Some(target_to);
-            }
-
-            match resolved.to_edit_operation() {
+            match change_to_operation(change, editable_paths) {
                 Ok(operation) => edits.push(operation),
                 Err(message) => {
                     return ModelResult::Edit {
@@ -161,6 +95,9 @@ impl StructuredEditProtocol {
                 EditOperation::Delete { path } => format!("Delete {}", path),
                 EditOperation::Move { from, to } => format!("Move {} to {}", from, to),
                 EditOperation::Overwrite { path, .. } => format!("Overwrite {}", path),
+                EditOperation::LineAnchor { path, .. } => {
+                    format!("Replace anchored range in {}", path)
+                }
             }
         } else {
             format!("Apply {} structured edits", edits.len())
@@ -180,8 +117,16 @@ impl StructuredEditProtocol {
     }
 
     /// Returns system prompt instructions for the structured-output protocol.
-    pub fn system_instructions(&self, editable_paths: &[String]) -> String {
-        self.system_instructions_for(&CapabilitySet::interactive_repl(), editable_paths)
+    pub fn system_instructions(
+        &self,
+        editable_paths: &[String],
+        patch_strategy: PatchStrategy,
+    ) -> String {
+        self.system_instructions_for(
+            &CapabilitySet::interactive_repl(),
+            editable_paths,
+            patch_strategy,
+        )
     }
 
     /// Returns system prompt instructions for an explicit capability set.
@@ -192,8 +137,10 @@ impl StructuredEditProtocol {
         &self,
         capabilities: &CapabilitySet,
         editable_paths: &[String],
+        patch_strategy: PatchStrategy,
     ) -> String {
-        let ctx = PromptRenderContext::new(editable_paths, None);
+        let ctx =
+            PromptRenderContext::new(editable_paths, None).with_patch_strategy(patch_strategy);
         let mut prompt = String::new();
         prompt.push_str("## Code Modification Protocol (Structured Output JSON)\n");
         prompt.push_str(
@@ -209,7 +156,11 @@ impl StructuredEditProtocol {
             return prompt;
         }
 
-        prompt.push_str("Every field of a change is required: use an empty string \"\" for fields that do not apply to the operation (e.g. `old_text`/`new_text` for 'create'/'delete', `content` for 'replace').\n\n");
+        // Every strategy-specific sentence of the contract comes from the
+        // profile, so the instructions and the declared schema describe the same
+        // fields.
+        let profile = StrategyProfile::of(patch_strategy);
+        prompt.push_str(profile.empty_field_guidance);
 
         prompt.push_str("Files inside <context> declare their status through a declarative `access` attribute: `access=\"editable\"` files may be modified directly, while a file marked `access=\"read_only\"` is provided for reference and becomes editable automatically once you propose a change to it. ");
         // The reachability of a file absent from <context> depends on whether
@@ -225,7 +176,8 @@ impl StructuredEditProtocol {
         prompt.push_str("CRITICAL INVARIANTS:\n");
         prompt.push_str("1. Output MUST be valid JSON adhering to the specified schema.\n");
         prompt.push_str("2. For 'replace', `path` MUST match a file present in <context>.\n");
-        prompt.push_str("3. For 'replace', `old_text` must match EXACTLY ONE location in the target file, including indentation and whitespace.\n");
+        prompt.push_str("3. ");
+        prompt.push_str(profile.replace_invariant);
         prompt.push_str("4. For 'create' and 'overwrite', `content` must contain the complete file content from first to last line.\n");
         prompt.push_str("5. If no code changes are needed, set `changes: []` and provide your answer in `message`.\n");
 
@@ -233,8 +185,8 @@ impl StructuredEditProtocol {
     }
 
     /// Returns the JSON-schema response format used to constrain generation.
-    pub fn response_format(&self, editable_paths: &[String]) -> Option<ResponseFormat> {
-        self.response_format_for(&CapabilitySet::interactive_repl(), editable_paths)
+    pub fn response_format(&self, patch_strategy: PatchStrategy) -> Option<ResponseFormat> {
+        self.response_format_for(&CapabilitySet::interactive_repl(), patch_strategy)
     }
 
     /// Returns the JSON-schema response format for an explicit capability set,
@@ -242,13 +194,13 @@ impl StructuredEditProtocol {
     pub fn response_format_for(
         &self,
         capabilities: &CapabilitySet,
-        editable_paths: &[String],
+        patch_strategy: PatchStrategy,
     ) -> Option<ResponseFormat> {
         Some(ResponseFormat::JsonSchema {
             json_schema: JsonSchemaDefinition {
                 name: "tauqe_edit_proposal".to_string(),
                 description: Some("Structured code modification proposal and response".to_string()),
-                schema: Self::schema_for(capabilities, editable_paths),
+                schema: Self::schema_for(capabilities, patch_strategy),
                 strict: Some(true),
             },
         })
@@ -660,6 +612,71 @@ fn parse_proposal(raw: &str) -> Option<ModelResultProposal> {
     parse_json_object(raw).and_then(|value| serde_json::from_value(value).ok())
 }
 
+/// Resolves one structured change into a concrete, validated edit operation.
+///
+/// The target path is resolved against the permitted files, the payload is
+/// normalized, and a move destination is resolved exactly like its source. Both
+/// wire vehicles — the structured `changes` field and the anchored change-set
+/// tag of the XML contour — travel through this routine, so a change is
+/// validated identically whichever encoding carried it.
+fn change_to_operation(
+    change: &StructuredChangeProposal,
+    editable_paths: &[String],
+) -> Result<EditOperation, String> {
+    let is_create = change.op == EditFileOp::Create;
+    let target_path = resolve_target_path_for_op(&change.path, editable_paths, is_create)?;
+
+    if !editable_paths.is_empty() && !is_create && !editable_paths.contains(&target_path) {
+        return Err(format!(
+            "File '{}' is not present in context. To edit it, request it first via context_requests. Permitted files in context: {}",
+            target_path,
+            editable_paths.join(", ")
+        ));
+    }
+
+    let mut resolved = change.clone();
+    resolved.path = target_path;
+    resolved.old_text = change.old_text.as_deref().map(normalize_content);
+    resolved.new_text = change.new_text.as_deref().map(normalize_content);
+    resolved.content = change.content.as_deref().map(normalize_content);
+
+    if resolved.op == EditFileOp::Move {
+        let destination = change.to.as_deref().unwrap_or_default();
+        resolved.to = Some(resolve_target_path_for_op(
+            destination,
+            editable_paths,
+            true,
+        )?);
+    }
+
+    resolved.to_edit_operation()
+}
+
+/// Decodes an anchored change set from its JSON array.
+///
+/// The anchored vehicle carries the very entries the structured contour declares
+/// in `changes`, so one conversion and one set of path rules serve both
+/// transports: the XML contour hands in the body of its change-set tag and the
+/// structured contour hands in the `changes` field. Every entry is resolved and
+/// validated like a structured change, so a file outside the permitted set or an
+/// operation missing its payload is reported as a diagnostic instead of reaching
+/// the staging engine.
+pub fn parse_anchor_edits(
+    body: &str,
+    editable_paths: &[String],
+) -> Result<Vec<EditOperation>, String> {
+    let trimmed = body.trim();
+    if trimmed.is_empty() {
+        return Ok(Vec::new());
+    }
+    let changes: Vec<StructuredChangeProposal> = serde_json::from_str(strip_code_fence(trimmed))
+        .map_err(|error| format!("invalid anchored change set: {error}"))?;
+    changes
+        .iter()
+        .map(|change| change_to_operation(change, editable_paths))
+        .collect()
+}
+
 /// Converts a parsed `<plan>` tag into a normalized plan update.
 fn plan_tag_to_update(
     tag: crate::edits::protocol::xml::tags::ParsedPlanTag,
@@ -685,8 +702,10 @@ fn plan_tag_to_update(
 
 /// Cleans raw text or JSON into conversational text without raw schema markup.
 ///
-/// Every control tag is removed by the single parametric sanitizer, so JSON
-/// scaffolding and XML control tags can never leak into conversational text.
+/// Every control tag is removed by the single parametric sanitizer, and a
+/// payload that is itself one structured response collapses to its `message`
+/// channel, so neither XML control tags nor JSON scaffolding can leak into
+/// conversational text, session history, or the streamed interface.
 pub fn clean_raw_json_or_text(raw: &str) -> String {
     let msgs = extract_json_messages(raw);
     if !msgs.is_empty() {
@@ -697,6 +716,20 @@ pub fn clean_raw_json_or_text(raw: &str) -> String {
         if !proposal.message.trim().is_empty() {
             return strip_all_control_tags(&proposal.message);
         }
+    }
+
+    // A payload that is itself a single structured response carries its whole
+    // conversational channel in `message`, and the extraction above already
+    // found that channel empty. The JSON object around it is protocol chrome,
+    // never an answer: collapsing the payload keeps raw wire markup out of
+    // session history and matches what the streaming filter showed the
+    // interface. The strict whole-payload parse keeps prose that merely quotes
+    // a JSON object on the plain-text path below, so explaining the protocol
+    // inside a conversation never collapses an answer.
+    if serde_json::from_str::<serde_json::Value>(strip_code_fence(raw))
+        .is_ok_and(|value| value.is_object())
+    {
+        return String::new();
     }
 
     if super::xml::has_xml_edit_tags(raw) {
@@ -939,7 +972,7 @@ mod tests {
 
     #[test]
     fn test_structured_schema_has_no_nullable_types() {
-        let schema = StructuredEditProtocol::schema(&[]);
+        let schema = StructuredEditProtocol::schema(PatchStrategy::SearchReplace);
         // Only the idle representation of the plan payload is nullable; every
         // edit field stays a concrete typed value.
         let changes = &schema["properties"]["changes"]["items"];
@@ -951,13 +984,13 @@ mod tests {
 
     #[test]
     fn test_structured_schema_and_instructions_include_overwrite() {
-        let schema = StructuredEditProtocol::schema(&[]);
+        let schema = StructuredEditProtocol::schema(PatchStrategy::SearchReplace);
         let ops = schema["properties"]["changes"]["items"]["properties"]["op"]["enum"]
             .as_array()
             .unwrap();
         assert!(ops.iter().any(|op| op == "overwrite"));
 
-        let instr = StructuredEditProtocol.system_instructions(&[]);
+        let instr = StructuredEditProtocol.system_instructions(&[], PatchStrategy::SearchReplace);
         assert!(instr.contains("overwrite"));
     }
 
@@ -1021,13 +1054,14 @@ mod tests {
 
     #[test]
     fn test_structured_system_instructions_respect_the_capability_set() {
-        let full = StructuredEditProtocol.system_instructions(&[]);
+        let full = StructuredEditProtocol.system_instructions(&[], PatchStrategy::SearchReplace);
         assert!(full.contains("context_requests"));
         assert!(full.contains("overwrite"));
 
         let narrowed = StructuredEditProtocol.system_instructions_for(
             &CapabilitySet::from_slice(&[LlmCapability::TextMessage, LlmCapability::FileEdits]),
             &[],
+            PatchStrategy::SearchReplace,
         );
         assert!(narrowed.contains("changes"));
         assert!(!narrowed.contains("context_requests"));
@@ -1035,11 +1069,94 @@ mod tests {
     }
 
     #[test]
+    fn test_structured_protocol_parses_an_anchored_change_set() {
+        let proto = StructuredEditProtocol;
+        let editable = vec!["src/lib.rs".to_string()];
+        let json = r#"{
+            "message": "Replace the guarded branch",
+            "changes": [{
+                "op": "replace",
+                "path": "src/lib.rs",
+                "to": "",
+                "start": "Kf9Q",
+                "end": "Tq2W",
+                "content": "fn replacement() {}\n"
+            }]
+        }"#;
+
+        match proto.parse_output(json, &editable) {
+            ModelResult::Edit { edits, outcome, .. } => {
+                assert!(outcome.error.is_none(), "{:?}", outcome.error);
+                match edits.as_slice() {
+                    [EditOperation::LineAnchor {
+                        path,
+                        start,
+                        end,
+                        content,
+                    }] => {
+                        assert_eq!(path, "src/lib.rs");
+                        assert_eq!(start, "Kf9Q");
+                        assert_eq!(end, "Tq2W");
+                        assert_eq!(content, "fn replacement() {}\n");
+                    }
+                    other => panic!("expected one anchored replacement, got {other:?}"),
+                }
+            }
+            other => panic!("expected anchored edits, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_anchor_change_set_vehicle_decodes_shared_entries() {
+        let editable = vec!["src/lib.rs".to_string()];
+        let body = r#"[{"op":"replace","path":"src/lib.rs","to":"","start":"Kf9Q","end":"Kf9Q","content":"x\n"}]"#;
+        let operations = parse_anchor_edits(body, &editable).expect("valid change set");
+        assert!(matches!(
+            operations.as_slice(),
+            [EditOperation::LineAnchor { start, end, .. }] if start == "Kf9Q" && end == "Kf9Q"
+        ));
+
+        // A change that addresses no file of the context is reported instead of
+        // reaching the staging engine.
+        assert!(
+            parse_anchor_edits(r#"[{"op":"replace","path":"../escape.rs"}]"#, &editable).is_err()
+        );
+
+        // An operation missing its payload, and a body that is not JSON at all,
+        // both stay diagnostics.
+        assert!(parse_anchor_edits(r#"[{"op":"create","path":"src/new.rs"}]"#, &editable).is_err());
+        assert!(parse_anchor_edits("not json", &editable).is_err());
+
+        // An empty vehicle requests no change at all.
+        assert!(parse_anchor_edits("   ", &editable)
+            .expect("an empty vehicle")
+            .is_empty());
+    }
+
+    #[test]
+    fn test_anchored_schema_declares_range_fields_instead_of_echoed_text() {
+        let schema = StructuredEditProtocol::schema(PatchStrategy::LineAnchor);
+        let items = &schema["properties"]["changes"]["items"];
+        let properties = items["properties"].as_object().expect("properties object");
+        for field in ["op", "path", "to", "start", "end", "content"] {
+            assert!(properties.contains_key(field), "missing {field}");
+        }
+        for field in ["old_text", "new_text"] {
+            assert!(!properties.contains_key(field), "{field} must be absent");
+        }
+        assert_eq!(
+            items["required"],
+            serde_json::json!(["op", "path", "to", "start", "end", "content"])
+        );
+        assert_eq!(items["additionalProperties"], serde_json::json!(false));
+    }
+
+    #[test]
     fn test_structured_protocol_system_instructions() {
         let proto = StructuredEditProtocol;
         let paths = vec!["src/lib.rs".to_string()];
 
-        let instr = proto.system_instructions(&paths);
+        let instr = proto.system_instructions(&paths, PatchStrategy::SearchReplace);
         assert!(!instr.contains("context_drops"));
         assert!(instr.contains("context_requests"));
     }
@@ -1084,8 +1201,37 @@ mod tests {
     }
 
     #[test]
+    fn test_clean_collapses_a_silent_structured_round() {
+        // A structured response whose only conversational channel is empty has
+        // no prose to recover. Its JSON scaffolding is protocol chrome, never
+        // an answer: collapsing it keeps raw wire markup out of session history
+        // and matches what the streaming filter showed the interface (nothing).
+        let silent = r#"{
+            "message": "",
+            "changes": [],
+            "context_requests": ["src/a.rs"],
+            "verify": {"target": "none", "on_success": "silent"},
+            "outcome": {"status": "none", "summary": "", "reason": "", "message": ""}
+        }"#;
+        assert_eq!(clean_raw_json_or_text(silent), "");
+
+        // A fenced payload is the same protocol response with decoration.
+        let fenced = "```json\n{\"message\":\"\",\"changes\":[]}\n```";
+        assert_eq!(clean_raw_json_or_text(fenced), "");
+    }
+
+    #[test]
+    fn test_clean_keeps_prose_that_quotes_a_json_object() {
+        // Prose that merely quotes a JSON object is conversational text: the
+        // object does not span the whole payload, so the structured collapse
+        // never fires and the explanation survives verbatim.
+        let prose = "A silent round is {\"message\":\"\",\"changes\":[]} in the journal.";
+        assert_eq!(clean_raw_json_or_text(prose), prose);
+    }
+
+    #[test]
     fn test_structured_schema_declares_control_fields() {
-        let schema = StructuredEditProtocol::schema(&[]);
+        let schema = StructuredEditProtocol::schema(PatchStrategy::SearchReplace);
         let required: Vec<&str> = schema["required"]
             .as_array()
             .unwrap()
@@ -1135,7 +1281,11 @@ mod tests {
             LlmCapability::Outcome,
             LlmCapability::Blocked,
         ]);
-        let instructions = StructuredEditProtocol.system_instructions_for(&capabilities, &[]);
+        let instructions = StructuredEditProtocol.system_instructions_for(
+            &capabilities,
+            &[],
+            PatchStrategy::SearchReplace,
+        );
         for field in ["doc_requests", "scratchpad", "outcome", "blocked"] {
             assert!(
                 instructions.contains(field),
@@ -1355,7 +1505,7 @@ mod tests {
             })
         );
 
-        let schema = StructuredEditProtocol::schema(&[]);
+        let schema = StructuredEditProtocol::schema(PatchStrategy::SearchReplace);
         let outcome = &schema["properties"]["outcome"];
         let statuses = outcome["properties"]["status"]["enum"]
             .as_array()
@@ -1514,7 +1664,7 @@ mod tests {
 
     #[test]
     fn test_structured_schema_declares_verify_and_user_language() {
-        let schema = StructuredEditProtocol::schema(&[]);
+        let schema = StructuredEditProtocol::schema(PatchStrategy::SearchReplace);
         let required: Vec<&str> = schema["required"]
             .as_array()
             .unwrap()
@@ -1538,7 +1688,7 @@ mod tests {
 
     #[test]
     fn test_structured_schema_reflects_the_capability_set() {
-        let full = StructuredEditProtocol::schema(&[]);
+        let full = StructuredEditProtocol::schema(PatchStrategy::SearchReplace);
         let full_properties = full["properties"].as_object().expect("properties object");
         for field in [
             "message",
@@ -1573,7 +1723,7 @@ mod tests {
 
         let narrowed = StructuredEditProtocol::schema_for(
             &CapabilitySet::from_slice(&[LlmCapability::TextMessage, LlmCapability::FileEdits]),
-            &[],
+            PatchStrategy::SearchReplace,
         );
         let properties = narrowed["properties"]
             .as_object()
@@ -1619,7 +1769,7 @@ mod tests {
     #[test]
     fn test_structured_response_format_follows_the_capability_set() {
         let narrowed = CapabilitySet::from_slice(&[LlmCapability::TextMessage]);
-        match StructuredEditProtocol.response_format_for(&narrowed, &[]) {
+        match StructuredEditProtocol.response_format_for(&narrowed, PatchStrategy::SearchReplace) {
             Some(ResponseFormat::JsonSchema { json_schema, .. }) => {
                 let properties = json_schema.schema["properties"]
                     .as_object()

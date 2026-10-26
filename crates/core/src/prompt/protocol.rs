@@ -7,7 +7,7 @@
 //! pipeline therefore operates purely on normalized semantics and stays
 //! independent of any single protocol format.
 
-use tauqe_protocol::{CapabilitySet, EditProtocolKind, LlmCapability, LlmCommand};
+use tauqe_protocol::{CapabilitySet, EditProtocolKind, LlmCapability, LlmCommand, PatchStrategy};
 
 /// Decodes raw model output into normalized core commands.
 ///
@@ -84,7 +84,16 @@ pub trait PromptProtocol: Send + Sync {
     /// `has_eager_repo_map` reports whether the prompt already carries the
     /// rendered repository symbol map, so the guidance never advertises an
     /// on-demand map request for contours the model can already read.
-    fn system_instructions(&self, editable_paths: &[String], has_eager_repo_map: bool) -> String;
+    ///
+    /// `patch_strategy` carries the strategy that decides how a change set
+    /// addresses the lines it replaces, so the rendered reference advertises
+    /// exactly the fields the active decoder accepts.
+    fn system_instructions(
+        &self,
+        editable_paths: &[String],
+        has_eager_repo_map: bool,
+        patch_strategy: PatchStrategy,
+    ) -> String;
 
     /// Returns the active per-turn marker bound to this protocol, if any.
     ///
@@ -110,6 +119,7 @@ pub trait PromptProtocol: Send + Sync {
     fn response_format(
         &self,
         _editable_paths: &[String],
+        _patch_strategy: PatchStrategy,
     ) -> Option<crate::providers::ResponseFormat> {
         None
     }
@@ -156,6 +166,7 @@ mod tests {
             &self,
             _editable_paths: &[String],
             _has_eager_repo_map: bool,
+            _patch_strategy: PatchStrategy,
         ) -> String {
             String::new()
         }

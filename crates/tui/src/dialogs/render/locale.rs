@@ -17,7 +17,7 @@ use unicode_width::UnicodeWidthStr;
 
 use crate::app::{AppState, LocaleDialogButton, LocaleDialogState};
 use crate::components::modal::{
-    modal_geometry, render_dialog_footer, render_modal_container, ModalTone,
+    modal_geometry, render_dialog_footer, render_modal_container, verb_hint, ModalTone,
 };
 use crate::i18n::active_t;
 use crate::theme::engine::current_engine;
@@ -118,7 +118,11 @@ pub fn render_locale_dialog(frame: &mut ratatui::Frame, state: &AppState) {
 
     render_locale_body(frame, geometry.body, dialog, state);
     render_locale_actions(frame, geometry.action_bar, dialog);
-    render_dialog_footer(frame, geometry.hint_row, &locale_footer_hint(dialog));
+    render_dialog_footer(
+        frame,
+        geometry.hint_row,
+        &verb_hint(locale_footer_hint(dialog)),
+    );
 }
 
 /// Renders the body: the active language and the target-language field.

@@ -291,63 +291,49 @@ async fn prepare_turn(
 
 /// Resolves the prompt protocol for a turn from its declared intent.
 ///
-/// A read-only plan discussion always uses the structured discussion protocol,
-/// regardless of the configured `develop.protocol`: the discussion system prompt
-/// instructs the model to answer with the discussion JSON schema, so pairing it
-/// with an XML stream filter would leak the raw JSON scaffolding into the REPL.
+/// The configured `develop.protocol` chooses the encoding for every dialogue
+/// contour: an interactive turn, a focused review dialogue, and a plan
+/// discussion all serialize their commands through the transport the project
+/// declares. The transport never narrows or widens the capability surface — the
+/// declared intent decides what a turn may do — so a `structured` project and an
+/// `xml` project advertise the same operational surface for the same intent and
+/// differ only in how those commands travel.
 ///
-/// An interactive review focus dialogue and a plain develop turn keep the
-/// configured base protocol. This preserves the dual capability of a focused
-/// review (addressed concept c-3): the developer may reason about a finding and
-/// directly request a code fix, so the turn keeps the file-edit and
-/// toolchain-verification capabilities of the configured protocol instead of
-/// collapsing into the text-only discussion schema.
+/// Plan mutation follows the dialogue anchor rather than the transport. An
+/// interactive turn whose focus is a plan gains the mutation the anchor grants,
+/// and a plan discussion carries it by construction, because its regime is the
+/// discussion profile. An isolated step owns no plan permission at all, so no
+/// focus and no transport can hand it one. The mix runs through
+/// `with_capability_set`, so both encodings advertise and decode the very same
+/// mutation, and the harness keeps validating the mutation itself after
+/// decoding.
 ///
-/// The configured transport chooses the encoding only, never the capability
-/// surface: a `structured` project and an `xml` project advertise the same
-/// operational surface for the same intent, so the format changes how commands
-/// are serialized and nothing else. The two-contour `mixed` mode keeps the XML
-/// transport for code editing, while a plan discussion still answers with the
-/// discussion JSON Schema.
-///
-/// The plan permissions matrix is a property of the dialogue, never of the
-/// transport: a user may ask for a plan at any moment of an interactive turn,
-/// so plan authorship already belongs to the interactive profile, while
-/// modifying an existing plan requires the dialogue to be anchored on one.
-/// `plan_focused` carries that anchor, and an interactive turn whose focus is a
-/// plan mixes plan mutation into the chosen protocol's capability set. The mix
-/// runs through `with_capability_set`, so both encodings advertise and decode
-/// the very same mutation, and the harness keeps validating the mutation itself
-/// after decoding.
+/// Under Structured Output the operating mode follows the surface: a surface
+/// that permits file edits composes the registry edit schema, where
+/// `plan_update` is already declared, so a plan discussion shares the composite
+/// schema instead of a separate read-only discussion schema.
 ///
 /// The active turn marker is bound onto the chosen protocol when its wire format
-/// supports it; the structured discussion protocol encodes its structure in JSON
-/// Schema and therefore declines the marker.
+/// supports it; a structured protocol encodes its structure in JSON Schema and
+/// therefore declines the marker.
 pub(super) fn resolve_turn_protocol(
     intent: TurnIntent,
     develop_protocol: tauqe_protocol::EditProtocolKind,
     plan_focused: bool,
     marker: Option<&str>,
 ) -> Box<dyn PromptProtocol> {
-    // The declared intent, not the transport, decides what the turn may do:
-    // `PromptAssembly::effective_capabilities` narrows the rendered prompt and
-    // the FSM narrows the decoder of an isolated step, both through the
-    // intent-oriented profiles. Selecting a profile here by wire format would
-    // make XML and Structured Output disagree about the very same turn.
-    let base_protocol: Box<dyn PromptProtocol> = if intent.is_readonly_discussion() {
-        Box::new(JsonPromptProtocol::discussion())
-    } else {
-        match develop_protocol {
-            tauqe_protocol::EditProtocolKind::Structured => Box::new(JsonPromptProtocol::edits()),
-            tauqe_protocol::EditProtocolKind::Xml | tauqe_protocol::EditProtocolKind::Mixed => {
-                Box::new(XmlPromptProtocol)
-            }
+    let base_protocol: Box<dyn PromptProtocol> = match develop_protocol {
+        tauqe_protocol::EditProtocolKind::Structured => Box::new(JsonPromptProtocol::edits()),
+        tauqe_protocol::EditProtocolKind::Xml | tauqe_protocol::EditProtocolKind::Mixed => {
+            Box::new(XmlPromptProtocol)
         }
     };
-    // Plan mutation follows the dialogue focus rather than the wire format: an
-    // isolated step owns no plan permission at all, and a focused interactive
-    // turn gains exactly the mutation capability the anchor grants.
-    let base_protocol = if plan_focused && intent.is_interactive_repl() {
+    // A plan discussion owns the mutation by regime; an interactive turn gains
+    // it from the focus anchor. The grant is idempotent, so a protocol that
+    // already advertises the capability keeps it exactly once.
+    let plan_mutation_authorized =
+        intent.is_plan_discussion() || (plan_focused && intent.is_interactive_repl());
+    let base_protocol = if plan_mutation_authorized {
         let capabilities = base_protocol
             .capability_set()
             .with(LlmCapability::PlanUpdate);
@@ -971,13 +957,13 @@ async fn run_prepared_turn(
                 })),
             });
 
-            // An interactive turn that applied code edits swept the transient
-            // auto context layer away inside the FSM, so the stable prompt
-            // prefix those files warmed no longer exists. The dialogue starts a
-            // fresh provider session instead of being routed to a node holding
-            // a stale prefix cache. An isolated step owns no dialogue session,
-            // so it never rotates the interactive one.
-            if intent.is_interactive_repl()
+            // A dialogue turn that applied code edits swept the transient auto
+            // context layer away inside the FSM, so the stable prompt prefix
+            // those files warmed no longer exists. The dialogue starts a fresh
+            // provider session instead of being routed to a node holding a stale
+            // prefix cache. An isolated step owns no dialogue session, so it
+            // never rotates the interactive one.
+            if !intent.is_isolated_step()
                 && matches!(
                     &wf_result.result,
                     tauqe_protocol::ModelResult::Edit { outcome, .. } if outcome.applied

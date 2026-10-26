@@ -11,7 +11,7 @@ use tauqe_core::context::ContextManager;
 use tauqe_core::history::HistoryManager;
 use tauqe_core::prompt::protocol::PromptProtocol;
 use tauqe_core::providers::mock::{MockLlmProvider, MockResponse};
-use tauqe_core::providers::{LlmProvider, StreamEvent};
+use tauqe_core::providers::{ChatMessage, LlmProvider, StreamEvent};
 use tauqe_core::workflow::policy::ApplyPolicy;
 use tauqe_core::workflow::{
     AnswerEditLoop, EditLoop, ExecutionMode, GitTransactionPolicy, SingleExecution, Task, TaskEnv,
@@ -109,9 +109,8 @@ fn repo_map_block(content: &str) -> &str {
 /// Returns the head of a system message: everything rendered before the
 /// context block.
 ///
-/// The core contract, the frozen repository map, and the session history live
-/// here, so this region must stay byte-identical from one round of a turn to
-/// the next.
+/// The core contract and the frozen repository map live here, so this region
+/// must stay byte-identical from one round of a turn to the next.
 fn stable_system_prefix(content: &str) -> &str {
     match content.find("## Project Context") {
         Some(index) => &content[..index],
@@ -1765,7 +1764,7 @@ async fn discussion_turn_streams_clean_markdown_without_json_leakage() {
     let protocol = tauqe_core::prompt::json::JsonPromptProtocol::discussion();
 
     let plan_prompt = "# Plan Discussion: [discussion-plan] Refine plan\n";
-    let intent = tauqe_protocol::TurnIntent::ReadonlyDiscussion;
+    let intent = tauqe_protocol::TurnIntent::PlanDiscussion;
 
     let mut policy = tauqe_core::workflow::policy::DirectApplyPolicy::new();
     let options = WorkflowOptions::default();
@@ -1819,6 +1818,105 @@ async fn discussion_turn_streams_clean_markdown_without_json_leakage() {
 
     assert!(matches!(outcome.result, ModelResult::Answer { .. }));
     assert_eq!(outcome.assistant_text.trim(), message);
+}
+/// A plan discussion renders the real context layers instead of a global
+/// read-only view: an editable file stays editable, a reference file stays
+/// read-only, and a file the discussion discovers as editable renders with the
+/// access it requested.
+#[tokio::test]
+async fn plan_discussion_renders_the_real_context_access_layers() {
+    let (_dir, repo_root) = init_repo();
+    std::fs::write(
+        repo_root.join("target.rs"),
+        "pub fn compute() -> i32 { 0 }\n",
+    )
+    .expect("write target fixture");
+    std::fs::write(
+        repo_root.join("reference.rs"),
+        "pub const LIMIT: i32 = 7;\n",
+    )
+    .expect("write reference fixture");
+    std::fs::write(repo_root.join("helper.rs"), "pub const ANSWER: i32 = 42;\n")
+        .expect("write helper fixture");
+    commit_fixture(&repo_root, &["target.rs", "reference.rs", "helper.rs"]);
+
+    let mut context = ContextManager::new(repo_root.clone());
+    context
+        .add_file("target.rs", ContextAccess::Editable)
+        .expect("add target to context");
+    context
+        .add_file("reference.rs", ContextAccess::ReadOnly)
+        .expect("add reference to context");
+    let mut history = HistoryManager::new(repo_root.clone());
+
+    let discovery = serde_json::json!({
+        "message": "Запрашиваю константу.",
+        "plan_update": null,
+        "context_requests": [
+            { "path": "helper.rs", "access": "editable" }
+        ],
+        "user_language": "Russian"
+    })
+    .to_string();
+    let answer = serde_json::json!({
+        "message": "Инварианты обсуждены.",
+        "plan_update": null,
+        "context_requests": [],
+        "user_language": "Russian"
+    })
+    .to_string();
+
+    let provider =
+        MockLlmProvider::scripted([MockResponse::text(discovery), MockResponse::text(answer)]);
+    let model = ModelRef::openrouter("mock/model");
+    let protocol = tauqe_core::prompt::json::JsonPromptProtocol::discussion();
+    let mut policy = tauqe_core::workflow::policy::DirectApplyPolicy::new();
+    let options = WorkflowOptions::default();
+    let (stream_tx, cancel_rx) = event_channel();
+
+    let outcome = tauqe_core::workflow::fsm::run_fsm_turn(
+        "# Plan Discussion: [access-plan] Refine plan\n",
+        tauqe_protocol::TurnIntent::PlanDiscussion,
+        &provider,
+        &model,
+        &mut context,
+        &mut history,
+        &protocol,
+        &mut policy,
+        "git",
+        stream_tx,
+        cancel_rx,
+        &options,
+    )
+    .await
+    .expect("plan discussion turn executes");
+
+    assert!(matches!(outcome.result, ModelResult::Answer { .. }));
+    assert_eq!(provider.requests().len(), 2);
+
+    // A layout may distribute the context bodies through the transcript, so
+    // every message of the request is inspected instead of the head alone.
+    let rendered = |index: usize| -> String {
+        let messages = &provider.requests()[index].messages;
+        let mut joined = String::new();
+        for message in messages {
+            joined.push_str(&message.content);
+            joined.push('\n');
+        }
+        joined
+    };
+
+    let first = rendered(0);
+    assert!(first.contains("path=\"target.rs\" access=\"editable\""));
+    assert!(first.contains("path=\"reference.rs\" access=\"read_only\""));
+
+    let second = rendered(1);
+    assert!(second.contains("path=\"target.rs\" access=\"editable\""));
+    assert!(second.contains("path=\"reference.rs\" access=\"read_only\""));
+    assert!(
+        second.contains("path=\"helper.rs\" access=\"editable\""),
+        "a discovered file must keep the access the discussion requested: {second}"
+    );
 }
 
 /// A discussion turn must route the extracted `plan_update` into control
@@ -1877,7 +1975,7 @@ async fn discussion_turn_persists_plan_update_and_active_marker() {
 
     let outcome = tauqe_core::workflow::fsm::run_fsm_turn(
         plan_prompt,
-        tauqe_protocol::TurnIntent::ReadonlyDiscussion,
+        tauqe_protocol::TurnIntent::PlanDiscussion,
         &provider,
         &model,
         &mut context,
@@ -1914,34 +2012,40 @@ async fn discussion_turn_persists_plan_update_and_active_marker() {
     assert_eq!(active.as_deref(), Some("discussion-plan"));
 }
 
-/// A read-only discussion is a distinct typed turn intent, and the structured
+/// A plan discussion is a distinct typed turn intent, and the structured
 /// discussion protocol it selects hides code editing while keeping plan
 /// authoring. The protocol choice itself is resolved by the server from that
 /// intent, never from the prompt text.
 #[test]
-fn readonly_discussion_intent_selects_structured_discussion_protocol() {
-    let intent = tauqe_protocol::TurnIntent::ReadonlyDiscussion;
-    assert!(intent.is_readonly_discussion());
+fn plan_discussion_intent_carries_the_dialogue_surface() {
+    let intent = tauqe_protocol::TurnIntent::PlanDiscussion;
+    assert!(intent.is_plan_discussion());
     assert!(!intent.is_interactive_repl());
     assert!(!intent.is_isolated_step());
 
     // The core-level contract the server's protocol resolver relies on: a
-    // discussion turn always uses the structured discussion protocol, whose
-    // stream filter strips the JSON scaffolding and whose capabilities exclude
-    // code editing.
-    let protocol = tauqe_core::prompt::json::JsonPromptProtocol::discussion();
-    assert!(protocol.supports(tauqe_protocol::LlmCapability::PlanUpdate));
-    assert!(protocol.supports(tauqe_protocol::LlmCapability::PlanCreation));
-    assert!(!protocol.supports(tauqe_protocol::LlmCapability::FileEdits));
-    assert!(!protocol.supports(tauqe_protocol::LlmCapability::ToolchainVerify));
+    // plan discussion carries the whole dialogue surface, so the structured
+    // transport derives the edit mode and composes the registry schema,
+    // where the plan payload is already declared.
+    let protocol = tauqe_core::prompt::json::JsonPromptProtocol::edits();
+    assert!(protocol.supports(tauqe_protocol::LlmCapability::FileEdits));
+    assert!(protocol.supports(tauqe_protocol::LlmCapability::ToolchainVerify));
 
-    match protocol.response_format(&[]) {
+    let granted = protocol
+        .capability_set()
+        .with(tauqe_protocol::LlmCapability::PlanUpdate);
+    let narrowed = intent.narrow_capabilities(&granted);
+    assert!(narrowed.contains(tauqe_protocol::LlmCapability::PlanUpdate));
+    assert!(narrowed.contains(tauqe_protocol::LlmCapability::PlanCreation));
+    assert!(narrowed.contains(tauqe_protocol::LlmCapability::FileEdits));
+
+    match protocol.response_format(&[], tauqe_protocol::PatchStrategy::SearchReplace) {
         Some(tauqe_core::providers::ResponseFormat::JsonSchema { json_schema, .. }) => {
-            assert_eq!(json_schema.name, "discussion_response");
+            let schema = &json_schema.schema;
+            assert!(schema["properties"].get("changes").is_some());
+            assert!(schema["properties"].get("plan_update").is_some());
         }
-        other => panic!(
-            "discussion protocol must advertise the discussion_response schema, got {other:?}"
-        ),
+        other => panic!("the discussion surface must compose the registry schema, got {other:?}"),
     }
 }
 
@@ -2244,8 +2348,8 @@ async fn xml_and_structured_protocols_are_interchangeable_peers() {
 /// A discovery round must extend the cached prompt prefix instead of
 /// reshaping it.
 ///
-/// The head of the system message (core contract, frozen repository map,
-/// session history) is rendered byte-identically, the requested file extends
+/// The head of the system message (the core contract and the frozen repository
+/// map) is rendered byte-identically, the requested file extends
 /// the context block in insertion order, and the discovery feedback appends to
 /// the user message rather than being woven into the head.
 #[tokio::test]
@@ -2343,6 +2447,166 @@ async fn discovery_round_extends_the_stable_prompt_prefix() {
     assert!(provider.requests()[1].messages[1]
         .content
         .starts_with(&provider.requests()[0].messages[1].content));
+}
+
+/// Multiple consecutive discovery rounds must preserve the static head and
+/// monotonically grow the reusable prompt cache prefix as new files enter
+/// context under `line_anchor` strategy.
+#[tokio::test]
+async fn multi_round_discovery_preserves_and_monotonically_grows_cached_prefix() {
+    let (_dir, repo_root) = init_repo();
+    std::fs::write(
+        repo_root.join("target.rs"),
+        "pub fn compute() -> i32 { 0 }\n",
+    )
+    .expect("write target fixture");
+    std::fs::write(repo_root.join("a.rs"), "pub const A: i32 = 1;\n").expect("write a");
+    std::fs::write(repo_root.join("b.rs"), "pub const B: i32 = 2;\n").expect("write b");
+    std::fs::write(repo_root.join("c.rs"), "pub const C: i32 = 3;\n").expect("write c");
+    commit_fixture(&repo_root, &["target.rs", "a.rs", "b.rs", "c.rs"]);
+
+    let mut context = ContextManager::new(repo_root.clone());
+    context
+        .add_file("target.rs", ContextAccess::Editable)
+        .expect("add target to context");
+    let mut history = HistoryManager::new(repo_root.clone());
+
+    let req_a =
+        format!("Need a.rs.\n<context_request_{MARKER} path=\"a.rs\" access=\"read_only\" />");
+    let req_b =
+        format!("Need b.rs.\n<context_request_{MARKER} path=\"b.rs\" access=\"read_only\" />");
+    let req_c =
+        format!("Need c.rs.\n<context_request_{MARKER} path=\"c.rs\" access=\"read_only\" />");
+    let edit = edit_block(
+        "Use constants",
+        "target.rs",
+        "pub fn compute() -> i32 { 0 }",
+        "pub fn compute() -> i32 { 42 }",
+    );
+
+    let provider = MockLlmProvider::scripted([
+        MockResponse::text(req_a),
+        MockResponse::text(req_b),
+        MockResponse::text(req_c),
+        MockResponse::text(edit),
+    ]);
+    let model = ModelRef::openrouter("mock/model");
+    let protocol = tauqe_core::prompt::xml::XmlPromptProtocol
+        .with_turn_marker(MARKER)
+        .expect("marker-bound protocol");
+    let mut policy = tauqe_core::workflow::policy::DirectApplyPolicy::new();
+    let mut options = strategy_options("line_anchor");
+    options.session_id = Some("test-session-cache-invariants".to_string());
+    options.max_discovery_rounds = 5;
+    let (stream_tx, cancel_rx) = event_channel();
+
+    let output = {
+        let mut env = build_env(
+            &provider,
+            &model,
+            &mut context,
+            &mut history,
+            protocol.as_ref(),
+            &mut policy,
+            stream_tx,
+            cancel_rx,
+            &options,
+        );
+        AnswerEditLoop::new("Find constants and update target")
+            .execute(&mut env)
+            .await
+            .expect("answer/edit loop executes")
+    };
+
+    assert!(matches!(
+        &output.result,
+        ModelResult::Edit { edits, .. } if !edits.is_empty()
+    ));
+
+    let requests = provider.requests();
+    assert_eq!(
+        requests.len(),
+        4,
+        "must execute exactly 3 discovery rounds followed by 1 proposal round"
+    );
+
+    // 1. Session ID is preserved across all rounds to maintain provider KV-cache routing
+    for (i, req) in requests.iter().enumerate() {
+        assert_eq!(
+            req.session_id.as_deref(),
+            Some("test-session-cache-invariants"),
+            "round {i} must preserve the session_id"
+        );
+    }
+
+    // 2. Static system head (contract, frozen repo map) is byte-identical
+    //    across all rounds
+    let baseline_head = stable_system_prefix(&requests[0].messages[0].content);
+    let baseline_repo_map = repo_map_block(&requests[0].messages[0].content);
+    for (i, req) in requests.iter().enumerate() {
+        let head = stable_system_prefix(&req.messages[0].content);
+        assert_eq!(
+            head, baseline_head,
+            "round {i} must have identical static system head"
+        );
+        let rmap = repo_map_block(&req.messages[0].content);
+        assert_eq!(
+            rmap, baseline_repo_map,
+            "round {i} must preserve the frozen repo map"
+        );
+    }
+
+    // 3. Rendered context body extends strictly at the tail on each discovery round
+    for i in 0..requests.len() - 1 {
+        let ctx_cur = rendered_context_body(&requests[i].messages[0].content);
+        let ctx_next = rendered_context_body(&requests[i + 1].messages[0].content);
+        assert!(
+            ctx_next.starts_with(ctx_cur),
+            "round {} context must be a strict prefix extension of round {}",
+            i + 1,
+            i
+        );
+        assert!(
+            ctx_next.len() > ctx_cur.len(),
+            "round {} context must be strictly larger than round {}",
+            i + 1,
+            i
+        );
+    }
+
+    // 4. The divergence between two consecutive rounds is confined to the tail
+    //    that follows the context block: the session history renders after the
+    //    context so the divergence point of two consecutive turns falls as
+    //    late as possible, and within the turn the whole warmed context stays
+    //    inside the shared prefix, which grows with every discovery round.
+    let mut prev_prefix_len = 0;
+    for i in 1..requests.len() {
+        let prev_sys = &requests[i - 1].messages[0].content;
+        let cur_sys = &requests[i].messages[0].content;
+        let shared_len = common_prefix_len(prev_sys, cur_sys);
+        let context_close = prev_sys
+            .find("</context>")
+            .expect("the previous round must close its context block");
+
+        assert!(
+            shared_len >= context_close,
+            "round {i} shared prefix must cover the whole previous context block (shared: {shared_len}, context closes at: {context_close})"
+        );
+        assert!(
+            shared_len > prev_prefix_len,
+            "cached prefix length must monotonically grow: round {i} shared {shared_len} <= prev {prev_prefix_len}"
+        );
+        prev_prefix_len = shared_len;
+    }
+
+    // 5. User prompt preserves base task prompt prefix across rounds
+    let base_prompt = &requests[0].messages[1].content;
+    for (i, req) in requests.iter().enumerate().skip(1) {
+        assert!(
+            req.messages[1].content.starts_with(base_prompt),
+            "round {i} user prompt must preserve base prompt prefix"
+        );
+    }
 }
 
 /// The turn scratchpad is volatile: it appears as the last block of the system
@@ -4952,5 +5216,1246 @@ args = ['-c', 'printf "# self-preserved\n" >> tauqe.toml']
     assert!(
         worktree_status(&repo_root).is_empty(),
         "the turn must not leave unaccounted files behind"
+    );
+}
+
+/// Builds the workflow options a project declares through `[develop]
+/// patch_strategy`, pinning the semantic prompt layout.
+///
+/// The options are decoded from a declaration exactly as the daemon decodes
+/// `tauqe.toml`, so a test observes the same single source of truth the
+/// project configuration provides. The declaration also pins the semantic
+/// block order: the line-anchor and cache-invariant tests read the rendered
+/// context block out of the system message and measure the divergence of
+/// consecutive heads, so they state the layout they analyze instead of
+/// inheriting the intent-selected default of an interactive turn.
+fn strategy_options(strategy: &str) -> WorkflowOptions {
+    let declaration =
+        format!("[develop]\npatch_strategy = \"{strategy}\"\nprompt_layout = \"semantic\"\n");
+    let config: tauqe_core::config::AppConfig =
+        toml::from_str(&declaration).expect("parse the patch strategy declaration");
+    WorkflowOptions::from_app_config(&config)
+}
+/// Builds one anchored replacement of an inclusive line range.
+///
+/// Both bounds are copied from the anchors the context block rendered for the
+/// same line indices, so the proposal addresses the lines exactly as the model
+/// sees them.
+fn anchored_change(path: &str, start: u16, end: u16, content: &str) -> serde_json::Value {
+    serde_json::json!({
+        "op": "replace",
+        "path": path,
+        "start": tauqe_core::edits::anchor::encode_anchor(path, start),
+        "end": tauqe_core::edits::anchor::encode_anchor(path, end),
+        "content": content,
+    })
+}
+
+/// The declared `line_anchor` strategy reaches both halves of the turn: the
+/// context block renders the opaque anchor of every line, and the change set
+/// names its ranges through those anchors.
+///
+/// Disjoint ranges are applied from the bottom of the file upwards, so a lower
+/// replacement that grows the file never shifts the lines a higher range already
+/// addressed.
+#[tokio::test]
+async fn line_anchor_turn_replaces_disjoint_ranges_bottom_to_top() {
+    let (_dir, repo_root) = init_repo();
+    std::fs::write(repo_root.join("target.rs"), "alpha\nbeta\ngamma\n")
+        .expect("write target fixture");
+    commit_fixture(&repo_root, &["target.rs"]);
+
+    let mut context = ContextManager::new(repo_root.clone());
+    context
+        .add_file("target.rs", ContextAccess::Editable)
+        .expect("add target to context");
+    let mut history = HistoryManager::new(repo_root.clone());
+
+    // The lower range absorbs one line into three, while the higher range still
+    // addresses the line index of the original snapshot.
+    let response = serde_json::json!({
+        "message": "Rewrite the middle line and the tail.",
+        "changes": [
+            anchored_change("target.rs", 1, 1, "beta one\nbeta two\nbeta three\n"),
+            anchored_change("target.rs", 2, 2, "GAMMA\n"),
+        ],
+        "context_requests": [],
+    })
+    .to_string();
+
+    let provider = MockLlmProvider::scripted([MockResponse::text(response)]);
+    let model = ModelRef::openrouter("mock/model");
+    let protocol = tauqe_core::prompt::json::JsonPromptProtocol::edits();
+    let mut policy = tauqe_core::workflow::policy::DirectApplyPolicy::new();
+    let options = strategy_options("line_anchor");
+    let (stream_tx, cancel_rx) = event_channel();
+
+    let output = {
+        let mut env = build_env(
+            &provider,
+            &model,
+            &mut context,
+            &mut history,
+            &protocol,
+            &mut policy,
+            stream_tx,
+            cancel_rx,
+            &options,
+        );
+        AnswerEditLoop::new("Rewrite the middle line and the tail")
+            .execute(&mut env)
+            .await
+            .expect("answer/edit loop executes")
+    };
+
+    assert!(matches!(
+        &output.result,
+        ModelResult::Edit { outcome, .. } if outcome.applied
+    ));
+    assert_eq!(
+        provider.requests().len(),
+        1,
+        "one anchored change set must converge on the first attempt"
+    );
+
+    // The declaration is the single source of truth for both halves: the very
+    // key that stages the ranges is what rendered their anchors into the prompt.
+    let system = &provider.requests()[0].messages[0].content;
+    let first = tauqe_core::edits::anchor::encode_anchor("target.rs", 0);
+    let second = tauqe_core::edits::anchor::encode_anchor("target.rs", 1);
+    assert!(system.contains(&format!("{first} | alpha")));
+    assert!(system.contains(&format!("{second} | beta")));
+    assert!(!system.contains("\nalpha\nbeta\n"));
+
+    assert_eq!(
+        std::fs::read_to_string(repo_root.join("target.rs")).expect("read target fixture"),
+        "alpha\nbeta one\nbeta two\nbeta three\nGAMMA\n"
+    );
+}
+
+/// Two anchored ranges that share a line would make the result depend on the
+/// order of application, so the whole change set is rejected before a byte
+/// moves.
+///
+/// The retry receives the diagnostic, and the turn fails only once the retry
+/// budget is spent, which keeps the failure inside the bounded turn instead of
+/// reaching the working tree.
+#[tokio::test]
+async fn overlapping_anchor_ranges_are_rejected_before_any_byte_moves() {
+    let (_dir, repo_root) = init_repo();
+    std::fs::write(repo_root.join("target.rs"), "alpha\nbeta\ngamma\n")
+        .expect("write target fixture");
+    commit_fixture(&repo_root, &["target.rs"]);
+
+    let mut context = ContextManager::new(repo_root.clone());
+    context
+        .add_file("target.rs", ContextAccess::Editable)
+        .expect("add target to context");
+    let mut history = HistoryManager::new(repo_root.clone());
+
+    // The first range already claims the line the second one re-addresses.
+    let response = serde_json::json!({
+        "message": "Rewrite the overlapping block.",
+        "changes": [
+            anchored_change("target.rs", 1, 2, "BLOCK\n"),
+            anchored_change("target.rs", 2, 2, "TAIL\n"),
+        ],
+        "context_requests": [],
+    })
+    .to_string();
+
+    let provider = MockLlmProvider::scripted([
+        MockResponse::text(response.clone()),
+        MockResponse::text(response),
+    ]);
+    let model = ModelRef::openrouter("mock/model");
+    let protocol = tauqe_core::prompt::json::JsonPromptProtocol::edits();
+    let mut policy = tauqe_core::workflow::policy::DirectApplyPolicy::new();
+    let options = WorkflowOptions {
+        max_retries: 1,
+        ..strategy_options("line_anchor")
+    };
+    let (stream_tx, cancel_rx) = event_channel();
+
+    let output = {
+        let mut env = build_env(
+            &provider,
+            &model,
+            &mut context,
+            &mut history,
+            &protocol,
+            &mut policy,
+            stream_tx,
+            cancel_rx,
+            &options,
+        );
+        AnswerEditLoop::new("Rewrite the overlapping block")
+            .execute(&mut env)
+            .await
+            .expect("answer/edit loop executes")
+    };
+
+    match &output.result {
+        ModelResult::Edit { outcome, edits, .. } => {
+            assert!(!outcome.applied, "an overlapping change set must not apply");
+            assert!(edits.is_empty());
+            let error = outcome.error.clone().unwrap_or_default();
+            assert!(
+                error.contains("overlaps the range"),
+                "the diagnostic must name the collision: {error}"
+            );
+            assert!(
+                error.contains("disjoint line ranges"),
+                "the diagnostic must state the invariant: {error}"
+            );
+        }
+        other => panic!("expected a rejected change set, got {other:?}"),
+    }
+    assert_eq!(
+        provider.requests().len(),
+        2,
+        "the retry budget must be spent on the rejected change set"
+    );
+    let retry = &provider.requests()[1].messages[1].content;
+    assert!(retry.contains("Failed files and errors:"));
+    assert!(retry.contains("target.rs"));
+
+    assert_eq!(
+        std::fs::read_to_string(repo_root.join("target.rs")).expect("read target fixture"),
+        "alpha\nbeta\ngamma\n",
+        "a rejected change set must never reach the working tree"
+    );
+}
+
+/// An anchor outside the codec alphabet names no line at all, so the change set
+/// is rejected with a precise diagnostic that the patch retry hands back to the
+/// model.
+///
+/// The corrected proposal addresses the very same line through the anchor the
+/// context block rendered, and the turn then converges normally.
+#[tokio::test]
+async fn invalid_anchor_token_triggers_a_patch_retry_that_repairs_the_range() {
+    let (_dir, repo_root) = init_repo();
+    std::fs::write(repo_root.join("target.rs"), "alpha\nbeta\ngamma\n")
+        .expect("write target fixture");
+    commit_fixture(&repo_root, &["target.rs"]);
+
+    let mut context = ContextManager::new(repo_root.clone());
+    context
+        .add_file("target.rs", ContextAccess::Editable)
+        .expect("add target to context");
+    let mut history = HistoryManager::new(repo_root.clone());
+
+    // `0` is deliberately absent from the anchor alphabet, so this token cannot
+    // have been copied from the context block.
+    let broken = serde_json::json!({
+        "message": "Rewrite the middle line.",
+        "changes": [{
+            "op": "replace",
+            "path": "target.rs",
+            "start": "kR70",
+            "end": "kR70",
+            "content": "BETA\n",
+        }],
+        "context_requests": [],
+    })
+    .to_string();
+    let corrected = serde_json::json!({
+        "message": "Rewrite the middle line.",
+        "changes": [anchored_change("target.rs", 1, 1, "BETA\n")],
+        "context_requests": [],
+    })
+    .to_string();
+
+    let provider =
+        MockLlmProvider::scripted([MockResponse::text(broken), MockResponse::text(corrected)]);
+    let model = ModelRef::openrouter("mock/model");
+    let protocol = tauqe_core::prompt::json::JsonPromptProtocol::edits();
+    let mut policy = tauqe_core::workflow::policy::DirectApplyPolicy::new();
+    let options = strategy_options("line_anchor");
+    let (stream_tx, cancel_rx) = event_channel();
+
+    let output = {
+        let mut env = build_env(
+            &provider,
+            &model,
+            &mut context,
+            &mut history,
+            &protocol,
+            &mut policy,
+            stream_tx,
+            cancel_rx,
+            &options,
+        );
+        AnswerEditLoop::new("Rewrite the middle line")
+            .execute(&mut env)
+            .await
+            .expect("answer/edit loop executes")
+    };
+
+    assert!(matches!(
+        &output.result,
+        ModelResult::Edit { outcome, .. } if outcome.applied
+    ));
+    assert!(
+        output.assistant_text.contains("Patch Retry"),
+        "an undecodable anchor must run the patch retry loop: {:?}",
+        output.assistant_text
+    );
+    assert_eq!(
+        provider.requests().len(),
+        2,
+        "the retry must be spent on the malformed range"
+    );
+    let retry = &provider.requests()[1].messages[1].content;
+    assert!(retry.contains("Failed files and errors:"));
+    assert!(retry.contains("target.rs"));
+
+    assert_eq!(
+        std::fs::read_to_string(repo_root.join("target.rs")).expect("read target fixture"),
+        "alpha\nBETA\ngamma\n"
+    );
+}
+
+/// Builds the workflow options a project declares through `[develop]
+/// prompt_layout`.
+///
+/// The options are decoded from a declaration exactly as the daemon decodes
+/// `tauqe.toml`, so a test observes the same single source of truth the project
+/// configuration provides: one key decides the block order of every prompt the
+/// turn assembles.
+fn layout_options(layout: &str) -> WorkflowOptions {
+    let declaration = format!("[develop]\nprompt_layout = \"{layout}\"\n");
+    let config: tauqe_core::config::AppConfig =
+        toml::from_str(&declaration).expect("parse the prompt layout declaration");
+    WorkflowOptions::from_app_config(&config)
+}
+
+/// The layout policy a project declares reaches the prompt the FSM assembles:
+/// the same bounded turn composes the semantic block order or the chronological
+/// transcript exactly as declared, and a configuration without a declaration
+/// follows the turn intent.
+#[tokio::test]
+async fn declared_prompt_layout_reaches_the_prompt_assembly() {
+    let default_config_options =
+        WorkflowOptions::from_app_config(&tauqe_core::config::AppConfig::default());
+    for (case, options, chronological) in [
+        ("declared semantic", layout_options("semantic"), false),
+        (
+            "declared chronological",
+            layout_options("chronological"),
+            true,
+        ),
+        ("intent default", default_config_options, true),
+    ] {
+        let (_dir, repo_root) = init_repo();
+        std::fs::write(
+            repo_root.join("target.rs"),
+            "pub fn compute() -> i32 { 0 }\n",
+        )
+        .expect("write target fixture");
+        commit_fixture(&repo_root, &["target.rs"]);
+
+        let mut context = ContextManager::new(repo_root.clone());
+        context
+            .add_file("target.rs", ContextAccess::Editable)
+            .expect("add target to context");
+        let mut history = HistoryManager::new(repo_root.clone());
+
+        let edit = edit_block(
+            "Change compute to 42",
+            "target.rs",
+            "pub fn compute() -> i32 { 0 }",
+            "pub fn compute() -> i32 { 42 }",
+        );
+        let provider = MockLlmProvider::scripted([MockResponse::text(edit)]);
+        let model = ModelRef::openrouter("mock/model");
+        let protocol = tauqe_core::prompt::xml::XmlPromptProtocol
+            .with_turn_marker(MARKER)
+            .expect("marker-bound protocol");
+        let mut policy = tauqe_core::workflow::policy::DirectApplyPolicy::new();
+        let (stream_tx, cancel_rx) = event_channel();
+
+        let output = {
+            let mut env = build_env(
+                &provider,
+                &model,
+                &mut context,
+                &mut history,
+                protocol.as_ref(),
+                &mut policy,
+                stream_tx,
+                cancel_rx,
+                &options,
+            );
+            AnswerEditLoop::new("Change compute to return 42")
+                .execute(&mut env)
+                .await
+                .expect("answer/edit loop executes")
+        };
+
+        assert!(
+            matches!(
+                &output.result,
+                ModelResult::Edit { outcome, .. } if outcome.applied
+            ),
+            "the {case} turn must apply its edit"
+        );
+        let requests = provider.requests();
+        assert_eq!(
+            requests.len(),
+            1,
+            "the {case} turn must converge in a single proposal round"
+        );
+        let messages = &requests[0].messages;
+        let system = &messages[0].content;
+
+        assert!(
+            system.contains("## Core System Contract"),
+            "the {case} head must render the system contract"
+        );
+        if chronological {
+            assert!(
+                !system.contains("## Project Context"),
+                "the {case} head must not carry the context block"
+            );
+            assert!(
+                !system.contains("{ 0 }"),
+                "the {case} head must not carry the file body"
+            );
+            assert!(
+                messages.len() > 2,
+                "the {case} transcript must interleave the context body"
+            );
+            let body_in_transcript = messages.iter().skip(1).any(|message| {
+                message.content.contains("path=\"target.rs\"") && message.content.contains("{ 0 }")
+            });
+            assert!(
+                body_in_transcript,
+                "the {case} transcript must carry the file body"
+            );
+            assert!(
+                messages
+                    .iter()
+                    .any(|message| message.content.contains("<context_manifest>")),
+                "the {case} tail must render the context manifest"
+            );
+        } else {
+            assert!(
+                system.contains("## Project Context"),
+                "the {case} system message must carry the context block"
+            );
+            assert!(
+                system.contains("{ 0 }"),
+                "the {case} system message must carry the file body"
+            );
+            assert_eq!(
+                messages.len(),
+                2,
+                "the semantic policy must compose system and user messages only"
+            );
+        }
+        let last = messages
+            .last()
+            .map(|message| message.content.as_str())
+            .unwrap_or_default();
+        assert!(
+            last.ends_with("Change compute to return 42"),
+            "the {case} sequence must close with the developer message: {last:?}"
+        );
+    }
+}
+
+/// A plan discussion resolves its prompt layout exactly as the interactive REPL
+/// does: with the default configuration it builds the chronological transcript,
+/// so the head every dialogue shares stays byte-stable while the context bodies
+/// travel through the transcript instead of the head.
+#[tokio::test]
+async fn plan_discussion_turn_assembles_the_chronological_transcript() {
+    let (_dir, repo_root) = init_repo();
+    std::fs::write(
+        repo_root.join("target.rs"),
+        "pub fn compute() -> i32 { 0 }\n",
+    )
+    .expect("write target fixture");
+    commit_fixture(&repo_root, &["target.rs"]);
+
+    let mut context = ContextManager::new(repo_root.clone());
+    context
+        .add_file("target.rs", ContextAccess::Editable)
+        .expect("add target to context");
+    let mut history = HistoryManager::new(repo_root.clone());
+
+    let provider = MockLlmProvider::scripted([MockResponse::text(
+        "The invariants are settled; no edits are required.",
+    )]);
+    let model = ModelRef::openrouter("mock/model");
+    let protocol = tauqe_core::prompt::xml::XmlPromptProtocol
+        .with_turn_marker(MARKER)
+        .expect("marker-bound protocol");
+    let mut policy = tauqe_core::workflow::policy::DirectApplyPolicy::new();
+    let options = WorkflowOptions::from_app_config(&tauqe_core::config::AppConfig::default());
+    let (stream_tx, cancel_rx) = event_channel();
+
+    let output = {
+        let mut env = build_env(
+            &provider,
+            &model,
+            &mut context,
+            &mut history,
+            protocol.as_ref(),
+            &mut policy,
+            stream_tx,
+            cancel_rx,
+            &options,
+        );
+        env.intent = tauqe_protocol::TurnIntent::PlanDiscussion;
+        AnswerEditLoop::new("Refine the plan invariants")
+            .execute(&mut env)
+            .await
+            .expect("plan discussion turn executes")
+    };
+
+    assert!(matches!(output.result, ModelResult::Answer { .. }));
+    let requests = provider.requests();
+    assert_eq!(requests.len(), 1);
+
+    let messages = &requests[0].messages;
+    let head = &messages[0].content;
+    assert!(
+        !head.contains("## Project Context"),
+        "the shared head must not carry the context block"
+    );
+    assert!(
+        !head.contains("{ 0 }"),
+        "the shared head must not carry a file body"
+    );
+    assert!(
+        messages
+            .iter()
+            .skip(1)
+            .any(|message| message.content.contains("path=\"target.rs\"")
+                && message.content.contains("{ 0 }")),
+        "the transcript must carry the context body"
+    );
+    assert!(
+        messages
+            .iter()
+            .any(|message| message.content.contains("<context_manifest>")),
+        "the tail must render the context manifest"
+    );
+    assert_eq!(
+        messages.last().map(|message| message.content.as_str()),
+        Some("Refine the plan invariants")
+    );
+}
+
+/// Returns the length in bytes of the common prefix of two rendered strings.
+///
+/// The helper measures how much of an earlier prompt a later round reproduced
+/// byte for byte: a turn that only appends material keeps the shared prefix
+/// growing monotonically instead of reshaping what it already sent.
+fn common_prefix_len(a: &str, b: &str) -> usize {
+    a.bytes().zip(b.bytes()).take_while(|(x, y)| x == y).count()
+}
+
+/// Returns the tail user message of a chronological transcript.
+///
+/// The transcript closes with the developer task message, so the message in
+/// front of it is the volatile tail that carries the regime delta, the active
+/// plan, the context manifest, and the turn scratchpad.
+fn tail_message(messages: &[ChatMessage]) -> &str {
+    messages
+        .len()
+        .checked_sub(2)
+        .and_then(|index| messages.get(index))
+        .map(|message| message.content.as_str())
+        .unwrap_or_default()
+}
+
+/// Returns the developer task message that closes a transcript.
+fn task_message(messages: &[ChatMessage]) -> &str {
+    messages
+        .last()
+        .map(|message| message.content.as_str())
+        .unwrap_or_default()
+}
+
+/// Returns the regime delta block that leads the tail message.
+///
+/// The block opens the tail message and ends where the first volatile tail
+/// block begins, so two rounds compare the delta alone instead of the whole
+/// tail. A transcript without a leading delta reports an empty block.
+fn regime_delta(tail: &str) -> &str {
+    const HEADER: &str = "## Regime Delta\n";
+    if !tail.starts_with(HEADER) {
+        return "";
+    }
+    let rest = &tail[HEADER.len()..];
+    let end = [
+        "## Active Task Plan Context",
+        "## Project Context Manifest",
+        "## Turn Scratchpad (Working Memory)",
+    ]
+    .iter()
+    .filter_map(|heading| rest.find(heading))
+    .min()
+    .unwrap_or(rest.len());
+    &tail[..HEADER.len() + end]
+}
+
+/// The regime delta leads the tail of every dialogue round: it stays strictly in
+/// front of the context manifest and the turn scratchpad, it survives discovery
+/// and a patch retry byte for byte, and the round diagnostics land behind it in
+/// the developer task message.
+#[tokio::test]
+async fn dialogue_tail_leads_with_the_regime_delta_across_rounds() {
+    let (_dir, repo_root) = init_repo();
+    std::fs::write(
+        repo_root.join("target.rs"),
+        "pub fn compute() -> i32 { 0 }\n",
+    )
+    .expect("write target fixture");
+    std::fs::write(repo_root.join("helper.rs"), "pub const ANSWER: i32 = 42;\n")
+        .expect("write helper fixture");
+    commit_fixture(&repo_root, &["target.rs", "helper.rs"]);
+
+    let mut context = ContextManager::new(repo_root.clone());
+    context
+        .add_file("target.rs", ContextAccess::Editable)
+        .expect("add target to context");
+    let mut history = HistoryManager::new(repo_root.clone());
+
+    let discovery = format!(
+        "Recording working notes.\n\
+        <scratchpad_{MARKER}>\n- Finding: helper.rs holds ANSWER\n</scratchpad_{MARKER}>\n\
+        <context_request_{MARKER} path=\"helper.rs\" access=\"read_only\" />"
+    );
+    let broken = edit_block(
+        "Broken attempt",
+        "target.rs",
+        "this text does not exist in the file",
+        "irrelevant replacement",
+    );
+    let corrected = edit_block(
+        "Change compute to 42",
+        "target.rs",
+        "pub fn compute() -> i32 { 0 }",
+        "pub fn compute() -> i32 { 42 }",
+    );
+    let provider = MockLlmProvider::scripted([
+        MockResponse::text(discovery),
+        MockResponse::text(broken),
+        MockResponse::text(corrected),
+    ]);
+    let model = ModelRef::openrouter("mock/model");
+    let protocol = tauqe_core::prompt::xml::XmlPromptProtocol
+        .with_turn_marker(MARKER)
+        .expect("marker-bound protocol");
+    let mut policy = tauqe_core::workflow::policy::DirectApplyPolicy::new();
+    // Единая голова диалога требует транскрипта: при semantic-layout дельта
+    // режима сливается с сообщением задачи и хвостового сообщения не существует.
+    // Тест заявляет макет, который анализирует, вместо неявного дефолта.
+    let options = layout_options("chronological");
+    let (stream_tx, cancel_rx) = event_channel();
+
+    let output = {
+        let mut env = build_env(
+            &provider,
+            &model,
+            &mut context,
+            &mut history,
+            protocol.as_ref(),
+            &mut policy,
+            stream_tx,
+            cancel_rx,
+            &options,
+        );
+        AnswerEditLoop::new("Change compute to return 42")
+            .execute(&mut env)
+            .await
+            .expect("answer/edit loop executes")
+    };
+
+    assert!(matches!(
+        &output.result,
+        ModelResult::Edit { edits, .. } if !edits.is_empty()
+    ));
+    assert_eq!(
+        provider.requests().len(),
+        3,
+        "discovery, the patch retry, and the corrected proposal cost one round each"
+    );
+
+    let requests = provider.requests();
+    let rounds: Vec<(&str, &str)> = requests
+        .iter()
+        .map(|request| {
+            (
+                tail_message(&request.messages),
+                task_message(&request.messages),
+            )
+        })
+        .collect();
+
+    let first_delta = regime_delta(rounds[0].0);
+    assert!(
+        !first_delta.is_empty(),
+        "every dialogue round states the regime delta: {}",
+        rounds[0].0
+    );
+    for (index, (tail, task)) in rounds.iter().enumerate() {
+        assert!(
+            tail.starts_with("## Regime Delta"),
+            "round {index} tail must open with the delta: {tail}"
+        );
+        assert_eq!(
+            regime_delta(tail),
+            first_delta,
+            "round {index} must reproduce the delta byte for byte"
+        );
+        assert_eq!(
+            tail.matches("## Regime Delta").count(),
+            1,
+            "round {index} must carry exactly one delta block"
+        );
+        assert!(
+            common_prefix_len(rounds[0].0, tail) >= first_delta.len(),
+            "round {index} shared prefix must cover the whole delta"
+        );
+        assert!(
+            !task.contains("## Regime Delta"),
+            "the delta belongs in the tail, never in the task message"
+        );
+    }
+
+    // The tail keeps one fixed order behind the delta: the context manifest,
+    // then the turn scratchpad.
+    let tail = rounds[2].0;
+    let delta_end = regime_delta(tail).len();
+    let manifest_at = tail
+        .find("<context_manifest>")
+        .expect("the tail renders the context manifest");
+    let scratchpad_at = tail
+        .find("## Turn Scratchpad (Working Memory)")
+        .expect("the scratchpad discovery gathered survives the turn");
+    assert!(delta_end <= manifest_at, "the delta must lead the manifest");
+    assert!(
+        manifest_at < scratchpad_at,
+        "the manifest must precede the scratchpad"
+    );
+
+    // Round diagnostics append to the task message, behind the turn journal.
+    assert!(!rounds[0].1.contains("Failed files and errors:"));
+    // The broken attempt costs one round and the retry that carries its
+    // diagnostics costs the next one, so the repair prompt is the third.
+    let before_retry = rounds[1].1;
+    assert!(
+        !before_retry.contains("Failed files and errors:"),
+        "the retry diagnostics belong to the retry round: {before_retry}"
+    );
+    let retry = rounds[2].1;
+    assert!(
+        retry.contains("Failed files and errors:"),
+        "the patch retry must report its diagnostics: {retry}"
+    );
+    assert!(
+        !rounds[2].0.contains("Failed files and errors:"),
+        "diagnostics never reshape the tail"
+    );
+}
+
+/// Verification healing repeats the same turn, so the regime delta that leads
+/// the tail message must survive every additional round byte for byte while the
+/// compiler diagnostics travel in the task message.
+#[tokio::test]
+async fn verification_healing_reproduces_the_regime_delta_byte_for_byte() {
+    let (_dir, repo_root) = init_repo();
+    std::fs::write(repo_root.join("Cargo.toml"), HEAL_MANIFEST).expect("write manifest");
+    std::fs::create_dir_all(repo_root.join("src")).expect("create src directory");
+    std::fs::write(repo_root.join("src/lib.rs"), HEAL_LIB).expect("write broken library");
+    declare_verification(&repo_root);
+    commit_fixture(&repo_root, &["Cargo.toml", "src/lib.rs", "tauqe.toml"]);
+
+    let mut context = ContextManager::new(repo_root.clone());
+    context
+        .add_file("src/lib.rs", ContextAccess::Editable)
+        .expect("add library to context");
+    let mut history = HistoryManager::new(repo_root.clone());
+
+    let fix_alpha = format!(
+        "{edits}\n<verify_{MARKER} target=\"check\" on_success=\"silent\" />",
+        edits = edit_block(
+            "Repair alpha return type",
+            "src/lib.rs",
+            "pub fn alpha() -> i32 { \"alpha\" }",
+            "pub fn alpha() -> i32 { 1 }",
+        ),
+    );
+    let fix_beta = format!(
+        "{edits}\n<verify_{MARKER} target=\"check\" on_success=\"silent\" />",
+        edits = edit_block(
+            "Repair beta return type",
+            "src/lib.rs",
+            "pub fn beta() -> i32 { \"beta\" }",
+            "pub fn beta() -> i32 { 2 }",
+        ),
+    );
+    let provider =
+        MockLlmProvider::scripted([MockResponse::text(fix_alpha), MockResponse::text(fix_beta)]);
+    let model = ModelRef::openrouter("mock/model");
+    let protocol = tauqe_core::prompt::xml::XmlPromptProtocol
+        .with_turn_marker(MARKER)
+        .expect("marker-bound protocol");
+    let (stream_tx, cancel_rx) = event_channel();
+
+    let mut policy = GitTransactionPolicy::new();
+    // Healing повторяет тот же оборот: макет обязан быть тем же транскриптом,
+    // иначе байт-стабильность дельты проверялась бы на другом порядке блоков.
+    let exec = SingleExecution::new(layout_options("chronological"));
+    let execution = exec
+        .execute(
+            &mut policy,
+            "Fix the mismatched return types in src/lib.rs",
+            tauqe_protocol::TurnIntent::InteractiveRepl,
+            &provider,
+            &model,
+            &mut context,
+            &mut history,
+            protocol.as_ref(),
+            stream_tx,
+            cancel_rx,
+        )
+        .await
+        .expect("workflow execution succeeds");
+
+    assert!(matches!(
+        execution.result,
+        ModelResult::Edit { outcome, .. } if outcome.applied
+    ));
+    assert_eq!(
+        provider.requests().len(),
+        2,
+        "the first attempt must fail verification and heal"
+    );
+
+    let requests = provider.requests();
+    let rounds: Vec<(&str, &str)> = requests
+        .iter()
+        .map(|request| {
+            (
+                tail_message(&request.messages),
+                task_message(&request.messages),
+            )
+        })
+        .collect();
+
+    let first_delta = regime_delta(rounds[0].0);
+    assert!(
+        !first_delta.is_empty(),
+        "the healing round repeats the same regime delta: {}",
+        rounds[0].0
+    );
+    for (index, (tail, task)) in rounds.iter().enumerate() {
+        assert!(
+            tail.starts_with("## Regime Delta"),
+            "round {index} tail must open with the delta: {tail}"
+        );
+        assert_eq!(
+            regime_delta(tail),
+            first_delta,
+            "round {index} must reproduce the delta byte for byte"
+        );
+        assert_eq!(tail.matches("## Regime Delta").count(), 1);
+        assert!(common_prefix_len(rounds[0].0, tail) >= first_delta.len());
+        assert!(!task.contains("## Regime Delta"));
+    }
+    assert!(
+        rounds[1].1.contains("Please fix the errors"),
+        "the healing diagnostics stay behind the delta: {}",
+        rounds[1].1
+    );
+}
+
+/// A plan discussion is an editing dialogue: a change it proposes travels the
+/// full transactional path — in-memory staging, verified toolchain run, and
+/// exactly one atomic commit — while the intent keeps authorizing plan
+/// mutations through the discussion plan mode.
+#[cfg(unix)]
+#[tokio::test]
+async fn plan_discussion_edit_runs_the_transactional_path() {
+    let (_dir, repo_root) = init_repo();
+    std::fs::create_dir_all(repo_root.join("src")).expect("create src directory");
+    std::fs::write(
+        repo_root.join("src/lib.rs"),
+        "pub fn alpha() -> i32 { 0 }\n",
+    )
+    .expect("write library");
+    write_project_config(
+        &repo_root,
+        concat!(
+            "[models]\n",
+            "primary = [\"openrouter:mock/model\"]\n",
+            "\n",
+            "[project.verify]\n",
+            "command = \"grep\"\n",
+            "args = [\"-q\", \"pub fn alpha() -> i32 { 1 }\", \"src/lib.rs\"]\n",
+        ),
+    );
+    commit_fixture(&repo_root, &["src/lib.rs", "tauqe.toml"]);
+
+    let mut context = ContextManager::new(repo_root.clone());
+    context
+        .add_file("src/lib.rs", ContextAccess::Editable)
+        .expect("add library to context");
+    let mut history = HistoryManager::new(repo_root.clone());
+
+    let repair = format!(
+        "{edits}\n<verify_{MARKER} target=\"check\" on_success=\"silent\" />",
+        edits = edit_block(
+            "Raise the alpha constant",
+            "src/lib.rs",
+            "pub fn alpha() -> i32 { 0 }",
+            "pub fn alpha() -> i32 { 1 }",
+        ),
+    );
+    let provider = MockLlmProvider::scripted([MockResponse::text(repair)]);
+    let model = ModelRef::openrouter("mock/model");
+    let protocol = tauqe_core::prompt::xml::XmlPromptProtocol
+        .with_turn_marker(MARKER)
+        .expect("marker-bound protocol");
+    let (stream_tx, cancel_rx) = event_channel();
+
+    let baseline = commit_count(&repo_root);
+    let mut policy = GitTransactionPolicy::new();
+    let exec = SingleExecution::new(WorkflowOptions::default());
+    let execution = exec
+        .execute(
+            &mut policy,
+            "Raise the alpha constant",
+            tauqe_protocol::TurnIntent::PlanDiscussion,
+            &provider,
+            &model,
+            &mut context,
+            &mut history,
+            protocol.as_ref(),
+            stream_tx,
+            cancel_rx,
+        )
+        .await
+        .expect("plan discussion turn executes");
+
+    match execution.result {
+        ModelResult::Edit { outcome, .. } => {
+            assert!(
+                outcome.error.is_none(),
+                "unexpected error: {:?}",
+                outcome.error
+            );
+            assert!(
+                outcome.applied,
+                "a discussion edit must pass staging, verification, and the git transaction"
+            );
+            assert_eq!(outcome.changed_files, vec!["src/lib.rs".to_string()]);
+            assert!(
+                outcome.commit_hash.is_some(),
+                "the change set must be committed"
+            );
+        }
+        other => panic!("expected applied edits, got {other:?}"),
+    }
+    assert_eq!(
+        provider.requests().len(),
+        1,
+        "the declared verification must pass on the first attempt"
+    );
+    assert_eq!(
+        std::fs::read_to_string(repo_root.join("src/lib.rs")).expect("read library"),
+        "pub fn alpha() -> i32 { 1 }\n"
+    );
+    assert_eq!(
+        commit_paths(&repo_root),
+        vec!["src/lib.rs".to_string()],
+        "the discussion edit must be the only committed path"
+    );
+    assert_eq!(
+        commit_count(&repo_root),
+        baseline + 1,
+        "one bounded turn produces exactly one commit"
+    );
+    let status = worktree_status(&repo_root);
+    assert!(
+        status.is_empty(),
+        "the turn must not leave unaccounted files behind: {status:?}"
+    );
+}
+
+/// A failed verification inside a plan discussion rolls the working tree back to
+/// its pre-turn checkpoint, so a discussion edit never leaves a half-applied
+/// change behind.
+#[cfg(unix)]
+#[tokio::test]
+async fn plan_discussion_edit_rolls_back_a_failed_verification() {
+    let (_dir, repo_root) = init_repo();
+    std::fs::write(
+        repo_root.join("target.rs"),
+        "pub fn compute() -> i32 { 0 }\n",
+    )
+    .expect("write target fixture");
+    write_project_config(
+        &repo_root,
+        concat!(
+            "[models]\n",
+            "primary = [\"openrouter:mock/model\"]\n",
+            "\n",
+            "[project.verify]\n",
+            "command = \"sh\"\n",
+            "args = ['-c', 'exit 1']\n",
+        ),
+    );
+    commit_fixture(&repo_root, &["target.rs", "tauqe.toml"]);
+
+    let mut context = ContextManager::new(repo_root.clone());
+    context
+        .add_file("target.rs", ContextAccess::Editable)
+        .expect("add target to context");
+    let mut history = HistoryManager::new(repo_root.clone());
+
+    let edit = format!(
+        "{edits}\n<verify_{MARKER} target=\"check\" on_success=\"silent\" />",
+        edits = edit_block(
+            "Change compute to 42",
+            "target.rs",
+            "pub fn compute() -> i32 { 0 }",
+            "pub fn compute() -> i32 { 42 }",
+        ),
+    );
+    let provider = MockLlmProvider::scripted([MockResponse::text(edit)]);
+    let model = ModelRef::openrouter("mock/model");
+    let protocol = tauqe_core::prompt::xml::XmlPromptProtocol
+        .with_turn_marker(MARKER)
+        .expect("marker-bound protocol");
+    let (stream_tx, cancel_rx) = event_channel();
+
+    let baseline = commit_count(&repo_root);
+    let mut policy = GitTransactionPolicy::new();
+    let options = WorkflowOptions {
+        max_retries: 0,
+        ..WorkflowOptions::default()
+    };
+    let exec = SingleExecution::new(options);
+    let execution = exec
+        .execute(
+            &mut policy,
+            "Change compute to return 42",
+            tauqe_protocol::TurnIntent::PlanDiscussion,
+            &provider,
+            &model,
+            &mut context,
+            &mut history,
+            protocol.as_ref(),
+            stream_tx,
+            cancel_rx,
+        )
+        .await
+        .expect("plan discussion turn executes");
+
+    match execution.result {
+        ModelResult::Edit { outcome, .. } => {
+            assert!(!outcome.applied, "a failed verification must not commit");
+            let error = outcome.error.unwrap_or_default();
+            assert!(
+                error.contains("Code verification failed"),
+                "unexpected error: {error}"
+            );
+        }
+        other => panic!("expected a failed verification, got {other:?}"),
+    }
+    assert_eq!(
+        std::fs::read_to_string(repo_root.join("target.rs")).expect("read target fixture"),
+        "pub fn compute() -> i32 { 0 }\n",
+        "the rollback must restore the pre-turn source"
+    );
+    assert_eq!(
+        commit_count(&repo_root),
+        baseline,
+        "a rolled-back turn produces no commit"
+    );
+    let status = worktree_status(&repo_root);
+    assert!(
+        status.is_empty(),
+        "the rollback must leave a clean working tree: {status:?}"
+    );
+}
+
+/// A semantic block inside a plan discussion ends the turn before any byte
+/// reaches disk, exactly like an interactive block.
+#[tokio::test]
+async fn plan_discussion_blocked_outcome_rolls_back_its_working_tree() {
+    let (_dir, repo_root) = init_repo();
+    std::fs::write(
+        repo_root.join("target.rs"),
+        "pub fn compute() -> i32 { 0 }\n",
+    )
+    .expect("write target fixture");
+    commit_fixture(&repo_root, &["target.rs"]);
+
+    let mut context = ContextManager::new(repo_root.clone());
+    context
+        .add_file("target.rs", ContextAccess::Editable)
+        .expect("add target to context");
+    let mut history = HistoryManager::new(repo_root.clone());
+
+    let blocked_response = format!(
+        "Cannot revise the plan invariant.\n\
+        <blocked_{MARKER} reason=\"Plan invariant conflicts with the approved design\" />"
+    );
+    let provider = MockLlmProvider::scripted([MockResponse::text(blocked_response)]);
+    let model = ModelRef::openrouter("mock/model");
+    let protocol = tauqe_core::prompt::xml::XmlPromptProtocol
+        .with_turn_marker(MARKER)
+        .expect("marker-bound protocol");
+    let (stream_tx, cancel_rx) = event_channel();
+
+    let mut policy = GitTransactionPolicy::new();
+    let exec = SingleExecution::new(WorkflowOptions::default());
+    let execution = exec
+        .execute(
+            &mut policy,
+            "Refine the plan invariant",
+            tauqe_protocol::TurnIntent::PlanDiscussion,
+            &provider,
+            &model,
+            &mut context,
+            &mut history,
+            protocol.as_ref(),
+            stream_tx,
+            cancel_rx,
+        )
+        .await
+        .expect("plan discussion turn executes");
+
+    assert_eq!(
+        execution.blocked,
+        Some("Plan invariant conflicts with the approved design".to_string())
+    );
+    assert_eq!(
+        provider.remaining(),
+        0,
+        "a blocked discussion must not trigger retry loops"
+    );
+    assert_eq!(
+        std::fs::read_to_string(repo_root.join("target.rs")).expect("read target fixture"),
+        "pub fn compute() -> i32 { 0 }\n",
+        "the working tree must remain clean after a semantic block"
+    );
+}
+
+/// A review dialogue runs as an interactive turn, so an edit it proposes travels
+/// the same transactional path as any other dialogue edit: staging, verification,
+/// and exactly one atomic commit.
+#[cfg(unix)]
+#[tokio::test]
+async fn review_dialogue_edit_runs_the_transactional_path() {
+    let (_dir, repo_root) = init_repo();
+    std::fs::write(
+        repo_root.join("target.rs"),
+        "pub fn compute() -> i32 { 0 }\n",
+    )
+    .expect("write target fixture");
+    write_project_config(
+        &repo_root,
+        concat!(
+            "[models]\n",
+            "primary = [\"openrouter:mock/model\"]\n",
+            "\n",
+            "[project.verify]\n",
+            "command = \"grep\"\n",
+            "args = [\"-q\", \"pub fn compute() -> i32 { 42 }\", \"target.rs\"]\n",
+        ),
+    );
+    commit_fixture(&repo_root, &["target.rs", "tauqe.toml"]);
+
+    let mut context = ContextManager::new(repo_root.clone());
+    context
+        .add_file("target.rs", ContextAccess::Editable)
+        .expect("add target to context");
+    let mut history = HistoryManager::new(repo_root.clone());
+
+    // The review dialogue is an interactive turn by construction, and that very
+    // surface authorizes the edit a finding asks for.
+    let intent = tauqe_protocol::TurnIntent::InteractiveRepl;
+    let protocol = tauqe_core::prompt::xml::XmlPromptProtocol
+        .with_turn_marker(MARKER)
+        .expect("marker-bound protocol");
+    assert!(
+        intent
+            .narrow_capabilities(&protocol.capability_set())
+            .contains(tauqe_protocol::LlmCapability::FileEdits),
+        "a review dialogue must keep the file-edit surface"
+    );
+
+    let repair = format!(
+        "{edits}\n<verify_{MARKER} target=\"check\" on_success=\"silent\" />",
+        edits = edit_block(
+            "Address the finding",
+            "target.rs",
+            "pub fn compute() -> i32 { 0 }",
+            "pub fn compute() -> i32 { 42 }",
+        ),
+    );
+    let provider = MockLlmProvider::scripted([MockResponse::text(repair)]);
+    let model = ModelRef::openrouter("mock/model");
+    let (stream_tx, cancel_rx) = event_channel();
+
+    let baseline = commit_count(&repo_root);
+    let mut policy = GitTransactionPolicy::new();
+    let exec = SingleExecution::new(WorkflowOptions::default());
+    let execution = exec
+        .execute(
+            &mut policy,
+            "Address the review finding in target.rs",
+            intent,
+            &provider,
+            &model,
+            &mut context,
+            &mut history,
+            protocol.as_ref(),
+            stream_tx,
+            cancel_rx,
+        )
+        .await
+        .expect("review dialogue turn executes");
+
+    match execution.result {
+        ModelResult::Edit { outcome, .. } => {
+            assert!(
+                outcome.error.is_none(),
+                "unexpected error: {:?}",
+                outcome.error
+            );
+            assert!(
+                outcome.applied,
+                "a review-dialogue edit must pass staging, verification, and the git transaction"
+            );
+            assert_eq!(outcome.changed_files, vec!["target.rs".to_string()]);
+        }
+        other => panic!("expected applied edits, got {other:?}"),
+    }
+    assert_eq!(provider.requests().len(), 1);
+    assert_eq!(
+        commit_paths(&repo_root),
+        vec!["target.rs".to_string()],
+        "the review-dialogue edit must be the only committed path"
+    );
+    assert_eq!(
+        commit_count(&repo_root),
+        baseline + 1,
+        "one bounded turn produces exactly one commit"
+    );
+    let status = worktree_status(&repo_root);
+    assert!(
+        status.is_empty(),
+        "the turn must not leave unaccounted files behind: {status:?}"
     );
 }

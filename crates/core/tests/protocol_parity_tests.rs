@@ -16,17 +16,22 @@
 //!   structured schema that surface projects, and the commands equivalent
 //!   payloads decode into on both transports.
 
-use tauqe_core::capabilities::CapabilityRegistry;
+use tauqe_core::capabilities::{
+    intent_delta_rules, render_contract_rules, shared_trunk_rules, CapabilityRegistry,
+    ContractContext, PromptRenderContext,
+};
 use tauqe_core::prompt::json::JsonPromptProtocol;
 use tauqe_core::prompt::protocol::PromptProtocol;
 use tauqe_core::prompt::xml::XmlPromptProtocol;
 use tauqe_core::prompt::PromptAssembly;
-use tauqe_protocol::{CapabilitySet, EditProtocolKind, LlmCapability, LlmCommand, TurnIntent};
+use tauqe_protocol::{
+    CapabilitySet, EditProtocolKind, LlmCapability, LlmCommand, PatchStrategy, TurnIntent,
+};
 
 /// Every intent the harness can start a bounded turn with.
 const ALL_INTENTS: [TurnIntent; 3] = [
     TurnIntent::InteractiveRepl,
-    TurnIntent::ReadonlyDiscussion,
+    TurnIntent::PlanDiscussion,
     TurnIntent::IsolatedStep,
 ];
 
@@ -408,22 +413,36 @@ impl Combination {
         self.protocol.kind()
     }
 
-    /// Assembles the system prompt of the combination.
+    /// Assembles the prompt of the combination for its declared intent.
     ///
-    /// Capability narrowing happens inside the assembly, so the rendered text
-    /// is exactly what the same turn would carry in production.
-    fn prompt(&self) -> String {
+    /// Capability narrowing and delta composition happen inside the assembly, so
+    /// the rendered blocks are exactly what the same turn would carry in
+    /// production.
+    fn assembly(&self) -> PromptAssembly {
         PromptAssembly::new(None, 1, Vec::new(), "git", self.protocol.kind(), None, None)
             .with_intent(self.intent)
-            .build_system_prompt(self.protocol.as_ref())
+    }
+
+    /// Assembles the system prompt head of the combination.
+    fn prompt(&self) -> String {
+        self.assembly().build_system_prompt(self.protocol.as_ref())
+    }
+
+    /// Renders the regime delta block of the combination's trailing message.
+    ///
+    /// Every dialogue contour states a delta, so a missing one is a defect of
+    /// the composition rather than an expected outcome.
+    fn delta(&self) -> String {
+        self.assembly()
+            .format_regime_delta_section(self.protocol.as_ref())
+            .expect("every dialogue contour states a regime delta")
     }
 }
-
 /// Production `intent × transport` combinations of the purity matrix.
 ///
-/// `(ReadonlyDiscussion, xml)` is absent on purpose: the server always binds a
-/// plan discussion to the structured transport, so no XML discussion body
-/// exists in production.
+/// Every production combination is covered: the server selects the transport
+/// from the project configuration for every dialogue intent, so a plan
+/// discussion runs on whichever contour the project declares.
 fn purity_matrix() -> Vec<Combination> {
     vec![
         Combination {
@@ -443,8 +462,12 @@ fn purity_matrix() -> Vec<Combination> {
             protocol: Box::new(JsonPromptProtocol::edits()),
         },
         Combination {
-            intent: TurnIntent::ReadonlyDiscussion,
-            protocol: Box::new(JsonPromptProtocol::discussion()),
+            intent: TurnIntent::PlanDiscussion,
+            protocol: Box::new(XmlPromptProtocol),
+        },
+        Combination {
+            intent: TurnIntent::PlanDiscussion,
+            protocol: Box::new(JsonPromptProtocol::edits()),
         },
     ]
 }
@@ -510,7 +533,7 @@ fn xml_prompts_never_name_a_structured_schema_field() {
             );
         }
     }
-    assert_eq!(checked, 2, "the matrix lost an xml combination");
+    assert_eq!(checked, 3, "the matrix lost an xml combination");
 }
 
 // ---------------------------------------------------------------------------
@@ -570,8 +593,10 @@ fn expected_properties(surface: &CapabilitySet) -> Vec<String> {
 
 /// Returns the top-level properties of the fully advertised structured schema.
 fn structured_property_names() -> Vec<String> {
-    let schema = CapabilityRegistry::global()
-        .compose_structured_schema(&CapabilitySet::from_slice(LlmCapability::ALL));
+    let schema = CapabilityRegistry::global().compose_structured_schema(
+        &CapabilitySet::from_slice(LlmCapability::ALL),
+        PatchStrategy::SearchReplace,
+    );
     property_names(&schema)
 }
 
@@ -587,14 +612,25 @@ fn both_transports_narrow_to_the_same_capability_surface() {
 }
 
 #[test]
-fn the_discussion_transport_binds_the_discussion_surface() {
-    let discussion = JsonPromptProtocol::discussion();
-    let surface = narrowed_surface(&discussion, TurnIntent::ReadonlyDiscussion);
+fn the_discussion_intent_binds_the_dialogue_surface() {
+    let xml = XmlPromptProtocol;
+    let structured = JsonPromptProtocol::edits();
 
-    // A plan discussion always runs on the structured transport, and the
-    // narrowing leaves its specialized surface untouched.
-    assert_eq!(surface, CapabilitySet::discussion());
-    assert!(!surface.contains(LlmCapability::FileEdits));
+    // The intent, not the transport, decides the surface: both encodings of a
+    // plan discussion narrow to the very same dialogue head.
+    let xml_surface = narrowed_surface(&xml, TurnIntent::PlanDiscussion);
+    let structured_surface = narrowed_surface(&structured, TurnIntent::PlanDiscussion);
+    assert_eq!(xml_surface, structured_surface);
+    assert!(xml_surface.contains(LlmCapability::FileEdits));
+    assert!(xml_surface.contains(LlmCapability::ToolchainVerify));
+    assert!(!xml_surface.contains(LlmCapability::PlanUpdate));
+
+    // The plan mutation is granted by the server from the dialogue anchor, so
+    // the declared intent reaches the full discussion profile surface.
+    let granted = TurnIntent::PlanDiscussion
+        .narrow_capabilities(&CapabilitySet::from_slice(LlmCapability::ALL));
+    assert_eq!(granted, CapabilitySet::discussion());
+    assert!(granted.contains(LlmCapability::PlanUpdate));
 }
 
 #[test]
@@ -604,7 +640,7 @@ fn structured_schema_is_the_projection_of_the_narrowed_surface() {
 
     for intent in ALL_INTENTS {
         let surface = narrowed_surface(&structured, intent);
-        let schema = registry.compose_structured_schema(&surface);
+        let schema = registry.compose_structured_schema(&surface, PatchStrategy::SearchReplace);
 
         let mut declared = property_names(&schema);
         declared.sort();
@@ -629,8 +665,10 @@ fn the_plan_abort_and_custom_tool_fields_follow_the_surface() {
     let registry = CapabilityRegistry::global();
     let structured = JsonPromptProtocol::edits();
 
-    let repl = registry
-        .compose_structured_schema(&narrowed_surface(&structured, TurnIntent::InteractiveRepl));
+    let repl = registry.compose_structured_schema(
+        &narrowed_surface(&structured, TurnIntent::InteractiveRepl),
+        PatchStrategy::SearchReplace,
+    );
     for field in ["plan_update", "abort", "custom_tools"] {
         assert!(
             repl["properties"].get(field).is_some(),
@@ -638,18 +676,25 @@ fn the_plan_abort_and_custom_tool_fields_follow_the_surface() {
         );
     }
 
-    let step = registry
-        .compose_structured_schema(&narrowed_surface(&structured, TurnIntent::IsolatedStep));
+    let step = registry.compose_structured_schema(
+        &narrowed_surface(&structured, TurnIntent::IsolatedStep),
+        PatchStrategy::SearchReplace,
+    );
     assert!(step["properties"].get("plan_update").is_none());
     assert!(step["properties"].get("abort").is_some());
 
-    let discussion = registry.compose_structured_schema(&narrowed_surface(
-        &structured,
-        TurnIntent::ReadonlyDiscussion,
-    ));
-    assert!(discussion["properties"].get("plan_update").is_some());
-    assert!(discussion["properties"].get("changes").is_none());
-    assert!(discussion["properties"].get("abort").is_none());
+    // A plan discussion carries the whole dialogue surface, so its composed
+    // schema declares the change set, the plan payload, and every escape.
+    let discussion = registry.compose_structured_schema(
+        &narrowed_surface(&structured, TurnIntent::PlanDiscussion),
+        PatchStrategy::SearchReplace,
+    );
+    for field in ["plan_update", "changes", "abort", "blocked", "custom_tools"] {
+        assert!(
+            discussion["properties"].get(field).is_some(),
+            "discussion lacks {field}"
+        );
+    }
 }
 
 /// One payload expressed in both wire formats with identical semantics.
@@ -865,16 +910,29 @@ fn intent_narrowing_filters_the_same_commands_on_both_transports() {
         ]
     );
 
-    // A read-only discussion implements nothing and verifies nothing.
-    let discussion = decode_payloads(&xml, TurnIntent::ReadonlyDiscussion);
+    // A plan discussion carries the whole dialogue surface, so it decodes the
+    // same commands as the REPL: the dialogue head plus plan authorship.
+    let discussion = decode_payloads(&xml, TurnIntent::PlanDiscussion);
     assert_eq!(
         capability_names(&discussion),
         vec![
+            "abort",
+            "blocked",
+            "custom_tools",
             "discovery",
+            "doc_request",
+            "file_edits",
+            "outcome",
             "plan_creation",
+            "scratchpad",
             "text_message",
-            "user_language"
+            "toolchain_verify",
+            "user_language",
         ]
+    );
+    assert_eq!(
+        capability_names(&discussion),
+        capability_names(&decode_payloads(&xml, TurnIntent::InteractiveRepl))
     );
 }
 
@@ -945,5 +1003,326 @@ fn plan_creation_and_file_edits_translate_identically_on_both_transports() {
             assert_eq!(new_text, "new();");
         }
         other => panic!("expected one replace operation, got {other:?}"),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Dialogue head (one trunk for every dialogue contour)
+// ---------------------------------------------------------------------------
+
+/// The regime trunk of the `Core System Contract` is intent-independent for
+/// every dialogue: given one capability surface, one transport, and one set of
+/// render inputs, the trunk of a plan discussion is byte-identical to the trunk
+/// of the REPL.
+///
+/// That is the precondition the byte-stable head rests on, so it is asserted
+/// where the convergence is decided: the shared trunk plus the intent delta.
+/// Capability modules own their own contour-specific prose, and the full
+/// three-contour composition is asserted separately; here the trunk alone must
+/// already prove that switching the dialogue focus never invalidates the
+/// provider prefix cache.
+#[test]
+fn the_dialogue_trunk_is_byte_identical_for_the_repl_and_the_plan_discussion() {
+    let surface = CapabilitySet::interactive_repl();
+
+    for protocol in [EditProtocolKind::Xml, EditProtocolKind::Structured] {
+        let composed = |intent: TurnIntent| {
+            let render = PromptRenderContext::new(&[], Some("M12345"));
+            let ctx = ContractContext::new(intent, protocol, render);
+            let mut rules = shared_trunk_rules(&ctx, &surface);
+            rules.extend(intent_delta_rules(&ctx, &surface));
+            render_contract_rules(&rules)
+        };
+
+        let repl = composed(TurnIntent::InteractiveRepl);
+        let discussion = composed(TurnIntent::PlanDiscussion);
+        assert_eq!(
+            discussion, repl,
+            "the {protocol} trunk diverged between the REPL and a plan discussion"
+        );
+
+        assert!(
+            repl.contains("Plan-First Proposal"),
+            "the dialogue trunk must offer the plan-first proposal"
+        );
+        assert!(
+            !repl.contains("Discussion Mode Scope"),
+            "a plan discussion is a dialogue, so no rule restricts it to prose"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Dialogue head (one byte-stable head for every dialogue contour)
+// ---------------------------------------------------------------------------
+
+/// One transport with the three dialogue contours a session switches between.
+///
+/// The review discussion runs through the interactive intent — the server maps a
+/// review anchor onto [`TurnIntent::InteractiveRepl`] — so its contour is the
+/// REPL contour and its regime delta is the interactive delta. A plan discussion
+/// reaches the discussion surface the server grants from the dialogue anchor,
+/// because the plan mutation that regime authorizes travels in the delta list of
+/// its profile and never in the byte-stable head.
+struct DialogueContours {
+    /// Transport that serializes every contour of the matrix.
+    kind: EditProtocolKind,
+    /// Free interactive REPL dialogue.
+    repl: Combination,
+    /// Architectural discussion of a plan.
+    plan: Combination,
+    /// Review-finding dialogue, which runs as an interactive turn.
+    review: Combination,
+}
+
+impl DialogueContours {
+    /// Returns every contour of the matrix in comparison order.
+    fn all(&self) -> [&Combination; 3] {
+        [&self.repl, &self.plan, &self.review]
+    }
+}
+
+/// Returns the dialogue contours of both production transports.
+fn dialogue_matrices() -> [DialogueContours; 2] {
+    [
+        DialogueContours {
+            kind: EditProtocolKind::Xml,
+            repl: Combination {
+                intent: TurnIntent::InteractiveRepl,
+                protocol: Box::new(XmlPromptProtocol),
+            },
+            plan: Combination {
+                intent: TurnIntent::PlanDiscussion,
+                protocol: XmlPromptProtocol::with_capabilities(CapabilitySet::discussion()),
+            },
+            review: Combination {
+                intent: TurnIntent::InteractiveRepl,
+                protocol: Box::new(XmlPromptProtocol),
+            },
+        },
+        DialogueContours {
+            kind: EditProtocolKind::Structured,
+            repl: Combination {
+                intent: TurnIntent::InteractiveRepl,
+                protocol: Box::new(JsonPromptProtocol::edits()),
+            },
+            plan: Combination {
+                intent: TurnIntent::PlanDiscussion,
+                protocol: JsonPromptProtocol::with_capabilities(CapabilitySet::discussion()),
+            },
+            review: Combination {
+                intent: TurnIntent::InteractiveRepl,
+                protocol: Box::new(JsonPromptProtocol::edits()),
+            },
+        },
+    ]
+}
+
+/// Returns the spelling a plan mutation takes in `kind`.
+///
+/// The marker belongs to the contour that renders the delta: the XML delta names
+/// a control tag, while the structured delta names the action of its own schema
+/// field. Both spellings are asserted where they belong and forbidden in the
+/// head, which is what keeps the stable head free of a contour's vocabulary.
+fn plan_update_marker(kind: EditProtocolKind) -> &'static str {
+    if matches!(kind, EditProtocolKind::Structured) {
+        "action: \"update\""
+    } else {
+        "<plan action=\"update\""
+    }
+}
+
+#[test]
+fn the_dialogue_head_is_byte_identical_across_every_dialogue_contour() {
+    for contours in dialogue_matrices() {
+        let repl = contours.repl.prompt();
+
+        // The head is the stable head: it states the shared contract and the
+        // project metadata, so the identity below compares two real heads rather
+        // than two empty strings.
+        assert!(repl.contains("## Core System Contract"));
+        assert!(repl.contains("## Project Metadata"));
+        assert!(repl.contains("Authoritative Source"));
+
+        for contour in contours.all() {
+            assert_eq!(
+                contour.prompt(),
+                repl,
+                "the {:?} contour of the {} transport diverged from the REPL head",
+                contour.intent,
+                contours.kind
+            );
+        }
+
+        // The review discussion is the interactive contour by construction: the
+        // server maps a review anchor onto the interactive intent, so the two
+        // contours carry one head and one capability surface.
+        assert_eq!(contours.review.intent, TurnIntent::InteractiveRepl);
+        assert_eq!(
+            contours.review.protocol.capability_set(),
+            contours.repl.protocol.capability_set()
+        );
+    }
+}
+
+#[test]
+fn the_dialogue_head_carries_no_regime_delta_rule() {
+    // A rule that only one dialogue regime authorizes renders in the tail, so it
+    // never reaches the byte-stable head — whichever regime asked for it.
+    for contours in dialogue_matrices() {
+        for contour in contours.all() {
+            let head = contour.prompt();
+            for title in [
+                "Read-Only Scope",
+                "Editable Scope",
+                "Action Authorization",
+                "Plan-First Proposal",
+                "Local Engineering Plan Actions",
+            ] {
+                assert!(
+                    !head.contains(title),
+                    "the {:?} head carries the delta rule {title}",
+                    contour.intent
+                );
+            }
+            // The plan-mutation semantics the discussion delta authorizes stay in
+            // the tail, so no contour leaks them into the cached head.
+            assert!(!head.contains("ordinary transactional path"));
+            assert!(!head.contains(plan_update_marker(contours.kind)));
+        }
+    }
+}
+
+#[test]
+fn the_review_delta_mirrors_the_repl_delta_and_the_plan_delta_extends_it() {
+    // The plan mutation is the only capability the discussion profile places in
+    // its delta list, so it reaches a turn through the delta and never the head.
+    let profile = TurnIntent::PlanDiscussion.regime_profile();
+    assert_eq!(profile.delta().as_slice(), &[LlmCapability::PlanUpdate]);
+    assert!(!profile.core().contains(LlmCapability::PlanUpdate));
+    assert!(CapabilitySet::discussion().contains(LlmCapability::PlanUpdate));
+
+    for contours in dialogue_matrices() {
+        let repl = contours.repl.delta();
+        let review = contours.review.delta();
+        let plan = contours.plan.delta();
+
+        // A review discussion carries the interactive delta verbatim: its own
+        // profile delta is empty, so moving focus to a review session moves no
+        // byte of the tail either.
+        assert_eq!(
+            review, repl,
+            "the review delta diverged from the REPL delta on the {} transport",
+            contours.kind
+        );
+
+        // The discussion delta is an extension, not a rewrite: the interactive
+        // rules arrive byte for byte and only the plan-action rule differs.
+        let marker = "Local Engineering Plan Actions: ";
+        let split = repl
+            .find(marker)
+            .expect("the interactive delta states the plan action rule");
+        assert!(
+            plan.starts_with(&repl[..split]),
+            "the discussion delta rewrote the interactive delta on the {} transport",
+            contours.kind
+        );
+
+        // The interactive regime may only propose a new plan, while the plan
+        // discussion also modifies one in place, exactly as its granted surface
+        // permits.
+        assert!(repl.contains("ONLY propose new plans"));
+        assert!(!repl.contains("ordinary transactional path"));
+        assert!(plan.contains("ordinary transactional path"));
+        assert!(!plan.contains("ONLY propose new plans"));
+        assert!(plan.contains(plan_update_marker(contours.kind)));
+        assert!(!repl.contains(plan_update_marker(contours.kind)));
+
+        // The delta capability is advertised only on the contour that carries it,
+        // and its invocation decodes only there.
+        assert!(contours
+            .plan
+            .protocol
+            .capability_set()
+            .contains(LlmCapability::PlanUpdate));
+        assert!(!contours
+            .repl
+            .protocol
+            .capability_set()
+            .contains(LlmCapability::PlanUpdate));
+        assert!(!contours
+            .review
+            .protocol
+            .capability_set()
+            .contains(LlmCapability::PlanUpdate));
+
+        if matches!(contours.kind, EditProtocolKind::Xml) {
+            let payload =
+                "<plan action=\"update\" id=\"p1\"><item id=\"1\" status=\"done\" /></plan>";
+            assert!(contours
+                .plan
+                .protocol
+                .decode(payload, &[])
+                .iter()
+                .any(|command| matches!(command, LlmCommand::Plan { .. })));
+            assert!(!contours
+                .repl
+                .protocol
+                .decode(payload, &[])
+                .iter()
+                .any(|command| matches!(command, LlmCommand::Plan { .. })));
+        }
+    }
+}
+
+#[test]
+fn the_head_stays_pure_and_the_delta_speaks_the_vocabulary_of_its_contour() {
+    let fields = structured_property_names();
+
+    for contours in dialogue_matrices() {
+        for contour in contours.all() {
+            let head = contour.prompt();
+            if matches!(contours.kind, EditProtocolKind::Structured) {
+                // A structured head never advertises a control tag, whichever
+                // dialogue regime renders it.
+                for tag in OPERATIONAL_TAGS {
+                    assert!(
+                        !head.contains(tag),
+                        "the {:?} structured head advertises {tag}",
+                        contour.intent
+                    );
+                }
+            } else {
+                // The XML head names no field of the structured schema. The scan
+                // is confined to the head, because the delta lives in the
+                // trailing user message and speaks its own vocabulary.
+                let section = contract_and_instruction_section(&head);
+                for field in &fields {
+                    let quoted = format!("`{field}`");
+                    assert!(
+                        !section.contains(&quoted),
+                        "the {:?} xml head names {quoted}",
+                        contour.intent
+                    );
+                }
+            }
+        }
+
+        // The delta speaks the vocabulary of its own contour: the structured
+        // delta names the schema fields, while the XML delta names control tags.
+        let plan = contours.plan.delta();
+        if matches!(contours.kind, EditProtocolKind::Structured) {
+            assert!(plan.contains("`plan_update`"));
+            assert!(plan.contains("action: \"update\""));
+            for tag in OPERATIONAL_TAGS {
+                assert!(
+                    !plan.contains(tag),
+                    "the structured discussion delta advertises {tag}"
+                );
+            }
+        } else {
+            assert!(plan.contains("<plan action=\"update\""));
+            assert!(!plan.contains("`plan_update`"));
+        }
     }
 }

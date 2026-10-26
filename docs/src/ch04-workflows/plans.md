@@ -138,13 +138,20 @@ Planning and execution are different regimes and use different wire contours:
 
 | Regime | Protocol | Shape |
 | --- | --- | --- |
-| Discussion and creation | structured `DiscussionResponse` | `message` first, then an optional `plan_update` with `action: save \| update \| delete` |
+| Discussion and creation | the transport configured for ordinary turns (`develop.protocol`) | the conversational message first, then an optional plan change with `action: save \| update \| delete` |
 | Step execution | streaming edits | search/replace hunks plus a terminal outcome tag |
 
-Declaring `message` first lets the interface stream the rationale while the plan
-payload is still arriving. A discussion touches a plan only when the developer
-explicitly asks for a change; the payload carries the intent, so nothing is inferred
-from the wording of a prompt.
+Declaring the message first lets the interface stream the rationale while the
+plan payload is still arriving. A discussion touches a plan only when the
+developer explicitly asks for a change; the payload carries the intent, so nothing
+is inferred from the wording of a prompt. The turn renders the composite response
+schema of the capability registry, so the discussion message and the plan payload
+travel together in every contour and the plan change keeps one shape. Its regime
+delta — the plan mutation capability that a plan discussion adds to the shared
+dialogue surface — travels in the leading block of the turn's trailing message,
+ahead of the plan snapshot itself, so refining the payload never moves the
+byte-stable head
+([The Autonomous Bounded Turn FSM](../ch01-foundations/bounded-turn-fsm.md)).
 
 ### 2.6 The two mutation actions
 

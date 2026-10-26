@@ -118,6 +118,17 @@ The checkpoint step also ensures that `.tauqe`, `credentials.toml`,
 `.git/info/exclude`. That keeps secrets and runtime state out of the checkpoint
 without modifying tracked project files.
 
+Installing those rules is fail-closed. A rule that cannot be appended aborts the
+checkpoint instead of proceeding, and the installed rules are then proven with one
+batched `git check-ignore` call over the protected paths:
+`.tauqe/credentials.toml`, `credentials.toml`, and `.credentials.toml`.
+`git add -A` stages everything Git does not consider ignored, so a checkpoint that
+cannot prove the exclusion would otherwise carry the API key into a temporary
+commit — an object that survives in the object database and the reflog long after
+the checkpoint is unwound. A project `.gitignore` outranks `.git/info/exclude`
+and can re-include one of those paths, which is why the exclusion is queried
+rather than assumed.
+
 ### 3.2 Temporary step commits
 
 Each applied change set is recorded as a step commit so verification heals
@@ -245,6 +256,9 @@ developer.
   keep working.
 - **It is not safe by assumption on crash.** Recovery refuses when the recorded
   base is not an ancestor or when the range contains a foreign commit.
+- **It is not created on an unproven exclusion.** A checkpoint whose ignore rules
+  cannot be installed, or whose protected paths Git reports as not ignored, aborts
+  before `git add -A` runs.
 - **It is not a way to hide AI involvement.** The co-author trailer is always
   present.
 - **It is not a substitute for verification.** A commit is created only after the

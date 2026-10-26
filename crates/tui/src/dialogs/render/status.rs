@@ -7,7 +7,7 @@ use unicode_width::UnicodeWidthStr;
 use tauqe_protocol::{PlanItemStatus, ReviewItemStatus};
 
 use crate::components::modal::{
-    modal_geometry, render_dialog_footer, render_modal_container, ModalTone,
+    modal_geometry, render_dialog_footer, render_modal_container, verb_hint, ModalTone,
 };
 use crate::i18n::active_t;
 use crate::theme::color::RgbColor;
@@ -412,7 +412,7 @@ pub fn render_status_dialog(frame: &mut ratatui::Frame, dialog: &crate::app::Sta
     let fast_select_label = status_fast_select_label(options_count);
     let footer_hint =
         active_t("dialog.status.fast_select_hint").replacen("{}", fast_select_label, 1);
-    render_dialog_footer(frame, geometry.hint_row, &footer_hint);
+    render_dialog_footer(frame, geometry.hint_row, &verb_hint(footer_hint));
 }
 
 #[cfg(test)]

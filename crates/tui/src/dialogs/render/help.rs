@@ -9,7 +9,8 @@ use crate::command::editor::EDITOR_COMMAND_MAP;
 use crate::command::global::GLOBAL_COMMAND_MAP;
 use crate::command::{CommandCategory, CommandMap};
 use crate::components::modal::{
-    button_style, modal_geometry, render_dialog_footer, render_modal_container, ModalTone,
+    button_style, modal_geometry, render_dialog_footer, render_modal_container, verb_hint,
+    ModalTone,
 };
 use crate::config::{MetaModifier, PrimaryModifier};
 use crate::i18n::active_t;
@@ -482,7 +483,11 @@ pub fn render_help_popup(
     .alignment(Alignment::Center);
     frame.render_widget(close, geometry.action_bar);
 
-    render_dialog_footer(frame, geometry.hint_row, &active_t("help.footer"));
+    render_dialog_footer(
+        frame,
+        geometry.hint_row,
+        &verb_hint(active_t("help.footer")),
+    );
 }
 
 #[cfg(test)]

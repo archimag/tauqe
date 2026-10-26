@@ -135,6 +135,120 @@ impl FromStr for EditProtocolKind {
     }
 }
 
+/// Strategy that decides how a change set addresses the lines it replaces.
+///
+/// The strategy is orthogonal to the transport. Both the XML and the structured
+/// contour serialize the same edit vocabulary, and the strategy only decides
+/// which fields address a line range: `SearchReplace` echoes the replaced text
+/// and matches it exactly, while `LineAnchor` names a range through the compact
+/// opaque anchors rendered beside every context line, so the model never has to
+/// reproduce the lines it replaces.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", try_from = "String")]
+pub enum PatchStrategy {
+    /// Search/replace blocks that echo the replaced lines (default).
+    #[default]
+    SearchReplace,
+    /// Opaque line anchors naming a range of lines without echoing them.
+    LineAnchor,
+}
+
+impl std::convert::TryFrom<String> for PatchStrategy {
+    type Error = String;
+
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        value.parse()
+    }
+}
+
+impl PatchStrategy {
+    /// Canonical lower-case identifier used on the wire.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::SearchReplace => "search_replace",
+            Self::LineAnchor => "line_anchor",
+        }
+    }
+}
+
+impl fmt::Display for PatchStrategy {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl FromStr for PatchStrategy {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "search_replace" => Ok(Self::SearchReplace),
+            "line_anchor" => Ok(Self::LineAnchor),
+            other => Err(format!(
+                "Unknown patch strategy '{}'. Expected 'search_replace' or 'line_anchor'",
+                other
+            )),
+        }
+    }
+}
+
+/// Strategy that decides how the rendered prompt blocks are composed into a
+/// message sequence.
+///
+/// The layout is a policy over blocks that are already rendered: the semantic
+/// layout groups them by kind, while the chronological layout interleaves
+/// context additions with history entries in the order they were added. The
+/// choice is a presentation decision only and stays orthogonal to the
+/// transport.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", try_from = "String")]
+pub enum PromptLayoutKind {
+    /// Semantic block order (default).
+    #[default]
+    Semantic,
+    /// Chronological interleaved transcript of history and context.
+    Chronological,
+}
+
+impl std::convert::TryFrom<String> for PromptLayoutKind {
+    type Error = String;
+
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        value.parse()
+    }
+}
+
+impl PromptLayoutKind {
+    /// Canonical lower-case identifier used on the wire.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Semantic => "semantic",
+            Self::Chronological => "chronological",
+        }
+    }
+}
+
+impl fmt::Display for PromptLayoutKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl FromStr for PromptLayoutKind {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "semantic" => Ok(Self::Semantic),
+            "chronological" => Ok(Self::Chronological),
+            other => Err(format!(
+                "Unknown prompt layout '{}'. Expected 'semantic' or 'chronological'",
+                other
+            )),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ConfigState {
     pub workflow: WorkflowKind,
@@ -399,5 +513,67 @@ mod tests {
             EditProtocolKind::Mixed
         );
         assert!("".parse::<EditProtocolKind>().is_err());
+    }
+
+    #[test]
+    fn test_patch_strategy_serde_default_and_parsing() {
+        assert_eq!(PatchStrategy::default(), PatchStrategy::SearchReplace);
+        assert_eq!(
+            serde_json::to_string(&PatchStrategy::SearchReplace).unwrap(),
+            "\"search_replace\""
+        );
+        assert_eq!(
+            serde_json::to_string(&PatchStrategy::LineAnchor).unwrap(),
+            "\"line_anchor\""
+        );
+        assert_eq!(
+            serde_json::from_str::<PatchStrategy>("\"line_anchor\"").unwrap(),
+            PatchStrategy::LineAnchor
+        );
+        assert_eq!(
+            serde_json::from_str::<PatchStrategy>("\"  LINE_ANCHOR \"").unwrap(),
+            PatchStrategy::LineAnchor
+        );
+        assert!(serde_json::from_str::<PatchStrategy>("\"anchors\"").is_err());
+
+        assert_eq!(PatchStrategy::SearchReplace.as_str(), "search_replace");
+        assert_eq!(PatchStrategy::LineAnchor.to_string(), "line_anchor");
+        assert_eq!(
+            "line_anchor".parse::<PatchStrategy>().unwrap(),
+            PatchStrategy::LineAnchor
+        );
+        assert!("".parse::<PatchStrategy>().is_err());
+        assert!("bogus".parse::<PatchStrategy>().is_err());
+    }
+
+    #[test]
+    fn test_prompt_layout_kind_serde_default_and_parsing() {
+        assert_eq!(PromptLayoutKind::default(), PromptLayoutKind::Semantic);
+        assert_eq!(
+            serde_json::to_string(&PromptLayoutKind::Semantic).unwrap(),
+            "\"semantic\""
+        );
+        assert_eq!(
+            serde_json::to_string(&PromptLayoutKind::Chronological).unwrap(),
+            "\"chronological\""
+        );
+        assert_eq!(
+            serde_json::from_str::<PromptLayoutKind>("\"chronological\"").unwrap(),
+            PromptLayoutKind::Chronological
+        );
+        assert_eq!(
+            serde_json::from_str::<PromptLayoutKind>("\"  CHRONOLOGICAL \"").unwrap(),
+            PromptLayoutKind::Chronological
+        );
+        assert!(serde_json::from_str::<PromptLayoutKind>("\"auto\"").is_err());
+
+        assert_eq!(PromptLayoutKind::Semantic.as_str(), "semantic");
+        assert_eq!(PromptLayoutKind::Chronological.to_string(), "chronological");
+        assert_eq!(
+            "semantic".parse::<PromptLayoutKind>().unwrap(),
+            PromptLayoutKind::Semantic
+        );
+        assert!("".parse::<PromptLayoutKind>().is_err());
+        assert!("bogus".parse::<PromptLayoutKind>().is_err());
     }
 }

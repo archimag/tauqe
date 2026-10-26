@@ -13,7 +13,7 @@ use crate::capabilities::CapabilityRegistry;
 use crate::edits::protocol::xml::is_valid_turn_marker;
 use crate::edits::protocol::XmlEditProtocol;
 use crate::edits::stream::XmlStreamFilter;
-use tauqe_protocol::{CapabilitySet, EditProtocolKind, LlmCapability, LlmCommand};
+use tauqe_protocol::{CapabilitySet, EditProtocolKind, LlmCapability, LlmCommand, PatchStrategy};
 
 use super::protocol::PromptProtocol;
 
@@ -59,12 +59,18 @@ impl PromptProtocol for XmlPromptProtocol {
         decode_with_capabilities(raw_text, None, &self.capability_set(), context_paths)
     }
 
-    fn system_instructions(&self, editable_paths: &[String], has_eager_repo_map: bool) -> String {
+    fn system_instructions(
+        &self,
+        editable_paths: &[String],
+        has_eager_repo_map: bool,
+        patch_strategy: PatchStrategy,
+    ) -> String {
         XmlEditProtocol.system_instructions_for(
             &self.capability_set(),
             editable_paths,
             None,
             has_eager_repo_map,
+            patch_strategy,
         )
     }
 
@@ -139,12 +145,18 @@ impl PromptProtocol for ScopedXmlPromptProtocol {
         )
     }
 
-    fn system_instructions(&self, editable_paths: &[String], has_eager_repo_map: bool) -> String {
+    fn system_instructions(
+        &self,
+        editable_paths: &[String],
+        has_eager_repo_map: bool,
+        patch_strategy: PatchStrategy,
+    ) -> String {
         XmlEditProtocol.system_instructions_for(
             &self.capabilities,
             editable_paths,
             self.marker.as_deref(),
             has_eager_repo_map,
+            patch_strategy,
         )
     }
 

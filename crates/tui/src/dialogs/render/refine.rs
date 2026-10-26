@@ -7,7 +7,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
 
 use super::{editor_lines, render_modal_confirm, ConfirmModalParams, ModalTone};
-use crate::components::modal::render_dialog_footer;
+use crate::components::modal::{render_dialog_footer, verb_hint};
 use crate::config::PrimaryModifier;
 use crate::i18n::active_t;
 use crate::theme::engine::current_engine;
@@ -248,7 +248,7 @@ pub fn render_plan_refine_dialog(
     // The navigation hint is docked to the card's bottom edge as its own strip
     // filled with `palette.overlay`, so it reads as persistent chrome instead
     // of a second line of buttons (c-1, c-2).
-    render_dialog_footer(frame, footer_area, &nav_hint);
+    render_dialog_footer(frame, footer_area, &verb_hint(nav_hint));
 }
 
 /// Renders the review-finding decomposition dialog.
@@ -443,7 +443,7 @@ pub fn render_review_refine_dialog(
 
     // The navigation hint is docked to the card's bottom edge as its own strip
     // filled with `palette.overlay`, so it reads as persistent chrome.
-    render_dialog_footer(frame, footer_area, &nav_hint);
+    render_dialog_footer(frame, footer_area, &verb_hint(nav_hint));
 }
 
 /// Presentation parameters for the "refinement blocked" modal, shared by the

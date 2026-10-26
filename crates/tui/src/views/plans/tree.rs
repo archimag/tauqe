@@ -166,6 +166,15 @@ pub(crate) fn prepare_plan_markdown(raw: &str) -> String {
     }
 }
 
+/// Whether the row at `index` opens a new plan, so it is preceded by the blank
+/// separator that visually separates two plans.
+///
+/// The renderer and the viewport measurement consult this single predicate, so a
+/// measured row height can never disagree with the lines actually drawn (c-2).
+pub(crate) fn plan_row_gap(index: usize, row: &VisiblePlanRow) -> bool {
+    index > 0 && matches!(row, VisiblePlanRow::PlanHeader { .. })
+}
+
 /// Renders the flattened Plans rows into lines and their row offsets.
 ///
 /// Each row contributes its summary line plus, when expanded, a detail block
@@ -178,6 +187,9 @@ pub(crate) fn prepare_plan_markdown(raw: &str) -> String {
 /// lines already rendered for the unchanged description, while a changed
 /// description, indent, width, or palette re-renders exactly that one body
 /// (c-1, c-3).
+///
+/// A slice holding a single row renders exactly that row, which is how the view
+/// measures the height of one row without materializing the whole tree (c-2).
 pub(crate) fn compute_unified_plan_lines(
     rows: &[VisiblePlanRow],
     selected_idx: usize,
@@ -196,7 +208,7 @@ pub(crate) fn compute_unified_plan_lines(
         // header, so it is emitted before the offset of that row is recorded.
         // Otherwise the offset anchors the gap and scrolling stops one line
         // short of the header it is meant to reveal (c-offset-accuracy).
-        if idx > 0 && matches!(row, VisiblePlanRow::PlanHeader { .. }) {
+        if plan_row_gap(idx, row) {
             all_lines.push(Line::raw(""));
         }
         offsets.push(all_lines.len());

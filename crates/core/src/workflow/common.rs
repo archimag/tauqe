@@ -1,4 +1,4 @@
-use tauqe_protocol::{EditOperation, ModelResult};
+use tauqe_protocol::{EditFileOp, EditOperation, HistoryFileChange, ModelResult};
 use tokio::sync::{mpsc, watch};
 
 use tauqe_protocol::ModelRef;
@@ -156,7 +156,11 @@ pub fn record_workflow_response(
             } else {
                 None
             };
-            if let Err(err) = history_manager.record_response(msg, None, summary, extra_files) {
+            let files: Vec<HistoryFileChange> = extra_files
+                .into_iter()
+                .map(HistoryFileChange::plain)
+                .collect();
+            if let Err(err) = history_manager.record_response(msg, None, summary, files) {
                 tracing::warn!(
                     "Failed to record the assistant answer in session history: {}",
                     err
@@ -182,24 +186,43 @@ pub fn record_workflow_response(
                 summary.clone()
             };
 
+            // The operation is typed knowledge the turn already holds, so the
+            // producer authors one record per touched path instead of flattening
+            // it into display text that every client would have to re-parse
+            // (Conventions §1.5).
             let mut seen = std::collections::HashSet::new();
             let mut files = Vec::new();
             for edit in edits {
                 let entry = match edit {
-                    EditOperation::Create { path, .. } => format!("[NEW] {}", path),
-                    EditOperation::Delete { path } => format!("[DEL] {}", path),
-                    EditOperation::Replace { path, .. } => format!("[EDIT] {}", path),
-                    EditOperation::Overwrite { path, .. } => format!("[OVERWRITE] {}", path),
-                    EditOperation::Move { from, to } => format!("[MOVE] {} -> {}", from, to),
+                    EditOperation::Create { path, .. } => {
+                        HistoryFileChange::operated(EditFileOp::Create, path.clone())
+                    }
+                    EditOperation::Delete { path } => {
+                        HistoryFileChange::operated(EditFileOp::Delete, path.clone())
+                    }
+                    EditOperation::Replace { path, .. } => {
+                        HistoryFileChange::operated(EditFileOp::Replace, path.clone())
+                    }
+                    EditOperation::LineAnchor { path, .. } => {
+                        HistoryFileChange::operated(EditFileOp::Replace, path.clone())
+                    }
+                    EditOperation::Overwrite { path, .. } => {
+                        HistoryFileChange::operated(EditFileOp::Overwrite, path.clone())
+                    }
+                    EditOperation::Move { from, to } => {
+                        HistoryFileChange::moved(from.clone(), to.clone())
+                    }
                 };
                 if seen.insert(entry.clone()) {
                     files.push(entry);
                 }
             }
 
+            // Post-hook artifacts name a path but carry no operation.
             for extra in extra_files {
-                if seen.insert(extra.clone()) {
-                    files.push(extra);
+                let entry = HistoryFileChange::plain(extra);
+                if seen.insert(entry.clone()) {
+                    files.push(entry);
                 }
             }
 
@@ -336,7 +359,10 @@ mod tests {
                 assert_eq!(message, "Refactored module A");
                 assert_eq!(commit.as_deref(), Some("1234567"));
                 assert_eq!(summary.as_deref(), Some("Refactored module A"));
-                assert_eq!(files, &vec!["[EDIT] src/a.rs"]);
+                assert_eq!(
+                    files,
+                    &vec![HistoryFileChange::operated(EditFileOp::Replace, "src/a.rs")]
+                );
             }
             _ => panic!("Expected Response entry"),
         }
@@ -371,7 +397,10 @@ mod tests {
         match &entries[0] {
             crate::history::entry::HistoryEntry::Response { message, files, .. } => {
                 assert_eq!(message, "Need file a.rs\n\nUpdated file a.rs");
-                assert_eq!(files, &vec!["[EDIT] a.rs"]);
+                assert_eq!(
+                    files,
+                    &vec![HistoryFileChange::operated(EditFileOp::Replace, "a.rs")]
+                );
                 assert!(!message.contains("changes"));
                 assert!(!message.contains("old_text"));
             }
@@ -485,7 +514,13 @@ mod tests {
             crate::history::entry::HistoryEntry::Response { message, files, .. } => {
                 assert!(!message.contains("scratchpad"));
                 assert!(!message.contains("Verified: timeout field"));
-                assert_eq!(files, &vec!["[EDIT] src/config.rs"]);
+                assert_eq!(
+                    files,
+                    &vec![HistoryFileChange::operated(
+                        EditFileOp::Replace,
+                        "src/config.rs"
+                    )]
+                );
             }
             _ => panic!("Expected Response entry"),
         }

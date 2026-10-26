@@ -1218,6 +1218,7 @@ mod tests {
             size_bytes: 100,
             estimated_tokens: 25,
             layer: tauqe_protocol::ContextLayer::User,
+            insertion_seq: 0,
         });
 
         let rev_model = ModelRef::openrouter("anthropic/claude-3.5-sonnet");

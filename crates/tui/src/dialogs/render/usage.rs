@@ -12,7 +12,7 @@ use ratatui::widgets::Paragraph;
 use tauqe_protocol::model::UsageTotalsSnapshot;
 
 use crate::components::modal::{
-    modal_geometry, render_dialog_footer, render_modal_container, ModalTone,
+    modal_geometry, render_dialog_footer, render_modal_container, verb_hint, ModalTone,
 };
 use crate::i18n::active_t;
 use crate::theme::engine::{current_engine, ThemeEngine};
@@ -43,7 +43,11 @@ pub fn render_usage_summary(
     *scroll = (*scroll).min(max_summary_scroll(lines.len(), geometry.body.height));
     frame.render_widget(Paragraph::new(lines).scroll((*scroll, 0)), geometry.body);
 
-    render_dialog_footer(frame, geometry.hint_row, &active_t("dialog.usage.footer"));
+    render_dialog_footer(
+        frame,
+        geometry.hint_row,
+        &verb_hint(active_t("dialog.usage.footer")),
+    );
 }
 
 /// Highest valid scroll offset for `line_count` lines in a viewport that is

@@ -3,9 +3,10 @@ use std::path::PathBuf;
 
 use serde::Deserialize;
 use struson::reader::{JsonReader, JsonStreamReader};
-use tauqe_protocol::{EditFileOp, EditFileStatus, StructuredChangeProposal};
+use tauqe_protocol::{EditFileOp, EditFileStatus, EditOperation, StructuredChangeProposal};
 
-use super::{normalize_hunk, resolve_path, EditStreamFilter, StagingSimulator};
+use super::{normalize_hunk, resolve_path, EditStreamFilter, OwnedAnchor, StagingSimulator};
+use crate::edits::staging::AnchorEdit;
 use crate::providers::StreamEvent;
 
 pub mod decode;
@@ -44,6 +45,12 @@ pub struct JsonStreamFilter {
     open_file_path: Option<String>,
     /// Path reported by the pending file's `EditFileDone` (differs for moves).
     open_file_display: String,
+    /// Anchored ranges each file has already addressed.
+    ///
+    /// The entries of one file arrive separately while the array streams, so the
+    /// accumulated ranges are re-applied to the original snapshot as one batch
+    /// instead of being applied one after another to already mutated text.
+    anchor_batches: HashMap<String, Vec<OwnedAnchor>>,
 }
 
 impl JsonStreamFilter {
@@ -61,6 +68,7 @@ impl JsonStreamFilter {
             file_hunk_counts: HashMap::new(),
             open_file_path: None,
             open_file_display: String::new(),
+            anchor_batches: HashMap::new(),
         }
     }
 
@@ -153,7 +161,61 @@ impl JsonStreamFilter {
     }
 
     /// Applies one completed `changes[i]` element and emits the corresponding
+    /// Opens `path` as the file the following hunks belong to.
+    ///
+    /// Completion of the previous file is buffered until the file changes, so
+    /// several operations against one file collapse into a single terminal event
+    /// carrying the exact hunks count, matching the XML filter.
+    fn open_file(&mut self, path: &str, op: EditFileOp, events: &mut Vec<StreamEvent>) {
+        if self.open_file_path.as_deref() == Some(path) {
+            return;
+        }
+        self.flush_open_file(events);
+        events.push(StreamEvent::EditFileStarted {
+            path: path.to_string(),
+            op_type: op,
+        });
+        self.open_file_path = Some(path.to_string());
+        self.open_file_display = path.to_string();
+    }
+
+    /// Returns the index the next hunk of `path` is reported under.
+    fn next_hunk_index(&self, path: &str) -> usize {
+        self.file_hunk_counts.get(path).copied().unwrap_or(0)
+    }
+
+    /// Completes the open file with a rejection the staging engine shares.
+    ///
+    /// The preview reports exactly the entries the staging engine would refuse,
+    /// so a change set the harness accepts never fails here and the diagnostic
+    /// is the one the retrying event will show.
+    fn fail_open_file(
+        &mut self,
+        path: String,
+        message: String,
+        hunks_count: usize,
+        events: &mut Vec<StreamEvent>,
+    ) {
+        events.push(StreamEvent::EditFileDone {
+            path: path.clone(),
+            status: EditFileStatus::Error,
+            error: Some(message),
+            hunks_count,
+        });
+        self.file_hunk_counts.remove(&path);
+        self.open_file_path = None;
+        self.open_file_display.clear();
+    }
+
+    /// Applies one completed `changes[i]` element and emits the corresponding
     /// hunk events, folding completion into the pending file.
+    ///
+    /// The shape of an edit is decided by the authoritative converter
+    /// [`StructuredChangeProposal::to_edit_operation`], never re-derived from the
+    /// individual fields the entry arrived with. An anchored replacement is
+    /// therefore previewed as the line range it names instead of a
+    /// search/replace block with an empty needle, and a malformed entry is
+    /// reported with the diagnostic the staging engine would produce.
     fn process_completed_change(
         &mut self,
         change: &StructuredChangeProposal,
@@ -164,109 +226,133 @@ impl JsonStreamFilter {
             self.has_emitted_edit_started = true;
         }
 
-        let op = change.op;
-        let is_create = op == EditFileOp::Create;
-        let resolved_path = resolve_path(&change.path, &self.editable_paths, is_create);
+        let operation = match change.to_edit_operation() {
+            Ok(operation) => operation,
+            Err(message) => {
+                let is_create = change.op == EditFileOp::Create;
+                let resolved = resolve_path(&change.path, &self.editable_paths, is_create);
+                self.open_file(&resolved, change.op, events);
+                let hunks_count = self.next_hunk_index(&resolved);
+                self.fail_open_file(resolved, message, hunks_count, events);
+                return;
+            }
+        };
 
-        if self.open_file_path.as_deref() != Some(resolved_path.as_str()) {
-            self.flush_open_file(events);
-            events.push(StreamEvent::EditFileStarted {
-                path: resolved_path.clone(),
-                op_type: op,
-            });
-            self.open_file_path = Some(resolved_path.clone());
-            self.open_file_display = resolved_path.clone();
-        }
-
-        let hunk_index = self
-            .file_hunk_counts
-            .get(&resolved_path)
-            .copied()
-            .unwrap_or(0);
-
-        match op {
-            EditFileOp::Create => {
-                let content = normalize_hunk(change.content.as_deref().unwrap_or_default());
+        match operation {
+            EditOperation::Create { path, content } => {
+                let resolved = resolve_path(&path, &self.editable_paths, true);
+                self.open_file(&resolved, EditFileOp::Create, events);
+                let hunk_index = self.next_hunk_index(&resolved);
+                let content = normalize_hunk(&content);
                 events.push(StreamEvent::EditHunk {
-                    path: resolved_path.clone(),
+                    path: resolved.clone(),
                     hunk_index,
                     old_text: String::new(),
                     new_text: content.clone(),
                 });
-                self.staging.overwrite(&resolved_path, content);
-                self.file_hunk_counts.insert(resolved_path, hunk_index + 1);
+                self.staging.overwrite(&resolved, content);
+                self.file_hunk_counts.insert(resolved, hunk_index + 1);
             }
-            EditFileOp::Overwrite => {
-                let new_content = normalize_hunk(change.content.as_deref().unwrap_or_default());
-                match self.staging.current_content(&resolved_path) {
+            EditOperation::Overwrite { path, content } => {
+                let resolved = resolve_path(&path, &self.editable_paths, false);
+                self.open_file(&resolved, EditFileOp::Overwrite, events);
+                let hunk_index = self.next_hunk_index(&resolved);
+                let new_content = normalize_hunk(&content);
+                match self.staging.current_content(&resolved) {
                     Ok(old_text) => {
                         events.push(StreamEvent::EditHunk {
-                            path: resolved_path.clone(),
+                            path: resolved.clone(),
                             hunk_index,
                             old_text,
                             new_text: new_content.clone(),
                         });
-                        self.staging.overwrite(&resolved_path, new_content);
-                        self.file_hunk_counts.insert(resolved_path, hunk_index + 1);
+                        self.staging.overwrite(&resolved, new_content);
+                        self.file_hunk_counts.insert(resolved, hunk_index + 1);
                     }
-                    Err(err_msg) => {
-                        events.push(StreamEvent::EditFileDone {
-                            path: resolved_path.clone(),
-                            status: EditFileStatus::Error,
-                            error: Some(err_msg),
-                            hunks_count: hunk_index,
-                        });
-                        self.file_hunk_counts.remove(&resolved_path);
-                        self.open_file_path = None;
-                    }
+                    Err(message) => self.fail_open_file(resolved, message, hunk_index, events),
                 }
             }
-            EditFileOp::Delete => {
+            EditOperation::Delete { path } => {
+                let resolved = resolve_path(&path, &self.editable_paths, false);
+                self.open_file(&resolved, EditFileOp::Delete, events);
                 // No hunk content; the pending EditFileDone reports zero hunks.
-                self.file_hunk_counts.entry(resolved_path).or_insert(0);
+                self.file_hunk_counts.entry(resolved).or_insert(0);
             }
-            EditFileOp::Move => {
-                let to_raw = change.to.as_deref().unwrap_or_default();
-                let resolved_to = resolve_path(to_raw, &self.editable_paths, true);
-                self.staging.apply_move(&resolved_path, &resolved_to);
-                self.open_file_display = format!("{} -> {}", resolved_path, resolved_to);
-                self.file_hunk_counts.entry(resolved_path).or_insert(0);
+            EditOperation::Move { from, to } => {
+                let resolved_from = resolve_path(&from, &self.editable_paths, false);
+                let resolved_to = resolve_path(&to, &self.editable_paths, true);
+                self.open_file(&resolved_from, EditFileOp::Move, events);
+                self.staging.apply_move(&resolved_from, &resolved_to);
+                self.open_file_display = format!("{} -> {}", resolved_from, resolved_to);
+                self.file_hunk_counts.entry(resolved_from).or_insert(0);
             }
-            EditFileOp::Replace => {
-                let old_text = normalize_hunk(change.old_text.as_deref().unwrap_or_default());
-                let new_text = normalize_hunk(
-                    change
-                        .new_text
-                        .as_deref()
-                        .filter(|s| !s.is_empty())
-                        .or(change.content.as_deref())
-                        .unwrap_or_default(),
-                );
-
+            EditOperation::Replace {
+                path,
+                old_text,
+                new_text,
+            } => {
+                let resolved = resolve_path(&path, &self.editable_paths, false);
+                self.open_file(&resolved, EditFileOp::Replace, events);
+                let hunk_index = self.next_hunk_index(&resolved);
+                let old_text = normalize_hunk(&old_text);
+                let new_text = normalize_hunk(&new_text);
                 events.push(StreamEvent::EditHunk {
-                    path: resolved_path.clone(),
+                    path: resolved.clone(),
                     hunk_index,
                     old_text: old_text.clone(),
                     new_text: new_text.clone(),
                 });
-
-                match self
-                    .staging
-                    .apply_hunk(&resolved_path, &old_text, &new_text)
-                {
+                match self.staging.apply_hunk(&resolved, &old_text, &new_text) {
                     Ok(()) => {
-                        self.file_hunk_counts.insert(resolved_path, hunk_index + 1);
+                        self.file_hunk_counts.insert(resolved, hunk_index + 1);
                     }
-                    Err(err_msg) => {
-                        events.push(StreamEvent::EditFileDone {
-                            path: resolved_path.clone(),
-                            status: EditFileStatus::Error,
-                            error: Some(err_msg),
-                            hunks_count: hunk_index + 1,
+                    Err(message) => self.fail_open_file(resolved, message, hunk_index + 1, events),
+                }
+            }
+            EditOperation::LineAnchor {
+                path,
+                start,
+                end,
+                content,
+            } => {
+                let resolved = resolve_path(&path, &self.editable_paths, false);
+                self.open_file(&resolved, EditFileOp::Replace, events);
+                let hunk_index = self.next_hunk_index(&resolved);
+                let replacement = normalize_hunk(&content);
+                self.anchor_batches
+                    .entry(resolved.clone())
+                    .or_default()
+                    .push(OwnedAnchor {
+                        start,
+                        end,
+                        content: replacement.clone(),
+                    });
+                // The anchors name the lines the context block rendered, so the
+                // ranges of one file are one batch resolved against the original
+                // snapshot, exactly as the staging engine applies them.
+                let outcome = {
+                    let batch: Vec<AnchorEdit<'_>> = self
+                        .anchor_batches
+                        .get(&resolved)
+                        .map(|anchors| anchors.iter().map(OwnedAnchor::as_edit).collect())
+                        .unwrap_or_default();
+                    self.staging.apply_anchor_batch(&resolved, &batch)
+                };
+                match outcome {
+                    Ok(replaced) => {
+                        // The snapshot text of the addressed range is the removed
+                        // side of the diff, so the preview shows an honest
+                        // replacement instead of a bare addition.
+                        let old_text = replaced.last().cloned().unwrap_or_default();
+                        events.push(StreamEvent::EditHunk {
+                            path: resolved.clone(),
+                            hunk_index,
+                            old_text,
+                            new_text: replacement,
                         });
-                        self.file_hunk_counts.remove(&resolved_path);
-                        self.open_file_path = None;
+                        self.file_hunk_counts.insert(resolved, hunk_index + 1);
                     }
+                    Err(message) => self.fail_open_file(resolved, message, hunk_index, events),
                 }
             }
         }
@@ -772,5 +858,164 @@ mod tests {
         assert_eq!(char_by_char.0, "Hello");
         assert_eq!(whole.0, "Hello");
         assert_eq!(char_by_char.1, whole.1);
+    }
+    /// Builds the anchored replacement entry of one inclusive line range.
+    fn anchored_change(path: &str, start: u16, end: u16, content: &str) -> serde_json::Value {
+        serde_json::json!({
+            "op": "replace",
+            "path": path,
+            "to": "",
+            "start": crate::edits::anchor::encode_anchor(path, start),
+            "end": crate::edits::anchor::encode_anchor(path, end),
+            "content": content,
+        })
+    }
+
+    /// Collects every reported hunk as `(index, old_text, new_text)`.
+    fn hunks(events: &[StreamEvent]) -> Vec<(usize, String, String)> {
+        events
+            .iter()
+            .filter_map(|event| match event {
+                StreamEvent::EditHunk {
+                    hunk_index,
+                    old_text,
+                    new_text,
+                    ..
+                } => Some((*hunk_index, old_text.clone(), new_text.clone())),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Collects the terminal event of every file as `(status, hunks_count)`.
+    fn completions(events: &[StreamEvent]) -> Vec<(EditFileStatus, usize)> {
+        events
+            .iter()
+            .filter_map(|event| match event {
+                StreamEvent::EditFileDone {
+                    status,
+                    hunks_count,
+                    ..
+                } => Some((*status, *hunks_count)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn test_anchored_replace_previews_the_range_it_replaces() {
+        let path = "crates/foo.rs";
+        let mut filter = JsonStreamFilter::new(vec![path.to_string()], std::env::temp_dir())
+            .with_staged_contents(HashMap::from([(
+                path.to_string(),
+                "alpha\nbeta\ngamma\n".to_string(),
+            )]));
+        let input = serde_json::json!({
+            "message": "Rewrite the middle line",
+            "changes": [anchored_change(path, 1, 1, "BETA\n")],
+        })
+        .to_string();
+
+        let mut events = filter.push_chunk(&input);
+        assert_eq!(
+            filter
+                .staging
+                .current_content(path)
+                .expect("staged content"),
+            "alpha\nBETA\ngamma\n"
+        );
+        events.extend(Box::new(filter).finish());
+
+        // The anchored entry is previewed as the range it names: the replaced
+        // snapshot text is the removed side, and no search/replace miss is
+        // reported, because the entry never was a search/replace block.
+        assert_eq!(
+            hunks(&events),
+            vec![(0, "beta".to_string(), "BETA\n".to_string())]
+        );
+        assert_eq!(completions(&events), vec![(EditFileStatus::Ok, 1)]);
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, StreamEvent::EditStarted))
+                .count(),
+            1
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, StreamEvent::EditFileStarted { .. }))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn test_anchored_entries_of_one_file_apply_as_one_batch() {
+        let path = "a.rs";
+        let mut filter = JsonStreamFilter::new(vec![path.to_string()], std::env::temp_dir())
+            .with_staged_contents(HashMap::from([(
+                path.to_string(),
+                "alpha\nbeta\ngamma\n".to_string(),
+            )]));
+        let input = serde_json::json!({
+            "message": "Rewrite two ranges",
+            "changes": [
+                anchored_change(path, 0, 0, "ALPHA\n"),
+                anchored_change(path, 2, 2, "GAMMA\n"),
+            ],
+        })
+        .to_string();
+
+        let mut events = filter.push_chunk(&input);
+        assert_eq!(
+            filter
+                .staging
+                .current_content(path)
+                .expect("staged content"),
+            "ALPHA\nbeta\nGAMMA\n"
+        );
+        events.extend(Box::new(filter).finish());
+
+        // Both ranges address the snapshot the context block rendered, so the
+        // later entry never overwrites the result of the earlier one.
+        assert_eq!(
+            hunks(&events),
+            vec![
+                (0, "alpha".to_string(), "ALPHA\n".to_string()),
+                (1, "gamma".to_string(), "GAMMA\n".to_string()),
+            ]
+        );
+        assert_eq!(completions(&events), vec![(EditFileStatus::Ok, 2)]);
+    }
+
+    #[test]
+    fn test_anchored_entry_beyond_the_file_reports_the_staging_rejection() {
+        let path = "a.rs";
+        let mut filter = JsonStreamFilter::new(vec![path.to_string()], std::env::temp_dir())
+            .with_staged_contents(HashMap::from([(
+                path.to_string(),
+                "alpha\nbeta\n".to_string(),
+            )]));
+        let input = serde_json::json!({
+            "message": "Rewrite",
+            "changes": [anchored_change(path, 4, 4, "x\n")],
+        })
+        .to_string();
+
+        let mut events = filter.push_chunk(&input);
+        events.extend(Box::new(filter).finish());
+
+        assert!(hunks(&events).is_empty());
+        let (status, error) = events
+            .iter()
+            .find_map(|event| match event {
+                StreamEvent::EditFileDone { status, error, .. } => Some((*status, error.clone())),
+                _ => None,
+            })
+            .expect("the file must be completed");
+        assert_eq!(status, EditFileStatus::Error);
+        let error = error.expect("the rejection must carry its diagnostic");
+        assert!(error.contains("names no line"), "{error}");
     }
 }

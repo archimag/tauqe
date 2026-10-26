@@ -212,7 +212,8 @@ fn two_layer_context(root: &Path) -> ContextManager {
     crate::git::cmd::commit_with_developer_author(root, "Add fixtures", false).unwrap();
 
     let mut cm = ContextManager::new(root.to_path_buf());
-    cm.add_file("user_file.rs", ContextAccess::Editable).unwrap();
+    cm.add_file("user_file.rs", ContextAccess::Editable)
+        .unwrap();
     cm.add_auto_file("auto_file.rs", ContextAccess::Editable)
         .unwrap();
     cm

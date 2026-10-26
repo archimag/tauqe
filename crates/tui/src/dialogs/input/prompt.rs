@@ -1,8 +1,10 @@
+use std::sync::Arc;
+
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use tauqe_protocol::{
     methods, DiscussionFocus, DiscussionRequest, DiscussionTarget, ModelAskParams,
 };
-use tokio::sync::MutexGuard;
+use tokio::sync::{Mutex, MutexGuard};
 
 use crate::app::{AppState, ModalFocus, PromptModalState, PromptModalTarget};
 use crate::input::{is_char_typing, InputResult};
@@ -14,6 +16,7 @@ use crate::rpc::{send_request, RpcConnection};
 /// a newline; `Tab` toggles between the editor and the action buttons.
 pub(super) async fn handle_prompt_modal(
     key: KeyEvent,
+    state: &Arc<Mutex<AppState>>,
     mut st: MutexGuard<'_, AppState>,
     server_writer: &mut RpcConnection,
 ) -> anyhow::Result<Option<InputResult>> {
@@ -44,14 +47,14 @@ pub(super) async fn handle_prompt_modal(
                 return Ok(Some(InputResult::Continue));
             }
             KeyCode::Char('y') | KeyCode::Char('Y') if is_char_typing(key.modifiers) => {
-                return submit_prompt_modal(st, modal, server_writer).await;
+                return submit_prompt_modal(state, st, modal, server_writer).await;
             }
             KeyCode::Char('n') | KeyCode::Char('N') if is_char_typing(key.modifiers) => {
                 return Ok(Some(InputResult::Continue));
             }
             KeyCode::Enter | KeyCode::Char(' ') => {
                 if modal.actions.is_confirm() {
-                    return submit_prompt_modal(st, modal, server_writer).await;
+                    return submit_prompt_modal(state, st, modal, server_writer).await;
                 } else {
                     return Ok(Some(InputResult::Continue));
                 }
@@ -78,10 +81,10 @@ pub(super) async fn handle_prompt_modal(
             if !key.modifiers.contains(KeyModifiers::SHIFT)
                 && !key.modifiers.contains(KeyModifiers::ALT) =>
         {
-            return submit_prompt_modal(st, modal, server_writer).await;
+            return submit_prompt_modal(state, st, modal, server_writer).await;
         }
         KeyCode::Char('s') | KeyCode::Char('S') if is_cmd => {
-            return submit_prompt_modal(st, modal, server_writer).await;
+            return submit_prompt_modal(state, st, modal, server_writer).await;
         }
         _ => {
             crate::input::handle_editor_key(&mut modal.prompt_editor, key, is_cmd, true);
@@ -100,6 +103,7 @@ pub(super) async fn handle_prompt_modal(
 /// failed write restores the previous answer, the batch flag, and the anchor,
 /// and hands the submitted comment back to its modal instead of losing it.
 pub(crate) async fn submit_prompt_modal(
+    state: &Arc<Mutex<AppState>>,
     mut st: MutexGuard<'_, AppState>,
     dialog: PromptModalState,
     server_writer: &mut RpcConnection,
@@ -164,8 +168,14 @@ pub(crate) async fn submit_prompt_modal(
     let snapshot = super::TurnLaunchSnapshot::capture(&st);
     super::begin_repl_turn(&mut st);
     st.discussion_focus = focus;
+    // The launch transition is complete, so the guard is released before the
+    // request leaves the loop and a daemon that stopped draining its stdin can
+    // never freeze the interface. A failed write re-acquires the lock to
+    // restore the snapshot and hand the comment back to its modal (c-1).
+    drop(st);
 
     if let Err(err) = send_request(server_writer, methods::MODEL_ASK, payload).await {
+        let mut st = state.lock().await;
         snapshot.restore(&mut st);
         st.prompt_modal = Some(dialog);
         st.notify_error(

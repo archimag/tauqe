@@ -1194,6 +1194,7 @@ mod tests {
                 id: "s-1".to_string(),
                 title: "Step".to_string(),
                 status: tauqe_protocol::PlanItemStatus::Todo,
+                files: vec!["src/step.rs".to_string()],
                 ..Default::default()
             }],
             test_architect(),
@@ -1283,6 +1284,7 @@ mod tests {
             id: "s-3".to_string(),
             title: "New step".to_string(),
             status: tauqe_protocol::PlanItemStatus::Todo,
+            files: vec!["src/new_step.rs".to_string()],
             ..Default::default()
         }];
 
@@ -1442,6 +1444,7 @@ mod tests {
             id: "step-1".to_string(),
             title: "Implementation step".to_string(),
             status: tauqe_protocol::PlanItemStatus::Todo,
+            files: vec!["src/step.rs".to_string()],
             ..Default::default()
         }];
 
@@ -1505,6 +1508,7 @@ mod tests {
             id: "step-1".to_string(),
             title: "Implementation step".to_string(),
             status: tauqe_protocol::PlanItemStatus::Todo,
+            files: vec!["src/step.rs".to_string()],
             ..Default::default()
         }];
 

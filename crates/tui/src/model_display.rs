@@ -138,7 +138,12 @@ fn collect_roles(summary: Option<&ModelRolesSummary>) -> HashMap<ModelRole, Mode
         (ModelRole::Reviewer, &summary.reviewer),
     ]
     .into_iter()
-    .map(|(role, model)| (role, ModelEntry::new(model.clone(), role_effort(summary, role))))
+    .map(|(role, model)| {
+        (
+            role,
+            ModelEntry::new(model.clone(), role_effort(summary, role)),
+        )
+    })
     .collect()
 }
 
@@ -266,7 +271,10 @@ mod tests {
         install_snapshot(Some(&fixture()));
         let unlisted = ModelRef::openrouter("~anthropic/claude-sonnet-latest");
 
-        assert_eq!(model_label(&unlisted, None), "~anthropic/claude-sonnet-latest");
+        assert_eq!(
+            model_label(&unlisted, None),
+            "~anthropic/claude-sonnet-latest"
+        );
         assert_eq!(
             model_label(&unlisted, Some(ReasoningEffort::Max)),
             "~anthropic/claude-sonnet-latest [max]"

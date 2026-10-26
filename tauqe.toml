@@ -31,8 +31,8 @@ models = [
 # itself and lives in the catalog entry, so the same model is never labelled in
 # two places.
 primary = [
-  "Gemini Flash",
-  { model = "GLM", effort = "high" }
+  { model = "GLM", effort = "high" },
+  "Gemini Flash"
 ]
 scribe = "Claude Haiku"    # history compaction, git squash commit messages, diff summarization
 # The coder list is the natural escalation ladder (level up): on verification
@@ -69,6 +69,20 @@ max_retries = 5
 # Maximum automated replanning cycles triggered by a blocked coder step before
 # requiring manual developer intervention (default: 2).
 # max_replans = 2
+# How a change set addresses the lines it replaces. `search_replace` (default)
+# echoes the replaced text and matches it exactly; `line_anchor` names an
+# inclusive line range through the compact opaque anchors rendered beside every
+# context line, so the model copies a short token instead of reproducing the
+# text it replaces. The strategy is orthogonal to `protocol`: the protocol picks
+# the encoding of an edit, the strategy picks the fields that address a range.
+patch_strategy = "line_anchor"
+# Prompt layout policy. `semantic` composes the prompt as blocks grouped by kind
+# (contract, repository map, context, plan, language, history, scratchpad), while
+# `chronological` interleaves context files with history entries in the order they
+# were added, so the prompt grows append-only from one turn to the next. When the
+# key is absent the layout follows the turn intent: interactive REPL turns use
+# `chronological`, isolated steps and discussions use `semantic`.
+# prompt_layout = "chronological"
 # workflow = "git"   # edit workflow: "git", "naive" (default: "git")
 # Active edit protocol. `structured` is the default and drives strict JSON-Schema
 # structured output, `xml` drives marker-protected XML tags, and `mixed` (legacy

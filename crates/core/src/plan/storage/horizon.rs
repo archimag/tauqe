@@ -458,6 +458,7 @@ mod tests {
                 title: "Waits for a cancelled step".to_string(),
                 status: PlanItemStatus::Todo,
                 depends_on: vec!["2".to_string()],
+                files: vec!["src/step1.rs".to_string()],
                 ..Default::default()
             },
             PlanItem {
@@ -492,6 +493,7 @@ mod tests {
             title: "Builds on the foundation".to_string(),
             status: PlanItemStatus::Todo,
             depends_on: vec!["1".to_string()],
+            files: vec!["src/step2.rs".to_string()],
             ..Default::default()
         }];
 
@@ -532,6 +534,7 @@ mod tests {
                 id: "3".to_string(),
                 title: "Synthesized step A".to_string(),
                 status: PlanItemStatus::Todo,
+                files: vec!["src/step3.rs".to_string()],
                 ..Default::default()
             },
             PlanItem {
@@ -539,6 +542,7 @@ mod tests {
                 title: "Synthesized step B".to_string(),
                 status: PlanItemStatus::Todo,
                 depends_on: vec!["3".to_string()],
+                files: vec!["src/step4.rs".to_string()],
                 ..Default::default()
             },
         ];
@@ -589,6 +593,7 @@ mod tests {
             id: "1".to_string(),
             title: "First".to_string(),
             status: PlanItemStatus::Todo,
+            files: vec!["src/first.rs".to_string()],
             ..Default::default()
         }];
 
@@ -637,6 +642,7 @@ mod tests {
                 id: "2".to_string(),
                 title: "Next".to_string(),
                 status: PlanItemStatus::Todo,
+                files: vec!["src/next.rs".to_string()],
                 ..Default::default()
             },
         ];
@@ -694,6 +700,7 @@ mod tests {
             id: "2".to_string(),
             title: "Synthesized".to_string(),
             status: PlanItemStatus::Todo,
+            files: vec!["src/synthesized.rs".to_string()],
             ..Default::default()
         }];
 
@@ -838,6 +845,7 @@ mod tests {
                 title: "Waits for a cancelled step".to_string(),
                 status: PlanItemStatus::Todo,
                 depends_on: vec!["2".to_string()],
+                files: vec!["src/step1.rs".to_string()],
                 ..Default::default()
             },
             PlanItem {

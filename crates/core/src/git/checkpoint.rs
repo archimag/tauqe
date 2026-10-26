@@ -2,7 +2,7 @@ use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
-use super::cmd::{commit_with_developer_author, run_git, stage_files};
+use super::cmd::{commit_with_developer_author, run_git, run_git_check_ignore, stage_files};
 use crate::atomic_write::{staging_backup_original_name, staging_temp_original_name};
 
 pub const TAUQE_CO_AUTHOR_TRAILER: &str = "Co-authored-by: Tauqe AI <noreply@tauqe.dev>";
@@ -319,7 +319,10 @@ pub fn ensure_tauqe_ignored(dir: &Path) -> Result<()> {
                 let mut file = std::fs::OpenOptions::new()
                     .create(true)
                     .append(true)
-                    .open(&exclude_path)?;
+                    .open(&exclude_path)
+                    .with_context(|| {
+                        format!("Failed to open the Git exclude file: {:?}", exclude_path)
+                    })?;
                 if !content.is_empty() && !content.ends_with('\n') {
                     writeln!(file)?;
                 }
@@ -327,14 +330,66 @@ pub fn ensure_tauqe_ignored(dir: &Path) -> Result<()> {
                     writeln!(file, "{pat}")?;
                 }
             }
+
+            // Appending a pattern does not prove that Git honours it: a project
+            // `.gitignore` outranks `.git/info/exclude` and can re-include a
+            // protected path, and a path already in the index is never ignored.
+            verify_protected_paths_ignored(dir)?;
         }
     }
     Ok(())
 }
 
+/// Repository-relative paths a checkpoint commit must never stage.
+///
+/// They hold the OpenRouter API key, so a temporary commit that includes them
+/// keeps the secret in the object database and the reflog long after the
+/// checkpoint is unwound. Rolling history back does not remove the object, and
+/// any tooling that walks dangling commits can read it.
+const PROTECTED_PATHS: [&str; 3] = [
+    ".tauqe/credentials.toml",
+    "credentials.toml",
+    ".credentials.toml",
+];
+
+/// Fails when Git does not exclude every protected path.
+///
+/// `git add -A` stages everything Git does not consider ignored, so a checkpoint
+/// may only be created once the ignore rules are proven to cover the protected
+/// set. The proof is one batched `git check-ignore` call for the whole set, and it
+/// is deliberately fail-closed: an unanswered or negative probe aborts the
+/// checkpoint instead of committing a credential file into a temporary commit.
+fn verify_protected_paths_ignored(dir: &Path) -> Result<()> {
+    let candidates: Vec<String> = PROTECTED_PATHS
+        .iter()
+        .map(|path| path.to_string())
+        .collect();
+    let ignored = run_git_check_ignore(dir, &candidates)
+        .context("Failed to verify that the protected paths are ignored by Git")?;
+
+    let leaked: Vec<&str> = PROTECTED_PATHS
+        .iter()
+        .copied()
+        .filter(|path| !ignored.iter().any(|entry| entry.as_str() == *path))
+        .collect();
+
+    if leaked.is_empty() {
+        return Ok(());
+    }
+
+    bail!(
+        "Refusing to create a checkpoint: Git does not ignore protected path(s): {}; \
+         unresolvable ignore rules would commit a credential file",
+        leaked.join(", ")
+    );
+}
+
 /// Creates a safe checkpoint of uncommitted changes before applying AI modifications.
 pub fn create_checkpoint(dir: &Path) -> Result<CheckpointInfo> {
-    let _ = ensure_tauqe_ignored(dir);
+    // The ignore rules are the only mechanism that keeps the credential file out
+    // of `git add -A`, so a failure to install them aborts the checkpoint instead
+    // of committing the API key into a temporary commit.
+    ensure_tauqe_ignored(dir)?;
 
     let head = run_git(Some(dir), &["rev-parse", "HEAD"])
         .unwrap_or_else(|_| "HEAD".to_string())
@@ -888,5 +943,73 @@ mod tests {
             .to_string();
         assert_eq!(head_before, head_after);
         assert!(read_transaction_marker(path).is_some());
+    }
+
+    #[test]
+    fn test_create_checkpoint_refuses_when_ignore_rules_cannot_be_installed() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path();
+        crate::git::state::init_repository(Some(path), true).unwrap();
+
+        // A directory occupying `.git/info/exclude` makes every attempt to append
+        // an ignore rule fail, so `git add -A` would see the credential file as an
+        // ordinary untracked path and commit the API key.
+        let exclude_path = path.join(".git").join("info").join("exclude");
+        if exclude_path.is_file() {
+            fs::remove_file(&exclude_path).unwrap();
+        }
+        fs::create_dir_all(&exclude_path).unwrap();
+
+        let tauqe_dir = path.join(".tauqe");
+        fs::create_dir_all(&tauqe_dir).unwrap();
+        fs::write(
+            tauqe_dir.join("credentials.toml"),
+            "[openrouter]\napi_key = \"sk-or-v1-secret\"\n",
+        )
+        .unwrap();
+
+        let err = create_checkpoint(path)
+            .expect_err("the checkpoint must abort instead of committing the API key");
+        assert!(err.to_string().contains("exclude"), "{err}");
+
+        // Nothing was committed and no transaction was opened, so no secret ever
+        // reached the object database.
+        let subject = crate::git::cmd::run_git(Some(path), &["log", "-1", "--format=%s"])
+            .unwrap()
+            .trim()
+            .to_string();
+        assert_eq!(subject, "chore: initial commit");
+        let tracked = crate::git::cmd::run_git(Some(path), &["ls-files"]).unwrap();
+        assert!(!tracked.contains("credentials.toml"), "{tracked}");
+        assert!(!tauqe_dir.join("active-transaction.json").exists());
+    }
+
+    #[test]
+    fn test_create_checkpoint_refuses_when_protected_path_is_not_ignored() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path();
+        crate::git::state::init_repository(Some(path), true).unwrap();
+
+        // Installing the ignore rules succeeds here, but a project `.gitignore`
+        // outranks `.git/info/exclude` and re-includes the credential file, so the
+        // rules are in place without actually covering the protected path.
+        fs::write(path.join(".gitignore"), "!credentials.toml\n").unwrap();
+        fs::write(
+            path.join("credentials.toml"),
+            "[openrouter]\napi_key = \"sk-or-v1-secret\"\n",
+        )
+        .unwrap();
+
+        let err = create_checkpoint(path)
+            .expect_err("a credential file Git does not ignore must abort the checkpoint");
+        assert!(err.to_string().contains("credentials.toml"), "{err}");
+
+        let subject = crate::git::cmd::run_git(Some(path), &["log", "-1", "--format=%s"])
+            .unwrap()
+            .trim()
+            .to_string();
+        assert_eq!(subject, "chore: initial commit");
+        let tracked = crate::git::cmd::run_git(Some(path), &["ls-files"]).unwrap();
+        assert!(!tracked.contains("credentials.toml"), "{tracked}");
     }
 }

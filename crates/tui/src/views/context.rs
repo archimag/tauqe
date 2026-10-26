@@ -14,6 +14,36 @@ pub enum ContextRow {
     Item(ContextItem),
 }
 
+/// One row of the Context file picker.
+///
+/// The bulk mass-add action and concrete repository paths are two different
+/// kinds of rows. The enum makes that distinction a typed fact instead of a
+/// string-prefix probe (Conventions 1.5): the Enter/Tab dispatch and the row
+/// renderer match variants and never inspect row text.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ContextCandidate {
+    /// Synthetic bulk row: mass-add every repository file matching `pattern`.
+    BulkPattern { pattern: String, count: usize },
+    /// A concrete repository file path.
+    File(String),
+}
+
+impl ContextCandidate {
+    /// Display text of the picker row.
+    ///
+    /// The `[+] Add all matching` wording is derived here and nowhere else,
+    /// so the rendered label can never diverge from the typed dispatch
+    /// decision that consumes the same variant.
+    pub fn display_label(&self) -> String {
+        match self {
+            Self::BulkPattern { pattern, count } => {
+                format!("[+] Add all matching '{}' ({} files)", pattern, count)
+            }
+            Self::File(path) => path.clone(),
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct ContextViewState {
     pub cursor_index: usize,
@@ -25,7 +55,7 @@ pub struct ContextViewState {
     pub adding_file: bool,
     pub add_access: ContextAccess,
     pub add_input: InputEditor,
-    pub filtered_candidates: Vec<String>,
+    pub filtered_candidates: Vec<ContextCandidate>,
     pub total_matching: usize,
     pub selected_candidate_index: usize,
     pub confirm_clear_auto: bool,
@@ -150,10 +180,10 @@ impl ContextViewState {
                 .count();
 
             if matching_pattern_count > 0 && is_pattern_query {
-                candidates.push(format!(
-                    "[+] Add all matching '{}' ({} files)",
-                    query, matching_pattern_count
-                ));
+                candidates.push(ContextCandidate::BulkPattern {
+                    pattern: query.to_string(),
+                    count: matching_pattern_count,
+                });
             }
 
             let query_lower = query.to_lowercase();
@@ -167,7 +197,7 @@ impl ContextViewState {
                 .collect();
 
             self.total_matching = all_matches.len();
-            candidates.extend(all_matches.into_iter().take(50));
+            candidates.extend(all_matches.into_iter().take(50).map(ContextCandidate::File));
         } else {
             let available: Vec<String> = all_repo_files
                 .iter()
@@ -175,19 +205,23 @@ impl ContextViewState {
                 .cloned()
                 .collect();
             self.total_matching = available.len();
-            candidates = available.into_iter().take(50).collect();
+            candidates = available
+                .into_iter()
+                .take(50)
+                .map(ContextCandidate::File)
+                .collect();
         }
 
         self.filtered_candidates = candidates;
 
-        // The synthetic "[+] Add all matching" row is convenient but risky: a
-        // single Enter mass-adds every match and can bloat the context without
-        // warning. Default the selection to the first concrete file so Enter is
-        // safe, while keeping the bulk row reachable by navigating up.
-        let bulk_row_first = self
-            .filtered_candidates
-            .first()
-            .is_some_and(|c| c.starts_with("[+] Add all matching '"));
+        // The typed bulk row is convenient but risky: a single Enter mass-adds
+        // every match and can bloat the context without warning. Default the
+        // selection to the first concrete file so Enter is safe, while keeping
+        // the bulk row reachable by navigating up.
+        let bulk_row_first = matches!(
+            self.filtered_candidates.first(),
+            Some(ContextCandidate::BulkPattern { .. })
+        );
 
         if self.filtered_candidates.is_empty() {
             self.selected_candidate_index = 0;
@@ -213,6 +247,7 @@ mod tests {
             size_bytes: 16,
             estimated_tokens: 4,
             layer,
+            insertion_seq: 0,
         }
     }
 
@@ -240,6 +275,44 @@ mod tests {
     }
 
     #[test]
+    fn test_sentinel_prefixed_path_stays_a_file_candidate() {
+        let mut view = ContextViewState::default();
+        // A real repository path may literally start with the old sentinel
+        // prefix; the typed model keeps it a concrete file row.
+        let suspicious = "[+] Add all matching '*.rs' (3 files)";
+        let all_repo_files = vec![suspicious.to_string(), "src/lib.rs".to_string()];
+
+        view.update_filtered_candidates(&[], &all_repo_files);
+
+        assert_eq!(
+            view.filtered_candidates.first(),
+            Some(&ContextCandidate::File(suspicious.to_string()))
+        );
+    }
+
+    #[test]
+    fn test_pattern_query_produces_typed_bulk_row_and_skips_it() {
+        let mut view = ContextViewState::default();
+        let all_repo_files = vec!["src/lib.rs".to_string(), "src/main.rs".to_string()];
+        view.add_input.insert_str("*.rs");
+
+        view.update_filtered_candidates(&[], &all_repo_files);
+
+        assert_eq!(
+            view.filtered_candidates.first(),
+            Some(&ContextCandidate::BulkPattern {
+                pattern: "*.rs".to_string(),
+                count: 2,
+            })
+        );
+        // Enter stays safe: the default selection is the first concrete file.
+        assert_eq!(
+            view.filtered_candidates.get(view.selected_candidate_index),
+            Some(&ContextCandidate::File("src/lib.rs".to_string()))
+        );
+    }
+
+    #[test]
     fn test_compute_rows_keeps_layer_sections_and_respects_folding() {
         let mut view = ContextViewState::default();
         let items = vec![
@@ -257,5 +330,68 @@ mod tests {
         view.collapse_all();
         let folded = view.compute_rows(&items);
         assert!(rendered_paths(&folded).is_empty());
+    }
+
+    #[test]
+    fn update_filtered_candidates_produces_a_typed_bulk_row_for_a_pattern_query() {
+        let mut view = ContextViewState::default();
+        view.add_input.insert_str("*.rs");
+        let all_repo_files = vec!["a.rs".to_string(), "b.rs".to_string()];
+
+        view.update_filtered_candidates(&[], &all_repo_files);
+
+        assert_eq!(
+            view.filtered_candidates,
+            vec![
+                ContextCandidate::BulkPattern {
+                    pattern: "*.rs".to_string(),
+                    count: 2,
+                },
+                ContextCandidate::File("a.rs".to_string()),
+                ContextCandidate::File("b.rs".to_string()),
+            ]
+        );
+        assert_eq!(view.total_matching, 2);
+        // Enter stays safe: the default selection is the first concrete file.
+        assert_eq!(view.selected_candidate_index, 1);
+    }
+
+    /// A repository path may literally begin with the historical sentinel
+    /// prefix. Row kind is carried by the variant, never recovered from the
+    /// text, so such a path stays a plain file row.
+    #[test]
+    fn update_filtered_candidates_keeps_a_sentinel_prefixed_path_a_plain_file_row() {
+        let sentinel_path = "[+] Add all matching 'demo.rs' (2 files)".to_string();
+        let mut view = ContextViewState::default();
+        view.add_input.insert_str("demo.rs");
+        let all_repo_files = vec![sentinel_path.clone()];
+
+        view.update_filtered_candidates(&[], &all_repo_files);
+
+        assert_eq!(
+            view.filtered_candidates,
+            vec![ContextCandidate::File(sentinel_path)]
+        );
+        let has_bulk_row = view
+            .filtered_candidates
+            .iter()
+            .any(|candidate| matches!(candidate, ContextCandidate::BulkPattern { .. }));
+        assert!(!has_bulk_row);
+    }
+
+    #[test]
+    fn bulk_row_display_label_is_derived_from_the_variant() {
+        let bulk = ContextCandidate::BulkPattern {
+            pattern: "*.rs".to_string(),
+            count: 3,
+        };
+        assert_eq!(
+            bulk.display_label(),
+            "[+] Add all matching '*.rs' (3 files)"
+        );
+        assert_eq!(
+            ContextCandidate::File("x.rs".to_string()).display_label(),
+            "x.rs"
+        );
     }
 }

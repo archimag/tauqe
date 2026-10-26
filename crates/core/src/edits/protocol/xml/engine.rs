@@ -150,6 +150,17 @@ pub(crate) const XML_TAG_SPECS: &[XmlTagSpec] = &[
     spec("delete", TagCloseMode::Simple, true),
     spec("move", TagCloseMode::Simple, true),
     spec("summary", TagCloseMode::Control, false),
+    // Anchor change-set vehicle. The XML contour carries an anchored change set
+    // as one JSON array inside this tag, so the replaced lines are named by the
+    // opaque anchors rendered in context instead of being echoed back. The tag
+    // is a control tag: the user-facing stream suppresses it and conversational
+    // text never keeps it.
+    control_spec(
+        "file_edits",
+        LlmCapability::FileEdits,
+        TagCloseMode::Control,
+        MarkerPolicy::Strict,
+    ),
     // Capability control tags.
     control_spec(
         "context_request",
@@ -484,6 +495,36 @@ pub(crate) fn strip_all_control_tags(text: &str) -> String {
     text
 }
 
+/// Re-activates unmarked hidden control tags that marker normalization
+/// protected as literal text.
+///
+/// `normalize_marked_xml` protects every unsuffixed tag as literal content, so a
+/// source snippet quoted in prose can never issue a protocol command. Control
+/// tags need the opposite treatment on the way out: when the model drops the
+/// marker suffix, the scaffolding must still be hidden from the user-facing
+/// text. Re-materializing those tags lets [`strip_all_control_tags`] remove
+/// them, while code-modification tags stay protected literals and never start an
+/// edit block.
+///
+/// The streaming contour and the final cleaner both call this, so the streamed
+/// preview and the persisted record hide exactly the same tags.
+pub(crate) fn activate_unmarked_hidden_tags(normalized: &str, marker: &str) -> String {
+    let protection = format!("\u{e000}{}\u{e001}", marker);
+    if !normalized.contains(&protection) {
+        return normalized.to_string();
+    }
+    let mut restored = normalized.to_string();
+    for spec in XML_TAG_SPECS
+        .iter()
+        .filter(|spec| spec.is_control() && spec.stream_suppress_unmarked)
+    {
+        let base = spec.base_name;
+        restored = restored.replace(&format!("{}/{}", protection, base), &format!("</{}", base));
+        restored = restored.replace(&format!("{}{}", protection, base), &format!("<{}", base));
+    }
+    restored
+}
+
 /// Locates the earliest complete control tag in `text`.
 pub(crate) fn find_earliest_control_tag(text: &str) -> Option<(usize, usize)> {
     let fences = CodeFences::find(text);
@@ -751,7 +792,8 @@ mod tests {
 
         // An explicit recommendation attribute wins over the body, so a model
         // never has to choose between the two forms.
-        let both = "<abort reason=\"Blocked\" recommendation=\"Run: make setup\">ignored body</abort>";
+        let both =
+            "<abort reason=\"Blocked\" recommendation=\"Run: make setup\">ignored body</abort>";
         let found = match find_next_tag(both, spec_of("abort")) {
             Some(found) => found,
             None => panic!("abort tag not found"),
