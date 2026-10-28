@@ -100,7 +100,7 @@ fn test_plan_get_params_defaults_the_absent_id() {
 }
 
 #[test]
-fn test_plan_execute_params_carry_coder_selection_and_instructions() {
+fn test_plan_execute_params_carry_coder_selection() {
     // The starting rung of the coder ladder travels whole: the model together
     // with the reasoning depth it was configured with, so the server never
     // re-derives the depth from the configured role lists.
@@ -111,16 +111,14 @@ fn test_plan_execute_params_carry_coder_selection_and_instructions() {
             model: ModelRef::openrouter("anthropic/claude-3.5-sonnet"),
             effort: Some(ReasoningEffort::High),
         }),
-        instructions: Some("Keep the public API stable".to_string()),
     };
     let json = serde_json::to_string(&params).unwrap();
     assert!(json.contains("\"effort\":\"high\""), "{json}");
-    assert!(json.contains("Keep the public API stable"), "{json}");
     let de: PlanExecuteParams = serde_json::from_str(&json).unwrap();
     assert_eq!(de, params);
 
-    // A request that predates the fields keeps decoding unchanged and reports
-    // no explicit selection, so the ladder starts at its base rung.
+    // A request that predates the selection field keeps decoding unchanged and
+    // reports no explicit selection, so the ladder starts at its base rung.
     let legacy: PlanExecuteParams = serde_json::from_value(serde_json::json!({
         "plan_id": "legacy-plan",
         "step_id": "1"
@@ -128,18 +126,16 @@ fn test_plan_execute_params_carry_coder_selection_and_instructions() {
     .unwrap();
     assert_eq!(legacy.plan_id, "legacy-plan");
     assert!(legacy.model.is_none());
-    assert!(legacy.instructions.is_none());
 
     // An absent selection stays out of the wire form instead of emitting
     // explicit nulls.
     let bare_json = serde_json::to_string(&legacy).unwrap();
     assert!(!bare_json.contains("model"), "{bare_json}");
-    assert!(!bare_json.contains("instructions"), "{bare_json}");
 
     // A malformed selection fails the typed parse rather than being dropped.
     assert!(
         serde_json::from_value::<PlanExecuteParams>(serde_json::json!({
-            "plan_id": "p",
+            "plan_id": "bad-selection",
             "model": 42
         }))
         .is_err()
@@ -147,32 +143,36 @@ fn test_plan_execute_params_carry_coder_selection_and_instructions() {
 }
 
 #[test]
-fn test_plan_execute_pipeline_params_carry_coder_selection_and_instructions() {
+fn test_plan_execute_pipeline_params_carry_coder_selection() {
     let params = PlanExecutePipelineParams {
         plan_ids: vec!["plan-a".to_string(), "plan-b".to_string()],
         model: Some(ModelSelection::Role(ModelRole::Coder)),
-        instructions: Some("Run the queue end to end".to_string()),
     };
     let json = serde_json::to_string(&params).unwrap();
     assert!(json.contains("\"coder\""), "{json}");
-    assert!(json.contains("Run the queue end to end"), "{json}");
     let de: PlanExecutePipelineParams = serde_json::from_str(&json).unwrap();
     assert_eq!(de, params);
 
-    // A legacy queue payload still decodes to an empty selection and empty
-    // directives, so the pipeline starts from the base rung of the ladder.
+    // A legacy queue payload still decodes to an empty selection, so the
+    // pipeline starts from the base rung of the ladder.
     let legacy: PlanExecutePipelineParams =
         serde_json::from_value(serde_json::json!({ "plan_ids": ["plan-a"] })).unwrap();
     assert_eq!(legacy.plan_ids, vec!["plan-a".to_string()]);
     assert!(legacy.model.is_none());
-    assert!(legacy.instructions.is_none());
 
     // An absent selection adds no key to the document.
     let bare_json = serde_json::to_string(&legacy).unwrap();
     assert!(!bare_json.contains("model"), "{bare_json}");
-    assert!(!bare_json.contains("instructions"), "{bare_json}");
-}
 
+    // A malformed selection fails the typed parse rather than being dropped.
+    assert!(
+        serde_json::from_value::<PlanExecutePipelineParams>(serde_json::json!({
+            "plan_ids": ["plan-a"],
+            "model": 42
+        }))
+        .is_err()
+    );
+}
 #[test]
 fn test_plan_item_status_lifecycle() {
     let status = PlanItemStatus::Discussion;

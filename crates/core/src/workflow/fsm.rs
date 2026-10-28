@@ -37,7 +37,8 @@ use cache::TurnInputCache;
 use guard::{finalize_blocked_turn, finish_turn, rollback_or_log};
 use healing::run_apply_and_verify_phase;
 use proposal::{
-    extract_error_message, log_fsm_phase, merge_text, run_proposal_step, ProposalStep, TurnState,
+    extract_error_message, log_fsm_phase, merge_text, outcome_carries_result, run_proposal_step,
+    ProposalStep, TurnState,
 };
 use staging::{
     reask_after_empty_round, run_discovery_phase, run_staging_phase, DiscoveryPhase,
@@ -451,16 +452,23 @@ fn record_plan_rejections(history_manager: &mut HistoryManager, outcome: &FsmTur
 
 /// Returns the capability set of an isolated step, narrowed from `protocol`.
 ///
-/// Plan authoring is removed from whatever the active protocol advertises, so an
-/// isolated step never advertises plan mutations regardless of the concrete wire
-/// format. Removing a capability the protocol does not carry is a no-op, which
-/// keeps the narrowing protocol-agnostic: no caller branches on a protocol name
-/// or on a concrete protocol type.
+/// The step profile is the single source of truth for what an isolated step may
+/// do: plan authoring is excluded because the plan is immutable while the step
+/// runs, and documentation requests are excluded because a step implements an
+/// approved design inside the codebase instead of reasoning about the harness.
+/// Intersecting the advertised surface with that profile keeps the narrowing
+/// protocol-agnostic — no caller branches on a protocol name or on a concrete
+/// protocol type — and a capability the protocol never advertises is simply
+/// absent from the result.
 fn isolated_step_capabilities(protocol: &dyn PromptProtocol) -> tauqe_protocol::CapabilitySet {
-    protocol
-        .capability_set()
-        .without(tauqe_protocol::LlmCapability::PlanCreation)
-        .without(tauqe_protocol::LlmCapability::PlanUpdate)
+    let allowed = tauqe_protocol::CapabilitySet::isolated_step();
+    let advertised = protocol.capability_set();
+    let kept: Vec<tauqe_protocol::LlmCapability> = advertised
+        .iter()
+        .copied()
+        .filter(|capability| allowed.contains(*capability))
+        .collect();
+    tauqe_protocol::CapabilitySet::from_slice(&kept)
 }
 
 /// Reports whether a proposal round still carries investigation commands.
@@ -956,14 +964,14 @@ enum WrittenAnswer {
 /// turn text is deliberately not consulted: it also carries the harness banners
 /// (round headers, patch-retry notices, the discovery-limit warning), so its
 /// presence proves that the turn ran, never that the model concluded. A turn
-/// that declared a terminal outcome, or that answered with a concrete proposal,
-/// is returned unchanged.
+/// that declared a terminal outcome carrying its result, or that answered
+/// with a concrete proposal, is returned unchanged.
 async fn ensure_written_answer(
     ctx: &mut PhaseContext<'_>,
     step: ProposalStep,
 ) -> anyhow::Result<WrittenAnswer> {
     if !step.text().trim().is_empty()
-        || ctx.state.terminal_outcome.is_some()
+        || outcome_carries_result(ctx.state.terminal_outcome.as_ref())
         || ctx.state.abort.is_some()
     {
         return Ok(WrittenAnswer::Ready(Box::new(step)));
@@ -1890,5 +1898,106 @@ mod tests {
             TARGET,
             "a rejected change set must never reach the working tree"
         );
+    }
+    /// A `success` status without a summary states an outcome but no result, so
+    /// the round is empty: the corrective machine re-asks the model, and a model
+    /// that keeps answering that way finishes the turn with a visible error
+    /// instead of recording a silent conclusion.
+    #[tokio::test]
+    async fn a_payload_free_success_never_concludes_the_turn() {
+        let (_dir, root) = setup_repo(&[("a.rs", TARGET)]);
+        let mut context = context_with_target(&root);
+        let mut history = HistoryManager::new(root.clone());
+
+        let provider = MockLlmProvider::scripted([
+            MockResponse::text("<success />"),
+            MockResponse::text("<success />"),
+            MockResponse::text("<success />"),
+        ]);
+        let model = ModelRef::openrouter("mock/model");
+        let protocol = XmlPromptProtocol;
+        let mut policy = DirectApplyPolicy::new();
+        let options = WorkflowOptions::default();
+        let (stream_tx, rx) = mpsc::channel(256);
+        drop(rx);
+        let (_cancel_tx, cancel_rx) = watch::channel(false);
+
+        let outcome = run_fsm_turn(
+            "Summarize the change",
+            tauqe_protocol::TurnIntent::InteractiveRepl,
+            &provider,
+            &model,
+            &mut context,
+            &mut history,
+            &protocol,
+            &mut policy,
+            "git",
+            stream_tx,
+            cancel_rx,
+            &options,
+        )
+        .await
+        .unwrap();
+
+        match outcome.result {
+            ModelResult::Edit { outcome, edits, .. } => {
+                assert!(!outcome.applied);
+                assert!(edits.is_empty());
+                assert!(
+                    outcome.error.unwrap_or_default().contains("empty response"),
+                    "the turn must fail with a visible error"
+                );
+            }
+            other => panic!("a payload-free success must not conclude the turn: {other:?}"),
+        }
+        assert_eq!(
+            provider.requests().len(),
+            1 + MAX_EMPTY_STEP_RETRIES,
+            "every corrective round must be spent before the turn fails"
+        );
+        assert_eq!(std::fs::read_to_string(root.join("a.rs")).unwrap(), TARGET);
+    }
+
+    /// A `success` that states its result, and a written answer that carries the
+    /// status, both remain validated conclusions of the turn.
+    #[tokio::test]
+    async fn a_summarized_success_concludes_the_turn() {
+        let (_dir, root) = setup_repo(&[("a.rs", TARGET)]);
+        let mut context = context_with_target(&root);
+        let mut history = HistoryManager::new(root.clone());
+
+        let response = concat!(
+            "Nothing to change: the helper already returns the expected value.\n",
+            "<success summary=\"Confirmed the helper returns the expected value\" />",
+        );
+        let provider = MockLlmProvider::scripted([MockResponse::text(response)]);
+        let model = ModelRef::openrouter("mock/model");
+        let protocol = XmlPromptProtocol;
+        let mut policy = DirectApplyPolicy::new();
+        let options = WorkflowOptions::default();
+        let (stream_tx, rx) = mpsc::channel(256);
+        drop(rx);
+        let (_cancel_tx, cancel_rx) = watch::channel(false);
+
+        let outcome = run_fsm_turn(
+            "Check the helper",
+            tauqe_protocol::TurnIntent::InteractiveRepl,
+            &provider,
+            &model,
+            &mut context,
+            &mut history,
+            &protocol,
+            &mut policy,
+            "git",
+            stream_tx,
+            cancel_rx,
+            &options,
+        )
+        .await
+        .unwrap();
+
+        assert!(matches!(outcome.result, ModelResult::Answer { .. }));
+        assert!(outcome.has_terminal_success);
+        assert_eq!(provider.requests().len(), 1);
     }
 }

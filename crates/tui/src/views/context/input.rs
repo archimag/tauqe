@@ -615,25 +615,31 @@ pub async fn handle_context_key(
         }
         ContextAction::ToggleAccess => {
             if let Some(ContextRow::Item(ref item)) = current_row {
-                if item.layer == ContextLayer::Pinned {
-                    st.notify_warning(active_t("notify.pinned_readonly"));
-                } else {
-                    let path = item.path.clone();
-                    let next_access = match item.access {
-                        ContextAccess::Editable => ContextAccess::ReadOnly,
-                        ContextAccess::ReadOnly => ContextAccess::Editable,
-                    };
-                    drop(st);
-                    let params = ContextSetAccessParams {
-                        path,
-                        access: next_access,
-                    };
-                    send_request(
-                        server_writer,
-                        methods::CONTEXT_SET_ACCESS,
-                        serde_json::to_value(params)?,
-                    )
-                    .await?;
+                match item.layer {
+                    ContextLayer::Pinned => {
+                        st.notify_warning(active_t("notify.pinned_readonly"));
+                    }
+                    ContextLayer::Refs => {
+                        st.notify_warning(active_t("notify.refs_readonly"));
+                    }
+                    ContextLayer::User | ContextLayer::Auto => {
+                        let path = item.path.clone();
+                        let next_access = match item.access {
+                            ContextAccess::Editable => ContextAccess::ReadOnly,
+                            ContextAccess::ReadOnly => ContextAccess::Editable,
+                        };
+                        drop(st);
+                        let params = ContextSetAccessParams {
+                            path,
+                            access: next_access,
+                        };
+                        send_request(
+                            server_writer,
+                            methods::CONTEXT_SET_ACCESS,
+                            serde_json::to_value(params)?,
+                        )
+                        .await?;
+                    }
                 }
             }
         }
@@ -688,6 +694,9 @@ pub async fn handle_context_key(
                     st.context_view.confirm_clear_user = true;
                     st.confirm_button = crate::app::ConfirmDialogButton::Cancel;
                 }
+            }
+            Some(ContextRow::Header(ContextLayer::Refs)) => {
+                st.notify_info(active_t("notify.refs_protected_section"));
             }
             _ => {}
         },
@@ -755,7 +764,7 @@ mod tests {
             .push(item("src/lib.rs", ContextLayer::User));
         st.context.items.push(item("auto.rs", ContextLayer::Auto));
         // Select an item
-        st.context_view.cursor_index = 2; // User file item
+        st.context_view.cursor_index = 3; // User file item
         let state = Arc::new(Mutex::new(st));
         let mut conn = RpcConnection::new(Vec::<u8>::new());
 
@@ -774,7 +783,7 @@ mod tests {
         st.context
             .items
             .push(item("src/lib.rs", ContextLayer::User));
-        st.context_view.cursor_index = 2; // User file item
+        st.context_view.cursor_index = 3; // User file item
         let state = Arc::new(Mutex::new(st));
         let mut conn = RpcConnection::new(Vec::<u8>::new());
 
@@ -801,6 +810,7 @@ mod tests {
         assert!(!guard.context_view.pinned_expanded);
         assert!(!guard.context_view.user_expanded);
         assert!(!guard.context_view.auto_expanded);
+        assert!(!guard.context_view.refs_expanded);
     }
 
     #[test]
@@ -924,6 +934,46 @@ mod tests {
         assert_eq!(
             guard.context_view.filtered_candidates,
             vec![ContextCandidate::File("a.rs".to_string())]
+        );
+    }
+    #[tokio::test]
+    async fn test_remove_on_the_refs_header_reports_the_registry() {
+        let mut st = test_state();
+        st.view_mode = ViewMode::Context;
+        st.context.items.push(item("refs.md", ContextLayer::Refs));
+        // Rows: Pinned, Refs header, Refs item, User, Auto.
+        st.context_view.cursor_index = 1;
+        let state = Arc::new(Mutex::new(st));
+        let mut conn = RpcConnection::new(Vec::<u8>::new());
+
+        let key = KeyEvent::new(KeyCode::Delete, crossterm::event::KeyModifiers::NONE);
+        handle_context_key(key, &state, &mut conn).await.unwrap();
+
+        let guard = state.lock().await;
+        assert!(!guard.context_view.confirm_clear_auto);
+        assert!(!guard.context_view.confirm_clear_user);
+        assert!(
+            conn.written().is_empty(),
+            "the registry layer is never cleared from the interface"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_toggle_access_on_a_refs_document_is_refused() {
+        let mut st = test_state();
+        st.view_mode = ViewMode::Context;
+        st.context.items.push(item("refs.md", ContextLayer::Refs));
+        // Rows: Pinned, Refs header, Refs item, User, Auto.
+        st.context_view.cursor_index = 2;
+        let state = Arc::new(Mutex::new(st));
+        let mut conn = RpcConnection::new(Vec::<u8>::new());
+
+        let key = KeyEvent::new(KeyCode::Char('t'), crossterm::event::KeyModifiers::NONE);
+        handle_context_key(key, &state, &mut conn).await.unwrap();
+
+        assert!(
+            conn.written().is_empty(),
+            "a reference document must never send an access change"
         );
     }
 }

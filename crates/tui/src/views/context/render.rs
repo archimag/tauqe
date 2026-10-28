@@ -38,6 +38,12 @@ pub fn render_context_view(
         .iter()
         .filter(|i| i.layer == ContextLayer::Auto)
         .count();
+    let refs_count = state
+        .context
+        .items
+        .iter()
+        .filter(|i| i.layer == ContextLayer::Refs)
+        .count();
 
     context_lines.push(Line::from(vec![
         Span::raw(format!("{} ", active_t("context.total_size"))),
@@ -46,9 +52,10 @@ pub fn render_context_view(
             engine.fg(palette.status_info).bold(),
         ),
         Span::raw(format!(
-            " | Files: {} (Pinned: {}, User: {}, Auto: {})",
+            " | Files: {} (Pinned: {}, Refs: {}, User: {}, Auto: {})",
             state.context.items.len(),
             pinned_count,
+            refs_count,
             user_count,
             auto_count
         )),
@@ -84,6 +91,28 @@ pub fn render_context_view(
                             tokens,
                             palette.status_info,
                             active_t("context.section.pinned_hint"),
+                        )
+                    }
+                    ContextLayer::Refs => {
+                        let arrow = if state.context_view.refs_expanded {
+                            "▼"
+                        } else {
+                            "▶"
+                        };
+                        let tokens: u64 = state
+                            .context
+                            .items
+                            .iter()
+                            .filter(|i| i.layer == ContextLayer::Refs)
+                            .map(|i| i.estimated_tokens)
+                            .sum();
+                        (
+                            arrow,
+                            active_t("context.section.refs"),
+                            refs_count,
+                            tokens,
+                            palette.status_success,
+                            active_t("context.section.refs_hint"),
                         )
                     }
                     ContextLayer::User => {
@@ -216,6 +245,10 @@ pub fn render_context_view(
             active_t("context.info.pinned"),
             engine.fg(palette.status_info),
         )),
+        Some(ContextRow::Header(ContextLayer::Refs)) => Line::from(Span::styled(
+            active_t("context.info.refs"),
+            engine.fg(palette.status_success),
+        )),
         Some(ContextRow::Header(ContextLayer::User)) => Line::from(Span::styled(
             active_t("context.info.user"),
             engine.fg(palette.status_warning),
@@ -230,6 +263,12 @@ pub fn render_context_view(
                     .replacen("{}", it.path.as_str(), 1)
                     .replacen("{}", &it.estimated_tokens.to_string(), 1),
                 engine.fg(palette.status_info),
+            )),
+            ContextLayer::Refs => Line::from(Span::styled(
+                active_t("context.info.refs_item")
+                    .replacen("{}", it.path.as_str(), 1)
+                    .replacen("{}", &it.estimated_tokens.to_string(), 1),
+                engine.fg(palette.status_success),
             )),
             ContextLayer::User => {
                 let badge = match it.access {

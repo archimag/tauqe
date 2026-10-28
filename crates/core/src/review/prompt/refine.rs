@@ -284,6 +284,8 @@ mod tests {
             items: vec![ReviewItem {
                 id: 42,
                 title: "Decompose this issue".to_string(),
+                uuid: None,
+                group: None,
                 subplan_last_replanned_step: None,
                 model: None,
                 issue_type: IssueType::Bug,
@@ -298,6 +300,7 @@ mod tests {
                 body: "Needs structural division".to_string(),
             }],
             raw_markdown: String::new(),
+            ..Default::default()
         }
     }
 

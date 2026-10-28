@@ -144,7 +144,15 @@ pub(crate) async fn preload_readonly_files(
         let available_files = tauqe_core::git::list_repository_files(Some(&root))
             .ok()
             .unwrap_or_default();
-        let outcome = apply_context_requests_detailed(ctx, &requests, &available_files, usize::MAX);
+        // Declared preload files are never capped by an artificial quota, so both
+        // the files budget and the refs budget stay unbounded here.
+        let outcome = apply_context_requests_detailed(
+            ctx,
+            &requests,
+            &available_files,
+            usize::MAX,
+            usize::MAX,
+        );
         let new_state = ctx.get_state();
         (outcome, new_state)
     })

@@ -65,6 +65,15 @@ arboard = "3.7"
 toml_edit = "0.22"
 
 # Test-only dependencies shared by workspace crates.
+# Test-only dependencies shared by workspace crates.
 tempfile = "3"
 wiremock = "0.6"
 
+# Dev and test builds carry no debug information: behavior is verified by
+# the toolchain gate and the test suite, never through an interactive
+# debugger, so DWARF data only inflates codegen, link times, and the size of
+# target/. The test profile inherits dev, so test binaries link faster too;
+# metadata passes (check, clippy) are unaffected. Release installs never
+# carried debug info to begin with.
+[profile.dev]
+debug = 0

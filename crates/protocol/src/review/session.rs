@@ -2,6 +2,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::model::{deserialize_model_ref_lenient, ModelRef};
 
+use super::group::{ReviewGroup, ReviewLaunchConfig, ReviewPostAnalysis};
 use super::item::{ReviewIssue, ReviewItem, ReviewItemStatus};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -22,6 +23,21 @@ pub struct ReviewSession {
     pub items: Vec<ReviewItem>,
     #[serde(default)]
     pub raw_markdown: String,
+    /// Groups this session audits, in launch order.
+    ///
+    /// Empty for a session written before grouping existed and for a
+    /// single-audit run; [`Self::effective_groups`] resolves both cases.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub groups: Vec<ReviewGroup>,
+    /// Classification produced by the Architect role over the whole session.
+    ///
+    /// Replacing it discards only the previous classification: the findings it
+    /// references are immutable and are never rescanned to rebuild this layer.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub post_analysis: Option<ReviewPostAnalysis>,
+    /// Snapshot of the configuration that launched this session.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub launch_config: Option<ReviewLaunchConfig>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -41,6 +57,20 @@ pub struct ReviewSummary {
 }
 
 impl ReviewSession {
+    /// The groups this session actually audits.
+    ///
+    /// A session created before grouping existed, or one launched as a single
+    /// audit, carries no explicit groups: it is the degenerate case of one
+    /// implicit `Default` group covering the session target files. Synthesizing
+    /// it here keeps every consumer on one code path instead of branching on
+    /// "legacy or grouped".
+    pub fn effective_groups(&self) -> Vec<ReviewGroup> {
+        if self.groups.is_empty() {
+            return vec![ReviewGroup::single_default(self.target_files.clone())];
+        }
+        self.groups.clone()
+    }
+
     pub fn summary(&self) -> ReviewSummary {
         let (total, fixed) = self.stats();
         ReviewSummary {

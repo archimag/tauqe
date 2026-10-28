@@ -234,7 +234,7 @@ mod tests {
             },
             Plan {
                 id: "context-layers".to_string(),
-                title: "Three-Tier Context Layers".to_string(),
+                title: "Layered Context Model".to_string(),
                 ..Default::default()
             },
         ]
@@ -264,7 +264,7 @@ mod tests {
         assert_eq!(res.id, "tui-keymaps");
 
         // Title match
-        let res = resolve_plan_id("Three-Tier Context Layers", &plans, None).unwrap();
+        let res = resolve_plan_id("Layered Context Model", &plans, None).unwrap();
         assert_eq!(res.id, "context-layers");
     }
 

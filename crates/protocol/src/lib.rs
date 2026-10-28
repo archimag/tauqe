@@ -43,7 +43,7 @@ pub use command::{
 };
 pub use config::{
     ConfigCreateParams, ConfigSetParams, ConfigState, CredentialsSaveParams, EditProtocolKind,
-    PatchStrategy, PromptLayoutKind, SystemStatusResult, WorkflowKind,
+    PatchStrategy, PromptLayoutKind, ReviewPresetSummary, SystemStatusResult, WorkflowKind,
 };
 pub use context::{
     ContextAccess, ContextAddParams, ContextAddPatternParams, ContextAddPatternResult,
@@ -122,10 +122,13 @@ pub use project::{
     ResolvedProjectCommand, TaskRunnerKind,
 };
 pub use review::{
-    IssueStatus, IssueType, ReviewCancelParams, ReviewContentDeltaEvent, ReviewDeleteParams,
-    ReviewDeleteResult, ReviewErrorEvent, ReviewExecuteParams, ReviewFinishedEvent,
-    ReviewGetParams, ReviewGetResult, ReviewIssue, ReviewItem, ReviewItemStatus,
-    ReviewListChangedEvent, ReviewListParams, ReviewListResult, ReviewReasoningDeltaEvent,
+    ArchitecturalIssueGroup, IssueStatus, IssueType, ReviewAnalyzeFinishedEvent,
+    ReviewAnalyzeParams, ReviewAnalyzeResult, ReviewAnalyzeStartedEvent, ReviewCancelParams,
+    ReviewContentDeltaEvent, ReviewDeleteParams, ReviewDeleteResult, ReviewErrorEvent,
+    ReviewExecuteParams, ReviewFinishedEvent, ReviewGetParams, ReviewGetResult, ReviewGroup,
+    ReviewGroupFinishedEvent, ReviewGroupStartedEvent, ReviewIssue, ReviewItem, ReviewItemStatus,
+    ReviewListChangedEvent, ReviewListParams, ReviewListResult, ReviewPostAnalysis,
+    ReviewReasoningDeltaEvent, ReviewRefineGroupParams, ReviewRefineGroupResult,
     ReviewRefineItemParams, ReviewRefineItemResult, ReviewSession, ReviewSeverity,
     ReviewStartParams, ReviewStartedEvent, ReviewSummary, ReviewUpdateItemParams,
     ReviewUpdateItemResult, ReviewUpdatedEvent,

@@ -31,7 +31,10 @@ known recovery path.
 5. **The process is deterministic; the content is generative.** The model chooses
    what to write, never which stage runs next.
 6. **Volatile data never moves the cached prefix of the prompt.** Which is what
-   keeps a multi-round turn economically viable.
+  keeps a multi-round turn economically viable.
+7. **Silence is not an action.** A round the harness cannot act upon is a
+   non-answer, whatever status it declares. It is re-asked, and a budget that
+   runs out ends the turn with a visible error instead of a validated silence.
 
 ---
 
@@ -149,7 +152,30 @@ A blocked outcome is not a failure to retry: the transaction is rolled back, no
 patch retry or healing cycle runs, and the owning supervisor may replan instead of
 repeating.
 
-### 3.2.5 ApplyPolicy
+Every terminal status carries its own result: `success` states what the turn
+accomplished, `error` carries its message, `skip` carries its reason. The
+decoders substitute a deterministic payload for `error` and `skip`, because for
+those two the status already means something. `success` cannot be completed that
+way — only the model can say what the turn achieved — so a payload-free success
+is a protocol defect rather than a result, and it cannot close a turn.
+
+### 3.2.6 Result-Bearing Elements and Auxiliary Channels
+
+A round is judged by what the harness can act upon, not by how much the model
+wrote. One classification decides it:
+
+| Channel | Elements | Advances the turn? |
+| --- | --- | --- |
+| Result-bearing | conversational text, file edits, discovery requests, plan updates, a verification request, a project command invocation, a protocol error, a terminal outcome carrying its payload, a blocked report, an abort | yes |
+| Auxiliary | scratchpad notes, the user-language declaration | no |
+
+An auxiliary channel is memory and configuration, not work: it records what the
+model is thinking and which language it must answer in. It never widens the
+context, never stages a byte, and therefore never makes a round actionable on its
+own. A round carrying only auxiliary material is as empty as a round carrying
+nothing at all.
+
+### 3.2.7 ApplyPolicy
 
 `ApplyPolicy` isolates *how* validated edits reach disk from the state machine. It
 exposes four operations: staging, apply temporary, apply final, and rollback. Two
@@ -157,7 +183,7 @@ implementations cover the supported transaction models: a direct policy that wri
 straight to disk for naive mode and tests, and a Git policy that checkpoints,
 commits a temporary step, and finalizes or rolls back.
 
-### 3.2.6 The record, its status, and the three stores
+### 3.2.8 The record, its status, and the three stores
 
 A session keeps three separate stores, and the harness never treats one as a
 stand-in for another:
@@ -261,7 +287,35 @@ not answered yet. The round still closes with its terminal success tag, so an
 accepted or declined offer is a completed turn rather than an unfinished one, and
 the plan itself is written only after explicit confirmation (*Local Plans*).
 
-### 3.3.3 Project Command Execution & Feedback Loop
+### 3.3.3 Silence Is Re-Asked, Never Accepted
+
+The invariant is enforced once, immediately after a round is decoded and before
+any phase consumes it.
+
+A round whose buckets are all empty is a non-answer rather than a reply, so the
+machine neither fails it nor records it. It issues a corrective request that
+states the contract the round violated — the model owes at least one
+result-bearing element, and a status tag alone does not discharge that debt — and
+lets the model answer again. The corrective loop is bounded like every other
+loop of the turn, so a re-ask can never grow into an open conversation.
+
+Exhausting that budget is a failure, not a conclusion: the turn terminates with a
+visible error that names the empty round, so the interface reports what happened,
+the coder ladder may escalate to a stronger tier, and a batch supervisor records
+a failed step. Three properties follow.
+
+1. **A written answer is required.** Any result-bearing element advances the turn:
+   text, an edit, a discovery request, a plan update, a verification request, a
+   project command invocation, a blocked report, an abort, or a terminal outcome
+   that carries its payload.
+2. **A status tag is a claim, not a result.** A `success` without a stated summary
+   is decoded into a command and then fails the same emptiness test as a blank
+   round, so the model cannot close a turn by asserting that it closed.
+3. **No phase observes silence.** Discovery, Staging, and Healing run only on
+   rounds that already passed the test, so a later phase never has to distinguish
+   "nothing to do" from "nothing was said".
+
+### 3.3.4 Project Command Execution & Feedback Loop
 
 When a proposal invokes a declared project command (or a recipe from the external
 task runner's `tauqe` group) without code modifications, the harness treats it as a
@@ -283,7 +337,7 @@ diagnostic investigation step rather than a terminal completion.
    round budget (`context.max_discovery_rounds`), preventing unbounded agentic loops
    while ensuring models have sufficient feedback to diagnose complex failures.
 
-### 3.3.4 Patch retry
+### 3.3.5 Patch retry
 
 Matching is deterministic and tolerant of what models actually produce: indentation
 shifts, tab versus space variance, and trailing whitespace are normalized before a
@@ -296,7 +350,7 @@ report, and the model is asked to re-emit only the failing hunks. The repair log
 append-only, so attempt *n* carries the history of attempts `1..n` instead of
 replacing it, and the loop is bounded by `develop.max_retries`.
 
-### 3.3.5 Verification
+### 3.3.6 Verification
 
 Once staging converges, edits are applied atomically to disk and verification runs
 through the declared project commands in three phases: in-memory formatting of
@@ -310,7 +364,7 @@ A verification request names its target (all, check, test, or a lint pass); a
 repository without a detected toolchain skips the gate transparently instead of
 failing.
 
-### 3.3.6 Healing and intra-role escalation
+### 3.3.7 Healing and intra-role escalation
 
 A failed check enters a targeted healing round: the diagnostics are formatted into
 a clean report, missing error paths are staged into the context, and the prompt goes
@@ -323,7 +377,7 @@ reasoning on the same model first, a stronger coder afterwards, saturating on th
 final rung. Escalation never leaves the coder role; *Model Roles and the Coder
 Ladder* owns that boundary. A blocked report bypasses the ladder entirely.
 
-### 3.3.7 Finalize or roll back
+### 3.3.8 Finalize or roll back
 
 A converged, verified turn is finalized as one isolated commit authored by the
 developer, marked with a co-author trailer so the harness can recognize its own
@@ -366,7 +420,7 @@ explicitly — appended, compacted, and rolled back — so a rollback never
 masquerades as a trailing append and a compaction never masquerades as a message.
 
 ### 3.3.8 The five pipeline layers
-
+### 3.3.9 The five pipeline layers
 The machine is decomposed so that each layer owns one reason to change, which is
 what makes it testable without a network:
 
@@ -390,7 +444,7 @@ the queue halts. Hard cancellation wins when both are pending, and the two modes
 surface as distinct terminal statuses.
 
 ### 3.3.9 Prompt layout policies across rounds
-
+### 3.3.10 Prompt layout policies across rounds
 Every round re-sends the whole assembled prompt, and providers cache the longest
 unchanged token prefix. Turning that prompt into a message sequence is a policy
 behind one trait, so the same rendered material can become different sequences:
@@ -460,7 +514,7 @@ One typed resolution decides which policy a turn runs under: a declared layout w
 otherwise an interactive REPL turn takes the chronological transcript and a
 discussion or an isolated step takes the semantic order, because those turns carry
 no growing history to interleave.
-### 3.3.10 Transport resilience and output ceiling
+### 3.3.11 Transport resilience and output ceiling
 
 Transport failures that say nothing about the request — a timeout, a reset
 connection, a rate-limit or server-error status, a stream that breaks before its
@@ -479,7 +533,7 @@ is metered against a hard ceiling. Crossing it aborts the attempt, discards the
 partial output, and reports a terminal error that is deliberately not retried: the
 same request would reproduce the same loop.
 
-### 3.3.11 The process container
+### 3.3.12 The process container
 
 The turn runs inside a daemon that is a child of the client. The daemon opens no
 socket, keeps no lock file, and registers no singleton: it reads requests from
@@ -495,7 +549,7 @@ wait are declared together, with the wait strictly greater than the budget, so t
 client never kills a daemon that is still rolling back. A detached lifetime is
 deliberately absent: it would introduce a second lifecycle that no turn depends on.
 
-### 3.3.12 Guards and budgets
+### 3.3.13 Guards and budgets
 
 | Guard | Setting |
 | --- | --- |
@@ -530,6 +584,13 @@ learns what to decompose instead of watching a turn fail anonymously.
   developer confirms.
 - **It does not hide failure.** An exhausted budget, a blocked step, and a rolled
   back turn are all reported as distinct, named outcomes.
+- **It does not treat silence as a conclusion.** An auxiliary channel — the
+  scratchpad, the language declaration — grants no right to be silent, and a
+  status without its payload cannot close a turn.
+- **It cannot delegate its verdict to the schema.** JSON Schema can require a
+  field, not a non-empty string, so the schema and the prompt state the payload
+  obligation while the authoritative test runs after decoding, on the typed
+  commands. A schema never decides by itself whether a turn is finished.
 - **It does not keep an uncommitted prompt in the model context.** A turn that
   produced no result leaves no record behind, so the model never reads a task whose
   outcome it cannot see.
@@ -546,6 +607,8 @@ learns what to decompose instead of watching a turn fail anonymously.
   machine enforces.
 - [Model Roles and the Coder Ladder](model-roles.md) — intra-role escalation.
 - [Turn Scratchpad](turn-scratchpad.md) — the volatile tail of the prompt.
+- [The Context Model](../ch02-perception/context-model.md) — the working set the
+  rendered context block carries.
 - [The TauqeProjectProtocol](../ch03-project/tauqe-project-protocol.md) — what
   verification delegates to.
 - [The Three-Phase Modification Lifecycle](../ch03-project/three-phase-lifecycle.md) —

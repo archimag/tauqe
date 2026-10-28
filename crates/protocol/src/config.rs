@@ -249,6 +249,21 @@ impl FromStr for PromptLayoutKind {
     }
 }
 
+/// Compact identity of one review preset declared by the project.
+///
+/// A launcher renders a preset by its name and, when the project declares
+/// one, by the human-readable title. Groups, paths, and local prompts stay
+/// on the server, because they are applied when a session is launched, so
+/// the snapshot never ships them.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReviewPresetSummary {
+    /// Name that identifies the preset in `[[review.presets]]`.
+    pub name: String,
+    /// Human-readable title the interface renders instead of `name`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ConfigState {
     pub workflow: WorkflowKind,
@@ -266,6 +281,14 @@ pub struct ConfigState {
     pub available_edit_protocols: Vec<EditProtocolKind>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub available_models: Vec<ModelRef>,
+    /// Review presets the project declares in its `[review]` section.
+    ///
+    /// A client renders its review launcher from this snapshot instead of
+    /// re-reading `tauqe.toml`. The field is absent when the project
+    /// declares no preset and when a legacy daemon does not carry the
+    /// snapshot at all, and both cases read as `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub review_presets: Option<Vec<ReviewPresetSummary>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -359,6 +382,7 @@ mod tests {
             available_workflows: vec![WorkflowKind::Git],
             available_edit_protocols: vec![EditProtocolKind::Xml],
             available_models: vec![ModelRef::openrouter("coder-model")],
+            review_presets: None,
         };
 
         let json = serde_json::to_string(&state).unwrap();
@@ -575,5 +599,86 @@ mod tests {
         );
         assert!("".parse::<PromptLayoutKind>().is_err());
         assert!("bogus".parse::<PromptLayoutKind>().is_err());
+    }
+
+    /// Builds a `ConfigState` carrying every mandatory field, so a test can
+    /// focus on the optional review-preset snapshot alone.
+    fn config_state_without_presets() -> ConfigState {
+        ConfigState {
+            workflow: WorkflowKind::Git,
+            edit_protocol: EditProtocolKind::Mixed,
+            model: ModelRef::openrouter("anthropic/claude-3.7-sonnet"),
+            selection: None,
+            roles: None,
+            history_model: None,
+            available_workflows: Vec::new(),
+            available_edit_protocols: Vec::new(),
+            available_models: Vec::new(),
+            review_presets: None,
+        }
+    }
+
+    #[test]
+    fn test_config_state_reads_absent_review_presets_as_none() {
+        // A daemon that advertises no preset omits the field entirely, so the
+        // absence must read as `None` rather than as an empty selection.
+        let json = serde_json::to_string(&config_state_without_presets()).unwrap();
+        assert!(!json.contains("review_presets"), "got: {json}");
+
+        let de: ConfigState = serde_json::from_str(&json).unwrap();
+        assert!(de.review_presets.is_none());
+    }
+
+    #[test]
+    fn test_config_state_roundtrips_review_presets() {
+        let mut state = config_state_without_presets();
+        state.review_presets = Some(vec![
+            ReviewPresetSummary {
+                name: "backend".to_string(),
+                title: Some("Backend audit".to_string()),
+            },
+            ReviewPresetSummary {
+                name: "frontend".to_string(),
+                title: None,
+            },
+        ]);
+
+        let json = serde_json::to_string(&state).unwrap();
+        assert!(json.contains("\"backend\""));
+        assert!(json.contains("\"Backend audit\""));
+        // A preset without a title contributes no field of its own.
+        assert_eq!(json.matches("\"title\"").count(), 1, "got: {json}");
+
+        let de: ConfigState = serde_json::from_str(&json).unwrap();
+        let restored = de.review_presets.expect("presets survive the roundtrip");
+        assert_eq!(restored, state.review_presets.unwrap());
+    }
+
+    /// A frontend compiled before the snapshot gained the presets knows nothing
+    /// about them, so decoding a newer payload must keep succeeding by ignoring
+    /// the unknown key instead of failing.
+    #[test]
+    fn test_legacy_client_view_ignores_review_presets() {
+        #[derive(serde::Deserialize)]
+        struct LegacyConfigState {
+            workflow: WorkflowKind,
+            edit_protocol: EditProtocolKind,
+            model: ModelRef,
+        }
+
+        let mut state = config_state_without_presets();
+        state.review_presets = Some(vec![ReviewPresetSummary {
+            name: "backend".to_string(),
+            title: Some("Backend audit".to_string()),
+        }]);
+        let json = serde_json::to_string(&state).unwrap();
+
+        let legacy: LegacyConfigState = serde_json::from_str(&json).unwrap();
+        assert_eq!(legacy.workflow, WorkflowKind::Git);
+        assert_eq!(legacy.edit_protocol, EditProtocolKind::Mixed);
+        assert_eq!(
+            legacy.model,
+            ModelRef::openrouter("anthropic/claude-3.7-sonnet")
+        );
     }
 }

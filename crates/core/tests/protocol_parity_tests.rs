@@ -901,7 +901,6 @@ fn intent_narrowing_filters_the_same_commands_on_both_transports() {
             "blocked",
             "custom_tools",
             "discovery",
-            "doc_request",
             "file_edits",
             "outcome",
             "scratchpad",

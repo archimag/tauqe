@@ -8,8 +8,8 @@ harness** — bridle, bit, reins, and blinkers — not an open shell.
 This chapter states the paradigm and the invariants that follow from it. Every
 mechanism that implements those invariants lives in its own sovereign chapter: the
 turn machine in *The Autonomous Bounded Turn FSM*, the role boundaries in *Model
-Roles and the Coder Ladder*, the perceived working set in *Three-Tier Context
-Model*, and the transactions in *Git Safety & Transactions*.
+Roles and the Coder Ladder*, the perceived working set in *The Context Model*,
+and the transactions in *Git Safety & Transactions*.
 
 ---
 
@@ -97,7 +97,27 @@ Two further terms are used precisely throughout this book:
   mandate, repeat failed actions, or redefine the task it was given.
 - **Bounded turn** — one finite-state cycle of discovery, proposal, staging,
   verification, and healing that terminates in a declared outcome.
+### 1.2.1 Knowledge about the environment
 
+The environment describes itself, and that description is not equally relevant
+everywhere.
+
+The **interactive dialogue** is where the developer prepares a project, chooses
+a workflow, and organizes the work, so it carries a compact ontology: the
+literal-harness paradigm, the split between the Architect who fixes *what* and
+the Coder who implements *how*, the three paths work travels (the interactive
+change, a local plan, a code review), and the configuration surfaces a
+consultation starts from (`[project.verify]`, `[project.format]`, `[models]`).
+That baseline answers conceptual questions immediately. A detail that must be
+exact — a parameter, a default, a budget, a keybinding, an API surface — is
+never reconstructed from the baseline: the dialogue consults the authoritative
+documentation chapter, so a recalled number cannot displace a declared one.
+
+The **isolated step** carries neither the ontology nor the documentation
+request. Its turn implements one approved decision inside the working tree, and
+a chapter about the paradigm or the keyboard cannot improve that patch. The
+omission is safe because the roles make it so: the Architect already answered
+the *what*, so the step needs the repository far more than the reference manual.
 ---
 
 ## 1.3 Mechanics & Lifecycle ("How it behaves")
@@ -141,6 +161,10 @@ constraints:
   the working set when they choose to, not as a prerequisite for every prompt.
 - **It is not a shell wrapper.** No surface of the product forwards a
   model-chosen command to the operating system.
+- **It is not a self-documenting step.** The environment ontology and the
+  documentation request belong to the interactive dialogue. An isolated step
+  reaches its turn without either, because the Architect already settled the
+  *what* and the step needs the repository, not the reference manual.
 - **It is not autonomy reduction to zero.** The model keeps full freedom inside the
   step: it selects files, reads contracts, designs the patch, and asks for
   verification. Only the process around the step is fixed.
@@ -154,6 +178,6 @@ constraints:
 - [Model Roles and the Coder Ladder](model-roles.md) — who owns "what" and who
   owns "how".
 - [Turn Scratchpad](turn-scratchpad.md) — the turn-local working memory.
-- [Three-Tier Context Model](../ch02-perception/three-tier-model.md) — what the
-  model perceives and how discovery widens it.
+- [The Context Model](../ch02-perception/context-model.md) — what the
+model perceives and how discovery widens it.
 - [Git Safety & Transactions](../ch03-project/git-transactions.md) — the reins.

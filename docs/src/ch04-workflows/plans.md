@@ -553,7 +553,7 @@ keeps naming a plan that no longer exists (*Discussion Focus* §3.4).
   Architect owns *what*, the Coder owns *how*, and escalation stays intra-role.
 - [The Autonomous Bounded Turn FSM](../ch01-foundations/bounded-turn-fsm.md) — the
   turn a step runs, including staging, verification, and healing.
-- [Three-Tier Context Model](../ch02-perception/three-tier-model.md) — what
+- [The Context Model](../ch02-perception/context-model.md) — what
   preloading a step's files actually changes.
 - [Repository Map and Blinkers](../ch02-perception/repo-map.md) — why contours are
   not contracts during synthesis.

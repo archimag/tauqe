@@ -127,7 +127,7 @@ pub enum ProjectConfigError {
     MissingVerify,
     /// An entry names neither an executable nor a declared command.
     BlankCommand { operation: String },
-    /// A declared command name is empty or unusable.
+    /// A declared command name or protected pattern is empty or unusable.
     InvalidName { operation: String, name: String },
     /// An entry refers to a command that is not declared.
     UnknownCommand { operation: String, name: String },
@@ -151,10 +151,7 @@ impl fmt::Display for ProjectConfigError {
                 write!(f, "`{operation}` names neither an executable nor a command")
             }
             Self::InvalidName { operation, name } => {
-                write!(
-                    f,
-                    "`{operation}` declares an unusable command name `{name}`"
-                )
+                write!(f, "`{operation}` declares an unusable name `{name}`")
             }
             Self::UnknownCommand { operation, name } => {
                 write!(f, "`{operation}` refers to an undeclared command `{name}`")
@@ -195,6 +192,27 @@ impl fmt::Display for ProjectConfigError {
 }
 
 impl std::error::Error for ProjectConfigError {}
+/// Trust boundaries of the project environment.
+///
+/// `protected` lists the repository glob patterns the harness tracks through
+/// Git and never lets a turn modify: the task manifest, the specifications, and
+/// the generated sources belong here, so an implementation step cannot rewrite
+/// the contract it is verified against. Each pattern uses the glob syntax of
+/// [`crate::glob::GlobPattern`]; this crate only declares it, while compilation
+/// and enforcement belong to the engine.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct ProjectBoundaries {
+    /// Repository glob patterns no turn may modify.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub protected: Vec<String>,
+}
+
+impl ProjectBoundaries {
+    /// Reports whether the subsection declares no boundary at all.
+    pub fn is_empty(&self) -> bool {
+        self.protected.is_empty()
+    }
+}
 
 /// The `[project]` section of `tauqe.toml`.
 ///
@@ -215,6 +233,9 @@ pub struct ProjectConfig {
     /// Optional disk-side post-hook.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub post_hook: Option<ProjectCommandSpec>,
+    /// Trust boundaries of the project.
+    #[serde(default, skip_serializing_if = "ProjectBoundaries::is_empty")]
+    pub boundaries: ProjectBoundaries,
     /// Named project commands published as typed custom tools.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub commands: BTreeMap<String, ProjectCommandSpec>,
@@ -227,6 +248,7 @@ impl ProjectConfig {
             && self.verify.is_none()
             && self.format.is_none()
             && self.post_hook.is_none()
+            && self.boundaries.is_empty()
             && self.commands.is_empty()
     }
 
@@ -322,6 +344,9 @@ impl ProjectConfig {
     /// runnable command line with an addressable parameter contract, so an
     /// invalid declaration is rejected as a whole instead of degrading into an
     /// unverified turn.
+    ///
+    /// A protected pattern must name something as well, so a blank entry is
+    /// rejected instead of silently protecting nothing.
     pub fn validate(&self) -> Result<(), ProjectConfigError> {
         if self.runner.is_none() {
             self.verify_command()?;
@@ -335,7 +360,14 @@ impl ProjectConfig {
         if let Some(post_hook) = &self.post_hook {
             self.resolve("post_hook", post_hook)?;
         }
-
+        for pattern in &self.boundaries.protected {
+            if pattern.trim().is_empty() {
+                return Err(ProjectConfigError::InvalidName {
+                    operation: "boundaries.protected".to_string(),
+                    name: pattern.clone(),
+                });
+            }
+        }
         for (name, spec) in &self.commands {
             if name.trim().is_empty() {
                 return Err(ProjectConfigError::InvalidName {
@@ -843,5 +875,99 @@ mod tests {
             operation: "verify".to_string(),
         };
         assert!(reference.to_string().contains("verify"));
+    }
+    #[test]
+    fn test_project_boundaries_parse_and_roundtrip() {
+        let config = parse(
+            r#"{
+                "verify": { "command": "cargo" },
+                "boundaries": {
+                    "protected": ["Justfile", "docs/specs/**", "crates/*/src/generated.rs"]
+                }
+            }"#,
+        );
+
+        assert_eq!(
+            config.boundaries.protected,
+            ["Justfile", "docs/specs/**", "crates/*/src/generated.rs"]
+        );
+        assert!(!config.boundaries.is_empty());
+        assert!(!config.is_empty());
+        assert!(config.validate().is_ok());
+
+        let encoded = serde_json::to_string(&config).expect("the section encodes");
+        assert_eq!(parse(&encoded), config);
+    }
+
+    #[test]
+    fn test_project_boundaries_stay_absent_when_empty() {
+        let config = parse(r#"{"verify":{"command":"cargo"}}"#);
+        assert!(config.boundaries.protected.is_empty());
+        assert!(config.boundaries.is_empty());
+        assert_eq!(config.boundaries, ProjectBoundaries::default());
+
+        // An absent subsection stays absent on the wire.
+        let encoded = serde_json::to_string(&config).expect("the section encodes");
+        assert!(
+            !encoded.contains("boundaries"),
+            "unexpected subsection: {encoded}"
+        );
+
+        // A subsection that declares nothing is absent as well.
+        let declared = parse(r#"{"verify":{"command":"cargo"},"boundaries":{}}"#);
+        assert!(declared.boundaries.is_empty());
+        let encoded = serde_json::to_string(&declared).expect("the section encodes");
+        assert!(
+            !encoded.contains("boundaries"),
+            "unexpected subsection: {encoded}"
+        );
+
+        // The default section declares nothing at all.
+        let empty = serde_json::to_string(&ProjectConfig::default()).expect("the section encodes");
+        assert_eq!(empty, "{}");
+    }
+
+    #[test]
+    fn test_project_boundaries_reject_blank_patterns() {
+        for source in [
+            r#"{"verify":{"command":"cargo"},"boundaries":{"protected":[""]}}"#,
+            r#"{"verify":{"command":"cargo"},"boundaries":{"protected":["Justfile","  "]}}"#,
+        ] {
+            let config = parse(source);
+            let blank = config
+                .boundaries
+                .protected
+                .iter()
+                .find(|pattern| pattern.trim().is_empty())
+                .expect("the declaration carries a blank pattern");
+            match config.validate() {
+                Err(ProjectConfigError::InvalidName { operation, name }) => {
+                    assert_eq!(operation, "boundaries.protected");
+                    assert_eq!(&name, blank);
+                }
+                other => panic!("an unusable pattern was accepted: {other:?}"),
+            }
+        }
+
+        // A blank pattern alone still makes the section non-empty, and the
+        // mandatory verification command takes precedence over the pattern.
+        let config = parse(r#"{"boundaries":{"protected":[" "]}}"#);
+        assert!(!config.is_empty());
+        assert_eq!(config.validate(), Err(ProjectConfigError::MissingVerify));
+
+        // Once verification is declared, the blank pattern itself is reported,
+        // so a section never silently protects nothing.
+        let config = parse(r#"{"verify":{"command":"cargo"},"boundaries":{"protected":[" "]}}"#);
+        assert!(matches!(
+            config.validate(),
+            Err(ProjectConfigError::InvalidName { .. })
+        ));
+    }
+
+    #[test]
+    fn test_project_boundaries_make_the_section_non_empty() {
+        let config = parse(r#"{"boundaries":{"protected":["Justfile"]}}"#);
+        assert!(!config.is_empty());
+        assert_eq!(config.validate(), Err(ProjectConfigError::MissingVerify));
     }
 }

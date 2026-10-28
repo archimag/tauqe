@@ -390,6 +390,9 @@ pub(super) async fn run_apply_and_verify_phase(
                     ctx.options.repomap_token_budget,
                     ctx.options.discovery_limits,
                     false,
+                    // The healing round races the turn's own cancel signal, so
+                    // an abandoned repair stops waiting for a slow reference host.
+                    Some(ctx.cancel_rx),
                 )
                 .await;
                 // Healing findings join the turn journal, so a later healing

@@ -5,10 +5,10 @@ use crossterm::event::{KeyCode, KeyEvent};
 use tauqe_protocol::{methods, ModelAskParams};
 use tokio::sync::Mutex;
 
-use crate::app::AppState;
+use crate::app::{AppState, DiffInspectorState};
 use crate::command::CommandCategory::{Essential, Helpers, Interface};
 use crate::command::{CommandMap, CommandSpec, KeyChord};
-use crate::config::{InputConfig, MetaModifier, PrimaryModifier};
+use crate::config::InputConfig;
 use crate::i18n::engine::active_t;
 use crate::input::InputResult;
 use crate::rpc::{send_request, RpcConnection};
@@ -121,6 +121,18 @@ pub static REPL_COMMAND_MAP: CommandMap<ReplAction> = CommandMap::new(&[
         ReplAction::NextModifiedFile,
         Interface,
         "cmd.repl.next_file",
+    ),
+    CommandSpec::new(
+        KeyChord::Primary(KeyCode::Char('l')),
+        ReplAction::RecenterSelectedFile,
+        Interface,
+        "cmd.repl.recenter",
+    ),
+    CommandSpec::new(
+        KeyChord::Ctrl(KeyCode::Char('l')),
+        ReplAction::RecenterSelectedFile,
+        Interface,
+        "cmd.repl.recenter",
     ),
     CommandSpec::new(
         KeyChord::Alt(KeyCode::Up),
@@ -443,6 +455,21 @@ pub static REPL_COMMAND_MAP: CommandMap<ReplAction> = CommandMap::new(&[
     ),
 ]);
 
+/// Viewport-only chords of the Develop tab.
+///
+/// The bare letter `v` opens the diff inspector while the response area owns the
+/// keyboard. It lives in its own map because the prompt editor must insert every
+/// printable character unconditionally: a bare letter can never be a chord of
+/// the text-input scope (Conventions §5.1). `Enter` on a staged file opens the
+/// same inspector through the shared `Enter` binding that the Viewport remaps in
+/// [`resolve_viewport_action`].
+pub static VIEWPORT_COMMAND_MAP: CommandMap<ReplAction> = CommandMap::new(&[CommandSpec::new(
+    KeyChord::Bare(KeyCode::Char('v')),
+    ReplAction::OpenDiffInspector,
+    Interface,
+    "cmd.repl.open_diff_inspector",
+)]);
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReplAction {
     // Editor buffer mutations & navigation
@@ -479,6 +506,10 @@ pub enum ReplAction {
     PrevModifiedFile,
     NextModifiedFile,
     ToggleSelectedFileFold,
+    /// Recenter the Viewport on the selected staged file block.
+    RecenterSelectedFile,
+    /// Open the fullscreen audit of the staged change set.
+    OpenDiffInspector,
 
     // Viewport scrolling
     ScrollResponseUp,
@@ -524,21 +555,29 @@ pub fn is_editor_action(action: ReplAction) -> bool {
     )
 }
 
-/// Resolves a key event while the Viewport has focus. Navigation keys act on the
-/// response and file diffs; editing keys fall through unchanged so the caller can
-/// return focus to the prompt.
-pub fn resolve_viewport_action(
-    key: KeyEvent,
-    primary_mod: PrimaryModifier,
-    meta_mod: MetaModifier,
-) -> Option<ReplAction> {
-    let action = resolve_repl_action(key, primary_mod, meta_mod)?;
+/// Resolves a key event while the Viewport has focus.
+///
+/// Navigation keys act on the response and the staged file diffs; editing keys
+/// fall through unchanged so the caller can return focus to the prompt. The
+/// Viewport-only chords (such as the bare `v` that opens the diff inspector) are
+/// resolved first, because no text buffer owns the keyboard here.
+///
+/// Chords resolve through the complete workstation [`InputConfig`], so the
+/// configured `layout` and `langmap` reach the same bare and modified commands
+/// (Conventions §5.1). Translation applies to chord matching only: a bare letter
+/// still falls through as an insertion.
+pub fn resolve_viewport_action(key: KeyEvent, input: &InputConfig) -> Option<ReplAction> {
+    if let Some(spec) = VIEWPORT_COMMAND_MAP.resolve(key, input, false) {
+        return Some(spec.action);
+    }
+
+    let action = resolve_repl_action(key, input)?;
     Some(match action {
         ReplAction::ClearPromptSaving => ReplAction::ToggleFocus,
         ReplAction::SendPrompt
-            if key.code == KeyCode::Enter && !primary_mod.matches(key.modifiers) =>
+            if key.code == KeyCode::Enter && !input.is_primary(key.modifiers) =>
         {
-            ReplAction::ToggleSelectedFileFold
+            ReplAction::OpenDiffInspector
         }
         ReplAction::HistoryPrev | ReplAction::LineUpOrHistoryPrev | ReplAction::MoveLineUp => {
             ReplAction::ViewportPrev
@@ -556,19 +595,16 @@ pub fn resolve_viewport_action(
 }
 
 /// Resolves a key event into a deterministic `ReplAction`, eliminating shortcut
-/// shadowing between primary command modifier (`C-`) and Alt-based Readline navigation.
-pub fn resolve_repl_action(
-    key: KeyEvent,
-    primary_mod: PrimaryModifier,
-    meta_mod: MetaModifier,
-) -> Option<ReplAction> {
-    let input = InputConfig {
-        primary_modifier: primary_mod,
-        meta_modifier: meta_mod,
-        ..InputConfig::default()
-    };
-
-    if let Some(spec) = REPL_COMMAND_MAP.resolve(key, &input, false) {
+/// shadowing between the primary command modifier (`C-`) and the Alt-based
+/// Readline navigation.
+///
+/// Chords resolve through the complete workstation [`InputConfig`], so the
+/// configured keyboard `layout` and `langmap` reach the same bare and modified
+/// commands. Only chord matching is translated: a printable character typed
+/// without a command modifier is inserted verbatim, in the language it was
+/// typed in (Conventions §5.1).
+pub fn resolve_repl_action(key: KeyEvent, input: &InputConfig) -> Option<ReplAction> {
+    if let Some(spec) = REPL_COMMAND_MAP.resolve(key, input, false) {
         return Some(spec.action);
     }
 
@@ -588,19 +624,21 @@ pub async fn handle_repl_key(
     state: &Arc<Mutex<AppState>>,
     server_writer: &mut RpcConnection,
 ) -> anyhow::Result<InputResult> {
-    let (primary_mod, meta_mod, in_viewport) = {
+    // The whole workstation input configuration travels with the key, so the
+    // configured `layout` and `langmap` reach the prompt chords and the
+    // Viewport navigation alike (c-1, c-4).
+    let (input, in_viewport) = {
         let st = state.lock().await;
         (
-            st.tui_config.input.primary_modifier,
-            st.tui_config.input.meta_modifier,
+            st.tui_config.input.clone(),
             st.model.focus == ReplFocus::Viewport,
         )
     };
 
     let resolved = if in_viewport {
-        resolve_viewport_action(key, primary_mod, meta_mod)
+        resolve_viewport_action(key, &input)
     } else {
-        resolve_repl_action(key, primary_mod, meta_mod)
+        resolve_repl_action(key, &input)
     };
     let action = match resolved {
         Some(act) => act,
@@ -772,6 +810,27 @@ pub async fn handle_repl_key(
                 st.model.scroll_to_selected_file(view_height);
             }
         }
+        ReplAction::OpenDiffInspector => {
+            if st.model.files.is_empty() {
+                st.notify_warning(active_t("notify.diff_inspector_empty"));
+            } else {
+                // The audit captures the staged set when it opens, so reading it
+                // never depends on edits that are still arriving, and the
+                // highlight starts on the file the Viewport had selected (c-3).
+                let selected_file = st
+                    .model
+                    .selected_file_index
+                    .min(st.model.files.len().saturating_sub(1));
+                st.diff_inspector = Some(DiffInspectorState {
+                    files: st.model.files.clone(),
+                    selected_file,
+                    diff_scroll: 0,
+                });
+            }
+        }
+        ReplAction::RecenterSelectedFile => {
+            st.model.recenter_selected_file(view_height);
+        }
         ReplAction::ScrollResponseUp => {
             st.model.auto_scroll = false;
             st.model.scroll = st.model.scroll.saturating_sub(1);
@@ -843,28 +902,76 @@ pub async fn handle_repl_key(
     Ok(InputResult::Continue)
 }
 
+/// Moves the Viewport one line up.
+///
+/// While the selected file is expanded the movement stays inside that file's
+/// block; the selection leaves it only after the block start has been reached,
+/// so a long patch is read backward line by line instead of being skipped by a
+/// single keystroke (c-2).
 fn step_viewport_up(model: &mut ReplView, view_height: u16) {
     if !model.files.is_empty() {
-        model.selected_file_index = model.selected_file_index.saturating_sub(1);
-        model.scroll_to_selected_file(view_height);
-    } else {
-        model.auto_scroll = false;
-        model.scroll = model.scroll.saturating_sub(1);
+        let selected = model.selected_file_index;
+        let expanded = model.files.get(selected).is_some_and(|file| file.expanded);
+        let window = if expanded {
+            model.file_scroll_window(selected, view_height)
+        } else {
+            None
+        };
+        if window.is_some_and(|(block_start, _)| model.scroll > block_start) {
+            model.auto_scroll = false;
+            model.scroll = model.scroll.saturating_sub(1);
+            return;
+        }
+        if selected > 0 {
+            model.auto_scroll = false;
+            model.selected_file_index = selected - 1;
+            let previous = model.file_scroll_window(selected - 1, view_height);
+            if let Some((_, block_end)) = previous {
+                model.scroll = block_end;
+            }
+            model.clamp_scroll(view_height);
+            return;
+        }
     }
+    model.auto_scroll = false;
+    model.scroll = model.scroll.saturating_sub(1);
 }
 
+/// Moves the Viewport one line down.
+///
+/// Inside an expanded file the movement scrolls the diff body until its last
+/// line reaches the bottom edge; only then does the selection advance to the
+/// next file, which keeps the reading position stable for long patches (c-2).
 fn step_viewport_down(model: &mut ReplView, view_height: u16) {
     if !model.files.is_empty() {
-        if model.selected_file_index + 1 < model.files.len() {
-            model.selected_file_index += 1;
-            model.scroll_to_selected_file(view_height);
+        let selected = model.selected_file_index;
+        let expanded = model.files.get(selected).is_some_and(|file| file.expanded);
+        let window = if expanded {
+            model.file_scroll_window(selected, view_height)
+        } else {
+            None
+        };
+        if window.is_some_and(|(_, block_end)| model.scroll < block_end) {
+            model.auto_scroll = false;
+            model.scroll = model.scroll.saturating_add(1);
+            return;
         }
-    } else {
-        let max = model.max_scroll(view_height);
-        model.scroll = (model.scroll.saturating_add(1)).min(max);
-        if model.scroll >= max {
-            model.auto_scroll = true;
+        if selected + 1 < model.files.len() {
+            model.auto_scroll = false;
+            model.selected_file_index = selected + 1;
+            let next = model.file_scroll_window(selected + 1, view_height);
+            if let Some((block_start, _)) = next {
+                model.scroll = block_start;
+            }
+            model.clamp_scroll(view_height);
+            return;
         }
+    }
+    model.auto_scroll = false;
+    let max = model.max_scroll(view_height);
+    model.scroll = model.scroll.saturating_add(1).min(max);
+    if model.scroll >= max {
+        model.auto_scroll = true;
     }
 }
 
@@ -873,16 +980,28 @@ mod tests {
     use super::*;
     use crossterm::event::KeyModifiers;
 
+    use crate::config::{LayoutPreset, MetaModifier, PrimaryModifier};
+
     fn key(code: KeyCode, modifiers: KeyModifiers) -> KeyEvent {
         KeyEvent::new(code, modifiers)
     }
 
+    /// Workstation input configuration with a fixed `C-` / `M-` assignment and
+    /// the default layout.
+    fn input_with(primary_mod: PrimaryModifier) -> InputConfig {
+        InputConfig {
+            primary_modifier: primary_mod,
+            meta_modifier: MetaModifier::Alt,
+            ..InputConfig::default()
+        }
+    }
+
     fn resolve_repl_action(key: KeyEvent, primary_mod: PrimaryModifier) -> Option<ReplAction> {
-        super::resolve_repl_action(key, primary_mod, MetaModifier::Alt)
+        super::resolve_repl_action(key, &input_with(primary_mod))
     }
 
     fn resolve_viewport_action(key: KeyEvent, primary_mod: PrimaryModifier) -> Option<ReplAction> {
-        super::resolve_viewport_action(key, primary_mod, MetaModifier::Alt)
+        super::resolve_viewport_action(key, &input_with(primary_mod))
     }
 
     #[test]
@@ -1143,7 +1262,17 @@ mod tests {
         );
         assert_eq!(
             resolve_viewport_action(key(KeyCode::Enter, KeyModifiers::NONE), p),
-            Some(ReplAction::ToggleSelectedFileFold)
+            Some(ReplAction::OpenDiffInspector)
+        );
+        assert_eq!(
+            resolve_viewport_action(key(KeyCode::Char('v'), KeyModifiers::NONE), p),
+            Some(ReplAction::OpenDiffInspector)
+        );
+        // The focused command chord keeps sending the prompt from the Viewport
+        // and leaves folding to `Tab` / `C-t`.
+        assert_eq!(
+            resolve_viewport_action(key(KeyCode::Enter, KeyModifiers::CONTROL), p),
+            Some(ReplAction::SendPrompt)
         );
         assert_eq!(
             resolve_viewport_action(key(KeyCode::Char('t'), KeyModifiers::CONTROL), p),
@@ -1170,7 +1299,34 @@ mod tests {
     }
 
     #[test]
-    fn test_develop_line_navigation_invariants() {
+    fn recenter_chord_reaches_the_file_block_from_the_prompt_and_the_viewport() {
+        let p = PrimaryModifier::Ctrl;
+
+        // C-l is a structural chord rather than text editing: it reaches the
+        // file recenter from the prompt, and the Viewport keeps it unchanged.
+        assert_eq!(
+            resolve_repl_action(key(KeyCode::Char('l'), KeyModifiers::CONTROL), p),
+            Some(ReplAction::RecenterSelectedFile)
+        );
+        assert_eq!(
+            resolve_viewport_action(key(KeyCode::Char('l'), KeyModifiers::CONTROL), p),
+            Some(ReplAction::RecenterSelectedFile)
+        );
+
+        // With Alt as the primary modifier the global locale picker owns
+        // M-l at the dispatcher level, so the raw Ctrl spelling keeps the
+        // command reachable, mirroring the History, Plans, and Review maps.
+        assert_eq!(
+            resolve_repl_action(
+                key(KeyCode::Char('l'), KeyModifiers::CONTROL),
+                PrimaryModifier::Alt
+            ),
+            Some(ReplAction::RecenterSelectedFile)
+        );
+    }
+
+    #[test]
+    fn newline_insertion_is_reserved_to_dedicated_chords() {
         let p = PrimaryModifier::Ctrl;
 
         // C-j is the electric-newline; newline insertion is reserved for Enter,
@@ -1208,6 +1364,47 @@ mod tests {
                 assert_ne!(chord, other, "duplicate key chord in REPL_COMMAND_MAP");
             }
         }
+    }
+
+    /// Proves the Develop resolver honours the configured keyboard layout for
+    /// both the prompt chords and the Viewport navigation, while a typed
+    /// character keeps its original form (c-3, c-4).
+    #[test]
+    fn cyrillic_layout_reaches_the_viewport_chords_and_types_verbatim() {
+        let input = InputConfig {
+            layout: LayoutPreset::RuJcuken,
+            ..input_with(PrimaryModifier::Ctrl)
+        };
+
+        // `м` sits on `v`: the Viewport-only inspector chord answers to it.
+        assert_eq!(
+            super::resolve_viewport_action(key(KeyCode::Char('м'), KeyModifiers::NONE), &input),
+            Some(ReplAction::OpenDiffInspector)
+        );
+
+        // `т` and `з` sit on `n` and `p`: the navigation chords follow the
+        // configured layout instead of demanding a Latin key.
+        assert_eq!(
+            super::resolve_viewport_action(key(KeyCode::Char('т'), KeyModifiers::CONTROL), &input),
+            Some(ReplAction::ViewportNext)
+        );
+        assert_eq!(
+            super::resolve_viewport_action(key(KeyCode::Char('з'), KeyModifiers::CONTROL), &input),
+            Some(ReplAction::ViewportPrev)
+        );
+
+        // `е` sits on `t`: the modified folding chord follows it too.
+        assert_eq!(
+            super::resolve_repl_action(key(KeyCode::Char('е'), KeyModifiers::CONTROL), &input),
+            Some(ReplAction::ToggleSelectedFileFold)
+        );
+
+        // A printable character typed into the prompt is inserted verbatim, in
+        // the language it was typed in, and never translated (Conventions §5.1).
+        let typed = super::resolve_repl_action(key(KeyCode::Char('ч'), KeyModifiers::NONE), &input)
+            .expect("a printable character always resolves to insertion");
+        assert_eq!(typed, ReplAction::InsertChar('ч'));
+        assert!(is_editor_action(typed));
     }
 
     #[tokio::test]
@@ -1286,5 +1483,157 @@ mod tests {
         let st = state.lock().await;
         assert!(!st.confirm_detach_focus);
         assert!(!st.confirm_cancel);
+    }
+}
+
+#[cfg(test)]
+mod viewport_scroll_tests {
+    use super::super::state::{EditOp, FileEditStatus, StreamingFileEdit, StreamingHunk};
+    use super::*;
+
+    fn diff_file(path: &str, expanded: bool) -> StreamingFileEdit {
+        StreamingFileEdit {
+            path: path.to_string(),
+            op_type: EditOp::Replace,
+            status: FileEditStatus::Ok,
+            error: None,
+            hunks: vec![StreamingHunk {
+                hunk_index: 0,
+                old_text: "let a = 1;".to_string(),
+                new_text: "let a = 2;".to_string(),
+            }],
+            expanded,
+            retry_info: None,
+        }
+    }
+
+    /// One answer line, the proposed-edits header, an expanded first file with
+    /// a three-line diff body and a collapsed second file:
+    ///
+    /// ```text
+    /// 0  answer
+    /// 1  blank
+    /// 2  proposed edits header
+    /// 3  file 0 summary
+    /// 4  @@ diff @@
+    /// 5  - let a = 1;
+    /// 6  + let a = 2;
+    /// 7  file 1 summary
+    /// ```
+    fn viewport_model() -> ReplView {
+        ReplView {
+            text: "answer".to_string(),
+            files: vec![
+                diff_file("crates/tui/src/a.rs", true),
+                diff_file("crates/tui/src/b.rs", false),
+            ],
+            ..ReplView::default()
+        }
+    }
+
+    #[test]
+    fn the_selection_leaves_an_expanded_file_only_after_its_last_diff_line() {
+        let mut model = viewport_model();
+        let height = 3;
+
+        model.scroll = 3;
+        step_viewport_down(&mut model, height);
+        assert_eq!((model.selected_file_index, model.scroll), (0, 4));
+
+        step_viewport_down(&mut model, height);
+        assert_eq!(model.selected_file_index, 1);
+        assert_eq!(model.scroll, 5);
+    }
+
+    #[test]
+    fn the_selection_returns_into_the_previous_diff_body_line_by_line() {
+        let mut model = viewport_model();
+        let height = 3;
+
+        model.selected_file_index = 1;
+        model.scroll = 5;
+
+        step_viewport_up(&mut model, height);
+        assert_eq!((model.selected_file_index, model.scroll), (0, 4));
+
+        step_viewport_up(&mut model, height);
+        assert_eq!((model.selected_file_index, model.scroll), (0, 3));
+
+        step_viewport_up(&mut model, height);
+        assert_eq!(model.scroll, 2);
+    }
+
+    #[test]
+    fn the_last_file_hands_the_viewport_back_to_plain_scrolling() {
+        let mut model = viewport_model();
+        let height = 3;
+
+        model.selected_file_index = 1;
+        model.scroll = 4;
+
+        step_viewport_down(&mut model, height);
+        assert_eq!(model.selected_file_index, 1);
+        assert_eq!(model.scroll, 5);
+    }
+    /// Proves the Develop handler carries the configured keyboard layout into
+    /// chord resolution, so the Viewport answers to a Cyrillic press exactly as
+    /// it answers to the Latin chord (c-1, c-4).
+    #[tokio::test]
+    async fn the_configured_layout_reaches_the_viewport_through_the_handler() {
+        let mut st = crate::app::test_state();
+        st.tui_config.input.layout = crate::config::LayoutPreset::RuJcuken;
+        st.model.focus = ReplFocus::Viewport;
+        st.model.files = vec![
+            diff_file("crates/tui/src/a.rs", false),
+            diff_file("crates/tui/src/b.rs", false),
+        ];
+        let state = Arc::new(Mutex::new(st));
+        let mut conn = RpcConnection::new(Vec::<u8>::new());
+
+        // `м` sits on `v`: the Viewport-only inspector chord must answer to the
+        // configured layout instead of typing a character.
+        handle_repl_key(
+            KeyEvent::new(KeyCode::Char('м'), crossterm::event::KeyModifiers::NONE),
+            &state,
+            &mut conn,
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            state.lock().await.diff_inspector.is_some(),
+            "the translated `v` chord must open the diff inspector"
+        );
+    }
+
+    /// C-l re-centers the Viewport on the expanded diff of the selected
+    /// file: the first beat aligns the top of the tall block, and manual
+    /// recentering disables auto-scroll (Conventions.md §5.2).
+    #[tokio::test]
+    async fn ctrl_l_recenters_the_viewport_on_the_selected_file_block() {
+        let mut st = crate::app::test_state();
+        st.model = viewport_model();
+        st.model.focus = ReplFocus::Viewport;
+        st.last_model_height = 3;
+        let state = Arc::new(Mutex::new(st));
+        let mut conn = RpcConnection::new(Vec::<u8>::new());
+
+        handle_repl_key(
+            KeyEvent::new(KeyCode::Char('l'), crossterm::event::KeyModifiers::CONTROL),
+            &state,
+            &mut conn,
+        )
+        .await
+        .unwrap();
+
+        let st = state.lock().await;
+        assert_eq!(
+            st.model.scroll, 3,
+            "the center beat aligns the tall block's top"
+        );
+        assert!(
+            !st.model.auto_scroll,
+            "manual recentering disables auto-scroll"
+        );
     }
 }

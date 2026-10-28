@@ -1,11 +1,33 @@
-use crate::theme::engine::current_engine;
+use crate::theme::engine::{current_engine, ThemeEngine};
 use crate::ui::format::format_tokens;
 use ratatui::style::{Style, Stylize};
 use ratatui::text::{Line, Span};
 
-use super::super::state::{EditOp, FileEditStatus, ReplView, ToolchainState};
+use super::super::state::{EditOp, FileEditStatus, ReplView, StagedFileSpan, ToolchainState};
 use super::indicator_style;
 use super::SPINNER_FRAMES;
+
+/// Resolves the compact operation badge of a staged file.
+///
+/// The Viewport file row, the sticky overlay of the reading position, and the
+/// diff inspector file pane share this single mapping, so a badge can never name
+/// a different operation than the row it summarizes (c-1, c-3). The label is
+/// resolved through the catalog and the separator column is appended here, so a
+/// translated badge never has to preserve trailing whitespace (Conventions §9).
+pub(crate) fn file_op_badge(engine: &ThemeEngine, op: &EditOp) -> Span<'static> {
+    let palette = engine.palette();
+    let (key, color) = match op {
+        EditOp::Create => ("repl.op.create", palette.status_success),
+        EditOp::Delete => ("repl.op.delete", palette.status_error),
+        EditOp::Move => ("repl.op.move", palette.status_info),
+        EditOp::Overwrite => ("repl.op.overwrite", palette.status_warning),
+        EditOp::Replace => ("repl.op.replace", palette.button_active_bg),
+    };
+    Span::styled(
+        format!("{} ", crate::i18n::active_t(key)),
+        engine.fg(color).bold(),
+    )
+}
 
 pub fn compute_model_lines(model: &mut ReplView) -> Vec<Line<'static>> {
     let engine = current_engine();
@@ -83,6 +105,7 @@ pub fn compute_model_lines(model: &mut ReplView) -> Vec<Line<'static>> {
         model_lines.extend(model.reasoning.render_lines());
     }
 
+    let mut staged_spans: Vec<StagedFileSpan> = Vec::new();
     if model.edits_active || !model.files.is_empty() {
         model_lines.push(Line::raw(""));
 
@@ -152,6 +175,7 @@ pub fn compute_model_lines(model: &mut ReplView) -> Vec<Line<'static>> {
         }
 
         for (idx, file) in model.files.iter().enumerate() {
+            let header_line = model_lines.len();
             let is_selected = idx == model.selected_file_index;
             let fold_icon = if file.expanded { "▼ " } else { "▶ " };
             let cursor_prefix = if is_selected { "> " } else { "  " };
@@ -165,13 +189,7 @@ pub fn compute_model_lines(model: &mut ReplView) -> Vec<Line<'static>> {
                 ),
             };
 
-            let (op_label, op_style) = match file.op_type {
-                EditOp::Create => ("[NEW] ", engine.fg(palette.status_success).bold()),
-                EditOp::Delete => ("[DEL] ", engine.fg(palette.status_error).bold()),
-                EditOp::Move => ("[MOVE] ", engine.fg(palette.status_info).bold()),
-                EditOp::Overwrite => ("[OVERWRITE] ", engine.fg(palette.status_warning).bold()),
-                EditOp::Replace => ("[EDIT] ", engine.fg(palette.button_active_bg).bold()),
-            };
+            let op_badge = file_op_badge(&engine, &file.op_type);
 
             let hunk_count = file.hunks.len();
             let hunk_label = match file.op_type {
@@ -207,7 +225,7 @@ pub fn compute_model_lines(model: &mut ReplView) -> Vec<Line<'static>> {
                 Span::raw("  "),
                 Span::styled(cursor_prefix, engine.fg(palette.status_info)),
                 Span::styled(fold_icon, engine.fg(palette.text_muted)),
-                Span::styled(op_label, op_style),
+                op_badge,
                 Span::styled(file.path.clone(), Style::default().bold()),
                 Span::raw(" "),
                 Span::styled(format!("({})", hunk_label), engine.fg(palette.text_muted)),
@@ -244,11 +262,23 @@ pub fn compute_model_lines(model: &mut ReplView) -> Vec<Line<'static>> {
                 }
             }
 
-            if file.expanded {
-                model_lines.extend(model.diff_cache.lines_for(file));
-            }
+            let body_start = model_lines.len();
+            let hunk_offsets = if file.expanded {
+                let rendered = model.diff_cache.render(file);
+                model_lines.extend(rendered.lines);
+                rendered.hunk_rows
+            } else {
+                Vec::new()
+            };
+            staged_spans.push(StagedFileSpan {
+                header_line,
+                body_start: (model_lines.len() > body_start).then_some(body_start),
+                body_end: model_lines.len(),
+                hunk_offsets,
+            });
         }
     }
+    model.staged_file_spans = staged_spans;
 
     // The usage line mirrors the daemon's single accumulator: the operation in
     // flight while a turn runs, otherwise the last completed one. An empty

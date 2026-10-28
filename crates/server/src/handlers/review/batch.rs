@@ -31,7 +31,7 @@ use tauqe_core::workflow::batch::{
 use tauqe_protocol::{
     errors, events, BatchFinishStatus, BatchFinishSummary, IssueStatus, ModelSelection, Plan,
     PlanScopeEvaluation, Request, Response, ResponseError, ReviewBatchFinishedEvent,
-    ReviewExecuteParams, ReviewItem,
+    ReviewExecuteParams, ReviewItem, ReviewSession,
 };
 use tokio::sync::{mpsc, watch};
 
@@ -158,6 +158,36 @@ fn response_error(code: &str, message: impl Into<String>) -> ResponseError {
         message: message.into(),
         data: None,
     }
+}
+/// Whether a finding can still produce work in a resolving turn.
+fn is_actionable(item: &ReviewItem) -> bool {
+    matches!(
+        item.status,
+        IssueStatus::Todo | IssueStatus::InProgress | IssueStatus::Refine
+    )
+}
+
+/// Resolves a client-ordered selection of finding ids against one session.
+///
+/// The ids are kept verbatim in the given order; ids that are unknown,
+/// duplicated, or no longer actionable are dropped instead of guessed at, so
+/// the queue runs exactly the findings the client saw in the section it
+/// launched.
+fn resolve_session_queue(session: &ReviewSession, item_ids: &[u32]) -> Vec<u32> {
+    let mut resolved: Vec<u32> = Vec::new();
+    for id in item_ids {
+        if resolved.contains(id) {
+            continue;
+        }
+        let actionable = session
+            .items
+            .iter()
+            .any(|item| item.id == *id && is_actionable(item));
+        if actionable {
+            resolved.push(*id);
+        }
+    }
+    resolved
 }
 
 /// Adapter that executes a single review finding as a [`BatchStepExecutor`] step.
@@ -436,6 +466,13 @@ pub async fn handle_review_execute(req: Request, state: &Arc<AppState>) -> Respo
             let mut target_step: Option<String> = None;
             let item_ids: Vec<u32> = match params.item_id {
                 Some(item_id) => {
+                    if params.item_ids.is_some() {
+                        return Response::err(
+                            req.id,
+                            errors::INVALID_PARAMS,
+                            "item_ids cannot be combined with item_id",
+                        );
+                    }
                     let item = match session.find_item(item_id) {
                         Some(i) => i,
                         None => {
@@ -512,7 +549,7 @@ pub async fn handle_review_execute(req: Request, state: &Arc<AppState>) -> Respo
                             "step_id requires both review_id and item_id",
                         );
                     }
-                    let ids: Vec<u32> = session
+                    let session_queue: Vec<u32> = session
                         .items
                         .iter()
                         .filter(|i| {
@@ -523,6 +560,14 @@ pub async fn handle_review_execute(req: Request, state: &Arc<AppState>) -> Respo
                         })
                         .map(|i| i.id)
                         .collect();
+                    // A section queue is the audited selection: the ids are
+                    // resolved verbatim in client order, and stale or unknown
+                    // ones are dropped instead of widening the run behind the
+                    // dialog that promised less.
+                    let ids: Vec<u32> = match params.item_ids.as_deref() {
+                        Some(selected) => resolve_session_queue(&session, selected),
+                        None => session_queue,
+                    };
                     if ids.is_empty() {
                         return Response::err(
                             req.id,
@@ -540,11 +585,11 @@ pub async fn handle_review_execute(req: Request, state: &Arc<AppState>) -> Respo
             (review_id.to_string(), tasks, target_step)
         }
         None => {
-            if params.item_id.is_some() || params.step_id.is_some() {
+            if params.item_id.is_some() || params.step_id.is_some() || params.item_ids.is_some() {
                 return Response::err(
                     req.id,
                     errors::INVALID_PARAMS,
-                    "item_id and step_id cannot be specified when review_id is omitted",
+                    "item_id, step_id, and item_ids cannot be specified when review_id is omitted",
                 );
             }
             let list_root = repo_root.clone();
@@ -666,4 +711,60 @@ pub async fn handle_review_execute(req: Request, state: &Arc<AppState>) -> Respo
     });
 
     response
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tauqe_protocol::{IssueType, ModelRef, ReviewIssue};
+
+    fn finding(id: u32, status: IssueStatus) -> ReviewItem {
+        ReviewItem::from(ReviewIssue {
+            id,
+            title: format!("Finding {id}"),
+            uuid: None,
+            group: None,
+            model: None,
+            issue_type: IssueType::Architecture,
+            status,
+            description: String::new(),
+            recommendations: Vec::new(),
+            files: Vec::new(),
+            readonly_files: Vec::new(),
+            plan: Vec::new(),
+            note: None,
+        })
+    }
+
+    fn session_with(items: Vec<ReviewItem>) -> ReviewSession {
+        ReviewSession {
+            id: "rev-queue".to_string(),
+            title: "Queue".to_string(),
+            created_at: 0,
+            model: ModelRef::default(),
+            items,
+            ..Default::default()
+        }
+    }
+
+    /// The queue resolver is the contract between the section-scoped launch
+    /// and the supervisor: client order wins, stale and unknown ids are
+    /// dropped, and duplicates collapse to their first occurrence, so the
+    /// batch runs exactly the findings the confirmation showed.
+    #[test]
+    fn test_resolve_session_queue_keeps_client_order_and_drops_stale_ids() {
+        let session = session_with(vec![
+            finding(1, IssueStatus::Fixed),
+            finding(2, IssueStatus::Todo),
+            finding(3, IssueStatus::Refine),
+            finding(4, IssueStatus::Discussion),
+        ]);
+
+        assert_eq!(
+            resolve_session_queue(&session, &[4, 9, 3, 2, 3]),
+            vec![3, 2]
+        );
+        assert!(resolve_session_queue(&session, &[1, 4]).is_empty());
+        assert!(resolve_session_queue(&session, &[]).is_empty());
+    }
 }

@@ -677,7 +677,58 @@ pub fn render_confirm_delete_review_popup(
 ) {
     render_modal_confirm(frame, delete_review_params(state, session_id));
 }
+/// Presentation parameters for the Architect post-analysis confirmation.
+///
+/// The classification is a costly LLM layer over immutable findings, so the
+/// dialog names the audited session and leaves the safe `Cancel` button in
+/// focus before any tokens are spent (c-4).
+pub fn review_analyze_params(state: &AppState) -> Option<ConfirmModalParams<'_>> {
+    let target = state.confirm_review_analyze.as_ref()?;
+    let engine = current_engine();
+    let palette = engine.palette();
 
+    let body_lines = vec![
+        Line::raw(""),
+        Line::from(Span::styled(
+            active_t("dialog.review_analyze.heading"),
+            engine.fg(palette.status_info).bold(),
+        )),
+        Line::raw(""),
+        Line::from(vec![
+            Span::styled(
+                active_t("dialog.review_analyze.review_label"),
+                engine.fg(palette.text_muted),
+            ),
+            Span::styled(&target.review_title, engine.fg(palette.text_primary).bold()),
+            Span::styled(
+                format!(" [{}]", target.review_id),
+                engine.fg(palette.text_muted),
+            ),
+        ]),
+        Line::raw(""),
+        Line::from(Span::styled(
+            active_t("dialog.review_analyze.note"),
+            engine.fg(palette.text_muted),
+        )),
+    ];
+
+    Some(ConfirmModalParams {
+        title: active_t("dialog.review_analyze.title"),
+        tone: ModalTone::Info,
+        body_lines,
+        confirm_label: active_t("dialog.button.run_analysis"),
+        cancel_label: active_t("modal.cancel"),
+        confirm_button: state.confirm_button,
+        destructive: false,
+        width: 64,
+    })
+}
+
+pub fn render_confirm_review_analyze_popup(frame: &mut ratatui::Frame, state: &AppState) {
+    if let Some(params) = review_analyze_params(state) {
+        render_modal_confirm(frame, params);
+    }
+}
 /// Presentation parameters for the "clear Auto context" confirmation.
 pub fn clear_auto_params(state: &AppState) -> ConfirmModalParams<'_> {
     let engine = current_engine();
@@ -945,6 +996,8 @@ mod tests {
         tauqe_protocol::ReviewIssue {
             id,
             title: format!("Finding {id}"),
+            uuid: None,
+            group: None,
             model: None,
             issue_type,
             status: tauqe_protocol::IssueStatus::Todo,
@@ -1271,5 +1324,35 @@ mod tests {
                 "cancel row for '{confirm_label}': {cancel_row:?}"
             );
         }
+    }
+    /// The post-analysis confirmation names the audited session and keeps the
+    /// safe `Cancel` default, so a costly classification is never launched by a
+    /// stray keystroke (c-4).
+    #[test]
+    fn test_review_analyze_params_are_safe_and_named() {
+        let mut st = crate::app::test_state();
+        assert!(review_analyze_params(&st).is_none());
+
+        st.confirm_review_analyze = Some(crate::app::ConfirmReviewAnalyzeState {
+            review_id: "rev-9".to_string(),
+            review_title: "Backend audit".to_string(),
+        });
+
+        let params = review_analyze_params(&st).expect("params should be generated");
+        assert_eq!(params.title, "Run Post-Analysis");
+        assert_eq!(params.tone, ModalTone::Info);
+        assert_eq!(params.confirm_label, "Run Analysis");
+        assert_eq!(params.cancel_label, "Cancel");
+        assert_eq!(
+            params.confirm_button,
+            crate::app::ConfirmDialogButton::Cancel
+        );
+        assert!(!params.destructive);
+        let texts: Vec<String> = params.body_lines.iter().map(|l| l.to_string()).collect();
+        assert!(
+            texts.iter().any(|t| t.contains("Backend audit")),
+            "{texts:?}"
+        );
+        assert!(texts.iter().any(|t| t.contains("rev-9")), "{texts:?}");
     }
 }

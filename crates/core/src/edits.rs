@@ -4,10 +4,13 @@ use tauqe_protocol::{EditOperation, EditProposal};
 use thiserror::Error;
 
 use crate::context::ContextManager;
+use crate::mockups::is_mockups_path;
+use protection::{is_protected, protected_patterns};
 
 pub mod anchor;
 mod atomic;
 mod fuzzy;
+mod protection;
 pub mod protocol;
 mod staging;
 pub(crate) mod strategy;
@@ -27,6 +30,11 @@ use atomic::commit_staged_edits;
 /// auto-promotes such a file to editable once a change set that touches it is
 /// applied, so auto-promotion is the single documented enforcement path and the
 /// enum never advertises a rejection the engine cannot produce.
+///
+/// A path declared in `[project.boundaries.protected]` is the opposite case:
+/// the declaration exists precisely to keep a turn away from that path, so it
+/// can never be promoted and every operation that would touch it is rejected as
+/// [`EditError::ProtectedPath`] during staging.
 #[derive(Debug, Error)]
 pub enum EditError {
     #[error("File '{0}' is not in context. Only files explicitly in context can be edited.")]
@@ -57,6 +65,16 @@ pub enum EditError {
         "Path '{0}' is excluded by the repository ignore rules (.gitignore or .git/info/exclude). Choose a path the repository tracks."
     )]
     IgnoredByGit(String),
+
+    #[error(
+        "Path '{0}' is inside the mockups sandbox but the repository ignore rules do not exclude it. The sandbox is admitted only while Git ignores it: a mockup Git would track joins the change set and aborts the Git transaction."
+    )]
+    MockupsNotIgnored(String),
+
+    #[error(
+        "Path '{0}' is declared in [project.boundaries.protected] and must never be created, modified, moved, or deleted by a turn: it stays tracked by Git and readable. Request it as a read-only reference instead."
+    )]
+    ProtectedPath(String),
 
     #[error("In file '{path}': {source}")]
     InvalidAnchor {
@@ -228,6 +246,9 @@ fn stage_and_validate_edits_inner(
     let mut file_order = Vec::new();
     let mut grouped: HashMap<String, Vec<&EditOperation>> = HashMap::new();
     let mut invalid_paths = HashSet::new();
+    // The declared trust boundaries are compiled once per change set, so every
+    // operation of the set is checked against one declaration.
+    let protected = protected_patterns(repo_root);
     let ignored_paths = ignored_target_paths(repo_root, context_manager, edits);
 
     let flush_grouped = |grouped: &mut HashMap<String, Vec<&EditOperation>>,
@@ -278,6 +299,15 @@ fn stage_and_validate_edits_inner(
                         continue;
                     }
                 };
+                // A trust boundary is rejected before every other
+                // consideration: the move would delete the protected source.
+                if is_protected(&protected, &clean_from) {
+                    result.failed_files.push(FailedFileEdit {
+                        path: clean_from.clone(),
+                        error: EditError::ProtectedPath(clean_from),
+                    });
+                    continue;
+                }
 
                 let clean_to = match context_manager.normalize_path(to) {
                     Ok(p) => p,
@@ -289,6 +319,15 @@ fn stage_and_validate_edits_inner(
                         continue;
                     }
                 };
+                // The destination of a move is a boundary as well: writing it
+                // would overwrite a path the turn may never touch.
+                if is_protected(&protected, &clean_to) {
+                    result.failed_files.push(FailedFileEdit {
+                        path: clean_to.clone(),
+                        error: EditError::ProtectedPath(clean_to),
+                    });
+                    continue;
+                }
 
                 if clean_from == clean_to {
                     result.failed_files.push(FailedFileEdit {
@@ -301,10 +340,10 @@ fn stage_and_validate_edits_inner(
                     continue;
                 }
 
-                if ignored_paths.contains(&clean_to) {
+                if let Err(error) = admit_write(&clean_to, &ignored_paths) {
                     result.failed_files.push(FailedFileEdit {
                         path: clean_to.clone(),
-                        error: EditError::IgnoredByGit(clean_to),
+                        error,
                     });
                     continue;
                 }
@@ -391,17 +430,33 @@ fn stage_and_validate_edits_inner(
             | EditOperation::LineAnchor { path, .. } => {
                 match context_manager.normalize_path(path) {
                     Ok(clean_path) => {
+                        // A trust boundary is rejected before any other check:
+                        // the path is tracked for reading, never for a turn to
+                        // create, rewrite, move, or delete.
+                        if is_protected(&protected, &clean_path) {
+                            result.failed_files.push(FailedFileEdit {
+                                path: clean_path.clone(),
+                                error: EditError::ProtectedPath(clean_path),
+                            });
+                            continue;
+                        }
                         // Git refuses to stage a path its ignore rules exclude,
                         // so writing such a path is rejected here, while the
-                        // change set is still purely in memory.
+                        // change set is still purely in memory. A mockups path
+                        // inverts the same answer instead of bypassing it.
                         let writes_body = matches!(
                             edit,
                             EditOperation::Create { .. } | EditOperation::Overwrite { .. }
                         );
-                        if writes_body && ignored_paths.contains(&clean_path) {
+                        let refusal = if writes_body {
+                            admit_write(&clean_path, &ignored_paths).err()
+                        } else {
+                            None
+                        };
+                        if let Some(error) = refusal {
                             result.failed_files.push(FailedFileEdit {
                                 path: clean_path.clone(),
-                                error: EditError::IgnoredByGit(clean_path),
+                                error,
                             });
                             continue;
                         }
@@ -425,6 +480,31 @@ fn stage_and_validate_edits_inner(
 
     flush_grouped(&mut grouped, &mut file_order, &mut result);
     result
+}
+/// Decides whether a change set may write `path`, given the batched ignore
+/// answer.
+///
+/// A path outside the mockups sandbox keeps the ordinary rule: a write Git
+/// ignores is refused with [`EditError::IgnoredByGit`], because the change set
+/// could never be committed. The sandbox inverts that rule rather than
+/// escaping it: `.tauqe/mockups/` is writable exactly as long as the same
+/// answer covers it, so a mockup Git would track is refused with
+/// [`EditError::MockupsNotIgnored`] instead of entering a transaction it would
+/// abort. Both branches read one answer, so the admission and the refusal can
+/// never disagree about what Git ignores.
+fn admit_write(path: &str, ignored_paths: &HashSet<String>) -> Result<(), EditError> {
+    let ignored = ignored_paths.contains(path);
+    if is_mockups_path(path) {
+        if ignored {
+            Ok(())
+        } else {
+            Err(EditError::MockupsNotIgnored(path.to_string()))
+        }
+    } else if ignored {
+        Err(EditError::IgnoredByGit(path.to_string()))
+    } else {
+        Ok(())
+    }
 }
 
 /// Resolves the repository paths a change set would create, rewrite, or move to.
@@ -715,7 +795,17 @@ pub async fn apply_edit_proposal(
             }
         }
     });
-    Ok(result.successful_paths)
+    // The sandbox never joins the change set a turn reports. The bytes above are
+    // already on disk and the created mockup stays visible to the model through
+    // the context layer, but `.tauqe/mockups/` must not reach `git add`, the
+    // change set delivered to project verification, or the post-hook
+    // differential: Git ignores it, so a sandbox path listed as a change would
+    // abort the commit of a verified turn.
+    Ok(result
+        .successful_paths
+        .into_iter()
+        .filter(|path| !is_mockups_path(path))
+        .collect())
 }
 
 #[cfg(test)]
@@ -1199,7 +1289,202 @@ mod staging_tests {
         );
         assert!(root.join("source.rs").exists());
     }
+    #[test]
+    fn the_sandbox_admits_creates_and_move_destinations_git_ignores() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        crate::git::run_git(Some(root), &["init"]).unwrap();
+        // The harness keeps `.tauqe/` out of Git, and that exclusion is the
+        // precondition of the sandbox: one ignore answer keeps a mockup out of
+        // the change set and admits the write that creates it.
+        crate::git::checkpoint::ensure_tauqe_ignored(root).unwrap();
+        std::fs::write(root.join("source.rs"), "fn hello() {}\n").unwrap();
+        let mut cm = ContextManager::new(root.to_path_buf());
+        cm.add_file("source.rs", ContextAccess::Editable).unwrap();
 
+        let created = EditOperation::Create {
+            path: ".tauqe/mockups/prototype.rs".into(),
+            content: "pub fn prototype() {}\n".into(),
+        };
+        let result = stage_and_validate_edits(root, &cm, std::slice::from_ref(&created), None);
+        assert!(result.is_success(), "{:?}", result.failed_files);
+        assert_eq!(
+            result.staged_state.staged_files[".tauqe/mockups/prototype.rs"],
+            "pub fn prototype() {}\n"
+        );
+
+        let moved = EditOperation::Move {
+            from: "source.rs".into(),
+            to: ".tauqe/mockups/copied.rs".into(),
+        };
+        let result = stage_and_validate_edits(
+            root,
+            &cm,
+            std::slice::from_ref(&moved),
+            Some(&result.staged_state),
+        );
+        assert!(result.is_success(), "{:?}", result.failed_files);
+        assert_eq!(
+            result.staged_state.staged_files[".tauqe/mockups/copied.rs"],
+            "fn hello() {}\n"
+        );
+        assert!(result.staged_state.deleted_paths.contains("source.rs"));
+
+        // A mockup is staged in memory like every other file.
+        assert!(!root.join(".tauqe/mockups/prototype.rs").exists());
+        assert!(!root.join(".tauqe/mockups/copied.rs").exists());
+    }
+
+    #[test]
+    fn a_mockup_git_does_not_ignore_is_refused() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        crate::git::run_git(Some(root), &["init"]).unwrap();
+        // No ignore rule covers `.tauqe/`, so Git would track the sandbox file
+        // and the commit of the change set would fail on it.
+        let cm = ContextManager::new(root.to_path_buf());
+
+        let created = EditOperation::Create {
+            path: ".tauqe/mockups/prototype.rs".into(),
+            content: "pub fn prototype() {}\n".into(),
+        };
+        let result = stage_and_validate_edits(root, &cm, std::slice::from_ref(&created), None);
+        assert!(!result.is_success());
+        assert_eq!(result.failed_files.len(), 1);
+        assert!(matches!(
+            &result.failed_files[0].error,
+            EditError::MockupsNotIgnored(path) if path == ".tauqe/mockups/prototype.rs"
+        ));
+        assert!(result.staged_state.staged_files.is_empty());
+        assert!(!root.join(".tauqe/mockups/prototype.rs").exists());
+    }
+
+    #[test]
+    fn an_existing_mockup_is_edited_under_the_ordinary_context_rules() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        crate::git::run_git(Some(root), &["init"]).unwrap();
+        crate::git::checkpoint::ensure_tauqe_ignored(root).unwrap();
+        std::fs::create_dir_all(root.join(".tauqe/mockups")).unwrap();
+        std::fs::write(
+            root.join(".tauqe/mockups/prototype.rs"),
+            "pub fn prototype() -> i32 { 0 }\n",
+        )
+        .unwrap();
+        let mut cm = ContextManager::new(root.to_path_buf());
+        cm.add_file(".tauqe/mockups/prototype.rs", ContextAccess::Editable)
+            .unwrap();
+
+        let replaced = stage_and_validate_edits(
+            root,
+            &cm,
+            &[replace(
+                ".tauqe/mockups/prototype.rs",
+                "pub fn prototype() -> i32 { 0 }",
+                "pub fn prototype() -> i32 { 42 }",
+            )],
+            None,
+        );
+        assert!(replaced.is_success(), "{:?}", replaced.failed_files);
+        assert_eq!(
+            replaced.staged_state.staged_files[".tauqe/mockups/prototype.rs"],
+            "pub fn prototype() -> i32 { 42 }\n"
+        );
+
+        let rewritten = stage_and_validate_edits(
+            root,
+            &cm,
+            &[EditOperation::Overwrite {
+                path: ".tauqe/mockups/prototype.rs".into(),
+                content: "pub fn prototype() -> i32 { 7 }\n".into(),
+            }],
+            Some(&replaced.staged_state),
+        );
+        assert!(rewritten.is_success(), "{:?}", rewritten.failed_files);
+        assert_eq!(
+            rewritten.staged_state.staged_files[".tauqe/mockups/prototype.rs"],
+            "pub fn prototype() -> i32 { 7 }\n"
+        );
+        // The sandbox lives in memory until the turn commits, like every file.
+        assert_eq!(
+            std::fs::read_to_string(root.join(".tauqe/mockups/prototype.rs")).unwrap(),
+            "pub fn prototype() -> i32 { 0 }\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_mockup_only_change_set_reaches_disk_without_joining_the_change_set() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        crate::git::run_git(Some(root), &["init"]).unwrap();
+        crate::git::checkpoint::ensure_tauqe_ignored(root).unwrap();
+        let mut cm = ContextManager::new(root.to_path_buf());
+
+        let proposal = EditProposal {
+            summary: "Draft a prototype".into(),
+            edits: vec![EditOperation::Create {
+                path: ".tauqe/mockups/prototype.rs".into(),
+                content: "pub fn prototype() -> i32 { 42 }\n".into(),
+            }],
+        };
+        let changed = apply_edit_proposal(root, &mut cm, &proposal).await.unwrap();
+
+        assert!(
+            changed.is_empty(),
+            "the sandbox never joins the reported change set: {changed:?}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join(".tauqe/mockups/prototype.rs")).unwrap(),
+            "pub fn prototype() -> i32 { 42 }\n",
+            "the draft must still reach its sandbox file"
+        );
+        // The context reconciliation runs over the complete staged state, so the
+        // draft stays visible to the model even though it never joins the change
+        // set.
+        assert!(cm.contains(".tauqe/mockups/prototype.rs").unwrap());
+        assert!(cm.is_editable(".tauqe/mockups/prototype.rs").unwrap());
+        assert_eq!(
+            cm.auto_files(),
+            vec![".tauqe/mockups/prototype.rs".to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_mixed_change_set_reports_only_the_tracked_paths() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        crate::git::run_git(Some(root), &["init"]).unwrap();
+        crate::git::checkpoint::ensure_tauqe_ignored(root).unwrap();
+        std::fs::write(root.join("a.rs"), "pub fn value() -> i32 { 0 }\n").unwrap();
+        let mut cm = ContextManager::new(root.to_path_buf());
+        cm.add_file("a.rs", ContextAccess::Editable).unwrap();
+
+        let proposal = EditProposal {
+            summary: "Prototype and edit".into(),
+            edits: vec![
+                EditOperation::Create {
+                    path: ".tauqe/mockups/prototype.rs".into(),
+                    content: "pub fn prototype() {}\n".into(),
+                },
+                replace(
+                    "a.rs",
+                    "pub fn value() -> i32 { 0 }",
+                    "pub fn value() -> i32 { 42 }",
+                ),
+            ],
+        };
+        let changed = apply_edit_proposal(root, &mut cm, &proposal).await.unwrap();
+
+        assert_eq!(changed, vec!["a.rs".to_string()]);
+        assert_eq!(
+            std::fs::read_to_string(root.join("a.rs")).unwrap(),
+            "pub fn value() -> i32 { 42 }\n"
+        );
+        assert!(
+            root.join(".tauqe/mockups/prototype.rs").exists(),
+            "the draft is written even though it stays out of the change set"
+        );
+    }
     /// Valid project configuration used by the configuration-validation tests.
     const VALID_CONFIG: &str = "[models]\nprimary = [\"openrouter:a/b\"]\n\n[project.verify]\ncommand = \"cargo\"\nargs = [\"test\"]\n";
 
@@ -1673,5 +1958,175 @@ mod staging_tests {
             PatchStrategy::SearchReplace,
         );
         assert!(echoed_prompt.contains(&echoed_reason), "{echoed_prompt}");
+    }
+    /// Declares the protected patterns of the repository under test.
+    fn declare_protected_patterns(root: &Path, patterns: &[&str]) {
+        let declared = patterns
+            .iter()
+            .map(|pattern| format!("\"{pattern}\""))
+            .collect::<Vec<String>>()
+            .join(", ");
+        std::fs::write(
+            root.join("tauqe.toml"),
+            format!("[project.boundaries]\nprotected = [{declared}]\n"),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn every_operation_on_a_protected_path_is_rejected() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        std::fs::write(root.join("Justfile"), "check:\n\tcargo check\n").unwrap();
+        std::fs::create_dir_all(root.join("docs/specs")).unwrap();
+        std::fs::write(root.join("docs/specs/auth.md"), "# Auth spec\n").unwrap();
+        std::fs::write(root.join("src.rs"), "pub fn value() {}\n").unwrap();
+        declare_protected_patterns(root, &["Justfile", "docs/specs/**"]);
+        let mut cm = ContextManager::new(root.to_path_buf());
+        cm.add_file("Justfile", ContextAccess::Editable).unwrap();
+        cm.add_file("docs/specs/auth.md", ContextAccess::Editable)
+            .unwrap();
+        cm.add_file("src.rs", ContextAccess::Editable).unwrap();
+
+        let rejected = vec![
+            replace("Justfile", "cargo check", "cargo test"),
+            EditOperation::Create {
+                path: "docs/specs/new.md".into(),
+                content: "# New spec\n".into(),
+            },
+            EditOperation::Overwrite {
+                path: "docs/specs/auth.md".into(),
+                content: "# Rewritten spec\n".into(),
+            },
+            EditOperation::Delete {
+                path: "Justfile".into(),
+            },
+            anchored_range("docs/specs/auth.md", 0, 0, "# Rewritten spec\n"),
+            EditOperation::Move {
+                from: "Justfile".into(),
+                to: "Justfile.bak".into(),
+            },
+            EditOperation::Move {
+                from: "src.rs".into(),
+                to: "docs/specs/src.rs".into(),
+            },
+        ];
+
+        for operation in rejected {
+            let result =
+                stage_and_validate_edits(root, &cm, std::slice::from_ref(&operation), None);
+            assert!(
+                !result.is_success(),
+                "a protected path must be rejected: {operation:?}"
+            );
+            assert_eq!(result.failed_files.len(), 1, "{operation:?}");
+            assert!(
+                matches!(&result.failed_files[0].error, EditError::ProtectedPath(_)),
+                "{operation:?} produced {:?}",
+                result.failed_files[0].error
+            );
+            assert!(result.staged_state.staged_files.is_empty());
+            assert!(result.staged_state.deleted_paths.is_empty());
+        }
+
+        // Nothing above reached disk.
+        assert_eq!(
+            std::fs::read_to_string(root.join("Justfile")).unwrap(),
+            "check:\n\tcargo check\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join("docs/specs/auth.md")).unwrap(),
+            "# Auth spec\n"
+        );
+        assert!(root.join("src.rs").exists());
+        assert!(!root.join("Justfile.bak").exists());
+        assert!(!root.join("docs/specs/new.md").exists());
+        assert!(!root.join("docs/specs/src.rs").exists());
+    }
+
+    #[test]
+    fn paths_outside_the_declared_boundaries_stage_normally() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        std::fs::write(root.join("Justfile"), "check:\n").unwrap();
+        std::fs::write(root.join("src.rs"), "pub fn value() {}\n").unwrap();
+        declare_protected_patterns(root, &["Justfile", "docs/specs/**"]);
+        let mut cm = ContextManager::new(root.to_path_buf());
+        cm.add_file("Justfile", ContextAccess::Editable).unwrap();
+        cm.add_file("src.rs", ContextAccess::Editable).unwrap();
+
+        let result = stage_and_validate_edits(
+            root,
+            &cm,
+            &[replace(
+                "src.rs",
+                "pub fn value() {}",
+                "pub fn value() -> i32 { 0 }",
+            )],
+            None,
+        );
+        assert!(result.is_success(), "{:?}", result.failed_files);
+        assert_eq!(
+            result.staged_state.staged_files["src.rs"],
+            "pub fn value() -> i32 { 0 }\n"
+        );
+    }
+
+    #[test]
+    fn a_repository_without_a_boundary_declaration_protects_nothing() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        std::fs::write(root.join("Justfile"), "check:\n").unwrap();
+        // Verification is declared, the boundary subsection is not: every path
+        // stays editable.
+        std::fs::write(
+            root.join("tauqe.toml"),
+            "[project.verify]\ncommand = \"cargo\"\nargs = [\"test\"]\n",
+        )
+        .unwrap();
+        let mut cm = ContextManager::new(root.to_path_buf());
+        cm.add_file("Justfile", ContextAccess::Editable).unwrap();
+
+        let result = stage_and_validate_edits(
+            root,
+            &cm,
+            &[replace("Justfile", "check:", "check: fmt")],
+            None,
+        );
+        assert!(result.is_success(), "{:?}", result.failed_files);
+        assert_eq!(result.staged_state.staged_files["Justfile"], "check: fmt\n");
+    }
+
+    #[test]
+    fn the_boundary_rejection_reaches_the_retry_request_verbatim() {
+        use std::collections::{HashMap, HashSet};
+        use tauqe_protocol::PatchStrategy;
+
+        let error = EditError::ProtectedPath("docs/specs/auth.md".to_string());
+        let message = error.to_string();
+        assert!(
+            message.contains("[project.boundaries.protected]"),
+            "{message}"
+        );
+        assert!(message.contains("docs/specs/auth.md"), "{message}");
+
+        let failed = HashMap::from([("docs/specs/auth.md".to_string(), error)]);
+        for strategy in [PatchStrategy::SearchReplace, PatchStrategy::LineAnchor] {
+            // A boundary rejection carries no strategy vocabulary, so both
+            // dialects repeat the message unchanged.
+            let reason = crate::workflow::retry::format_patch_retry_reason(
+                &failed["docs/specs/auth.md"],
+                strategy,
+            );
+            assert_eq!(reason, message, "{strategy} reworded a boundary rejection");
+            let prompt = crate::workflow::retry::build_patch_retry_prompt(
+                &HashSet::new(),
+                &failed,
+                &[],
+                None,
+                strategy,
+            );
+            assert!(prompt.contains(&message), "{strategy}: {prompt}");
+        }
     }
 }

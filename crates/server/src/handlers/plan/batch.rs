@@ -147,11 +147,11 @@ pub async fn handle_plan_execute(req: Request, state: &Arc<AppState>) -> Respons
     state.clear_discussion_focus().await;
 
     let step_ids: Vec<String> = steps.iter().map(|s| s.id.clone()).collect();
-    // The coder selection and the developer directives travel with the request,
-    // so every step of the batch starts from the chosen ladder rung and prompt.
+    // The coder selection travels with the request, so every step of the batch
+    // starts from the chosen ladder rung. The plan itself is the single source
+    // of per-step instructions (concept #c-1).
     let options = PlanBatchOptions {
         model: params.model,
-        instructions: params.instructions,
     };
     // The identity of the registered operation travels with the acknowledgement,
     // so a client can attribute every lifecycle event of the batch — the

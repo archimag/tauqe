@@ -496,20 +496,26 @@ async fn run_review_step_inner(
         clear_auto_context(state).await;
         preload_item_files(state, repo_root, &item.files).await;
 
-        if auto_level_up {
-            let from_tier = ladder_idx;
-            ladder_idx += 1;
-            let tier = models_config.coder_tier(ladder_idx);
+        // A rung without a stronger successor is saturated, and a manual run on a
+        // model the ladder excludes cannot escalate at all: the retry keeps the
+        // current model instead of silently entering another one.
+        let next_rung = if auto_level_up {
+            models_config.next_coder_tier(ladder_idx)
+        } else {
+            None
+        };
+        if let Some((next_idx, tier)) = next_rung {
             tracing::warn!(
                 review_id = review_id,
                 item_id = item_id,
-                from_tier = from_tier,
-                to_tier = ladder_idx,
+                from_tier = ladder_idx,
+                to_tier = next_idx,
                 to_model = %tier.model,
                 effort = ?tier.effort,
                 reason = %reason,
                 "review step coder escalation"
             );
+            ladder_idx = next_idx;
             selection = ModelSelection::Specific(tier.model);
             reasoning_effort = tier.effort;
         }

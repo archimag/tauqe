@@ -380,6 +380,8 @@ mod tests {
         let issue = ReviewIssue {
             id: 3,
             title: "Guard the parser".to_string(),
+            uuid: None,
+            group: None,
             model: None,
             issue_type: IssueType::Bug,
             status: IssueStatus::Todo,

@@ -2,10 +2,11 @@ use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
 
 use crate::atomic_write::write_atomic;
+use std::collections::HashMap;
 use std::sync::{Mutex, MutexGuard};
 use tauqe_protocol::{
-    ArchitectTier, IssueStatus, Plan, PlanItem, ReviewIssue, ReviewItem, ReviewSession,
-    ReviewSummary,
+    ArchitectTier, IssueStatus, Plan, PlanItem, ReviewGroup, ReviewIssue, ReviewItem,
+    ReviewSession, ReviewSummary,
 };
 
 pub struct ReviewStorage;
@@ -669,6 +670,249 @@ impl ReviewStorage {
 
         Ok(updated_issue)
     }
+
+    /// Replaces the unified remediation subplan of one review group's
+    /// architectural root cause while preserving the immutable `Done`
+    /// foundation.
+    ///
+    /// A group is the operational unit of remediation: one root cause is fixed
+    /// by one coherent change set, so its horizon is synthesized exactly like a
+    /// plan's. The Architect returns only the new steps for the remaining work
+    /// and the harness guarantees the atomic concatenation
+    /// `[...done_steps, ...new_horizon_steps]`. Completed steps are never
+    /// regenerated, leaf-only file declarations are normalized, derived
+    /// container statuses are recomputed, and a horizon that would close a
+    /// dependency cycle or leave no ready step is rejected before anything
+    /// reaches disk.
+    ///
+    /// `architect` is the configuration that produced the horizon and
+    /// `last_replanned_step` names the sub-step whose horizon this wave
+    /// reprojects. Both are recorded on the group, so a later wave reads them
+    /// from disk instead of from in-memory supervisor state. An initial
+    /// synthesis passes `None`.
+    ///
+    /// Returns `None` when the named session does not exist or declares no
+    /// group with that identifier.
+    pub fn replace_uncompleted_group_subplan(
+        repo_root: &Path,
+        review_id: &str,
+        group_id: &str,
+        new_subplan: Vec<PlanItem>,
+        architect: ArchitectTier,
+        last_replanned_step: Option<String>,
+    ) -> Result<Option<ReviewGroup>> {
+        crate::blocking::run_blocking(move || {
+            let _guard = Self::lock();
+            Self::replace_uncompleted_group_subplan_unlocked(
+                repo_root,
+                review_id,
+                group_id,
+                new_subplan,
+                architect,
+                last_replanned_step,
+            )
+        })
+    }
+
+    /// Lock-free core of [`Self::replace_uncompleted_group_subplan`]; the
+    /// caller must hold the storage lock.
+    fn replace_uncompleted_group_subplan_unlocked(
+        repo_root: &Path,
+        review_id: &str,
+        group_id: &str,
+        new_subplan: Vec<PlanItem>,
+        architect: ArchitectTier,
+        last_replanned_step: Option<String>,
+    ) -> Result<Option<ReviewGroup>> {
+        let mut session = match Self::load_review_unlocked(repo_root, review_id)? {
+            Some(session) => session,
+            None => return Ok(None),
+        };
+
+        // A group horizon lives on the group itself, so a session that does not
+        // declare the group has nothing to reproject and reports that it
+        // changed nothing instead of inventing one.
+        let Some(group) = find_group_mut(&mut session, group_id) else {
+            return Ok(None);
+        };
+        group.subplan = crate::plan::storage::merge_subplan(&group.subplan, new_subplan)?;
+        group.subplan_architect = Some(architect);
+        group.subplan_last_replanned_step = last_replanned_step;
+        let updated = group.clone();
+
+        Self::save_session_unlocked(repo_root, &session)?;
+        Ok(Some(updated))
+    }
+
+    /// Replaces the unified remediation subplan of one review group without
+    /// preserving the previous horizon.
+    ///
+    /// The supplied subplan is the authoritative remediation horizon of the
+    /// group, so it is normalized before it is persisted. Container steps carry
+    /// no authoritative status of their own: their status is a pure function of
+    /// their leaves, and [`Plan::refresh_parent_statuses`] recomputes that
+    /// derived value, so a stored container can never disagree with the children
+    /// it aggregates. The whole read-modify-write cycle runs inside a single
+    /// acquisition of the process-global storage lock, so a concurrent update
+    /// cannot interleave between the load and the save.
+    ///
+    /// Returns `None` when the named session does not exist or declares no group
+    /// with that identifier.
+    pub fn update_group_subplan(
+        repo_root: &Path,
+        review_id: &str,
+        group_id: &str,
+        subplan: Vec<PlanItem>,
+    ) -> Result<Option<ReviewGroup>> {
+        crate::blocking::run_blocking(move || {
+            let _guard = Self::lock();
+            Self::update_group_subplan_unlocked(repo_root, review_id, group_id, subplan)
+        })
+    }
+
+    /// Lock-free core of [`Self::update_group_subplan`]; the caller must hold
+    /// the storage lock.
+    fn update_group_subplan_unlocked(
+        repo_root: &Path,
+        review_id: &str,
+        group_id: &str,
+        subplan: Vec<PlanItem>,
+    ) -> Result<Option<ReviewGroup>> {
+        let mut session = match Self::load_review_unlocked(repo_root, review_id)? {
+            Some(session) => session,
+            None => return Ok(None),
+        };
+
+        let Some(group) = find_group_mut(&mut session, group_id) else {
+            return Ok(None);
+        };
+        let mut plan = Plan {
+            items: subplan,
+            ..Default::default()
+        };
+        plan.refresh_parent_statuses();
+        group.subplan = plan.items;
+        let updated = group.clone();
+
+        Self::save_session_unlocked(repo_root, &session)?;
+        Ok(Some(updated))
+    }
+
+    /// Regroups the explicitly named review session in place.
+    ///
+    /// Post-analysis owns no projection beside the session: it rewrites the
+    /// session itself. The global verdict becomes the session description, the
+    /// classification replaces `groups`, and every finding moves to the group
+    /// its classification assigned. The findings keep their identity, their
+    /// content, and their status, and the audited code is never rescanned, so a
+    /// repeated analysis substitutes only the grouping of the previous one.
+    ///
+    /// `assignments` carries `(uuid, group_id)` pairs keyed by the identity the
+    /// session stores. A finding whose identity is not named keeps the group it
+    /// already belongs to, so a partial classification never strands a finding
+    /// outside the group list.
+    pub fn regroup_session(
+        repo_root: &Path,
+        review_id: &str,
+        verdict: String,
+        groups: Vec<ReviewGroup>,
+        assignments: Vec<(String, String)>,
+    ) -> Result<Option<ReviewSession>> {
+        crate::blocking::run_blocking(move || {
+            let _guard = Self::lock();
+            Self::regroup_session_unlocked(repo_root, review_id, verdict, groups, assignments)
+        })
+    }
+
+    /// Lock-free core of [`Self::regroup_session`]; the caller must hold the
+    /// storage lock.
+    fn regroup_session_unlocked(
+        repo_root: &Path,
+        review_id: &str,
+        verdict: String,
+        groups: Vec<ReviewGroup>,
+        assignments: Vec<(String, String)>,
+    ) -> Result<Option<ReviewSession>> {
+        let mut session = match Self::load_review_unlocked(repo_root, review_id)? {
+            Some(session) => session,
+            None => return Ok(None),
+        };
+
+        let assigned: HashMap<String, String> = assignments.into_iter().collect();
+        for item in &mut session.items {
+            // The classification references the identity the session stores, so
+            // the lookup needs no normalization here.
+            let Some(uuid) = item.uuid.clone() else {
+                continue;
+            };
+            if let Some(group_id) = assigned.get(&uuid) {
+                item.group = Some(group_id.clone());
+            }
+        }
+
+        session.description = Some(verdict);
+        session.groups = groups;
+        Self::save_session_unlocked(repo_root, &session)?;
+
+        Ok(Some(session))
+    }
+
+    /// Appends the findings one review group produced to the named session.
+    ///
+    /// Every appended finding is stamped with a freshly minted UUIDv7 identity
+    /// and the identifier of the group that produced it: the identity is what
+    /// the post-analysis layer references, and the provenance is what the
+    /// grouped session view renders. Findings are appended in order and the
+    /// items already stored are never modified, so a group that fails or is
+    /// cancelled withholds only its own findings instead of invalidating the
+    /// results the other groups already produced.
+    pub fn append_group_findings(
+        repo_root: &Path,
+        review_id: &str,
+        group_id: &str,
+        findings: Vec<ReviewIssue>,
+    ) -> Result<Option<ReviewSession>> {
+        crate::blocking::run_blocking(move || {
+            let _guard = Self::lock();
+            Self::append_group_findings_unlocked(repo_root, review_id, group_id, findings)
+        })
+    }
+
+    /// Lock-free core of [`Self::append_group_findings`]; the caller must hold
+    /// the storage lock.
+    fn append_group_findings_unlocked(
+        repo_root: &Path,
+        review_id: &str,
+        group_id: &str,
+        findings: Vec<ReviewIssue>,
+    ) -> Result<Option<ReviewSession>> {
+        let mut session = match Self::load_review_unlocked(repo_root, review_id)? {
+            Some(session) => session,
+            None => return Ok(None),
+        };
+
+        for mut finding in findings {
+            finding.uuid = Some(super::uuid::generate_uuid_v7());
+            finding.group = Some(group_id.to_string());
+            session.items.push(ReviewItem::from(finding));
+        }
+
+        Self::save_session_unlocked(repo_root, &session)?;
+
+        Ok(Some(session))
+    }
+}
+
+/// Resolves the review group of a session by id.
+///
+/// A group horizon lives on the group itself, so a session that does not
+/// declare the group has nothing to update; both cases resolve to `None` and
+/// leave the stored session untouched.
+fn find_group_mut<'a>(
+    session: &'a mut ReviewSession,
+    group_id: &str,
+) -> Option<&'a mut ReviewGroup> {
+    session.groups.iter_mut().find(|group| group.id == group_id)
 }
 
 /// Extracts the UUIDv7 millisecond timestamp embedded in a session id.
@@ -686,6 +930,9 @@ mod tests {
     use super::*;
     use tauqe_protocol::{IssueType, ReviewSeverity};
     use tempfile::tempdir;
+
+    /// Canonical finding identifier exercised by the identity assertions.
+    const FINDING_UUID: &str = "018f9c1e-6b3a-7c1e-8b3a-000000000001";
 
     /// Architect provenance recorded by the synthesis primitive under test.
     fn test_architect() -> ArchitectTier {
@@ -708,6 +955,8 @@ mod tests {
             items: vec![ReviewItem {
                 id: 1,
                 title: "Security finding".to_string(),
+                uuid: None,
+                group: None,
                 subplan_last_replanned_step: None,
                 model: None,
                 issue_type: IssueType::Security,
@@ -722,6 +971,7 @@ mod tests {
                 body: "Check input validation".to_string(),
             }],
             raw_markdown: "## [CRITICAL] Security finding\n...".to_string(),
+            ..Default::default()
         };
 
         // 1. Save
@@ -803,6 +1053,8 @@ mod tests {
             .map(|i| ReviewItem {
                 id: i,
                 title: format!("Item {i}"),
+                uuid: None,
+                group: None,
                 subplan_last_replanned_step: None,
                 model: None,
                 issue_type: tauqe_protocol::IssueType::Quality,
@@ -828,6 +1080,7 @@ mod tests {
             target_files: vec![],
             items,
             raw_markdown: String::new(),
+            ..Default::default()
         };
         ReviewStorage::save_session(&root, &session).unwrap();
 
@@ -875,6 +1128,7 @@ mod tests {
             target_files: vec![],
             items: vec![],
             raw_markdown: String::new(),
+            ..Default::default()
         };
         ReviewStorage::save_session(root, &session).unwrap();
 
@@ -901,6 +1155,7 @@ mod tests {
             target_files: vec![],
             items: vec![],
             raw_markdown: String::new(),
+            ..Default::default()
         };
         ReviewStorage::save_session(root, &first).unwrap();
         assert!(ReviewStorage::reviews_dir(root)
@@ -919,6 +1174,7 @@ mod tests {
             target_files: vec![],
             items: vec![],
             raw_markdown: String::new(),
+            ..Default::default()
         };
         ReviewStorage::save_session(root, &second).unwrap();
 
@@ -954,6 +1210,7 @@ mod tests {
             target_files: vec![],
             items: vec![],
             raw_markdown: String::new(),
+            ..Default::default()
         };
         ReviewStorage::save_session(root, &session).unwrap();
         let stored = ReviewStorage::reviews_dir(root).join("Legacy-Review.json");
@@ -979,6 +1236,7 @@ mod tests {
             target_files: vec![],
             items: vec![],
             raw_markdown: String::new(),
+            ..Default::default()
         };
         ReviewStorage::save_session(root, &first).unwrap();
 
@@ -993,6 +1251,7 @@ mod tests {
             target_files: vec![],
             items: vec![],
             raw_markdown: String::new(),
+            ..Default::default()
         };
         let err = ReviewStorage::save_session(root, &colliding).unwrap_err();
         assert!(err
@@ -1022,6 +1281,7 @@ mod tests {
             target_files: vec![],
             items: vec![],
             raw_markdown: String::new(),
+            ..Default::default()
         };
         ReviewStorage::save_session(root, &session).unwrap();
 
@@ -1053,6 +1313,8 @@ mod tests {
             items: vec![ReviewItem {
                 id: 1,
                 title: "Finding".to_string(),
+                uuid: None,
+                group: None,
                 subplan_last_replanned_step: None,
                 model: None,
                 issue_type: IssueType::Quality,
@@ -1067,6 +1329,7 @@ mod tests {
                 body: String::new(),
             }],
             raw_markdown: String::new(),
+            ..Default::default()
         };
 
         ReviewStorage::save_session(root, &make_session("rev-a")).unwrap();
@@ -1109,6 +1372,7 @@ mod tests {
             target_files: vec![],
             items: vec![],
             raw_markdown: String::new(),
+            ..Default::default()
         };
         ReviewStorage::save_session(root, &session).unwrap();
         ReviewStorage::save_active_id(root, Some("atomic-review")).unwrap();
@@ -1145,6 +1409,8 @@ mod tests {
             items: vec![ReviewItem {
                 id: 1,
                 title: "Finding".to_string(),
+                uuid: None,
+                group: None,
                 subplan_last_replanned_step: None,
                 model: None,
                 issue_type: IssueType::Architecture,
@@ -1159,6 +1425,7 @@ mod tests {
                 body: "Body".to_string(),
             }],
             raw_markdown: String::new(),
+            ..Default::default()
         };
 
         ReviewStorage::save_session(&root, &session).unwrap();
@@ -1250,6 +1517,8 @@ mod tests {
             items: vec![ReviewItem {
                 id: 1,
                 title: "Finding with subplan".to_string(),
+                uuid: None,
+                group: None,
                 subplan_last_replanned_step: None,
                 model: None,
                 issue_type: IssueType::Architecture,
@@ -1277,6 +1546,7 @@ mod tests {
                 body: "Body".to_string(),
             }],
             raw_markdown: String::new(),
+            ..Default::default()
         };
         ReviewStorage::save_session(root, &session).unwrap();
 
@@ -1336,6 +1606,8 @@ mod tests {
             items: vec![ReviewItem {
                 id: 1,
                 title: "Finding awaiting a subplan".to_string(),
+                uuid: None,
+                group: None,
                 subplan_last_replanned_step: None,
                 model: None,
                 issue_type: IssueType::Architecture,
@@ -1350,6 +1622,7 @@ mod tests {
                 body: "Body".to_string(),
             }],
             raw_markdown: String::new(),
+            ..Default::default()
         };
         ReviewStorage::save_session(root, &session).unwrap();
 
@@ -1423,6 +1696,8 @@ mod tests {
             items: vec![ReviewItem {
                 id: 1,
                 title: "Architectural finding".to_string(),
+                uuid: None,
+                group: None,
                 subplan_last_replanned_step: None,
                 model: None,
                 issue_type: IssueType::Architecture,
@@ -1437,6 +1712,7 @@ mod tests {
                 body: "Body".to_string(),
             }],
             raw_markdown: String::new(),
+            ..Default::default()
         };
         ReviewStorage::save_session(root, &session).unwrap();
 
@@ -1487,6 +1763,8 @@ mod tests {
             items: vec![ReviewItem {
                 id: 1,
                 title: "Finding under planning".to_string(),
+                uuid: None,
+                group: None,
                 subplan_last_replanned_step: None,
                 model: None,
                 issue_type: IssueType::Quality,
@@ -1501,6 +1779,7 @@ mod tests {
                 body: "Body".to_string(),
             }],
             raw_markdown: String::new(),
+            ..Default::default()
         };
         ReviewStorage::save_session(root, &session).unwrap();
 
@@ -1548,6 +1827,8 @@ mod tests {
             items: vec![ReviewItem {
                 id: 1,
                 title: "Finding with extended fields".to_string(),
+                uuid: Some(FINDING_UUID.to_string()),
+                group: Some("core".to_string()),
                 subplan_last_replanned_step: Some("s-9".to_string()),
                 model: None,
                 issue_type: IssueType::Architecture,
@@ -1562,6 +1843,7 @@ mod tests {
                 body: "Root cause analysis".to_string(),
             }],
             raw_markdown: String::new(),
+            ..Default::default()
         };
 
         ReviewStorage::save_session(root, &session).unwrap();
@@ -1611,6 +1893,13 @@ mod tests {
             loaded.items[0].subplan_last_replanned_step.as_deref(),
             Some("s-9")
         );
+        // The finding identity and the group that produced it are the
+        // references the post-analysis layer and the grouped view rely on, so
+        // the issue round-trip must carry both unchanged.
+        assert_eq!(updated.uuid.as_deref(), Some(FINDING_UUID));
+        assert_eq!(updated.group.as_deref(), Some("core"));
+        assert_eq!(loaded.items[0].uuid.as_deref(), Some(FINDING_UUID));
+        assert_eq!(loaded.items[0].group.as_deref(), Some("core"));
     }
 
     /// A finding update round-trips through `ReviewIssue` and back into
@@ -1627,6 +1916,8 @@ mod tests {
         let make_item = |id: u32, issue_type: IssueType, severity: ReviewSeverity| ReviewItem {
             id,
             title: format!("Finding {id}"),
+            uuid: None,
+            group: None,
             subplan_last_replanned_step: None,
             model: None,
             issue_type,
@@ -1654,6 +1945,7 @@ mod tests {
                 make_item(2, IssueType::Performance, ReviewSeverity::Warning),
             ],
             raw_markdown: String::new(),
+            ..Default::default()
         };
         ReviewStorage::save_session(root, &session).unwrap();
 
@@ -1686,5 +1978,344 @@ mod tests {
         let issues = loaded.issues();
         assert_eq!(issues[0].issue_type, IssueType::Security);
         assert_eq!(issues[1].issue_type, IssueType::Performance);
+    }
+    /// Re-running the post-analysis replaces the whole grouping of the session
+    /// while the findings it references stay untouched.
+    #[test]
+    fn test_regroup_session_replaces_groups_and_keeps_findings() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+
+        let session = ReviewSession {
+            id: "rev-post-analysis".to_string(),
+            title: "Post Analysis".to_string(),
+            created_at: 100,
+            model: tauqe_protocol::ModelRef::openrouter("test-model"),
+            items: vec![ReviewItem {
+                id: 1,
+                title: "Finding".to_string(),
+                uuid: Some(FINDING_UUID.to_string()),
+                group: Some("core".to_string()),
+                subplan_last_replanned_step: None,
+                model: None,
+                issue_type: IssueType::Quality,
+                severity: ReviewSeverity::Suggestion,
+                status: IssueStatus::Discussion,
+                recommendations: vec![],
+                files: vec![],
+                readonly_files: vec![],
+                subplan: Vec::new(),
+                subplan_architect: None,
+                resolution_notes: None,
+                body: "Body".to_string(),
+            }],
+            raw_markdown: String::new(),
+            ..Default::default()
+        };
+        ReviewStorage::save_session(root, &session).unwrap();
+
+        // The classification is the session itself: the first pass introduces
+        // the group list every finding is assigned to.
+        let local_only = vec![ReviewGroup {
+            id: "local".to_string(),
+            title: "Local Issues".to_string(),
+            ..Default::default()
+        }];
+        let first = ReviewStorage::regroup_session(
+            root,
+            "rev-post-analysis",
+            "first pass".to_string(),
+            local_only.clone(),
+            vec![(FINDING_UUID.to_string(), "local".to_string())],
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(first.description.as_deref(), Some("first pass"));
+        assert_eq!(first.groups, local_only);
+        assert_eq!(first.items[0].group.as_deref(), Some("local"));
+
+        // A second pass substitutes the grouping wholesale: no part of the
+        // previous one survives, while the finding keeps its identity, its
+        // content, and its lifecycle status.
+        let architectural = vec![ReviewGroup {
+            id: "arch-1".to_string(),
+            title: "Shared root cause".to_string(),
+            description: Some("One lock explains both symptoms".to_string()),
+            ..Default::default()
+        }];
+        let replaced = ReviewStorage::regroup_session(
+            root,
+            "rev-post-analysis",
+            "second pass".to_string(),
+            architectural.clone(),
+            vec![(FINDING_UUID.to_string(), "arch-1".to_string())],
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(replaced.description.as_deref(), Some("second pass"));
+        assert_eq!(replaced.groups, architectural);
+        assert_eq!(replaced.items[0].group.as_deref(), Some("arch-1"));
+        assert_eq!(replaced.items[0].title, session.items[0].title);
+        assert_eq!(replaced.items[0].uuid.as_deref(), Some(FINDING_UUID));
+        assert_eq!(replaced.items[0].status, IssueStatus::Discussion);
+
+        let loaded = ReviewStorage::load_review(root, "rev-post-analysis")
+            .unwrap()
+            .unwrap();
+        assert_eq!(loaded.groups, architectural);
+        assert_eq!(loaded.description.as_deref(), Some("second pass"));
+
+        // A finding the assignment does not name keeps the group it already
+        // belongs to, so a partial classification never strands it outside the
+        // rendered tree.
+        let untouched = ReviewStorage::regroup_session(
+            root,
+            "rev-post-analysis",
+            "third pass".to_string(),
+            architectural,
+            Vec::new(),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(untouched.items[0].group.as_deref(), Some("arch-1"));
+
+        // A missing session resolves to nothing instead of creating one.
+        let missing = ReviewStorage::regroup_session(
+            root,
+            "rev-missing",
+            "no session".to_string(),
+            Vec::new(),
+            Vec::new(),
+        )
+        .unwrap();
+        assert!(missing.is_none());
+        let missing_loaded = ReviewStorage::load_review(root, "rev-missing").unwrap();
+        assert!(missing_loaded.is_none());
+    }
+
+    /// Every finding a group produces is appended with a fresh identity and the
+    /// provenance of the group that produced it.
+    #[test]
+    fn test_append_group_findings_stamps_uuid_and_group() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+
+        let session = ReviewSession {
+            id: "rev-group-append".to_string(),
+            title: "Group Append".to_string(),
+            created_at: 100,
+            model: tauqe_protocol::ModelRef::openrouter("test-model"),
+            items: Vec::new(),
+            raw_markdown: String::new(),
+            ..Default::default()
+        };
+        ReviewStorage::save_session(root, &session).unwrap();
+
+        let finding = |id: u32| ReviewIssue {
+            id,
+            title: format!("Finding {id}"),
+            uuid: None,
+            group: None,
+            model: None,
+            issue_type: IssueType::Architecture,
+            status: IssueStatus::Discussion,
+            description: "Body".to_string(),
+            recommendations: vec![],
+            files: vec!["src/a.rs".to_string()],
+            readonly_files: vec![],
+            plan: Vec::new(),
+            note: None,
+        };
+
+        let stored = ReviewStorage::append_group_findings(
+            root,
+            "rev-group-append",
+            "core",
+            vec![finding(1), finding(2)],
+        )
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(stored.items.len(), 2);
+        for item in &stored.items {
+            let uuid = item.uuid.as_deref().expect("identity assigned");
+            assert!(crate::review::uuid::is_valid_uuid_v7(uuid), "uuid: {uuid}");
+            assert_eq!(item.group.as_deref(), Some("core"));
+        }
+        assert_ne!(stored.items[0].uuid, stored.items[1].uuid);
+
+        // A second group appends to the same session without rewriting the
+        // findings the first one produced.
+        let after_second = ReviewStorage::append_group_findings(
+            root,
+            "rev-group-append",
+            "protocol",
+            vec![finding(3)],
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(after_second.items.len(), 3);
+        assert_eq!(after_second.items[0].uuid, stored.items[0].uuid);
+        assert_eq!(after_second.items[2].group.as_deref(), Some("protocol"));
+
+        // A missing session resolves to nothing instead of creating one.
+        let missing =
+            ReviewStorage::append_group_findings(root, "rev-missing", "core", vec![finding(9)])
+                .unwrap();
+        assert!(missing.is_none());
+    }
+    /// Session carrying one classified group with the given remediation
+    /// horizon.
+    fn grouped_layer_session(review_id: &str, subplan: Vec<PlanItem>) -> ReviewSession {
+        ReviewSession {
+            id: review_id.to_string(),
+            title: "Grouped Audit".to_string(),
+            created_at: 100,
+            model: tauqe_protocol::ModelRef::openrouter("test-model"),
+            description: Some("One shared root cause.".to_string()),
+            groups: vec![ReviewGroup {
+                id: "arch-1".to_string(),
+                title: "Shared root cause".to_string(),
+                description: Some("Both findings manifest one defect.".to_string()),
+                subplan,
+                ..Default::default()
+            }],
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn test_update_group_subplan_normalizes_derived_container_statuses() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        let review = "rev-group-subplan";
+        ReviewStorage::save_session(root, &grouped_layer_session(review, Vec::new())).unwrap();
+
+        // The container arrives as `Done` while one of its leaves is still
+        // `Todo`; the persisted status must be recomputed from the leaves.
+        let subplan = vec![PlanItem {
+            id: "phase-1".to_string(),
+            title: "Phase".to_string(),
+            status: tauqe_protocol::PlanItemStatus::Done,
+            children: vec![
+                PlanItem {
+                    id: "p-1".to_string(),
+                    title: "Finished step".to_string(),
+                    status: tauqe_protocol::PlanItemStatus::Done,
+                    ..Default::default()
+                },
+                PlanItem {
+                    id: "p-2".to_string(),
+                    title: "Pending step".to_string(),
+                    status: tauqe_protocol::PlanItemStatus::Todo,
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        }];
+
+        let updated = ReviewStorage::update_group_subplan(root, review, "arch-1", subplan).unwrap();
+        let updated = updated.expect("the group accepts a horizon");
+        assert_eq!(updated.subplan.len(), 1);
+        assert_eq!(
+            updated.subplan[0].status,
+            tauqe_protocol::PlanItemStatus::InProgress
+        );
+
+        // The horizon belongs to the group, so it survives a reload with the
+        // container status already derived from its leaves.
+        let stored = ReviewStorage::load_review(root, review).unwrap().unwrap();
+        assert_eq!(stored.groups[0].subplan.len(), 1);
+        assert_eq!(
+            stored.groups[0].subplan[0].status,
+            tauqe_protocol::PlanItemStatus::InProgress
+        );
+
+        // An unknown group resolves to nothing and never rewrites the layer.
+        let missing = ReviewStorage::update_group_subplan(root, review, "arch-9", Vec::new());
+        assert!(missing.unwrap().is_none());
+        let stored = ReviewStorage::load_review(root, review).unwrap().unwrap();
+        assert_eq!(stored.groups[0].subplan.len(), 1);
+    }
+
+    /// One root cause is fixed by one horizon: a synthesized wave preserves the
+    /// finished steps of the group and records how the horizon was produced.
+    #[test]
+    fn test_replace_uncompleted_group_subplan_records_provenance() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        let review = "rev-group-horizon";
+
+        let existing = vec![
+            PlanItem {
+                id: "s-1".to_string(),
+                title: "Finished step".to_string(),
+                status: tauqe_protocol::PlanItemStatus::Done,
+                ..Default::default()
+            },
+            PlanItem {
+                id: "s-2".to_string(),
+                title: "Old step".to_string(),
+                status: tauqe_protocol::PlanItemStatus::Todo,
+                ..Default::default()
+            },
+        ];
+        ReviewStorage::save_session(root, &grouped_layer_session(review, existing)).unwrap();
+
+        let new_horizon = vec![
+            PlanItem {
+                id: "s-1".to_string(),
+                title: "Stale duplicate".to_string(),
+                status: tauqe_protocol::PlanItemStatus::Todo,
+                ..Default::default()
+            },
+            PlanItem {
+                id: "s-3".to_string(),
+                title: "New step".to_string(),
+                status: tauqe_protocol::PlanItemStatus::Todo,
+                files: vec!["src/new_step.rs".to_string()],
+                ..Default::default()
+            },
+        ];
+
+        let updated = ReviewStorage::replace_uncompleted_group_subplan(
+            root,
+            review,
+            "arch-1",
+            new_horizon,
+            test_architect(),
+            Some("s-2".to_string()),
+        )
+        .unwrap();
+        let updated = updated.expect("the group accepts a horizon");
+        assert_eq!(updated.subplan.len(), 2);
+        let finished = &updated.subplan[0];
+        let synthesized = &updated.subplan[1];
+        assert_eq!(finished.id, "s-1");
+        assert_eq!(finished.status, tauqe_protocol::PlanItemStatus::Done);
+        assert_eq!(synthesized.id, "s-3");
+        assert_eq!(updated.subplan_architect, Some(test_architect()));
+        assert_eq!(updated.subplan_last_replanned_step.as_deref(), Some("s-2"));
+
+        // The provenance and the preserved foundation survive a reload, so a
+        // later wave derives escalation from disk state.
+        let stored = ReviewStorage::load_review(root, review).unwrap().unwrap();
+        let group = &stored.groups[0];
+        assert_eq!(group.subplan.len(), 2);
+        assert_eq!(group.subplan[0].id, "s-1");
+        assert_eq!(group.subplan_architect, Some(test_architect()));
+        assert_eq!(group.subplan_last_replanned_step.as_deref(), Some("s-2"));
+
+        // An unknown group resolves to nothing instead of accepting a horizon.
+        let missing = ReviewStorage::replace_uncompleted_group_subplan(
+            root,
+            review,
+            "arch-9",
+            Vec::new(),
+            test_architect(),
+            None,
+        )
+        .unwrap();
+        assert!(missing.is_none());
     }
 }

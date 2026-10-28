@@ -306,7 +306,15 @@ pub(super) async fn preload_item_files(state: &Arc<AppState>, repo_root: &Path, 
     };
 
     let outcome = with_context_mutation(state, move |ctx| {
-        let oc = apply_context_requests_detailed(ctx, &requests, &available_files, usize::MAX);
+        // Declared finding files are never capped by an artificial quota, so both
+        // the files budget and the refs budget stay unbounded here.
+        let oc = apply_context_requests_detailed(
+            ctx,
+            &requests,
+            &available_files,
+            usize::MAX,
+            usize::MAX,
+        );
         let s = ctx.get_state();
         (oc, s)
     })
@@ -409,6 +417,8 @@ mod tests {
             items: vec![tauqe_protocol::ReviewItem {
                 id: 1,
                 title: "Finding".to_string(),
+                uuid: None,
+                group: None,
                 subplan_last_replanned_step: None,
                 model: None,
                 issue_type: tauqe_protocol::review::IssueType::Quality,
@@ -423,6 +433,9 @@ mod tests {
                 body: String::new(),
             }],
             raw_markdown: String::new(),
+            groups: Vec::new(),
+            post_analysis: None,
+            launch_config: None,
         };
         ReviewStorage::save_session(&root, &session).unwrap();
 

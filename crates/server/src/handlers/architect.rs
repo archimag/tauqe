@@ -16,6 +16,7 @@ mod stream;
 use std::sync::Arc;
 
 use tauqe_core::config::AppConfig;
+use tauqe_core::plan::prompt::ArchitectLevelUp;
 use tauqe_core::providers::{create_provider, LlmProvider};
 use tauqe_protocol::ArchitectTier;
 
@@ -51,4 +52,37 @@ pub(crate) fn format_architect_tier(tier: &ArchitectTier) -> String {
         Some(effort) => format!("{} ({})", tier.model, effort),
         None => tier.model.to_string(),
     }
+}
+
+/// Renders the Architect configuration note published with a synthesis round.
+///
+/// A round that escalated reports the rung it entered. A replanning round that runs
+/// on a configuration the automatic ladder excludes (`level_up = false`) reports
+/// that escalation is unavailable instead, so a developer who pinned the Architect
+/// by hand sees why no stronger rung was engaged rather than assuming a silent
+/// downgrade.
+pub(crate) fn format_architect_escalation_note(
+    tier: &ArchitectTier,
+    level_up: Option<&ArchitectLevelUp>,
+    escalation_unavailable: bool,
+) -> String {
+    if let Some(level) = level_up {
+        let from = level
+            .from
+            .as_ref()
+            .map(format_architect_tier)
+            .unwrap_or_else(|| "not recorded".to_string());
+        return format!(
+            "\n> Architect level up: {} → {}",
+            from,
+            format_architect_tier(&level.to)
+        );
+    }
+    if escalation_unavailable {
+        return format!(
+            "\n> Architect escalation unavailable: `{}` is excluded from the automatic ladder (`level_up = false`), so this round stays on the selected configuration.",
+            format_architect_tier(tier)
+        );
+    }
+    String::new()
 }

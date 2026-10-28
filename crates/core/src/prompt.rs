@@ -1459,8 +1459,67 @@ mod tests {
         assert!(!sys_prompt.contains("<plan"));
         assert!(!sys_prompt.contains("<verify"));
 
+        // An isolated step carries no documentation surface: the capability is
+        // absent from its profile, so neither the self-knowledge rule nor the
+        // environment ontology reaches it. A coder executing an approved design
+        // never reads about a harness it cannot consult.
+        assert!(!sys_prompt.contains("Self-Knowledge"));
+        assert!(!sys_prompt.contains("<doc_request"));
+        assert!(!sys_prompt.contains("Environment Ontology"));
+        assert!(!delta.contains("Self-Knowledge"));
+        assert!(!delta.contains("Environment Ontology"));
+        assert!(!delta.contains("<doc_request"));
+
         let messages = assembly.assemble_chat_messages("Execute step", &proto);
         assert!(!messages[0].content.contains("## Active Task Plan Context"));
+    }
+
+    #[test]
+    fn test_interactive_repl_delta_states_the_environment_ontology() {
+        let proto = XmlPromptProtocol;
+        let assembly =
+            PromptAssembly::new(None, 1, vec![], "git", EditProtocolKind::Xml, None, None);
+
+        // The head states the self-knowledge invariant every dialogue shares, so
+        // switching the focus never rewrites it; the ontology that invariant
+        // enables is stated once in the tail delta instead of widening the
+        // byte-stable head.
+        let sys_prompt = assembly.build_system_prompt(&proto);
+        assert!(sys_prompt.contains("Self-Knowledge"));
+        assert!(sys_prompt.contains("<doc_request"));
+        assert!(sys_prompt.contains("<system_documentation>"));
+        assert!(!sys_prompt.contains("Environment Ontology"));
+        assert!(!sys_prompt.contains("literal harness rather than an agent"));
+
+        let delta = assembly
+            .format_regime_delta_section(&proto)
+            .expect("the interactive regime states a delta");
+        assert!(delta.contains("Environment Ontology"));
+        assert!(delta.contains("literal harness rather than an agent"));
+        assert!(delta.contains("`tauqe.toml`"));
+        assert!(delta.contains("consult the authoritative documentation"));
+    }
+
+    #[test]
+    fn test_documentation_surface_is_absent_from_the_isolated_step_schema() {
+        use crate::capabilities::CapabilityRegistry;
+
+        let registry = CapabilityRegistry::global();
+        let interactive = registry.compose_structured_schema(
+            &CapabilitySet::interactive_repl(),
+            PatchStrategy::SearchReplace,
+        );
+        assert!(interactive["properties"].get("doc_requests").is_some());
+
+        // The composed schema is a projection of the capability set, so a turn
+        // that cannot consult the documentation never advertises a field its
+        // decoder would reject.
+        let step = registry.compose_structured_schema(
+            &CapabilitySet::isolated_step(),
+            PatchStrategy::SearchReplace,
+        );
+        assert!(step["properties"].get("doc_requests").is_none());
+        assert!(step["properties"].get("changes").is_some());
     }
 
     #[test]
@@ -1611,20 +1670,29 @@ mod tests {
         assert!(!prompt.contains("<scratchpad"));
         assert!(!prompt.contains("<success"));
         assert!(!prompt.contains("Self-Knowledge"));
+        assert!(!prompt.contains("<doc_request"));
         assert!(!prompt.contains("Turn Scratchpad"));
 
         // The same set narrows decoding, so a disabled capability never reaches
         // the execution pipeline.
-        let raw =
-            "Working.\n<context_request path=\"src/a.rs\" />\n<scratchpad>notes</scratchpad>\n";
+        let raw = concat!(
+            "Working.\n<context_request path=\"src/a.rs\" />\n",
+            "<doc_request topic=\"config\" />\n<scratchpad>notes</scratchpad>\n"
+        );
         let full = XmlPromptProtocol.decode(raw, &[]);
         assert!(full
             .iter()
             .any(|command| matches!(command, LlmCommand::ContextRequest { .. })));
+        assert!(full
+            .iter()
+            .any(|command| matches!(command, LlmCommand::DocRequest { .. })));
         let filtered = narrowed.decode(raw, &[]);
         assert!(!filtered
             .iter()
             .any(|command| matches!(command, LlmCommand::ContextRequest { .. })));
+        assert!(!filtered
+            .iter()
+            .any(|command| matches!(command, LlmCommand::DocRequest { .. })));
         assert!(!filtered
             .iter()
             .any(|command| matches!(command, LlmCommand::Scratchpad { .. })));

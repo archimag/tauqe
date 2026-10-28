@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 
 use super::cmd::{commit_with_developer_author, run_git, run_git_check_ignore, stage_files};
 use crate::atomic_write::{staging_backup_original_name, staging_temp_original_name};
+use crate::refs::{REFS_DIR, REFS_MANIFEST};
 
 pub const TAUQE_CO_AUTHOR_TRAILER: &str = "Co-authored-by: Tauqe AI <noreply@tauqe.dev>";
 pub const CHECKPOINT_PREFIX: &str = "tauqe-checkpoint:";
@@ -278,8 +279,44 @@ pub fn recover_interrupted_workflow(dir: &Path) -> Result<Option<String>> {
 }
 
 /// Ensures that `.tauqe` and sensitive credential/runtime files are ignored by Git in the
-/// repository's local exclude configuration (`.git/info/exclude`), protecting them without
-/// modifying tracked project files.
+/// Git ignore rules that hide the harness state while keeping the tracked
+/// registry reachable.
+///
+/// `.git/info/exclude` follows gitignore semantics: within one file the last
+/// matching rule wins, and Git descends into a directory only while no rule
+/// ignores it. The state directory is therefore re-included first, then the
+/// registry directory, and finally the manifest file, so every level of the
+/// tracked path stays reachable while each sibling under the state directory
+/// stays excluded.
+///
+/// The state directory is derived from the manifest location instead of being
+/// written out again, because a negation re-opens descent only when it names
+/// the exact ancestor of the path it protects.
+fn tauqe_ignore_rules() -> Vec<String> {
+    let state_dir = REFS_DIR.split_once('/').map_or(REFS_DIR, |(root, _)| root);
+    vec![
+        format!("!{state_dir}"),
+        format!("{state_dir}/*"),
+        format!("!{REFS_DIR}/"),
+        format!("{REFS_DIR}/*"),
+        format!("!{REFS_MANIFEST}"),
+        "credentials.toml".to_string(),
+        ".credentials.toml".to_string(),
+        "*.tauqe-tmp*".to_string(),
+        "*.tauqe-bak*".to_string(),
+    ]
+}
+
+/// Ensures that the harness state and sensitive credential/runtime files are
+/// ignored by Git in the repository's local exclude configuration
+/// (`.git/info/exclude`), protecting them without modifying tracked project
+/// files.
+///
+/// The tracked reference registry lives inside the state directory, so the
+/// rules re-include it instead of hiding the whole tree. A rule written by an
+/// earlier revision is left in place: within one exclude file a later rule
+/// overrides an earlier one, so the negation re-opens a directory that rule had
+/// excluded and the manifest becomes trackable without rewriting the file.
 pub fn ensure_tauqe_ignored(dir: &Path) -> Result<()> {
     let git_dir_res = run_git(Some(dir), &["rev-parse", "--git-dir"]);
     if let Ok(git_dir_str) = git_dir_res {
@@ -294,13 +331,7 @@ pub fn ensure_tauqe_ignored(dir: &Path) -> Result<()> {
             let exclude_path = info_dir.join("exclude");
             let _ = std::fs::create_dir_all(&info_dir);
             let content = std::fs::read_to_string(&exclude_path).unwrap_or_default();
-            let patterns = [
-                ".tauqe",
-                "credentials.toml",
-                ".credentials.toml",
-                "*.tauqe-tmp*",
-                "*.tauqe-bak*",
-            ];
+            let patterns = tauqe_ignore_rules();
             let mut to_append = Vec::new();
             for pat in patterns {
                 let already_ignored = content.lines().any(|line| {
@@ -478,8 +509,31 @@ pub fn create_step_commit(dir: &Path, changed_files: &[String], step_name: &str)
 
     Ok(short_hash)
 }
+/// Closes an open transaction whose change set produced no tracked path.
+///
+/// A bounded turn can verify cleanly while every file it wrote lives outside
+/// Git: the `.tauqe/mockups/` sandbox is the documented case, because the
+/// harness keeps it out of every commit. Such a turn still opened a checkpoint
+/// and recorded a transaction marker, so the transaction is unwound here. The
+/// checkpoint commit is rolled back into the working tree, which keeps the
+/// developer's uncommitted work, and the empty hash reports that no commit was
+/// created.
+fn close_transaction_without_changes(
+    dir: &Path,
+    checkpoint: Option<&CheckpointInfo>,
+) -> Result<String> {
+    if matches!(checkpoint, Some(checkpoint) if checkpoint.created_checkpoint_commit) {
+        let _ = unwind_checkpoint_if_present(dir)?;
+    }
+    clear_transaction_marker(dir);
+    Ok(String::new())
+}
 
 /// Squashes all intermediate step commits into a single final AI commit.
+///
+/// A change set without a single tracked path — one that lives entirely in the
+/// mockups sandbox — closes the open transaction and reports the absence of a
+/// commit instead of failing the verified turn.
 pub fn finalize_ai_commit(
     dir: &Path,
     checkpoint: &CheckpointInfo,
@@ -487,7 +541,7 @@ pub fn finalize_ai_commit(
     summary: &str,
 ) -> Result<String> {
     if changed_files.is_empty() {
-        bail!("No changed files to commit");
+        return close_transaction_without_changes(dir, Some(checkpoint));
     }
 
     // 1. Soft-reset back to checkpoint base
@@ -521,7 +575,7 @@ pub fn finalize_ai_commit(
 /// Creates an isolated AI commit containing only the files modified by the model.
 pub fn create_ai_commit(dir: &Path, changed_files: &[String], summary: &str) -> Result<String> {
     if changed_files.is_empty() {
-        bail!("No changed files to commit");
+        return close_transaction_without_changes(dir, None);
     }
 
     // If HEAD is a temporary checkpoint commit, unwind it so user dirty changes remain in working tree
@@ -1011,5 +1065,123 @@ mod tests {
         assert_eq!(subject, "chore: initial commit");
         let tracked = crate::git::cmd::run_git(Some(path), &["ls-files"]).unwrap();
         assert!(!tracked.contains("credentials.toml"), "{tracked}");
+    }
+
+    #[test]
+    fn test_finalize_and_create_ai_commit_close_an_empty_transaction() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path();
+        crate::git::state::init_repository(Some(path), true).unwrap();
+
+        // A developer's uncommitted work opens a real checkpoint commit, which
+        // finalization has to roll back into the working tree.
+        let user_file = path.join("user_work.txt");
+        fs::write(&user_file, "uncommitted work").unwrap();
+        let checkpoint = create_checkpoint(path).unwrap();
+        assert!(checkpoint.created_checkpoint_commit);
+
+        // The turn wrote nothing Git tracks, so closing the transaction reports
+        // the absence of a commit instead of failing the verified turn.
+        let hash = finalize_ai_commit(path, &checkpoint, &[], "draft only").unwrap();
+        assert!(hash.is_empty());
+        assert!(!transaction_marker_path(path).exists());
+        assert_eq!(
+            fs::read_to_string(&user_file).unwrap(),
+            "uncommitted work",
+            "the developer's work must survive the closed transaction"
+        );
+        let subject = crate::git::cmd::run_git(Some(path), &["log", "-1", "--format=%s"])
+            .unwrap()
+            .trim()
+            .to_string();
+        assert_eq!(subject, "chore: initial commit");
+
+        // An isolated commit without a checkpoint closes the same way.
+        let hash = create_ai_commit(path, &[], "draft only").unwrap();
+        assert!(hash.is_empty());
+        assert!(!transaction_marker_path(path).exists());
+    }
+
+    #[test]
+    fn test_ensure_tauqe_ignored_keeps_the_tracked_registry_reachable() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path();
+        crate::git::state::init_repository(Some(path), true).unwrap();
+
+        let manifest = path.join(crate::refs::REFS_MANIFEST);
+        fs::create_dir_all(manifest.parent().unwrap()).unwrap();
+        fs::write(&manifest, "# external references\n").unwrap();
+        fs::write(path.join(".tauqe/credentials.toml"), "key = \"secret\"").unwrap();
+
+        ensure_tauqe_ignored(path).unwrap();
+        // A repeated run must recognise every rule of the scheme it wrote.
+        ensure_tauqe_ignored(path).unwrap();
+
+        let manifest_name = crate::refs::REFS_MANIFEST.to_string();
+        let credentials_name = ".tauqe/credentials.toml".to_string();
+        let candidates = [manifest_name.clone(), credentials_name.clone()];
+        let ignored = crate::git::cmd::run_git_check_ignore(path, &candidates).unwrap();
+        assert!(
+            !ignored.iter().any(|entry| entry == &manifest_name),
+            "the tracked registry must stay reachable: {ignored:?}"
+        );
+        assert!(
+            ignored.iter().any(|entry| entry == &credentials_name),
+            "credentials must stay ignored: {ignored:?}"
+        );
+
+        let exclude = fs::read_to_string(path.join(".git").join("info").join("exclude")).unwrap();
+        let negation = format!("!{manifest_name}");
+        assert_eq!(
+            exclude
+                .lines()
+                .filter(|line| line.trim() == negation.as_str())
+                .count(),
+            1,
+            "the negation must be written exactly once: {exclude}"
+        );
+    }
+
+    #[test]
+    fn test_ensure_tauqe_ignored_unblocks_the_registry_after_a_legacy_rule() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path();
+        crate::git::state::init_repository(Some(path), true).unwrap();
+
+        // An earlier revision ignored the whole state directory.
+        let exclude_path = path.join(".git").join("info").join("exclude");
+        fs::create_dir_all(exclude_path.parent().unwrap()).unwrap();
+        fs::write(&exclude_path, ".tauqe\n").unwrap();
+
+        let manifest = path.join(crate::refs::REFS_MANIFEST);
+        fs::create_dir_all(manifest.parent().unwrap()).unwrap();
+        fs::write(&manifest, "# external references\n").unwrap();
+        fs::write(path.join(".tauqe/credentials.toml"), "key = \"secret\"").unwrap();
+
+        ensure_tauqe_ignored(path).unwrap();
+
+        let exclude = fs::read_to_string(&exclude_path).unwrap();
+        let negation = format!("!{}", crate::refs::REFS_MANIFEST);
+        assert!(
+            exclude.lines().any(|line| line.trim() == ".tauqe"),
+            "the legacy rule must survive: {exclude}"
+        );
+        assert!(
+            exclude.lines().any(|line| line.trim() == negation.as_str()),
+            "the scheme must follow the legacy rule: {exclude}"
+        );
+
+        let manifest_name = crate::refs::REFS_MANIFEST.to_string();
+        let credentials_name = ".tauqe/credentials.toml".to_string();
+        let candidates = [manifest_name.clone(), credentials_name.clone()];
+        let ignored = crate::git::cmd::run_git_check_ignore(path, &candidates).unwrap();
+        assert!(
+            !ignored.iter().any(|entry| entry == &manifest_name),
+            "the legacy rule must not keep the registry ignored: {ignored:?}"
+        );
+        assert!(
+            ignored.iter().any(|entry| entry == &credentials_name),
+            "the legacy rule must keep hiding credentials: {ignored:?}"
+        );
     }
 }

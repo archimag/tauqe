@@ -202,6 +202,13 @@ impl PlanRefineDialogState {
 /// Both the plan horizon refinement and the review finding decomposition dialogs
 /// read this single helper, so the architect ladder can never drift between the
 /// two refinement surfaces (Conventions §1.3).
+///
+/// Configured entries travel whole — the model, its reasoning depth, and its
+/// escalation marker — so the shared selector states that an entry the
+/// Architect ladder never escalates to is reachable only by a deliberate
+/// manual choice (c-4). Nothing is filtered out here: the developer always
+/// sees every configured Architect entry, and the fallback entry stays
+/// unmarked because the resolved role is itself an escalation rung.
 pub fn architect_entries(st: &AppState) -> Vec<ModelEntry> {
     st.model_choice
         .roles

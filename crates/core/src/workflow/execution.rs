@@ -158,19 +158,14 @@ impl WorkflowOptions {
 /// already at its strongest rung so escalation terminates deterministically.
 /// A rung counts as an advance when either the model or the reasoning effort
 /// changes, which lets the ladder deepen reasoning on the same model before
-/// switching to a stronger model.
+/// switching to a stronger model. The rule itself lives in
+/// `ModelsConfig::next_coder_tier`, so the harness holds one authoritative
+/// definition of an advancing rung.
 fn next_coder_tier(
     models_config: &crate::config::ModelsConfig,
     current_idx: usize,
 ) -> Option<(usize, ModelEntry)> {
-    let current = models_config.coder_tier(current_idx);
-    let next_idx = current_idx + 1;
-    let next = models_config.coder_tier(next_idx);
-    if next.model == current.model && next.effort == current.effort {
-        None
-    } else {
-        Some((next_idx, next))
-    }
+    models_config.next_coder_tier(current_idx)
 }
 
 /// Strategy governing how bounded turns are executed and supervised.

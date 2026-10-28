@@ -228,11 +228,18 @@ pub(crate) fn scratchpad_fragment() -> Value {
 }
 
 /// Schema fragment of the terminal outcome property.
+///
+/// A terminal status is a claim that something happened, so the fragment states
+/// the payload contract in its descriptions: `success` carries a non-empty
+/// `summary`, `error` carries its `message`, and `skip` carries its `reason`.
+/// JSON Schema cannot express non-emptiness — `required` already demands every
+/// field and an empty string stays valid — so the descriptions formulate the
+/// contract while the harness enforces it after decoding.
 pub(crate) fn outcome_fragment() -> Value {
     json!({
         "outcome": {
             "type": "object",
-            "description": "Terminal outcome of the turn; status 'none' while the turn continues",
+            "description": "Terminal outcome of the turn; status 'none' while the turn continues, while a terminal status carries its own payload",
             "properties": {
                 "status": {
                     "type": "string",
@@ -241,15 +248,15 @@ pub(crate) fn outcome_fragment() -> Value {
                 },
                 "summary": {
                     "type": "string",
-                    "description": "Success summary (empty string otherwise)"
+                    "description": "Non-empty success summary carried by status 'success'; a success without a summary is a protocol defect rather than a result (empty string otherwise)"
                 },
                 "message": {
                     "type": "string",
-                    "description": "Error message (empty string otherwise)"
+                    "description": "Error message carried by status 'error' (empty string otherwise)"
                 },
                 "reason": {
                     "type": "string",
-                    "description": "Skip reason (empty string otherwise)"
+                    "description": "Skip reason carried by status 'skip' (empty string otherwise)"
                 }
             },
             "required": ["status", "summary", "message", "reason"],
@@ -567,5 +574,43 @@ mod tests {
         assert_eq!(item["properties"]["name"]["type"], "string");
         assert_eq!(item["properties"]["args"]["type"], "object");
         assert_eq!(item["additionalProperties"], serde_json::json!(false));
+    }
+    #[test]
+    fn the_outcome_fragment_states_the_payload_contract() {
+        let fragment = outcome_fragment();
+        let outcome = fragment["outcome"]
+            .as_object()
+            .expect("the outcome is an object");
+        let properties = outcome["properties"]
+            .as_object()
+            .expect("the outcome declares its fields");
+
+        // A terminal status is a claim that something happened, so the schema
+        // states which payload each status carries.
+        let summary = properties["summary"]["description"]
+            .as_str()
+            .expect("the summary declares its purpose");
+        assert!(summary.contains("Non-empty"), "{summary}");
+        assert!(summary.contains("'success'"), "{summary}");
+        assert!(summary.contains("protocol defect"), "{summary}");
+        assert!(properties["message"]["description"]
+            .as_str()
+            .expect("the message declares its purpose")
+            .contains("'error'"));
+        assert!(properties["reason"]["description"]
+            .as_str()
+            .expect("the reason declares its purpose")
+            .contains("'skip'"));
+        assert!(outcome["description"]
+            .as_str()
+            .expect("the outcome declares its purpose")
+            .contains("carries its own payload"));
+
+        // Non-emptiness stays a description rather than a shape: the strict
+        // object still requires exactly the fields it declares.
+        assert_eq!(
+            outcome["required"].as_array().map(Vec::len),
+            Some(properties.len())
+        );
     }
 }

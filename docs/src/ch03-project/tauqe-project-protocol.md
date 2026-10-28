@@ -125,6 +125,7 @@ follow:
 | `[project.format]` | the in-memory stream filter | optional |
 | `[project.post_hook]` | the disk-side step after the write | optional |
 | `[project.commands]` | named allowlisted commands | optional |
+| `[project.boundaries]` | repository glob patterns no turn may modify | optional |
 
 Every entry shares one shape:
 
@@ -142,7 +143,10 @@ runs, so an entry can never silently drop the arguments it lists.
 invocation instead of defining the command line. The outermost declared budget wins
 along a reference chain, and a reference that declares none inherits the budget of
 the command it names, so a stage can tighten a shared command without restating it.
-
+The `[project.boundaries]` subsection follows neither shape: `protected` is a list of
+repository glob patterns rather than a command line. A pattern names a path the harness keeps
+tracked and readable while refusing every turn that would create, rewrite, move, or delete
+it; *Protected Paths and Trust Boundaries* specifies that rejection.
 ### 2.3 Phases and moments
 
 | Phase | Invocation shape | Moment | Failure contract |
@@ -415,6 +419,8 @@ prompt bytes stay stable across turns.
 
 - [The Three-Phase Modification Lifecycle](three-phase-lifecycle.md) — the three
   phases in the order a modification uses them.
+- [Protected Paths and Trust Boundaries](protected-paths.md) — the trust boundary a staged
+  operation is checked against first.
 - [Structured Diagnostics and Verification Healing](verification-healing.md) — what
   a failing verification produces.
 - [Git Safety & Transactions](git-transactions.md) — what happens to the tree after

@@ -262,17 +262,21 @@ pub async fn handle_modal_click(
         }
         Some(ActiveModal::Review) => {
             if let Some(mut dialog) = st.review_dialog.take() {
-                let geo = crate::dialogs::render::review_dialog_geometry(
-                    term_rect,
-                    dialog.selector.len(),
-                );
+                let geo = crate::dialogs::render::review_dialog_geometry(term_rect, &dialog);
 
                 if rect_contains(geo.confirm_button, mouse.column, mouse.row) {
-                    // Shared with the keyboard launch so a typed target path
-                    // rides along on a mouse click too.
-                    let params = serde_json::to_value(dialog.start_params())?;
-                    crate::dialogs::input::confirm_start_review(state, st, server_writer, params)
-                        .await?;
+                    // Shared with the keyboard launch, so a click honours the
+                    // live match gate: a target pattern that selects no
+                    // repository file is refused with a warning, the dialog
+                    // keeps its fields, and no request reaches the daemon
+                    // (c-2, c-4).
+                    crate::dialogs::input::start_review_from_dialog(
+                        state,
+                        st,
+                        dialog,
+                        server_writer,
+                    )
+                    .await?;
                     return Ok(InputResult::Continue);
                 }
 
@@ -294,9 +298,49 @@ pub async fn handle_modal_click(
                         dialog.selector.select_index(index);
                     }
                     dialog.focus = crate::app::ReviewDialogFocus::ModelList;
+                } else if rect_contains(geo.preset_rows, mouse.column, mouse.row) {
+                    // Clicking a preset row selects it and hands the keyboard to
+                    // the section, exactly like the reviewer rows above. The
+                    // click is translated with the selector's own scroll
+                    // arithmetic and the same row rectangle the renderer draws,
+                    // so hit-testing and the drawn window cannot drift apart
+                    // (c-5).
+                    let visible = geo.preset_rows.height as usize;
+                    let start = dialog.preset_selector.scroll_offset();
+                    let clicked_row = (mouse.row - geo.preset_rows.y) as usize;
+                    let index = start + clicked_row;
+                    if index < dialog.preset_selector.item_count() {
+                        dialog.preset_selector.select_index(index, visible);
+                        dialog.focus = crate::app::ReviewDialogFocus::PresetList;
+                    }
+                } else if rect_contains(geo.completions, mouse.column, mouse.row) {
+                    // Clicking a completion row accepts it into the active path
+                    // row, exactly as `Tab` accepts the highlighted candidate,
+                    // and the row is translated through the completion's own
+                    // scroll arithmetic so hit-testing and the drawn window
+                    // cannot drift apart (c-5).
+                    let visible = geo.completions.height.saturating_sub(2) as usize;
+                    let start = dialog.path_completion.visible_start(visible);
+                    let clicked_row = (mouse.row - geo.completions.y).saturating_sub(1) as usize;
+                    let index = start + clicked_row;
+                    if index < dialog.path_completion.candidates().len() {
+                        dialog.accept_path_completion_at(index);
+                    }
+                } else if rect_contains(geo.path_rows, mouse.column, mouse.row) {
+                    // Clicking a path row focuses that very row, so the keyboard
+                    // continues exactly where the developer pointed (c-3).
+                    let visible = geo.path_rows.height as usize;
+                    let start = dialog.path_visible_start(visible);
+                    let clicked_row = (mouse.row - geo.path_rows.y) as usize;
+                    let index = start + clicked_row;
+                    if index < dialog.path_row_count() {
+                        dialog.path_active = index;
+                        dialog.refresh_path_completion();
+                    }
+                    dialog.focus = crate::app::ReviewDialogFocus::PathEditor;
                 } else if rect_contains(geo.path_area, mouse.column, mouse.row) {
-                    // Clicking the target-paths field focuses it so the next
-                    // keystroke edits the clicked input.
+                    // Clicking the frame or the counter row focuses the section
+                    // without moving the active row.
                     dialog.focus = crate::app::ReviewDialogFocus::PathEditor;
                 } else if rect_contains(geo.editor_area, mouse.column, mouse.row) {
                     dialog.focus = crate::app::ReviewDialogFocus::PromptEditor;
@@ -639,6 +683,31 @@ pub async fn handle_modal_click(
                 }
             }
         }
+        Some(ActiveModal::ReviewAnalyze) => {
+            if let Some(target) = st.confirm_review_analyze.clone() {
+                let geom = match crate::dialogs::render::review_analyze_params(&st) {
+                    Some(params) => geometry_of(term_rect, &params),
+                    None => return Ok(InputResult::Continue),
+                };
+                match check_confirm_hit(&geom, mouse.column, mouse.row) {
+                    ModalHit::Confirm => {
+                        st.confirm_review_analyze = None;
+                        crate::dialogs::input::confirm_review_analyze(
+                            state,
+                            st,
+                            target,
+                            server_writer,
+                        )
+                        .await?;
+                    }
+                    ModalHit::Cancel | ModalHit::Outside => {
+                        st.confirm_review_analyze = None;
+                        st.confirm_button = crate::app::ConfirmDialogButton::Cancel;
+                    }
+                    ModalHit::InsideBody => {}
+                }
+            }
+        }
         Some(ActiveModal::ExecuteReview) => {
             // Point execution draws the Coder form dialog, whose action buttons,
             // model rows, and editor area come from one geometry source shared
@@ -747,9 +816,9 @@ pub async fn handle_modal_click(
             }
         }
         Some(ActiveModal::ExecuteScope) => {
-            // Executing a step or a whole scope draws the Coder form dialog,
-            // whose action buttons, model rows, and editor area come from one
-            // geometry source shared with the renderer (Conventions §6, §7).
+            // Executing a step or a whole scope draws the Coder confirmation,
+            // whose action buttons and model rows come from one geometry source
+            // shared with the renderer (Conventions §6, §7).
             if let Some(mut target) = st.confirm_execute_scope.take() {
                 let geo = crate::dialogs::render::execute_scope_dialog_geometry(
                     term_rect,
@@ -780,9 +849,7 @@ pub async fn handle_modal_click(
                     if index < target.selector.len() {
                         target.selector.select_index(index);
                     }
-                    target.focus = crate::views::plans::RefineDialogFocus::ModelList;
-                } else if rect_contains(geo.editor_area, mouse.column, mouse.row) {
-                    target.focus = crate::views::plans::RefineDialogFocus::InstructionsEditor;
+                    target.focus = crate::app::ExecuteScopeFocus::ModelList;
                 }
 
                 st.confirm_execute_scope = Some(target);
@@ -1057,8 +1124,232 @@ pub async fn handle_modal_click(
                 st.help_scroll = 0;
             }
         }
+        // The inspector reserves its stacking slot ahead of the renderer and
+        // the pointer routing delivered by the following steps of this plan
+        // (c-3).
+        Some(ActiveModal::DiffInspector) => {}
         None => {}
     }
 
     Ok(InputResult::Continue)
+}
+
+#[cfg(test)]
+mod tests {
+    use crossterm::event::{KeyModifiers, MouseButton};
+    use ratatui::layout::Rect;
+
+    use super::*;
+    use crate::app::{
+        ConfirmDialogButton, NotificationLevel, ReviewDialogFocus, ReviewDialogState, ViewMode,
+    };
+
+    /// Builds a review dialog whose directory section derives from the given
+    /// repository file list.
+    fn review_dialog_with_files(files: &[&str]) -> ReviewDialogState {
+        ReviewDialogState::new(
+            0,
+            0,
+            Vec::new(),
+            files.iter().map(|path| path.to_string()).collect(),
+        )
+    }
+
+    fn left_click(column: u16, row: u16) -> MouseEvent {
+        MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        }
+    }
+
+    /// The Confirm click runs the same launch helper as the keyboard, so a
+    /// target pattern that selects no repository file is refused: the warning
+    /// names the pattern, the dialog keeps its fields, and the transport stays
+    /// silent (c-2, c-4).
+    #[tokio::test]
+    async fn confirm_click_refuses_a_pattern_without_matches() {
+        let term = Rect::new(0, 0, 120, 50);
+        let mut dialog = review_dialog_with_files(&["src/lib.rs"]);
+        dialog.path_inputs[0].insert_str("srx/*.rs");
+        dialog.focus = ReviewDialogFocus::Actions;
+        dialog.confirm_button = ConfirmDialogButton::Confirm;
+
+        let geo = crate::dialogs::render::review_dialog_geometry(term, &dialog);
+        let mouse = left_click(geo.confirm_button.x + 1, geo.confirm_button.y);
+
+        let mut st = crate::app::test_state();
+        st.view_mode = ViewMode::Review;
+        st.last_frame_area = term;
+        st.review_dialog = Some(dialog);
+        let state = Arc::new(Mutex::new(st));
+        let mut conn = RpcConnection::new(Vec::<u8>::new());
+        let guard = state.lock().await;
+        handle_modal_click(mouse, term, &state, guard, &mut conn)
+            .await
+            .expect("in-memory dispatch never fails");
+
+        assert!(
+            conn.written().is_empty(),
+            "a refused launch never reaches the daemon"
+        );
+
+        let guard = state.lock().await;
+        let dialog = guard
+            .review_dialog
+            .as_ref()
+            .expect("the refused launch keeps the dialog open");
+        assert_eq!(dialog.path_inputs[0].get_text(), "srx/*.rs");
+        let notification = guard
+            .active_notification()
+            .expect("the refusal explains itself");
+        assert_eq!(notification.level, NotificationLevel::Warning);
+        assert!(
+            notification.text.contains("srx/*.rs"),
+            "the warning names the offending pattern: {}",
+            notification.text
+        );
+    }
+
+    /// A Confirm click with a pattern that selects files launches the review
+    /// through the same typed request the keyboard sends (c-2, c-4).
+    #[tokio::test]
+    async fn confirm_click_launches_a_review_for_a_matching_pattern() {
+        let term = Rect::new(0, 0, 120, 50);
+        let mut dialog = review_dialog_with_files(&["src/lib.rs"]);
+        dialog.path_inputs[0].insert_str("*.rs");
+        dialog.focus = ReviewDialogFocus::Actions;
+        dialog.confirm_button = ConfirmDialogButton::Confirm;
+        let geo = crate::dialogs::render::review_dialog_geometry(term, &dialog);
+        let mouse = left_click(geo.confirm_button.x + 1, geo.confirm_button.y);
+
+        let mut st = crate::app::test_state();
+        st.view_mode = ViewMode::Review;
+        st.last_frame_area = term;
+        st.review_dialog = Some(dialog);
+
+        let state = Arc::new(Mutex::new(st));
+        let mut conn = RpcConnection::new(Vec::<u8>::new());
+        let guard = state.lock().await;
+        handle_modal_click(mouse, term, &state, guard, &mut conn)
+            .await
+            .expect("in-memory dispatch never fails");
+
+        let payload = String::from_utf8(conn.written().to_vec()).expect("utf-8 payload");
+        assert!(payload.contains("review/start"), "{payload}");
+        assert!(payload.contains("path_patterns"), "{payload}");
+        assert!(payload.contains("*.rs"), "{payload}");
+
+        let guard = state.lock().await;
+        assert!(
+            guard.review_dialog.is_none(),
+            "a launched review closes its dialog"
+        );
+    }
+    /// A click on a preset row selects that row and hands the keyboard to the
+    /// section, exactly like the reviewer and directory rows above it, and the
+    /// row is translated through the selector's own scroll arithmetic (c-5).
+    #[tokio::test]
+    async fn preset_row_click_selects_it_and_focuses_the_section() {
+        let term = Rect::new(0, 0, 120, 50);
+        let dialog = review_dialog_with_files(&["src/lib.rs"]).with_presets(vec![
+            tauqe_protocol::ReviewPresetSummary {
+                name: "backend".to_string(),
+                title: Some("Backend audit".to_string()),
+            },
+        ]);
+        let geo = crate::dialogs::render::review_dialog_geometry(term, &dialog);
+        let mouse = left_click(geo.preset_rows.x + 1, geo.preset_rows.y + 1);
+
+        let mut st = crate::app::test_state();
+        st.view_mode = ViewMode::Review;
+        st.last_frame_area = term;
+        st.review_dialog = Some(dialog);
+
+        let state = Arc::new(Mutex::new(st));
+        let mut conn = RpcConnection::new(Vec::<u8>::new());
+        let guard = state.lock().await;
+        let res = handle_modal_click(mouse, term, &state, guard, &mut conn)
+            .await
+            .expect("in-memory dispatch never fails");
+        assert_eq!(res, InputResult::Continue);
+
+        let guard = state.lock().await;
+        let dialog = guard.review_dialog.as_ref().expect("the dialog stays open");
+        assert_eq!(dialog.preset_selector.selected_index(), 1);
+        assert_eq!(
+            dialog.selected_preset().map(|preset| preset.name.as_str()),
+            Some("backend")
+        );
+        assert_eq!(dialog.focus, ReviewDialogFocus::PresetList);
+        drop(guard);
+        assert!(
+            conn.written().is_empty(),
+            "selecting a preset starts nothing"
+        );
+    }
+    /// A click on the post-analysis `Run Analysis` button dispatches the same
+    /// typed request the keyboard confirmation sends (c-4).
+    #[tokio::test]
+    async fn review_analyze_confirm_click_submits_the_request() {
+        let term = Rect::new(0, 0, 120, 40);
+        let mut st = crate::app::test_state();
+        st.view_mode = ViewMode::Review;
+        st.last_frame_area = term;
+        st.confirm_review_analyze = Some(crate::app::ConfirmReviewAnalyzeState {
+            review_id: "rev-1".to_string(),
+            review_title: "Session rev-1".to_string(),
+        });
+
+        let params = crate::dialogs::render::review_analyze_params(&st).expect("params");
+        let geom = geometry_of(term, &params);
+        let mouse = left_click(geom.confirm_button.x + 1, geom.confirm_button.y);
+
+        let state = Arc::new(Mutex::new(st));
+        let mut conn = RpcConnection::new(Vec::<u8>::new());
+        let guard = state.lock().await;
+        let res = handle_modal_click(mouse, term, &state, guard, &mut conn)
+            .await
+            .expect("in-memory dispatch never fails");
+        assert_eq!(res, InputResult::Continue);
+
+        let payload = String::from_utf8(conn.written().to_vec()).expect("utf-8 payload");
+        assert!(payload.contains("review/analyze"), "{payload}");
+
+        let guard = state.lock().await;
+        assert!(guard.confirm_review_analyze.is_none());
+        assert!(guard.review.analyzing);
+    }
+
+    /// A click on a completion row accepts that directory into the active path
+    /// row, exactly as `Tab` accepts the highlighted candidate (c-5).
+    #[tokio::test]
+    async fn completion_row_click_fills_the_active_path_row() {
+        let term = Rect::new(0, 0, 120, 50);
+        let mut dialog = review_dialog_with_files(&["crates/core/src/lib.rs", "src/lib.rs"]);
+        dialog.focus = ReviewDialogFocus::PathEditor;
+        dialog.path_inputs[0].insert_str("cra");
+        dialog.refresh_path_completion();
+        let geo = crate::dialogs::render::review_dialog_geometry(term, &dialog);
+        assert!(geo.completions.height > 0);
+        let mouse = left_click(geo.completions.x + 2, geo.completions.y + 1);
+
+        let mut st = crate::app::test_state();
+        st.view_mode = ViewMode::Review;
+        st.last_frame_area = term;
+        st.review_dialog = Some(dialog);
+        let state = Arc::new(Mutex::new(st));
+        let mut conn = RpcConnection::new(Vec::<u8>::new());
+        let guard = state.lock().await;
+        handle_modal_click(mouse, term, &state, guard, &mut conn)
+            .await
+            .expect("in-memory dispatch never fails");
+
+        let guard = state.lock().await;
+        let dialog = guard.review_dialog.as_ref().expect("the dialog stays open");
+        assert_eq!(dialog.path_inputs[0].get_text(), "crates/");
+        drop(guard);
+        assert!(conn.written().is_empty());
+    }
 }

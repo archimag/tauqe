@@ -135,11 +135,7 @@ impl LlmCapability {
     /// Every capability a built-in protocol profile may advertise.
     ///
     /// The order matches the enum declaration so iteration, prompt
-    /// composition, and tests stay deterministic. A declared capability stays
-    /// absent from this list until the capability module that owns its tags,
-    /// prompt text, and decoder is registered: the registry requires a module
-    /// for every advertised capability, so advertising one earlier would offer
-    /// the model a protocol surface nothing can decode.
+    /// composition, and tests stay deterministic.
     pub const ALL: &'static [LlmCapability] = &[
         Self::TextMessage,
         Self::FileEdits,
@@ -191,26 +187,15 @@ impl LlmCapability {
         }
     }
 
-    /// How this capability's protocol output is delivered to the harness.
+    /// How the capability's protocol output reaches the harness.
     ///
-    /// Delivery is orthogonal to [`LlmCapability::phase`]: the execution phase
-    /// emits both streamed text and edits, which are consumed on the fly, and
-    /// round-deferred payloads such as scratchpad notes, plan updates, and
-    /// custom tool invocations, which are only read once generation completes.
+    /// Declaring delivery beside the capability keeps a single source of
+    /// truth: a streaming scanner or a round-level decoder reads this property
+    /// instead of special-casing capability names.
     pub const fn delivery(self) -> CapabilityDelivery {
         match self {
             Self::TextMessage | Self::FileEdits => CapabilityDelivery::LiveStreaming,
-            Self::Discovery
-            | Self::DocRequest
-            | Self::ToolchainVerify
-            | Self::PlanCreation
-            | Self::PlanUpdate
-            | Self::Scratchpad
-            | Self::Outcome
-            | Self::Blocked
-            | Self::Abort
-            | Self::UserLanguage
-            | Self::CustomTools => CapabilityDelivery::RoundDeferred,
+            _ => CapabilityDelivery::RoundDeferred,
         }
     }
 }
@@ -218,145 +203,6 @@ impl LlmCapability {
 impl fmt::Display for LlmCapability {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(self.as_str())
-    }
-}
-
-/// Deterministic, duplicate-free ordered set of [`LlmCapability`] values.
-///
-/// A `CapabilitySet` is the single declarative description of what a protocol
-/// role or operating mode may do. It preserves insertion order so prompts,
-/// diagnostics, and tests stay stable, and it never stores the same capability
-/// twice so composition through [`CapabilitySet::with`] is idempotent.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
-#[serde(transparent)]
-pub struct CapabilitySet {
-    capabilities: Vec<LlmCapability>,
-}
-
-impl CapabilitySet {
-    /// Creates an empty capability set.
-    pub fn new() -> Self {
-        Self {
-            capabilities: Vec::new(),
-        }
-    }
-
-    /// Builds a set from a slice, preserving first-seen order and dropping
-    /// duplicates.
-    pub fn from_slice(capabilities: &[LlmCapability]) -> Self {
-        let mut set = Self::new();
-        for &capability in capabilities {
-            set.insert(capability);
-        }
-        set
-    }
-
-    /// Inserts a capability unless it is already present.
-    fn insert(&mut self, capability: LlmCapability) {
-        if !self.capabilities.contains(&capability) {
-            self.capabilities.push(capability);
-        }
-    }
-
-    /// Reports whether the set contains the given capability.
-    pub fn contains(&self, capability: LlmCapability) -> bool {
-        self.capabilities.contains(&capability)
-    }
-
-    /// Returns a new set with `capability` added.
-    ///
-    /// Adding a capability that is already present leaves the set unchanged.
-    pub fn with(&self, capability: LlmCapability) -> Self {
-        let mut next = self.clone();
-        next.insert(capability);
-        next
-    }
-
-    /// Returns a new set without `capability`.
-    pub fn without(&self, capability: LlmCapability) -> Self {
-        Self {
-            capabilities: self
-                .capabilities
-                .iter()
-                .copied()
-                .filter(|existing| *existing != capability)
-                .collect(),
-        }
-    }
-
-    /// Iterates over the capabilities in their deterministic order.
-    pub fn iter(&self) -> std::slice::Iter<'_, LlmCapability> {
-        self.capabilities.iter()
-    }
-
-    /// Returns the capabilities as a slice in their deterministic order.
-    pub fn as_slice(&self) -> &[LlmCapability] {
-        &self.capabilities
-    }
-
-    /// Reports whether the set is empty.
-    pub fn is_empty(&self) -> bool {
-        self.capabilities.is_empty()
-    }
-
-    /// Returns the subset of capabilities belonging to the given phase,
-    /// preserving order.
-    pub fn by_phase(&self, phase: CapabilityPhase) -> Self {
-        Self {
-            capabilities: self
-                .capabilities
-                .iter()
-                .copied()
-                .filter(|capability| capability.phase() == phase)
-                .collect(),
-        }
-    }
-
-    /// Format-independent capability set for a free interactive REPL dialogue.
-    ///
-    /// The profile names a turn regime, not a wire format: the XML and the
-    /// structured transports decode this very surface, so switching the
-    /// protocol changes only the encoding. It is the full advertised surface
-    /// minus plan mutation, because a user may ask for a plan at any moment of
-    /// a dialogue while modifying an existing plan requires an active plan
-    /// focus (`discussion_focus`).
-    pub fn interactive_repl() -> Self {
-        CapabilityProfile::interactive_repl().surface()
-    }
-
-    /// Format-independent capability set for executing one isolated step.
-    ///
-    /// Plan creation and modification are excluded: while an isolated step
-    /// runs the plan is immutable and progress is recorded deterministically
-    /// by the harness, never by the model.
-    ///
-    /// Toolchain verification stays declared in the profile and is stripped by
-    /// the turn-intent narrowing, so the decision that the harness owns
-    /// verification for a step lives in exactly one place instead of being
-    /// duplicated across this profile and the narrowing rule.
-    pub fn isolated_step() -> Self {
-        CapabilityProfile::isolated_step().surface()
-    }
-
-    /// Discussion and planning capability set.
-    ///
-    /// The set is the declared surface of [`CapabilityProfile::discussion`], so a
-    /// plan discussion carries the whole dialogue head — the very list every
-    /// dialogue contour renders into its byte-stable head — plus the plan
-    /// mutation the regime authorizes. The head and the delta therefore stay one
-    /// declaration, and a capability can never belong to the discussion without
-    /// also belonging to its profile.
-    pub fn discussion() -> Self {
-        CapabilityProfile::discussion().surface()
-    }
-
-    /// Architect discovery capability set.
-    ///
-    /// The architect gathers context and refines plans but never edits files
-    /// or runs toolchain verification, so the file-edit and verification
-    /// capabilities are excluded.
-    pub fn architect_discovery() -> Self {
-        CapabilityProfile::architect_discovery().surface()
     }
 }
 
@@ -426,10 +272,13 @@ impl CapabilityProfile {
         )
     }
 
-    /// One isolated step: the REPL head minus plan authoring, no delta.
+    /// One isolated step: the dialogue head minus plan authoring and
+    /// documentation, no delta.
     pub fn isolated_step() -> Self {
         Self::new(
-            Self::dialogue_head().without(LlmCapability::PlanCreation),
+            Self::dialogue_head()
+                .without(LlmCapability::PlanCreation)
+                .without(LlmCapability::DocRequest),
             CapabilitySet::new(),
         )
     }
@@ -454,6 +303,147 @@ impl CapabilityProfile {
     /// Head shared by every dialogue contour: the REPL surface.
     fn dialogue_head() -> CapabilitySet {
         CapabilitySet::from_slice(LlmCapability::ALL).without(LlmCapability::PlanUpdate)
+    }
+}
+
+/// Ordered, de-duplicated collection of capabilities a protocol advertises.
+///
+/// A set preserves first-seen order and never holds a duplicate, so the
+/// prompt, the response schema, and the decoder all observe one deterministic
+/// surface for the same declaration.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(transparent)]
+pub struct CapabilitySet {
+    capabilities: Vec<LlmCapability>,
+}
+
+impl CapabilitySet {
+    /// Creates an empty set.
+    pub fn new() -> Self {
+        Self {
+            capabilities: Vec::new(),
+        }
+    }
+
+    /// Builds a set from a slice, dropping duplicates and keeping first-seen
+    /// order.
+    pub fn from_slice(capabilities: &[LlmCapability]) -> Self {
+        let mut set = Self::new();
+        for capability in capabilities {
+            set.insert(*capability);
+        }
+        set
+    }
+
+    /// Returns the capabilities in the order they entered the set.
+    pub fn as_slice(&self) -> &[LlmCapability] {
+        &self.capabilities
+    }
+
+    /// Iterates the capabilities of the set.
+    pub fn iter(&self) -> std::slice::Iter<'_, LlmCapability> {
+        self.capabilities.iter()
+    }
+
+    /// Reports whether the set holds no capability.
+    pub fn is_empty(&self) -> bool {
+        self.capabilities.is_empty()
+    }
+
+    /// Reports whether `capability` belongs to the set.
+    pub fn contains(&self, capability: LlmCapability) -> bool {
+        self.capabilities.contains(&capability)
+    }
+
+    /// Inserts `capability` when it is absent.
+    pub fn insert(&mut self, capability: LlmCapability) {
+        if !self.contains(capability) {
+            self.capabilities.push(capability);
+        }
+    }
+
+    /// Returns a copy extended with `capability`.
+    pub fn with(&self, capability: LlmCapability) -> Self {
+        let mut set = self.clone();
+        set.insert(capability);
+        set
+    }
+
+    /// Returns a copy without `capability`.
+    pub fn without(&self, capability: LlmCapability) -> Self {
+        Self {
+            capabilities: self
+                .capabilities
+                .iter()
+                .copied()
+                .filter(|kept| *kept != capability)
+                .collect(),
+        }
+    }
+
+    /// Keeps only the capabilities of `phase`, preserving their order.
+    pub fn by_phase(&self, phase: CapabilityPhase) -> Self {
+        Self {
+            capabilities: self
+                .capabilities
+                .iter()
+                .copied()
+                .filter(|capability| capability.phase() == phase)
+                .collect(),
+        }
+    }
+    /// Free interactive REPL dialogue capability set.
+    ///
+    /// The set is the declared surface of [`CapabilityProfile::interactive_repl`]:
+    /// the dialogue head every interactive contour renders, without plan
+    /// mutation, which the delta of a focused discussion carries instead.
+    pub fn interactive_repl() -> Self {
+        CapabilityProfile::interactive_repl().surface()
+    }
+
+    /// Discussion and planning capability set.
+    ///
+    /// The set is the declared surface of [`CapabilityProfile::discussion`], so a
+    /// plan discussion carries the whole dialogue head — the very list every
+    /// dialogue contour renders into its byte-stable head — plus the plan
+    /// mutation the regime authorizes. The head and the delta therefore stay one
+    /// declaration, and a capability can never belong to the discussion without
+    /// also belonging to its profile.
+    pub fn discussion() -> Self {
+        CapabilityProfile::discussion().surface()
+    }
+
+    /// Capability set of one isolated step.
+    ///
+    /// Plan creation and modification are excluded: while an isolated step
+    /// runs the plan is immutable and progress is recorded deterministically
+    /// by the harness, never by the model.
+    ///
+    /// Documentation requests are excluded as well: an isolated step executes
+    /// an approved design inside the codebase, so knowledge about the harness
+    /// itself is noise the step cannot act on.
+    ///
+    /// Toolchain verification stays declared in the profile and is stripped by
+    /// the turn-intent narrowing, so the decision that the harness owns
+    /// verification for a step lives in exactly one place instead of being
+    /// duplicated across this profile and the narrowing rule.
+    pub fn isolated_step() -> Self {
+        CapabilityProfile::isolated_step().surface()
+    }
+
+    /// Architect discovery capability set.
+    ///
+    /// The architect gathers context and refines plans but never edits files
+    /// or runs toolchain verification, so the file-edit and verification
+    /// capabilities are excluded.
+    pub fn architect_discovery() -> Self {
+        CapabilityProfile::architect_discovery().surface()
+    }
+}
+
+impl Default for CapabilitySet {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -1238,13 +1228,17 @@ mod tests {
         assert_eq!(repl.as_slice(), expected.as_slice());
 
         // A step keeps the operational surface of a dialogue except plan
-        // authoring; toolchain verification stays declared in the profile and
-        // is removed by the turn-intent narrowing.
+        // authoring and documentation; toolchain verification stays declared
+        // in the profile and is removed by the turn-intent narrowing.
         let step = CapabilitySet::isolated_step();
         assert_eq!(
             step.as_slice(),
-            repl.without(LlmCapability::PlanCreation).as_slice()
+            repl.without(LlmCapability::PlanCreation)
+                .without(LlmCapability::DocRequest)
+                .as_slice()
         );
+        assert!(!step.contains(LlmCapability::PlanCreation));
+        assert!(!step.contains(LlmCapability::DocRequest));
         assert!(step.contains(LlmCapability::ToolchainVerify));
         assert!(step.contains(LlmCapability::Blocked));
         assert!(step.contains(LlmCapability::Abort));
@@ -1445,6 +1439,10 @@ mod tests {
         assert!(
             !step.core().contains(LlmCapability::PlanCreation),
             "an isolated step never authors a plan"
+        );
+        assert!(
+            !step.core().contains(LlmCapability::DocRequest),
+            "an isolated step never consults the harness documentation"
         );
         assert!(step.core().contains(LlmCapability::ToolchainVerify));
     }

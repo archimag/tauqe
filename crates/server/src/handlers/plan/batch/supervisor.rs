@@ -52,15 +52,12 @@ pub(in crate::handlers::plan) enum BatchOutcome {
 
 /// Execution options a plan batch forwards to every step it runs.
 ///
-/// The coder selection names the ladder rung a step starts from, and the
-/// directives are appended to the prompt of every step. Both travel from the RPC
-/// parameters, so a batch never invents a starting model of its own.
+/// The coder selection names the ladder rung a step starts from. It travels
+/// from the RPC parameters, so a batch never invents a starting model of its own.
 #[derive(Debug, Clone, Default)]
 pub(in crate::handlers::plan) struct PlanBatchOptions {
     /// Coder selection the batch starts from, resolved against the coder ladder.
     pub(crate) model: Option<ModelSelection>,
-    /// Developer directives appended to the prompt of every step.
-    pub(crate) instructions: Option<String>,
 }
 
 /// Emits the single terminal `plan/batch_finished` event for a batch run.
@@ -373,7 +370,6 @@ pub(super) async fn run_plan_batch_with(
             batch_step_ids: &current_step_ids,
             operation,
             model: options.model.as_ref(),
-            instructions: options.instructions.as_deref(),
         };
 
         let report = BatchExecution::new()

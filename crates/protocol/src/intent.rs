@@ -95,6 +95,11 @@ impl TurnIntent {
     ///   toolchain verification, because the harness owns verification for a
     ///   step deterministically.
     ///
+    /// The isolated-step profile carries neither plan authoring nor
+    /// documentation requests: a step executes an approved design inside the
+    /// codebase, so knowledge about the harness itself is never part of its
+    /// surface.
+    ///
     /// The narrowing always intersects with a regime profile, never with a
     /// wire-format profile, so both transports converge on the same capability
     /// surface for a given intent.
@@ -198,7 +203,7 @@ mod tests {
     }
 
     #[test]
-    fn test_narrow_capabilities_isolated_step_drops_plan_and_verification() {
+    fn test_narrow_capabilities_isolated_step_drops_plan_verification_and_documentation() {
         let advertised = CapabilitySet::from_slice(LlmCapability::ALL);
         let narrowed = TurnIntent::IsolatedStep.narrow_capabilities(&advertised);
 
@@ -208,6 +213,9 @@ mod tests {
         assert!(!narrowed.contains(LlmCapability::PlanCreation));
         assert!(!narrowed.contains(LlmCapability::PlanUpdate));
         assert!(!narrowed.contains(LlmCapability::ToolchainVerify));
+        // A step owns the implementation only, so the documentation channel of
+        // the interactive dialogue is absent from its surface.
+        assert!(!narrowed.contains(LlmCapability::DocRequest));
     }
 
     #[test]

@@ -13,7 +13,7 @@ use tauqe_protocol::{
 };
 
 use crate::handlers::architect::{
-    format_architect_tier, resolve_architect_provider, run_architect_discovery_loop,
+    format_architect_escalation_note, resolve_architect_provider, run_architect_discovery_loop,
     ArchitectDiscoveryError, ArchitectDiscoveryOutcome, ArchitectDiscoveryRequest,
 };
 use crate::handlers::common::{
@@ -59,6 +59,7 @@ pub(super) async fn execute_plan_horizon_synthesis(
         provider,
         architect_tier,
         level_up,
+        escalation_excluded,
         repomap_budget,
         max_discovery_rounds,
         files_token_budget,
@@ -79,10 +80,17 @@ pub(super) async fn execute_plan_horizon_synthesis(
                 Ok(p) => p,
                 Err(err) => return Response::err(req_id, errors::NO_API_KEY, err),
             };
+        // A manual run on a configuration the automatic ladder excludes cannot
+        // escalate, which the published note states instead of leaving the
+        // developer to assume a silent downgrade.
+        let escalation_excluded = cfg
+            .models
+            .excluded_from_escalation(ModelRole::Architect, &architect_tier.model);
         (
             provider,
             architect_tier,
             level_up,
+            escalation_excluded,
             cfg.context.repomap_token_budget,
             cfg.context.max_discovery_rounds,
             cfg.context.files_token_budget,
@@ -135,21 +143,11 @@ pub(super) async fn execute_plan_horizon_synthesis(
         .ok(),
     });
 
-    let level_up_note = level_up
-        .as_ref()
-        .map(|level| {
-            let from = level
-                .from
-                .as_ref()
-                .map(format_architect_tier)
-                .unwrap_or_else(|| "not recorded".to_string());
-            format!(
-                "\n> Architect level up: {} → {}",
-                from,
-                format_architect_tier(&level.to)
-            )
-        })
-        .unwrap_or_default();
+    let level_up_note = format_architect_escalation_note(
+        &architect_tier,
+        level_up.as_ref(),
+        escalation_excluded && diagnostics.is_some(),
+    );
 
     let intro_header = match &diagnostics {
         Some(diag) => format!(

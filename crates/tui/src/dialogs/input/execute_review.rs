@@ -188,6 +188,8 @@ mod tests {
         ReviewIssue {
             id,
             title: format!("Finding {}", id),
+            uuid: None,
+            group: None,
             model: None,
             issue_type: IssueType::Bug,
             status: IssueStatus::Todo,

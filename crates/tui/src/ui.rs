@@ -20,7 +20,8 @@ use crate::dialogs::render::{
     render_confirm_clear_user_popup, render_confirm_delete_plan_popup,
     render_confirm_delete_review_popup, render_confirm_detach_focus_popup,
     render_confirm_execute_pipeline_popup, render_confirm_execute_review_popup,
-    render_confirm_execute_scope_popup, render_confirm_quit_popup, render_disconnected_popup,
+    render_confirm_execute_scope_popup, render_confirm_quit_popup,
+    render_confirm_review_analyze_popup, render_diff_inspector, render_disconnected_popup,
     render_help_popup, render_locale_dialog, render_plan_refine_blocked_dialog,
     render_plan_refine_dialog, render_prompt_modal, render_review_dialog, render_selection_dialog,
     render_squash_popup, render_status_dialog, render_usage_summary,
@@ -308,6 +309,7 @@ pub fn render_ui(frame: &mut ratatui::Frame, state: &mut AppState) {
                 render_confirm_delete_review_popup(frame, session_id, state);
             }
         }
+        Some(ActiveModal::ReviewAnalyze) => render_confirm_review_analyze_popup(frame, state),
         Some(ActiveModal::ExecuteReview) => render_confirm_execute_review_popup(frame, state),
         Some(ActiveModal::ExecutePipeline) => render_confirm_execute_pipeline_popup(frame, state),
         Some(ActiveModal::ExecuteScope) => render_confirm_execute_scope_popup(frame, state),
@@ -347,6 +349,14 @@ pub fn render_ui(frame: &mut ratatui::Frame, state: &mut AppState) {
         Some(ActiveModal::Selection) => {
             if let Some(dialog) = &state.selection_dialog {
                 render_selection_dialog(frame, dialog);
+            }
+        }
+        // The inspector reads the change set it captured when it opened and the
+        // diff cache the Develop viewport already filled, so the audit paints
+        // exactly the rows the REPL laid out (c-3).
+        Some(ActiveModal::DiffInspector) => {
+            if let Some(inspector) = state.diff_inspector.as_mut() {
+                render_diff_inspector(frame, inspector, &mut state.model.diff_cache);
             }
         }
         Some(ActiveModal::ThemeSelector) => {

@@ -15,7 +15,7 @@ use crate::ui::HitRegistry;
 use crate::views::context::ContextViewState;
 use crate::views::history::HistoryViewState;
 use crate::views::plans::{PlansViewState, RefineDialogFocus};
-use crate::views::repl::{ReplView, TurnStatus};
+use crate::views::repl::{ReplView, StreamingFileEdit, TurnStatus};
 use crate::views::review::ReviewViewState;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -99,6 +99,8 @@ pub enum ActiveModal {
     /// Second tier, raised when the plan still carries unfinished work.
     DeletePlanFinal,
     DeleteReview,
+    /// Confirmation of the expensive Architect post-analysis over a session.
+    ReviewAnalyze,
     ExecuteReview,
     ExecutePipeline,
     ExecuteScope,
@@ -109,6 +111,10 @@ pub enum ActiveModal {
     ClearHistory,
     Status,
     Selection,
+    /// Fullscreen two-pane audit of the change set staged in the Develop
+    /// viewport: a read-only reading surface that outranks the informational
+    /// overlays below it (c-3).
+    DiffInspector,
     ThemeSelector,
     /// Full usage telemetry breakdown for the session and the operations.
     UsageSummary,
@@ -333,12 +339,62 @@ impl StatusDialogTarget {
 }
 
 /// Pending confirmation of a plan step or scope execution.
+/// Section of the plan step and scope execution dialog that owns the keyboard.
+///
+/// Executing a step or a scope hands control to the Coder role, and the plan is
+/// the single source of truth for what each step must implement, so the
+/// confirmation carries exactly two keyboard targets: the starting Coder rung and
+/// the action buttons. There is no directives editor to reach, so two states
+/// describe the whole focus model (c-4, Conventions §6, §7).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ExecuteScopeFocus {
+    /// The embedded Coder ladder owns digits, arrows, and paging.
+    #[default]
+    ModelList,
+    /// The action bar owns button stepping and activation.
+    Actions,
+}
+
+impl ExecuteScopeFocus {
+    /// Whether the embedded Coder list owns the keyboard.
+    pub fn is_model_list(&self) -> bool {
+        matches!(self, Self::ModelList)
+    }
+
+    /// Whether the action bar owns the keyboard.
+    pub fn is_actions(&self) -> bool {
+        matches!(self, Self::Actions)
+    }
+
+    /// Advances focus to the next section in visual order.
+    ///
+    /// A dialog offering a single Coder entry has no list to navigate, so the
+    /// action bar stays focused instead of cycling through a one-row picker.
+    pub fn cycle_next(&mut self, entry_count: usize) {
+        *self = match self {
+            Self::ModelList => Self::Actions,
+            Self::Actions if entry_count > 1 => Self::ModelList,
+            Self::Actions => Self::Actions,
+        };
+    }
+
+    /// Moves focus to the previous section in visual order.
+    pub fn cycle_prev(&mut self, entry_count: usize) {
+        *self = match self {
+            Self::ModelList => Self::Actions,
+            Self::Actions if entry_count > 1 => Self::ModelList,
+            Self::Actions => Self::Actions,
+        };
+    }
+}
+
+/// Pending confirmation of a plan step or scope execution.
 ///
 /// Executing a step or a scope hands control to the Coder role, so the dialog
-/// carries the configured Coder ladder, a directives editor, and the section
-/// that currently owns the keyboard. The developer therefore picks the
-/// implementing model before any bounded turn spends tokens, exactly as in the
-/// single-target review execution dialog (c-tui-selector).
+/// carries the configured Coder ladder and the section that currently owns the
+/// keyboard. The plan states every step's instructions itself, so no directives
+/// editor travels with the confirmation: the developer picks only the
+/// implementing model before any bounded turn spends tokens (c-4).
 #[derive(Debug, Clone)]
 pub struct ConfirmExecuteScopeState {
     pub plan_id: String,
@@ -347,12 +403,10 @@ pub struct ConfirmExecuteScopeState {
     pub step_id: Option<String>,
     pub steps: Vec<tauqe_protocol::PlanItem>,
     /// Coder-role model selector: configured entries, cyclic navigation, and the
-    /// shared embedded-list rendering (c-tui-selector).
+    /// shared embedded-list rendering (c-4).
     pub selector: ModelSelector,
-    /// Optional implementation directives forwarded to the Coder turn.
-    pub instructions_editor: InputEditor,
     /// Section of the dialog that currently owns the keyboard.
-    pub focus: RefineDialogFocus,
+    pub focus: ExecuteScopeFocus,
     /// Focused action button; the safe `Cancel` holds the default.
     pub confirm_button: ConfirmDialogButton,
 }
@@ -362,7 +416,7 @@ impl ConfirmExecuteScopeState {
     ///
     /// One constructor serves both shapes — a single step and a whole scope,
     /// including a concept-only plan whose horizon is projected just-in-time —
-    /// so the state definition cannot drift between them (c-tui-selector).
+    /// so the state definition cannot drift between them (c-4).
     pub fn new(
         plan_id: String,
         plan_title: String,
@@ -378,8 +432,7 @@ impl ConfirmExecuteScopeState {
             step_id,
             steps,
             selector: ModelSelector::new(ModelRole::Coder, coder_entries, 0),
-            instructions_editor: InputEditor::default(),
-            focus: RefineDialogFocus::default(),
+            focus: ExecuteScopeFocus::default(),
             confirm_button: ConfirmDialogButton::Cancel,
         }
     }
@@ -389,7 +442,6 @@ impl ConfirmExecuteScopeState {
         self.selector.selected_entry()
     }
 }
-
 /// Pending confirmation of a multi-plan execution pipeline.
 ///
 /// A pipeline is a super-batch: every queued plan runs one after another under a
@@ -404,6 +456,19 @@ pub struct ConfirmExecutePipelineState {
     pub steps: Vec<tauqe_protocol::PlanItem>,
     /// Titles of the plans whose horizon the batch projects just-in-time.
     pub pending_synthesis: Vec<String>,
+}
+
+/// Pending confirmation of the Architect post-analysis over one review session.
+///
+/// The classification is a costly LLM operation that replaces the whole
+/// post-analysis layer of the session, so launching it requires an explicit
+/// confirmation whose safe default keeps the existing layer untouched (c-4).
+#[derive(Debug, Clone)]
+pub struct ConfirmReviewAnalyzeState {
+    /// Session whose findings the Architect classifies.
+    pub review_id: String,
+    /// Display title of that session, captured when the dialog opens.
+    pub review_title: String,
 }
 
 #[derive(Debug, Clone)]
@@ -610,6 +675,22 @@ impl StatusDialogState {
     }
 }
 
+/// Snapshot of the change set a developer audits in the fullscreen inspector.
+///
+/// The inspector is a reading surface, not a live projection of the stream: the
+/// staged files are captured when the Develop viewport hands them over, so
+/// scrolling, resizing, and re-rendering never depend on edits that are still
+/// arriving. The captured list is the session file list the left pane walks,
+/// while the scroll offset belongs to the isolated diff pane alone (c-3).
+pub struct DiffInspectorState {
+    /// Staged files of the audited turn, in Viewport order.
+    pub files: Vec<StreamingFileEdit>,
+    /// Index of the highlighted file inside [`Self::files`].
+    pub selected_file: usize,
+    /// Vertical scroll offset of the isolated diff read area.
+    pub diff_scroll: u16,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ViewMode {
     Repl,
@@ -669,15 +750,18 @@ impl HelpTab {
 
 /// Focus section of the review launch dialog.
 ///
-/// The dialog exposes three keyboard targets — the embedded Reviewer model
-/// list, the instruction editor, and the action buttons — and `Tab` cycles
-/// through them in visual order. Making the section explicit replaces the old
+/// The dialog exposes the embedded Reviewer model list, the review-preset
+/// list, the two text fields, and the action bar, and `Tab` cycles through
+/// them in visual order. Making the section explicit replaces the old
 /// heuristic that inferred the target from whether the editor was empty, so
 /// list navigation and text editing never fight over the same keys
 /// (Conventions §6, §7).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ReviewDialogFocus {
     ModelList,
+    /// Selectable list of the project's review presets, led by the explicit
+    /// `Custom` row (c-5).
+    PresetList,
     /// Single-line field for the target directory or glob pattern.
     PathEditor,
     #[default]
@@ -686,44 +770,32 @@ pub enum ReviewDialogFocus {
 }
 
 impl ReviewDialogFocus {
-    /// Advances focus to the next section in visual order.
-    ///
-    /// When only one model is configured, `ModelList` is omitted from cycling so
-    /// navigation moves directly between the path field, the prompt editor, and
-    /// the action buttons.
-    pub fn cycle_next(&mut self, entry_count: usize) {
-        *self = match self {
-            Self::ModelList => Self::PathEditor,
-            Self::PathEditor => Self::PromptEditor,
-            Self::PromptEditor => Self::Actions,
-            Self::Actions => {
-                if entry_count > 1 {
-                    Self::ModelList
-                } else {
-                    Self::PathEditor
-                }
-            }
-        };
-    }
+    /// Visual order of the dialog sections, from the reviewer list to the
+    /// action bar. Focus cycling walks this sequence and skips the sections
+    /// that cannot receive the keyboard (c-3, c-5).
+    const VISUAL_ORDER: [ReviewDialogFocus; 5] = [
+        ReviewDialogFocus::ModelList,
+        ReviewDialogFocus::PresetList,
+        ReviewDialogFocus::PathEditor,
+        ReviewDialogFocus::PromptEditor,
+        ReviewDialogFocus::Actions,
+    ];
 
-    /// Moves focus to the previous section in visual order.
-    pub fn cycle_prev(&mut self, entry_count: usize) {
-        *self = match self {
-            Self::ModelList => Self::Actions,
-            Self::PathEditor => {
-                if entry_count > 1 {
-                    Self::ModelList
-                } else {
-                    Self::Actions
-                }
-            }
-            Self::PromptEditor => Self::PathEditor,
-            Self::Actions => Self::PromptEditor,
-        };
+    /// Position of the section in the visual order.
+    fn position(self) -> usize {
+        Self::VISUAL_ORDER
+            .iter()
+            .position(|section| *section == self)
+            .unwrap_or(0)
     }
 
     pub fn is_model_list(&self) -> bool {
         matches!(self, Self::ModelList)
+    }
+
+    /// Whether the focus is on the review-preset section.
+    pub fn is_preset_list(&self) -> bool {
+        matches!(self, Self::PresetList)
     }
 
     pub fn is_path_editor(&self) -> bool {
@@ -739,6 +811,140 @@ impl ReviewDialogFocus {
     }
 }
 
+/// Candidate rows of the contextual directory completion menu kept in state.
+///
+/// The menu is drawn under the path block, so the list is capped to keep the
+/// popup compact: a longer prefix match is narrowed by typing one more
+/// character rather than by scrolling an arbitrarily long menu (c-5).
+pub const PATH_COMPLETION_MAX_ROWS: usize = 6;
+
+/// Contextual directory completion of the active target-path row (c-5).
+///
+/// The completion holds the repository directory prefixes that continue the
+/// text typed in the active row, together with the highlighted candidate. It is
+/// pure presentation state: it selects nothing by itself and never reaches the
+/// wire, because only an accepted candidate changes the row text that becomes
+/// `ReviewStartParams::path_patterns`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PathCompletion {
+    candidates: Vec<String>,
+    selected: usize,
+}
+
+impl PathCompletion {
+    /// Whether the menu currently offers at least one candidate.
+    pub fn is_open(&self) -> bool {
+        !self.candidates.is_empty()
+    }
+
+    /// Candidate prefixes the menu draws, in repository order.
+    pub fn candidates(&self) -> &[String] {
+        &self.candidates
+    }
+
+    /// Index of the highlighted candidate.
+    pub fn selected_index(&self) -> usize {
+        self.selected
+    }
+
+    /// Highlighted candidate, if any.
+    pub fn selected_candidate(&self) -> Option<&str> {
+        self.candidates.get(self.selected).map(String::as_str)
+    }
+
+    /// Index of the first candidate drawn in a window of `visible_rows` rows,
+    /// keeping the highlight visible.
+    pub fn visible_start(&self, visible_rows: usize) -> usize {
+        visible_start(self.selected, self.candidates.len(), visible_rows)
+    }
+
+    /// Replaces the candidate list, preserving the highlight while the list is
+    /// unchanged and returning it to the first row otherwise, so moving the
+    /// cursor inside the row never resets a candidate already chosen.
+    pub fn reset(&mut self, candidates: Vec<String>) {
+        if self.candidates != candidates {
+            self.selected = 0;
+        }
+        self.candidates = candidates;
+        self.clamp();
+    }
+
+    /// Highlights the next candidate, wrapping around at the end.
+    pub fn select_next(&mut self) {
+        if !self.candidates.is_empty() {
+            self.selected = (self.selected + 1) % self.candidates.len();
+        }
+    }
+
+    /// Highlights the previous candidate, wrapping around at the start.
+    pub fn select_prev(&mut self) {
+        if !self.candidates.is_empty() {
+            self.selected = self
+                .selected
+                .checked_sub(1)
+                .unwrap_or(self.candidates.len() - 1);
+        }
+    }
+
+    /// Highlights the candidate at `index`, clamped into range.
+    pub fn select_index(&mut self, index: usize) {
+        if self.candidates.is_empty() {
+            return;
+        }
+        self.selected = index.min(self.candidates.len() - 1);
+    }
+
+    /// Closes the menu without touching the rows.
+    pub fn close(&mut self) {
+        self.candidates.clear();
+        self.selected = 0;
+    }
+
+    fn clamp(&mut self) {
+        if self.candidates.is_empty() {
+            self.selected = 0;
+        } else if self.selected >= self.candidates.len() {
+            self.selected = self.candidates.len() - 1;
+        }
+    }
+}
+
+/// Index of the first row of a window of `visible_rows` rows that keeps
+/// `selected` visible.
+///
+/// The completion menu and the path rows share this arithmetic, so neither
+/// surface re-derives its own scroll window.
+fn visible_start(selected: usize, len: usize, visible_rows: usize) -> usize {
+    if len == 0 || visible_rows == 0 {
+        return 0;
+    }
+    let height = visible_rows.min(len);
+    let max_start = len - height;
+    let mut start = 0;
+    if selected >= height {
+        start = selected + 1 - height;
+    }
+    start.min(max_start)
+}
+
+/// Directory prefixes of `directories` that continue `prefix` (c-5).
+///
+/// Every repository directory that starts with the typed text and is not the
+/// text itself continues it. A blank prefix offers nothing, because an empty row
+/// narrows nothing and the whole directory tree is not a suggestion. The list is
+/// capped so the popup stays compact.
+fn completion_candidates(prefix: &str, directories: &[String]) -> Vec<String> {
+    if prefix.is_empty() {
+        return Vec::new();
+    }
+    directories
+        .iter()
+        .filter(|directory| directory.starts_with(prefix) && directory.as_str() != prefix)
+        .take(PATH_COMPLETION_MAX_ROWS)
+        .cloned()
+        .collect()
+}
+
 #[derive(Debug, Clone)]
 pub struct ReviewDialogState {
     pub files_count: usize,
@@ -746,13 +952,41 @@ pub struct ReviewDialogState {
     /// Reviewer-role model selector: configured entries, cyclic navigation,
     /// embedded-list rendering, and the shared scroll arithmetic (c-1, c-2).
     pub selector: ModelSelector,
-    /// Single-line target directory or glob pattern narrowing the reviewed set.
+    /// Repository file list the handshake delivered.
     ///
-    /// The value is sent as `ReviewStartParams::path_pattern`, so the matched
-    /// files are merged alongside the User Context on the server instead of
-    /// replacing it: the developer keeps exclusive ownership of that layer
-    /// (c-review-context-input).
-    pub path_editor: InputEditor,
+    /// The live match counter evaluates the target text against exactly this
+    /// list with the same `tauqe_protocol::glob::GlobPattern` the server
+    /// applies, so a local preview can never predict a selection the server
+    /// resolves differently (c-2).
+    pub repo_files: Vec<String>,
+    /// Review presets the project declares, offered as a selectable section.
+    ///
+    /// Row zero of [`Self::preset_selector`] is the explicit `Custom` entry, so
+    /// a developer can always fall back to a manual launch after inspecting a
+    /// preset (c-5). An empty list collapses the section and leaves the dialog
+    /// exactly as it was before presets existed.
+    pub presets: Vec<tauqe_protocol::ReviewPresetSummary>,
+    /// Cursor and scroll window of the preset section. The shared
+    /// `ListSelector` owns the navigation arithmetic, so the section carries no
+    /// index math of its own (c-5).
+    pub preset_selector: ListSelector,
+    /// Ordered path and glob rows narrowing the audited set.
+    ///
+    /// Every non-empty row becomes one entry of `ReviewStartParams::path_patterns`,
+    /// which the server resolves as a disjunction: a file is audited when at
+    /// least one row selects it. The rows are sent as one list, so the matched
+    /// files are merged with the current User Context rather than replacing it:
+    /// the developer keeps exclusive ownership of that layer (c-3, c-6).
+    pub path_inputs: Vec<InputEditor>,
+    /// Index of the path row that currently owns the keyboard.
+    pub path_active: usize,
+    /// Directory prefixes the repository offers to the active path row.
+    ///
+    /// Derived once from `repo_files` through `collect_directories`, so typing
+    /// never re-walks the whole file list to rebuild the prefix tree (c-5).
+    pub path_directories: Vec<String>,
+    /// Contextual directory completion of the active path row (c-5).
+    pub path_completion: PathCompletion,
     pub prompt_editor: InputEditor,
     /// Section that currently owns the keyboard.
     pub focus: ReviewDialogFocus,
@@ -763,37 +997,370 @@ pub struct ReviewDialogState {
 impl ReviewDialogState {
     /// Builds a review launch dialog selecting among the configured
     /// `reviewer_entries` for the Reviewer role.
+    ///
+    /// `repo_files` is the repository file list the handshake delivered: the
+    /// dialog evaluates the target text against it locally, so a launch needs
+    /// no matching RPC (c-2).
     pub fn new(
         files_count: usize,
         estimated_tokens: usize,
         reviewer_entries: Vec<tauqe_protocol::ModelEntry>,
+        repo_files: Vec<String>,
     ) -> Self {
+        let path_directories = crate::dialogs::pattern::collect_directories(&repo_files);
         Self {
             files_count,
             estimated_tokens,
             selector: ModelSelector::new(ModelRole::Reviewer, reviewer_entries, 0),
-            path_editor: InputEditor::default(),
+            repo_files,
+            presets: Vec::new(),
+            preset_selector: ListSelector::new(0, 0),
+            path_inputs: vec![InputEditor::default()],
+            path_active: 0,
+            path_directories,
+            path_completion: PathCompletion::default(),
             prompt_editor: InputEditor::default(),
             focus: ReviewDialogFocus::default(),
             confirm_button: ConfirmDialogButton::Cancel,
         }
     }
 
-    /// Currently selected reviewer entry, if any.
+    /// Registers the project's review presets as a selectable section.
+    ///
+    /// The section lists the explicit `Custom` row first and one row per
+    /// configured preset, so a manual launch is always one row away after a
+    /// preset has been inspected (c-5). A project that declares no preset keeps
+    /// the section collapsed and the dialog exactly as it was before.
+    pub fn with_presets(mut self, presets: Vec<tauqe_protocol::ReviewPresetSummary>) -> Self {
+        if !presets.is_empty() {
+            self.preset_selector = ListSelector::new(presets.len() + 1, 0);
+        }
+        self.presets = presets;
+        self
+    }
+
+    /// Whether the project declares any review preset.
+    pub fn has_presets(&self) -> bool {
+        !self.presets.is_empty()
+    }
+
+    /// Labels of the selectable preset rows: the explicit `Custom` entry first,
+    /// then every configured preset by its human-readable title, or by its name
+    /// when the preset declares no title (c-5).
+    ///
+    /// The list is empty when the project declares no preset, so a caller can
+    /// never draw a row that [`Self::preset_selector`] does not own.
+    pub fn preset_labels(&self) -> Vec<String> {
+        if !self.has_presets() {
+            return Vec::new();
+        }
+        let mut labels = Vec::with_capacity(self.presets.len() + 1);
+        labels.push(active_t("dialog.review_launch.preset_custom"));
+        for preset in &self.presets {
+            let title = preset
+                .title
+                .as_deref()
+                .map(str::trim)
+                .filter(|title| !title.is_empty());
+            labels.push(match title {
+                Some(title) => title.to_string(),
+                None => preset.name.clone(),
+            });
+        }
+        labels
+    }
+
+    /// Preset the highlighted row selects, or `None` while the explicit `Custom`
+    /// row owns the highlight (c-5).
+    pub fn selected_preset(&self) -> Option<&tauqe_protocol::ReviewPresetSummary> {
+        self.preset_selector
+            .selected_index()
+            .checked_sub(1)
+            .and_then(|index| self.presets.get(index))
+    }
+
+    /// Whether the launch is the custom, one-off audit the developer assembles
+    /// by hand.
+    ///
+    /// The explicit `Custom` row of the preset section owns this mode; a
+    /// highlighted preset owns the launch instead and supplies its own groups,
+    /// paths, and prompts. The mode governs the whole dialog surface: the
+    /// target field is its input aid and exists only in this mode, while the
+    /// preset section itself is the mode switcher and stays visible in both
+    /// (c-5).
+    pub fn is_custom_launch(&self) -> bool {
+        self.selected_preset().is_none()
+    }
     pub fn selected_entry(&self) -> Option<&tauqe_protocol::ModelEntry> {
         self.selector.selected_entry()
     }
 
+    /// Trimmed, non-empty path rows in entry order (c-3, c-6).
+    ///
+    /// Blank rows narrow nothing, so they are dropped instead of being sent as
+    /// worthless patterns that would select the whole repository.
+    pub fn path_patterns(&self) -> Vec<String> {
+        self.path_inputs
+            .iter()
+            .map(|editor| editor.get_text().trim().to_string())
+            .filter(|pattern| !pattern.is_empty())
+            .collect()
+    }
+
+    /// Number of path rows the dialog currently lists.
+    pub fn path_row_count(&self) -> usize {
+        self.path_inputs.len()
+    }
+
+    /// Text editor of the row that currently owns the keyboard.
+    pub fn active_path_editor(&self) -> Option<&InputEditor> {
+        self.path_inputs.get(self.path_active)
+    }
+
+    /// Mutable text editor of the row that currently owns the keyboard.
+    pub fn active_path_editor_mut(&mut self) -> Option<&mut InputEditor> {
+        self.path_inputs.get_mut(self.path_active)
+    }
+
+    /// Whether the active row holds no text, which is what makes `Backspace`
+    /// close it instead of deleting a character (c-3).
+    pub fn active_path_is_empty(&self) -> bool {
+        self.active_path_editor().is_some_and(InputEditor::is_empty)
+    }
+
+    /// Whether the active row carries a usable path or glob.
+    ///
+    /// A row is usable once it holds non-whitespace text: the glob matcher is
+    /// total and degrades an unterminated character class to a literal bracket
+    /// instead of rejecting the pattern, so emptiness is the only defect a row
+    /// can carry (c-3).
+    pub fn active_path_is_valid(&self) -> bool {
+        self.active_path_editor()
+            .is_some_and(|editor| !editor.get_text().trim().is_empty())
+    }
+
+    /// Appends the next path row when the active one carries a usable pattern.
+    ///
+    /// `C-j` opens a row below the active one and hands it the keyboard, so a
+    /// further pattern is typed without leaving the section. An empty or blank
+    /// row refuses the append, which keeps stray empty rows out of the list
+    /// (c-3). Returns whether a row was added.
+    pub fn append_path_row(&mut self) -> bool {
+        if !self.active_path_is_valid() {
+            return false;
+        }
+        self.path_inputs.push(InputEditor::default());
+        self.path_active = self.path_inputs.len() - 1;
+        self.refresh_path_completion();
+        true
+    }
+
+    /// Closes the active row and hands the keyboard to the previous one.
+    ///
+    /// Only an empty row can be closed, and the dialog always keeps at least one
+    /// row, so a row holding text is never dropped by a single keystroke and a
+    /// multi-row list can never shrink into nothing (c-3). Returns whether a row
+    /// was removed.
+    pub fn remove_active_path_row(&mut self) -> bool {
+        if !self.active_path_is_empty() || self.path_inputs.len() <= 1 {
+            return false;
+        }
+        self.path_inputs.remove(self.path_active);
+        self.path_active = self
+            .path_active
+            .saturating_sub(1)
+            .min(self.path_inputs.len() - 1);
+        self.refresh_path_completion();
+        true
+    }
+
+    /// Walks the active path row with `C-n` / `C-p`.
+    ///
+    /// Returns `true` while the walk stays inside the list and `false` at its
+    /// boundary, where the caller hands the keyboard to the neighbouring section
+    /// instead. The rows therefore behave like a vertical stack of input fields
+    /// without ever trapping the focus (c-4).
+    pub fn step_path_row(&mut self, forward: bool) -> bool {
+        if forward {
+            if self.path_active + 1 >= self.path_inputs.len() {
+                return false;
+            }
+            self.path_active += 1;
+        } else {
+            match self.path_active.checked_sub(1) {
+                Some(previous) => self.path_active = previous,
+                None => return false,
+            }
+        }
+        self.refresh_path_completion();
+        true
+    }
+
+    /// Index of the first path row drawn in a window of `visible_rows` rows,
+    /// keeping the active row visible.
+    pub fn path_visible_start(&self, visible_rows: usize) -> usize {
+        visible_start(self.path_active, self.path_inputs.len(), visible_rows)
+    }
+
+    /// Recomputes the directory completion of the active row (c-5).
+    pub fn refresh_path_completion(&mut self) {
+        let prefix = self
+            .active_path_editor()
+            .map(|editor| editor.get_text().trim().to_string())
+            .unwrap_or_default();
+        let candidates = completion_candidates(&prefix, &self.path_directories);
+        self.path_completion.reset(candidates);
+    }
+
+    /// Accepts the highlighted directory completion into the active row (c-5).
+    ///
+    /// The candidate replaces the typed text, so the row ends exactly on a
+    /// directory prefix the matcher resolves as "every path beneath it". Returns
+    /// whether a candidate was accepted.
+    pub fn accept_path_completion(&mut self) -> bool {
+        let candidate = match self.path_completion.selected_candidate() {
+            Some(candidate) => candidate.to_string(),
+            None => return false,
+        };
+        if let Some(editor) = self.active_path_editor_mut() {
+            editor.clear();
+            editor.insert_str(&candidate);
+        }
+        self.refresh_path_completion();
+        true
+    }
+
+    /// Highlights the candidate at `index` and accepts it into the active row.
+    pub fn accept_path_completion_at(&mut self, index: usize) -> bool {
+        self.path_completion.select_index(index);
+        self.accept_path_completion()
+    }
+
+    /// Highlights the next directory completion of the active row.
+    pub fn next_path_completion(&mut self) -> bool {
+        if !self.path_completion.is_open() {
+            return false;
+        }
+        self.path_completion.select_next();
+        true
+    }
+
+    /// Highlights the previous directory completion of the active row.
+    pub fn prev_path_completion(&mut self) -> bool {
+        if !self.path_completion.is_open() {
+            return false;
+        }
+        self.path_completion.select_prev();
+        true
+    }
+
+    /// Closes the directory completion menu without touching the rows.
+    pub fn close_path_completion(&mut self) {
+        self.path_completion.close();
+    }
+
+    /// Candidate rows the completion menu presents while the path section owns
+    /// the keyboard, and none while another section holds it.
+    pub fn visible_completion_rows(&self) -> usize {
+        if self.focus.is_path_editor() {
+            self.path_completion.candidates().len()
+        } else {
+            0
+        }
+    }
+
+    /// Number of repository files the entered path rows select together.
+    ///
+    /// The rows form a union: a file is counted once no matter how many rows
+    /// select it. The value is always computed from the live row texts, so the
+    /// counter can never drift from what a launch would send: `None` means the
+    /// rows narrow nothing, `Some(0)` means they match nothing (c-6).
+    pub fn pattern_match_count(&self) -> Option<usize> {
+        crate::dialogs::pattern::count_multi_matches(&self.path_patterns(), &self.repo_files)
+    }
+
+    /// Whether a launch may proceed with the entered path rows.
+    ///
+    /// A highlighted preset supplies its own paths, so the rows are ignored and
+    /// can never block the launch (c-5). On the explicit `Custom` row an empty
+    /// list narrows nothing and passes silently, while entered patterns that
+    /// select no repository file are refused: the server rejects such a launch
+    /// with `INVALID_PARAMS`, and the dialog must not promise an audit over a
+    /// selection that does not exist (c-6).
+    pub fn is_pattern_launchable(&self) -> bool {
+        self.selected_preset().is_some() || !matches!(self.pattern_match_count(), Some(0))
+    }
+
+    /// Advances focus to the next selectable section in visual order.
+    ///
+    /// Sections that cannot receive the keyboard are skipped: the reviewer list
+    /// when a single model is configured, and the target field when a
+    /// highlighted preset owns the launch (c-5).
+    pub fn cycle_focus_next(&mut self) {
+        self.focus = self.step_focus(true);
+    }
+
+    /// Moves focus to the previous selectable section in visual order.
+    pub fn cycle_focus_prev(&mut self) {
+        self.focus = self.step_focus(false);
+    }
+
+    /// Walks the visual order from the current section until an available one
+    /// is reached. The walk is bounded by the number of sections, so a dialog
+    /// whose lists are unavailable still terminates on a text field.
+    fn step_focus(&self, forward: bool) -> ReviewDialogFocus {
+        let order = ReviewDialogFocus::VISUAL_ORDER;
+        let len = order.len();
+        let mut index = self.focus.position();
+        for _ in 0..len {
+            index = if forward {
+                (index + 1) % len
+            } else {
+                index.checked_sub(1).unwrap_or(len - 1)
+            };
+            let candidate = order
+                .get(index)
+                .copied()
+                .unwrap_or(ReviewDialogFocus::PromptEditor);
+            if self.focus_is_available(candidate) {
+                return candidate;
+            }
+        }
+        ReviewDialogFocus::PromptEditor
+    }
+
+    /// Whether a section can take the keyboard in this dialog.
+    ///
+    /// The target field is an input aid of the custom launch: under a
+    /// highlighted preset it is absent from the card and can never hold the
+    /// keyboard, so focus never lands on a hidden section (c-5).
+    fn focus_is_available(&self, focus: ReviewDialogFocus) -> bool {
+        let custom = self.is_custom_launch();
+        match focus {
+            ReviewDialogFocus::ModelList => self.selector.len() > 1,
+            ReviewDialogFocus::PresetList => self.has_presets(),
+            ReviewDialogFocus::PathEditor => custom,
+            _ => true,
+        }
+    }
+
     /// Builds the RPC parameters that launch this review.
+    ///
+    /// A highlighted preset owns the launch: the server expands it into the
+    /// groups, paths, and prompts it declares, so the dialog sends only its name
+    /// and never a target pattern that would contradict the preset's own paths
+    /// (c-5). The explicit `Custom` row keeps the previous behaviour — the
+    /// entered rows become the `path_patterns` list, which the server resolves
+    /// as a union and merges into the matched files of the current User Context
+    /// without mutating the developer's layer
+    /// (c-review-context-input).
     ///
     /// Both text fields are trimmed and collapse to `None` when blank, so an
     /// empty prompt or path never reaches the server as a meaningless value.
-    /// The optional directory or glob becomes `path_pattern`, which the server
-    /// applies by merging the matched files with the current User Context
-    /// without mutating the developer's layer (c-review-context-input).
     pub fn start_params(&self) -> ReviewStartParams {
         let prompt = self.prompt_editor.get_text().trim().to_string();
-        let pattern = self.path_editor.get_text().trim().to_string();
+        let patterns = self.path_patterns();
+        let preset = self.selected_preset();
         ReviewStartParams {
             // The selected reviewer rung travels whole — the model together
             // with the reasoning depth it was configured with — so the reviewer
@@ -808,11 +1375,17 @@ impl ReviewDialogState {
             } else {
                 Some(prompt)
             },
-            path_pattern: if pattern.is_empty() {
-                None
+            // A preset supplies its own paths, so the typed rows are dropped
+            // exactly as the ignored target field was (c-5, c-6).
+            path_patterns: if preset.is_some() {
+                Vec::new()
             } else {
-                Some(pattern)
+                patterns
             },
+            // A preset name launches the groups the project configured; its
+            // absence is the custom, one-off launch the developer assembled by
+            // hand (c-5).
+            preset: preset.map(|preset| preset.name.clone()),
         }
     }
 }
@@ -1091,6 +1664,10 @@ pub struct AppState {
     pub context_view: ContextViewState,
     pub history_view: HistoryViewState,
     pub review: ReviewViewState,
+    /// Review presets declared by the project, mirrored from the configuration
+    /// snapshot so the launch dialog can offer them without re-reading
+    /// `tauqe.toml` (c-5).
+    pub review_presets: Vec<tauqe_protocol::ReviewPresetSummary>,
     pub plans_view: PlansViewState,
     pub onboarding: OnboardingState,
     pub input_editor: InputEditor,
@@ -1119,6 +1696,8 @@ pub struct AppState {
     /// would be discarded.
     pub confirm_delete_plan_final: Option<String>,
     pub confirm_delete_review: Option<String>,
+    /// Session awaiting confirmation of the costly Architect post-analysis.
+    pub confirm_review_analyze: Option<ConfirmReviewAnalyzeState>,
     pub confirm_execute_scope: Option<ConfirmExecuteScopeState>,
     pub confirm_execute_pipeline: Option<ConfirmExecutePipelineState>,
     pub confirm_execute_review: Option<ConfirmExecuteReviewState>,
@@ -1128,6 +1707,8 @@ pub struct AppState {
     pub squash_dialog: Option<SquashDialogState>,
     pub review_dialog: Option<ReviewDialogState>,
     pub prompt_modal: Option<PromptModalState>,
+    /// Fullscreen two-pane audit of the change set the Develop viewport stages.
+    pub diff_inspector: Option<DiffInspectorState>,
     pub notification: Option<AppNotification>,
     pub turn_started_at: Option<std::time::Instant>,
     pub server_disconnected: Option<String>,
@@ -1188,6 +1769,7 @@ impl AppState {
             context_view: ContextViewState::default(),
             history_view: HistoryViewState::default(),
             review: ReviewViewState::default(),
+            review_presets: Vec::new(),
             plans_view: PlansViewState::default(),
             onboarding: init.onboarding,
             input_editor: init.input_editor,
@@ -1207,6 +1789,7 @@ impl AppState {
             confirm_delete_plan: None,
             confirm_delete_plan_final: None,
             confirm_delete_review: None,
+            confirm_review_analyze: None,
             confirm_execute_scope: None,
             confirm_execute_pipeline: None,
             confirm_execute_review: None,
@@ -1216,6 +1799,7 @@ impl AppState {
             squash_dialog: None,
             review_dialog: None,
             prompt_modal: None,
+            diff_inspector: None,
             notification: None,
             turn_started_at: None,
             server_disconnected: None,
@@ -1424,6 +2008,9 @@ impl AppState {
         if self.confirm_delete_review.is_some() {
             return Some(ActiveModal::DeleteReview);
         }
+        if self.confirm_review_analyze.is_some() {
+            return Some(ActiveModal::ReviewAnalyze);
+        }
         if self.confirm_execute_review.is_some() {
             return Some(ActiveModal::ExecuteReview);
         }
@@ -1453,6 +2040,12 @@ impl AppState {
         }
         if self.selection_dialog.is_some() {
             return Some(ActiveModal::Selection);
+        }
+        // The inspector is a reading surface opened over the Develop viewport:
+        // every confirmation above outranks it, while the informational
+        // overlays below never displace an audit in progress (c-3).
+        if self.diff_inspector.is_some() {
+            return Some(ActiveModal::DiffInspector);
         }
         if self.theme_selector.is_some() {
             return Some(ActiveModal::ThemeSelector);
@@ -2160,6 +2753,35 @@ mod tests {
         assert!(st.has_active_modal());
     }
 
+    /// The diff inspector is a read-only audit surface: it owns the keyboard
+    /// while it is open, above every informational overlay, and a pending
+    /// confirmation still outranks it so an interrupt is never swallowed (c-3).
+    #[test]
+    fn test_diff_inspector_stacks_below_confirmations() {
+        let mut st = test_state();
+        st.diff_inspector = Some(DiffInspectorState {
+            files: Vec::new(),
+            selected_file: 0,
+            diff_scroll: 0,
+        });
+
+        assert_eq!(st.active_modal(), Some(ActiveModal::DiffInspector));
+        assert!(st.has_active_modal());
+
+        // Reading surfaces below it never displace an audit in progress.
+        st.show_help = true;
+        st.open_usage_summary();
+        assert_eq!(st.active_modal(), Some(ActiveModal::DiffInspector));
+
+        // A pending confirmation always outranks the inspector.
+        st.confirm_quit = true;
+        assert_eq!(st.active_modal(), Some(ActiveModal::ConfirmQuit));
+
+        st.confirm_quit = false;
+        st.diff_inspector = None;
+        assert_eq!(st.active_modal(), Some(ActiveModal::UsageSummary));
+    }
+
     #[test]
     fn test_clear_user_modal_priority() {
         let mut st = test_state();
@@ -2244,70 +2866,460 @@ mod tests {
         assert_eq!(button, BatchCancelButton::SoftStop);
     }
 
+    /// Builds a review dialog over the given repository files.
+    fn review_dialog_with(repo_files: &[&str], reviewers: usize) -> ReviewDialogState {
+        let entries = (0..reviewers)
+            .map(|i| {
+                let model = ModelRef::openrouter(format!("reviewer-{i}"));
+                tauqe_protocol::ModelEntry::new(model, None)
+            })
+            .collect();
+        ReviewDialogState::new(
+            0,
+            0,
+            entries,
+            repo_files.iter().map(|path| path.to_string()).collect(),
+        )
+    }
+
     #[test]
-    fn test_review_dialog_focus_cycles_through_path_editor() {
-        // More than one reviewer configured: the model list participates.
-        let mut focus = ReviewDialogFocus::PromptEditor;
-        focus.cycle_next(3);
-        assert_eq!(focus, ReviewDialogFocus::Actions);
-        focus.cycle_next(3);
-        assert_eq!(focus, ReviewDialogFocus::ModelList);
-        focus.cycle_next(3);
-        assert_eq!(focus, ReviewDialogFocus::PathEditor);
-        focus.cycle_next(3);
-        assert_eq!(focus, ReviewDialogFocus::PromptEditor);
+    fn test_review_dialog_match_counter_follows_the_target_paths() {
+        let mut dialog =
+            review_dialog_with(&["src/lib.rs", "crates/tui/src/main.rs", "README.md"], 1);
+
+        // An empty list narrows nothing, so the counter stays silent.
+        assert_eq!(dialog.pattern_match_count(), None);
+        assert!(dialog.is_pattern_launchable());
+
+        dialog.path_inputs[0].insert_str("*.rs");
+        assert_eq!(dialog.pattern_match_count(), Some(2));
+        assert!(dialog.is_pattern_launchable());
+
+        // A second row joins the union: `README.md` is selected by the new row
+        // while the first one keeps its two source files, so the audit covers
+        // three files and no file is counted twice (c-6).
+        assert!(dialog.append_path_row());
+        assert_eq!(dialog.path_active, 1);
+        dialog.path_inputs[1].insert_str("README.md");
+        assert_eq!(dialog.pattern_match_count(), Some(3));
+
+        // Editing a row re-evaluates the counter, so the displayed number always
+        // describes the rows a launch would send (c-6).
+        dialog.path_inputs[0].clear();
+        assert_eq!(dialog.pattern_match_count(), Some(1));
+
+        dialog.path_inputs[1].clear();
+        assert_eq!(dialog.pattern_match_count(), None);
+        assert!(dialog.is_pattern_launchable());
+    }
+
+    #[test]
+    fn test_review_dialog_gate_refuses_a_pattern_without_matches() {
+        let mut dialog = review_dialog_with(&["src/lib.rs"], 1);
+        dialog.path_inputs[0].insert_str("srx/**/*.rs");
+
+        assert_eq!(dialog.pattern_match_count(), Some(0));
+        assert!(
+            !dialog.is_pattern_launchable(),
+            "a pattern that selects no file must block the launch"
+        );
+    }
+
+    #[test]
+    fn test_review_dialog_focus_cycles_through_every_section() {
+        // More than one reviewer: every section takes part in the cycle, in
+        // visual order, and the target field stays reachable on the explicit
+        // `Custom` row (c-3, c-5).
+        let mut dialog = review_dialog_with(&["src/lib.rs"], 2);
+        assert_eq!(dialog.focus, ReviewDialogFocus::PromptEditor);
+
+        dialog.cycle_focus_next();
+        assert_eq!(dialog.focus, ReviewDialogFocus::Actions);
+        dialog.cycle_focus_next();
+        assert_eq!(dialog.focus, ReviewDialogFocus::ModelList);
+        dialog.cycle_focus_next();
+        assert_eq!(dialog.focus, ReviewDialogFocus::PathEditor);
+        dialog.cycle_focus_next();
+        assert_eq!(dialog.focus, ReviewDialogFocus::PromptEditor);
 
         // Backward order mirrors the forward order exactly.
-        focus.cycle_prev(3);
-        assert_eq!(focus, ReviewDialogFocus::PathEditor);
-        focus.cycle_prev(3);
-        assert_eq!(focus, ReviewDialogFocus::ModelList);
-        focus.cycle_prev(3);
-        assert_eq!(focus, ReviewDialogFocus::Actions);
-        focus.cycle_prev(3);
-        assert_eq!(focus, ReviewDialogFocus::PromptEditor);
+        dialog.cycle_focus_prev();
+        assert_eq!(dialog.focus, ReviewDialogFocus::PathEditor);
+        dialog.cycle_focus_prev();
+        assert_eq!(dialog.focus, ReviewDialogFocus::ModelList);
+        dialog.cycle_focus_prev();
+        assert_eq!(dialog.focus, ReviewDialogFocus::Actions);
+        dialog.cycle_focus_prev();
+        assert_eq!(dialog.focus, ReviewDialogFocus::PromptEditor);
     }
 
     #[test]
-    fn test_review_dialog_focus_skips_model_list_when_single_reviewer() {
-        let mut focus = ReviewDialogFocus::PromptEditor;
-        focus.cycle_next(1);
-        assert_eq!(focus, ReviewDialogFocus::Actions);
-        focus.cycle_next(1);
-        assert_eq!(focus, ReviewDialogFocus::PathEditor);
-        focus.cycle_next(1);
-        assert_eq!(focus, ReviewDialogFocus::PromptEditor);
+    fn test_review_dialog_focus_skips_unavailable_sections() {
+        // A single reviewer: only the two text fields and the action bar can
+        // take the keyboard.
+        let mut dialog = review_dialog_with(&[], 1);
 
-        focus.cycle_prev(1);
-        assert_eq!(focus, ReviewDialogFocus::PathEditor);
-        focus.cycle_prev(1);
-        assert_eq!(focus, ReviewDialogFocus::Actions);
-        focus.cycle_prev(1);
-        assert_eq!(focus, ReviewDialogFocus::PromptEditor);
+        dialog.cycle_focus_next();
+        assert_eq!(dialog.focus, ReviewDialogFocus::Actions);
+        dialog.cycle_focus_next();
+        assert_eq!(dialog.focus, ReviewDialogFocus::PathEditor);
+        dialog.cycle_focus_next();
+        assert_eq!(dialog.focus, ReviewDialogFocus::PromptEditor);
+
+        dialog.cycle_focus_prev();
+        assert_eq!(dialog.focus, ReviewDialogFocus::PathEditor);
+        dialog.cycle_focus_prev();
+        assert_eq!(dialog.focus, ReviewDialogFocus::Actions);
+        dialog.cycle_focus_prev();
+        assert_eq!(dialog.focus, ReviewDialogFocus::PromptEditor);
     }
+    /// A highlighted preset owns the launch, so its input aid — the target
+    /// field — leaves the focus cycle, while the preset section stays reachable
+    /// as the mode switcher. Returning to the `Custom` row restores the full
+    /// cycle (c-5).
+    #[test]
+    fn test_review_dialog_focus_skips_custom_sections_under_a_preset() {
+        let mut dialog = review_dialog_with(&["src/lib.rs"], 1).with_presets(vec![
+            tauqe_protocol::ReviewPresetSummary {
+                name: "backend".to_string(),
+                title: None,
+            },
+        ]);
+        let rows = dialog.preset_selector.item_count();
+        dialog.preset_selector.select_index(1, rows);
+        assert!(dialog.selected_preset().is_some());
+        assert!(!dialog.is_custom_launch());
 
+        // The forward and backward walks visit only the sections that exist in
+        // the preset mode.
+        for _ in 0..ReviewDialogFocus::VISUAL_ORDER.len() {
+            dialog.cycle_focus_next();
+            assert_ne!(dialog.focus, ReviewDialogFocus::PathEditor);
+        }
+        for _ in 0..ReviewDialogFocus::VISUAL_ORDER.len() {
+            dialog.cycle_focus_prev();
+            assert_ne!(dialog.focus, ReviewDialogFocus::PathEditor);
+        }
+
+        // Returning to the `Custom` row restores the target field to the cycle.
+        dialog.preset_selector.select_index(0, rows);
+        assert!(dialog.is_custom_launch());
+        dialog.cycle_focus_next();
+        assert_eq!(dialog.focus, ReviewDialogFocus::Actions);
+        dialog.cycle_focus_next();
+        assert_eq!(dialog.focus, ReviewDialogFocus::PresetList);
+        dialog.cycle_focus_next();
+        assert_eq!(dialog.focus, ReviewDialogFocus::PathEditor);
+        dialog.cycle_focus_next();
+        assert_eq!(dialog.focus, ReviewDialogFocus::PromptEditor);
+    }
     #[test]
     fn test_review_dialog_start_params_folds_path_and_prompt() {
-        let mut dialog = ReviewDialogState::new(0, 0, Vec::new());
+        let mut dialog = ReviewDialogState::new(0, 0, Vec::new(), Vec::new());
 
         // Both fields start blank: neither reaches the wire.
         let params = dialog.start_params();
         assert!(params.user_prompt.is_none());
-        assert!(params.path_pattern.is_none());
+        assert!(params.path_patterns.is_empty());
         assert_eq!(serde_json::to_string(&params).unwrap(), "{}");
 
         dialog
             .prompt_editor
             .insert_str("  focus on error handling  ");
-        dialog.path_editor.insert_str(" crates/core/src/**/*.rs ");
+        dialog.path_inputs[0].insert_str(" crates/core/src/**/*.rs ");
         let params = dialog.start_params();
         assert_eq!(
             params.user_prompt.as_deref(),
             Some("focus on error handling")
         );
         assert_eq!(
-            params.path_pattern.as_deref(),
-            Some("crates/core/src/**/*.rs")
+            params.path_patterns,
+            vec!["crates/core/src/**/*.rs".to_string()]
         );
+    }
+    /// The preset section joins the focus cycle only when the project declares
+    /// presets, so a project without them keeps the previous dialog, and a manual
+    /// (`Custom`) launch stays one row away after a preset is inspected (c-5).
+    #[test]
+    fn test_review_dialog_focus_cycles_through_the_preset_section() {
+        let mut dialog = review_dialog_with(&["src/lib.rs"], 1).with_presets(vec![
+            tauqe_protocol::ReviewPresetSummary {
+                name: "backend".to_string(),
+                title: Some("Backend audit".to_string()),
+            },
+            tauqe_protocol::ReviewPresetSummary {
+                name: "frontend".to_string(),
+                title: None,
+            },
+        ]);
+
+        assert!(dialog.has_presets());
+        assert_eq!(dialog.preset_selector.item_count(), 3);
+        assert_eq!(
+            dialog.preset_labels(),
+            vec![
+                active_t("dialog.review_launch.preset_custom"),
+                "Backend audit".to_string(),
+                "frontend".to_string(),
+            ],
+            "the Custom row leads, then every preset by its title or name"
+        );
+        assert!(
+            dialog.selected_preset().is_none(),
+            "the Custom row owns the initial highlight"
+        );
+
+        // One reviewer: the reviewer list is unavailable, so the cycle walks
+        // prompt -> actions -> preset -> path.
+        assert_eq!(dialog.focus, ReviewDialogFocus::PromptEditor);
+        dialog.cycle_focus_next();
+        assert_eq!(dialog.focus, ReviewDialogFocus::Actions);
+        dialog.cycle_focus_next();
+        assert_eq!(dialog.focus, ReviewDialogFocus::PresetList);
+        dialog.cycle_focus_next();
+        assert_eq!(dialog.focus, ReviewDialogFocus::PathEditor);
+        dialog.cycle_focus_next();
+        assert_eq!(dialog.focus, ReviewDialogFocus::PromptEditor);
+
+        // The backward walk mirrors the forward one.
+        dialog.cycle_focus_prev();
+        assert_eq!(dialog.focus, ReviewDialogFocus::PathEditor);
+        dialog.cycle_focus_prev();
+        assert_eq!(dialog.focus, ReviewDialogFocus::PresetList);
+        dialog.cycle_focus_prev();
+        assert_eq!(dialog.focus, ReviewDialogFocus::Actions);
+    }
+
+    /// A highlighted preset owns the launch parameters: its name travels, the
+    /// target pattern is dropped, and returning to `Custom` restores the previous
+    /// pattern-driven launch (c-5).
+    #[test]
+    fn test_review_dialog_start_params_carry_the_selected_preset() {
+        let mut dialog = ReviewDialogState::new(0, 0, Vec::new(), Vec::new()).with_presets(vec![
+            tauqe_protocol::ReviewPresetSummary {
+                name: "backend".to_string(),
+                title: None,
+            },
+        ]);
+        dialog.path_inputs[0].insert_str("crates/**/*.rs");
+
+        // Row zero is the explicit `Custom` launch: the pattern still travels.
+        let params = dialog.start_params();
+        assert_eq!(params.preset, None);
+        assert_eq!(params.path_patterns, vec!["crates/**/*.rs".to_string()]);
+
+        let rows = dialog.preset_selector.item_count();
+        dialog.preset_selector.select_index(1, rows);
+        assert!(dialog.selected_preset().is_some());
+
+        let params = dialog.start_params();
+        assert_eq!(params.preset.as_deref(), Some("backend"));
+        assert!(
+            params.path_patterns.is_empty(),
+            "a preset supplies its own paths, so the target field is ignored"
+        );
+        assert!(
+            dialog.is_pattern_launchable(),
+            "a preset launch is never blocked by the ignored pattern field"
+        );
+    }
+
+    /// A project without presets keeps the previous dialog: the section stays
+    /// collapsed, the selector owns no row, and the manual launch is unchanged
+    /// (c-5).
+    #[test]
+    fn test_review_dialog_without_presets_keeps_the_manual_launch() {
+        let mut dialog = ReviewDialogState::new(0, 0, Vec::new(), Vec::new());
+        assert!(!dialog.has_presets());
+        assert_eq!(dialog.preset_selector.item_count(), 0);
+        assert!(dialog.preset_labels().is_empty());
+        assert!(dialog.selected_preset().is_none());
+        assert_eq!(dialog.start_params().preset, None);
+
+        // The section is skipped by the focus cycle entirely.
+        for _ in 0..ReviewDialogFocus::VISUAL_ORDER.len() {
+            dialog.cycle_focus_next();
+            assert_ne!(dialog.focus, ReviewDialogFocus::PresetList);
+        }
+    }
+    /// The post-analysis confirmation owns the keyboard while it is open and
+    /// outranks every informational overlay below it (c-4).
+    #[test]
+    fn test_review_analyze_confirmation_owns_the_keyboard() {
+        let mut st = test_state();
+        st.confirm_review_analyze = Some(ConfirmReviewAnalyzeState {
+            review_id: "rev-1".to_string(),
+            review_title: "Session rev-1".to_string(),
+        });
+        assert_eq!(st.active_modal(), Some(ActiveModal::ReviewAnalyze));
+        assert!(st.has_active_modal());
+
+        st.show_help = true;
+        assert_eq!(st.active_modal(), Some(ActiveModal::ReviewAnalyze));
+
+        st.confirm_review_analyze = None;
+        assert_eq!(st.active_modal(), Some(ActiveModal::Help));
+    }
+
+    /// A row is appended only after a usable pattern, so stray empty rows never
+    /// enter the list (c-3).
+    #[test]
+    fn test_path_rows_append_only_after_a_usable_pattern() {
+        let mut dialog = review_dialog_with(&["src/lib.rs"], 1);
+        assert_eq!(dialog.path_row_count(), 1);
+
+        assert!(!dialog.append_path_row(), "an empty row refuses the append");
+        dialog.path_inputs[0].insert_str("   ");
+        assert!(!dialog.append_path_row(), "a blank row refuses the append");
+        assert_eq!(dialog.path_row_count(), 1);
+
+        dialog.path_inputs[0].clear();
+        dialog.path_inputs[0].insert_str("src/");
+        assert!(dialog.append_path_row());
+        assert_eq!(dialog.path_row_count(), 2);
+        assert_eq!(dialog.path_active, 1, "the new row takes the keyboard");
+        assert!(dialog.active_path_editor().unwrap().is_empty());
+    }
+
+    /// `Backspace` closes an empty row and returns the keyboard to the previous
+    /// one; a row holding text and the last remaining row are never removed
+    /// (c-3).
+    #[test]
+    fn test_path_rows_remove_only_an_empty_row_and_keep_one() {
+        let mut dialog = review_dialog_with(&["src/lib.rs"], 1);
+        dialog.path_inputs[0].insert_str("src/");
+        assert!(dialog.append_path_row());
+
+        assert!(dialog.active_path_is_empty());
+        assert!(dialog.remove_active_path_row());
+        assert_eq!(dialog.path_row_count(), 1);
+        assert_eq!(dialog.path_active, 0);
+
+        dialog.path_inputs[0].clear();
+        assert!(dialog.active_path_is_empty());
+        assert!(!dialog.remove_active_path_row(), "one row always survives");
+        assert_eq!(dialog.path_row_count(), 1);
+
+        dialog.path_inputs[0].insert_str("crates/");
+        assert!(!dialog.remove_active_path_row(), "a filled row is edited");
+        assert_eq!(dialog.path_row_count(), 1);
+    }
+
+    /// `C-n` / `C-p` walk the rows and report the list boundary, where the
+    /// caller hands the keyboard to the neighbouring section (c-4).
+    #[test]
+    fn test_path_row_navigation_reports_the_list_boundary() {
+        let mut dialog = review_dialog_with(&["src/lib.rs"], 1);
+        dialog.path_inputs[0].insert_str("src/");
+        assert!(dialog.append_path_row());
+        assert_eq!(dialog.path_active, 1);
+
+        assert!(dialog.step_path_row(false));
+        assert_eq!(dialog.path_active, 0);
+        assert!(
+            !dialog.step_path_row(false),
+            "the first row is the top edge"
+        );
+        assert!(dialog.step_path_row(true));
+        assert_eq!(dialog.path_active, 1);
+        assert!(
+            !dialog.step_path_row(true),
+            "the last row is the bottom edge"
+        );
+    }
+
+    /// The rows generate the `path_patterns` list a launch sends, and their
+    /// union drives both the live counter and the launch gate (c-6).
+    #[test]
+    fn test_path_rows_form_one_union_scope() {
+        let mut dialog = review_dialog_with(&["src/lib.rs", "docs/guide.md"], 1);
+        dialog.path_inputs[0].insert_str("*.rs");
+        assert_eq!(dialog.pattern_match_count(), Some(1));
+
+        assert!(dialog.append_path_row());
+        dialog.path_inputs[1].insert_str("  docs/  ");
+        assert_eq!(dialog.pattern_match_count(), Some(2));
+
+        let params = dialog.start_params();
+        assert_eq!(
+            params.path_patterns,
+            vec!["*.rs".to_string(), "docs/".to_string()],
+            "each row travels whole, trimmed of surrounding blanks"
+        );
+
+        // A row that selects nothing no longer zeroes the union on its own, but
+        // a union that selects no file at all blocks the launch (c-6).
+        dialog.path_inputs[0].clear();
+        dialog.path_inputs[0].insert_str("missing/");
+        dialog.path_inputs[1].clear();
+        dialog.path_inputs[1].insert_str("absent/");
+        assert_eq!(dialog.pattern_match_count(), Some(0));
+        assert!(!dialog.is_pattern_launchable());
+    }
+
+    /// Typing narrows the repository directory completions of the active row and
+    /// accepting one fills the row with the full prefix (c-5).
+    #[test]
+    fn test_path_completion_offers_repository_directories() {
+        let mut dialog = review_dialog_with(
+            &[
+                "src/lib.rs",
+                "crates/core/src/lib.rs",
+                "crates/tui/src/main.rs",
+                "README.md",
+            ],
+            1,
+        );
+        assert!(
+            !dialog.path_completion.is_open(),
+            "an empty row offers nothing"
+        );
+
+        dialog.path_inputs[0].insert_str("cra");
+        dialog.refresh_path_completion();
+        assert_eq!(
+            dialog.path_completion.candidates(),
+            &[
+                "crates/".to_string(),
+                "crates/core/".to_string(),
+                "crates/core/src/".to_string(),
+                "crates/tui/".to_string(),
+                "crates/tui/src/".to_string(),
+            ]
+        );
+
+        assert!(dialog.accept_path_completion());
+        assert_eq!(dialog.path_inputs[0].get_text(), "crates/");
+        // Accepting a candidate narrows the menu to its children, so repeated
+        // `Tab` presses walk deeper into the tree.
+        assert_eq!(
+            dialog.path_completion.candidates(),
+            &[
+                "crates/core/".to_string(),
+                "crates/core/src/".to_string(),
+                "crates/tui/".to_string(),
+                "crates/tui/src/".to_string(),
+            ]
+        );
+    }
+
+    /// The rendered window follows the active row, so a list longer than the
+    /// drawn rows never hides the row being typed (c-3).
+    #[test]
+    fn test_path_visible_start_keeps_the_active_row_in_the_window() {
+        let mut dialog = review_dialog_with(&["src/lib.rs"], 1);
+        for _ in 0..5 {
+            if let Some(last) = dialog.path_inputs.last_mut() {
+                last.insert_str("src/");
+            }
+            assert!(dialog.append_path_row());
+        }
+        assert_eq!(dialog.path_row_count(), 6);
+
+        assert_eq!(dialog.path_active, 5);
+        assert_eq!(dialog.path_visible_start(3), 3);
+        dialog.path_active = 0;
+        assert_eq!(dialog.path_visible_start(3), 0);
+        assert_eq!(dialog.path_visible_start(0), 0);
     }
 }

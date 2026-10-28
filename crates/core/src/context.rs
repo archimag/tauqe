@@ -31,6 +31,18 @@ pub struct PatternAddOutcome {
     pub truncated: bool,
 }
 
+/// One document of the Refs context layer.
+///
+/// `item` is the read-only snapshot the model reads; `lru` is the monotonic
+/// watermark of the most recent request for it. Eviction compares those
+/// watermarks rather than arrival order, so a document requested again stays
+/// resident while the ones nobody asked for are dropped first.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RefsEntry {
+    item: ContextItem,
+    lru: u64,
+}
+
 #[derive(Debug, Clone)]
 pub struct ContextManager {
     repo_root: PathBuf,
@@ -46,6 +58,14 @@ pub struct ContextManager {
     pinned: IndexMap<String, ContextItem>,
     user: IndexMap<String, ContextItem>,
     auto: IndexMap<String, ContextItem>,
+    /// Documents materialized from the external reference registry.
+    ///
+    /// The layer is persistent for the whole task: it is context rather than
+    /// transcript, so history compaction never touches it and only its own
+    /// token budget can evict a document.
+    refs: IndexMap<String, RefsEntry>,
+    /// Monotonic source of `RefsEntry::lru`.
+    refs_lru_counter: u64,
 }
 
 /// Stores `item` in `layer`, returning `true` only when the layer contents
@@ -80,6 +100,8 @@ impl ContextManager {
             pinned: IndexMap::new(),
             user: IndexMap::new(),
             auto: IndexMap::new(),
+            refs: IndexMap::new(),
+            refs_lru_counter: 0,
         };
         cm.load_pinned_from_repo();
         cm
@@ -94,6 +116,8 @@ impl ContextManager {
             pinned: IndexMap::new(),
             user: IndexMap::new(),
             auto: IndexMap::new(),
+            refs: IndexMap::new(),
+            refs_lru_counter: 0,
         };
         cm.load_pinned(pinned_patterns);
         cm
@@ -124,7 +148,9 @@ impl ContextManager {
                 found = true;
             }
         }
-        if found {
+        // A reference document is read-only by construction, so it answers the
+        // same way the read-only entries of the other three layers do.
+        if found || self.refs.contains_key(clean_path) {
             Some(ContextAccess::ReadOnly)
         } else {
             None
@@ -136,23 +162,28 @@ impl ContextManager {
         let mut seen = std::collections::HashSet::new();
         let mut total_estimated_tokens = 0u64;
 
-        // Emit every context path exactly once, in pinned -> user -> auto order.
-        // A file present in the pinned layer must never be duplicated when it
-        // also lives in another layer (for example an editable override), so the
-        // first owning layer wins and the merged effective access is applied to
-        // the single emitted item.
-        for layer in [&self.pinned, &self.user, &self.auto] {
-            for it in layer.values() {
-                if !seen.insert(it.path.clone()) {
-                    continue;
-                }
-                let mut item = it.clone();
-                if let Some(eff) = self.effective_access_for(&item.path) {
-                    item.access = eff;
-                }
-                total_estimated_tokens += item.estimated_tokens;
-                items.push(item);
+        // Emit every context path exactly once, in pinned -> refs -> user ->
+        // auto order. A file present in the pinned layer must never be
+        // duplicated when it also lives in another layer (for example an
+        // editable override), so the first owning layer wins and the merged
+        // effective access is applied to the single emitted item.
+        let refs_items = self.refs.iter().map(|(path, entry)| (path, &entry.item));
+        let ordered = self
+            .pinned
+            .iter()
+            .chain(refs_items)
+            .chain(self.user.iter())
+            .chain(self.auto.iter());
+        for (_, it) in ordered {
+            if !seen.insert(it.path.clone()) {
+                continue;
             }
+            let mut item = it.clone();
+            if let Some(eff) = self.effective_access_for(&item.path) {
+                item.access = eff;
+            }
+            total_estimated_tokens += item.estimated_tokens;
+            items.push(item);
         }
 
         ContextState {
@@ -164,8 +195,8 @@ impl ContextManager {
 
     /// Reads every context file together with its insertion watermark.
     ///
-    /// Files are emitted in layer order (pinned -> user -> auto) and in each
-    /// layer's insertion order.
+    /// Files are emitted in layer order (pinned -> refs -> user -> auto) and in
+    /// each layer's insertion order.
     fn read_context_files_with_seq(&self) -> Vec<(u64, ContextFileContent)> {
         // Reading every context file is blocking file I/O. Run it through the
         // blocking helper so a large context never stalls an async worker.
@@ -178,6 +209,7 @@ impl ContextManager {
             for path in self
                 .pinned
                 .keys()
+                .chain(self.refs.keys())
                 .chain(self.user.keys())
                 .chain(self.auto.keys())
             {
@@ -207,8 +239,8 @@ impl ContextManager {
         })
     }
 
-    /// Reads the context files in semantic order: layer order (pinned -> user
-    /// -> auto) and insertion order within each layer.
+    /// Reads the context files in semantic order: layer order (pinned -> refs
+    /// -> user -> auto) and insertion order within each layer.
     pub fn read_context_files(&self) -> Vec<ContextFileContent> {
         self.read_context_files_with_seq()
             .into_iter()
@@ -232,6 +264,7 @@ impl ContextManager {
     pub fn contains(&self, relative_path: &str) -> Result<bool> {
         let clean_path = self.normalize_path(relative_path)?;
         Ok(self.pinned.contains_key(&clean_path)
+            || self.refs.contains_key(&clean_path)
             || self.user.contains_key(&clean_path)
             || self.auto.contains_key(&clean_path))
     }
@@ -239,6 +272,138 @@ impl ContextManager {
     pub fn is_editable(&self, relative_path: &str) -> Result<bool> {
         let clean_path = self.normalize_path(relative_path)?;
         Ok(self.effective_access_for(&clean_path) == Some(ContextAccess::Editable))
+    }
+
+    /// Returns all paths currently tracked in the Refs context layer.
+    pub fn refs_files(&self) -> Vec<String> {
+        self.refs.keys().cloned().collect()
+    }
+
+    /// Admits one external reference document into the Refs layer.
+    ///
+    /// The document is stored read-only, because it is a snapshot the harness
+    /// materialized and the model must never rewrite it. A repeated request
+    /// refreshes the LRU watermark only: the snapshot is immutable for the whole
+    /// task, so no rendered byte changes and the context revision stays put.
+    ///
+    /// Insertion keeps the layer inside `refs_token_budget` by evicting the least
+    /// recently requested documents. A document that alone exceeds the budget is
+    /// rejected with a diagnostic instead of evicting every other document and
+    /// failing anyway.
+    pub fn add_refs_file(
+        &mut self,
+        relative_path: &str,
+        refs_token_budget: usize,
+    ) -> Result<ContextItem> {
+        crate::blocking::run_blocking(|| {
+            let clean_path = self.normalize_path(relative_path)?;
+            let full_path = self.repo_root.join(&clean_path);
+            if !full_path.is_file() {
+                bail!("Reference document not found: {}", clean_path);
+            }
+
+            let existing = self.refs.get(&clean_path).map(|entry| entry.item.clone());
+            if let Some(snapshot) = existing {
+                self.bump_refs_lru(&clean_path);
+                return Ok(snapshot);
+            }
+
+            let metadata = std::fs::metadata(&full_path)?;
+            let size_bytes = metadata.len();
+            let estimated_tokens = estimate_tokens_from_bytes(size_bytes);
+            if estimated_tokens > refs_token_budget as u64 {
+                bail!(
+                    "Reference document '{}' needs ~{} tokens, more than the configured \
+                     refs budget of {}",
+                    clean_path,
+                    estimated_tokens,
+                    refs_token_budget
+                );
+            }
+
+            self.refs_lru_counter += 1;
+            let item = ContextItem {
+                path: clean_path.clone(),
+                access: ContextAccess::ReadOnly,
+                size_bytes,
+                estimated_tokens,
+                layer: ContextLayer::Refs,
+                insertion_seq: self.resolve_insertion_seq(&clean_path),
+            };
+            self.refs.insert(
+                clean_path,
+                RefsEntry {
+                    item: item.clone(),
+                    lru: self.refs_lru_counter,
+                },
+            );
+            self.evict_refs_to_budget(refs_token_budget);
+            self.revision += 1;
+            Ok(item)
+        })
+    }
+
+    /// Marks `relative_path` as the most recently requested reference document.
+    ///
+    /// The watermark only decides which document is evicted first, so refreshing
+    /// it changes no rendered byte and does not advance the context revision.
+    /// Returns `false` when the document is not in the Refs layer.
+    pub fn touch_refs_lru(&mut self, relative_path: &str) -> bool {
+        let Ok(clean_path) = self.normalize_path(relative_path) else {
+            return false;
+        };
+        self.bump_refs_lru(&clean_path)
+    }
+
+    /// Refreshes the LRU watermark of an already-normalized Refs path.
+    fn bump_refs_lru(&mut self, clean_path: &str) -> bool {
+        if !self.refs.contains_key(clean_path) {
+            return false;
+        }
+        self.refs_lru_counter += 1;
+        if let Some(entry) = self.refs.get_mut(clean_path) {
+            entry.lru = self.refs_lru_counter;
+        }
+        true
+    }
+
+    /// Evicts the least recently requested documents until the layer fits
+    /// `refs_token_budget`, reporting whether anything was dropped.
+    fn evict_refs_to_budget(&mut self, refs_token_budget: usize) -> bool {
+        let mut evicted = false;
+        loop {
+            let total: u64 = self
+                .refs
+                .values()
+                .map(|entry| entry.item.estimated_tokens)
+                .sum();
+            if total <= refs_token_budget as u64 {
+                return evicted;
+            }
+            let victim = self
+                .refs
+                .iter()
+                .min_by_key(|(_, entry)| entry.lru)
+                .map(|(path, _)| path.clone());
+            let Some(victim) = victim else {
+                return evicted;
+            };
+            self.refs.shift_remove(&victim);
+            evicted = true;
+        }
+    }
+
+    /// Drops every document of the Refs context layer.
+    ///
+    /// Returns `true` only when the layer actually held documents, so callers can
+    /// rotate the dialogue session exactly when the stable prompt prefix shrank.
+    pub fn clear_refs(&mut self) -> bool {
+        if self.refs.is_empty() {
+            return false;
+        }
+        self.refs.clear();
+        self.revision += 1;
+        true
     }
 
     /// Returns the insertion watermark `clean_path` already carries.
@@ -253,6 +418,10 @@ impl ContextManager {
                 let seq = item.insertion_seq;
                 watermark = Some(watermark.map_or(seq, |current: u64| current.max(seq)));
             }
+        }
+        if let Some(entry) = self.refs.get(clean_path) {
+            let seq = entry.item.insertion_seq;
+            watermark = Some(watermark.map_or(seq, |current: u64| current.max(seq)));
         }
         watermark
     }
@@ -349,6 +518,12 @@ impl ContextManager {
                     } else {
                         store_item(&mut self.auto, item.clone())
                     }
+                }
+                // The Refs layer belongs to the external-reference registry: a
+                // document enters it only through `add_refs_file`, which applies
+                // the LRU budget, so a manual add is refused rather than stored.
+                ContextLayer::Refs => {
+                    bail!("The Refs layer is registry-managed and cannot be filled manually")
                 }
             };
 
@@ -514,7 +689,7 @@ impl ContextManager {
 
     /// Removes a path from the mutable context layers.
     ///
-    /// Only the `user` and `auto` layers are emptied here. Pinned files are
+    /// The `user`, `auto`, and `refs` layers are emptied here. Pinned files are
     /// owned by project configuration and are deliberately left in place, so
     /// removing a pinned-only path reports `Ok(false)` (no change) instead of
     /// silently succeeding.
@@ -522,7 +697,11 @@ impl ContextManager {
         let clean_path = self.normalize_path(relative_path)?;
         let removed_user = self.user.shift_remove(&clean_path).is_some();
         let removed_auto = self.auto.shift_remove(&clean_path).is_some();
-        if removed_user || removed_auto {
+        // A reference document leaves the layer on an explicit removal, because
+        // dropping one document is a deliberate developer action; the registry
+        // only withholds access and layer changes.
+        let removed_refs = self.refs.shift_remove(&clean_path).is_some();
+        if removed_user || removed_auto || removed_refs {
             self.recompute_pinned();
             self.revision += 1;
             Ok(true)
@@ -553,6 +732,11 @@ impl ContextManager {
                 found_layer = Some(ContextLayer::Auto);
             } else if self.pinned.contains_key(&clean_from) {
                 bail!("Pinned file '{}' cannot be renamed or moved", clean_from);
+            } else if self.refs.contains_key(&clean_from) {
+                bail!(
+                    "Reference document '{}' cannot be renamed or moved",
+                    clean_from
+                );
             }
 
             if let (Some(mut item), Some(layer)) = (found_item, found_layer) {
@@ -569,7 +753,9 @@ impl ContextManager {
                     ContextLayer::Auto => {
                         self.auto.insert(clean_to, item);
                     }
-                    ContextLayer::Pinned => {}
+                    // Neither layer can reach this point: pinned and reference
+                    // documents are rejected before the rename begins.
+                    ContextLayer::Pinned | ContextLayer::Refs => {}
                 }
                 self.recompute_pinned();
                 self.revision += 1;
@@ -600,6 +786,12 @@ impl ContextManager {
             return Ok(true);
         }
 
+        if self.refs.contains_key(&clean_path) {
+            bail!(
+                "Reference document '{}' is read-only and its access cannot be changed",
+                clean_path
+            );
+        }
         if self.pinned.contains_key(&clean_path) {
             bail!("Pinned file '{}' access cannot be changed", clean_path);
         }
@@ -607,16 +799,17 @@ impl ContextManager {
         Ok(false)
     }
 
-    /// Drops every file of the mutable user and auto context layers.
+    /// Drops every file of the mutable user, auto, and refs context layers.
     ///
     /// Returns `true` only when at least one layer actually held files, so a
     /// clear that removed nothing is distinguishable from a clear that shrank
     /// the prompt prefix.
     pub fn clear(&mut self) -> bool {
-        let had_items = !self.user.is_empty() || !self.auto.is_empty();
+        let had_items = !self.user.is_empty() || !self.auto.is_empty() || !self.refs.is_empty();
         if had_items {
             self.user.clear();
             self.auto.clear();
+            self.refs.clear();
             self.recompute_pinned();
             self.revision += 1;
             true
@@ -647,6 +840,19 @@ impl ContextManager {
             removed.extend(prune_layer(&mut self.pinned, &self.repo_root));
             removed.extend(prune_layer(&mut self.user, &self.repo_root));
             removed.extend(prune_layer(&mut self.auto, &self.repo_root));
+            // A reference snapshot lives in the isolated cache, so a document
+            // whose cached file disappeared is dropped like any other missing
+            // context path instead of lingering as a dangling entry.
+            let stale_refs: Vec<String> = self
+                .refs
+                .keys()
+                .filter(|path| !self.repo_root.join(path).is_file())
+                .cloned()
+                .collect();
+            for path in &stale_refs {
+                self.refs.shift_remove(path);
+            }
+            removed.extend(stale_refs);
 
             let pinned_changed = self.recompute_pinned();
 
@@ -685,6 +891,24 @@ impl ContextManager {
             }
             changed |= previous_auto != self.auto;
 
+            // 1b. Merge the turn's reference documents. The layer is persistent
+            // for the whole task, so a document the turn materialized survives
+            // the merge; a path present on both sides keeps the more recent LRU
+            // watermark, so a document requested again inside the turn is not
+            // evicted ahead of the ones it now outranks.
+            for (path, entry) in &turn_context.refs {
+                match self.refs.entry(path.clone()) {
+                    indexmap::map::Entry::Occupied(occupied) => {
+                        let slot = occupied.into_mut();
+                        slot.lru = slot.lru.max(entry.lru);
+                    }
+                    indexmap::map::Entry::Vacant(vacant) => {
+                        vacant.insert(entry.clone());
+                        changed = true;
+                    }
+                }
+            }
+
             // 2. Remove files that no longer exist on disk (prunes deleted files).
             // The prune advances the revision itself when it drops anything, so its
             // outcome is not counted again here.
@@ -716,7 +940,8 @@ impl ContextManager {
             // Recompute hierarchical pinned files after merging user and auto layers.
             changed |= self.recompute_pinned();
 
-            // 4. Refresh metadata for all files in context.
+            // 4. Refresh metadata for all files in context, the reference
+            // snapshots the turn materialized included.
             for layer in [&mut self.pinned, &mut self.user, &mut self.auto] {
                 for (path, item) in layer.iter_mut() {
                     let full_path = self.repo_root.join(path);
@@ -731,6 +956,18 @@ impl ContextManager {
                     }
                 }
             }
+            for (path, entry) in self.refs.iter_mut() {
+                let full_path = self.repo_root.join(path);
+                if let Ok(meta) = std::fs::metadata(&full_path) {
+                    let size = meta.len();
+                    let tokens = estimate_tokens_from_bytes(size);
+                    if entry.item.size_bytes != size || entry.item.estimated_tokens != tokens {
+                        entry.item.size_bytes = size;
+                        entry.item.estimated_tokens = tokens;
+                        changed = true;
+                    }
+                }
+            }
 
             // The turn may have consumed watermarks the primary never saw, so
             // the counter advances to the highest value either side reached and
@@ -738,6 +975,9 @@ impl ContextManager {
             // handed out. Advancing the counter alone changes no bytes, so it
             // does not mark the merge as a change.
             self.insertion_counter = self.insertion_counter.max(turn_context.insertion_counter);
+            // The LRU counter follows the same rule, so a document merged from
+            // the turn keeps its eviction rank against later requests.
+            self.refs_lru_counter = self.refs_lru_counter.max(turn_context.refs_lru_counter);
 
             if changed {
                 self.revision += 1;
@@ -817,7 +1057,7 @@ mod tests {
     }
 
     #[test]
-    fn test_three_tier_layers_and_permission_merging() {
+    fn test_context_layers_and_permission_merging() {
         let dir = tempdir().unwrap();
         let root = dir.path().to_path_buf();
         std::fs::write(root.join("pinned.rs"), "pub fn pinned() {}").unwrap();
@@ -1298,5 +1538,190 @@ mod tests {
             .map(|file| file.path)
             .collect();
         assert_eq!(chronological, vec!["pinned.rs", "auto.rs", "user.rs"]);
+    }
+
+    #[test]
+    fn test_refs_layer_emits_read_only_documents_in_layer_order() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        for name in ["pinned.rs", "refs.md", "user.rs", "auto.rs"] {
+            std::fs::write(root.join(name), "fn f() {}\n").unwrap();
+        }
+
+        let mut cm = ContextManager::new(root);
+        cm.load_pinned(&["pinned.rs".to_string()]);
+        let document = cm.add_refs_file("refs.md", 10_000).unwrap();
+        cm.add_file("user.rs", ContextAccess::ReadOnly).unwrap();
+        cm.add_auto_file("auto.rs", ContextAccess::ReadOnly)
+            .unwrap();
+
+        assert_eq!(document.layer, ContextLayer::Refs);
+        assert_eq!(document.access, ContextAccess::ReadOnly);
+        assert!(!cm.is_editable("refs.md").unwrap());
+        assert_eq!(cm.refs_files(), vec!["refs.md".to_string()]);
+
+        let state = cm.get_state();
+        let paths: Vec<&str> = state.items.iter().map(|item| item.path.as_str()).collect();
+        assert_eq!(paths, vec!["pinned.rs", "refs.md", "user.rs", "auto.rs"]);
+        let emitted = state
+            .items
+            .iter()
+            .find(|item| item.path == "refs.md")
+            .unwrap();
+        assert_eq!(emitted.layer, ContextLayer::Refs);
+        assert_eq!(emitted.access, ContextAccess::ReadOnly);
+
+        let files = cm.read_context_files();
+        let file_paths: Vec<&str> = files.iter().map(|file| file.path.as_str()).collect();
+        assert_eq!(
+            file_paths,
+            vec!["pinned.rs", "refs.md", "user.rs", "auto.rs"]
+        );
+    }
+
+    #[test]
+    fn test_a_repeated_refs_request_touches_the_lru_without_a_revision_change() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        std::fs::write(root.join("refs.md"), "reference notes\n").unwrap();
+
+        let mut cm = ContextManager::new(root);
+        cm.add_refs_file("refs.md", 10_000).unwrap();
+        let revision = cm.get_state().revision;
+
+        // A repeated request refreshes the watermark only: the snapshot is
+        // immutable for the whole task, so nothing rendered changes.
+        let again = cm.add_refs_file("refs.md", 10_000).unwrap();
+        assert_eq!(again.layer, ContextLayer::Refs);
+        assert_eq!(cm.get_state().revision, revision);
+        assert_eq!(cm.refs_files(), vec!["refs.md".to_string()]);
+
+        assert!(cm.touch_refs_lru("refs.md"));
+        assert!(!cm.touch_refs_lru("missing.md"));
+        assert_eq!(cm.get_state().revision, revision);
+    }
+
+    #[test]
+    fn test_refs_layer_evicts_the_least_recently_requested_document() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        std::fs::write(root.join("a.md"), "reference notes\n").unwrap();
+        std::fs::write(root.join("b.md"), "reference notes\n").unwrap();
+        std::fs::write(root.join("c.md"), "reference notes\n").unwrap();
+
+        let mut cm = ContextManager::new(root);
+        let first = cm.add_refs_file("a.md", 10_000).unwrap();
+        let second = cm.add_refs_file("b.md", 10_000).unwrap();
+        // The repeated request pushes `a` ahead of `b`, so `b` becomes the least
+        // recently requested document even though it arrived last.
+        cm.add_refs_file("a.md", 10_000).unwrap();
+
+        // The budget fits exactly two equal documents, so admitting the third
+        // drops the least recently requested one.
+        let budget = (first.estimated_tokens + second.estimated_tokens) as usize;
+        cm.add_refs_file("c.md", budget).unwrap();
+
+        assert_eq!(
+            cm.refs_files(),
+            vec!["a.md".to_string(), "c.md".to_string()]
+        );
+    }
+
+    #[test]
+    fn test_a_refs_document_larger_than_the_budget_is_rejected() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        std::fs::write(root.join("huge.md"), "x".repeat(4096)).unwrap();
+
+        let mut cm = ContextManager::new(root);
+        let error = cm
+            .add_refs_file("huge.md", 1)
+            .expect_err("a document larger than the budget is refused");
+
+        assert!(
+            error.to_string().contains("refs budget"),
+            "unexpected error: {error}"
+        );
+        assert!(cm.refs_files().is_empty());
+        assert!(!cm.contains("huge.md").unwrap());
+    }
+
+    #[test]
+    fn test_the_refs_layer_survives_clear_auto_and_a_turn_merge() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        std::fs::write(root.join("base.md"), "base reference\n").unwrap();
+        std::fs::write(root.join("turn.md"), "turn reference\n").unwrap();
+        std::fs::write(root.join("auto.rs"), "fn auto() {}\n").unwrap();
+
+        let mut primary = ContextManager::new(root);
+        primary.add_refs_file("base.md", 10_000).unwrap();
+        primary
+            .add_auto_file("auto.rs", ContextAccess::ReadOnly)
+            .unwrap();
+        let mut turn = primary.clone();
+        turn.add_refs_file("turn.md", 10_000).unwrap();
+
+        primary.merge_turn_context(&turn);
+        assert_eq!(
+            primary.refs_files(),
+            vec!["base.md".to_string(), "turn.md".to_string()]
+        );
+
+        // The Auto layer is transient, while reference documents persist for the
+        // whole task and survive its removal.
+        primary.clear_auto();
+        assert_eq!(
+            primary.refs_files(),
+            vec!["base.md".to_string(), "turn.md".to_string()]
+        );
+
+        assert!(primary.clear());
+        assert!(primary.refs_files().is_empty());
+    }
+
+    #[test]
+    fn test_set_access_on_a_refs_document_is_rejected() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        std::fs::write(root.join("refs.md"), "reference notes\n").unwrap();
+
+        let mut cm = ContextManager::new(root);
+        cm.add_refs_file("refs.md", 10_000).unwrap();
+
+        assert!(cm.set_access("refs.md", ContextAccess::Editable).is_err());
+        assert!(!cm.is_editable("refs.md").unwrap());
+    }
+
+    #[test]
+    fn test_the_refs_layer_cannot_be_filled_manually() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        std::fs::write(root.join("refs.md"), "reference notes\n").unwrap();
+
+        let mut cm = ContextManager::new(root);
+        let error = cm
+            .add_file_to_layer("refs.md", ContextAccess::ReadOnly, ContextLayer::Refs)
+            .expect_err("the registry owns the Refs layer");
+
+        assert!(
+            error.to_string().contains("registry"),
+            "unexpected error: {error}"
+        );
+        assert!(cm.refs_files().is_empty());
+    }
+
+    #[test]
+    fn test_clear_refs_reports_whether_documents_were_removed() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        std::fs::write(root.join("refs.md"), "reference notes\n").unwrap();
+
+        let mut cm = ContextManager::new(root);
+        assert!(!cm.clear_refs(), "an empty Refs layer reports no change");
+        cm.add_refs_file("refs.md", 10_000).unwrap();
+        assert!(cm.clear_refs(), "removing a document reports a change");
+        assert!(!cm.clear_refs(), "a repeated clear reports no change");
+        assert!(cm.refs_files().is_empty());
     }
 }

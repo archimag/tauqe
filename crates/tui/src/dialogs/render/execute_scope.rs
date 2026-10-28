@@ -1,16 +1,16 @@
-//! Plan step and scope execution dialog: Coder picker and directives editor.
+//! Plan step and scope execution dialog: the Coder picker and the action bar.
 //!
 //! Executing a plan step or an implementation scope hands control to the Coder
-//! role, so the confirmation exposes the configured Coder ladder and a
-//! directives editor before any bounded turn spends tokens. The layout mirrors
-//! the single-target review execution dialog — header, embedded model list,
-//! editor, action bar, docked hint strip — so both pickers read identically
-//! (c-tui-selector, Conventions §6, §7).
+//! role, so the confirmation exposes the configured Coder ladder before any
+//! bounded turn spends tokens. The plan is the single source of truth for what
+//! each step must implement, so the dialog carries no directives editor: the
+//! layout is the header, the embedded model list, the action bar, and the docked
+//! hint strip (c-4, Conventions §6, §7).
 
 use ratatui::layout::{Alignment, Rect};
 use ratatui::style::{Style, Stylize};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
+use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 
 use crate::app::{AppState, ConfirmDialogButton, ConfirmExecuteScopeState};
 use crate::components::modal::verb_hint;
@@ -21,7 +21,10 @@ use crate::ui::header::truncate_to_width;
 /// Width of the execution dialog, as a percentage of the terminal.
 const EXECUTE_SCOPE_DIALOG_WIDTH: u16 = 68;
 /// Height of the execution dialog, as a percentage of the terminal.
-const EXECUTE_SCOPE_DIALOG_HEIGHT: u16 = 56;
+///
+/// The dialog carries no directives editor, so it needs noticeably less vertical
+/// room than a picker that stacks a model list above a text field (c-4).
+const EXECUTE_SCOPE_DIALOG_HEIGHT: u16 = 48;
 /// Header rows: the plan, the scope, and the targeted step or queue preview.
 const EXECUTE_SCOPE_HEADER_HEIGHT: u16 = 4;
 
@@ -67,10 +70,9 @@ fn cancel_label() -> String {
 pub struct ExecuteScopeDialogGeometry {
     /// Whole dialog frame.
     pub area: Rect,
-    /// Inner rows of the Coder model list (one row per entry).
+    /// Inner rows of the Coder model list (one row per entry), spanning the band
+    /// the shared picker layout would reserve for an instructions editor.
     pub model_rows: Rect,
-    /// The directives editor block.
-    pub editor_area: Rect,
     /// Confirm button.
     pub confirm_button: Rect,
     /// Cancel button.
@@ -99,19 +101,34 @@ pub fn execute_scope_dialog_geometry(
 
     ExecuteScopeDialogGeometry {
         area,
-        model_rows: super::inset(chunks.list),
-        editor_area: chunks.editor,
+        model_rows: super::inset(model_list_area(&chunks)),
         confirm_button,
         cancel_button,
     }
 }
 
+/// Rows of the Coder list, merged with the band the shared picker layout reserves
+/// below it.
+///
+/// The picker stacks a model list above an instructions editor. The execution
+/// dialog has no editor, so the reserved band and the blank row that separated it
+/// belong to the list instead of leaving an empty zone under the last rung
+/// (c-4, Conventions §6.7).
+fn model_list_area(chunks: &super::PickerDialogChunks) -> Rect {
+    let bottom = chunks.editor.y.saturating_add(chunks.editor.height);
+    Rect::new(
+        chunks.list.x,
+        chunks.list.y,
+        chunks.list.width,
+        bottom.saturating_sub(chunks.list.y),
+    )
+}
+
 /// Renders the plan step or scope execution confirmation.
 ///
-/// The developer picks the starting Coder rung and may add implementation
-/// directives; both travel on the wire, so the coder that runs is the coder
-/// shown on screen and the server never re-derives the selection
-/// (c-tui-selector, Conventions §6, §7).
+/// The developer picks the starting Coder rung; it travels on the wire, so the
+/// coder that runs is the coder shown on screen and the server never
+/// re-derives the selection (c-tui-selector, Conventions §6, §7).
 pub fn render_execute_scope_dialog(frame: &mut ratatui::Frame, state: &AppState) {
     let Some(target) = state.confirm_execute_scope.as_ref() else {
         return;
@@ -136,14 +153,14 @@ pub fn render_execute_scope_dialog(frame: &mut ratatui::Frame, state: &AppState)
         .style(Style::default().bg(engine.color(palette.surface)));
     frame.render_widget(outer_block, area);
 
-    let super::PickerDialogChunks {
-        header: header_area,
-        list: list_area,
-        editor: editor_area,
-        buttons: buttons_area,
-        footer: footer_area,
-        ..
-    } = super::picker_dialog_chunks(area, entry_count, EXECUTE_SCOPE_HEADER_HEIGHT, 0);
+    let chunks = super::picker_dialog_chunks(area, entry_count, EXECUTE_SCOPE_HEADER_HEIGHT, 0);
+    let header_area = chunks.header;
+    // The picker layout reserves an instructions-editor band below the list. The
+    // execution dialog has no editor, so the list claims that band and the card
+    // carries no empty zone under the last rung (c-4, Conventions §6.7).
+    let list_area = model_list_area(&chunks);
+    let buttons_area = chunks.buttons;
+    let footer_area = chunks.footer;
 
     // Header: which plan and scope are about to be executed.
     let mut header_lines = vec![
@@ -235,46 +252,6 @@ pub fn render_execute_scope_dialog(frame: &mut ratatui::Frame, state: &AppState)
             .render_list_lines(list_inner.height as usize);
         frame.render_widget(Paragraph::new(rows), list_inner);
     }
-
-    // Directives editor. The cursor is drawn only when the editor owns focus.
-    let show_cursor = target.focus.is_instructions_editor();
-    let mut editor_content = Vec::new();
-    if target.instructions_editor.is_empty() {
-        let mut spans = vec![Span::raw("> ")];
-        if show_cursor {
-            spans.push(Span::styled("█", engine.fg(palette.status_warning)));
-        }
-        spans.push(Span::styled(
-            active_t("dialog.execute_scope.editor_placeholder"),
-            dim,
-        ));
-        editor_content.push(Line::from(spans));
-    } else {
-        for line in super::editor_lines(&target.instructions_editor, show_cursor) {
-            let mut spans = vec![Span::raw("> ")];
-            spans.extend(line.spans);
-            editor_content.push(Line::from(spans));
-        }
-    }
-    let editor_border = if show_cursor {
-        engine.fg(palette.status_success).bold()
-    } else {
-        engine.fg(palette.border)
-    };
-    let editor_block = Block::default()
-        .title(format!(
-            " {} ",
-            active_t("dialog.execute_scope.editor_title")
-        ))
-        .borders(Borders::ALL)
-        .border_style(editor_border)
-        .style(Style::default().bg(engine.color(palette.surface)));
-    frame.render_widget(
-        Paragraph::new(editor_content)
-            .block(editor_block)
-            .wrap(Wrap { trim: false }),
-        editor_area,
-    );
 
     // Action bar with focus-aware styling.
     let in_actions = target.focus.is_actions();
@@ -397,6 +374,38 @@ mod tests {
             read(geom.cancel_button).contains("Cancel"),
             "cancel row: {:?}",
             read(geom.cancel_button)
+        );
+    }
+    /// The execution dialog carries no directives editor, so the band the shared
+    /// picker layout reserves below the model list belongs to the Coder list
+    /// instead of staying blank (c-4, Conventions §6.7).
+    #[test]
+    fn model_rows_claim_the_band_the_editor_used_to_occupy() {
+        let term = Rect::new(0, 0, 100, 40);
+        let entry_count = 2;
+        let area = crate::ui::centered_rect(
+            EXECUTE_SCOPE_DIALOG_WIDTH,
+            EXECUTE_SCOPE_DIALOG_HEIGHT,
+            term,
+        );
+        let chunks = crate::dialogs::render::picker_dialog_chunks(
+            area,
+            entry_count,
+            EXECUTE_SCOPE_HEADER_HEIGHT,
+            0,
+        );
+        let merged_height = chunks
+            .editor
+            .y
+            .saturating_add(chunks.editor.height)
+            .saturating_sub(chunks.list.y);
+
+        let geom = execute_scope_dialog_geometry(term, entry_count, true);
+        assert_eq!(geom.model_rows.y, chunks.list.y + 1);
+        assert_eq!(geom.model_rows.height, merged_height - 2);
+        assert!(
+            geom.model_rows.height > chunks.list.height,
+            "the Coder list must claim the band the directives editor used to occupy"
         );
     }
 }

@@ -31,7 +31,7 @@ use tauqe_protocol::{
 };
 
 use crate::handlers::architect::{
-    format_architect_tier, resolve_architect_provider, run_architect_discovery_loop,
+    format_architect_escalation_note, resolve_architect_provider, run_architect_discovery_loop,
     ArchitectDiscoveryError, ArchitectDiscoveryOutcome, ArchitectDiscoveryRequest,
 };
 use crate::handlers::common::record_synthesis_history;
@@ -384,6 +384,7 @@ async fn refine_finding_with_architect_inner(
         provider,
         architect_tier,
         level_up,
+        escalation_excluded,
         repomap_budget,
         max_discovery_rounds,
         files_token_budget,
@@ -407,10 +408,17 @@ async fn refine_finding_with_architect_inner(
                 Ok(p) => p,
                 Err(err) => return Err(refine_error(errors::NO_API_KEY, err)),
             };
+        // A manual run on a configuration the automatic ladder excludes cannot
+        // escalate, which the published note states instead of leaving the
+        // developer to assume a silent downgrade.
+        let escalation_excluded = cfg
+            .models
+            .excluded_from_escalation(ModelRole::Architect, &architect_tier.model);
         (
             provider,
             architect_tier,
             level_up,
+            escalation_excluded,
             cfg.context.repomap_token_budget,
             cfg.context.max_discovery_rounds,
             cfg.context.files_token_budget,
@@ -435,21 +443,11 @@ async fn refine_finding_with_architect_inner(
         );
     }
 
-    let level_up_note = level_up
-        .as_ref()
-        .map(|level| {
-            let from = level
-                .from
-                .as_ref()
-                .map(format_architect_tier)
-                .unwrap_or_else(|| "not recorded".to_string());
-            format!(
-                "\n> Architect level up: {} → {}",
-                from,
-                format_architect_tier(&level.to)
-            )
-        })
-        .unwrap_or_default();
+    let level_up_note = format_architect_escalation_note(
+        &architect_tier,
+        level_up.as_ref(),
+        escalation_excluded && diagnostics.is_some(),
+    );
 
     clear_auto_context(state).await;
 
@@ -782,6 +780,7 @@ fn refine_error(code: &'static str, message: String) -> ResponseError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::handlers::architect::format_architect_tier;
     use tauqe_protocol::{ArchitectTier, ModelRef, PlanItemStatus, ReasoningEffort};
 
     #[test]
@@ -837,6 +836,8 @@ mod tests {
         ReviewItem::from(ReviewIssue {
             id: 12,
             title: "Guard the parser".to_string(),
+            uuid: None,
+            group: None,
             model: None,
             issue_type: tauqe_protocol::IssueType::Bug,
             status,

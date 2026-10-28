@@ -11,6 +11,7 @@ use std::sync::Arc;
 use tauqe_core::context::ContextFileContent;
 use tauqe_core::edits::protocol::ContextRequest;
 use tauqe_core::providers::{ChatMessage, LlmProvider, ResponseFormat};
+use tauqe_core::refs::materialize::materialize_requests;
 use tauqe_core::workflow::common::apply_context_requests_detailed;
 use tauqe_protocol::{
     events, ContextAccess, LlmCommand, ModelDeltaEvent, ModelErrorEvent, ModelFinishedEvent,
@@ -378,6 +379,14 @@ where
                 })
                 .collect();
 
+            // A declared reference has no file on disk until the harness
+            // materializes it, so the requested names are resolved into their
+            // isolated snapshots before the context mutation runs. The pre-step
+            // races this synthesis's cancel signal, so an abandoned run stops
+            // waiting for a slow reference host instead of outliving the turn.
+            let (requests, refs_feedback) =
+                materialize_requests(repo_root, &requests, Some(&cancel_rx)).await;
+
             let searches = output.repo_searches.clone();
             let repo_map_requests = output.repo_maps.clone();
 
@@ -391,6 +400,7 @@ where
                     &requests,
                     &available_files,
                     files_token_budget,
+                    discovery_limits.refs_token_budget,
                 );
                 let new_state = ctx.get_state();
                 (oc, new_state)
@@ -602,6 +612,13 @@ where
             );
 
             let mut fb = String::new();
+            // A reference the harness could not materialize leads the feedback:
+            // the model learns why the declared document is unavailable before
+            // it reads the rest of the round's findings.
+            for diagnostic in &refs_feedback {
+                fb.push_str(diagnostic);
+                fb.push('\n');
+            }
             if !search_results.is_empty() {
                 let search_feedback =
                     tauqe_core::workflow::discovery::format_search_feedback(&search_results);

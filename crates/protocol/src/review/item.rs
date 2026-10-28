@@ -149,6 +149,18 @@ impl From<IssueType> for ReviewSeverity {
 pub struct ReviewIssue {
     pub id: u32,
     pub title: String,
+    /// Stable identifier of the finding, an RFC 9562 UUIDv7 minted once.
+    ///
+    /// The post-analysis layer references findings by this identifier, so a
+    /// finding keeps its identity across regroupings, refinements, and re-runs
+    /// of the analysis.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub uuid: Option<String>,
+    /// Identifier of the review group that produced the finding.
+    ///
+    /// `None` means the implicit default group of a single-audit session.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub model: Option<ModelSelection>,
     #[serde(rename = "type", alias = "severity", alias = "issue_type")]
@@ -203,6 +215,18 @@ impl ReviewIssue {
 pub struct ReviewItem {
     pub id: u32,
     pub title: String,
+    /// Stable identifier of the finding, an RFC 9562 UUIDv7 minted once.
+    ///
+    /// The post-analysis layer references findings by this identifier, so a
+    /// finding keeps its identity across regroupings, refinements, and re-runs
+    /// of the analysis.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub uuid: Option<String>,
+    /// Identifier of the review group that produced the finding.
+    ///
+    /// `None` means the implicit default group of a single-audit session.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub model: Option<ModelSelection>,
     /// Authoritative semantic category of the finding.
@@ -254,6 +278,10 @@ struct ReviewItemWire {
     id: u32,
     title: String,
     #[serde(default)]
+    uuid: Option<String>,
+    #[serde(default)]
+    group: Option<String>,
+    #[serde(default)]
     model: Option<ModelSelection>,
     #[serde(rename = "type", alias = "severity", alias = "issue_type", default)]
     issue_type: IssueType,
@@ -282,6 +310,8 @@ impl From<ReviewItemWire> for ReviewItem {
         Self {
             id: wire.id,
             title: wire.title,
+            uuid: wire.uuid,
+            group: wire.group,
             model: wire.model,
             issue_type: wire.issue_type,
             severity: ReviewSeverity::from(wire.issue_type),
@@ -322,6 +352,8 @@ impl From<ReviewIssue> for ReviewItem {
         Self {
             id: issue.id,
             title: issue.title,
+            uuid: issue.uuid,
+            group: issue.group,
             model: issue.model,
             issue_type: issue.issue_type,
             severity: ReviewSeverity::from(issue.issue_type),
@@ -352,11 +384,17 @@ impl From<ReviewIssue> for ReviewItem {
 /// provenance it keeps instead of inheriting a stale escalation marker. The
 /// storage primitives carry both markers over explicitly for exactly that
 /// reason.
+///
+/// The finding identifier and the group that produced it do survive the
+/// projection: they are the identity the post-analysis layer references, so
+/// they must round-trip unchanged.
 impl From<ReviewItem> for ReviewIssue {
     fn from(item: ReviewItem) -> Self {
         Self {
             id: item.id,
             title: item.title,
+            uuid: item.uuid,
+            group: item.group,
             model: item.model,
             issue_type: item.issue_type,
             status: item.status,

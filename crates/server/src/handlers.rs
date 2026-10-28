@@ -66,6 +66,7 @@ pub async fn handle_request(req: Request, state: &Arc<AppState>) -> Response {
         methods::REVIEW_DELETE => review::handle_review_delete(req, state).await,
         methods::REVIEW_EXECUTE => review::handle_review_execute(req, state).await,
         methods::REVIEW_REFINE_ITEM => review::handle_review_refine_item(req, state).await,
+        methods::REVIEW_ANALYZE => review::handle_review_analyze(req, state).await,
 
         methods::PLAN_LIST => plan::handle_plan_list(req, state).await,
         methods::PLAN_GET => plan::handle_plan_get(req, state).await,
@@ -434,5 +435,28 @@ mod tests {
         let result = run_preflight_verification(&dir).await;
         let _ = std::fs::remove_dir_all(&dir);
         assert!(result.is_ok(), "got: {:?}", result.err());
+    }
+    /// `review/analyze` is wired into the dispatcher: an unresolvable session is
+    /// answered with the review error code instead of `METHOD_NOT_FOUND`.
+    #[tokio::test]
+    async fn test_review_analyze_is_dispatched() {
+        let (out, _rx) = OutChannel::new();
+        let (hist_tx, _hist_rx) = tokio::sync::mpsc::unbounded_channel();
+        let state = AppState::new(
+            tauqe_core::config::AppConfig::default(),
+            std::path::PathBuf::from("/nonexistent"),
+            hist_tx,
+            out,
+        );
+
+        let req = Request {
+            id: RequestId::Number(7),
+            method: methods::REVIEW_ANALYZE.to_string(),
+            params: Some(serde_json::json!({ "review_id": "missing-session" })),
+        };
+
+        let resp = handle_request(req, &state).await;
+        assert_eq!(resp.id, RequestId::Number(7));
+        assert_eq!(resp.error.unwrap().code, errors::NOT_FOUND);
     }
 }

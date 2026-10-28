@@ -127,11 +127,11 @@ pub async fn handle_plan_execute_pipeline(req: Request, state: &Arc<AppState>) -
     // client can attribute every lifecycle event of the pipeline — each plan's
     // terminal `plan/batch_finished` and its replanning phases included — to
     // the request it just sent.
-    // The coder selection and the developer directives apply to every plan of
-    // the queue, so each plan starts from the chosen ladder rung and prompt.
+    // The coder selection applies to every plan of the queue, so each plan
+    // starts from the chosen ladder rung. The plan itself is the single source
+    // of per-step instructions (concept #c-1).
     let options = PlanBatchOptions {
         model: params.model,
-        instructions: params.instructions,
     };
     let response = Response::ok(
         req.id,

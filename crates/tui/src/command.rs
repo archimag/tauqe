@@ -14,6 +14,7 @@ pub mod global;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 use crate::config::{InputConfig, MetaModifier, PrimaryModifier};
+use crate::input::layout::translate_char;
 
 /// Abstract keyboard chord expressed independently of the physical modifiers.
 ///
@@ -49,33 +50,39 @@ impl KeyChord {
     /// stolen from the buffer and the unconditional character insertion
     /// invariant holds. `Primary` and `Meta` resolve through `input`, while
     /// `Ctrl` and `Alt` always match their physical modifier.
+    ///
+    /// The pressed character is projected through the configured keyboard
+    /// layout before the comparison (see `translate_code`), so a chord authored
+    /// as a Latin key stays reachable from an alternative layout while the
+    /// characters a text editor inserts are never translated.
     pub fn matches(&self, key: KeyEvent, input: &InputConfig, text_input_active: bool) -> bool {
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         let alt = key.modifiers.contains(KeyModifiers::ALT);
+        let code = translate_code(key.code, input);
 
         match *self {
             KeyChord::Bare(expected) => {
-                !text_input_active && !ctrl && !alt && bare_code(expected, key)
+                !text_input_active && !ctrl && !alt && bare_code(expected, code, key.modifiers)
             }
             KeyChord::Primary(expected) => {
-                input.is_primary(key.modifiers) && lenient_code(expected, key.code)
+                input.is_primary(key.modifiers) && lenient_code(expected, code)
             }
             KeyChord::Meta(expected) => {
-                input.is_meta(key.modifiers) && lenient_code(expected, key.code)
+                input.is_meta(key.modifiers) && lenient_code(expected, code)
             }
             KeyChord::PrimaryOrMeta(expected) => {
                 (input.is_primary(key.modifiers) || input.is_meta(key.modifiers))
-                    && lenient_code(expected, key.code)
+                    && lenient_code(expected, code)
             }
             KeyChord::Shift(expected) => {
                 !ctrl
                     && !alt
                     && (key.modifiers.contains(KeyModifiers::SHIFT)
-                        || matches!(key.code, KeyCode::BackTab))
-                    && shift_code(expected, key.code)
+                        || matches!(code, KeyCode::BackTab))
+                    && shift_code(expected, code)
             }
-            KeyChord::Ctrl(expected) => ctrl && !alt && lenient_code(expected, key.code),
-            KeyChord::Alt(expected) => alt && !ctrl && lenient_code(expected, key.code),
+            KeyChord::Ctrl(expected) => ctrl && !alt && lenient_code(expected, code),
+            KeyChord::Alt(expected) => alt && !ctrl && lenient_code(expected, code),
         }
     }
 
@@ -105,7 +112,32 @@ impl KeyChord {
     }
 }
 
+/// Projects the pressed key code through the configured keyboard layout.
+///
+/// Only character keys carry a layout-dependent value, so they are mapped
+/// through `translate_char`: a Cyrillic letter (`LayoutPreset::RuJcuken`) or
+/// any character covered by a custom `langmap` becomes the Latin key it
+/// physically occupies, while a character outside the configured mapping stays
+/// as typed. Dedicated navigation keys pass through unchanged.
+///
+/// The projection runs strictly inside chord resolution. It never touches the
+/// text a buffer receives, so the unconditional character insertion invariant
+/// is preserved (Conventions §5.1): a layout only widens which key reaches a
+/// command, never which character is typed.
+fn translate_code(code: KeyCode, input: &InputConfig) -> KeyCode {
+    match code {
+        KeyCode::Char(c) => {
+            KeyCode::Char(translate_char(c, input.layout, input.langmap.as_deref()))
+        }
+        other => other,
+    }
+}
+
 /// Matches a bare structural-navigation key.
+///
+/// `actual` is the key code already projected through the configured layout
+/// (see `translate_code`), so the comparison stays purely Latin and a Cyrillic
+/// press reaches the same binding as its Latin equivalent.
 ///
 /// A bare character is selected by its exact case, but a terminal reports the
 /// Shift state of a letter inconsistently: a lowercase character pressed with
@@ -124,21 +156,21 @@ impl KeyChord {
 /// Symbols, digits, and dedicated navigation keys keep the exact-code test, and
 /// a navigation key never matches while `Shift` is held, leaving `Shift` chords
 /// unambiguous.
-fn bare_code(expected: KeyCode, key: KeyEvent) -> bool {
-    let shift = key.modifiers.contains(KeyModifiers::SHIFT);
+fn bare_code(expected: KeyCode, actual: KeyCode, modifiers: KeyModifiers) -> bool {
+    let shift = modifiers.contains(KeyModifiers::SHIFT);
     match expected {
         KeyCode::Char(expected_char) if expected_char.is_ascii_lowercase() => {
-            !shift && matches!(key.code, KeyCode::Char(actual) if actual == expected_char)
+            !shift && matches!(actual, KeyCode::Char(pressed) if pressed == expected_char)
         }
-        KeyCode::Char(expected_char) if expected_char.is_ascii_uppercase() => match key.code {
-            KeyCode::Char(actual) => {
-                actual.eq_ignore_ascii_case(&expected_char)
-                    && (shift || actual.is_ascii_uppercase())
+        KeyCode::Char(expected_char) if expected_char.is_ascii_uppercase() => match actual {
+            KeyCode::Char(pressed) => {
+                pressed.eq_ignore_ascii_case(&expected_char)
+                    && (shift || pressed.is_ascii_uppercase())
             }
             _ => false,
         },
-        KeyCode::Char(_) => expected == key.code,
-        _ => !shift && expected == key.code,
+        KeyCode::Char(_) => expected == actual,
+        _ => !shift && expected == actual,
     }
 }
 
@@ -157,6 +189,9 @@ fn shift_code(expected: KeyCode, actual: KeyCode) -> bool {
 
 /// Case-insensitive key-code comparison used by command chords, because
 /// terminals report the letter case of a chord inconsistently with Shift.
+///
+/// `actual` is already projected through the configured layout (see
+/// `translate_code`), so a Cyrillic press compares like its Latin chord.
 fn lenient_code(expected: KeyCode, actual: KeyCode) -> bool {
     match (expected, actual) {
         (KeyCode::Char(expected), KeyCode::Char(actual)) => expected.eq_ignore_ascii_case(&actual),
@@ -304,6 +339,8 @@ mod tests {
     use super::global::GLOBAL_COMMAND_MAP;
     use super::*;
 
+    use crate::config::LayoutPreset;
+    use crate::input::layout::cyrillic_to_qwerty;
     use crate::views::context::input::{ContextAction, CONTEXT_COMMAND_MAP};
     use crate::views::history::input::HISTORY_COMMAND_MAP;
     use crate::views::plans::input::{PlansAction, PLANS_COMMAND_MAP};
@@ -322,6 +359,22 @@ mod tests {
         InputConfig {
             primary_modifier: PrimaryModifier::Alt,
             meta_modifier: MetaModifier::Ctrl,
+            ..InputConfig::default()
+        }
+    }
+
+    fn ru_jcuken_primary() -> InputConfig {
+        InputConfig {
+            layout: LayoutPreset::RuJcuken,
+            primary_modifier: PrimaryModifier::Ctrl,
+            meta_modifier: MetaModifier::Alt,
+            ..InputConfig::default()
+        }
+    }
+
+    fn custom_langmap(langmap: &str) -> InputConfig {
+        InputConfig {
+            langmap: Some(langmap.to_string()),
             ..InputConfig::default()
         }
     }
@@ -472,6 +525,125 @@ mod tests {
             &input,
             true
         ));
+    }
+
+    #[test]
+    fn bare_chord_reaches_its_latin_binding_from_a_cyrillic_layout() {
+        let input = ru_jcuken_primary();
+        let next = KeyChord::Bare(KeyCode::Char('n'));
+        let previous = KeyChord::Bare(KeyCode::Char('p'));
+
+        // `т` and `з` sit on the `n` and `p` positions of the JCUKEN layout.
+        assert!(next.matches(key(KeyCode::Char('т'), KeyModifiers::NONE), &input, false));
+        assert!(previous.matches(key(KeyCode::Char('з'), KeyModifiers::NONE), &input, false));
+
+        // A letter from a different physical key never reaches the binding.
+        assert!(!next.matches(key(KeyCode::Char('п'), KeyModifiers::NONE), &input, false));
+    }
+
+    #[test]
+    fn cyrillic_layout_keeps_the_case_discrimination_of_bare_chords() {
+        let input = ru_jcuken_primary();
+        let copy = KeyChord::Bare(KeyCode::Char('c'));
+        let clear = KeyChord::Shift(KeyCode::Char('C'));
+        let new_session = KeyChord::Bare(KeyCode::Char('N'));
+
+        // `с` sits on `c`, and the lowercase binding ignores `Shift`, so it can
+        // never capture the destructive `Shift+C` chord.
+        assert!(copy.matches(key(KeyCode::Char('с'), KeyModifiers::NONE), &input, false));
+        assert!(!copy.matches(key(KeyCode::Char('с'), KeyModifiers::SHIFT), &input, false));
+        assert!(!copy.matches(key(KeyCode::Char('С'), KeyModifiers::NONE), &input, false));
+
+        // Both terminal spellings of `Shift+с` reach the destructive chord.
+        assert!(clear.matches(key(KeyCode::Char('С'), KeyModifiers::SHIFT), &input, false));
+        assert!(clear.matches(key(KeyCode::Char('с'), KeyModifiers::SHIFT), &input, false));
+
+        // An uppercase binding (`N`) accepts the Cyrillic uppercase spelling and
+        // the shifted lowercase one, but never the bare lowercase letter.
+        assert!(new_session.matches(key(KeyCode::Char('Т'), KeyModifiers::NONE), &input, false));
+        assert!(new_session.matches(key(KeyCode::Char('т'), KeyModifiers::SHIFT), &input, false));
+        assert!(!new_session.matches(key(KeyCode::Char('т'), KeyModifiers::NONE), &input, false));
+    }
+
+    #[test]
+    fn modified_chords_match_their_cyrillic_equivalents() {
+        let input = ru_jcuken_primary();
+        let execute = KeyChord::Primary(KeyCode::Char('x'));
+        let forward = KeyChord::Meta(KeyCode::Char('f'));
+        let either = KeyChord::PrimaryOrMeta(KeyCode::Char('s'));
+
+        // `ч`, `а`, and `ы` sit on the `x`, `f`, and `s` positions.
+        assert!(execute.matches(key(KeyCode::Char('ч'), KeyModifiers::CONTROL), &input, true));
+        assert!(forward.matches(key(KeyCode::Char('а'), KeyModifiers::ALT), &input, true));
+        assert!(either.matches(key(KeyCode::Char('ы'), KeyModifiers::CONTROL), &input, true));
+        assert!(either.matches(key(KeyCode::Char('ы'), KeyModifiers::ALT), &input, true));
+
+        // The chord stays scoped to its configured physical modifier.
+        assert!(!execute.matches(key(KeyCode::Char('ч'), KeyModifiers::ALT), &input, true));
+        assert!(!forward.matches(key(KeyCode::Char('а'), KeyModifiers::CONTROL), &input, true));
+    }
+
+    #[test]
+    fn cyrillic_layout_never_claims_a_bare_key_while_a_text_editor_is_active() {
+        let input = ru_jcuken_primary();
+        let execute = KeyChord::Bare(KeyCode::Char('x'));
+
+        // While a text editor captures input the bare binding stays silent, so
+        // `ч` is inserted as a literal character instead of executing a step.
+        assert!(execute.matches(key(KeyCode::Char('ч'), KeyModifiers::NONE), &input, false));
+        assert!(!execute.matches(key(KeyCode::Char('ч'), KeyModifiers::NONE), &input, true));
+    }
+
+    #[test]
+    fn layout_translation_is_inert_without_a_configured_layout() {
+        let input = ctrl_primary();
+        let bare = KeyChord::Bare(KeyCode::Char('n'));
+        let modified = KeyChord::Primary(KeyCode::Char('x'));
+
+        assert!(!bare.matches(key(KeyCode::Char('т'), KeyModifiers::NONE), &input, false));
+        assert!(!modified.matches(key(KeyCode::Char('ч'), KeyModifiers::CONTROL), &input, true));
+    }
+
+    #[test]
+    fn custom_langmap_translates_characters_for_chord_matching() {
+        let input = custom_langmap("й:q, ц:w");
+        let kill_word = KeyChord::Primary(KeyCode::Char('w'));
+        let quote = KeyChord::Bare(KeyCode::Char('q'));
+
+        assert!(kill_word.matches(key(KeyCode::Char('ц'), KeyModifiers::CONTROL), &input, true));
+        assert!(quote.matches(key(KeyCode::Char('й'), KeyModifiers::NONE), &input, false));
+
+        // A character outside the langmap keeps its literal value, so the
+        // preset fallback decides whether it reaches a binding.
+        assert!(!quote.matches(key(KeyCode::Char('т'), KeyModifiers::NONE), &input, false));
+    }
+
+    #[test]
+    fn structural_views_respond_to_the_translated_cyrillic_chords() {
+        let input = ru_jcuken_primary();
+        let execute = key(KeyCode::Char('ч'), KeyModifiers::NONE);
+        let refresh = key(KeyCode::Char('п'), KeyModifiers::NONE);
+
+        assert_eq!(
+            resolve_action(&PLANS_COMMAND_MAP, execute, &input),
+            Some(PlansAction::Execute),
+            "Plans: `ч` sits on `x` and must execute the selected step"
+        );
+        assert_eq!(
+            resolve_action(&REVIEW_COMMAND_MAP, execute, &input),
+            Some(ReviewAction::Execute),
+            "Review: `ч` must execute the selected finding"
+        );
+        assert_eq!(
+            resolve_action(&CONTEXT_COMMAND_MAP, refresh, &input),
+            Some(ContextAction::Refresh),
+            "Context: `п` sits on `g` and must refresh the view"
+        );
+        assert_eq!(
+            resolve_action(&PLANS_COMMAND_MAP, refresh, &input),
+            Some(PlansAction::Refresh),
+            "Plans: `п` must refresh the view"
+        );
     }
 
     #[test]
@@ -935,6 +1107,39 @@ mod tests {
     }
 
     #[test]
+    fn shift_a_runs_the_architect_post_analysis() {
+        let input = ctrl_primary();
+
+        assert_eq!(
+            resolve_action(
+                &REVIEW_COMMAND_MAP,
+                key(KeyCode::Char('A'), KeyModifiers::NONE),
+                &input
+            ),
+            Some(ReviewAction::Analyze),
+            "uppercase A must launch the Architect post-analysis"
+        );
+        assert_eq!(
+            resolve_action(
+                &REVIEW_COMMAND_MAP,
+                key(KeyCode::Char('a'), KeyModifiers::SHIFT),
+                &input
+            ),
+            Some(ReviewAction::Analyze),
+            "the shifted lowercase spelling must reach it too"
+        );
+        assert_eq!(
+            resolve_action(
+                &REVIEW_COMMAND_MAP,
+                key(KeyCode::Char('a'), KeyModifiers::NONE),
+                &input
+            ),
+            Some(ReviewAction::FoldAll),
+            "bare a keeps the global fold"
+        );
+    }
+
+    #[test]
     fn lowercase_g_refreshes_in_every_navigation_view() {
         let input = ctrl_primary();
         let refresh = key(KeyCode::Char('g'), KeyModifiers::NONE);
@@ -1061,5 +1266,174 @@ mod tests {
         assert_no_key_event_collisions(&PLANS_COMMAND_MAP, &input, "PLANS_COMMAND_MAP");
         assert_no_key_event_collisions(&REPL_COMMAND_MAP, &input, "REPL_COMMAND_MAP");
         assert_no_key_event_collisions(&REVIEW_COMMAND_MAP, &input, "REVIEW_COMMAND_MAP");
+    }
+    // --- End-to-end JCUKEN layout scenario (c-1, c-2, c-3, c-4) ---
+
+    /// Returns the Cyrillic key that occupies the physical position of a Latin
+    /// command key on the JCUKEN layout.
+    ///
+    /// The inverse direction is derived from the authoritative
+    /// `cyrillic_to_qwerty` table instead of a second hand-written mapping, so
+    /// the scenario can never drift from the table that performs the
+    /// translation (c-2).
+    fn jcuken_key_for(latin: char) -> Option<char> {
+        let lower = latin.to_ascii_lowercase();
+        let cyrillic = ('а'..='я')
+            .chain(std::iter::once('ё'))
+            .find(|candidate| cyrillic_to_qwerty(*candidate) == lower)?;
+        if latin.is_ascii_uppercase() {
+            cyrillic.to_uppercase().next()
+        } else {
+            Some(cyrillic)
+        }
+    }
+
+    /// Pairs the physical event a chord is authored with against the event that
+    /// presses the Cyrillic key in the same physical position.
+    ///
+    /// Chords without a character key (`Tab`, arrows) and characters a layout
+    /// never remaps (digits, symbols) yield nothing, because both presses are
+    /// literally the same event for them.
+    fn jcuken_equivalent_events(chord: KeyChord, input: &InputConfig) -> Vec<(KeyEvent, KeyEvent)> {
+        let (code, modifiers): (KeyCode, Vec<KeyModifiers>) = match chord {
+            KeyChord::Primary(code) => (
+                code,
+                vec![physical_primary_modifiers(input.primary_modifier)],
+            ),
+            KeyChord::Meta(code) => (code, vec![physical_meta_modifiers(input.meta_modifier)]),
+            KeyChord::PrimaryOrMeta(code) => (
+                code,
+                vec![
+                    physical_primary_modifiers(input.primary_modifier),
+                    physical_meta_modifiers(input.meta_modifier),
+                ],
+            ),
+            KeyChord::Shift(code) => (code, vec![KeyModifiers::SHIFT]),
+            KeyChord::Bare(code) => (code, vec![KeyModifiers::NONE]),
+            KeyChord::Ctrl(code) => (code, vec![KeyModifiers::CONTROL]),
+            KeyChord::Alt(code) => (code, vec![KeyModifiers::ALT]),
+        };
+        let latin = match code {
+            KeyCode::Char(latin) if latin.is_ascii_alphabetic() => latin,
+            _ => return Vec::new(),
+        };
+        let cyrillic = match jcuken_key_for(latin) {
+            Some(cyrillic) => cyrillic,
+            None => return Vec::new(),
+        };
+        modifiers
+            .into_iter()
+            .map(|modifiers| {
+                (
+                    key(KeyCode::Char(latin), modifiers),
+                    key(KeyCode::Char(cyrillic), modifiers),
+                )
+            })
+            .collect()
+    }
+    /// Asserts every character chord of a map is reachable from the JCUKEN
+    /// layout by the key in the same physical position.
+    ///
+    /// The authored chord and its Cyrillic twin must resolve to the same
+    /// command, so no map can gain a binding that works in one layout and
+    /// silently disappears in the other (c-2, c-4). The comparison is made on
+    /// the resolved action, not on the chord: a map may deliberately declare
+    /// both terminal spellings of one destructive chord (an uppercase bare
+    /// letter together with its `Shift` combination), and whichever spec is
+    /// declared first then captures the other one's exact key event. Equal
+    /// actions mean equal commands, exactly as the collision detector treats
+    /// them.
+    fn assert_jcuken_equivalents<A>(map: &CommandMap<A>, label: &str)
+    where
+        A: Copy + PartialEq + std::fmt::Debug + 'static,
+    {
+        let input = ru_jcuken_primary();
+        for spec in map.specs() {
+            for (latin, cyrillic) in jcuken_equivalent_events(spec.chord, &input) {
+                assert_eq!(
+                    map.resolve(latin, &input, false)
+                        .map(|resolved| resolved.action),
+                    Some(spec.action),
+                    "{label}: chord {:?} must resolve to its own command",
+                    spec.chord
+                );
+                assert_eq!(
+                    map.resolve(cyrillic, &input, false)
+                        .map(|resolved| resolved.action),
+                    Some(spec.action),
+                    "{label}: {:?} sits on the position of {:?} and must resolve to the same command",
+                    cyrillic.code,
+                    spec.chord
+                );
+            }
+        }
+    }
+
+    /// Proves the JCUKEN layout works uniformly across every command map.
+    ///
+    /// A key reachable in one scope cannot become unreachable in another merely
+    /// because the developer works in Cyrillic: the global, editor, dialog, and
+    /// every view map are held to the same equivalence (c-2, c-4).
+    #[test]
+    fn ru_jcuken_equivalents_cover_every_command_map() {
+        assert_jcuken_equivalents(&GLOBAL_COMMAND_MAP, "GLOBAL_COMMAND_MAP");
+        assert_jcuken_equivalents(&EDITOR_COMMAND_MAP, "EDITOR_COMMAND_MAP");
+        assert_jcuken_equivalents(&DIALOG_COMMAND_MAP, "DIALOG_COMMAND_MAP");
+        assert_jcuken_equivalents(&CONTEXT_COMMAND_MAP, "CONTEXT_COMMAND_MAP");
+        assert_jcuken_equivalents(&HISTORY_COMMAND_MAP, "HISTORY_COMMAND_MAP");
+        assert_jcuken_equivalents(&PLANS_COMMAND_MAP, "PLANS_COMMAND_MAP");
+        assert_jcuken_equivalents(&REPL_COMMAND_MAP, "REPL_COMMAND_MAP");
+        assert_jcuken_equivalents(&REVIEW_COMMAND_MAP, "REVIEW_COMMAND_MAP");
+    }
+
+    /// Asserts the destructive Context clearing chord is reachable in every
+    /// spelling a terminal reports, while the lowercase copy binding keeps
+    /// copying.
+    ///
+    /// The map deliberately declares both the uppercase bare letter and the
+    /// explicit `Shift` combination for the same clearing action (c-4), so the
+    /// lookup may return either specification. What matters is the resolved
+    /// action: the destructive chord must never degrade into the copy, and the
+    /// bare lowercase letter must never clear a layer.
+    #[test]
+    fn context_clear_user_is_reachable_in_every_shift_spelling() {
+        let input = ctrl_primary();
+
+        assert_eq!(
+            resolve_action(
+                &CONTEXT_COMMAND_MAP,
+                key(KeyCode::Char('C'), KeyModifiers::NONE),
+                &input
+            ),
+            Some(ContextAction::ClearUser),
+            "the uppercase bare letter must clear the user layer"
+        );
+        assert_eq!(
+            resolve_action(
+                &CONTEXT_COMMAND_MAP,
+                key(KeyCode::Char('C'), KeyModifiers::SHIFT),
+                &input
+            ),
+            Some(ContextAction::ClearUser),
+            "a terminal reporting the uppercase letter with Shift must clear the layer"
+        );
+        assert_eq!(
+            resolve_action(
+                &CONTEXT_COMMAND_MAP,
+                key(KeyCode::Char('c'), KeyModifiers::SHIFT),
+                &input
+            ),
+            Some(ContextAction::ClearUser),
+            "a terminal reporting the lowercase letter with Shift must clear the layer"
+        );
+        assert_eq!(
+            resolve_action(
+                &CONTEXT_COMMAND_MAP,
+                key(KeyCode::Char('c'), KeyModifiers::NONE),
+                &input
+            ),
+            Some(ContextAction::Copy),
+            "the bare lowercase letter must copy and never clear"
+        );
     }
 }

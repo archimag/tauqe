@@ -387,6 +387,8 @@ mod tests {
             vec![tauqe_protocol::ReviewIssue {
                 id: 1,
                 title: "Finding".to_string(),
+                uuid: None,
+                group: None,
                 model: None,
                 issue_type: tauqe_protocol::IssueType::Architecture,
                 status: tauqe_protocol::IssueStatus::Todo,

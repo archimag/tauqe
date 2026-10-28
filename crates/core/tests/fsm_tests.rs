@@ -6459,3 +6459,124 @@ async fn review_dialogue_edit_runs_the_transactional_path() {
         "the turn must not leave unaccounted files behind: {status:?}"
     );
 }
+
+/// Neither wire format lets a payload-free terminal success conclude the turn.
+///
+/// A terminal `success` states what the turn accomplished through its summary,
+/// so a status without one is a protocol defect rather than a result. Both
+/// transports therefore decode it into the same empty round: the corrective
+/// machine re-asks with the payload reminder, and once the retry budget is spent
+/// the turn fails with a visible error instead of recording a silent success or
+/// touching the working tree.
+#[tokio::test]
+async fn payload_less_success_runs_the_corrective_rounds_in_either_transport() {
+    let xml_protocol = tauqe_core::prompt::xml::XmlPromptProtocol
+        .with_turn_marker(MARKER)
+        .expect("marker-bound protocol");
+    let structured_protocol = tauqe_core::prompt::json::JsonPromptProtocol::edits();
+
+    let cases: Vec<(&str, &dyn PromptProtocol, String)> = vec![
+        (
+            "xml",
+            xml_protocol.as_ref(),
+            format!("<success_{MARKER} />"),
+        ),
+        (
+            "structured",
+            &structured_protocol,
+            serde_json::json!({
+                "message": "",
+                "changes": [],
+                "outcome": {"status": "success", "summary": "", "message": "", "reason": ""}
+            })
+            .to_string(),
+        ),
+    ];
+
+    for (case, protocol, response) in cases {
+        let (_dir, repo_root) = init_repo();
+        std::fs::write(
+            repo_root.join("target.rs"),
+            "pub fn compute() -> i32 { 0 }\n",
+        )
+        .expect("write target fixture");
+        commit_fixture(&repo_root, &["target.rs"]);
+
+        let mut context = ContextManager::new(repo_root.clone());
+        context
+            .add_file("target.rs", ContextAccess::Editable)
+            .expect("add target to context");
+        let mut history = HistoryManager::new(repo_root.clone());
+
+        let provider = MockLlmProvider::scripted([
+            MockResponse::text(response.clone()),
+            MockResponse::text(response.clone()),
+            MockResponse::text(response),
+        ]);
+        let model = ModelRef::openrouter("mock/model");
+        let mut policy = tauqe_core::workflow::policy::DirectApplyPolicy::new();
+        let options = WorkflowOptions::default();
+        let (stream_tx, cancel_rx) = event_channel();
+
+        let output = {
+            let mut env = build_env(
+                &provider,
+                &model,
+                &mut context,
+                &mut history,
+                protocol,
+                &mut policy,
+                stream_tx,
+                cancel_rx,
+                &options,
+            );
+            AnswerEditLoop::new("Summarize the change")
+                .execute(&mut env)
+                .await
+                .expect("answer/edit loop executes")
+        };
+
+        match &output.result {
+            ModelResult::Edit { outcome, edits, .. } => {
+                assert!(!outcome.applied, "the {case} turn must not apply silence");
+                assert!(edits.is_empty());
+                let error = outcome.error.clone().unwrap_or_default();
+                assert!(
+                    error.contains("empty response"),
+                    "the {case} turn must fail with a visible error: {error}"
+                );
+            }
+            other => {
+                panic!("a payload-free success must not conclude the {case} turn: {other:?}")
+            }
+        }
+
+        // The initial round plus one corrective re-ask per granted retry.
+        assert_eq!(
+            provider.requests().len(),
+            3,
+            "the {case} turn must spend its corrective budget"
+        );
+        for (index, request) in provider.requests().iter().enumerate().skip(1) {
+            let prompt = request
+                .messages
+                .last()
+                .map(|message| message.content.as_str())
+                .unwrap_or_default();
+            assert!(
+                prompt.contains("Your previous reply was empty"),
+                "round {index} of the {case} turn must ask again: {prompt}"
+            );
+            assert!(
+                prompt.contains("state the payload"),
+                "round {index} of the {case} turn must state the payload contract: {prompt}"
+            );
+        }
+
+        assert_eq!(
+            std::fs::read_to_string(repo_root.join("target.rs")).expect("read target fixture"),
+            "pub fn compute() -> i32 { 0 }\n",
+            "a {case} turn without a result must leave the working tree untouched"
+        );
+    }
+}

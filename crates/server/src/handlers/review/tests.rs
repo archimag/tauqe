@@ -53,6 +53,8 @@ fn test_item(id: u32, status: IssueStatus, file: &str) -> tauqe_protocol::Review
     tauqe_protocol::ReviewIssue {
         id,
         title: format!("Finding {}", id),
+        uuid: None,
+        group: None,
         model: None,
         issue_type: tauqe_protocol::IssueType::Quality,
         status,
@@ -80,6 +82,9 @@ fn test_session(id: &str, items: Vec<tauqe_protocol::ReviewIssue>) -> ReviewSess
         target_files: vec!["foo.rs".to_string()],
         items: items.into_iter().map(ReviewItem::from).collect(),
         raw_markdown: String::new(),
+        groups: Vec::new(),
+        post_analysis: None,
+        launch_config: None,
     }
 }
 
@@ -1185,6 +1190,8 @@ async fn test_review_batch_preloads_multiple_files() {
         vec![tauqe_protocol::ReviewIssue {
             id: 1,
             title: "Multi-file finding".to_string(),
+            uuid: None,
+            group: None,
             model: None,
             // A `Quality` finding requires no autonomous architect
             // decomposition, so the test stays focused on multi-file
@@ -1468,7 +1475,7 @@ async fn test_review_start_with_path_pattern_preserves_user_context() {
         id: tauqe_protocol::RequestId::Number(1),
         method: tauqe_protocol::methods::REVIEW_START.to_string(),
         params: Some(serde_json::json!({
-            "path_pattern": "src/*.rs",
+            "path_patterns": ["src/*.rs"],
             "user_prompt": "Check code quality"
         })),
     };
@@ -1530,7 +1537,7 @@ async fn test_review_start_pattern_batch_cap_limits_and_reports_omissions() {
     let req = Request {
         id: tauqe_protocol::RequestId::Number(1),
         method: tauqe_protocol::methods::REVIEW_START.to_string(),
-        params: Some(serde_json::json!({ "path_pattern": "src/*.rs" })),
+        params: Some(serde_json::json!({ "path_patterns": ["src/*.rs"] })),
     };
     let res = handle_review_start(req, &state).await;
     assert!(res.error.is_none(), "review start must succeed");
@@ -1602,7 +1609,7 @@ async fn test_review_start_pattern_token_budget_caps_expansion() {
     let req = Request {
         id: tauqe_protocol::RequestId::Number(1),
         method: tauqe_protocol::methods::REVIEW_START.to_string(),
-        params: Some(serde_json::json!({ "path_pattern": "src/*.rs" })),
+        params: Some(serde_json::json!({ "path_patterns": ["src/*.rs"] })),
     };
     let res = handle_review_start(req, &state).await;
     assert!(res.error.is_none(), "review start must succeed");
@@ -4100,4 +4107,181 @@ async fn test_replace_uncompleted_subplan_rejects_dangling_dependency() {
     assert_eq!(issue.plan[0].id, "1.1");
     assert_eq!(issue.plan[0].status, PlanItemStatus::Done);
     assert_eq!(reloaded.find_item(1).unwrap().status, IssueStatus::Todo);
+}
+
+/// A non-empty pattern that matches no repository file is a mistyped or
+/// unsupported selection, never a narrower audit: the launch is refused with a
+/// diagnostic naming the pattern, before the operation slot is claimed and
+/// before the reviewer model is consulted.
+#[tokio::test]
+async fn test_review_start_rejects_pattern_with_no_repository_matches() {
+    let dir = TestDir::new();
+    init_repo_with_file(&dir, "src/target.rs");
+
+    let provider = Arc::new(MockLlmProvider::scripted([MockResponse::text(
+        r#"{"summary":"Must never run.","findings":[]}"#,
+    )]));
+    let state = test_state_with_provider(&dir, test_config(), provider.clone()).await;
+
+    let patterns = ["src/*.py", "/tmp/outside-repo/*.rs"];
+    for (index, pattern) in patterns.iter().enumerate() {
+        let req = Request {
+            id: tauqe_protocol::RequestId::Number(1 + index as u64),
+            method: tauqe_protocol::methods::REVIEW_START.to_string(),
+            params: Some(serde_json::json!({ "path_patterns": [pattern] })),
+        };
+        let res = handle_review_start(req, &state).await;
+        let err = match res.error {
+            Some(err) => err,
+            None => panic!("pattern {pattern} must be rejected"),
+        };
+        assert_eq!(err.code, "INVALID_PARAMS", "pattern {pattern}");
+        assert!(
+            err.message.contains(*pattern),
+            "the diagnostic must name the pattern: {}",
+            err.message
+        );
+        assert!(
+            !state.is_operation_active(),
+            "pattern {pattern} must be rejected before the operation slot is claimed"
+        );
+    }
+
+    assert_eq!(
+        provider.requests().len(),
+        0,
+        "a rejected pattern must never reach the model"
+    );
+}
+
+/// A pattern whose repository matches are already loaded in context still
+/// selects files: the zero-match guarantee counts repository matches before the
+/// context filter, so a valid selection is never mistaken for a typo.
+#[tokio::test]
+async fn test_review_start_pattern_matching_only_loaded_files_is_accepted() {
+    let dir = TestDir::new();
+    init_repo_with_file(&dir, "src/target.rs");
+
+    let payload = r#"{"summary":"Reviewed the loaded selection.","findings":[]}"#;
+    let provider: Arc<dyn LlmProvider> =
+        Arc::new(MockLlmProvider::scripted([MockResponse::text(payload)]));
+
+    let (out, mut rx) = OutChannel::new();
+    let (hist_tx, _hist_rx) = tokio::sync::mpsc::unbounded_channel();
+    let state = AppState::new(test_config(), dir.path().to_path_buf(), hist_tx, out);
+    *state.provider_override.lock().await = Some(provider);
+
+    state
+        .context
+        .write()
+        .await
+        .add_file("src/target.rs", ContextAccess::Editable)
+        .unwrap();
+
+    let req = Request {
+        id: tauqe_protocol::RequestId::Number(1),
+        method: tauqe_protocol::methods::REVIEW_START.to_string(),
+        params: Some(serde_json::json!({ "path_patterns": ["src/*.rs"] })),
+    };
+    let res = handle_review_start(req, &state).await;
+    assert!(
+        res.error.is_none(),
+        "review start must succeed: {:?}",
+        res.error
+    );
+
+    while let Ok(Some(line)) =
+        tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv()).await
+    {
+        if line.contains(events::REVIEW_FINISHED) || line.contains(events::REVIEW_ERROR) {
+            break;
+        }
+    }
+
+    let session = ReviewStorage::load_latest(dir.path())
+        .unwrap()
+        .expect("review session must be saved");
+    assert_eq!(session.target_files, vec!["src/target.rs".to_string()]);
+}
+
+/// A blank pattern keeps the pre-existing audit scope: the pattern gate neither
+/// widens nor narrows the loaded context.
+#[tokio::test]
+async fn test_review_start_blank_pattern_reviews_the_loaded_context() {
+    let dir = TestDir::new();
+    init_repo_with_file(&dir, "src/target.rs");
+
+    let payload = r#"{"summary":"Reviewed the loaded context.","findings":[]}"#;
+    let provider: Arc<dyn LlmProvider> =
+        Arc::new(MockLlmProvider::scripted([MockResponse::text(payload)]));
+
+    let (out, mut rx) = OutChannel::new();
+    let (hist_tx, _hist_rx) = tokio::sync::mpsc::unbounded_channel();
+    let state = AppState::new(test_config(), dir.path().to_path_buf(), hist_tx, out);
+    *state.provider_override.lock().await = Some(provider);
+
+    state
+        .context
+        .write()
+        .await
+        .add_file("src/target.rs", ContextAccess::Editable)
+        .unwrap();
+
+    let req = Request {
+        id: tauqe_protocol::RequestId::Number(1),
+        method: tauqe_protocol::methods::REVIEW_START.to_string(),
+        params: Some(serde_json::json!({ "path_patterns": ["   "] })),
+    };
+    let res = handle_review_start(req, &state).await;
+    assert!(
+        res.error.is_none(),
+        "review start must succeed: {:?}",
+        res.error
+    );
+
+    while let Ok(Some(line)) =
+        tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv()).await
+    {
+        if line.contains(events::REVIEW_FINISHED) || line.contains(events::REVIEW_ERROR) {
+            break;
+        }
+    }
+
+    let session = ReviewStorage::load_latest(dir.path())
+        .unwrap()
+        .expect("review session must be saved");
+    assert_eq!(session.target_files, vec!["src/target.rs".to_string()]);
+}
+
+/// With no pattern and no files the pre-existing `EMPTY_CONTEXT` outcome stays
+/// distinct from a pattern rejection: an empty context is a missing selection,
+/// not a mistyped one.
+#[tokio::test]
+async fn test_review_start_blank_or_absent_pattern_keeps_empty_context_outcome() {
+    let dir = TestDir::new();
+    init_repo_with_file(&dir, "src/target.rs");
+
+    let provider = Arc::new(MockLlmProvider::scripted([MockResponse::text(
+        r#"{"summary":"Must never run.","findings":[]}"#,
+    )]));
+    let state = test_state_with_provider(&dir, test_config(), provider.clone()).await;
+
+    let param_sets = [None, Some(serde_json::json!({ "path_patterns": ["   "] }))];
+    for (index, params) in param_sets.into_iter().enumerate() {
+        let req = Request {
+            id: tauqe_protocol::RequestId::Number(1 + index as u64),
+            method: tauqe_protocol::methods::REVIEW_START.to_string(),
+            params,
+        };
+        let res = handle_review_start(req, &state).await;
+        let err = res.error.expect("an empty context cannot be reviewed");
+        assert_eq!(err.code, "EMPTY_CONTEXT", "params: {index}");
+        assert!(!state.is_operation_active());
+    }
+
+    assert_eq!(
+        provider.requests().len(),
+        0,
+        "an empty context must never reach the model"
+    );
 }

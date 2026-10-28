@@ -23,6 +23,9 @@ pub const DEFAULT_MAX_FEEDBACK_CHARS: usize = 4_000;
 /// Default maximum characters of a turn scratchpad block kept before truncation.
 pub const DEFAULT_MAX_SCRATCHPAD_CHARS: usize = 4_000;
 
+/// Default total token budget of the lazily loaded external reference documents.
+pub const DEFAULT_REFS_TOKEN_BUDGET: usize = 50_000;
+
 fn default_max_discovery_rounds() -> usize {
     DEFAULT_MAX_DISCOVERY_ROUNDS
 }
@@ -67,6 +70,10 @@ fn default_max_scratchpad_chars() -> usize {
     DEFAULT_MAX_SCRATCHPAD_CHARS
 }
 
+fn default_refs_token_budget() -> usize {
+    DEFAULT_REFS_TOKEN_BUDGET
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ContextConfig {
     #[serde(default, deserialize_with = "deserialize_pinned")]
@@ -99,6 +106,9 @@ pub struct ContextConfig {
     /// Characters of a turn scratchpad block kept before safe truncation.
     #[serde(default = "default_max_scratchpad_chars")]
     pub max_scratchpad_chars: usize,
+    /// Total token budget of the external reference documents kept in context.
+    #[serde(default = "default_refs_token_budget")]
+    pub refs_token_budget: usize,
 }
 
 impl Default for ContextConfig {
@@ -116,6 +126,7 @@ impl Default for ContextConfig {
             max_repo_map_requests_per_round: DEFAULT_MAX_REPO_MAP_REQUESTS_PER_ROUND,
             max_feedback_chars: DEFAULT_MAX_FEEDBACK_CHARS,
             max_scratchpad_chars: DEFAULT_MAX_SCRATCHPAD_CHARS,
+            refs_token_budget: DEFAULT_REFS_TOKEN_BUDGET,
         }
     }
 }

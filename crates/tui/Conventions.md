@@ -139,7 +139,7 @@ This document specifies mandatory architectural and UX invariants for the Tauqe 
      - `C-W` — kill word backward;
      - `M-B`, `M-F` — move word backward / forward;
      - `C-A`, `C-E`, `C-K`, `C-U`, `C-Y`, `C-D`, `C-B`, `C-F` — standard line editing and yank;
-     - `C-P`, `C-N` — move cursor line up / down;
+     - `C-P`, `C-N` — move cursor line up / down in the shared text editor; inside a modal dialog the same symmetric pair is the vertical field walk between input fields and rows (§6.2), so the vertical axis never relies on `Tab`;
      - `M-P`, `M-N` — navigate prompt history backward / forward;
      - `C-T` — toggle file diff folding;
      - `C-Space` / `Shift+Tab` — switch Develop focus between the prompt and the Viewport;
@@ -184,6 +184,9 @@ This document specifies mandatory architectural and UX invariants for the Tauqe 
 
 2. **Standardized Command Navigation:**
    - **Focus Cycling:** `Tab` and `Shift+Tab` cycle focus between actionable controls (buttons or fields).
+   - **Vertical Field Walk:** `C-n` and `C-p` are the universal vertical movement of a dialog. They step to the next and the previous input field, and inside a field that owns several rows (the review launcher's Target Paths) they walk those rows and leave the section only at its boundary. The chords reach the dialog before its single-line fields, while a multiline editor keeps them for cursor line movement, so vertical motion never depends on the surrounding control.
+   - **`Tab` as Contextual Completion:** `Tab` accepts the highlighted candidate while a completion menu (the directory prefixes of the active path row) is open, and falls through to the shared focus move only when no candidate is offered. `Shift+Tab` always keeps the reverse focus move.
+   - **Multi-Row Input Fields:** `C-j` opens the next row of a multi-row field, and only while the active row already carries usable input, so one press never chains empty rows. `Backspace` on an empty row closes it and returns the cursor to the previous row.
    - **Horizontal Button Stepping:** `←` / `→` move focus between adjacent buttons in action bars.
    - **Execution & Safe Defaults:** `Enter` or `Space` activates the currently focused button. For destructive actions as well as long-running, autonomous execution tasks (plan execution, review finding batch execution), safe cancellation (`Cancel`) must always receive default focus.
    - **Fast Accelerators in Confirmation Modals:** Direct `y` / `Y` confirms immediately; `n` / `N` or `Esc` cancels and closes immediately, regardless of button focus.
@@ -239,10 +242,11 @@ This document specifies mandatory architectural and UX invariants for the Tauqe 
   - Reason: arrow keys and `C-P` / `C-N` have different meanings in the editor (cursor navigation) and in the response (file selection, scrolling). Separate focus removes this conflict without adding bare-letter shortcuts.
 
 2. **Viewport Navigation:**
-  - `C-N` / `C-P` and `↓` / `↑` select the next / previous modified file, or scroll the response when there are no files.
-  - `Tab`, `Enter`, and `C-T` fold or unfold the selected diff.
+  - `C-N` / `C-P` and `↓` / `↑` move the reading position. Inside an expanded file they scroll its diff body line by line and cross into the next or previous file only at the boundaries of that file's block — the next file opens at its summary row, the previous one at its last diff line — so a long patch is never interrupted mid-read.
+  - A collapsed file is crossed in one keystroke, the explicit `C-[` / `C-]` chords switch files directly, and with no files at all the same keys scroll the response.
+  - `Tab` and `C-T` fold or unfold the selected diff. `Enter` on the selected file, and the bare `v` chord, open the fullscreen diff inspector instead: `n` / `p` walk the audited files, `j` / `k` and `↑` / `↓` scroll the isolated diff line by line, `PgUp` / `PgDn` page it, and `Esc` returns to the exact reading position the audit was opened from.
   - `PgUp`, `PgDn`, `Home`, and `End` scroll the response.
-  - Bare letters and `Space` are never Viewport commands. This keeps the unconditional character insertion rule from §5.
+   - Apart from the single bare `v` inspector chord, bare letters and `Space` are never Viewport commands. This keeps the unconditional character insertion rule from §5: every other bare letter falls through to the prompt and is inserted there.
 
 3. **Automatic Return to the Prompt:**
   - Any key that types text or edits the prompt moves focus back to the prompt and is applied there. No keystroke is lost.

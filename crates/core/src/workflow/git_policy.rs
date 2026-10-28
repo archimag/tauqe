@@ -131,7 +131,11 @@ impl ApplyPolicy for GitTransactionPolicy {
 
         self.clear_transaction_state();
         match res? {
-            Ok(hash) => Ok(hash),
+            // A verified change set can live entirely outside Git — the
+            // `.tauqe/mockups/` sandbox is the documented case — so finalization
+            // reports the absence of a commit rather than a hash the caller
+            // would try to resolve.
+            Ok(hash) => Ok(hash.filter(|hash| !hash.is_empty())),
             Err(err) => {
                 tracing::warn!("Failed to finalize squashed AI commit: {}", err);
                 Err(err)
@@ -400,15 +404,24 @@ mod tests {
             "three\n"
         );
     }
-
     #[tokio::test]
-    async fn git_policy_apply_final_returns_err_on_empty_changes() {
+    async fn git_policy_apply_final_reports_a_verified_empty_change_set_without_a_commit() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         init_repo(root);
 
         let mut policy = GitTransactionPolicy::new();
-        let res = policy.apply_final(root, &[], "empty summary").await;
-        assert!(res.is_err());
+        // A verified change set may live entirely outside Git, where the turn
+        // produced no tracked path at all: finalization reports the absence of a
+        // commit instead of failing the turn.
+        let hash = policy
+            .apply_final(root, &[], "empty summary")
+            .await
+            .expect("a verified change set outside Git must not fail finalization");
+        assert!(
+            hash.is_none(),
+            "an untracked change set produces no commit: {hash:?}"
+        );
+        assert_eq!(head_subject(root), "Initial commit");
     }
 }

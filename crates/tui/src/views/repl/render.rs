@@ -11,11 +11,12 @@ use crate::theme::engine::{current_engine, ThemeEngine};
 use crate::ui::geometry;
 use crate::ui::{wrap_line, UiAction};
 
-use super::state::ReplFocus;
+use super::state::{ReplFocus, StickyDiffHeader};
 
 mod model;
 mod splash;
 
+pub(crate) use self::model::file_op_badge;
 use self::splash::render_splash;
 
 pub use self::model::compute_model_lines;
@@ -321,6 +322,56 @@ fn render_plan_stepper(frame: &mut ratatui::Frame, lines: Vec<Line<'static>>, ar
     frame.render_widget(paragraph, area);
 }
 
+/// Renders the floating file anchor over the first visible Viewport row.
+///
+/// The band is filled with `palette.surface`, so the diff rows underneath never
+/// bleed through the label, and it carries the operation badge, the path, the
+/// active hunk, and the position of the file inside the staged set. It is a
+/// pure indicator: it registers no clickable region and never intercepts input
+/// (c-1, Conventions.md §1).
+fn render_sticky_header(frame: &mut ratatui::Frame, header: &StickyDiffHeader<'_>, inner: Rect) {
+    if inner.width == 0 || inner.height == 0 {
+        return;
+    }
+
+    let engine = current_engine();
+    let palette = engine.palette();
+    let band = Rect::new(inner.x, inner.y, inner.width, 1);
+
+    let mut spans = vec![
+        file_op_badge(&engine, header.op),
+        Span::raw(" "),
+        Span::styled(
+            header.path.to_string(),
+            engine.fg(palette.text_primary).bold(),
+        ),
+    ];
+
+    if let Some(hunk) = header.hunk {
+        spans.push(Span::raw(" "));
+        spans.push(Span::styled(
+            counter_label("repl.sticky_hunk", hunk, header.hunk_count),
+            engine.fg(palette.status_info),
+        ));
+    }
+
+    spans.push(Span::styled(" • ", engine.fg(palette.text_muted)));
+    spans.push(Span::styled(
+        counter_label("repl.sticky_file", header.file, header.file_count),
+        engine.fg(palette.text_muted),
+    ));
+
+    let band_block = Block::default().style(engine.bg(palette.surface));
+    frame.render_widget(Paragraph::new(Line::from(spans)).block(band_block), band);
+}
+
+/// Fills the two placeholders of a `first/second` catalog template.
+fn counter_label(key: &str, first: usize, second: usize) -> String {
+    active_t(key)
+        .replacen("{}", &first.to_string(), 1)
+        .replacen("{}", &second.to_string(), 1)
+}
+
 fn render_model_pane(frame: &mut ratatui::Frame, state: &mut AppState, area: Rect) {
     let model_block = Block::default().padding(Padding::horizontal(1));
     let inner = model_block.inner(area);
@@ -394,6 +445,13 @@ fn render_model_pane(frame: &mut ratatui::Frame, state: &mut AppState, area: Rec
     // row, because a later registration wins over the surface it covers. The
     // viewport therefore owns its Markdown geometry and the pointer dispatcher
     // never recomputes a column or a scroll offset (c-1, c-2).
+    // The overlay is resolved from the geometry that was just laid out, so it
+    // names the file whose own header the developer can no longer see and can
+    // never disagree with the rows underneath it (c-1).
+    let sticky = state
+        .model
+        .sticky_diff_header(&raw_to_visual_start, &raw_to_visual_end);
+
     let mut block_regions: Vec<(Rect, UiAction)> = Vec::new();
     for block in &state.model.code_blocks {
         if let Some(rect) = geometry::code_block_body_rect(
@@ -423,6 +481,11 @@ fn render_model_pane(frame: &mut ratatui::Frame, state: &mut AppState, area: Rec
         }
     }
     for (rect, action) in block_regions {
+        // The band covers the first visible row, so a control drawn there is
+        // not reachable until the diff scrolls it out from under the overlay.
+        if sticky.is_some() && rect.y == inner.y {
+            continue;
+        }
         state.hit_regions.register(rect, action);
     }
 
@@ -436,6 +499,12 @@ fn render_model_pane(frame: &mut ratatui::Frame, state: &mut AppState, area: Rec
 
     let model_paragraph = Paragraph::new(visible_lines).block(model_block);
     frame.render_widget(model_paragraph, area);
+
+    // The overlay is a pure indicator: it fills the first visible row and never
+    // intercepts input, so the Viewport focus model stays untouched (c-1).
+    if let Some(header) = sticky {
+        render_sticky_header(frame, &header, inner);
+    }
 }
 
 /// Computes the prompt editor scroll offset so the cursor stays visible,

@@ -7,8 +7,6 @@
 //! on tree state and navigation, and keeps the strictly increasing indent
 //! invariant testable in one place (Conventions §4.8).
 
-use std::collections::HashSet;
-
 use ratatui::style::{Style, Stylize};
 use ratatui::text::{Line, Span};
 use tauqe_protocol::{IssueStatus, IssueType, ModelSelection, PlanItem, PlanItemStatus};
@@ -21,40 +19,6 @@ use crate::views::plans::architect_badge;
 use crate::views::plans::tree::prepare_plan_markdown;
 
 use super::VisibleReviewRow;
-
-/// Expansion key of one subplan step inside a finding's embedded plan.
-///
-/// The `s:` segment keeps step keys disjoint from the `session:item` keys that
-/// mark an expanded finding, so the two expansion scopes never collide.
-pub(crate) fn subplan_key(session_id: &str, item_id: u32, step_id: &str) -> String {
-    format!("{}:{}:s:{}", session_id, item_id, step_id)
-}
-
-/// Records every subplan step of a finding as expanded.
-pub(crate) fn collect_subplan_keys(
-    session_id: &str,
-    item_id: u32,
-    steps: &[PlanItem],
-    out: &mut HashSet<String>,
-) {
-    for step in steps {
-        out.insert(subplan_key(session_id, item_id, &step.id));
-        collect_subplan_keys(session_id, item_id, &step.children, out);
-    }
-}
-
-/// Whether every subplan step of a finding is expanded.
-pub(crate) fn subplan_all_expanded(
-    expanded: &HashSet<String>,
-    session_id: &str,
-    item_id: u32,
-    steps: &[PlanItem],
-) -> bool {
-    steps.iter().all(|step| {
-        expanded.contains(&subplan_key(session_id, item_id, &step.id))
-            && subplan_all_expanded(expanded, session_id, item_id, &step.children)
-    })
-}
 
 /// Cache key of the rendered description body of a finding.
 ///
@@ -76,14 +40,20 @@ const REVIEW_INDENT_STEP: usize = 2;
 /// Nesting level of a session header row.
 const REVIEW_SESSION_LEVEL: usize = 0;
 
-/// Nesting level of the Executive Summary row of a session.
-const REVIEW_SUMMARY_LEVEL: usize = 1;
+/// Nesting level of every top-level node of one session: the Executive Summary,
+/// the post-analysis verdict block, a provenance group, an architectural
+/// section, and the independent-issues section.
+///
+/// One shared baseline puts the whole session body on a single visual band and
+/// holds each of those nodes strictly deeper than the session header itself
+/// (Conventions §4.8).
+const REVIEW_TOP_LEVEL: usize = REVIEW_SESSION_LEVEL + 1;
 
 /// Nesting level of a finding row.
 ///
 /// A finding's own detail block and its top-level subplan steps both sit one
 /// level deeper, so the body never reads as deeper than the children.
-const REVIEW_ITEM_LEVEL: usize = 2;
+const REVIEW_ITEM_LEVEL: usize = REVIEW_TOP_LEVEL + 1;
 
 /// Leading indentation of a node rendered at `level`.
 ///
@@ -233,6 +203,53 @@ fn subplan_progress(items: &[PlanItem]) -> (usize, usize) {
     (completed, total)
 }
 
+/// Appends one line per step of a group's unified plan.
+///
+/// An architectural group fixes one root cause with one coherent change set,
+/// so the plan belongs to the group rather than to a single finding (concept
+/// #c-4). The steps are read-only rows here: the group executes and reprojects
+/// them as a unit, and nested container steps nest one level deeper.
+fn push_group_plan_lines(
+    engine: &crate::theme::engine::ThemeEngine,
+    steps: &[PlanItem],
+    depth: usize,
+    out: &mut Vec<Line<'static>>,
+) {
+    let palette = engine.palette();
+    for step in steps {
+        // The indent already compensates for the selection gutter of a
+        // summary row, so the plan step starts on the very band of the findings
+        // it fixes; the muted bullet stands in for the fold marker a read-only
+        // step has no need for (Conventions §4.8).
+        let indent = review_body_indent(REVIEW_ITEM_LEVEL + depth);
+        let clean_title = step.title.replace(['\r', '\n'], " ");
+        let mut spans = vec![
+            Span::styled(indent, engine.fg(palette.text_muted)),
+            Span::styled("• ", engine.fg(palette.text_muted)),
+            Span::styled(format!(" {} ", step.status), plan_status_style(step.status)),
+            Span::raw(" "),
+            Span::styled(
+                format!("#{} {}", step.id, clean_title.trim()),
+                engine.fg(palette.text_primary),
+            ),
+        ];
+        if step.children.is_empty() && !step.files.is_empty() {
+            spans.push(Span::styled(
+                format!(
+                    " [{}]",
+                    crate::i18n::active_t("plans.file_count").replacen(
+                        "{}",
+                        &step.files.len().to_string(),
+                        1
+                    )
+                ),
+                engine.fg(palette.text_muted),
+            ));
+        }
+        out.push(Line::from(spans));
+        push_group_plan_lines(engine, &step.children, depth + 1, out);
+    }
+}
 /// Badge naming the concrete model behind a finding's recorded selection.
 ///
 /// A role is a selection mechanism, not a property of a printed name, so a
@@ -412,7 +429,7 @@ pub(crate) fn compute_unified_review_lines(
                 let fold_icon = if *is_expanded { "▼ " } else { "▶ " };
                 let spans = vec![
                     gutter,
-                    Span::raw(review_indent(REVIEW_SUMMARY_LEVEL)),
+                    Span::raw(review_indent(REVIEW_TOP_LEVEL)),
                     Span::styled(fold_icon, engine.fg(palette.status_warning).bold()),
                     Span::styled(
                         format!("{}:", crate::i18n::active_t("review.executive_summary")),
@@ -430,7 +447,7 @@ pub(crate) fn compute_unified_review_lines(
                     let trimmed = description.trim();
                     if !trimmed.is_empty() {
                         let body_prefix = Span::styled(
-                            format!("{}│ ", review_body_indent(REVIEW_SUMMARY_LEVEL + 1)),
+                            format!("{}│ ", review_body_indent(REVIEW_TOP_LEVEL + 1)),
                             engine.fg(palette.text_muted),
                         );
                         let mut theme = crate::markdown::MarkdownTheme::answer_themed(theme_mode);
@@ -848,6 +865,107 @@ pub(crate) fn compute_unified_review_lines(
                 rendered.extend(detail_lines);
                 all_lines.extend(rendered);
             }
+            VisibleReviewRow::GroupHeader {
+                session_id,
+                group_id,
+                title,
+                description,
+                findings_count,
+                subplan,
+                subplan_architect,
+                is_expanded,
+            } => {
+                // A group owns a body whenever it holds findings, a unified
+                // remediation plan, or a documented root cause, so the fold
+                // icon reflects every branch it can reveal. A group whose
+                // findings are all filtered out still keeps its description
+                // reachable instead of hiding it behind a missing fold icon
+                // (Conventions §4.1, concept #c-3).
+                let has_description = description
+                    .as_deref()
+                    .is_some_and(|text| !text.trim().is_empty());
+                let fold_icon = if *findings_count > 0 || !subplan.is_empty() || has_description {
+                    if *is_expanded {
+                        "▼ "
+                    } else {
+                        "▶ "
+                    }
+                } else {
+                    ""
+                };
+                let mut spans = vec![
+                    gutter,
+                    Span::raw(review_indent(REVIEW_TOP_LEVEL)),
+                    Span::styled(fold_icon, engine.fg(palette.status_warning).bold()),
+                    Span::styled(title.clone(), engine.fg(palette.text_primary).bold()),
+                ];
+                spans.push(Span::styled(
+                    format!(
+                        " [{}]",
+                        crate::i18n::active_t("review.group_findings_count").replacen(
+                            "{}",
+                            &findings_count.to_string(),
+                            1
+                        )
+                    ),
+                    engine.fg(palette.text_muted),
+                ));
+                if !subplan.is_empty() {
+                    let (done, total) = subplan_progress(subplan);
+                    if total > 0 {
+                        spans.push(Span::styled(
+                            format!(
+                                " [{}]",
+                                crate::i18n::active_t("review.steps_count")
+                                    .replacen("{}", &done.to_string(), 1)
+                                    .replacen("{}", &total.to_string(), 1)
+                            ),
+                            engine.fg(palette.status_info),
+                        ));
+                    }
+                }
+                if let Some(tier) = subplan_architect {
+                    spans.push(architect_badge(tier));
+                }
+                let mut header_line = Line::from(spans).style(row_style);
+                if is_selected {
+                    header_line = pad_line_to_width(header_line, width, row_style);
+                }
+                let row_lines = vec![header_line];
+                let mut detail_lines: Vec<Line<'static>> = Vec::new();
+                let mut plan_lines: Vec<Line<'static>> = Vec::new();
+
+                if *is_expanded {
+                    if let Some(description) = description
+                        .as_deref()
+                        .filter(|text| !text.trim().is_empty())
+                    {
+                        let body_prefix = Span::styled(
+                            format!("{}│ ", review_body_indent(REVIEW_TOP_LEVEL + 1)),
+                            engine.fg(palette.text_muted),
+                        );
+                        let mut theme = crate::markdown::MarkdownTheme::answer_themed(theme_mode);
+                        theme.text_style = engine.fg(palette.text_secondary);
+                        theme.hard_breaks = true;
+                        theme.compact = true;
+                        theme.line_prefix = Some(body_prefix);
+                        let key = format!("{}:g:{}:d", session_id, group_id);
+                        let body = cache.lines_for(
+                            &key,
+                            description.trim(),
+                            &theme,
+                            Some(width),
+                            theme_mode,
+                        );
+                        detail_lines.extend(body.iter().cloned());
+                    }
+                    push_group_plan_lines(&engine, subplan, 0, &mut plan_lines);
+                }
+
+                all_lines.extend(wrap_lines(row_lines, width));
+                all_lines.extend(detail_lines);
+                all_lines.extend(wrap_lines(plan_lines, width));
+            }
         }
     }
 
@@ -866,6 +984,8 @@ mod tests {
         ReviewIssue {
             id,
             title: format!("Finding {}", id),
+            uuid: None,
+            group: None,
             model: None,
             issue_type: IssueType::Architecture,
             status: IssueStatus::Todo,
@@ -892,6 +1012,9 @@ mod tests {
                 .map(|&i| ReviewItem::from(make_item(i)))
                 .collect(),
             raw_markdown: String::new(),
+            groups: Vec::new(),
+            post_analysis: None,
+            launch_config: None,
         }
     }
 
@@ -972,7 +1095,135 @@ mod tests {
             &mut view.markdown_cache,
         )
     }
+    /// Group and architectural section headers sit exactly one level above the
+    /// findings they contain, and a finding body never renders deeper than the
+    /// sections' children (Conventions §4.8).
+    #[test]
+    fn test_group_headers_sit_between_session_and_findings() {
+        let mut session = make_session("rev-groups", &[1]);
+        session.groups = vec![tauqe_protocol::ReviewGroup {
+            id: "alpha".to_string(),
+            title: "Alpha slice".to_string(),
+            paths: vec!["crates/alpha/".to_string()],
+            prompt: None,
+            ..Default::default()
+        }];
+        session.items[0].group = Some("alpha".to_string());
+        session.items[0].uuid = Some("u-1".to_string());
+        let mut view = ReviewViewState {
+            sessions: vec![session],
+            ..Default::default()
+        };
 
+        let (lines, _) = render_view(&mut view, usize::MAX, 160);
+        let header = leading_indent(&lines[find_line(&lines, "[rev-groups]")]);
+        let group = leading_indent(&lines[find_line(&lines, "Alpha slice")]);
+        let item = leading_indent(&lines[find_line(&lines, "#1 Finding 1")]);
+        assert!(header < group, "{header} >= {group}");
+        assert!(group < item, "{group} >= {item}");
+    }
+
+    /// A group whose findings are all filtered out but whose root cause is
+    /// documented still owns a body. Without the fold icon the description
+    /// would be unreachable, so the header must stay foldable and the body
+    /// must appear exactly while the group is expanded
+    /// (Conventions §4.1, concept #c-3).
+    #[test]
+    fn test_group_header_stays_foldable_when_only_its_description_remains() {
+        let mut session = make_session("rev-group-desc", &[1]);
+        session.groups = vec![tauqe_protocol::ReviewGroup {
+            id: "alpha".to_string(),
+            title: "Alpha slice".to_string(),
+            description: Some("Both symptoms share one cause.".to_string()),
+            ..Default::default()
+        }];
+        session.items[0].group = Some("alpha".to_string());
+        session.items[0].status = IssueStatus::Fixed;
+        let mut view = ReviewViewState {
+            sessions: vec![session],
+            hide_closed: true,
+            ..Default::default()
+        };
+
+        // Expanded: the root cause renders below the header of its group, even
+        // though the open-findings filter left no finding under it.
+        let (lines, _) = render_view(&mut view, usize::MAX, 160);
+        let header = line_text(&lines[find_line(&lines, "Alpha slice")]);
+        assert!(
+            header.contains("▼"),
+            "an expandable group header must carry the fold icon: {header}"
+        );
+        let rendered = lines.iter().map(line_text).collect::<Vec<_>>().join("\n");
+        assert!(
+            rendered.contains("Both symptoms share one cause."),
+            "the group description must render while the group is expanded: {rendered}"
+        );
+
+        // Folded: only the body disappears, the icon flips and stays reachable.
+        view.toggle_group_expanded("rev-group-desc", "alpha");
+        let (lines, _) = render_view(&mut view, usize::MAX, 160);
+        let header = line_text(&lines[find_line(&lines, "Alpha slice")]);
+        assert!(
+            header.contains("▶"),
+            "a folded group header must stay foldable: {header}"
+        );
+        let rendered = lines.iter().map(line_text).collect::<Vec<_>>().join("\n");
+        assert!(
+            !rendered.contains("Both symptoms share one cause."),
+            "a folded group must hide its description: {rendered}"
+        );
+    }
+
+    /// A group header advertises the unified remediation plan of its root
+    /// cause and renders that description at the level of its findings, so a
+    /// decomposed group reads like a decomposed finding (concept #c-4).
+    #[test]
+    fn test_group_header_advertises_its_subplan_and_renders_the_description() {
+        let mut session = make_session("rev-group-plan", &[1]);
+        session.groups = vec![tauqe_protocol::ReviewGroup {
+            id: "alpha".to_string(),
+            title: "Alpha slice".to_string(),
+            description: Some("One cause behind both symptoms.".to_string()),
+            subplan: vec![PlanItem {
+                children: vec![subplan_step("1.1", "Leaf", PlanItemStatus::Done)],
+                ..subplan_step("1", "Unify the guard", PlanItemStatus::Todo)
+            }],
+            ..Default::default()
+        }];
+        session.items[0].group = Some("alpha".to_string());
+        let mut view = ReviewViewState {
+            sessions: vec![session],
+            ..Default::default()
+        };
+
+        let (lines, _) = render_view(&mut view, 1, 160);
+        let rendered = lines.iter().map(line_text).collect::<Vec<_>>().join("\n");
+        assert!(
+            rendered.contains("[1/1 steps]"),
+            "the header must advertise the group plan progress: {rendered}"
+        );
+        assert!(
+            rendered.contains("One cause behind both symptoms."),
+            "the header body must render the root cause: {rendered}"
+        );
+
+        let header = leading_indent(&lines[find_line(&lines, "Alpha slice")]);
+        let body = leading_indent(&lines[find_line(&lines, "One cause behind both symptoms.")]);
+        let item = leading_indent(&lines[find_line(&lines, "#1 Finding 1")]);
+        let step = leading_indent(&lines[find_line(&lines, "#1 Unify the guard")]);
+        assert!(
+            header < body,
+            "the group body must sit deeper than its header: {header} >= {body}"
+        );
+        assert!(
+            body <= item,
+            "the group body must never sit deeper than its findings: {body} > {item}"
+        );
+        assert_eq!(
+            body, step,
+            "the group plan renders at the level of the findings it fixes"
+        );
+    }
     /// Body lines of a rendered tree: the detail block lines that carry the `│`
     /// body prefix, as opposed to the summary line of a row.
     fn body_lines(lines: &[Line<'static>]) -> Vec<Line<'static>> {

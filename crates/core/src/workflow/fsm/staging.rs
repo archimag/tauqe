@@ -90,6 +90,9 @@ pub(super) async fn run_discovery_phase(
             // files are visible, so such a round can be answered instead of
             // being mistaken for a dead end.
             true,
+            // The round races the turn's own cancel signal, so an abandoned
+            // discovery request stops waiting for a slow reference host.
+            Some(ctx.cancel_rx),
         )
         .await;
 
@@ -334,14 +337,16 @@ pub(super) const ALREADY_SATISFIED_DIRECTIVE: &str = "<response_directive>\nEver
 /// requesting paths the harness will no longer load.
 pub(super) const DISCOVERY_LIMIT_DIRECTIVE: &str = "<response_directive>\nThe discovery round limit is exhausted: no further files, repository searches, directory listings, or documentation will be loaded in this turn. Your investigation for this turn is complete. Do not request additional paths. Answer the task from the material you already hold, stating the conclusions or emitting the file edits the gathered context supports.\n</response_directive>";
 
-/// Corrective suffix appended to the request after an empty proposal round.</search_47DD627A7A91FC1C>
+/// Corrective suffix appended to the request after an empty proposal round.
 ///
 /// The suffix extends the previous request instead of replacing it, so the
 /// corrective round keeps the provider-cached prompt prefix and the model keeps
 /// the original task statement in view. It names the plain-text analysis as a
 /// valid conclusion, so a model that has finished its investigation answers the
-/// task instead of believing that only file edits count as a result.
-pub(super) const EMPTY_STEP_REMINDER: &str = "\n\nYour previous reply was empty: it carried no text, no file edits, and no protocol command, so nothing could be acted upon. Respond again with a concrete result: when the context you already hold answers the task, write the analysis or the conclusion in plain conversational text; when the code must change, emit the file edits; otherwise declare an explicit terminal outcome.";
+/// task instead of believing that only file edits count as a result, and it
+/// states the payload contract of a terminal outcome, because a status without
+/// its payload is as empty as a reply without content.
+pub(super) const EMPTY_STEP_REMINDER: &str = "\n\nYour previous reply was empty: it carried no text, no file edits, no discovery command, and no terminal outcome with its payload, so nothing could be acted upon. Respond again with a concrete result: when the context you already hold answers the task, write the analysis or the conclusion in plain conversational text; when the code must change, emit the file edits; otherwise declare an explicit terminal outcome and state the payload of the status you declare, because a terminal status without its payload is a protocol defect rather than a result.";
 
 /// Outcome of the corrective proposal round requested after an empty round.
 pub(super) enum EmptyStepRetry {
@@ -2170,5 +2175,242 @@ args = ["-c", "printf 'formatter failed' >&2; exit 3"]
             TARGET,
             "a turn without edits must leave the working tree untouched"
         );
+    }
+
+    /// Counts the commits reachable from HEAD.
+    fn commit_count(root: &std::path::Path) -> usize {
+        crate::git::cmd::run_git(Some(root), &["rev-list", "--count", "HEAD"])
+            .expect("count the commits")
+            .trim()
+            .parse()
+            .expect("parse the commit count")
+    }
+
+    /// Reads the working copy status of the test repository.
+    fn worktree_status(root: &std::path::Path) -> String {
+        crate::git::cmd::run_git(Some(root), &["status", "--porcelain"])
+            .expect("read the working copy status")
+    }
+
+    /// Returns the repository-relative paths recorded by the commit at HEAD.
+    #[cfg(unix)]
+    fn committed_paths(root: &std::path::Path) -> Vec<String> {
+        let mut paths: Vec<String> = crate::git::cmd::run_git(
+            Some(root),
+            &["show", "--name-only", "--pretty=format:", "HEAD"],
+        )
+        .expect("read the committed paths")
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(str::to_string)
+        .collect();
+        paths.sort();
+        paths
+    }
+
+    /// A turn whose whole change set lives in the mockups sandbox applies and
+    /// verifies without producing a commit.
+    ///
+    /// The sandbox is deliberately outside Git, so the transaction has nothing
+    /// to record. Finalization must close the open checkpoint instead of failing
+    /// the verified turn, and the draft must still reach the working tree.
+    #[tokio::test]
+    async fn mockups_only_turn_applies_without_a_commit() {
+        let (_dir, root) = setup_repo(&[("a.rs", TARGET)]);
+        // The sandbox is admitted only while Git ignores it, which is also the
+        // reason a draft can never join the change set of a turn.
+        crate::git::checkpoint::ensure_tauqe_ignored(&root).unwrap();
+        let mut context = context_with_target(&root);
+        let mut history = HistoryManager::new(root.clone());
+
+        let provider = MockLlmProvider::scripted([MockResponse::text(concat!(
+            "<tauqe_edits summary=\"Draft a prototype\">\n",
+            "<create path=\".tauqe/mockups/prototype.rs\">\n",
+            "pub fn prototype() -> i32 { 42 }\n",
+            "</create>\n",
+            "</tauqe_edits>",
+        ))]);
+        let model = ModelRef::openrouter("mock/model");
+        let protocol = XmlPromptProtocol;
+        let mut policy = crate::workflow::git_policy::GitTransactionPolicy::new();
+        let options = WorkflowOptions::default();
+        let (stream_tx, rx) = mpsc::channel(256);
+        drop(rx);
+        let (_cancel_tx, cancel_rx) = watch::channel(false);
+
+        let baseline = commit_count(&root);
+        let outcome = run_fsm_turn(
+            "Sketch a prototype",
+            &provider,
+            &model,
+            &mut context,
+            &mut history,
+            &protocol,
+            &mut policy,
+            "git",
+            stream_tx,
+            cancel_rx,
+            &options,
+        )
+        .await
+        .unwrap();
+
+        match outcome.result {
+            ModelResult::Edit { edits, outcome, .. } => {
+                assert!(
+                    outcome.error.is_none(),
+                    "unexpected error: {:?}",
+                    outcome.error
+                );
+                assert!(outcome.applied, "a verified draft must still apply");
+                assert_eq!(edits.len(), 1, "the model proposed exactly one edit");
+                assert!(
+                    outcome.changed_files.is_empty(),
+                    "the sandbox never joins the change set: {:?}",
+                    outcome.changed_files
+                );
+                assert!(
+                    outcome.commit_hash.is_none(),
+                    "a draft outside Git produces no commit"
+                );
+            }
+            other => panic!("expected applied edits, got {other:?}"),
+        }
+
+        assert_eq!(
+            std::fs::read_to_string(root.join(".tauqe/mockups/prototype.rs")).unwrap(),
+            "pub fn prototype() -> i32 { 42 }\n",
+            "the draft must reach its sandbox file"
+        );
+        assert!(
+            worktree_status(&root).trim().is_empty(),
+            "the turn must not leave the working copy dirty"
+        );
+        assert_eq!(
+            commit_count(&root),
+            baseline,
+            "an untracked draft must not produce a commit"
+        );
+    }
+
+    /// A turn that drafts a mockup and edits a tracked file commits the tracked
+    /// file alone.
+    ///
+    /// The sandbox path never reaches `git add`, the commit, or the change set
+    /// the project verification command receives on its standard input, so the
+    /// draft can neither break the build nor abort the Git transaction.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_mixed_turn_commits_only_the_tracked_files() {
+        let capture = tempfile::tempdir().unwrap();
+        let capture_path = capture.path().join("change-set.txt");
+        let config = format!(
+            concat!(
+                "[models]\n",
+                "primary = [\"openrouter:mock/model\"]\n",
+                "\n",
+                "[project.verify]\n",
+                "command = \"sh\"\n",
+                "args = ['-c', 'tee {} > /dev/null']\n",
+            ),
+            capture_path.display()
+        );
+        let (_dir, root) = setup_repo(&[("a.rs", TARGET), ("tauqe.toml", config.as_str())]);
+        crate::git::checkpoint::ensure_tauqe_ignored(&root).unwrap();
+        let mut context = context_with_target(&root);
+        let mut history = HistoryManager::new(root.clone());
+
+        let provider = MockLlmProvider::scripted([MockResponse::text(concat!(
+            "<tauqe_edits summary=\"Prototype and edit\">\n",
+            "<create path=\".tauqe/mockups/prototype.rs\">\n",
+            "pub fn prototype() -> i32 { 42 }\n",
+            "</create>\n",
+            "<edit path=\"a.rs\">\n",
+            "<search>\npub fn compute() -> i32 { 0 }\n</search>\n",
+            "<replace>\npub fn compute() -> i32 { 42 }\n</replace>\n",
+            "</edit>\n",
+            "</tauqe_edits>",
+        ))]);
+        let model = ModelRef::openrouter("mock/model");
+        let protocol = XmlPromptProtocol;
+        let mut policy = crate::workflow::git_policy::GitTransactionPolicy::new();
+        let options = WorkflowOptions::default();
+        let (stream_tx, rx) = mpsc::channel(256);
+        drop(rx);
+        let (_cancel_tx, cancel_rx) = watch::channel(false);
+
+        let outcome = run_fsm_turn(
+            "Prototype the change and apply it",
+            &provider,
+            &model,
+            &mut context,
+            &mut history,
+            &protocol,
+            &mut policy,
+            "git",
+            stream_tx,
+            cancel_rx,
+            &options,
+        )
+        .await
+        .unwrap();
+
+        match outcome.result {
+            ModelResult::Edit { outcome, .. } => {
+                assert!(
+                    outcome.error.is_none(),
+                    "unexpected error: {:?}",
+                    outcome.error
+                );
+                assert!(outcome.applied, "the verified change set must be committed");
+                assert_eq!(
+                    outcome.changed_files,
+                    vec!["a.rs".to_string()],
+                    "the sandbox never joins the change set of a turn"
+                );
+                assert!(outcome.commit_hash.is_some());
+            }
+            other => panic!("expected applied edits, got {other:?}"),
+        }
+        assert_eq!(
+            committed_paths(&root),
+            vec!["a.rs".to_string()],
+            "the commit records the tracked file alone"
+        );
+        assert!(
+            root.join(".tauqe/mockups/prototype.rs").exists(),
+            "the draft is written even though it stays out of the commit"
+        );
+        assert!(
+            worktree_status(&root).trim().is_empty(),
+            "the turn must not leave unaccounted files behind"
+        );
+
+        let captured = std::fs::read_to_string(&capture_path)
+            .expect("the verification command captured its standard input");
+        let mut delivered: Vec<&str> = captured
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .collect();
+        delivered.sort();
+        assert_eq!(
+            delivered,
+            vec!["a.rs"],
+            "verification must read the change set without the sandbox: {captured:?}"
+        );
+    }
+    #[test]
+    fn the_empty_step_reminder_requires_a_result_not_a_silent_status() {
+        // The corrective round owes a result, and a payload-free terminal status
+        // is named as a non-result, so a model cannot satisfy the reminder by
+        // declaring an empty outcome.
+        assert!(super::EMPTY_STEP_REMINDER.contains("Your previous reply was empty"));
+        assert!(super::EMPTY_STEP_REMINDER.contains("plain conversational text"));
+        assert!(super::EMPTY_STEP_REMINDER.contains("emit the file edits"));
+        assert!(super::EMPTY_STEP_REMINDER.contains("terminal outcome"));
+        assert!(super::EMPTY_STEP_REMINDER.contains("payload"));
+        assert!(super::EMPTY_STEP_REMINDER.contains("protocol defect"));
     }
 }

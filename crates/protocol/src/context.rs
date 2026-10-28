@@ -11,6 +11,8 @@ pub enum ContextAccess {
 #[serde(rename_all = "snake_case")]
 pub enum ContextLayer {
     Pinned,
+    /// External reference documents materialized into the isolated cache.
+    Refs,
     #[default]
     User,
     Auto,
@@ -134,5 +136,19 @@ mod tests {
             serde_json::from_str::<ContextAccess>("\"editable\"").unwrap(),
             ContextAccess::Editable
         );
+    }
+    #[test]
+    fn test_context_layer_refs_serde() {
+        // The fourth layer travels under the stable name `refs`, so a client
+        // written before the layer existed never meets an unknown token.
+        assert_eq!(
+            serde_json::to_string(&ContextLayer::Refs).unwrap(),
+            "\"refs\""
+        );
+        assert_eq!(
+            serde_json::from_str::<ContextLayer>("\"refs\"").unwrap(),
+            ContextLayer::Refs
+        );
+        assert_eq!(ContextLayer::default(), ContextLayer::User);
     }
 }

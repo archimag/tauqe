@@ -4,18 +4,18 @@ use std::path::Path;
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use tauqe_core::config::ModelsConfig;
 use tauqe_core::edits::protocol::ContextRequest;
 use tauqe_core::plan::storage::PlanStorage;
 use tauqe_core::providers::{format_session_id, StreamEvent, SESSION_PREFIX_PLAN};
 use tauqe_core::workflow::batch::{BatchStep, BatchStepExecutor, BatchStepOutcome};
 use tauqe_core::workflow::common::apply_context_requests_detailed;
 use tauqe_protocol::{
-    events, ContextAccess, ModelRole, ModelSelection, ModelTurnPlanContext, PlanItem,
+    events, ContextAccess, ModelRef, ModelRole, ModelSelection, ModelTurnPlanContext, PlanItem,
     PlanItemStatus, TurnIntent,
 };
 use tokio::sync::{mpsc, watch};
 
-use crate::handlers::common::append_developer_directives;
 use crate::handlers::model::{build_apply_policy, execute_model_turn, StepTurnOptions};
 use crate::state::{AppState, OperationGuard};
 
@@ -48,7 +48,15 @@ pub(crate) async fn preload_step_files(state: &Arc<AppState>, repo_root: &Path, 
         let available_files = tauqe_core::git::list_repository_files(Some(&root))
             .ok()
             .unwrap_or_default();
-        let outcome = apply_context_requests_detailed(ctx, &requests, &available_files, usize::MAX);
+        // Declared step files are never capped by an artificial quota, so both
+        // the files budget and the refs budget stay unbounded here.
+        let outcome = apply_context_requests_detailed(
+            ctx,
+            &requests,
+            &available_files,
+            usize::MAX,
+            usize::MAX,
+        );
         let new_state = ctx.get_state();
         (outcome, new_state)
     })
@@ -79,7 +87,6 @@ async fn run_plan_step(
     batch_step_ids: &[String],
     operation: Arc<OperationGuard>,
     model: Option<&ModelSelection>,
-    instructions: Option<&str>,
 ) -> BatchStepOutcome {
     let outcome = run_plan_step_inner(
         state,
@@ -89,7 +96,6 @@ async fn run_plan_step(
         batch_step_ids,
         operation,
         model,
-        instructions,
     )
     .await;
     clear_auto_context(state).await;
@@ -105,7 +111,6 @@ async fn run_plan_step_inner(
     batch_step_ids: &[String],
     operation: Arc<OperationGuard>,
     model: Option<&ModelSelection>,
-    instructions: Option<&str>,
 ) -> BatchStepOutcome {
     let load_root = repo_root.to_path_buf();
     let load_plan_id = plan_id.to_string();
@@ -202,8 +207,6 @@ async fn run_plan_step_inner(
             return BatchStepOutcome::failed(err);
         }
     };
-
-    append_developer_directives(&mut prompt, instructions);
 
     let (max_retries, auto_level_up, models_config) = {
         let cfg = state.config.lock().await.config.clone();
@@ -376,6 +379,42 @@ async fn run_plan_step_inner(
                 "Step finished without applying any code changes".to_string()
             }
         });
+        // The rung automatic escalation would enter next. `None` means the ladder is
+        // already saturated: the step sits on the strongest eligible rung, either
+        // because the developer pinned a model the ladder excludes
+        // (`level_up = false`) or because no stronger rung exists. Retrying would
+        // only repeat the configuration that just failed, so a step on a saturated
+        // ladder ends terminally instead of escalating behind the developer's back.
+        let next_rung = if auto_level_up {
+            models_config.next_coder_tier(ladder_idx)
+        } else {
+            None
+        };
+        if auto_level_up && next_rung.is_none() {
+            set_step_status(
+                state,
+                repo_root,
+                plan_id,
+                step_id,
+                PlanItemStatus::Todo,
+                None,
+            )
+            .await;
+            let model = models_config.resolve_model(&selection);
+            let message = escalation_saturated_message(&models_config, &model, &item, &reason);
+            tracing::warn!(
+                plan_id = plan_id,
+                step_id = step_id,
+                tier = ladder_idx,
+                model = %model,
+                reason = %reason,
+                "plan step escalation saturated; the step ends without a stronger tier"
+            );
+            if turn.error.is_none() {
+                report_step_failure(state, &turn.operation_id, &message);
+            }
+            return BatchStepOutcome::failed(message);
+        }
 
         if attempt >= max_retries {
             set_step_status(
@@ -397,20 +436,18 @@ async fn run_plan_step_inner(
         clear_auto_context(state).await;
         preload_step_files(state, repo_root, &item).await;
 
-        if auto_level_up {
-            let from_tier = ladder_idx;
-            ladder_idx += 1;
-            let tier = models_config.coder_tier(ladder_idx);
+        if let Some((next_idx, tier)) = next_rung {
             tracing::warn!(
                 plan_id = plan_id,
                 step_id = step_id,
-                from_tier = from_tier,
-                to_tier = ladder_idx,
+                from_tier = ladder_idx,
+                to_tier = next_idx,
                 to_model = %tier.model,
                 effort = ?tier.effort,
                 reason = %reason,
                 "plan step coder escalation"
             );
+            ladder_idx = next_idx;
             selection = ModelSelection::Specific(tier.model);
             reasoning_effort = tier.effort;
         }
@@ -423,6 +460,37 @@ async fn run_plan_step_inner(
         );
         attempt += 1;
     }
+}
+
+/// Diagnostic reported when automatic escalation cannot advance beyond the rung a
+/// plan step runs on.
+///
+/// The step ends with this failure instead of retrying, because the ladder is
+/// already saturated: either the developer started the step manually on a model the
+/// ladder excludes (`level_up = false`), or the run sits on the strongest eligible
+/// rung. The verdict reads the typed exclusion of the coder role, never the model
+/// name.
+fn escalation_saturated_message(
+    models_config: &ModelsConfig,
+    model: &ModelRef,
+    item: &PlanItem,
+    reason: &str,
+) -> String {
+    let saturation = if models_config.excluded_from_escalation(ModelRole::Coder, model) {
+        format!(
+            "`{}` is excluded from the automatic ladder (`level_up = false`)",
+            model
+        )
+    } else {
+        format!(
+            "`{}` is already the strongest rung of the automatic ladder",
+            model
+        )
+    };
+    format!(
+        "Coder escalation is exhausted for step '{}' ({}): {}. The failure is terminal, so no stronger coder tier is attempted and the step is not retried.\n\nCause: {}",
+        item.id, item.title, saturation, reason
+    )
 }
 
 /// Adapter that executes a single plan step as a [`BatchStepExecutor`] step.
@@ -438,8 +506,6 @@ pub(super) struct PlanStepExecutor<'a> {
     pub(super) operation: &'a Arc<OperationGuard>,
     /// Coder selection the batch starts from, applied to every step it runs.
     pub(super) model: Option<&'a ModelSelection>,
-    /// Developer directives appended to the prompt of every step.
-    pub(super) instructions: Option<&'a str>,
 }
 
 #[async_trait]
@@ -458,7 +524,6 @@ impl BatchStepExecutor for PlanStepExecutor<'_> {
             self.batch_step_ids,
             Arc::clone(self.operation),
             self.model,
-            self.instructions,
         )
         .await)
     }

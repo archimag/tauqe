@@ -2899,7 +2899,6 @@ async fn test_plan_batch_starts_ladder_from_the_selected_coder_tier() {
         model: Some(tauqe_protocol::ModelSelection::Specific(
             tauqe_protocol::ModelRef::openrouter("coder/mid"),
         )),
-        instructions: Some("Keep the public signature.".to_string()),
     };
     let outcome = run_plan_batch(
         &state,
@@ -2917,11 +2916,6 @@ async fn test_plan_batch_starts_ladder_from_the_selected_coder_tier() {
     assert_eq!(requests[0].model, "coder/mid");
     // ...and the retry escalates above it instead of restarting at the base.
     assert_eq!(requests[1].model, "coder/strong");
-
-    // The developer directives travel with the step prompt.
-    let user_prompt = &requests[0].messages[1].content;
-    assert!(user_prompt.contains("## Developer Directives:"));
-    assert!(user_prompt.contains("Keep the public signature."));
 
     assert_eq!(
         std::fs::read_to_string(dir.path().join("src.rs")).unwrap(),
@@ -2993,7 +2987,6 @@ async fn test_plan_batch_selected_coder_rung_completes_on_the_first_attempt() {
         model: Some(tauqe_protocol::ModelSelection::Specific(
             tauqe_protocol::ModelRef::openrouter("coder/mid"),
         )),
-        instructions: None,
     };
     let outcome = run_plan_batch(
         &state,
@@ -3020,5 +3013,125 @@ async fn test_plan_batch_selected_coder_rung_completes_on_the_first_attempt() {
     assert_eq!(
         reloaded.find_item("1").unwrap().status,
         PlanItemStatus::Done
+    );
+}
+
+/// A step the developer starts manually on a coder model excluded from the
+/// automatic ladder (`level_up = false`) runs on exactly that model and fails
+/// terminally: the ladder is already saturated, so the failing attempt is never
+/// retried and no stronger tier is entered.
+#[tokio::test]
+async fn test_plan_batch_manual_excluded_coder_ends_without_escalation() {
+    let dir = TestDir::new();
+    tauqe_core::git::init_repository(Some(dir.path()), true).unwrap();
+    std::fs::write(dir.path().join("src.rs"), "pub fn value() -> i32 { 0 }\n").unwrap();
+    tauqe_core::git::cmd::stage_files(dir.path(), &["src.rs".to_string()]).unwrap();
+    tauqe_core::git::cmd::commit_with_developer_author(dir.path(), "Initial", false).unwrap();
+
+    let mut item = test_item("1", PlanItemStatus::Todo);
+    item.title = "Step 1".to_string();
+    item.files = vec!["src.rs".to_string()];
+    let plan = Plan {
+        id: "manual-saturated".to_string(),
+        title: "Manual Saturated".to_string(),
+        created_at: 1,
+        updated_at: 1,
+        items: vec![item],
+        ..Default::default()
+    };
+    PlanStorage::save_plan(dir.path(), &plan).unwrap();
+
+    // The turn answers without a change set, so the step cannot complete and the
+    // harness would otherwise look for a stronger coder tier.
+    let mock_provider = Arc::new(MockLlmProvider::scripted([MockResponse::text(
+        "The step looks complete.",
+    )]));
+
+    let mut config = tauqe_core::config::AppConfig::default();
+    config.develop.workflow = tauqe_protocol::WorkflowKind::Naive;
+    config.develop.protocol = tauqe_protocol::EditProtocolKind::Xml;
+    config.develop.max_retries = 3;
+    config.models.auto_level_up = true;
+    config.models.primary = vec![tauqe_protocol::ModelRef::openrouter("coder/one").into()];
+    let manual_model = tauqe_protocol::ModelRef::openrouter("coder/manual");
+    let mut manual_entry = tauqe_protocol::ModelEntry::new(manual_model.clone(), None);
+    manual_entry.level_up = Some(false);
+    config.models.coder = Some(vec![
+        tauqe_protocol::ModelEntry::new(tauqe_protocol::ModelRef::openrouter("coder/one"), None),
+        manual_entry,
+        tauqe_protocol::ModelEntry::new(tauqe_protocol::ModelRef::openrouter("coder/strong"), None),
+    ]);
+
+    let (out, mut rx) = OutChannel::new();
+    let (hist_tx, _hist_rx) = tokio::sync::mpsc::unbounded_channel();
+    let state = AppState::new(config, dir.path().to_path_buf(), hist_tx, out);
+    let provider: Arc<dyn tauqe_core::providers::LlmProvider> = mock_provider.clone();
+    *state.provider_override.lock().await = Some(provider);
+
+    let operation = Arc::new(
+        state
+            .try_begin_operation()
+            .expect("register batch operation"),
+    );
+    let options = PlanBatchOptions {
+        model: Some(tauqe_protocol::ModelSelection::Specific(manual_model)),
+    };
+    let outcome = run_plan_batch(
+        &state,
+        "manual-saturated",
+        vec!["1".to_string()],
+        operation,
+        options,
+    )
+    .await;
+
+    match outcome {
+        BatchOutcome::Failed {
+            completed,
+            step_id,
+            reason,
+        } => {
+            assert_eq!(completed, 0);
+            assert_eq!(step_id, "1");
+            assert!(
+                reason.contains("escalation is exhausted"),
+                "the terminal diagnostic must name the saturated ladder: {reason}"
+            );
+            assert!(
+                reason.contains("coder/manual"),
+                "the terminal diagnostic must name the rung the step ran on: {reason}"
+            );
+        }
+        other => panic!("Expected a failed outcome without escalation, got {other:?}"),
+    }
+
+    // The manual rung ran the step exactly once: a saturated ladder never repeats
+    // the failing attempt on another model.
+    let requests = mock_provider.requests();
+    assert_eq!(
+        requests.len(),
+        1,
+        "a saturated ladder must not retry the step"
+    );
+    assert_eq!(requests[0].model, "coder/manual");
+
+    let mut emitted = Vec::new();
+    while let Ok(raw) = rx.try_recv() {
+        emitted.push(raw);
+    }
+    assert!(
+        !emitted
+            .iter()
+            .any(|event| event.contains(events::MODEL_ESCALATED)),
+        "a saturated ladder must never publish an escalation event: {emitted:?}"
+    );
+
+    // The failed step returns to TODO so the developer can retry it deliberately.
+    let reloaded = PlanStorage::load_plan(dir.path(), "manual-saturated")
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        reloaded.find_item("1").unwrap().status,
+        PlanItemStatus::Todo
     );
 }

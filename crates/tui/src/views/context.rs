@@ -52,6 +52,7 @@ pub struct ContextViewState {
     pub pinned_expanded: bool,
     pub user_expanded: bool,
     pub auto_expanded: bool,
+    pub refs_expanded: bool,
     pub adding_file: bool,
     pub add_access: ContextAccess,
     pub add_input: InputEditor,
@@ -71,6 +72,7 @@ impl Default for ContextViewState {
             pinned_expanded: true,
             user_expanded: true,
             auto_expanded: true,
+            refs_expanded: true,
             adding_file: false,
             add_access: ContextAccess::ReadOnly,
             add_input: InputEditor::default(),
@@ -107,6 +109,14 @@ impl ContextViewState {
                     .map(|it| ContextRow::Item(it.clone())),
             );
         }
+        rows.push(ContextRow::Header(ContextLayer::Refs));
+        if self.refs_expanded {
+            rows.extend(
+                sorted_layer_items(items, ContextLayer::Refs)
+                    .into_iter()
+                    .map(|it| ContextRow::Item(it.clone())),
+            );
+        }
 
         rows.push(ContextRow::Header(ContextLayer::User));
         if self.user_expanded {
@@ -133,24 +143,27 @@ impl ContextViewState {
         match layer {
             ContextLayer::Pinned => self.pinned_expanded = !self.pinned_expanded,
             ContextLayer::User => self.user_expanded = !self.user_expanded,
+            ContextLayer::Refs => self.refs_expanded = !self.refs_expanded,
             ContextLayer::Auto => self.auto_expanded = !self.auto_expanded,
         }
     }
 
     pub fn is_all_expanded(&self) -> bool {
-        self.pinned_expanded && self.user_expanded && self.auto_expanded
+        self.pinned_expanded && self.refs_expanded && self.user_expanded && self.auto_expanded
     }
 
     pub fn expand_all(&mut self) {
         self.pinned_expanded = true;
         self.user_expanded = true;
         self.auto_expanded = true;
+        self.refs_expanded = true;
     }
 
     pub fn collapse_all(&mut self) {
         self.pinned_expanded = false;
         self.user_expanded = false;
         self.auto_expanded = false;
+        self.refs_expanded = false;
     }
 
     pub fn toggle_fold_all(&mut self) {
@@ -318,18 +331,43 @@ mod tests {
         let items = vec![
             item("pinned.rs", ContextLayer::Pinned),
             item("user.rs", ContextLayer::User),
+            item("refs.md", ContextLayer::Refs),
             item("auto.rs", ContextLayer::Auto),
         ];
 
         let rows = view.compute_rows(&items);
         assert_eq!(
             rendered_paths(&rows),
-            vec!["pinned.rs", "user.rs", "auto.rs"]
+            vec!["pinned.rs", "refs.md", "user.rs", "auto.rs"]
         );
 
         view.collapse_all();
         let folded = view.compute_rows(&items);
         assert!(rendered_paths(&folded).is_empty());
+    }
+
+    #[test]
+    fn test_the_refs_section_is_folded_independently() {
+        let mut view = ContextViewState::default();
+        let items = vec![
+            item("pinned.rs", ContextLayer::Pinned),
+            item("refs.md", ContextLayer::Refs),
+            item("user.rs", ContextLayer::User),
+        ];
+
+        assert!(view.is_all_expanded());
+        view.toggle_section(ContextLayer::Refs);
+        assert!(!view.refs_expanded);
+        assert_eq!(
+            rendered_paths(&view.compute_rows(&items)),
+            vec!["pinned.rs", "user.rs"]
+        );
+
+        view.toggle_section(ContextLayer::Refs);
+        assert_eq!(
+            rendered_paths(&view.compute_rows(&items)),
+            vec!["pinned.rs", "refs.md", "user.rs"]
+        );
     }
 
     #[test]

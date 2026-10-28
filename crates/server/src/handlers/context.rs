@@ -49,13 +49,21 @@ pub async fn handle_context_add(req: Request, state: &Arc<AppState>) -> Response
     };
 
     // Honor the requested layer instead of always defaulting to the User layer.
-    // The Pinned layer stays configuration-only, so it is refused here.
+    // The Pinned layer stays configuration-only and the Refs layer is owned by
+    // the external-reference registry, so both are refused here.
     let layer = params.layer.unwrap_or(ContextLayer::User);
     if layer == ContextLayer::Pinned {
         return Response::err(
             req.id,
             errors::PINNED_PROTECTED,
             "Pinned files are managed by project configuration and cannot be added manually",
+        );
+    }
+    if layer == ContextLayer::Refs {
+        return Response::err(
+            req.id,
+            errors::INVALID_PARAMS,
+            "The Refs layer is registry-managed and cannot be added manually",
         );
     }
 
@@ -261,11 +269,11 @@ pub async fn handle_context_clear(req: Request, state: &Arc<AppState>) -> Respon
 
     // Clearing recomputes hierarchical pinned files, which stats the disk, so it
     // runs on the blocking pool like every other context mutation. Clearing the
-    // Auto layer or the whole context really shrinks the stable prompt prefix,
-    // so those two paths go through the shared `AppState` facade, which rotates
-    // the dialogue session exactly when files were removed. A user-layer clear
-    // leaves the Auto layer intact, so it keeps the warm session and stays a
-    // plain context mutation.
+    // Auto layer, the Refs layer, or the whole context really shrinks the stable
+    // prompt prefix, so those paths go through the shared `AppState` facade,
+    // which rotates the dialogue session exactly when files were removed. A
+    // user-layer clear leaves the Auto layer intact, so it keeps the warm
+    // session and stays a plain context mutation.
     let cleared = match params.layer {
         Some(ContextLayer::Auto) => state.clear_auto_context().await,
         Some(ContextLayer::User) => {
@@ -275,6 +283,9 @@ pub async fn handle_context_clear(req: Request, state: &Arc<AppState>) -> Respon
             })
             .await
         }
+        // Reference documents form a persistent layer of their own, so clearing
+        // it drops exactly that layer and leaves the other three intact.
+        Some(ContextLayer::Refs) => state.clear_refs_context().await,
         // The Pinned layer is refused above, so nothing else remains to clear.
         _ => state.clear_all_context().await,
     };
@@ -728,5 +739,84 @@ mod tests {
         // Read query still succeeds while busy
         let res = handle_context_get(make_req(methods::CONTEXT_GET, None), &state).await;
         assert!(res.error.is_none());
+    }
+    #[tokio::test]
+    async fn test_handle_context_add_rejects_the_refs_layer() {
+        let dir = TestDir::new();
+        let (state, _rx) = test_state(&dir);
+        std::fs::write(dir.path().join("ref.md"), "# Reference\n").unwrap();
+
+        let req = Request {
+            id: RequestId::Number(1),
+            method: methods::CONTEXT_ADD.to_string(),
+            params: serde_json::to_value(ContextAddParams {
+                path: "ref.md".to_string(),
+                access: ContextAccess::ReadOnly,
+                layer: Some(ContextLayer::Refs),
+            })
+            .ok(),
+        };
+        let res = handle_context_add(req, &state).await;
+
+        assert_eq!(res.error.unwrap().code, errors::INVALID_PARAMS);
+        assert!(
+            !state.context.read().await.contains("ref.md").unwrap(),
+            "the registry owns the Refs layer"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_handle_context_clear_drops_only_the_refs_layer() {
+        let dir = TestDir::new();
+        let (state, mut rx) = test_state(&dir);
+        std::fs::write(dir.path().join("ref.md"), "# Reference snapshot\n").unwrap();
+        std::fs::write(dir.path().join("user.rs"), "fn user() {}\n").unwrap();
+
+        state
+            .context
+            .write()
+            .await
+            .add_refs_file("ref.md", 10_000)
+            .unwrap();
+        state
+            .context
+            .write()
+            .await
+            .add_file("user.rs", ContextAccess::ReadOnly)
+            .unwrap();
+        let warm_session = state.session_uuid().await;
+
+        let req = Request {
+            id: RequestId::Number(1),
+            method: methods::CONTEXT_CLEAR.to_string(),
+            params: serde_json::to_value(ContextClearParams {
+                layer: Some(ContextLayer::Refs),
+            })
+            .ok(),
+        };
+        let res = handle_context_clear(req, &state).await;
+        assert!(res.error.is_none());
+
+        let cleared: tauqe_protocol::ContextState =
+            serde_json::from_value(res.result.unwrap()).unwrap();
+        assert!(
+            cleared
+                .items
+                .iter()
+                .all(|item| item.layer != ContextLayer::Refs),
+            "the Refs layer must be empty"
+        );
+        assert!(
+            cleared.items.iter().any(|item| item.path == "user.rs"),
+            "clearing references must leave the other layers intact"
+        );
+        assert_ne!(
+            warm_session,
+            state.session_uuid().await,
+            "removing reference documents must rotate the provider session"
+        );
+
+        let evt = rx.try_recv().expect("event received");
+        assert!(evt.contains(events::CONTEXT_CHANGED));
     }
 }

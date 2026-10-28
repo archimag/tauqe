@@ -408,21 +408,27 @@ pub(super) async fn run_review_subplan(
             clear_auto_context(state).await;
             preload_step_files(state, repo_root, &step).await;
 
-            if auto_level_up {
-                let from_tier = ladder_idx;
-                ladder_idx += 1;
-                let tier = models_config.coder_tier(ladder_idx);
+            // A rung without a stronger successor is saturated, and a manual run on
+            // a model the ladder excludes cannot escalate at all: the retry keeps the
+            // current model instead of silently entering another one.
+            let next_rung = if auto_level_up {
+                models_config.next_coder_tier(ladder_idx)
+            } else {
+                None
+            };
+            if let Some((next_idx, tier)) = next_rung {
                 tracing::warn!(
                     review_id = review_id,
                     item_id = item_id,
                     step_id = current_step_id.as_str(),
-                    from_tier = from_tier,
-                    to_tier = ladder_idx,
+                    from_tier = ladder_idx,
+                    to_tier = next_idx,
                     to_model = %tier.model,
                     effort = ?tier.effort,
                     reason = %reason,
                     "review subplan step coder escalation"
                 );
+                ladder_idx = next_idx;
                 selection = ModelSelection::Specific(tier.model);
                 reasoning_effort = tier.effort;
             }
@@ -528,6 +534,8 @@ mod tests {
         let mut item = ReviewItem::from(tauqe_protocol::review::ReviewIssue {
             id: 7,
             title: "Guard the parser".to_string(),
+            uuid: None,
+            group: None,
             model: None,
             issue_type: tauqe_protocol::review::IssueType::Bug,
             status: IssueStatus::Todo,
@@ -589,6 +597,7 @@ mod tests {
             target_files: vec![],
             items: vec![item.clone()],
             raw_markdown: String::new(),
+            ..Default::default()
         };
         ReviewStorage::save_session(&root, &session).unwrap();
 

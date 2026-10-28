@@ -7,7 +7,7 @@ use tauqe_core::workflow::WorkflowFactory;
 use tauqe_protocol::{
     errors, events, ConfigSetParams, ConfigState, CredentialsSaveParams, Event, ModelCatalogEntry,
     ModelRole, ModelRolesEffort, ModelRolesEntries, ModelRolesSummary, ModelSelection, Request,
-    Response, SystemStatusResult,
+    Response, ReviewPresetSummary, SystemStatusResult,
 };
 
 use crate::state::AppState;
@@ -55,6 +55,29 @@ pub(crate) fn effective_roles_summary(cfg: &AppConfig) -> ModelRolesSummary {
     summary
 }
 
+/// Projects the declared review presets into the compact snapshot a client
+/// renders its review launcher from.
+///
+/// Groups, paths, and local prompts stay on the server, because they are applied
+/// when a session is launched. A project that declares no preset adds no field
+/// to the wire, so the client reads the snapshot as absent.
+fn review_preset_summaries(cfg: &AppConfig) -> Option<Vec<ReviewPresetSummary>> {
+    let summaries: Vec<ReviewPresetSummary> = cfg
+        .review
+        .presets
+        .iter()
+        .map(|preset| ReviewPresetSummary {
+            name: preset.name.clone(),
+            title: preset.title.clone(),
+        })
+        .collect();
+    if summaries.is_empty() {
+        None
+    } else {
+        Some(summaries)
+    }
+}
+
 pub fn config_state(cfg: &AppConfig, selection: Option<&ModelSelection>) -> ConfigState {
     let sel = selection
         .cloned()
@@ -71,6 +94,7 @@ pub fn config_state(cfg: &AppConfig, selection: Option<&ModelSelection>) -> Conf
         available_workflows: WorkflowFactory::available_workflows(),
         available_edit_protocols: EditProtocolFactory::available_protocols(),
         available_models: cfg.available_models(),
+        review_presets: review_preset_summaries(cfg),
     }
 }
 
@@ -685,6 +709,43 @@ mod tests {
             .expect("entries are always present")
             .catalog
             .is_none());
+    }
+
+    /// The snapshot carries the compact identity of every declared review
+    /// preset, because the client renders its review launcher from this payload
+    /// instead of re-reading `tauqe.toml`.
+    #[test]
+    fn test_config_state_carries_review_preset_summaries() {
+        let mut cfg = AppConfig::default();
+        cfg.review.presets = vec![
+            tauqe_core::config::ReviewPreset {
+                name: "backend".to_string(),
+                title: Some("Backend audit".to_string()),
+                groups: Vec::new(),
+                post_analysis: tauqe_protocol::review::PostAnalysisMode::None,
+            },
+            tauqe_core::config::ReviewPreset {
+                name: "frontend".to_string(),
+                title: None,
+                groups: Vec::new(),
+                post_analysis: tauqe_protocol::review::PostAnalysisMode::None,
+            },
+        ];
+
+        let st = config_state(&cfg, None);
+        let presets = st
+            .review_presets
+            .expect("declared presets must reach the snapshot");
+        assert_eq!(presets.len(), 2);
+        assert_eq!(presets[0].name, "backend");
+        assert_eq!(presets[0].title.as_deref(), Some("Backend audit"));
+        assert_eq!(presets[1].name, "frontend");
+        assert_eq!(presets[1].title, None);
+
+        // A project that declares no preset ships no snapshot field at all, so
+        // the client reads the launcher as absent rather than as an empty list.
+        let empty = config_state(&AppConfig::default(), None);
+        assert!(empty.review_presets.is_none());
     }
 
     #[tokio::test]

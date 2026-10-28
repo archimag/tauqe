@@ -20,26 +20,46 @@ pub struct DiffRenderCache {
 
 struct DiffCacheEntry {
     fingerprint: u64,
-    lines: Vec<Line<'static>>,
+    rendered: RenderedDiff,
+}
+
+/// A rendered diff body together with the row offsets of its hunk headers.
+///
+/// The offsets are relative to `lines`, so the Viewport projects them through
+/// its own visual coordinates and names the hunk under the top edge without
+/// re-deriving the patch layout (c-1).
+#[derive(Debug, Clone, Default)]
+pub(crate) struct RenderedDiff {
+    pub lines: Vec<Line<'static>>,
+    pub hunk_rows: Vec<usize>,
 }
 
 impl DiffRenderCache {
     /// Returns the rendered diff body for `file`, recomputing it only when the
     /// cached fingerprint no longer matches the file's hunks.
     pub(super) fn lines_for(&mut self, file: &StreamingFileEdit) -> Vec<Line<'static>> {
+        self.render(file).lines
+    }
+
+    /// Renders the diff body together with the row offsets of its hunk headers.
+    ///
+    /// The Viewport needs those offsets to name the hunk the top edge sits
+    /// inside, so the overlay reuses the very rows that were drawn instead of
+    /// re-deriving them from the patch text (c-1).
+    pub(crate) fn render(&mut self, file: &StreamingFileEdit) -> RenderedDiff {
         let fingerprint = diff_fingerprint(file);
-        if let Some(lines) = self.cached_lines(&file.path, fingerprint) {
-            return lines;
+        if let Some(rendered) = self.cached_render(&file.path, fingerprint) {
+            return rendered;
         }
-        let lines = render_expanded_diff_lines(file);
+        let rendered = render_expanded_diff(file);
         self.entries.insert(
             file.path.clone(),
             DiffCacheEntry {
                 fingerprint,
-                lines: lines.clone(),
+                rendered: rendered.clone(),
             },
         );
-        lines
+        rendered
     }
 
     /// Discards the cached diff body of a single path.
@@ -52,10 +72,10 @@ impl DiffRenderCache {
         self.entries.remove(path);
     }
 
-    fn cached_lines(&self, path: &str, fingerprint: u64) -> Option<Vec<Line<'static>>> {
+    fn cached_render(&self, path: &str, fingerprint: u64) -> Option<RenderedDiff> {
         let entry = self.entries.get(path)?;
         if entry.fingerprint == fingerprint {
-            Some(entry.lines.clone())
+            Some(entry.rendered.clone())
         } else {
             None
         }
@@ -83,11 +103,13 @@ fn diff_fingerprint(file: &StreamingFileEdit) -> u64 {
 ///
 /// Extracted from the model-line builder so the result can be cached and its
 /// length reused for scroll accounting without recomputing the diff.
-fn render_expanded_diff_lines(file: &StreamingFileEdit) -> Vec<Line<'static>> {
+fn render_expanded_diff(file: &StreamingFileEdit) -> RenderedDiff {
     let engine = current_engine();
     let palette = engine.palette();
     let mut lines: Vec<Line<'static>> = Vec::new();
+    let mut hunk_rows: Vec<usize> = Vec::new();
     for hunk in &file.hunks {
+        hunk_rows.push(lines.len());
         if file.op_type == EditOp::Create {
             lines.push(Line::from(vec![Span::styled(
                 "  @@ new file @@",
@@ -149,7 +171,7 @@ fn render_expanded_diff_lines(file: &StreamingFileEdit) -> Vec<Line<'static>> {
             }
         }
     }
-    lines
+    RenderedDiff { lines, hunk_rows }
 }
 
 #[cfg(test)]

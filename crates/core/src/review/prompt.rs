@@ -1,18 +1,21 @@
 //! Prompt builders for review workflows.
 //!
-//! The review prompt surface is decomposed into four cohesive submodules:
-//! `discussion` (review Q&A and full-session audit prompts), `refine`
-//! (Architect finding decomposition into a resolution subplan), `step`
+//! The review prompt surface is decomposed into five cohesive submodules:
+//! `analysis` (the cross-group post-analysis of every finding a session
+//! produced), `discussion` (review Q&A and full-session audit prompts),
+//! `refine` (Architect finding decomposition into a resolution subplan), `step`
 //! (isolated finding resolution, retry, and skip handling), and `subplan`
 //! (the architectural-context scaffolding a finding hands to its sub-steps).
 //! Every public item is re-exported here so callers keep using the stable
 //! `review::prompt::*` paths.
 
+pub mod analysis;
 pub mod discussion;
 pub mod refine;
 pub mod step;
 pub mod subplan;
 
+pub use analysis::{build_post_analysis_system_prompt, build_post_analysis_user_prompt};
 pub use discussion::{
     build_review_system_prompt, build_review_user_prompt, format_review_discussion_prompt,
     format_review_discussion_prompt_items, REVIEW_DISCUSSION_PREFIX,
@@ -73,6 +76,8 @@ mod tests {
             items: vec![ReviewItem {
                 id: 1,
                 title: "Refactor architecture".to_string(),
+                uuid: None,
+                group: None,
                 subplan_last_replanned_step: None,
                 model: None,
                 issue_type: IssueType::Architecture,
@@ -98,6 +103,7 @@ mod tests {
                 body: "Break down large file".to_string(),
             }],
             raw_markdown: String::new(),
+            ..Default::default()
         };
 
         let prompt =
@@ -124,6 +130,8 @@ mod tests {
             items: vec![ReviewItem {
                 id: 42,
                 title: "Decompose this issue".to_string(),
+                uuid: None,
+                group: None,
                 subplan_last_replanned_step: None,
                 model: None,
                 issue_type: IssueType::Bug,
@@ -138,6 +146,7 @@ mod tests {
                 body: "Needs structural division".to_string(),
             }],
             raw_markdown: String::new(),
+            ..Default::default()
         };
 
         let sys = build_review_finding_refine_system_prompt();
@@ -174,6 +183,8 @@ mod tests {
             items: vec![ReviewItem {
                 id: 3,
                 title: "Excessive clone in hot path".to_string(),
+                uuid: None,
+                group: None,
                 subplan_last_replanned_step: None,
                 model: None,
                 issue_type: IssueType::Performance,
@@ -188,6 +199,7 @@ mod tests {
                 body: "Replace clone with reference borrowing".to_string(),
             }],
             raw_markdown: String::new(),
+            ..Default::default()
         };
 
         let prompt =
@@ -215,6 +227,8 @@ mod tests {
             items: vec![ReviewItem {
                 id: 1,
                 title: "Race condition in cache".to_string(),
+                uuid: None,
+                group: None,
                 subplan_last_replanned_step: None,
                 model: None,
                 issue_type: IssueType::Bug,
@@ -229,6 +243,7 @@ mod tests {
                 body: "Lock is dropped prematurely.".to_string(),
             }],
             raw_markdown: String::new(),
+            ..Default::default()
         };
 
         let prompt = format_review_discussion_prompt(&session, Some(1), "Is this really possible?");

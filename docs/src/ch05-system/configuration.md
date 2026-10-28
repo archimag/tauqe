@@ -8,8 +8,8 @@ section boundary between them is the concept.
   policy.
 - The **`[project]` declaration** of the same file declares how the repository is
   built and verified: the mandatory verification command, the optional external task
-  runner, the optional in-memory formatter, the optional disk post-hook, and the named
-  commands the model may address.
+  runner, the optional in-memory formatter, the optional disk post-hook, the named
+  commands the model may address, and the trust boundaries no staged operation may cross.
 
 Two further files complete the picture without belonging to either audience: the
 personal workstation file (`tui.toml`) and the credentials file. Neither is ever read
@@ -101,7 +101,7 @@ it runs a declared command line and reads its exit status.
   onboarding create action; it is also the living reference.
 - **Role** — a semantic responsibility (`primary`, `scribe`, `coder`, `architect`,
   `reviewer`) resolved to a concrete model by the server.
-- **Entry** — one model reference with an optional reasoning `effort`; a role slot
+- **Entry** — one model reference with an optional reasoning `effort` and an optional `level_up` marker; a role slot
   never carries a display alias.
 - **Catalog entry** — a model registered in `[providers.openrouter].models`, with an
   optional `alias` that is the single source of truth for its display name.
@@ -133,7 +133,7 @@ it runs a declared command line and reads its exit status.
 | `[develop]` | edit retries, verification healing budget, replan budget, workflow mode, edit protocol, patch strategy, prompt layout |
 | `[git]` | upstream base and hook bypass |
 | `[history]` | token budget and uncompressed tail length |
-| `[context]` | discovery rounds, file and outline budgets, pattern cap, pinned patterns |
+| `[context]` | discovery rounds, file, outline, and external-reference budgets, report caps, pattern cap, pinned patterns |
 
 The `[develop]` section also selects the wire format of the model exchange through
 its `protocol` key. The value is `structured` (the default), `xml`, or `mixed`; the
@@ -198,12 +198,21 @@ onboarding.
 | `[project.format]` | the in-memory stream filter | optional | before the write |
 | `[project.post_hook]` | the disk-side step | optional | after the write |
 | `[project.commands]` | named allowlisted commands | optional | on an explicit invocation |
+| `[project.boundaries]` | the repository paths no turn may modify | optional | on every staged operation |
 
 Every entry accepts `command`, `args`, and `timeout_secs`. An entry whose `command`
 is `@` plus a declared name reuses that declaration; such an entry carries no
 arguments of its own, and a reference cycle or an undeclared target invalidates the
 declaration rather than being ignored. The command contract itself is specified in
 *The TauqeProjectProtocol*; this chapter states only where it lives and who owns it.
+
+The boundary subsection is the one part of the declaration that runs no process. `protected`
+lists repository glob patterns, resolved by the shared matcher, and every staged operation
+that would create, rewrite, move, or delete a matching path is refused before the toolchain
+starts. The shipped `tauqe.toml` is the living example: it protects `Justfile`, the
+specifications under `docs/specs/`, and `.tauqe/refs/refs.md`, because each of them judges a
+change set rather than being judged by one. The rejection itself belongs to *Protected Paths
+and Trust Boundaries*.
 
 ### 2.4 Resolution hierarchy
 
@@ -239,6 +248,7 @@ The workstation file is resolved separately, in `$XDG_CONFIG_HOME/tauqe/tui.toml
 | `context.files_token_budget` | 300,000 | aggregate cost of context files |
 | `context.repomap_token_budget` | 4,000 | the repository outline |
 | `context.max_pattern_batch` | 150 | files admitted by one glob request |
+| `context.refs_token_budget` | 50,000 | the lazily loaded external reference documents |
 | `history.budget_tokens` | 20,000 | session history before compaction |
 | `history.tail_turns` | 10 | turns kept uncompressed |
 | `develop.max_retries` | 5 | staging retries, verification healing rounds, and corrective step re-runs |
@@ -294,7 +304,8 @@ model specification or a `{ model, alias }` table, so a display name is written
 beside the model itself instead of on every role slot that selects it. A role entry
 then names a model either by its provider identifier or by that catalog alias and
 adds only the runtime parameters of the slot — an optional `effort` (`low`,
-`medium`, `high`, `xhigh`, `max`). Both reference forms normalize to the same
+`medium`, `high`, `xhigh`, `max`) and an optional `level_up` marker (`false`
+excludes the entry from ladder escalation while leaving it selectable by hand). Both reference forms normalize to the same
 concrete model before a turn starts, and an entry that repeats an `alias` is
 rejected, because two sources of truth for one label drift apart.
 
@@ -404,6 +415,14 @@ directory tree instead; the two outlines are mutually exclusive by design. This
 repository widens the documented defaults (8 rounds, 500,000 file tokens, 40,000
 outline tokens), which is exactly why they are configuration rather than constants.
 
+`refs_token_budget` (50,000 by default) bounds one more working set: the external
+documents the registry materialized during the task. It is the only ceiling that can drop
+a document from that layer — it evicts the least recently requested one until the layer
+fits, and it refuses a document that alone exceeds it instead of evicting every other
+document for nothing. The aggregate `files_token_budget` counts a loaded snapshot like
+every other context entry, yet it never removes one. *The External Reference Registry*
+owns the layer, the manifest, and those eviction rules.
+
 `pinned` names files that travel with every prompt, and resolution is hierarchical
 rather than a flat root lookup. Each pattern is resolved at the repository root, and
 then for every file in the User or Auto context layer each parent directory up to the
@@ -415,7 +434,7 @@ manual addition.
 
 Pinned entries are read-only and configuration-owned: the interface cannot add,
 remove, or re-permission them, and a path that escapes the repository root is
-rejected. The layers themselves belong to *Three-Tier Context Model*.
+rejected. The layers themselves belong to *The Context Model*.
 
 ### 3.7 Preparing a repository
 
@@ -528,13 +547,17 @@ Localization* owns the interface language.
 
 - [The TauqeProjectProtocol](../ch03-project/tauqe-project-protocol.md) — the command
   contract, its declaration, and its process boundary.
+- [Protected Paths and Trust Boundaries](../ch03-project/protected-paths.md) — the
+  `[project.boundaries]` subsection and the staging rejection it drives.
 - [The Three-Phase Modification Lifecycle](../ch03-project/three-phase-lifecycle.md) —
   where formatting, post-hooks, and verification run, and where the patch-strategy
   profile lives.
 - [Structured Diagnostics and Verification Healing](../ch03-project/verification-healing.md) —
   what a failing phase produces.
-- [Three-Tier Context Model](../ch02-perception/three-tier-model.md) — the layers these
+- [The Context Model](../ch02-perception/context-model.md) — the layers these
   budgets bound.
+- [The External Reference Registry](../ch02-perception/reference-registry.md) — the
+  external-reference context layer and the `refs_token_budget` that bounds it.
 - [Model Roles and the Coder Ladder](../ch01-foundations/model-roles.md) — the role
   boundaries both ladders obey.
 - [The Autonomous Bounded Turn FSM](../ch01-foundations/bounded-turn-fsm.md) — where the

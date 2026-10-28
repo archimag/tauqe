@@ -13,6 +13,7 @@ pub const MODEL_CHANGED: &str = "model/changed";
 pub const MODEL_ESCALATED: &str = "model/escalated";
 
 pub const CONTEXT_CHANGED: &str = "context/changed";
+pub const CONFIG_CHANGED: &str = "config/changed";
 
 pub const HISTORY_ENTRY_ADDED: &str = "history/entryAdded";
 pub const HISTORY_COMPACTED: &str = "history/compacted";
@@ -33,9 +34,6 @@ pub const TOOLCHAIN_FINISHED: &str = "toolchain/finished";
 pub const GIT_STATE_CHANGED: &str = "git/stateChanged";
 pub const GIT_COMMIT_CREATED: &str = "git/commitCreated";
 pub const GIT_SQUASH_COMPLETED: &str = "git/squashCompleted";
-pub const GIT_UNDO_COMPLETED: &str = "git/undoCompleted";
-
-pub const CONFIG_CHANGED: &str = "config/changed";
 
 pub const REVIEW_STARTED: &str = "review/started";
 pub const REVIEW_REASONING_DELTA: &str = "review/reasoningDelta";
@@ -45,6 +43,10 @@ pub const REVIEW_CANCELLED: &str = "review/cancelled";
 pub const REVIEW_ERROR: &str = "review/error";
 pub const REVIEW_UPDATED: &str = "review/updated";
 pub const REVIEW_LIST_CHANGED: &str = "review/listChanged";
+pub const REVIEW_GROUP_STARTED: &str = "review/groupStarted";
+pub const REVIEW_GROUP_FINISHED: &str = "review/groupFinished";
+pub const REVIEW_ANALYZE_STARTED: &str = "review/analyzeStarted";
+pub const REVIEW_ANALYZE_FINISHED: &str = "review/analyzeFinished";
 pub const REVIEW_BATCH_FINISHED: &str = "review/batchFinished";
 
 pub const PLAN_UPDATED: &str = "plan/updated";

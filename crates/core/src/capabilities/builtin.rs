@@ -16,6 +16,7 @@ use crate::edits::protocol::xml::engine::{self, XmlTagSpec};
 use crate::edits::protocol::xml::tags::{ParsedPlanItem, ParsedPlanTag};
 use crate::edits::protocol::{TerminalOutcome, VerifyOnSuccess, VerifyTarget, XmlEditProtocol};
 use crate::edits::strategy::StrategyProfile;
+use crate::mockups::MOCKUPS_DIR;
 
 use super::registry::{
     resolve_specs, CapabilityModule, ContractContext, ContractRule, PromptRenderContext, XmlParser,
@@ -96,6 +97,43 @@ impl CapabilityModule for TextMessageModule {
     }
 }
 
+/// Sentence publishing the mockups sandbox to the edit surface.
+///
+/// A sketch has no place in the change set of the project, so the rule names the
+/// sandbox where one belongs instead of leaving the model to infer that a
+/// prototype cannot be written at all. The path travels from its single
+/// declaration, so the prompt and the admission check never spell it
+/// differently.
+fn mockups_sandbox_sentence() -> String {
+    format!(
+        "The `{MOCKUPS_DIR}` directory is a sandbox isolated from Git and excluded from project verification: files there may be created and overwritten freely, while every other path obeys the ordinary edit rules."
+    )
+}
+
+/// Sentence publishing the protected paths the project declares.
+///
+/// The patterns travel as one backtick-quoted list so a reader copies an exact
+/// spelling, and a declaration that protects nothing publishes no sentence at
+/// all. Iteration keeps the declaration order, so identical state renders
+/// identical bytes.
+fn protected_paths_sentence(project: Option<&ProjectConfig>) -> Option<String> {
+    let project = project?;
+    let mut patterns: Vec<String> = Vec::new();
+    for pattern in &project.boundaries.protected {
+        let pattern = pattern.trim();
+        if !pattern.is_empty() {
+            patterns.push(format!("`{pattern}`"));
+        }
+    }
+    if patterns.is_empty() {
+        return None;
+    }
+    let listed = patterns.join(", ");
+    Some(format!(
+        "The project declares {listed} as protected trust boundaries: editing them is categorically forbidden, and such a file is requested only as `read_only` reference material."
+    ))
+}
+
 static FILE_EDITS_SPECS: OnceLock<Vec<&'static XmlTagSpec>> = OnceLock::new();
 
 /// File edit operations (replace, create, overwrite, move, delete).
@@ -151,11 +189,21 @@ impl CapabilityModule for FileEditsModule {
         Some(schema::changes_fragment(patch_strategy))
     }
 
-    fn render_contract_rule(&self, _ctx: &ContractContext<'_>) -> Option<ContractRule> {
-        Some(ContractRule::new(
-            "Minimal Coherent Change",
+    fn render_contract_rule(&self, ctx: &ContractContext<'_>) -> Option<ContractRule> {
+        // The sandbox and the declared trust boundaries are project facts rather
+        // than regime decisions, so both sentences render into the byte-stable
+        // head: one module states one rule, and the head stays identical for
+        // every dialogue contour.
+        let mut body = String::from(
             "Prefer the smallest coherent modification that satisfies the intent. Whenever you propose file edits, precede them with a concise 1-3 sentence explanation of what changed, why, and how the edits achieve the goal; never output edits alone.",
-        ))
+        );
+        body.push(' ');
+        body.push_str(&mockups_sandbox_sentence());
+        if let Some(protected) = protected_paths_sentence(ctx.render.project) {
+            body.push(' ');
+            body.push_str(&protected);
+        }
+        Some(ContractRule::new("Minimal Coherent Change", body))
     }
 
     fn render_xml_instruction(&self, ctx: &PromptRenderContext<'_>) -> Option<String> {
@@ -359,15 +407,18 @@ impl CapabilityModule for DocRequestModule {
     fn render_contract_rule(&self, ctx: &ContractContext<'_>) -> Option<ContractRule> {
         let topics = crate::docs::topic_hint();
         // The `<system_documentation>` block is a prompt-side feedback payload,
-        // not a request vehicle, so it stays in both contours.
+        // not a request vehicle, so it stays in both contours. The rule states
+        // the two-tier policy: conceptual consultation is answered at once from
+        // the baseline understanding of the harness, while a detail that must be
+        // exact waits for the authoritative documentation.
         let body = if ctx.protocol == EditProtocolKind::Xml {
             let doc = ctx.tag_name(self.canonical_tag()?);
             format!(
-                "Never guess answers about your identity, capabilities, concepts, workflows, keyboard shortcuts, or configuration. Environment behavior is declared in `tauqe.toml` at the repository root; questions about its parameters, defaults, budgets, or the recommended project layout are answered only from the authoritative documentation requested via <{doc} topic=\"{topics}\" />, where topic=\"config\" covers configuration and project preparation. Output nothing else except a short note, and answer strictly from the returned <system_documentation> blocks in the user's language."
+                "Never invent exact details. Answer conceptual questions about your identity, capabilities, and working processes, and help the developer set up a project, choose a workflow, or organize the work, from your baseline understanding of this harness, without a documentation request. Details that must be exact — parameters, defaults, budgets, keyboard shortcuts, configuration keys, and API surfaces — are not knowable from that understanding: environment behavior is declared in `tauqe.toml` at the repository root, so they are answered only from the authoritative documentation requested via <{doc} topic=\"{topics}\" />, where topic=\"config\" covers configuration and project preparation. When such a detail is needed, emit the request, output nothing else except a short note, and answer strictly from the returned <system_documentation> blocks in the user's language."
             )
         } else {
             format!(
-                "Never guess answers about your identity, capabilities, concepts, workflows, keyboard shortcuts, or configuration. Environment behavior is declared in `tauqe.toml` at the repository root; questions about its parameters, defaults, budgets, or the recommended project layout are answered only from the authoritative documentation requested through the `doc_requests` field (topics: {topics}), where the `config` topic covers configuration and project preparation. Output nothing else except a short note, and answer strictly from the returned <system_documentation> blocks in the user's language."
+                "Never invent exact details. Answer conceptual questions about your identity, capabilities, and working processes, and help the developer set up a project, choose a workflow, or organize the work, from your baseline understanding of this harness, without a documentation request. Details that must be exact — parameters, defaults, budgets, keyboard shortcuts, configuration keys, and API surfaces — are not knowable from that understanding: environment behavior is declared in `tauqe.toml` at the repository root, so they are answered only from the authoritative documentation requested through the `doc_requests` field (topics: {topics}), where the `config` topic covers configuration and project preparation. When such a detail is needed, populate that field, keep the rest of the response to a short note, and answer strictly from the returned <system_documentation> blocks in the user's language."
             )
         };
         Some(ContractRule::new("Self-Knowledge", body))
@@ -810,10 +861,10 @@ impl CapabilityModule for OutcomeModule {
             let success = ctx.tag_name(self.canonical_tag()?);
             let error = ctx.tag_name("error");
             format!(
-                "Conclude every turn with an explicit <{success} summary=\"...\" /> on success or <{error} message=\"...\" /> on failure."
+                "Conclude every turn with an explicit terminal outcome that carries its own payload: <{success} summary=\"...\" /> on success or <{error} message=\"...\" /> on failure. A terminal status without its payload is a protocol defect rather than a result, so it never concludes a turn as a validated conclusion: a success states a non-empty summary of what was achieved, and a failure states the message that the turn failed."
             )
         } else {
-            "Conclude every turn by populating the `outcome` field: `status` 'success' together with a `summary` when the turn succeeds, or `status` 'error' together with a `message` when it fails.".to_string()
+            "Conclude every turn by populating the `outcome` field with an explicit terminal status that carries its own payload: `status` 'success' together with a non-empty `summary` when the turn succeeds, `status` 'error' together with a `message` when it fails, or `status` 'skip' together with a `reason` when the work is already satisfied and no change is required. A terminal status without its payload is a protocol defect rather than a result, so it never concludes a turn as a validated conclusion.".to_string()
         };
         Some(ContractRule::new("Terminal Outcome", body))
     }
@@ -822,12 +873,12 @@ impl CapabilityModule for OutcomeModule {
         let success = ctx.tag_name(self.canonical_tag()?);
         let error = ctx.tag_name("error");
         Some(format!(
-            "- Terminal outcome: conclude with <{success} summary=\"...\" /> on success or <{error} message=\"...\" /> on failure."
+            "- Terminal outcome: conclude with <{success} summary=\"...\" /> on success or <{error} message=\"...\" /> on failure, and always state the payload of the status you declare."
         ))
     }
 
     fn render_structured_instruction(&self, _ctx: &PromptRenderContext<'_>) -> Option<String> {
-        Some("- `outcome`: terminal outcome object with `status` ('none' while the turn continues, 'success' when it succeeds, 'error' when it fails, 'skip' when the work is already satisfied and no change is required), `summary` for a success summary, `message` for an error message, and `reason` for a skip reason; unrelated fields stay empty.".to_string())
+        Some("- `outcome`: terminal outcome object with `status` ('none' while the turn continues, 'success' when it succeeds, 'error' when it fails, 'skip' when the work is already satisfied and no change is required), `summary` for a success summary, `message` for an error message, and `reason` for a skip reason; unrelated fields stay empty. Every terminal status carries its own payload: a non-empty `summary` for 'success', the `message` for 'error', and the `reason` for 'skip'. A terminal status without its payload is a protocol defect rather than a result.".to_string())
     }
 
     fn decode_xml(
@@ -2073,6 +2124,45 @@ mod tests {
     }
 
     #[test]
+    fn the_outcome_contract_requires_a_payload_in_both_contours() {
+        let module = OutcomeModule;
+
+        // The XML contour states that a terminal tag carries its own payload and
+        // that a status without one is a protocol defect rather than a result.
+        let xml = rule_in(&module, EditProtocolKind::Xml);
+        assert!(xml.body.contains("carries its own payload"));
+        assert!(xml.body.contains("protocol defect"));
+        assert!(xml.body.contains("non-empty summary"));
+
+        let structured = rule_in(&module, EditProtocolKind::Structured);
+        assert!(structured.body.contains("carries its own payload"));
+        assert!(structured.body.contains("protocol defect"));
+        assert!(structured.body.contains("non-empty `summary`"));
+        assert_no_operational_tags(&structured);
+
+        // The protocol reference formulates the same obligation, so the rule and
+        // the schema cannot describe different contracts.
+        let render = PromptRenderContext::new(&[], None);
+        let instruction = module
+            .render_structured_instruction(&render)
+            .expect("the outcome publishes a structured instruction");
+        assert!(instruction.contains("carries its own payload"));
+        assert!(instruction.contains("protocol defect"));
+
+        // The composed schema carries the contract of the property it declares,
+        // so a structured turn reads it from the schema of its own turn.
+        let schema = crate::capabilities::registry::CapabilityRegistry::global()
+            .compose_structured_schema(
+                &tauqe_protocol::CapabilitySet::interactive_repl(),
+                PatchStrategy::SearchReplace,
+            );
+        let description = schema["properties"]["outcome"]["properties"]["summary"]["description"]
+            .as_str()
+            .expect("the composed schema describes the summary");
+        assert!(description.contains("Non-empty"), "{description}");
+    }
+
+    #[test]
     fn the_blocked_rule_is_dualized_by_the_wire_format() {
         let module = BlockedModule;
 
@@ -2246,6 +2336,113 @@ mod tests {
         assert_no_operational_tag_in(&instructions, "the structured protocol instructions");
         for field in ["`message`", "`changes`", "`doc_requests`", "`outcome`"] {
             assert!(instructions.contains(field), "missing {field}");
+        }
+    }
+    /// Builds a `[project]` declaration carrying the declared protected patterns.
+    fn project_with_protected(patterns: &[&str]) -> ProjectConfig {
+        let mut project = ProjectConfig::default();
+        project.boundaries.protected = patterns.iter().map(|p| (*p).to_string()).collect();
+        project
+    }
+
+    /// Renders the edit rule of one contour for an interactive turn.
+    fn edit_rule(protocol: EditProtocolKind, project: Option<&ProjectConfig>) -> ContractRule {
+        let render = PromptRenderContext::new(&[], None).with_project(project);
+        let ctx = ContractContext::new(TurnIntent::InteractiveRepl, protocol, render);
+        FileEditsModule
+            .render_contract_rule(&ctx)
+            .expect("the edit module always renders a contract rule")
+    }
+
+    /// Renders the edit rule of one contour for a plan discussion.
+    fn discussion_edit_rule(
+        protocol: EditProtocolKind,
+        project: Option<&ProjectConfig>,
+    ) -> ContractRule {
+        let render = PromptRenderContext::new(&[], None).with_project(project);
+        let ctx = ContractContext::new(TurnIntent::PlanDiscussion, protocol, render);
+        FileEditsModule
+            .render_contract_rule(&ctx)
+            .expect("the edit module always renders a contract rule")
+    }
+
+    #[test]
+    fn the_edit_rule_lists_the_protected_paths_of_the_project() {
+        let project = project_with_protected(&["Justfile", "docs/specs/**"]);
+        let rule = edit_rule(EditProtocolKind::Xml, Some(&project));
+
+        assert_eq!(rule.title, "Minimal Coherent Change");
+        assert!(rule.body.contains("`Justfile`"));
+        assert!(rule.body.contains("`docs/specs/**`"));
+        assert!(rule.body.contains("categorically forbidden"));
+        assert!(rule.body.contains("`read_only`"));
+    }
+
+    #[test]
+    fn the_edit_rule_names_no_protected_path_without_a_declaration() {
+        // An absent section and a section that protects nothing both publish no
+        // prohibition, so the prompt never advertises a boundary nobody declared.
+        let bare = edit_rule(EditProtocolKind::Xml, None);
+        assert!(!bare.body.contains("protected"));
+        assert!(!bare.body.contains("categorically forbidden"));
+
+        let empty = project_with_protected(&[]);
+        let undeclared = edit_rule(EditProtocolKind::Xml, Some(&empty));
+        assert_eq!(undeclared.body, bare.body);
+    }
+
+    #[test]
+    fn the_sandbox_sentence_follows_the_edit_surface() {
+        use crate::capabilities::registry::CapabilityRegistry;
+        use tauqe_protocol::CapabilitySet;
+
+        let registry = CapabilityRegistry::global();
+        let render = PromptRenderContext::new(&[], None);
+        let full = registry.compose_core_contract_rules(
+            &CapabilitySet::interactive_repl(),
+            &ContractContext::new(TurnIntent::InteractiveRepl, EditProtocolKind::Xml, render),
+        );
+        assert!(full.contains(MOCKUPS_DIR));
+        assert!(full.contains("sandbox isolated from Git"));
+
+        // A surface without the edit capability publishes no boundary at all, so
+        // the sandbox never appears where no file can be written.
+        let render = PromptRenderContext::new(&[], None);
+        let without_edits =
+            CapabilitySet::from_slice(&[LlmCapability::TextMessage, LlmCapability::DocRequest]);
+        let narrowed = registry.compose_core_contract_rules(
+            &without_edits,
+            &ContractContext::new(TurnIntent::InteractiveRepl, EditProtocolKind::Xml, render),
+        );
+        assert!(!narrowed.contains(MOCKUPS_DIR));
+        assert!(!narrowed.contains("Minimal Coherent Change"));
+    }
+
+    #[test]
+    fn the_boundary_rule_is_identical_across_dialogue_intents() {
+        let project = project_with_protected(&["Justfile"]);
+        let repl = edit_rule(EditProtocolKind::Xml, Some(&project));
+        let discussion = discussion_edit_rule(EditProtocolKind::Xml, Some(&project));
+
+        // One module states one rule: the sandbox and the declared boundaries are
+        // project facts rather than regime decisions, so the head stays identical.
+        assert_eq!(repl.title, discussion.title);
+        assert_eq!(repl.body, discussion.body);
+        assert!(repl.body.contains("`Justfile`"));
+        assert!(repl.body.contains(MOCKUPS_DIR));
+    }
+
+    #[test]
+    fn the_boundary_rule_keeps_the_contour_dictionary_clean() {
+        let project = project_with_protected(&["Justfile", "docs/specs/**"]);
+
+        for protocol in [EditProtocolKind::Xml, EditProtocolKind::Structured] {
+            let rule = edit_rule(protocol, Some(&project));
+            // The paths and the sandbox are prompt-side facts, so both contours
+            // describe the same boundaries without naming a control tag.
+            assert!(rule.body.contains("`Justfile`"));
+            assert!(rule.body.contains(MOCKUPS_DIR));
+            assert_no_operational_tags(&rule);
         }
     }
 }

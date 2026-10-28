@@ -145,6 +145,38 @@ and the failure is reported instead of retried. Plan step reprompting and review
 finding repair use the same ladder, so recovery behaves identically wherever a
 coder turn runs.
 
+#### The level-up opt-out
+
+Not every configured rung should be entered automatically. A project may keep
+an expensive or specialized model for a deliberate manual run and still need a
+ladder to escalate along, so a role entry carries an optional `level_up`
+marker:
+
+```toml
+coder = [
+  "DeepSeek Flash",
+  { model = "Claude Sonnet", level_up = false },
+]
+```
+
+- **absent or `true`** — the entry participates in automatic escalation. This is
+  the default, so a configuration written before the marker existed behaves
+  exactly as it did.
+- **`false`** — the entry stays in the role catalog but the ladder never enters
+  it.
+
+The two surfaces are deliberately distinct. The **role catalog**
+(`role_entries`, and therefore the role summary a client renders its selectors
+from) keeps every configured model, so an opted-out model stays selectable by
+hand. The **escalation ladder** (`coder_ladder`, `architect_ladder`) filters the
+opted-out entries out, so sequential escalation steps over them, and a ladder
+whose every rung opted out still keeps one base rung instead of becoming empty.
+
+A run started by hand on an opted-out model is already at the top: it occupies
+no ladder position, it starts from the strongest eligible rung, and the ladder
+is saturated immediately. A failed turn therefore ends in an error or a blocked
+outcome instead of quietly promoting the model the developer reserved.
+
 ### 3.3 The architect ladder
 
 Each horizon synthesis records the architect configuration that produced it (model
@@ -296,3 +328,6 @@ the exact role-list entry the developer chose.
   provider catalog; it is never a duplicate of the configured primary models.
 - **The ladder is not an infinite retry.** It is a finite ordered list that
   saturates, so escalation has a deterministic terminus.
+- **`level_up = false` is not a ban.** The marker removes a model from
+  automatic escalation only; the model stays in the role catalog and remains
+  reachable through an explicit selection by hand.

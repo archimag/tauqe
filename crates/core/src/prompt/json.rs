@@ -1194,4 +1194,119 @@ mod tests {
             "a silent structured round must never become raw JSON text"
         );
     }
+    #[test]
+    fn test_decode_payload_less_success_reports_success_without_a_result() {
+        // A terminal `success` states what the turn accomplished through its
+        // summary and nothing else, so an empty summary decodes into a success
+        // that carries no payload. The bounded turn can then re-ask the model
+        // instead of recording a silent conclusion.
+        let protocol = JsonPromptProtocol::edits();
+        let output = r#"{
+            "message": "",
+            "changes": [],
+            "outcome": {"status": "success", "summary": "  ", "message": "", "reason": ""}
+        }"#;
+        let commands = protocol.decode(output, &[]);
+        assert_eq!(
+            commands,
+            vec![LlmCommand::Outcome {
+                outcome: LlmOutcome::Success { summary: None },
+            }],
+            "a payload-free success must decode as a success without a result"
+        );
+    }
+
+    #[test]
+    fn test_decode_empty_object_emits_no_commands() {
+        // An empty object is the smallest silent structured round: it carries no
+        // conversational channel and no actionable field, so the decoded surface
+        // stays empty and never degrades into raw JSON text.
+        let protocol = JsonPromptProtocol::edits();
+        let commands = protocol.decode("{}", &[]);
+        assert!(
+            commands.is_empty(),
+            "an empty structured round must decode into no command at all: {commands:?}"
+        );
+        assert!(
+            !commands
+                .iter()
+                .any(|command| matches!(command, LlmCommand::Text { .. })),
+            "an empty structured round must never become raw JSON text"
+        );
+    }
+
+    /// Returns the terminal-outcome commands carried by a decoded round.
+    ///
+    /// A round may decode other commands besides its outcome: the `<skip>` tag
+    /// deliberately survives conversational cleaning, because the review contour
+    /// reads it back from the cleaned assistant text to record why a finding was
+    /// skipped. Transport parity is therefore asserted on the decoded outcome
+    /// payload, which is what the bounded turn inspects.
+    fn decoded_outcomes(commands: &[LlmCommand]) -> Vec<LlmOutcome> {
+        commands
+            .iter()
+            .filter_map(|command| match command {
+                LlmCommand::Outcome { outcome } => Some(outcome.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn test_decode_terminal_outcomes_always_carry_their_payload() {
+        // Nobody but the model can state what a turn accomplished, so `success`
+        // without a summary has no deterministic completion: it stays a success
+        // without a result. `error` and `skip` are completed deterministically,
+        // and both contours decode one and the same outcome for every status.
+        let protocol = JsonPromptProtocol::edits();
+
+        let bare_success = LlmOutcome::Success { summary: None };
+        let structured_success = r#"{
+            "message": "",
+            "changes": [],
+            "outcome": {"status": "success", "summary": "", "message": "", "reason": ""}
+        }"#;
+        assert_eq!(
+            decoded_outcomes(&protocol.decode(structured_success, &[])),
+            vec![bare_success.clone()]
+        );
+        assert_eq!(
+            decoded_outcomes(&protocol.decode("<success />\n", &[])),
+            vec![bare_success]
+        );
+
+        let execution_error = LlmOutcome::Error {
+            message: "Execution error".to_string(),
+        };
+        let structured_error = r#"{
+            "message": "",
+            "changes": [],
+            "outcome": {"status": "error", "summary": "", "message": "", "reason": ""}
+        }"#;
+        assert_eq!(
+            decoded_outcomes(&protocol.decode(structured_error, &[])),
+            vec![execution_error.clone()]
+        );
+        assert_eq!(
+            decoded_outcomes(&protocol.decode("<error />\n", &[])),
+            vec![execution_error]
+        );
+
+        let unstated_skip = LlmOutcome::Skip {
+            reason: "Step skipped without a stated reason".to_string(),
+        };
+        let structured_skip = r#"{
+            "message": "",
+            "changes": [],
+            "outcome": {"status": "skip", "summary": "", "message": "", "reason": "  "}
+        }"#;
+        assert_eq!(
+            decoded_outcomes(&protocol.decode(structured_skip, &[])),
+            vec![unstated_skip.clone()]
+        );
+        assert_eq!(
+            decoded_outcomes(&protocol.decode("<skip />\n", &[])),
+            vec![unstated_skip]
+        );
+    }
 }

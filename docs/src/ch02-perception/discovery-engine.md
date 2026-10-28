@@ -61,7 +61,7 @@ every handler that owns a command, and folds the results into one outcome.
 | `<repo_map path>` | targeted outline | the symbol map of one subtree |
 | `<dir_list path recursive>` | directory listing | tracked files of one directory |
 | `<doc_request topic>` | documentation | the embedded chapter of one topic |
-
+| `<doc_request topic>` | documentation | the embedded chapter of one topic, in the interactive dialogue only |
 Each handler owns its validation, its disk work, and its feedback text. The turn
 loop dispatches polymorphically instead of branching on individual command types,
 so a capability cannot drift from its validation or its explanation.
@@ -171,7 +171,15 @@ that names the limitation instead of an opaque engine error.
 `workflow`, `git`, `interface`, `review`, `plan`, `config`, or `all`. The model
 asks for the authoritative chapter instead of reconstructing behavior from partial
 source memory.
-
+The capability belongs to the interactive dialogue, where the developer
+prepares a project and chooses a workflow. An isolated step execution carries
+no documentation request at all: its turn implements one approved architectural
+decision, so the Architect already settled *what* must be built and the step
+needs the repository rather than the reference manual. The isolation follows
+from the capability surface itself, so a turn without the request renders no
+documentation rule, declares no documentation field in its schema, and decodes
+no documentation tag; the prompt never advertises a channel the decoder would
+reject.
 ### 3.6 The turn journal
 
 The journal is an ordered, append-only collection of feedback blocks. Blank blocks
@@ -235,7 +243,7 @@ that keeps asking for what it already holds cannot loop forever.
 
 ## 5. Related Chapters
 
-- [Three-Tier Context Model](three-tier-model.md) — the layers discovery widens.
+- [The Context Model](context-model.md) — the layers discovery widens.
 - [Repository Map and Blinkers](repo-map.md) — the outline that motivates the next
   request.
 - [The Autonomous Bounded Turn FSM](../ch01-foundations/bounded-turn-fsm.md) —

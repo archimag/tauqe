@@ -89,6 +89,16 @@ pub fn resolve_architect_tier(
         return (tier, None);
     }
 
+    // A recorded rung the ladder excludes by `level_up = false` is a configuration
+    // the developer pinned by hand: the ladder is already saturated, so the
+    // reprojection stays on it and no level up is reported.
+    if let Some(tier) = recorded.filter(|tier| {
+        cfg.models
+            .excluded_from_escalation(ModelRole::Architect, &tier.model)
+    }) {
+        return (tier.clone(), None);
+    }
+
     let tier = cfg.models.next_architect_tier(recorded);
     let level_up = ArchitectLevelUp {
         from: recorded.cloned(),
@@ -207,5 +217,35 @@ mod tests {
         let level_up = level_up.expect("a repeated failure always reports the escalation");
         assert_eq!(level_up.from, Some(tier_two.clone()));
         assert_eq!(level_up.to, tier_two);
+    }
+
+    #[test]
+    fn manual_selection_on_an_excluded_architect_stays_saturated() {
+        let manual_model = ModelRef::openrouter("planner/manual");
+        let mut manual_entry = ModelEntry::new(manual_model.clone(), None);
+        manual_entry.level_up = Some(false);
+        let cfg = config_with_ladder(vec![
+            ModelEntry::new(ModelRef::openrouter("planner/one"), None),
+            manual_entry,
+            ModelEntry::new(ModelRef::openrouter("planner/two"), None),
+        ]);
+        let manual = ArchitectTier::from(manual_model);
+
+        // A repeated failure of the same step normally escalates one rung. The
+        // recorded configuration is excluded from the ladder though, so it is a
+        // manual run the developer pinned: the round stays on it and reports no
+        // level up instead of silently restarting at the base rung.
+        let (tier, level_up) =
+            resolve_architect_tier(&cfg, Some(&manual), None, Some("s-1"), Some("s-1"));
+        assert_eq!(tier, manual);
+        assert!(level_up.is_none());
+
+        // An explicit developer selection naming the excluded model never escalates
+        // either, so both entry points honour the pinned configuration.
+        let selection = ModelSelection::Specific(manual.model.clone());
+        let (tier, level_up) =
+            resolve_architect_tier(&cfg, None, Some(&selection), Some("s-1"), Some("s-1"));
+        assert_eq!(tier, manual);
+        assert!(level_up.is_none());
     }
 }

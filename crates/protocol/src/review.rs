@@ -11,6 +11,7 @@
 
 mod dto;
 mod events;
+mod group;
 mod item;
 mod session;
 
@@ -18,13 +19,20 @@ mod session;
 mod tests;
 
 pub use dto::{
-    ReviewCancelParams, ReviewDeleteParams, ReviewDeleteResult, ReviewExecuteParams,
-    ReviewGetParams, ReviewGetResult, ReviewListParams, ReviewListResult, ReviewRefineItemParams,
+    ReviewAnalyzeParams, ReviewAnalyzeResult, ReviewCancelParams, ReviewDeleteParams,
+    ReviewDeleteResult, ReviewExecuteParams, ReviewGetParams, ReviewGetResult, ReviewListParams,
+    ReviewListResult, ReviewRefineGroupParams, ReviewRefineGroupResult, ReviewRefineItemParams,
     ReviewRefineItemResult, ReviewStartParams, ReviewUpdateItemParams, ReviewUpdateItemResult,
 };
 pub use events::{
-    ReviewContentDeltaEvent, ReviewErrorEvent, ReviewFinishedEvent, ReviewListChangedEvent,
-    ReviewReasoningDeltaEvent, ReviewStartedEvent, ReviewUpdatedEvent,
+    ReviewAnalyzeFinishedEvent, ReviewAnalyzeStartedEvent, ReviewContentDeltaEvent,
+    ReviewErrorEvent, ReviewFinishedEvent, ReviewGroupFinishedEvent, ReviewGroupStartedEvent,
+    ReviewListChangedEvent, ReviewReasoningDeltaEvent, ReviewStartedEvent, ReviewUpdatedEvent,
 };
+pub use group::DEFAULT_REVIEW_GROUP_ID;
+pub use group::{
+    ArchitecturalIssueGroup, PostAnalysisMode, ReviewGroup, ReviewLaunchConfig, ReviewPostAnalysis,
+};
+pub use group::{LOCAL_REVIEW_GROUP_ID, LOCAL_REVIEW_GROUP_TITLE};
 pub use item::{IssueStatus, IssueType, ReviewIssue, ReviewItem, ReviewItemStatus, ReviewSeverity};
 pub use session::{ReviewSession, ReviewSummary};

@@ -25,7 +25,18 @@ tauqe.toml
 Thumbs.db
 
 # Tauqe runtime artifacts
-.tauqe/
+#
+# The whole state directory stays out of the repository: credentials, history,
+# plans, reviews, mockups, and the reference cache are runtime data, not sources.
+# The reference registry is the one tracked path inside it, so the directory is
+# re-included, every sibling is excluded again, and the manifest alone is
+# re-included once more. A rule later in this file overrides an earlier one, and
+# Git descends only into a directory no rule ignores, so the order is load-bearing.
+!.tauqe
+.tauqe/*
+!.tauqe/refs/
+.tauqe/refs/*
+!.tauqe/refs/refs.md
 
 # Transient file-operation siblings (staged writes and rollback backups)
 *.tauqe-tmp

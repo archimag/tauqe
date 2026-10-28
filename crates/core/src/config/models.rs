@@ -95,15 +95,20 @@ impl<'de> Deserialize<'de> for ModelReference {
 
 /// A role entry as written in configuration.
 ///
-/// Pairs the written model reference with the reasoning depth of that role
-/// slot. A display alias is not a role parameter: it describes the model itself
-/// and is declared once in the provider catalog, so a role entry that carries
-/// one is rejected instead of quietly reinstating a second source of truth for
-/// the same label.
+/// Pairs the written model reference with the runtime parameters of that role
+/// slot: the reasoning depth and the level-up marker. A display alias is not a
+/// role parameter: it describes the model itself and is declared once in the
+/// provider catalog, so a role entry that carries one is rejected instead of
+/// quietly reinstating a second source of truth for the same label.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct RoleModelSpec {
     reference: ModelReference,
     effort: Option<ReasoningEffort>,
+    /// Explicit level-up marker, absent by default.
+    ///
+    /// An absent marker means the entry participates in ladder escalation, so
+    /// `level_up = false` is the only spelling that excludes a model from it.
+    level_up: Option<bool>,
 }
 
 impl<'de> Deserialize<'de> for RoleModelSpec {
@@ -117,7 +122,7 @@ impl<'de> Deserialize<'de> for RoleModelSpec {
             type Value = RoleModelSpec;
 
             fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-                f.write_str("a model string or a { model, effort } table")
+                f.write_str("a model string or a { model, effort, level_up } table")
             }
 
             fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
@@ -127,6 +132,7 @@ impl<'de> Deserialize<'de> for RoleModelSpec {
                 Ok(RoleModelSpec {
                     reference: ModelReference::parse_text(value)?,
                     effort: None,
+                    level_up: None,
                 })
             }
 
@@ -137,6 +143,8 @@ impl<'de> Deserialize<'de> for RoleModelSpec {
                 let mut reference: Option<ModelReference> = None;
                 let mut effort: Option<ReasoningEffort> = None;
                 let mut effort_seen = false;
+                let mut level_up: Option<bool> = None;
+                let mut level_up_seen = false;
 
                 while let Some(key) = map.next_key::<String>()? {
                     match key.as_str() {
@@ -163,10 +171,20 @@ impl<'de> Deserialize<'de> for RoleModelSpec {
                                 _ => None,
                             };
                         }
+                        "level_up" => {
+                            if level_up_seen {
+                                return Err(serde::de::Error::duplicate_field("level_up"));
+                            }
+                            level_up_seen = true;
+                            // The marker is a boolean literal or absent; any
+                            // other type is a configuration error instead of a
+                            // silently ignored annotation.
+                            level_up = map.next_value::<Option<bool>>()?;
+                        }
                         other => {
                             return Err(serde::de::Error::unknown_field(
                                 other,
-                                &["model", "effort"],
+                                &["model", "effort", "level_up"],
                             ))
                         }
                     }
@@ -177,7 +195,11 @@ impl<'de> Deserialize<'de> for RoleModelSpec {
                     None => return Err(serde::de::Error::missing_field("model")),
                 };
 
-                Ok(RoleModelSpec { reference, effort })
+                Ok(RoleModelSpec {
+                    reference,
+                    effort,
+                    level_up,
+                })
             }
         }
 
@@ -293,7 +315,13 @@ impl ModelsConfig {
                         .reference
                         .resolve(catalog)
                         .map_err(|err| format!("[models] {}: {}", role, err))?;
-                    Ok(ModelEntry::new(model, spec.effort))
+                    // The configured marker travels with the entry, so the
+                    // resolved catalog preserves an exclusion declared on disk.
+                    Ok(ModelEntry {
+                        model,
+                        effort: spec.effort,
+                        level_up: spec.level_up,
+                    })
                 })
                 .collect()
         }
@@ -380,6 +408,20 @@ impl ModelsConfig {
         self.role_slice(role)?
             .iter()
             .find(|entry| &entry.model == model)
+    }
+
+    /// Reports whether the role excludes `model` from automatic escalation.
+    ///
+    /// A model declared with `level_up = false` stays in the role catalog
+    /// ([`ModelsConfig::role_entries`]) so the developer may run it directly, while
+    /// [`ModelsConfig::coder_ladder`] and [`ModelsConfig::architect_ladder`] skip it.
+    /// A run started on such a model is already saturated: the automatic ladder
+    /// never enters it and holds no stronger rung above it.
+    pub fn excluded_from_escalation(&self, role: ModelRole, model: &ModelRef) -> bool {
+        self.role_slice(role)
+            .unwrap_or(&[])
+            .iter()
+            .any(|entry| &entry.model == model && entry.level_up() == Some(false))
     }
 
     /// Ordered model list backing a functional role.
@@ -481,12 +523,27 @@ impl ModelsConfig {
     /// Returns the ordered coder escalation ladder.
     ///
     /// The ladder is the coder list when present, otherwise the inherited
-    /// `primary` list. When even that is empty it degrades to a single rung
+    /// `primary` list. A rung whose entry declares `level_up = false` is
+    /// skipped: the model stays selectable in the role catalog
+    /// ([`ModelsConfig::role_entries`]) but automatic escalation never enters
+    /// it. When even that leaves nothing, the ladder degrades to a single rung
     /// resolved through the role chain, so escalation always has a base.
+    ///
+    /// Every rung preserves the level-up marker declared on its configuration
+    /// entry, so an excluded model remains distinguishable from a participating
+    /// rung without re-reading configuration.
     pub fn coder_ladder(&self) -> Vec<ModelEntry> {
-        match self.role_slice(ModelRole::Coder) {
-            Some(entries) if !entries.is_empty() => entries.to_vec(),
-            _ => vec![self.fallback_coder_tier()],
+        let ladder: Vec<ModelEntry> = self
+            .role_slice(ModelRole::Coder)
+            .unwrap_or(&[])
+            .iter()
+            .filter(|entry| entry.level_up() != Some(false))
+            .cloned()
+            .collect();
+        if ladder.is_empty() {
+            vec![self.fallback_coder_tier()]
+        } else {
+            ladder
         }
     }
 
@@ -503,6 +560,25 @@ impl ModelsConfig {
             .unwrap_or_else(|| self.fallback_coder_tier())
     }
 
+    /// Returns the rung that follows ladder position `idx`.
+    ///
+    /// `None` means the ladder is saturated: the next position resolves to the same
+    /// `(model, effort)` pair, so advancing would only repeat the configuration that
+    /// already failed. A run started on a model the coder role excludes by
+    /// `level_up = false` begins at the strongest eligible position
+    /// ([`ModelsConfig::coder_tier_index`]), so it saturates here as well and no
+    /// stronger tier is ever entered automatically.
+    pub fn next_coder_tier(&self, idx: usize) -> Option<(usize, ModelEntry)> {
+        let current = self.coder_tier(idx);
+        let next_idx = idx + 1;
+        let next = self.coder_tier(next_idx);
+        if next.model == current.model && next.effort == current.effort {
+            None
+        } else {
+            Some((next_idx, next))
+        }
+    }
+
     /// Returns the ladder position a coder selection starts execution from.
     ///
     /// The ladder is the very list [`ModelsConfig::coder_ladder`] exposes, so an
@@ -510,8 +586,12 @@ impl ModelsConfig {
     /// The selection is resolved to its concrete model and reasoning depth
     /// first: an entry matching both wins, because the same model may occupy
     /// several rungs at different depths; a model-only match is the fallback.
-    /// An absent selection, or a model the ladder does not carry, restarts from
-    /// the base rung instead of guessing a position.
+    /// An absent selection, or a model the ladder does not carry at all, restarts
+    /// from the base rung instead of guessing a position. A manual run on a model
+    /// the coder role excludes from escalation by `level_up = false` is not a
+    /// ladder position either, yet it is already at the top: it starts from the
+    /// strongest eligible rung and leaves the ladder saturated
+    /// ([`ModelsConfig::next_coder_tier`]).
     pub fn coder_tier_index(&self, selection: Option<&ModelSelection>) -> usize {
         let Some(selection) = selection else {
             return 0;
@@ -519,11 +599,20 @@ impl ModelsConfig {
         let model = self.resolve_model(selection);
         let effort = self.resolve_selection_effort(ModelRole::Coder, selection);
         let ladder = self.coder_ladder();
-        ladder
+        let position = ladder
             .iter()
             .position(|entry| entry.model == model && entry.effort == effort)
-            .or_else(|| ladder.iter().position(|entry| entry.model == model))
-            .unwrap_or(0)
+            .or_else(|| ladder.iter().position(|entry| entry.model == model));
+        match position {
+            Some(index) => index,
+            // A model the coder role excludes from escalation is a manual run: it
+            // occupies no ladder position, so it starts on the strongest eligible
+            // rung and retrying can never enter a stronger tier.
+            None if self.excluded_from_escalation(ModelRole::Coder, &model) => {
+                ladder.len().saturating_sub(1)
+            }
+            None => 0,
+        }
     }
 
     /// Fallback coder rung derived from the deterministic role resolution chain.
@@ -535,14 +624,26 @@ impl ModelsConfig {
     ///
     /// The ladder is the architect list when present, otherwise the inherited
     /// `primary` list, so re-planning never loses access to the configured
-    /// Architect models. When even that is empty it degrades to a single rung
-    /// resolved through the role chain, so escalation always has a base.
+    /// Architect models. A tier whose entry declares `level_up = false` is
+    /// skipped: the model stays selectable in the role catalog but automatic
+    /// escalation never enters it. When even that leaves nothing, the ladder
+    /// degrades to a single rung resolved through the role chain, so escalation
+    /// always has a base.
+    ///
+    /// Every rung preserves the level-up marker declared on its configuration
+    /// entry, so an excluded Architect remains distinguishable from a
+    /// participating rung without re-reading configuration.
     pub fn architect_ladder(&self) -> Vec<ArchitectTier> {
         let ladder: Vec<ArchitectTier> = self
             .role_slice(ModelRole::Architect)
             .unwrap_or(&[])
             .iter()
-            .map(|entry| ArchitectTier::new(entry.model.clone(), entry.effort))
+            .filter(|entry| entry.level_up() != Some(false))
+            .map(|entry| ArchitectTier {
+                model: entry.model.clone(),
+                effort: entry.effort,
+                level_up: entry.level_up,
+            })
             .collect();
         if ladder.is_empty() {
             vec![self.fallback_architect_tier()]
@@ -585,10 +686,19 @@ impl ModelsConfig {
     /// Returns the rung that follows a recorded Architect configuration.
     ///
     /// A recorded rung that is absent from the current ladder restarts from the
-    /// base rung, so escalation never guesses a position. The last rung
-    /// saturates, so an exhausted ladder keeps the strongest Architect.
+    /// base rung, so escalation never guesses a position. The last rung saturates,
+    /// so an exhausted ladder keeps the strongest Architect. A recorded rung the
+    /// ladder excludes by `level_up = false` is a manual run the developer pinned:
+    /// restarting would silently downgrade it, so the configuration stays as it is
+    /// and escalation is saturated.
     pub fn next_architect_tier(&self, recorded: Option<&ArchitectTier>) -> ArchitectTier {
-        match self.architect_tier_index(recorded) {
+        let Some(recorded) = recorded else {
+            return self.architect_tier(0);
+        };
+        if self.excluded_from_escalation(ModelRole::Architect, &recorded.model) {
+            return recorded.clone();
+        }
+        match self.architect_tier_index(Some(recorded)) {
             Some(idx) => self.architect_tier(idx + 1),
             None => self.architect_tier(0),
         }
@@ -1379,6 +1489,445 @@ coder = [
                 "other/model"
             )))),
             2
+        );
+    }
+    #[test]
+    fn test_level_up_defaults_to_participation() {
+        // A bare string reference and a table without the marker both leave the
+        // entry without an explicit marker, so it participates in escalation.
+        let config = parse_models(
+            r#"
+primary = ["openrouter:base/primary"]
+coder = [
+    "openrouter:one/coder",
+    { model = "openrouter:two/coder", effort = "high" },
+]
+architect = ["openrouter:one/architect"]
+"#,
+        );
+
+        let catalog = config.role_entries(ModelRole::Coder);
+        assert_eq!(catalog.len(), 2);
+        for entry in &catalog {
+            assert_eq!(entry.level_up(), None);
+        }
+        for entry in config.coder_ladder() {
+            assert_eq!(entry.level_up(), None);
+        }
+        for tier in config.architect_ladder() {
+            assert_eq!(tier.level_up(), None);
+        }
+
+        // Without any marker the ladder is the role catalog itself, so a
+        // configuration written before the opt-out existed behaves identically.
+        assert_eq!(config.coder_ladder(), config.role_entries(ModelRole::Coder));
+        let architect_catalog = config.role_entries(ModelRole::Architect);
+        let architect_ladder = config.architect_ladder();
+        assert_eq!(architect_ladder.len(), architect_catalog.len());
+        for (tier, entry) in architect_ladder.iter().zip(&architect_catalog) {
+            assert_eq!(tier.model, entry.model);
+            assert_eq!(tier.effort, entry.effort);
+            assert_eq!(tier.level_up, entry.level_up);
+        }
+        // An unmarked entry is a supported declaration, not an incomplete one.
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn test_level_up_false_keeps_the_model_in_the_role_catalog() {
+        let config = parse_models(
+            r#"
+primary = ["openrouter:base/primary"]
+coder = [
+    { model = "openrouter:fast/coder", effort = "low" },
+    { model = "openrouter:premium/coder", effort = "max", level_up = false },
+]
+architect = [{ model = "openrouter:premium/architect", level_up = false }]
+"#,
+        );
+
+        // The role catalog keeps every configured model selectable, including
+        // the one excluded from automatic escalation.
+        let catalog = config.role_entries(ModelRole::Coder);
+        assert_eq!(catalog.len(), 2);
+        assert_eq!(catalog[0].level_up(), None);
+        assert_eq!(catalog[1].model, ModelRef::openrouter("premium/coder"));
+        assert_eq!(catalog[1].effort, Some(ReasoningEffort::Max));
+        assert_eq!(catalog[1].level_up(), Some(false));
+
+        // The escalation ladder drops the opted-out rung, so a model the
+        // developer reserved for a manual run is never entered automatically.
+        let ladder = config.coder_ladder();
+        assert_eq!(ladder.len(), 1);
+        assert_eq!(ladder[0].model, ModelRef::openrouter("fast/coder"));
+
+        // A ladder whose every rung opted out keeps one base rung instead of
+        // becoming empty, so escalation always has somewhere to start.
+        let tiers = config.architect_ladder();
+        assert_eq!(tiers.len(), 1);
+        assert_eq!(tiers[0].model, ModelRef::openrouter("premium/architect"));
+
+        // Excluding a model is a supported declaration, not an invalid one.
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn test_coder_ladder_skips_excluded_rungs_in_declaration_order() {
+        let config = parse_models(
+            r#"
+primary = ["openrouter:base/primary"]
+coder = [
+    { model = "openrouter:start/model", effort = "low" },
+    { model = "openrouter:premium/model", effort = "max", level_up = false },
+    { model = "openrouter:strong/model", effort = "xhigh" },
+]
+"#,
+        );
+
+        // The catalog keeps every configured model, so the excluded one stays
+        // available for a manual run.
+        assert_eq!(config.role_entries(ModelRole::Coder).len(), 3);
+
+        // The ladder skips the opted-out rung and keeps the declared order of
+        // the remaining ones.
+        let ladder = config.coder_ladder();
+        assert_eq!(ladder.len(), 2);
+        assert_eq!(ladder[0].model, ModelRef::openrouter("start/model"));
+        assert_eq!(ladder[0].effort, Some(ReasoningEffort::Low));
+        assert_eq!(ladder[1].model, ModelRef::openrouter("strong/model"));
+        assert_eq!(ladder[1].effort, Some(ReasoningEffort::XHigh));
+        for rung in &ladder {
+            assert_ne!(rung.model, ModelRef::openrouter("premium/model"));
+        }
+    }
+
+    #[test]
+    fn test_ladder_walk_skips_an_opted_out_rung() {
+        // `next_coder_tier` advances one ladder index at a time and reads the
+        // rungs through `coder_tier`, so the filtered ladder alone makes the
+        // walk step over the excluded model.
+        let config = parse_models(
+            r#"
+primary = ["openrouter:base/primary"]
+coder = [
+    { model = "openrouter:start/model", effort = "low" },
+    { model = "openrouter:premium/model", effort = "max", level_up = false },
+    { model = "openrouter:strong/model", effort = "xhigh" },
+]
+"#,
+        );
+
+        let base = config.coder_tier(0);
+        let advanced = config.coder_tier(1);
+        assert_eq!(base.model, ModelRef::openrouter("start/model"));
+        assert_eq!(advanced.model, ModelRef::openrouter("strong/model"));
+        assert_ne!(advanced.model, ModelRef::openrouter("premium/model"));
+
+        // The walk saturates on the last rung instead of leaving the ladder.
+        assert_eq!(config.coder_tier(2), advanced);
+        assert_eq!(config.coder_tier(7), advanced);
+
+        // A selection naming the excluded model is a manual run: it is not a
+        // ladder position, so it starts on the strongest eligible rung and the
+        // ladder is already saturated from there. A `Tier` selection that
+        // references the filtered rung is clamped the same way.
+        let manual = ModelSelection::Specific(ModelRef::openrouter("premium/model"));
+        assert_eq!(config.coder_tier_index(Some(&manual)), 1);
+        assert!(config.next_coder_tier(1).is_none());
+        let tier = ModelSelection::Tier {
+            model: ModelRef::openrouter("premium/model"),
+            effort: Some(ReasoningEffort::Max),
+        };
+        assert_eq!(config.coder_tier_index(Some(&tier)), 1);
+    }
+
+    #[test]
+    fn test_architect_ladder_skips_excluded_tiers() {
+        let config = parse_models(
+            r#"
+primary = ["openrouter:base/primary"]
+architect = [
+    { model = "openrouter:planner/first", effort = "high" },
+    { model = "openrouter:planner/premium", effort = "max", level_up = false },
+    { model = "openrouter:planner/second", effort = "xhigh" },
+]
+"#,
+        );
+
+        // Every configured Architect stays selectable in the role catalog.
+        assert_eq!(config.role_entries(ModelRole::Architect).len(), 3);
+
+        let ladder = config.architect_ladder();
+        assert_eq!(ladder.len(), 2);
+        assert_eq!(
+            ladder[0],
+            ArchitectTier::new(
+                ModelRef::openrouter("planner/first"),
+                Some(ReasoningEffort::High)
+            )
+        );
+        assert_eq!(
+            ladder[1],
+            ArchitectTier::new(
+                ModelRef::openrouter("planner/second"),
+                Some(ReasoningEffort::XHigh)
+            )
+        );
+
+        // Escalation advances across the filtered ladder only.
+        assert_eq!(config.next_architect_tier(None), ladder[0]);
+        assert_eq!(config.next_architect_tier(Some(&ladder[0])), ladder[1]);
+        assert_eq!(config.next_architect_tier(Some(&ladder[1])), ladder[1]);
+        assert_eq!(config.architect_tier(1), ladder[1]);
+        assert_eq!(config.architect_tier_index(Some(&ladder[1])), Some(1));
+    }
+
+    #[test]
+    fn test_excluded_from_escalation_reports_the_declared_marker() {
+        let config = parse_models(
+            r#"
+primary = ["openrouter:base/primary"]
+coder = [
+    "openrouter:base/coder",
+    { model = "openrouter:premium/coder", level_up = false },
+]
+architect = [{ model = "openrouter:premium/architect", level_up = false }]
+"#,
+        );
+
+        // The predicate reads the marker declared on the role entry, so a manual
+        // run is recognized without comparing model names by text.
+        assert!(
+            !config.excluded_from_escalation(ModelRole::Coder, &ModelRef::openrouter("base/coder"))
+        );
+        assert!(config
+            .excluded_from_escalation(ModelRole::Coder, &ModelRef::openrouter("premium/coder")));
+        // A model the role does not configure at all carries no marker.
+        assert!(!config
+            .excluded_from_escalation(ModelRole::Coder, &ModelRef::openrouter("unknown/coder")));
+        assert!(config.excluded_from_escalation(
+            ModelRole::Architect,
+            &ModelRef::openrouter("premium/architect")
+        ));
+        // Scribe is a derived single model and never declares an exclusion.
+        assert!(!config
+            .excluded_from_escalation(ModelRole::Scribe, &ModelRef::openrouter("premium/coder")));
+    }
+
+    #[test]
+    fn test_manual_architect_selection_saturates_the_ladder() {
+        let config = parse_models(
+            r#"
+primary = ["openrouter:base/primary"]
+architect = [
+    "openrouter:planner/one",
+    { model = "openrouter:planner/manual", level_up = false },
+    "openrouter:planner/two",
+]
+"#,
+        );
+        let manual = ArchitectTier::from(ModelRef::openrouter("planner/manual"));
+
+        // The developer pinned an Architect the ladder excludes, so a repeated
+        // failure keeps that configuration instead of restarting from the base
+        // rung, which would silently downgrade the chosen model.
+        assert_eq!(config.next_architect_tier(Some(&manual)), manual);
+        // The ladder itself still advances across its eligible rungs.
+        let first = ArchitectTier::from(ModelRef::openrouter("planner/one"));
+        let second = ArchitectTier::from(ModelRef::openrouter("planner/two"));
+        assert_eq!(config.next_architect_tier(Some(&first)), second);
+    }
+
+    #[test]
+    fn test_ladder_keeps_a_base_rung_when_every_rung_opts_out() {
+        let config = parse_models(
+            r#"
+primary = ["openrouter:base/primary"]
+coder = [{ model = "openrouter:only/coder", effort = "max", level_up = false }]
+architect = [{ model = "openrouter:only/architect", level_up = false }]
+"#,
+        );
+
+        // A ladder always keeps one base rung, so escalation has somewhere to
+        // start even when every configured rung opted out.
+        let ladder = config.coder_ladder();
+        assert_eq!(ladder.len(), 1);
+        assert_eq!(config.coder_tier(0), ladder[0]);
+        assert_eq!(config.coder_tier(3), ladder[0]);
+
+        let tiers = config.architect_ladder();
+        assert_eq!(tiers.len(), 1);
+        assert_eq!(config.architect_tier(0), tiers[0]);
+
+        // The declaration itself survives in the role catalog.
+        assert_eq!(
+            config.role_entries(ModelRole::Coder)[0].level_up(),
+            Some(false)
+        );
+        assert_eq!(
+            config.role_entries(ModelRole::Architect)[0].level_up(),
+            Some(false)
+        );
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn test_resolve_role_still_reaches_an_opted_out_model() {
+        let config = parse_models(
+            r#"
+primary = ["openrouter:base/primary"]
+coder = [
+    { model = "openrouter:premium/coder", effort = "max", level_up = false },
+    "openrouter:base/coder",
+]
+architect = [
+    { model = "openrouter:premium/architect", level_up = false },
+    "openrouter:base/architect",
+]
+"#,
+        );
+
+        // Manual selection resolves against the catalog, so a model excluded
+        // from escalation stays reachable as a role target.
+        let premium = ModelRef::openrouter("premium/coder");
+        assert_eq!(config.resolve_role(ModelRole::Coder), premium);
+        assert_eq!(
+            config.resolve_effort(ModelRole::Coder),
+            Some(ReasoningEffort::Max)
+        );
+        let manual = ModelSelection::Specific(premium.clone());
+        assert_eq!(config.resolve_model(&manual), premium);
+
+        // The same model is absent from the ladder the harness may enter on
+        // its own.
+        let ladder = config.coder_ladder();
+        assert_eq!(ladder.len(), 1);
+        assert_eq!(ladder[0].model, ModelRef::openrouter("base/coder"));
+        assert_eq!(
+            config.resolve_role(ModelRole::Architect),
+            ModelRef::openrouter("premium/architect")
+        );
+    }
+
+    #[test]
+    fn test_level_up_marker_survives_a_configuration_round_trip() {
+        let config = parse_models(
+            r#"
+primary = ["openrouter:base/primary"]
+coder = [
+    "openrouter:base/coder",
+    { model = "openrouter:premium/coder", effort = "max", level_up = false },
+]
+"#,
+        );
+        let catalog = config.role_entries(ModelRole::Coder);
+        assert_eq!(catalog.len(), 2);
+        assert_eq!(catalog[1].level_up(), Some(false));
+
+        // Writing the section back preserves the marker, so a round-trip
+        // through disk never turns an excluded rung into a participating one.
+        let serialized = toml::to_string(&config).expect("serialize models config");
+        let raw: ModelsConfigRaw = toml::from_str(&serialized).expect("re-parse models config");
+        let restored = ModelsConfig::resolve(raw, &[]).expect("resolve models config");
+        assert_eq!(restored.role_entries(ModelRole::Coder), catalog);
+        assert_eq!(restored.coder_ladder(), config.coder_ladder());
+        assert_eq!(restored.coder_ladder().len(), 1);
+    }
+
+    #[test]
+    fn test_level_up_marker_field_rules() {
+        // An explicit `true` is the explicit form of the default and survives.
+        let config = parse_models(
+            r#"
+primary = ["openrouter:base/primary"]
+coder = [{ model = "openrouter:one/coder", level_up = true }]
+"#,
+        );
+        assert_eq!(config.coder_ladder()[0].level_up(), Some(true));
+
+        // A repeated marker is rejected instead of letting the last value win.
+        let err = toml::from_str::<ModelsConfigRaw>(
+            r#"
+primary = ["openrouter:base/primary"]
+coder = [{ model = "openrouter:one/coder", level_up = true, level_up = false }]
+"#,
+        )
+        .expect_err("a duplicated level_up key must be rejected")
+        .to_string();
+        assert!(err.contains("duplicate key"), "got: {err}");
+        assert!(err.contains("level_up"), "got: {err}");
+
+        // A marker must be a boolean literal: any other type is a configuration
+        // error instead of a silently ignored annotation.
+        assert!(
+            toml::from_str::<ModelsConfigRaw>(
+                r#"
+primary = ["openrouter:base/primary"]
+coder = [{ model = "openrouter:one/coder", level_up = "false" }]
+"#,
+            )
+            .is_err(),
+            "a non-boolean level_up must be rejected"
+        );
+    }
+
+    /// One configuration exercises every concept of the level-up opt-out end to
+    /// end: the role catalog keeps both models selectable, the escalation ladder
+    /// drops the excluded one, and a manual run on it leaves the ladder
+    /// saturated (c-1, c-2, c-3, c-4).
+    #[test]
+    fn test_level_up_opt_out_end_to_end() {
+        let config = parse_models(
+            r#"
+primary = ["openrouter:base/primary"]
+coder = [
+    "openrouter:cheap/coder",
+    { model = "openrouter:expensive/coder", effort = "max", level_up = false },
+]
+"#,
+        );
+
+        let cheap = ModelRef::openrouter("cheap/coder");
+        let expensive = ModelRef::openrouter("expensive/coder");
+
+        // c-1: an omitted marker means participation, while the explicit marker
+        // survives resolution together with the reasoning depth of its entry.
+        let catalog = config.role_entries(ModelRole::Coder);
+        assert_eq!(catalog.len(), 2);
+        assert_eq!(catalog[0].model, cheap);
+        assert_eq!(catalog[0].level_up(), None);
+        assert_eq!(catalog[1].model, expensive);
+        assert_eq!(catalog[1].effort, Some(ReasoningEffort::Max));
+        assert_eq!(catalog[1].level_up(), Some(false));
+
+        // c-4: that catalog is the payload of the role summary a selection
+        // dialog renders, so the marker reaches the client. A participating
+        // rung keeps its terse bare-string wire form, which a payload written
+        // before the marker existed decodes unchanged.
+        let wire = serde_json::to_string(&catalog).expect("serialize role catalog");
+        assert!(wire.contains(r#""level_up":false"#), "got: {wire}");
+        assert!(wire.contains(r#""openrouter:cheap/coder""#), "got: {wire}");
+        let restored: Vec<ModelEntry> = serde_json::from_str(&wire).expect("decode role catalog");
+        assert_eq!(restored, catalog);
+
+        // c-2: the ladder filters the opted-out rung out, so sequential
+        // escalation never enters the expensive model.
+        let ladder = config.coder_ladder();
+        assert_eq!(ladder.len(), 1);
+        assert_eq!(ladder[0].model, cheap);
+        assert!(
+            config.next_coder_tier(0).is_none(),
+            "a single-rung ladder is already saturated"
+        );
+
+        // c-3: a manual run on the excluded model occupies no ladder position,
+        // so it starts on the strongest eligible rung and never escalates.
+        let manual = ModelSelection::Specific(expensive);
+        let manual_index = config.coder_tier_index(Some(&manual));
+        assert_eq!(manual_index, 0, "a manual run starts on the strongest rung");
+        assert!(
+            config.next_coder_tier(manual_index).is_none(),
+            "an opted-out model is already saturated"
         );
     }
 }

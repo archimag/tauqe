@@ -7,8 +7,10 @@
 //!
 //! The trunk is assembled as two typed lists. The shared list carries the
 //! invariants that every turn states identically, so it renders into the
-//! byte-stable head of the prompt. The intent list carries the rules that only
-//! one regime states, so it renders into the tail delta of that regime.
+//! byte-stable head of the prompt. The intent list carries the rules that the
+//! shared list cannot state for every regime — the scope and authorization
+//! rules of a dialogue and the decision, verification, and scope rules of an
+//! isolated step — so it renders into the tail delta of the turn.
 //!
 //! A rule that names the wire representation is dualized by the declared
 //! protocol. The XML contour spells a command as a marker-bound tag through
@@ -168,6 +170,20 @@ pub fn intent_delta_rules(
             };
             rules.push(ContractRule::new("Plan-First Proposal", proposal));
         }
+    }
+
+    // A dialogue that can consult the documentation is where the developer
+    // prepares a project and organizes the work, so it is also where the
+    // environment itself is stated once. The ontology therefore travels with
+    // that capability rather than with the declared intent: it lives in the
+    // delta, so every dialogue keeps the byte-stable head and pays one tail
+    // rule for it. An isolated step carries no documentation capability, so it
+    // states nothing about an environment it never asks about.
+    if capabilities.contains(LlmCapability::DocRequest) {
+        rules.push(ContractRule::new(
+            "Environment Ontology",
+            "TAUQE is a literal harness rather than an agent: the developer states the objective, the environment holds the work inside typed contracts, and the toolchain proves every change before it is committed. The roles divide the questions: the Architect owns what must be built and fixes the invariants, the Coder implements inside those invariants, the Reviewer inspects without editing, and the Scribe compacts history. Work arrives through one of three paths: the interactive dialogue for a focused change, a local plan when the work must land in dependent verified stages, and a code review for analytical inspection. The project declares its behavior in `tauqe.toml` at the repository root: `[project.verify]` names the deterministic checks, `[project.format]` the in-staging formatter, and `[models]` the model role ladders. Use this baseline to help the developer prepare a project, choose the workflow that fits the work, and organize it into steps; when a concrete parameter, default, budget, shortcut, or command must be exact, consult the authoritative documentation instead of recalling it.",
+        ));
     }
 
     if ctx.intent.is_isolated_step() {
@@ -489,14 +505,30 @@ mod tests {
         assert!(editable.contains("<create"));
         assert!(!editable.contains("`changes`"));
 
-        // The very same trunk renders for the free REPL, which is what keeps the
-        // provider prefix cache warm when a dialogue changes its focus.
+        // The environment ontology travels with the documentation capability
+        // rather than with the declared intent, so every dialogue states it;
+        // removing that capability removes the rule and nothing else, which
+        // keeps a dialogue that changes its focus on one shared trunk.
         let repl = trunk(
             TurnIntent::InteractiveRepl,
             &CapabilitySet::interactive_repl(),
             EditProtocolKind::Xml,
             None,
         );
+        assert!(titles(&repl).contains(&"Environment Ontology"));
+        assert!(titles(&rules).contains(&"Environment Ontology"));
+
+        let without_docs = trunk(
+            TurnIntent::InteractiveRepl,
+            &CapabilitySet::interactive_repl().without(LlmCapability::DocRequest),
+            EditProtocolKind::Xml,
+            None,
+        );
+        assert!(!titles(&without_docs).contains(&"Environment Ontology"));
+
+        // A plan discussion carries the documentation capability the ontology
+        // travels with, so its trunk renders the dialogue trunk of the REPL
+        // byte for byte: a dialogue that changes its focus moves no shared byte.
         assert_eq!(render_contract_rules(&rules), render_contract_rules(&repl));
     }
 
@@ -977,6 +1009,7 @@ mod tests {
         "Editable Scope",
         "Action Authorization",
         "Plan-First Proposal",
+        "Environment Ontology",
         "Architectural Decision Immutability",
         "Code Verification",
         "Step Execution Scope",
@@ -1043,6 +1076,7 @@ mod tests {
         assert!(names.contains(&"Editable Scope"));
         assert!(names.contains(&"Action Authorization"));
         assert!(names.contains(&"Plan-First Proposal"));
+        assert!(names.contains(&"Environment Ontology"));
         assert!(!names.contains(&"Discussion Mode Scope"));
         assert!(!names.contains(&"Architectural Decision Immutability"));
         assert!(!names.contains(&"Step Execution Scope"));
@@ -1056,6 +1090,7 @@ mod tests {
         let names = titles(&discussion);
         assert!(!names.contains(&"Discussion Mode Scope"));
         assert!(!names.contains(&"Read-Only Context Exploration"));
+        assert!(names.contains(&"Environment Ontology"));
         // A plan discussion states the same dialogue pair as the REPL, because
         // its surface is the dialogue head plus the plan mutation.
         assert!(names.contains(&"Read-Only Scope"));
@@ -1076,8 +1111,97 @@ mod tests {
         assert!(names.contains(&"Step Execution Scope"));
         assert!(!names.contains(&"Action Authorization"));
         assert!(!names.contains(&"Plan-First Proposal"));
+        assert!(!names.contains(&"Environment Ontology"));
         assert!(!names.contains(&"Discussion Mode Scope"));
         assert_eq!(names.last(), Some(&"Step Execution Scope"));
+    }
+    #[test]
+    fn the_interactive_repl_states_the_environment_ontology() {
+        let rules = delta(
+            TurnIntent::InteractiveRepl,
+            &CapabilitySet::interactive_repl(),
+            EditProtocolKind::Xml,
+            None,
+        );
+        let ontology = body(&rules, "Environment Ontology");
+
+        // The ontology names the paradigm, the role split, the paths work
+        // travels, and the configuration surface a consultation starts from.
+        assert!(ontology.contains("literal harness"));
+        assert!(ontology.contains("Architect"));
+        assert!(ontology.contains("what must be built"));
+        assert!(ontology.contains("Coder"));
+        assert!(ontology.contains("local plan"));
+        assert!(ontology.contains("code review"));
+        assert!(ontology.contains("`tauqe.toml`"));
+        assert!(ontology.contains("`[project.verify]`"));
+        assert!(ontology.contains("`[project.format]`"));
+        assert!(ontology.contains("`[models]`"));
+
+        // The ontology is a consultation baseline, so it routes every exact
+        // detail to the authoritative documentation instead of asserting it.
+        assert!(ontology.contains("consult the authoritative documentation"));
+
+        // A plan discussion carries the documentation capability the ontology
+        // travels with, so it states the environment exactly as the REPL does.
+        let discussion = delta(
+            TurnIntent::PlanDiscussion,
+            &CapabilitySet::discussion(),
+            EditProtocolKind::Xml,
+            None,
+        );
+        assert!(titles(&discussion).contains(&"Environment Ontology"));
+
+        // An isolated step carries no documentation capability, so the coder
+        // never reads about an environment it never asks about.
+        let step = delta(
+            TurnIntent::IsolatedStep,
+            &CapabilitySet::isolated_step(),
+            EditProtocolKind::Xml,
+            None,
+        );
+        assert!(
+            !titles(&step).contains(&"Environment Ontology"),
+            "the isolated step regime states the environment ontology"
+        );
+    }
+
+    #[test]
+    fn the_environment_ontology_is_wire_neutral() {
+        // The rule states a conceptual surface and names no command channel, so
+        // both contours render it byte for byte and no control tag leaks into a
+        // structured prompt.
+        let xml = delta(
+            TurnIntent::InteractiveRepl,
+            &CapabilitySet::interactive_repl(),
+            EditProtocolKind::Xml,
+            None,
+        );
+        let structured = delta(
+            TurnIntent::InteractiveRepl,
+            &CapabilitySet::interactive_repl(),
+            EditProtocolKind::Structured,
+            None,
+        );
+        let ontology = body(&xml, "Environment Ontology");
+        assert_eq!(ontology, body(&structured, "Environment Ontology"));
+        for prefix in XML_TAG_PREFIXES {
+            assert!(
+                !ontology.contains(prefix),
+                "the environment ontology advertises {prefix}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_environment_ontology_requires_the_documentation_capability() {
+        let rules = delta(
+            TurnIntent::InteractiveRepl,
+            &CapabilitySet::interactive_repl().without(LlmCapability::DocRequest),
+            EditProtocolKind::Xml,
+            None,
+        );
+        assert!(!titles(&rules).contains(&"Environment Ontology"));
     }
 
     #[test]

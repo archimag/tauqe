@@ -12,11 +12,14 @@
 //! The selector stays presentation-agnostic: [`ModelSelector::render_stepper_spans`]
 //! returns composable spans so each dialog can prepend its own field label while
 //! still sharing one model-presentation rule. That rule is
-//! [`crate::model_display::entry_label`] — the single formatter the header, the
-//! pickers, and the dialogs all use — so one model can never be named two
-//! different ways. The display alias is catalog metadata of the model: it reaches
-//! the client through the provider catalog published with the role summary, so
-//! the selector never derives a name from the model string (c-1, c-2).
+//! [`crate::model_display::selection_label`] — the single formatter the header,
+//! the pickers, and the dialogs all use — so one model can never be named two
+//! different ways. An entry excluded from ladder escalation keeps its row and
+//! gains the marker of a deliberate manual choice in the stepper and in every
+//! list row alike (c-4). The display alias is catalog metadata of the model: it
+//! reaches the client through the provider catalog published with the role
+//! summary, so the selector never derives a name from the model string
+//! (c-1, c-2).
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::style::Stylize;
@@ -24,7 +27,7 @@ use ratatui::text::{Line, Span};
 use tauqe_protocol::{ModelEntry, ModelRole};
 
 use crate::config::{MetaModifier, PrimaryModifier};
-use crate::model_display::{entry_label, numbered_entry_label};
+use crate::model_display::{numbered_selection_label, selection_label};
 use crate::theme::engine::current_engine;
 
 /// Stateful selector over the models configured for one semantic role.
@@ -199,10 +202,12 @@ impl ModelSelector {
     }
 
     /// Builds the standardized stepper line as composable spans: the selected
-    /// entry rendered through the shared interface label formatter, and, when
-    /// more than one entry is configured, the `[X of Y]` counter together with
-    /// the switch hint. The semantic role is never printed: it is a selection
-    /// mechanism, not a property of the model name (c-2).
+    /// entry rendered through the shared interface selection label — its plain
+    /// name, its reasoning depth, and the escalation marker when the entry is
+    /// excluded from the ladder — and, when more than one entry is configured,
+    /// the `[X of Y]` counter together with the switch hint. The semantic role
+    /// is never printed: it is a selection mechanism, not a property of the
+    /// model name (c-2).
     ///
     /// Returning spans rather than a whole line lets each dialog prepend its own
     /// field label while the selector remains the single source of truth for the
@@ -214,7 +219,7 @@ impl ModelSelector {
 
         match self.selected_entry() {
             Some(entry) => spans.push(Span::styled(
-                entry_label(entry),
+                selection_label(entry),
                 engine.fg(palette.status_success).bold(),
             )),
             None => spans.push(Span::styled(
@@ -269,7 +274,7 @@ impl ModelSelector {
 
             lines.push(Line::from(vec![
                 Span::styled(marker, marker_style),
-                Span::styled(numbered_entry_label(index, entry), row_style),
+                Span::styled(numbered_selection_label(index, entry), row_style),
             ]));
         }
 
@@ -470,6 +475,33 @@ mod tests {
             text_of(&selector.render_stepper_spans(PrimaryModifier::Alt)),
             "x/a [high]  [1 of 2 • M-M]"
         );
+    }
+
+    #[test]
+    fn stepper_and_list_mark_an_entry_excluded_from_escalation() {
+        let manual = ModelEntry {
+            level_up: Some(false),
+            ..entry("x/a", Some(ReasoningEffort::High))
+        };
+        let selector = ModelSelector::new(ModelRole::Coder, vec![manual, entry("x/b", None)], 0);
+        let marker = crate::i18n::active_t("model.badge.manual");
+        assert!(!marker.trim().is_empty(), "the marker text must resolve");
+
+        // The stepper names the selected entry with the marker ahead of its
+        // position counter, so the reason it is reachable only manually stays
+        // readable next to the model it describes (c-4).
+        let stepper = text_of(&selector.render_stepper_spans(PrimaryModifier::Ctrl));
+        let marked = format!("x/a [high] {marker}");
+        assert!(stepper.starts_with(&marked));
+        assert!(stepper.ends_with("[1 of 2 • C-M / M-M]"));
+
+        // Every entry keeps its row; only the opted-out one carries the marker.
+        let rows = selector.render_list_lines(5);
+        assert_eq!(rows.len(), 2);
+        let expected = format!(" ▶ [1] x/a [high] {marker}");
+        let first = text_of_line(&rows[0]);
+        assert_eq!(first, expected);
+        assert_eq!(text_of_line(&rows[1]), "   [2] x/b");
     }
 
     #[test]

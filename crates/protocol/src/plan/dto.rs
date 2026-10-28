@@ -81,9 +81,6 @@ pub struct PlanExecutePipelineParams {
     /// picked. An absent selection starts the coder ladder at its base rung.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<ModelSelection>,
-    /// Developer directives applied to the queued plans.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub instructions: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -100,9 +97,6 @@ pub struct PlanExecuteParams {
     /// at its base rung.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<ModelSelection>,
-    /// Developer directives applied to the executed step or scope.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub instructions: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]

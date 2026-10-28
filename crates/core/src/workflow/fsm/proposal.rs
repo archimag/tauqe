@@ -269,19 +269,20 @@ impl ProposalStep {
     ///
     /// An empty round produced no conversational text, no file edits, no
     /// protocol error, no discovery command, no plan mutation, no verification
-    /// request, no project command invocation, and no terminal outcome. Such a
-    /// round is a transport-level
-    /// non-answer rather than a validated reply, so the FSM re-asks the model
-    /// instead of recording it as an `ModelResult::Answer`. Ephemeral signals
-    /// that grant no capability — the scratchpad notes and the detected user
-    /// language — never make a round actionable on their own.
+    /// request, no project command invocation, and no terminal outcome that
+    /// carries its own result. Such a round is a transport-level non-answer
+    /// rather than a validated reply, so the FSM re-asks the model instead of
+    /// recording it as an `ModelResult::Answer`. Ephemeral signals that grant no
+    /// capability — the scratchpad notes and the detected user language — never
+    /// make a round actionable on their own, and neither does a `success` status
+    /// the model declared without stating what it accomplished.
     pub(super) fn is_empty_step(&self) -> bool {
         self.text.trim().is_empty()
             && self.edits.is_empty()
             && self.protocol_errors.is_empty()
             && self.plans.is_empty()
             && self.verify_request.is_none()
-            && self.terminal_outcome.is_none()
+            && !outcome_carries_result(self.terminal_outcome.as_ref())
             && self.blocked.is_none()
             && self.abort.is_none()
             && self.custom_tools.is_empty()
@@ -326,6 +327,31 @@ impl TurnState {
         self.plans.extend(step.plans().iter().cloned());
         self.repo_searches
             .extend(step.repo_searches().iter().cloned());
+    }
+}
+/// Reports whether a success summary states what the turn accomplished.
+///
+/// A summary is the only payload a `success` status carries, so an absent or
+/// blank summary declares an outcome without stating a result.
+fn summary_states_result(summary: Option<&str>) -> bool {
+    match summary {
+        Some(text) => !text.trim().is_empty(),
+        None => false,
+    }
+}
+
+/// Reports whether a terminal outcome carries the result its status declares.
+///
+/// `error` and `skip` always qualify: their decoders substitute a deterministic
+/// message or reason when the model supplied none, so the status still travels
+/// with a payload. `success` cannot be completed that way, because nobody but
+/// the model can state what the turn accomplished; a payload-free success is
+/// therefore a protocol defect rather than a result.
+pub(super) fn outcome_carries_result(outcome: Option<&LlmOutcome>) -> bool {
+    match outcome {
+        Some(LlmOutcome::Success { summary }) => summary_states_result(summary.as_deref()),
+        Some(LlmOutcome::Error { .. } | LlmOutcome::Skip { .. }) => true,
+        None => false,
     }
 }
 
@@ -790,9 +816,69 @@ mod tests {
         }]);
         assert!(!malformed.is_empty_step());
 
-        let terminal = ProposalStep::from_commands(vec![LlmCommand::Outcome {
+        // A status without its payload is a protocol defect, not a result, so
+        // the round stays empty and the corrective machine re-asks the model.
+        let bare_success = ProposalStep::from_commands(vec![LlmCommand::Outcome {
             outcome: LlmOutcome::Success { summary: None },
         }]);
-        assert!(!terminal.is_empty_step());
+        assert!(bare_success.is_empty_step());
+
+        let summarized = ProposalStep::from_commands(vec![LlmCommand::Outcome {
+            outcome: LlmOutcome::Success {
+                summary: Some("Confirmed the change".to_string()),
+            },
+        }]);
+        assert!(!summarized.is_empty_step());
+    }
+    #[test]
+    fn a_terminal_success_counts_only_when_it_states_a_result() {
+        use tauqe_protocol::{EditOperation, LlmCommand, LlmOutcome};
+
+        // A written conclusion is a result on its own, whatever the status says.
+        let explained = ProposalStep::from_commands(vec![
+            LlmCommand::Text {
+                content: "The helper already returns 42.".to_string(),
+            },
+            LlmCommand::Outcome {
+                outcome: LlmOutcome::Success { summary: None },
+            },
+        ]);
+        assert!(!explained.is_empty_step());
+
+        // So is a proposal the harness can stage.
+        let edited = ProposalStep::from_commands(vec![
+            LlmCommand::Edit {
+                operation: EditOperation::Create {
+                    path: "src/new.rs".to_string(),
+                    content: "fn created() {}\n".to_string(),
+                },
+            },
+            LlmCommand::Outcome {
+                outcome: LlmOutcome::Success { summary: None },
+            },
+        ]);
+        assert!(!edited.is_empty_step());
+
+        // A blank summary states no result either.
+        let blank = ProposalStep::from_commands(vec![LlmCommand::Outcome {
+            outcome: LlmOutcome::Success {
+                summary: Some("  \n\t ".to_string()),
+            },
+        }]);
+        assert!(blank.is_empty_step());
+
+        // `error` and `skip` always carry their result: a decoder substitutes a
+        // deterministic payload when the model supplied none.
+        for outcome in [
+            LlmOutcome::Error {
+                message: "Execution error".to_string(),
+            },
+            LlmOutcome::Skip {
+                reason: "Step skipped without a stated reason".to_string(),
+            },
+        ] {
+            let step = ProposalStep::from_commands(vec![LlmCommand::Outcome { outcome }]);
+            assert!(!step.is_empty_step());
+        }
     }
 }

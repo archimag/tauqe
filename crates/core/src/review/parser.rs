@@ -160,6 +160,8 @@ pub fn parse_review_output(raw: &str) -> (Option<String>, Option<String>, Vec<Re
                     ReviewIssue {
                         id: index as u32 + 1,
                         title: normalize_title(finding.title, issue_type),
+                        uuid: None,
+                        group: None,
                         model: None,
                         issue_type,
                         status: IssueStatus::Discussion,
@@ -189,6 +191,8 @@ pub fn parse_review_output(raw: &str) -> (Option<String>, Option<String>, Vec<Re
                     vec![ReviewIssue {
                         id: 1,
                         title: "General Review Findings".to_string(),
+                        uuid: None,
+                        group: None,
                         model: None,
                         issue_type: IssueType::Quality,
                         status: IssueStatus::Discussion,

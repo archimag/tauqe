@@ -5,8 +5,9 @@ use tauqe_protocol::{
     GitCommitCreatedEvent, GitSquashApplyResult, HistoryCompactedEvent, HistoryEntryAddedEvent,
     HistoryEntryRolledBackEvent, ModelDeltaEvent, ModelErrorEvent, ModelEscalatedEvent,
     ModelResult, ModelResultEvent, ModelStartedEvent, ModelUsageTotalsEvent,
-    PlanBatchFinishedEvent, RepositoryState, ReviewBatchFinishedEvent, ReviewContentDeltaEvent,
-    ReviewErrorEvent, ReviewFinishedEvent, ReviewReasoningDeltaEvent, ReviewStartedEvent,
+    PlanBatchFinishedEvent, RepositoryState, ReviewAnalyzeFinishedEvent, ReviewBatchFinishedEvent,
+    ReviewContentDeltaEvent, ReviewErrorEvent, ReviewFinishedEvent, ReviewGroupStartedEvent,
+    ReviewReasoningDeltaEvent, ReviewStartedEvent,
 };
 use tokio::sync::Mutex;
 
@@ -776,6 +777,10 @@ pub async fn handle_event(ev: Event, state: &Arc<Mutex<AppState>>, is_reasoning:
         }
         events::REVIEW_STARTED => {
             st.review.running = true;
+            // Every run opens with a clean telemetry slate, so the group and
+            // post-analysis badges of a previous run never leak into the new
+            // one (c-4).
+            st.review.reset_run_telemetry();
             st.turn_started_at = Some(std::time::Instant::now());
             if let Some(params) = ev.params {
                 if let Ok(data) = serde_json::from_value::<ReviewStartedEvent>(params) {
@@ -829,6 +834,10 @@ pub async fn handle_event(ev: Event, state: &Arc<Mutex<AppState>>, is_reasoning:
                 }
             }
             finish_review_turn(&mut st.model);
+            // The terminal review event closes the run: its group and
+            // post-analysis badges never outlive the session it settled
+            // (c-4).
+            st.review.reset_run_telemetry();
             if let Some(started) = started {
                 let elapsed = started.elapsed().as_secs();
                 let focused = st.terminal_focused;
@@ -853,6 +862,9 @@ pub async fn handle_event(ev: Event, state: &Arc<Mutex<AppState>>, is_reasoning:
             st.turn_started_at = None;
             st.review.error = Some(active_t("notify.review_cancelled"));
             end_review_turn(&mut st.model, TurnStatus::Cancelled, None);
+            // The run is over: its group and post-analysis badges are
+            // dropped with it (c-4).
+            st.review.reset_run_telemetry();
         }
         events::REVIEW_ERROR => {
             st.review.running = false;
@@ -881,6 +893,50 @@ pub async fn handle_event(ev: Event, state: &Arc<Mutex<AppState>>, is_reasoning:
             }
             st.review.error = Some(message.clone());
             end_review_turn(&mut st.model, TurnStatus::Error, Some(message));
+            // The run is over: its group and post-analysis badges are
+            // dropped with it (c-4).
+            st.review.reset_run_telemetry();
+        }
+        events::REVIEW_GROUP_STARTED => {
+            if let Some(params) = ev.params {
+                if let Ok(data) = serde_json::from_value::<ReviewGroupStartedEvent>(params) {
+                    // The badge mirrors the group that just started; the
+                    // event carries no ordinal, so the position is derived
+                    // from the supervisor's sequential traversal (c-4).
+                    st.review.begin_group(data.group_id, data.group_title);
+                }
+            }
+        }
+        events::REVIEW_GROUP_FINISHED => {
+            // The event method is the authoritative lifecycle signal: the
+            // group settles and the counter advances even when the payload
+            // is missing or malformed (c-2).
+            st.review.finish_group();
+        }
+        events::REVIEW_ANALYZE_STARTED => {
+            st.review.analyzing = true;
+        }
+        events::REVIEW_ANALYZE_FINISHED => {
+            st.review.analyzing = false;
+            if let Some(params) = ev.params {
+                if let Ok(data) = serde_json::from_value::<ReviewAnalyzeFinishedEvent>(params) {
+                    // The classification is a layer over immutable
+                    // findings: the mirrored session is swapped in place,
+                    // because the full `set_session` reset would clear the
+                    // running flag and re-anchor the viewport in the middle
+                    // of a grouped run (c-4).
+                    st.review.update_session(data.session);
+                }
+            }
+            // A batch member never settles the shared turn on its own: the
+            // supervisor's terminal event remains the single lifecycle
+            // signal for the whole queue (c-2).
+            if st.model.is_batch {
+                return;
+            }
+            *is_reasoning = false;
+            st.turn_started_at = None;
+            finish_review_turn(&mut st.model);
         }
         events::PLAN_UPDATED => {
             if let Some(params) = ev.params {
@@ -2572,5 +2628,224 @@ mod tests {
         let fallback = active_t("notify.review_failed_no_payload");
         assert_eq!(guard.review.error.as_deref(), Some(fallback.as_str()));
         assert_eq!(guard.model.error.as_deref(), Some(fallback.as_str()));
+    }
+
+    fn group_started_event(group_id: &str, group_title: &str) -> Event {
+        Event {
+            method: events::REVIEW_GROUP_STARTED.to_string(),
+            params: Some(
+                serde_json::to_value(tauqe_protocol::ReviewGroupStartedEvent {
+                    operation_id: "op-groups".to_string(),
+                    group_id: group_id.to_string(),
+                    group_title: group_title.to_string(),
+                    files_count: 2,
+                    estimated_tokens: 256,
+                })
+                .unwrap(),
+            ),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_group_started_mirrors_the_running_group() {
+        let state = Arc::new(Mutex::new(crate::app::test_state()));
+        let mut is_reasoning = false;
+
+        handle_event(
+            group_started_event("grp-core", "Core Engine"),
+            &state,
+            &mut is_reasoning,
+        )
+        .await;
+
+        let guard = state.lock().await;
+        let group = guard
+            .review
+            .running_group
+            .as_ref()
+            .expect("the running group mirrors its started event");
+        assert_eq!(group.id, "grp-core");
+        assert_eq!(group.title, "Core Engine");
+    }
+
+    #[tokio::test]
+    async fn test_group_finished_without_payload_still_closes_the_group() {
+        let mut st = crate::app::test_state();
+        st.review
+            .begin_group("grp-core".to_string(), "Core Engine".to_string());
+
+        let state = Arc::new(Mutex::new(st));
+        let mut is_reasoning = false;
+        let ev = Event {
+            method: events::REVIEW_GROUP_FINISHED.to_string(),
+            params: None,
+        };
+
+        handle_event(ev, &state, &mut is_reasoning).await;
+
+        let guard = state.lock().await;
+        assert!(
+            guard.review.running_group.is_none(),
+            "the event method alone must settle the group"
+        );
+        assert_eq!(
+            guard.review.finished_groups, 1,
+            "the finished counter feeds the ordinal of the next group"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_review_started_resets_stale_run_telemetry() {
+        let mut st = crate::app::test_state();
+        st.review
+            .begin_group("grp-stale".to_string(), "Stale".to_string());
+        st.review.finished_groups = 3;
+        st.review.analyzing = true;
+
+        let state = Arc::new(Mutex::new(st));
+        let mut is_reasoning = false;
+        let ev = Event {
+            method: events::REVIEW_STARTED.to_string(),
+            params: None,
+        };
+
+        handle_event(ev, &state, &mut is_reasoning).await;
+
+        let guard = state.lock().await;
+        assert!(guard.review.running_group.is_none());
+        assert_eq!(guard.review.finished_groups, 0);
+        assert!(!guard.review.analyzing);
+    }
+
+    #[tokio::test]
+    async fn test_analyze_events_toggle_the_post_analysis_flag() {
+        let state = Arc::new(Mutex::new(crate::app::test_state()));
+        let mut is_reasoning = false;
+
+        let started = Event {
+            method: events::REVIEW_ANALYZE_STARTED.to_string(),
+            params: None,
+        };
+        handle_event(started, &state, &mut is_reasoning).await;
+        assert!(state.lock().await.review.analyzing);
+
+        let finished = Event {
+            method: events::REVIEW_ANALYZE_FINISHED.to_string(),
+            params: None,
+        };
+        handle_event(finished, &state, &mut is_reasoning).await;
+
+        let guard = state.lock().await;
+        assert!(!guard.review.analyzing);
+    }
+
+    #[tokio::test]
+    async fn test_analyze_finished_settles_a_standalone_turn_and_swaps_the_session() {
+        let mut st = crate::app::test_state();
+        st.model.is_batch = false;
+        st.model.status = TurnStatus::Thinking;
+        st.turn_started_at = Some(std::time::Instant::now());
+        st.review.analyzing = true;
+
+        let session = tauqe_protocol::ReviewSession {
+            id: "rev-1".to_string(),
+            title: "Audit".to_string(),
+            created_at: 0,
+            model: ModelRef::openrouter("architect"),
+            post_analysis: Some(tauqe_protocol::ReviewPostAnalysis {
+                created_at: 1,
+                summary: "One shared root cause.".to_string(),
+                independent_issues: Vec::new(),
+                architectural_groups: Vec::new(),
+            }),
+            ..Default::default()
+        };
+        let state = Arc::new(Mutex::new(st));
+        let mut is_reasoning = true;
+        let ev = Event {
+            method: events::REVIEW_ANALYZE_FINISHED.to_string(),
+            params: Some(
+                serde_json::to_value(tauqe_protocol::ReviewAnalyzeFinishedEvent {
+                    operation_id: "op-analyze".to_string(),
+                    session,
+                })
+                .unwrap(),
+            ),
+        };
+
+        handle_event(ev, &state, &mut is_reasoning).await;
+
+        let guard = state.lock().await;
+        assert!(!guard.review.analyzing);
+        assert_eq!(guard.model.status, TurnStatus::Done);
+        assert!(
+            guard.turn_started_at.is_none(),
+            "a standalone classification settles its own turn"
+        );
+        assert!(!is_reasoning);
+        let mirrored = guard.review.session.as_ref();
+        assert_eq!(
+            mirrored
+                .and_then(|s| s.post_analysis.as_ref())
+                .map(|layer| layer.summary.as_str()),
+            Some("One shared root cause."),
+            "the classification layer must reach the mirrored session"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_analyze_finished_leaves_a_batch_turn_to_the_supervisor() {
+        let mut st = crate::app::test_state();
+        st.model.is_batch = true;
+        st.model.status = TurnStatus::Thinking;
+        st.turn_started_at = Some(std::time::Instant::now());
+
+        let state = Arc::new(Mutex::new(st));
+        let mut is_reasoning = true;
+        let ev = Event {
+            method: events::REVIEW_ANALYZE_FINISHED.to_string(),
+            params: None,
+        };
+
+        handle_event(ev, &state, &mut is_reasoning).await;
+
+        let guard = state.lock().await;
+        assert_eq!(
+            guard.model.status,
+            TurnStatus::Thinking,
+            "a batch member never settles the turn the queue shares"
+        );
+        assert!(guard.turn_started_at.is_some());
+        assert!(is_reasoning);
+    }
+
+    #[tokio::test]
+    async fn test_terminal_review_events_reset_the_run_telemetry() {
+        for method in [
+            events::REVIEW_FINISHED,
+            events::REVIEW_CANCELLED,
+            events::REVIEW_ERROR,
+        ] {
+            let mut st = crate::app::test_state();
+            st.review.running = true;
+            st.review
+                .begin_group("grp-core".to_string(), "Core Engine".to_string());
+            st.review.finished_groups = 2;
+            st.review.analyzing = true;
+
+            let state = Arc::new(Mutex::new(st));
+            let mut is_reasoning = false;
+            let ev = Event {
+                method: method.to_string(),
+                params: None,
+            };
+
+            handle_event(ev, &state, &mut is_reasoning).await;
+
+            let guard = state.lock().await;
+            assert!(guard.review.running_group.is_none(), "{method}");
+            assert_eq!(guard.review.finished_groups, 0, "{method}");
+            assert!(!guard.review.analyzing, "{method}");
+        }
     }
 }

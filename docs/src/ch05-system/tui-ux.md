@@ -48,6 +48,9 @@ contacts a provider.
 9. **The terminal is restored on every exit path**, including panics and signals.
 10. **Auxiliary views never print shortcut banners.** The Help dialog is the single
     discovery surface.
+11. **A patch is never blind.** While the Viewport reads a diff, a sticky band
+    names the file, its operation, and the active hunk, and the whole change set
+    opens as one isolated card on the inspector chord.
 
 ---
 
@@ -124,10 +127,27 @@ mean different things in a text buffer and in a diff list.
 - **Editor focus (default).** Every printable character is inserted; Emacs and Readline
   chords move the cursor, kill, and yank; prompt history cycles with the configured
   meta chords.
-- **Viewport focus.** `Ctrl+N` / `Ctrl+P` and the arrows select the next or previous
-  modified file, or scroll the response when there are no files; the fold chords fold a
-  diff. While the viewport holds focus, the prompt border is dimmed and titled
-  `[VIEWPORT]`.
+- **Viewport focus.** `Ctrl+N` / `Ctrl+P` and the arrows move the reading position. Inside
+  an expanded file they scroll its diff body line by line, and the selection crosses into
+  the next or previous file only once the block boundary is reached: the next file opens
+  at its summary row, the previous one at its last diff line. A collapsed file is crossed
+  in one keystroke, the explicit `Ctrl+[` / `Ctrl+]` chords switch files directly, and
+  with no files at all the keys scroll the response. The fold chords fold a diff. While
+  the viewport holds focus, the prompt border is dimmed and titled `[VIEWPORT]`.
+- **The sticky anchor.** While the reading position sits inside the diff body of
+  an expanded file, the first row of the response names what is being read: the
+  operation badge, the path, the active hunk (`Hunk 2/3`), and the position of
+  the file in the staged set (`File 2/5`). The band appears only once the file's
+  own summary row has scrolled out of view, so a header that is still visible is
+  never duplicated, and it is a pure indicator: it registers no click target and
+  intercepts no key.
+- **The diff inspector.** `Enter` on the selected file, or the bare `v` chord,
+  opens a fullscreen audit of the change set: the audited files on the left with
+  their operation and verification badges, the isolated diff of the highlighted
+  file on the right with a line-number gutter and its own scroll offset. `n` / `p`
+  walk the files, `j` / `k` and the arrows scroll the patch, `PgUp` / `PgDn` page
+  it, and `Esc` or `q` closes the card and returns to the reading position it was
+  opened from. The inspector never mutates the staged set and never starts a turn.
 - **Switching.** `Ctrl+Space` or `Shift+Tab` toggles focus and `Esc` returns to the
   prompt. Any key that types or edits text returns focus to the prompt and is applied
   there, so no keystroke is lost.
@@ -145,10 +165,11 @@ mean different things in a text buffer and in a diff list.
   `Interface` (navigation and view state), and `Helpers` (copy, filter, recenter). The
   Help dialog renders them in that canonical order and omits an empty tier.
 - **Command maps** — one static map per scope: global, the shared text editor, each
-  view, and the shared dialog map. A collision validator in the test suite enumerates
-  printable characters and navigation keys across the modifier sets and asserts that no
-  single event resolves to two actions inside one map, so declaration order never
-  decides what a key does.
+  view, the Develop Viewport, the diff inspector, and the shared dialog map. A
+  collision validator in the test suite enumerates printable characters and
+  navigation keys across the modifier sets and asserts that no single event
+  resolves to two actions inside one map, so declaration order never decides what
+  a key does.
 
 ### 2.5 The modal card
 
@@ -277,15 +298,27 @@ the data underneath changes.
 
 Reserved meanings follow from the same scale rule. `r` / `R` belong to the Architect, so
 refresh uses `g`. `N` creates a new review session, because creation and decomposition
-are different acts and must not share a letter. `c` and `y` only place content in the
-clipboard, while a mass clear requires `Shift+C` and a confirmation whose default focus
-is `Cancel`. A view with nothing to clear leaves `Shift+C` unbound rather than borrowing
-a destructive chord for a copy.
+are different acts and must not share a letter. `Shift+A` in Review runs the Architect
+post-analysis over the selected session, so the bare `a` keeps the global fold. `c`
+and `y` only place content in the clipboard, while a mass clear requires `Shift+C` and
+a confirmation whose default focus is `Cancel`. A view with nothing to clear leaves
+`Shift+C` unbound rather than borrowing a destructive chord for a copy.
 
 ### 3.3 Dialog interaction
 
 - `Tab` and `Shift+Tab` cycle focus, `←` / `→` step between adjacent buttons, and
   `Enter` or `Space` activates the focused control.
+- `Ctrl+N` and `Ctrl+P` are the vertical field walk: they move to the next and the
+  previous input field, and inside a field that owns several rows — the review
+  launcher's Target Paths — they walk those rows and leave the section only at its
+  boundary. The vertical axis therefore never depends on `Tab`, and a multiline
+  editor keeps the same chords for cursor line movement.
+- `Tab` is the contextual completion chord: while a completion menu of directory
+  prefixes is open it accepts the highlighted candidate, and without a candidate it
+  falls through to the shared focus move.
+- A multi-row path field grows with `Ctrl+J`, which opens the next row only while the
+  active row already carries a usable pattern, and shrinks with `Backspace` on an
+  empty row, which returns the cursor to the previous row.
 - `Esc` dismisses a dialog and takes its cancel path. `Ctrl+G` is normalized to `Esc`
   once, before any handler runs, so the Emacs `keyboard-quit` chord behaves identically
   everywhere without a per-handler binding and without a `SIGINT` handler.
@@ -371,6 +404,55 @@ history chord performs it explicitly.
 The editor history matters most exactly here. After a rollback the journal no longer
 holds the prompt at all, so the recall list is the only copy the developer still has.
 
+### 3.10 Reading a patch
+
+Two reading surfaces carry a diff: the Viewport itself and the fullscreen
+inspector. Both answer the same question — which file is being read right now —
+and neither is allowed to move anything else.
+
+**The overlay follows the top edge.** The band is drawn from the geometry the
+frame has just laid out, so it can never disagree with the rows underneath it. It
+appears when three conditions hold together: the file's summary row has scrolled
+past the top edge, the top edge still falls inside that file's diff body, and the
+file is expanded. A collapsed file therefore raises no band, and a wrapped summary
+row stays visible until its last visual row scrolls out. The hunk counter names
+the last hunk header at or above the top edge, so the label changes exactly when
+the reader crosses a hunk boundary.
+
+**Scrolling stops at the block boundaries.** Inside an expanded file one keystroke
+**Scrolling stops at the block boundaries.** Inside an expanded file one keystroke
+moves the reading position one line, and the selection leaves the file only when
+the movement reaches the block edge: downward once the last diff line has reached
+the bottom edge, upward from the first diff line. Crossing forward opens the next
+file at its summary row; crossing backward opens the previous file at its last
+diff line. A single keystroke can therefore never skip a long patch, and a
+collapsed file costs exactly one step of the walk.
+
+**`Ctrl+L` recenters on the selected file block.** The chord reaches the command
+from both the prompt and the Viewport, and repeated presses walk the shared
+center — top — bottom cycle. The block geometry comes from the same layout the
+renderer emits, so the beats land on the rows the developer reads; a block taller
+than the viewport aligns its top edge first, keeping a long expanded diff
+readable from its beginning, and manual recentering disables auto-scroll.
+**The inspector isolates one diff.** Opening the card captures the change set as
+it stands, so reading never depends on edits that are still arriving. The file
+list and the diff pane own separate scroll offsets: scrolling the patch keeps the
+highlight in place, and moving the highlight resets the patch to its beginning, so
+a shorter diff never inherits a stale offset. The action row reports the position
+of the file inside the audited set and the hunk under the top edge of the pane.
+Closing the card returns to the scroll offset and the selected file the audit was
+opened from, because the audit never touched them.
+
+**Failure states are named, not guessed.** An empty change set and a file without
+a rendered diff each carry their own placeholder inside the pane, and the
+operation and verification badges are reserved before the path, so a deep
+repository path truncates instead of hiding the status of the file.
+
+**Every label resolves through the catalog.** The operation badge, the titles of
+both panes, the progress counters, the placeholders, the docked hint, and the
+command descriptions behind `v` and `Enter` are catalog entries, so a hot-swapped
+locale reaches the overlay and the inspector without editing a renderer.
+
 ---
 
 ## 4. Boundaries & Anti-Patterns ("What it is NOT")
@@ -400,12 +482,17 @@ holds the prompt at all, so the recall list is the only copy the developer still
   stays visible in the first and is deleted from the second.
 - **It is not silent about failure.** A rolled-back turn keeps its record, its reason,
   and a restore hint instead of disappearing from the view.
+- **It is not a blind diff.** The Viewport always names the file under the top
+  edge, and the whole change set is one chord away in an isolated card; a long
+  patch is never scrolled without a header.
+- **It is not an editing surface.** The inspector reads the staged change set. It
+  never mutates it, never opens a turn, and never moves the REPL reading position.
 
 ---
 
 ## 5. Related Chapters
 
-- [Three-Tier Context Model](../ch02-perception/three-tier-model.md) — the layers the
+- [The Context Model](../ch02-perception/context-model.md) — the layers the
   Context view renders.
 - [Local Plans](../ch04-workflows/plans.md) — the Plans commands and the step stepper.
 - [Structured Code Review](../ch04-workflows/review.md) — the Review commands.

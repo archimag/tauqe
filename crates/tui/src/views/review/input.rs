@@ -6,7 +6,7 @@ use tauqe_protocol::{
 };
 use tokio::sync::Mutex;
 
-use crate::app::{AppState, ReviewDialogState, ViewMode};
+use crate::app::{AppState, ConfirmReviewAnalyzeState, ReviewDialogState, ViewMode};
 use crate::command::CommandCategory::{Essential, Helpers, Interface};
 use crate::command::{CommandMap, CommandSpec, KeyChord};
 use crate::i18n::engine::active_t;
@@ -26,6 +26,7 @@ pub enum ReviewAction {
     Discuss,
     Refine,
     RefineAll,
+    Analyze,
     ChangeStatus,
     SetFocus,
     ToggleHideClosed,
@@ -107,6 +108,22 @@ pub static REVIEW_COMMAND_MAP: CommandMap<ReviewAction> = CommandMap::new(&[
         ReviewAction::RunReview,
         Essential,
         "cmd.review.run",
+    ),
+    // Case-differentiated analysis chords, declared before the bare `a` below:
+    // Shift+A launches the Architect post-analysis over the selected session
+    // (#c-3), so the global fold keeps only the bare `a` and the uppercase
+    // letter no longer aliases it.
+    CommandSpec::new(
+        KeyChord::Bare(KeyCode::Char('A')),
+        ReviewAction::Analyze,
+        Essential,
+        "cmd.review.analyze",
+    ),
+    CommandSpec::new(
+        KeyChord::Shift(KeyCode::Char('a')),
+        ReviewAction::Analyze,
+        Essential,
+        "cmd.review.analyze",
     ),
     // Case-differentiated filter chords, declared before the bare `f`.
     CommandSpec::new(
@@ -309,12 +326,6 @@ pub static REVIEW_COMMAND_MAP: CommandMap<ReviewAction> = CommandMap::new(&[
         Interface,
         "cmd.review.fold_all",
     ),
-    CommandSpec::new(
-        KeyChord::Bare(KeyCode::Char('A')),
-        ReviewAction::FoldAll,
-        Interface,
-        "cmd.review.fold_all",
-    ),
     // Helpers: clipboard, refresh, and destructive operations.
     //
     // The clipboard is isolated from destructive clearing: lowercase `c` and `y`
@@ -500,6 +511,80 @@ fn execute_review_scope_action(
             coder_entries,
         ));
     }
+}
+/// Arms the execution confirmation for every actionable finding of one
+/// rendered group.
+///
+/// `x` on a group executes exactly the findings that group renders, filtered
+/// to the
+/// statuses that can still produce work, so the queue never silently widens
+/// to the whole session (concept #c-2).
+fn execute_review_group_action(
+    st: &mut AppState,
+    session_id: &str,
+    group_id: &str,
+    scope_title: &str,
+) {
+    if st.model.is_busy() {
+        st.notify_warning(active_t("notify.model_busy_esc"));
+        return;
+    }
+
+    let session = match st
+        .review
+        .sessions
+        .iter()
+        .find(|s| s.id == session_id)
+        .cloned()
+        .or_else(|| {
+            st.review
+                .session
+                .as_ref()
+                .filter(|s| s.id == session_id)
+                .cloned()
+        }) {
+        Some(s) => s,
+        None => {
+            st.notify_error(active_t("notify.review_not_found").replace("{}", session_id));
+            return;
+        }
+    };
+
+    let items: Vec<ReviewIssue> = st
+        .review
+        .group_findings(&session, group_id)
+        .into_iter()
+        .filter(|item| {
+            matches!(
+                item.status,
+                IssueStatus::Refine | IssueStatus::Todo | IssueStatus::InProgress
+            )
+        })
+        .map(ReviewIssue::from)
+        .collect();
+
+    if items.is_empty() {
+        st.notify_info(active_t("notify.review_no_todo_section"));
+        return;
+    }
+
+    let session_title = if session.title.trim().is_empty() {
+        session.id.clone()
+    } else {
+        session.title.clone()
+    };
+
+    let coder_entries = st.coder_entries();
+    st.confirm_button = crate::app::ConfirmDialogButton::Cancel;
+    st.confirm_execute_review = Some(crate::app::ConfirmExecuteReviewState::new(
+        Some(session.id.clone()),
+        session_title,
+        scope_title.to_string(),
+        None,
+        None,
+        items,
+        coder_entries,
+    ));
 }
 
 pub(crate) fn execute_all_reviews_action(st: &mut AppState) {
@@ -823,6 +908,15 @@ pub async fn handle_review_key(
                         st.review.clamp_selection();
                         st.review.scroll_to_selected();
                     }
+                    VisibleReviewRow::GroupHeader {
+                        session_id,
+                        group_id,
+                        ..
+                    } => {
+                        st.review.toggle_group_expanded(&session_id, &group_id);
+                        st.review.clamp_selection();
+                        st.review.scroll_to_selected();
+                    }
                 }
             }
         }
@@ -872,6 +966,15 @@ pub async fn handle_review_key(
                             &title,
                         );
                     }
+                    VisibleReviewRow::GroupHeader {
+                        session_id,
+                        group_id,
+                        ..
+                    } => {
+                        st.review.toggle_group_expanded(&session_id, &group_id);
+                        st.review.clamp_selection();
+                        st.review.scroll_to_selected();
+                    }
                 }
             }
         }
@@ -919,6 +1022,16 @@ pub async fn handle_review_key(
                             &title,
                         );
                     }
+                    // A group executes exactly its own findings, so the queue
+                    // never widens to the whole session (concept #c-3, #c-4).
+                    VisibleReviewRow::GroupHeader {
+                        session_id,
+                        group_id,
+                        title,
+                        ..
+                    } => {
+                        execute_review_group_action(&mut st, &session_id, &group_id, &title);
+                    }
                 }
             }
         }
@@ -941,10 +1054,18 @@ pub async fn handle_review_key(
                     });
 
                 if let Some(session) = session_opt {
-                    let mut focused = Vec::new();
-                    if let VisibleReviewRow::ReviewItem { item_id, title, .. } = row {
-                        focused.push((item_id, title));
-                    }
+                    let focused: Vec<(u32, String)> = match &row {
+                        VisibleReviewRow::ReviewItem { item_id, title, .. } => {
+                            vec![(*item_id, title.clone())]
+                        }
+                        VisibleReviewRow::GroupHeader { group_id, .. } => st
+                            .review
+                            .group_findings(&session, group_id)
+                            .into_iter()
+                            .map(|item| (item.id, item.title))
+                            .collect(),
+                        _ => Vec::new(),
+                    };
                     st.prompt_modal = Some(crate::app::PromptModalState::new(
                         crate::app::PromptModalTarget::Review {
                             review_id: session.id.clone(),
@@ -1103,6 +1224,19 @@ pub async fn handle_review_key(
                     }
                     Some(text)
                 }
+                Some(VisibleReviewRow::GroupHeader {
+                    title,
+                    findings_count,
+                    ..
+                }) => Some(format!(
+                    "{} ({})",
+                    title,
+                    active_t("review.group_findings_count").replacen(
+                        "{}",
+                        &findings_count.to_string(),
+                        1
+                    )
+                )),
                 None => None,
             };
 
@@ -1155,8 +1289,16 @@ pub async fn handle_review_key(
                 let files_count = st.context.items.len();
                 let estimated_tokens = st.context.total_estimated_tokens as usize;
                 st.review.error = None;
-                let mut dialog =
-                    ReviewDialogState::new(files_count, estimated_tokens, reviewer_entries);
+                // The handshake file list feeds the dialog's directory section
+                // and its live match counter, so the launch is validated locally
+                // with the same matcher the server applies (c-2, c-3).
+                let mut dialog = ReviewDialogState::new(
+                    files_count,
+                    estimated_tokens,
+                    reviewer_entries,
+                    st.all_repo_files.clone(),
+                )
+                .with_presets(st.review_presets.clone());
                 // Open on the reviewer list when more than one model is
                 // configured so it can be picked instantly with the digit
                 // shortcuts; a single model leaves focus on the editor
@@ -1176,6 +1318,43 @@ pub async fn handle_review_key(
         ReviewAction::RefineAll => {
             drop(st);
             refine_all_findings(state, server_writer).await?;
+        }
+        // Launch the Architect post-analysis over the session the cursor rests
+        // on. The classification is a costly LLM layer over immutable findings,
+        // so `A` arms a confirmation whose safe default cancels it instead of
+        // spending tokens on a stray keystroke (c-4).
+        ReviewAction::Analyze => {
+            if st.model.is_busy()
+                || st.review.running
+                || st.review.refining.is_some()
+                || st.review.analyzing
+            {
+                st.notify_warning(active_t("notify.model_busy"));
+            } else {
+                match st.review.selected_row() {
+                    Some(row) => {
+                        let review_id = row.session_id().to_string();
+                        let review_title = st
+                            .review
+                            .sessions
+                            .iter()
+                            .chain(st.review.session.iter())
+                            .find(|session| session.id == review_id)
+                            .map(|session| session.title.trim())
+                            .filter(|title| !title.is_empty())
+                            .map(str::to_string)
+                            .unwrap_or_else(|| review_id.clone());
+                        st.confirm_button = crate::app::ConfirmDialogButton::Cancel;
+                        st.confirm_review_analyze = Some(ConfirmReviewAnalyzeState {
+                            review_id,
+                            review_title,
+                        });
+                    }
+                    None => {
+                        st.notify_info(active_t("notify.review_no_sessions"));
+                    }
+                }
+            }
         }
         // Refresh review sessions from the server.
         ReviewAction::Refresh => {
@@ -1220,6 +1399,10 @@ mod tests {
             layer: tauqe_protocol::ContextLayer::User,
             insertion_seq: 0,
         });
+        st.all_repo_files = vec![
+            "crates/core/src/lib.rs".to_string(),
+            "src/lib.rs".to_string(),
+        ];
 
         let rev_model = ModelRef::openrouter("anthropic/claude-3.5-sonnet");
         let rev_entry =
@@ -1257,6 +1440,9 @@ mod tests {
         let selected = dialog.selected_entry().expect("entry must exist");
         assert_eq!(selected.model, rev_model);
         assert_eq!(selected.effort, Some(ReasoningEffort::High));
+        // The match counter is derived from the handshake file list, so the
+        // dialog validates a launch locally without a matching RPC (c-2, c-4).
+        assert_eq!(dialog.pattern_match_count(), None);
     }
 
     #[test]
@@ -1279,6 +1465,8 @@ mod tests {
             items: vec![ReviewIssue {
                 id: 1,
                 title: "Finding".to_string(),
+                uuid: None,
+                group: None,
                 model: None,
                 issue_type: IssueType::Architecture,
                 status: IssueStatus::Todo,
@@ -1291,6 +1479,9 @@ mod tests {
             }
             .into()],
             raw_markdown: String::new(),
+            groups: Vec::new(),
+            post_analysis: None,
+            launch_config: None,
         };
         st.review.sessions = vec![session.clone()];
         st.review.session = Some(session);
@@ -1328,6 +1519,8 @@ mod tests {
                 ReviewIssue {
                     id: 1,
                     title: "Finding 1".to_string(),
+                    uuid: None,
+                    group: None,
                     model: None,
                     issue_type: IssueType::Architecture,
                     status: IssueStatus::Discussion,
@@ -1342,6 +1535,8 @@ mod tests {
                 ReviewIssue {
                     id: 2,
                     title: "Finding 2".to_string(),
+                    uuid: None,
+                    group: None,
                     model: None,
                     issue_type: IssueType::Quality,
                     status: IssueStatus::Discussion,
@@ -1355,6 +1550,9 @@ mod tests {
                 .into(),
             ],
             raw_markdown: String::new(),
+            groups: Vec::new(),
+            post_analysis: None,
+            launch_config: None,
         };
         st.review.sessions = vec![session];
 
@@ -1391,6 +1589,8 @@ mod tests {
                 ReviewIssue {
                     id: 1,
                     title: "Finding 1".to_string(),
+                    uuid: None,
+                    group: None,
                     model: None,
                     issue_type: IssueType::Architecture,
                     status: IssueStatus::Todo,
@@ -1405,6 +1605,8 @@ mod tests {
                 ReviewIssue {
                     id: 2,
                     title: "Finding 2".to_string(),
+                    uuid: None,
+                    group: None,
                     model: None,
                     issue_type: IssueType::Quality,
                     status: IssueStatus::Fixed,
@@ -1418,6 +1620,9 @@ mod tests {
                 .into(),
             ],
             raw_markdown: String::new(),
+            groups: Vec::new(),
+            post_analysis: None,
+            launch_config: None,
         };
         let session2 = ReviewSession {
             id: "rev-2".to_string(),
@@ -1431,6 +1636,8 @@ mod tests {
                 ReviewIssue {
                     id: 1,
                     title: "Finding 3".to_string(),
+                    uuid: None,
+                    group: None,
                     model: None,
                     issue_type: IssueType::Bug,
                     status: IssueStatus::InProgress,
@@ -1445,6 +1652,8 @@ mod tests {
                 ReviewIssue {
                     id: 2,
                     title: "Finding 4".to_string(),
+                    uuid: None,
+                    group: None,
                     model: None,
                     issue_type: IssueType::Quality,
                     status: IssueStatus::Discussion,
@@ -1458,6 +1667,9 @@ mod tests {
                 .into(),
             ],
             raw_markdown: String::new(),
+            groups: Vec::new(),
+            post_analysis: None,
+            launch_config: None,
         };
         st.review.sessions = vec![session1, session2];
 
@@ -1498,6 +1710,8 @@ mod tests {
             items: vec![ReviewIssue {
                 id: 1,
                 title: "Finding 1".to_string(),
+                uuid: None,
+                group: None,
                 model: None,
                 issue_type: IssueType::Architecture,
                 status: IssueStatus::Fixed,
@@ -1510,6 +1724,9 @@ mod tests {
             }
             .into()],
             raw_markdown: String::new(),
+            groups: Vec::new(),
+            post_analysis: None,
+            launch_config: None,
         };
         st.review.sessions = vec![session];
 
@@ -1574,7 +1791,6 @@ mod tests {
             "C-l must cycle recenter positions in review view"
         );
     }
-
     #[tokio::test]
     async fn test_handle_review_key_capital_x_triggers_batch_execute() {
         use tauqe_protocol::{IssueStatus, IssueType, ReviewIssue, ReviewSession};
@@ -1592,6 +1808,8 @@ mod tests {
             items: vec![ReviewIssue {
                 id: 1,
                 title: "Todo Finding".to_string(),
+                uuid: None,
+                group: None,
                 model: None,
                 issue_type: IssueType::Architecture,
                 status: IssueStatus::Todo,
@@ -1604,6 +1822,9 @@ mod tests {
             }
             .into()],
             raw_markdown: String::new(),
+            groups: Vec::new(),
+            post_analysis: None,
+            launch_config: None,
         };
         st.review.sessions = vec![session];
 
@@ -1634,6 +1855,8 @@ mod tests {
             items: vec![ReviewIssue {
                 id: item_id,
                 title: "Todo Finding".to_string(),
+                uuid: None,
+                group: None,
                 model: None,
                 issue_type: IssueType::Architecture,
                 status: IssueStatus::Todo,
@@ -1646,6 +1869,9 @@ mod tests {
             }
             .into()],
             raw_markdown: String::new(),
+            groups: Vec::new(),
+            post_analysis: None,
+            launch_config: None,
         }
     }
 
@@ -1666,8 +1892,9 @@ mod tests {
         let mut st = crate::app::test_state();
         st.view_mode = ViewMode::Review;
         st.review.sessions = vec![todo_session("rev-1", 1)];
-        // Row 0 is the session header; row 1 is the finding.
-        st.review.selected_index = 1;
+        // Row 0 is the session header, row 1 is the default group header, and
+        // row 2 is the finding.
+        st.review.selected_index = 2;
 
         let state = Arc::new(Mutex::new(st));
         let mut conn = RpcConnection::new(Vec::<u8>::new());
@@ -1759,6 +1986,103 @@ mod tests {
         );
     }
 
+    /// The post-analysis is a costly LLM operation, so `A` arms the
+    /// confirmation dialog instead of dispatching immediately: nothing reaches
+    /// the daemon until the developer confirms, and the safe `Cancel` holds the
+    /// default focus (c-4).
+    #[tokio::test]
+    async fn test_shift_a_arms_the_post_analysis_confirmation() {
+        let mut st = crate::app::test_state();
+        st.view_mode = ViewMode::Review;
+        st.review.sessions = vec![todo_session("rev-1", 1)];
+
+        let state = Arc::new(Mutex::new(st));
+        let mut conn = RpcConnection::new(Vec::<u8>::new());
+
+        let key = KeyEvent::new(KeyCode::Char('A'), crossterm::event::KeyModifiers::NONE);
+        handle_review_key(key, &state, &mut conn).await.unwrap();
+
+        let st = state.lock().await;
+        let target = st
+            .confirm_review_analyze
+            .as_ref()
+            .expect("the confirmation must be armed");
+        assert_eq!(target.review_id, "rev-1");
+        assert_eq!(target.review_title, "Session rev-1");
+        assert_eq!(st.confirm_button, crate::app::ConfirmDialogButton::Cancel);
+        assert!(
+            !st.review.analyzing,
+            "the classification starts only after the confirmation"
+        );
+        assert!(
+            conn.written().is_empty(),
+            "the confirmation dialog launches nothing"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_shift_a_while_the_model_is_busy_sends_no_request() {
+        let mut st = crate::app::test_state();
+        st.view_mode = ViewMode::Review;
+        st.review.sessions = vec![todo_session("rev-1", 1)];
+        st.model.status = crate::views::repl::TurnStatus::Responding;
+
+        let state = Arc::new(Mutex::new(st));
+        let mut conn = RpcConnection::new(Vec::<u8>::new());
+
+        let key = KeyEvent::new(KeyCode::Char('A'), crossterm::event::KeyModifiers::NONE);
+        handle_review_key(key, &state, &mut conn).await.unwrap();
+
+        let st = state.lock().await;
+        assert!(conn.written().is_empty());
+        assert!(!st.review.analyzing);
+        assert_eq!(
+            st.active_notification().map(|n| n.text.as_str()),
+            Some("Model is currently busy; wait for operation to finish")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_shift_a_while_an_analysis_is_running_sends_no_request() {
+        let mut st = crate::app::test_state();
+        st.view_mode = ViewMode::Review;
+        st.review.sessions = vec![todo_session("rev-1", 1)];
+        st.review.analyzing = true;
+
+        let state = Arc::new(Mutex::new(st));
+        let mut conn = RpcConnection::new(Vec::<u8>::new());
+
+        let key = KeyEvent::new(KeyCode::Char('A'), crossterm::event::KeyModifiers::NONE);
+        handle_review_key(key, &state, &mut conn).await.unwrap();
+
+        let st = state.lock().await;
+        assert!(conn.written().is_empty());
+        assert_eq!(
+            st.active_notification().map(|n| n.text.as_str()),
+            Some("Model is currently busy; wait for operation to finish")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_shift_a_without_sessions_notifies_instead_of_dispatching() {
+        let mut st = crate::app::test_state();
+        st.view_mode = ViewMode::Review;
+
+        let state = Arc::new(Mutex::new(st));
+        let mut conn = RpcConnection::new(Vec::<u8>::new());
+
+        let key = KeyEvent::new(KeyCode::Char('A'), crossterm::event::KeyModifiers::NONE);
+        handle_review_key(key, &state, &mut conn).await.unwrap();
+
+        let st = state.lock().await;
+        assert!(conn.written().is_empty());
+        assert!(!st.review.analyzing);
+        assert_eq!(
+            st.active_notification().map(|n| n.text.as_str()),
+            Some("No review sessions available.")
+        );
+    }
+
     /// A session holding `count` collapsed findings, used by the paging tests.
     fn session_with_items(id: &str, count: u32) -> tauqe_protocol::ReviewSession {
         use tauqe_protocol::{IssueStatus, IssueType, ReviewIssue, ReviewSession};
@@ -1776,6 +2100,8 @@ mod tests {
                     ReviewIssue {
                         id: n,
                         title: format!("Finding {n}"),
+                        uuid: None,
+                        group: None,
                         model: None,
                         issue_type: IssueType::Architecture,
                         status: IssueStatus::Todo,
@@ -1790,7 +2116,68 @@ mod tests {
                 })
                 .collect(),
             raw_markdown: String::new(),
+            groups: Vec::new(),
+            post_analysis: None,
+            launch_config: None,
         }
+    }
+
+    /// Proves the Review handler resolves every chord through the configured
+    /// keyboard layout: a Cyrillic press navigates, executes, and refreshes
+    /// exactly like its Latin equivalent (c-4).
+    #[tokio::test]
+    async fn cyrillic_layout_navigates_executes_and_refreshes_the_review_view() {
+        let mut st = crate::app::test_state();
+        st.view_mode = ViewMode::Review;
+        st.tui_config.input.layout = crate::config::LayoutPreset::RuJcuken;
+        st.review.sessions = vec![todo_session("rev-1", 1)];
+        st.review.selected_index = 0;
+
+        let state = Arc::new(Mutex::new(st));
+        let mut conn = RpcConnection::new(Vec::<u8>::new());
+
+        // `т` sits on `n`: two presses walk from the session header past the
+        // group header onto the finding row.
+        for _ in 0..2 {
+            handle_review_key(
+                KeyEvent::new(KeyCode::Char('т'), crossterm::event::KeyModifiers::NONE),
+                &state,
+                &mut conn,
+            )
+            .await
+            .unwrap();
+        }
+        assert_eq!(state.lock().await.review.selected_index, 2);
+
+        // `ч` sits on `x`: the finding under the cursor arms its confirmation.
+        handle_review_key(
+            KeyEvent::new(KeyCode::Char('ч'), crossterm::event::KeyModifiers::NONE),
+            &state,
+            &mut conn,
+        )
+        .await
+        .unwrap();
+        {
+            let guard = state.lock().await;
+            let target = guard
+                .confirm_execute_review
+                .as_ref()
+                .expect("the execution confirmation must be armed");
+            assert_eq!(target.item_id, Some(1));
+        }
+
+        // `п` sits on `g`: the view requests a lightweight refresh.
+        handle_review_key(
+            KeyEvent::new(KeyCode::Char('п'), crossterm::event::KeyModifiers::NONE),
+            &state,
+            &mut conn,
+        )
+        .await
+        .unwrap();
+        assert!(
+            !conn.written().is_empty(),
+            "the refresh chord must reach the daemon"
+        );
     }
 
     /// Asserts that the row under the cursor lies entirely inside the viewport.
@@ -1850,7 +2237,7 @@ mod tests {
         }
         {
             let mut guard = state.lock().await;
-            assert_eq!(guard.review.selected_index, 60);
+            assert_eq!(guard.review.selected_index, 61);
             assert_cursor_visible(&mut guard.review);
         }
 
@@ -1858,7 +2245,7 @@ mod tests {
         handle_review_key(up, &state, &mut conn).await.unwrap();
         {
             let mut guard = state.lock().await;
-            assert_eq!(guard.review.selected_index, 52);
+            assert_eq!(guard.review.selected_index, 53);
             assert_cursor_visible(&mut guard.review);
         }
     }

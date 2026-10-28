@@ -60,7 +60,7 @@ The book is organized into five orthogonal parts. Each significant concept lives
 
 ### Part II — Context Perception & Discovery
 
-- **[Three-Tier Context Model](ch02-perception/three-tier-model.md)** — Architectural rationale of Pinned, User, and Auto context layers, token hygiene, and multi-round Discovery.
+- **[The Context Model](ch02-perception/context-model.md)** — Architectural rationale of the Pinned, Refs, User, and Auto context layers, token hygiene, and multi-round Discovery.
 - **[Discussion Focus](ch02-perception/discussion-focus.md)** — Anchored architectural dialogue and its typed target.
 - **[Repository Map and Blinkers](ch02-perception/repo-map.md)** — The deterministic Tree-sitter outline and its budgets.
 - **[Discovery Engine](ch02-perception/discovery-engine.md)** — Handler dispatch, round guards, and the cumulative discovery journal.

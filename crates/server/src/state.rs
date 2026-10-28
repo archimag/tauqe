@@ -648,6 +648,15 @@ impl AppState {
         self.clear_context(|ctx| ctx.clear_auto()).await
     }
 
+    /// Clears the external reference layer and starts a fresh dialogue session
+    /// when documents were actually removed.
+    ///
+    /// Reference snapshots are part of the stable prompt prefix, so dropping
+    /// them shrinks it exactly like clearing the Auto layer does.
+    pub async fn clear_refs_context(self: &Arc<Self>) -> Result<ContextState, String> {
+        self.clear_context(|ctx| ctx.clear_refs()).await
+    }
+
     /// Clears every mutable context layer and starts a fresh dialogue session
     /// when files were actually removed.
     pub async fn clear_all_context(self: &Arc<Self>) -> Result<ContextState, String> {

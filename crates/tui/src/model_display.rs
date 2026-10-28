@@ -20,12 +20,20 @@
 //!
 //! Every renderer prints through this module, so no frontend module assembles a
 //! model label from the provider string on its own (c-2).
+//!
+//! An entry the ladder never escalates to keeps its plain name and gains a
+//! trailing marker, so a selector states that the automation cannot advance to
+//! it while the developer may still pick it deliberately (c-4). The marker is
+//! appended by [`selection_label`] and [`numbered_selection_label`], never by a
+//! renderer.
 
 use std::collections::HashMap;
 
 use tauqe_protocol::{
     ModelEntry, ModelRef, ModelRole, ModelRolesEntries, ModelRolesSummary, ReasoningEffort,
 };
+
+use crate::i18n::active_t;
 
 /// Display state published once per frame: the catalog aliases and the concrete
 /// entry every semantic role currently resolves to.
@@ -79,16 +87,40 @@ pub fn model_label(model: &ModelRef, effort: Option<ReasoningEffort>) -> String 
 }
 
 /// Renders the display label of a configured role entry.
+///
+/// The label names the model and its reasoning depth only; whether the entry
+/// participates in ladder escalation is stated by [`selection_label`], so a
+/// surface that prints a model outside a selector is never widened by a
+/// selection marker.
 pub fn entry_label(entry: &ModelEntry) -> String {
     model_label(&entry.model, entry.effort)
 }
 
-/// Renders a numbered list row as `[N] <label>`.
+/// Renders the selection label of a configured role entry.
 ///
-/// The row reuses [`entry_label`], so the index and the name can never be
-/// produced by two different rules and drift apart.
-pub fn numbered_entry_label(index: usize, entry: &ModelEntry) -> String {
-    format!("[{}] {}", index + 1, entry_label(entry))
+/// The label is [`entry_label`] plus a trailing marker when the entry is
+/// explicitly excluded from ladder escalation. The model stays fully
+/// selectable: the marker states only that the automation never advances to
+/// it, so a deliberate manual choice is visible as such in every selector
+/// (c-4). A participating entry keeps the plain label, so a row is never
+/// widened by a marker it does not describe.
+pub fn selection_label(entry: &ModelEntry) -> String {
+    let label = entry_label(entry);
+    if entry.level_up() == Some(false) {
+        let marker = active_t("model.badge.manual");
+        format!("{label} {marker}")
+    } else {
+        label
+    }
+}
+
+/// Renders a numbered selection row as `[N] <selection label>`.
+///
+/// The row reuses [`selection_label`], so the index, the name, and the
+/// escalation marker can never be produced by two different rules and drift
+/// apart.
+pub fn numbered_selection_label(index: usize, entry: &ModelEntry) -> String {
+    format!("[{}] {}", index + 1, selection_label(entry))
 }
 
 /// Resolves a semantic role to the concrete entry it currently runs on.
@@ -309,16 +341,51 @@ mod tests {
         install_snapshot(Some(&fixture()));
 
         let coder = ModelEntry::new(deepseek(), Some(ReasoningEffort::High));
-        assert_eq!(numbered_entry_label(0, &coder), "[1] DeepSeek Flash [high]");
+        assert_eq!(
+            numbered_selection_label(0, &coder),
+            "[1] DeepSeek Flash [high]"
+        );
 
         let unlisted = ModelEntry::new(
             ModelRef::openrouter("~anthropic/claude-sonnet-latest"),
             None,
         );
         assert_eq!(
-            numbered_entry_label(1, &unlisted),
+            numbered_selection_label(1, &unlisted),
             "[2] ~anthropic/claude-sonnet-latest"
         );
+    }
+
+    /// An entry excluded from ladder escalation keeps its plain name and gains
+    /// the trailing marker, so a selector states that the automation never
+    /// advances to it while the model stays selectable (c-4).
+    #[test]
+    fn selection_label_marks_only_the_entries_the_ladder_skips() {
+        install_snapshot(Some(&fixture()));
+        let marker = active_t("model.badge.manual");
+        assert!(!marker.trim().is_empty(), "the marker text must resolve");
+
+        // An absent marker and an explicit `true` both participate.
+        let participating = ModelEntry::new(deepseek(), Some(ReasoningEffort::High));
+        let explicit = ModelEntry {
+            level_up: Some(true),
+            ..participating.clone()
+        };
+        for entry in [&participating, &explicit] {
+            assert_eq!(entry_label(entry), "DeepSeek Flash [high]");
+            assert_eq!(selection_label(entry), "DeepSeek Flash [high]");
+        }
+
+        // An explicit opt-out stays selectable and is marked as such.
+        let manual = ModelEntry {
+            level_up: Some(false),
+            ..participating
+        };
+        assert_eq!(entry_label(&manual), "DeepSeek Flash [high]");
+        let marked = format!("DeepSeek Flash [high] {marker}");
+        assert_eq!(selection_label(&manual), marked);
+        let numbered = format!("[1] {marked}");
+        assert_eq!(numbered_selection_label(0, &manual), numbered);
     }
 
     #[test]

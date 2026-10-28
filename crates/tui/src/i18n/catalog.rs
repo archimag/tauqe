@@ -160,6 +160,7 @@ pub fn canonical_catalog() -> Vec<LocaleCatalogItem> {
         item("dialog.button.dismiss", "Dismiss", "Dismiss dialog button", Some(12)),
         item("dialog.button.confirm_delete", "Confirm Delete", "Confirm destructive deletion button", Some(16)),
         item("dialog.button.confirm_clear", "Confirm Clear", "Confirm clearing a context layer button", Some(16)),
+        item("dialog.button.run_analysis", "Run Analysis", "Confirm the Architect post-analysis button", Some(14)),
         item("dialog.button.resolve", "Resolve", "Resolve a single review finding button", Some(12)),
         item("dialog.button.resolve_queue", "Resolve Queue", "Resolve a review findings queue button", Some(16)),
         item("dialog.button.execute", "Execute", "Execute a single plan step button", Some(12)),
@@ -234,15 +235,14 @@ pub fn canonical_catalog() -> Vec<LocaleCatalogItem> {
         item("dialog.execute_scope.heading_jit", "Project and execute the first implementation horizon autonomously?", "Execute-concept-plan dialog heading", None),
         item("dialog.execute_scope.jit_note", "No implementation horizon has been synthesized yet; the Architect projects the first one before the first step runs.", "Execute-concept-plan note about just-in-time horizon synthesis", None),
 
-        // The execution dialog is a form: it exposes the configured Coder ladder
-        // and a directives editor, so the developer picks the starting rung
-        // before any bounded turn spends tokens (c-tui-selector).
+        // The execution dialog is a form: it exposes the configured Coder ladder,
+        // so the developer picks the starting rung before any bounded turn spends
+        // tokens. The plan is the single source of truth for what each step must
+        // implement, so the dialog carries no directives editor (c-4).
         item("dialog.execute_scope.step_label", " Step: ", "Execute-scope targeted step field label", None),
         item("dialog.execute_scope.model_list_title", " Coder Model ", "Execute-scope coder model list title with a single entry", None),
         item("dialog.execute_scope.model_list_counter", " Coder Model  [{} of {}] ", "Execute-scope coder model list title with a position counter", None),
         item("dialog.execute_scope.no_models", "  (no coder models configured)", "Execute-scope empty coder model list placeholder", None),
-        item("dialog.execute_scope.editor_title", "Coder Instructions (optional)", "Execute-scope instructions editor block title", None),
-        item("dialog.execute_scope.editor_placeholder", " Additional implementation directives [optional]...", "Execute-scope empty instructions placeholder", None),
         item("dialog.execute_scope.hint_actions", "Enter execute • ← / → button • Esc cancel", "Execute-scope dialog footer hint while the action bar has focus", None),
         item("dialog.execute_scope.hint_fields", "{}Enter execute • Tab focus • {} model • Esc cancel", "Execute-scope dialog footer hint while a field has focus", None),
 
@@ -272,7 +272,16 @@ pub fn canonical_catalog() -> Vec<LocaleCatalogItem> {
         item("dialog.delete_review.question", "Are you sure you want to delete this review session?", "Delete-review dialog question line", None),
         item("dialog.delete_review.review_label", "Review: ", "Delete-review review field label", None),
         item("dialog.delete_review.note", "The review file in .tauqe/reviews/ will be permanently removed.", "Delete-review note about removing the file", None),
-
+        // ------------------------------------------------------------------
+        // Architect post-analysis confirmation (c-4): launching the
+        // classification spends tokens and replaces the session's post-analysis
+        // layer, so the dialog names the audited session and keeps the safe
+        // cancel default.
+        // ------------------------------------------------------------------
+        item("dialog.review_analyze.title", "Run Post-Analysis", "Title for the Architect post-analysis confirmation dialog", None),
+        item("dialog.review_analyze.heading", "Classify the findings of this session with the Architect?", "Heading in the post-analysis confirmation dialog", None),
+        item("dialog.review_analyze.review_label", " Review: ", "Post-analysis confirmation session field label", None),
+        item("dialog.review_analyze.note", "The post-analysis replaces the previous classification layer with a fresh architectural analysis of the findings.", "Post-analysis confirmation note explaining that the classification layer is rebuilt", None),
         item("dialog.clear_auto.question", "Clear all Auto-context files?", "Clear-auto-context dialog question line", None),
         item("dialog.clear_auto.body_prefix", "Are you sure you want to remove all ", "Clear-auto-context body prefix before the count", None),
         item("dialog.clear_auto.body_count", "{} file(s)", "Clear-auto-context styled file count", None),
@@ -371,12 +380,30 @@ pub fn canonical_catalog() -> Vec<LocaleCatalogItem> {
         item("context.section.pinned_hint", " [Protected / Config]", "Context Pinned section header hint", None),
         item("context.section.user_hint", " [Editable / Read-Only]", "Context User section header hint", None),
         item("context.section.auto_hint", " [Model Requested]", "Context Auto section header hint", None),
+        item(
+            "context.section.refs",
+            "Reference Documents",
+            "Context Refs layer section header",
+            None,
+        ),
+        item(
+            "context.section.refs_hint",
+            " [Registry / Read-Only]",
+            "Context Refs section header hint",
+            None,
+        ),
         item("context.badge.editable", "[EDITABLE]", "Badge marking an editable context file", Some(12)),
         item("context.badge.readonly", "[READ-ONLY]", "Badge marking a read-only context file", Some(14)),
         item("context.info.pinned", "Pinned layer: Architecture & reference documents specified in tauqe.toml", "Context info line for the Pinned layer", None),
         item("context.info.user", "User layer: Persistent files curated by the developer (Editable or Read-Only)", "Context info line for the User layer", None),
         item("context.info.auto", "Auto layer: Files autonomously requested by the model during discovery rounds", "Context info line for the Auto layer", None),
-        item("context.info.default", "Context state: 3 layers (Pinned, User, Auto) | Press '?' for commands", "Context info line when no row is selected", None),
+        item(
+            "context.info.refs",
+            "Refs layer: External reference documents materialized from .tauqe/refs/refs.md into the isolated cache; read-only for the whole task",
+            "Context info line for the Refs layer",
+            None,
+        ),
+        item("context.info.default", "Context state: 4 layers (Pinned, Refs, User, Auto) | Press '?' for commands", "Context info line when no row is selected", None),
         item("context.picker.title_editable", "Add EDITABLE to Context (Path, directory or glob like *.rs)", "Context file picker title for editable mode", None),
         item("context.picker.title_readonly", "Add READ-ONLY to Context (Path, directory or glob like *.rs)", "Context file picker title for read-only mode", None),
         item("context.picker.file_pattern", "File / Pattern:", "Context file picker input label", None),
@@ -412,6 +439,24 @@ pub fn canonical_catalog() -> Vec<LocaleCatalogItem> {
         item("review.executive_summary", "Executive Summary", "Review session executive summary block heading", None),
         item("review.refining", "[Refining: Architect is decomposing the finding...]", "Review view refinement-in-progress indicator", None),
         item("review.in_progress", "Review in progress...", "Review view running indicator", None),
+        item(
+            "review.group_progress",
+            "Group {}/{}: {}",
+            "Review info-strip badge naming the running group position, the total group count, and the group title",
+            None,
+        ),
+        item(
+            "review.group_progress_no_total",
+            "Group {}: {}",
+            "Review info-strip badge naming the running group ordinal and title before the mirrored session knows the total",
+            None,
+        ),
+        item(
+            "review.analyzing",
+            "Analyzing findings...",
+            "Review info-strip badge while the Architect post-analysis classifies the findings",
+            None,
+        ),
         item("review.running_hint", "Streaming findings and summary in Develop view (Ctrl+1).", "Review view hint while a review streams", None),
         item("review.empty_title", "No code reviews yet.", "Review view empty-state heading", None),
         item("review.empty_hint", "Add files to Context (Ctrl+4), then press 'N' to run a code review.", "Review view empty-state hint", None),
@@ -434,6 +479,55 @@ pub fn canonical_catalog() -> Vec<LocaleCatalogItem> {
         item("repl.detach_hint", "[Esc to detach]", "Develop hint for detaching the discussion focus", None),
         item("repl.viewport_title", "[VIEWPORT]", "Develop viewport focus title", Some(14)),
         item("repl.stepper_plan", "Plan:", "Develop plan stepper header label", None),
+        item(
+            "repl.sticky_hunk",
+            "Hunk {}/{}",
+            "Develop sticky header naming the active hunk and the total hunk count of the file under the viewport top edge",
+            None,
+        ),
+        item(
+            "repl.sticky_file",
+            "File {}/{}",
+            "Develop sticky header naming the position of the active file inside the staged set",
+            None,
+        ),
+
+        // The operation badges are shared by the Viewport file rows, the sticky
+        // overlay of the reading position, and the diff inspector file pane, so
+        // one declaration keeps all three surfaces naming an operation
+        // identically (c-1, c-3). The separator column is appended by the badge
+        // helper, never stored here, so a translation preserves no trailing
+        // whitespace of its own.
+        item(
+            "repl.op.create",
+            "[NEW]",
+            "Operation badge marking a file the staged set creates",
+            Some(12),
+        ),
+        item(
+            "repl.op.delete",
+            "[DEL]",
+            "Operation badge marking a file the staged set deletes",
+            Some(12),
+        ),
+        item(
+            "repl.op.move",
+            "[MOVE]",
+            "Operation badge marking a file the staged set moves",
+            Some(12),
+        ),
+        item(
+            "repl.op.overwrite",
+            "[OVERWRITE]",
+            "Operation badge marking a file the staged set rewrites as a whole",
+            Some(14),
+        ),
+        item(
+            "repl.op.replace",
+            "[EDIT]",
+            "Operation badge marking a file the staged set patches with anchored hunks",
+            Some(12),
+        ),
 
         // ------------------------------------------------------------------
         // Onboarding (Setup) view headings.
@@ -597,7 +691,9 @@ pub fn canonical_catalog() -> Vec<LocaleCatalogItem> {
         item("cmd.review.refine", "Decompose the selected finding into steps with the Architect", "Review command description", None),
         item("cmd.review.refine_all", "Decompose every finding awaiting architectural refinement", "Review command description", None),
         item("cmd.review.run", "Run a code review on the current context", "Review command description", None),
+        item("cmd.review.analyze", "Classify the findings of the selected session with the Architect post-analysis", "Review command description", None),
         item("cmd.review.toggle_hide_closed", "Toggle the filter between all findings and open findings only", "Review command description", None),
+        item("cmd.review.refresh", "Refresh the review sessions from the server", "Review command description", None),
         item("cmd.review.set_focus", "Set the discussion focus to the selection without leaving the view", "Review command description", None),
         item("cmd.review.activate", "Execute the selected finding; fold or unfold on session headers", "Review command description", None),
         item("cmd.review.discuss", "Discuss the selected finding or the entire session in the REPL", "Review command description", None),
@@ -616,7 +712,70 @@ pub fn canonical_catalog() -> Vec<LocaleCatalogItem> {
         item("cmd.review.fold_all", "Toggle fold or unfold for all sessions and findings", "Review command description", None),
         item("cmd.review.copy", "Copy the selected finding or session to the clipboard", "Review command description", None),
         item("cmd.review.delete", "Delete the review session (with confirmation)", "Review command description", None),
-        item("cmd.review.refresh", "Refresh review sessions from the server", "Review command description", None),
+        item(
+            "cmd.review.toggle_projection",
+            "Switch the review tree between the Provenance and Architectural projections",
+            "Review command description",
+            None,
+        ),
+
+        // ------------------------------------------------------------------
+        // Dual review-tree projection (c-6): the info-strip badge naming the
+        // active projection, its two labels, the findings counter of a
+        // provenance group header, and the Architectural view
+        // surfaces — the Independent Issues section, the participant badge of
+        // a root-cause group, and the post-analysis verdict block. Declaring
+        // them here lets a hot-swapped locale reach both projections without
+        // touching the renderers (c-1, c-2).
+        // ------------------------------------------------------------------
+        item(
+            "review.projection_badge",
+            "Projection: {}",
+            "Info-strip badge naming the active review projection; {} receives its label",
+            None,
+        ),
+        item(
+            "review.projection.provenance",
+            "Provenance",
+            "Review projection label naming the provenance view",
+            Some(16),
+        ),
+        item(
+            "review.projection.architectural",
+            "Architectural",
+            "Review projection label naming the architectural view",
+            Some(16),
+        ),
+        item(
+            "review.group_findings_count",
+            "{} finding(s)",
+            "Review group header badge counting the findings it produced",
+            None,
+        ),
+        item(
+            "review.participants_count",
+            "{} participant(s)",
+            "Architectural group badge counting the findings that share its root cause",
+            None,
+        ),
+        item(
+            "review.independent_issues",
+            "Independent Issues",
+            "Architectural section header for findings without a shared root cause",
+            None,
+        ),
+        item(
+            "review.post_analysis_summary",
+            "Post-Analysis Summary",
+            "Review heading of the post-analysis verdict block",
+            None,
+        ),
+        item(
+            "review.post_analysis_missing",
+            "No post-analysis layer yet: every finding stays a flat independent list; the classification is produced by the daemon's review/analyze call",
+            "Architectural projection hint shown while the session carries no post-analysis layer",
+            None,
+        ),
 
         // ------------------------------------------------------------------
         // Command descriptions for the REPL (Develop) view.
@@ -627,6 +786,12 @@ pub fn canonical_catalog() -> Vec<LocaleCatalogItem> {
         item("cmd.repl.toggle_file_fold", "Fold or unfold the selected file diff", "REPL command description", None),
         item("cmd.repl.prev_file", "Select the previous modified file", "REPL command description", None),
         item("cmd.repl.next_file", "Select the next modified file", "REPL command description", None),
+        item(
+            "cmd.repl.recenter",
+            "Recenter the Viewport on the selected file diff (center, top, bottom)",
+            "REPL command description",
+            None,
+        ),
         item("cmd.repl.scroll_up", "Scroll the response up", "REPL command description", None),
         item("cmd.repl.scroll_down", "Scroll the response down", "REPL command description", None),
         item("cmd.repl.page_up", "Scroll the response up one page", "REPL command description", None),
@@ -653,6 +818,7 @@ pub fn canonical_catalog() -> Vec<LocaleCatalogItem> {
         item("cmd.repl.yank", "Yank from the kill ring or the clipboard", "REPL command description", None),
         item("cmd.repl.copy_response", "Copy the model response to the clipboard", "REPL command description", None),
         item("cmd.repl.clear_prompt", "Interrupt, or clear the prompt (saving it to the kill ring)", "REPL command description", None),
+        item("cmd.repl.open_diff_inspector", "Open the diff inspector for the staged changes", "REPL command description", None),
 
         // ------------------------------------------------------------------
         // Command descriptions for the Onboarding (Setup) view.
@@ -674,6 +840,18 @@ pub fn canonical_catalog() -> Vec<LocaleCatalogItem> {
         item("notify.pinned_readonly", "Pinned files are read-only and cannot be changed", "Context notification rejecting a Pinned access change", None),
         item("notify.pinned_protected_remove", "Pinned files are protected and cannot be removed", "Context notification rejecting a Pinned removal", None),
         item("notify.pinned_protected_section", "Pinned section is protected and cannot be removed", "Context notification rejecting a Pinned section removal", None),
+        item(
+            "notify.refs_readonly",
+            "Reference documents are read-only and their access cannot be changed",
+            "Context notification rejecting an access change on a Refs document",
+            None,
+        ),
+        item(
+            "notify.refs_protected_section",
+            "Reference documents are managed by the registry manifest and cannot be removed here",
+            "Context notification explaining that the Refs layer is owned by the reference registry",
+            None,
+        ),
         item("notify.context_copied", "File path copied to clipboard", "Context notification after copying file path", None),
         item("notify.context_copied_osc52", "File path sent to terminal clipboard (OSC 52)", "Context notification after copying file path via OSC 52", None),
         item("notify.context_no_files_copy", "No files in section to copy", "Context notification when copying an empty section", None),
@@ -714,18 +892,21 @@ pub fn canonical_catalog() -> Vec<LocaleCatalogItem> {
         item("notify.review_rejected_status", "Finding #{} is REJECTED; change status to TODO (t) before executing.", "Review notification blocking a rejected finding", None),
         item("notify.review_all_fixed_session", "All findings in this review session are already FIXED.", "Review notification for a completed session", None),
         item("notify.review_no_todo_session", "No TODO findings to execute in this review session.", "Review notification when a session has no TODO findings", None),
+        item("notify.review_no_todo_section", "No actionable findings to execute in this section.", "Review notification when a rendered review section carries no actionable findings", None),
         item("notify.review_no_sessions", "No review sessions available.", "Review notification when no sessions exist", None),
         item("notify.review_no_findings", "No findings in review sessions.", "Review notification when sessions have no findings", None),
         item("notify.review_discussion_only", "All remaining findings are in DISCUSSION status; approve or change status to TODO (t) before executing.", "Review notification when only discussion findings remain", None),
         item("notify.review_all_fixed", "All findings across all review sessions are already FIXED.", "Review notification when all sessions are complete", None),
         item("notify.review_no_todo_cross", "No TODO findings to execute across review sessions.", "Review notification when no cross-session TODO findings remain", None),
         item("notify.review_refining", "Decomposing finding with the Architect...", "Review notification while refining a finding", None),
+        item("notify.review_analyze_started", "Classifying findings with the Architect...", "Review notification while the Architect post-analysis classifies the selected session", None),
         item("notify.review_select_finding", "Select a finding to decompose into steps (r)", "Review notification prompting to select a finding", None),
         item("notify.review_no_refine_needed", "No findings require architectural decomposition", "Review notification when no findings need refinement", None),
         item("notify.review_focus_set", "Discussion focus set to review '{}'", "Review notification confirming a session focus change", None),
         item("notify.review_focus_item_set", "Discussion focus set to {} in review '{}'", "Review notification confirming a finding focus change", None),
         item("notify.review_cannot_start_busy", "Cannot start a review while the model is generating", "Review notification rejecting a review while busy", None),
         item("notify.review_pattern_files_omitted", "Pattern matched {} file(s) beyond the configured batch or token limit; they were not added to the audit", "Review notification when a target pattern expansion is truncated by the configured context budgets", None),
+        item("notify.review_pattern_no_matches", "The target pattern '{}' matches no repository files; correct it or clear the field", "Review notification rejecting a launch whose target pattern selects no repository file", None),
         item("notify.review_context_empty", "Context is empty: add files in the Context tab (Ctrl+2) first", "Review notification requiring context files", None),
         item("notify.review_copied", "Review findings copied to clipboard", "Review notification after copying findings", None),
         item("notify.review_copied_osc52", "Review findings sent to terminal clipboard (OSC 52)", "Review notification after an OSC 52 copy", None),
@@ -875,10 +1056,31 @@ pub fn canonical_catalog() -> Vec<LocaleCatalogItem> {
         item("dialog.review_launch.question", "Run automated code review on active context files?", "Review launch dialog question line", None),
         item("dialog.review_launch.files_label", "  Files: ", "Review launch dialog files count label", None),
         item("dialog.review_launch.tokens_label", "    Estimated tokens: ", "Review launch dialog estimated tokens label", None),
-        item("dialog.review_launch.note", "  Only file contents are sent: history and repo map are excluded.", "Review launch dialog note about what is sent", None),
+        item("dialog.review_launch.note", "  Files and tokens describe the User Context; a target pattern adds its matches on top. History and repo map are excluded.", "Review launch dialog note stating that the counts describe the User Context and a target pattern adds matches on top", None),
+        item("dialog.review_launch.note_preset", "  Files and tokens describe the User Context; the highlighted preset supplies the audited groups and paths. History and repo map are excluded.", "Review launch dialog note shown while a highlighted preset owns the launch and the target field is absent", None),
         item("dialog.review_launch.model_list_counter", " Reviewer Model  [{} of {}] ", "Review launch dialog reviewer list title with a position counter", None),
         item("dialog.review_launch.model_list_title", " Reviewer Model ", "Review launch dialog reviewer list title with a single entry", None),
         item("dialog.review_launch.no_models", "  (no reviewer models configured)", "Review launch dialog empty reviewer list placeholder", None),
+        item("dialog.review_launch.presets_title", " Presets ", "Review launch dialog review-preset section title", None),
+        item("dialog.review_launch.preset_custom", "Custom (manual launch)", "Review launch dialog preset row that falls back to a one-off manual launch", None),
+        item(
+            "dialog.review_launch.directories_title",
+            " Directories ",
+            "Review launch dialog repository directory section title",
+            None,
+        ),
+        item(
+            "dialog.review_launch.counter_matches",
+            "{} file(s) match the target pattern",
+            "Review launch dialog live match counter for the target pattern",
+            None,
+        ),
+        item(
+            "dialog.review_launch.counter_idle",
+            "no target pattern: the whole User Context is audited",
+            "Review launch dialog counter text while the target pattern is empty",
+            None,
+        ),
         item("dialog.review_launch.path_placeholder", " target directory or glob, e.g. src/**/*.rs (optional)", "Review launch dialog empty target-paths placeholder", None),
         item("dialog.review_launch.path_title", "Target Paths (optional)", "Review launch dialog target-paths block title", None),
         item("dialog.review_launch.editor_title", "  Additional review instructions (optional):", "Review launch dialog instructions editor title", None),
@@ -894,6 +1096,18 @@ pub fn canonical_catalog() -> Vec<LocaleCatalogItem> {
         item("dialog.model_select.title_primary", "Select Primary Model", "Model picker title when choosing a configured primary entry", None),
         item("dialog.model_select.intro_primary", " Models configured under [models.primary] in tauqe.toml", "Model picker intro for the configured primary entries", None),
         item("dialog.model_select.footer_primary", "1-9 quick select • ↑ / ↓ navigate • PgUp / PgDn page • Enter select • Esc dismiss", "Model picker footer hint for the configured primary entries", None),
+
+        // ------------------------------------------------------------------
+        // Model escalation marker: the trailing badge naming a configured model
+        // the automatic ladder never escalates to, so a deliberate manual
+        // choice reads the same in the stepper and in every list row (c-4).
+        // ------------------------------------------------------------------
+        item(
+            "model.badge.manual",
+            "[manual]",
+            "Trailing marker appended to a configured model that is excluded from automatic ladder escalation and is reachable only by a deliberate manual choice",
+            Some(24),
+        ),
 
         // ------------------------------------------------------------------
         // Squash commits dialog: base selection, diff inspection, message
@@ -942,6 +1156,32 @@ pub fn canonical_catalog() -> Vec<LocaleCatalogItem> {
         item("dialog.squash_confirm.confirm_button", "Confirm Squash", "Squash apply confirmation button", Some(16)),
         item("dialog.squash_confirm.no_message", "(no message)", "Squash apply confirmation placeholder when the message is empty", None),
 
+        // ------------------------------------------------------------------
+        // Fullscreen diff inspector (c-3): the two-pane audit of the change
+        // set the Develop viewport staged. The card names the audited files,
+        // their operation and verification badges, the isolated diff read
+        // area, and the audit progress row.
+        // ------------------------------------------------------------------
+        item("dialog.diff_inspector.title", "Diff Inspector", "Title for the fullscreen two-pane diff audit dialog", None),
+        item("dialog.diff_inspector.files_title", " Files ({}) ", "Diff inspector left pane title naming the number of audited files", None),
+        item("dialog.diff_inspector.diff_title", " Diff ", "Diff inspector right pane title of the isolated diff read area", None),
+        item("dialog.diff_inspector.no_files", "No staged files to audit.", "Diff inspector placeholder when the audited change set is empty", None),
+        item("dialog.diff_inspector.no_diff", "No diff to display for this file.", "Diff inspector placeholder when the highlighted file carries no rendered diff", None),
+        item("dialog.diff_inspector.badge_ok", "[OK]", "Diff inspector badge marking a file whose edits were validated", Some(8)),
+        item("dialog.diff_inspector.badge_error", "[ERR]", "Diff inspector badge marking a file whose edits failed validation", Some(8)),
+        item("dialog.diff_inspector.badge_running", "[RUN]", "Diff inspector badge marking a file whose edits are still streaming", Some(8)),
+        item("dialog.diff_inspector.badge_retrying", "[RETRY]", "Diff inspector badge marking a file whose patch is being regenerated", Some(8)),
+        item("dialog.diff_inspector.file_progress", "File {}/{}", "Diff inspector action row naming the highlighted file inside the audited set", None),
+        item("dialog.diff_inspector.hunk_progress", "Hunk {}/{}", "Diff inspector action row naming the hunk under the top edge of the read area", None),
+        item("dialog.diff_inspector.footer", "n / p file • j / k scroll • Esc close", "Diff inspector docked footer hint naming the audit navigation", None),
+        item("cmd.diff_inspector.close", "Close the diff inspector", "Diff inspector command description", None),
+        item("cmd.diff_inspector.next_file", "Select the next audited file", "Diff inspector command description", None),
+        item("cmd.diff_inspector.prev_file", "Select the previous audited file", "Diff inspector command description", None),
+        item("cmd.diff_inspector.scroll_up", "Scroll the audited diff up one line", "Diff inspector command description", None),
+        item("cmd.diff_inspector.scroll_down", "Scroll the audited diff down one line", "Diff inspector command description", None),
+        item("cmd.diff_inspector.page_up", "Scroll the audited diff up one page", "Diff inspector command description", None),
+        item("cmd.diff_inspector.page_down", "Scroll the audited diff down one page", "Diff inspector command description", None),
+        item("notify.diff_inspector_empty", "No staged changes to inspect", "Notification when the diff inspector is requested with an empty change set", None),
         // ------------------------------------------------------------------
         // RPC response and system notifications: configuration diagnostics,
         // pre-flight verification, context mutations, locale switching,
@@ -1067,6 +1307,7 @@ pub fn canonical_catalog() -> Vec<LocaleCatalogItem> {
         item("notify.squash_busy", "Cannot squash while the model is generating", "Notification rejecting a squash while the model is busy", None),
         item("notify.onboarding_required", "Complete the initial setup before using this feature", "Notification requiring onboarding to finish first", None),
         item("notify.config_reloading", "Reloading configuration...", "Notification while configuration reloads", None),
+        item("notify.config_reloaded", "Configuration reloaded", "Notification after the interface configuration is reloaded from disk", None),
         item("notify.mouse_shift_tip", "Hold Shift and drag to select text with the mouse", "Notification tip for mouse text selection", None),
         item("notify.locale_generate_failed", "Failed to synthesize the interface language: {}", "Notification when locale synthesis fails", None),
         item("notify.locale_generated", "Interface language '{}' synthesized", "Notification after a locale is synthesized", None),
@@ -1133,6 +1374,12 @@ pub fn canonical_catalog() -> Vec<LocaleCatalogItem> {
         item("context.info.pinned_item", "Pinned document: {} (protected, ~{} tokens)", "Context info line for a selected Pinned file", None),
         item("context.info.user_item", "User file: {} {}, ~{} tokens", "Context info line for a selected User file", None),
         item("context.info.auto_item", "Auto-discovered file: {} {}, ~{} tokens", "Context info line for a selected Auto file", None),
+        item(
+            "context.info.refs_item",
+            "Reference document: {} (read-only, ~{} tokens)",
+            "Context info line for a selected Refs document",
+            None,
+        ),
 
         // ------------------------------------------------------------------
         // Plans and Review section labels surfaced beside the section headers
@@ -1292,6 +1539,9 @@ mod tests {
         assert!(keys.contains("context.section.pinned"));
         assert!(keys.contains("plans.empty_title"));
         assert!(keys.contains("review.executive_summary"));
+        assert!(keys.contains("review.group_progress"));
+        assert!(keys.contains("review.group_progress_no_total"));
+        assert!(keys.contains("review.analyzing"));
 
         // Command descriptions across the subsystem command maps.
         assert!(keys.contains("cmd.global.cancel_generation"));
@@ -1310,6 +1560,14 @@ mod tests {
         assert!(keys.contains("notify.turn_completed"));
         assert!(keys.contains("notify.plan_scope_blocked"));
         assert!(keys.contains("notify.onboarding_key_detected"));
+
+        // The diff-reading surfaces: the sticky overlay, the shared operation
+        // badges, and the inspector card (c-1, c-3).
+        assert!(keys.contains("repl.sticky_hunk"));
+        assert!(keys.contains("repl.sticky_file"));
+        assert!(keys.contains("repl.op.overwrite"));
+        assert!(keys.contains("dialog.diff_inspector.file_progress"));
+        assert!(keys.contains("cmd.diff_inspector.next_file"));
     }
 
     #[test]
@@ -1389,6 +1647,14 @@ mod tests {
                 "views/repl/render/model.rs",
                 include_str!("../views/repl/render/model.rs"),
             ),
+            (
+                "views/repl/render.rs",
+                include_str!("../views/repl/render.rs"),
+            ),
+            (
+                "dialogs/render/diff_inspector.rs",
+                include_str!("../dialogs/render/diff_inspector.rs"),
+            ),
             ("views/history.rs", include_str!("../views/history.rs")),
             (
                 "views/plans/render.rs",
@@ -1466,6 +1732,50 @@ mod tests {
                 assert!(
                     !production.contains(fragment),
                     "{name} hardcodes the catalog phrase {fragment:?}"
+                );
+            }
+        }
+    }
+
+    /// The Viewport file rows, the sticky overlay, and the diff inspector file
+    /// pane name a file's operation through one catalog mapping, so none of the
+    /// audited renderers may keep a badge literal of its own (c-1, c-3,
+    /// Conventions §9). The trailing separator column is rendered by the badge
+    /// helper, so a translated label never has to preserve whitespace.
+    #[test]
+    fn test_operation_badges_resolve_through_the_catalog() {
+        let catalog = canonical_catalog();
+        for key in [
+            "repl.op.create",
+            "repl.op.delete",
+            "repl.op.move",
+            "repl.op.overwrite",
+            "repl.op.replace",
+        ] {
+            assert!(
+                catalog.iter().any(|item| item.key == key),
+                "the catalog must declare the operation badge {key}"
+            );
+        }
+
+        let sources: &[(&str, &str)] = &[
+            (
+                "views/repl/render/model.rs",
+                include_str!("../views/repl/render/model.rs"),
+            ),
+            (
+                "dialogs/render/diff_inspector.rs",
+                include_str!("../dialogs/render/diff_inspector.rs"),
+            ),
+        ];
+        let forbidden: &[&str] = &["[NEW]", "[DEL]", "[MOVE]", "[OVERWRITE]", "[EDIT]"];
+
+        for (name, source) in sources {
+            let production = source.split("#[cfg(test)]").next().unwrap_or_default();
+            for &fragment in forbidden {
+                assert!(
+                    !production.contains(fragment),
+                    "{name} hardcodes the operation badge {fragment:?}"
                 );
             }
         }

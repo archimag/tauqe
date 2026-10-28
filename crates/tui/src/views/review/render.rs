@@ -124,6 +124,33 @@ pub fn render_review_view(
                 engine.fg(palette.status_warning).bold(),
             ));
         }
+        // The group badge derives its ordinal from the supervisor's
+        // sequential traversal and its total from the mirrored session: the
+        // session is published only after the first group finishes, so the
+        // first badge degrades to an ordinal without a denominator instead
+        // of inventing a total (c-4).
+        if let Some(group) = state.review.running_group.as_ref() {
+            let position = (state.review.finished_groups + 1).to_string();
+            let label = match state.review.running_group_total() {
+                Some(total) => active_t("review.group_progress")
+                    .replacen("{}", &position, 1)
+                    .replacen("{}", &total.to_string(), 1)
+                    .replacen("{}", &group.title, 1),
+                None => active_t("review.group_progress_no_total")
+                    .replacen("{}", &position, 1)
+                    .replacen("{}", &group.title, 1),
+            };
+            status_spans.push(Span::styled(
+                format!(" | {}", label),
+                engine.fg(palette.status_warning),
+            ));
+        }
+        if state.review.analyzing {
+            status_spans.push(Span::styled(
+                format!(" | {}", active_t("review.analyzing")),
+                engine.fg(palette.status_warning).bold(),
+            ));
+        }
         // The tree was already flattened for this frame, so the status line
         // reads the selected row out of that list instead of flattening and
         // cloning the whole tree a second time (c-2).
@@ -336,6 +363,35 @@ fn describe_review_row(
             }
             spans
         }
+        VisibleReviewRow::GroupHeader {
+            title,
+            description,
+            findings_count,
+            ..
+        } => {
+            let mut spans = vec![Span::styled(
+                format!(" {}", title),
+                engine.fg(palette.text_primary).bold(),
+            )];
+            spans.push(Span::styled(
+                format!(
+                    "  {}",
+                    active_t("review.group_findings_count").replacen(
+                        "{}",
+                        &findings_count.to_string(),
+                        1
+                    )
+                ),
+                engine.fg(palette.text_secondary),
+            ));
+            if let Some(desc) = first_content_line(description.as_deref()) {
+                spans.push(Span::styled(
+                    format!("  —  {}", desc),
+                    engine.fg(palette.text_muted),
+                ));
+            }
+            spans
+        }
     }
 }
 
@@ -394,6 +450,8 @@ mod tests {
             items: vec![ReviewIssue {
                 id: 1,
                 title: "Finding".to_string(),
+                uuid: None,
+                group: None,
                 model: None,
                 issue_type: IssueType::Architecture,
                 status: IssueStatus::Todo,
@@ -406,6 +464,9 @@ mod tests {
             }
             .into()],
             raw_markdown: String::new(),
+            groups: Vec::new(),
+            post_analysis: None,
+            launch_config: None,
         };
         review.set_session(session);
 
@@ -494,6 +555,8 @@ mod tests {
                 ReviewItem::from(ReviewIssue {
                     id,
                     title: format!("Finding {id}"),
+                    uuid: None,
+                    group: None,
                     model: None,
                     issue_type: IssueType::Architecture,
                     status: IssueStatus::Todo,
@@ -516,6 +579,9 @@ mod tests {
             target_files: Vec::new(),
             items,
             raw_markdown: String::new(),
+            groups: Vec::new(),
+            post_analysis: None,
+            launch_config: None,
         }];
         // The cursor rests on the first row while the developer scrolls away.
         state.review.selected_index = 0;
@@ -578,6 +644,8 @@ mod tests {
             items: vec![ReviewItem::from(ReviewIssue {
                 id: 1,
                 title: "Finding".to_string(),
+                uuid: None,
+                group: None,
                 model: None,
                 issue_type: IssueType::Architecture,
                 status: IssueStatus::Todo,
@@ -595,6 +663,9 @@ mod tests {
                 note: None,
             })],
             raw_markdown: String::new(),
+            groups: Vec::new(),
+            post_analysis: None,
+            launch_config: None,
         }];
         state.review.toggle_item_expanded("rev-tall", 1);
         state
@@ -623,6 +694,105 @@ mod tests {
         assert_eq!(
             state.review.scroll, max,
             "the renderer clamps the viewport by the document length only"
+        );
+    }
+
+    fn rendered_status_line(state: &mut crate::app::AppState) -> String {
+        let backend = TestBackend::new(100, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|f| {
+                let area = f.area();
+                let main_area = Rect::new(0, 0, area.width, area.height.saturating_sub(1));
+                let info_area = Rect::new(0, area.height.saturating_sub(1), area.width, 1);
+                render_review_view(f, state, main_area, info_area);
+            })
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        buffer.content().iter().map(|c| c.symbol()).collect()
+    }
+
+    #[test]
+    fn status_line_names_the_running_group_with_its_ordinal_and_total() {
+        use tauqe_protocol::{ReviewGroup, ReviewSession};
+
+        let session = ReviewSession {
+            id: "rev-groups".to_string(),
+            title: "Grouped Audit".to_string(),
+            created_at: 0,
+            model: tauqe_protocol::ModelRef::openrouter("reviewer"),
+            groups: vec![
+                ReviewGroup {
+                    id: "grp-alpha".to_string(),
+                    title: "Alpha Slice".to_string(),
+                    paths: Vec::new(),
+                    prompt: None,
+                    ..Default::default()
+                },
+                ReviewGroup {
+                    id: "grp-beta".to_string(),
+                    title: "Beta Slice".to_string(),
+                    paths: Vec::new(),
+                    prompt: None,
+                    ..Default::default()
+                },
+                ReviewGroup {
+                    id: "grp-gamma".to_string(),
+                    title: "Gamma Slice".to_string(),
+                    paths: Vec::new(),
+                    prompt: None,
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+
+        let mut state = crate::app::test_state();
+        state.review.running = true;
+        state.review.set_sessions(vec![session], None);
+        state.review.finished_groups = 1;
+        state
+            .review
+            .begin_group("grp-beta".to_string(), "Beta Slice".to_string());
+
+        let content = rendered_status_line(&mut state);
+
+        assert!(
+            content.contains("Group 2/3: Beta Slice"),
+            "expected the group progress badge, got: {content}"
+        );
+    }
+
+    #[test]
+    fn status_line_degrades_the_group_badge_without_a_session_mirror() {
+        let mut state = crate::app::test_state();
+        state.review.running = true;
+        state
+            .review
+            .begin_group("grp-alpha".to_string(), "Alpha Slice".to_string());
+
+        let content = rendered_status_line(&mut state);
+
+        assert!(
+            content.contains("Group 1: Alpha Slice"),
+            "expected the ordinal-only badge, got: {content}"
+        );
+        assert!(
+            !content.contains("Group 1/"),
+            "no denominator may appear before the mirror knows the total"
+        );
+    }
+
+    #[test]
+    fn status_line_marks_the_post_analysis_phase() {
+        let mut state = crate::app::test_state();
+        state.review.analyzing = true;
+
+        let content = rendered_status_line(&mut state);
+
+        assert!(
+            content.contains("Analyzing findings..."),
+            "expected the post-analysis badge, got: {content}"
         );
     }
 }

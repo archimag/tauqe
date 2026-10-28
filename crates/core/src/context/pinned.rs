@@ -3,6 +3,7 @@ use std::collections::BTreeSet;
 use std::path::Path;
 
 use crate::prompt::estimate_tokens_from_bytes;
+use crate::refs::REFS_MANIFEST;
 use tauqe_protocol::{ContextAccess, ContextItem, ContextLayer};
 
 use super::ContextManager;
@@ -24,11 +25,18 @@ impl ContextManager {
 
     /// Recomputes the pinned context layer with hierarchical resolution.
     ///
-    /// Root-level pinned files matching `pinned_patterns` from `repo_root` are always
-    /// included. Additionally, for every file present in the `user` or `auto` context
-    /// layers, all parent directories up to the project root are traversed: at each level,
-    /// every pinned pattern is resolved as a relative path and any existing file is added
-    /// to the pinned layer (read-only, deduplicated, never escaping repo root).
+    /// Root-level pinned files matching `pinned_patterns` from `repo_root` are
+    /// always included, and so is the external reference registry manifest
+    /// (`.tauqe/refs/refs.md`) when it exists on disk. The manifest is the
+    /// showcase that lists the declared reference documents, so pinning it lets
+    /// the model read the catalogue without requesting it first; a repository
+    /// that declares no manifest contributes no entry.
+    ///
+    /// In addition, for every file present in the `user` or `auto` context
+    /// layers, all parent directories up to the project root are traversed: at
+    /// each level, every pinned pattern is resolved as a relative path and any
+    /// existing file is added to the pinned layer (read-only, deduplicated,
+    /// never escaping repo root).
     pub(super) fn recompute_pinned(&mut self) -> bool {
         // The ancestor walk, `verify_path_within_repo` symlink checks, and
         // `metadata()` inspections are all blocking filesystem work, so the
@@ -49,7 +57,25 @@ impl ContextManager {
                 }
             }
 
-            // 2. Hierarchical pinned files for all items in user and auto layers
+            // 2. The external reference registry showcase (`.tauqe/refs/refs.md`).
+            //
+            // The manifest is the catalogue of declared reference documents, so
+            // pinning it renders the showcase into the `<context>` block without
+            // the model having to request it. A missing manifest is not an
+            // error: `insert_pinned_candidate` admits only files that exist. An
+            // explicitly pinned manifest is already in the map, so it is neither
+            // duplicated nor moved to a new insertion watermark.
+            if let Ok(clean_manifest) = self.normalize_path(REFS_MANIFEST) {
+                insert_pinned_candidate(
+                    &self.repo_root,
+                    &self.pinned,
+                    &mut new_pinned,
+                    &mut self.insertion_counter,
+                    clean_manifest,
+                );
+            }
+
+            // 3. Hierarchical pinned files for all items in user and auto layers
             let mut checked_dirs = BTreeSet::new();
             for file_path in self.user.keys().chain(self.auto.keys()) {
                 let mut curr = Path::new(file_path).parent();
@@ -342,5 +368,143 @@ mod tests {
             .read_context_files()
             .iter()
             .any(|file| file.path == "crates/core/Conventions.md"));
+    }
+    #[test]
+    fn test_the_registry_manifest_is_pinned_read_only_and_rendered() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        let manifest = root.join(REFS_MANIFEST);
+        std::fs::create_dir_all(manifest.parent().unwrap()).unwrap();
+        std::fs::write(
+            &manifest,
+            "- [API](vendor/api.md) = https://example.com/llm.txt\n",
+        )
+        .unwrap();
+
+        let cm = ContextManager::new(root);
+        assert!(cm.contains(REFS_MANIFEST).unwrap());
+        assert!(!cm.is_editable(REFS_MANIFEST).unwrap());
+
+        let state = cm.get_state();
+        let showcased: Vec<_> = state
+            .items
+            .iter()
+            .filter(|item| item.path == REFS_MANIFEST)
+            .collect();
+        assert_eq!(
+            showcased.len(),
+            1,
+            "the showcase must be pinned exactly once"
+        );
+        assert_eq!(showcased[0].layer, ContextLayer::Pinned);
+        assert_eq!(showcased[0].access, ContextAccess::ReadOnly);
+
+        let files = cm.read_context_files();
+        assert!(files.iter().any(|file| file.path == REFS_MANIFEST));
+    }
+
+    #[test]
+    fn test_the_showcase_keeps_its_watermark_across_recomputations() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        let manifest = root.join(REFS_MANIFEST);
+        std::fs::create_dir_all(manifest.parent().unwrap()).unwrap();
+        std::fs::write(&manifest, "# References\n").unwrap();
+        std::fs::write(root.join("auto.rs"), "fn auto() {}\n").unwrap();
+
+        let mut cm = ContextManager::new(root);
+        let watermark = cm
+            .get_state()
+            .items
+            .into_iter()
+            .find(|item| item.path == REFS_MANIFEST)
+            .expect("the showcase is pinned on construction")
+            .insertion_seq;
+
+        // Any later recomputation must reuse the watermark the manifest was
+        // given when it first entered the context, so the showcase never jumps
+        // to the tail of the chronological timeline.
+        cm.add_auto_file("auto.rs", ContextAccess::ReadOnly)
+            .unwrap();
+        assert!(!cm.recompute_pinned(), "the pinned layer must not change");
+
+        let again: Vec<_> = cm
+            .get_state()
+            .items
+            .into_iter()
+            .filter(|item| item.path == REFS_MANIFEST)
+            .collect();
+        assert_eq!(again.len(), 1);
+        assert_eq!(again[0].insertion_seq, watermark);
+    }
+
+    #[test]
+    fn test_an_explicitly_pinned_manifest_is_not_duplicated_by_the_showcase() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        let manifest = root.join(REFS_MANIFEST);
+        std::fs::create_dir_all(manifest.parent().unwrap()).unwrap();
+        std::fs::write(&manifest, "# References\n").unwrap();
+
+        let cm = ContextManager::with_pinned(root, &[REFS_MANIFEST.to_string()]);
+        let state = cm.get_state();
+        assert_eq!(
+            state
+                .items
+                .iter()
+                .filter(|item| item.path == REFS_MANIFEST)
+                .count(),
+            1,
+            "an explicitly pinned manifest must be admitted exactly once"
+        );
+        assert!(!cm.is_editable(REFS_MANIFEST).unwrap());
+    }
+
+    #[test]
+    fn test_a_repository_without_a_manifest_pins_no_showcase() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        std::fs::write(root.join("file.rs"), "fn file() {}\n").unwrap();
+
+        let mut cm = ContextManager::new(root);
+        cm.add_file("file.rs", ContextAccess::ReadOnly).unwrap();
+
+        assert!(!cm.contains(REFS_MANIFEST).unwrap());
+        assert!(!cm
+            .get_state()
+            .items
+            .iter()
+            .any(|item| item.path == REFS_MANIFEST));
+    }
+
+    #[test]
+    fn test_the_showcase_leaves_the_hierarchical_pinned_walk_untouched() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        let manifest = root.join(REFS_MANIFEST);
+        std::fs::create_dir_all(manifest.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(root.join("crates/core/src")).unwrap();
+        std::fs::write(&manifest, "# References\n").unwrap();
+        std::fs::write(root.join("Conventions.md"), "# Root Conventions").unwrap();
+        std::fs::write(
+            root.join("crates/core/Conventions.md"),
+            "# Core Conventions",
+        )
+        .unwrap();
+        std::fs::write(root.join("crates/core/src/lib.rs"), "pub fn core() {}").unwrap();
+
+        let mut cm = ContextManager::with_pinned(root, &["Conventions.md".to_string()]);
+        cm.add_file("crates/core/src/lib.rs", ContextAccess::Editable)
+            .unwrap();
+        assert!(cm.contains(REFS_MANIFEST).unwrap());
+        assert!(cm.contains("Conventions.md").unwrap());
+        assert!(cm.contains("crates/core/Conventions.md").unwrap());
+
+        // The hierarchical entry follows the user layer, while the root pattern
+        // and the showcase stay pinned.
+        cm.clear_user();
+        assert!(cm.contains(REFS_MANIFEST).unwrap());
+        assert!(cm.contains("Conventions.md").unwrap());
+        assert!(!cm.contains("crates/core/Conventions.md").unwrap());
     }
 }

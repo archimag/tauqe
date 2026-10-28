@@ -12,8 +12,7 @@ const SEMANTIC_HARNESS: &str =
 const BOUNDED_TURN: &str = include_str!("../../../docs/src/ch01-foundations/bounded-turn-fsm.md");
 const MODEL_ROLES: &str = include_str!("../../../docs/src/ch01-foundations/model-roles.md");
 const SCRATCHPAD: &str = include_str!("../../../docs/src/ch01-foundations/turn-scratchpad.md");
-const THREE_TIER_CONTEXT: &str =
-    include_str!("../../../docs/src/ch02-perception/three-tier-model.md");
+const CONTEXT_MODEL: &str = include_str!("../../../docs/src/ch02-perception/context-model.md");
 const DISCUSSION_FOCUS: &str =
     include_str!("../../../docs/src/ch02-perception/discussion-focus.md");
 const REPO_MAP: &str = include_str!("../../../docs/src/ch02-perception/repo-map.md");
@@ -66,12 +65,7 @@ pub(crate) fn get_documentation(topic: DocTopic) -> String {
         // Part I: the paradigm and the roles that own "what" and "how".
         DocTopic::Overview => &[INTRO, SEMANTIC_HARNESS, MODEL_ROLES],
         // Part II: the perceived working set and how discovery widens it.
-        DocTopic::Context => &[
-            THREE_TIER_CONTEXT,
-            DISCUSSION_FOCUS,
-            REPO_MAP,
-            DISCOVERY_ENGINE,
-        ],
+        DocTopic::Context => &[CONTEXT_MODEL, DISCUSSION_FOCUS, REPO_MAP, DISCOVERY_ENGINE],
         // Part I and Part III: the turn machine plus the project work it
         // delegates to the driver.
         DocTopic::Workflow => &[
@@ -93,7 +87,7 @@ pub(crate) fn get_documentation(topic: DocTopic) -> String {
             BOUNDED_TURN,
             MODEL_ROLES,
             SCRATCHPAD,
-            THREE_TIER_CONTEXT,
+            CONTEXT_MODEL,
             DISCUSSION_FOCUS,
             REPO_MAP,
             DISCOVERY_ENGINE,
@@ -131,7 +125,7 @@ mod tests {
     fn every_topic_resolves_to_its_chapters() {
         assert!(get_documentation(DocTopic::Overview).contains("The Semantic Harness"));
         assert!(get_documentation(DocTopic::Overview).contains("Model Roles and the Coder Ladder"));
-        assert!(get_documentation(DocTopic::Context).contains("Three-Tier Context Model"));
+        assert!(get_documentation(DocTopic::Context).contains("The Context Model"));
         assert!(get_documentation(DocTopic::Context).contains("Discovery Engine"));
         assert!(get_documentation(DocTopic::Workflow).contains("The TauqeProjectProtocol"));
         assert!(get_documentation(DocTopic::Workflow).contains("Turn Scratchpad"));
@@ -155,7 +149,7 @@ mod tests {
             "Autonomous Bounded Turn FSM",
             "Model Roles and the Coder Ladder",
             "Turn Scratchpad",
-            "Three-Tier Context Model",
+            "The Context Model",
             "Discussion Focus",
             "Repository Map and Blinkers",
             "Discovery Engine",

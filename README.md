@@ -88,7 +88,7 @@ On first launch, an interactive onboarding wizard automatically checks your Git 
 | Shortcut | View | Description |
 | :--- | :--- | :--- |
 | `Ctrl+1` | **REPL** | Conversational harness, streaming diffs, toolchain healing, and instant undo |
-| `Ctrl+2` | **Context** | Three-tier context manager (`Pinned`, `User`, `Auto`) with glob patterns |
+| `Ctrl+2` | **Context** | Four-layer context manager (`Pinned`, `Refs`, `User`, `Auto`) with glob patterns |
 | `Ctrl+3` | **Review** | Code audit sessions, finding triage, and autonomous batch fixes |
 | `Ctrl+4` | **Plans** | Hierarchical task trees, deep refinement, and isolated step execution |
 | `Ctrl+5` | **History** | Chronological session audit trail, token metrics, and commit inspect |

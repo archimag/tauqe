@@ -1,34 +1,85 @@
-use std::sync::Arc;
-
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-use tauqe_protocol::{methods, GitSquashPreviewParams};
-use tokio::sync::Mutex;
-
-use crate::app::{ActiveModal, AppState, SquashDialogFocus, ViewMode};
-use crate::command::global::{GlobalCommand, GLOBAL_COMMAND_MAP};
-use crate::rpc::{send_request, RpcConnection};
-use crate::views::{context, history, onboarding, plans, repl, review};
+//! Terminal input dispatch: keys, pointer events, and pasted text.
+//!
+//! The module is the single entry point the event loop calls for every terminal
+//! event. A key press is normalized once — the Emacs `C-g` chord becomes `Esc` —
+//! then routed to the top-most modal, then to the global command map, and finally
+//! to the handler of the active view. The surface that owns the keyboard is
+//! therefore always the surface that receives the keystroke, and an open dialog
+//! can never leak an event into the view below it (Conventions §3, §5, §7).
+//!
+//! Every binding is declared once as a
+//! [`CommandSpec`](crate::command::CommandSpec) and resolved through its map, so
+//! this module carries no ad-hoc shortcut comparison of its own.
 
 pub mod layout;
 pub mod mouse;
 pub mod squash;
 
-/// Opens the squash dialog and requests its preview.
+use std::sync::Arc;
+
+use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use tauqe_protocol::{methods, GitSquashPreviewParams, HistoryGetParams};
+use tokio::sync::Mutex;
+
+use crate::app::{
+    ActiveModal, AppState, BatchCancelButton, ConfirmDialogButton, HelpTab, SquashDialogState,
+    ViewMode,
+};
+use crate::command::global::{GlobalCommand, GLOBAL_COMMAND_MAP};
+use crate::config::{InputConfig, TuiConfig};
+use crate::editor::InputEditor;
+use crate::i18n::active_t;
+use crate::rpc::{send_request, RpcConnection};
+use crate::views::{context, history, onboarding, plans, repl, review};
+
+pub use crate::components::editor::is_char_typing;
+
+/// Outcome of handling one terminal event.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InputResult {
+    /// The application keeps running.
+    Continue,
+    /// The developer asked to quit.
+    Exit,
+}
+
+/// Reports whether the key event is the canonical Emacs keyboard-quit (`C-g`).
 ///
-/// The function owns its locking: the dialog state is installed under the guard,
-/// the guard is released, and only then is the preview requested (c-1).
+/// The chord is recognized before any handler runs because it is normalized to
+/// `Esc` and never dispatched as a command of its own (Conventions §5.5). The
+/// AltGr compose chord (`Ctrl+Alt`) is excluded, so a composed character never
+/// aborts a running operation.
+pub fn is_keyboard_quit(key: &KeyEvent) -> bool {
+    matches!(key.code, KeyCode::Char('g'))
+        && key.modifiers.contains(KeyModifiers::CONTROL)
+        && !key.modifiers.contains(KeyModifiers::ALT)
+}
+
+/// Routes one key event into the shared text editor.
+///
+/// `multiline` selects the field shape: the prompt, a discussion comment, and
+/// the squash message are multiline buffers, while a path or a language field
+/// stays a single-line input whose `Enter` confirms the dialog instead of
+/// inserting a newline.
+pub fn handle_editor_key(editor: &mut InputEditor, key: KeyEvent, is_cmd: bool, multiline: bool) {
+    editor.multiline = multiline;
+    editor.handle_key(key, is_cmd);
+}
+
+/// Opens the squash dialog and requests the preview of its default base.
 pub async fn open_squash_dialog(
     state: &Arc<Mutex<AppState>>,
     server_writer: &mut RpcConnection,
 ) -> anyhow::Result<()> {
-    let mut st = state.lock().await;
-    if st.model.is_busy() {
-        st.notify_warning(crate::i18n::active_t("notify.squash_busy"));
-        return Ok(());
-    }
-    st.squash_dialog = Some(crate::app::SquashDialogState::default());
-    drop(st);
-    let params = GitSquashPreviewParams { base_ref: None };
+    let params = {
+        let mut st = state.lock().await;
+        if st.model.is_busy() || st.review.running {
+            st.notify_warning(active_t("notify.squash_busy"));
+            return Ok(());
+        }
+        st.squash_dialog = Some(SquashDialogState::default());
+        GitSquashPreviewParams { base_ref: None }
+    };
     send_request(
         server_writer,
         methods::GIT_SQUASH_PREVIEW,
@@ -38,1534 +89,485 @@ pub async fn open_squash_dialog(
     Ok(())
 }
 
-/// Centralized view switching for both keyboard shortcuts and mouse clicks.
-/// Prevents accidental onboarding bypass and handles lazy History data loading.
+/// Switches the active view and refreshes the data the target view renders.
+///
+/// The switch is a presentation transition, so the state lock is held for the
+/// shortest possible window and released before any request leaves the
+/// transport; a daemon that stopped draining its stdin therefore cannot freeze
+/// the interface (c-1).
 pub async fn switch_view(
     state: &Arc<Mutex<AppState>>,
-    target_mode: ViewMode,
+    target: ViewMode,
     server_writer: &mut RpcConnection,
 ) -> anyhow::Result<()> {
-    let mut st = state.lock().await;
-    if st.view_mode == ViewMode::Onboarding {
-        st.notify_warning(crate::i18n::active_t("notify.onboarding_required"));
-        return Ok(());
+    {
+        let mut st = state.lock().await;
+        st.view_mode = target;
+        st.confirm_button = ConfirmDialogButton::Cancel;
     }
 
-    if st.view_mode == target_mode {
-        return Ok(());
-    }
-
-    // The local switch and its lazy-load bookkeeping complete under the guard;
-    // the resulting request is issued only after it is released, so a stalled
-    // daemon can never freeze the loop (c-1).
-    let request = if target_mode == ViewMode::History {
-        st.view_mode = ViewMode::History;
-        st.history_view.auto_scroll = true;
-        if !st.history_view.items.is_empty() {
-            st.history_view.selected_item_index = st.history_view.items.len().saturating_sub(1);
-            None
-        } else if !st.history_view.loading {
-            st.history_view.loading = true;
-            let params = tauqe_protocol::HistoryGetParams {
-                limit: Some(20),
+    match target {
+        ViewMode::History => {
+            let params = HistoryGetParams {
+                limit: Some(10),
                 before_id: None,
             };
-            Some((methods::HISTORY_GET, serde_json::to_value(params)?))
-        } else {
-            None
+            send_request(
+                server_writer,
+                methods::HISTORY_GET,
+                serde_json::to_value(params)?,
+            )
+            .await?;
         }
-    } else if target_mode == ViewMode::Review {
-        st.view_mode = ViewMode::Review;
-        if st.review.sessions.is_empty() {
-            Some((methods::REVIEW_LIST, serde_json::json!({})))
-        } else {
-            None
+        ViewMode::Plans => {
+            send_request(server_writer, methods::PLAN_LIST, serde_json::json!({})).await?;
+            send_request(server_writer, methods::PLAN_GET, serde_json::json!({})).await?;
         }
-    } else {
-        st.view_mode = target_mode;
-        None
-    };
-    drop(st);
-
-    if let Some((method, params)) = request {
-        send_request(server_writer, method, params).await?;
+        ViewMode::Review => {
+            send_request(server_writer, methods::REVIEW_LIST, serde_json::json!({})).await?;
+            send_request(server_writer, methods::REVIEW_GET, serde_json::json!({})).await?;
+        }
+        ViewMode::Repl | ViewMode::Context | ViewMode::Onboarding => {}
     }
     Ok(())
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum InputResult {
-    Continue,
-    Exit,
-}
-
-/// Returns whether text input is actively being entered (where bare keystrokes must
-/// be inserted literally without translation).
-pub fn is_text_input_active(st: &AppState) -> bool {
-    // Derive the answer from the canonical modal ordering: only the surfaces that
-    // actually own a live text editor report an active text input.
-    match st.active_modal() {
-        Some(ActiveModal::Squash) => st.squash_dialog.as_ref().is_some_and(|dialog| {
-            dialog.confirm.is_none()
-                && !dialog.applying
-                && (dialog.custom_input_active || dialog.focus == SquashDialogFocus::MessageEditor)
-        }),
-        Some(ActiveModal::Prompt) => st
-            .prompt_modal
-            .as_ref()
-            .is_some_and(|modal| modal.focus.is_editor()),
-        Some(ActiveModal::Review) => st
-            .review_dialog
-            .as_ref()
-            .is_some_and(|d| d.focus.is_prompt_editor() || d.focus.is_path_editor()),
-        Some(ActiveModal::RefineDialog) => st
-            .plans_view
-            .refine_dialog
-            .as_ref()
-            .is_some_and(|d| d.focus.is_instructions_editor()),
-        Some(ActiveModal::ReviewRefine) => st
-            .review
-            .refine_dialog
-            .as_ref()
-            .is_some_and(|d| d.focus.is_instructions_editor()),
-        Some(ActiveModal::Locale) => st
-            .locale_dialog
-            .as_ref()
-            .is_some_and(|dialog| dialog.focus.is_editor()),
-        // Point execution of a single finding or subplan step exposes the
-        // multiline Coder directives editor, which must accept literal typing
-        // without layout translation (Conventions §5.1).
-        Some(ActiveModal::ExecuteReview) => {
-            st.confirm_execute_review.as_ref().is_some_and(|target| {
-                target.is_single_target() && target.focus.is_instructions_editor()
-            })
-        }
-        // Plan step and scope execution expose the same Coder-directives
-        // editor, so it must also accept literal typing without layout
-        // translation (Conventions §5.1).
-        Some(ActiveModal::ExecuteScope) => st
-            .confirm_execute_scope
-            .as_ref()
-            .is_some_and(|target| target.focus.is_instructions_editor()),
-        Some(_) => false,
-        None => match st.view_mode {
-            ViewMode::Repl => true,
-            ViewMode::Context => st.context_view.adding_file,
-            ViewMode::Onboarding => st.onboarding.input_active,
-            ViewMode::Review | ViewMode::Plans | ViewMode::History => false,
-        },
-    }
-}
-
-/// Returns whether the key event's modifiers correspond to normal character typing:
-/// either no modifiers, Shift only, or AltGr (Ctrl+Alt / Ctrl+Alt+Shift) on Windows/X11.
-pub use crate::components::editor::is_char_typing;
-
-/// Returns whether the key event is the canonical keyboard-quit chord: `C-g`
-/// (Emacs `keyboard-quit`, ASCII BEL 0x07). The TUI treats it exactly like
-/// `Esc`, so one chord always aborts the running operation or closes the active
-/// surface without intercepting the system `SIGINT` signal.
+/// Routes pasted text to the surface that currently owns the keyboard.
 ///
-/// The AltGr / compose chord (`CONTROL | ALT`) is excluded, mirroring every
-/// other command chord in the codebase: terminals without the kitty keyboard
-/// protocol report a composed character as `Ctrl+Alt`, so that spelling must
-/// never be rewritten to `Esc` and silently dismiss a surface (Conventions
-/// §5.2).
-pub fn is_keyboard_quit(key: &KeyEvent) -> bool {
-    key.code == KeyCode::Char('g')
-        && key.modifiers.contains(KeyModifiers::CONTROL)
-        && !key.modifiers.contains(KeyModifiers::ALT)
-}
-
-/// Helper to remove the last word from a simple string buffer (equivalent to Ctrl+W).
-pub fn pop_word_backward(buf: &mut String) {
-    while buf.ends_with(char::is_whitespace) {
-        buf.pop();
-    }
-    while let Some(c) = buf.chars().last() {
-        if c.is_whitespace() {
-            break;
-        }
-        buf.pop();
-    }
-}
-
-/// Emacs and Readline keyboard handling for modal text editors (`InputEditor`).
-/// Printable characters without command modifiers are unconditionally inserted.
-pub fn handle_editor_key(
-    editor: &mut crate::editor::InputEditor,
-    key: KeyEvent,
-    is_cmd: bool,
-    multiline: bool,
-) -> bool {
-    editor.multiline = multiline;
-    editor.handle_key(key, is_cmd)
-}
-
-/// Routes terminal paste events strictly by modal stack priority, ensuring background
-/// editors are not polluted and active modal input targets receive the pasted text.
+/// A modal receives the text in the field it exposes, and the Develop prompt
+/// takes it when no modal is open. Every other surface ignores a paste, so a
+/// bracketed paste can never mutate a view the developer is not editing.
 pub fn handle_paste(st: &mut AppState, text: &str) {
-    // Route paste through the canonical modal ordering so it can never leak into a
-    // background editor that is not the visible, top-most surface.
+    if text.is_empty() {
+        return;
+    }
     match st.active_modal() {
-        // Text-editing modals receive the pasted text directly.
         Some(ActiveModal::Squash) => {
             if let Some(dialog) = st.squash_dialog.as_mut() {
-                if dialog.applying || dialog.confirm.is_some() {
-                    return;
-                }
                 if dialog.custom_input_active {
                     dialog.custom_editor.insert_paste_single_line(text);
-                } else if dialog.focus == SquashDialogFocus::MessageEditor {
-                    dialog.message_editor.insert_paste(text);
-                }
-            }
-        }
-        Some(ActiveModal::Review) => {
-            if let Some(dialog) = st.review_dialog.as_mut() {
-                // Paste targets the field that owns the keyboard, so a pasted
-                // path never lands in the prompt editor and vice versa.
-                if dialog.focus.is_path_editor() {
-                    dialog.path_editor.insert_paste_single_line(text);
                 } else {
-                    dialog.prompt_editor.insert_paste(text);
+                    dialog.message_editor.insert_paste(text);
                 }
             }
         }
         Some(ActiveModal::Prompt) => {
             if let Some(modal) = st.prompt_modal.as_mut() {
-                if modal.focus.is_editor() {
-                    modal.prompt_editor.insert_paste(text);
+                modal.prompt_editor.insert_paste(text);
+            }
+        }
+        Some(ActiveModal::Review) => {
+            if let Some(dialog) = st.review_dialog.as_mut() {
+                if dialog.focus.is_path_editor() {
+                    if let Some(editor) = dialog.active_path_editor_mut() {
+                        editor.insert_paste_single_line(text);
+                    }
+                    dialog.refresh_path_completion();
+                } else {
+                    dialog.prompt_editor.insert_paste(text);
                 }
-            }
-        }
-        Some(ActiveModal::RefineDialog) => {
-            if let Some(dialog) = st.plans_view.refine_dialog.as_mut() {
-                dialog.instructions_editor.insert_paste(text);
-            }
-        }
-        Some(ActiveModal::ReviewRefine) => {
-            if let Some(dialog) = st.review.refine_dialog.as_mut() {
-                dialog.instructions_editor.insert_paste(text);
             }
         }
         Some(ActiveModal::Locale) => {
             if let Some(dialog) = st.locale_dialog.as_mut() {
-                if dialog.focus.is_editor() {
-                    dialog.language_editor.insert_paste_single_line(text);
-                }
+                dialog.language_editor.insert_paste_single_line(text);
             }
         }
-        // The single-target execution form owns a directives editor; pasted
-        // text lands there instead of being silently discarded.
-        Some(ActiveModal::ExecuteReview) => {
-            if let Some(target) = st.confirm_execute_review.as_mut() {
-                if target.is_single_target() && target.focus.is_instructions_editor() {
-                    target.instructions_editor.insert_paste(text);
-                }
-            }
-        }
-        // The plan step and scope form owns the same directives editor; pasted
-        // text lands there instead of being silently absorbed.
-        Some(ActiveModal::ExecuteScope) => {
-            if let Some(target) = st.confirm_execute_scope.as_mut() {
-                if target.focus.is_instructions_editor() {
-                    target.instructions_editor.insert_paste(text);
-                }
-            }
-        }
-        // Blocking modals absorb paste without forwarding it to the background.
         Some(_) => {}
-        // No modal: route to the active view's text target.
-        None => match st.view_mode {
-            ViewMode::Repl => {
-                st.model.focus = repl::ReplFocus::Editor;
+        None => {
+            if st.view_mode == ViewMode::Repl {
                 st.input_editor.insert_paste(text);
             }
-            ViewMode::Context => {
-                if st.context_view.adding_file {
-                    st.context_view.add_input.insert_paste_single_line(text);
-                    st.context_view.selected_candidate_index = 0;
-                    st.update_filtered_candidates();
-                }
-            }
-            ViewMode::Onboarding => {
-                if st.onboarding.input_active {
-                    st.onboarding.input_buffer.insert_paste_single_line(text);
-                }
-            }
-            ViewMode::Review | ViewMode::Plans | ViewMode::History => {}
-        },
+        }
     }
 }
 
+/// Handles one terminal event and reports whether the interface keeps running.
 pub async fn handle_terminal_event(
-    terminal_event: crossterm::event::Event,
+    event: Event,
     state: &Arc<Mutex<AppState>>,
     server_writer: &mut RpcConnection,
 ) -> anyhow::Result<InputResult> {
-    match terminal_event {
-        crossterm::event::Event::FocusGained => {
-            let mut st = state.lock().await;
-            st.terminal_focused = true;
-            Ok(InputResult::Continue)
-        }
-        crossterm::event::Event::FocusLost => {
-            let mut st = state.lock().await;
-            st.terminal_focused = false;
-            Ok(InputResult::Continue)
-        }
-        crossterm::event::Event::Paste(text) => {
+    match event {
+        Event::Key(key) => handle_key_event(key, state, server_writer).await,
+        Event::Mouse(mouse) => mouse::handle_mouse_event(mouse, state, server_writer).await,
+        Event::Paste(text) => {
             let mut st = state.lock().await;
             handle_paste(&mut st, &text);
             Ok(InputResult::Continue)
         }
-        crossterm::event::Event::Mouse(mouse) => {
-            mouse::handle_mouse_event(mouse, state, server_writer).await
+        Event::FocusGained => {
+            state.lock().await.terminal_focused = true;
+            Ok(InputResult::Continue)
         }
-        crossterm::event::Event::Key(mut key)
-            if key.kind != crossterm::event::KeyEventKind::Release =>
-        {
-            let (text_input_active, layout_preset, custom_langmap, primary_modifier) = {
-                let st = state.lock().await;
-                (
-                    is_text_input_active(&st),
-                    st.tui_config.input.layout,
-                    st.tui_config.input.langmap.clone(),
-                    st.tui_config.input.primary_modifier,
-                )
-            };
-
-            // Translate characters only if a layout mapping or custom langmap is explicitly configured:
-            // 1. Command modifiers (PrimaryModifier, Ctrl or Alt) are active, OR
-            // 2. The user is in a non-text navigation mode (Vim style).
-            let is_ctrl_alt = key.modifiers.contains(KeyModifiers::CONTROL)
-                && key.modifiers.contains(KeyModifiers::ALT);
-            let is_primary_mod = !is_ctrl_alt && primary_modifier.matches(key.modifiers);
-            let has_layout_mapping =
-                layout_preset != crate::config::LayoutPreset::None || custom_langmap.is_some();
-            if has_layout_mapping
-                && (!text_input_active
-                    || (!is_char_typing(key.modifiers)
-                        && (is_primary_mod
-                            || key.modifiers.contains(KeyModifiers::CONTROL)
-                            || key.modifiers.contains(KeyModifiers::ALT))))
-            {
-                if let KeyCode::Char(c) = key.code {
-                    key.code = KeyCode::Char(layout::translate_char(
-                        c,
-                        layout_preset,
-                        custom_langmap.as_deref(),
-                    ));
-                }
-            }
-
-            // C-g (keyboard-quit) is the canonical abort chord: normalize it to
-            // `Esc` here so every view and modal reacts identically without a
-            // per-handler binding (Conventions §5). It runs after layout
-            // translation so a mapped key still resolves back to `C-g`.
-            if is_keyboard_quit(&key) {
-                key = KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
-            }
-
-            // `Ctrl+Q` is a raw quit chord, so it excludes the AltGr / compose
-            // spelling (`CONTROL | ALT`) exactly like `C-g` above.
-            if key.modifiers.contains(KeyModifiers::CONTROL)
-                && !key.modifiers.contains(KeyModifiers::ALT)
-                && key.code == KeyCode::Char('q')
-            {
-                let mut st = state.lock().await;
-                if st.confirm_quit {
-                    return Ok(InputResult::Exit);
-                }
-                let has_unsaved_work = st.model.is_busy()
-                    || st.review.running
-                    || !st.input_editor.is_empty()
-                    || st
-                        .squash_dialog
-                        .as_ref()
-                        .is_some_and(|d| d.applying || !d.message_editor.is_empty());
-                if has_unsaved_work {
-                    st.confirm_quit = true;
-                    st.confirm_button = crate::app::ConfirmDialogButton::Cancel;
-                    return Ok(InputResult::Continue);
-                }
-                return Ok(InputResult::Exit);
-            }
-
-            if state.lock().await.server_disconnected.is_some() {
-                if key.code == KeyCode::Char('q') || key.code == KeyCode::Esc {
-                    return Ok(InputResult::Exit);
-                }
-                return Ok(InputResult::Continue);
-            }
-
-            // 1. Modals & Dialogs (Squash, Confirmations, Model Picker, Help)
-            if let Some(res) =
-                crate::dialogs::input::handle_dialog_event(key, state, server_writer).await?
-            {
-                return Ok(res);
-            }
-
-            // 2. Global application-level shortcuts
-            if let Some(res) =
-                handle_global_shortcuts(key, state, server_writer, text_input_active).await?
-            {
-                return Ok(res);
-            }
-
-            // 3. View-specific handlers
-            let mode = { state.lock().await.view_mode };
-            match mode {
-                ViewMode::Repl => repl::handle_repl_key(key, state, server_writer).await,
-                ViewMode::Context => context::handle_context_key(key, state, server_writer).await,
-                ViewMode::Onboarding => {
-                    onboarding::handle_onboarding_key(key, state, server_writer).await
-                }
-                ViewMode::Review => review::handle_review_key(key, state, server_writer).await,
-                ViewMode::Plans => plans::handle_plans_key(key, state, server_writer).await,
-                ViewMode::History => history::handle_history_key(key, state, server_writer).await,
-            }
+        Event::FocusLost => {
+            state.lock().await.terminal_focused = false;
+            Ok(InputResult::Continue)
         }
+        // A resize is redrawn by the event loop itself, and any future event
+        // kind is inert until the interface subscribes to it.
         _ => Ok(InputResult::Continue),
     }
 }
 
-/// Reloads the TUI configuration from disk and asks the server to reload its
-/// own configuration, keeping both sides in sync. Shared by the workspace and
-/// onboarding configuration-reload shortcuts.
-///
-/// The configuration file is read before the guard is taken: a synchronous
-/// filesystem read on a slow home directory must never stall the event loop
-/// while the interface state is locked (c-1).
-async fn reload_configuration(
-    state: &Arc<Mutex<AppState>>,
-    server_writer: &mut RpcConnection,
-) -> anyhow::Result<()> {
-    let loaded = crate::config::TuiConfig::load_checked();
-    {
-        let mut st = state.lock().await;
-        match loaded {
-            Ok(cfg) => {
-                st.tui_config = cfg;
-                st.sync_theme_mode();
-                st.notify_info(crate::i18n::active_t("notify.config_reloading"));
-            }
-            Err(err) => {
-                st.notify_error(
-                    crate::i18n::active_t("notify.config_reload_error")
-                        .replace("{}", &err.to_string()),
-                );
-            }
-        }
-    }
-    send_request(server_writer, methods::CONFIG_RELOAD, serde_json::json!({})).await?;
-    Ok(())
-}
-
-async fn handle_global_shortcuts(
+/// Applies the canonical dispatch order to one key press.
+async fn handle_key_event(
     key: KeyEvent,
     state: &Arc<Mutex<AppState>>,
     server_writer: &mut RpcConnection,
-    text_input_active: bool,
-) -> anyhow::Result<Option<InputResult>> {
-    // Zero modal ambiguity (§6 Conventions): when typing into any active text buffer
-    // (Develop prompt, Onboarding fields, Context file search, Squash editor), printable
-    // characters typed without command modifiers (including Shift and AltGr) must be passed
-    // directly to the text input handler without interference from global shortcuts.
-    if text_input_active && is_char_typing(key.modifiers) {
-        if let KeyCode::Char(_) = key.code {
-            return Ok(None);
-        }
+) -> anyhow::Result<InputResult> {
+    if !matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
+        return Ok(InputResult::Continue);
     }
 
-    let mut st = state.lock().await;
-
-    // Resolve the key once against the single source of truth for global
-    // bindings. The command map already blocks bare structural chords while a
-    // text editor is active, so the unconditional character insertion
-    // invariant holds without any per-key branching here (Conventions §3, §5).
-    let Some(command) = GLOBAL_COMMAND_MAP
-        .resolve(key, &st.tui_config.input, text_input_active)
-        .map(|spec| spec.action)
-    else {
-        return Ok(None);
+    // `C-g` is the universal abort chord: normalize it once, before any view or
+    // modal handler runs, so every surface reacts exactly as it reacts to `Esc`
+    // (Conventions §5.5).
+    let key = if is_keyboard_quit(&key) {
+        KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)
+    } else {
+        key
     };
 
-    // Onboarding is a modal first-run flow. Workspace-level shortcuts (tab
-    // switching, model picker, squash, reasoning toggle, cancel) must not fire
-    // before setup completes: for example the squash chord would issue a squash
-    // request with no repository. Only Help and configuration reload stay
-    // available, because the onboarding footer advertises them.
-    if st.view_mode == ViewMode::Onboarding
-        && !matches!(
+    let (modal_open, disconnected, command, mode) = {
+        let st = state.lock().await;
+        let input = input_config(&st);
+        let command = GLOBAL_COMMAND_MAP
+            .resolve(key, &input, text_input_active(&st))
+            .map(|spec| spec.action);
+        (
+            st.active_modal().is_some(),
+            st.server_disconnected.is_some(),
             command,
-            GlobalCommand::OpenHelp | GlobalCommand::ReloadConfig
+            st.view_mode,
         )
-    {
-        return Ok(None);
+    };
+
+    // A disconnected daemon leaves the interface read-only: the card offers the
+    // quit chords and nothing else (Conventions §6).
+    if disconnected {
+        let quits = matches!(key.code, KeyCode::Esc | KeyCode::Char('q'))
+            || matches!(command, Some(GlobalCommand::Quit));
+        return Ok(if quits {
+            InputResult::Exit
+        } else {
+            InputResult::Continue
+        });
     }
 
+    if modal_open {
+        return crate::dialogs::input::handle_dialog_event(key, state, server_writer)
+            .await
+            .map(|handled| handled.unwrap_or(InputResult::Continue));
+    }
+
+    if let Some(command) = command {
+        return execute_global_command(command, state, server_writer).await;
+    }
+
+    match mode {
+        ViewMode::Repl => repl::input::handle_repl_key(key, state, server_writer).await,
+        ViewMode::Plans => plans::input::handle_plans_key(key, state, server_writer).await,
+        ViewMode::Review => review::input::handle_review_key(key, state, server_writer).await,
+        ViewMode::Context => context::input::handle_context_key(key, state, server_writer).await,
+        ViewMode::History => history::input::handle_history_key(key, state, server_writer).await,
+        ViewMode::Onboarding => {
+            onboarding::input::handle_onboarding_key(key, state, server_writer).await
+        }
+    }
+}
+
+/// Executes one resolved global command.
+async fn execute_global_command(
+    command: GlobalCommand,
+    state: &Arc<Mutex<AppState>>,
+    server_writer: &mut RpcConnection,
+) -> anyhow::Result<InputResult> {
     match command {
-        GlobalCommand::OpenHelp => {
-            st.show_help = true;
-            st.help_scroll = 0;
+        GlobalCommand::Quit => {
+            let mut st = state.lock().await;
+            if st.server_disconnected.is_some() {
+                return Ok(InputResult::Exit);
+            }
+            st.confirm_quit = true;
+            st.confirm_button = ConfirmDialogButton::Cancel;
         }
-        GlobalCommand::ReloadConfig => {
-            // The configuration reload ends with a transport write, so the guard
-            // is released before the helper is awaited (c-1).
-            drop(st);
-            reload_configuration(state, server_writer).await?;
-        }
-        GlobalCommand::ToggleReasoning => {
-            st.model.reasoning.toggle_fold();
-            let h = st.last_model_height;
-            st.model.clamp_scroll(h);
-        }
-        GlobalCommand::SwitchView(target_mode) => {
-            // Both helpers issue a transport write once their local transition
-            // is complete, so the guard is released before they are awaited
-            // (c-1).
-            drop(st);
-            switch_view(state, target_mode, server_writer).await?;
+        // The chord is normalized to `Esc` before dispatch, so this arm is
+        // unreachable in practice; the binding stays declared so the Help
+        // surface and the dispatcher read one vocabulary (Conventions §5.5).
+        GlobalCommand::KeyboardQuit => {}
+        GlobalCommand::CancelGeneration => {
+            let mut st = state.lock().await;
+            cancel_active_operation(&mut st);
         }
         GlobalCommand::SquashCommits => {
-            drop(st);
             open_squash_dialog(state, server_writer).await?;
         }
-        GlobalCommand::SelectTheme => {
-            st.open_theme_selector();
-        }
-        GlobalCommand::SelectLocale => {
-            st.open_locale_dialog();
+        GlobalCommand::SwitchView(target) => {
+            switch_view(state, target, server_writer).await?;
         }
         GlobalCommand::SelectModel => {
+            let mut st = state.lock().await;
             if st.model.is_busy() {
-                st.notify_warning(crate::i18n::active_t("notify.model_select_busy"));
-            } else if !st.open_model_dialog() {
-                return Ok(None);
+                st.notify_warning(active_t("notify.model_select_busy"));
+            } else {
+                st.open_model_dialog();
             }
         }
-        GlobalCommand::CancelGeneration => {
-            if st.model.is_batch && st.model.is_busy() {
-                // A batch supervisor runs a bounded queue of isolated turns: offer
-                // the three-way choice between continuing, stopping after the
-                // current member, and aborting immediately instead of a plain
-                // interrupt (Conventions.md §7).
-                st.confirm_batch_cancel = true;
-                st.batch_cancel_button = crate::app::BatchCancelButton::Continue;
-            } else if st.model.is_busy() || st.review.running {
-                st.confirm_cancel = true;
-                st.confirm_button = crate::app::ConfirmDialogButton::Cancel;
-            } else {
-                st.notify_info(crate::i18n::active_t("notify.quit_hint"));
-            }
+        GlobalCommand::SelectTheme => {
+            state.lock().await.open_theme_selector();
+        }
+        GlobalCommand::SelectLocale => {
+            state.lock().await.open_locale_dialog();
         }
         GlobalCommand::OpenUsageSummary => {
-            // Reading telemetry spends no tokens and mutates no domain state, so
-            // the breakdown opens regardless of a running turn (c-4).
-            st.open_usage_summary();
+            state.lock().await.open_usage_summary();
         }
-        // Quit and keyboard-quit are consumed earlier in `handle_terminal_event`
-        // (Ctrl+Q handling and the C-g normalization); the arms only satisfy the
-        // exhaustive match over the global command set.
-        GlobalCommand::Quit | GlobalCommand::KeyboardQuit => return Ok(None),
+        GlobalCommand::ToggleReasoning => {
+            let mut st = state.lock().await;
+            st.model.reasoning.toggle_fold();
+            st.model.update_reasoning_markdown();
+        }
+        GlobalCommand::OpenHelp => {
+            let mut st = state.lock().await;
+            let open = !st.show_help;
+            st.show_help = open;
+            st.help_scroll = 0;
+            if open {
+                st.help_tab = HelpTab::Global;
+            }
+        }
+        GlobalCommand::ReloadConfig => reload_configuration(state).await,
     }
+    Ok(InputResult::Continue)
+}
 
-    Ok(Some(InputResult::Continue))
+/// Raises the confirmation that interrupts whatever owns the operation slot.
+///
+/// A running batch gets the three-way dialog whose safe default is `Continue`;
+/// a single turn or a review gets the binary confirmation whose default is
+/// `Cancel` (Conventions §6.3, §7).
+fn cancel_active_operation(st: &mut AppState) {
+    if st.model.is_batch && st.model.is_busy() {
+        st.confirm_batch_cancel = true;
+        st.batch_cancel_button = BatchCancelButton::Continue;
+    } else if st.model.is_busy() || st.review.running {
+        st.confirm_cancel = true;
+        st.confirm_button = ConfirmDialogButton::Cancel;
+    }
+}
+
+/// Reloads the workstation configuration from disk and repaints the interface.
+async fn reload_configuration(state: &Arc<Mutex<AppState>>) {
+    let mut st = state.lock().await;
+    match TuiConfig::load_checked() {
+        Ok(config) => {
+            st.tui_config = config;
+            st.sync_theme_mode();
+            st.notify_success(active_t("notify.config_reloaded"));
+        }
+        Err(err) => {
+            st.notify_error(active_t("notify.config_reload_error").replace("{}", &err.to_string()));
+        }
+    }
+}
+
+/// Modifier configuration the shared command maps resolve their chords with.
+fn input_config(st: &AppState) -> InputConfig {
+    // Forward the whole workstation input configuration verbatim: rebuilding it
+    // field by field silently dropped `layout` and `langmap`, leaving the shared
+    // command maps unaware of the configured keyboard layout.
+    st.tui_config.input.clone()
+}
+
+/// Whether a text buffer currently captures printable characters.
+///
+/// The flag neutralizes bare structural chords (such as the bare `?` that opens
+/// Help) while the developer is typing, so the unconditional character
+/// insertion invariant holds (Conventions §5.1).
+fn text_input_active(st: &AppState) -> bool {
+    match st.view_mode {
+        ViewMode::Repl => true,
+        ViewMode::Onboarding => st.onboarding.input_active,
+        ViewMode::Context => st.context_view.adding_file,
+        _ => false,
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::app::*;
-    use tauqe_protocol::ModelRef;
-
-    #[tokio::test]
-    async fn test_focus_events_update_terminal_focus_state() {
-        let state = Arc::new(Mutex::new(test_state()));
-        let mut conn = RpcConnection::new(Vec::<u8>::new());
-
-        assert!(state.lock().await.terminal_focused);
-
-        let res = handle_terminal_event(crossterm::event::Event::FocusLost, &state, &mut conn)
-            .await
-            .unwrap();
-        assert_eq!(res, InputResult::Continue);
-        assert!(!state.lock().await.terminal_focused);
-
-        let res = handle_terminal_event(crossterm::event::Event::FocusGained, &state, &mut conn)
-            .await
-            .unwrap();
-        assert_eq!(res, InputResult::Continue);
-        assert!(state.lock().await.terminal_focused);
-    }
 
     #[test]
-    fn test_is_keyboard_quit_only_matches_ctrl_g() {
+    fn ctrl_g_is_the_keyboard_quit_and_altgr_is_not() {
         assert!(is_keyboard_quit(&KeyEvent::new(
             KeyCode::Char('g'),
             KeyModifiers::CONTROL
         )));
         assert!(!is_keyboard_quit(&KeyEvent::new(
             KeyCode::Char('g'),
-            KeyModifiers::NONE
-        )));
-        assert!(!is_keyboard_quit(&KeyEvent::new(
-            KeyCode::Char('x'),
-            KeyModifiers::CONTROL
-        )));
-        // The AltGr / compose spelling of `g` (`CONTROL | ALT`) is a composed
-        // character, never the raw `C-g` abort chord.
-        assert!(!is_keyboard_quit(&KeyEvent::new(
-            KeyCode::Char('g'),
             KeyModifiers::CONTROL | KeyModifiers::ALT
         )));
-    }
-
-    /// The squash dialog advertises its generate-message chord as the meta chord
-    /// (`Alt+G` by default), because `C-g` is the global keyboard-quit and is
-    /// normalized to `Esc` before any dialog sees it. This drives the whole
-    /// terminal event path, proving the advertised chord reaches
-    /// `begin_generate` instead of merely moving focus.
-    #[tokio::test]
-    async fn squash_dialog_meta_chord_generates_message_through_terminal_event() {
-        let mut st = test_state();
-        st.squash_dialog = Some(SquashDialogState {
-            loading: false,
-            base_ref: "origin/master".to_string(),
-            focus: SquashDialogFocus::MessageEditor,
-            ..Default::default()
-        });
-        let state = Arc::new(Mutex::new(st));
-        let mut conn = RpcConnection::new(Vec::<u8>::new());
-
-        let key = KeyEvent::new(KeyCode::Char('g'), KeyModifiers::ALT);
-        handle_terminal_event(crossterm::event::Event::Key(key), &state, &mut conn)
-            .await
-            .expect("in-memory dispatch never fails");
-
-        let guard = state.lock().await;
-        let dialog = guard.squash_dialog.as_ref().expect("dialog stays open");
-        assert!(
-            dialog.generating_message,
-            "the meta chord must start message generation"
-        );
-        assert_eq!(dialog.focus, SquashDialogFocus::MessageEditor);
-        drop(guard);
-        assert!(
-            !conn.written().is_empty(),
-            "the generate request reaches the daemon"
-        );
-    }
-
-    /// `Ctrl+G` stays the global keyboard-quit: it is rewritten to `Esc`, so the
-    /// message editor returns to the file list and never issues a request.
-    #[tokio::test]
-    async fn squash_dialog_keyboard_quit_never_generates_a_message() {
-        let mut st = test_state();
-        st.squash_dialog = Some(SquashDialogState {
-            loading: false,
-            focus: SquashDialogFocus::MessageEditor,
-            ..Default::default()
-        });
-        let state = Arc::new(Mutex::new(st));
-        let mut conn = RpcConnection::new(Vec::<u8>::new());
-
-        let key = KeyEvent::new(KeyCode::Char('g'), KeyModifiers::CONTROL);
-        handle_terminal_event(crossterm::event::Event::Key(key), &state, &mut conn)
-            .await
-            .expect("in-memory dispatch never fails");
-
-        let guard = state.lock().await;
-        let dialog = guard.squash_dialog.as_ref().expect("dialog stays open");
-        assert!(!dialog.generating_message);
-        assert_eq!(dialog.focus, SquashDialogFocus::FileList);
-        drop(guard);
-        assert!(conn.written().is_empty());
-    }
-
-    /// The AltGr / compose spelling of `g` (`CONTROL | ALT`) must never be
-    /// normalized to `Esc`: the dialog neither dismisses nor issues a request.
-    #[tokio::test]
-    async fn squash_dialog_altgr_chord_never_quits_or_dismisses() {
-        let mut st = test_state();
-        st.squash_dialog = Some(SquashDialogState {
-            loading: false,
-            focus: SquashDialogFocus::MessageEditor,
-            ..Default::default()
-        });
-        let state = Arc::new(Mutex::new(st));
-        let mut conn = RpcConnection::new(Vec::<u8>::new());
-
-        let key = KeyEvent::new(
+        assert!(!is_keyboard_quit(&KeyEvent::new(
             KeyCode::Char('g'),
-            KeyModifiers::CONTROL | KeyModifiers::ALT,
-        );
-        handle_terminal_event(crossterm::event::Event::Key(key), &state, &mut conn)
-            .await
-            .expect("in-memory dispatch never fails");
-
-        let guard = state.lock().await;
-        let dialog = guard.squash_dialog.as_ref().expect("dialog stays open");
-        assert!(!dialog.generating_message);
-        assert_eq!(dialog.focus, SquashDialogFocus::MessageEditor);
-        drop(guard);
-        assert!(conn.written().is_empty());
-    }
-
-    /// The AltGr / compose spelling of `q` (`CONTROL | ALT`) is a composed
-    /// character, so it never arms the quit confirmation and never exits.
-    #[tokio::test]
-    async fn test_altgr_q_never_arms_the_quit_gate() {
-        let state = Arc::new(Mutex::new(test_state()));
-        let mut conn = RpcConnection::new(Vec::<u8>::new());
-
-        let key = KeyEvent::new(
-            KeyCode::Char('q'),
-            KeyModifiers::CONTROL | KeyModifiers::ALT,
-        );
-        let res = handle_terminal_event(crossterm::event::Event::Key(key), &state, &mut conn)
-            .await
-            .unwrap();
-        assert_eq!(res, InputResult::Continue);
-        assert!(!state.lock().await.confirm_quit);
-    }
-
-    #[tokio::test]
-    async fn test_ctrl_g_closes_active_modal_like_esc() {
-        let mut st = test_state();
-        st.show_help = true;
-        let state = Arc::new(Mutex::new(st));
-        let mut conn = RpcConnection::new(Vec::<u8>::new());
-
-        let key = KeyEvent::new(KeyCode::Char('g'), KeyModifiers::CONTROL);
-        let res = handle_terminal_event(crossterm::event::Event::Key(key), &state, &mut conn)
-            .await
-            .unwrap();
-        assert_eq!(res, InputResult::Continue);
-        assert!(!state.lock().await.show_help);
+            KeyModifiers::NONE
+        )));
     }
 
     #[test]
-    fn test_handle_paste_routes_to_develop_editor() {
-        let mut st = test_state();
-        handle_paste(&mut st, "hello world");
-        assert_eq!(st.input_editor.get_text(), "hello world");
+    fn paste_reaches_the_develop_prompt_and_no_other_view() {
+        let mut develop = crate::app::test_state();
+        develop.view_mode = ViewMode::Repl;
+        handle_paste(&mut develop, "док");
+        assert_eq!(develop.input_editor.get_text(), "док");
+
+        let mut plans_view = crate::app::test_state();
+        plans_view.view_mode = ViewMode::Plans;
+        handle_paste(&mut plans_view, "док");
+        assert!(plans_view.input_editor.is_empty());
+    }
+    #[test]
+    fn input_config_forwards_layout_and_langmap_from_workstation_config() {
+        use crate::config::{LayoutPreset, MetaModifier, PrimaryModifier};
+
+        let mut st = crate::app::test_state();
+        st.tui_config.input.layout = LayoutPreset::RuJcuken;
+        st.tui_config.input.langmap = Some("йцукен".to_string());
+        st.tui_config.input.primary_modifier = PrimaryModifier::Alt;
+        st.tui_config.input.meta_modifier = MetaModifier::Ctrl;
+
+        let input = input_config(&st);
+        assert_eq!(input.layout, LayoutPreset::RuJcuken);
+        assert_eq!(input.langmap.as_deref(), Some("йцукен"));
+        assert_eq!(input.primary_modifier, PrimaryModifier::Alt);
+        assert_eq!(input.meta_modifier, MetaModifier::Ctrl);
+        assert!(input.is_primary(KeyModifiers::ALT));
+        assert!(input.is_meta(KeyModifiers::CONTROL));
     }
 
     #[test]
-    fn test_handle_paste_into_develop_returns_focus_to_editor() {
-        let mut st = test_state();
-        st.model.focus = crate::views::repl::ReplFocus::Viewport;
-        handle_paste(&mut st, "hello world");
-        assert!(matches!(
-            &st.model.focus,
-            crate::views::repl::ReplFocus::Editor
-        ));
-        assert_eq!(st.input_editor.get_text(), "hello world");
+    fn input_config_tracks_the_selected_layout_preset() {
+        use crate::config::LayoutPreset;
+
+        let mut st = crate::app::test_state();
+        st.tui_config.input.layout = LayoutPreset::None;
+        assert_eq!(input_config(&st).layout, LayoutPreset::None);
+
+        st.tui_config.input.layout = LayoutPreset::RuJcuken;
+        assert_eq!(input_config(&st).layout, LayoutPreset::RuJcuken);
     }
-
+    /// Runs the end-to-end JCUKEN scenario through the dispatcher inputs.
+    ///
+    /// The workstation state carries the selected layout, the dispatcher derives
+    /// the `InputConfig` from it, and the shared command maps resolve the
+    /// physical press: a Cyrillic key reaches the navigation and execution
+    /// commands of a structural view, while in the Develop prompt the very same
+    /// key is a literal character that never reaches a command (c-1, c-3, c-4).
     #[test]
-    fn test_handle_paste_blocked_by_confirm_cancel() {
-        let mut st = test_state();
-        st.confirm_cancel = true;
-        handle_paste(&mut st, "should not appear");
-        assert_eq!(st.input_editor.get_text(), "");
-    }
+    fn ru_jcuken_scenario_reaches_structural_actions_and_stays_literal_in_the_prompt() {
+        use crate::config::LayoutPreset;
+        use crate::views::context::input::{ContextAction, CONTEXT_COMMAND_MAP};
+        use crate::views::plans::input::{PlansAction, PLANS_COMMAND_MAP};
+        use crate::views::repl::input::REPL_COMMAND_MAP;
+        use crate::views::review::input::{ReviewAction, REVIEW_COMMAND_MAP};
 
-    #[test]
-    fn test_handle_paste_blocked_by_squash_modal_when_browsing() {
-        let mut st = test_state();
-        st.squash_dialog = Some(SquashDialogState::default());
-        handle_paste(&mut st, "should not appear");
-        assert_eq!(st.input_editor.get_text(), "");
-    }
+        let mut st = crate::app::test_state();
+        st.tui_config.input.layout = LayoutPreset::RuJcuken;
 
-    #[test]
-    fn test_handle_paste_into_squash_custom_input() {
-        let mut st = test_state();
-        let dialog = SquashDialogState {
-            custom_input_active: true,
-            ..Default::default()
-        };
-        st.squash_dialog = Some(dialog);
-        handle_paste(&mut st, " feature/my-branch \n");
-        assert_eq!(
-            st.squash_dialog.as_ref().unwrap().custom_editor.get_text(),
-            "feature/my-branch"
-        );
-        assert_eq!(st.input_editor.get_text(), "");
-    }
-
-    #[test]
-    fn test_is_text_input_active_in_prompt_modal() {
-        let mut st = test_state();
-        st.view_mode = ViewMode::Review;
-        assert!(!is_text_input_active(&st));
-
-        st.prompt_modal = Some(PromptModalState::new(PromptModalTarget::Review {
-            review_id: "test".to_string(),
-            review_title: "Test".to_string(),
-            focused_items: Vec::new(),
-        }));
-        assert!(is_text_input_active(&st));
-
-        st.prompt_modal.as_mut().unwrap().focus = ModalFocus::Actions;
-        assert!(!is_text_input_active(&st));
-    }
-
-    #[test]
-    fn test_handle_paste_into_prompt_modal() {
-        let mut st = test_state();
-        st.prompt_modal = Some(PromptModalState::new(PromptModalTarget::Review {
-            review_id: "r1".to_string(),
-            review_title: "Review 1".to_string(),
-            focused_items: Vec::new(),
-        }));
-        handle_paste(&mut st, "pasted review comment");
-        assert_eq!(
-            st.prompt_modal.as_ref().unwrap().prompt_editor.get_text(),
-            "pasted review comment"
-        );
-        assert_eq!(st.input_editor.get_text(), "");
-    }
-
-    #[test]
-    fn test_is_text_input_active_in_plan_prompt_modal() {
-        let mut st = test_state();
+        // `т`, `з`, and `ч` occupy the `n`, `p`, and `x` positions of JCUKEN.
         st.view_mode = ViewMode::Plans;
-        assert!(!is_text_input_active(&st));
-
-        st.prompt_modal = Some(PromptModalState::new(PromptModalTarget::Plan {
-            plan_id: "test".to_string(),
-            plan_title: "Test".to_string(),
-            focused_items: Vec::new(),
-        }));
-        assert!(is_text_input_active(&st));
-    }
-
-    #[test]
-    fn test_handle_editor_key_newline_shortcuts() {
-        let mut editor = crate::editor::InputEditor::default();
-        editor.insert_str("line 1");
-
-        // C-j inserts newline (electric-newline)
-        let key_cj = KeyEvent::new(KeyCode::Char('j'), KeyModifiers::CONTROL);
-        assert!(handle_editor_key(&mut editor, key_cj, true, true));
-        assert_eq!(editor.get_text(), "line 1\n");
-
-        // Alt+Enter inserts newline
-        let key_alt_enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::ALT);
-        assert!(handle_editor_key(&mut editor, key_alt_enter, false, true));
-        assert_eq!(editor.get_text(), "line 1\n\n");
-
-        // C-n must never insert a newline in multiline mode; it navigates one line down.
-        let before = editor.get_text().to_string();
-        let key_cn = KeyEvent::new(KeyCode::Char('n'), KeyModifiers::CONTROL);
-        assert!(handle_editor_key(&mut editor, key_cn, true, true));
-        assert_eq!(editor.get_text(), before);
-    }
-
-    #[test]
-    fn test_handle_editor_key_vertical_navigation_symmetry() {
-        let mut editor = crate::editor::InputEditor::default();
-        editor.insert_str("line 1\nline 2\nline 3");
-        editor.cursor = 0;
-
-        let original = editor.get_text().to_string();
-
-        // C-n moves exactly one line down and leaves the buffer untouched.
-        let key_cn = KeyEvent::new(KeyCode::Char('n'), KeyModifiers::CONTROL);
-        assert!(handle_editor_key(&mut editor, key_cn, true, true));
-        assert_eq!(editor.cursor_line_col().0, 1);
-        assert_eq!(editor.get_text(), original);
-
-        // C-p moves back up, restoring strict C-p / C-n symmetry.
-        let key_cp = KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL);
-        assert!(handle_editor_key(&mut editor, key_cp, true, true));
-        assert_eq!(editor.cursor_line_col().0, 0);
-        assert_eq!(editor.get_text(), original);
-    }
-
-    #[test]
-    fn test_handle_paste_into_plan_prompt_modal() {
-        let mut st = test_state();
-        st.view_mode = ViewMode::Plans;
-        st.prompt_modal = Some(PromptModalState::new(PromptModalTarget::Plan {
-            plan_id: "p1".to_string(),
-            plan_title: "Plan 1".to_string(),
-            focused_items: Vec::new(),
-        }));
-        handle_paste(&mut st, "русский текст с переносом\nвторая строка");
-        assert_eq!(
-            st.prompt_modal.as_ref().unwrap().prompt_editor.get_text(),
-            "русский текст с переносом\nвторая строка"
-        );
-        assert_eq!(st.input_editor.get_text(), "");
-    }
-
-    #[test]
-    fn test_handle_paste_into_review_dialog_editor() {
-        let mut st = test_state();
-        let dialog = ReviewDialogState::new(
-            2,
-            100,
-            vec![tauqe_protocol::ModelEntry::new(
-                ModelRef::openrouter("test-model"),
-                None,
-            )],
-        );
-        st.review_dialog = Some(dialog);
-        handle_paste(&mut st, "focus on security and memory leaks");
-        assert_eq!(
-            st.review_dialog.as_ref().unwrap().prompt_editor.get_text(),
-            "focus on security and memory leaks"
-        );
-        assert_eq!(st.input_editor.get_text(), "");
-    }
-
-    #[test]
-    fn test_handle_paste_into_squash_message_editor() {
-        let mut st = test_state();
-        let dialog = SquashDialogState {
-            focus: SquashDialogFocus::MessageEditor,
-            ..Default::default()
-        };
-        st.squash_dialog = Some(dialog);
-        handle_paste(&mut st, "feat: implement paste routing\n\nFull details.");
-        assert_eq!(
-            st.squash_dialog.as_ref().unwrap().message_editor.get_text(),
-            "feat: implement paste routing\n\nFull details."
-        );
-        assert_eq!(st.input_editor.get_text(), "");
-    }
-
-    #[test]
-    fn test_handle_paste_into_context_file_picker() {
-        let mut st = test_state();
-        st.view_mode = ViewMode::Context;
-        st.context_view.adding_file = true;
-        st.all_repo_files = vec!["crates/core/src/lib.rs".to_string()];
-        handle_paste(&mut st, " crates/core/src/lib.rs ");
-        assert_eq!(
-            st.context_view.add_input.get_text(),
-            "crates/core/src/lib.rs"
-        );
-        assert_eq!(st.context_view.selected_candidate_index, 0);
-    }
-
-    #[tokio::test]
-    async fn test_bare_question_mark_does_not_open_help_in_empty_develop() {
-        let state = Arc::new(Mutex::new(test_state()));
-        let mut conn = RpcConnection::new(Vec::<u8>::new());
-
-        let key = KeyEvent::new(KeyCode::Char('?'), KeyModifiers::NONE);
-        let res = handle_global_shortcuts(key, &state, &mut conn, true)
-            .await
-            .unwrap();
-        assert_eq!(res, None);
-        assert!(!state.lock().await.show_help);
-    }
-
-    #[tokio::test]
-    async fn test_bare_question_mark_opens_help_in_plans_view() {
-        let mut st = test_state();
-        st.view_mode = ViewMode::Plans;
-        let state = Arc::new(Mutex::new(st));
-        let mut conn = RpcConnection::new(Vec::<u8>::new());
-
-        let key = KeyEvent::new(KeyCode::Char('?'), KeyModifiers::NONE);
-        let res = handle_global_shortcuts(key, &state, &mut conn, false)
-            .await
-            .unwrap();
-        assert_eq!(res, Some(InputResult::Continue));
-        assert!(state.lock().await.show_help);
-    }
-
-    #[tokio::test]
-    async fn test_ctrl_h_opens_help_in_develop_view() {
-        let state = Arc::new(Mutex::new(test_state()));
-        let mut conn = RpcConnection::new(Vec::<u8>::new());
-
-        let key = KeyEvent::new(KeyCode::Char('h'), KeyModifiers::CONTROL);
-        let res = handle_global_shortcuts(key, &state, &mut conn, true)
-            .await
-            .unwrap();
-        assert_eq!(res, Some(InputResult::Continue));
-        assert!(state.lock().await.show_help);
-    }
-
-    #[tokio::test]
-    async fn test_function_keys_are_ignored_by_global_shortcuts() {
-        let state = Arc::new(Mutex::new(test_state()));
-        let mut conn = RpcConnection::new(Vec::<u8>::new());
-
-        for f in 1..=7 {
-            let res = handle_global_shortcuts(
-                KeyEvent::new(KeyCode::F(f), KeyModifiers::NONE),
-                &state,
-                &mut conn,
-                true,
-            )
-            .await
-            .unwrap();
-            assert_eq!(res, None, "function key F{} must be ignored", f);
+        assert!(!text_input_active(&st), "Plans captures no text");
+        let input = input_config(&st);
+        let structural = text_input_active(&st);
+        for (cyrillic, expected) in [
+            ('т', PlansAction::NavNext),
+            ('з', PlansAction::NavPrev),
+            ('ч', PlansAction::Execute),
+        ] {
+            let resolved = PLANS_COMMAND_MAP
+                .resolve(
+                    KeyEvent::new(KeyCode::Char(cyrillic), KeyModifiers::NONE),
+                    &input,
+                    structural,
+                )
+                .map(|spec| spec.action);
+            assert_eq!(
+                resolved,
+                Some(expected),
+                "Plans: {cyrillic:?} must resolve to {expected:?}"
+            );
         }
 
-        let st = state.lock().await;
-        assert!(!st.show_help);
-        assert_eq!(st.view_mode, ViewMode::Repl);
-        assert!(st.squash_dialog.is_none());
-        assert!(st.theme_selector.is_none());
-    }
-
-    #[tokio::test]
-    async fn test_switch_view_blocks_leaving_onboarding() {
-        let mut st = test_state();
-        st.view_mode = ViewMode::Onboarding;
-        let state = Arc::new(Mutex::new(st));
-        let mut conn = RpcConnection::new(Vec::<u8>::new());
-
-        switch_view(&state, ViewMode::Repl, &mut conn)
-            .await
-            .unwrap();
-        let st = state.lock().await;
-        assert_eq!(st.view_mode, ViewMode::Onboarding);
-        let notif = st.notification.as_ref().expect("a warning is reported");
-        assert_eq!(notif.level, NotificationLevel::Warning);
-        assert_eq!(
-            notif.text,
-            crate::i18n::active_t("notify.onboarding_required")
-        );
-    }
-
-    #[tokio::test]
-    async fn test_altgr_digits_do_not_switch_tabs_in_text_input() {
-        let state = Arc::new(Mutex::new(test_state()));
-        let mut conn = RpcConnection::new(Vec::<u8>::new());
-
-        // AltGr on Windows/X11: CONTROL | ALT
-        let altgr = KeyModifiers::CONTROL | KeyModifiers::ALT;
-        let key = KeyEvent::new(KeyCode::Char('2'), altgr);
-        let res = handle_global_shortcuts(key, &state, &mut conn, true)
-            .await
-            .unwrap();
-        assert_eq!(res, None);
-        assert_eq!(state.lock().await.view_mode, ViewMode::Repl);
-    }
-
-    #[tokio::test]
-    async fn test_ctrl_q_with_prompt_draft_triggers_confirm_quit() {
-        let mut st = test_state();
-        st.input_editor.insert_str("important unsubmitted prompt");
-        let state = Arc::new(Mutex::new(st));
-        let mut conn = RpcConnection::new(Vec::<u8>::new());
-
-        let key = KeyEvent::new(KeyCode::Char('q'), KeyModifiers::CONTROL);
-        let res = handle_terminal_event(crossterm::event::Event::Key(key), &state, &mut conn)
-            .await
-            .unwrap();
-        assert_eq!(res, InputResult::Continue);
-        assert!(state.lock().await.confirm_quit);
-    }
-
-    #[tokio::test]
-    async fn test_ctrl_q_empty_prompt_and_idle_exits_directly() {
-        let st = test_state();
-        assert!(st.input_editor.is_empty());
-        let state = Arc::new(Mutex::new(st));
-        let mut conn = RpcConnection::new(Vec::<u8>::new());
-
-        let key = KeyEvent::new(KeyCode::Char('q'), KeyModifiers::CONTROL);
-        let res = handle_terminal_event(crossterm::event::Event::Key(key), &state, &mut conn)
-            .await
-            .unwrap();
-        assert_eq!(res, InputResult::Exit);
-        assert!(!state.lock().await.confirm_quit);
-    }
-
-    #[tokio::test]
-    async fn test_confirmation_modals_default_to_cancel_even_if_leaked() {
-        let mut st = test_state();
-        // A leaked non-default button focus must be forced back to the safe
-        // Cancel whenever a global shortcut arms a confirmation.
-        st.confirm_button = ConfirmDialogButton::Confirm;
-        st.model.status = crate::views::repl::TurnStatus::Thinking;
-
-        let state = Arc::new(Mutex::new(st));
-        let mut conn = RpcConnection::new(Vec::<u8>::new());
-
-        // Cancel shortcut (Ctrl+C) when busy arms the confirmation and resets
-        // the focused button to the safe Cancel.
-        let key_ctrl_c = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
-        let res = handle_global_shortcuts(key_ctrl_c, &state, &mut conn, true)
-            .await
-            .unwrap();
-        assert_eq!(res, Some(InputResult::Continue));
-        assert!(state.lock().await.confirm_cancel);
-        assert_eq!(
-            state.lock().await.confirm_button,
-            ConfirmDialogButton::Cancel
-        );
-    }
-
-    #[tokio::test]
-    async fn test_cancel_shortcut_opens_batch_dialog_for_running_batch() {
-        let mut st = test_state();
-        st.model.status = crate::views::repl::TurnStatus::Responding;
-        st.model.is_batch = true;
-        let state = Arc::new(Mutex::new(st));
-        let mut conn = RpcConnection::new(Vec::<u8>::new());
-
-        let key = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
-        let res = handle_global_shortcuts(key, &state, &mut conn, true)
-            .await
-            .unwrap();
-        assert_eq!(res, Some(InputResult::Continue));
-
-        let guard = state.lock().await;
-        assert!(guard.confirm_batch_cancel);
-        assert!(!guard.confirm_cancel);
-        assert_eq!(
-            guard.batch_cancel_button,
-            crate::app::BatchCancelButton::Continue
-        );
-        assert!(!guard.batch_stopping);
-    }
-
-    #[tokio::test]
-    async fn test_altgr_digits_do_not_switch_tabs_in_navigation_view() {
-        let mut st = test_state();
-        st.view_mode = ViewMode::Plans;
-        let state = Arc::new(Mutex::new(st));
-        let mut conn = RpcConnection::new(Vec::<u8>::new());
-
-        let altgr = KeyModifiers::CONTROL | KeyModifiers::ALT;
-        let key = KeyEvent::new(KeyCode::Char('2'), altgr);
-        let res = handle_global_shortcuts(key, &state, &mut conn, false)
-            .await
-            .unwrap();
-        assert_eq!(res, None);
-        assert_eq!(state.lock().await.view_mode, ViewMode::Plans);
-    }
-
-    #[tokio::test]
-    async fn test_global_shortcuts_blocked_during_onboarding() {
-        let mut st = test_state();
-        st.view_mode = ViewMode::Onboarding;
-        let state = Arc::new(Mutex::new(st));
-        let mut conn = RpcConnection::new(Vec::<u8>::new());
-
-        // The squash chord must not fire before a workspace exists.
-        let key_cs = KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL);
-        let res = handle_global_shortcuts(key_cs, &state, &mut conn, false)
-            .await
-            .unwrap();
-        assert_eq!(res, None);
-        assert!(state.lock().await.squash_dialog.is_none());
-
-        // Ctrl+L is no longer a global shortcut (history clearing is isolated
-        // to the History view), so onboarding must stay unaffected by it.
-        let key_ctrl_l = KeyEvent::new(KeyCode::Char('l'), KeyModifiers::CONTROL);
-        let res = handle_global_shortcuts(key_ctrl_l, &state, &mut conn, false)
-            .await
-            .unwrap();
-        assert_eq!(res, None);
-        assert!(!state.lock().await.confirm_clear_history);
-
-        // Tab switching is blocked too.
-        let key_c2 = KeyEvent::new(KeyCode::Char('2'), KeyModifiers::CONTROL);
-        let res = handle_global_shortcuts(key_c2, &state, &mut conn, false)
-            .await
-            .unwrap();
-        assert_eq!(res, None);
-        assert_eq!(state.lock().await.view_mode, ViewMode::Onboarding);
-    }
-
-    #[tokio::test]
-    async fn test_config_reload_shortcut_allowed_during_onboarding() {
-        let mut st = test_state();
-        st.view_mode = ViewMode::Onboarding;
-        let state = Arc::new(Mutex::new(st));
-        let mut conn = RpcConnection::new(Vec::<u8>::new());
-
-        let key = KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL);
-        let res = handle_global_shortcuts(key, &state, &mut conn, false)
-            .await
-            .unwrap();
-        assert_eq!(res, Some(InputResult::Continue));
-    }
-
-    #[tokio::test]
-    async fn test_meta_t_opens_the_theme_selector() {
-        let state = Arc::new(Mutex::new(test_state()));
-        let mut conn = RpcConnection::new(Vec::<u8>::new());
-
-        let key = KeyEvent::new(KeyCode::Char('t'), KeyModifiers::ALT);
-        let res = handle_global_shortcuts(key, &state, &mut conn, false)
-            .await
-            .unwrap();
-        assert_eq!(res, Some(InputResult::Continue));
-        assert!(state.lock().await.theme_selector.is_some());
-    }
-
-    #[tokio::test]
-    async fn test_help_shortcut_allowed_during_onboarding() {
-        let mut st = test_state();
-        st.view_mode = ViewMode::Onboarding;
-        let state = Arc::new(Mutex::new(st));
-        let mut conn = RpcConnection::new(Vec::<u8>::new());
-
-        let key = KeyEvent::new(KeyCode::Char('?'), KeyModifiers::NONE);
-        let res = handle_global_shortcuts(key, &state, &mut conn, false)
-            .await
-            .unwrap();
-        assert_eq!(res, Some(InputResult::Continue));
-        assert!(state.lock().await.show_help);
-    }
-
-    #[tokio::test]
-    async fn test_command_digits_switch_tabs() {
-        let state = Arc::new(Mutex::new(test_state()));
-        let mut conn = RpcConnection::new(Vec::<u8>::new());
-
-        // C-2 (Primary) switches to Plans.
-        let res = handle_global_shortcuts(
-            KeyEvent::new(KeyCode::Char('2'), KeyModifiers::CONTROL),
-            &state,
-            &mut conn,
-            false,
-        )
-        .await
-        .unwrap();
-        assert_eq!(res, Some(InputResult::Continue));
-        assert_eq!(state.lock().await.view_mode, ViewMode::Plans);
-
-        // M-4 (Meta) switches to Context.
-        let res = handle_global_shortcuts(
-            KeyEvent::new(KeyCode::Char('4'), KeyModifiers::ALT),
-            &state,
-            &mut conn,
-            false,
-        )
-        .await
-        .unwrap();
-        assert_eq!(res, Some(InputResult::Continue));
-        assert_eq!(state.lock().await.view_mode, ViewMode::Context);
-    }
-
-    #[tokio::test]
-    async fn test_command_chords_open_squash_dialog() {
-        let state = Arc::new(Mutex::new(test_state()));
-        let mut conn = RpcConnection::new(Vec::<u8>::new());
-
-        // C-S (Primary).
-        let res = handle_global_shortcuts(
-            KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL),
-            &state,
-            &mut conn,
-            false,
-        )
-        .await
-        .unwrap();
-        assert_eq!(res, Some(InputResult::Continue));
-        assert!(state.lock().await.squash_dialog.is_some());
-    }
-
-    #[tokio::test]
-    async fn test_meta_s_opens_squash_dialog() {
-        let state = Arc::new(Mutex::new(test_state()));
-        let mut conn = RpcConnection::new(Vec::<u8>::new());
-
-        // M-S (Meta).
-        let res = handle_global_shortcuts(
-            KeyEvent::new(KeyCode::Char('s'), KeyModifiers::ALT),
-            &state,
-            &mut conn,
-            false,
-        )
-        .await
-        .unwrap();
-        assert_eq!(res, Some(InputResult::Continue));
-        assert!(state.lock().await.squash_dialog.is_some());
-    }
-
-    /// The usage breakdown is read-only: its chord opens the dialog both while
-    /// navigating and while a prompt draft is being typed, because reading
-    /// telemetry spawns no turn and spends no tokens (c-4).
-    #[tokio::test]
-    async fn test_meta_u_opens_the_usage_breakdown() {
-        let state = Arc::new(Mutex::new(test_state()));
-        let mut conn = RpcConnection::new(Vec::<u8>::new());
-
-        // M-U (Meta) from a navigation context.
-        let res = handle_global_shortcuts(
-            KeyEvent::new(KeyCode::Char('u'), KeyModifiers::ALT),
-            &state,
-            &mut conn,
-            false,
-        )
-        .await
-        .unwrap();
-        assert_eq!(res, Some(InputResult::Continue));
-        assert!(state.lock().await.usage_summary.is_some());
-
-        let mut st = test_state();
-        st.input_editor.insert_str("draft being typed");
-        let state = Arc::new(Mutex::new(st));
-        let res = handle_global_shortcuts(
-            KeyEvent::new(KeyCode::Char('u'), KeyModifiers::ALT),
-            &state,
-            &mut conn,
-            true,
-        )
-        .await
-        .unwrap();
-        assert_eq!(res, Some(InputResult::Continue));
-        assert!(state.lock().await.usage_summary.is_some());
-    }
-
-    #[tokio::test]
-    async fn test_meta_l_opens_the_locale_dialog() {
-        let state = Arc::new(Mutex::new(test_state()));
-        let mut conn = RpcConnection::new(Vec::<u8>::new());
-
-        // M-L (Meta) opens the client-only locale dialog.
-        let res = handle_global_shortcuts(
-            KeyEvent::new(KeyCode::Char('l'), KeyModifiers::ALT),
-            &state,
-            &mut conn,
-            false,
-        )
-        .await
-        .unwrap();
-        assert_eq!(res, Some(InputResult::Continue));
-        assert!(state.lock().await.locale_dialog.is_some());
-    }
-
-    fn review_refine_dialog_with_focus(
-        focus: crate::views::plans::RefineDialogFocus,
-    ) -> crate::views::review::ReviewRefineDialogState {
-        let mut dialog = crate::views::review::ReviewRefineDialogState::new(
-            "rev-1".to_string(),
-            "Session rev-1".to_string(),
-            2,
-            "Missing auth guard".to_string(),
-            Vec::new(),
-        );
-        dialog.focus = focus;
-        dialog
-    }
-
-    #[test]
-    fn test_is_text_input_active_in_review_refine_dialog() {
-        let mut st = test_state();
         st.view_mode = ViewMode::Review;
-        st.review.refine_dialog = Some(review_refine_dialog_with_focus(
-            crate::views::plans::RefineDialogFocus::ModelList,
-        ));
-        assert!(!is_text_input_active(&st));
+        assert!(!text_input_active(&st), "Review captures no text");
+        let input = input_config(&st);
+        let structural = text_input_active(&st);
+        for (cyrillic, expected) in [
+            ('т', ReviewAction::NavNext),
+            ('з', ReviewAction::NavPrev),
+            ('ч', ReviewAction::Execute),
+        ] {
+            let resolved = REVIEW_COMMAND_MAP
+                .resolve(
+                    KeyEvent::new(KeyCode::Char(cyrillic), KeyModifiers::NONE),
+                    &input,
+                    structural,
+                )
+                .map(|spec| spec.action);
+            assert_eq!(
+                resolved,
+                Some(expected),
+                "Review: {cyrillic:?} must resolve to {expected:?}"
+            );
+        }
 
-        st.review.refine_dialog = Some(review_refine_dialog_with_focus(
-            crate::views::plans::RefineDialogFocus::InstructionsEditor,
-        ));
-        assert!(is_text_input_active(&st));
+        st.view_mode = ViewMode::Context;
+        st.context_view.adding_file = false;
+        assert!(!text_input_active(&st), "the Context list captures no text");
+        let input = input_config(&st);
+        let structural = text_input_active(&st);
+        for (cyrillic, expected) in [('т', ContextAction::NavNext), ('з', ContextAction::NavPrev)]
+        {
+            let resolved = CONTEXT_COMMAND_MAP
+                .resolve(
+                    KeyEvent::new(KeyCode::Char(cyrillic), KeyModifiers::NONE),
+                    &input,
+                    structural,
+                )
+                .map(|spec| spec.action);
+            assert_eq!(
+                resolved,
+                Some(expected),
+                "Context: {cyrillic:?} must resolve to {expected:?}"
+            );
+        }
 
-        st.review.refine_dialog = Some(review_refine_dialog_with_focus(
-            crate::views::plans::RefineDialogFocus::Actions,
-        ));
-        assert!(!is_text_input_active(&st));
-    }
-
-    #[test]
-    fn test_handle_paste_into_review_refine_instructions_editor() {
-        let mut st = test_state();
-        st.view_mode = ViewMode::Review;
-        st.review.refine_dialog = Some(review_refine_dialog_with_focus(
-            crate::views::plans::RefineDialogFocus::InstructionsEditor,
-        ));
-
-        handle_paste(&mut st, "split the finding into executable steps");
-
-        assert_eq!(
-            st.review
-                .refine_dialog
-                .as_ref()
-                .expect("dialog stays open")
-                .instructions_editor
-                .get_text(),
-            "split the finding into executable steps"
+        // The same physical presses are typed into the prompt instead of being
+        // dispatched, so the unconditional insertion invariant holds (c-3).
+        st.view_mode = ViewMode::Repl;
+        assert!(
+            text_input_active(&st),
+            "the Develop prompt captures printable characters"
         );
-        assert_eq!(st.input_editor.get_text(), "");
-    }
+        let input = input_config(&st);
+        let capturing = text_input_active(&st);
+        for cyrillic in ['т', 'з', 'ч'] {
+            let resolved = REPL_COMMAND_MAP
+                .resolve(
+                    KeyEvent::new(KeyCode::Char(cyrillic), KeyModifiers::NONE),
+                    &input,
+                    capturing,
+                )
+                .map(|spec| spec.action);
+            assert!(
+                resolved.is_none(),
+                "Develop: {cyrillic:?} must be typed into the prompt, not dispatched"
+            );
+        }
 
-    fn execute_review_dialog(
-        focus: crate::views::plans::RefineDialogFocus,
-    ) -> ConfirmExecuteReviewState {
-        let finding = tauqe_protocol::ReviewIssue {
-            id: 1,
-            title: "Missing auth guard".to_string(),
-            model: None,
-            issue_type: tauqe_protocol::IssueType::Bug,
-            status: tauqe_protocol::IssueStatus::Todo,
-            description: String::new(),
-            recommendations: Vec::new(),
-            files: Vec::new(),
-            readonly_files: Vec::new(),
-            plan: Vec::new(),
-            note: None,
-        };
-        let mut dialog = ConfirmExecuteReviewState::new(
-            Some("rev-1".to_string()),
-            "Session rev-1".to_string(),
-            "Finding 1".to_string(),
-            Some(1),
-            Some("step-1".to_string()),
-            vec![finding],
-            Vec::new(),
-        );
-        dialog.focus = focus;
-        dialog
-    }
-
-    #[test]
-    fn test_is_text_input_active_in_execute_review_dialog() {
-        let mut st = test_state();
-        st.view_mode = ViewMode::Review;
-        assert!(!is_text_input_active(&st));
-
-        st.confirm_execute_review = Some(execute_review_dialog(
-            crate::views::plans::RefineDialogFocus::ModelList,
-        ));
-        assert!(!is_text_input_active(&st));
-
-        st.confirm_execute_review = Some(execute_review_dialog(
-            crate::views::plans::RefineDialogFocus::InstructionsEditor,
-        ));
-        assert!(is_text_input_active(&st));
-
-        st.confirm_execute_review = Some(execute_review_dialog(
-            crate::views::plans::RefineDialogFocus::Actions,
-        ));
-        assert!(!is_text_input_active(&st));
-    }
-
-    #[test]
-    fn test_handle_paste_into_execute_review_instructions_editor() {
-        let mut st = test_state();
-        st.view_mode = ViewMode::Review;
-        st.confirm_execute_review = Some(execute_review_dialog(
-            crate::views::plans::RefineDialogFocus::InstructionsEditor,
-        ));
-
-        handle_paste(&mut st, "keep the patch minimal");
-
-        assert_eq!(
-            st.confirm_execute_review
-                .as_ref()
-                .expect("dialog stays open")
-                .instructions_editor
-                .get_text(),
-            "keep the patch minimal"
-        );
-        assert_eq!(st.input_editor.get_text(), "");
-    }
-
-    fn execute_scope_dialog(
-        focus: crate::views::plans::RefineDialogFocus,
-    ) -> ConfirmExecuteScopeState {
-        let mut dialog = ConfirmExecuteScopeState::new(
-            "plan-1".to_string(),
-            "Plan One".to_string(),
-            "Step One".to_string(),
-            Some("1".to_string()),
-            vec![tauqe_protocol::PlanItem {
-                id: "1".to_string(),
-                title: "Step One".to_string(),
-                status: tauqe_protocol::PlanItemStatus::Todo,
-                ..Default::default()
-            }],
-            vec![tauqe_protocol::ModelEntry::new(
-                ModelRef::openrouter("coder-model"),
-                None,
-            )],
-        );
-        dialog.focus = focus;
-        dialog
-    }
-
-    #[test]
-    fn test_is_text_input_active_in_execute_scope_dialog() {
-        let mut st = test_state();
-        st.view_mode = ViewMode::Plans;
-        assert!(!is_text_input_active(&st));
-
-        st.confirm_execute_scope = Some(execute_scope_dialog(
-            crate::views::plans::RefineDialogFocus::ModelList,
-        ));
-        assert!(!is_text_input_active(&st));
-
-        st.confirm_execute_scope = Some(execute_scope_dialog(
-            crate::views::plans::RefineDialogFocus::InstructionsEditor,
-        ));
-        assert!(is_text_input_active(&st));
-
-        st.confirm_execute_scope = Some(execute_scope_dialog(
-            crate::views::plans::RefineDialogFocus::Actions,
-        ));
-        assert!(!is_text_input_active(&st));
-    }
-
-    #[test]
-    fn test_handle_paste_into_execute_scope_instructions_editor() {
-        let mut st = test_state();
-        st.view_mode = ViewMode::Plans;
-        st.confirm_execute_scope = Some(execute_scope_dialog(
-            crate::views::plans::RefineDialogFocus::InstructionsEditor,
-        ));
-
-        handle_paste(&mut st, "keep the patch minimal");
-
-        assert_eq!(
-            st.confirm_execute_scope
-                .as_ref()
-                .expect("dialog stays open")
-                .instructions_editor
-                .get_text(),
-            "keep the patch minimal"
-        );
-        assert_eq!(st.input_editor.get_text(), "");
-    }
-
-    /// With a non-`None` layout preset the navigation-mode translator rewrites
-    /// bare characters, so the directives editor must be reported as a live
-    /// text input and receive the typed character literally.
-    #[tokio::test]
-    async fn test_execute_scope_editor_inserts_characters_without_layout_translation() {
-        let mut st = test_state();
-        st.view_mode = ViewMode::Plans;
-        st.tui_config.input.layout = crate::config::LayoutPreset::RuJcuken;
-        st.confirm_execute_scope = Some(execute_scope_dialog(
-            crate::views::plans::RefineDialogFocus::InstructionsEditor,
-        ));
-        let state = Arc::new(Mutex::new(st));
-        let mut conn = RpcConnection::new(Vec::<u8>::new());
-
-        let key = KeyEvent::new(KeyCode::Char('ф'), KeyModifiers::NONE);
-        handle_terminal_event(crossterm::event::Event::Key(key), &state, &mut conn)
-            .await
-            .expect("in-memory dispatch never fails");
-
-        let guard = state.lock().await;
-        let target = guard
-            .confirm_execute_scope
-            .as_ref()
-            .expect("dialog stays open");
-        assert_eq!(target.instructions_editor.get_text(), "ф");
-        assert_eq!(
-            target.focus,
-            crate::views::plans::RefineDialogFocus::InstructionsEditor
-        );
+        // The buffer keeps the original characters: the layout translation lives
+        // strictly inside chord matching and never rewrites typed text (c-3).
+        handle_paste(&mut st, "тзч");
+        assert_eq!(st.input_editor.get_text(), "тзч");
     }
 }

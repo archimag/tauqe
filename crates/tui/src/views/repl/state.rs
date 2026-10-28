@@ -4,11 +4,11 @@ use ratatui::text::Line;
 use tauqe_protocol::model::UsageTotalsSnapshot;
 use tauqe_protocol::{ModelRef, ModelResult};
 
-use crate::i18n::active_t;
-
 use super::diff_cache::DiffRenderCache;
 use super::reasoning::ReasoningState;
 use super::render::compute_model_lines;
+use crate::i18n::active_t;
+use crate::views::recenter::RecenterState;
 
 /// Minimum interval between full markdown re-parses while a response is streaming.
 const MARKDOWN_THROTTLE: Duration = Duration::from_millis(80);
@@ -207,6 +207,46 @@ pub struct RetryingState {
     pub delay_secs: u64,
 }
 
+/// Vertical anchor of one staged file inside the rendered Viewport.
+///
+/// The Viewport draws one flat sequence of lines, so a scroll offset alone
+/// cannot say which file the top edge sits inside. The model-line builder
+/// records one span per staged file while it emits the rows, and the renderer
+/// projects the spans through the raw-to-visual map it has just computed, so
+/// the sticky overlay reads the geometry that was actually drawn (c-1).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StagedFileSpan {
+    /// Raw line index of the file's summary row.
+    pub header_line: usize,
+    /// Raw line index of the first expanded diff row, when the file is expanded.
+    pub body_start: Option<usize>,
+    /// Raw line index one past the last row of the file block.
+    pub body_end: usize,
+    /// Raw row offsets of the hunk headers inside the diff body.
+    pub hunk_offsets: Vec<usize>,
+}
+
+/// The staged file the Viewport top edge currently sits inside.
+///
+/// It exists only while the file's own summary row has scrolled out of view and
+/// the top edge still belongs to the file's diff body, so the overlay names a
+/// file whose header the developer can no longer see (c-1).
+#[derive(Debug, Clone, Copy)]
+pub struct StickyDiffHeader<'a> {
+    /// Repository-relative path of the active file.
+    pub path: &'a str,
+    /// Operation the file carries in the staged set.
+    pub op: &'a EditOp,
+    /// One-based active hunk, when the file carries any hunk header.
+    pub hunk: Option<usize>,
+    /// Total number of hunks the file carries.
+    pub hunk_count: usize,
+    /// One-based position of the file inside the staged set.
+    pub file: usize,
+    /// Total number of staged files.
+    pub file_count: usize,
+}
+
 /// Which pane of the REPL tab receives navigation keys.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ReplFocus {
@@ -241,6 +281,11 @@ pub struct ReplView {
     pub edits_active: bool,
     pub files: Vec<StreamingFileEdit>,
     pub selected_file_index: usize,
+    /// Three-beat recenter state of the staged-file selection.
+    ///
+    /// The shared [`RecenterState`] component owns only the cycle bookkeeping;
+    /// the view keeps owning its selection, its scroll, and its layout.
+    pub recenter: RecenterState,
     pub edit_final_applied: Option<bool>,
     pub edit_final_error: Option<String>,
     pub last_commit_hash: Option<String>,
@@ -278,6 +323,14 @@ pub struct ReplView {
     pub(crate) markdown_dirty: bool,
     pub(crate) last_markdown_render: Option<Instant>,
     pub diff_cache: DiffRenderCache,
+    /// Vertical anchors of the staged file blocks the Viewport laid out last.
+    ///
+    /// The Viewport renders one flat sequence of lines, so a scroll offset
+    /// alone cannot say which file the top edge sits inside. The builder
+    /// records one span per staged file while it emits the rows, and the
+    /// renderer projects them through the raw-to-visual map of the current
+    /// frame to resolve the sticky overlay (c-1).
+    pub staged_file_spans: Vec<StagedFileSpan>,
 }
 
 impl Default for ReplView {
@@ -300,6 +353,7 @@ impl Default for ReplView {
             edits_active: false,
             files: Vec::new(),
             selected_file_index: 0,
+            recenter: RecenterState::default(),
             edit_final_applied: None,
             edit_final_error: None,
             last_commit_hash: None,
@@ -324,6 +378,7 @@ impl Default for ReplView {
             markdown_dirty: false,
             last_markdown_render: None,
             diff_cache: DiffRenderCache::default(),
+            staged_file_spans: Vec::new(),
         }
     }
 }
@@ -345,6 +400,7 @@ impl ReplView {
         self.markdown_lines.clear();
         self.code_blocks.clear();
         self.diff_cache = DiffRenderCache::default();
+        self.staged_file_spans.clear();
         self.markdown_dirty = false;
         self.last_markdown_render = None;
         self.error = None;
@@ -352,6 +408,9 @@ impl ReplView {
         self.edits_active = false;
         self.files.clear();
         self.selected_file_index = 0;
+        // The recenter cycle is scoped to the selection, and a fresh turn
+        // starts it over from its first beat.
+        self.recenter = RecenterState::default();
         self.edit_final_applied = None;
         self.edit_final_error = None;
         self.last_commit_hash = None;
@@ -529,7 +588,80 @@ impl ReplView {
         }
     }
 
-    pub fn file_line_offset(&mut self, target_idx: usize) -> usize {
+    /// Resolves the staged file the Viewport top edge currently sits inside.
+    ///
+    /// `visual_start` and `visual_end` are the raw-to-visual projections the
+    /// renderer built for the current frame, so the probe reads exactly the
+    /// geometry that was drawn and the overlay can never disagree with the rows
+    /// underneath it. The result is `None` while the top edge still shows the
+    /// file's own summary row, sits outside every file block, or falls on a
+    /// file that carries no expanded diff body, so a header that is still
+    /// visible is never duplicated (c-1).
+    pub fn sticky_diff_header<'a>(
+        &'a self,
+        visual_start: &[usize],
+        visual_end: &[usize],
+    ) -> Option<StickyDiffHeader<'a>> {
+        let top = usize::from(self.scroll);
+        let file_count = self.staged_file_spans.len();
+        if file_count == 0 {
+            return None;
+        }
+
+        let mut active: Option<(usize, &StagedFileSpan)> = None;
+        for (index, span) in self.staged_file_spans.iter().enumerate() {
+            let Some(start) = visual_start.get(span.header_line) else {
+                continue;
+            };
+            if *start <= top {
+                active = Some((index, span));
+            }
+        }
+        let (index, span) = active?;
+
+        let header_end = *visual_end.get(span.header_line)?;
+        if top <= header_end {
+            return None;
+        }
+
+        let body_start = span.body_start?;
+        if top < *visual_start.get(body_start)? {
+            return None;
+        }
+        let last_body_line = span.body_end.checked_sub(1)?;
+        if top > *visual_end.get(last_body_line)? {
+            return None;
+        }
+
+        let file = self.files.get(index)?;
+        let hunk = span
+            .hunk_offsets
+            .iter()
+            .enumerate()
+            .filter_map(|(position, offset)| {
+                let row = visual_start.get(body_start + offset)?;
+                (*row <= top).then_some(position + 1)
+            })
+            .next_back();
+
+        Some(StickyDiffHeader {
+            path: file.path.as_str(),
+            op: &file.op_type,
+            hunk,
+            hunk_count: span.hunk_offsets.len(),
+            file: index + 1,
+            file_count,
+        })
+    }
+
+    /// Raw `[start, end)` line range occupied by the staged file block at
+    /// `file_index`: the summary row plus, when the file is expanded, its whole
+    /// diff body.
+    ///
+    /// The Viewport draws one flat sequence of lines, so the block geometry is
+    /// derived from the same layout the renderer emits; the block end is what
+    /// lets line-by-line scrolling stop exactly at the file boundary (c-2).
+    fn file_block_bounds(&mut self, file_index: usize) -> Option<(usize, usize)> {
         let mut line_idx = 0;
         if self.error.is_some() {
             line_idx += 1;
@@ -566,9 +698,7 @@ impl ReplView {
             }
 
             for (idx, file) in self.files.iter().enumerate() {
-                if idx == target_idx {
-                    return line_idx;
-                }
+                let block_start = line_idx;
                 line_idx += 1;
                 if file.status != FileEditStatus::Ok && file.error.is_some() {
                     line_idx += 1;
@@ -576,36 +706,94 @@ impl ReplView {
                 if file.expanded {
                     line_idx += self.diff_cache.lines_for(file).len();
                 }
+                if idx == file_index {
+                    return Some((block_start, line_idx));
+                }
             }
         }
-        line_idx
+        None
+    }
+
+    /// Vertical scroll window `[lower, upper]` of the staged file block at
+    /// `file_index`, expressed in scroll offsets.
+    ///
+    /// `lower` puts the block start on the top edge and `upper` brings the
+    /// block end to the bottom edge, so every line of an expanded diff is read
+    /// before the selection leaves the file (c-2).
+    pub fn file_scroll_window(
+        &mut self,
+        file_index: usize,
+        view_height: u16,
+    ) -> Option<(u16, u16)> {
+        let (block_start, block_end) = self.file_block_bounds(file_index)?;
+        let block_start = u16::try_from(block_start).unwrap_or(u16::MAX);
+        let block_end = u16::try_from(block_end).unwrap_or(u16::MAX);
+        let max = self.max_scroll(view_height);
+        let lower = block_start.min(max);
+        let upper = block_end
+            .saturating_sub(view_height)
+            .max(block_start)
+            .min(max);
+        Some((lower, upper))
     }
 
     pub fn scroll_to_selected_file(&mut self, view_height: u16) {
         if self.files.is_empty() || view_height == 0 {
             return;
         }
-        let target_line =
-            u16::try_from(self.file_line_offset(self.selected_file_index)).unwrap_or(u16::MAX);
+        let bounds = self.file_block_bounds(self.selected_file_index);
+        let Some((block_start, block_end)) = bounds else {
+            return;
+        };
+        let target_line = u16::try_from(block_start).unwrap_or(u16::MAX);
+        let block_end = u16::try_from(block_end).unwrap_or(u16::MAX);
         let is_expanded = self
             .files
             .get(self.selected_file_index)
-            .map(|f| f.expanded)
-            .unwrap_or(false);
+            .is_some_and(|file| file.expanded);
 
         if target_line < self.scroll {
             self.auto_scroll = false;
             self.scroll = target_line;
         } else if is_expanded {
-            if target_line.saturating_add(4) >= self.scroll.saturating_add(view_height) {
+            if block_end >= self.scroll.saturating_add(view_height) {
                 self.auto_scroll = false;
-                self.scroll = target_line.saturating_sub(1);
+                self.scroll = target_line;
             }
         } else if target_line >= self.scroll.saturating_add(view_height) {
             self.auto_scroll = false;
             self.scroll = target_line.saturating_add(1).saturating_sub(view_height);
         }
         self.clamp_scroll(view_height);
+    }
+
+    /// Recenters the Viewport on the staged file block under the selection.
+    ///
+    /// Repeated presses walk the shared three-beat cycle — center, top,
+    /// bottom — and moving the selection restarts the cycle, exactly like
+    /// the recenter command of the cursor-driven views (Conventions.md §5.2).
+    /// The block geometry comes from the same layout the renderer emits, so
+    /// the beats land on the rows the developer reads; a block taller than
+    /// the viewport aligns its top edge first, keeping long expanded diffs
+    /// readable from their beginning.
+    pub fn recenter_selected_file(&mut self, view_height: u16) {
+        if self.files.is_empty() || view_height == 0 {
+            return;
+        }
+        let selected = self.selected_file_index;
+        let Some((block_start, block_end)) = self.file_block_bounds(selected) else {
+            return;
+        };
+        let total_lines = if self.rendered_lines_count > 0 {
+            self.rendered_lines_count
+        } else {
+            compute_model_lines(self).len()
+        };
+        let scroll =
+            self.recenter
+                .recenter(selected, block_start, block_end, total_lines, view_height);
+        self.auto_scroll = false;
+        self.scroll = scroll;
     }
 
     pub fn is_busy(&self) -> bool {
@@ -628,6 +816,12 @@ mod turn_reset_tests {
 
     fn stale_view() -> ReplView {
         let mut view = ReplView::default();
+        view.staged_file_spans.push(StagedFileSpan {
+            header_line: 0,
+            body_start: Some(1),
+            body_end: 2,
+            hunk_offsets: vec![0],
+        });
         view.reasoning.append_delta("stale reasoning");
         view.reasoning.toggle_fold();
         view.text = "stale answer".to_string();
@@ -680,14 +874,16 @@ mod turn_reset_tests {
         assert!(!view.reasoning.is_empty());
         assert!(!view.markdown_lines.is_empty());
 
-        view.reset_turn_buffers();
+        // The cycle is driven once, so the reset has a non-default beat to clear.
+        view.recenter_selected_file(10);
+        assert_ne!(view.recenter, RecenterState::default());
 
-        assert!(view.reasoning.is_empty());
-        assert!(view.reasoning.show, "the reasoning block reopens folded");
+        view.reset_turn_buffers();
         assert!(!view.reasoning.is_streaming());
         assert!(view.text.is_empty());
         assert!(view.markdown_lines.is_empty());
         assert!(view.code_blocks.is_empty());
+        assert!(view.staged_file_spans.is_empty());
         assert!(view.files.is_empty());
         assert!(!view.edits_active);
         assert!(view.edit_final_applied.is_none());
@@ -708,6 +904,11 @@ mod turn_reset_tests {
         assert!(view.error.is_none());
         assert!(view.result.is_none());
         assert!(view.copy_flash.is_none());
+        assert_eq!(
+            view.recenter,
+            RecenterState::default(),
+            "a fresh turn starts the recenter cycle over"
+        );
         assert!(!view.markdown_dirty);
         assert!(
             view.splash_visible(),
@@ -976,5 +1177,270 @@ mod splash_tests {
         };
         assert!(busy_view.background_active());
         assert!(busy_view.needs_spinner());
+    }
+}
+
+#[cfg(test)]
+mod sticky_header_tests {
+    use super::*;
+
+    fn file(path: &str, op: EditOp, expanded: bool) -> StreamingFileEdit {
+        StreamingFileEdit {
+            path: path.to_string(),
+            op_type: op,
+            status: FileEditStatus::Ok,
+            error: None,
+            hunks: Vec::new(),
+            expanded,
+            retry_info: None,
+        }
+    }
+
+    /// Two expanded files laid out back to back:
+    ///
+    /// ```text
+    /// 0  file 0 summary row
+    /// 1  hunk 1
+    /// 2  body
+    /// 3  hunk 2
+    /// 4  file 1 summary row
+    /// 5  hunk 1
+    /// 6  body
+    /// 7  body
+    /// ```
+    fn two_file_view() -> ReplView {
+        ReplView {
+            files: vec![
+                file("crates/tui/src/a.rs", EditOp::Replace, true),
+                file("crates/tui/src/b.rs", EditOp::Move, true),
+            ],
+            staged_file_spans: vec![
+                StagedFileSpan {
+                    header_line: 0,
+                    body_start: Some(1),
+                    body_end: 4,
+                    hunk_offsets: vec![0, 2],
+                },
+                StagedFileSpan {
+                    header_line: 4,
+                    body_start: Some(5),
+                    body_end: 8,
+                    hunk_offsets: vec![0],
+                },
+            ],
+            ..ReplView::default()
+        }
+    }
+
+    fn identity_map(rows: usize) -> (Vec<usize>, Vec<usize>) {
+        let rows: Vec<usize> = (0..rows).collect();
+        (rows.clone(), rows)
+    }
+
+    #[test]
+    fn a_visible_summary_row_suppresses_the_overlay() {
+        let mut view = two_file_view();
+        let (start, end) = identity_map(8);
+
+        view.scroll = 0;
+        assert!(
+            view.sticky_diff_header(&start, &end).is_none(),
+            "the first file header is still visible"
+        );
+
+        view.scroll = 4;
+        assert!(
+            view.sticky_diff_header(&start, &end).is_none(),
+            "the second file header is still visible"
+        );
+    }
+
+    #[test]
+    fn the_overlay_names_the_file_and_the_hunk_under_the_top_edge() {
+        let mut view = two_file_view();
+        let (start, end) = identity_map(8);
+
+        view.scroll = 1;
+        let header = view
+            .sticky_diff_header(&start, &end)
+            .expect("the top edge sits inside the first diff body");
+        assert_eq!(header.path, "crates/tui/src/a.rs");
+        assert_eq!(header.op, &EditOp::Replace);
+        assert_eq!(header.hunk, Some(1));
+        assert_eq!(header.hunk_count, 2);
+        assert_eq!((header.file, header.file_count), (1, 2));
+
+        view.scroll = 3;
+        let header = view
+            .sticky_diff_header(&start, &end)
+            .expect("the top edge sits on the second hunk");
+        assert_eq!(header.hunk, Some(2));
+    }
+
+    #[test]
+    fn the_overlay_follows_the_scroll_into_the_next_file() {
+        let mut view = two_file_view();
+        let (start, end) = identity_map(8);
+
+        view.scroll = 6;
+        let header = view
+            .sticky_diff_header(&start, &end)
+            .expect("the top edge sits inside the second diff body");
+        assert_eq!(header.path, "crates/tui/src/b.rs");
+        assert_eq!(header.op, &EditOp::Move);
+        assert_eq!((header.file, header.file_count), (2, 2));
+        assert_eq!(header.hunk, Some(1));
+    }
+
+    #[test]
+    fn a_file_without_an_expanded_diff_body_raises_no_overlay() {
+        let view = ReplView {
+            files: vec![file("crates/tui/src/a.rs", EditOp::Replace, false)],
+            staged_file_spans: vec![StagedFileSpan {
+                header_line: 0,
+                body_start: None,
+                body_end: 2,
+                hunk_offsets: Vec::new(),
+            }],
+            scroll: 1,
+            ..ReplView::default()
+        };
+
+        let (start, end) = identity_map(3);
+        assert!(view.sticky_diff_header(&start, &end).is_none());
+    }
+
+    #[test]
+    fn a_wrapped_summary_row_stays_visible_until_it_fully_scrolls_out() {
+        let mut view = two_file_view();
+        // The first summary row wraps onto a second visual row.
+        let start = vec![0, 1, 2, 3, 5, 6, 7, 8];
+        let end = vec![1, 1, 2, 3, 6, 6, 7, 8];
+
+        view.scroll = 1;
+        assert!(
+            view.sticky_diff_header(&start, &end).is_none(),
+            "the wrapped summary row still owns the top edge"
+        );
+
+        view.scroll = 2;
+        let header = view
+            .sticky_diff_header(&start, &end)
+            .expect("the top edge sits inside the wrapped diff body");
+        assert_eq!(header.path, "crates/tui/src/a.rs");
+        assert_eq!(header.hunk, Some(1));
+    }
+}
+
+#[cfg(test)]
+mod file_scroll_window_tests {
+    use super::*;
+
+    fn file(path: &str, expanded: bool) -> StreamingFileEdit {
+        StreamingFileEdit {
+            path: path.to_string(),
+            op_type: EditOp::Replace,
+            status: FileEditStatus::Ok,
+            error: None,
+            hunks: vec![StreamingHunk {
+                hunk_index: 0,
+                old_text: "let a = 1;".to_string(),
+                new_text: "let a = 2;".to_string(),
+            }],
+            expanded,
+            retry_info: None,
+        }
+    }
+
+    /// One answer line, the proposed-edits header, an expanded first file with
+    /// a three-line diff body and a collapsed second file:
+    ///
+    /// ```text
+    /// 0  answer
+    /// 1  blank
+    /// 2  proposed edits header
+    /// 3  file 0 summary
+    /// 4  @@ diff @@
+    /// 5  - let a = 1;
+    /// 6  + let a = 2;
+    /// 7  file 1 summary
+    /// ```
+    fn view() -> ReplView {
+        ReplView {
+            text: "answer".to_string(),
+            files: vec![
+                file("crates/tui/src/a.rs", true),
+                file("crates/tui/src/b.rs", false),
+            ],
+            ..ReplView::default()
+        }
+    }
+
+    #[test]
+    fn block_bounds_cover_the_summary_row_and_the_expanded_body() {
+        let mut view = view();
+        assert_eq!(view.file_block_bounds(0), Some((3, 7)));
+        assert_eq!(view.file_block_bounds(1), Some((7, 8)));
+        assert_eq!(view.file_block_bounds(2), None);
+    }
+
+    #[test]
+    fn the_scroll_window_reads_a_block_to_its_last_line_before_the_next_file() {
+        let mut view = view();
+        assert_eq!(view.file_scroll_window(0, 3), Some((3, 4)));
+        assert_eq!(view.file_scroll_window(1, 3), Some((5, 5)));
+    }
+
+    #[test]
+    fn recenter_walks_center_top_bottom_over_the_expanded_block() {
+        let mut view = view();
+
+        // The block of file 0 spans rows 3..7 in an 8-line document; with a
+        // 3-row viewport it is taller than the window, so the center beat
+        // aligns its top edge.
+        view.recenter_selected_file(3);
+        assert_eq!(view.scroll, 3, "center aligns the top of the tall block");
+        assert!(!view.auto_scroll);
+
+        view.recenter_selected_file(3);
+        assert_eq!(view.scroll, 3, "top beat");
+
+        view.recenter_selected_file(3);
+        assert_eq!(view.scroll, 4, "bottom beat aligns the block end");
+
+        view.recenter_selected_file(3);
+        assert_eq!(view.scroll, 3, "the cycle wraps back to the center beat");
+    }
+
+    #[test]
+    fn recenter_of_a_collapsed_file_centers_its_summary_row() {
+        let mut view = view();
+        view.selected_file_index = 1;
+
+        // The collapsed block spans rows 7..8, so the center beat computes
+        // offset 6 and saturates at the document's max_scroll.
+        let max = view.max_scroll(3);
+        view.recenter_selected_file(3);
+        assert_eq!(view.scroll, 6.min(max));
+
+        // Moving the selection restarts the cycle on the center beat.
+        view.selected_file_index = 0;
+        view.recenter_selected_file(3);
+        assert_eq!(view.scroll, 3, "a different file restarts on center");
+    }
+
+    #[test]
+    fn recenter_without_staged_files_is_inert() {
+        // `ReplView::default()` already opens with auto-scroll on, so the test
+        // starts from the exact state it asserts must survive recentering.
+        let mut view = ReplView::default();
+
+        view.recenter_selected_file(3);
+
+        assert_eq!(view.scroll, 0);
+        assert!(
+            view.auto_scroll,
+            "an empty staged set leaves auto-scroll on"
+        );
     }
 }

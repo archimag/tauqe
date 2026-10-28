@@ -128,6 +128,10 @@ async fn main() -> anyhow::Result<()> {
     // Initial model selection and tier assignments
     rpc::send_request(&mut conn, methods::MODEL_CURRENT, serde_json::json!({})).await?;
 
+    // Review presets declared by the project, so the launch dialog offers them
+    // without the client re-reading `tauqe.toml` (c-5).
+    rpc::send_request(&mut conn, methods::CONFIG_GET, serde_json::json!({})).await?;
+
     // Initial plans fetch
     rpc::send_request(&mut conn, methods::PLAN_LIST, serde_json::json!({})).await?;
     rpc::send_request(&mut conn, methods::PLAN_GET, serde_json::json!({})).await?;

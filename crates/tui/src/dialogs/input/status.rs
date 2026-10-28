@@ -133,6 +133,8 @@ mod tests {
         ReviewItem::from(ReviewIssue {
             id,
             title: format!("Finding {id}"),
+            uuid: None,
+            group: None,
             model: None,
             issue_type: IssueType::Architecture,
             status: ReviewItemStatus::Todo,
@@ -156,6 +158,9 @@ mod tests {
             target_files: Vec::new(),
             items: vec![item(1)],
             raw_markdown: String::new(),
+            groups: Vec::new(),
+            post_analysis: None,
+            launch_config: None,
         }
     }
 

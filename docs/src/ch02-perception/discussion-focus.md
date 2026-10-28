@@ -220,7 +220,7 @@ state moves only on an explicit developer decision or a verified execution.
 
 ## 5. Related Chapters
 
-- [Three-Tier Context Model](three-tier-model.md) — the working set a focused
+- [The Context Model](context-model.md) — the working set a focused
   dialogue inspects.
 - [Local Plans](../ch04-workflows/plans.md) — plan structure, refinement, and
   execution.

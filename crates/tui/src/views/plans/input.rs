@@ -1404,6 +1404,58 @@ mod tests {
         );
     }
 
+    /// Proves the Plans handler resolves every chord through the configured
+    /// keyboard layout: a Cyrillic press navigates, executes, and refreshes
+    /// exactly like its Latin equivalent (c-4).
+    #[tokio::test]
+    async fn cyrillic_layout_navigates_executes_and_refreshes_the_plans_view() {
+        let mut st = tall_plan_state();
+        st.tui_config.input.layout = crate::config::LayoutPreset::RuJcuken;
+
+        let state = Arc::new(Mutex::new(st));
+        let mut conn = RpcConnection::new(Vec::<u8>::new());
+
+        // `т` sits on `n`: the row cursor moves to the next step.
+        handle_plans_key(
+            KeyEvent::new(KeyCode::Char('т'), crossterm::event::KeyModifiers::NONE),
+            &state,
+            &mut conn,
+        )
+        .await
+        .unwrap();
+        assert_eq!(state.lock().await.plans_view.selected_index, 2);
+
+        // `ч` sits on `x`: the step under the cursor arms its confirmation.
+        handle_plans_key(
+            KeyEvent::new(KeyCode::Char('ч'), crossterm::event::KeyModifiers::NONE),
+            &state,
+            &mut conn,
+        )
+        .await
+        .unwrap();
+        {
+            let guard = state.lock().await;
+            let target = guard
+                .confirm_execute_scope
+                .as_ref()
+                .expect("the execution confirmation must be armed");
+            assert_eq!(target.step_id.as_deref(), Some("2"));
+        }
+
+        // `п` sits on `g`: the view requests a lightweight refresh.
+        handle_plans_key(
+            KeyEvent::new(KeyCode::Char('п'), crossterm::event::KeyModifiers::NONE),
+            &state,
+            &mut conn,
+        )
+        .await
+        .unwrap();
+        assert!(
+            !conn.written().is_empty(),
+            "the refresh chord must reach the daemon"
+        );
+    }
+
     /// A plan holding sixty single-line steps, so the rendered tree is much
     /// taller than the viewport and every navigation command can move the
     /// cursor off screen.

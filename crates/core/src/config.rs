@@ -13,12 +13,13 @@ mod history;
 mod models;
 mod paths;
 mod providers;
+mod review;
 
 pub use context::{
     ContextConfig, DEFAULT_FILES_TOKEN_BUDGET, DEFAULT_INCLUDE_REPO_MAP,
     DEFAULT_MAX_DIR_LIST_ENTRIES, DEFAULT_MAX_DISCOVERY_ROUNDS, DEFAULT_MAX_FEEDBACK_CHARS,
     DEFAULT_MAX_MATCHED_FILES_PER_SEARCH, DEFAULT_MAX_REPO_MAP_REQUESTS_PER_ROUND,
-    DEFAULT_MAX_SCRATCHPAD_CHARS, DEFAULT_MAX_SEARCH_REQUESTS_PER_ROUND,
+    DEFAULT_MAX_SCRATCHPAD_CHARS, DEFAULT_MAX_SEARCH_REQUESTS_PER_ROUND, DEFAULT_REFS_TOKEN_BUDGET,
 };
 pub use credentials::default_credentials_path;
 pub use develop::{DevelopConfig, EditConfig};
@@ -40,6 +41,7 @@ pub use providers::{
     read_credentials_file, write_credentials_file, write_credentials_stub, Credentials,
     OpenRouterConfig, OpenRouterCredentials, ProvidersConfig,
 };
+pub use review::{ReviewConfig, ReviewGroupConfig, ReviewPreset};
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(try_from = "AppConfigRaw")]
@@ -58,6 +60,13 @@ pub struct AppConfig {
     pub context: ContextConfig,
     pub git: GitConfig,
     pub history: HistoryConfig,
+    /// The `[review]` section: named presets for a multi-level review run.
+    ///
+    /// A preset decomposes one audit into isolated groups with their own paths
+    /// and local prompts, and declares when the post-analysis layer is
+    /// produced. An absent section declares no preset, so a single-audit
+    /// session stays available without any migration.
+    pub review: ReviewConfig,
     /// Explicit configuration file path supplied on the command line.
     ///
     /// Recorded so a running session re-applies the same override whenever it
@@ -106,6 +115,8 @@ struct AppConfigRaw {
     git: GitConfig,
     #[serde(default)]
     history: HistoryConfig,
+    #[serde(default)]
+    review: ReviewConfig,
 }
 
 impl TryFrom<AppConfigRaw> for AppConfig {
@@ -120,6 +131,7 @@ impl TryFrom<AppConfigRaw> for AppConfig {
             context,
             git,
             history,
+            review,
         } = raw;
 
         Ok(AppConfig {
@@ -130,6 +142,7 @@ impl TryFrom<AppConfigRaw> for AppConfig {
             context,
             git,
             history,
+            review,
             explicit_config_path: None,
             explicit_credentials_path: None,
             config_error: None,
@@ -250,6 +263,9 @@ impl AppConfig {
         self.project
             .validate()
             .map_err(|err| format!("[project] {}", err))?;
+        self.review
+            .validate()
+            .map_err(|err| format!("[review] {}", err))?;
         Ok(())
     }
 
@@ -426,6 +442,7 @@ pub fn validate_project_config_on_disk(repo_root: &Path) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tauqe_protocol::review::PostAnalysisMode;
     use tauqe_protocol::{EditProtocolKind, PromptLayoutKind, TurnIntent, WorkflowKind};
 
     #[test]
@@ -748,12 +765,14 @@ files_token_budget = 150000
         );
         assert_eq!(defaults.max_feedback_chars, DEFAULT_MAX_FEEDBACK_CHARS);
         assert_eq!(defaults.max_scratchpad_chars, DEFAULT_MAX_SCRATCHPAD_CHARS);
+        assert_eq!(defaults.refs_token_budget, DEFAULT_REFS_TOKEN_BUDGET);
         assert_eq!(defaults.max_search_requests_per_round, 5);
         assert_eq!(defaults.max_matched_files_per_search, 50);
         assert_eq!(defaults.max_dir_list_entries, 100);
         assert_eq!(defaults.max_repo_map_requests_per_round, 3);
         assert_eq!(defaults.max_feedback_chars, 4_000);
         assert_eq!(defaults.max_scratchpad_chars, 4_000);
+        assert_eq!(defaults.refs_token_budget, 50_000);
 
         // A project that routinely needs wider searches, larger listings, or
         // roomier tool-output reporting raises the ceilings in `tauqe.toml`.
@@ -766,6 +785,7 @@ max_dir_list_entries = 40
 max_repo_map_requests_per_round = 1
 max_feedback_chars = 800
 max_scratchpad_chars = 1500
+refs_token_budget = 70000
 "#,
         )
         .expect("parse config");
@@ -775,6 +795,7 @@ max_scratchpad_chars = 1500
         assert_eq!(overridden.context.max_repo_map_requests_per_round, 1);
         assert_eq!(overridden.context.max_feedback_chars, 800);
         assert_eq!(overridden.context.max_scratchpad_chars, 1500);
+        assert_eq!(overridden.context.refs_token_budget, 70_000);
 
         // A partially declared section keeps the defaults of omitted keys.
         let partial: AppConfig =
@@ -784,6 +805,7 @@ max_scratchpad_chars = 1500
             partial.context.max_search_requests_per_round,
             DEFAULT_MAX_SEARCH_REQUESTS_PER_ROUND
         );
+        assert_eq!(partial.context.refs_token_budget, DEFAULT_REFS_TOKEN_BUDGET);
     }
 
     #[test]
@@ -1188,5 +1210,261 @@ args = ["check", "--all-targets"]
                 );
             }
         }
+    }
+
+    #[test]
+    fn test_review_section_defaults_to_no_presets() {
+        // The section is optional: an omitted declaration leaves the project
+        // without a preset, so a single audit stays available.
+        let default_cfg = AppConfig::default();
+        assert!(default_cfg.review.presets.is_empty());
+        assert!(default_cfg.review.validate().is_ok());
+
+        let absent: AppConfig =
+            toml::from_str("[models]\nprimary = [\"openrouter:a/b\"]\n").expect("parse config");
+        assert!(absent.review.presets.is_empty());
+    }
+
+    #[test]
+    fn test_review_section_parses_named_presets() {
+        let toml_str = r#"
+[models]
+primary = ["openrouter:a/b"]
+
+[project.verify]
+command = "cargo"
+args = ["test"]
+
+[[review.presets]]
+name = "backend"
+title = "Backend audit"
+post_analysis = "manual"
+
+[[review.presets.groups]]
+name = "core"
+paths = ["crates/core/src"]
+prompt = "Audit the harness invariants."
+
+[[review.presets.groups]]
+name = "server"
+paths = ["crates/server/src", "crates/protocol/src"]
+
+[[review.presets]]
+name = "frontend"
+post_analysis = "automatic"
+
+[[review.presets.groups]]
+name = "tui"
+paths = ["crates/tui/src"]
+"#;
+        let config: AppConfig = toml::from_str(toml_str).expect("parse config");
+        assert_eq!(config.review.presets.len(), 2);
+
+        let backend = &config.review.presets[0];
+        assert_eq!(backend.name, "backend");
+        assert_eq!(backend.title.as_deref(), Some("Backend audit"));
+        assert_eq!(backend.post_analysis, PostAnalysisMode::Manual);
+        assert_eq!(backend.groups.len(), 2);
+        assert_eq!(backend.groups[0].name, "core");
+        assert_eq!(backend.groups[0].paths, vec!["crates/core/src".to_string()]);
+        assert_eq!(
+            backend.groups[0].prompt.as_deref(),
+            Some("Audit the harness invariants.")
+        );
+        assert_eq!(backend.groups[1].prompt, None);
+
+        let frontend = &config.review.presets[1];
+        assert_eq!(frontend.name, "frontend");
+        assert_eq!(frontend.title, None);
+        assert_eq!(frontend.post_analysis, PostAnalysisMode::Automatic);
+
+        // A valid section keeps the whole configuration valid.
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn test_review_preset_materializes_launch_groups() {
+        let config: AppConfig = toml::from_str(
+            r#"
+[[review.presets]]
+name = "backend"
+
+[[review.presets.groups]]
+name = "core"
+paths = ["crates/core/src", "crates/protocol/src"]
+prompt = "Audit the wire contract."
+
+[[review.presets.groups]]
+name = "server"
+paths = ["crates/server/src"]
+"#,
+        )
+        .expect("parse config");
+
+        let groups = config.review.presets[0].to_launch_groups();
+        assert_eq!(groups.len(), 2);
+        assert_eq!(groups[0].title, "core");
+        assert_eq!(
+            groups[0].paths,
+            vec![
+                "crates/core/src".to_string(),
+                "crates/protocol/src".to_string()
+            ]
+        );
+        assert_eq!(
+            groups[0].prompt.as_deref(),
+            Some("Audit the wire contract.")
+        );
+        assert_eq!(groups[1].title, "server");
+        assert_eq!(groups[1].prompt, None);
+
+        // Every launch mints its own identifiers, so two sessions started from
+        // one preset never collide.
+        assert!(crate::review::uuid::is_valid_uuid_v7(&groups[0].id));
+        assert!(crate::review::uuid::is_valid_uuid_v7(&groups[1].id));
+        assert_ne!(groups[0].id, groups[1].id);
+        assert_ne!(
+            groups[0].id,
+            config.review.presets[0].to_launch_groups()[0].id
+        );
+    }
+
+    #[test]
+    fn test_review_section_rejects_empty_and_duplicate_preset_names() {
+        let unnamed: AppConfig = toml::from_str(
+            r#"
+[[review.presets]]
+name = "   "
+
+[[review.presets.groups]]
+name = "core"
+paths = ["crates/core/src"]
+"#,
+        )
+        .expect("parse config");
+        let err = unnamed
+            .review
+            .validate()
+            .expect_err("an empty preset name must be rejected");
+        assert!(err.contains("empty name"), "got: {err}");
+
+        // Names are compared after trimming, so surrounding whitespace cannot
+        // smuggle a second preset under the same name.
+        let duplicate: AppConfig = toml::from_str(
+            r#"
+[[review.presets]]
+name = "backend"
+
+[[review.presets.groups]]
+name = "core"
+paths = ["crates/core/src"]
+
+[[review.presets]]
+name = " backend "
+
+[[review.presets.groups]]
+name = "tui"
+paths = ["crates/tui/src"]
+"#,
+        )
+        .expect("parse config");
+        let err = duplicate
+            .review
+            .validate()
+            .expect_err("a duplicate preset name must be rejected");
+        assert!(err.contains("backend"), "got: {err}");
+    }
+
+    #[test]
+    fn test_review_section_rejects_a_preset_without_groups_or_paths() {
+        let no_groups: AppConfig = toml::from_str(
+            r#"
+[[review.presets]]
+name = "backend"
+"#,
+        )
+        .expect("parse config");
+        let err = no_groups
+            .review
+            .validate()
+            .expect_err("a preset without groups must be rejected");
+        assert!(err.contains("backend"), "got: {err}");
+
+        let no_paths: AppConfig = toml::from_str(
+            r#"
+[models]
+primary = ["openrouter:a/b"]
+
+[project.verify]
+command = "cargo"
+args = ["test"]
+
+[[review.presets]]
+name = "backend"
+
+[[review.presets.groups]]
+name = "core"
+paths = []
+"#,
+        )
+        .expect("parse config");
+        let err = no_paths
+            .review
+            .validate()
+            .expect_err("a group without paths must be rejected");
+        assert!(err.contains("core"), "got: {err}");
+
+        // The rejection reaches the whole configuration through the section
+        // hook and names the offending section.
+        let whole = no_paths
+            .validate()
+            .expect_err("an invalid review section must invalidate the configuration");
+        assert!(whole.contains("[review]"), "got: {whole}");
+    }
+
+    #[test]
+    fn test_review_post_analysis_modes_are_typed() {
+        let absent: AppConfig = toml::from_str(
+            r#"
+[[review.presets]]
+name = "modes"
+
+[[review.presets.groups]]
+name = "core"
+paths = ["crates/core/src"]
+"#,
+        )
+        .expect("parse config");
+        assert_eq!(
+            absent.review.presets[0].post_analysis,
+            PostAnalysisMode::None
+        );
+
+        for (declared, expected) in [
+            ("automatic", PostAnalysisMode::Automatic),
+            ("manual", PostAnalysisMode::Manual),
+            ("none", PostAnalysisMode::None),
+        ] {
+            let toml_str = format!(
+                "[[review.presets]]\nname = \"modes\"\npost_analysis = \"{declared}\"\n\n\
+                 [[review.presets.groups]]\nname = \"core\"\npaths = [\"crates/core/src\"]\n"
+            );
+            let config: AppConfig = toml::from_str(&toml_str).expect("parse config");
+            assert_eq!(
+                config.review.presets[0].post_analysis, expected,
+                "declared {declared} must resolve"
+            );
+        }
+
+        // A spelling outside the three modes is rejected instead of silently
+        // defaulting to `none`.
+        let unknown = toml::from_str::<AppConfig>(
+            "[[review.presets]]\nname = \"modes\"\npost_analysis = \"later\"\n\n\
+             [[review.presets.groups]]\nname = \"core\"\npaths = [\"crates/core/src\"]\n",
+        );
+        assert!(
+            unknown.is_err(),
+            "an unknown post-analysis mode must be rejected"
+        );
     }
 }

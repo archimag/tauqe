@@ -7,20 +7,43 @@ use super::reference::ModelRef;
 /// A model entry configured for a semantic role.
 ///
 /// Pairs the model a role slot runs on with the runtime parameters of that
-/// slot. A display alias is not a role parameter: it describes the model itself
-/// and is declared once in the provider catalog (`ModelCatalogEntry`), so the
+/// slot: an optional reasoning depth and an optional level-up marker. A
+/// display alias is not a role parameter: it describes the model itself and
+/// is declared once in the provider catalog (`ModelCatalogEntry`), so the
 /// same model is never labelled in two places and every surface resolves a
 /// display name from a single source.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ModelEntry {
     pub model: ModelRef,
     pub effort: Option<ReasoningEffort>,
+    /// Explicit level-up marker, absent by default.
+    ///
+    /// An absent marker means the entry participates in ladder escalation.
+    pub level_up: Option<bool>,
 }
 
 impl ModelEntry {
     /// Creates a role entry from a model and an optional reasoning depth.
+    ///
+    /// The created entry carries no level-up marker, so it participates in
+    /// ladder escalation.
     pub fn new(model: ModelRef, effort: Option<ReasoningEffort>) -> Self {
-        Self { model, effort }
+        Self {
+            model,
+            effort,
+            level_up: None,
+        }
+    }
+
+    /// Returns the explicit level-up marker the entry was configured with.
+    ///
+    /// An absent marker means the entry participates in ladder escalation:
+    /// `level_up = true` reserves the entry for an explicit level-up, and
+    /// `level_up = false` is the explicit form of that default. Consumers
+    /// read the marker through this accessor so the participation rule has
+    /// a single authoritative statement.
+    pub fn level_up(&self) -> Option<bool> {
+        self.level_up
     }
 
     /// Renders the entry as the canonical model specification, with the
@@ -38,16 +61,17 @@ impl From<ModelRef> for ModelEntry {
         Self {
             model,
             effort: None,
+            level_up: None,
         }
     }
 }
 
 /// Shared polymorphic specification for a configured model role entry.
 ///
-/// A configured entry is either a bare model string or a table with a mandatory
-/// `model` field and an optional `effort` field. `ModelEntry`, `CoderTier`, and
-/// `ArchitectTier` all deserialize through this single type, so the three kinds
-/// cannot drift apart.
+/// A configured entry is either a bare model string or a table with a
+/// mandatory `model` field and optional `effort` and `level_up` fields.
+/// `ModelEntry`, `CoderTier`, and `ArchitectTier` all deserialize through
+/// this single type, so the three kinds cannot drift apart.
 ///
 /// The value is dispatched on its runtime shape with a visitor rather than an
 /// untagged enum. An untagged enum reports every malformed field as the opaque
@@ -57,6 +81,20 @@ impl From<ModelRef> for ModelEntry {
 struct ModelEntrySpec {
     model: ModelRef,
     effort: Option<ReasoningEffort>,
+    level_up: Option<bool>,
+}
+
+/// Decodes the optional level-up marker from an already-read value.
+///
+/// Only a genuine boolean literal carries intent. Every other value shape
+/// (`null`, a string, a number, an array, a table) degrades to the absent
+/// marker instead of failing the entry, so a malformed annotation never
+/// renders a configured role unreadable.
+fn decode_level_up_marker(raw: serde_json::Value) -> Option<bool> {
+    match raw {
+        serde_json::Value::Bool(marker) => Some(marker),
+        _ => None,
+    }
 }
 
 impl ModelEntrySpec {
@@ -67,9 +105,10 @@ impl ModelEntrySpec {
     /// of leaving the entry without the intended reasoning depth. A display
     /// alias belongs to the provider catalog entry of a model, so a role slot
     /// that carries one is rejected as well instead of quietly reinstating a
-    /// second source of truth for the same label. A repeated key is reported as
-    /// a `duplicate field` error rather than letting the last value silently
-    /// win.
+    /// second source of truth for the same label. A repeated key is reported
+    /// as a `duplicate field` error rather than letting the last value
+    /// silently win. The level-up marker alone decodes leniently: a value that
+    /// is not a boolean literal degrades to the absent marker.
     fn deserialize<'de, D>(deserializer: D) -> Result<Self, D::Error>
     where
         D: serde::Deserializer<'de>,
@@ -80,7 +119,7 @@ impl ModelEntrySpec {
             type Value = ModelEntrySpec;
 
             fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-                f.write_str("a model string or a { model, effort } table")
+                f.write_str("a model string or a { model, effort, level_up } table")
             }
 
             fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
@@ -91,6 +130,7 @@ impl ModelEntrySpec {
                     Ok(model) => Ok(ModelEntrySpec {
                         model,
                         effort: None,
+                        level_up: None,
                     }),
                     Err(err) => Err(E::custom(err)),
                 }
@@ -103,6 +143,8 @@ impl ModelEntrySpec {
                 let mut model: Option<String> = None;
                 let mut effort: Option<ReasoningEffort> = None;
                 let mut effort_seen = false;
+                let mut level_up: Option<bool> = None;
+                let mut level_up_seen = false;
 
                 while let Some(key) = map.next_key::<String>()? {
                     match key.as_str() {
@@ -122,10 +164,17 @@ impl ModelEntrySpec {
                                 Err(err) => return Err(serde::de::Error::custom(err)),
                             };
                         }
+                        "level_up" => {
+                            if level_up_seen {
+                                return Err(serde::de::Error::duplicate_field("level_up"));
+                            }
+                            level_up_seen = true;
+                            level_up = decode_level_up_marker(map.next_value()?);
+                        }
                         other => {
                             return Err(serde::de::Error::unknown_field(
                                 other,
-                                &["model", "effort"],
+                                &["model", "effort", "level_up"],
                             ))
                         }
                     }
@@ -140,7 +189,11 @@ impl ModelEntrySpec {
                     Err(err) => return Err(serde::de::Error::custom(err)),
                 };
 
-                Ok(ModelEntrySpec { model, effort })
+                Ok(ModelEntrySpec {
+                    model,
+                    effort,
+                    level_up,
+                })
             }
         }
 
@@ -154,7 +207,11 @@ impl<'de> Deserialize<'de> for ModelEntry {
         D: serde::Deserializer<'de>,
     {
         let spec = ModelEntrySpec::deserialize(deserializer)?;
-        Ok(ModelEntry::new(spec.model, spec.effort))
+        Ok(ModelEntry {
+            model: spec.model,
+            effort: spec.effort,
+            level_up: spec.level_up,
+        })
     }
 }
 
@@ -163,34 +220,52 @@ impl Serialize for ModelEntry {
     where
         S: serde::Serializer,
     {
-        match self.effort {
-            Some(effort) => {
-                use serde::ser::SerializeStruct;
-                let mut state = serializer.serialize_struct("ModelEntry", 2)?;
-                state.serialize_field("model", &self.model.to_spec())?;
-                state.serialize_field("effort", &effort)?;
-                state.end()
-            }
-            None => serializer.serialize_str(&self.model.to_spec()),
-        }
+        serialize_rung(
+            &self.model,
+            self.effort,
+            self.level_up,
+            "ModelEntry",
+            serializer,
+        )
     }
 }
 
 /// A single rung of the coder escalation ladder.
 ///
-/// Pairs a concrete model with an optional reasoning depth. Deserializes from
-/// either a bare model string or a `{ model, effort }` table, so a ladder may
-/// mix terse and detailed rungs.
+/// Pairs a concrete model with an optional reasoning depth and an optional
+/// level-up marker. Deserializes from either a bare model string or a
+/// `{ model, effort, level_up }` table, so a ladder may mix terse and
+/// detailed rungs. A rung without the marker participates in escalation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CoderTier {
     pub model: ModelRef,
     pub effort: Option<ReasoningEffort>,
+    /// Explicit level-up marker, absent by default.
+    ///
+    /// An absent marker means the rung participates in ladder escalation.
+    pub level_up: Option<bool>,
 }
 
 impl CoderTier {
     /// Creates a coder rung from a model and an optional reasoning depth.
+    ///
+    /// The created rung carries no level-up marker, so it participates in
+    /// ladder escalation.
     pub fn new(model: ModelRef, effort: Option<ReasoningEffort>) -> Self {
-        Self { model, effort }
+        Self {
+            model,
+            effort,
+            level_up: None,
+        }
+    }
+
+    /// Returns the explicit level-up marker the rung was configured with.
+    ///
+    /// An absent marker means the rung participates in ladder escalation:
+    /// `level_up = true` reserves the rung for an explicit level-up, and
+    /// `level_up = false` is the explicit form of that default.
+    pub fn level_up(&self) -> Option<bool> {
+        self.level_up
     }
 }
 
@@ -199,32 +274,40 @@ impl From<ModelRef> for CoderTier {
         Self {
             model,
             effort: None,
+            level_up: None,
         }
     }
 }
 
-/// Serializes a `{ model, effort }` rung.
+/// Serializes a `{ model, effort, level_up }` rung.
 ///
-/// A rung without a reasoning depth is written as the bare model string, so
-/// every rung kind shares a single wire form and the kinds cannot drift apart.
+/// A rung with neither a reasoning depth nor a level-up marker is written as
+/// the bare model string, so every rung kind shares a single wire form and
+/// the kinds cannot drift apart.
 fn serialize_rung<S>(
     model: &ModelRef,
     effort: Option<ReasoningEffort>,
+    level_up: Option<bool>,
     name: &'static str,
     serializer: S,
 ) -> Result<S::Ok, S::Error>
 where
     S: serde::Serializer,
 {
-    match effort {
-        Some(effort) => {
+    match (effort, level_up) {
+        (None, None) => serializer.serialize_str(&model.to_spec()),
+        _ => {
             use serde::ser::SerializeStruct;
-            let mut state = serializer.serialize_struct(name, 2)?;
+            let mut state = serializer.serialize_struct(name, 3)?;
             state.serialize_field("model", &model.to_spec())?;
-            state.serialize_field("effort", &effort)?;
+            if let Some(effort) = effort {
+                state.serialize_field("effort", &effort)?;
+            }
+            if let Some(level_up) = level_up {
+                state.serialize_field("level_up", &level_up)?;
+            }
             state.end()
         }
-        None => serializer.serialize_str(&model.to_spec()),
     }
 }
 
@@ -232,23 +315,44 @@ where
 ///
 /// A plan and a review finding both record which Architect model, at which
 /// reasoning depth, produced their decomposition. Recording the pair makes a
-/// later refinement reproducible with the same Architect configuration instead
-/// of re-deriving one, and keeps the *What* role's provenance visible in the
-/// document itself.
+/// later refinement reproducible with the same Architect configuration
+/// instead of re-deriving one, and keeps the *What* role's provenance visible
+/// in the document itself.
 ///
-/// Deserializes from either a bare model string or a `{ model, effort }` table
-/// through the shared entry spec, exactly like [`CoderTier`].
+/// Deserializes from either a bare model string or a `{ model, effort,
+/// level_up }` table through the shared entry spec, exactly like
+/// [`CoderTier`]. A tier without the marker participates in escalation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ArchitectTier {
     pub model: ModelRef,
     pub effort: Option<ReasoningEffort>,
+    /// Explicit level-up marker, absent by default.
+    ///
+    /// An absent marker means the tier participates in ladder escalation.
+    pub level_up: Option<bool>,
 }
 
 impl ArchitectTier {
     /// Creates an Architect configuration from a model and an optional
     /// reasoning depth.
+    ///
+    /// The created tier carries no level-up marker, so it participates in
+    /// ladder escalation.
     pub fn new(model: ModelRef, effort: Option<ReasoningEffort>) -> Self {
-        Self { model, effort }
+        Self {
+            model,
+            effort,
+            level_up: None,
+        }
+    }
+
+    /// Returns the explicit level-up marker the tier was configured with.
+    ///
+    /// An absent marker means the tier participates in ladder escalation:
+    /// `level_up = true` reserves the tier for an explicit level-up, and
+    /// `level_up = false` is the explicit form of that default.
+    pub fn level_up(&self) -> Option<bool> {
+        self.level_up
     }
 }
 
@@ -257,6 +361,7 @@ impl From<ModelRef> for ArchitectTier {
         Self {
             model,
             effort: None,
+            level_up: None,
         }
     }
 }
@@ -267,7 +372,11 @@ impl<'de> Deserialize<'de> for CoderTier {
         D: serde::Deserializer<'de>,
     {
         let spec = ModelEntrySpec::deserialize(deserializer)?;
-        Ok(CoderTier::new(spec.model, spec.effort))
+        Ok(CoderTier {
+            model: spec.model,
+            effort: spec.effort,
+            level_up: spec.level_up,
+        })
     }
 }
 
@@ -276,7 +385,13 @@ impl Serialize for CoderTier {
     where
         S: serde::Serializer,
     {
-        serialize_rung(&self.model, self.effort, "CoderTier", serializer)
+        serialize_rung(
+            &self.model,
+            self.effort,
+            self.level_up,
+            "CoderTier",
+            serializer,
+        )
     }
 }
 
@@ -286,7 +401,11 @@ impl<'de> Deserialize<'de> for ArchitectTier {
         D: serde::Deserializer<'de>,
     {
         let spec = ModelEntrySpec::deserialize(deserializer)?;
-        Ok(ArchitectTier::new(spec.model, spec.effort))
+        Ok(ArchitectTier {
+            model: spec.model,
+            effort: spec.effort,
+            level_up: spec.level_up,
+        })
     }
 }
 
@@ -295,7 +414,13 @@ impl Serialize for ArchitectTier {
     where
         S: serde::Serializer,
     {
-        serialize_rung(&self.model, self.effort, "ArchitectTier", serializer)
+        serialize_rung(
+            &self.model,
+            self.effort,
+            self.level_up,
+            "ArchitectTier",
+            serializer,
+        )
     }
 }
 
@@ -541,6 +666,7 @@ mod tests {
         let entry = ModelEntry::new(model.clone(), Some(ReasoningEffort::Low));
         assert_eq!(entry.model, model);
         assert_eq!(entry.effort, Some(ReasoningEffort::Low));
+        assert_eq!(entry.level_up(), None);
         assert_eq!(entry.display_label(), "openrouter:base/model [low]");
     }
 
@@ -566,5 +692,107 @@ mod tests {
         // exactly as configuration stated it.
         let restored: ModelRolesEntries = serde_json::from_str(&json).unwrap();
         assert_eq!(restored, with_catalog);
+    }
+
+    #[test]
+    fn test_level_up_marker_decodes_leniently() {
+        // An entry without the marker participates in ladder escalation.
+        let plain: ModelEntry =
+            serde_json::from_str(r#"{"model":"openrouter:a/b","effort":"high"}"#).unwrap();
+        assert_eq!(plain.level_up(), None);
+
+        // A genuine boolean literal carries intent and round-trips.
+        let marked: ModelEntry =
+            serde_json::from_str(r#"{"model":"openrouter:a/b","level_up":true}"#).unwrap();
+        assert_eq!(marked.level_up(), Some(true));
+        let marked_json = serde_json::to_string(&marked).unwrap();
+        assert_eq!(marked_json, r#"{"model":"openrouter:a/b","level_up":true}"#);
+        assert_eq!(
+            serde_json::from_str::<ModelEntry>(&marked_json).unwrap(),
+            marked
+        );
+
+        // An explicit false is the explicit form of the default and survives
+        // a round-trip.
+        let explicit: ModelEntry =
+            serde_json::from_str(r#"{"model":"openrouter:a/b","level_up":false}"#).unwrap();
+        assert_eq!(explicit.level_up(), Some(false));
+        assert_eq!(
+            serde_json::to_string(&explicit).unwrap(),
+            r#"{"model":"openrouter:a/b","level_up":false}"#
+        );
+
+        // Every other value shape degrades to the absent marker instead of
+        // failing the entry.
+        for raw in [
+            r#"{"model":"openrouter:a/b","level_up":null}"#,
+            r#"{"model":"openrouter:a/b","level_up":"true"}"#,
+            r#"{"model":"openrouter:a/b","level_up":1}"#,
+            r#"{"model":"openrouter:a/b","level_up":[true]}"#,
+            r#"{"model":"openrouter:a/b","level_up":{"set":true}}"#,
+        ] {
+            let entry: ModelEntry = serde_json::from_str(raw).unwrap();
+            assert_eq!(entry.level_up(), None, "got: {raw}");
+        }
+    }
+
+    #[test]
+    fn test_ladder_rungs_carry_the_level_up_marker() {
+        // Coder and Architect rungs deserialize through the shared entry spec,
+        // so the marker travels with both wire forms.
+        let tier: CoderTier = serde_json::from_str(
+            r#"{"model":"openrouter:strong/model","effort":"high","level_up":true}"#,
+        )
+        .unwrap();
+        assert_eq!(tier.level_up(), Some(true));
+        let tier_json = serde_json::to_string(&tier).unwrap();
+        assert_eq!(
+            tier_json,
+            r#"{"model":"openrouter:strong/model","effort":"high","level_up":true}"#
+        );
+        assert_eq!(serde_json::from_str::<CoderTier>(&tier_json).unwrap(), tier);
+
+        let architect: ArchitectTier =
+            serde_json::from_str(r#"{"model":"openrouter:planner/model","level_up":true}"#)
+                .unwrap();
+        assert_eq!(architect.level_up(), Some(true));
+        assert_eq!(
+            serde_json::to_string(&architect).unwrap(),
+            r#"{"model":"openrouter:planner/model","level_up":true}"#
+        );
+
+        // A rung without a marker keeps the terse bare-string wire form.
+        let bare: CoderTier = serde_json::from_str("\"openrouter:base/model\"").unwrap();
+        assert_eq!(bare.level_up(), None);
+        assert_eq!(
+            serde_json::to_string(&bare).unwrap(),
+            "\"openrouter:base/model\""
+        );
+
+        // Promotion from a bare model reference yields an unmarked rung.
+        assert_eq!(
+            ModelEntry::from(ModelRef::openrouter("primary/model")).level_up(),
+            None
+        );
+        assert_eq!(
+            CoderTier::from(ModelRef::openrouter("base/model")).level_up(),
+            None
+        );
+        assert_eq!(
+            ArchitectTier::from(ModelRef::openrouter("planner/model")).level_up(),
+            None
+        );
+    }
+
+    #[test]
+    fn test_level_up_rejects_duplicate_keys() {
+        // A repeated marker is reported instead of letting the last value win.
+        let err = serde_json::from_str::<ModelEntry>(
+            r#"{"model":"openrouter:a/b","level_up":true,"level_up":false}"#,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("duplicate field"), "got: {err}");
+        assert!(err.contains("level_up"), "got: {err}");
     }
 }

@@ -27,9 +27,13 @@ models = [
 # Every entry names a model either by its provider identifier ("~provider/model")
 # or by an alias registered in `[providers.openrouter].models`, and carries the
 # runtime parameters of that slot: an optional `effort` ("low", "medium", "high",
-# "xhigh", "max"). A display alias is not a role field — it describes the model
-# itself and lives in the catalog entry, so the same model is never labelled in
-# two places.
+# "xhigh", "max") and an optional `level_up` marker. A display alias is not a
+# role field — it describes the model itself and lives in the catalog entry, so
+# the same model is never labelled in two places.
+#
+# `level_up = false` keeps a coder or architect rung out of automatic level-up
+# escalation while leaving the model selectable by hand; the default (`true`)
+# lets the harness escalate onto the rung when verification fails.
 primary = [
   { model = "GLM", effort = "high" },
   "Gemini Flash"
@@ -40,11 +44,18 @@ scribe = "Claude Haiku"    # history compaction, git squash commit messages, dif
 # saturating on the last one. Escalation stays strictly within the Coder role and
 # never switches to Architect, preserving the What vs How role isolation.
 coder = [
-  "DeepSeek Flash",
-  { model = "GLM", effort = "high" }
+  { model = "DeepSeek Flash", effort = "max" },
+  { model = "GLM", effort = "max" },
+  { model = "Gemini Flash", level_up = false },
+  # `level_up = false` keeps a rung manually selectable only: the automatic
+  # escalation ladder never enters it.
+  # { model = "Claude Opus", effort = "max", level_up = false }
 ]
 architect = [
-  "GLM"
+  "GLM",
+  # `level_up = false` keeps a rung manually selectable only: re-planning
+  # escalation never enters it.
+  # { model = "Claude Opus", level_up = false }
 ]
 # conceptual design, plan refinement, blocked-step replanning
 reviewer = [
@@ -108,7 +119,8 @@ patch_strategy = "line_anchor"
 # verification gate, `format` fills the in-memory format filter, `post-hook` fills the
 # disk-side hook, and every other exported recipe becomes a typed custom tool. The
 # technology-specific command lines therefore live in `Justfile`, while this file keeps
-# only the harness policies. This repository declares the runner alone.
+# only the harness policies. This repository declares the runner and the trust
+# boundaries below.
 #
 # A declaration in this section always takes precedence over the runner, so a stage may
 # be pinned here without touching the runner. Each entry is a plain command line with
@@ -142,6 +154,16 @@ patch_strategy = "line_anchor"
 # timeout_secs = 600
 runner = "just"
 
+# Trust boundaries: paths the harness tracks through Git and keeps readable as
+# reference, yet never lets a turn create, rewrite, move, or delete. `Justfile`
+# owns the project verification lifecycle, so a change set able to rewrite it
+# could also make verification agree with itself. `docs/specs/**` holds the
+# specifications an implementation step is checked against, and
+# `.tauqe/refs/refs.md` declares which external documents the harness may fetch,
+# so a turn able to rewrite it could choose its own sources.
+[project.boundaries]
+protected = ["Justfile", "docs/specs/**", ".tauqe/refs/refs.md"]
+
 [git]
 # upstream = "origin/master"  # base upstream branch for calculating diffs (auto-detected by default)
 # bypass_hooks = true         # pass --no-verify so Tauqe commits skip project pre-commit/commit-msg hooks (default: true)
@@ -162,8 +184,33 @@ include_repo_map = true  # include the Tree-sitter repository map in turn prompt
 # max_repo_map_requests_per_round = 3  # targeted repository maps rendered per Discovery round (default: 3)
 # max_feedback_chars = 4000            # characters of one project command stream reported back to the model (default: 4000)
 # max_scratchpad_chars = 4000          # characters of a turn scratchpad block kept before truncation (default: 4000)
+# refs_token_budget = 50000            # total token budget of lazily loaded external reference documents (default: 50000)
 pinned = [
     "Conventions.md",
     "Vision.md",
     "docs/src/SUMMARY.md"
 ]
+
+# Named review presets decompose one audit into isolated groups, each carrying
+# its own repository paths and an optional local prompt, and declare when the
+# post-analysis layer is produced: `automatic` classifies the findings once
+# every group has finished, `manual` waits for an explicit `review/analyze`
+# request, and `none` keeps them a flat list (default). A preset is declared as
+# `[[review.presets]]` with a mandatory `name`, an optional `title`, the
+# `post_analysis` mode, and one or more `[[review.presets.groups]]` entries
+# carrying a `name`, `paths`, and an optional `prompt`. An absent section
+# declares no preset, so single-audit sessions stay available. This repository
+# declares none.
+# [[review.presets]]
+# name = "backend"
+# title = "Backend audit"
+# post_analysis = "manual"
+#
+# [[review.presets.groups]]
+# name = "core"
+# paths = ["crates/core/src", "crates/protocol/src"]
+# prompt = "Audit the harness invariants and the wire contract."
+#
+# [[review.presets.groups]]
+# name = "server"
+# paths = ["crates/server/src"]

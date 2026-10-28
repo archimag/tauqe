@@ -561,6 +561,7 @@ mod tests {
             confirm_delete_plan: None,
             confirm_delete_plan_final: None,
             confirm_delete_review: None,
+            confirm_review_analyze: None,
             confirm_execute_scope: None,
             confirm_execute_pipeline: None,
             confirm_execute_review: None,
@@ -571,6 +572,7 @@ mod tests {
             review_dialog: None,
             prompt_modal: None,
             notification: None,
+            diff_inspector: None,
             turn_started_at: None,
             server_disconnected: None,
             server_log_path: std::path::PathBuf::from(".tauqe/server.log"),
@@ -587,6 +589,7 @@ mod tests {
             i18n: crate::i18n::I18nEngine::english(),
             locale_dialog: None,
             usage_summary: None,
+            review_presets: Vec::new(),
         }
     }
 

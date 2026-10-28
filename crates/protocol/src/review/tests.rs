@@ -1,7 +1,7 @@
 use super::*;
 
 use crate::model::{ArchitectTier, CancelMode, ModelRef, ModelSelection, ReasoningEffort};
-use crate::plan::PlanItem;
+use crate::plan::{PlanItem, PlanItemStatus};
 
 #[test]
 fn test_review_execute_params_serde() {
@@ -35,6 +35,7 @@ fn test_review_execute_params_serde() {
         review_id: Some("rev-3".to_string()),
         item_id: Some(5),
         step_id: Some("5.1".to_string()),
+        item_ids: None,
         model: Some(ModelSelection::Role(crate::model::ModelRole::Coder)),
         instructions: Some("focus on unit tests".to_string()),
     };
@@ -44,6 +45,19 @@ fn test_review_execute_params_serde() {
     assert!(full_json.contains("\"instructions\":\"focus on unit tests\""));
     let de_full: ReviewExecuteParams = serde_json::from_str(&full_json).unwrap();
     assert_eq!(de_full, full);
+
+    // A section queue names its findings explicitly: the ids serialize
+    // verbatim in client order, and an absent list keeps the whole-session
+    // queue, so the wire form stays compact for every other caller.
+    let section = ReviewExecuteParams {
+        review_id: Some("rev-4".to_string()),
+        item_ids: Some(vec![3, 1, 2]),
+        ..Default::default()
+    };
+    let json = serde_json::to_string(&section).unwrap();
+    assert!(json.contains("\"item_ids\":[3,1,2]"), "got: {json}");
+    let de: ReviewExecuteParams = serde_json::from_str(&json).unwrap();
+    assert_eq!(de, section);
 }
 
 #[test]
@@ -68,7 +82,9 @@ fn test_review_issue_serde() {
     let issue = ReviewIssue {
         id: 1,
         title: "Potential race condition".to_string(),
-        model: Some(ModelSelection::Role(crate::model::ModelRole::Architect)),
+        uuid: None,
+        group: None,
+        model: None,
         issue_type: IssueType::Bug,
         status: IssueStatus::Discussion,
         description: "Lock is released before turn concludes".to_string(),
@@ -254,13 +270,13 @@ fn test_review_model_ref_lenient_is_total_and_keeps_precise_errors() {
 }
 
 #[test]
-fn test_review_start_params_path_pattern_backward_compatible() {
-    // A legacy client omits `path_pattern`; it stays absent and is never
-    // serialized, preserving the old wire shape.
+fn test_review_start_params_path_patterns_backward_compatible() {
+    // A legacy client omits the target paths; the list stays empty and is
+    // never serialized, preserving the old wire shape.
     let legacy: ReviewStartParams =
         serde_json::from_str(r#"{"model":{"provider":"openrouter","name":"openai/gpt-4o"}}"#)
             .unwrap();
-    assert!(legacy.path_pattern.is_none());
+    assert!(legacy.path_patterns.is_empty());
     // A legacy client that names only a model keeps decoding: the untagged
     // selection form maps the model reference to an explicit `Specific`
     // selection, so no reasoning depth is implied.
@@ -271,14 +287,21 @@ fn test_review_start_params_path_pattern_backward_compatible() {
         )))
     );
 
-    let with_pattern = ReviewStartParams {
-        path_pattern: Some("crates/core/src/**/*.rs".to_string()),
+    // Coverage travels as one ordered list, so several audit lines reach the
+    // server as a single typed field instead of competing scalar keys (c-1).
+    let with_patterns = ReviewStartParams {
+        path_patterns: vec![
+            "crates/core/src/**/*.rs".to_string(),
+            "crates/server/src/**/*.rs".to_string(),
+        ],
         ..Default::default()
     };
-    let json = serde_json::to_string(&with_pattern).unwrap();
-    assert!(json.contains("\"path_pattern\":\"crates/core/src/**/*.rs\""));
+    let json = serde_json::to_string(&with_patterns).unwrap();
+    assert!(json.contains("\"path_patterns\""));
+    assert!(json.contains("crates/core/src/**/*.rs"));
+    assert!(json.contains("crates/server/src/**/*.rs"));
     let de: ReviewStartParams = serde_json::from_str(&json).unwrap();
-    assert_eq!(de.path_pattern.as_deref(), Some("crates/core/src/**/*.rs"));
+    assert_eq!(de.path_patterns, with_patterns.path_patterns);
 
     assert_eq!(
         serde_json::to_string(&ReviewStartParams::default()).unwrap(),
@@ -378,6 +401,8 @@ fn test_review_refine_item_result_serde_and_helpers() {
     let item = ReviewIssue {
         id: 3,
         title: "Finding".to_string(),
+        uuid: None,
+        group: None,
         model: None,
         issue_type: IssueType::Bug,
         status: IssueStatus::Todo,
@@ -503,6 +528,8 @@ fn test_review_issue_serde_and_plan_stats() {
     let issue = ReviewIssue {
         id: 42,
         title: "Memory leak in cache".to_string(),
+        uuid: None,
+        group: None,
         model: None,
         issue_type: IssueType::Bug,
         status: IssueStatus::Refine,
@@ -570,6 +597,8 @@ fn finding(id: u32, status: IssueStatus) -> ReviewItem {
     ReviewItem {
         id,
         title: format!("Finding {id}"),
+        uuid: None,
+        group: None,
         model: None,
         issue_type: IssueType::Bug,
         severity: ReviewSeverity::Critical,
@@ -644,6 +673,8 @@ fn categorized_finding(id: u32, issue_type: IssueType) -> ReviewItem {
     ReviewItem::from(ReviewIssue {
         id,
         title: format!("Finding {}", issue_type.as_str()),
+        uuid: None,
+        group: None,
         model: None,
         issue_type,
         status: IssueStatus::Todo,
@@ -814,4 +845,308 @@ fn test_review_issue_projection_drops_architect_provenance() {
     assert_eq!(restored.status, item.status);
     assert_eq!(restored.subplan, item.subplan);
     assert_eq!(restored.body, item.body);
+}
+
+#[test]
+fn test_review_legacy_session_without_groups_or_post_analysis() {
+    // A session written before grouping existed carries none of the new
+    // fields and still reads, because every one of them defaults.
+    let legacy = r#"{
+        "id": "rev-legacy",
+        "title": "Legacy",
+        "created_at": 10,
+        "user_prompt": "audit the engine",
+        "target_files": ["crates/core/src/lib.rs"]
+    }"#;
+    let session: ReviewSession = serde_json::from_str(legacy).unwrap();
+    assert!(session.groups.is_empty());
+    assert!(session.post_analysis.is_none());
+    assert!(session.launch_config.is_none());
+
+    // Such a session is the degenerate case of a single audit: one implicit
+    // Default group covering the session target files.
+    let groups = session.effective_groups();
+    assert_eq!(groups.len(), 1);
+    assert_eq!(groups[0].id, "default");
+    assert_eq!(groups[0].title, "Default");
+    assert_eq!(groups[0].paths, vec!["crates/core/src/lib.rs".to_string()]);
+    assert!(groups[0].prompt.is_none());
+
+    // None of the new fields is written back, so the record keeps its old
+    // wire shape.
+    let json = serde_json::to_string(&session).unwrap();
+    assert!(!json.contains("\"groups\""), "got: {json}");
+    assert!(!json.contains("post_analysis"), "got: {json}");
+    assert!(!json.contains("launch_config"), "got: {json}");
+}
+
+#[test]
+fn test_review_post_analysis_mode_defaults_to_none() {
+    // A session that never asked for a classification keeps the flat list.
+    assert_eq!(PostAnalysisMode::default(), PostAnalysisMode::None);
+    assert_eq!(
+        serde_json::to_string(&PostAnalysisMode::Automatic).unwrap(),
+        "\"automatic\""
+    );
+    assert_eq!(
+        serde_json::to_string(&PostAnalysisMode::Manual).unwrap(),
+        "\"manual\""
+    );
+    assert_eq!(
+        serde_json::to_string(&PostAnalysisMode::None).unwrap(),
+        "\"none\""
+    );
+    assert_eq!(
+        serde_json::from_str::<PostAnalysisMode>("\"automatic\"").unwrap(),
+        PostAnalysisMode::Automatic
+    );
+}
+
+#[test]
+fn test_review_launch_snapshot_and_post_analysis_roundtrip() {
+    let config = ReviewLaunchConfig {
+        preset: Some("deep-audit".to_string()),
+        mode: PostAnalysisMode::Automatic,
+        groups: vec![
+            ReviewGroup {
+                id: "engine".to_string(),
+                title: "Engine".to_string(),
+                paths: vec!["crates/core/src".to_string()],
+                prompt: Some("focus on the turn FSM".to_string()),
+                ..Default::default()
+            },
+            ReviewGroup {
+                id: "frontend".to_string(),
+                title: "Frontend".to_string(),
+                paths: vec!["crates/tui/src".to_string()],
+                prompt: None,
+                ..Default::default()
+            },
+        ],
+    };
+    let analysis = ReviewPostAnalysis {
+        created_at: 42,
+        summary: "One shared root cause".to_string(),
+        independent_issues: vec!["0192f0aa-0000-7000-8000-000000000001".to_string()],
+        architectural_groups: vec![ArchitecturalIssueGroup {
+            id: "arch-1".to_string(),
+            title: "Unbounded retry".to_string(),
+            description: "Retries lack a shared budget".to_string(),
+            issue_ids: vec![
+                "0192f0aa-0000-7000-8000-000000000002".to_string(),
+                "0192f0aa-0000-7000-8000-000000000003".to_string(),
+            ],
+            subplan: vec![PlanItem {
+                id: "1.1".to_string(),
+                title: "Introduce one shared retry budget".to_string(),
+                status: PlanItemStatus::Todo,
+                files: vec!["crates/core/src/providers/retry.rs".to_string()],
+                ..Default::default()
+            }],
+            subplan_architect: Some(ArchitectTier::new(
+                ModelRef::openrouter("test/architect"),
+                Some(ReasoningEffort::High),
+            )),
+            subplan_last_replanned_step: Some("1.1".to_string()),
+        }],
+    };
+
+    let session = ReviewSession {
+        id: "rev-grouped".to_string(),
+        title: "Grouped".to_string(),
+        created_at: 1,
+        groups: config.groups.clone(),
+        launch_config: Some(config.clone()),
+        post_analysis: Some(analysis.clone()),
+        ..Default::default()
+    };
+
+    let json = serde_json::to_string(&session).unwrap();
+    let restored: ReviewSession = serde_json::from_str(&json).unwrap();
+    assert_eq!(restored.groups, config.groups);
+    assert_eq!(restored.launch_config, Some(config));
+    assert_eq!(restored.post_analysis, Some(analysis));
+
+    // Explicit groups win over the implicit single-audit group.
+    assert_eq!(restored.effective_groups(), restored.groups);
+    // A freshly classified group carries no horizon, so the new fields stay
+    // absent from the wire form instead of being written as empty values.
+    let fresh = ArchitecturalIssueGroup {
+        id: "arch-2".to_string(),
+        title: "Fresh root cause".to_string(),
+        description: String::new(),
+        ..Default::default()
+    };
+    let fresh_json = serde_json::to_string(&fresh).unwrap();
+    assert!(!fresh_json.contains("subplan"), "got: {fresh_json}");
+}
+
+#[test]
+fn test_review_item_uuid_and_group_survive_issue_roundtrip() {
+    let mut item = finding(1, IssueStatus::Todo);
+    item.uuid = Some("0192f0aa-0000-7000-8000-00000000000a".to_string());
+    item.group = Some("engine".to_string());
+
+    let json = serde_json::to_string(&item).unwrap();
+    assert!(json.contains("\"uuid\":\"0192f0aa-0000-7000-8000-00000000000a\""));
+    assert!(json.contains("\"group\":\"engine\""));
+    let restored: ReviewItem = serde_json::from_str(&json).unwrap();
+    assert_eq!(restored.uuid, item.uuid);
+    assert_eq!(restored.group, item.group);
+
+    // The analytical view carries both identifiers, so a finding rebuilt from
+    // it keeps the identity the post-analysis layer refers to.
+    let issue = ReviewIssue::from(item.clone());
+    assert_eq!(issue.uuid, item.uuid);
+    assert_eq!(issue.group, item.group);
+    let rebuilt = ReviewItem::from(issue);
+    assert_eq!(rebuilt.uuid, item.uuid);
+    assert_eq!(rebuilt.group, item.group);
+
+    // A finding written before the identifiers existed stays readable and
+    // keeps them absent from the wire form.
+    let legacy = r#"{"id": 9, "title": "Legacy", "type": "bug", "status": "todo"}"#;
+    let legacy_item: ReviewItem = serde_json::from_str(legacy).unwrap();
+    assert!(legacy_item.uuid.is_none());
+    assert!(legacy_item.group.is_none());
+    let legacy_json = serde_json::to_string(&legacy_item).unwrap();
+    assert!(!legacy_json.contains("uuid"), "got: {legacy_json}");
+    assert!(!legacy_json.contains("\"group\""), "got: {legacy_json}");
+}
+
+#[test]
+fn test_review_start_params_preset_backward_compatible() {
+    // A legacy client omits `preset`: it stays absent and is never serialized,
+    // so a single-audit or one-off custom launch keeps its old wire shape.
+    let legacy: ReviewStartParams = serde_json::from_str("{}").unwrap();
+    assert!(legacy.preset.is_none());
+    assert_eq!(serde_json::to_string(&legacy).unwrap(), "{}");
+
+    let preset = ReviewStartParams {
+        preset: Some("deep-audit".to_string()),
+        ..Default::default()
+    };
+    let json = serde_json::to_string(&preset).unwrap();
+    assert!(json.contains("\"preset\":\"deep-audit\""), "got: {json}");
+    let de: ReviewStartParams = serde_json::from_str(&json).unwrap();
+    assert_eq!(de.preset.as_deref(), Some("deep-audit"));
+}
+
+#[test]
+fn test_review_analyze_params_and_result_serde() {
+    let params = ReviewAnalyzeParams {
+        review_id: "rev-1".to_string(),
+    };
+    let json = serde_json::to_string(&params).unwrap();
+    assert_eq!(json, "{\"review_id\":\"rev-1\"}");
+    let de: ReviewAnalyzeParams = serde_json::from_str(&json).unwrap();
+    assert_eq!(de, params);
+
+    // The session identifier is mandatory: post-analysis classifies exactly one
+    // stored session and never guesses which one the caller meant.
+    let err = serde_json::from_str::<ReviewAnalyzeParams>("{}")
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("missing field"), "got: {err}");
+
+    let session = ReviewSession {
+        id: "rev-1".to_string(),
+        title: "Audit".to_string(),
+        created_at: 7,
+        ..Default::default()
+    };
+    let result = ReviewAnalyzeResult {
+        session: session.clone(),
+    };
+    let json = serde_json::to_string(&result).unwrap();
+    assert!(json.contains("\"session\":{"), "got: {json}");
+    let de: ReviewAnalyzeResult = serde_json::from_str(&json).unwrap();
+    assert_eq!(de.session, session);
+}
+
+#[test]
+fn test_review_group_events_roundtrip() {
+    let started = ReviewGroupStartedEvent {
+        operation_id: "op-1".to_string(),
+        group_id: "engine".to_string(),
+        group_title: "Engine".to_string(),
+        files_count: 12,
+        estimated_tokens: 4096,
+    };
+    let json = serde_json::to_string(&started).unwrap();
+    assert!(json.contains("\"group_id\":\"engine\""), "got: {json}");
+    let de: ReviewGroupStartedEvent = serde_json::from_str(&json).unwrap();
+    assert_eq!(de.operation_id, started.operation_id);
+    assert_eq!(de.group_title, "Engine");
+    assert_eq!(de.files_count, 12);
+    assert_eq!(de.estimated_tokens, 4096);
+
+    // A successful group carries no reason and stays compact on the wire.
+    let finished = ReviewGroupFinishedEvent {
+        operation_id: "op-1".to_string(),
+        group_id: "engine".to_string(),
+        findings_count: 3,
+        success: true,
+        error: None,
+    };
+    let json = serde_json::to_string(&finished).unwrap();
+    assert!(!json.contains("error"), "got: {json}");
+    let de: ReviewGroupFinishedEvent = serde_json::from_str(&json).unwrap();
+    assert_eq!(de.findings_count, 3);
+    assert!(de.success);
+    assert!(de.error.is_none());
+
+    let legacy = r#"{"operation_id":"op-1","group_id":"engine","findings_count":1,"success":true}"#;
+    let de: ReviewGroupFinishedEvent = serde_json::from_str(legacy).unwrap();
+    assert!(de.error.is_none());
+
+    // A failed group reports its reason locally: the findings the other groups
+    // already produced stay intact.
+    let failed = ReviewGroupFinishedEvent {
+        operation_id: "op-1".to_string(),
+        group_id: "frontend".to_string(),
+        findings_count: 0,
+        success: false,
+        error: Some("provider timed out".to_string()),
+    };
+    let json = serde_json::to_string(&failed).unwrap();
+    assert!(json.contains("\"success\":false"), "got: {json}");
+    let de: ReviewGroupFinishedEvent = serde_json::from_str(&json).unwrap();
+    assert_eq!(de.error.as_deref(), Some("provider timed out"));
+}
+
+#[test]
+fn test_review_analyze_events_roundtrip() {
+    let started = ReviewAnalyzeStartedEvent {
+        operation_id: "op-2".to_string(),
+        model: ModelRef::openrouter("anthropic/claude-3.7-sonnet"),
+        findings_count: 5,
+    };
+    let json = serde_json::to_string(&started).unwrap();
+    assert!(json.contains("\"findings_count\":5"), "got: {json}");
+    let de: ReviewAnalyzeStartedEvent = serde_json::from_str(&json).unwrap();
+    assert_eq!(de.model, started.model);
+    assert_eq!(de.findings_count, 5);
+
+    // A legacy string model reference still decodes, exactly like every other
+    // review record carrying a model.
+    let legacy = r#"{"operation_id":"op-2","model":"openai/gpt-4o","findings_count":2}"#;
+    let de: ReviewAnalyzeStartedEvent = serde_json::from_str(legacy).unwrap();
+    assert_eq!(de.model, ModelRef::openrouter("openai/gpt-4o"));
+
+    // The finished event carries the session whose post-analysis layer was
+    // replaced, so the client renders the new classification without a refetch.
+    let session = ReviewSession {
+        id: "rev-1".to_string(),
+        created_at: 9,
+        ..Default::default()
+    };
+    let finished = ReviewAnalyzeFinishedEvent {
+        operation_id: "op-2".to_string(),
+        session: session.clone(),
+    };
+    let json = serde_json::to_string(&finished).unwrap();
+    let de: ReviewAnalyzeFinishedEvent = serde_json::from_str(&json).unwrap();
+    assert_eq!(de.operation_id, "op-2");
+    assert_eq!(de.session, session);
 }

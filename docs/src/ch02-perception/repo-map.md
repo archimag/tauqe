@@ -194,7 +194,7 @@ requested during discovery are round feedback, not a new map.
 
 ## 5. Related Chapters
 
-- [Three-Tier Context Model](three-tier-model.md) — the working set the map
+- [The Context Model](context-model.md) — the working set the map
   complements and the context files the map excludes.
 - [Discovery Engine](discovery-engine.md) — where targeted outlines are requested
   and bounded.

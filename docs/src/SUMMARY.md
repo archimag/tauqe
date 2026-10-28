@@ -11,7 +11,8 @@
 
 # Part II — Context Perception & Discovery
 
-- [Three-Tier Context Model](ch02-perception/three-tier-model.md)
+- [The Context Model](ch02-perception/context-model.md)
+- [The External Reference Registry](ch02-perception/reference-registry.md)
 - [Discussion Focus](ch02-perception/discussion-focus.md)
 - [Repository Map and Blinkers](ch02-perception/repo-map.md)
 - [Discovery Engine](ch02-perception/discovery-engine.md)
@@ -19,9 +20,11 @@
 # Part III — Project Integration & Execution
 
 - [Sovereign Project Contracts](ch03-project/tauqe-project-protocol.md)
+- [Protected Paths and Trust Boundaries](ch03-project/protected-paths.md)
 - [The Three-Phase Modification Lifecycle](ch03-project/three-phase-lifecycle.md)
 - [Structured Diagnostics and Verification Healing](ch03-project/verification-healing.md)
 - [Git Safety & Transactions](ch03-project/git-transactions.md)
+- [The Mockups Sandbox](ch03-project/mockups-sandbox.md)
 
 # Part IV — Workflows
 

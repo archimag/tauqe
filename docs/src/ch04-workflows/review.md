@@ -77,11 +77,16 @@ defect inside it, deliberately split into a diagnosis and a remediation.
 | `user_prompt` | the raw audit instructions |
 | `target_files` | the audited repository-relative paths |
 | `items` | the discrete findings |
-| `raw_markdown` | the untouched model payload, retained for audit |
+| `items` | the discrete findings |
+| `groups` | the isolated slices the audit ran in, in launch order |
+| `post_analysis` | the Architect classification layer, when one exists |
+| `launch_config` | snapshot of the configuration that launched the session |
 
 | Finding field | Meaning |
 | --- | --- |
 | `id` | numeric identity inside the session |
+| `uuid` | stable UUIDv7 identity used by the post-analysis layer |
+| `group` | identifier of the group that produced the finding |
 | `title` | concise defect title |
 | `type` | the problem category |
 | `status` | the lifecycle state |
@@ -130,7 +135,7 @@ that can follow.
 [DISCUSSION] --approve--> [TODO] --> [IN_PROGRESS] --> [FIXED] | [SKIPPED]
       |                      |                        (verified)
       v                      +--broaden--> [REFINE] --Architect--> [TODO] + plan
- [REJECTED]                                    (decomposition needed)
+                            (decomposition needed)
 ```
 
 - **DISCUSSION** — the initial state. Human triage, feasibility assessment, or
@@ -165,15 +170,45 @@ rewritten: a scoped audit can cover code never explicitly added, while control o
 the working set stays untouched. Because matched files are read from the working
 tree, the audit always inspects current source.
 
+The launch dialog previews the pattern locally before a request is sent, and the
+preview is a contract, not a decoration: both the directory list and the match
+counter are computed from the repository file list that arrived with the
+handshake, never touching disk, Git, or the network. Directories are offered
+as sorted, unique prefixes, each terminated with `/`, because that is the
+pattern form that selects every path beneath it. The match counter applies the
+same `GlobPattern` the server applies, so a preview can never predict a selection
+the server resolves differently. A blank pattern narrows nothing and the launch
+runs unrestricted; a pattern that matches nothing is an honest zero, and the
+launch is refused before a request is sent.
+
 Pattern expansion is bounded by the same context budgets that govern discovery: at
 most `context.max_pattern_batch` matched files are loaded per audit, and the
 expansion stops at the first file that would push the loaded total past
 `context.files_token_budget`. Matches beyond either cap are not inspected. The
 `review/started` event reports how many matched files were omitted, the daemon
 records a warning, and the interface raises one, so a silently narrow audit is
-impossible.
+impossible. A pattern that matches no tracked file is refused outright: launching
+anyway would audit a different file set than the one the developer believes the
+pattern chose. A partial selection stays a lawful run, reported through the
+omitted count.
 
-### 3.2 Isolation
+While the run is in flight, the Review view mirrors its progress in the info
+strip. A grouped session audits its slices one at a time, and the strip names
+the group that is currently streaming: its one-based position in the
+supervisor's sequential traversal, the total group count once the mirrored
+session is known, and the group title. The session is published only after
+the first group finishes, so the first badge degrades honestly to an ordinal
+without a denominator instead of inventing a total. When the Architect
+post-analysis layer classifies the findings, the strip raises an analysis
+badge; a standalone classification request is a turn of its own and settles
+the interface when its terminal event arrives, while the automatic
+classification inside a grouped run stays subordinate to the run's own
+terminal event. `Shift+A` launches the classification manually over the
+session the cursor rests on, so a stored audit can be classified later or
+re-analyzed after new findings: the request is refused while a turn, an
+audit, or another classification is in flight, and the layer it produces
+replaces the previous one wholesale while every finding keeps its identity
+and status.
 
 The reviewer receives the pure content of the selected files — no Develop history and
 no repository map. Three reasons make that deliberate:
@@ -211,10 +246,11 @@ explicit developer decision or a verified execution.
 ### 3.5 Discussion
 
 `d` anchors the REPL dialogue on one finding or on the whole session and opens the
-review discussion contour. A review focus deliberately keeps the editing surface: the
-developer holds the full finding context and can ask for the fix to be applied
-directly, so edits are staged, verified, and committed exactly as in an ordinary
-Develop turn. Reasoning and resolution therefore share one anchored dialogue instead
+`d` anchors the REPL dialogue on one finding, on one tree section, or on the
+whole session and opens the review discussion contour. A review focus
+deliberately keeps the editing surface: the developer holds the full finding
+context and can ask for the fix to be applied directly, so edits are staged,
+verified, and committed exactly as in an ordinary
 of splitting across a screen switch.
 
 The prompt presents every `readonly_files` path as an immutable contract, and it
@@ -271,6 +307,19 @@ contour. The server records the explanation in `note`, transitions the finding t
 session still holding findings in `DISCUSSION` is refused, because human triage is a
 precondition, and `REFINE` findings are excluded from the queue rather than silently
 executed.
+
+### Section batch
+
+`x` on an architectural section — a root-cause group or the independent-issues
+### Section batch (§3.3)
+statuses that can still produce work. The audited selection travels on the wire
+as an explicit, client-ordered list of finding ids, so the run can never
+silently widen to the whole session behind a dialog that promised less. Ids
+that went stale between the confirmation and the launch — a finding already
+fixed, skipped, or sent back to discussion — are dropped instead of executed,
+and an empty selection is refused before any token is spent. Provenance groups
+keep the session-wide scope of their header; sections fold like every other
+tree node, and `d` on one anchors the discussion on the findings it renders.
 
 ### Cross-session batch
 
@@ -404,12 +453,12 @@ compile failure is a *how* problem.
 | `Home` / `End` (`Alt+<` / `Alt+>`) | first / last row |
 | `PgUp` / `PgDn` | page through the tree |
 | `Ctrl+N` / `Ctrl+P` | accordion walk to the next / previous finding |
-| `Tab` / `Space` | fold or unfold the selected item |
-| `a` | fold or unfold every session and finding |
-| `Enter` / `x` | resolve the selected finding or session batch, with confirmation |
+| `Tab` / `Space` | fold or unfold the selected session, section, finding, or step |
+| `a` | fold or unfold every session, section, and finding |
+| `Enter` / `x` | resolve the selected finding, section, or session batch, with confirmation |
 | `X` | resolve every open finding across all sessions as one batch |
 | `r` / `R` | decompose the selected finding / every finding awaiting decomposition with the Architect |
-| `d` | discuss the selected finding or the whole session in Develop |
+| `Shift+A` | classify the findings of the selected session with the Architect post-analysis |
 | `t` / `s` | open the status dialog |
 | `N` | start a new audit of the current context |
 | `g` | re-read sessions from the daemon |
@@ -457,7 +506,7 @@ compile failure is a *how* problem.
   how a failing gate becomes typed diagnostics.
 - [Git Safety & Transactions](../ch03-project/git-transactions.md) — the checkpoint a
   failed finding returns to.
-- [Three-Tier Context Model](../ch02-perception/three-tier-model.md) — why a target
+- [The Context Model](../ch02-perception/context-model.md) — why a target
   pattern widens one run without mutating the developer's layer.
 - [Keyboard-First Interface](../ch05-system/tui-ux.md) — the authoritative command
   matrix and the batch cancellation dialog.
