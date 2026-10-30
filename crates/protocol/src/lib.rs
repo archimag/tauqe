@@ -38,8 +38,8 @@ pub mod review;
 // instead of a silently ambiguous glob re-export. Module paths remain public,
 // so both `tauqe_protocol::Item` and `tauqe_protocol::module::Item` resolve.
 pub use command::{
-    CapabilityDelivery, CapabilityPhase, CapabilitySet, DocTopic, LlmCapability, LlmCommand,
-    LlmOutcome, VerifyOnSuccess, VerifyTarget,
+    CapabilityDelivery, CapabilityPhase, CapabilityProfile, CapabilitySet, DocTopic, LlmCapability,
+    LlmCommand, LlmOutcome, VerifyOnSuccess, VerifyTarget,
 };
 pub use config::{
     ConfigCreateParams, ConfigSetParams, ConfigState, CredentialsSaveParams, EditProtocolKind,
@@ -51,12 +51,12 @@ pub use context::{
     ContextSetAccessParams, ContextState,
 };
 pub use discussion::{
-    discussion_response_schema, discussion_response_schema_definition, DirListRequest,
-    DiscussionClearFocusParams, DiscussionClearFocusResult, DiscussionContextRequest,
-    DiscussionFocus, DiscussionFocusChangedEvent, DiscussionGetFocusParams,
-    DiscussionGetFocusResult, DiscussionPlanAction, DiscussionPlanUpdate, DiscussionRequest,
-    DiscussionResponse, DiscussionSetFocusParams, DiscussionSetFocusResult, DiscussionTarget,
-    RepoSearchRequest,
+    custom_tool_call_schema, discussion_response_schema, discussion_response_schema_definition,
+    DirListRequest, DiscussionClearFocusParams, DiscussionClearFocusResult,
+    DiscussionContextRequest, DiscussionFocus, DiscussionFocusChangedEvent,
+    DiscussionGetFocusParams, DiscussionGetFocusResult, DiscussionPlanAction, DiscussionPlanUpdate,
+    DiscussionRequest, DiscussionResponse, DiscussionSetFocusParams, DiscussionSetFocusResult,
+    DiscussionTarget, RepoSearchRequest,
 };
 pub use edit::{
     EditFileDoneEvent, EditFileOp, EditFileRetryingEvent, EditFileStartedEvent, EditFileStatus,
@@ -64,19 +64,19 @@ pub use edit::{
     StructuredChangeProposal,
 };
 pub use errors::{
-    ADD_FAILED, ADD_PATTERN_FAILED, CANCELLED, COMMITS_AHEAD_FAILED, CONFIG_CREATE_FAILED,
-    CREDENTIALS_SAVE_FAILED, CREDENTIALS_STUB_FAILED, EMPTY_CONTEXT, EMPTY_ITEMS, GET_DIFF_FAILED,
-    INIT_FAILED, INTERNAL_ERROR, INVALID_KEY, INVALID_MODEL, INVALID_PARAMS, INVALID_PLAN_ID,
-    INVALID_PLAN_TREE, INVALID_PROTOCOL, INVALID_REQUEST, INVALID_WORKFLOW, ITEM_IN_DISCUSSION,
-    ITEM_IN_REFINE, ITEM_REJECTED, LIST_FILES_FAILED, METHOD_NOT_FOUND, MODEL_ERROR, NEEDS_CONTEXT,
-    NOTHING_TO_EXECUTE, NOT_A_LEAF, NOT_FOUND, NO_API_KEY, OPERATION_IN_PROGRESS, PARSE_ERROR,
-    PINNED_PROTECTED, PLAN_CLEAR_FAILED, PLAN_DELETE_FAILED, PLAN_GET_FAILED, PLAN_LIST_FAILED,
-    PLAN_LOAD_FAILED, PLAN_SAVE_FAILED, PLAN_SET_ACTIVE_FAILED, PLAN_UPDATE_FAILED,
-    PREFLIGHT_VERIFICATION_FAILED, REMOVE_FAILED, REPOSITORY_STATE_FAILED, REVIEW_DELETE_FAILED,
-    REVIEW_GET_FAILED, REVIEW_LIST_FAILED, REVIEW_LOAD_FAILED, REVIEW_UPDATE_FAILED, SCHEMA_ERROR,
-    SET_ACCESS_FAILED, SQUASH_FAILED, SQUASH_PREVIEW_FAILED, STEP_BLOCKED,
-    STEP_BLOCKED_BY_DEPENDENCIES, STEP_CANCELLED, STEP_IMMUTABLE, STEP_IN_DISCUSSION,
-    UNEXPECTED_STATUS,
+    ADD_FAILED, ADD_PATTERN_FAILED, ARCHITECTURAL_GROUP_EXECUTION_REQUIRED, CANCELLED,
+    COMMITS_AHEAD_FAILED, CONFIG_CREATE_FAILED, CREDENTIALS_SAVE_FAILED, CREDENTIALS_STUB_FAILED,
+    EMPTY_CONTEXT, EMPTY_ITEMS, GET_DIFF_FAILED, INIT_FAILED, INTERNAL_ERROR, INVALID_KEY,
+    INVALID_MODEL, INVALID_PARAMS, INVALID_PLAN_ID, INVALID_PLAN_TREE, INVALID_PROTOCOL,
+    INVALID_REQUEST, INVALID_WORKFLOW, ITEM_IN_DISCUSSION, ITEM_REJECTED, LIST_FILES_FAILED,
+    METHOD_NOT_FOUND, MODEL_ERROR, NEEDS_CONTEXT, NOTHING_TO_EXECUTE, NOT_A_LEAF, NOT_FOUND,
+    NO_API_KEY, OPERATION_IN_PROGRESS, PARSE_ERROR, PINNED_PROTECTED, PLAN_CLEAR_FAILED,
+    PLAN_DELETE_FAILED, PLAN_GET_FAILED, PLAN_LIST_FAILED, PLAN_LOAD_FAILED, PLAN_SAVE_FAILED,
+    PLAN_SET_ACTIVE_FAILED, PLAN_UPDATE_FAILED, PREFLIGHT_VERIFICATION_FAILED, REMOVE_FAILED,
+    REPOSITORY_STATE_FAILED, REVIEW_DELETE_FAILED, REVIEW_GET_FAILED, REVIEW_LIST_FAILED,
+    REVIEW_LOAD_FAILED, REVIEW_UPDATE_FAILED, SCHEMA_ERROR, SET_ACCESS_FAILED, SQUASH_FAILED,
+    SQUASH_PREVIEW_FAILED, STEP_BLOCKED, STEP_BLOCKED_BY_DEPENDENCIES, STEP_CANCELLED,
+    STEP_IMMUTABLE, STEP_IN_DISCUSSION, UNEXPECTED_STATUS,
 };
 pub use git::{
     GitCommitCreatedEvent, GitDiffParams, GitDiffResult, GitSquashApplyParams,
@@ -122,16 +122,17 @@ pub use project::{
     ResolvedProjectCommand, TaskRunnerKind,
 };
 pub use review::{
-    ArchitecturalIssueGroup, IssueStatus, IssueType, ReviewAnalyzeFinishedEvent,
+    ArchitecturalIssueGroup, IssueStatus, IssueType, PostAnalysisMode, ReviewAnalyzeFinishedEvent,
     ReviewAnalyzeParams, ReviewAnalyzeResult, ReviewAnalyzeStartedEvent, ReviewCancelParams,
     ReviewContentDeltaEvent, ReviewDeleteParams, ReviewDeleteResult, ReviewErrorEvent,
     ReviewExecuteParams, ReviewFinishedEvent, ReviewGetParams, ReviewGetResult, ReviewGroup,
-    ReviewGroupFinishedEvent, ReviewGroupStartedEvent, ReviewIssue, ReviewItem, ReviewItemStatus,
-    ReviewListChangedEvent, ReviewListParams, ReviewListResult, ReviewPostAnalysis,
-    ReviewReasoningDeltaEvent, ReviewRefineGroupParams, ReviewRefineGroupResult,
-    ReviewRefineItemParams, ReviewRefineItemResult, ReviewSession, ReviewSeverity,
-    ReviewStartParams, ReviewStartedEvent, ReviewSummary, ReviewUpdateItemParams,
-    ReviewUpdateItemResult, ReviewUpdatedEvent,
+    ReviewGroupFinishedEvent, ReviewGroupKind, ReviewGroupStartedEvent, ReviewIssue, ReviewItem,
+    ReviewItemStatus, ReviewLaunchConfig, ReviewListChangedEvent, ReviewListParams,
+    ReviewListResult, ReviewPostAnalysis, ReviewPreviewGroup, ReviewPreviewParams,
+    ReviewPreviewResult, ReviewPreviewWindow, ReviewReasoningDeltaEvent, ReviewSession,
+    ReviewSeverity, ReviewStartParams, ReviewStartedEvent, ReviewSummary, ReviewUpdateItemParams,
+    ReviewUpdateItemResult, ReviewUpdatedEvent, DEFAULT_REVIEW_GROUP_ID, LOCAL_REVIEW_GROUP_ID,
+    LOCAL_REVIEW_GROUP_TITLE,
 };
 
 #[cfg(test)]

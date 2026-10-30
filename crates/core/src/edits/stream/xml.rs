@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use tauqe_protocol::{EditFileOp, EditFileStatus, EditOperation};
 
 use super::{normalize_hunk, resolve_path, EditStreamFilter, OwnedAnchor, StagingSimulator};
-use crate::edits::protocol::xml::engine::OpenTag;
+use crate::edits::protocol::xml::engine::{OpenTag, ScanStep, TextScan};
 use crate::edits::protocol::xml::{is_valid_turn_marker, FileBlockTag, XmlEditProtocol};
 use crate::edits::staging::AnchorEdit;
 use crate::providers::StreamEvent;
@@ -12,9 +12,8 @@ use crate::providers::StreamEvent;
 mod scanner;
 
 use scanner::{
-    activate_unmarked_hidden_tags, extract_attr, find_any_edit_start, find_container_close,
-    find_file_tag_start, find_next_control_tag, find_next_hunk, safe_text_emit_len,
-    starts_with_edit_container,
+    activate_unmarked_hidden_tags, extract_attr, find_container_close, find_file_tag_start,
+    find_next_hunk, starts_with_edit_container,
 };
 
 /// State-machine streaming parser for XML edits.
@@ -26,6 +25,7 @@ pub struct XmlStreamFilter {
     marker: Option<String>,
     raw_buffer: String,
     marker_stack: Vec<OpenTag>,
+    scan: TextScan,
     in_edits_block: bool,
     current_file: Option<CurrentStreamingFile>,
     file_hunks_count: usize,
@@ -46,6 +46,7 @@ impl XmlStreamFilter {
             marker: None,
             raw_buffer: String::new(),
             marker_stack: Vec::new(),
+            scan: TextScan::new(),
             in_edits_block: false,
             current_file: None,
             file_hunks_count: 0,
@@ -110,66 +111,62 @@ impl XmlStreamFilter {
         }
     }
 
+    /// Drops `len` bytes from the front of the buffer and realigns the scanner.
+    ///
+    /// The incremental scanner tracks absolute offsets, so every consumption of
+    /// buffered bytes has to shift them with it.
+    fn consume(&mut self, len: usize) {
+        if len == 0 {
+            return;
+        }
+        self.buffer.drain(..len);
+        self.scan.rebase(len);
+    }
+
     fn push_normalized_chunk(&mut self, chunk: &str) -> Vec<StreamEvent> {
         self.buffer.push_str(chunk);
         let mut events = Vec::new();
 
         loop {
             if !self.in_edits_block {
-                if let Some((ctl_start, ctl_end)) = find_next_control_tag(&self.buffer) {
-                    let edit_first = find_any_edit_start(&self.buffer)
-                        .is_some_and(|edit_idx| edit_idx < ctl_start);
-                    if !edit_first {
-                        let text_part = self.buffer[..ctl_start].to_string();
-                        let control = self.buffer[ctl_start..ctl_end].to_string();
-                        self.buffer.drain(..ctl_end);
+                match self.scan.classify(&self.buffer) {
+                    ScanStep::Control { start, end } => {
+                        let text_part = self.buffer[..start].to_string();
+                        let control = self.buffer[start..end].to_string();
+                        self.consume(end);
                         if !text_part.is_empty() {
                             events.push(StreamEvent::TextDelta(text_part));
                         }
                         self.preview_anchor_vehicle(&control, &mut events);
                         continue;
                     }
-                }
-
-                let safe_limit = safe_text_emit_len(&self.buffer);
-
-                if let Some(tag_idx) = find_any_edit_start(&self.buffer) {
-                    if safe_limit < self.buffer.len() && tag_idx >= safe_limit {
-                        if safe_limit > 0 {
-                            let text_part = self.buffer[..safe_limit].to_string();
+                    ScanStep::EditStart { start } => {
+                        if start > 0 {
+                            let text_part = self.buffer[..start].to_string();
                             events.push(StreamEvent::TextDelta(text_part));
-                            self.buffer.drain(..safe_limit);
+                            self.consume(start);
                         }
-                        break;
-                    }
-
-                    if tag_idx > 0 {
-                        let text_part = self.buffer[..tag_idx].to_string();
-                        events.push(StreamEvent::TextDelta(text_part));
-                        self.buffer.drain(..tag_idx);
-                    }
-
-                    if starts_with_edit_container(&self.buffer) {
-                        if let Some(close_tag_bracket) = self.buffer.find('>') {
-                            self.buffer.drain(..=close_tag_bracket);
-                            self.in_edits_block = true;
-                            events.push(StreamEvent::EditStarted);
-                            continue;
-                        } else {
+                        if starts_with_edit_container(&self.buffer) {
+                            if let Some(close_tag_bracket) = self.buffer.find('>') {
+                                self.consume(close_tag_bracket + 1);
+                                self.in_edits_block = true;
+                                events.push(StreamEvent::EditStarted);
+                                continue;
+                            }
                             break;
                         }
-                    } else {
                         self.in_edits_block = true;
                         events.push(StreamEvent::EditStarted);
                         continue;
                     }
-                } else {
-                    if safe_limit > 0 {
-                        let text_part = self.buffer[..safe_limit].to_string();
-                        events.push(StreamEvent::TextDelta(text_part));
-                        self.buffer.drain(..safe_limit);
+                    ScanStep::Text { safe } => {
+                        if safe > 0 {
+                            let text_part = self.buffer[..safe].to_string();
+                            events.push(StreamEvent::TextDelta(text_part));
+                            self.consume(safe);
+                        }
+                        break;
                     }
-                    break;
                 }
             }
 
@@ -180,7 +177,7 @@ impl XmlStreamFilter {
                         .as_ref()
                         .is_none_or(|(_, start)| close_start < *start)
                     {
-                        self.buffer.drain(..close_start + close_len);
+                        self.consume(close_start + close_len);
                         self.in_edits_block = false;
                         continue;
                     }
@@ -204,7 +201,7 @@ impl XmlStreamFilter {
                                     path: display_path.clone(),
                                     op_type: EditFileOp::Move,
                                 });
-                                self.buffer.drain(..tag_start + close_bracket + 1);
+                                self.consume(tag_start + close_bracket + 1);
                                 self.staging.apply_move(&resolved_from, &resolved_to);
                                 events.push(StreamEvent::EditFileDone {
                                     path: display_path,
@@ -213,7 +210,7 @@ impl XmlStreamFilter {
                                     hunks_count: 0,
                                 });
                             } else {
-                                self.buffer.drain(..tag_start + close_bracket + 1);
+                                self.consume(tag_start + close_bracket + 1);
                             }
                             continue;
                         }
@@ -228,7 +225,7 @@ impl XmlStreamFilter {
                                 op_type: block.op,
                             });
 
-                            self.buffer.drain(..tag_start + close_bracket + 1);
+                            self.consume(tag_start + close_bracket + 1);
                             self.file_hunks_count = 0;
 
                             if is_self_closing || block.op == EditFileOp::Delete {
@@ -247,7 +244,7 @@ impl XmlStreamFilter {
                             continue;
                         }
 
-                        self.buffer.drain(..tag_start + close_bracket + 1);
+                        self.consume(tag_start + close_bracket + 1);
                         continue;
                     } else {
                         break;
@@ -267,7 +264,7 @@ impl XmlStreamFilter {
                 if curr_block.op != EditFileOp::Replace {
                     if let Some(close_pos) = self.buffer.find(&close_tag) {
                         let content = self.buffer[..close_pos].to_string();
-                        self.buffer.drain(..close_pos + close_tag.len());
+                        self.consume(close_pos + close_tag.len());
 
                         let norm_content = self.restore_content(&normalize_hunk(&content));
 
@@ -326,7 +323,7 @@ impl XmlStreamFilter {
                             new_text,
                         });
 
-                        self.buffer.drain(..hunk_end);
+                        self.consume(hunk_end);
 
                         if let Err(err_msg) = val_res {
                             events.push(StreamEvent::EditFileDone {
@@ -342,7 +339,7 @@ impl XmlStreamFilter {
                     }
 
                     if let Some(close_pos) = self.buffer.find(&close_tag) {
-                        self.buffer.drain(..close_pos + close_tag.len());
+                        self.consume(close_pos + close_tag.len());
                         events.push(StreamEvent::EditFileDone {
                             path: curr_path,
                             status: EditFileStatus::Ok,
@@ -645,8 +642,18 @@ impl EditStreamFilter for XmlStreamFilter {
         self.restore_events(&mut events);
         events
     }
-}
 
+    fn reset(&mut self) {
+        self.buffer.clear();
+        self.raw_buffer.clear();
+        self.marker_stack.clear();
+        self.scan = TextScan::new();
+        self.in_edits_block = false;
+        self.current_file = None;
+        self.file_hunks_count = 0;
+        self.staging.reset();
+    }
+}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1231,5 +1238,33 @@ mod tests {
         assert_eq!(status, EditFileStatus::Error);
         let error = error.expect("the rejection must carry its diagnostic");
         assert!(error.contains("names no line"), "{error}");
+    }
+    #[test]
+    fn test_long_control_tag_body_streams_in_linear_time() {
+        // The body dwarfs the chunks, so a filter that rescans it per delta pays
+        // orders of magnitude more work than one that follows the appended bytes.
+        let body = "a note line long enough to exercise the buffer\n".repeat(60_000);
+        let input = format!("Intro.\n<scratchpad>\n{body}</scratchpad>\nOutro.");
+        let mut filter = XmlStreamFilter::new(vec![], std::env::temp_dir());
+        let chars: Vec<char> = input.chars().collect();
+        let started = std::time::Instant::now();
+        let mut events = Vec::new();
+        for chunk in chars.chunks(61) {
+            let text: String = chunk.iter().collect();
+            events.extend(filter.push_chunk(&text));
+        }
+        events.extend(Box::new(filter).finish());
+        let elapsed = started.elapsed();
+
+        // The scratchpad body is protocol payload, so it never reaches the stream.
+        assert_eq!(text_of(&events), "Intro.\n\nOutro.");
+        assert!(!events
+            .iter()
+            .any(|event| matches!(event, StreamEvent::EditStarted)));
+        assert!(
+            elapsed < std::time::Duration::from_secs(20),
+            "streaming a {} byte payload took {elapsed:?}; the per-chunk cost must follow the appended bytes",
+            input.len()
+        );
     }
 }

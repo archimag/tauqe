@@ -2,7 +2,6 @@ use serde::{Deserialize, Serialize};
 
 pub const DEFAULT_MAX_DISCOVERY_ROUNDS: usize = 5;
 pub const DEFAULT_FILES_TOKEN_BUDGET: usize = 300_000;
-pub const DEFAULT_MAX_PATTERN_BATCH: usize = 150;
 pub const DEFAULT_INCLUDE_REPO_MAP: bool = true;
 
 /// Default number of repository search queries honored in one Discovery round.
@@ -32,10 +31,6 @@ fn default_max_discovery_rounds() -> usize {
 
 fn default_files_token_budget() -> usize {
     DEFAULT_FILES_TOKEN_BUDGET
-}
-
-fn default_max_pattern_batch() -> usize {
-    DEFAULT_MAX_PATTERN_BATCH
 }
 
 fn default_include_repo_map() -> bool {
@@ -86,8 +81,6 @@ pub struct ContextConfig {
     pub repomap_token_budget: usize,
     #[serde(default = "default_include_repo_map")]
     pub include_repo_map: bool,
-    #[serde(default = "default_max_pattern_batch")]
-    pub max_pattern_batch: usize,
     /// Repository search queries honored in one Discovery round.
     #[serde(default = "default_max_search_requests_per_round")]
     pub max_search_requests_per_round: usize,
@@ -119,7 +112,6 @@ impl Default for ContextConfig {
             files_token_budget: DEFAULT_FILES_TOKEN_BUDGET,
             repomap_token_budget: default_repomap_token_budget(),
             include_repo_map: DEFAULT_INCLUDE_REPO_MAP,
-            max_pattern_batch: DEFAULT_MAX_PATTERN_BATCH,
             max_search_requests_per_round: DEFAULT_MAX_SEARCH_REQUESTS_PER_ROUND,
             max_matched_files_per_search: DEFAULT_MAX_MATCHED_FILES_PER_SEARCH,
             max_dir_list_entries: DEFAULT_MAX_DIR_LIST_ENTRIES,
@@ -185,4 +177,30 @@ where
         }
     }
     Ok(files)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A project configuration written before the file-count limit was retired
+    /// still decodes: the retired key stays an unknown key of `[context]`, and
+    /// the file token budget remains the only measure of how much a project
+    /// admits into the context.
+    #[test]
+    fn test_a_retired_max_pattern_batch_key_is_ignored() {
+        let config: ContextConfig = toml::from_str(
+            r#"
+            max_pattern_batch = 250
+            files_token_budget = 1234
+            "#,
+        )
+        .expect("a retired key must not fail decoding");
+
+        assert_eq!(config.files_token_budget, 1234);
+        assert_eq!(
+            config.max_search_requests_per_round,
+            DEFAULT_MAX_SEARCH_REQUESTS_PER_ROUND
+        );
+    }
 }

@@ -1,4 +1,3 @@
-//! Modal dialogs colocated by concern: rendering under [`render`] and input
 //! Modal dialogs colocated by concern: rendering under [`render`], input
 //! handling under [`input`], and the pure path-pattern preview under
 //! [`pattern`].

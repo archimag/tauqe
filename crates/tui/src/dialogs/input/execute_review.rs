@@ -197,11 +197,13 @@ mod tests {
             recommendations: Vec::new(),
             files: Vec::new(),
             readonly_files: Vec::new(),
-            plan: Vec::new(),
             note: None,
         }
     }
 
+    /// Finding-level point target: it names the finding itself, so it never
+    /// carries a subplan step — a step id travels only with a group target
+    /// (c-4, c-5).
     fn state_with_target() -> AppState {
         let mut st = test_state();
         st.view_mode = ViewMode::Review;
@@ -210,7 +212,9 @@ mod tests {
             "Session rev-1".to_string(),
             "Finding 1".to_string(),
             Some(1),
-            Some("step-1".to_string()),
+            // A finding-level target names the finding itself; a subplan step
+            // travels only together with a group target (c-4, c-5).
+            None,
             vec![finding(1)],
             vec![coder("coder-a"), coder("coder-b")],
         ));
@@ -245,7 +249,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn ctrl_enter_submits_selected_coder_step_and_directives() {
+    async fn ctrl_enter_submits_selected_coder_and_directives() {
         let state = Arc::new(Mutex::new(state_with_target()));
         let mut conn = RpcConnection::new(Vec::<u8>::new());
 
@@ -272,7 +276,10 @@ mod tests {
         assert!(payload.contains("coder-b"), "{payload}");
         assert!(payload.contains("keep it minimal"), "{payload}");
         assert!(payload.contains("\"item_id\":1"), "{payload}");
-        assert!(payload.contains("\"step_id\":\"step-1\""), "{payload}");
+        assert!(
+            !payload.contains("\"step_id\""),
+            "a finding-level target never carries a subplan step: {payload}"
+        );
 
         let guard = state.lock().await;
         assert!(guard.confirm_execute_review.is_none());
@@ -422,5 +429,60 @@ mod tests {
         assert!(guard.confirm_execute_review.is_none());
         assert_eq!(guard.view_mode, ViewMode::Review);
         assert!(conn.written().is_empty());
+    }
+
+    /// A step of a group plan travels as `group_id` + `step_id` with the
+    /// developer's Coder rung and directives, and never as a finding queue
+    /// (c-1, c-4, c-5).
+    #[tokio::test]
+    async fn ctrl_enter_submits_the_targeted_group_step() {
+        let mut st = test_state();
+        st.view_mode = ViewMode::Review;
+        st.confirm_execute_review = Some(
+            ConfirmExecuteReviewState::new(
+                Some("rev-1".to_string()),
+                "Session rev-1".to_string(),
+                "Unified auth guard".to_string(),
+                None,
+                Some("1.1".to_string()),
+                Vec::new(),
+                vec![coder("coder-a"), coder("coder-b")],
+            )
+            .with_group("arch-auth".to_string(), "Unified auth guard".to_string()),
+        );
+        {
+            let target = st
+                .confirm_execute_review
+                .as_mut()
+                .expect("dialog must be open");
+            target.selector.select_index(1);
+            target
+                .instructions_editor
+                .insert_str("keep the guard unified");
+        }
+
+        let state = Arc::new(Mutex::new(st));
+        let mut conn = RpcConnection::new(Vec::<u8>::new());
+        press(
+            &state,
+            &mut conn,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::CONTROL),
+        )
+        .await;
+
+        let payload = String::from_utf8(conn.written().to_vec()).expect("utf-8 payload");
+        assert!(payload.contains("review/execute"), "{payload}");
+        assert!(payload.contains("\"group_id\":\"arch-auth\""), "{payload}");
+        assert!(payload.contains("\"step_id\":\"1.1\""), "{payload}");
+        assert!(payload.contains("coder-b"), "{payload}");
+        assert!(payload.contains("keep the guard unified"), "{payload}");
+        assert!(
+            !payload.contains("item_ids"),
+            "a group step never queues findings: {payload}"
+        );
+
+        let guard = state.lock().await;
+        assert!(guard.confirm_execute_review.is_none());
+        assert_eq!(guard.view_mode, ViewMode::Repl);
     }
 }

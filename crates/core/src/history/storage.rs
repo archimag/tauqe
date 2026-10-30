@@ -279,4 +279,42 @@ mod tests {
         let entries = storage.read_entries().unwrap();
         assert_eq!(entries, vec![entry]);
     }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_storage_rewrite_preserves_restrictive_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempdir().unwrap();
+        let repo_root = dir.path().to_path_buf();
+        let storage = SessionStorage::new(repo_root);
+
+        let entry = HistoryEntry::Turn {
+            id: Some(1),
+            prompt: "Restricted prompt".to_string(),
+            context: vec![],
+            context_watermark: None,
+        };
+        storage.append_entry(&entry).unwrap();
+
+        let history_file = storage.history_path();
+        std::fs::set_permissions(&history_file, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+        // `std::slice::from_ref` borrows the entry, so the value stays
+        // available for the equality assertion below.
+        storage
+            .rewrite_entries(std::slice::from_ref(&entry))
+            .unwrap();
+
+        let mode = std::fs::metadata(&history_file)
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(
+            mode, 0o600,
+            "history compaction must not widen the mode of the journal"
+        );
+        assert_eq!(storage.read_entries().unwrap(), vec![entry]);
+    }
 }

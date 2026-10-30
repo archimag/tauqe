@@ -41,13 +41,11 @@ pub(crate) const PLAN_STATUS_ORDER: [PlanItemStatus; 6] = [
     PlanItemStatus::Cancelled,
 ];
 
-/// Ordered review status cycle presented by the dialog, with `Refine` sitting
-/// between `InProgress` and `Fixed`.
-pub(crate) const REVIEW_STATUS_ORDER: [ReviewItemStatus; 7] = [
+/// Ordered review status cycle presented by the dialog.
+pub(crate) const REVIEW_STATUS_ORDER: [ReviewItemStatus; 6] = [
     ReviewItemStatus::Discussion,
     ReviewItemStatus::Todo,
     ReviewItemStatus::InProgress,
-    ReviewItemStatus::Refine,
     ReviewItemStatus::Fixed,
     ReviewItemStatus::Skipped,
     ReviewItemStatus::Rejected,
@@ -131,12 +129,6 @@ fn review_status_option(status: ReviewItemStatus, palette: &ThemePalette) -> Sta
             palette.text_inverse,
             "dialog.status.review.option.in_progress",
         ),
-        ReviewItemStatus::Refine => (
-            "REFINE",
-            palette.status_error,
-            palette.text_inverse,
-            "dialog.status.review.option.refine",
-        ),
         ReviewItemStatus::Fixed => (
             "FIXED",
             palette.status_success,
@@ -218,9 +210,7 @@ fn status_body(body: Rect) -> StatusBody {
 /// Fast-select hint rendered on the Apply button, matching the `1..N` digits
 /// the dialog accepts for the current option count.
 fn status_fast_select_label(options_count: usize) -> &'static str {
-    if options_count >= 7 {
-        "1-7"
-    } else if options_count >= 6 {
+    if options_count >= 6 {
         "1-6"
     } else if options_count >= 5 {
         "1-5"
@@ -421,10 +411,10 @@ mod tests {
     use ratatui::backend::TestBackend;
     use ratatui::Terminal;
 
-    /// The review status dialog exposes the full seven-status lifecycle,
-    /// including `REFINE`, and advertises the `1-7` fast-select range.
+    /// The review status dialog exposes the full six-status lifecycle and
+    /// advertises the `1-6` fast-select range.
     #[test]
-    fn review_status_dialog_renders_seven_options_including_refine() {
+    fn review_status_dialog_renders_six_options_without_refine() {
         let term = Rect::new(0, 0, 100, 30);
         let dialog = crate::app::StatusDialogState::new(
             crate::app::StatusDialogTarget::ReviewItem {
@@ -435,7 +425,7 @@ mod tests {
             },
             0,
         );
-        assert_eq!(dialog.target.options_count(), 7);
+        assert_eq!(dialog.target.options_count(), 6);
 
         let mut terminal = Terminal::new(TestBackend::new(term.width, term.height)).unwrap();
         terminal.draw(|f| render_status_dialog(f, &dialog)).unwrap();
@@ -449,16 +439,20 @@ mod tests {
             text.push('\n');
         }
         assert!(
-            text.contains("REFINE"),
-            "expected the REFINE option: {text}"
+            text.contains("IN_PROGRESS"),
+            "expected the IN_PROGRESS option: {text}"
         );
         assert!(text.contains("FIXED"), "expected the FIXED option: {text}");
         assert!(
-            text.contains("1-7"),
-            "expected the 1-7 fast-select hint: {text}"
+            !text.contains("REFINE"),
+            "the retired REFINE option must never be offered: {text}"
+        );
+        assert!(
+            text.contains("1-6"),
+            "expected the 1-6 fast-select hint: {text}"
         );
 
-        let (apply_btn, cancel_btn) = status_dialog_buttons(term, 7);
+        let (apply_btn, cancel_btn) = status_dialog_buttons(term, 6);
         assert!(
             apply_btn.right() <= cancel_btn.x,
             "action buttons must not overlap"

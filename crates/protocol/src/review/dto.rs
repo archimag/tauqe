@@ -2,7 +2,6 @@ use serde::{Deserialize, Serialize};
 
 use crate::model::{CancelMode, ModelSelection};
 
-use super::group::ArchitecturalIssueGroup;
 use super::item::{IssueStatus, ReviewIssue};
 use super::session::ReviewSession;
 
@@ -42,6 +41,116 @@ pub struct ReviewStartParams {
     /// a legacy single-audit run and for a one-off custom launch.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub preset: Option<String>,
+}
+
+/// Parameters for `review/preview`.
+///
+/// The projection describes the audit window `review/start` would launch from
+/// the same selection, so a client resolves consent against exactly the shape
+/// the run would take instead of learning about a truncated window after the
+/// fact. Only the fields that decide the composition of the window travel
+/// here: the active context, the repository listing, and the configured
+/// budgets are server-side facts, while the model and the user prompt shape
+/// the audit itself and never its size.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReviewPreviewParams {
+    /// Optional list of directory or glob patterns selecting additional audit
+    /// targets, interpreted exactly as `ReviewStartParams::path_patterns`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub path_patterns: Vec<String>,
+    /// Name of the configured review preset whose groups would be audited.
+    ///
+    /// A preset launch never reads the interactive context window, so its
+    /// projection describes the declared groups instead.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preset: Option<String>,
+}
+
+/// Composition of one audit window before a review runs.
+///
+/// Every counter is a deterministic pre-computation: the projection applies
+/// the same selection order and the same limits as the launch it describes, so
+/// a window that previews clean is the window the run audits.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReviewPreviewWindow {
+    /// Number of files the active context contributes to the window.
+    #[serde(default)]
+    pub context_files: usize,
+    /// Estimated tokens the active context contributes.
+    #[serde(default)]
+    pub context_tokens: usize,
+    /// Number of repository files the path patterns matched.
+    ///
+    /// A file the context already carries is counted here and is not selected
+    /// a second time, so this number reports how much the patterns found
+    /// rather than how much they added.
+    #[serde(default)]
+    pub matched_files: usize,
+    /// Number of matched files the window accepted.
+    #[serde(default)]
+    pub selected_files: usize,
+    /// Estimated tokens the selected files add.
+    #[serde(default)]
+    pub selected_tokens: usize,
+    /// Number of matched files the file token budget dropped.
+    ///
+    /// The file token budget is the only knife the window applies, so this
+    /// aggregate and [`Self::omitted_by_budget`] report the same files: no
+    /// other limit exists to drop a candidate, and a count of files is never a
+    /// limit of its own.
+    #[serde(default)]
+    pub omitted_files: usize,
+    /// Matched files dropped because the file token budget was exhausted.
+    #[serde(default)]
+    pub omitted_by_budget: usize,
+    /// File token budget the pattern expansion shares with discovery.
+    #[serde(default)]
+    pub files_token_budget: usize,
+}
+
+impl ReviewPreviewWindow {
+    /// Whether the file token budget drops files the selection matched.
+    ///
+    /// This is the single predicate a client branches on before launching the
+    /// audit: a window that drops nothing needs no consent step, because the
+    /// run audits exactly what the developer selected. The verdict is read from
+    /// the budget breakdown, never from a generic count of dropped files, so
+    /// truncation keeps exactly one cause.
+    pub fn is_truncated(&self) -> bool {
+        self.omitted_by_budget > 0
+    }
+}
+
+/// One group of a grouped audit projected by `review/preview`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReviewPreviewGroup {
+    /// Title of the configured group the window belongs to.
+    ///
+    /// A launch mints fresh group identifiers, so a projection names the
+    /// configured title instead of an identity that does not exist yet.
+    #[serde(default)]
+    pub title: String,
+    /// The window the group would audit.
+    #[serde(default)]
+    pub window: ReviewPreviewWindow,
+}
+
+/// Outcome of projecting a review audit window.
+///
+/// The aggregate window is the single audit itself or, for a preset launch,
+/// the sum of the grouped windows, so a client renders one coherent picture of
+/// the coverage instead of summing per-group numbers on its own.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReviewPreviewResult {
+    /// Aggregate window of the launch the request describes.
+    #[serde(default)]
+    pub window: ReviewPreviewWindow,
+    /// Per-group windows of a preset launch, in execution order.
+    ///
+    /// Empty for a plain single audit, which audits the context window without
+    /// declaring explicit groups.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub groups: Vec<ReviewPreviewGroup>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -93,6 +202,15 @@ pub struct ReviewExecuteParams {
     pub item_id: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub step_id: Option<String>,
+    /// Identifier of the review group whose unified subplan is executed.
+    ///
+    /// A group run addresses the group itself, never one of its findings:
+    /// `step_id` then names a step of the group subplan. The field is a target
+    /// of its own, so a request names either a group or findings, and the
+    /// server rejects a request that mixes `group_id` with `item_id` or
+    /// `item_ids`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group_id: Option<String>,
     /// Client-ordered finding ids limiting a session queue to the findings
     /// one rendered section shows.
     ///
@@ -126,74 +244,6 @@ pub struct ReviewUpdateItemParams {
     pub note: Option<String>,
 }
 
-/// Parameters for `review/refineItem`.
-///
-/// Decomposes a single finding into an embedded plan carried by
-/// `ReviewItem::subplan`. Refinement is conceptually identical to plan
-/// refinement: both delegate to the Architect role, so the parameter shape
-/// mirrors `PlanRefineParams`. `review_id` is optional so the finding is
-/// addressed in the active session when omitted.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
-pub struct ReviewRefineItemParams {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub review_id: Option<String>,
-    pub item_id: u32,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub model: Option<ModelSelection>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub instructions: Option<String>,
-}
-
-/// Outcome of refining a single finding into an embedded plan.
-///
-/// The Architect role either produces a decomposed subplan carried by the
-/// updated `item`, or reports a semantic block. Tagged by `status`, mirroring
-/// `PlanRefineResult`, so clients branch deterministically without inspecting
-/// free-form text.
-///
-/// The size difference between the variants is inherent to the wire contract:
-/// `Success` carries the complete decomposed finding while `Blocked` carries
-/// only a reason string. Boxing the payload would add indirection for every
-/// consumer without shrinking the serialized form, so the size lint is
-/// allowed here.
-#[allow(clippy::large_enum_variant)]
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "status", rename_all = "snake_case")]
-pub enum ReviewRefineItemResult {
-    Success {
-        item: ReviewIssue,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        explanation: Option<String>,
-    },
-    Blocked {
-        reason: String,
-    },
-}
-
-impl ReviewRefineItemResult {
-    pub fn is_success(&self) -> bool {
-        matches!(self, Self::Success { .. })
-    }
-
-    pub fn is_blocked(&self) -> bool {
-        matches!(self, Self::Blocked { .. })
-    }
-
-    pub fn item(&self) -> Option<&ReviewIssue> {
-        match self {
-            Self::Success { item, .. } => Some(item),
-            Self::Blocked { .. } => None,
-        }
-    }
-
-    pub fn reason(&self) -> Option<&str> {
-        match self {
-            Self::Success { .. } => None,
-            Self::Blocked { reason } => Some(reason),
-        }
-    }
-}
-
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ReviewUpdateItemResult {
     pub item: ReviewIssue,
@@ -221,75 +271,4 @@ pub struct ReviewAnalyzeParams {
 pub struct ReviewAnalyzeResult {
     /// The session carrying the freshly replaced post-analysis layer.
     pub session: ReviewSession,
-}
-
-/// Parameters for `review/refineGroup`.
-///
-/// Decomposes an architectural issue group — a cluster of findings that share
-/// one root cause — into the unified subplan carried by
-/// `ArchitecturalIssueGroup::subplan`. Group decomposition mirrors finding
-/// refinement: both dispatch to the Architect role, so the parameter shape
-/// mirrors `ReviewRefineItemParams`. `review_id` is required so the group is
-/// addressed in an explicit session, never the process-global active marker.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
-pub struct ReviewRefineGroupParams {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub review_id: Option<String>,
-    /// Identifier of the architectural group in the session's post-analysis
-    /// layer.
-    pub group_id: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub model: Option<ModelSelection>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub instructions: Option<String>,
-}
-
-/// Outcome of refining an architectural issue group into a unified subplan.
-///
-/// The Architect role either produces the decomposed group carrying its
-/// unified subplan, or reports a semantic block. Tagged by `status`, mirroring
-/// `ReviewRefineItemResult`, so clients branch deterministically without
-/// inspecting free-form text.
-///
-/// The size difference between the variants is inherent to the wire contract:
-/// `Success` carries the complete decomposed group while `Blocked` carries
-/// only a reason string. Boxing the payload would add indirection for every
-/// consumer without shrinking the serialized form, so the size lint is
-/// allowed here.
-#[allow(clippy::large_enum_variant)]
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "status", rename_all = "snake_case")]
-pub enum ReviewRefineGroupResult {
-    Success {
-        group: ArchitecturalIssueGroup,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        explanation: Option<String>,
-    },
-    Blocked {
-        reason: String,
-    },
-}
-
-impl ReviewRefineGroupResult {
-    pub fn is_success(&self) -> bool {
-        matches!(self, Self::Success { .. })
-    }
-
-    pub fn is_blocked(&self) -> bool {
-        matches!(self, Self::Blocked { .. })
-    }
-
-    pub fn group(&self) -> Option<&ArchitecturalIssueGroup> {
-        match self {
-            Self::Success { group, .. } => Some(group),
-            Self::Blocked { .. } => None,
-        }
-    }
-
-    pub fn reason(&self) -> Option<&str> {
-        match self {
-            Self::Success { .. } => None,
-            Self::Blocked { reason } => Some(reason),
-        }
-    }
 }

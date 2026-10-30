@@ -102,6 +102,10 @@ max_retries = 1
     #[test]
     fn test_develop_patch_strategy_defaults_and_overrides() {
         let config: AppConfig = toml::from_str("[develop]\n").unwrap();
+        assert_eq!(config.develop.patch_strategy, PatchStrategy::LineAnchor);
+
+        let config: AppConfig =
+            toml::from_str("[develop]\npatch_strategy = \"search_replace\"\n").unwrap();
         assert_eq!(config.develop.patch_strategy, PatchStrategy::SearchReplace);
 
         let config: AppConfig =

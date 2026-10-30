@@ -126,6 +126,22 @@ impl Task for EditLoop {
                     }
                 } else {
                     record_session_response(env.history, &output);
+                    // A plan mutation the storage engine refused never fails the
+                    // turn, but it is a protocol-level diagnostic the developer
+                    // must see. The corrective round applies its own plan
+                    // payload, so the merged outcome carries every attempt's
+                    // rejection and the banner reports them once the turn
+                    // settles.
+                    if let Some(notice) = output.plan_rejection_notice() {
+                        tracing::warn!("{}", notice);
+                        let _ = env
+                            .stream_tx
+                            .send(StreamEvent::TextDelta(format!(
+                                "\n\n---\n\u{26a0}\u{fe0f} {}\n\n",
+                                notice
+                            )))
+                            .await;
+                    }
                 }
                 Ok(output)
             }
@@ -222,19 +238,48 @@ fn build_edit_retry_prompt(target_language: Option<&str>) -> String {
     prompt
 }
 
+/// Folds a retried attempt into the accumulated turn outcome.
+///
+/// A corrective retry is a complete bounded turn of its own: it stages and
+/// verifies its own change set and applies its own plan payload. Its plan
+/// rejections are therefore appended to the ones already collected instead of
+/// replacing them, and an abort report travels with the attempt that raised
+/// it, so a supervisor can still tell a host-environment stop from an ordinary
+/// failure.
+///
+/// Every field is destructured explicitly, so a field added to
+/// [`FsmTurnOutcome`] later cannot be silently dropped here: the compiler
+/// rejects the incomplete pattern instead.
 fn merge_output(target: &mut FsmTurnOutcome, next: FsmTurnOutcome, banner: &str) {
+    let FsmTurnOutcome {
+        assistant_text,
+        result,
+        is_cancelled,
+        blocked,
+        has_terminal_success,
+        plan_saved,
+        plan_errors,
+        skip_reason,
+        abort,
+    } = next;
+
     target.assistant_text = format!(
         "{}{}{}",
         target.assistant_text.trim_end(),
         banner,
-        next.assistant_text.trim_start()
+        assistant_text.trim_start()
     );
-    target.result = next.result;
-    target.is_cancelled = next.is_cancelled;
-    target.blocked = next.blocked;
-    target.has_terminal_success = next.has_terminal_success;
-    target.plan_saved = next.plan_saved;
-    target.skip_reason = next.skip_reason;
+    target.result = result;
+    target.is_cancelled = is_cancelled;
+    target.blocked = blocked;
+    target.has_terminal_success = has_terminal_success;
+    target.plan_saved = plan_saved;
+    target.skip_reason = skip_reason;
+    // Each attempt applies its plan payload independently, so a rejection the
+    // corrective round reported is appended rather than replacing the
+    // first-attempt list.
+    target.plan_errors.extend(plan_errors);
+    target.abort = abort;
 }
 
 #[cfg(test)]
@@ -250,10 +295,11 @@ mod tests {
     use crate::history::HistoryManager;
     use crate::prompt::protocol::PromptProtocol;
     use crate::providers::{ChatMessage, LlmProvider, ResponseFormat, StreamEvent};
+    use crate::workflow::fsm::{AbortReport, FsmTurnOutcome};
     use crate::workflow::policy::DirectApplyPolicy;
     use crate::workflow::WorkflowOptions;
 
-    use super::{AnswerEditLoop, EditLoop, Task, TaskEnv};
+    use super::{merge_output, AnswerEditLoop, EditLoop, Task, TaskEnv};
 
     struct MockScriptProvider {
         responses: Mutex<VecDeque<String>>,
@@ -635,5 +681,223 @@ mod tests {
             1,
             "a terminal error must not consume a retry attempt"
         );
+    }
+
+    /// A plan mutation the storage engine refuses during a corrective retry is
+    /// a diagnostic the merged outcome must carry: it reaches the recorded
+    /// history, the turn result, and the developer-facing stream.
+    #[tokio::test]
+    async fn test_edit_loop_retry_keeps_the_retried_plan_rejection() {
+        let (_dir, repo_root) = init_repo_with_target();
+        // An established plan makes the corrective round's `save` an explicit
+        // mutation of stored work, which Develop mode refuses. The turn regime
+        // authorizes plan creation rather than plan update, so `save` is the
+        // payload a corrective round can actually emit and have rejected.
+        let existing = tauqe_protocol::Plan {
+            id: "develop-plan".to_string(),
+            title: "Develop Plan".to_string(),
+            items: vec![tauqe_protocol::PlanItem {
+                id: "1".to_string(),
+                title: "Step 1".to_string(),
+                status: tauqe_protocol::PlanItemStatus::Todo,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        crate::plan::storage::PlanStorage::save_plan(&repo_root, &existing)
+            .expect("seed the established plan");
+
+        let mut context = ContextManager::new(repo_root.clone());
+        context
+            .add_file("target.rs", ContextAccess::Editable)
+            .unwrap();
+        let mut history = HistoryManager::new(repo_root.clone());
+        let protocol = crate::prompt::xml::XmlPromptProtocol;
+        let protocol = protocol.with_turn_marker("MOCK").unwrap();
+
+        let no_edit = "The helper already looks correct; no changes are required.".to_string();
+        let with_edit_and_rejected_plan = concat!(
+            "<tauqe_edits_MOCK summary=\"Fix compute\">\n",
+            "<edit_MOCK path=\"target.rs\">\n",
+            "<search_MOCK>\npub fn compute() -> i32 { 0 }\n</search_MOCK>\n",
+            "<replace_MOCK>\npub fn compute() -> i32 { 42 }\n</replace_MOCK>\n",
+            "</edit_MOCK>\n",
+            "</tauqe_edits_MOCK>\n",
+            "<plan_MOCK action=\"save\" id=\"develop-plan\" title=\"Develop Plan\">\n",
+            "<concept_MOCK>\n",
+            "<concept_item_MOCK id=\"c-1\" title=\"Retry invariant\" />\n",
+            "</concept_MOCK>\n",
+            "<item_MOCK id=\"1\" status=\"done\" />\n",
+            "</plan_MOCK>"
+        )
+        .to_string();
+
+        let provider = MockScriptProvider::new(vec![no_edit, with_edit_and_rejected_plan]);
+        let model = ModelRef::openrouter("test/model");
+        let (tx, mut rx) = mpsc::channel(256);
+        let (_cancel_tx, cancel_rx) = watch::channel(false);
+        let options = WorkflowOptions::default();
+        let mut policy = DirectApplyPolicy::new();
+
+        // Drain the stream concurrently: the sender lives on the environment,
+        // which is released at the end of the block, so collecting afterwards
+        // would race the channel shutdown.
+        let collector = tokio::spawn(async move {
+            let mut streamed = String::new();
+            while let Some(event) = rx.recv().await {
+                if let StreamEvent::TextDelta(delta) = event {
+                    streamed.push_str(&delta);
+                }
+            }
+            streamed
+        });
+
+        let out = {
+            let mut env = TaskEnv {
+                intent: tauqe_protocol::TurnIntent::InteractiveRepl,
+                provider: &provider,
+                model: &model,
+                context: &mut context,
+                history: &mut history,
+                protocol: protocol.as_ref(),
+                policy: &mut policy,
+                workflow_name: "git",
+                stream_tx: tx,
+                cancel_rx,
+                options: &options,
+            };
+            let task = EditLoop::new("Change compute to return 42");
+            task.execute(&mut env).await.unwrap()
+        };
+
+        assert!(
+            out.assistant_text.contains("Edit Retry 1/3"),
+            "the corrective round must run: {}",
+            out.assistant_text
+        );
+        assert!(
+            matches!(&out.result, ModelResult::Edit { outcome, .. } if outcome.applied),
+            "the corrective round must apply its edits: {:?}",
+            out.result
+        );
+        assert_eq!(
+            provider.remaining(),
+            0,
+            "both scripted rounds must be spent"
+        );
+
+        // The merged outcome carries the rejection the corrective round produced.
+        assert_eq!(out.plan_errors.len(), 1, "{:?}", out.plan_errors);
+        assert!(
+            out.plan_errors[0].contains("Develop mode"),
+            "{:?}",
+            out.plan_errors
+        );
+        let notice = out
+            .plan_rejection_notice()
+            .expect("a rejected mutation must produce a notice");
+        assert!(notice.contains("Develop mode"), "{notice}");
+
+        // The diagnostic reaches the recorded history, so the next round's
+        // prompt carries the exact cause the model must repair.
+        let messages: Vec<String> = history
+            .get_entries()
+            .unwrap()
+            .iter()
+            .filter_map(|entry| match entry {
+                crate::history::entry::HistoryEntry::Response { message, .. } => {
+                    Some(message.clone())
+                }
+                _ => None,
+            })
+            .collect();
+        assert!(
+            messages
+                .iter()
+                .any(|message| message.contains("Plan mutation rejected")
+                    && message.contains("Develop mode")),
+            "the rejection must reach the recorded history: {messages:?}"
+        );
+
+        // And the developer sees it on the turn stream.
+        let streamed = collector.await.expect("the collector joins");
+        assert!(
+            streamed.contains("Plan mutation rejected"),
+            "the rejection must surface in the turn stream: {streamed:?}"
+        );
+    }
+
+    /// `merge_output` folds every field of the retried outcome. The helper
+    /// destructures [`FsmTurnOutcome`] exhaustively, so a field added later
+    /// cannot be dropped silently, and this checklist names each field the
+    /// retry must carry into the merged outcome.
+    #[test]
+    fn merge_output_folds_every_field_of_the_retried_outcome() {
+        // The first attempt and the retry carry deliberately distinct values,
+        // so every assertion below proves the corresponding field was folded.
+        let mut target = FsmTurnOutcome {
+            assistant_text: "first attempt text".to_string(),
+            result: ModelResult::Answer {
+                text: "first attempt text".to_string(),
+            },
+            is_cancelled: false,
+            blocked: None,
+            has_terminal_success: false,
+            plan_saved: false,
+            plan_errors: vec!["first attempt rejection".to_string()],
+            skip_reason: None,
+            abort: None,
+        };
+        let retried = FsmTurnOutcome {
+            assistant_text: "retried attempt text".to_string(),
+            result: ModelResult::Answer {
+                text: "retried attempt text".to_string(),
+            },
+            is_cancelled: true,
+            blocked: Some("blocked on the retried attempt".to_string()),
+            has_terminal_success: true,
+            plan_saved: true,
+            plan_errors: vec!["retried attempt rejection".to_string()],
+            skip_reason: Some("skipped on the retried attempt".to_string()),
+            abort: Some(AbortReport {
+                reason: "host capability missing".to_string(),
+                recommendation: "install the missing package".to_string(),
+            }),
+        };
+
+        merge_output(&mut target, retried, "\n\n--- retry ---\n\n");
+
+        assert_eq!(
+            target.assistant_text,
+            "first attempt text\n\n--- retry ---\n\nretried attempt text"
+        );
+        match &target.result {
+            ModelResult::Answer { text } => assert_eq!(text, "retried attempt text"),
+            other => panic!("the retried result must be folded, got {other:?}"),
+        }
+        assert!(target.is_cancelled);
+        assert_eq!(
+            target.blocked.as_deref(),
+            Some("blocked on the retried attempt")
+        );
+        assert!(target.has_terminal_success);
+        assert!(target.plan_saved);
+        assert_eq!(
+            target.plan_errors,
+            vec![
+                "first attempt rejection".to_string(),
+                "retried attempt rejection".to_string()
+            ],
+            "each attempt's rejections are independent and both must survive"
+        );
+        assert_eq!(
+            target.skip_reason.as_deref(),
+            Some("skipped on the retried attempt")
+        );
+        let abort = target
+            .abort
+            .expect("the retried abort report must be folded");
+        assert_eq!(abort.reason, "host capability missing");
+        assert_eq!(abort.recommendation, "install the missing package");
     }
 }

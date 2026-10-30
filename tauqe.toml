@@ -80,13 +80,14 @@ max_retries = 5
 # Maximum automated replanning cycles triggered by a blocked coder step before
 # requiring manual developer intervention (default: 2).
 # max_replans = 2
-# How a change set addresses the lines it replaces. `search_replace` (default)
-# echoes the replaced text and matches it exactly; `line_anchor` names an
-# inclusive line range through the compact opaque anchors rendered beside every
-# context line, so the model copies a short token instead of reproducing the
-# text it replaces. The strategy is orthogonal to `protocol`: the protocol picks
-# the encoding of an edit, the strategy picks the fields that address a range.
-patch_strategy = "line_anchor"
+# How a change set addresses the lines it replaces. `line_anchor` (default)
+# names an inclusive line range through the compact opaque anchors rendered
+# beside every context line, so the model copies a short token instead of
+# reproducing the text it replaces; `search_replace` echoes the replaced text
+# and matches it exactly. The strategy is orthogonal to `protocol`: the
+# protocol picks the encoding of an edit, the strategy picks the fields that
+# address a range.
+# patch_strategy = "line_anchor"
 # Prompt layout policy. `semantic` composes the prompt as blocks grouped by kind
 # (contract, repository map, context, plan, language, history, scratchpad), while
 # `chronological` interleaves context files with history entries in the order they
@@ -174,10 +175,9 @@ budget_tokens = 20000  # session history token budget before compaction is trigg
 
 [context]
 max_discovery_rounds = 8  # maximum rounds for autonomous context discovery
-files_token_budget = 500000  # token budget for files in active context (default: 300000)
+files_token_budget = 900000  # token budget for files in active context (default: 300000)
 repomap_token_budget = 40000  # token budget for the repository map (default: 4000)
 include_repo_map = true  # include the Tree-sitter repository map in turn prompts (default: true, false for on-demand)
-# max_pattern_batch = 150  # maximum files added per glob pattern request (default: 150)
 # max_search_requests_per_round = 5    # repository search queries honored per Discovery round (default: 5)
 # max_matched_files_per_search = 50    # matching files reported for one search query (default: 50)
 # max_dir_list_entries = 100           # entries rendered by one directory listing (default: 100)

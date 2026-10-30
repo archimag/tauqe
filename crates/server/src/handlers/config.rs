@@ -1,7 +1,10 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use tauqe_core::config::{load_config_with_options, AppConfig, ConfigLoadOptions};
+use tauqe_core::config::{
+    default_config_path, default_credentials_path, find_config_file, find_credentials_file,
+    load_config_with_options, AppConfig, ConfigLoadOptions,
+};
 use tauqe_core::edits::EditProtocolFactory;
 use tauqe_core::workflow::WorkflowFactory;
 use tauqe_protocol::{
@@ -190,49 +193,112 @@ async fn repo_has_git(repo_opt: Option<&Path>) -> bool {
         .unwrap_or(false)
 }
 
+/// Filesystem-derived locations reported by [`SystemStatusResult`].
+///
+/// Discovery walks candidate directories and checks whether each candidate
+/// exists, so the values are resolved once on the blocking pool and then
+/// carried as plain in-memory data. A handler that has just written a file
+/// replaces the discovered location with the written one, so the report never
+/// names a stale path.
+struct StatusPaths {
+    /// The configuration file the status reports, absent when none was found.
+    config: Option<String>,
+    /// The credentials file the status reports, absent when none was found.
+    credentials: Option<String>,
+    /// The path a configuration file would take if it were created now.
+    default_config: String,
+    /// The path a credentials file would take if it were saved now.
+    default_credentials: String,
+}
+
+impl StatusPaths {
+    /// Runs every location probe against the filesystem and the environment.
+    ///
+    /// Discovery compares the metadata of every candidate location, and the
+    /// default-path resolution reads the process environment, so this belongs
+    /// on the blocking pool and never on an async worker thread.
+    fn resolve(
+        repo_root: Option<&Path>,
+        explicit_config: Option<&Path>,
+        explicit_credentials: Option<&Path>,
+    ) -> Self {
+        let config = find_config_file(repo_root, explicit_config);
+        let credentials = find_credentials_file(repo_root, explicit_credentials);
+        let default_config = default_config_path(repo_root, explicit_config);
+        let default_credentials = default_credentials_path(repo_root, explicit_credentials);
+        Self {
+            config: config.map(|p| p.to_string_lossy().to_string()),
+            credentials: credentials.map(|p| p.to_string_lossy().to_string()),
+            default_config: default_config.to_string_lossy().to_string(),
+            default_credentials: default_credentials.to_string_lossy().to_string(),
+        }
+    }
+
+    /// The report used when the probes themselves cannot run.
+    ///
+    /// The blocking task fails only if the probe panicked, so the status still
+    /// answers with an empty location report instead of failing the request.
+    fn unknown() -> Self {
+        Self {
+            config: None,
+            credentials: None,
+            default_config: String::new(),
+            default_credentials: String::new(),
+        }
+    }
+}
+
+/// Resolves the reported status locations on the blocking pool.
+///
+/// The probes behind [`StatusPaths::resolve`] walk candidate directories,
+/// compare metadata, and read the process environment. They are offloaded for
+/// the same reason [`repo_has_git`] offloads its git subprocess: the async
+/// worker keeps serving other requests, and no caller holds the shared
+/// configuration guard across directory I/O — the guard is taken only for the
+/// in-memory assembly that follows.
+async fn resolve_status_paths(
+    repo_opt: Option<&Path>,
+    explicit_config: Option<PathBuf>,
+    explicit_credentials: Option<PathBuf>,
+) -> StatusPaths {
+    let root = repo_opt.map(Path::to_path_buf);
+    super::offload(move || {
+        StatusPaths::resolve(
+            root.as_deref(),
+            explicit_config.as_deref(),
+            explicit_credentials.as_deref(),
+        )
+    })
+    .await
+    .unwrap_or_else(|err| {
+        tracing::warn!(error = %err, "Failed to resolve the status paths");
+        StatusPaths::unknown()
+    })
+}
+
 /// Assembles the authoritative [`SystemStatusResult`] from a single source so
 /// derived fields such as `ready` (which requires both a Git repository and an
 /// API key) stay consistent across every status-producing handler.
 ///
-/// `config_path` and `credentials_path` may be supplied with the freshly written
-/// path after a create/save operation; otherwise the discovered file is reported.
+/// Every filesystem-derived value arrives pre-resolved in `paths`, so the
+/// assembly is pure in-memory work: a caller holds the configuration guard only
+/// for these reads instead of across directory probes.
 fn build_system_status(
     cfg: &AppConfig,
     selection: &ModelSelection,
-    repo_opt: Option<&Path>,
     has_git: bool,
-    config_path: Option<String>,
-    credentials_path: Option<String>,
+    paths: &StatusPaths,
 ) -> SystemStatusResult {
     let has_api_key = tauqe_core::config::has_openrouter_key(cfg);
 
-    let explicit_config = cfg.explicit_config_path.as_deref();
-    let explicit_credentials = cfg.explicit_credentials_path.as_deref();
-
-    let config_path = config_path.or_else(|| {
-        tauqe_core::config::find_config_file(repo_opt, explicit_config)
-            .map(|p| p.to_string_lossy().to_string())
-    });
-    let credentials_path = credentials_path.or_else(|| {
-        tauqe_core::config::find_credentials_file(repo_opt, explicit_credentials)
-            .map(|p| p.to_string_lossy().to_string())
-    });
-
     SystemStatusResult {
         has_git,
-        has_config: config_path.is_some(),
-        config_path,
-        default_config_path: tauqe_core::config::default_config_path(repo_opt, explicit_config)
-            .to_string_lossy()
-            .to_string(),
+        has_config: paths.config.is_some(),
+        config_path: paths.config.clone(),
+        default_config_path: paths.default_config.clone(),
         has_api_key,
-        credentials_path,
-        default_credentials_path: tauqe_core::config::default_credentials_path(
-            repo_opt,
-            explicit_credentials,
-        )
-        .to_string_lossy()
-        .to_string(),
+        credentials_path: paths.credentials.clone(),
+        default_credentials_path: paths.default_credentials.clone(),
         ready: has_git && has_api_key,
         model: cfg.resolve_model(selection),
         selection: Some(selection.clone()),
@@ -242,7 +308,6 @@ fn build_system_status(
         config_error: cfg.config_error.clone(),
     }
 }
-
 pub async fn handle_config_get(req: Request, state: &Arc<AppState>) -> Response {
     let guard = state.config.lock().await;
     let result = config_state(&guard.config, Some(&guard.selection));
@@ -250,13 +315,17 @@ pub async fn handle_config_get(req: Request, state: &Arc<AppState>) -> Response 
 }
 
 pub async fn handle_config_set(req: Request, state: &Arc<AppState>) -> Response {
-    if state.is_operation_active() {
-        return Response::err(
-            req.id,
-            errors::OPERATION_IN_PROGRESS,
-            "Cannot change workflow, edit protocol or model while a model operation is in progress",
-        );
-    }
+    // The mutation replaces the shared configuration and model selection, so
+    // the slot is claimed: a turn registering right after a plain check would
+    // observe a configuration swapped underneath its running batch.
+    let _operation = match super::begin_exclusive_operation(
+        &req.id,
+        state,
+        "Cannot change workflow, edit protocol or model while a model operation is in progress",
+    ) {
+        Ok(guard) => guard,
+        Err(resp) => return *resp,
+    };
 
     let params: ConfigSetParams = match req.params.and_then(|p| serde_json::from_value(p).ok()) {
         Some(p) => p,
@@ -379,27 +448,25 @@ pub async fn handle_system_status(req: Request, state: &Arc<AppState>) -> Respon
     let repo_opt = repo_root.as_deref();
 
     let has_git = repo_has_git(repo_opt).await;
+    let (explicit_config, explicit_credentials) = explicit_cli_paths(state).await;
+    let paths = resolve_status_paths(repo_opt, explicit_config, explicit_credentials).await;
     let guard = state.config.lock().await;
-    let status = build_system_status(
-        &guard.config,
-        &guard.selection,
-        repo_opt,
-        has_git,
-        None,
-        None,
-    );
+    let status = build_system_status(&guard.config, &guard.selection, has_git, &paths);
 
     Response::ok_typed(req.id, &status)
 }
 
 pub async fn handle_config_reload(req: Request, state: &Arc<AppState>) -> Response {
-    if state.is_operation_active() {
-        return Response::err(
-            req.id,
-            errors::OPERATION_IN_PROGRESS,
-            "Cannot reload configuration while a model operation is in progress",
-        );
-    }
+    // The reload replaces the shared configuration for every later turn, so the
+    // slot is claimed for the whole reload instead of sampled once.
+    let _operation = match super::begin_exclusive_operation(
+        &req.id,
+        state,
+        "Cannot reload configuration while a model operation is in progress",
+    ) {
+        Ok(guard) => guard,
+        Err(resp) => return *resp,
+    };
 
     let repo_root = resolved_repo_root(state).await;
     let repo_opt = repo_root.as_deref();
@@ -424,25 +491,30 @@ pub async fn handle_config_reload(req: Request, state: &Arc<AppState>) -> Respon
     });
 
     let has_git = repo_has_git(repo_opt).await;
+    let (explicit_config, explicit_credentials) = explicit_cli_paths(state).await;
+    let paths = resolve_status_paths(repo_opt, explicit_config, explicit_credentials).await;
     let guard = state.config.lock().await;
-    let status = build_system_status(&guard.config, &cur_sel_val, repo_opt, has_git, None, None);
+    let status = build_system_status(&guard.config, &cur_sel_val, has_git, &paths);
 
     Response::ok_typed(req.id, &status)
 }
 
 pub async fn handle_config_create(req: Request, state: &Arc<AppState>) -> Response {
-    if state.is_operation_active() {
-        return Response::err(
-            req.id,
-            errors::OPERATION_IN_PROGRESS,
-            "Cannot create configuration while a model operation is in progress",
-        );
-    }
+    // Creating the file is followed by the same full rebind a reload performs,
+    // so the slot is claimed for both halves of the operation.
+    let _operation = match super::begin_exclusive_operation(
+        &req.id,
+        state,
+        "Cannot create configuration while a model operation is in progress",
+    ) {
+        Ok(guard) => guard,
+        Err(resp) => return *resp,
+    };
 
     let repo_root = resolved_repo_root(state).await;
     let repo_opt = repo_root.as_deref();
 
-    let (explicit_config, _) = explicit_cli_paths(state).await;
+    let (explicit_config, explicit_credentials) = explicit_cli_paths(state).await;
     let target_path = tauqe_core::config::default_config_path(repo_opt, explicit_config.as_deref());
     let write_path = target_path.clone();
     let write_outcome =
@@ -480,28 +552,25 @@ pub async fn handle_config_create(req: Request, state: &Arc<AppState>) -> Respon
     });
 
     let has_git = repo_has_git(repo_opt).await;
+    let mut paths = resolve_status_paths(repo_opt, explicit_config, explicit_credentials).await;
+    paths.config = Some(target_path.to_string_lossy().to_string());
     let guard = state.config.lock().await;
-    let config_path = Some(target_path.to_string_lossy().to_string());
-    let status = build_system_status(
-        &guard.config,
-        &cur_sel_val,
-        repo_opt,
-        has_git,
-        config_path,
-        None,
-    );
+    let status = build_system_status(&guard.config, &cur_sel_val, has_git, &paths);
 
     Response::ok_typed(req.id, &status)
 }
 
 pub async fn handle_credentials_save(req: Request, state: &Arc<AppState>) -> Response {
-    if state.is_operation_active() {
-        return Response::err(
-            req.id,
-            errors::OPERATION_IN_PROGRESS,
-            "Cannot save credentials while a model operation is in progress",
-        );
-    }
+    // Saving credentials reloads the configuration that every later turn reads,
+    // so the slot is claimed for the write and the reload together.
+    let _operation = match super::begin_exclusive_operation(
+        &req.id,
+        state,
+        "Cannot save credentials while a model operation is in progress",
+    ) {
+        Ok(guard) => guard,
+        Err(resp) => return *resp,
+    };
 
     let repo_root = resolved_repo_root(state).await;
     let repo_opt = repo_root.as_deref();
@@ -523,7 +592,7 @@ pub async fn handle_credentials_save(req: Request, state: &Arc<AppState>) -> Res
         return Response::err(req.id, errors::INVALID_KEY, "API key cannot be empty");
     }
 
-    let (_, explicit_credentials) = explicit_cli_paths(state).await;
+    let (explicit_config, explicit_credentials) = explicit_cli_paths(state).await;
     let target_path =
         tauqe_core::config::default_credentials_path(repo_opt, explicit_credentials.as_deref());
     let write_path = target_path.clone();
@@ -563,33 +632,30 @@ pub async fn handle_credentials_save(req: Request, state: &Arc<AppState>) -> Res
     });
 
     let has_git = repo_has_git(repo_opt).await;
+    let mut paths = resolve_status_paths(repo_opt, explicit_config, explicit_credentials).await;
+    paths.credentials = Some(target_path.to_string_lossy().to_string());
     let guard = state.config.lock().await;
-    let credentials_path = Some(target_path.to_string_lossy().to_string());
-    let status = build_system_status(
-        &guard.config,
-        &cur_sel_val,
-        repo_opt,
-        has_git,
-        None,
-        credentials_path,
-    );
+    let status = build_system_status(&guard.config, &cur_sel_val, has_git, &paths);
 
     Response::ok_typed(req.id, &status)
 }
 
 pub async fn handle_credentials_create_stub(req: Request, state: &Arc<AppState>) -> Response {
-    if state.is_operation_active() {
-        return Response::err(
-            req.id,
-            errors::OPERATION_IN_PROGRESS,
-            "Cannot create a credentials stub while a model operation is in progress",
-        );
-    }
+    // The stub replaces a file the configuration loader reads, so the slot is
+    // claimed for the write instead of being observed once before it.
+    let _operation = match super::begin_exclusive_operation(
+        &req.id,
+        state,
+        "Cannot create a credentials stub while a model operation is in progress",
+    ) {
+        Ok(guard) => guard,
+        Err(resp) => return *resp,
+    };
 
     let repo_root = resolved_repo_root(state).await;
     let repo_opt = repo_root.as_deref();
 
-    let (_, explicit_credentials) = explicit_cli_paths(state).await;
+    let (explicit_config, explicit_credentials) = explicit_cli_paths(state).await;
     let target_path =
         tauqe_core::config::default_credentials_path(repo_opt, explicit_credentials.as_deref());
     let write_path = target_path.clone();
@@ -613,16 +679,10 @@ pub async fn handle_credentials_create_stub(req: Request, state: &Arc<AppState>)
     }
 
     let has_git = repo_has_git(repo_opt).await;
+    let mut paths = resolve_status_paths(repo_opt, explicit_config, explicit_credentials).await;
+    paths.credentials = Some(target_path.to_string_lossy().to_string());
     let guard = state.config.lock().await;
-    let credentials_path = Some(target_path.to_string_lossy().to_string());
-    let status = build_system_status(
-        &guard.config,
-        &guard.selection,
-        repo_opt,
-        has_git,
-        None,
-        credentials_path,
-    );
+    let status = build_system_status(&guard.config, &guard.selection, has_git, &paths);
 
     Response::ok_typed(req.id, &status)
 }
@@ -832,7 +892,72 @@ mod tests {
         assert_eq!(fallback.explicit_config_path, Some(cfg_path));
         assert_eq!(fallback.explicit_credentials_path, Some(creds_path));
     }
+    /// The status locations are resolved off the async worker, so the
+    /// repository root and the explicit CLI overrides must reach both the
+    /// discovery probe and the default-path computation.
+    #[tokio::test]
+    async fn test_resolve_status_paths_reports_discovered_and_default_locations() {
+        let root = unique_repo_dir("status-paths");
+        let repo_config = root.join("tauqe.toml");
+        // Discovery only checks that a candidate is a file, so the fixture
+        // carries no configuration.
+        std::fs::write(&repo_config, "").unwrap();
 
+        let paths = resolve_status_paths(Some(&root), None, None).await;
+        let expected = repo_config.to_string_lossy().to_string();
+        assert_eq!(paths.config, Some(expected.clone()));
+        assert_eq!(
+            paths.default_config, expected,
+            "the default location matches the file discovered in the repository"
+        );
+
+        // An explicit override wins over the repository candidates for both
+        // the discovered file and the location a new file would take.
+        let explicit = root.join("custom.toml");
+        std::fs::write(&explicit, "").unwrap();
+        let paths = resolve_status_paths(Some(&root), Some(explicit.clone()), None).await;
+        let expected = explicit.to_string_lossy().to_string();
+        assert_eq!(paths.config, Some(expected.clone()));
+        assert_eq!(paths.default_config, expected);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// `build_system_status` consumes the pre-resolved locations, so a caller
+    /// holds the configuration guard only for in-memory reads while a freshly
+    /// written file still replaces the discovered one.
+    #[test]
+    fn test_build_system_status_consumes_the_resolved_locations() {
+        let cfg = AppConfig::default();
+        let selection = cfg.default_selection();
+        let paths = StatusPaths {
+            config: Some("/resolved/tauqe.toml".to_string()),
+            credentials: None,
+            default_config: "/default/tauqe.toml".to_string(),
+            default_credentials: "/default/creds.toml".to_string(),
+        };
+
+        let status = build_system_status(&cfg, &selection, true, &paths);
+        assert_eq!(status.config_path, paths.config);
+        assert!(status.has_config);
+        assert!(status.credentials_path.is_none());
+        assert_eq!(status.default_config_path, "/default/tauqe.toml");
+        assert_eq!(status.default_credentials_path, "/default/creds.toml");
+        assert!(status.has_git);
+
+        // A create/save handler replaces the discovered location with the file
+        // it has just written before the status is assembled.
+        let written = StatusPaths {
+            config: Some("/fresh/tauqe.toml".to_string()),
+            credentials: Some("/fresh/creds.toml".to_string()),
+            ..paths
+        };
+        let status = build_system_status(&cfg, &selection, false, &written);
+        assert_eq!(status.config_path, written.config);
+        assert_eq!(status.credentials_path, written.credentials);
+        assert_eq!(status.default_config_path, "/default/tauqe.toml");
+        assert!(!status.has_git);
+    }
     #[tokio::test]
     async fn test_credentials_create_stub_rejected_while_operation_active() {
         let (out, _rx) = crate::transport::OutChannel::new();
@@ -857,6 +982,48 @@ mod tests {
         let resp = handle_credentials_create_stub(req, &state).await;
         let err = resp.error.expect("stub creation must be rejected");
         assert_eq!(err.code, errors::OPERATION_IN_PROGRESS);
+    }
+
+    /// `config/set` replaces the shared configuration and model selection, so it
+    /// must own the operation slot: while a turn is registered the request is
+    /// refused and the selection is left exactly as the turn reads it.
+    #[tokio::test]
+    async fn test_config_set_is_refused_while_an_operation_is_registered() {
+        let mut cfg = AppConfig::default();
+        cfg.models.primary = vec![
+            ModelRef::openrouter("alpha/model").into(),
+            ModelRef::openrouter("beta/model").into(),
+        ];
+
+        let (out, _rx) = crate::transport::OutChannel::new();
+        let (history_sender, _hrx) = tokio::sync::mpsc::unbounded_channel();
+        let state = AppState::new(cfg, std::env::temp_dir(), history_sender, out);
+
+        let operation = state
+            .try_begin_operation()
+            .expect("operation slot must be free");
+        let before = state.config.lock().await.selection.clone();
+
+        let resp = handle_config_set(
+            config_set_request(ModelSelection::Specific(ModelRef::openrouter("beta/model"))),
+            &state,
+        )
+        .await;
+        let err = resp.error.expect("the switch must be refused");
+        assert_eq!(err.code, errors::OPERATION_IN_PROGRESS);
+
+        assert_eq!(
+            state.config.lock().await.selection,
+            before,
+            "a refused config/set must not change the selection"
+        );
+        assert!(
+            state.is_operation_active(),
+            "the running operation must keep owning the slot"
+        );
+
+        drop(operation);
+        assert!(!state.is_operation_active());
     }
 
     /// Creates an isolated temporary repository directory for tests that need a

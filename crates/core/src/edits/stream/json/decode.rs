@@ -11,9 +11,6 @@
 //! (`strip_code_fence`) and balanced-object scanning (`balanced_object_end`),
 //! reused by every structured-output parser across the engine.
 
-use struson::reader::{JsonReader, JsonStreamReader};
-use tauqe_protocol::EditFileOp;
-
 /// Removes a surrounding markdown code fence from `input`, returning the inner
 /// payload.
 ///
@@ -108,81 +105,6 @@ pub(crate) fn prepare_json_payload(buffer: &str) -> String {
         }
         None => unfenced.to_string(),
     }
-}
-
-/// Extracts `(op, path)` for an incomplete element at `target_idx` in `changes` array.
-///
-/// The operation is parsed into the strict [`EditFileOp`], so file edit
-/// reporting starts only once a partially streamed element carries a valid,
-/// unambiguous edit signature.
-pub(crate) fn extract_incomplete_change_op_and_path(
-    buffer: &str,
-    target_idx: usize,
-) -> Option<(EditFileOp, String)> {
-    let brace_idx = buffer.find('{')?;
-    let json_bytes = &buffer.as_bytes()[brace_idx..];
-    let mut reader = JsonStreamReader::new(json_bytes);
-    reader.begin_object().ok()?;
-    while let Ok(true) = reader.has_next() {
-        let name = reader.next_name().ok()?;
-        if name == "changes" {
-            reader.begin_array().ok()?;
-            let mut current_idx = 0;
-            while let Ok(true) = reader.has_next() {
-                if current_idx < target_idx {
-                    reader.skip_value().ok()?;
-                    current_idx += 1;
-                } else if current_idx == target_idx {
-                    reader.begin_object().ok()?;
-                    let mut op: Option<String> = None;
-                    let mut path: Option<String> = None;
-                    while let Ok(true) = reader.has_next() {
-                        let field_name = match reader.next_name() {
-                            Ok(n) => n.to_string(),
-                            Err(_) => break,
-                        };
-                        match field_name.as_str() {
-                            "op" => {
-                                if let Ok(val) = reader.next_str() {
-                                    op = Some(val.to_string());
-                                } else {
-                                    break;
-                                }
-                            }
-                            "path" => {
-                                if let Ok(val) = reader.next_str() {
-                                    path = Some(val.to_string());
-                                } else {
-                                    break;
-                                }
-                            }
-                            _ => {
-                                if reader.skip_value().is_err() {
-                                    break;
-                                }
-                            }
-                        }
-                    }
-                    if let (Some(op), Some(path)) = (op, path) {
-                        let trimmed_path = path.trim().to_string();
-                        if trimmed_path.is_empty() {
-                            return None;
-                        }
-                        return op
-                            .trim()
-                            .parse::<EditFileOp>()
-                            .ok()
-                            .map(|op| (op, trimmed_path));
-                    }
-                    return None;
-                }
-            }
-            return None;
-        } else {
-            reader.skip_value().ok()?;
-        }
-    }
-    None
 }
 
 /// Locates the byte offset right after the opening quote of a top-level string value

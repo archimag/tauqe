@@ -1,17 +1,8 @@
 use crate::escape::{escape_xml_text, single_line};
 use tauqe_protocol::review::ReviewSession;
-use tauqe_protocol::{EditProtocolKind, PlanItem};
+use tauqe_protocol::EditProtocolKind;
 
 pub const REVIEW_STEP_RETRY_PREFIX: &str = "# Correction Required: Review Finding Turn Incomplete";
-
-/// Joins identifiers or paths into a single escaped, comma-separated line.
-fn escape_list(items: &[String]) -> String {
-    items
-        .iter()
-        .map(|item| escape_xml_text(item))
-        .collect::<Vec<_>>()
-        .join(", ")
-}
 
 /// Renders repository paths as escaped, backticked breadcrumbs.
 fn render_paths(paths: &[String]) -> String {
@@ -190,10 +181,6 @@ pub fn format_review_step_execution_prompt(
             ));
         }
     }
-    if !issue.plan.is_empty() {
-        out.push_str("### Decomposed Subplan Steps:\n");
-        render_subplan_exec(&mut out, &issue.plan, 0);
-    }
     out.push('\n');
 
     out.push_str("## Execution Directives:\n");
@@ -245,39 +232,6 @@ pub fn format_review_step_execution_prompt(
     }
 
     Ok(out)
-}
-
-/// Renders a decomposition plan as an indented outline of its steps.
-fn render_subplan_exec(out: &mut String, items: &[PlanItem], depth: usize) {
-    let indent = "  ".repeat(depth);
-    for sub in items {
-        out.push_str(&format!(
-            "{}- [{}] #{} {}",
-            indent,
-            sub.status,
-            escape_xml_text(&sub.id),
-            escape_xml_text(&sub.title)
-        ));
-        if !sub.files.is_empty() {
-            out.push_str(&format!(" (files: {})", escape_list(&sub.files)));
-        }
-        if !sub.readonly_files.is_empty() {
-            out.push_str(&format!(
-                " (readonly: {})",
-                escape_list(&sub.readonly_files)
-            ));
-        }
-        if let Some(details) = &sub.details {
-            let trimmed = details.trim();
-            if !trimmed.is_empty() {
-                out.push_str(&format!(": {}", escape_xml_text(trimmed)));
-            }
-        }
-        out.push('\n');
-        if !sub.children.is_empty() {
-            render_subplan_exec(out, &sub.children, depth + 1);
-        }
-    }
 }
 
 /// Prefix recorded in `resolution_notes` when a domain failure skips a finding.
@@ -389,7 +343,6 @@ mod tests {
             recommendations: vec!["Return a structured error".to_string()],
             files: vec!["crates/x/src/parser.rs".to_string()],
             readonly_files: vec!["crates/x/src/api.rs".to_string()],
-            plan: Vec::new(),
             note: Some("Keep the public signature stable.".to_string()),
         };
         ReviewSession {
@@ -412,8 +365,6 @@ mod tests {
         assert!(prompt.contains("Return a structured error"));
         assert!(prompt.contains("crates/x/src/parser.rs"));
         assert!(prompt.contains("Keep the public signature stable."));
-        // No decomposition was produced, so no subplan section is rendered.
-        assert!(!prompt.contains("Decomposed Subplan Steps"));
     }
 
     #[test]

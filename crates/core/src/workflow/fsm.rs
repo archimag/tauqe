@@ -30,7 +30,7 @@ use crate::workflow::common::{compact_history_if_needed_with_budget, record_work
 use crate::workflow::discovery::journal::TurnDiscoveryJournal;
 use crate::workflow::policy::ApplyPolicy;
 use crate::workflow::retry::format_patch_retry_reason;
-use crate::workflow::verification::run_workflow_verification;
+use crate::workflow::verification::run_workflow_verification_with_config;
 use crate::workflow::WorkflowOptions;
 
 use cache::TurnInputCache;
@@ -131,6 +131,26 @@ impl AbortReport {
 }
 
 impl FsmTurnOutcome {
+    /// Reports a turn ended by the cancel signal before its phase completed.
+    ///
+    /// A phase boundary that observes the signal and a provider stream that
+    /// reports it therefore surface the same outcome, so callers never
+    /// distinguish where the interruption happened.
+    pub fn cancelled(assistant_text: String) -> Self {
+        Self {
+            assistant_text,
+            result: ModelResult::Answer {
+                text: String::new(),
+            },
+            is_cancelled: true,
+            blocked: None,
+            abort: None,
+            has_terminal_success: false,
+            plan_saved: false,
+            plan_errors: Vec::new(),
+            skip_reason: None,
+        }
+    }
     /// Whether the turn produced a conversational answer without edits and
     /// without an explicit terminal success signal.
     ///
@@ -208,6 +228,29 @@ struct PhaseContext<'a> {
     accumulated_text: String,
 }
 
+impl PhaseContext<'_> {
+    /// Returns the project configuration frozen at the start of the turn.
+    ///
+    /// The first proposal round resolves the effective configuration — reading
+    /// `tauqe.toml` and, when a task runner is declared, running its dump once —
+    /// and the turn cache freezes that result. Every later phase reads the same
+    /// snapshot, so a patch retry, a healing round, and a project-command round
+    /// never re-read the declaration or re-run the runner.
+    async fn project(&mut self) -> tauqe_protocol::ProjectConfig {
+        self.input_cache
+            .project(self.repo_root, Some(self.cancel_rx))
+            .await
+    }
+}
+
+/// Whether the step's cancel signal is already raised.
+///
+/// Phase boundaries that are about to produce work read it, so a cancellation
+/// observed inside a phase ends the step before the next phase starts instead
+/// of only interrupting the provider stream.
+fn cancel_requested(cancel_rx: &watch::Receiver<bool>) -> bool {
+    *cancel_rx.borrow()
+}
 /// Runs a single proposal round with the turn's accumulated language and
 /// scratchpad context.
 ///
@@ -647,12 +690,19 @@ pub(super) async fn run_fsm_turn_body(
             CustomToolPhase::Executed(step) => *step,
             CustomToolPhase::Terminate(outcome) => return Ok(*outcome),
         };
-        // A project-command round hands control back to the model. If the
-        // resulting proposal still carries investigation commands, the turn
-        // keeps cycling through discovery and diagnostic execution until the
-        // shared round budget is spent or the model proposes code edits or a
-        // terminal answer. Without this hand-back, a discovery request emitted
-        // right after a command run would be mistaken for a final answer.
+
+        // A terminal error declared by the project-command answer round ends the
+        // turn at the same phase boundary every other round uses, so the
+        // investigation hand-back below never spends further rounds on a turn
+        // that already declared its failure.
+        if let Some(outcome) = finish_on_error_outcome(&mut ctx).await {
+            return Ok(outcome);
+        } // A project-command round hands control back to the model. If the
+          // resulting proposal still carries investigation commands, the turn
+          // keeps cycling through discovery and diagnostic execution until the
+          // shared round budget is spent or the model proposes code edits or a
+          // terminal answer. Without this hand-back, a discovery request emitted
+          // right after a command run would be mistaken for a final answer.
         let tool_executed = ctx.rounds_used > rounds_before_tools;
         if tool_executed
             && step.edits().is_empty()
@@ -702,11 +752,24 @@ pub(super) async fn run_fsm_turn_body(
     if let Some(outcome) = finish_on_abort_outcome(&mut ctx).await {
         return Ok(outcome);
     }
-
+    // The corrective answer round is guarded exactly like the abort above: an
+    // error it declared is terminal, so it ends the turn before anything is
+    // staged or recorded instead of falling through to the answer finisher.
+    if let Some(outcome) = finish_on_error_outcome(&mut ctx).await {
+        return Ok(outcome);
+    }
     let current_edits = step.edits();
     let current_protocol_errors = step.protocol_errors();
     if current_edits.is_empty() && current_protocol_errors.is_empty() {
         return Ok(finish_answer_without_edits(&mut ctx).await);
+    }
+
+    // Phase boundary: staging is about to validate the change set, so a cancel
+    // observed during discovery ends the turn before staging produces work.
+    if cancel_requested(ctx.cancel_rx) {
+        let _ = ctx.stream_tx.send(StreamEvent::Done).await;
+        let accumulated = std::mem::take(&mut ctx.accumulated_text);
+        return Ok(FsmTurnOutcome::cancelled(accumulated));
     }
 
     match run_staging_phase(&mut ctx, &step).await? {
@@ -856,8 +919,19 @@ async fn finish_aborted_turn(ctx: &mut PhaseContext<'_>, abort: AbortReport) -> 
 /// Finalizes a turn that produced conversational text without edits.
 ///
 /// When the model also requested toolchain verification, the verification
-/// report is appended to the answer text before the turn is recorded.
+/// report is appended to the answer text before the turn is recorded. The
+/// verification round reads the project configuration the turn froze on its
+/// first proposal round, so it never re-reads `tauqe.toml` or re-runs a
+/// declared task runner's dump.
 async fn finish_answer_without_edits(ctx: &mut PhaseContext<'_>) -> FsmTurnOutcome {
+    // A terminal error that reaches the answer-only finisher keeps its declared
+    // semantics instead of degrading into a plain answer. This finisher is the
+    // single exit every answer-only path must pass through, so the invariant no
+    // longer depends on each caller remembering the check, and only `success`
+    // and `skip` outcomes reach the reading below.
+    if let Some(outcome) = finish_on_error_outcome(ctx).await {
+        return outcome;
+    }
     // A bare answer is a validated conclusion only when the model marked it
     // with an explicit `<success>` signal; otherwise it is an unverified reply.
     let has_terminal_success = matches!(
@@ -874,8 +948,10 @@ async fn finish_answer_without_edits(ctx: &mut PhaseContext<'_>) -> FsmTurnOutco
     if let Some(request) = ctx.state.verify_request.clone() {
         // An answer without edits touches no file, so the project command
         // receives no change set and runs its full suite.
-        let outcome = run_workflow_verification(
+        let project = ctx.project().await;
+        let outcome = run_workflow_verification_with_config(
             ctx.repo_root,
+            &project,
             &[],
             &request,
             ctx.stream_tx,

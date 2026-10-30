@@ -1,11 +1,13 @@
 //! Review handler facade.
 //!
 //! The review subsystem is decomposed into focused submodules: shared helpers
-//! (`common`), session CRUD (`storage_ops`), primary audit synthesis
+//! (`common`), session CRUD (`storage_ops`), the deterministic audit-window
+//! projection every launch consumes (`window`), primary audit synthesis
 //! (`synthesis`), cross-group post-analysis (`analysis`), Architect-driven
-//! finding decomposition (`refine`), per-finding
-//! bounded-turn execution (`step`), and the batch supervisor (`batch`). Every RPC
-//! handler keeps its public name and signature so the dispatcher stays unchanged,
+//! group root-cause decomposition (`refine`), per-finding bounded-turn execution
+//! (`step`), unified-plan execution of an architectural review group
+//! (`group_exec`), and the batch supervisor (`batch`). Every RPC handler keeps
+//! its public name and signature so the dispatcher stays unchanged,
 //! and the lifecycle and concurrency invariants — parallel-mutation rejection,
 //! cancellation handling, and the decomposition status gate that refuses a
 //! finished, rejected, or untriaged finding — are preserved across the split.
@@ -13,23 +15,30 @@
 mod analysis;
 mod batch;
 mod common;
-// The grouped launch flow wires the supervisor into `review/start` in the
-// following review step; until then it is exercised by its own tests, so the
-// dead-code lint is silenced here instead of by a stub caller.
+// The executor of an architectural group's unified plan: just-in-time Architect
+// synthesis, the ordered walk over the group horizon, and the group-wide finding
+// lifecycle it publishes.
 #[allow(dead_code)]
+mod group_exec;
+// The grouped preset launch audits one group per batch member, so the supervisor
+// is wired directly into `review/start` and shares the audit-window projection
+// with the plain launch instead of carrying its own expansion.
 mod groups;
+// The read-only projection a client resolves consent against before launching.
+mod preview;
+// The Architect decomposition of an architectural group into its unified
+// remediation subplan, shared by the just-in-time synthesis and the replanning
+// wave.
 mod refine;
 mod step;
 mod storage_ops;
 mod synthesis;
+// The deterministic projection of the audit window a launch reads.
+mod window;
 
 pub use analysis::handle_review_analyze;
 pub use batch::handle_review_execute;
-// Exposed for the grouped launch flow of the following review step; the
-// supervisor tests are the only consumer of the re-export until then.
-#[allow(unused_imports)]
-pub(crate) use groups::run_group_audits;
-pub use refine::handle_review_refine_item;
+pub use preview::handle_review_preview;
 pub use storage_ops::{
     handle_review_delete, handle_review_get, handle_review_list, handle_review_update_item,
 };

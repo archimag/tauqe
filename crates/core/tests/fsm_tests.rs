@@ -5516,7 +5516,196 @@ async fn invalid_anchor_token_triggers_a_patch_retry_that_repairs_the_range() {
         "alpha\nBETA\ngamma\n"
     );
 }
+/// A LineAnchor turn that rewrites the file from its first anchor to its last
+/// one reaches Git as the minimal diff.
+///
+/// The model resends every unchanged line around the edit inside a range that
+/// spans the whole file. Staging trims the shared leading and trailing lines
+/// before a byte moves, so the committed change is the single line the model
+/// really changed instead of a rewrite of the addressed range.
+#[tokio::test]
+async fn line_anchor_turn_compresses_a_whole_file_replacement_to_the_changed_line() {
+    let (_dir, repo_root) = init_repo();
+    std::fs::write(
+        repo_root.join("target.rs"),
+        "pub fn alpha() -> i32 { 0 }\npub fn beta() -> i32 { 1 }\npub fn gamma() -> i32 { 2 }\n",
+    )
+    .expect("write target fixture");
+    commit_fixture(&repo_root, &["target.rs"]);
 
+    let mut context = ContextManager::new(repo_root.clone());
+    context
+        .add_file("target.rs", ContextAccess::Editable)
+        .expect("add target to context");
+    let mut history = HistoryManager::new(repo_root.clone());
+
+    // The anchored range spans the file from its first line to its last one,
+    // while only `beta` differs from the snapshot the anchors name.
+    let response = serde_json::json!({
+        "message": "Raise beta.",
+        "changes": [anchored_change(
+            "target.rs",
+            0,
+            2,
+            "pub fn alpha() -> i32 { 0 }\npub fn beta() -> i32 { 42 }\npub fn gamma() -> i32 { 2 }\n",
+        )],
+        "context_requests": [],
+    })
+    .to_string();
+
+    let provider = MockLlmProvider::scripted([MockResponse::text(response)]);
+    let model = ModelRef::openrouter("mock/model");
+    let protocol = tauqe_core::prompt::json::JsonPromptProtocol::edits();
+    let (stream_tx, cancel_rx) = event_channel();
+
+    let mut policy = GitTransactionPolicy::new();
+    let exec = SingleExecution::new(strategy_options("line_anchor"));
+    let execution = exec
+        .execute(
+            &mut policy,
+            "Raise beta",
+            tauqe_protocol::TurnIntent::InteractiveRepl,
+            &provider,
+            &model,
+            &mut context,
+            &mut history,
+            &protocol,
+            stream_tx,
+            cancel_rx,
+        )
+        .await
+        .expect("workflow execution succeeds");
+
+    match execution.result {
+        ModelResult::Edit { outcome, .. } => {
+            assert!(
+                outcome.error.is_none(),
+                "unexpected error: {:?}",
+                outcome.error
+            );
+            assert!(outcome.applied, "the verified change set must be committed");
+            assert_eq!(outcome.changed_files, vec!["target.rs".to_string()]);
+        }
+        other => panic!("expected applied edits, got {other:?}"),
+    }
+    assert_eq!(
+        provider.requests().len(),
+        1,
+        "a whole-file range must converge on the first attempt"
+    );
+
+    assert_eq!(
+        std::fs::read_to_string(repo_root.join("target.rs")).expect("read target fixture"),
+        "pub fn alpha() -> i32 { 0 }\npub fn beta() -> i32 { 42 }\npub fn gamma() -> i32 { 2 }\n"
+    );
+    let numstat = tauqe_core::git::cmd::run_git(
+        Some(&repo_root),
+        &["show", "--numstat", "--format=", "HEAD"],
+    )
+    .expect("read the committed diffstat");
+    assert_eq!(
+        numstat.trim(),
+        "1\t1\ttarget.rs",
+        "the trimmed range must reach Git as the one line it changed"
+    );
+}
+
+/// A LineAnchor turn advertises a wire schema that withdraws the full-rewrite
+/// operation.
+///
+/// A full rewrite under the anchored strategy is a range spanning the file, so
+/// the strict `op` enum offered to the provider carries no `overwrite` value at
+/// all, while the search/replace contour keeps the operation.
+#[tokio::test]
+async fn line_anchor_turn_advertises_a_schema_without_the_overwrite_operation() {
+    let (_dir, repo_root) = init_repo();
+    std::fs::write(repo_root.join("target.rs"), "alpha\nbeta\n").expect("write target fixture");
+    commit_fixture(&repo_root, &["target.rs"]);
+
+    let mut context = ContextManager::new(repo_root.clone());
+    context
+        .add_file("target.rs", ContextAccess::Editable)
+        .expect("add target to context");
+    let mut history = HistoryManager::new(repo_root.clone());
+
+    let response = serde_json::json!({
+        "message": "Rewrite beta.",
+        "changes": [anchored_change("target.rs", 1, 1, "BETA\n")],
+        "context_requests": [],
+    })
+    .to_string();
+
+    let provider = MockLlmProvider::scripted([MockResponse::text(response)]);
+    let model = ModelRef::openrouter("mock/model");
+    let protocol = tauqe_core::prompt::json::JsonPromptProtocol::edits();
+    let mut policy = tauqe_core::workflow::policy::DirectApplyPolicy::new();
+    let options = strategy_options("line_anchor");
+    let (stream_tx, cancel_rx) = event_channel();
+
+    let output = {
+        let mut env = build_env(
+            &provider,
+            &model,
+            &mut context,
+            &mut history,
+            &protocol,
+            &mut policy,
+            stream_tx,
+            cancel_rx,
+            &options,
+        );
+        AnswerEditLoop::new("Rewrite beta")
+            .execute(&mut env)
+            .await
+            .expect("answer/edit loop executes")
+    };
+    assert!(matches!(
+        &output.result,
+        ModelResult::Edit { outcome, .. } if outcome.applied
+    ));
+
+    // The schema the turn actually sent to the provider decides which
+    // operations the model can select, so it is read from the recorded request.
+    let schema = match provider.requests()[0].response_format.clone() {
+        Some(tauqe_core::providers::ResponseFormat::JsonSchema { json_schema, .. }) => {
+            json_schema.schema
+        }
+        other => panic!("expected a JSON-schema response format, got {other:?}"),
+    };
+    let operations = schema["properties"]["changes"]["items"]["properties"]["op"]["enum"]
+        .as_array()
+        .expect("the change entry declares its operation selector");
+    assert!(
+        !operations.iter().any(|operation| operation == "overwrite"),
+        "the anchored schema must withdraw the full-rewrite operation: {schema}"
+    );
+    for operation in ["replace", "create", "delete", "move"] {
+        assert!(
+            operations.iter().any(|value| value == operation),
+            "the anchored schema must keep '{operation}': {schema}"
+        );
+    }
+    let described = schema["properties"]["changes"]["items"]["properties"]["op"]["description"]
+        .as_str()
+        .expect("the selector states its values");
+    assert!(!described.contains("overwrite"), "{described}");
+
+    // The search/replace contour keeps the operation: echoing the whole file as
+    // `old_text` is how a full rewrite is expressed there.
+    let echoed = match protocol.response_format(&[], tauqe_protocol::PatchStrategy::SearchReplace) {
+        Some(tauqe_core::providers::ResponseFormat::JsonSchema { json_schema, .. }) => {
+            json_schema.schema
+        }
+        other => panic!("expected a JSON-schema response format, got {other:?}"),
+    };
+    let operations = echoed["properties"]["changes"]["items"]["properties"]["op"]["enum"]
+        .as_array()
+        .expect("the change entry declares its operation selector");
+    assert!(
+        operations.iter().any(|operation| operation == "overwrite"),
+        "the echoed schema keeps the full-rewrite operation: {echoed}"
+    );
+}
 /// Builds the workflow options a project declares through `[develop]
 /// prompt_layout`.
 ///
@@ -6579,4 +6768,336 @@ async fn payload_less_success_runs_the_corrective_rounds_in_either_transport() {
             "a {case} turn without a result must leave the working tree untouched"
         );
     }
+}
+
+/// A terminal error declared by the corrective answer round terminates the turn
+/// with its declared semantics instead of being absorbed into a plain answer.
+///
+/// The opening round carries only a verification request, so the turn owes a
+/// readable conclusion and asks for one through the Answer Requested round.
+/// That round declares a terminal error, which must end the turn as an
+/// unapplied edit before the requested verification runs.
+#[tokio::test]
+async fn answer_request_round_error_terminates_the_turn_as_an_unapplied_edit() {
+    let (_dir, repo_root) = init_repo();
+    std::fs::write(
+        repo_root.join("target.rs"),
+        "pub fn compute() -> i32 { 0 }\n",
+    )
+    .expect("write target fixture");
+    commit_fixture(&repo_root, &["target.rs"]);
+
+    let mut context = ContextManager::new(repo_root.clone());
+    context
+        .add_file("target.rs", ContextAccess::Editable)
+        .expect("add target to context");
+    let mut history = HistoryManager::new(repo_root.clone());
+
+    let verify_only = format!("<verify_{MARKER} target=\"check\" on_success=\"silent\" />");
+    let error_response = format!("<error_{MARKER} message=\"Analysis is impossible\" />");
+    let provider = MockLlmProvider::scripted([
+        MockResponse::text(verify_only),
+        MockResponse::text(error_response),
+    ]);
+    let model = ModelRef::openrouter("mock/model");
+    let protocol = tauqe_core::prompt::xml::XmlPromptProtocol
+        .with_turn_marker(MARKER)
+        .expect("marker-bound protocol");
+    let mut policy = tauqe_core::workflow::policy::DirectApplyPolicy::new();
+    let options = WorkflowOptions::default();
+    let (stream_tx, cancel_rx) = event_channel();
+
+    let outcome = tauqe_core::workflow::fsm::run_fsm_turn(
+        "Analyse target.rs",
+        tauqe_protocol::TurnIntent::InteractiveRepl,
+        &provider,
+        &model,
+        &mut context,
+        &mut history,
+        protocol.as_ref(),
+        &mut policy,
+        "git",
+        stream_tx,
+        cancel_rx,
+        &options,
+    )
+    .await
+    .expect("fsm turn executes");
+
+    assert!(
+        !outcome.is_unverified_answer(),
+        "a declared terminal error must not look like an unverified answer"
+    );
+    match outcome.result {
+        ModelResult::Edit { outcome, edits, .. } => {
+            assert!(!outcome.applied, "a declared error must never apply");
+            assert!(edits.is_empty());
+            assert_eq!(outcome.error.as_deref(), Some("Analysis is impossible"));
+        }
+        other => panic!("expected a terminated turn, got {other:?}"),
+    }
+    assert_eq!(
+        provider.requests().len(),
+        2,
+        "the declared error must end the turn before the requested verification runs"
+    );
+    assert_eq!(
+        std::fs::read_to_string(repo_root.join("target.rs")).expect("read target fixture"),
+        "pub fn compute() -> i32 { 0 }\n",
+        "a terminated turn must never touch the working tree"
+    );
+}
+
+/// A terminal error declared by the answer round of a project command
+/// terminates the turn with its declared semantics.
+///
+/// The command round widens what the model knows and asks for a follow-up
+/// proposal. That follow-up declares a terminal error, so the declared failure
+/// ends the turn as an unapplied edit instead of being absorbed into a plain
+/// answer that a supervisor would classify as incomplete work.
+#[cfg(unix)]
+#[tokio::test]
+async fn project_command_answer_round_error_terminates_the_turn_as_an_unapplied_edit() {
+    let (_dir, repo_root) = init_repo();
+    std::fs::write(
+        repo_root.join("target.rs"),
+        "pub fn compute() -> i32 { 0 }\n",
+    )
+    .expect("write target fixture");
+    write_project_config(&repo_root, PROBE_DECLARATION);
+    commit_fixture(&repo_root, &["target.rs", "tauqe.toml"]);
+
+    let mut context = ContextManager::new(repo_root.clone());
+    context
+        .add_file("target.rs", ContextAccess::Editable)
+        .expect("add target to context");
+    let mut history = HistoryManager::new(repo_root.clone());
+
+    let probe_response =
+        format!("Inspecting the project diagnostics.\n<custom_tool_{MARKER} name=\"probe\" />");
+    let error_response =
+        format!("The runner is broken.\n<error_{MARKER} message=\"Runner misconfigured\" />");
+    let provider = MockLlmProvider::scripted([
+        MockResponse::text(probe_response),
+        MockResponse::text(error_response),
+    ]);
+    let model = ModelRef::openrouter("mock/model");
+    let protocol = tauqe_core::prompt::xml::XmlPromptProtocol
+        .with_turn_marker(MARKER)
+        .expect("marker-bound protocol");
+    let mut policy = tauqe_core::workflow::policy::DirectApplyPolicy::new();
+    let options = WorkflowOptions::default();
+    let (stream_tx, cancel_rx) = event_channel();
+
+    let outcome = tauqe_core::workflow::fsm::run_fsm_turn(
+        "Run the project diagnostics",
+        tauqe_protocol::TurnIntent::InteractiveRepl,
+        &provider,
+        &model,
+        &mut context,
+        &mut history,
+        protocol.as_ref(),
+        &mut policy,
+        "git",
+        stream_tx,
+        cancel_rx,
+        &options,
+    )
+    .await
+    .expect("fsm turn executes");
+
+    assert!(
+        !outcome.is_unverified_answer(),
+        "a declared terminal error must not look like an unverified answer"
+    );
+    match outcome.result {
+        ModelResult::Edit { outcome, edits, .. } => {
+            assert!(!outcome.applied, "a declared error must never apply");
+            assert!(edits.is_empty());
+            assert_eq!(outcome.error.as_deref(), Some("Runner misconfigured"));
+        }
+        other => panic!("expected a terminated turn, got {other:?}"),
+    }
+    assert_eq!(
+        provider.requests().len(),
+        2,
+        "the declared error must end the turn before a further proposal round"
+    );
+    assert_eq!(
+        std::fs::read_to_string(repo_root.join("target.rs")).expect("read target fixture"),
+        "pub fn compute() -> i32 { 0 }\n",
+        "a terminated turn must never touch the working tree"
+    );
+}
+
+/// The `EditLoop` supervisor treats a declared terminal error of a project
+/// command answer round as a concluded failure instead of a missing proposal.
+///
+/// The corrective edit retry exists for a round that forgot its edits, so a
+/// round that declared a terminal error must neither be re-asked nor consume
+/// the spare proposal the loop could spend on it.
+#[cfg(unix)]
+#[tokio::test]
+async fn edit_loop_does_not_re_ask_after_a_tool_round_terminal_error() {
+    let (_dir, repo_root) = init_repo();
+    std::fs::write(
+        repo_root.join("target.rs"),
+        "pub fn compute() -> i32 { 0 }\n",
+    )
+    .expect("write target fixture");
+    write_project_config(&repo_root, PROBE_DECLARATION);
+    commit_fixture(&repo_root, &["target.rs", "tauqe.toml"]);
+
+    let mut context = ContextManager::new(repo_root.clone());
+    context
+        .add_file("target.rs", ContextAccess::Editable)
+        .expect("add target to context");
+    let mut history = HistoryManager::new(repo_root.clone());
+
+    let probe_response =
+        format!("Inspecting the project diagnostics.\n<custom_tool_{MARKER} name=\"probe\" />");
+    let error_response =
+        format!("The runner is broken.\n<error_{MARKER} message=\"Runner misconfigured\" />");
+    let spare_response = edit_block(
+        "Change compute to 42",
+        "target.rs",
+        "pub fn compute() -> i32 { 0 }",
+        "pub fn compute() -> i32 { 42 }",
+    );
+    let provider = MockLlmProvider::scripted([
+        MockResponse::text(probe_response),
+        MockResponse::text(error_response),
+        MockResponse::text(spare_response),
+    ]);
+    let model = ModelRef::openrouter("mock/model");
+    let protocol = tauqe_core::prompt::xml::XmlPromptProtocol
+        .with_turn_marker(MARKER)
+        .expect("marker-bound protocol");
+    let mut policy = tauqe_core::workflow::policy::DirectApplyPolicy::new();
+    let options = WorkflowOptions::default();
+    let (stream_tx, cancel_rx) = event_channel();
+
+    let output = {
+        let mut env = build_env(
+            &provider,
+            &model,
+            &mut context,
+            &mut history,
+            protocol.as_ref(),
+            &mut policy,
+            stream_tx,
+            cancel_rx,
+            &options,
+        );
+        EditLoop::new("Run the project diagnostics")
+            .execute(&mut env)
+            .await
+            .expect("edit loop executes")
+    };
+
+    match output.result {
+        ModelResult::Edit { outcome, .. } => {
+            assert!(!outcome.applied, "a declared error must never apply");
+            assert_eq!(outcome.error.as_deref(), Some("Runner misconfigured"));
+        }
+        other => panic!("expected a terminated turn, got {other:?}"),
+    }
+    assert!(
+        !output.assistant_text.contains("Edit Retry"),
+        "a terminal error must not trigger the corrective edit retry: {:?}",
+        output.assistant_text
+    );
+    assert_eq!(
+        provider.remaining(),
+        1,
+        "the spare proposal must never be consumed"
+    );
+    assert_eq!(
+        std::fs::read_to_string(repo_root.join("target.rs")).expect("read target fixture"),
+        "pub fn compute() -> i32 { 0 }\n",
+        "a terminated turn must never touch the working tree"
+    );
+}
+
+/// The `SingleExecution` supervisor reports a declared terminal error of a
+/// project command answer round as a concluded failure rather than an
+/// unverified answer.
+///
+/// An unverified answer is what the coder ladder escalates, so a turn that
+/// declared its error must keep the ladder out of play: the reply is a terminal
+/// failure, no escalation event is emitted, and no further coder-tier attempt is
+/// spent.
+#[cfg(unix)]
+#[tokio::test]
+async fn single_execution_reports_the_tool_round_error_as_a_terminal_failure() {
+    let (_dir, repo_root) = init_repo();
+    std::fs::write(
+        repo_root.join("target.rs"),
+        "pub fn compute() -> i32 { 0 }\n",
+    )
+    .expect("write target fixture");
+    write_project_config(&repo_root, PROBE_DECLARATION);
+    commit_fixture(&repo_root, &["target.rs", "tauqe.toml"]);
+
+    let mut context = ContextManager::new(repo_root.clone());
+    context
+        .add_file("target.rs", ContextAccess::Editable)
+        .expect("add target to context");
+    let mut history = HistoryManager::new(repo_root.clone());
+
+    let probe_response =
+        format!("Inspecting the project diagnostics.\n<custom_tool_{MARKER} name=\"probe\" />");
+    let error_response =
+        format!("The runner is broken.\n<error_{MARKER} message=\"Runner misconfigured\" />");
+    let provider = MockLlmProvider::scripted([
+        MockResponse::text(probe_response),
+        MockResponse::text(error_response),
+    ]);
+    let model = ModelRef::openrouter("mock/model");
+    let protocol = tauqe_core::prompt::xml::XmlPromptProtocol
+        .with_turn_marker(MARKER)
+        .expect("marker-bound protocol");
+    let mut policy = tauqe_core::workflow::policy::DirectApplyPolicy::new();
+    let (stream_tx, mut stream_rx, cancel_rx) = event_channel_with_rx();
+
+    let exec = SingleExecution::new(WorkflowOptions::default());
+    let execution = exec
+        .execute(
+            &mut policy,
+            "Run the project diagnostics",
+            tauqe_protocol::TurnIntent::InteractiveRepl,
+            &provider,
+            &model,
+            &mut context,
+            &mut history,
+            protocol.as_ref(),
+            stream_tx,
+            cancel_rx,
+        )
+        .await
+        .expect("single execution runs to completion");
+
+    match execution.result {
+        ModelResult::Edit { outcome, .. } => {
+            assert!(!outcome.applied, "a declared error must never apply");
+            assert_eq!(outcome.error.as_deref(), Some("Runner misconfigured"));
+        }
+        other => panic!("expected a terminated turn, got {other:?}"),
+    }
+    assert_eq!(
+        provider.requests().len(),
+        2,
+        "the declared error must not spend a further coder-tier attempt"
+    );
+
+    let mut saw_escalation = false;
+    while let Ok(event) = stream_rx.try_recv() {
+        if matches!(event, StreamEvent::ModelEscalated { .. }) {
+            saw_escalation = true;
+        }
+    }
+    assert!(
+        !saw_escalation,
+        "a declared error must never escalate the coder ladder"
+    );
 }

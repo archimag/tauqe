@@ -3,7 +3,7 @@ use ratatui::style::{Style, Stylize};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 
-use super::{editor_lines, render_modal_frame, ModalFrameParams, ModalTone};
+use super::{editor_lines, render_modal_frame, ModalFrame, ModalTone};
 use crate::components::modal::verb_hint;
 use crate::i18n::active_t;
 use crate::theme::engine::current_engine;
@@ -142,7 +142,7 @@ pub fn render_prompt_modal(frame: &mut ratatui::Frame, modal: &crate::app::Promp
     } else {
         active_t("dialog.prompt.hint_editor")
     });
-    let frame_params = ModalFrameParams {
+    let frame_params = ModalFrame {
         title: &dialog_title,
         tone,
         area,

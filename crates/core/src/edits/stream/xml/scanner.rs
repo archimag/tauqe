@@ -1,8 +1,8 @@
 //! Low-level XML tag boundary, hunk, and attribute scanning helpers.
 //!
 //! These routines operate purely on the accumulated stream buffer: they locate
-//! edit-block boundaries, delimit hunks, extract tag attributes, and compute
-//! safe text emission limits. Every edit tag spelling they look for is resolved
+//! edit-block boundaries, delimit hunks, and extract tag attributes. Every edit
+//! tag spelling they look for is resolved
 //! from the capability registry, so no scanner carries a literal edit tag of
 //! its own. Keeping them separate leaves all state transitions to
 //! [`XmlStreamFilter`](super::XmlStreamFilter).
@@ -18,36 +18,6 @@ use crate::edits::stream::normalize_hunk;
 /// `strip_all_control_tags`, so the streaming contour and the final cleaner
 /// derive from one implementation and hide exactly the same tags.
 pub(super) use crate::edits::protocol::xml::engine::activate_unmarked_hidden_tags;
-
-/// Locates the earliest control tag declared by the tag registry.
-pub(super) fn find_next_control_tag(buf: &str) -> Option<(usize, usize)> {
-    crate::edits::protocol::xml::engine::find_earliest_control_tag(buf)
-}
-
-/// Byte length of `buf` that is safe to emit as conversational text.
-///
-/// A trailing partial tag prefix and any still-open suppressed tag are withheld
-/// so the interface never shows protocol scaffolding mid-tag.
-pub(super) fn safe_text_emit_len(buf: &str) -> usize {
-    crate::edits::protocol::xml::engine::compute_safe_stream_emit_len(buf)
-}
-
-/// Locates the earliest opening of an edit container or file block.
-pub(super) fn find_any_edit_start(buf: &str) -> Option<usize> {
-    let tags = file_edit_tags();
-    let mut earliest: Option<usize> = None;
-    for name in &tags.containers {
-        if let Some(idx) = find_named_tag(buf, name, false) {
-            earliest = Some(earliest.map_or(idx, |current| current.min(idx)));
-        }
-    }
-    for block in &tags.file_blocks {
-        if let Some(idx) = find_named_tag(buf, block.name, true) {
-            earliest = Some(earliest.map_or(idx, |current| current.min(idx)));
-        }
-    }
-    earliest
-}
 
 /// Reports whether the buffer opens with an edit container tag.
 pub(super) fn starts_with_edit_container(buf: &str) -> bool {

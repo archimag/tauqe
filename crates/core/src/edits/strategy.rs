@@ -156,9 +156,9 @@ static SEARCH_REPLACE: StrategyProfile = StrategyProfile {
 /// Profile of the opaque line-anchor strategy.
 static LINE_ANCHOR: StrategyProfile = StrategyProfile {
     replaced_line_fields: LINE_ANCHOR_FIELDS,
-    content_description: "Complete replacement of the addressed line range for 'replace' (the replaced lines are never echoed back), complete file content for 'create' and 'overwrite', empty string otherwise",
+    content_description: "Complete replacement of the addressed line range for 'replace' (the replaced lines are never echoed back), complete file content for 'create', empty string otherwise",
     xml_instruction: line_anchor_xml_instruction,
-    structured_instruction: "- `changes`: array of edit operations with `op` ('replace'|'create'|'delete'|'move'|'overwrite') plus `path`, `to`, `start`, `end`, and `content`. A 'replace' entry names the replaced lines by the opaque anchors rendered beside every context line, `start` for the first replaced line and `end` for the last one, and carries the complete replacement of that range in `content`; both anchors must be copied character for character, and the replaced lines are never echoed back. 'create' and 'overwrite' carry the whole file in `content`, 'move' names its destination in `to`, and both leave `start` and `end` empty.",
+    structured_instruction: "- `changes`: array of edit operations with `op` ('replace'|'create'|'delete'|'move') plus `path`, `to`, `start`, `end`, and `content`. A 'replace' entry names the replaced lines by the opaque anchors rendered beside every context line, `start` for the first replaced line and `end` for the last one, and carries the complete replacement of that range in `content`; both anchors must be copied character for character, and the replaced lines are never echoed back. 'create' carries the whole file in `content`, 'move' names its destination in `to`, and both leave `start` and `end` empty. A whole-file rewrite is a 'replace' entry whose range spans the file from its first line to its last one.",
     empty_field_guidance: "Every field of a change is required: use an empty string \"\" for fields that do not apply to the operation (e.g. `start`/`end` for 'create'/'delete', `to` for every operation except 'move').\n\n",
     replace_invariant: "For 'replace', `start` and `end` MUST be anchors rendered in <context> for that same file, the named range MUST NOT overlap another entry, and `content` replaces exactly the addressed lines.\n",
     no_match_hint: "The change set addressed no line of the file. Copy the anchor of the first and of the last replaced line from the <context> block of that same file.",
@@ -174,7 +174,7 @@ const SEARCH_REPLACE_NO_RANGE_HINT: &str =
 
 /// Explanation of a change set that addresses no replaced line, in the
 /// line-anchor dialect.
-const LINE_ANCHOR_NO_RANGE_HINT: &str = "The change set addressed no line range. Copy the `start` and `end` anchors of the lines you replace from the <context> block of that same file, or use 'overwrite' with the complete file content when most of the file changes.";
+const LINE_ANCHOR_NO_RANGE_HINT: &str = "The change set addressed no line range. Copy the `start` and `end` anchors of the lines you replace from the <context> block of that same file, or replace the whole file by naming its first and its last line with `start` and `end` when most of the content changes.";
 
 /// Suffix of the search/replace explanation of an ambiguous match.
 const SEARCH_REPLACE_AMBIGUOUS_SUFFIX: &str =
@@ -210,7 +210,7 @@ fn search_replace_xml_instruction(tag_name: &dyn Fn(&str) -> String) -> String {
 /// Renders the XML instruction of the opaque line-anchor strategy.
 fn line_anchor_xml_instruction(tag_name: &dyn Fn(&str) -> String) -> String {
     let file_edits = tag_name("file_edits");
-    format!("- Code edits: send the whole change set as one JSON array inside <{file_edits}>...</{file_edits}>, as in <{file_edits}>[{{\"op\":\"replace\",\"path\":\"src/lib.rs\",\"to\":\"\",\"start\":\"<first-anchor>\",\"end\":\"<last-anchor>\",\"content\":\"<complete replacement>\"}}]</{file_edits}>.\n  - Every entry names its operation in `op` ('replace', 'create', 'delete', 'move', or 'overwrite'), its file in `path`, and, for 'move', its destination in `to`.\n  - A 'replace' entry names the replaced lines by the opaque anchors rendered beside every context line: `start` is the anchor of the first replaced line, `end` the anchor of the last one, and `content` is the complete replacement of that range. Copy both anchors character for character from <context>: they are decoded deterministically, so a re-typed, reordered, or reformatted anchor names a different line and is rejected with a diagnostic. Never echo the replaced text and never renumber the file yourself.\n  - A 'create' or 'overwrite' entry carries the whole file content in `content`, 'move' names its destination in `to`, and 'delete' needs neither; these operations leave `start` and `end` empty.\n  - Files inside <context> declare their status through the `access` attribute: `access=\"editable\"` files may be modified directly, while a file marked `access=\"read_only\"` is provided for reference and becomes editable automatically once you propose a change to it. A 'replace' entry `path` MUST match a file present in <context>, while a 'create' path MUST be a valid repository-relative path.\n  - Ranges of one change set MUST NOT overlap; they are applied from the bottom of the file upwards, so every anchor stays valid while the rest of the change set is applied.\n  - The array MUST be valid JSON: a trailing comma or a comment makes the whole change set undecodable.\n  - If no code changes are needed, answer in plain text without the change-set tag.")
+    format!("- Code edits: send the whole change set as one JSON array inside <{file_edits}>...</{file_edits}>, as in <{file_edits}>[{{\"op\":\"replace\",\"path\":\"src/lib.rs\",\"to\":\"\",\"start\":\"<first-anchor>\",\"end\":\"<last-anchor>\",\"content\":\"<complete replacement>\"}}]</{file_edits}>.\n  - Every entry names its operation in `op` ('replace', 'create', 'delete', or 'move'), its file in `path`, and, for 'move', its destination in `to`.\n  - A 'replace' entry names the replaced lines by the opaque anchors rendered beside every context line: `start` is the anchor of the first replaced line, `end` the anchor of the last one, and `content` is the complete replacement of that range. Copy both anchors character for character from <context>: they are decoded deterministically, so a re-typed, reordered, or reformatted anchor names a different line and is rejected with a diagnostic. Never echo the replaced text and never renumber the file yourself.\n  - A 'create' entry carries the whole file content in `content`, 'move' names its destination in `to`, and 'delete' needs neither; these operations leave `start` and `end` empty. A whole-file rewrite is a 'replace' entry whose range spans the file from its first line to its last one.\n  - Files inside <context> declare their status through the `access` attribute: `access=\"editable\"` files may be modified directly, while a file marked `access=\"read_only\"` is provided for reference and becomes editable automatically once you propose a change to it. A 'replace' entry `path` MUST match a file present in <context>, while a 'create' path MUST be a valid repository-relative path.\n  - Ranges of one change set MUST NOT overlap; they are applied from the bottom of the file upwards, so every anchor stays valid while the rest of the change set is applied.\n  - The array MUST be valid JSON: a trailing comma or a comment makes the whole change set undecodable.\n  - If no code changes are needed, answer in plain text without the change-set tag.")
 }
 
 #[cfg(test)]
@@ -287,6 +287,39 @@ mod tests {
                 "echoed text names the change-set vehicle"
             );
         }
+    }
+
+    #[test]
+    fn the_anchored_profile_never_advertises_the_full_rewrite_operation() {
+        // A full rewrite under the line-anchor strategy is a range spanning the
+        // whole file, so the separate operation is absent from the vocabulary
+        // of the profile, exactly as the strict `op` enum of its schema omits
+        // it. The search/replace strategy keeps the operation.
+        let anchored = StrategyProfile::of(PatchStrategy::LineAnchor);
+        let xml = anchored.render_xml_instruction(&bare_tag);
+        let ambiguous = (anchored.ambiguous_match_hint)(2);
+        for text in [
+            xml.as_str(),
+            anchored.structured_instruction,
+            anchored.content_description,
+            anchored.empty_field_guidance,
+            anchored.replace_invariant,
+            anchored.no_match_hint,
+            anchored.no_range_hint,
+            anchored.retry_instruction,
+            ambiguous.as_str(),
+        ] {
+            assert!(
+                !text.contains("overwrite"),
+                "anchored text names the full rewrite operation: {text}"
+            );
+        }
+
+        let echoed = StrategyProfile::of(PatchStrategy::SearchReplace);
+        let echoed_xml = echoed.render_xml_instruction(&bare_tag);
+        assert!(echoed_xml.contains("overwrite"), "{echoed_xml}");
+        assert!(echoed.structured_instruction.contains("overwrite"));
+        assert!(echoed.content_description.contains("overwrite"));
     }
 
     #[test]
@@ -372,7 +405,7 @@ mod tests {
                 }
                 EditError::ReplaceWithoutRange { .. } => {
                     assert!(echoed.contains("old_text"), "{echoed}");
-                    assert!(anchored.contains("overwrite"), "{anchored}");
+                    assert!(anchored.contains("`start`"), "{anchored}");
                     assert!(!anchored.contains("old_text"), "{anchored}");
                 }
                 _ => assert_eq!(

@@ -31,6 +31,26 @@ pub const LOCAL_REVIEW_GROUP_ID: &str = "local";
 /// Title of the group collecting the findings that share no root cause.
 pub const LOCAL_REVIEW_GROUP_TITLE: &str = "Local Issues";
 
+/// Class of a review group, the typed dichotomy that governs its execution.
+///
+/// A simple group collects independent defects, so each of its findings is
+/// addressed by its own isolated execution. An architectural group collects
+/// manifestations of one shared root cause: its findings are symptoms, so the
+/// group is executed exclusively through its unified `subplan`, and a finding
+/// of such a group is never executed on its own.
+///
+/// The class is a stored field rather than a property derived from the shape
+/// of a group `id`: a prefix is a guess, not a contract.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReviewGroupKind {
+    /// Group of independent findings, executed finding by finding.
+    #[default]
+    Simple,
+    /// Group of findings that share one root cause, executed as one plan.
+    Architectural,
+}
+
 /// Whether and when the post-analysis layer is produced.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -77,6 +97,14 @@ pub struct ReviewGroup {
     /// member list.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
+    /// Class of this group, which decides how the group is executed.
+    ///
+    /// The class is stored, never derived: a simple group is executed finding
+    /// by finding, while an architectural group is executed exclusively
+    /// through its unified `subplan`. A record written before the field
+    /// existed carries no class and decodes as [`ReviewGroupKind::Simple`].
+    #[serde(default)]
+    pub kind: ReviewGroupKind,
     /// Unified remediation plan for the whole group.
     ///
     /// A root cause is fixed by one coherent change set, so the group owns a
@@ -116,6 +144,7 @@ impl ReviewGroup {
             paths,
             prompt: None,
             description: None,
+            kind: ReviewGroupKind::Simple,
             subplan: Vec::new(),
             subplan_architect: None,
             subplan_last_replanned_step: None,

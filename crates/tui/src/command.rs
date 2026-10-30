@@ -1050,7 +1050,7 @@ mod tests {
     }
 
     #[test]
-    fn r_refines_selection_and_shift_r_refines_everything() {
+    fn r_replans_the_selected_horizon_and_shift_r_replans_everything() {
         let input = ctrl_primary();
 
         assert_eq!(
@@ -1072,14 +1072,17 @@ mod tests {
             "uppercase R must replan every blocked step"
         );
 
+        // Manual decomposition of a review finding no longer exists: the
+        // Architect projects a missing group plan just in time, so `r` / `R`
+        // must stay unbound in the Review view (c-2, c-5).
         assert_eq!(
             resolve_action(
                 &REVIEW_COMMAND_MAP,
                 key(KeyCode::Char('r'), KeyModifiers::NONE),
                 &input
             ),
-            Some(ReviewAction::Refine),
-            "lowercase r must decompose the selected finding"
+            None,
+            "the Review view must not bind a manual refine verb"
         );
         assert_eq!(
             resolve_action(
@@ -1087,8 +1090,8 @@ mod tests {
                 key(KeyCode::Char('R'), KeyModifiers::NONE),
                 &input
             ),
-            Some(ReviewAction::RefineAll),
-            "uppercase R must decompose every awaiting finding"
+            None,
+            "the Review view must not bind a batch refine verb"
         );
     }
 

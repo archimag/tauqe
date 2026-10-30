@@ -158,10 +158,16 @@ pub async fn handle_mouse_event(
             Ok(InputResult::Continue)
         }
         MouseEventKind::Down(MouseButton::Middle) => {
-            // Middle-click pastes the terminal Primary Selection. Routing the
-            // text through `handle_paste` keeps the modal stack authoritative:
-            // only the visible, top-most surface ever receives the paste.
-            if let Some(text) = crate::clipboard::get_primary_or_clipboard() {
+            // Middle-click pastes the terminal Primary Selection. The read is a
+            // native round trip bounded at NATIVE_CLIPBOARD_TIMEOUT, so the state
+            // guard is released before it and re-acquired only to deliver the
+            // text. Routing the text through `handle_paste` keeps the modal stack
+            // authoritative: only the visible, top-most surface ever receives
+            // the paste (c-1).
+            drop(st);
+            let pasted = crate::clipboard::get_primary_or_clipboard_async().await;
+            let mut st = state.lock().await;
+            if let Some(text) = pasted {
                 crate::input::handle_paste(&mut st, &text);
             }
             Ok(InputResult::Continue)
@@ -396,7 +402,6 @@ mod tests {
                 recommendations: Vec::new(),
                 files: Vec::new(),
                 readonly_files: Vec::new(),
-                plan: Vec::new(),
                 note: None,
             }],
             entries,
@@ -527,23 +532,6 @@ mod tests {
         assert_eq!(state.lock().await.usage_summary.as_ref().unwrap().scroll, 0);
     }
 
-    fn architect_entry(name: &str) -> tauqe_protocol::ModelEntry {
-        tauqe_protocol::ModelEntry::new(tauqe_protocol::ModelRef::openrouter(name), None)
-    }
-
-    fn state_with_review_refine_dialog() -> crate::app::AppState {
-        let mut st = crate::app::test_state();
-        st.last_frame_area = Rect::new(0, 0, 120, 40);
-        st.review.refine_dialog = Some(crate::views::review::ReviewRefineDialogState::new(
-            "rev-1".to_string(),
-            "Session rev-1".to_string(),
-            2,
-            "Missing auth guard".to_string(),
-            vec![architect_entry("arch-a"), architect_entry("arch-b")],
-        ));
-        st
-    }
-
     fn left_click(column: u16, row: u16) -> MouseEvent {
         MouseEvent {
             kind: MouseEventKind::Down(MouseButton::Left),
@@ -551,99 +539,6 @@ mod tests {
             row,
             modifiers: crossterm::event::KeyModifiers::NONE,
         }
-    }
-
-    /// A click on the review-refine `Start Refinement` button must launch the
-    /// same `review/refineItem` request the keyboard confirm does.
-    #[tokio::test]
-    async fn review_refine_confirm_click_submits_the_request() {
-        let st = state_with_review_refine_dialog();
-        let geo = crate::dialogs::render::refine::refine_dialog_geometry(st.last_frame_area, 2);
-        let mouse = left_click(geo.confirm_button.x + 1, geo.confirm_button.y);
-
-        let state = Arc::new(Mutex::new(st));
-        let mut conn = RpcConnection::new(Vec::<u8>::new());
-        let res = handle_mouse_event(mouse, &state, &mut conn).await.unwrap();
-        assert_eq!(res, InputResult::Continue);
-
-        let payload = String::from_utf8(conn.written().to_vec()).expect("utf-8 payload");
-        assert!(payload.contains("review/refineItem"), "{payload}");
-
-        let guard = state.lock().await;
-        assert!(guard.review.refine_dialog.is_none());
-        assert_eq!(guard.review.refining.as_deref(), Some("rev-1"));
-    }
-
-    /// A click on the `Cancel` button must dismiss the dialog without sending a
-    /// request, leaving the Review view idle.
-    #[tokio::test]
-    async fn review_refine_cancel_click_dismisses_without_a_request() {
-        let st = state_with_review_refine_dialog();
-        let geo = crate::dialogs::render::refine::refine_dialog_geometry(st.last_frame_area, 2);
-        let mouse = left_click(geo.cancel_button.x + 1, geo.cancel_button.y);
-
-        let state = Arc::new(Mutex::new(st));
-        let mut conn = RpcConnection::new(Vec::<u8>::new());
-        let res = handle_mouse_event(mouse, &state, &mut conn).await.unwrap();
-        assert_eq!(res, InputResult::Continue);
-
-        let guard = state.lock().await;
-        assert!(guard.review.refine_dialog.is_none());
-        assert!(guard.review.refining.is_none());
-        assert!(conn.written().is_empty());
-    }
-
-    /// Clicking an architect row selects that model and moves focus to the
-    /// list, mirroring keyboard list navigation.
-    #[tokio::test]
-    async fn review_refine_model_row_click_selects_and_focuses_the_list() {
-        let st = state_with_review_refine_dialog();
-        let geo = crate::dialogs::render::refine::refine_dialog_geometry(st.last_frame_area, 2);
-        let mouse = left_click(geo.model_rows.x + 1, geo.model_rows.y + 1);
-
-        let state = Arc::new(Mutex::new(st));
-        let mut conn = RpcConnection::new(Vec::<u8>::new());
-        let res = handle_mouse_event(mouse, &state, &mut conn).await.unwrap();
-        assert_eq!(res, InputResult::Continue);
-
-        let guard = state.lock().await;
-        let dialog = guard
-            .review
-            .refine_dialog
-            .as_ref()
-            .expect("dialog stays open");
-        assert_eq!(dialog.selector.selected_index(), 1);
-        assert_eq!(
-            dialog.focus,
-            crate::views::plans::RefineDialogFocus::ModelList
-        );
-        assert!(conn.written().is_empty());
-    }
-
-    /// Clicking the instructions area must move focus there so the next
-    /// keystroke edits the clicked field.
-    #[tokio::test]
-    async fn review_refine_editor_click_moves_focus_and_keeps_the_dialog() {
-        let st = state_with_review_refine_dialog();
-        let geo = crate::dialogs::render::refine::refine_dialog_geometry(st.last_frame_area, 2);
-        let mouse = left_click(geo.editor_area.x + 1, geo.editor_area.y + 1);
-
-        let state = Arc::new(Mutex::new(st));
-        let mut conn = RpcConnection::new(Vec::<u8>::new());
-        let res = handle_mouse_event(mouse, &state, &mut conn).await.unwrap();
-        assert_eq!(res, InputResult::Continue);
-
-        let guard = state.lock().await;
-        let dialog = guard
-            .review
-            .refine_dialog
-            .as_ref()
-            .expect("dialog stays open");
-        assert_eq!(
-            dialog.focus,
-            crate::views::plans::RefineDialogFocus::InstructionsEditor
-        );
-        assert!(conn.written().is_empty());
     }
 
     /// Builds a Plans state holding one `Todo` step and an open status dialog,
@@ -985,27 +880,6 @@ mod tests {
             !interior(list_area.y).trim().is_empty(),
             "the first item must be drawn at the top of the hit-tested list"
         );
-    }
-
-    /// The spacer between the refinement list and its editor is inert: a click
-    /// there submits nothing and keeps the dialog open (Conventions §6.7, c-1).
-    #[tokio::test]
-    async fn review_refine_spacer_click_keeps_the_dialog_untouched() {
-        let st = state_with_review_refine_dialog();
-        let geo = crate::dialogs::render::refine::refine_dialog_geometry(st.last_frame_area, 2);
-
-        let state = Arc::new(Mutex::new(st));
-        let mut conn = RpcConnection::new(Vec::<u8>::new());
-        handle_mouse_event(
-            left_click(geo.editor_area.x + 2, geo.editor_area.y - 1),
-            &state,
-            &mut conn,
-        )
-        .await
-        .unwrap();
-
-        assert!(conn.written().is_empty());
-        assert!(state.lock().await.review.refine_dialog.is_some());
     }
 
     /// A click on a rendered code block body resolves through the registry to

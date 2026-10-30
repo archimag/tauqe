@@ -69,9 +69,9 @@ pub(crate) async fn apply_status_dialog(
             current_status,
             ..
         } => {
-            // The review lifecycle carries seven statuses and is read from the
-            // same ordered list the dialog renders, so `Refine` keeps sitting
-            // between `InProgress` and `Fixed` for both the rows and the digits.
+            // The review lifecycle carries six statuses and is read from the
+            // same ordered list the dialog renders, so a digit and the row it
+            // highlights can never disagree about a status.
             let new_status = match REVIEW_STATUS_ORDER.get(chosen_idx).copied() {
                 Some(s) => s,
                 None => return Ok(()),
@@ -142,7 +142,6 @@ mod tests {
             recommendations: Vec::new(),
             files: Vec::new(),
             readonly_files: Vec::new(),
-            plan: Vec::new(),
             note: None,
         })
     }
@@ -205,7 +204,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn applies_refine_status_optimistically() {
+    async fn applies_fixed_status_optimistically() {
         let mut st = crate::app::test_state();
         st.review = ReviewViewState {
             sessions: vec![session("rev-1")],
@@ -219,7 +218,7 @@ mod tests {
                 item_title: "Finding 1".to_string(),
                 current_status: ReviewItemStatus::Todo,
             },
-            // Option index 3 is REFINE in the seven-status lifecycle.
+            // Option index 3 is FIXED in the six-status lifecycle.
             3,
         ));
 
@@ -231,7 +230,7 @@ mod tests {
         let st = state.lock().await;
         assert_eq!(
             st.review.sessions[0].items[0].status,
-            ReviewItemStatus::Refine
+            ReviewItemStatus::Fixed
         );
         assert_eq!(st.status_dialog, None, "the dialog must be consumed");
     }

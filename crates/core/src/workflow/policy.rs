@@ -1,10 +1,14 @@
 use std::path::Path;
 
 use async_trait::async_trait;
-use tauqe_protocol::{EditOperation, EditProposal};
+use tauqe_protocol::{EditOperation, EditProposal, ProjectConfig};
+use tokio::sync::watch;
 
 use crate::context::ContextManager;
-use crate::edits::{apply_edit_proposal, prepare_staged_edits, StageEditsResult, StagedEditsState};
+use crate::edits::{
+    apply_edit_proposal_with_config, prepare_staged_edits_with_config, StageEditsResult,
+    StagedEditsState,
+};
 
 /// Phased strategy that governs how validated edits reach the working tree.
 ///
@@ -13,21 +17,26 @@ use crate::edits::{apply_edit_proposal, prepare_staged_edits, StageEditsResult, 
 /// sessions and checkpointed Git transactions for verified ones.
 #[async_trait]
 pub trait ApplyPolicy: Send + Sync {
-    /// Validates `edits` in memory, retaining any earlier staged state supplied
-    /// by the caller. No bytes are written to disk at this stage.
+    /// Validates `edits` in memory under the turn's frozen project configuration,
+    /// retaining any earlier staged state supplied by the caller. No bytes are
+    /// written to disk at this stage.
     async fn staging(
         &mut self,
         repo_root: &Path,
+        project: &ProjectConfig,
         context_manager: &ContextManager,
         edits: &[EditOperation],
         staged_state: Option<&StagedEditsState>,
+        cancel_rx: Option<&watch::Receiver<bool>>,
     ) -> StageEditsResult;
 
-    /// Writes the validated proposal to the working tree so it can be compiled
-    /// and tested before being finalized.
+    /// Writes the validated proposal to the working tree under the turn's frozen
+    /// project configuration, so it can be compiled and tested before being
+    /// finalized.
     async fn apply_temporary(
         &mut self,
         repo_root: &Path,
+        project: &ProjectConfig,
         context_manager: &mut ContextManager,
         proposal: &EditProposal,
     ) -> anyhow::Result<Vec<String>>;
@@ -63,20 +72,32 @@ impl ApplyPolicy for DirectApplyPolicy {
     async fn staging(
         &mut self,
         repo_root: &Path,
+        project: &ProjectConfig,
         context_manager: &ContextManager,
         edits: &[EditOperation],
         staged_state: Option<&StagedEditsState>,
+        cancel_rx: Option<&watch::Receiver<bool>>,
     ) -> StageEditsResult {
-        prepare_staged_edits(repo_root, context_manager, edits, staged_state).await
+        prepare_staged_edits_with_config(
+            repo_root,
+            project,
+            context_manager,
+            edits,
+            staged_state,
+            cancel_rx,
+        )
+        .await
     }
 
     async fn apply_temporary(
         &mut self,
         repo_root: &Path,
+        project: &ProjectConfig,
         context_manager: &mut ContextManager,
         proposal: &EditProposal,
     ) -> anyhow::Result<Vec<String>> {
-        let changed_files = apply_edit_proposal(repo_root, context_manager, proposal).await?;
+        let changed_files =
+            apply_edit_proposal_with_config(repo_root, project, context_manager, proposal).await?;
         Ok(changed_files)
     }
 
@@ -98,7 +119,7 @@ impl ApplyPolicy for DirectApplyPolicy {
 mod tests {
     use super::{ApplyPolicy, DirectApplyPolicy};
     use crate::context::ContextManager;
-    use tauqe_protocol::{ContextAccess, EditOperation, EditProposal};
+    use tauqe_protocol::{ContextAccess, EditOperation, EditProposal, ProjectConfig};
 
     #[tokio::test]
     async fn direct_policy_stages_applies_and_finalizes_without_commit() {
@@ -115,7 +136,10 @@ mod tests {
         }];
 
         let mut policy = DirectApplyPolicy::new();
-        let staged = policy.staging(root, &cm, &edits, None).await;
+        let project = ProjectConfig::default();
+        let staged = policy
+            .staging(root, &project, &cm, &edits, None, None)
+            .await;
         assert!(staged.is_success());
 
         let proposal = EditProposal {
@@ -123,7 +147,7 @@ mod tests {
             edits: edits.clone(),
         };
         let changed = policy
-            .apply_temporary(root, &mut cm, &proposal)
+            .apply_temporary(root, &project, &mut cm, &proposal)
             .await
             .unwrap();
         assert_eq!(changed, vec!["a.rs".to_string()]);

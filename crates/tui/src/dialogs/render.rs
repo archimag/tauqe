@@ -9,7 +9,7 @@ use crate::theme::engine::current_engine;
 pub(crate) use crate::components::confirm::{
     confirm_modal_geometry, render_modal_confirm, ConfirmModalGeometry, ConfirmModalParams,
 };
-pub(crate) use crate::components::modal::{render_modal_frame, ModalFrameParams, ModalTone};
+pub(crate) use crate::components::modal::{render_modal_frame, ModalFrame, ModalTone};
 use crate::editor::InputEditor;
 
 pub(crate) mod batch_cancel;
@@ -33,14 +33,16 @@ pub(crate) use confirm::{
     clear_auto_params, clear_history_params, clear_horizon_final_params, clear_horizon_params,
     clear_user_params, confirm_cancel_params, confirm_detach_focus_params, confirm_quit_params,
     delete_plan_final_params, delete_plan_params, delete_review_params, execute_pipeline_params,
-    execute_review_params, plan_unfinished_steps, render_confirm_cancel_popup,
-    render_confirm_clear_auto_popup, render_confirm_clear_history_popup,
-    render_confirm_clear_horizon_final_popup, render_confirm_clear_horizon_popup,
-    render_confirm_clear_user_popup, render_confirm_delete_plan_final_popup,
-    render_confirm_delete_plan_popup, render_confirm_delete_review_popup,
-    render_confirm_detach_focus_popup, render_confirm_execute_pipeline_popup,
-    render_confirm_execute_review_popup, render_confirm_execute_scope_popup,
-    render_confirm_quit_popup, render_confirm_review_analyze_popup, review_analyze_params,
+    execute_review_params, plan_unfinished_steps, remove_context_file_params,
+    render_confirm_cancel_popup, render_confirm_clear_auto_popup,
+    render_confirm_clear_history_popup, render_confirm_clear_horizon_final_popup,
+    render_confirm_clear_horizon_popup, render_confirm_clear_user_popup,
+    render_confirm_delete_plan_final_popup, render_confirm_delete_plan_popup,
+    render_confirm_delete_review_popup, render_confirm_detach_focus_popup,
+    render_confirm_execute_pipeline_popup, render_confirm_execute_review_popup,
+    render_confirm_execute_scope_popup, render_confirm_quit_popup,
+    render_confirm_remove_context_file_popup, render_confirm_review_analyze_popup,
+    render_confirm_review_truncation_popup, review_analyze_params, review_truncation_params,
 };
 pub(crate) use diff_inspector::render_diff_inspector;
 pub(crate) use disconnected::{disconnected_button_geometry, render_disconnected_popup};

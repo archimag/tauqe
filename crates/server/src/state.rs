@@ -141,6 +141,11 @@ pub struct AppState {
     /// The lock lives in an `Arc` so a mutation can move its owned guard into
     /// the blocking pool and keep the whole read-modify-write sequence
     /// exclusive, instead of cloning the manager and overwriting it afterwards.
+    ///
+    /// A bounded turn is the one exception: it works on a private clone adopted
+    /// back through [`AppState::adopt_history`] when it ends, so the guard is
+    /// never held across its provider rounds and a `history/get` served while
+    /// the turn streams reads this manager instead of waiting for the turn.
     pub history: Arc<tokio::sync::Mutex<HistoryManager>>,
     pub session_lock: Mutex<()>,
     /// Single registration slot for the currently running operation.
@@ -207,9 +212,12 @@ impl AppState {
             );
         }
 
-        // Review legacy migration runs exactly once at startup, so listing or
-        // loading reviews never writes to disk and stays free of read side
-        // effects. Failures are logged by the core.
+        // Read RPCs are side-effect free: listing, loading, and resolving a
+        // plan or a review never writes to disk, and the read handlers
+        // (`plan/get`, `review/get`) never persist the fallback entity they
+        // resolve, so promoting one stays an explicit mutation. Review legacy
+        // migration therefore runs exactly once here at startup. Failures are
+        // logged by the core.
         tauqe_core::review::ReviewStorage::migrate_legacy_if_needed(&repo_path);
 
         let default_selection = config.default_selection();
@@ -515,6 +523,12 @@ impl AppState {
     /// short read guard and overwriting the slot afterwards would let a
     /// concurrent mutation be silently lost and would reset the monotonic
     /// context revision.
+    ///
+    /// A guarded closure must never perform subprocess work. The guard excludes
+    /// every context reader for its whole body, so spawning a `git` process
+    /// inside it would stall `context/get` and every `repo_root` lookup behind
+    /// that spawn. Resolve such inputs on the blocking pool first and move the
+    /// result into the closure.
     pub async fn mutate_context<T, F>(self: &Arc<Self>, mutate: F) -> Result<T, String>
     where
         F: FnOnce(&mut ContextManager) -> T + Send + 'static,
@@ -549,6 +563,41 @@ impl AppState {
         })
         .await
         .map_err(|err| format!("blocking task failed: {}", err))
+    }
+    /// Adopts the history manager a bounded turn worked with.
+    ///
+    /// A turn never holds this guard: it clones the manager, records its prompt,
+    /// response, rollbacks, and compaction against that private clone, and hands
+    /// the clone back here. Adopting it under a short lock leaves the shared
+    /// manager carrying the identifier watermark the turn consumed — the journal
+    /// already holds the entries — so the next record can never reuse one of
+    /// them and a `history/get` served while the turn runs keeps reading a
+    /// coherent manager.
+    pub async fn adopt_history(&self, history: HistoryManager) {
+        let mut shared = self.history.lock().await;
+        *shared = history;
+    }
+
+    /// Rebuilds the shared history manager from the authoritative journal.
+    ///
+    /// A turn that panicked or was force-aborted never reached
+    /// [`AppState::adopt_history`], so its private clone — and the identifier
+    /// watermark it consumed — was dropped with it while the entries it already
+    /// appended stay in `<repo_root>/.tauqe/history.jsonl`. Rebuilding the
+    /// manager from that journal restores the watermark the daemon itself
+    /// derives at startup, so the next record can never reuse an identifier that
+    /// is already written. The journal is reread on the blocking pool, under the
+    /// same exclusive guard the mutations use.
+    pub async fn resync_history_from_journal(self: &Arc<Self>) -> Result<(), String> {
+        let repo_root = self.repo_root().await;
+        let mut rebuilt = tokio::task::spawn_blocking(move || HistoryManager::new(repo_root))
+            .await
+            .map_err(|err| format!("blocking task failed: {}", err))?;
+        let sender = self.history_sender.clone();
+        rebuilt.set_listener(move |mutation| {
+            let _ = sender.send(mutation);
+        });
+        self.mutate_history(move |shared| *shared = rebuilt).await
     }
 
     /// Returns the current discussion focus anchor.

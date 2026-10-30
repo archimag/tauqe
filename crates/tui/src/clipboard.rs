@@ -206,6 +206,52 @@ pub fn get_primary_or_clipboard() -> Option<String> {
     run_bounded(read_best_clipboard_now, None)
 }
 
+/// Reads the paste buffer without blocking the event-loop task.
+///
+/// The synchronous accessors wait up to [`NATIVE_CLIPBOARD_TIMEOUT`] for the
+/// worker reply. A caller that runs on the tokio event loop — where a stalled
+/// clipboard owner would freeze every draw and every server message — uses this
+/// wrapper instead, so the wait happens on the blocking pool while the caller
+/// awaits and keeps the state guard released.
+pub async fn get_from_clipboard_async() -> Option<String> {
+    run_bounded_async(get_from_clipboard, None).await
+}
+
+/// Reads the best available paste buffer without blocking the event-loop task,
+/// unified with [`get_from_clipboard_async`].
+pub async fn get_primary_or_clipboard_async() -> Option<String> {
+    run_bounded_async(get_primary_or_clipboard, None).await
+}
+
+/// Copies `text` without blocking the event-loop task.
+///
+/// The native round trip and the OSC 52 write are blocking by nature, so they
+/// run on the blocking pool while the caller awaits. The await also keeps the
+/// stdout write out of the draw path and out of the state-locked region: a
+/// caller releases the guard, awaits this function, and re-locks only to report
+/// the typed outcome.
+pub async fn copy_to_clipboard_async(text: &str) -> CopyResult {
+    let owned = text.to_string();
+    run_bounded_async(move || copy_to_clipboard(&owned), CopyResult::Failed).await
+}
+
+/// Awaits blocking clipboard work on the blocking pool.
+///
+/// `spawn_blocking` moves the bounded native wait off the event-loop task, so
+/// the interface keeps rendering and keeps draining RPC messages while the
+/// worker waits for the OS clipboard. A job that panics or cannot be scheduled
+/// yields the fallback value instead of propagating.
+async fn run_bounded_async<T, F>(work: F, fallback: T) -> T
+where
+    T: Send + 'static,
+    F: FnOnce() -> T + Send + 'static,
+{
+    match tokio::task::spawn_blocking(work).await {
+        Ok(value) => value,
+        Err(_) => fallback,
+    }
+}
+
 fn read_best_clipboard_now(clipboard: &mut ClipboardHandle) -> Option<String> {
     let std_text = read_standard_clipboard_now(clipboard);
     let prim_text = read_primary_selection_now(clipboard);
@@ -632,7 +678,35 @@ mod tests {
             99
         );
     }
+    /// The awaited surface keeps the bounded guarantees of the synchronous
+    /// engine: an idle worker returns the computed value and a busy worker still
+    /// rejects the request immediately instead of queueing it.
+    #[tokio::test]
+    async fn test_async_dispatch_keeps_the_bounded_fallbacks() {
+        assert_eq!(run_bounded_async(|| 42, 0).await, 42);
 
+        let worker = spawn_test_worker();
+        // Claim the worker directly: `swap` yields the previous state, so an
+        // idle worker is the only one that can be claimed here.
+        assert!(
+            !worker.busy.swap(true, Ordering::AcqRel),
+            "a freshly spawned worker must start idle"
+        );
+        let rejected = run_bounded_async(
+            move || run_worker_job(&worker, |_clipboard: &mut ClipboardHandle| 5, 9),
+            7,
+        )
+        .await;
+        assert_eq!(rejected, 9, "a busy worker must reject without waiting");
+    }
+
+    /// The awaited accessors degrade to `None` on a headless host instead of
+    /// panicking, exactly like the synchronous ones.
+    #[tokio::test]
+    async fn test_async_accessors_degrade_gracefully() {
+        let _ = get_from_clipboard_async().await;
+        let _ = get_primary_or_clipboard_async().await;
+    }
     /// The OSC 52 payload carries the standard Base64 alphabet, padding
     /// included, because that is what a terminal decodes (Conventions §1.6).
     #[test]

@@ -112,8 +112,28 @@ fn deepest_existing_ancestor(path: &Path) -> &Path {
     ancestor
 }
 
+/// Resolves the canonical repository root both boundary checks compare against.
+///
+/// Sharing the resolution keeps the two entry points in agreement about whether
+/// the boundary is inspectable at all, and records the degradation exactly once
+/// per check.
+fn boundary_canonical_root(repo_root: &Path) -> Option<PathBuf> {
+    match canonical_repo_root(repo_root) {
+        Ok(canonical) => Some(canonical),
+        Err(err) => {
+            tracing::warn!(
+                repo_root = %repo_root.display(),
+                error = %err,
+                "repository root cannot be canonicalized; \
+                 the symlink escape boundary cannot be inspected"
+            );
+            None
+        }
+    }
+}
+
 /// Verifies that `relative_path` does not resolve to a symlink outside
-/// `repo_root`.
+/// `repo_root`, for read-only inspection and for paths already in context.
 ///
 /// Every component of the relative path is inspected from the repository root
 /// downward with `symlink_metadata` (lstat), which detects a symlink even when
@@ -121,13 +141,49 @@ fn deepest_existing_ancestor(path: &Path) -> &Path {
 /// `read_link` and resolved to its deepest existing ancestor, so a link that
 /// dangles outside the repository is rejected instead of being silently
 /// traversed while missing parent directories are created.
+///
+/// Degradation contract: when `repo_root` cannot be canonicalized — it was
+/// removed, renamed, or made inaccessible, or a parent directory denies search
+/// permission — the boundary cannot be inspected at all. The read-side check
+/// then reports success and records the degradation through the semantic
+/// journal, because accepting a path here writes nothing and a blanket refusal
+/// would break read-only inspection and the synthetic repositories of unit
+/// tests. Every write admission calls [`verify_path_within_repo_for_write`]
+/// instead, which fails closed on the same failure.
 pub fn verify_path_within_repo(repo_root: &Path, relative_path: &str) -> Result<()> {
-    let Ok(canonical_root) = canonical_repo_root(repo_root) else {
-        // If repo_root cannot be canonicalized (e.g. does not exist in a synthetic test),
-        // we cannot inspect symlinks on disk.
-        return Ok(());
-    };
+    match boundary_canonical_root(repo_root) {
+        Some(canonical_root) => verify_path_components(repo_root, relative_path, &canonical_root),
+        None => Ok(()),
+    }
+}
 
+/// Verifies `relative_path` for write admission, failing closed when the
+/// repository root cannot be inspected.
+///
+/// The escape check itself is identical to [`verify_path_within_repo`], but a
+/// path that is about to be written is admitted only while the boundary is
+/// actually inspectable. A write the check should have refused cannot be undone
+/// afterwards, so an uncanonicalizable root is reported as an error instead of
+/// being accepted.
+pub fn verify_path_within_repo_for_write(repo_root: &Path, relative_path: &str) -> Result<()> {
+    match boundary_canonical_root(repo_root) {
+        Some(canonical_root) => verify_path_components(repo_root, relative_path, &canonical_root),
+        None => bail!(
+            "Path '{}' cannot be verified for writing: repository root '{}' \
+             cannot be canonicalized",
+            relative_path,
+            repo_root.display()
+        ),
+    }
+}
+
+/// Walks every component of `relative_path` and rejects a symlink that resolves
+/// outside `canonical_root`.
+fn verify_path_components(
+    repo_root: &Path,
+    relative_path: &str,
+    canonical_root: &Path,
+) -> Result<()> {
     let full_path = repo_root.join(relative_path);
 
     let Ok(relative) = full_path.strip_prefix(repo_root) else {
@@ -181,7 +237,7 @@ pub fn verify_path_within_repo(repo_root: &Path, relative_path: &str) -> Result<
                     err
                 )
             })?;
-        if !resolved.starts_with(&canonical_root) {
+        if !resolved.starts_with(canonical_root) {
             bail!(
                 "Path '{}' escapes repository root via symlink '{}' pointing to '{}'",
                 relative_path,
@@ -369,5 +425,46 @@ mod tests {
             assert!(verify_path_within_repo(&repo_root, "src/lib.rs").is_ok());
         }
         assert!(verify_path_within_repo(&repo_root, "../escape.rs").is_err());
+    }
+    /// A root that cannot be canonicalized must not silently disable the
+    /// boundary: the read-side check stays permissive for inspection but leaves
+    /// an observable record naming the root and the failure.
+    #[test]
+    fn canonicalization_failure_is_reported_for_read_only_verification() {
+        let dir = tempdir().unwrap();
+        let missing_root = dir.path().join("no-such-repository");
+
+        let (buffer, _guard) = crate::blocking::log_capture::install();
+        assert!(verify_path_within_repo(&missing_root, "src/lib.rs").is_ok());
+
+        let logged = crate::blocking::log_capture::contents(&buffer);
+        assert!(
+            logged.contains("the symlink escape boundary cannot be inspected"),
+            "the degradation must be observable: {logged}"
+        );
+        assert!(
+            logged.contains(&missing_root.display().to_string()),
+            "the record must name the repository root: {logged}"
+        );
+    }
+
+    /// The same failure fails closed for write admission: a path about to be
+    /// written is refused while the boundary cannot be inspected, and the
+    /// identical path is admitted once the root resolves again.
+    #[test]
+    fn write_admission_fails_closed_while_the_root_cannot_be_canonicalized() {
+        let dir = tempdir().unwrap();
+        let missing_root = dir.path().join("no-such-repository");
+
+        let error = verify_path_within_repo_for_write(&missing_root, "lib.rs")
+            .expect_err("a write path is refused while the boundary is uninspectable");
+        assert!(
+            error.to_string().contains("cannot be verified for writing"),
+            "unexpected error: {error}"
+        );
+
+        std::fs::create_dir_all(&missing_root).unwrap();
+        std::fs::write(missing_root.join("lib.rs"), "pub fn ok() {}").unwrap();
+        assert!(verify_path_within_repo_for_write(&missing_root, "lib.rs").is_ok());
     }
 }

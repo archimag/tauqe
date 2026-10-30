@@ -109,11 +109,11 @@ pub async fn handle_context_add_pattern(req: Request, state: &Arc<AppState>) -> 
             }
         };
 
-    // Read the configurable batch limit before taking the context write lock so
-    // the two locks are never held at the same time.
-    let max_batch = {
+    // Read the file token budget before taking the context write lock so the
+    // two locks are never held at the same time.
+    let files_token_budget = {
         let guard = state.config.lock().await;
-        guard.config.context.max_pattern_batch
+        guard.config.context.files_token_budget
     };
 
     let repo_root = state.repo_root().await;
@@ -123,20 +123,26 @@ pub async fn handle_context_add_pattern(req: Request, state: &Arc<AppState>) -> 
             .map(|result| result.unwrap_or_default())
             .unwrap_or_default();
 
-    // The batch reads metadata of up to `max_pattern_batch` files from disk, so
-    // the whole application runs inside the blocking closure.
+    // Matching the pattern against the repository listing and pricing every
+    // admitted file from its metadata touches the disk, so the whole
+    // application runs inside the blocking closure.
     let outcome = super::with_context_mutation(state, move |ctx| {
-        ctx.add_files_by_pattern(&params.pattern, params.access, &available_files, max_batch)
-            .map(|outcome| {
-                let state = ctx.get_state();
-                (
-                    outcome.added_items.len(),
-                    outcome.added_tokens,
-                    outcome.truncated,
-                    state,
-                )
-            })
-            .map_err(|err| err.to_string())
+        ctx.add_files_by_pattern(
+            &params.pattern,
+            params.access,
+            &available_files,
+            files_token_budget,
+        )
+        .map(|outcome| {
+            let state = ctx.get_state();
+            (
+                outcome.added_items.len(),
+                outcome.added_tokens,
+                outcome.truncated,
+                state,
+            )
+        })
+        .map_err(|err| err.to_string())
     })
     .await;
 

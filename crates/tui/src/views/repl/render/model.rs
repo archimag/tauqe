@@ -3,7 +3,7 @@ use crate::ui::format::format_tokens;
 use ratatui::style::{Style, Stylize};
 use ratatui::text::{Line, Span};
 
-use super::super::state::{EditOp, FileEditStatus, ReplView, StagedFileSpan, ToolchainState};
+use super::super::state::{EditOp, FileEditStatus, ReplView, ToolchainState};
 use super::indicator_style;
 use super::SPINNER_FRAMES;
 
@@ -105,7 +105,10 @@ pub fn compute_model_lines(model: &mut ReplView) -> Vec<Line<'static>> {
         model_lines.extend(model.reasoning.render_lines());
     }
 
-    let mut staged_spans: Vec<StagedFileSpan> = Vec::new();
+    // The proposed edits are a compact summary: every file renders exactly one
+    // row with its operation, path, patch count, and verification status. The
+    // patch bodies belong to the two-pane diff inspector, so a long diff never
+    // breaks the conversational flow of the canvas (c-4).
     if model.edits_active || !model.files.is_empty() {
         model_lines.push(Line::raw(""));
 
@@ -175,9 +178,7 @@ pub fn compute_model_lines(model: &mut ReplView) -> Vec<Line<'static>> {
         }
 
         for (idx, file) in model.files.iter().enumerate() {
-            let header_line = model_lines.len();
             let is_selected = idx == model.selected_file_index;
-            let fold_icon = if file.expanded { "▼ " } else { "▶ " };
             let cursor_prefix = if is_selected { "> " } else { "  " };
 
             let (status_icon, status_style) = match file.status {
@@ -224,7 +225,6 @@ pub fn compute_model_lines(model: &mut ReplView) -> Vec<Line<'static>> {
             let mut file_spans = vec![
                 Span::raw("  "),
                 Span::styled(cursor_prefix, engine.fg(palette.status_info)),
-                Span::styled(fold_icon, engine.fg(palette.text_muted)),
                 op_badge,
                 Span::styled(file.path.clone(), Style::default().bold()),
                 Span::raw(" "),
@@ -261,24 +261,8 @@ pub fn compute_model_lines(model: &mut ReplView) -> Vec<Line<'static>> {
                     ]));
                 }
             }
-
-            let body_start = model_lines.len();
-            let hunk_offsets = if file.expanded {
-                let rendered = model.diff_cache.render(file);
-                model_lines.extend(rendered.lines);
-                rendered.hunk_rows
-            } else {
-                Vec::new()
-            };
-            staged_spans.push(StagedFileSpan {
-                header_line,
-                body_start: (model_lines.len() > body_start).then_some(body_start),
-                body_end: model_lines.len(),
-                hunk_offsets,
-            });
         }
     }
-    model.staged_file_spans = staged_spans;
 
     // The usage line mirrors the daemon's single accumulator: the operation in
     // flight while a turn runs, otherwise the last completed one. An empty

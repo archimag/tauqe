@@ -12,7 +12,7 @@ use std::collections::BTreeMap;
 use std::path::Path;
 
 use serde_json::Value;
-use tauqe_protocol::{EditOutcome, LlmCommand, ModelResult, TurnPhase};
+use tauqe_protocol::{EditOutcome, LlmCommand, ModelResult, ProjectConfig, TurnPhase};
 use tokio::sync::watch;
 
 use crate::escape::{escape_xml_attr, escape_xml_text};
@@ -93,11 +93,16 @@ pub(super) async fn run_custom_tool_phase(
         })
         .await;
 
+    // The turn froze its effective project configuration on the first proposal
+    // round, so an invocation validates its declaration against that snapshot
+    // instead of re-reading `tauqe.toml` and re-running a task runner dump.
+    let project = ctx.project().await;
     let max_feedback_chars = ctx.options.max_feedback_chars;
     let mut blocks = Vec::new();
     for (name, args) in invocations {
         let answer = execute_invocation(
             ctx.repo_root,
+            &project,
             ctx.cancel_rx,
             &name,
             &args,
@@ -182,6 +187,7 @@ pub(super) async fn run_custom_tool_phase(
 /// the model reads is the project's decision rather than a compile-time ceiling.
 async fn execute_invocation(
     repo_root: &Path,
+    project: &ProjectConfig,
     cancel_rx: &watch::Receiver<bool>,
     name: &str,
     args: &Value,
@@ -197,7 +203,14 @@ async fn execute_invocation(
         }
     };
 
-    match crate::toolchain::run_project_command(repo_root, name, &arguments, Some(cancel_rx)).await
+    match crate::toolchain::run_project_command_with_config(
+        repo_root,
+        project,
+        name,
+        &arguments,
+        Some(cancel_rx),
+    )
+    .await
     {
         Ok(result) if result.is_cancelled => InvocationAnswer {
             block: String::new(),
@@ -380,13 +393,23 @@ mod tests {
         dir
     }
 
+    /// Resolves the project configuration the declaration of `dir` describes.
+    ///
+    /// These tests exercise command execution outside a bounded turn, so they
+    /// resolve the configuration the way a turn-free caller does.
+    async fn project_of(dir: &Path) -> tauqe_protocol::ProjectConfig {
+        crate::toolchain::effective_project_config(dir, None).await
+    }
+
     #[tokio::test]
     async fn executes_a_declared_argument_free_command() {
         let dir = repo("[project.commands.greet]\ncommand = \"printf\"\nargs = [\"hello\"]\n");
         let (_cancel_tx, cancel_rx) = watch::channel(false);
+        let project = project_of(dir.path()).await;
 
         let answer = execute_invocation(
             dir.path(),
+            &project,
             &cancel_rx,
             "greet",
             &Value::Null,
@@ -404,9 +427,11 @@ mod tests {
     async fn rejects_an_undeclared_command() {
         let dir = repo("[project.commands.greet]\ncommand = \"printf\"\nargs = [\"hello\"]\n");
         let (_cancel_tx, cancel_rx) = watch::channel(false);
+        let project = project_of(dir.path()).await;
 
         let answer = execute_invocation(
             dir.path(),
+            &project,
             &cancel_rx,
             "rm-rf",
             &Value::Null,
@@ -424,10 +449,12 @@ mod tests {
     async fn rejects_an_undeclared_parameter() {
         let dir = repo("[project.commands.greet]\ncommand = \"printf\"\nargs = [\"hello\"]\n");
         let (_cancel_tx, cancel_rx) = watch::channel(false);
+        let project = project_of(dir.path()).await;
 
         let args = serde_json::json!({ "path": "../escape" });
         let answer = execute_invocation(
             dir.path(),
+            &project,
             &cancel_rx,
             "greet",
             &args,
@@ -448,10 +475,12 @@ mod tests {
              parameters = [{ name = \"who\" }, { name = \"count\", default = \"1\" }]\n",
         );
         let (_cancel_tx, cancel_rx) = watch::channel(false);
+        let project = project_of(dir.path()).await;
 
         let args = serde_json::json!({ "who": "tauqe" });
         let answer = execute_invocation(
             dir.path(),
+            &project,
             &cancel_rx,
             "greet",
             &args,
@@ -471,9 +500,11 @@ mod tests {
              parameters = [{ name = \"who\" }]\n",
         );
         let (_cancel_tx, cancel_rx) = watch::channel(false);
+        let project = project_of(dir.path()).await;
 
         let missing = execute_invocation(
             dir.path(),
+            &project,
             &cancel_rx,
             "greet",
             &Value::Null,
@@ -486,6 +517,7 @@ mod tests {
         let args = serde_json::json!({ "who": ["a", "b"] });
         let structured = execute_invocation(
             dir.path(),
+            &project,
             &cancel_rx,
             "greet",
             &args,
@@ -500,9 +532,11 @@ mod tests {
     async fn rejects_a_broken_reference_chain() {
         let dir = repo("[project.commands.broken]\ncommand = \"@missing\"\n");
         let (_cancel_tx, cancel_rx) = watch::channel(false);
+        let project = project_of(dir.path()).await;
 
         let answer = execute_invocation(
             dir.path(),
+            &project,
             &cancel_rx,
             "broken",
             &Value::Null,

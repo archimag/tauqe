@@ -138,6 +138,7 @@ pub(super) async fn execute_plan_horizon_synthesis(
             alias: None,
             effort: architect_tier.effort,
             plan_context: None,
+            work_context: None,
             is_batch,
         })
         .ok(),

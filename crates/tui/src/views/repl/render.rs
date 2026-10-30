@@ -2,6 +2,9 @@ use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Style, Stylize};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Padding, Paragraph};
+use tauqe_protocol::model::{
+    ModelTurnPlanContext, ReviewWorkPhase, TurnWorkContext, TurnWorkItem, TurnWorkQueue,
+};
 use tauqe_protocol::{DiscussionFocus, DiscussionTarget};
 
 use crate::app::AppState;
@@ -11,7 +14,7 @@ use crate::theme::engine::{current_engine, ThemeEngine};
 use crate::ui::geometry;
 use crate::ui::{wrap_line, UiAction};
 
-use super::state::{ReplFocus, StickyDiffHeader};
+use super::state::ReplFocus;
 
 mod model;
 mod splash;
@@ -36,8 +39,11 @@ pub(crate) fn indicator_style(engine: &ThemeEngine, bg: RgbColor) -> Style {
         .bold()
 }
 
-/// Maximum number of batch steps rendered in the Develop Plan Stepper.
-const MAX_STEPPER_STEPS: usize = 8;
+/// Fixed capacity of the sliding step window drawn around the active member.
+const MAX_STEPPER_WINDOW: usize = 5;
+
+/// Response rows the work marker never takes, so model output stays readable.
+const MIN_MODEL_ROWS: u16 = 4;
 
 pub fn render_repl_view(
     frame: &mut ratatui::Frame,
@@ -64,22 +70,30 @@ pub fn render_repl_view(
         (model_area, None)
     };
 
-    if let Some(lines) = plan_stepper_lines(state) {
-        let body = u16::try_from(lines.len()).unwrap_or(u16::MAX);
-        let desired = body.saturating_add(2);
-        let max_allowed = model_area.height.saturating_sub(4);
-        let stepper_height = desired.min(max_allowed);
-
-        if stepper_height >= 3 {
-            let chunks = Layout::vertical([Constraint::Length(stepper_height), Constraint::Min(0)])
-                .split(model_area);
-            render_plan_stepper(frame, lines, chunks[0]);
-            render_model_pane(frame, state, chunks[1]);
-        } else {
-            render_model_pane(frame, state, model_area);
+    // The universal work marker states what the turn executes and never
+    // displaces a readable response pane: without room for the expanded card
+    // it keeps its single dense row (c-3, c-4).
+    let marker = work_marker(state);
+    let marker_layout = marker
+        .as_ref()
+        .map(|marker| marker.layout(model_area.height))
+        .unwrap_or(MarkerLayout::Hidden);
+    let (marker_area, model_area) = match marker.as_ref() {
+        Some(marker) if marker_layout != MarkerLayout::Hidden => {
+            let chunks = Layout::vertical([
+                Constraint::Length(marker.height(marker_layout)),
+                Constraint::Min(0),
+            ])
+            .split(model_area);
+            (Some(chunks[0]), chunks[1])
         }
-    } else {
-        render_model_pane(frame, state, model_area);
+        _ => (None, model_area),
+    };
+
+    render_model_pane(frame, state, model_area);
+
+    if let (Some(marker), Some(area)) = (marker.as_ref(), marker_area) {
+        marker.render(frame, area, marker_layout);
     }
 
     if let Some(banner_area) = banner_area {
@@ -229,147 +243,410 @@ fn render_discussion_focus_banner(frame: &mut ratatui::Frame, state: &AppState, 
     frame.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
-/// Builds the compact Plan Stepper header for the active plan execution context.
+/// Layout of the universal work marker above the response pane.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MarkerLayout {
+    /// No marker: the running turn executes no declared work.
+    Hidden,
+    /// The single dense breadcrumb row (c-3).
+    Compact,
+    /// The breadcrumb plus the sliding step window in a bordered card (c-4).
+    Expanded,
+}
+
+/// One member of the ordered work queue, resolved for rendering.
+struct WorkMember {
+    id: String,
+    title: String,
+}
+
+impl WorkMember {
+    /// Resolves a member the daemon declared as typed work.
+    fn from_item(item: &TurnWorkItem) -> Self {
+        Self {
+            id: item.id.clone(),
+            title: item.title.clone(),
+        }
+    }
+
+    /// Resolves a member a legacy producer declared by its identifier alone.
+    fn from_id(id: &str) -> Self {
+        Self {
+            id: id.to_string(),
+            title: String::new(),
+        }
+    }
+}
+
+/// Breadcrumb content of the universal work marker.
 ///
-/// Returns `None` for ad-hoc turns (no plan context) or when the referenced
-/// plan is not loaded, so Develop keeps its standard layout with zero overhead.
-fn plan_stepper_lines(state: &AppState) -> Option<Vec<Line<'static>>> {
-    let plan_ctx = state.model.plan_context.as_ref()?;
-    let plan = state
-        .plans_view
-        .plans
-        .iter()
-        .find(|plan| plan.id == plan_ctx.plan_id)?;
+/// Every field is resolved once from the declaration the daemon sent, so the
+/// compact row and the expanded window can never name two different tasks and
+/// the viewport never reconstructs the running work from the stored plans and
+/// reviews (c-1).
+struct WorkBreadcrumb {
+    /// Catalog key of the work-kind badge.
+    badge_key: &'static str,
+    /// Name of the entity that owns the work.
+    entity: String,
+    /// Ordered work members, empty when the work is not a batch.
+    members: Vec<WorkMember>,
+    /// Zero-based index of the member the turn executes.
+    active_index: Option<usize>,
+    /// Catalog key of a phase that executes no work member.
+    phase_key: Option<&'static str>,
+}
 
+impl WorkBreadcrumb {
+    /// Active member together with its one-based position and the queue length.
+    fn active(&self) -> Option<(&WorkMember, usize, usize)> {
+        let index = self.active_index?;
+        let member = self.members.get(index)?;
+        Some((member, index + 1, self.members.len()))
+    }
+}
+
+/// Fixed-capacity slice of the work queue rendered around the active member.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct StepWindow {
+    start: usize,
+    len: usize,
+}
+
+impl StepWindow {
+    /// One past the last member the window renders.
+    fn end(self) -> usize {
+        self.start + self.len
+    }
+}
+
+/// Positions the sliding window so the active member always stays visible.
+///
+/// The window keeps a fixed capacity and centers on the active member, clamped
+/// to the queue so it never runs past either end. Members outside the window
+/// are reported by count instead of being rendered, which keeps a plan or a
+/// group plan of any length inside a bounded marker (c-4). A queue of at most
+/// one member needs no window at all.
+fn step_window(total: usize, active: usize, capacity: usize) -> Option<StepWindow> {
+    if capacity == 0 || total <= 1 || active >= total {
+        return None;
+    }
+    let len = capacity.min(total);
+    let start = active.saturating_sub(len / 2).min(total - len);
+    Some(StepWindow { start, len })
+}
+
+/// Universal work marker rendered above the response pane.
+///
+/// The marker names the work the running turn declares — its kind, the owning
+/// entity, the position inside the batch queue, the active member, and the
+/// phase — from the typed work contract, so the Develop viewport never derives
+/// the task from the stored plans and reviews (c-1). It occupies one dense row
+/// by default (c-3) and adds the sliding window of the queued members once the
+/// developer expands it (c-4).
+struct WorkMarker {
+    /// The always-visible single-row breadcrumb.
+    header: Line<'static>,
+    /// Member rows of the sliding window, empty while the marker is compact.
+    window: Vec<Line<'static>>,
+}
+
+impl WorkMarker {
+    /// Chooses how much of the marker fits above a readable response pane.
+    ///
+    /// The breadcrumb is never dropped for lack of space: when the expanded
+    /// card cannot fit, the marker keeps its single dense row instead of
+    /// displacing the model output (c-3).
+    fn layout(&self, available: u16) -> MarkerLayout {
+        if available <= 1 {
+            return MarkerLayout::Hidden;
+        }
+        if self.window.is_empty() {
+            return MarkerLayout::Compact;
+        }
+        let rows = u16::try_from(self.window.len()).unwrap_or(u16::MAX);
+        if rows.saturating_add(3) <= available.saturating_sub(MIN_MODEL_ROWS) {
+            MarkerLayout::Expanded
+        } else {
+            MarkerLayout::Compact
+        }
+    }
+
+    /// Vertical rows the marker occupies in `layout`.
+    fn height(&self, layout: MarkerLayout) -> u16 {
+        let rows = u16::try_from(self.window.len()).unwrap_or(u16::MAX);
+        match layout {
+            MarkerLayout::Hidden => 0,
+            MarkerLayout::Compact => 1,
+            MarkerLayout::Expanded => rows.saturating_add(3),
+        }
+    }
+
+    /// Draws the marker into the rows carved for it.
+    fn render(&self, frame: &mut ratatui::Frame, area: Rect, layout: MarkerLayout) {
+        if layout == MarkerLayout::Hidden {
+            return;
+        }
+        let engine = current_engine();
+        let mut block = Block::default().padding(Padding::horizontal(1));
+        let mut lines = Vec::with_capacity(self.window.len() + 1);
+        lines.push(self.header.clone());
+        if layout == MarkerLayout::Expanded {
+            block = block
+                .borders(Borders::ALL)
+                .border_style(engine.fg(engine.palette().border));
+            lines.extend(self.window.iter().cloned());
+        }
+        frame.render_widget(Paragraph::new(lines).block(block), area);
+    }
+}
+
+/// Builds the universal work marker from the declared work contract.
+///
+/// A turn that executes no declared work yields `None`, so an interactive
+/// answer keeps the whole response area and Develop pays nothing (c-1, c-3).
+fn work_marker(state: &AppState) -> Option<WorkMarker> {
+    let breadcrumb = work_breadcrumb(state)?;
     let engine = current_engine();
-    let palette = engine.palette();
-
-    let mut lines: Vec<Line<'static>> = Vec::new();
-    lines.push(Line::from(vec![
-        Span::styled(
-            format!("{} ", active_t("repl.stepper_plan")),
-            engine.fg(palette.text_muted).bold(),
-        ),
-        Span::styled(plan.title.clone(), engine.fg(palette.status_info).bold()),
-    ]));
-
-    let step_ids: Vec<&str> = if plan_ctx.batch_step_ids.is_empty() {
-        vec![plan_ctx.step_id.as_str()]
+    let spinner = state
+        .model
+        .is_busy()
+        .then(|| SPINNER_FRAMES[state.model.spinner_frame % SPINNER_FRAMES.len()]);
+    let window = if state.model.work_marker_expanded {
+        step_window_lines(&breadcrumb, spinner, &engine)
     } else {
-        plan_ctx.batch_step_ids.iter().map(String::as_str).collect()
+        Vec::new()
+    };
+    Some(WorkMarker {
+        header: breadcrumb_header(&breadcrumb, spinner, &engine),
+        window,
+    })
+}
+
+/// Resolves the marker content from the work the turn declares.
+///
+/// The typed [`TurnWorkContext`] is the primary source. A producer that
+/// predates the contract declares only the plan coordinates of the turn, so
+/// those coordinates are rendered as they are instead of inferring a work kind
+/// the client was never told (c-1).
+fn work_breadcrumb(state: &AppState) -> Option<WorkBreadcrumb> {
+    if let Some(context) = state.model.work_context.as_ref() {
+        return work_context_breadcrumb(context);
+    }
+    let context = state.model.plan_context.as_ref()?;
+    Some(plan_context_breadcrumb(context))
+}
+
+/// Resolves the breadcrumb of a declared work context.
+fn work_context_breadcrumb(context: &TurnWorkContext) -> Option<WorkBreadcrumb> {
+    let breadcrumb = match context {
+        TurnWorkContext::Interactive => return None,
+        TurnWorkContext::PlanStep {
+            plan_title, queue, ..
+        } => queue_breadcrumb("repl.work.badge_plan", plan_title, queue, None),
+        TurnWorkContext::ReviewGroupStep {
+            review_title,
+            group_title,
+            queue,
+            ..
+        } => {
+            let entity = format!("{review_title} \u{203a} {group_title}");
+            queue_breadcrumb("repl.work.badge_review_group", &entity, queue, None)
+        }
+        TurnWorkContext::ReviewStep {
+            review_title,
+            queue,
+            ..
+        } => queue_breadcrumb("repl.work.badge_review", review_title, queue, None),
+        TurnWorkContext::ReviewPhase {
+            review_title,
+            phase,
+            queue,
+            ..
+        } => {
+            let phase = review_phase_key(*phase);
+            queue_breadcrumb("repl.work.badge_review", review_title, queue, Some(phase))
+        }
+    };
+    Some(breadcrumb)
+}
+
+/// Builds the breadcrumb of one ordered work queue.
+fn queue_breadcrumb(
+    badge_key: &'static str,
+    entity: &str,
+    queue: &TurnWorkQueue,
+    phase: Option<&'static str>,
+) -> WorkBreadcrumb {
+    WorkBreadcrumb {
+        badge_key,
+        entity: entity.to_string(),
+        members: queue.items.iter().map(WorkMember::from_item).collect(),
+        active_index: queue.active().map(|_| queue.active_index),
+        phase_key: phase,
+    }
+}
+
+/// Builds the breadcrumb of a producer that declares plan coordinates alone.
+fn plan_context_breadcrumb(context: &ModelTurnPlanContext) -> WorkBreadcrumb {
+    let members: Vec<WorkMember> = if context.batch_step_ids.is_empty() {
+        vec![WorkMember::from_id(&context.step_id)]
+    } else {
+        context
+            .batch_step_ids
+            .iter()
+            .map(|id| WorkMember::from_id(id.as_str()))
+            .collect()
+    };
+    let active_index = members
+        .iter()
+        .position(|member| member.id == context.step_id);
+    WorkBreadcrumb {
+        badge_key: "repl.work.badge_plan",
+        entity: context.plan_id.clone(),
+        members,
+        active_index,
+        phase_key: None,
+    }
+}
+
+/// Catalog key of the phase a review turn executes without a work member.
+fn review_phase_key(phase: ReviewWorkPhase) -> &'static str {
+    match phase {
+        ReviewWorkPhase::Audit => "repl.work.phase_audit",
+        ReviewWorkPhase::Decomposition => "repl.work.phase_decomposition",
+        ReviewWorkPhase::PostAnalysis => "repl.work.phase_post_analysis",
+    }
+}
+
+/// Builds the single-row breadcrumb: badge, entity, queue position, the active
+/// member, and the phase, in that order (c-3).
+fn breadcrumb_header(
+    breadcrumb: &WorkBreadcrumb,
+    spinner: Option<&'static str>,
+    engine: &ThemeEngine,
+) -> Line<'static> {
+    let palette = engine.palette();
+    let mut spans = vec![
+        Span::styled(
+            format!(" {} ", active_t(breadcrumb.badge_key)),
+            indicator_style(engine, palette.status_info),
+        ),
+        Span::raw(" "),
+        Span::styled(
+            breadcrumb.entity.clone(),
+            engine.fg(palette.text_primary).bold(),
+        ),
+    ];
+
+    if let Some((active, position, total)) = breadcrumb.active() {
+        spans.push(Span::raw(" "));
+        spans.push(Span::styled(
+            format!("[{position}/{total}]"),
+            engine.fg(palette.status_info),
+        ));
+        spans.push(Span::raw(" "));
+        spans.push(Span::styled(
+            format!("#{}", active.id),
+            engine.fg(palette.text_muted),
+        ));
+        if !active.title.is_empty() {
+            spans.push(Span::raw(" "));
+            spans.push(Span::styled(
+                active.title.clone(),
+                engine.fg(palette.text_secondary),
+            ));
+        }
+    }
+
+    if let Some(phase_key) = breadcrumb.phase_key {
+        spans.push(Span::raw(" "));
+        spans.push(Span::styled(
+            active_t(phase_key),
+            engine.fg(palette.status_warning).bold(),
+        ));
+    }
+
+    if let Some(spinner) = spinner {
+        spans.push(Span::raw(" "));
+        spans.push(Span::styled(spinner, engine.fg(palette.status_warning)));
+    }
+
+    Line::from(spans)
+}
+
+/// Renders the sliding step window around the active work member (c-4).
+fn step_window_lines(
+    breadcrumb: &WorkBreadcrumb,
+    spinner: Option<&'static str>,
+    engine: &ThemeEngine,
+) -> Vec<Line<'static>> {
+    let Some((_, position, total)) = breadcrumb.active() else {
+        return Vec::new();
+    };
+    let active_index = position - 1;
+    let Some(window) = step_window(total, active_index, MAX_STEPPER_WINDOW) else {
+        return Vec::new();
     };
 
-    for id in step_ids.into_iter().take(MAX_STEPPER_STEPS) {
-        let Some(item) = plan.find_item(id) else {
+    let palette = engine.palette();
+    let mut rows = Vec::with_capacity(window.len + 2);
+
+    if window.start > 0 {
+        rows.push(hidden_members_row(
+            engine,
+            "repl.work.hidden_before",
+            window.start,
+        ));
+    }
+
+    for index in window.start..window.end() {
+        let Some(member) = breadcrumb.members.get(index) else {
             continue;
         };
-        let is_active = id == plan_ctx.step_id;
-
-        let (badge, badge_style) = if is_active {
-            (
-                SPINNER_FRAMES[state.model.spinner_frame % SPINNER_FRAMES.len()],
-                engine.fg(palette.status_warning).bold(),
-            )
-        } else {
-            plan_status_badge(item.status)
+        let is_active = index == active_index;
+        let prefix = match (is_active, spinner) {
+            (true, Some(spinner)) => format!(" {spinner} "),
+            _ => "   ".to_string(),
         };
-
         let title_style = if is_active {
             engine.fg(palette.text_primary).bold()
         } else {
             engine.fg(palette.text_secondary)
         };
-
-        lines.push(Line::from(vec![
-            Span::styled(
-                if is_active { "> " } else { "  " },
-                engine.fg(palette.status_info),
-            ),
-            Span::styled(badge.to_string(), badge_style),
-            Span::raw(" "),
-            Span::styled(format!("#{} ", item.id), engine.fg(palette.text_muted)),
-            Span::styled(item.title.clone(), title_style),
-        ]));
-    }
-
-    Some(lines)
-}
-
-fn plan_status_badge(status: tauqe_protocol::PlanItemStatus) -> (&'static str, Style) {
-    let engine = current_engine();
-    let palette = engine.palette();
-    match status {
-        tauqe_protocol::PlanItemStatus::Done => ("✓", engine.fg(palette.status_success).bold()),
-        tauqe_protocol::PlanItemStatus::InProgress => {
-            ("▶", engine.fg(palette.status_warning).bold())
-        }
-        tauqe_protocol::PlanItemStatus::Todo => ("○", engine.fg(palette.text_muted)),
-        tauqe_protocol::PlanItemStatus::Blocked => ("!", engine.fg(palette.status_error).bold()),
-        tauqe_protocol::PlanItemStatus::Cancelled => ("✗", engine.fg(palette.status_error)),
-        tauqe_protocol::PlanItemStatus::Discussion => {
-            ("?", engine.fg(palette.button_active_bg).bold())
-        }
-    }
-}
-
-fn render_plan_stepper(frame: &mut ratatui::Frame, lines: Vec<Line<'static>>, area: Rect) {
-    let engine = current_engine();
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_style(engine.fg(engine.palette().border))
-        .padding(Padding::horizontal(1));
-    let paragraph = Paragraph::new(lines).block(block);
-    frame.render_widget(paragraph, area);
-}
-
-/// Renders the floating file anchor over the first visible Viewport row.
-///
-/// The band is filled with `palette.surface`, so the diff rows underneath never
-/// bleed through the label, and it carries the operation badge, the path, the
-/// active hunk, and the position of the file inside the staged set. It is a
-/// pure indicator: it registers no clickable region and never intercepts input
-/// (c-1, Conventions.md §1).
-fn render_sticky_header(frame: &mut ratatui::Frame, header: &StickyDiffHeader<'_>, inner: Rect) {
-    if inner.width == 0 || inner.height == 0 {
-        return;
-    }
-
-    let engine = current_engine();
-    let palette = engine.palette();
-    let band = Rect::new(inner.x, inner.y, inner.width, 1);
-
-    let mut spans = vec![
-        file_op_badge(&engine, header.op),
-        Span::raw(" "),
-        Span::styled(
-            header.path.to_string(),
-            engine.fg(palette.text_primary).bold(),
-        ),
-    ];
-
-    if let Some(hunk) = header.hunk {
-        spans.push(Span::raw(" "));
+        let mut spans = vec![Span::styled(prefix, engine.fg(palette.status_info).bold())];
         spans.push(Span::styled(
-            counter_label("repl.sticky_hunk", hunk, header.hunk_count),
-            engine.fg(palette.status_info),
+            format!("#{}", member.id),
+            engine.fg(palette.text_muted),
+        ));
+        if !member.title.is_empty() {
+            spans.push(Span::raw(" "));
+            spans.push(Span::styled(member.title.clone(), title_style));
+        }
+        rows.push(Line::from(spans));
+    }
+
+    let hidden_after = total.saturating_sub(window.end());
+    if hidden_after > 0 {
+        rows.push(hidden_members_row(
+            engine,
+            "repl.work.hidden_after",
+            hidden_after,
         ));
     }
 
-    spans.push(Span::styled(" • ", engine.fg(palette.text_muted)));
-    spans.push(Span::styled(
-        counter_label("repl.sticky_file", header.file, header.file_count),
-        engine.fg(palette.text_muted),
-    ));
-
-    let band_block = Block::default().style(engine.bg(palette.surface));
-    frame.render_widget(Paragraph::new(Line::from(spans)).block(band_block), band);
+    rows
 }
 
-/// Fills the two placeholders of a `first/second` catalog template.
-fn counter_label(key: &str, first: usize, second: usize) -> String {
-    active_t(key)
-        .replacen("{}", &first.to_string(), 1)
-        .replacen("{}", &second.to_string(), 1)
+/// Renders one hidden-members indicator row of the sliding window.
+fn hidden_members_row(engine: &ThemeEngine, key: &str, count: usize) -> Line<'static> {
+    Line::from(vec![
+        Span::raw("   "),
+        Span::styled(
+            active_t(key).replacen("{}", &count.to_string(), 1),
+            engine.fg(engine.palette().text_muted),
+        ),
+    ])
 }
 
 fn render_model_pane(frame: &mut ratatui::Frame, state: &mut AppState, area: Rect) {
@@ -445,13 +722,6 @@ fn render_model_pane(frame: &mut ratatui::Frame, state: &mut AppState, area: Rec
     // row, because a later registration wins over the surface it covers. The
     // viewport therefore owns its Markdown geometry and the pointer dispatcher
     // never recomputes a column or a scroll offset (c-1, c-2).
-    // The overlay is resolved from the geometry that was just laid out, so it
-    // names the file whose own header the developer can no longer see and can
-    // never disagree with the rows underneath it (c-1).
-    let sticky = state
-        .model
-        .sticky_diff_header(&raw_to_visual_start, &raw_to_visual_end);
-
     let mut block_regions: Vec<(Rect, UiAction)> = Vec::new();
     for block in &state.model.code_blocks {
         if let Some(rect) = geometry::code_block_body_rect(
@@ -481,11 +751,6 @@ fn render_model_pane(frame: &mut ratatui::Frame, state: &mut AppState, area: Rec
         }
     }
     for (rect, action) in block_regions {
-        // The band covers the first visible row, so a control drawn there is
-        // not reachable until the diff scrolls it out from under the overlay.
-        if sticky.is_some() && rect.y == inner.y {
-            continue;
-        }
         state.hit_regions.register(rect, action);
     }
 
@@ -499,12 +764,6 @@ fn render_model_pane(frame: &mut ratatui::Frame, state: &mut AppState, area: Rec
 
     let model_paragraph = Paragraph::new(visible_lines).block(model_block);
     frame.render_widget(model_paragraph, area);
-
-    // The overlay is a pure indicator: it fills the first visible row and never
-    // intercepts input, so the Viewport focus model stays untouched (c-1).
-    if let Some(header) = sticky {
-        render_sticky_header(frame, &header, inner);
-    }
 }
 
 /// Computes the prompt editor scroll offset so the cursor stays visible,
@@ -584,7 +843,7 @@ fn render_prompt_input(
 
 #[cfg(test)]
 mod tests {
-    use super::ensure_visible_input_scroll;
+    use super::*;
 
     #[test]
     fn moving_within_the_window_keeps_the_scroll_stable() {
@@ -641,5 +900,93 @@ mod tests {
         assert_eq!(observed[1], total - visible);
         assert!(observed.iter().all(|&s| s <= total - visible));
         assert_eq!(*observed.last().unwrap(), 0);
+    }
+    #[test]
+    fn the_step_window_centers_on_the_active_member_and_clamps_at_both_ends() {
+        assert_eq!(step_window(10, 5, 5), Some(StepWindow { start: 3, len: 5 }));
+        // The window clamps to both ends of the queue instead of running past
+        // them.
+        assert_eq!(step_window(10, 0, 5), Some(StepWindow { start: 0, len: 5 }));
+        assert_eq!(step_window(10, 9, 5), Some(StepWindow { start: 5, len: 5 }));
+        // A queue shorter than the capacity is rendered whole.
+        assert_eq!(step_window(3, 1, 5), Some(StepWindow { start: 0, len: 3 }));
+        // A single member, an out-of-range index, and an empty capacity need
+        // no window at all.
+        assert_eq!(step_window(1, 0, 5), None);
+        assert_eq!(step_window(10, 10, 5), None);
+        assert_eq!(step_window(10, 5, 0), None);
+    }
+
+    #[test]
+    fn the_active_member_always_lands_inside_the_window() {
+        for total in 1..=24usize {
+            for active in 0..total {
+                let Some(window) = step_window(total, active, MAX_STEPPER_WINDOW) else {
+                    assert_eq!(total, 1, "only a one-member queue needs no window");
+                    continue;
+                };
+                assert!(window.len <= MAX_STEPPER_WINDOW);
+                assert!(
+                    window.start <= active,
+                    "the window never starts below the active member"
+                );
+                assert!(active < window.end(), "the active member stays visible");
+                assert!(
+                    window.end() <= total,
+                    "the window never runs past the queue"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_expanded_card_degrades_to_the_compact_row_on_a_short_pane() {
+        let marker = WorkMarker {
+            header: Line::from("breadcrumb"),
+            window: vec![Line::from("member"); 5],
+        };
+        // Five member rows plus the breadcrumb and the two borders need eight
+        // rows while the response pane keeps its own minimum.
+        assert_eq!(marker.layout(12), MarkerLayout::Expanded);
+        assert_eq!(marker.height(MarkerLayout::Expanded), 8);
+        assert_eq!(marker.layout(11), MarkerLayout::Compact);
+        assert_eq!(marker.height(MarkerLayout::Compact), 1);
+        assert_eq!(marker.layout(1), MarkerLayout::Hidden);
+
+        let collapsed = WorkMarker {
+            header: Line::from("breadcrumb"),
+            window: Vec::new(),
+        };
+        assert_eq!(collapsed.layout(2), MarkerLayout::Compact);
+    }
+
+    #[test]
+    fn a_legacy_plan_producer_still_names_its_declared_step() {
+        let context = ModelTurnPlanContext {
+            plan_id: "plan-1".to_string(),
+            step_id: "2".to_string(),
+            batch_step_ids: vec!["1".to_string(), "2".to_string(), "3".to_string()],
+        };
+        let breadcrumb = plan_context_breadcrumb(&context);
+        assert_eq!(breadcrumb.badge_key, "repl.work.badge_plan");
+        assert_eq!(breadcrumb.entity, "plan-1");
+        let (member, position, total) = breadcrumb.active().expect("the declared step is active");
+        assert_eq!(member.id, "2");
+        assert_eq!((position, total), (2, 3));
+
+        // A turn outside a batch declares a single coordinate and needs no
+        // window.
+        let single = ModelTurnPlanContext {
+            batch_step_ids: Vec::new(),
+            ..context
+        };
+        let breadcrumb = plan_context_breadcrumb(&single);
+        assert_eq!(
+            breadcrumb
+                .active()
+                .map(|(_, position, total)| (position, total)),
+            Some((1, 1))
+        );
+        assert_eq!(step_window(1, 0, MAX_STEPPER_WINDOW), None);
     }
 }

@@ -272,15 +272,6 @@ pub(super) fn report_item_failure(state: &Arc<AppState>, operation_id: &str, mes
 /// that cloned the manager and overwrote the shared state afterwards.
 pub(super) use crate::handlers::with_context_mutation;
 
-/// Re-exported under the review-side name so existing call sites stay stable
-/// while the loading logic is defined once in `crate::handlers::common`.
-///
-/// Loads the target finding's files into the read-only auto context layer before
-/// the architect begins decomposition, guaranteeing baseline visibility of the
-/// affected code on the first generation round. Declared target files are never
-/// capped by the files token budget.
-pub(super) use crate::handlers::common::preload_readonly_files as preload_refine_item_files;
-
 /// Loads all files referenced by a finding into editable context before the turn
 /// starts. Declared finding files are never capped by the files token budget.
 pub(super) async fn preload_item_files(state: &Arc<AppState>, repo_root: &Path, files: &[String]) {
@@ -419,7 +410,6 @@ mod tests {
                 title: "Finding".to_string(),
                 uuid: None,
                 group: None,
-                subplan_last_replanned_step: None,
                 model: None,
                 issue_type: tauqe_protocol::review::IssueType::Quality,
                 severity: tauqe_protocol::review::ReviewSeverity::Suggestion,
@@ -427,8 +417,6 @@ mod tests {
                 recommendations: vec![],
                 files: vec![],
                 readonly_files: vec![],
-                subplan: Vec::new(),
-                subplan_architect: None,
                 resolution_notes: None,
                 body: String::new(),
             }],

@@ -61,6 +61,13 @@ pub struct ContextViewState {
     pub selected_candidate_index: usize,
     pub confirm_clear_auto: bool,
     pub confirm_clear_user: bool,
+    /// Path the developer asked to remove from the context layers and whose
+    /// removal awaits the shared confirmation card. While it is set,
+    /// `AppState::active_modal` reports `ActiveModal::RemoveContextFile`, so the
+    /// `context/remove` request leaves the client only after the developer
+    /// accepts the card and never on the bare keystroke
+    /// (Conventions §4.3, §5.4).
+    pub pending_remove: Option<String>,
 }
 
 impl Default for ContextViewState {
@@ -81,6 +88,7 @@ impl Default for ContextViewState {
             selected_candidate_index: 0,
             confirm_clear_auto: false,
             confirm_clear_user: false,
+            pending_remove: None,
         }
     }
 }

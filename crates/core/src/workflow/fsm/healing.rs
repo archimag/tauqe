@@ -23,12 +23,30 @@ use crate::providers::StreamEvent;
 use crate::workflow::discovery::execute_discovery_commands;
 use crate::workflow::verification::{
     build_verification_missing_edits_prompt, build_verification_retry_prompt, extract_error_paths,
-    run_workflow_verification, VerificationOutcome,
+    run_workflow_verification_with_config, VerificationOutcome,
 };
 
 use super::guard::{finish_turn, TransactionRollbackGuard};
 use super::proposal::{extract_success_summary, log_fsm_phase, merge_text};
-use super::{propose, FsmTurnOutcome, PhaseContext};
+use super::{cancel_requested, propose, FsmTurnOutcome, PhaseContext};
+
+/// Finalizes a step interrupted at a phase boundary.
+///
+/// The cancel signal is authoritative on every boundary that would produce more
+/// work, so the open transaction is rolled back, the working tree returns to its
+/// pre-step state, the context change is published, and the turn reports
+/// cancellation instead of a verified result.
+async fn finish_cancelled_step(
+    guard: &mut TransactionRollbackGuard<'_>,
+    stream_tx: &mpsc::Sender<StreamEvent>,
+    accumulated_text: String,
+) -> FsmTurnOutcome {
+    guard.rollback().await;
+    let ctx_state = guard.context_manager.get_state();
+    let _ = stream_tx.send(StreamEvent::ContextChanged(ctx_state)).await;
+    let _ = stream_tx.send(StreamEvent::Done).await;
+    FsmTurnOutcome::cancelled(accumulated_text)
+}
 
 /// Runs the verification and healing phases and finalizes the turn.
 ///
@@ -52,12 +70,25 @@ pub(super) async fn run_apply_and_verify_phase(
     };
 
     let repo_root = ctx.repo_root;
+    // The turn freezes its effective project configuration on the first proposal
+    // round, so the staged application, the declared post-hook, and every
+    // verification round read one snapshot instead of re-running a task runner
+    // dump.
+    let project = ctx.project().await;
     let mut guard = TransactionRollbackGuard::new(
         ctx.policy,
         ctx.context_manager,
         repo_root,
+        &project,
         ctx.cancel_rx.clone(),
     );
+
+    // Phase boundary: a cancel observed before the change set reaches the disk
+    // ends the step here, so no application, verification, or commit follows.
+    if cancel_requested(ctx.cancel_rx) {
+        let accumulated = std::mem::take(&mut ctx.accumulated_text);
+        return Ok(finish_cancelled_step(&mut guard, ctx.stream_tx, accumulated).await);
+    }
 
     let mut total_changed_files = match guard.apply_temporary(&proposal).await {
         Ok(files) => {
@@ -107,6 +138,13 @@ pub(super) async fn run_apply_and_verify_phase(
     // The verification phase owns the open transaction until it finalizes or
     // rolls the working tree back, so it runs as one scoped stage.
     {
+        // Phase boundary: verification is the most expensive phase of a step,
+        // so a cancel observed while the change set was applied ends the step
+        // before the toolchain starts.
+        if cancel_requested(ctx.cancel_rx) {
+            let accumulated = std::mem::take(&mut ctx.accumulated_text);
+            return Ok(finish_cancelled_step(&mut guard, ctx.stream_tx, accumulated).await);
+        }
         log_fsm_phase(
             ctx.workflow_name,
             ctx.model,
@@ -131,8 +169,9 @@ pub(super) async fn run_apply_and_verify_phase(
         // checks from it, so it is assembled before the first round runs.
         let mut verify_files = total_changed_files.clone();
         merge_changed_files(&mut verify_files, guard.worktree_changes());
-        let mut verify_outcome = run_workflow_verification(
+        let mut verify_outcome = run_workflow_verification_with_config(
             ctx.repo_root,
+            &project,
             &verify_files,
             &verify_request,
             ctx.stream_tx,
@@ -181,6 +220,13 @@ pub(super) async fn run_apply_and_verify_phase(
         let mut healing_protocol_errors = Vec::new();
         while !verify_outcome.success && healing_attempt < ctx.options.max_retries {
             healing_attempt += 1;
+            // Phase boundary: a repair round is a whole model turn, so the
+            // cancel signal is honoured before it is requested instead of only
+            // while its provider stream runs.
+            if cancel_requested(ctx.cancel_rx) {
+                let accumulated = std::mem::take(&mut ctx.accumulated_text);
+                return Ok(finish_cancelled_step(&mut guard, ctx.stream_tx, accumulated).await);
+            }
             log_fsm_phase(
                 ctx.workflow_name,
                 ctx.model,
@@ -437,8 +483,9 @@ pub(super) async fn run_apply_and_verify_phase(
                     // repaired files alone.
                     verify_files = total_changed_files.clone();
                     merge_changed_files(&mut verify_files, guard.worktree_changes());
-                    verify_outcome = run_workflow_verification(
+                    verify_outcome = run_workflow_verification_with_config(
                         ctx.repo_root,
+                        &project,
                         &verify_files,
                         &verify_request,
                         ctx.stream_tx,
@@ -504,6 +551,13 @@ pub(super) async fn run_apply_and_verify_phase(
         }
 
         if verify_outcome.success {
+            // Phase boundary: the verified change set is about to be committed,
+            // so a cancel observed here rolls the transaction back instead of
+            // recording a result the developer already aborted.
+            if cancel_requested(ctx.cancel_rx) {
+                let accumulated = std::mem::take(&mut ctx.accumulated_text);
+                return Ok(finish_cancelled_step(&mut guard, ctx.stream_tx, accumulated).await);
+            }
             if let Some(text) = extract_success_summary(ctx.state.terminal_outcome.as_ref()) {
                 summary = text;
             }

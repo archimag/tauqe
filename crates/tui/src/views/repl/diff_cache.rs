@@ -7,10 +7,10 @@ use crate::theme::engine::current_engine;
 
 use super::state::{EditOp, StreamingFileEdit};
 
-/// Cache of rendered diff lines for expanded file edits.
+/// Cache of rendered diff bodies for the staged file edits.
 ///
-/// Computing a `similar::TextDiff` is comparatively expensive and was
-/// previously repeated for every expanded file on every frame and navigation
+/// Computing a `similar::TextDiff` is comparatively expensive and would
+/// otherwise be repeated for the audited file on every frame and navigation
 /// key. Entries are keyed by file path and invalidated by a cheap fingerprint
 /// of the file's hunks, so a changed hunk always re-renders.
 #[derive(Default)]
@@ -35,12 +35,6 @@ pub(crate) struct RenderedDiff {
 }
 
 impl DiffRenderCache {
-    /// Returns the rendered diff body for `file`, recomputing it only when the
-    /// cached fingerprint no longer matches the file's hunks.
-    pub(super) fn lines_for(&mut self, file: &StreamingFileEdit) -> Vec<Line<'static>> {
-        self.render(file).lines
-    }
-
     /// Renders the diff body together with the row offsets of its hunk headers.
     ///
     /// The Viewport needs those offsets to name the hunk the top edge sits
@@ -191,7 +185,6 @@ mod invalidate_tests {
                 old_text: "let a = 1;".to_string(),
                 new_text: "let a = 2;".to_string(),
             }],
-            expanded: true,
             retry_info: None,
         }
     }
@@ -202,8 +195,8 @@ mod invalidate_tests {
         let kept = file_with_hunk("crates/tui/src/main.rs");
         let retried = file_with_hunk("crates/tui/src/app.rs");
 
-        assert!(!cache.lines_for(&kept).is_empty());
-        assert!(!cache.lines_for(&retried).is_empty());
+        assert!(!cache.render(&kept).lines.is_empty());
+        assert!(!cache.render(&retried).lines.is_empty());
         assert_eq!(cache.entries.len(), 2);
 
         cache.invalidate("crates/tui/src/app.rs");

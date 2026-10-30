@@ -98,7 +98,24 @@ pub async fn effective_project_config(
     project
 }
 
-/// Runs the declared verification lifecycle, stopping at the first failure.
+/// Resolves the effective project configuration and runs the declared
+/// verification lifecycle, stopping at the first failure.
+///
+/// This is the entry point for callers outside a bounded turn. A turn holds the
+/// configuration it froze on its first proposal round and calls
+/// [`run_verification_pipeline_with_config`], so a declared task runner's dump
+/// runs once for the whole turn instead of once per verification round.
+pub async fn run_verification_pipeline(
+    repo_root: &Path,
+    changed_files: &[String],
+    cancel_rx: Option<&watch::Receiver<bool>>,
+) -> (bool, Vec<ToolchainCheckResult>) {
+    let project = effective_project_config(repo_root, cancel_rx).await;
+    run_verification_pipeline_with_config(repo_root, &project, changed_files, cancel_rx).await
+}
+
+/// Runs the declared verification lifecycle under an already resolved project
+/// configuration, stopping at the first failure.
 ///
 /// The pipeline opens with phase zero: `tauqe.toml` itself is validated on
 /// disk, because it is the declaration every later step obeys. A change set or
@@ -119,8 +136,13 @@ pub async fn effective_project_config(
 /// while the transaction is open the working copy also holds post-hook artifacts
 /// and the developer's uncommitted work. An empty change set sends no input at
 /// all, so the command conservatively runs its full suite.
-pub async fn run_verification_pipeline(
+///
+/// `project` is the configuration a bounded turn froze on its first proposal
+/// round, so no verification round re-reads `tauqe.toml` or runs a declared task
+/// runner's dump again.
+pub async fn run_verification_pipeline_with_config(
     repo_root: &Path,
+    project: &ProjectConfig,
     changed_files: &[String],
     cancel_rx: Option<&watch::Receiver<bool>>,
 ) -> (bool, Vec<ToolchainCheckResult>) {
@@ -129,8 +151,7 @@ pub async fn run_verification_pipeline(
         return (false, vec![config_check]);
     }
 
-    let project = effective_project_config(repo_root, cancel_rx).await;
-    let steps = commands::resolve_verification_plan(&project);
+    let steps = commands::resolve_verification_plan(project);
     let mut results = Vec::new();
     let change_set = change_set_payload(changed_files);
 
@@ -229,7 +250,19 @@ pub async fn run_post_hooks(
     cancel_rx: Option<&watch::Receiver<bool>>,
 ) -> Result<ProjectPostHookResponse, String> {
     let project = effective_project_config(repo_root, cancel_rx).await;
+    run_post_hooks_with_config(repo_root, &project, cancel_rx).await
+}
 
+/// Runs the disk-side post-hook declared by `[project.post_hook]` under an
+/// already resolved project configuration.
+///
+/// A bounded turn passes the configuration it froze on its first proposal
+/// round, so the hook is never preceded by a second task runner dump.
+pub async fn run_post_hooks_with_config(
+    repo_root: &Path,
+    project: &ProjectConfig,
+    cancel_rx: Option<&watch::Receiver<bool>>,
+) -> Result<ProjectPostHookResponse, String> {
     let Some(spec) = project.post_hook.as_ref() else {
         return Ok(ProjectPostHookResponse {
             success: true,
@@ -285,12 +318,27 @@ pub async fn run_project_command(
     arguments: &BTreeMap<String, String>,
     cancel_rx: Option<&watch::Receiver<bool>>,
 ) -> Result<ToolchainCheckResult, String> {
+    let project = effective_project_config(repo_root, cancel_rx).await;
+    run_project_command_with_config(repo_root, &project, name, arguments, cancel_rx).await
+}
+
+/// Runs one project command the model may address by name, under an already
+/// resolved project configuration.
+///
+/// A bounded turn passes the configuration it froze on its first proposal
+/// round, so an invocation validates its declaration against one snapshot
+/// instead of re-reading `tauqe.toml` and re-running a task runner dump.
+pub async fn run_project_command_with_config(
+    repo_root: &Path,
+    project: &ProjectConfig,
+    name: &str,
+    arguments: &BTreeMap<String, String>,
+    cancel_rx: Option<&watch::Receiver<bool>>,
+) -> Result<ToolchainCheckResult, String> {
     let name = name.trim();
     if name.is_empty() {
         return Err("the invocation names no project command".to_string());
     }
-
-    let project = effective_project_config(repo_root, cancel_rx).await;
 
     let Some(spec) = project.commands.get(name) else {
         return Err(format!(

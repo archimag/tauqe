@@ -54,9 +54,9 @@ the end of the turn.
    only through the materialization a declared external reference produced, it
    stays read-only for the whole task, and nothing but the layer's own token
    budget evicts it automatically.
-6. **Budgets are measured, not guessed.** File cost is estimated from size, and
-   the aggregate is checked against a configured ceiling before anything is
-   added.
+6. **Budgets are measured, not guessed.** File cost is its estimated content plus
+   the estimated wrapper its `<file>` element renders, and the aggregate is checked
+   against a configured ceiling before anything is added.
 7. **Order is deterministic and belongs to the layout policy.** Every entry
    carries a monotonic insertion watermark, so a file's position derives from
    when it arrived, never from its name or from hash iteration order. The
@@ -113,7 +113,8 @@ before it can be touched.
   and resolved at the repository root and at each ancestor directory of every
   User and Auto file.
 - **Pattern batch** — one glob or directory prefix matched against the tracked
-  file list, capped by `context.max_pattern_batch`.
+  file list; the file token budget is the only measure of how much one batch may
+  admit.
 - **Reference document** — a snapshot the harness materialized from a declared
   external source and admitted read-only into the Refs layer.
 - **LRU watermark** — the monotonic counter value recorded on the most recent
@@ -257,10 +258,13 @@ act rather than a curation of the project.
 
 ### 3.5 Budgets and pattern intake
 
-Per-file cost is estimated from size, and the assembled context reports an
-aggregate `total_estimated_tokens`. `context.files_token_budget` (300,000 by
-default) bounds that aggregate. The check runs inside discovery: current tokens
-plus the estimated cost of the candidate additions are compared with the budget
+Per-file cost is the estimated content plus the estimated wrapper its own `<file>`
+element renders — the opening header carrying its path and access attribute and the
+closing footer — priced by the same builder that renders the `<context>` block, so the
+estimate and the rendered element cannot disagree. The assembled context reports an
+aggregate `total_estimated_tokens`, and `context.files_token_budget` (300,000 by
+default) bounds that aggregate. The check runs inside discovery: current tokens plus
+the estimated cost of the candidate additions are compared with the budget
 before a single file is added. A breach rejects the whole addition set, halts the
 round with a diagnostic naming the current, requested, and allowed amounts, and
 lets the developer scope the task down instead of watching the turn fail
@@ -268,9 +272,11 @@ anonymously.
 
 A whole family of files can be loaded by glob pattern or directory prefix in one
 batch. The intake matches the tracked file list, skips paths already curated in
-the User layer, sorts matches for determinism, and caps the batch at
-`context.max_pattern_batch` (150 by default). When the match set exceeds the cap,
-the outcome reports truncation, so the limit is never silent.
+the User layer, sorts matches for determinism, and admits them until
+`context.files_token_budget` is exhausted. The number of files is never a limit of
+its own: a thousand small headers can cost less than one generated bundle, so only
+the priced total decides. When the budget drops a match, the outcome reports
+truncation, so the omission is never silent.
 
 Three further budgets belong to neighbouring mechanics:
 `context.max_discovery_rounds` bounds widening rounds (see *Discovery Engine*),
@@ -333,6 +339,8 @@ This keeps clients honest: a revision bump always means the visible state moved.
   insertion order is what keeps the prompt prefix cacheable.
 - **It is not unlimited.** A breached budget halts the round with a diagnostic
   instead of silently dropping files.
+- **It is not bounded by a file count.** The file token budget is the only measure
+  of volume; the number of files one request may admit has no separate ceiling.
 - **It is not a substitute for curation.** The model can discover files
   autonomously, but loading the task-relevant files up front removes discovery
   rounds and spends fewer tokens.

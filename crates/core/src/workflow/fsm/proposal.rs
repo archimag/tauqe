@@ -18,6 +18,7 @@ use crate::edits::protocol::{
     ContextRequest, VerifyOnSuccess as EditVerifyOnSuccess, VerifyRequest as EditVerifyRequest,
     VerifyTarget as EditVerifyTarget,
 };
+use crate::edits::stream::EditStreamFilter;
 use crate::edits::StagedEditsState;
 use crate::history::HistoryManager;
 use crate::prompt::protocol::PromptProtocol;
@@ -424,6 +425,96 @@ pub(super) fn log_fsm_phase(
     );
 }
 
+/// Drains one proposal stream, forwarding the filtered events to the client.
+///
+/// A retried attempt starts from a clean slate: `ResetStream` clears the decoded
+/// accumulator together with the protocol filter, so neither the decoded
+/// commands nor the streamed preview can inherit a fragment of the attempt the
+/// transport voided. The filter keeps what describes the turn rather than the
+/// attempt - the turn marker and the editable path list.
+async fn forward_provider_stream(
+    mut llm_rx: mpsc::Receiver<StreamEvent>,
+    mut stream_filter: Box<dyn EditStreamFilter>,
+    forward_stream_tx: mpsc::Sender<StreamEvent>,
+) -> (String, bool, Option<String>, bool) {
+    let mut assistant_text = String::new();
+    let mut cancelled = false;
+    let mut stream_error = None;
+    let mut completed = false;
+    while let Some(event) = llm_rx.recv().await {
+        match event {
+            StreamEvent::TextDelta(ref delta) => {
+                assistant_text.push_str(delta);
+                for forwarded in stream_filter.push_chunk(delta) {
+                    if forward_stream_tx.send(forwarded).await.is_err() {
+                        break;
+                    }
+                }
+            }
+            StreamEvent::Cancelled => {
+                cancelled = true;
+                let _ = forward_stream_tx.send(StreamEvent::Cancelled).await;
+            }
+            StreamEvent::Error(ref err) => {
+                stream_error = Some(err.clone());
+                let _ = forward_stream_tx
+                    .send(StreamEvent::Error(err.clone()))
+                    .await;
+            }
+            // The transport decorator discarded the fragments of the
+            // interrupted attempt and re-issued the request, so the text
+            // accumulated for decoding is discarded with them. The protocol
+            // filter is reset beside it, because a preview the client already
+            // reset must not be completed by the bytes of the attempt that
+            // replaces it.
+            StreamEvent::ResetStream => {
+                assistant_text.clear();
+                stream_filter.reset();
+                let _ = forward_stream_tx.send(StreamEvent::ResetStream).await;
+            }
+            StreamEvent::Done => {
+                completed = true;
+            }
+            // Events the view does not model are forwarded as-is. A client
+            // that stopped listening only silences the forwarding: the round
+            // keeps draining the provider, so its output is still decoded and
+            // the turn reaches a deterministic outcome instead of being
+            // reported as an interrupted stream.
+            other => {
+                let _ = forward_stream_tx.send(other).await;
+            }
+        }
+    }
+    for forwarded in stream_filter.finish() {
+        let _ = forward_stream_tx.send(forwarded).await;
+    }
+    (assistant_text, cancelled, stream_error, completed)
+}
+
+/// Operation label recorded when an offloaded repository-state read fails.
+const REPOSITORY_STATE_OPERATION: &str = "repository state resolution";
+
+/// Offloads blocking work and records a failed offload before degrading.
+///
+/// The returned `Option` reports whether the offload completed at all: `Some`
+/// wraps whatever the closure produced, while `None` reports a panicked or
+/// cancelled blocking task. The `JoinError` always travels through
+/// [`crate::blocking::log_join_error`] before the caller degrades, so a failed
+/// offload never hides behind a legitimately absent result.
+async fn offload_or_record<T, F>(operation: &str, work: F) -> Option<T>
+where
+    F: FnOnce() -> T + Send + 'static,
+    T: Send + 'static,
+{
+    match crate::blocking::run_blocking_async(work).await {
+        Ok(value) => Some(value),
+        Err(error) => {
+            crate::blocking::log_join_error(&error, operation);
+            None
+        }
+    }
+}
+
 /// Runs a single atomic model interaction and decodes it into commands.
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn run_proposal_step(
@@ -447,13 +538,14 @@ pub(super) async fn run_proposal_step(
 
     // Reading the repository state shells out to git; the call runs off the
     // async executor thread. A repository that cannot be inspected degrades to
-    // an absent state block instead of failing the turn.
+    // an absent state block instead of failing the turn, and a failed offload
+    // is recorded before the block goes absent, so a panicked read never looks
+    // like a repository that was simply never inspected.
     let root = repo_root.clone();
-    let repo_state = crate::blocking::run_blocking_async(move || {
+    let repo_state = offload_or_record(REPOSITORY_STATE_OPERATION, move || {
         crate::git::state::get_repository_state(Some(&root))
     })
-    .await
-    .ok();
+    .await;
 
     let ctx_state = context_manager.get_state();
     let root = repo_root.clone();
@@ -584,7 +676,7 @@ pub(super) async fn run_proposal_step(
         assembly.assemble_chat_messages_with_context_cache(prompt, protocol, cache.context_cache());
     let response_format = protocol.response_format(&context_paths, patch_strategy);
 
-    let (llm_tx, mut llm_rx) = mpsc::channel::<StreamEvent>(100);
+    let (llm_tx, llm_rx) = mpsc::channel::<StreamEvent>(100);
     // A session identifier pins the proposal round to one provider backend and
     // keeps its prompt-prefix cache warm across the discovery, patch-retry, and
     // healing rounds of the same turn. Without one the provider serves the
@@ -604,62 +696,15 @@ pub(super) async fn run_proposal_step(
         .unwrap_or_default();
     // The streaming preview receives the same context list as the decoder, so a
     // reported edit and the staged edit always name the same file.
-    let mut stream_filter =
+    let stream_filter =
         protocol.create_stream_filter(context_paths.clone(), repo_root, staged_for_filter);
     let forward_stream_tx = stream_tx.clone();
 
+    // The forwarder owns the protocol filter for the whole round, so it resets
+    // it together with the decoded accumulator whenever the transport voids an
+    // attempt and starts the next one.
     let forward_task = tokio::spawn(async move {
-        let mut assistant_text = String::new();
-        let mut cancelled = false;
-        let mut stream_error = None;
-        let mut completed = false;
-        while let Some(event) = llm_rx.recv().await {
-            match event {
-                StreamEvent::TextDelta(ref delta) => {
-                    assistant_text.push_str(delta);
-                    for forwarded in stream_filter.push_chunk(delta) {
-                        if forward_stream_tx.send(forwarded).await.is_err() {
-                            break;
-                        }
-                    }
-                }
-                StreamEvent::Cancelled => {
-                    cancelled = true;
-                    let _ = forward_stream_tx.send(StreamEvent::Cancelled).await;
-                }
-                StreamEvent::Error(ref err) => {
-                    stream_error = Some(err.clone());
-                    let _ = forward_stream_tx
-                        .send(StreamEvent::Error(err.clone()))
-                        .await;
-                }
-                // A retried attempt starts from a clean slate: the transport
-                // decorator discarded the fragments of the interrupted attempt
-                // and re-issued the request, so the text accumulated for
-                // decoding is discarded with them. Otherwise the partial output
-                // of a broken attempt would be decoded together with the
-                // complete answer of its retry.
-                StreamEvent::ResetStream => {
-                    assistant_text.clear();
-                    let _ = forward_stream_tx.send(StreamEvent::ResetStream).await;
-                }
-                StreamEvent::Done => {
-                    completed = true;
-                }
-                // Events the view does not model are forwarded as-is. A client
-                // that stopped listening only silences the forwarding: the
-                // round keeps draining the provider, so its output is still
-                // decoded and the turn reaches a deterministic outcome instead
-                // of being reported as an interrupted stream.
-                other => {
-                    let _ = forward_stream_tx.send(other).await;
-                }
-            }
-        }
-        for forwarded in stream_filter.finish() {
-            let _ = forward_stream_tx.send(forwarded).await;
-        }
-        (assistant_text, cancelled, stream_error, completed)
+        forward_provider_stream(llm_rx, stream_filter, forward_stream_tx).await
     });
 
     let client_result = client_call.await;
@@ -880,5 +925,204 @@ mod tests {
             let step = ProposalStep::from_commands(vec![LlmCommand::Outcome { outcome }]);
             assert!(!step.is_empty_step());
         }
+    }
+    /// Drives one proposal stream over `filter`, returning the events the
+    /// client observed and the text the turn would decode.
+    async fn drive_forward_stream(
+        filter: Box<dyn EditStreamFilter>,
+        events: Vec<StreamEvent>,
+    ) -> (Vec<StreamEvent>, String) {
+        let (llm_tx, llm_rx) = mpsc::channel(64);
+        let (stream_tx, mut stream_rx) = mpsc::channel(64);
+        let forward =
+            tokio::spawn(async move { forward_provider_stream(llm_rx, filter, stream_tx).await });
+        for event in events {
+            llm_tx
+                .send(event)
+                .await
+                .expect("the forwarder is listening");
+        }
+        drop(llm_tx);
+
+        let (assistant_text, ..) = forward.await.expect("the forward task joins");
+        let mut observed = Vec::new();
+        while let Some(event) = stream_rx.recv().await {
+            observed.push(event);
+        }
+        (observed, assistant_text)
+    }
+
+    /// Returns the events forwarded after the transport reset the stream.
+    fn events_after_reset(events: &[StreamEvent]) -> &[StreamEvent] {
+        let reset_at = events
+            .iter()
+            .position(|event| matches!(event, StreamEvent::ResetStream))
+            .expect("the transport must void the interrupted attempt");
+        &events[reset_at + 1..]
+    }
+
+    /// Concatenates the conversational text of the given events.
+    fn streamed_text(events: &[StreamEvent]) -> String {
+        events
+            .iter()
+            .filter_map(|event| match event {
+                StreamEvent::TextDelta(text) => Some(text.as_str()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Collects the terminal event of every previewed file.
+    fn file_completions(events: &[StreamEvent]) -> Vec<(tauqe_protocol::EditFileStatus, usize)> {
+        events
+            .iter()
+            .filter_map(|event| match event {
+                StreamEvent::EditFileDone {
+                    status,
+                    hunks_count,
+                    ..
+                } => Some((*status, *hunks_count)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn a_reset_stream_restarts_the_xml_preview_from_a_clean_filter() {
+        use std::collections::HashMap;
+
+        use crate::edits::stream::XmlStreamFilter;
+
+        let filter = Box::new(
+            XmlStreamFilter::new(vec!["a.rs".to_string()], std::env::temp_dir())
+                .with_staged_contents(HashMap::from([(
+                    "a.rs".to_string(),
+                    "fn old() {}\n".to_string(),
+                )])),
+        );
+
+        // The interrupted attempt opens a file block and stops in the middle of
+        // a replacement, leaving the filter inside the edit container with an
+        // open file and a partially scanned hunk.
+        let interrupted = concat!(
+            "First try.\n",
+            "<tauqe_edits><edit path=\"a.rs\">\n",
+            "<search>\nfn old() {}\n</search>\n<replace>\npartial"
+        );
+        let retried = concat!(
+            "<tauqe_edits><edit path=\"a.rs\">\n",
+            "<search>\nfn old() {}\n</search>\n<replace>\nfn new() {}\n</replace>\n",
+            "</edit></tauqe_edits>\nAll done."
+        );
+
+        let (events, assistant_text) = drive_forward_stream(
+            filter,
+            vec![
+                StreamEvent::TextDelta(interrupted.to_string()),
+                StreamEvent::ResetStream,
+                StreamEvent::TextDelta(retried.to_string()),
+                StreamEvent::Done,
+            ],
+        )
+        .await;
+
+        // The decoded accumulator restarts with the filter, so the retried
+        // attempt is the only text the turn decodes.
+        assert!(!assistant_text.contains("First try."));
+        assert!(assistant_text.contains("All done."));
+
+        let retried_events = events_after_reset(&events);
+        assert_eq!(streamed_text(retried_events).trim(), "All done.");
+        assert_eq!(
+            file_completions(retried_events),
+            vec![(tauqe_protocol::EditFileStatus::Ok, 1)],
+            "the retried replacement applies to the untouched snapshot"
+        );
+        assert!(!retried_events.iter().any(|event| matches!(
+            event,
+            StreamEvent::EditHunk { new_text, .. } if new_text.contains("partial")
+        )));
+    }
+
+    #[tokio::test]
+    async fn a_reset_stream_restarts_the_json_preview_from_a_clean_filter() {
+        use std::collections::HashMap;
+
+        use crate::edits::stream::JsonStreamFilter;
+
+        let filter = Box::new(
+            JsonStreamFilter::new(vec!["a.rs".to_string()], std::env::temp_dir())
+                .with_staged_contents(HashMap::from([(
+                    "a.rs".to_string(),
+                    "alpha\nbeta\ngamma\n".to_string(),
+                )])),
+        );
+
+        // The interrupted attempt completes one change and stops inside the
+        // `message` value, so the cascaded cursor and the staging simulator both
+        // carry state of the voided attempt.
+        let interrupted = concat!(
+            "{\"changes\":[{\"op\":\"replace\",\"path\":\"a.rs\",",
+            "\"old_text\":\"alpha\",\"new_text\":\"ALPHA\"}],",
+            "\"message\":\"First try."
+        );
+        let retried = concat!(
+            "{\"message\":\"Second try.\",\"changes\":[{\"op\":\"replace\",",
+            "\"path\":\"a.rs\",\"old_text\":\"alpha\",\"new_text\":\"ALPHA\"}]}"
+        );
+
+        let (events, assistant_text) = drive_forward_stream(
+            filter,
+            vec![
+                StreamEvent::TextDelta(interrupted.to_string()),
+                StreamEvent::ResetStream,
+                StreamEvent::TextDelta(retried.to_string()),
+                StreamEvent::Done,
+            ],
+        )
+        .await;
+
+        assert!(!assistant_text.contains("First try."));
+
+        let retried_events = events_after_reset(&events);
+        assert_eq!(streamed_text(retried_events), "Second try.");
+        assert_eq!(
+            file_completions(retried_events),
+            vec![(tauqe_protocol::EditFileStatus::Ok, 1)],
+            "the retried change applies to the snapshot, not to the voided hunk"
+        );
+        assert!(!retried_events.iter().any(|event| matches!(
+            event,
+            StreamEvent::EditFileDone { status, .. }
+                if *status == tauqe_protocol::EditFileStatus::Error
+        )));
+    }
+
+    /// A failed offload must never degrade silently: the record emitted by
+    /// `log_join_error` keeps a panicked repository-state read distinguishable
+    /// from a repository that was never inspected.
+    #[tokio::test]
+    async fn a_failed_offload_leaves_an_observable_record() {
+        let (buffer, _guard) = crate::blocking::log_capture::install();
+
+        let state = offload_or_record(REPOSITORY_STATE_OPERATION, || -> u32 {
+            panic!("intentional panic for test")
+        })
+        .await;
+
+        assert!(state.is_none(), "a failed offload degrades to `None`");
+        let logged = crate::blocking::log_capture::contents(&buffer);
+        assert!(
+            logged.contains("offloaded blocking task failed"),
+            "the degradation must be observable: {logged}"
+        );
+        assert!(
+            logged.contains(REPOSITORY_STATE_OPERATION),
+            "the record must name the failed operation: {logged}"
+        );
+        assert!(
+            logged.contains("panicked"),
+            "the record must report the failure kind: {logged}"
+        );
     }
 }

@@ -562,6 +562,8 @@ mod tests {
             confirm_delete_plan_final: None,
             confirm_delete_review: None,
             confirm_review_analyze: None,
+            pending_review_launch: None,
+            confirm_review_truncation: None,
             confirm_execute_scope: None,
             confirm_execute_pipeline: None,
             confirm_execute_review: None,

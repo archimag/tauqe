@@ -12,8 +12,8 @@
 
 use async_trait::async_trait;
 use tauqe_protocol::{
-    ModelEntry, ModelRef, ModelResult, ModelRole, PatchStrategy, PromptLayoutKind, ReasoningEffort,
-    TurnIntent,
+    EditOutcome, ModelEntry, ModelRef, ModelResult, ModelRole, PatchStrategy, PromptLayoutKind,
+    ReasoningEffort, TurnIntent,
 };
 use tokio::sync::mpsc;
 use tokio::sync::watch;
@@ -26,8 +26,10 @@ use crate::workflow::policy::ApplyPolicy;
 
 use super::WorkflowExecutionResult;
 use crate::workflow::discovery::DiscoveryLimits;
-use crate::workflow::fsm::guard::rollback_or_log;
-use crate::workflow::fsm::{begin_session_turn, record_session_response, run_fsm_turn_body};
+use crate::workflow::fsm::guard::{attempt_rollback, rollback_or_log};
+use crate::workflow::fsm::{
+    begin_session_turn, record_session_response, run_fsm_turn_body, AbortReport, FsmTurnOutcome,
+};
 
 /// Execution options and token budgets for edit workflows.
 #[derive(Debug, Clone)]
@@ -352,19 +354,77 @@ impl ExecutionMode for SingleExecution {
                     let provider_ready =
                         next_m.provider == current_model.provider || new_provider.is_some();
                     if provider_ready {
-                        // A failed rollback must stay observable: the next
-                        // attempt starts from a tree that may still hold the
-                        // failed writes, so the developer is warned before the
-                        // stronger tier begins.
-                        if !rollback_or_log(policy, context_manager.repo_root()).await {
-                            let notice = concat!(
-                                "\n\n> ⚠️ **Rollback Failed:** ",
-                                "The failed attempt could not be reverted; ",
-                                "the working tree may still hold its writes. ",
-                                "Escalating anyway...\n\n"
-                            )
-                            .to_string();
+                        // A failed rollback breaks the clean-tree invariant:
+                        // the next tier would start from a working tree that
+                        // still holds the failed writes, so the ladder stops
+                        // here instead of escalating onto a dirty tree. The
+                        // developer receives the failure together with the
+                        // exact manual diagnostic to run.
+                        // A policy that holds no open transaction restores
+                        // nothing and reports it as such, so only a rollback
+                        // that actually failed stops the ladder.
+                        if attempt_rollback(policy, context_manager.repo_root())
+                            .await
+                            .is_failed()
+                        {
+                            let abort = AbortReport {
+                                reason: format!(
+                                    "The failed attempt on coder tier {} (`{}`) could not be reverted, so the working tree may still hold its writes. Escalating to tier {} (`{}`) would start from a dirty tree.",
+                                    ladder_idx, current_model, next_idx, next_m
+                                ),
+                                recommendation: "Inspect the working tree with `git status` and `git diff`, restore the repository to a clean state (for example `git checkout -- .` or `git stash`), then re-run the step.".to_string(),
+                            };
+                            let message = abort.to_message();
+                            tracing::error!(
+                                from_tier = ladder_idx,
+                                to_tier = next_idx,
+                                from_model = %current_model,
+                                to_model = %next_m,
+                                reason = %abort.reason,
+                                "coder ladder escalation aborted: the failed attempt could not be rolled back"
+                            );
+                            let notice =
+                                format!("\n\n---\n⛔ **[Execution Aborted]**\n\n{}\n\n", message);
                             let _ = stream_tx.send(StreamEvent::TextDelta(notice)).await;
+                            // Pruning missing files performs filesystem metadata
+                            // checks, so it runs off the async executor thread.
+                            crate::blocking::run_blocking(|| {
+                                context_manager.prune_missing_files();
+                            });
+                            let ctx_state = context_manager.get_state();
+                            let _ = stream_tx.send(StreamEvent::ContextChanged(ctx_state)).await;
+                            let _ = stream_tx.send(StreamEvent::Done).await;
+                            let aborted = FsmTurnOutcome {
+                                assistant_text: turn.assistant_text.clone(),
+                                result: ModelResult::Edit {
+                                    summary: "Execution aborted".to_string(),
+                                    edits: Vec::new(),
+                                    proposal: None,
+                                    outcome: EditOutcome {
+                                        applied: false,
+                                        error: Some(message),
+                                        changed_files: Vec::new(),
+                                        commit_hash: None,
+                                    },
+                                },
+                                is_cancelled: false,
+                                blocked: None,
+                                abort: Some(abort),
+                                has_terminal_success: false,
+                                plan_saved: false,
+                                plan_errors: Vec::new(),
+                                skip_reason: None,
+                            };
+                            record_session_response(history_manager, &aborted);
+                            return Ok(WorkflowExecutionResult {
+                                result: aborted.result,
+                                assistant_text: aborted.assistant_text,
+                                blocked: aborted.blocked,
+                                skip_reason: aborted.skip_reason,
+                                abort: aborted.abort,
+                                plan_saved: aborted.plan_saved,
+                                plan_errors: aborted.plan_errors,
+                            });
                         }
                         // Pruning missing files performs filesystem metadata
                         // checks, so it runs off the async executor thread.
@@ -674,23 +734,33 @@ coder = [
         async fn staging(
             &mut self,
             repo_root: &Path,
+            project: &tauqe_protocol::ProjectConfig,
             context_manager: &ContextManager,
             edits: &[EditOperation],
             staged_state: Option<&StagedEditsState>,
+            cancel_rx: Option<&watch::Receiver<bool>>,
         ) -> StageEditsResult {
             self.inner
-                .staging(repo_root, context_manager, edits, staged_state)
+                .staging(
+                    repo_root,
+                    project,
+                    context_manager,
+                    edits,
+                    staged_state,
+                    cancel_rx,
+                )
                 .await
         }
 
         async fn apply_temporary(
             &mut self,
             repo_root: &Path,
+            project: &tauqe_protocol::ProjectConfig,
             context_manager: &mut ContextManager,
             proposal: &EditProposal,
         ) -> anyhow::Result<Vec<String>> {
             self.inner
-                .apply_temporary(repo_root, context_manager, proposal)
+                .apply_temporary(repo_root, project, context_manager, proposal)
                 .await
         }
 
@@ -707,6 +777,75 @@ coder = [
 
         async fn rollback(&mut self, _repo_root: &Path) -> anyhow::Result<bool> {
             Err(anyhow::anyhow!("simulated rollback failure"))
+        }
+    }
+
+    /// Policy whose rollback fails a fixed number of times before it succeeds,
+    /// standing in for a file lock that an IDE, a language server, or the
+    /// operating system releases shortly. Every other phase delegates to
+    /// [`DirectApplyPolicy`], so the double satisfies the whole `ApplyPolicy`
+    /// contract instead of leaving a panicking branch the retry seam never
+    /// exercises.
+    struct TransientRollbackPolicy {
+        inner: DirectApplyPolicy,
+        failures_left: usize,
+    }
+
+    #[async_trait::async_trait]
+    impl ApplyPolicy for TransientRollbackPolicy {
+        async fn staging(
+            &mut self,
+            repo_root: &Path,
+            project: &tauqe_protocol::ProjectConfig,
+            context_manager: &ContextManager,
+            edits: &[EditOperation],
+            staged_state: Option<&StagedEditsState>,
+            cancel_rx: Option<&watch::Receiver<bool>>,
+        ) -> StageEditsResult {
+            self.inner
+                .staging(
+                    repo_root,
+                    project,
+                    context_manager,
+                    edits,
+                    staged_state,
+                    cancel_rx,
+                )
+                .await
+        }
+
+        async fn apply_temporary(
+            &mut self,
+            repo_root: &Path,
+            project: &tauqe_protocol::ProjectConfig,
+            context_manager: &mut ContextManager,
+            proposal: &EditProposal,
+        ) -> anyhow::Result<Vec<String>> {
+            self.inner
+                .apply_temporary(repo_root, project, context_manager, proposal)
+                .await
+        }
+
+        async fn apply_final(
+            &mut self,
+            repo_root: &Path,
+            changed_files: &[String],
+            summary: &str,
+        ) -> anyhow::Result<Option<String>> {
+            self.inner
+                .apply_final(repo_root, changed_files, summary)
+                .await
+        }
+
+        /// Fails while the simulated lock is held and reports a restored tree
+        /// once it clears, which is exactly what the retry seam of the
+        /// escalation path must observe before it enters the next tier.
+        async fn rollback(&mut self, _repo_root: &Path) -> anyhow::Result<bool> {
+            if self.failures_left == 0 {
+                return Ok(true);
+            }
+            self.failures_left -= 1;
+            anyhow::bail!("the working tree is locked by another process")
         }
     }
 
@@ -1014,7 +1153,7 @@ coder = [
     }
 
     #[tokio::test]
-    async fn escalation_surfaces_a_failed_rollback_in_the_stream() {
+    async fn a_failed_rollback_stops_escalation_and_aborts_the_turn() {
         let (_dir, repo_root) = repo_with_target();
         let mut context = ContextManager::new(repo_root.clone());
         context
@@ -1028,8 +1167,9 @@ coder = [
         let edit = format!(
             "<tauqe_edits_{MARKER} summary=\"Set compute to 42\">\n<edit_{MARKER} path=\"target.rs\">\n<search_{MARKER}>\npub fn compute() -> i32 {{ 0 }}\n</search_{MARKER}>\n<replace_{MARKER}>\npub fn compute() -> i32 {{ 42 }}\n</replace_{MARKER}>\n</edit_{MARKER}>\n</tauqe_edits_{MARKER}>"
         );
-        // The first reply is a bare answer, so the ladder escalates — and the
-        // rollback that precedes the retry fails.
+        // The first reply is a bare answer, so the ladder would escalate — and
+        // the rollback that precedes the retry fails, so the ladder must stop
+        // instead of starting the next tier from a dirty tree.
         let provider = MockLlmProvider::scripted([
             MockResponse::text("I need more information before changing the code."),
             MockResponse::text(edit),
@@ -1064,15 +1204,54 @@ coder = [
                 cancel_rx,
             )
             .await
-            .expect("escalation survives a failed rollback");
+            .expect("an aborted escalation still reports its outcome");
 
+        let abort = execution
+            .abort
+            .expect("the abort report rides on the turn result");
+        assert!(
+            abort.reason.contains("could not be reverted"),
+            "the reason must name the failed rollback: {}",
+            abort.reason
+        );
+        assert!(
+            abort.recommendation.contains("git status"),
+            "the recommendation must tell the developer how to diagnose the tree: {}",
+            abort.recommendation
+        );
         match execution.result {
             ModelResult::Edit { outcome, .. } => {
-                assert!(outcome.applied, "the escalated attempt must still apply");
+                assert!(!outcome.applied, "an aborted turn applies nothing");
+                assert!(
+                    outcome
+                        .error
+                        .unwrap_or_default()
+                        .contains("Execution aborted"),
+                    "the failure must stay visible on the turn result"
+                );
             }
-            other => panic!("expected applied edits after a failed rollback, got {other:?}"),
+            other => panic!("expected an aborted turn, got {other:?}"),
         }
+        assert_eq!(
+            provider.requests().len(),
+            1,
+            "no tier may be entered while the working tree is dirty"
+        );
+        assert_eq!(
+            std::fs::read_to_string(repo_root.join("target.rs")).unwrap(),
+            "pub fn compute() -> i32 { 0 }\n",
+            "the aborted turn must leave the working tree untouched"
+        );
+
         let events = collector.await.expect("event collector joins");
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, StreamEvent::ModelEscalated { .. }))
+                .count(),
+            0,
+            "the ladder must not announce a tier it refuses to enter"
+        );
         let streamed: String = events
             .iter()
             .filter_map(|event| match event {
@@ -1081,13 +1260,110 @@ coder = [
             })
             .collect();
         assert!(
-            streamed.contains("Rollback Failed"),
-            "a failed rollback must surface in the streamed diagnostics: {streamed}"
+            streamed.contains("Execution Aborted"),
+            "the developer must see the abort in the streamed diagnostics: {streamed}"
         );
+    }
+
+    /// A rollback that fails once and then succeeds must not stop the ladder:
+    /// the retry seam absorbs the transient lock, the tree is clean again, and
+    /// the next coder tier enters as if the failed attempt had been reverted
+    /// cleanly on the first try.
+    #[tokio::test]
+    async fn escalation_proceeds_when_a_transient_rollback_failure_clears() {
+        let (_dir, repo_root) = repo_with_target();
+        let mut context = ContextManager::new(repo_root.clone());
+        context
+            .add_file("target.rs", ContextAccess::Editable)
+            .expect("add target to context");
+        let mut history = HistoryManager::new(repo_root.clone());
+
+        let protocol = crate::prompt::xml::XmlPromptProtocol;
+        let protocol = protocol.with_turn_marker(MARKER).unwrap();
+
+        let edit = format!(
+            "<tauqe_edits_{MARKER} summary=\"Set compute to 42\">\n<edit_{MARKER} path=\"target.rs\">\n<search_{MARKER}>\npub fn compute() -> i32 {{ 0 }}\n</search_{MARKER}>\n<replace_{MARKER}>\npub fn compute() -> i32 {{ 42 }}\n</replace_{MARKER}>\n</edit_{MARKER}>\n</tauqe_edits_{MARKER}>"
+        );
+        // The first reply is a bare answer, so the ladder would escalate — and
+        // the rollback that precedes the retry is locked exactly once, so the
+        // retry seam must clear it instead of aborting the turn.
+        let provider = MockLlmProvider::scripted([
+            MockResponse::text("I need more information before changing the code."),
+            MockResponse::text(edit),
+        ]);
+        let model = ModelRef::openrouter("base/model");
+        let (tx, mut rx) = mpsc::channel(256);
+        let (_cancel_tx, cancel_rx) = watch::channel(false);
+        let mut policy = TransientRollbackPolicy {
+            inner: DirectApplyPolicy::new(),
+            failures_left: 1,
+        };
+
+        // Drain the stream concurrently: the sender is dropped with the turn, so
+        // collecting only afterwards would race the channel shutdown.
+        let collector = tokio::spawn(async move {
+            let mut events = Vec::new();
+            while let Some(event) = rx.recv().await {
+                events.push(event);
+            }
+            events
+        });
+
+        let exec = SingleExecution::new(coder_ladder_options());
+        let execution = exec
+            .execute(
+                &mut policy,
+                "Set compute to return 42",
+                tauqe_protocol::TurnIntent::InteractiveRepl,
+                &provider,
+                &model,
+                &mut context,
+                &mut history,
+                protocol.as_ref(),
+                tx,
+                cancel_rx,
+            )
+            .await
+            .expect("a cleared rollback lock lets the escalation finish");
+
+        assert!(
+            execution.abort.is_none(),
+            "a transient lock must not abort the turn: {:?}",
+            execution.abort
+        );
+        match execution.result {
+            ModelResult::Edit { outcome, .. } => {
+                assert!(
+                    outcome.applied,
+                    "the escalated tier must apply its edits: {:?}",
+                    outcome.error
+                );
+            }
+            other => panic!("expected applied edits after escalation, got {other:?}"),
+        }
         assert_eq!(
             provider.requests().len(),
             2,
-            "the escalation must still run the stronger tier after the rollback failure"
+            "the retry must reach the next coder tier"
+        );
+        assert_eq!(
+            std::fs::read_to_string(repo_root.join("target.rs")).unwrap(),
+            "pub fn compute() -> i32 { 42 }\n"
+        );
+
+        let events = collector.await.expect("event collector joins");
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, StreamEvent::ModelEscalated { .. })),
+            "the ladder must announce the tier it enters"
+        );
+        assert!(
+            !events.iter().any(|event| matches!(
+                event,
+                StreamEvent::TextDelta(text) if text.contains("Execution Aborted")
+            )),
+            "a cleared transient lock must not surface an abort banner"
         );
     }
 }

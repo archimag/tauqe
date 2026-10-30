@@ -9,7 +9,7 @@ pub mod path;
 pub mod pinned;
 
 pub use path::verify_path_within_repo;
-
+pub use path::verify_path_within_repo_for_write;
 #[derive(Debug, Clone)]
 pub struct ContextFileContent {
     pub path: String,
@@ -22,12 +22,14 @@ pub struct ContextFileContent {
 pub struct PatternAddOutcome {
     /// Files newly added to the context layer.
     pub added_items: Vec<ContextItem>,
-    /// Total estimated tokens contributed by the added files.
+    /// Total estimated tokens the added files consume, the wrapper their
+    /// `<file>` elements render included.
     pub added_tokens: u64,
-    /// Whether the match set exceeded the batch limit and was capped.
+    /// Whether the file token budget dropped matched files.
     ///
-    /// When `true`, some matching files were skipped because `max_batch` was
-    /// reached. Callers should surface this so the cap is never silent.
+    /// When `true`, some matching files were skipped because admitting them
+    /// would have breached the file token budget. Callers should surface this
+    /// so the omission is never silent.
     pub truncated: bool,
 }
 
@@ -471,7 +473,13 @@ impl ContextManager {
             if !full_path.is_file() {
                 bail!("File not found or is a directory: {}", clean_path);
             }
-
+            // Admitting a path as Editable is a write admission: an edit may
+            // later write it. The strict check refuses the admission while the
+            // escape boundary cannot be inspected, so a degraded repository
+            // root never widens what the change set may touch.
+            if access == ContextAccess::Editable {
+                verify_path_within_repo_for_write(&self.repo_root, &clean_path)?;
+            }
             let metadata = std::fs::metadata(&full_path)?;
             let size_bytes = metadata.len();
             let estimated_tokens = estimate_tokens_from_bytes(size_bytes);
@@ -595,16 +603,19 @@ impl ContextManager {
 
     /// Adds all repository files matching a glob pattern or directory prefix.
     ///
-    /// Skips files already present in context. The number of files added in a
-    /// single call is bounded by `max_batch`; when the match set exceeds it the
-    /// batch is capped and the outcome reports `truncated = true` so the caller
-    /// can surface the cap instead of silently dropping files.
+    /// Skips files already present in the user layer. The file token budget is
+    /// the only measure of how much one call may add: a candidate is priced as
+    /// its content plus the wrapper its `<file>` element renders, priced by the
+    /// same builder that renders the `<context>` block. Files are admitted in
+    /// sorted order until the budget is exhausted, and the outcome then reports
+    /// `truncated = true` so the caller can surface the omission instead of
+    /// silently dropping files.
     pub fn add_files_by_pattern(
         &mut self,
         pattern: &str,
         access: ContextAccess,
         available_files: &[String],
-        max_batch: usize,
+        files_token_budget: usize,
     ) -> Result<PatternAddOutcome> {
         let trimmed_pat = pattern.trim();
         if trimmed_pat.is_empty() {
@@ -626,23 +637,48 @@ impl ContextManager {
         // Sort for deterministic addition order
         matched_files.sort();
 
-        // Cap the batch at the configured limit and remember whether files were
-        // left out so the truncation is never silent.
-        let truncated = matched_files.len() > max_batch;
-        if truncated {
-            matched_files.truncate(max_batch);
-        }
+        // The budget covers the whole context, so what the loaded files already
+        // spend is measured first with the same wrapper-aware rule. A matched
+        // path is excluded here because the loop below prices it, whether it
+        // arrives fresh or is promoted out of another layer.
+        let mut spent_tokens: usize = self
+            .get_state()
+            .items
+            .iter()
+            .filter(|item| !matched_files.contains(&item.path))
+            .map(|item| {
+                item.estimated_tokens as usize
+                    + crate::prompt::context_element_overhead_tokens(&item.path, item.access)
+            })
+            .sum();
 
         let mut added_items = Vec::new();
         let mut total_added_tokens = 0u64;
         let mut any_changed = false;
+        let mut truncated = false;
 
         for path in matched_files {
+            // The candidate is priced from its metadata before admission, so
+            // the wrapper of its own path is charged to the budget it spends.
+            let cost = match std::fs::metadata(self.repo_root.join(&path)) {
+                Ok(metadata) => {
+                    estimate_tokens_from_bytes(metadata.len()) as usize
+                        + crate::prompt::context_element_overhead_tokens(&path, access)
+                }
+                // A path that vanished between the listing and the read adds
+                // nothing, and it is not a budget omission.
+                Err(_) => continue,
+            };
+            if spent_tokens.saturating_add(cost) > files_token_budget {
+                truncated = true;
+                break;
+            }
             let rev_before = self.revision;
             if let Ok(item) =
                 self.add_file_to_layer_internal(&path, access, ContextLayer::User, false)
             {
-                total_added_tokens += item.estimated_tokens;
+                spent_tokens += cost;
+                total_added_tokens += cost as u64;
                 added_items.push(item);
                 if self.revision > rev_before {
                     any_changed = true;
@@ -767,7 +803,11 @@ impl ContextManager {
 
     pub fn set_access(&mut self, relative_path: &str, access: ContextAccess) -> Result<bool> {
         let clean_path = self.normalize_path(relative_path)?;
-
+        // Promoting a path to Editable is a write admission: the file may be
+        // written afterwards, so the escape boundary must be inspectable.
+        if access == ContextAccess::Editable {
+            verify_path_within_repo_for_write(&self.repo_root, &clean_path)?;
+        }
         // User and auto entries own their access directly.
         if let Some(item) = self.user.get_mut(&clean_path) {
             if item.access == access {
@@ -1010,7 +1050,7 @@ mod tests {
 
         let mut cm = ContextManager::new(root);
         let outcome = cm
-            .add_files_by_pattern("src/*.rs", ContextAccess::ReadOnly, &repo_files, 150)
+            .add_files_by_pattern("src/*.rs", ContextAccess::ReadOnly, &repo_files, 300_000)
             .unwrap();
 
         assert_eq!(outcome.added_items.len(), 2);
@@ -1022,7 +1062,7 @@ mod tests {
     }
 
     #[test]
-    fn test_add_files_by_pattern_reports_truncation() {
+    fn test_add_files_by_pattern_reports_a_budget_truncation() {
         let dir = tempdir().unwrap();
         let root = dir.path().to_path_buf();
 
@@ -1032,9 +1072,16 @@ mod tests {
 
         let repo_files = vec!["src/a.rs".to_string(), "src/b.rs".to_string()];
 
+        // The file token budget is the only measure: it pays for one file's
+        // content together with the wrapper its `<file>` element renders, so
+        // exactly one of the two matches is admitted.
+        let budget = crate::prompt::estimate_tokens_from_bytes("pub fn a() {}".len() as u64)
+            as usize
+            + crate::prompt::context_element_overhead_tokens("src/a.rs", ContextAccess::ReadOnly);
+
         let mut cm = ContextManager::new(root);
         let outcome = cm
-            .add_files_by_pattern("src/*.rs", ContextAccess::ReadOnly, &repo_files, 1)
+            .add_files_by_pattern("src/*.rs", ContextAccess::ReadOnly, &repo_files, budget)
             .unwrap();
 
         assert_eq!(outcome.added_items.len(), 1);

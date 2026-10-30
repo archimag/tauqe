@@ -139,6 +139,20 @@ pub fn render_execute_review_dialog(frame: &mut ratatui::Frame, state: &AppState
     }
     let mut header_lines = vec![Line::from(review_spans)];
 
+    // The architectural group owns the unified plan, so the form names it before
+    // the step: a group step is addressed through the group that carries the
+    // root cause, never through one of its findings (c-1, c-4, c-5).
+    if let Some(group_id) = target.group_id.as_deref() {
+        header_lines.push(Line::from(vec![
+            Span::styled(active_t("dialog.execute_review.group_label"), dim),
+            Span::styled(
+                truncate_to_width(&target.group_title, 48),
+                engine.fg(palette.text_primary).bold(),
+            ),
+            Span::styled(format!(" [{}]", group_id), dim),
+        ]));
+    }
+
     if let Some(item) = target.items.first() {
         header_lines.push(Line::from(vec![
             Span::styled(active_t("dialog.execute_review.finding_label"), dim),
@@ -147,15 +161,6 @@ pub fn render_execute_review_dialog(frame: &mut ratatui::Frame, state: &AppState
                 engine.fg(palette.text_primary).bold(),
             ),
         ]));
-        if let Some(step_id) = target.step_id.as_deref() {
-            header_lines.push(Line::from(vec![
-                Span::styled(active_t("dialog.execute_review.step_label"), dim),
-                Span::styled(
-                    step_id.to_string(),
-                    engine.fg(palette.status_warning).bold(),
-                ),
-            ]));
-        }
         if !item.files.is_empty() {
             header_lines.push(Line::from(vec![
                 Span::styled(active_t("dialog.execute_review.files_label"), dim),
@@ -166,6 +171,20 @@ pub fn render_execute_review_dialog(frame: &mut ratatui::Frame, state: &AppState
             ]));
         }
     }
+
+    if let Some(step_id) = target.step_id.as_deref() {
+        header_lines.push(Line::from(vec![
+            Span::styled(active_t("dialog.execute_review.step_label"), dim),
+            Span::styled(
+                step_id.to_string(),
+                engine.fg(palette.status_warning).bold(),
+            ),
+        ]));
+    }
+    // The header band is fixed at EXECUTE_REVIEW_HEADER_HEIGHT rows, so a card
+    // that would carry more lines keeps the leading ones instead of painting
+    // into the model list below it.
+    header_lines.truncate(EXECUTE_REVIEW_HEADER_HEIGHT as usize);
     frame.render_widget(Paragraph::new(header_lines), header_area);
 
     // Coder list. The shared `ModelSelector` owns the rows, numbering, scrolling,
@@ -305,4 +324,50 @@ pub fn render_execute_review_dialog(frame: &mut ratatui::Frame, state: &AppState
             )
     };
     crate::components::modal::render_dialog_footer(frame, footer_area, &verb_hint(nav_hint));
+}
+
+#[cfg(test)]
+mod tests {
+    use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
+
+    use super::*;
+    use crate::app::ConfirmExecuteReviewState;
+
+    /// A step of an architectural group names the group and the step in its
+    /// header band, so a point execution never loses the root cause it belongs
+    /// to (c-1, c-4, c-5).
+    #[test]
+    fn group_step_form_renders_the_group_and_the_step() {
+        let mut st = crate::app::test_state();
+        st.confirm_execute_review = Some(
+            ConfirmExecuteReviewState::new(
+                Some("rev-1".to_string()),
+                "Session rev-1".to_string(),
+                "Unified auth guard".to_string(),
+                None,
+                Some("1.1".to_string()),
+                Vec::new(),
+                Vec::new(),
+            )
+            .with_group("arch-auth".to_string(), "Unified auth guard".to_string()),
+        );
+
+        let mut terminal = Terminal::new(TestBackend::new(120, 40)).unwrap();
+        terminal
+            .draw(|frame| render_execute_review_dialog(frame, &st))
+            .unwrap();
+
+        let buffer = terminal.backend().buffer();
+        let mut screen = String::new();
+        for row in 0..40u16 {
+            for column in 0..120u16 {
+                screen.push_str(buffer[(column, row)].symbol());
+            }
+            screen.push('\n');
+        }
+        assert!(screen.contains("Unified auth guard"), "{screen}");
+        assert!(screen.contains("[arch-auth]"), "{screen}");
+        assert!(screen.contains("1.1"), "{screen}");
+    }
 }

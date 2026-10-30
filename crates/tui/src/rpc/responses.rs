@@ -8,60 +8,31 @@
 
 use std::sync::Arc;
 
+use tauqe_protocol::review::ReviewPreviewResult;
 use tauqe_protocol::{
     methods, ConfigState, ContextAddPatternResult, ContextState, GitSquashGenerateMessageResult,
     GitSquashPreviewResult, HistoryGetResult, ModelCurrentResult, ModelRef, ModelRolesSummary,
     ModelSelectResult, ModelSelection, PlanClearHorizonResult, PlanListResult, PlanRefineResult,
     RepositoryInitResult, RepositoryListFilesResult, RequestId, Response, ReviewAnalyzeResult,
-    ReviewGetResult, ReviewListResult, ReviewRefineGroupResult, ReviewRefineItemParams,
-    ReviewRefineItemResult, SystemStatusResult,
+    ReviewGetResult, ReviewListResult, SystemStatusResult,
 };
 use tokio::sync::Mutex;
 
 use super::events::fail_safe_reject_edits;
 use super::transport::{send_request, OptimisticRollback, RpcConnection};
-use crate::app::{AppState, ModelChoice, SquashFileItem};
+use crate::app::{
+    AppState, ConfirmDialogButton, ConfirmReviewTruncationState, ModelChoice, PendingReviewLaunch,
+    SquashFileItem,
+};
 use crate::i18n::active_t;
 use crate::views::repl::TurnStatus;
-use crate::views::review::RefineTarget;
-
-/// Onboarding confirmations raised by daemon responses.
-///
-/// Setup runs before any interface locale can exist, so these confirmations are
-/// rendered in English; every other user-facing text resolves through the
-/// localization catalog.
-pub mod messages {
-    /// Fallback edit failure recorded when the daemon omits its own reason.
-    pub const EDIT_FAILED_FALLBACK: &str = "Edit failed on the server";
-
-    /// The project configuration file was created.
-    pub const CONFIG_CREATED: &str = "tauqe.toml created successfully.";
-
-    /// The OpenRouter API key was stored.
-    pub const API_KEY_SAVED: &str = "OpenRouter API key saved successfully.";
-
-    /// Every check passed after the configuration reload.
-    pub const CONFIG_RELOADED_OK: &str = "Configuration reloaded. All checks passed!";
-
-    /// The reload left the system without an API key.
-    pub const API_KEY_NOT_FOUND: &str =
-        "API key still not found. Enter it or create a stub credentials file.";
-
-    /// The repository was initialized.
-    pub const GIT_INIT_OK: &str = "Git repository initialized successfully.";
-
-    /// Confirmation raised after a stub credentials file was created.
-    pub fn stub_credentials_created(path: &str) -> String {
-        format!("Stub credentials file created at '{path}'. Edit it and select 'Check again'.")
-    }
-}
 
 /// A request the client dispatches once the applied response is fully handled.
 enum FollowUp {
     /// Fire-and-forget request carrying the given parameters.
     Request(&'static str, serde_json::Value),
-    /// The next finding of a running architectural decomposition queue.
-    ReviewRefine(RefineTarget),
+    /// The audit of a review launch whose projected window was not truncated.
+    ReviewLaunch(Box<PendingReviewLaunch>),
 }
 
 /// Applies one daemon response to the shared application state.
@@ -123,8 +94,8 @@ fn apply_response(
                 apply_system_status(st, status, true);
             } else if let Ok(config) = serde_json::from_value::<ConfigState>(value) {
                 apply_config(st, config);
-                st.onboarding.set_status(messages::CONFIG_RELOADED_OK);
-                st.onboarding.step = st.onboarding.next_step();
+                st.onboarding
+                    .set_status(active_t("onboarding.status.config_reloaded"));
                 st.onboarding.selected_index = 0;
             }
         }
@@ -165,7 +136,8 @@ fn apply_response(
             if let Ok(initialized) = serde_json::from_value::<RepositoryInitResult>(value) {
                 st.repo_state = Some(initialized.repository);
                 st.onboarding.has_git = true;
-                st.onboarding.set_status(messages::GIT_INIT_OK);
+                st.onboarding
+                    .set_status(active_t("onboarding.status.git_initialized"));
                 st.onboarding.step = st.onboarding.next_step();
                 st.onboarding.selected_index = 0;
                 follow_ups.push(FollowUp::Request(
@@ -176,20 +148,22 @@ fn apply_response(
         }
         Some(methods::CONFIG_CREATE) => {
             st.onboarding.has_config = true;
-            st.onboarding.set_status(messages::CONFIG_CREATED);
+            st.onboarding
+                .set_status(active_t("onboarding.status.config_created"));
             st.onboarding.step = st.onboarding.next_step();
             st.onboarding.selected_index = 0;
         }
         Some(methods::CREDENTIALS_SAVE) => {
             st.onboarding.has_api_key = true;
-            st.onboarding.set_status(messages::API_KEY_SAVED);
-            st.onboarding.step = st.onboarding.next_step();
+            st.onboarding
+                .set_status(active_t("onboarding.status.api_key_saved"));
             st.onboarding.selected_index = 0;
         }
         Some(methods::CREDENTIALS_CREATE_STUB) => {
             let path = st.onboarding.default_credentials_path.clone();
-            st.onboarding
-                .set_status(messages::stub_credentials_created(&path));
+            let template = active_t("onboarding.status.stub_credentials_created");
+            let confirmation = template.replacen("{}", &path, 1);
+            st.onboarding.set_status(confirmation);
         }
         Some(methods::CONTEXT_GET)
         | Some(methods::CONTEXT_ADD)
@@ -288,69 +262,9 @@ fn apply_response(
                 }
             }
         }
+        Some(methods::REVIEW_PREVIEW) => apply_review_preview(st, value, follow_ups),
         Some(methods::REVIEW_DELETE) => {
             st.notify_info(active_t("notify.review_deleted"));
-        }
-        Some(methods::REVIEW_REFINE_ITEM) => {
-            st.review.refine_dialog = None;
-            match serde_json::from_value::<ReviewRefineItemResult>(value) {
-                Ok(ReviewRefineItemResult::Success { explanation, .. }) => {
-                    st.review.error = None;
-                    let message = match explanation
-                        .as_deref()
-                        .map(str::trim)
-                        .filter(|text| !text.is_empty())
-                    {
-                        Some(text) => active_t("notify.finding_decomposed").replacen("{}", text, 1),
-                        None => active_t("notify.finding_decomposed_default"),
-                    };
-                    st.notify_success(message);
-                    match st.review.next_refine_target() {
-                        Some(target) => {
-                            st.review.refining = Some(target.review_id.clone());
-                            follow_ups.push(FollowUp::ReviewRefine(target));
-                        }
-                        None => st.review.refining = None,
-                    }
-                }
-                Ok(ReviewRefineItemResult::Blocked { reason }) => {
-                    st.review.refining = None;
-                    st.review.refine_queue.clear();
-                    st.notify_warning(
-                        active_t("notify.finding_decompose_blocked").replace("{}", &reason),
-                    );
-                    st.review.error = Some(reason);
-                }
-                Err(_) => {
-                    st.review.refining = None;
-                    st.review.refine_queue.clear();
-                }
-            }
-        }
-        Some(methods::REVIEW_REFINE_GROUP) => {
-            st.review.refine_dialog = None;
-            st.review.refining = None;
-            match serde_json::from_value::<ReviewRefineGroupResult>(value) {
-                Ok(ReviewRefineGroupResult::Success { explanation, .. }) => {
-                    st.review.error = None;
-                    let message = match explanation
-                        .as_deref()
-                        .map(str::trim)
-                        .filter(|text| !text.is_empty())
-                    {
-                        Some(text) => active_t("notify.finding_decomposed").replacen("{}", text, 1),
-                        None => active_t("notify.finding_decomposed_default"),
-                    };
-                    st.notify_success(message);
-                }
-                Ok(ReviewRefineGroupResult::Blocked { reason }) => {
-                    st.notify_warning(
-                        active_t("notify.finding_decompose_blocked").replace("{}", &reason),
-                    );
-                    st.review.error = Some(reason);
-                }
-                Err(_) => {}
-            }
         }
         Some(methods::REVIEW_ANALYZE) => {
             st.review.analyzing = false;
@@ -377,6 +291,43 @@ fn apply_response(
     }
 }
 
+/// Applies the audit-window projection to the review launch that requested it.
+///
+/// The answer is the consent gate of the launch: an untruncated window starts the
+/// audit immediately through the shared launch helper, while a truncated one
+/// opens the confirmation card with the full counters and sends nothing until
+/// the developer confirms it (c-3). A projection that cannot be read returns the
+/// launch dialog with its typed fields instead of starting an audit nobody
+/// described.
+fn apply_review_preview(
+    st: &mut AppState,
+    value: serde_json::Value,
+    follow_ups: &mut Vec<FollowUp>,
+) {
+    let Some(pending) = st.pending_review_launch.take() else {
+        return;
+    };
+    let preview = match serde_json::from_value::<ReviewPreviewResult>(value) {
+        Ok(preview) => preview,
+        Err(error) => {
+            st.review_dialog = Some(pending.dialog);
+            st.notify_error(
+                active_t("notify.review_preview_failed").replace("{}", &error.to_string()),
+            );
+            return;
+        }
+    };
+    if preview.window.is_truncated() {
+        st.confirm_review_truncation = Some(ConfirmReviewTruncationState {
+            pending,
+            window: preview.window,
+        });
+        st.confirm_button = ConfirmDialogButton::Cancel;
+    } else {
+        follow_ups.push(FollowUp::ReviewLaunch(Box::new(pending)));
+    }
+}
+
 /// Settles the state a rejected request started.
 ///
 /// A request that the daemon refuses never produces the events that normally
@@ -385,17 +336,19 @@ fn apply_response(
 /// never arrive (c-3).
 fn reject_response(st: &mut AppState, method: Option<&str>, message: &str) {
     match method {
+        Some(methods::REVIEW_PREVIEW) => {
+            // A refused projection settles the launch it started: the dialog
+            // returns with its typed fields and no operation opens (c-3).
+            if let Some(pending) = st.pending_review_launch.take() {
+                st.review_dialog = Some(pending.dialog);
+            }
+            st.confirm_button = ConfirmDialogButton::Cancel;
+            st.notify_error(active_t("notify.review_preview_failed").replace("{}", message));
+        }
         Some(methods::REVIEW_ANALYZE) => {
             st.review.analyzing = false;
             st.review.error = Some(message.to_string());
             settle_failed_turn(st, message);
-        }
-        Some(methods::REVIEW_REFINE_ITEM) | Some(methods::REVIEW_REFINE_GROUP) => {
-            st.review.refine_dialog = None;
-            st.review.refining = None;
-            st.review.refine_queue.clear();
-            st.review.error = Some(message.to_string());
-            st.notify_error(active_t("notify.rpc_error").replace("{}", message));
         }
         Some(methods::PLAN_REFINE) | Some(methods::PLAN_REPLAN) => {
             st.plans_view.refine_dialog = None;
@@ -546,9 +499,11 @@ fn apply_system_status(st: &mut AppState, status: SystemStatusResult, reloaded: 
     }
     if reloaded {
         if status.has_api_key {
-            st.onboarding.set_status(messages::CONFIG_RELOADED_OK);
+            st.onboarding
+                .set_status(active_t("onboarding.status.config_reloaded"));
         } else {
-            st.onboarding.set_error(messages::API_KEY_NOT_FOUND);
+            st.onboarding
+                .set_error(active_t("onboarding.status.api_key_not_found").as_str());
         }
     }
     st.onboarding.step = st.onboarding.next_step();
@@ -681,36 +636,182 @@ async fn run_follow_ups(
                     st.notify_error(active_t("notify.rpc_error").replace("{}", &error.to_string()));
                 }
             }
-            FollowUp::ReviewRefine(target) => {
-                let params = ReviewRefineItemParams {
-                    review_id: Some(target.review_id),
-                    item_id: target.item_id,
-                    model: None,
-                    instructions: None,
-                };
-                let params = match serde_json::to_value(params) {
-                    Ok(params) => params,
-                    Err(error) => {
-                        let mut st = state.lock().await;
-                        st.review.refining = None;
-                        st.notify_error(
-                            active_t("notify.rpc_error").replace("{}", &error.to_string()),
-                        );
-                        continue;
-                    }
-                };
+            FollowUp::ReviewLaunch(pending) => {
+                // The audit starts through the same launch helper the consent
+                // card uses, so an untruncated projection and a confirmed
+                // truncation dispatch the identical request (c-3).
+                let pending = *pending;
+                let st = state.lock().await;
                 if let Err(error) =
-                    send_request(server_writer, methods::REVIEW_REFINE_ITEM, params).await
+                    crate::dialogs::input::launch_review(state, st, server_writer, pending.params)
+                        .await
                 {
                     let mut st = state.lock().await;
-                    st.review.refining = None;
-                    st.review.refine_queue.clear();
                     st.notify_error(active_t("notify.rpc_error").replace("{}", &error.to_string()));
-                } else {
-                    let mut st = state.lock().await;
-                    st.notify_info(active_t("notify.review_refining"));
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use tauqe_protocol::review::{ReviewPreviewResult, ReviewPreviewWindow};
+    use tauqe_protocol::{methods, RequestId, Response};
+    use tokio::sync::Mutex;
+
+    use super::*;
+    use crate::app::{
+        ActiveModal, ConfirmDialogButton, NotificationLevel, PendingReviewLaunch,
+        ReviewDialogState, ViewMode,
+    };
+
+    /// Answers a pending review projection through the response handler.
+    async fn deliver_preview(
+        state: &Arc<Mutex<AppState>>,
+        conn: &mut RpcConnection,
+        result: ReviewPreviewResult,
+    ) {
+        let id = send_request(conn, methods::REVIEW_PREVIEW, serde_json::json!({}))
+            .await
+            .expect("an in-memory sink never fails to write");
+        handle_response(
+            Response::ok_typed(RequestId::Number(id), &result),
+            state,
+            conn,
+        )
+        .await;
+    }
+
+    /// Builds the pending launch a confirmed launch dialog leaves behind.
+    fn pending_launch(path: &str) -> PendingReviewLaunch {
+        let mut dialog = ReviewDialogState::new(1, 10, Vec::new(), Vec::new());
+        dialog.path_inputs[0].insert_str(path);
+        PendingReviewLaunch {
+            dialog,
+            params: tauqe_protocol::ReviewStartParams {
+                path_patterns: vec![path.to_string()],
+                ..Default::default()
+            },
+        }
+    }
+
+    /// A window the budgets leave intact launches the audit immediately, so an
+    /// ordinary launch never pays for an extra confirmation step (c-3).
+    #[tokio::test]
+    async fn an_untruncated_projection_launches_the_audit_immediately() {
+        let mut st = crate::app::test_state();
+        st.view_mode = ViewMode::Review;
+        st.pending_review_launch = Some(pending_launch("src/"));
+
+        let state = Arc::new(Mutex::new(st));
+        let mut conn = RpcConnection::new(Vec::<u8>::new());
+        deliver_preview(
+            &state,
+            &mut conn,
+            ReviewPreviewResult {
+                window: ReviewPreviewWindow {
+                    matched_files: 2,
+                    selected_files: 2,
+                    selected_tokens: 1_000,
+                    files_token_budget: 60_000,
+                    ..Default::default()
+                },
+                groups: Vec::new(),
+            },
+        )
+        .await;
+
+        let payload = String::from_utf8(conn.written().to_vec()).expect("utf-8 payload");
+        assert!(payload.contains("review/start"), "{payload}");
+        assert!(payload.contains("src/"), "{payload}");
+
+        let guard = state.lock().await;
+        assert!(guard.pending_review_launch.is_none());
+        assert!(guard.confirm_review_truncation.is_none());
+        assert!(guard.review.running);
+    }
+
+    /// A truncated window asks for consent with the full counters and opens no
+    /// audit until the developer answers (c-3).
+    #[tokio::test]
+    async fn a_truncated_projection_opens_the_consent_card() {
+        let mut st = crate::app::test_state();
+        st.view_mode = ViewMode::Review;
+        st.pending_review_launch = Some(pending_launch("crates/"));
+
+        let state = Arc::new(Mutex::new(st));
+        let mut conn = RpcConnection::new(Vec::<u8>::new());
+        deliver_preview(
+            &state,
+            &mut conn,
+            ReviewPreviewResult {
+                window: ReviewPreviewWindow {
+                    matched_files: 9,
+                    selected_files: 4,
+                    selected_tokens: 40_000,
+                    omitted_files: 5,
+                    omitted_by_budget: 5,
+                    files_token_budget: 60_000,
+                    ..Default::default()
+                },
+                groups: Vec::new(),
+            },
+        )
+        .await;
+
+        let guard = state.lock().await;
+        let target = guard
+            .confirm_review_truncation
+            .as_ref()
+            .expect("the truncated window asks for consent");
+        assert_eq!(target.window.omitted_files, 5);
+        assert_eq!(target.window.omitted_by_budget, 5);
+        assert_eq!(target.window.files_token_budget, 60_000);
+        assert!(guard.pending_review_launch.is_none());
+        assert_eq!(guard.active_modal(), Some(ActiveModal::ReviewTruncation));
+        assert_eq!(guard.confirm_button, ConfirmDialogButton::Cancel);
+        assert!(!guard.review.running, "a pending consent opens no audit");
+    }
+
+    /// A refused projection restores the launch dialog with its typed fields
+    /// instead of leaving the launch pending forever (c-3).
+    #[tokio::test]
+    async fn a_refused_projection_restores_the_launch_dialog() {
+        let mut st = crate::app::test_state();
+        st.view_mode = ViewMode::Review;
+        st.pending_review_launch = Some(pending_launch("srx/"));
+
+        let state = Arc::new(Mutex::new(st));
+        let mut conn = RpcConnection::new(Vec::<u8>::new());
+        let id = send_request(&mut conn, methods::REVIEW_PREVIEW, serde_json::json!({}))
+            .await
+            .expect("an in-memory sink never fails to write");
+        handle_response(
+            Response::err(
+                RequestId::Number(id),
+                tauqe_protocol::errors::INVALID_PARAMS,
+                "pattern selects no file",
+            ),
+            &state,
+            &mut conn,
+        )
+        .await;
+
+        let guard = state.lock().await;
+        assert!(guard.pending_review_launch.is_none());
+        assert!(guard.confirm_review_truncation.is_none());
+        let dialog = guard
+            .review_dialog
+            .as_ref()
+            .expect("the launch dialog returns with its fields");
+        assert_eq!(dialog.path_inputs[0].get_text(), "srx/");
+        assert!(!guard.review.running);
+        assert_eq!(
+            guard.active_notification().map(|n| n.level),
+            Some(NotificationLevel::Error)
+        );
     }
 }

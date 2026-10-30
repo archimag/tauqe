@@ -70,6 +70,102 @@ pub struct ModelTurnPlanContext {
     pub batch_step_ids: Vec<String>,
 }
 
+/// One member of the ordered queue a batch turn advances through.
+///
+/// A queue is described by data, not by the interface: a plan step lists the
+/// steps it executes, a review group step lists the sub-steps of the group
+/// subplan, and a review step lists the findings of the session. `id` is the
+/// identifier the owning subsystem already uses — a plan or sub-step
+/// identifier, or a finding number rendered as text — so one sliding-window
+/// renderer serves every kind of work.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TurnWorkItem {
+    pub id: String,
+    pub title: String,
+}
+
+/// Ordered queue of work a batch turn advances through, addressed by position.
+///
+/// `active_index` addresses `items`: the member the turn currently executes.
+/// [`Self::active`] performs the lookup, so a turn whose index falls outside
+/// the list reports no active member instead of forcing every client to
+/// bounds-check the pair itself. An empty queue means the turn is not a member
+/// of a batch.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct TurnWorkQueue {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub items: Vec<TurnWorkItem>,
+    #[serde(default)]
+    pub active_index: usize,
+}
+
+impl TurnWorkQueue {
+    /// The member the turn currently executes, or `None` outside the list.
+    pub fn active(&self) -> Option<&TurnWorkItem> {
+        self.items.get(self.active_index)
+    }
+
+    /// One-based position of the active member together with the queue length.
+    pub fn position(&self) -> Option<(usize, usize)> {
+        self.active()
+            .map(|_| (self.active_index + 1, self.items.len()))
+    }
+}
+
+/// Lifecycle phase of a review run that executes no plan step of its own.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReviewWorkPhase {
+    /// The audit that produces the findings of a session or one of its groups.
+    Audit,
+    /// The just-in-time decomposition of an architectural group into a subplan.
+    Decomposition,
+    /// The cross-group classification of the produced findings.
+    PostAnalysis,
+}
+
+/// Work the model executes in a turn, declared by whoever starts the turn.
+///
+/// A turn never infers its own task: the harness states it here, so the
+/// interface renders the running work — its kind, the entity that owns it, the
+/// active member, and its position in the batch queue — from typed fields
+/// instead of reconstructing them from the stored plans, reviews, and group
+/// lists. The variant is the work kind, so an interactive answer can never be
+/// mistaken for a plan step and no kind is decoded from a title.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum TurnWorkContext {
+    /// Interactive dialogue turn that answers the developer directly.
+    Interactive,
+    /// One step of a local plan.
+    PlanStep {
+        plan_id: String,
+        plan_title: String,
+        queue: TurnWorkQueue,
+    },
+    /// One sub-step of an architectural review group subplan.
+    ReviewGroupStep {
+        review_id: String,
+        review_title: String,
+        group_id: String,
+        group_title: String,
+        queue: TurnWorkQueue,
+    },
+    /// One finding of a review session executed on its own.
+    ReviewStep {
+        review_id: String,
+        review_title: String,
+        queue: TurnWorkQueue,
+    },
+    /// A review lifecycle phase that executes no plan step.
+    ReviewPhase {
+        review_id: String,
+        review_title: String,
+        phase: ReviewWorkPhase,
+        queue: TurnWorkQueue,
+    },
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModelStartedEvent {
     pub operation_id: String,
@@ -82,6 +178,14 @@ pub struct ModelStartedEvent {
     pub effort: Option<ReasoningEffort>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub plan_context: Option<ModelTurnPlanContext>,
+    /// Work the turn executes, declared by whoever started it.
+    ///
+    /// Absent from a producer that predates the contract, so a client falls
+    /// back to the coordinates it already receives instead of guessing a kind
+    /// it was never told. A declared [`TurnWorkContext::Interactive`] states
+    /// that the turn answers the developer rather than executing stored work.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub work_context: Option<TurnWorkContext>,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub is_batch: bool,
 }
@@ -726,5 +830,186 @@ mod tests {
         let decoded: ModelResultProposal =
             serde_json::from_str(r#"{"message":"x","context_requests":null}"#).unwrap();
         assert!(decoded.context_requests.is_empty());
+    }
+    /// The two-step queue every work-context test addresses.
+    fn two_step_queue() -> TurnWorkQueue {
+        TurnWorkQueue {
+            items: vec![
+                TurnWorkItem {
+                    id: "1".to_string(),
+                    title: "Declare the work contract".to_string(),
+                },
+                TurnWorkItem {
+                    id: "2".to_string(),
+                    title: "Wire the producers".to_string(),
+                },
+            ],
+            active_index: 1,
+        }
+    }
+
+    #[test]
+    fn test_turn_work_queue_reports_the_active_member() {
+        let queue = two_step_queue();
+        assert_eq!(queue.active().map(|item| item.id.as_str()), Some("2"));
+        assert_eq!(
+            queue.active().map(|item| item.title.as_str()),
+            Some("Wire the producers")
+        );
+        // The position clients render as `[i/N]` is one-based.
+        assert_eq!(queue.position(), Some((2, 2)));
+
+        // An index outside the list reports no active member instead of forcing
+        // every client to bounds-check the pair itself.
+        let beyond = TurnWorkQueue {
+            items: two_step_queue().items,
+            active_index: 5,
+        };
+        assert!(beyond.active().is_none());
+        assert!(beyond.position().is_none());
+
+        // A turn that is not a batch member carries an empty queue.
+        let idle = TurnWorkQueue::default();
+        assert!(idle.active().is_none());
+        assert!(idle.position().is_none());
+    }
+
+    #[test]
+    fn test_turn_work_context_plan_step_serde() {
+        let context = TurnWorkContext::PlanStep {
+            plan_id: "plan-1".to_string(),
+            plan_title: "Universal work marker".to_string(),
+            queue: two_step_queue(),
+        };
+        let json = serde_json::to_string(&context).unwrap();
+        assert!(json.contains("\"kind\":\"plan_step\""));
+        assert!(json.contains("\"plan_id\":\"plan-1\""));
+        assert!(json.contains("\"active_index\":1"));
+        assert!(json.contains("\"items\":[{\"id\":\"1\""));
+
+        let decoded: TurnWorkContext = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded, context);
+    }
+
+    #[test]
+    fn test_turn_work_context_review_variants_serde() {
+        let finding = TurnWorkItem {
+            id: "7".to_string(),
+            title: "Shared transaction boundary".to_string(),
+        };
+        let finding_queue = TurnWorkQueue {
+            items: vec![finding],
+            active_index: 0,
+        };
+
+        let step = TurnWorkContext::ReviewStep {
+            review_id: "rev-1".to_string(),
+            review_title: "Multi-level audit".to_string(),
+            queue: finding_queue.clone(),
+        };
+        let json = serde_json::to_string(&step).unwrap();
+        assert!(json.contains("\"kind\":\"review_step\""));
+        assert_eq!(
+            serde_json::from_str::<TurnWorkContext>(&json).unwrap(),
+            step
+        );
+
+        let group_step = TurnWorkContext::ReviewGroupStep {
+            review_id: "rev-1".to_string(),
+            review_title: "Multi-level audit".to_string(),
+            group_id: "arch-1".to_string(),
+            group_title: "Shared commit boundary".to_string(),
+            queue: finding_queue,
+        };
+        let json = serde_json::to_string(&group_step).unwrap();
+        assert!(json.contains("\"kind\":\"review_group_step\""));
+        assert!(json.contains("\"group_id\":\"arch-1\""));
+        assert_eq!(
+            serde_json::from_str::<TurnWorkContext>(&json).unwrap(),
+            group_step
+        );
+    }
+
+    #[test]
+    fn test_turn_work_context_phase_and_interactive_serde() {
+        let interactive = TurnWorkContext::Interactive;
+        let json = serde_json::to_string(&interactive).unwrap();
+        assert_eq!(json, "{\"kind\":\"interactive\"}");
+        assert_eq!(
+            serde_json::from_str::<TurnWorkContext>(&json).unwrap(),
+            interactive
+        );
+
+        let phase = TurnWorkContext::ReviewPhase {
+            review_id: "rev-1".to_string(),
+            review_title: "Multi-level audit".to_string(),
+            phase: ReviewWorkPhase::PostAnalysis,
+            queue: TurnWorkQueue::default(),
+        };
+        let json = serde_json::to_string(&phase).unwrap();
+        assert!(json.contains("\"kind\":\"review_phase\""));
+        assert!(json.contains("\"phase\":\"post_analysis\""));
+        // A phase that executes no batch member omits the empty item list
+        // instead of sending `[]`.
+        assert!(!json.contains("\"items\""));
+        assert_eq!(
+            serde_json::from_str::<TurnWorkContext>(&json).unwrap(),
+            phase
+        );
+
+        // Every phase keeps a stable wire spelling of its own.
+        for (value, expected) in [
+            (ReviewWorkPhase::Audit, "\"audit\""),
+            (ReviewWorkPhase::Decomposition, "\"decomposition\""),
+            (ReviewWorkPhase::PostAnalysis, "\"post_analysis\""),
+        ] {
+            assert_eq!(serde_json::to_string(&value).unwrap(), expected);
+        }
+    }
+
+    #[test]
+    fn test_model_started_event_carries_an_optional_work_context() {
+        // A producer that predates the work contract sends no `work_context`:
+        // the event still decodes, and the absence stays distinguishable from a
+        // declared interactive turn.
+        let legacy: ModelStartedEvent = serde_json::from_str(
+            r#"{"operation_id":"op-1","model":{"provider":"openrouter","name":"m"}}"#,
+        )
+        .unwrap();
+        assert!(legacy.work_context.is_none());
+        assert!(legacy.plan_context.is_none());
+        let json = serde_json::to_string(&legacy).unwrap();
+        assert!(!json.contains("work_context"));
+        assert!(!json.contains("plan_context"));
+
+        let event = ModelStartedEvent {
+            operation_id: "op-2".to_string(),
+            model: ModelRef::openrouter("coder/model"),
+            role: Some(ModelRole::Coder),
+            alias: None,
+            effort: Some(ReasoningEffort::High),
+            plan_context: Some(ModelTurnPlanContext {
+                plan_id: "plan-1".to_string(),
+                step_id: "1".to_string(),
+                batch_step_ids: vec!["1".to_string(), "2".to_string()],
+            }),
+            work_context: Some(TurnWorkContext::PlanStep {
+                plan_id: "plan-1".to_string(),
+                plan_title: "Universal work marker".to_string(),
+                queue: two_step_queue(),
+            }),
+            is_batch: true,
+        };
+        let json = serde_json::to_string(&event).unwrap();
+        assert!(json.contains("\"work_context\":{\"kind\":\"plan_step\""));
+        // The plan stepper keeps receiving the coordinates it always read, so
+        // the new field declares the running work instead of replacing them.
+        assert!(json.contains("\"plan_context\""));
+        assert!(json.contains("\"is_batch\":true"));
+
+        let decoded: ModelStartedEvent = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded.operation_id, "op-2");
+        assert_eq!(decoded.work_context, event.work_context);
+        assert_eq!(decoded.plan_context, event.plan_context);
     }
 }

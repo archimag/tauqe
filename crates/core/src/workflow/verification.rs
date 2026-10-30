@@ -1,4 +1,5 @@
 use std::path::Path;
+use tauqe_protocol::ProjectConfig;
 use tokio::sync::{mpsc, watch};
 
 use crate::edits::protocol::{VerifyOnSuccess, VerifyRequest, VerifyTarget};
@@ -37,15 +38,54 @@ fn log_verification_outcome(target: &str, duration_ms: u64, outcome: &Verificati
     }
 }
 
-/// Executes project verification pipeline according to model's `<verify .../>` request.
+/// Resolves the effective project configuration and runs the verification
+/// pipeline of a `<verify .../>` request.
+///
+/// This facade is reserved for turn-free callers — a manual or CLI invocation
+/// that owns no turn state. No call site inside a bounded turn may invoke it: a
+/// turn holds the project configuration it froze on its first proposal round
+/// and must call [`run_workflow_verification_with_config`], so no verification
+/// round re-reads `tauqe.toml` or re-runs a declared task runner's dump.
+// The facade has no caller inside the crate: every bounded turn verifies
+// against the configuration it froze on its first proposal round, so the
+// turn-free surface is exercised by its tests alone.
+#[allow(dead_code)]
+pub async fn run_workflow_verification(
+    repo_root: &Path,
+    changed_files: &[String],
+    verify_req: &VerifyRequest,
+    stream_tx: &mpsc::Sender<StreamEvent>,
+    stream_output: bool,
+    cancel_rx: Option<&watch::Receiver<bool>>,
+) -> VerificationOutcome {
+    let project = crate::toolchain::effective_project_config(repo_root, cancel_rx).await;
+    run_workflow_verification_with_config(
+        repo_root,
+        &project,
+        changed_files,
+        verify_req,
+        stream_tx,
+        stream_output,
+        cancel_rx,
+    )
+    .await
+}
+
+/// Executes the project verification pipeline according to the model's
+/// `<verify .../>` request, under an already resolved project configuration.
 ///
 /// `changed_files` is the authoritative change set of the turn: the model's
 /// edits, the post-hook artifacts, the files a repair round touched, and the
 /// working-copy differential of the transaction. It reaches the project command
 /// on standard input, one path per line, so a project dispatcher can narrow the
 /// checks to the affected technologies while the mandatory gate stays in force.
-pub async fn run_workflow_verification(
+///
+/// `project` is the configuration a bounded turn froze on its first proposal
+/// round, so a healing round never re-reads `tauqe.toml` or runs a declared task
+/// runner's dump again.
+pub async fn run_workflow_verification_with_config(
     repo_root: &Path,
+    project: &ProjectConfig,
     changed_files: &[String],
     verify_req: &VerifyRequest,
     stream_tx: &mpsc::Sender<StreamEvent>,
@@ -72,8 +112,13 @@ pub async fn run_workflow_verification(
         let _ = stream_tx.send(StreamEvent::TextDelta(start_msg)).await;
     }
 
-    let (ok, results) =
-        crate::toolchain::run_verification_pipeline(repo_root, changed_files, cancel_rx).await;
+    let (ok, results) = crate::toolchain::run_verification_pipeline_with_config(
+        repo_root,
+        project,
+        changed_files,
+        cancel_rx,
+    )
+    .await;
 
     if results.is_empty() {
         let note = "⚠️ The project declares no verification command, so the change set was not verified.\n"

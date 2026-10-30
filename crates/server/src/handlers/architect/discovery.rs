@@ -18,7 +18,7 @@ use tauqe_protocol::{
     TurnPhase, TurnPhaseEvent,
 };
 
-use crate::handlers::common::{clear_auto_context, emit};
+use crate::handlers::common::{clear_auto_context, emit, load_repository_files};
 use crate::handlers::with_context_mutation;
 use crate::state::{AppState, OperationGuard};
 use crate::usage::UsageGuard;
@@ -390,15 +390,17 @@ where
             let searches = output.repo_searches.clone();
             let repo_map_requests = output.repo_maps.clone();
 
-            let ctx_root = repo_root.to_path_buf();
+            // The tracked-file listing is one `git` subprocess for the whole
+            // round: it is resolved here, before either guarded mutation, and
+            // shared with the repo-map path, so no closure holds the exclusive
+            // context guard across a process spawn.
+            let available_files = load_repository_files(repo_root).await;
+            let request_listing = available_files.clone();
             let (outcome, new_ctx_state) = match with_context_mutation(state, move |ctx| {
-                let available_files = tauqe_core::git::list_repository_files(Some(&ctx_root))
-                    .ok()
-                    .unwrap_or_default();
                 let oc = apply_context_requests_detailed(
                     ctx,
                     &requests,
-                    &available_files,
+                    &request_listing,
                     files_token_budget,
                     discovery_limits.refs_token_budget,
                 );
@@ -479,14 +481,12 @@ where
                     .collect();
                 let m_root = repo_root.to_path_buf();
                 let map_budget = repomap_budget;
+                let map_listing = available_files.clone();
                 match with_context_mutation(state, move |ctx| {
-                    let available_files = tauqe_core::git::list_repository_files(Some(&m_root))
-                        .ok()
-                        .unwrap_or_default();
                     tauqe_core::workflow::discovery::execute_discovery_commands_sync(
                         ctx,
                         &m_root,
-                        &available_files,
+                        &map_listing,
                         &commands,
                         files_token_budget,
                         map_budget,

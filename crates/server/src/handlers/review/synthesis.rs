@@ -5,7 +5,6 @@
 //! while raw JSON syntax stays server-side. Cancellation supports both a soft
 //! stop (drain the current turn) and an immediate hard stop.
 
-use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -22,10 +21,10 @@ use tauqe_core::review::{
 use tauqe_core::workflow::batch::BatchStop;
 use tauqe_protocol::review::{PostAnalysisMode, ReviewLaunchConfig};
 use tauqe_protocol::{
-    errors, events, ContextAccess, ModelRole, ModelSelection, ModelUsageEvent, ModelUsageInfo,
-    Request, Response, ReviewCancelParams, ReviewContentDeltaEvent, ReviewFinishedEvent,
-    ReviewIssue, ReviewItem, ReviewListChangedEvent, ReviewReasoningDeltaEvent, ReviewSession,
-    ReviewStartParams, ReviewStartedEvent, ReviewUpdatedEvent,
+    errors, events, ModelRole, ModelSelection, ModelUsageEvent, ModelUsageInfo, Request, Response,
+    ReviewCancelParams, ReviewContentDeltaEvent, ReviewFinishedEvent, ReviewIssue, ReviewItem,
+    ReviewListChangedEvent, ReviewReasoningDeltaEvent, ReviewSession, ReviewStartParams,
+    ReviewStartedEvent, ReviewUpdatedEvent,
 };
 use tokio::sync::mpsc;
 
@@ -35,6 +34,7 @@ use crate::state::{next_operation_id, AppState};
 use super::analysis::run_review_post_analysis;
 use super::common::{emit, emit_error, offload_review};
 use super::groups::run_group_audits;
+use super::window::{expand_window, WindowBudgets, WindowContext};
 pub async fn handle_review_start(mut req: Request, state: &Arc<AppState>) -> Response {
     let params: ReviewStartParams = match req.params.take() {
         Some(p) => match serde_json::from_value(p) {
@@ -60,7 +60,7 @@ pub async fn handle_review_start(mut req: Request, state: &Arc<AppState>) -> Res
         return start_preset_review(req, state, &params, preset_name.to_string()).await;
     }
 
-    let (provider, model, reasoning_effort, max_pattern_batch, files_token_budget) = {
+    let (provider, model, reasoning_effort, budgets) = {
         let cfg = state.config.lock().await.config.clone();
         // The request carries the whole reviewer selection — the model together
         // with the reasoning depth of the configured entry the developer picked
@@ -101,8 +101,9 @@ pub async fn handle_review_start(mut req: Request, state: &Arc<AppState>) -> Res
             provider,
             model,
             reasoning_effort,
-            cfg.context.max_pattern_batch,
-            cfg.context.files_token_budget,
+            WindowBudgets {
+                files_tokens: cfg.context.files_token_budget,
+            },
         )
     };
 
@@ -124,14 +125,10 @@ pub async fn handle_review_start(mut req: Request, state: &Arc<AppState>) -> Res
         }
     };
 
-    // Pattern-matched files the configured budgets kept out of the audit.
-    // Reported on the started event so a truncated expansion is never silent.
-    let mut omitted_files = 0usize;
-
-    // Audit coverage is the union of every declared line: a repository file is
-    // selected as soon as one pattern matches it, so several paths widen the
-    // audit instead of competing for it. Blank lines narrow nothing and are
-    // dropped before compilation (c-1, c-6).
+    // The audit window is the union of the active context and every declared
+    // line: a repository file is selected as soon as one pattern matches it, so
+    // several paths widen the audit instead of competing for it. Blank lines
+    // narrow nothing and are dropped before compilation (c-1, c-6).
     let patterns: Vec<String> = params
         .path_patterns
         .iter()
@@ -140,56 +137,34 @@ pub async fn handle_review_start(mut req: Request, state: &Arc<AppState>) -> Res
         .map(str::to_string)
         .collect();
 
-    if !patterns.is_empty() {
-        let existing_paths: HashSet<String> = files.iter().map(|f| f.path.clone()).collect();
-        let listing_patterns = patterns.clone();
-        let root = repo_root.clone();
-        // Listing the repository and reading every matched file is blocking git
-        // and filesystem work, so it is offloaded off the async worker thread.
-        let listing = crate::handlers::offload(move || {
-            let available_files =
-                tauqe_core::git::list_repository_files(Some(&root)).unwrap_or_default();
-            let compiled: Vec<tauqe_protocol::GlobPattern> = listing_patterns
-                .iter()
-                .map(|pattern| tauqe_protocol::GlobPattern::new(pattern))
-                .collect();
-            let mut matched: Vec<String> = available_files
-                .into_iter()
-                .filter(|path| compiled.iter().any(|pattern| pattern.matches(path)))
-                .collect();
-            // The repository match count is taken before the context filter, so a
-            // pattern whose files are already loaded still selects something,
-            // while zero repository matches prove that the pattern names nothing.
-            let repo_matches = matched.len();
-            matched.retain(|path| !existing_paths.contains(path));
-            matched.sort();
-            let total_matched = matched.len();
-            // One wide glob may match the whole tree, so the batch is cut at
-            // the configured pattern limit before any file is read.
-            matched.truncate(max_pattern_batch);
+    // Pattern-matched files the configured budgets kept out of the audit.
+    // Reported on the started event so a truncated expansion is never silent.
+    let mut omitted_files = 0usize;
 
-            let mut read = Vec::new();
-            for path in matched {
-                if tauqe_core::context::verify_path_within_repo(&root, &path).is_err() {
-                    continue;
-                }
-                let full_path = root.join(&path);
-                if let Ok(content) = std::fs::read_to_string(&full_path) {
-                    read.push((path, content));
-                }
-            }
-            (read, total_matched, repo_matches)
-        })
+    if !patterns.is_empty() {
+        // The expansion is the single deterministic projection of the audit
+        // window: the preset launch and the read-only preview read the same
+        // function, so the window the developer previewed is the window this
+        // launch reads (#c-1, #c-4).
+        let expanded = expand_window(
+            &repo_root,
+            WindowContext {
+                files: &files,
+                tokens: estimated_tokens,
+            },
+            &patterns,
+            budgets,
+        )
         .await;
 
-        let (matched_reads, total_matched) = match listing {
-            Ok((matched_reads, total_matched, repo_matches)) => {
+        match expanded {
+            Ok(expanded) => {
                 // A pattern that selects nothing is a mistyped or unsupported
                 // path, never a narrower audit: launching anyway would review a
                 // different file set while the developer believes the pattern
                 // chose it. A partial selection stays a lawful run reported
                 // through `omitted_files`, so only a zero match is refused.
-                if repo_matches == 0 {
+                if expanded.selected_nothing() {
                     return Response::err(
                         req.id,
                         errors::INVALID_PARAMS,
@@ -199,7 +174,17 @@ pub async fn handle_review_start(mut req: Request, state: &Arc<AppState>) -> Res
                         ),
                     );
                 }
-                (matched_reads, total_matched)
+                estimated_tokens = expanded.estimated_tokens;
+                omitted_files = expanded.window.omitted_files;
+                if omitted_files > 0 {
+                    tracing::warn!(
+                        omitted = omitted_files,
+                        selected = expanded.window.selected_files,
+                        matched = expanded.window.matched_files,
+                        "path pattern expansion exhausted the configured file token budget; remaining matched files were not loaded"
+                    );
+                }
+                files.extend(expanded.files);
             }
             Err(err) => {
                 // The listing failed at the infrastructure level, which says
@@ -210,35 +195,7 @@ pub async fn handle_review_start(mut req: Request, state: &Arc<AppState>) -> Res
                     error = %err,
                     "Failed to list repository files for the review path pattern"
                 );
-                (Vec::new(), 0)
             }
-        };
-
-        let mut added = 0usize;
-        for (path, content) in matched_reads {
-            let tokens =
-                tauqe_core::prompt::estimate_tokens_from_bytes(content.len() as u64) as usize;
-            // The expansion shares the discovery files token budget, so it
-            // stops at the first file that would push the audit window past
-            // the configured limit.
-            if estimated_tokens + tokens > files_token_budget {
-                break;
-            }
-            estimated_tokens += tokens;
-            files.push(tauqe_core::context::ContextFileContent {
-                path,
-                access: ContextAccess::ReadOnly,
-                content,
-            });
-            added += 1;
-        }
-        omitted_files = total_matched.saturating_sub(added);
-        if omitted_files > 0 {
-            tracing::warn!(
-                omitted = omitted_files,
-                matched = total_matched,
-                "path pattern expansion reached the configured batch or token budget; remaining matched files were not loaded"
-            );
         }
     }
 
@@ -977,7 +934,6 @@ mod tests {
             recommendations: Vec::new(),
             files: Vec::new(),
             readonly_files: Vec::new(),
-            plan: Vec::new(),
             note: None,
         }
     }

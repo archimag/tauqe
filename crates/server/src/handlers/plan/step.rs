@@ -10,6 +10,7 @@ use tauqe_core::plan::storage::PlanStorage;
 use tauqe_core::providers::{format_session_id, StreamEvent, SESSION_PREFIX_PLAN};
 use tauqe_core::workflow::batch::{BatchStep, BatchStepExecutor, BatchStepOutcome};
 use tauqe_core::workflow::common::apply_context_requests_detailed;
+use tauqe_protocol::model::{TurnWorkContext, TurnWorkItem, TurnWorkQueue};
 use tauqe_protocol::{
     events, ContextAccess, ModelRef, ModelRole, ModelSelection, ModelTurnPlanContext, PlanItem,
     PlanItemStatus, TurnIntent,
@@ -43,11 +44,11 @@ pub(crate) async fn preload_step_files(state: &Arc<AppState>, repo_root: &Path, 
         access: ContextAccess::ReadOnly,
     }));
 
-    let root = repo_root.to_path_buf();
+    // The tracked-file listing is a `git` subprocess, so it is resolved before
+    // the context mutation takes the exclusive write guard: a guarded closure
+    // must never hold every context reader behind a process spawn.
+    let available_files = crate::handlers::common::load_repository_files(repo_root).await;
     let preloaded = with_context_mutation(state, move |ctx| {
-        let available_files = tauqe_core::git::list_repository_files(Some(&root))
-            .ok()
-            .unwrap_or_default();
         // Declared step files are never capped by an artificial quota, so both
         // the files budget and the refs budget stay unbounded here.
         let outcome = apply_context_requests_detailed(
@@ -87,6 +88,7 @@ async fn run_plan_step(
     batch_step_ids: &[String],
     operation: Arc<OperationGuard>,
     model: Option<&ModelSelection>,
+    cancel_rx: &watch::Receiver<bool>,
 ) -> BatchStepOutcome {
     let outcome = run_plan_step_inner(
         state,
@@ -96,6 +98,7 @@ async fn run_plan_step(
         batch_step_ids,
         operation,
         model,
+        cancel_rx,
     )
     .await;
     clear_auto_context(state).await;
@@ -111,6 +114,7 @@ async fn run_plan_step_inner(
     batch_step_ids: &[String],
     operation: Arc<OperationGuard>,
     model: Option<&ModelSelection>,
+    cancel_rx: &watch::Receiver<bool>,
 ) -> BatchStepOutcome {
     let load_root = repo_root.to_path_buf();
     let load_plan_id = plan_id.to_string();
@@ -208,6 +212,46 @@ async fn run_plan_step_inner(
         }
     };
 
+    // Declare the work this turn executes from typed fields: the owning plan and
+    // the ordered batch queue whose active member is the running step. The
+    // client renders the work marker, the position `[i/N]`, and the active title
+    // from this payload instead of re-deriving them from stored plans.
+    let queue = match batch_step_ids.iter().position(|id| id.as_str() == step_id) {
+        Some(active_index) => TurnWorkQueue {
+            items: batch_step_ids
+                .iter()
+                .map(|id| match plan.find_item(id.as_str()) {
+                    Some(member) => TurnWorkItem {
+                        id: member.id.clone(),
+                        title: member.title.clone(),
+                    },
+                    // A batch that lists a step the stored plan no longer carries
+                    // keeps its positions aligned: the identifier stands in for
+                    // the missing title instead of silently dropping a member.
+                    None => TurnWorkItem {
+                        id: id.clone(),
+                        title: id.clone(),
+                    },
+                })
+                .collect(),
+            active_index,
+        },
+        // A step executed outside a scheduled batch still declares itself as the
+        // only member of its queue, so live work is never reported anonymously.
+        None => TurnWorkQueue {
+            items: vec![TurnWorkItem {
+                id: item.id.clone(),
+                title: item.title.clone(),
+            }],
+            active_index: 0,
+        },
+    };
+    let work_context = TurnWorkContext::PlanStep {
+        plan_id: plan_id.to_string(),
+        plan_title: plan.title.clone(),
+        queue,
+    };
+
     let (max_retries, auto_level_up, models_config) = {
         let cfg = state.config.lock().await.config.clone();
         (
@@ -229,6 +273,22 @@ async fn run_plan_step_inner(
     let mut attempt = 0usize;
 
     loop {
+        // Phase boundary: every attempt is a whole bounded turn, so a cancel
+        // observed here ends the step before another turn is requested. The step
+        // returns to TODO exactly as a cancelled turn does.
+        let cancelled = *cancel_rx.borrow();
+        if cancelled {
+            set_step_status(
+                state,
+                repo_root,
+                plan_id,
+                step_id,
+                PlanItemStatus::Todo,
+                None,
+            )
+            .await;
+            return BatchStepOutcome::cancelled();
+        }
         let workflow = state.config.lock().await.config.develop.workflow;
         let policy = build_apply_policy(state, workflow);
 
@@ -246,10 +306,14 @@ async fn run_plan_step_inner(
                 intent: TurnIntent::IsolatedStep,
                 custom_selection: Some(selection.clone()),
                 plan_context: Some(plan_context),
+                work_context: Some(work_context.clone()),
                 reasoning_effort,
                 marker: marker.clone(),
                 shared_operation: Some(Arc::clone(&operation)),
                 session_id: session_id.clone(),
+                // A plan step streams the turn's live phases into the client
+                // channel, so verifying and healing one step stay visible.
+                phase_out: Some(state.out.clone()),
             },
         )
         .await;
@@ -514,7 +578,7 @@ impl BatchStepExecutor for PlanStepExecutor<'_> {
         &mut self,
         step: &BatchStep,
         _stream_tx: mpsc::Sender<StreamEvent>,
-        _cancel_rx: watch::Receiver<bool>,
+        cancel_rx: watch::Receiver<bool>,
     ) -> anyhow::Result<BatchStepOutcome> {
         Ok(run_plan_step(
             self.state,
@@ -524,6 +588,7 @@ impl BatchStepExecutor for PlanStepExecutor<'_> {
             self.batch_step_ids,
             Arc::clone(self.operation),
             self.model,
+            &cancel_rx,
         )
         .await)
     }

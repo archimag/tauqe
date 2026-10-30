@@ -3,7 +3,7 @@
 use super::extract_and_strip_inner_tag;
 use crate::edits::protocol::xml::extract_attribute;
 use crate::edits::protocol::xml::tags::strip_tags;
-
+use crate::plan::prompt::refine::MAX_PLAN_REFINEMENT_DEPTH;
 fn next_concept_item_bounds(text: &str) -> Option<(usize, usize)> {
     let mut from = 0;
     while from < text.len() {
@@ -87,8 +87,9 @@ fn next_concept_item_bounds(text: &str) -> Option<(usize, usize)> {
 
 pub(super) fn parse_concept_items_with_diagnostics(
     content: &str,
+    remaining_depth: usize,
 ) -> (Vec<tauqe_protocol::ConceptItem>, Vec<String>) {
-    let (items, errors) = parse_concept_items_inner(content);
+    let (items, errors) = parse_concept_items_inner(content, remaining_depth);
     if items.is_empty() && !content.trim().is_empty() {
         let fallback_items = parse_concept_items_fallback(content);
         if !fallback_items.is_empty() {
@@ -104,8 +105,13 @@ pub(super) fn parse_concept_items_with_diagnostics(
 /// into their bodies, but it never runs the unstructured-text fallback. The
 /// fallback belongs to the section root only (see
 /// [`parse_concept_items_with_diagnostics`]), so `<details>` prose inside a
-/// recognized `<concept_item>` cannot spawn phantom child entries.
-fn parse_concept_items_inner(content: &str) -> (Vec<tauqe_protocol::ConceptItem>, Vec<String>) {
+/// recognized `<concept_item>` cannot spawn phantom child entries. Descent stops
+/// once the remaining depth budget of the plan hierarchy is exhausted, so
+/// model-controlled nesting can never overflow the thread stack.
+fn parse_concept_items_inner(
+    content: &str,
+    remaining_depth: usize,
+) -> (Vec<tauqe_protocol::ConceptItem>, Vec<String>) {
     let mut items = Vec::new();
     let mut errors = Vec::new();
     let mut pos = 0;
@@ -225,7 +231,17 @@ fn parse_concept_items_inner(content: &str) -> (Vec<tauqe_protocol::ConceptItem>
 
             if let (Some(cend), Some(cend_full)) = (close_start, close_end) {
                 let body = &content[header_end..cend];
-                let (children, child_errors) = parse_concept_items_inner(body);
+                let (children, child_errors) = if remaining_depth > 1 {
+                    parse_concept_items_inner(body, remaining_depth - 1)
+                } else {
+                    if next_concept_item_bounds(body).is_some() {
+                        errors.push(format!(
+                            "Plan concept item '{}': nesting exceeds the maximum plan hierarchy depth of {MAX_PLAN_REFINEMENT_DEPTH}; deeper <concept_item> entries were ignored",
+                            if id.is_empty() { &raw_title } else { &id }
+                        ));
+                    }
+                    (Vec::new(), Vec::new())
+                };
                 errors.extend(child_errors);
                 let text_only = strip_tags(body, next_concept_item_bounds);
 
@@ -470,7 +486,8 @@ mod tests {
   </details>
 </concept_item>
 "#;
-        let (items, errors) = parse_concept_items_with_diagnostics(content);
+        let (items, errors) =
+            parse_concept_items_with_diagnostics(content, MAX_PLAN_REFINEMENT_DEPTH);
         assert!(errors.is_empty(), "Unexpected errors: {:?}", errors);
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].id, "c-1");
@@ -483,7 +500,8 @@ mod tests {
     #[test]
     fn fallback_runs_once_at_the_section_root() {
         let content = "- #c-1 Verification Symmetry\n  Preflight runs the same checks.";
-        let (items, errors) = parse_concept_items_with_diagnostics(content);
+        let (items, errors) =
+            parse_concept_items_with_diagnostics(content, MAX_PLAN_REFINEMENT_DEPTH);
         assert!(errors.is_empty(), "Unexpected errors: {:?}", errors);
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].id, "c-1");
@@ -502,7 +520,8 @@ mod tests {
   <concept_item id="c-1.1" title="Child" />
 </concept_item>
 "#;
-        let (items, errors) = parse_concept_items_with_diagnostics(content);
+        let (items, errors) =
+            parse_concept_items_with_diagnostics(content, MAX_PLAN_REFINEMENT_DEPTH);
         assert!(errors.is_empty(), "Unexpected errors: {:?}", errors);
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].children.len(), 1);

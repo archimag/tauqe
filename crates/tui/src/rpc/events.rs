@@ -11,7 +11,6 @@ use tauqe_protocol::{
 };
 use tokio::sync::Mutex;
 
-use super::responses::messages;
 use crate::app::{AppState, RunningModel, ViewMode};
 use crate::i18n::active_t;
 use crate::views::repl::{
@@ -72,7 +71,23 @@ fn mark_files_awaiting_healing(model: &mut ReplView) {
         file.error = None;
     }
 }
-
+/// Refreshes the audited file list of the open diff inspector.
+///
+/// The inspector is a live projection of the staged change set, never a frozen
+/// copy: every event that mutates `st.model.files` — a file start, a streamed
+/// hunk, a retry, a verification verdict, or a terminal reconciliation —
+/// republishes the slice it audits, so the reading surface never shows an edit
+/// the Viewport has already moved past (c-3). The highlight is clamped to the
+/// refreshed set, because a reconciliation may shrink it.
+fn sync_diff_inspector(st: &mut AppState) {
+    let Some(inspector) = st.diff_inspector.as_mut() else {
+        return;
+    };
+    inspector.files.clone_from(&st.model.files);
+    if inspector.selected_file >= inspector.files.len() {
+        inspector.selected_file = inspector.files.len().saturating_sub(1);
+    }
+}
 pub async fn handle_event(ev: Event, state: &Arc<Mutex<AppState>>, is_reasoning: &mut bool) {
     let mut st = state.lock().await;
     match ev.method.as_str() {
@@ -95,6 +110,7 @@ pub async fn handle_event(ev: Event, state: &Arc<Mutex<AppState>>, is_reasoning:
                         f.error = None;
                         f.retry_info = None;
                     }
+                    sync_diff_inspector(&mut st);
                 }
             }
         }
@@ -262,9 +278,15 @@ pub async fn handle_event(ev: Event, state: &Arc<Mutex<AppState>>, is_reasoning:
                     // steps can never accumulate the payload of the
                     // previous member.
                     st.model.reset_turn_buffers();
+                    sync_diff_inspector(&mut st);
                     st.model.scroll = 0;
                     st.model.status = TurnStatus::Awaiting;
                     st.model.plan_context = data.plan_context;
+                    // The declared work outlives the payload reset performed
+                    // just above: an event that carries no context clears the
+                    // marker instead of leaving the work of a previous turn on
+                    // screen (c-1).
+                    st.model.work_context = data.work_context;
                     st.model.is_batch = data.is_batch;
                     st.model.auto_scroll = true;
                 }
@@ -312,6 +334,7 @@ pub async fn handle_event(ev: Event, state: &Arc<Mutex<AppState>>, is_reasoning:
                     // (c-healing-phase-visual).
                     if data.phase == tauqe_protocol::TurnPhase::Healing {
                         mark_files_awaiting_healing(&mut st.model);
+                        sync_diff_inspector(&mut st);
                     }
                 }
             }
@@ -358,6 +381,7 @@ pub async fn handle_event(ev: Event, state: &Arc<Mutex<AppState>>, is_reasoning:
                     // streams its replacements (c-healing-phase-visual).
                     if failed {
                         mark_files_awaiting_healing(&mut st.model);
+                        sync_diff_inspector(&mut st);
                     }
                 }
             }
@@ -480,12 +504,12 @@ pub async fn handle_event(ev: Event, state: &Arc<Mutex<AppState>>, is_reasoning:
                             status: FileEditStatus::Running,
                             error: None,
                             hunks: Vec::new(),
-                            expanded: false,
                             retry_info: None,
                         });
                         st.model.selected_file_index = st.model.files.len() - 1;
                     }
                     scroll_to_stream_end(&mut st);
+                    sync_diff_inspector(&mut st);
                 }
             }
         }
@@ -501,6 +525,7 @@ pub async fn handle_event(ev: Event, state: &Arc<Mutex<AppState>>, is_reasoning:
                         });
                     }
                     scroll_to_stream_end(&mut st);
+                    sync_diff_inspector(&mut st);
                 }
             }
         }
@@ -516,6 +541,7 @@ pub async fn handle_event(ev: Event, state: &Arc<Mutex<AppState>>, is_reasoning:
                         }
                     }
                     scroll_to_stream_end(&mut st);
+                    sync_diff_inspector(&mut st);
                 }
             }
         }
@@ -538,12 +564,12 @@ pub async fn handle_event(ev: Event, state: &Arc<Mutex<AppState>>, is_reasoning:
                             status: FileEditStatus::Retrying,
                             error: None,
                             hunks: Vec::new(),
-                            expanded: false,
                             retry_info: Some(retry_msg),
                         });
                         st.model.selected_file_index = st.model.files.len() - 1;
                     }
                     scroll_to_stream_end(&mut st);
+                    sync_diff_inspector(&mut st);
                 }
             }
         }
@@ -566,7 +592,7 @@ pub async fn handle_event(ev: Event, state: &Arc<Mutex<AppState>>, is_reasoning:
                             .model
                             .edit_final_error
                             .clone()
-                            .or_else(|| Some(messages::EDIT_FAILED_FALLBACK.to_string()));
+                            .or_else(|| Some(active_t("repl.edit_failed_fallback")));
                         for f in st.model.files.iter_mut() {
                             if matches!(
                                 f.status,
@@ -580,6 +606,7 @@ pub async fn handle_event(ev: Event, state: &Arc<Mutex<AppState>>, is_reasoning:
                             }
                         }
                     }
+                    sync_diff_inspector(&mut st);
                 }
             }
         }
@@ -626,7 +653,7 @@ pub async fn handle_event(ev: Event, state: &Arc<Mutex<AppState>>, is_reasoning:
                                     f.retry_info = None;
                                     if f.error.is_none() {
                                         f.error = outcome.error.clone().or_else(|| {
-                                            Some(messages::EDIT_FAILED_FALLBACK.to_string())
+                                            Some(active_t("repl.edit_failed_fallback"))
                                         });
                                     }
                                 }
@@ -634,6 +661,7 @@ pub async fn handle_event(ev: Event, state: &Arc<Mutex<AppState>>, is_reasoning:
                         }
                         _ => {}
                     }
+                    sync_diff_inspector(&mut st);
                     st.model.result = Some(data.result);
                     if st.model.auto_scroll {
                         let h = st.last_model_height;
@@ -709,6 +737,7 @@ pub async fn handle_event(ev: Event, state: &Arc<Mutex<AppState>>, is_reasoning:
                 );
                 st.notify_success(msg);
             }
+            sync_diff_inspector(&mut st);
         }
         events::MODEL_CANCELLED => {
             *is_reasoning = false;
@@ -726,6 +755,7 @@ pub async fn handle_event(ev: Event, state: &Arc<Mutex<AppState>>, is_reasoning:
             fail_safe_reject_edits(&mut st.model, &active_t("notify.cancelled_before_edits"));
             let h = st.last_model_height;
             st.model.clamp_scroll(h);
+            sync_diff_inspector(&mut st);
         }
         events::MODEL_ERROR => {
             // The failure message is optional enrichment: the event method is
@@ -774,6 +804,7 @@ pub async fn handle_event(ev: Event, state: &Arc<Mutex<AppState>>, is_reasoning:
             st.model.error = Some(message);
             let h = st.last_model_height;
             st.model.clamp_scroll(h);
+            sync_diff_inspector(&mut st);
         }
         events::REVIEW_STARTED => {
             st.review.running = true;
@@ -1010,8 +1041,8 @@ pub async fn handle_event(ev: Event, state: &Arc<Mutex<AppState>>, is_reasoning:
                     // settle the turn the members deliberately left open.
                     st.batch_stopping = false;
                     st.model.is_batch = false;
-                    settle_batch_turn(&mut st, data.summary.status);
-                    notify_batch_finished(&st, "Plan", &data.summary);
+                    settle_batch_turn(&mut st, &data.summary);
+                    notify_batch_finished(&mut st, BatchKind::Plan, &data.summary);
                 }
             }
         }
@@ -1022,8 +1053,8 @@ pub async fn handle_event(ev: Event, state: &Arc<Mutex<AppState>>, is_reasoning:
                     // the only point that settles the shared turn.
                     st.batch_stopping = false;
                     st.model.is_batch = false;
-                    settle_batch_turn(&mut st, data.summary.status);
-                    notify_batch_finished(&st, "Review", &data.summary);
+                    settle_batch_turn(&mut st, &data.summary);
+                    notify_batch_finished(&mut st, BatchKind::Review, &data.summary);
                 }
             }
         }
@@ -1043,6 +1074,10 @@ fn begin_review_turn(model: &mut ReplView, data: &ReviewStartedEvent) {
     model.scroll = 0;
     model.status = TurnStatus::Responding;
     model.plan_context = None;
+    // The launch declares its own work, so the marker of the plan turn that
+    // just settled never names the wrong entity; a launch that declares
+    // nothing carries no marker at all (c-1).
+    model.work_context = None;
     model.is_batch = false;
     model.auto_scroll = true;
 }
@@ -1096,20 +1131,24 @@ fn end_review_turn(model: &mut ReplView, status: TurnStatus, error: Option<Strin
 /// `MODEL_ERROR` handlers): the queue owns one turn from its first member to
 /// its last. This is therefore the single point that stops the spinner, clears
 /// the phase telemetry, projects the aggregate outcome onto the turn status,
-/// and reconciles the streamed file edits, so the interface never stays stuck
-/// in a busy state after the queue ends.
-fn settle_batch_turn(st: &mut AppState, status: BatchFinishStatus) {
+/// records the terminal stop reason, and reconciles the streamed file edits, so
+/// the interface never stays stuck in a busy state after the queue ends.
+fn settle_batch_turn(st: &mut AppState, summary: &BatchFinishSummary) {
     st.running_model = None;
     st.turn_started_at = None;
     st.confirm_cancel = false;
 
     let applied = st.model.edit_final_applied == Some(true) || st.model.last_commit_hash.is_some();
     let height = st.last_model_height;
+    // The supervisor states the terminal cause in one typed field, so the
+    // interface projects it instead of reconstructing a reason from the member
+    // journals (c-1).
+    let reason = batch_stop_reason(summary);
 
     let model = &mut st.model;
     model.reasoning.finalize();
     model.reasoning.show = false;
-    model.status = match status {
+    model.status = match summary.status {
         BatchFinishStatus::Completed => TurnStatus::Done,
         BatchFinishStatus::Failed | BatchFinishStatus::Blocked => TurnStatus::Error,
         BatchFinishStatus::Cancelled | BatchFinishStatus::Stopped => TurnStatus::Cancelled,
@@ -1121,6 +1160,13 @@ fn settle_batch_turn(st: &mut AppState, status: BatchFinishStatus) {
     model.turn_max_rounds = None;
     model.turn_phase_detail = None;
     model.end_in_flight_usage();
+    // A queue never settles into a bare `Error`: the reason reported by the
+    // supervisor reaches the response pane exactly like a single failed turn
+    // (c-2). A member diagnostic already recorded stays in place when the
+    // summary carries no reason of its own.
+    if let Some(reason) = reason {
+        model.error = Some(reason);
+    }
     if applied {
         for file in model.files.iter_mut() {
             file.status = FileEditStatus::Ok;
@@ -1134,11 +1180,49 @@ fn settle_batch_turn(st: &mut AppState, status: BatchFinishStatus) {
     model.clamp_scroll(height);
 }
 
-/// Raises exactly one aggregate notification when a batch supervisor finishes.
+/// True when the queue terminated on a failure the developer must see.
+fn batch_failed(status: BatchFinishStatus) -> bool {
+    matches!(
+        status,
+        BatchFinishStatus::Failed | BatchFinishStatus::Blocked
+    )
+}
+
+/// Compact reason a batch supervisor stopped early.
+///
+/// The terminal cause travels in [`BatchFinishSummary::error`]; the interface
+/// projects only its first usable line, because the full diagnostic repeats the
+/// whole failure report of the interrupted member (c-1, c-2). A completed,
+/// cancelled, or gracefully stopped queue reports no reason at all.
+fn batch_stop_reason(summary: &BatchFinishSummary) -> Option<String> {
+    if !batch_failed(summary.status) {
+        return None;
+    }
+    summary.error.as_deref().and_then(first_non_empty_line)
+}
+
+/// Returns the trimmed first non-empty line of `text`.
+fn first_non_empty_line(text: &str) -> Option<String> {
+    text.lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .map(str::to_string)
+}
+
+/// Raises the aggregate notification when a batch supervisor finishes.
 ///
 /// Batch members run as a single unit of waiting: their individual turns stay
 /// silent, and only this terminal event produces a sound or desktop alert.
-fn notify_batch_finished(st: &AppState, kind: &str, summary: &BatchFinishSummary) {
+/// A terminal failure additionally raises the in-app error record, so a stopped
+/// queue is explained wherever the developer looks (c-2).
+fn notify_batch_finished(st: &mut AppState, kind: BatchKind, summary: &BatchFinishSummary) {
+    let (title, body) = format_batch_summary(kind, summary);
+    // The interface raises its own error record for a terminal failure, so the
+    // stop reason is readable in-app even when the desktop alert is gated off
+    // by the configured policy (c-2).
+    if batch_failed(summary.status) {
+        st.notify_error(body.clone());
+    }
     let focused = st.terminal_focused;
     if !st
         .tui_config
@@ -1147,7 +1231,6 @@ fn notify_batch_finished(st: &AppState, kind: &str, summary: &BatchFinishSummary
     {
         return;
     }
-    let (title, body) = format_batch_summary(kind, summary);
     crate::terminal::trigger_turn_notification(
         &title,
         &body,
@@ -1158,29 +1241,32 @@ fn notify_batch_finished(st: &AppState, kind: &str, summary: &BatchFinishSummary
 
 /// Builds the title and body for a batch completion notification from its
 /// aggregate outcome, progress counters, and elapsed time.
-fn format_batch_summary(kind: &str, summary: &BatchFinishSummary) -> (String, String) {
-    let status_word = match summary.status {
-        BatchFinishStatus::Completed => "completed",
-        BatchFinishStatus::Failed => "failed",
-        BatchFinishStatus::Blocked => "blocked",
-        BatchFinishStatus::Cancelled => "cancelled",
-        BatchFinishStatus::Stopped => "stopped",
+fn format_batch_summary(kind: BatchKind, summary: &BatchFinishSummary) -> (String, String) {
+    let kind_key = match kind {
+        BatchKind::Plan => "notify.batch_kind.plan",
+        BatchKind::Review => "notify.batch_kind.review",
     };
+    let status_key = match summary.status {
+        BatchFinishStatus::Completed => "notify.batch_status.completed",
+        BatchFinishStatus::Failed => "notify.batch_status.failed",
+        BatchFinishStatus::Blocked => "notify.batch_status.blocked",
+        BatchFinishStatus::Cancelled => "notify.batch_status.cancelled",
+        BatchFinishStatus::Stopped => "notify.batch_status.stopped",
+    };
+    let kind_label = active_t(kind_key);
+    let status_word = active_t(status_key);
     let title = active_t("notify.batch_title")
-        .replacen("{}", kind, 1)
-        .replacen("{}", status_word, 1);
+        .replacen("{}", &kind_label, 1)
+        .replacen("{}", &status_word, 1);
     let mut body = active_t("notify.batch_body")
-        .replacen("{}", kind, 1)
+        .replacen("{}", &kind_label, 1)
         .replacen("{}", &summary.owner_id, 1)
         .replacen("{}", &summary.executed_count.to_string(), 1)
         .replacen("{}", &summary.total_count.to_string(), 1)
         .replacen("{}", &format_elapsed(summary.elapsed_seconds), 1);
-    if let Some(err) = summary.error.as_deref() {
-        let first_line = err.lines().next().unwrap_or("").trim();
-        if !first_line.is_empty() {
-            body.push_str(" - ");
-            body.push_str(first_line);
-        }
+    if let Some(first_line) = summary.error.as_deref().and_then(first_non_empty_line) {
+        body.push_str(" - ");
+        body.push_str(&first_line);
     }
     (title, body)
 }
@@ -1211,6 +1297,15 @@ fn format_elapsed(seconds: u64) -> String {
     } else {
         format!("{}m {}s", seconds / 60, seconds % 60)
     }
+}
+/// The supervisor queue a finished batch belongs to.
+///
+/// The notification builder resolves the queue's localized label and status
+/// word from the catalog itself, so the caller forwards a typed variant
+/// instead of an English literal (Conventions §9).
+enum BatchKind {
+    Plan,
+    Review,
 }
 
 #[cfg(test)]
@@ -1248,7 +1343,7 @@ mod tests {
     #[test]
     fn test_format_batch_summary_completed() {
         let (title, body) = format_batch_summary(
-            "Plan",
+            BatchKind::Plan,
             &batch_summary(BatchFinishStatus::Completed, 3, 3, 42),
         );
         assert_eq!(title, "TAUQE Plan batch completed");
@@ -1260,9 +1355,7 @@ mod tests {
     fn test_format_batch_summary_failed_keeps_first_error_line() {
         let mut summary = batch_summary(BatchFinishStatus::Failed, 1, 3, 90);
         summary.error = Some("compiler error\nlong details".to_string());
-        let (title, body) = format_batch_summary("Plan", &summary);
-        assert_eq!(title, "TAUQE Plan batch failed");
-        assert!(body.contains("1/3"));
+        let (_, body) = format_batch_summary(BatchKind::Plan, &summary);
         assert!(body.contains("1m 30s"));
         assert!(body.contains("compiler error"));
         assert!(!body.contains("long details"));
@@ -1292,7 +1385,6 @@ mod tests {
             status: FileEditStatus::Running,
             error: None,
             hunks: Vec::new(),
-            expanded: false,
             retry_info: None,
         });
 
@@ -2091,7 +2183,6 @@ mod tests {
                 old_text: "let a = 1;".to_string(),
                 new_text: "let a = 2;".to_string(),
             }],
-            expanded: true,
             retry_info: Some("1/3 retrying: no match".to_string()),
         });
 
@@ -2134,7 +2225,6 @@ mod tests {
             status: FileEditStatus::Ok,
             error: None,
             hunks: Vec::new(),
-            expanded: false,
             retry_info: None,
         }
     }
@@ -2847,5 +2937,183 @@ mod tests {
             assert_eq!(guard.review.finished_groups, 0, "{method}");
             assert!(!guard.review.analyzing, "{method}");
         }
+    }
+    #[test]
+    fn test_first_non_empty_line_skips_leading_blank_lines() {
+        assert_eq!(
+            first_non_empty_line("\n\n  boom  \nrest").as_deref(),
+            Some("boom")
+        );
+        assert_eq!(first_non_empty_line("  \n\t\n"), None);
+    }
+
+    #[tokio::test]
+    async fn test_plan_batch_finished_records_the_compact_failure_reason() {
+        let mut st = crate::app::test_state();
+        st.model.is_batch = true;
+        st.model.status = TurnStatus::Responding;
+
+        let state = Arc::new(Mutex::new(st));
+        let mut is_reasoning = false;
+        let mut summary = batch_summary(BatchFinishStatus::Failed, 1, 3, 90);
+        summary.error = Some("compiler error\nlong details".to_string());
+        let ev = Event {
+            method: events::PLAN_BATCH_FINISHED.to_string(),
+            params: Some(
+                serde_json::to_value(PlanBatchFinishedEvent {
+                    operation_id: "op-plan-batch".to_string(),
+                    summary,
+                })
+                .unwrap(),
+            ),
+        };
+
+        handle_event(ev, &state, &mut is_reasoning).await;
+
+        let guard = state.lock().await;
+        assert_eq!(guard.model.status, TurnStatus::Error);
+        assert_eq!(
+            guard.model.error.as_deref(),
+            Some("compiler error"),
+            "the summary reason reaches the response pane"
+        );
+        let notif = guard
+            .active_notification()
+            .expect("a failed batch raises an in-app error record");
+        assert_eq!(notif.level, crate::app::NotificationLevel::Error);
+        assert!(notif.text.contains("compiler error"));
+        assert!(
+            !notif.text.contains("long details"),
+            "the notification carries the compact reason, not the whole report"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_review_batch_finished_records_a_blocked_reason() {
+        let mut st = crate::app::test_state();
+        st.model.is_batch = true;
+        st.model.status = TurnStatus::Verifying;
+
+        let state = Arc::new(Mutex::new(st));
+        let mut is_reasoning = false;
+        let mut summary = batch_summary(BatchFinishStatus::Blocked, 2, 4, 12);
+        summary.error = Some("an invariant cannot be satisfied".to_string());
+        let ev = Event {
+            method: events::REVIEW_BATCH_FINISHED.to_string(),
+            params: Some(
+                serde_json::to_value(ReviewBatchFinishedEvent {
+                    operation_id: "op-review-batch".to_string(),
+                    summary,
+                })
+                .unwrap(),
+            ),
+        };
+
+        handle_event(ev, &state, &mut is_reasoning).await;
+
+        let guard = state.lock().await;
+        assert_eq!(guard.model.status, TurnStatus::Error);
+        assert_eq!(
+            guard.model.error.as_deref(),
+            Some("an invariant cannot be satisfied")
+        );
+        let notif = guard
+            .active_notification()
+            .expect("a blocked batch raises an in-app error record");
+        assert_eq!(notif.level, crate::app::NotificationLevel::Error);
+        assert!(notif.text.contains("an invariant cannot be satisfied"));
+    }
+
+    #[tokio::test]
+    async fn test_completed_batch_projects_no_failure_reason() {
+        let mut st = crate::app::test_state();
+        st.model.is_batch = true;
+
+        let state = Arc::new(Mutex::new(st));
+        let mut is_reasoning = false;
+        let mut summary = batch_summary(BatchFinishStatus::Completed, 3, 3, 42);
+        summary.error = Some("stale note".to_string());
+        let ev = Event {
+            method: events::PLAN_BATCH_FINISHED.to_string(),
+            params: Some(
+                serde_json::to_value(PlanBatchFinishedEvent {
+                    operation_id: "op-plan-batch".to_string(),
+                    summary,
+                })
+                .unwrap(),
+            ),
+        };
+
+        handle_event(ev, &state, &mut is_reasoning).await;
+
+        let guard = state.lock().await;
+        assert_eq!(guard.model.status, TurnStatus::Done);
+        assert!(
+            guard.model.error.is_none(),
+            "only a failed or blocked queue projects a reason"
+        );
+        assert!(guard.active_notification().is_none());
+    }
+    /// The inspector is a live projection of the staged change set: a file that
+    /// starts streaming, receives a hunk, and settles must appear in an already
+    /// open audit exactly as the Viewport sees it (c-3).
+    #[tokio::test]
+    async fn test_open_diff_inspector_mirrors_the_streamed_edit_set() {
+        let mut st = crate::app::test_state();
+        st.diff_inspector = Some(crate::app::DiffInspectorState {
+            files: Vec::new(),
+            selected_file: 0,
+            diff_scroll: 0,
+            focus: crate::app::DiffInspectorFocus::Files,
+        });
+        let state = Arc::new(Mutex::new(st));
+        let mut is_reasoning = false;
+
+        handle_event(
+            edit_file_started_event(STREAMED_PATH),
+            &state,
+            &mut is_reasoning,
+        )
+        .await;
+        {
+            let guard = state.lock().await;
+            let inspector = guard
+                .diff_inspector
+                .as_ref()
+                .expect("the audit stays open across the stream");
+            assert_eq!(inspector.files.len(), 1);
+            assert_eq!(inspector.files[0].path, STREAMED_PATH);
+            assert_eq!(inspector.files[0].status, FileEditStatus::Running);
+        }
+
+        handle_event(
+            first_hunk_event(STREAMED_PATH, "let a = 1;", "let a = 2;"),
+            &state,
+            &mut is_reasoning,
+        )
+        .await;
+        {
+            let guard = state.lock().await;
+            let inspector = guard
+                .diff_inspector
+                .as_ref()
+                .expect("the audit stays open across the stream");
+            assert_eq!(inspector.files[0].hunks.len(), 1);
+            assert_eq!(inspector.files[0].hunks[0].new_text, "let a = 2;");
+        }
+
+        handle_event(
+            edit_file_done_event(STREAMED_PATH, tauqe_protocol::EditFileStatus::Ok, None),
+            &state,
+            &mut is_reasoning,
+        )
+        .await;
+
+        let guard = state.lock().await;
+        let inspector = guard
+            .diff_inspector
+            .as_ref()
+            .expect("the audit stays open across the stream");
+        assert_eq!(inspector.files[0].status, FileEditStatus::Ok);
     }
 }

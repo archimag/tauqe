@@ -54,6 +54,14 @@ impl EditStreamFilter for CommandStreamFilter {
         let CommandStreamFilter { inner, .. } = *self;
         inner.finish()
     }
+
+    fn reset(&mut self) {
+        // The recorded output is the text decoded once the turn ends, so the
+        // voided attempt must leave neither a fragment there nor in the filter
+        // that renders the preview.
+        self.raw.clear();
+        self.inner.reset();
+    }
 }
 
 #[cfg(test)]
@@ -72,6 +80,8 @@ mod tests {
         fn finish(self: Box<Self>) -> Vec<StreamEvent> {
             vec![StreamEvent::Done]
         }
+
+        fn reset(&mut self) {}
     }
 
     #[test]
@@ -97,5 +107,17 @@ mod tests {
         filter.push_chunk("delta");
         let events = Box::new(filter).finish();
         assert!(matches!(&events[..], [StreamEvent::Done]));
+    }
+    #[test]
+    fn test_reset_discards_the_recorded_output() {
+        let mut filter = CommandStreamFilter::new(Box::new(EchoFilter));
+        filter.push_chunk("first attempt");
+
+        filter.reset();
+        assert_eq!(filter.raw_text(), "");
+
+        let events = filter.push_chunk("second attempt");
+        assert!(matches!(&events[..], [StreamEvent::TextDelta(t)] if t == "second attempt"));
+        assert_eq!(filter.raw_text(), "second attempt");
     }
 }

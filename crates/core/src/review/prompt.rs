@@ -3,9 +3,10 @@
 //! The review prompt surface is decomposed into five cohesive submodules:
 //! `analysis` (the cross-group post-analysis of every finding a session
 //! produced), `discussion` (review Q&A and full-session audit prompts),
-//! `refine` (Architect finding decomposition into a resolution subplan), `step`
-//! (isolated finding resolution, retry, and skip handling), and `subplan`
-//! (the architectural-context scaffolding a finding hands to its sub-steps).
+//! `refine` (Architect decomposition of an architectural group into one
+//! remediation plan), `step` (isolated finding resolution, retry, and skip
+//! handling), and `subplan` (the architectural-context scaffolding a group
+//! hands to its sub-steps).
 //! Every public item is re-exported here so callers keep using the stable
 //! `review::prompt::*` paths.
 
@@ -15,28 +16,29 @@ pub mod refine;
 pub mod step;
 pub mod subplan;
 
+#[cfg(test)]
+mod group_prompt_tests;
 pub use analysis::{build_post_analysis_system_prompt, build_post_analysis_user_prompt};
 pub use discussion::{
     build_review_system_prompt, build_review_user_prompt, format_review_discussion_prompt,
     format_review_discussion_prompt_items, REVIEW_DISCUSSION_PREFIX,
 };
 pub use refine::{
-    build_review_finding_refine_system_prompt, build_review_finding_refine_user_prompt,
-    build_review_refine_system_prompt, build_review_refine_user_prompt, ReviewRefineDiagnostics,
-    MAX_REVIEW_SUBPLAN_DEPTH,
+    build_review_group_refine_system_prompt, build_review_group_refine_user_prompt,
+    ReviewGroupRefineDiagnostics, MAX_REVIEW_SUBPLAN_DEPTH,
 };
 pub use step::{
     format_review_step_execution_prompt, format_review_step_failure_note,
     format_review_step_retry_prompt, ReviewStepFailure, REVIEW_STEP_EXECUTION_PREFIX,
     REVIEW_STEP_RETRY_PREFIX,
 };
-pub use subplan::apply_finding_architectural_context;
+pub use subplan::apply_group_architectural_context;
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use tauqe_protocol::review::ReviewSession;
-    use tauqe_protocol::{EditProtocolKind, PlanItem};
+    use tauqe_protocol::EditProtocolKind;
 
     #[test]
     fn test_format_review_step_retry_prompt() {
@@ -61,114 +63,6 @@ mod tests {
     }
 
     #[test]
-    fn test_format_review_step_execution_prompt_with_subplan() {
-        use tauqe_protocol::review::{IssueType, ReviewItem, ReviewItemStatus};
-        use tauqe_protocol::PlanItemStatus;
-
-        let session = ReviewSession {
-            id: "rev-sub".to_string(),
-            title: "Subplan Review".to_string(),
-            created_at: 100,
-            model: tauqe_protocol::ModelRef::openrouter("model-x"),
-            description: None,
-            user_prompt: None,
-            target_files: vec!["crates/core/src/lib.rs".to_string()],
-            items: vec![ReviewItem {
-                id: 1,
-                title: "Refactor architecture".to_string(),
-                uuid: None,
-                group: None,
-                subplan_last_replanned_step: None,
-                model: None,
-                issue_type: IssueType::Architecture,
-                severity: tauqe_protocol::ReviewSeverity::Warning,
-                status: ReviewItemStatus::Todo,
-                recommendations: vec![],
-                files: vec!["crates/core/src/lib.rs".to_string()],
-                readonly_files: vec![],
-                subplan: vec![PlanItem {
-                    id: "1.1".to_string(),
-                    title: "Split module".to_string(),
-                    details: Some("Create submodules".to_string()),
-                    status: PlanItemStatus::Done,
-                    blocked_reason: None,
-                    concept_refs: vec![],
-                    files: vec!["crates/core/src/sub.rs".to_string()],
-                    readonly_files: vec![],
-                    depends_on: vec![],
-                    children: vec![],
-                }],
-                subplan_architect: None,
-                resolution_notes: None,
-                body: "Break down large file".to_string(),
-            }],
-            raw_markdown: String::new(),
-            ..Default::default()
-        };
-
-        let prompt =
-            format_review_step_execution_prompt(&session, 1, EditProtocolKind::Xml, Some("TAG"))
-                .unwrap();
-        assert!(prompt.contains("Decomposed Subplan Steps:"));
-        assert!(prompt.contains(
-            "- [DONE] #1.1 Split module (files: crates/core/src/sub.rs): Create submodules"
-        ));
-    }
-
-    #[test]
-    fn test_build_review_finding_refine_prompts() {
-        use tauqe_protocol::review::{IssueType, ReviewItem, ReviewItemStatus};
-
-        let session = ReviewSession {
-            id: "rev-ref".to_string(),
-            title: "Refinement Session".to_string(),
-            created_at: 100,
-            model: tauqe_protocol::ModelRef::openrouter("model-x"),
-            description: Some("Audit findings to refine".to_string()),
-            user_prompt: None,
-            target_files: vec!["crates/core/src/lib.rs".to_string()],
-            items: vec![ReviewItem {
-                id: 42,
-                title: "Decompose this issue".to_string(),
-                uuid: None,
-                group: None,
-                subplan_last_replanned_step: None,
-                model: None,
-                issue_type: IssueType::Bug,
-                severity: tauqe_protocol::ReviewSeverity::Critical,
-                status: ReviewItemStatus::Discussion,
-                recommendations: vec![],
-                files: vec!["crates/core/src/lib.rs".to_string()],
-                readonly_files: vec![],
-                subplan: vec![],
-                subplan_architect: None,
-                resolution_notes: Some("Break into sub-steps".to_string()),
-                body: "Needs structural division".to_string(),
-            }],
-            raw_markdown: String::new(),
-            ..Default::default()
-        };
-
-        let sys = build_review_finding_refine_system_prompt();
-        assert!(sys.contains("Review Finding Decomposition"));
-        assert!(sys.contains("Compilability Invariants"));
-
-        let user = build_review_finding_refine_user_prompt(
-            &session,
-            &session.items[0],
-            &[],
-            Some("fn outline()"),
-            None,
-            None,
-            Some("Focus on safety"),
-        );
-        assert!(user.contains("# Review Finding Refinement: [rev-ref#42] Decompose this issue"));
-        assert!(user.contains("Focus on safety"));
-        assert!(user.contains("fn outline()"));
-        assert!(user.contains("Break into sub-steps"));
-    }
-
-    #[test]
     fn test_format_review_step_execution_prompt() {
         use tauqe_protocol::review::{IssueType, ReviewItem, ReviewItemStatus};
 
@@ -185,7 +79,6 @@ mod tests {
                 title: "Excessive clone in hot path".to_string(),
                 uuid: None,
                 group: None,
-                subplan_last_replanned_step: None,
                 model: None,
                 issue_type: IssueType::Performance,
                 severity: tauqe_protocol::ReviewSeverity::Warning,
@@ -193,8 +86,6 @@ mod tests {
                 recommendations: vec![],
                 files: vec!["crates/tui/src/view.rs".to_string()],
                 readonly_files: vec![],
-                subplan: Vec::new(),
-                subplan_architect: None,
                 resolution_notes: None,
                 body: "Replace clone with reference borrowing".to_string(),
             }],
@@ -229,7 +120,6 @@ mod tests {
                 title: "Race condition in cache".to_string(),
                 uuid: None,
                 group: None,
-                subplan_last_replanned_step: None,
                 model: None,
                 issue_type: IssueType::Bug,
                 severity: tauqe_protocol::ReviewSeverity::Critical,
@@ -237,8 +127,6 @@ mod tests {
                 recommendations: vec![],
                 files: vec!["src/lib.rs".to_string()],
                 readonly_files: vec![],
-                subplan: Vec::new(),
-                subplan_architect: None,
                 resolution_notes: Some("Extend scope of mutex guard".to_string()),
                 body: "Lock is dropped prematurely.".to_string(),
             }],

@@ -1,18 +1,17 @@
-//! Review view state: sessions, fold state, navigation, and the refine flow.
+//! Review view state: sessions, fold state, and navigation.
 //!
 //! The pure projection machinery — the `VisibleReviewRow` row model and the
 //! group bucketing that collects findings under the group owning them — lives
 //! in `views::review::projection`, and row rendering lives in
-//! `views::review::tree`. This module keeps the interactive view state, the
-//! embedded refine dialog, and the viewport behavior (Conventions §3.5).
+//! `views::review::tree`. This module keeps the interactive view state and the
+//! viewport behavior (Conventions §3.5).
 
-use std::collections::{HashSet, VecDeque};
+use std::collections::HashSet;
 
 use tauqe_protocol::{
-    DiscussionFocus, IssueStatus, ModelEntry, PlanItem, ReviewIssue, ReviewItem, ReviewSession,
+    DiscussionFocus, IssueStatus, PlanItem, ReviewIssue, ReviewItem, ReviewSession,
 };
 
-use crate::components::model_selector::ModelSelector;
 use crate::markdown::MarkdownBodyCache;
 use crate::views::recenter::RecenterState;
 
@@ -23,79 +22,14 @@ pub mod tree;
 
 pub use self::input::{handle_review_key, REVIEW_COMMAND_MAP};
 pub use self::projection::VisibleReviewRow;
-use self::projection::{collect_subplan_keys, group_key, subplan_all_expanded, subplan_key};
+use self::projection::{
+    collect_subplan_keys, group_key, plan_branch_key, subplan_all_expanded, subplan_key,
+};
 pub use self::render::render_review_view;
 pub(crate) use self::tree::{
     compute_unified_review_lines, format_created_at, issue_status_label, issue_status_style,
     issue_type_badge, issue_type_style, location, model_badge, plan_status_style,
 };
-/// A finding targeted for Architect decomposition.
-/// The Architect decomposes one finding per bounded call, so a batch refinement
-/// keeps an ordered queue of the findings still awaiting decomposition and
-/// drains it one response at a time.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RefineTarget {
-    /// Review session the finding belongs to.
-    pub review_id: String,
-    /// Numeric finding id inside that session.
-    pub item_id: u32,
-}
-
-/// Review-finding decomposition dialog state.
-///
-/// The Architect decomposes one finding per bounded call, so `r` opens this
-/// dialog to choose the architect model and, optionally, to describe how the
-/// finding should be decomposed. Submitting dispatches `review/refineItem` with
-/// the selected model and directives, keeping the "what" decision explicit
-/// instead of an implicit retry (Vision.md §1.2).
-#[derive(Debug, Clone)]
-pub struct ReviewRefineDialogState {
-    pub review_id: String,
-    pub review_title: String,
-    pub item_id: u32,
-    pub item_title: String,
-    pub selector: ModelSelector,
-    pub instructions_editor: crate::editor::InputEditor,
-    /// Section that currently owns the keyboard.
-    pub focus: crate::views::plans::RefineDialogFocus,
-    pub confirm_button: crate::app::ConfirmDialogButton,
-}
-
-impl ReviewRefineDialogState {
-    /// Builds the dialog over the configured `architect_entries`.
-    ///
-    /// The entries arrive from the role configuration exactly as the daemon
-    /// reported them, so each one still carries the escalation marker the
-    /// shared selector renders: a finding can be decomposed manually on an
-    /// Architect the ladder never escalates to, and the dialog says so (c-4).
-    pub fn new(
-        review_id: String,
-        review_title: String,
-        item_id: u32,
-        item_title: String,
-        architect_entries: Vec<ModelEntry>,
-    ) -> Self {
-        Self {
-            review_id,
-            review_title,
-            item_id,
-            item_title,
-            selector: ModelSelector::new(
-                tauqe_protocol::ModelRole::Architect,
-                architect_entries,
-                0,
-            ),
-            instructions_editor: crate::editor::InputEditor::default(),
-            focus: crate::views::plans::RefineDialogFocus::default(),
-            confirm_button: crate::app::ConfirmDialogButton::Cancel,
-        }
-    }
-
-    /// Currently selected architect entry, if any.
-    pub fn selected_entry(&self) -> Option<&ModelEntry> {
-        self.selector.selected_entry()
-    }
-}
 
 /// Group whose isolated audit is currently streaming.
 ///
@@ -126,9 +60,6 @@ pub struct ReviewViewState {
     pub finished_groups: usize,
     /// Whether the Architect post-analysis layer is classifying the findings.
     pub analyzing: bool,
-    /// Review id currently under Architect decomposition (`review/refineItem`),
-    /// if any. Drives the in-flight footer indicator and blocks re-entry.
-    pub refining: Option<String>,
     pub sessions: Vec<ReviewSession>,
     pub session: Option<ReviewSession>,
     pub selected_index: usize,
@@ -140,6 +71,14 @@ pub struct ReviewViewState {
     /// Groups are expanded by default and folding one is presentation state
     /// only, so the session is never mutated (#c-3).
     pub collapsed_groups: HashSet<String>,
+    /// Folded plan branches, keyed by session and group through
+    /// `plan_branch_key`.
+    ///
+    /// The unified plan of a group owns a branch of its own, so folding it is
+    /// independent of the group header above it and of the findings below it;
+    /// like every other fold it is presentation state only and never mutates the
+    /// session (concept #c-1).
+    pub collapsed_plan_branches: HashSet<String>,
     pub expanded_items: HashSet<String>,
     pub hide_closed: bool,
     pub error: Option<String>,
@@ -150,13 +89,6 @@ pub struct ReviewViewState {
     /// Active discussion focus mirrored from the server, used to render the
     /// `[FOCUS]` indicator. Synced from `AppState::discussion_focus` on render.
     pub discussion_focus: DiscussionFocus,
-    /// Findings awaiting Architect decomposition, in dispatch order.
-    ///
-    /// The Architect decomposes one finding per bounded call, so a batch
-    /// refinement drains this queue one `review/refineItem` response at a time.
-    pub refine_queue: VecDeque<RefineTarget>,
-    /// Architect decomposition dialog for the selected finding, when open.
-    pub refine_dialog: Option<ReviewRefineDialogState>,
     /// Rendered Markdown bodies of the expanded finding descriptions and
     /// subplan step details, keyed by the item that owns the description.
     ///
@@ -340,6 +272,28 @@ impl ReviewViewState {
         }
     }
 
+    /// Whether the unified plan branch of a group is unfolded.
+    ///
+    /// The branch is expanded by default, because it carries the execution
+    /// mechanism of the root cause that the findings only manifest
+    /// (concept #c-1).
+    pub fn is_plan_branch_expanded(&self, session_id: &str, group_id: &str) -> bool {
+        !self
+            .collapsed_plan_branches
+            .contains(&plan_branch_key(session_id, group_id))
+    }
+
+    /// Folds or unfolds the unified plan branch of a group.
+    ///
+    /// Folding the branch hides its steps and leaves the findings of the group
+    /// untouched, so the two bands a group renders fold independently
+    /// (concept #c-1).
+    pub fn toggle_plan_branch_expanded(&mut self, session_id: &str, group_id: &str) {
+        let key = plan_branch_key(session_id, group_id);
+        if !self.collapsed_plan_branches.remove(&key) {
+            self.collapsed_plan_branches.insert(key);
+        }
+    }
     pub fn is_item_expanded(&self, session_id: &str, item_id: u32) -> bool {
         self.expanded_items
             .contains(&format!("{}:{}", session_id, item_id))
@@ -352,17 +306,27 @@ impl ReviewViewState {
         }
     }
 
-    /// Whether a single subplan step of a finding is expanded.
+    /// Whether a single step of a group plan is expanded.
     ///
     /// A leaf step reveals its details and file lists; a container step reveals
     /// its nested child steps.
-    pub fn is_subplan_item_expanded(&self, session_id: &str, item_id: u32, step_id: &str) -> bool {
+    pub fn is_subplan_item_expanded(
+        &self,
+        session_id: &str,
+        group_id: &str,
+        step_id: &str,
+    ) -> bool {
         self.expanded_items
-            .contains(&subplan_key(session_id, item_id, step_id))
+            .contains(&subplan_key(session_id, group_id, step_id))
     }
 
-    pub fn toggle_subplan_item_expanded(&mut self, session_id: &str, item_id: u32, step_id: &str) {
-        let key = subplan_key(session_id, item_id, step_id);
+    pub fn toggle_subplan_item_expanded(
+        &mut self,
+        session_id: &str,
+        group_id: &str,
+        step_id: &str,
+    ) {
+        let key = subplan_key(session_id, group_id, step_id);
         if !self.expanded_items.remove(&key) {
             self.expanded_items.insert(key);
         }
@@ -372,13 +336,18 @@ impl ReviewViewState {
         self.collapsed_sessions.clear();
         self.collapsed_summaries.clear();
         self.collapsed_groups.clear();
+        self.collapsed_plan_branches.clear();
         let effective = self.effective_sessions();
-        for s in &effective {
-            for issue in s.issues() {
-                self.expanded_items.insert(format!("{}:{}", s.id, issue.id));
-                collect_subplan_keys(&s.id, issue.id, &issue.plan, &mut self.expanded_items);
+        let mut keys: HashSet<String> = HashSet::new();
+        for session in &effective {
+            for issue in session.issues() {
+                keys.insert(format!("{}:{}", session.id, issue.id));
+            }
+            for bucket in self.group_buckets(session) {
+                collect_subplan_keys(&session.id, &bucket.id, &bucket.subplan, &mut keys);
             }
         }
+        self.expanded_items.extend(keys);
     }
     pub fn collapse_all(&mut self) {
         self.expanded_items.clear();
@@ -396,6 +365,21 @@ impl ReviewViewState {
             .collect();
         for key in keys {
             self.collapsed_groups.insert(key);
+        }
+        // The plan branch of every group carrying a plan folds together with the
+        // tree, so a collapsed overview never leaves a branch unfolded under a
+        // folded header (concept #c-1).
+        let branch_keys: Vec<String> = effective
+            .iter()
+            .flat_map(|session| {
+                self.group_buckets(session)
+                    .into_iter()
+                    .filter(|bucket| !bucket.subplan.is_empty())
+                    .map(|bucket| plan_branch_key(&session.id, &bucket.id))
+            })
+            .collect();
+        for key in branch_keys {
+            self.collapsed_plan_branches.insert(key);
         }
     }
 
@@ -416,20 +400,21 @@ impl ReviewViewState {
             if !self.is_summary_expanded(&session.id) {
                 return false;
             }
-            let groups_open = self
-                .group_buckets(session)
-                .iter()
-                .all(|bucket| self.is_group_expanded(&session.id, &bucket.id));
+            let groups = self.group_buckets(session);
+            let groups_open = groups.iter().all(|bucket| {
+                self.is_group_expanded(&session.id, &bucket.id)
+                    && self.is_plan_branch_expanded(&session.id, &bucket.id)
+                    && subplan_all_expanded(
+                        &self.expanded_items,
+                        &session.id,
+                        &bucket.id,
+                        &bucket.subplan,
+                    )
+            });
             groups_open
                 && session.issues().iter().all(|issue| {
                     self.expanded_items
                         .contains(&format!("{}:{}", session.id, issue.id))
-                        && subplan_all_expanded(
-                            &self.expanded_items,
-                            &session.id,
-                            issue.id,
-                            &issue.plan,
-                        )
                 })
         })
     }
@@ -445,48 +430,6 @@ impl ReviewViewState {
     pub fn toggle_hide_closed(&mut self) {
         self.hide_closed = !self.hide_closed;
         self.clamp_selection();
-    }
-
-    /// Findings still awaiting Architect decomposition, in session order.
-    ///
-    /// A finding in `REFINE` status has been classified by the Reviewer but not
-    /// yet broken into executable steps, so this set is exactly what the batch
-    /// decomposition (`R`) owes the developer.
-    pub fn pending_refine_targets(&self) -> Vec<RefineTarget> {
-        let mut targets = Vec::new();
-        for session in self.effective_sessions() {
-            for item in &session.items {
-                if item.status == IssueStatus::Refine {
-                    targets.push(RefineTarget {
-                        review_id: session.id.clone(),
-                        item_id: item.id,
-                    });
-                }
-            }
-        }
-        targets
-    }
-
-    /// Replaces the refine queue with `targets` and returns the first finding to
-    /// dispatch, or `None` when nothing is queued.
-    pub fn begin_refine_batch(&mut self, targets: Vec<RefineTarget>) -> Option<RefineTarget> {
-        self.refine_queue = targets.into();
-        self.next_refine_target()
-    }
-
-    /// Pops the next finding to decompose and marks the view busy while the
-    /// queue drains, clearing the marker once the queue is exhausted.
-    pub fn next_refine_target(&mut self) -> Option<RefineTarget> {
-        match self.refine_queue.pop_front() {
-            Some(target) => {
-                self.refining = Some(target.review_id.clone());
-                Some(target)
-            }
-            None => {
-                self.refining = None;
-                None
-            }
-        }
     }
 
     pub(crate) fn effective_sessions(&self) -> Vec<ReviewSession> {
@@ -607,15 +550,22 @@ impl ReviewViewState {
         #[derive(Clone)]
         struct ReviewNodeRef {
             session_id: String,
+            /// Group whose header, plan branch, plan step, or finding the node
+            /// names.
             section_id: Option<String>,
             item_id: Option<u32>,
             step_id: Option<String>,
             ancestor_steps: Vec<String>,
+            /// Whether the node is the plan branch of its group.
+            ///
+            /// The branch shares the group identifier of the header above it, so
+            /// this flag is what tells the two nodes apart (concept #c-1).
+            plan_branch: bool,
         }
 
         fn collect_subplan_nodes(
             session_id: &str,
-            item_id: u32,
+            group_id: &str,
             steps: &[PlanItem],
             ancestors: &mut Vec<String>,
             out: &mut Vec<ReviewNodeRef>,
@@ -623,13 +573,14 @@ impl ReviewViewState {
             for step in steps {
                 out.push(ReviewNodeRef {
                     session_id: session_id.to_string(),
-                    section_id: None,
-                    item_id: Some(item_id),
+                    section_id: Some(group_id.to_string()),
+                    item_id: None,
                     step_id: Some(step.id.clone()),
                     ancestor_steps: ancestors.clone(),
+                    plan_branch: false,
                 });
                 ancestors.push(step.id.clone());
-                collect_subplan_nodes(session_id, item_id, &step.children, ancestors, out);
+                collect_subplan_nodes(session_id, group_id, &step.children, ancestors, out);
                 ancestors.pop();
             }
         }
@@ -643,20 +594,44 @@ impl ReviewViewState {
                 item_id: None,
                 step_id: None,
                 ancestor_steps: Vec::new(),
+                plan_branch: false,
             });
             let groups = self
                 .group_buckets(session)
                 .into_iter()
-                .map(|bucket| (bucket.id, bucket.items))
+                .map(|bucket| (bucket.id, bucket.subplan, bucket.items))
                 .collect::<Vec<_>>();
-            for (group_id, items) in groups {
+            for (group_id, subplan, items) in groups {
                 all_nodes.push(ReviewNodeRef {
                     session_id: session.id.clone(),
-                    section_id: Some(group_id),
+                    section_id: Some(group_id.clone()),
                     item_id: None,
                     step_id: None,
                     ancestor_steps: Vec::new(),
+                    plan_branch: false,
                 });
+                // The plan branch is a node of its own: the walk stops on it
+                // before descending into the steps it owns (concept #c-1).
+                if !subplan.is_empty() {
+                    all_nodes.push(ReviewNodeRef {
+                        session_id: session.id.clone(),
+                        section_id: Some(group_id.clone()),
+                        item_id: None,
+                        step_id: None,
+                        ancestor_steps: Vec::new(),
+                        plan_branch: true,
+                    });
+                }
+                // The steps of the group plan are inspected one by one before
+                // its findings, exactly as the tree renders them.
+                let mut ancestors = Vec::new();
+                collect_subplan_nodes(
+                    &session.id,
+                    &group_id,
+                    &subplan,
+                    &mut ancestors,
+                    &mut all_nodes,
+                );
                 for issue in items {
                     all_nodes.push(ReviewNodeRef {
                         session_id: session.id.clone(),
@@ -664,15 +639,8 @@ impl ReviewViewState {
                         item_id: Some(issue.id),
                         step_id: None,
                         ancestor_steps: Vec::new(),
+                        plan_branch: false,
                     });
-                    let mut ancestors = Vec::new();
-                    collect_subplan_nodes(
-                        &session.id,
-                        issue.id,
-                        &issue.subplan,
-                        &mut ancestors,
-                        &mut all_nodes,
-                    );
                 }
             }
         }
@@ -697,7 +665,21 @@ impl ReviewViewState {
             }) => all_nodes
                 .iter()
                 .position(|n| {
-                    n.session_id == session_id && n.section_id.as_deref() == Some(group_id.as_str())
+                    n.session_id == session_id
+                        && !n.plan_branch
+                        && n.section_id.as_deref() == Some(group_id.as_str())
+                })
+                .unwrap_or(0),
+            Some(VisibleReviewRow::GroupPlanHeader {
+                session_id,
+                group_id,
+                ..
+            }) => all_nodes
+                .iter()
+                .position(|n| {
+                    n.session_id == session_id
+                        && n.plan_branch
+                        && n.section_id.as_deref() == Some(group_id.as_str())
                 })
                 .unwrap_or(0),
             Some(VisibleReviewRow::ReviewItem {
@@ -712,14 +694,14 @@ impl ReviewViewState {
                 .unwrap_or(0),
             Some(VisibleReviewRow::SubplanItem {
                 session_id,
-                item_id,
+                group_id,
                 step_id,
                 ..
             }) => all_nodes
                 .iter()
                 .position(|n| {
                     n.session_id == session_id
-                        && n.item_id == Some(item_id)
+                        && n.section_id.as_deref() == Some(group_id.as_str())
                         && n.step_id.as_deref() == Some(step_id.as_str())
                 })
                 .unwrap_or(0),
@@ -756,29 +738,44 @@ impl ReviewViewState {
         if let Some(section_id) = target.section_id.as_deref() {
             self.collapsed_groups
                 .remove(&group_key(&target.session_id, section_id));
+            // The branch header and every step of the plan live inside the
+            // branch, so the branch itself must be unfolded for either of them
+            // to render (concept #c-1).
+            self.collapsed_plan_branches
+                .remove(&plan_branch_key(&target.session_id, section_id));
         } else if target.item_id.is_some() {
             self.collapsed_groups
                 .retain(|key| !key.starts_with(&session_prefix));
         }
 
         self.expanded_items.clear();
-        if let Some(item_id) = target.item_id {
-            self.expanded_items
-                .insert(format!("{}:{}", target.session_id, item_id));
+        if let Some(section_id) = target.section_id.as_deref() {
             for ancestor in &target.ancestor_steps {
                 self.expanded_items
-                    .insert(subplan_key(&target.session_id, item_id, ancestor));
+                    .insert(subplan_key(&target.session_id, section_id, ancestor));
             }
             if let Some(step_id) = target.step_id.as_deref() {
                 self.expanded_items
-                    .insert(subplan_key(&target.session_id, item_id, step_id));
+                    .insert(subplan_key(&target.session_id, section_id, step_id));
             }
+        } else if let Some(item_id) = target.item_id {
+            self.expanded_items
+                .insert(format!("{}:{}", target.session_id, item_id));
         }
 
         let rows = self.flatten_rows();
         if let Some(pos) = rows.iter().position(|row| {
             if row.session_id() != target.session_id.as_str() {
                 return false;
+            }
+            // The plan branch shares the group identifier of the header above
+            // it, so it is resolved before the flat tuple match (concept #c-1).
+            if target.plan_branch {
+                return matches!(
+                    row,
+                    VisibleReviewRow::GroupPlanHeader { group_id, .. }
+                        if Some(group_id.as_str()) == target.section_id.as_deref()
+                );
             }
             match (row, &target.section_id, target.item_id, &target.step_id) {
                 (VisibleReviewRow::SessionHeader { .. }, None, None, None) => true,
@@ -791,12 +788,12 @@ impl ReviewViewState {
                 }
                 (
                     VisibleReviewRow::SubplanItem {
-                        item_id, step_id, ..
+                        group_id, step_id, ..
                     },
+                    Some(section),
                     None,
-                    Some(tid),
                     Some(sid),
-                ) => *item_id == tid && step_id == sid,
+                ) => group_id == section && step_id == sid,
                 _ => false,
             }
         }) {
@@ -812,7 +809,8 @@ impl ReviewViewState {
 mod tests {
     use super::*;
     use tauqe_protocol::{
-        IssueStatus, IssueType, ModelRef, PlanItemStatus, ReviewIssue, ReviewSession,
+        IssueStatus, IssueType, ModelRef, PlanItemStatus, ReviewGroup, ReviewGroupKind,
+        ReviewIssue, ReviewSession,
     };
     fn make_item(id: u32) -> ReviewIssue {
         ReviewIssue {
@@ -827,7 +825,6 @@ mod tests {
             recommendations: Vec::new(),
             files: Vec::new(),
             readonly_files: Vec::new(),
-            plan: vec![],
             note: None,
         }
     }
@@ -1016,25 +1013,38 @@ mod tests {
     }
 
     #[test]
-    fn test_accordion_navigation_walks_subplan_steps() {
+    fn test_accordion_navigation_walks_the_plan_branch_and_its_steps() {
         let mut session = make_session("rev-acc", &[1]);
-        session.items[0] = ReviewItem::from(ReviewIssue {
-            plan: vec![
+        session.groups = vec![ReviewGroup {
+            id: "arch".to_string(),
+            title: "Shared cause".to_string(),
+            kind: ReviewGroupKind::Architectural,
+            subplan: vec![
                 PlanItem {
                     children: vec![subplan_step("1.1", "Leaf one", PlanItemStatus::Todo)],
                     ..subplan_step("1", "Container", PlanItemStatus::Todo)
                 },
                 subplan_step("2", "Second top step", PlanItemStatus::Todo),
             ],
-            ..make_item(1)
-        });
+            ..Default::default()
+        }];
+        session.items[0].group = Some("arch".to_string());
         let mut view = ReviewViewState {
             sessions: vec![session],
             ..Default::default()
         };
-        // Row 0 is the session header, row 1 is the default group header, and
-        // row 2 is the finding.
-        view.selected_index = 2;
+        // Row 0 is the session header, row 1 is the group header, row 2 is the
+        // plan branch of the group, and row 3 is the first step of that plan;
+        // the finding closes the list.
+        view.selected_index = 1;
+
+        // The plan branch is a node of its own, so the walk stops on it before
+        // descending into the steps it owns (concept #c-1).
+        view.accordion_navigate(true);
+        assert!(matches!(
+            view.selected_row(),
+            Some(VisibleReviewRow::GroupPlanHeader { ref group_id, .. }) if group_id == "arch"
+        ));
 
         view.accordion_navigate(true);
         assert!(matches!(
@@ -1059,6 +1069,22 @@ mod tests {
         assert!(matches!(
             view.selected_row(),
             Some(VisibleReviewRow::SubplanItem { ref step_id, .. }) if step_id == "1.1"
+        ));
+
+        // The next backward step visits the container step that owns that
+        // leaf, and only then does the walk return to the plan branch node:
+        // a node forward navigation visits is never skipped backward
+        // (concept #c-1).
+        view.accordion_navigate(false);
+        assert!(matches!(
+            view.selected_row(),
+            Some(VisibleReviewRow::SubplanItem { ref step_id, .. }) if step_id == "1"
+        ));
+
+        view.accordion_navigate(false);
+        assert!(matches!(
+            view.selected_row(),
+            Some(VisibleReviewRow::GroupPlanHeader { ref group_id, .. }) if group_id == "arch"
         ));
     }
 
@@ -1257,21 +1283,24 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
         let mut session = make_session("rev-tall-step", &[1]);
-        session.items[0] = ReviewItem::from(ReviewIssue {
-            plan: vec![PlanItem {
+        session.groups = vec![ReviewGroup {
+            id: "arch".to_string(),
+            title: "Shared cause".to_string(),
+            kind: ReviewGroupKind::Architectural,
+            subplan: vec![PlanItem {
                 details: Some(long_details),
                 ..subplan_step("1.1", "Tall step", PlanItemStatus::Todo)
             }],
-            ..make_item(1)
-        });
+            ..Default::default()
+        }];
+        session.items[0].group = Some("arch".to_string());
         let mut view = ReviewViewState {
             sessions: vec![session],
             ..Default::default()
         };
         view.view_height = 20;
         view.content_width = 80;
-        view.toggle_item_expanded("rev-tall-step", 1);
-        view.toggle_subplan_item_expanded("rev-tall-step", 1, "1.1");
+        view.toggle_subplan_item_expanded("rev-tall-step", "arch", "1.1");
 
         let rows = view.flatten_rows();
         let step_row = rows
@@ -1306,8 +1335,11 @@ mod tests {
         view.scroll_to_selected();
         assert_eq!(view.scroll as usize, start);
 
-        // Free scrolling walks down to the last full screenful, where the final
-        // invariant line is on screen, and never snaps back to the top edge.
+        // Free scrolling walks down to the document's last full screenful.
+        // The cursor keeps the tail of its tall row readable — the viewport
+        // settles with the bottom of the step in view, because the findings of
+        // the group follow their plan — but it never snaps back to the step's
+        // first screenful (c-2).
         let max = view.max_scroll() as usize;
         assert_eq!(max, lines.len() - height);
         assert!(
@@ -1316,17 +1348,28 @@ mod tests {
         );
         view.scroll = u16::try_from(max).expect("the viewport offset fits in u16");
         view.scroll_to_selected();
-        assert_eq!(
-            view.scroll as usize, max,
+        let settled = view.scroll as usize;
+        assert!(
+            settled > start,
             "free scrolling down must never snap back to the step's first screenful"
         );
-        let last = lines
-            .last()
-            .map(|line| line.to_string())
-            .unwrap_or_default();
         assert!(
-            last.contains("Invariant line 79."),
-            "the last line of the tall step must be reachable: {last}"
+            settled + height >= end,
+            "the settled viewport must keep the last lines of the tall step readable: \
+             {settled}..{} ends before {end}",
+            settled + height
+        );
+        // The final detail line of the tall step sits inside the settled
+        // screenful, and the finding that closes the group follows it.
+        let tail_idx = lines
+            .iter()
+            .position(|line| line.to_string().contains("Invariant line 79."))
+            .expect("the final detail line of the tall step must render");
+        assert!(
+            tail_idx >= settled && tail_idx < settled + height,
+            "the last line of the tall step must be reachable in the settled screenful: \
+             {tail_idx} outside {settled}..{}",
+            settled + height
         );
     }
 

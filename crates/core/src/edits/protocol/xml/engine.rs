@@ -8,8 +8,10 @@
 
 use tauqe_protocol::LlmCapability;
 
-use super::extract_attribute;
-use super::tags::{is_inside_markdown_code_with_fences, CodeFences};
+use super::tags::{
+    inline_code_span, is_inside_markdown_code_with_fences, CodeFences, FenceScan, InlineCode,
+};
+use super::{extract_attribute, file_edit_tags};
 
 /// How a tag's closing boundary is delimited.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -526,85 +528,372 @@ pub(crate) fn activate_unmarked_hidden_tags(normalized: &str, marker: &str) -> S
 }
 
 /// Locates the earliest complete control tag in `text`.
-pub(crate) fn find_earliest_control_tag(text: &str) -> Option<(usize, usize)> {
-    let fences = CodeFences::find(text);
-    let mut from = 0;
-    while let Some(offset) = text[from..].find('<') {
-        let start = from + offset;
-        if !is_inside_markdown_code_with_fences(text, start, &fences) {
-            let after_lt = &text[start + 1..];
-            for spec in XML_TAG_SPECS.iter().filter(|spec| spec.is_control()) {
-                if let Some(after_base) = after_lt.strip_prefix(spec.base_name) {
-                    let suffix_len = marker_suffix_len(after_base);
-                    let rest = &after_base[suffix_len..];
-                    let boundary = rest
-                        .chars()
-                        .next()
-                        .is_some_and(|c| c.is_whitespace() || c == '>' || c == '/');
-                    if boundary {
-                        let name_end = start + 1 + spec.base_name.len() + suffix_len;
-                        if let Some(bounds) = tag_close_bounds(text, start, name_end, spec) {
-                            return Some(bounds);
-                        }
+/// One classified step of the accumulated stream buffer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ScanStep {
+    /// A complete control tag occupies `start..end`.
+    Control { start: usize, end: usize },
+    /// An edit construct opens at `start`; the text before it is plain prose.
+    EditStart { start: usize },
+    /// No construct is complete yet. The text before `safe` may be emitted; the
+    /// bytes at and after it must be withheld until more arrive.
+    Text { safe: usize },
+}
+
+/// What a completed tag means to the conversational path of the stream.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TagRole {
+    /// A control tag the filter consumes before it reaches the stream.
+    Control,
+    /// A whole-file or container edit construct the filter opens.
+    Edit,
+    /// A tag the conversational path ignores.
+    Plain,
+}
+
+/// Classifies a resolved tag for the conversational path of the stream.
+fn tag_role(spec: &XmlTagSpec) -> TagRole {
+    if spec.is_control() {
+        return TagRole::Control;
+    }
+    let tags = file_edit_tags();
+    let is_edit = tags.containers.contains(&spec.base_name)
+        || tags
+            .file_blocks
+            .iter()
+            .any(|block| block.name == spec.base_name);
+    if is_edit {
+        TagRole::Edit
+    } else {
+        TagRole::Plain
+    }
+}
+
+/// Resolves the registry entry a `<`-relative remainder opens, if any.
+///
+/// A tag takes effect only when its base name is followed by a tag boundary, so a
+/// longer name that merely starts with a shorter one is never mistaken for it. The
+/// returned suffix length is the turn-marker suffix the remainder carries, which
+/// the caller needs to locate the tag's name boundary.
+fn match_tag_base(after_lt: &str) -> Option<(&'static XmlTagSpec, usize)> {
+    XML_TAG_SPECS.iter().find_map(|spec| {
+        let rest = after_lt.strip_prefix(spec.base_name)?;
+        let suffix_len = marker_suffix_len(rest);
+        let boundary = rest[suffix_len..]
+            .chars()
+            .next()
+            .is_some_and(|c| c.is_whitespace() || c == '>' || c == '/');
+        boundary.then_some((spec, suffix_len))
+    })
+}
+
+/// How the search for a tag's closing boundary ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TagOutcome {
+    /// The tag is complete and occupies the returned bounds.
+    Complete { start: usize, end: usize },
+    /// The bytes seen so far cannot become this tag.
+    Rejected,
+    /// The bytes seen so far may still complete the tag.
+    Pending,
+}
+
+/// One tag whose opening `<` has been seen but whose end has not arrived.
+///
+/// A long body must not be re-searched from its opening tag on every chunk: the
+/// anchored change set is a single JSON array, and a plan nests its items. The
+/// pending tag therefore remembers where the closing-tag search reached and
+/// resumes there, backtracking only by the bounded seam a partial closing marker
+/// leaves at the tail.
+struct PendingTag {
+    /// Registry entry of the tag being completed.
+    spec: &'static XmlTagSpec,
+    /// Byte offset of the opening `<`.
+    start: usize,
+    /// Byte offset one past the tag's name, suffix included.
+    name_end: usize,
+    /// Byte offset one past the opening tag's `>`, once it is known.
+    header_end: Option<usize>,
+    /// Offset from which the closing tag is still to be searched.
+    searched_to: usize,
+}
+
+impl PendingTag {
+    /// Creates the pending state of a tag whose opening `<` is at `start`.
+    fn new(spec: &'static XmlTagSpec, start: usize, name_end: usize) -> Self {
+        Self {
+            spec,
+            start,
+            name_end,
+            header_end: None,
+            searched_to: name_end,
+        }
+    }
+
+    /// Resumes the search for the tag's closing boundary over `buf`.
+    fn locate(&mut self, buf: &str) -> TagOutcome {
+        let header_end = match self.header_end {
+            Some(end) => end,
+            None => {
+                let Some(offset) = buf.get(self.name_end..).and_then(|rest| rest.find('>')) else {
+                    return TagOutcome::Pending;
+                };
+                let end = self.name_end + offset + 1;
+                if buf[self.name_end..end - 1].trim_end().ends_with('/') {
+                    return TagOutcome::Complete {
+                        start: self.start,
+                        end,
+                    };
+                }
+                self.header_end = Some(end);
+                self.searched_to = end;
+                end
+            }
+        };
+        // An edit container streams its body through the filter itself, so its
+        // opener takes effect as soon as the header is complete. Waiting for the
+        // closing tag would hide a whole change set until its last byte.
+        if self.spec.close_mode == TagCloseMode::Container && tag_role(self.spec) == TagRole::Edit {
+            return TagOutcome::Complete {
+                start: self.start,
+                end: header_end,
+            };
+        }
+        let Some(name) = buf.get(self.start + 1..self.name_end) else {
+            return TagOutcome::Rejected;
+        };
+        let close_tag = format!("</{}>", name);
+        match self.spec.close_mode {
+            TagCloseMode::Simple => {
+                let Some(after_open) = buf.get(header_end..) else {
+                    return TagOutcome::Pending;
+                };
+                let trimmed = after_open.trim_start();
+                if !trimmed.starts_with(&close_tag) {
+                    // The closing tag has to follow the header immediately, so the
+                    // candidate is decided as soon as those bytes are present.
+                    return if trimmed.len() < close_tag.len() && close_tag.starts_with(trimmed) {
+                        TagOutcome::Pending
+                    } else {
+                        TagOutcome::Rejected
+                    };
+                }
+                let skipped = after_open.len() - trimmed.len();
+                TagOutcome::Complete {
+                    start: self.start,
+                    end: header_end + skipped + close_tag.len(),
+                }
+            }
+            TagCloseMode::Control | TagCloseMode::Container => {
+                let seam = close_tag.len().saturating_sub(1);
+                let from = self.searched_to.max(header_end);
+                let Some(rest) = buf.get(from..) else {
+                    return TagOutcome::Pending;
+                };
+                match rest.find(&close_tag) {
+                    Some(offset) => TagOutcome::Complete {
+                        start: self.start,
+                        end: from + offset + close_tag.len(),
+                    },
+                    None => {
+                        self.searched_to = buf.len().saturating_sub(seam).max(header_end);
+                        TagOutcome::Pending
                     }
                 }
             }
         }
-        from = start + 1;
     }
-    None
+
+    /// Shifts the tracked offsets after `drained` bytes left the buffer.
+    fn rebase(&mut self, drained: usize) {
+        self.start = self.start.saturating_sub(drained);
+        self.name_end = self.name_end.saturating_sub(drained);
+        self.searched_to = self.searched_to.saturating_sub(drained);
+        self.header_end = self.header_end.map(|end| end.saturating_sub(drained));
+    }
 }
 
-/// Byte length of `buf` that is safe to emit as conversational text.
+/// Incremental classifier of the accumulated stream buffer.
 ///
-/// A trailing partial tag prefix and any still-open suppressed tag are
-/// withheld so the interface never shows protocol scaffolding mid-tag.
-pub(crate) fn compute_safe_stream_emit_len(buf: &str) -> usize {
-    let fences = CodeFences::find(buf);
-    let mut limit = buf.len();
+/// The filter appends provider deltas to one buffer and asks the scanner what it
+/// may act on. Every offset the scanner has already cleared is remembered, an
+/// unfinished tag carries the offset its closing-tag search reached, and the
+/// markdown fence state persists between chunks, so a chunk costs work
+/// proportional to the bytes it appended rather than to the buffer length. The
+/// only re-examination is the seam a partial tag or a partial closing marker
+/// leaves at the tail, and that seam is bounded by the longest tag name.
+pub(crate) struct TextScan {
+    /// Offset from which the next candidate is still to be examined.
+    cursor: usize,
+    /// Markdown fence state at `cursor`.
+    fences: FenceScan,
+    /// Earliest tag whose opening was seen but whose end has not arrived.
+    pending: Option<PendingTag>,
+}
 
-    if let Some(last_lt) = buf.rfind('<') {
-        if !is_inside_markdown_code_with_fences(buf, last_lt, &fences) {
-            let trailing = &buf[last_lt..];
-            let partial = XML_TAG_SPECS
-                .iter()
-                .filter(|spec| spec.stream_suppress_unmarked)
-                .any(|spec| is_partial_tag_open(trailing, spec.base_name));
-            if partial {
-                limit = limit.min(last_lt);
+impl TextScan {
+    /// Creates a scanner positioned at the start of a fresh buffer.
+    pub(crate) fn new() -> Self {
+        Self {
+            cursor: 0,
+            fences: FenceScan::default(),
+            pending: None,
+        }
+    }
+
+    /// Classifies `buf` up to its first actionable construct.
+    pub(crate) fn classify(&mut self, buf: &str) -> ScanStep {
+        loop {
+            if self.pending.is_some() {
+                let outcome = match self.pending.as_mut() {
+                    Some(pending) => pending.locate(buf),
+                    None => continue,
+                };
+                let Some(spec) = self.pending.as_ref().map(|pending| pending.spec) else {
+                    continue;
+                };
+                match outcome {
+                    TagOutcome::Complete { start, end } => {
+                        self.pending = None;
+                        if let Some(step) = self.resolve(spec, buf, start, end) {
+                            return step;
+                        }
+                    }
+                    TagOutcome::Pending => {
+                        if !spec.stream_suppress_unmarked {
+                            let start = self.pending.take().map_or(self.cursor, |p| p.start);
+                            self.cursor = start + 1;
+                            continue;
+                        }
+                        let safe = self.pending.as_ref().map_or(self.cursor, |p| p.start);
+                        return ScanStep::Text { safe };
+                    }
+                    TagOutcome::Rejected => {
+                        let start = self.pending.take().map_or(self.cursor, |p| p.start);
+                        self.cursor = start + 1;
+                    }
+                }
+                continue;
+            }
+
+            let Some(start) = self.next_sigil(buf) else {
+                self.cursor = buf.len();
+                return ScanStep::Text { safe: buf.len() };
+            };
+            if matches!(inline_code_span(buf, start), InlineCode::Unsettled) {
+                // The span a backtick opened on this still growing line may still
+                // close, which would settle the offset back into prose.
+                self.cursor = start;
+                return ScanStep::Text { safe: start };
+            }
+            let after_sigil = &buf[start + 1..];
+            match match_tag_base(after_sigil) {
+                Some((spec, suffix_len)) => {
+                    let name_end = start + 1 + spec.base_name.len() + suffix_len;
+                    let mut pending = PendingTag::new(spec, start, name_end);
+                    match pending.locate(buf) {
+                        TagOutcome::Complete { start, end } => {
+                            if let Some(step) = self.resolve(spec, buf, start, end) {
+                                return step;
+                            }
+                        }
+                        TagOutcome::Pending if spec.stream_suppress_unmarked => {
+                            self.pending = Some(pending);
+                            self.cursor = start;
+                            return ScanStep::Text { safe: start };
+                        }
+                        _ => self.cursor = start + 1,
+                    }
+                }
+                None => {
+                    // A `<` whose remainder still prefixes a suppressible base name
+                    // may still become a control tag, so the bytes are withheld
+                    // instead of being rendered as prose.
+                    if is_partial_tag_open(&buf[start..]) {
+                        self.cursor = start;
+                        return ScanStep::Text { safe: start };
+                    }
+                    self.cursor = start + 1;
+                }
             }
         }
     }
 
-    for spec in XML_TAG_SPECS
-        .iter()
-        .filter(|spec| spec.stream_suppress_unmarked)
-    {
-        let Some(idx) = rfind_tag_open(buf, spec.base_name, &fences) else {
-            continue;
-        };
-        let rest = &buf[idx + 1 + spec.base_name.len()..];
-        let boundary = rest
-            .chars()
-            .next()
-            .is_some_and(|c| c.is_whitespace() || c == '>' || c == '/' || c == '_' || c == '-');
-        if !boundary {
-            continue;
-        }
-        let closed = if spec.is_control() {
-            matches!(
-                find_next_tag_bounds_with_fences(buf, spec, idx, &fences),
-                Some((s, _)) if s == idx
-            )
-        } else {
-            rest.contains('>')
-        };
-        if !closed {
-            limit = limit.min(idx);
+    /// Turns a completed tag into the step the filter must act on.
+    ///
+    /// Returns `None` when the tag carries no meaning for the conversational path,
+    /// so the caller keeps scanning past it.
+    fn resolve(
+        &mut self,
+        spec: &'static XmlTagSpec,
+        buf: &str,
+        start: usize,
+        end: usize,
+    ) -> Option<ScanStep> {
+        match tag_role(spec) {
+            TagRole::Control => {
+                self.cursor = end;
+                Some(ScanStep::Control { start, end })
+            }
+            TagRole::Edit => {
+                let header_end = buf[start..end]
+                    .find('>')
+                    .map_or(end, |offset| start + offset);
+                let header = &buf[start..header_end];
+                let requires_target = file_edit_tags()
+                    .file_blocks
+                    .iter()
+                    .any(|block| block.name == spec.base_name && block.requires_target);
+                if requires_target && !header.contains("path=") && !header.contains("from=") {
+                    self.cursor = end;
+                    return None;
+                }
+                self.cursor = start;
+                Some(ScanStep::EditStart { start })
+            }
+            TagRole::Plain => {
+                self.cursor = end;
+                None
+            }
         }
     }
 
-    limit
+    /// Advances the cursor past every `<` that cannot open a construct.
+    ///
+    /// Markdown code is skipped here, so the returned offset is the only position
+    /// the classifier still has to examine.
+    fn next_sigil(&mut self, buf: &str) -> Option<usize> {
+        let mut from = self.cursor;
+        loop {
+            let Some(offset) = buf[from..].find('<') else {
+                self.fences.advance_to(buf, buf.len());
+                return None;
+            };
+            let start = from + offset;
+            self.fences.advance_to(buf, start);
+            if self.fences.is_inside(buf, start) {
+                from = start + 1;
+                continue;
+            }
+            if matches!(inline_code_span(buf, start), InlineCode::Inside) {
+                from = start + 1;
+                continue;
+            }
+            return Some(start);
+        }
+    }
+
+    /// Shifts the tracked offsets after `drained` bytes left the buffer.
+    pub(crate) fn rebase(&mut self, drained: usize) {
+        if drained == 0 {
+            return;
+        }
+        self.cursor = self.cursor.saturating_sub(drained);
+        self.fences.rebase(drained);
+        if let Some(pending) = self.pending.as_mut() {
+            pending.rebase(drained);
+        }
+    }
 }
 
 /// Consumes an optional turn-marker suffix directly after the base name.
@@ -656,30 +945,21 @@ fn tag_close_bounds(
     }
 }
 
-/// Reports whether `trailing` is an incomplete opening tag of `base`.
-fn is_partial_tag_open(trailing: &str, base: &str) -> bool {
-    match trailing.strip_prefix('<') {
-        Some(rest) => base.starts_with(rest),
-        None => false,
-    }
+/// Reports whether a `<`-relative remainder may still become a withheld tag.
+///
+/// A remainder that is a strict prefix of a suppressible base name is withheld until
+/// the name resolves, so a tag is never half-rendered as prose. Only the bytes at the
+/// very tail of the buffer can qualify, because a longer remainder is no prefix of any
+/// declared base name.
+fn is_partial_tag_open(trailing: &str) -> bool {
+    let Some(rest) = trailing.strip_prefix('<') else {
+        return false;
+    };
+    XML_TAG_SPECS
+        .iter()
+        .filter(|spec| spec.stream_suppress_unmarked)
+        .any(|spec| spec.base_name.starts_with(rest))
 }
-
-/// Finds the byte offset of the last `"<base"` occurrence in `buf` outside markdown code.
-fn rfind_tag_open(buf: &str, base: &str, fences: &CodeFences) -> Option<usize> {
-    let mut last = None;
-    let mut from = 0;
-    while let Some(offset) = buf[from..].find('<') {
-        let start = from + offset;
-        if !is_inside_markdown_code_with_fences(buf, start, fences)
-            && buf[start + 1..].starts_with(base)
-        {
-            last = Some(start);
-        }
-        from = start + 1;
-    }
-    last
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -941,59 +1221,89 @@ mod tests {
         assert_eq!(iter_tags(text, spec_of("context_request")).count(), 0);
         assert_eq!(iter_tags(text, spec_of("verify")).count(), 1);
     }
-
     #[test]
-    fn earliest_control_tag_reports_the_first_declared_control_tag() {
+    fn text_scan_reports_the_first_actionable_construct() {
         let text = "text <verify target=\"all\" /> then <context_request path=\"a.rs\" />";
-        let (start, _) = match find_earliest_control_tag(text) {
-            Some(found) => found,
-            None => panic!("control tag not found"),
+        let mut scan = TextScan::new();
+        let start = match scan.classify(text) {
+            ScanStep::Control { start, .. } => start,
+            other => panic!("expected a control tag, got {other:?}"),
         };
         assert!(text[start..].starts_with("<verify"));
-        assert_eq!(find_earliest_control_tag("no tags here"), None);
+
+        // An edit construct opening before any control tag wins the scan.
+        let mut scan = TextScan::new();
+        assert_eq!(
+            scan.classify("<create path=\"a.rs\">x</create> <success />"),
+            ScanStep::EditStart { start: 0 }
+        );
+
+        // A buffer without any construct is fully emittable.
+        let mut scan = TextScan::new();
+        assert_eq!(
+            scan.classify("no tags here"),
+            ScanStep::Text {
+                safe: "no tags here".len()
+            }
+        );
     }
 
     #[test]
-    fn safe_stream_emit_len_withholds_incomplete_tags() {
-        let complete = "hello <verify target=\"all\" />";
-        assert_eq!(compute_safe_stream_emit_len(complete), complete.len());
+    fn text_scan_withholds_incomplete_tags_and_their_bodies() {
+        // A partial tag prefix must not be rendered as prose.
+        let mut scan = TextScan::new();
+        assert_eq!(scan.classify("hello <veri"), ScanStep::Text { safe: 6 });
 
-        let partial = "hello <veri";
-        assert_eq!(compute_safe_stream_emit_len(partial), "hello ".len());
-
-        let open = "hello <success>done";
-        assert_eq!(compute_safe_stream_emit_len(open), "hello ".len());
+        // An open control tag withholds its whole body until the close arrives.
+        let mut scan = TextScan::new();
+        let prefix = "hello <scratchpad>note\nnote\n";
+        assert_eq!(scan.classify(prefix), ScanStep::Text { safe: 6 });
+        let closed = format!("{prefix}</scratchpad>");
+        match scan.classify(&closed) {
+            ScanStep::Control { start, end } => {
+                assert_eq!(start, 6);
+                assert_eq!(end, closed.len());
+            }
+            other => panic!("expected the closed control tag, got {other:?}"),
+        }
     }
 
     #[test]
-    fn safe_stream_emit_len_ignores_markdown_fences_and_inline_code() {
+    fn text_scan_ignores_markdown_code() {
         let fenced_with_fake = "Text\n```rust\nif a < b && c < d {\n    <verify\n}\n```\nOutside";
+        let mut scan = TextScan::new();
         assert_eq!(
-            compute_safe_stream_emit_len(fenced_with_fake),
-            fenced_with_fake.len()
+            scan.classify(fenced_with_fake),
+            ScanStep::Text {
+                safe: fenced_with_fake.len()
+            }
         );
 
-        let inline_code_with_partial = "Note: `<verify` is not active";
+        // A tag quoted inside a closed inline span is prose: the span cannot
+        // change any more, so the text is emitted whole and the tag never acts.
+        let inline_code = "Note: `<verify` is not active";
+        let mut scan = TextScan::new();
         assert_eq!(
-            compute_safe_stream_emit_len(inline_code_with_partial),
-            inline_code_with_partial.len()
+            scan.classify(inline_code),
+            ScanStep::Text {
+                safe: inline_code.len()
+            }
         );
-    }
 
-    #[test]
-    fn earliest_control_tag_ignores_code_blocks_with_comparisons() {
-        let text = r#"
-Explanation:
-```rust
-let x = a < b;
-let y = c < d;
-<error message="fake" />
-```
-Real outcome:
-<verify target="all" />
-"#;
-        let (start, end) = find_earliest_control_tag(text).expect("should find real control tag");
-        assert_eq!(&text[start..end], "<verify target=\"all\" />");
+        // A span the growing line may still close withholds the tag, so a
+        // backtick that has not arrived yet cannot turn it into prose.
+        let unsettled = "Note: `<verify is still quoted";
+        let mut scan = TextScan::new();
+        assert_eq!(scan.classify(unsettled), ScanStep::Text { safe: 7 });
+
+        let quoted =
+            "```xml\n<error message=\"fake\" />\n```\nReal outcome:\n<verify target=\"all\" />";
+        let mut scan = TextScan::new();
+        let start = match scan.classify(quoted) {
+            ScanStep::Control { start, .. } => start,
+            other => panic!("expected the real control tag, got {other:?}"),
+        };
+        assert!(quoted[start..].starts_with("<verify"));
     }
 
     #[test]

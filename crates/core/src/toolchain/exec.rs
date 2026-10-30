@@ -169,16 +169,12 @@ async fn run_command_core(
             display.clone(),
         )
     });
-    let stdout_task = spawn_pipe_reader(child.stdout.take());
-    let stderr_task = spawn_pipe_reader(child.stderr.take());
+    let mut stdout_task = spawn_pipe_reader(child.stdout.take());
+    let mut stderr_task = spawn_pipe_reader(child.stderr.take());
 
-    let cancel_fut = async {
-        if let Some(rx) = cancel_rx {
-            wait_for_cancel(rx.clone()).await;
-        } else {
-            std::future::pending::<()>().await;
-        }
-    };
+    // Both the process wait and the pipe drain are bounded by the cancellation
+    // signal, so neither of them can outlive a cancelled turn.
+    let cancel_fut = wait_for_cancellation(cancel_rx);
 
     enum RaceOutcome {
         Exited(std::io::Result<std::process::ExitStatus>),
@@ -201,8 +197,27 @@ async fn run_command_core(
             if let Some(task) = stdin_task.as_ref() {
                 task.abort();
             }
-            let stdout_bytes = stdout_task.await.unwrap_or_default();
-            let stderr_bytes = stderr_task.await.unwrap_or_default();
+            // A descendant that inherited the pipes can hold them open long
+            // after the direct child exited, so the drain races the
+            // cancellation signal as well. The child is already reaped here, so
+            // its process group can no longer be signalled safely; abandoning
+            // the readers is what releases a cancelled turn instead of waiting
+            // for a descendant that may never exit.
+            let drain = async {
+                let stdout_bytes = (&mut stdout_task).await.unwrap_or_default();
+                let stderr_bytes = (&mut stderr_task).await.unwrap_or_default();
+                (stdout_bytes, stderr_bytes)
+            };
+            let drained = tokio::select! {
+                biased;
+                pipes = drain => Some(pipes),
+                _ = wait_for_cancellation(cancel_rx) => None,
+            };
+            let Some((stdout_bytes, stderr_bytes)) = drained else {
+                stdout_task.abort();
+                stderr_task.abort();
+                return cancelled_result(&display);
+            };
             match status_res {
                 Ok(status) => {
                     let stdout = String::from_utf8_lossy(&stdout_bytes).to_string();
@@ -314,6 +329,17 @@ pub(super) async fn wait_for_cancel(mut rx: watch::Receiver<bool>) {
     std::future::pending::<()>().await;
 }
 
+/// Waits for the cancellation signal the caller may or may not hold.
+///
+/// A caller that holds no signal receives a future that never resolves, so a
+/// `select!` can always race the signal against the work it bounds instead of
+/// branching on the `Option` at every call site.
+async fn wait_for_cancellation(cancel_rx: Option<&watch::Receiver<bool>>) {
+    match cancel_rx {
+        Some(rx) => wait_for_cancel(rx.clone()).await,
+        None => std::future::pending::<()>().await,
+    }
+}
 /// Outcome of a command that received its input on standard input.
 ///
 /// The rewritten content comes back on standard output, so a caller keeps the
@@ -773,6 +799,227 @@ mod tests {
         assert_eq!(
             size_at_kill, size_later,
             "the grandchild kept writing after the process-group kill"
+        );
+    }
+
+    /// A cancelled turn tears down the whole process group of the verification
+    /// command: the direct child and every descendant it spawned.
+    ///
+    /// The verification command leads its own process group, so the kill that
+    /// follows the cancellation signal must reach the grandchildren too. The
+    /// heartbeat is written by a grandchild of the direct child, and it stops
+    /// growing once the turn is cancelled.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_cancellation_kills_entire_process_group() {
+        let dir = tempdir().unwrap();
+        let heartbeat = dir.path().join("heartbeat.log");
+        let command =
+            "sh -c 'sh -c \"while true; do echo tick >> heartbeat.log; sleep 1; done\" & wait'";
+        let (cancel_tx, cancel_rx) = watch::channel(false);
+        let root = dir.path().to_path_buf();
+        let task = tokio::spawn(async move {
+            run_command(
+                &root,
+                &CommandLine::tokenized(command),
+                30,
+                None,
+                Some(&cancel_rx),
+            )
+            .await
+        });
+
+        // Cancel only once the grandchild is demonstrably writing, so the halt
+        // of the heartbeat proves the teardown instead of a slow start.
+        let mut writing = false;
+        for _ in 0..100 {
+            if std::fs::metadata(&heartbeat)
+                .map(|meta| meta.len())
+                .unwrap_or(0)
+                > 0
+            {
+                writing = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        assert!(writing, "the grandchild never wrote");
+        let _ = cancel_tx.send(true);
+
+        let res = task.await.unwrap();
+        assert!(!res.success);
+        assert!(res.is_cancelled);
+        assert!(res.combined_output.contains("was cancelled"));
+
+        let size_at_kill = std::fs::metadata(&heartbeat)
+            .map(|meta| meta.len())
+            .unwrap_or(0);
+        tokio::time::sleep(std::time::Duration::from_millis(2200)).await;
+        let size_later = std::fs::metadata(&heartbeat)
+            .map(|meta| meta.len())
+            .unwrap_or(0);
+        assert_eq!(
+            size_at_kill, size_later,
+            "the grandchild kept writing after the cancellation"
+        );
+    }
+
+    /// A cancelled turn stops waiting for a pipe a lingering descendant holds.
+    ///
+    /// The direct child can exit long before its descendants do, and a
+    /// descendant that inherited the standard output keeps the pipe from
+    /// reaching EOF. The drain therefore races the cancellation signal: the
+    /// turn ends when it is cancelled, not when the last descendant exits.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_cancellation_releases_a_drain_a_lingering_descendant_holds() {
+        let dir = tempdir().unwrap();
+        // The direct child exits at once; the grandchild keeps the inherited
+        // pipe open for several seconds.
+        let command = "sh -c 'sh -c \"sleep 3\" & exit 0'";
+        let (cancel_tx, cancel_rx) = watch::channel(false);
+        let root = dir.path().to_path_buf();
+        let task = tokio::spawn(async move {
+            run_command(
+                &root,
+                &CommandLine::tokenized(command),
+                30,
+                None,
+                Some(&cancel_rx),
+            )
+            .await
+        });
+
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        let started = std::time::Instant::now();
+        let _ = cancel_tx.send(true);
+
+        let res = task.await.unwrap();
+        assert!(res.is_cancelled, "the drain outlived the cancellation");
+        assert!(res.combined_output.contains("was cancelled"));
+        assert!(
+            started.elapsed() < std::time::Duration::from_millis(1200),
+            "the cancelled turn waited for the lingering descendant: {:?}",
+            started.elapsed()
+        );
+    }
+    /// A stream filter round-trips its standard input through standard
+    /// output: the staged text that comes back is exactly the bytes the
+    /// child emitted for the staged input.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_run_streaming_command_round_trips_the_staged_text() {
+        let dir = tempdir().unwrap();
+        let command = CommandLine::tokenized("cat");
+        let input = "staged line one\nstaged line two\n";
+
+        let outcome = run_streaming_command(dir.path(), &command, input, 10, None).await;
+
+        assert!(outcome.success, "command failed: {}", outcome.stderr);
+        assert!(!outcome.is_cancelled);
+        assert!(!outcome.timed_out);
+        assert_eq!(outcome.stdout, input);
+        assert!(outcome.stderr.is_empty());
+    }
+
+    /// A stream filter that exceeds its wall-clock budget reports a timeout,
+    /// never a cancellation, and returns no rewritten content.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_run_streaming_command_times_out_and_returns_no_content() {
+        let dir = tempdir().unwrap();
+        let command = CommandLine::tokenized("sleep 10");
+
+        let outcome = run_streaming_command(dir.path(), &command, "staged", 1, None).await;
+
+        assert!(!outcome.success);
+        assert!(outcome.timed_out);
+        assert!(!outcome.is_cancelled);
+        assert!(outcome.stdout.is_empty());
+        assert!(outcome.stderr.contains("timed out"));
+    }
+
+    /// A pre-cancelled turn never spawns the stream filter: no side effect
+    /// of the command can occur, and the outcome reports cancellation, not
+    /// failure.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_run_streaming_command_pre_cancelled_never_spawns() {
+        let dir = tempdir().unwrap();
+        let marker = dir.path().join("spawned.marker");
+        let command = CommandLine::new("touch", vec![marker.display().to_string()]);
+        let (cancel_tx, cancel_rx) = watch::channel(true);
+        drop(cancel_tx);
+
+        let outcome =
+            run_streaming_command(dir.path(), &command, "staged", 10, Some(&cancel_rx)).await;
+
+        assert!(!outcome.success);
+        assert!(outcome.is_cancelled);
+        assert!(!outcome.timed_out);
+        assert!(outcome.stdout.is_empty());
+        assert!(outcome.stderr.contains("cancelled"));
+        assert!(
+            !marker.exists(),
+            "a pre-cancelled filter must never spawn its command"
+        );
+    }
+
+    /// A cancelled stream filter tears down the whole process group it
+    /// leads: a grandchild that inherited the pipes and keeps writing stops
+    /// together with the direct child.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_run_streaming_command_cancellation_kills_entire_process_group() {
+        let dir = tempdir().unwrap();
+        let heartbeat = dir.path().join("heartbeat.log");
+        let command =
+            "sh -c 'sh -c \"while true; do echo tick >> heartbeat.log; sleep 1; done\" & wait'";
+        let (cancel_tx, cancel_rx) = watch::channel(false);
+        let root = dir.path().to_path_buf();
+        let task = tokio::spawn(async move {
+            run_streaming_command(
+                &root,
+                &CommandLine::tokenized(command),
+                "staged input\n",
+                30,
+                Some(&cancel_rx),
+            )
+            .await
+        });
+
+        // Cancel only once the grandchild is demonstrably writing, so the
+        // halt of the heartbeat proves the teardown instead of a slow start.
+        let mut writing = false;
+        for _ in 0..100 {
+            if std::fs::metadata(&heartbeat)
+                .map(|meta| meta.len())
+                .unwrap_or(0)
+                > 0
+            {
+                writing = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        assert!(writing, "the grandchild never wrote");
+        let _ = cancel_tx.send(true);
+
+        let outcome = task.await.unwrap();
+        assert!(!outcome.success);
+        assert!(outcome.is_cancelled);
+        assert!(outcome.stdout.is_empty());
+
+        let size_at_kill = std::fs::metadata(&heartbeat)
+            .map(|meta| meta.len())
+            .unwrap_or(0);
+        tokio::time::sleep(std::time::Duration::from_millis(2200)).await;
+        let size_later = std::fs::metadata(&heartbeat)
+            .map(|meta| meta.len())
+            .unwrap_or(0);
+        assert_eq!(
+            size_at_kill, size_later,
+            "the grandchild kept writing after the cancellation"
         );
     }
 }

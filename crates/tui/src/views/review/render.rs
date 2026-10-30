@@ -6,7 +6,6 @@ use tauqe_protocol::IssueStatus;
 
 use crate::app::AppState;
 use crate::i18n::active_t;
-use crate::views::plans::architect_badge;
 
 use super::{
     compute_unified_review_lines, format_created_at, issue_status_label, issue_status_style,
@@ -174,12 +173,6 @@ pub fn render_review_view(
                 engine.fg(palette.status_warning),
             ));
         }
-        if state.review.refining.is_some() {
-            status_spans.push(Span::styled(
-                format!(" | {}", active_t("review.refining")),
-                engine.fg(palette.status_warning).bold(),
-            ));
-        }
         if !rows.is_empty() {
             status_spans.push(Span::styled(
                 format!(
@@ -293,7 +286,6 @@ fn describe_review_row(
             status,
             model,
             files,
-            subplan_architect,
             ..
         } => {
             let mut spans = vec![
@@ -323,13 +315,10 @@ fn describe_review_row(
                     engine.fg(palette.text_muted),
                 ));
             }
-            if let Some(tier) = subplan_architect {
-                spans.push(architect_badge(tier));
-            }
             spans
         }
         VisibleReviewRow::SubplanItem {
-            item_id,
+            group_id,
             step_id,
             title,
             status,
@@ -338,7 +327,10 @@ fn describe_review_row(
             ..
         } => {
             let mut spans = vec![
-                Span::styled(format!(" #{} ", item_id), engine.fg(palette.text_secondary)),
+                Span::styled(
+                    format!(" [{}] ", group_id),
+                    engine.fg(palette.text_secondary),
+                ),
                 Span::styled(
                     format!(
                         " {} ",
@@ -387,6 +379,36 @@ fn describe_review_row(
             if let Some(desc) = first_content_line(description.as_deref()) {
                 spans.push(Span::styled(
                     format!("  —  {}", desc),
+                    engine.fg(palette.text_muted),
+                ));
+            }
+            spans
+        }
+        VisibleReviewRow::GroupPlanHeader {
+            title,
+            done,
+            total,
+            is_expanded,
+            ..
+        } => {
+            let mut spans = vec![
+                Span::styled(
+                    format!(" {}", title),
+                    engine.fg(palette.text_primary).bold(),
+                ),
+                Span::styled(
+                    format!(
+                        "  {}",
+                        active_t("review.steps_count")
+                            .replacen("{}", &done.to_string(), 1)
+                            .replacen("{}", &total.to_string(), 1)
+                    ),
+                    engine.fg(palette.status_info),
+                ),
+            ];
+            if !*is_expanded {
+                spans.push(Span::styled(
+                    active_t("review.folded_suffix"),
                     engine.fg(palette.text_muted),
                 ));
             }
@@ -459,7 +481,6 @@ mod tests {
                 recommendations: Vec::new(),
                 files: Vec::new(),
                 readonly_files: Vec::new(),
-                plan: Vec::new(),
                 note: None,
             }
             .into()],
@@ -564,7 +585,6 @@ mod tests {
                     recommendations: Vec::new(),
                     files: Vec::new(),
                     readonly_files: Vec::new(),
-                    plan: Vec::new(),
                     note: None,
                 })
             })
@@ -612,8 +632,8 @@ mod tests {
     #[test]
     fn render_review_view_keeps_a_deep_free_scroll_and_clamps_only_the_tail() {
         use tauqe_protocol::{
-            IssueStatus, IssueType, PlanItem, PlanItemStatus, ReviewIssue, ReviewItem,
-            ReviewSession,
+            IssueStatus, IssueType, PlanItem, PlanItemStatus, ReviewGroup, ReviewGroupKind,
+            ReviewIssue, ReviewItem, ReviewSession,
         };
 
         fn render_once(terminal: &mut Terminal<TestBackend>, state: &mut crate::app::AppState) {
@@ -645,7 +665,7 @@ mod tests {
                 id: 1,
                 title: "Finding".to_string(),
                 uuid: None,
-                group: None,
+                group: Some("arch".to_string()),
                 model: None,
                 issue_type: IssueType::Architecture,
                 status: IssueStatus::Todo,
@@ -653,24 +673,28 @@ mod tests {
                 recommendations: Vec::new(),
                 files: Vec::new(),
                 readonly_files: Vec::new(),
-                plan: vec![PlanItem {
+                note: None,
+            })],
+            raw_markdown: String::new(),
+            groups: vec![ReviewGroup {
+                id: "arch".to_string(),
+                title: "Shared cause".to_string(),
+                kind: ReviewGroupKind::Architectural,
+                subplan: vec![PlanItem {
                     id: "1.1".to_string(),
                     title: "Tall step".to_string(),
                     details: Some(long_details),
                     status: PlanItemStatus::Todo,
                     ..Default::default()
                 }],
-                note: None,
-            })],
-            raw_markdown: String::new(),
-            groups: Vec::new(),
+                ..Default::default()
+            }],
             post_analysis: None,
             launch_config: None,
         }];
-        state.review.toggle_item_expanded("rev-tall", 1);
         state
             .review
-            .toggle_subplan_item_expanded("rev-tall", 1, "1.1");
+            .toggle_subplan_item_expanded("rev-tall", "arch", "1.1");
         // The cursor rests on the session header while the developer reads deep
         // inside the step, so no redraw may re-anchor the viewport on row zero.
         state.review.selected_index = 0;

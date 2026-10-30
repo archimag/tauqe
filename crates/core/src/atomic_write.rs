@@ -71,12 +71,13 @@ pub fn write_atomic(target: &Path, contents: &[u8]) -> Result<()> {
     })
 }
 
-/// Stages `contents` into `staging`, syncs it, renames it over `target`, and
-/// syncs the directory that holds the result.
+/// Stages `contents` into `staging`, syncs it, carries the permissions of an
+/// existing `target` onto the staged copy, renames it over `target`, and syncs
+/// the directory that holds the result.
 fn stage_and_rename(staging: &Path, target: &Path, contents: &[u8]) -> Result<()> {
     stage_bytes(staging, contents)
         .with_context(|| format!("Failed to stage content at {}", staging.display()))?;
-
+    preserve_permissions_of(staging, target);
     std::fs::rename(staging, target).with_context(|| {
         format!(
             "Failed to atomically rename {} to {}",
@@ -212,11 +213,31 @@ fn is_staging_suffix(suffix: &str) -> bool {
     }
 }
 
+/// Copies the permissions of `target` onto `staged` when `target` exists.
+///
+/// A replacement must never change who may access the file it overwrites: a
+/// journal deliberately restricted to its owner stays restricted after a
+/// rewrite. Both durability paths of this module apply the rule before their
+/// rename, so the atomic replacement and the sibling commit cannot disagree.
+/// A target that does not exist yet keeps the process default mode, so a newly
+/// created document is unaffected, and a filesystem that rejects the permission
+/// change keeps that default instead of failing the replacement.
+fn preserve_permissions_of(staged: &Path, target: &Path) {
+    if let Ok(metadata) = std::fs::metadata(target) {
+        let _ = std::fs::set_permissions(staged, metadata.permissions());
+    }
+}
+
 /// Writes `content` into `staged` and syncs it to disk.
 ///
 /// Without the `sync_all` barrier a crash after the rename could publish a
 /// zero-length or truncated file, so the staged payload is flushed and synced
 /// before any rename can observe it.
+///
+/// The staging file itself carries the process default mode (`0666` masked by
+/// the umask). The permission contract of a replacement is applied by the
+/// caller through [`preserve_permissions_of`] before the rename, so this
+/// function stays concerned with bytes only.
 fn stage_bytes(staged: &Path, content: &[u8]) -> std::io::Result<()> {
     let mut file = std::fs::File::create(staged)?;
     file.write_all(content)?;
@@ -267,9 +288,7 @@ impl SiblingCommit {
         stage_bytes(&staged, content)?;
         // Carry the original's permissions over to the staged content so a
         // write never silently widens or narrows access.
-        if let Ok(metadata) = std::fs::metadata(target) {
-            let _ = std::fs::set_permissions(&staged, metadata.permissions());
-        }
+        preserve_permissions_of(&staged, target);
         Ok(Self::new(target, Some(staged)))
     }
 
@@ -580,5 +599,26 @@ mod tests {
         // An ordinary file is not a staging sibling.
         assert_eq!(staging_temp_original_name("source.rs"), None);
         assert_eq!(staging_backup_original_name("source.rs"), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rewriting_a_restricted_file_keeps_its_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempdir().unwrap();
+        let target = dir.path().join("history.jsonl");
+        std::fs::write(&target, "first").unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+        write_atomic(&target, b"second").unwrap();
+
+        assert_eq!(std::fs::read(&target).unwrap(), b"second");
+        let mode = std::fs::metadata(&target).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            mode, 0o600,
+            "a rewrite must never widen the mode of the file it replaces"
+        );
+        assert!(staging_leftovers(dir.path()).is_empty());
     }
 }

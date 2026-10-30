@@ -123,10 +123,11 @@ exist among tracked files or already in context. A path that fails becomes a
 missing-file diagnostic. A path whose current access already satisfies the request
 becomes an "already satisfied" note instead of a duplicate addition.
 
-Candidate additions are estimated from file metadata and compared with the
-remaining files budget. A breach rejects the whole addition set and reports the
-current, requested, and allowed amounts. Additions land in the Auto layer, upgrade
-access when needed, and never duplicate a pinned file.
+Candidate additions are priced as their estimated content plus the wrapper each
+`<file>` element renders and compared with the remaining files budget; the number of
+files a round admits has no separate ceiling. A breach rejects the whole addition set
+and reports the current, requested, and allowed amounts. Additions land in the Auto
+layer, upgrade access when needed, and never duplicate a pinned file.
 
 The already-satisfied note is deliberately aggregate-aware: it is emitted only when
 the round added no files, ran no searches, and the caller allows the explanation.

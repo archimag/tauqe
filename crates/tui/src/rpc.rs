@@ -5,7 +5,7 @@ pub mod transport;
 
 pub use events::{fail_safe_reject_edits, handle_event};
 pub use handshake::initialize_connection;
-pub use responses::{handle_response, messages};
+pub use responses::handle_response;
 pub use transport::{
     allocate_request_id, find_server_binary, send_request, send_request_with_id,
     spawn_message_reader, start_server, OptimisticRollback, RpcConnection,
@@ -37,24 +37,36 @@ mod tests {
     }
 
     #[test]
-    fn test_onboarding_messages_are_english() {
+    fn test_onboarding_status_keys_resolve_canonical_english() {
+        use crate::i18n::active_t;
+
         assert_eq!(
-            messages::stub_credentials_created("credentials.toml"),
-            "Stub credentials file created at 'credentials.toml'. Edit it and select 'Check again'."
+            active_t("onboarding.status.config_created"),
+            "tauqe.toml created successfully."
         );
-        assert_eq!(messages::CONFIG_CREATED, "tauqe.toml created successfully.");
         assert_eq!(
-            messages::API_KEY_SAVED,
+            active_t("onboarding.status.api_key_saved"),
             "OpenRouter API key saved successfully."
         );
         assert_eq!(
-            messages::CONFIG_RELOADED_OK,
+            active_t("onboarding.status.config_reloaded"),
             "Configuration reloaded. All checks passed!"
         );
-        assert!(messages::API_KEY_NOT_FOUND.starts_with("API key still not found"));
         assert_eq!(
-            messages::GIT_INIT_OK,
+            active_t("onboarding.status.git_initialized"),
             "Git repository initialized successfully."
+        );
+        assert!(
+            active_t("onboarding.status.api_key_not_found").starts_with("API key still not found")
+        );
+        let stub_created = active_t("onboarding.status.stub_credentials_created");
+        assert_eq!(
+            stub_created.replacen("{}", "credentials.toml", 1),
+            "Stub credentials file created at 'credentials.toml'. Edit it and select 'Check again'."
+        );
+        assert_eq!(
+            active_t("repl.edit_failed_fallback"),
+            "Edit failed on the server"
         );
     }
 
@@ -69,7 +81,6 @@ mod tests {
                     status: FileEditStatus::Retrying,
                     error: None,
                     hunks: Vec::new(),
-                    expanded: false,
                     retry_info: Some("1/3 retrying".to_string()),
                 },
                 StreamingFileEdit {
@@ -78,7 +89,6 @@ mod tests {
                     status: FileEditStatus::Running,
                     error: None,
                     hunks: Vec::new(),
-                    expanded: false,
                     retry_info: None,
                 },
                 StreamingFileEdit {
@@ -87,7 +97,6 @@ mod tests {
                     status: FileEditStatus::Ok,
                     error: None,
                     hunks: Vec::new(),
-                    expanded: false,
                     retry_info: None,
                 },
             ],

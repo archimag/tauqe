@@ -25,6 +25,7 @@ fn is_valid_plan_id(id: &str) -> bool {
     !id.trim().is_empty() && !id.contains('/') && !id.contains('\\')
 }
 
+/// Lists every stored plan together with the persisted active pointer.
 pub async fn handle_plan_list(req: Request, state: &Arc<AppState>) -> Response {
     let repo_root = state.context.read().await.repo_root().to_path_buf();
     match offload_plan(move || {
@@ -39,6 +40,12 @@ pub async fn handle_plan_list(req: Request, state: &Arc<AppState>) -> Response {
     }
 }
 
+/// Resolves a plan for display: the explicitly named one, the active one, or
+/// the first stored plan.
+///
+/// Resolution is a pure read. It never persists the plan it fell back to, so
+/// reading never rewrites which plan the client renders as active; promoting
+/// a plan is an explicit mutation through `plan/setActive`.
 pub async fn handle_plan_get(req: Request, state: &Arc<AppState>) -> Response {
     // Strict wire-contract parse: a present payload must decode through the
     // typed DTO, so a malformed `id` answers INVALID_PARAMS instead of
@@ -68,8 +75,9 @@ pub async fn handle_plan_get(req: Request, state: &Arc<AppState>) -> Response {
             .await
             .unwrap_or(None)
     };
-    let active_missing = active_id.is_none();
-
+    // Resolution never persists the fallback it picked: promoting a plan is an
+    // explicit mutation, so a read RPC leaves the stored active pointer as it
+    // found it.
     let plan_id = match &target_id {
         Some(id) => Some(id.clone()),
         None => match active_id {
@@ -85,14 +93,6 @@ pub async fn handle_plan_get(req: Request, state: &Arc<AppState>) -> Response {
             }
         },
     };
-
-    if target_id.is_none() && active_missing {
-        if let Some(id) = plan_id.clone() {
-            let root = repo_root.clone();
-            let _ =
-                offload_plan(move || PlanStorage::save_active_id(&root, Some(id.as_str()))).await;
-        }
-    }
 
     match plan_id {
         Some(id) => {
@@ -422,4 +422,124 @@ pub async fn handle_plan_set_active(req: Request, state: &Arc<AppState>) -> Resp
     }
 
     Response::ok(req.id, serde_json::json!({ "active_id": params.id }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::handlers::common::test_support::{scratch_root, snapshot_tree};
+    use crate::transport::OutChannel;
+    use tauqe_core::config::AppConfig;
+    use tauqe_protocol::{Plan, RequestId};
+
+    /// Builds the harness state a read-path regression test runs against.
+    fn state_over(root: std::path::PathBuf) -> Arc<AppState> {
+        let (out, _rx) = OutChannel::new();
+        let (history_sender, _history_rx) = tokio::sync::mpsc::unbounded_channel();
+        AppState::new(AppConfig::default(), root, history_sender, out)
+    }
+
+    /// Builds an id-less `plan/get`, the request that used to promote an active
+    /// plan as a side effect.
+    fn plan_get_request() -> Request {
+        Request {
+            id: RequestId::Number(1),
+            method: tauqe_protocol::methods::PLAN_GET.to_string(),
+            params: None,
+        }
+    }
+
+    /// Resolves a stored plan while nothing is active, and persists nothing.
+    #[tokio::test]
+    async fn plan_get_resolves_without_persisting_an_active_pointer() {
+        let root = scratch_root("plan-get-read-only");
+        let plan = Plan {
+            id: "plan-1".to_string(),
+            title: "Read Only".to_string(),
+            ..Default::default()
+        };
+        PlanStorage::save_plan(&root, &plan).expect("save the stored plan");
+        // Persisting a plan promotes the first stored one so a client always
+        // has a marker to render. The read path is what must never promote,
+        // so the pointer is cleared first and has to stay cleared.
+        PlanStorage::save_active_id(&root, None).expect("clear the active pointer");
+        // The scratch repository and the harness state are materialized before
+        // the snapshot, so the comparison captures exactly what the request
+        // itself changed.
+        let state = state_over(root.clone());
+        let before = snapshot_tree(&root);
+
+        let response = handle_plan_get(plan_get_request(), &state).await;
+        assert!(
+            response.error.is_none(),
+            "plan/get failed: {:?}",
+            response.error
+        );
+        let result: PlanGetResult =
+            serde_json::from_value(response.result.expect("plan/get result"))
+                .expect("plan/get result deserializes");
+        assert_eq!(
+            result.plan.as_ref().map(|plan| plan.id.as_str()),
+            Some("plan-1"),
+            "a stored plan is still resolved without an active pointer"
+        );
+        assert_eq!(
+            snapshot_tree(&root),
+            before,
+            "a read RPC must leave every persisted file byte-identical"
+        );
+        let stored = PlanStorage::load_active_id(&root).expect("read the active pointer");
+        assert!(
+            stored.is_none(),
+            "plan/get must never promote an active plan as a read side effect"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Resolves the active plan and keeps the stored pointer untouched, even
+    /// though another stored plan is enumerated first.
+    #[tokio::test]
+    async fn plan_get_preserves_an_existing_active_pointer() {
+        let root = scratch_root("plan-get-preserve");
+        for id in ["plan-a", "plan-b"] {
+            let plan = Plan {
+                id: id.to_string(),
+                title: id.to_string(),
+                ..Default::default()
+            };
+            PlanStorage::save_plan(&root, &plan).expect("save a stored plan");
+        }
+        PlanStorage::save_active_id(&root, Some("plan-b")).expect("store the active id");
+        let state = state_over(root.clone());
+        let before = snapshot_tree(&root);
+
+        let response = handle_plan_get(plan_get_request(), &state).await;
+        assert!(
+            response.error.is_none(),
+            "plan/get failed: {:?}",
+            response.error
+        );
+        let result: PlanGetResult =
+            serde_json::from_value(response.result.expect("plan/get result"))
+                .expect("plan/get result deserializes");
+        assert_eq!(
+            result.plan.as_ref().map(|plan| plan.id.as_str()),
+            Some("plan-b"),
+            "the active plan wins over the first enumerated plan"
+        );
+        assert_eq!(
+            snapshot_tree(&root),
+            before,
+            "a read RPC must not rewrite the persisted active pointer"
+        );
+        let stored = PlanStorage::load_active_id(&root).expect("read the active pointer");
+        assert_eq!(
+            stored,
+            Some("plan-b".to_string()),
+            "the stored pointer still names the active plan"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
 }

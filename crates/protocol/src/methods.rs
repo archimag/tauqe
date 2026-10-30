@@ -34,14 +34,13 @@ pub const CREDENTIALS_CREATE_STUB: &str = "credentials/createStub";
 pub const SYSTEM_STATUS: &str = "system/status";
 
 pub const REVIEW_START: &str = "review/start";
+pub const REVIEW_PREVIEW: &str = "review/preview";
 pub const REVIEW_CANCEL: &str = "review/cancel";
 pub const REVIEW_LIST: &str = "review/list";
 pub const REVIEW_GET: &str = "review/get";
 pub const REVIEW_UPDATE_ITEM: &str = "review/updateItem";
 pub const REVIEW_DELETE: &str = "review/delete";
 pub const REVIEW_EXECUTE: &str = "review/execute";
-pub const REVIEW_REFINE_ITEM: &str = "review/refineItem";
-pub const REVIEW_REFINE_GROUP: &str = "review/refineGroup";
 pub const REVIEW_ANALYZE: &str = "review/analyze";
 
 pub const PLAN_LIST: &str = "plan/list";
@@ -101,14 +100,13 @@ mod tests {
             CREDENTIALS_CREATE_STUB,
             SYSTEM_STATUS,
             REVIEW_START,
+            REVIEW_PREVIEW,
             REVIEW_CANCEL,
             REVIEW_LIST,
             REVIEW_GET,
             REVIEW_UPDATE_ITEM,
             REVIEW_DELETE,
             REVIEW_EXECUTE,
-            REVIEW_REFINE_ITEM,
-            REVIEW_REFINE_GROUP,
             REVIEW_ANALYZE,
             PLAN_LIST,
             PLAN_GET,

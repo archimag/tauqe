@@ -137,6 +137,7 @@ pub fn canonical_catalog() -> Vec<LocaleCatalogItem> {
         item("dialog.execute_review.title_all", "Execute All Review Sessions", "Title when executing every review session", None),
         item("dialog.execute_review.title_single", "Execute Review Finding", "Title when executing a single review finding", None),
         item("dialog.execute_review.title_session", "Execute Review Session", "Title when executing a review session queue", None),
+        item("dialog.execute_review.title_group", "Execute Architecture Group", "Title when executing the unified plan of one architectural review group", None),
         item("dialog.execute_scope.title_single", "Execute Plan Step", "Title when executing a single plan step", None),
         item("dialog.execute_scope.title_scope", "Execute Plan Scope", "Title when executing a plan scope queue", None),
         item("dialog.squash.title", "Squash Commits into Developer Feature Commit", "Title for the squash commits dialog", None),
@@ -199,9 +200,54 @@ pub fn canonical_catalog() -> Vec<LocaleCatalogItem> {
         item("dialog.execute_review.heading_all", "Resolve remaining findings sequentially across all sessions with automated verification?", "Execute-all-reviews dialog heading", None),
         item("dialog.execute_review.heading_single", "Resolve target review finding autonomously?", "Execute-single-finding dialog heading", None),
         item("dialog.execute_review.heading_session", "Resolve remaining findings sequentially with automated verification?", "Execute-review-session dialog heading", None),
+        item("dialog.execute_review.heading_group", "Execute the unified root-cause plan of this architectural group (steps are synthesized just-in-time when absent)?", "Execute-group-plan dialog heading", None),
         item("dialog.execute_review.review_label", " Review: ", "Execute-review review field label", None),
+        item("dialog.execute_review.group_label", " Group: ", "Execute-review review group field label", None),
         item("dialog.execute_review.scope_label", " Scope: ", "Execute-review scope field label", None),
         item("dialog.execute_review.scope_count", " ({} finding(s) to resolve)", "Execute-review scope finding count", None),
+        item("dialog.execute_review.plan_steps_count", "{} step(s) queued in the unified plan", "Execute-group-plan queued step count of the group's unified plan", None),
+        item("dialog.execute_review.jit_note", "No unified plan has been synthesized yet; the Architect projects it just-in-time before the first step runs.", "Execute-group-plan note announcing just-in-time synthesis of the group plan", None),
+        item(
+            "dialog.execute_review.group_plans_count",
+            " — {} architectural group plan(s) in the queue",
+            "Execute-review scope suffix counting the architectural group root-cause plans the queued run executes, projecting a missing plan just-in-time",
+            None,
+        ),
+        // Scope lines of the mixed review-execution queue. The routing builds
+        // them from the group class: an architectural group states the
+        // root-cause plan it executes while a simple group keeps its
+        // per-finding queue, and the confirmation appends the finding count
+        // itself (c-1, c-2, c-4).
+        item(
+            "review.group_plan_scope",
+            "Root-cause plan of group '{}' ({} plan step(s))",
+            "Execute-review scope naming the architectural group whose root-cause plan runs, with the number of leaf steps it carries",
+            None,
+        ),
+        item(
+            "review.group_plan_scope_jit",
+            "Root-cause plan of group '{}' (not synthesized yet: projected just-in-time)",
+            "Execute-review scope naming the architectural group whose root-cause plan the Architect projects just-in-time before the first step runs",
+            None,
+        ),
+        item(
+            "review.group_step_scope",
+            "Plan step '{}' of review group '{}'",
+            "Execute-review scope naming one step of a review group root-cause plan targeted by point execution",
+            None,
+        ),
+        item(
+            "review.session_queue_scope",
+            "All remaining TODO findings",
+            "Execute-review scope naming the actionable finding queue of one session or of every session; the confirmation appends the finding count itself",
+            None,
+        ),
+        item(
+            "review.all_sessions_title",
+            "All Review Sessions",
+            "Execute-review title of the cross-session queue launched with the batch execution verb",
+            None,
+        ),
         item("dialog.execute_review.files_label", " Files: ", "Execute-review files field label", None),
         item("dialog.execute_review.readonly_label", " Readonly: ", "Execute-review read-only files field label", None),
         item("dialog.execute_review.description_label", " Description: ", "Execute-review description field label", None),
@@ -294,6 +340,15 @@ pub fn canonical_catalog() -> Vec<LocaleCatalogItem> {
         item("dialog.clear_user.body_suffix", " from the User layer?", "Clear-user-context body suffix after the count", None),
         item("dialog.clear_user.note", "Protected Pinned files and Auto-requested files will not be affected.", "Clear-user-context note about untouched layers", None),
 
+        // Removing one file from the curated audit context is destructive to
+        // that selection, so it travels through the same confirmation card as
+        // every other context mutation (Conventions §4.3, §5.4).
+        item("dialog.remove_context_file.title", "Remove File from Context", "Title for the confirmation dialog removing one file from the Context view", None),
+        item("dialog.remove_context_file.question", "Remove this file from the context?", "Question line in the context-file removal confirmation dialog", None),
+        item("dialog.remove_context_file.file_label", " File: ", "Removal confirmation field label prefixing the file path", None),
+        item("dialog.remove_context_file.note", "The file leaves the active context; nothing on disk is deleted.", "Removal confirmation note stating that only the context entry is dropped", None),
+        item("dialog.button.remove", "Remove", "Button confirming the removal of one file from the context", Some(12)),
+
         item("dialog.clear_history.question", "Are you sure you want to clear conversation history?", "Clear-history dialog question line", None),
         item("dialog.clear_history.erase_note", "This will permanently erase session history:", "Clear-history note about erasing history", None),
         item("dialog.clear_history.view_note", "and clear the current model view output.", "Clear-history note about clearing the view", None),
@@ -352,7 +407,6 @@ pub fn canonical_catalog() -> Vec<LocaleCatalogItem> {
         item("dialog.status.plan.option.cancelled", "Superseded or cancelled", "Plan status option description for CANCELLED", None),
         item("dialog.status.review.option.todo", "Approved / ready for implementation", "Review status option description for TODO", None),
         item("dialog.status.review.option.in_progress", "Currently being fixed", "Review status option description for IN_PROGRESS", None),
-        item("dialog.status.review.option.refine", "Needs architectural decomposition before coding", "Review status option description for REFINE", None),
         item("dialog.status.review.option.fixed", "Resolved and addressed in code", "Review status option description for FIXED", None),
         item("dialog.status.review.option.skipped", "Skipped / no code changes needed", "Review status option description for SKIPPED", None),
         item("dialog.status.review.option.rejected", "False positive / won't fix", "Review status option description for REJECTED", None),
@@ -437,7 +491,6 @@ pub fn canonical_catalog() -> Vec<LocaleCatalogItem> {
         // ------------------------------------------------------------------
         item("review.session_label", "Review:", "Review info line session label", None),
         item("review.executive_summary", "Executive Summary", "Review session executive summary block heading", None),
-        item("review.refining", "[Refining: Architect is decomposing the finding...]", "Review view refinement-in-progress indicator", None),
         item("review.in_progress", "Review in progress...", "Review view running indicator", None),
         item(
             "review.group_progress",
@@ -478,26 +531,63 @@ pub fn canonical_catalog() -> Vec<LocaleCatalogItem> {
         item("repl.focus_badge_review", "[REVIEW]", "Develop discussion focus badge for a review", Some(14)),
         item("repl.detach_hint", "[Esc to detach]", "Develop hint for detaching the discussion focus", None),
         item("repl.viewport_title", "[VIEWPORT]", "Develop viewport focus title", Some(14)),
-        item("repl.stepper_plan", "Plan:", "Develop plan stepper header label", None),
+        // The universal work marker of the Develop viewport names every kind
+        // of running work in one dense row, so the viewport never reconstructs
+        // the task from the stored plans and reviews (c-1, c-3, c-4).
         item(
-            "repl.sticky_hunk",
-            "Hunk {}/{}",
-            "Develop sticky header naming the active hunk and the total hunk count of the file under the viewport top edge",
+            "repl.work.badge_plan",
+            "[PLAN]",
+            "Work marker badge naming the local plan step the model executes",
+            Some(14),
+        ),
+        item(
+            "repl.work.badge_review",
+            "[REVIEW]",
+            "Work marker badge naming the review audit, finding, or phase the model executes",
+            Some(14),
+        ),
+        item(
+            "repl.work.badge_review_group",
+            "[ARCH]",
+            "Work marker badge naming the root-cause plan of an architectural review group",
+            Some(14),
+        ),
+        item(
+            "repl.work.phase_audit",
+            "Audit",
+            "Work marker phase label for a review audit",
+            Some(18),
+        ),
+        item(
+            "repl.work.phase_decomposition",
+            "Decomposition",
+            "Work marker phase label for the Architect decomposition of a review group",
+            Some(18),
+        ),
+        item(
+            "repl.work.phase_post_analysis",
+            "Post-analysis",
+            "Work marker phase label for the Architect post-analysis of a review session",
+            Some(18),
+        ),
+        item(
+            "repl.work.hidden_before",
+            "… {} earlier step(s)",
+            "Sliding work window row counting the scheduled members hidden above the window",
             None,
         ),
         item(
-            "repl.sticky_file",
-            "File {}/{}",
-            "Develop sticky header naming the position of the active file inside the staged set",
+            "repl.work.hidden_after",
+            "… {} later step(s)",
+            "Sliding work window row counting the pending members hidden below the window",
             None,
         ),
 
-        // The operation badges are shared by the Viewport file rows, the sticky
-        // overlay of the reading position, and the diff inspector file pane, so
-        // one declaration keeps all three surfaces naming an operation
-        // identically (c-1, c-3). The separator column is appended by the badge
-        // helper, never stored here, so a translation preserves no trailing
-        // whitespace of its own.
+        // The operation badges are shared by the Viewport file rows and the
+        // diff inspector file pane, so one declaration keeps both surfaces
+        // naming an operation identically (c-1, c-3, c-4). The separator column
+        // is appended by the badge helper, never stored here, so a translation
+        // preserves no trailing whitespace of its own.
         item(
             "repl.op.create",
             "[NEW]",
@@ -635,7 +725,12 @@ pub fn canonical_catalog() -> Vec<LocaleCatalogItem> {
         item("cmd.context.fold_all", "Toggle fold or unfold for all context sections", "Context command description", None),
         item("cmd.context.copy", "Copy file path to clipboard", "Context command description", None),
         item("cmd.context.refresh", "Refresh context from the server", "Context command description", None),
-        item("cmd.context.remove", "Remove the selected file from context", "Context command description", None),
+        item(
+            "cmd.context.remove",
+            "Remove the selected file from context (with confirmation)",
+            "Context command description",
+            None,
+        ),
 
         // ------------------------------------------------------------------
         // Command descriptions for the History view.
@@ -687,15 +782,13 @@ pub fn canonical_catalog() -> Vec<LocaleCatalogItem> {
         // Command descriptions for the Review view.
         // ------------------------------------------------------------------
         item("cmd.review.execute_all", "Execute all Todo findings across all sessions (with confirmation)", "Review command description", None),
-        item("cmd.review.execute", "Execute the selected finding or all Todo findings in the session", "Review command description", None),
-        item("cmd.review.refine", "Decompose the selected finding into steps with the Architect", "Review command description", None),
-        item("cmd.review.refine_all", "Decompose every finding awaiting architectural refinement", "Review command description", None),
+        item("cmd.review.execute", "Execute the selected finding, group root-cause plan, or all Todo findings in the session", "Review command description", None),
         item("cmd.review.run", "Run a code review on the current context", "Review command description", None),
         item("cmd.review.analyze", "Classify the findings of the selected session with the Architect post-analysis", "Review command description", None),
         item("cmd.review.toggle_hide_closed", "Toggle the filter between all findings and open findings only", "Review command description", None),
         item("cmd.review.refresh", "Refresh the review sessions from the server", "Review command description", None),
         item("cmd.review.set_focus", "Set the discussion focus to the selection without leaving the view", "Review command description", None),
-        item("cmd.review.activate", "Execute the selected finding; fold or unfold on session headers", "Review command description", None),
+        item("cmd.review.activate", "Execute the selected finding, subplan step, or group plan; fold or unfold on session headers", "Review command description", None),
         item("cmd.review.discuss", "Discuss the selected finding or the entire session in the REPL", "Review command description", None),
         item("cmd.review.change_status", "Change the finding status", "Review command description", None),
         item("cmd.review.return", "Return to the REPL", "Review command description", None),
@@ -708,8 +801,8 @@ pub fn canonical_catalog() -> Vec<LocaleCatalogItem> {
         item("cmd.review.recenter", "Recenter the selected review row (center, top, bottom)", "Review command description", None),
         item("cmd.review.page_up", "Scroll the review view up one page", "Review command description", None),
         item("cmd.review.page_down", "Scroll the review view down one page", "Review command description", None),
-        item("cmd.review.fold_toggle", "Fold or unfold the session, summary, or finding details", "Review command description", None),
-        item("cmd.review.fold_all", "Toggle fold or unfold for all sessions and findings", "Review command description", None),
+        item("cmd.review.fold_toggle", "Fold or unfold the session, summary, group plan branch, or finding details", "Review command description", None),
+        item("cmd.review.fold_all", "Toggle fold or unfold for all sessions, groups, plan branches, and findings", "Review command description", None),
         item("cmd.review.copy", "Copy the selected finding or session to the clipboard", "Review command description", None),
         item("cmd.review.delete", "Delete the review session (with confirmation)", "Review command description", None),
         item(
@@ -753,6 +846,17 @@ pub fn canonical_catalog() -> Vec<LocaleCatalogItem> {
             None,
         ),
         item(
+            "review.group_plan_branch",
+            "Implementation Plan",
+            "Review branch header owning the unified root-cause plan of a group, rendered between the group header and the plan steps it owns",
+            None,
+        ),        item(
+            "review.group_kind.architectural",
+            "[ARCH]",
+            "Badge marking a review group whose findings share one architectural root cause and are executed as one unified plan",
+            Some(12),
+        ),
+        item(
             "review.participants_count",
             "{} participant(s)",
             "Architectural group badge counting the findings that share its root cause",
@@ -783,12 +887,11 @@ pub fn canonical_catalog() -> Vec<LocaleCatalogItem> {
         item("cmd.repl.send", "Send the prompt", "REPL command description", None),
         item("cmd.repl.squash", "Open the squash AI commits dialog", "REPL command description", None),
         item("cmd.repl.toggle_focus", "Switch focus between the prompt and the Viewport", "REPL command description", None),
-        item("cmd.repl.toggle_file_fold", "Fold or unfold the selected file diff", "REPL command description", None),
         item("cmd.repl.prev_file", "Select the previous modified file", "REPL command description", None),
         item("cmd.repl.next_file", "Select the next modified file", "REPL command description", None),
         item(
             "cmd.repl.recenter",
-            "Recenter the Viewport on the selected file diff (center, top, bottom)",
+            "Recenter the Viewport on the selected file row (center, top, bottom)",
             "REPL command description",
             None,
         ),
@@ -819,6 +922,12 @@ pub fn canonical_catalog() -> Vec<LocaleCatalogItem> {
         item("cmd.repl.copy_response", "Copy the model response to the clipboard", "REPL command description", None),
         item("cmd.repl.clear_prompt", "Interrupt, or clear the prompt (saving it to the kill ring)", "REPL command description", None),
         item("cmd.repl.open_diff_inspector", "Open the diff inspector for the staged changes", "REPL command description", None),
+        item(
+            "cmd.repl.toggle_work_marker",
+            "Toggle the work marker between the compact breadcrumb and the expanded step window",
+            "REPL command description",
+            None,
+        ),
 
         // ------------------------------------------------------------------
         // Command descriptions for the Onboarding (Setup) view.
@@ -885,7 +994,12 @@ pub fn canonical_catalog() -> Vec<LocaleCatalogItem> {
         // ------------------------------------------------------------------
         item("notify.review_not_found", "Review session '{}' not found", "Review notification when a session is missing", None),
         item("notify.review_item_not_found", "Review item #{} not found", "Review notification when a finding is missing", None),
-        item("notify.review_refine_required", "Finding #{} is in REFINE status: decompose it into steps with the Architect (R) before executing.", "Review notification requiring architectural refinement", None),
+        item(
+            "notify.review_item_in_architectural_group",
+            "Finding #{} belongs to the architectural group '{}': execute the group root-cause plan from its header (x)",
+            "Review notification refusing to execute one finding of an architectural group on its own; the first placeholder receives the finding id and the second the group title",
+            None,
+        ),
         item("notify.review_discussion_status", "Finding #{} is in DISCUSSION status; approve or change status to TODO (t) before executing.", "Review notification blocking a discussion finding", None),
         item("notify.review_already_fixed", "Finding #{} is already FIXED.", "Review notification for an already fixed finding", None),
         item("notify.review_skipped_status", "Finding #{} is SKIPPED; change status to TODO (t) before executing.", "Review notification blocking a skipped finding", None),
@@ -898,15 +1012,33 @@ pub fn canonical_catalog() -> Vec<LocaleCatalogItem> {
         item("notify.review_discussion_only", "All remaining findings are in DISCUSSION status; approve or change status to TODO (t) before executing.", "Review notification when only discussion findings remain", None),
         item("notify.review_all_fixed", "All findings across all review sessions are already FIXED.", "Review notification when all sessions are complete", None),
         item("notify.review_no_todo_cross", "No TODO findings to execute across review sessions.", "Review notification when no cross-session TODO findings remain", None),
-        item("notify.review_refining", "Decomposing finding with the Architect...", "Review notification while refining a finding", None),
         item("notify.review_analyze_started", "Classifying findings with the Architect...", "Review notification while the Architect post-analysis classifies the selected session", None),
-        item("notify.review_select_finding", "Select a finding to decompose into steps (r)", "Review notification prompting to select a finding", None),
-        item("notify.review_no_refine_needed", "No findings require architectural decomposition", "Review notification when no findings need refinement", None),
         item("notify.review_focus_set", "Discussion focus set to review '{}'", "Review notification confirming a session focus change", None),
         item("notify.review_focus_item_set", "Discussion focus set to {} in review '{}'", "Review notification confirming a finding focus change", None),
         item("notify.review_cannot_start_busy", "Cannot start a review while the model is generating", "Review notification rejecting a review while busy", None),
-        item("notify.review_pattern_files_omitted", "Pattern matched {} file(s) beyond the configured batch or token limit; they were not added to the audit", "Review notification when a target pattern expansion is truncated by the configured context budgets", None),
+        item("notify.review_pattern_files_omitted", "Pattern matched {} file(s) beyond the configured file token budget; they were not added to the audit", "Review notification when a target pattern expansion is truncated by the file token budget", None),
         item("notify.review_pattern_no_matches", "The target pattern '{}' matches no repository files; correct it or clear the field", "Review notification rejecting a launch whose target pattern selects no repository file", None),
+        // ------------------------------------------------------------------
+        // Truncated audit window (c-3). The confirmation card states the whole
+        // picture of the window the launch would audit — the context, the
+        // pattern matches, the selection, the omissions split by the limit that
+        // dropped them, and the shared token budget — so consent to a narrowed
+        // audit is explicit and never assumed.
+        // ------------------------------------------------------------------
+        item("review.truncation.title", "Truncated Review Window", "Title for the confirmation card shown before launching a review whose audited window the configured budgets truncate", None),
+        item("review.truncation.heading", "The configured budgets truncate the audited window.", "Heading in the review truncation confirmation card", None),
+        item("review.truncation.context_label", " Context: ", "Truncation card label for the files and tokens the active context contributes", None),
+        item("review.truncation.matched_label", " Matched: ", "Truncation card label for the files the target patterns matched", None),
+        item("review.truncation.selected_label", " Selected: ", "Truncation card label for the files the audited window accepted", None),
+        item("review.truncation.omitted_label", " Omitted: ", "Truncation card label for the files the budgets dropped", None),
+        item("review.truncation.budget_label", " Budget: ", "Truncation card label for the shared file token budget", None),
+        item("review.truncation.files_tokens", "{} file(s) (~{} tokens)", "Truncation card value naming a file count and its estimated tokens", None),
+        item("review.truncation.files_only", "{} file(s)", "Truncation card value naming a file count without a token estimate", None),
+        item("review.truncation.omitted_value", "{} file(s) dropped by the token budget", "Truncation card value naming how many matched files the shared file token budget dropped", None),
+        item("review.truncation.budget_value", "~{} of {} tokens", "Truncation card value naming the estimated tokens the selection spends against the shared file budget", None),
+        item("review.truncation.note", "TAUQE audits exactly the selected files. Raise the file budget or narrow the target patterns to audit the omitted ones.", "Warning note in the truncation card explaining how to widen the audited window", None),
+        item("review.truncation.confirm", "Audit Selected", "Button confirming a launch whose audited window the budgets truncate", Some(16)),
+        item("notify.review_preview_failed", "Failed to project the review window: {}", "Notification when the review audit-window projection cannot be requested or read", None),
         item("notify.review_context_empty", "Context is empty: add files in the Context tab (Ctrl+2) first", "Review notification requiring context files", None),
         item("notify.review_copied", "Review findings copied to clipboard", "Review notification after copying findings", None),
         item("notify.review_copied_osc52", "Review findings sent to terminal clipboard (OSC 52)", "Review notification after an OSC 52 copy", None),
@@ -946,7 +1078,17 @@ pub fn canonical_catalog() -> Vec<LocaleCatalogItem> {
         item("notify.onboarding_clipboard_empty", "Clipboard is empty or unavailable. Use your terminal's paste instead.", "Onboarding notification when the clipboard is unavailable", None),
         item("notify.onboarding_key_empty", "API key cannot be empty. Please enter or paste a valid key, or press Esc to cancel.", "Onboarding notification rejecting an empty API key", None),
         item("notify.onboarding_key_detected", "API key detected in clipboard. Press {} or {} to paste it.", "Onboarding notification announcing a clipboard API key", None),
-
+        // ------------------------------------------------------------------
+        // Onboarding status confirmations. The Setup view renders these on
+        // its status and error lines after daemon responses, so a hot-swapped
+        // locale reaches the setup feedback (Conventions §9).
+        // ------------------------------------------------------------------
+        item("onboarding.status.config_created", "tauqe.toml created successfully.", "Onboarding status line after the project configuration file is created", None),
+        item("onboarding.status.api_key_saved", "OpenRouter API key saved successfully.", "Onboarding status line after the OpenRouter key is stored", None),
+        item("onboarding.status.config_reloaded", "Configuration reloaded. All checks passed!", "Onboarding status line after a configuration reload passes every check", None),
+        item("onboarding.status.api_key_not_found", "API key still not found. Enter it or create a stub credentials file.", "Onboarding error line when a reload still finds no API key", None),
+        item("onboarding.status.git_initialized", "Git repository initialized successfully.", "Onboarding status line after the repository is initialized", None),
+        item("onboarding.status.stub_credentials_created", "Stub credentials file created at '{}'. Edit it and select 'Check again'.", "Onboarding status line naming the created stub credentials file; {} receives the path", None),
         // ------------------------------------------------------------------
         // Turn and batch lifecycle notifications.
         // ------------------------------------------------------------------
@@ -965,7 +1107,16 @@ pub fn canonical_catalog() -> Vec<LocaleCatalogItem> {
         item("notify.squashed_commits", "Squashed commits into {} ('{}')", "Notification after squashing commits", None),
         item("notify.batch_title", "TAUQE {} batch {}", "Desktop notification title for a finished batch", None),
         item("notify.batch_body", "{} '{}': {}/{} steps in {}", "Desktop notification body for a finished batch", None),
-
+        // Batch kind labels and status words: the typed supervisor outcome
+        // resolves its localized fragments here instead of the RPC layer
+        // forwarding English literals into the templates above.
+        item("notify.batch_kind.plan", "Plan", "Desktop notification label naming a finished plan batch", None),
+        item("notify.batch_kind.review", "Review", "Desktop notification label naming a finished review batch", None),
+        item("notify.batch_status.completed", "completed", "Desktop notification status word for a batch that finished its whole queue", None),
+        item("notify.batch_status.failed", "failed", "Desktop notification status word for a batch halted by a failed step", None),
+        item("notify.batch_status.blocked", "blocked", "Desktop notification status word for a batch halted by a blocked step", None),
+        item("notify.batch_status.cancelled", "cancelled", "Desktop notification status word for a batch cancelled by the developer", None),
+        item("notify.batch_status.stopped", "stopped", "Desktop notification status word for a batch stopped mid-queue", None),
         // ------------------------------------------------------------------
         // Locale (interface language) dialog.
         // ------------------------------------------------------------------
@@ -1041,14 +1192,6 @@ pub fn canonical_catalog() -> Vec<LocaleCatalogItem> {
         item("dialog.refine_blocked.plan_label", "Plan: ", "Refine-blocked dialog plan field label", None),
         item("dialog.refine_blocked.reason_label", "Reason / Contradiction:", "Refine-blocked dialog reason field label", None),
         item("dialog.refine_blocked.note", "TAUQE prohibits speculative guessing. Replan uncompleted horizon addressing architectural blockers.", "Refine-blocked dialog note about replanning", None),
-
-        // ------------------------------------------------------------------
-        // Review finding decomposition (architect) dialog.
-        // ------------------------------------------------------------------
-        item("dialog.review_refine.title", "Decompose Review Finding (AI Architect)", "Title for the review finding decomposition dialog", None),
-        item("dialog.review_refine.review_label", " Review: ", "Review finding decomposition dialog session field label", None),
-        item("dialog.review_refine.finding_label", " Finding: ", "Review finding decomposition dialog finding field label", None),
-        item("dialog.review_refine.header_note", " Decomposes the finding into verified atomic engineering steps without altering agreed architecture.", "Review finding decomposition dialog header note", None),
 
         // ------------------------------------------------------------------
         // Code review launch dialog.
@@ -1173,11 +1316,13 @@ pub fn canonical_catalog() -> Vec<LocaleCatalogItem> {
         item("dialog.diff_inspector.badge_retrying", "[RETRY]", "Diff inspector badge marking a file whose patch is being regenerated", Some(8)),
         item("dialog.diff_inspector.file_progress", "File {}/{}", "Diff inspector action row naming the highlighted file inside the audited set", None),
         item("dialog.diff_inspector.hunk_progress", "Hunk {}/{}", "Diff inspector action row naming the hunk under the top edge of the read area", None),
-        item("dialog.diff_inspector.footer", "n / p file • j / k scroll • Esc close", "Diff inspector docked footer hint naming the audit navigation", None),
+        item("dialog.diff_inspector.footer", "Tab pane • ↑ / ↓ move • j / k scroll • PgUp / PgDn page • [ / ] file • Esc / q close", "Diff inspector docked footer hint naming the pane switch, the focus-aware vertical motion, the patch scroll, the paging keys, the file switch, and the closing chords", None),
         item("cmd.diff_inspector.close", "Close the diff inspector", "Diff inspector command description", None),
         item("cmd.diff_inspector.next_file", "Select the next audited file", "Diff inspector command description", None),
         item("cmd.diff_inspector.prev_file", "Select the previous audited file", "Diff inspector command description", None),
-        item("cmd.diff_inspector.scroll_up", "Scroll the audited diff up one line", "Diff inspector command description", None),
+        item("cmd.diff_inspector.toggle_focus", "Switch the active pane between the audited file list and the diff read area", "Diff inspector command description", None),
+        item("cmd.diff_inspector.move_up", "Move up in the focused pane: the previous file or the patch one line up", "Diff inspector command description", None),
+        item("cmd.diff_inspector.move_down", "Move down in the focused pane: the next file or the patch one line down", "Diff inspector command description", None),        item("cmd.diff_inspector.scroll_up", "Scroll the audited diff up one line", "Diff inspector command description", None),
         item("cmd.diff_inspector.scroll_down", "Scroll the audited diff down one line", "Diff inspector command description", None),
         item("cmd.diff_inspector.page_up", "Scroll the audited diff up one page", "Diff inspector command description", None),
         item("cmd.diff_inspector.page_down", "Scroll the audited diff down one page", "Diff inspector command description", None),
@@ -1196,7 +1341,7 @@ pub fn canonical_catalog() -> Vec<LocaleCatalogItem> {
         item("notify.review_deleted", "Review session deleted", "Notification after a review session is deleted", None),
         item("notify.squashed_commit_fallback", "Squashed commit", "Fallback commit summary when a squash message is empty", None),
         item("notify.context_added", "Added {} files (~{} tokens)", "Notification when files are added to context by pattern", None),
-        item("notify.context_added_truncated", "Added {} files (~{} tokens); the match set exceeded the configured batch limit and remaining files were skipped", "Notification when a context pattern add exceeds the batch limit", None),
+        item("notify.context_added_truncated", "Added {} files (~{} tokens); the file token budget was exhausted and the remaining matched files were skipped", "Notification when a context pattern add exhausts the file token budget", None),
         item("notify.context_removed", "Removed {} file(s) from context", "Notification when files are removed from context", None),
         item("notify.context_cleared", "Cleared {} file(s) from context", "Notification when a context layer is cleared", None),
         item("notify.locale_busy", "Cannot change locale while model is generating", "Notification rejecting a locale change while the model is busy", None),
@@ -1215,7 +1360,16 @@ pub fn canonical_catalog() -> Vec<LocaleCatalogItem> {
         item("notify.review_completed_desktop_body", "Code review completed ({} findings)", "Desktop notification body for a completed review", None),
         item("notify.review_error_desktop_title", "TAUQE Review Error", "Desktop notification title for a failed review", None),
         item("notify.review_error_desktop_body", "Code review failed", "Desktop notification body for a failed review", None),
-
+        // ------------------------------------------------------------------
+        // Daemon lifecycle surfaces of the client loop: the disconnect modal
+        // banner raised when the server process dies, and the wrapper for
+        // terminal-event handling errors.
+        // ------------------------------------------------------------------
+        item("notify.server_disconnected.terminated", "Server process terminated ({})", "Disconnect modal status line naming the exit status of a terminated daemon; {} receives the status", None),
+        item("notify.server_disconnected.unexpected", "Server disconnected unexpectedly", "Disconnect modal status line when the daemon connection vanished without an exit status", None),
+        item("notify.server_disconnected.exited", "Server process exited ({})", "Disconnect modal status line naming the exit status the client poll observed; {} receives the status", None),
+        item("notify.server_disconnected.banner", "{}. Logs: {}. Press 'q' or Ctrl+Q to exit.", "Disconnect modal banner joining the status line, the server log path, and the quit hint; the first {} receives the status line and the second the log path", None),
+        item("notify.command_error", "Command error: {}", "Notification wrapping an error raised while handling a terminal event; {} receives the error", None),
         // ------------------------------------------------------------------
         // REPL command descriptions continued: buffer boundaries and forward
         // word-kill, bound to `M-<` / `C-Home`, `M->` / `C-End`, and `M-d`.
@@ -1415,7 +1569,7 @@ pub fn canonical_catalog() -> Vec<LocaleCatalogItem> {
         item("repl.hunk_deleted", "deleted", "Develop label describing a deleted file", None),
         item("repl.hunk_line_count", "{} line(s)", "Develop label counting the lines of a created file", None),
         item("repl.hunk_count", "{} hunk(s)", "Develop label counting the patches applied to a file", None),
-
+        item("repl.edit_failed_fallback", "Edit failed on the server", "Develop fallback error recorded on a staged file when the daemon omits its own failure reason", None),
         // ------------------------------------------------------------------
         // History record badges and body labels (views/history.rs).
         // ------------------------------------------------------------------
@@ -1534,7 +1688,8 @@ mod tests {
         assert!(keys.contains("dialog.confirm_cancel.title"));
         assert!(keys.contains("dialog.server_disconnected.title"));
         assert!(keys.contains("dialog.button.interrupt"));
-
+        assert!(keys.contains("dialog.execute_review.title_group"));
+        assert!(keys.contains("dialog.execute_review.jit_note"));
         // View section headers and empty states.
         assert!(keys.contains("context.section.pinned"));
         assert!(keys.contains("plans.empty_title"));
@@ -1549,7 +1704,7 @@ mod tests {
         assert!(keys.contains("cmd.context.add_editable"));
         assert!(keys.contains("cmd.history.clear"));
         assert!(keys.contains("cmd.plans.execute"));
-        assert!(keys.contains("cmd.review.refine"));
+        assert!(keys.contains("cmd.review.execute"));
         assert!(keys.contains("cmd.repl.send"));
 
         // Usage telemetry headings, including the project-wide lifetime block.
@@ -1561,13 +1716,22 @@ mod tests {
         assert!(keys.contains("notify.plan_scope_blocked"));
         assert!(keys.contains("notify.onboarding_key_detected"));
 
-        // The diff-reading surfaces: the sticky overlay, the shared operation
-        // badges, and the inspector card (c-1, c-3).
-        assert!(keys.contains("repl.sticky_hunk"));
-        assert!(keys.contains("repl.sticky_file"));
+        // The diff-reading surfaces: the shared operation badges and the
+        // two-pane live inspector card (c-1, c-3, c-4).
         assert!(keys.contains("repl.op.overwrite"));
         assert!(keys.contains("dialog.diff_inspector.file_progress"));
+        assert!(keys.contains("dialog.diff_inspector.badge_running"));
         assert!(keys.contains("cmd.diff_inspector.next_file"));
+        assert!(keys.contains("cmd.diff_inspector.toggle_focus"));
+
+        // The universal work marker of the Develop viewport (c-3, c-4).
+        assert!(keys.contains("repl.work.badge_plan"));
+        assert!(keys.contains("repl.work.badge_review"));
+        assert!(keys.contains("repl.work.badge_review_group"));
+        assert!(keys.contains("repl.work.phase_audit"));
+        assert!(keys.contains("repl.work.phase_post_analysis"));
+        assert!(keys.contains("repl.work.hidden_before"));
+        assert!(keys.contains("repl.work.hidden_after"));
     }
 
     #[test]
@@ -1778,6 +1942,65 @@ mod tests {
                     "{name} hardcodes the operation badge {fragment:?}"
                 );
             }
+        }
+    }
+
+    /// The RPC layers and the client loop own no user-facing literals: the
+    /// batch labels, onboarding confirmations, and disconnect banners they
+    /// render resolve through the catalog, so a reintroduced literal fails
+    /// this audit the same way the view-renderer audit above does.
+    #[test]
+    fn test_rpc_and_main_surfaces_resolve_phrases_through_the_catalog() {
+        let sources: &[(&str, &str)] = &[
+            ("rpc/responses.rs", include_str!("../rpc/responses.rs")),
+            ("rpc/events.rs", include_str!("../rpc/events.rs")),
+            ("main.rs", include_str!("../main.rs")),
+        ];
+
+        let forbidden: &[&str] = &[
+            "pub mod messages",
+            "\"Plan\"",
+            "\"Review\"",
+            "Edit failed on the server",
+            "tauqe.toml created successfully",
+            "OpenRouter API key saved successfully",
+            "Configuration reloaded. All checks passed",
+            "API key still not found",
+            "Git repository initialized successfully",
+            "Stub credentials file created at",
+            "Server process terminated",
+            "Server process exited",
+            "Server disconnected unexpectedly",
+            ". Logs: {}. Press 'q' or Ctrl+Q to exit.",
+            "Command error: ",
+        ];
+
+        for (name, source) in sources {
+            let production = source.split("#[cfg(test)]").next().unwrap_or_default();
+            for &fragment in forbidden {
+                assert!(
+                    !production.contains(fragment),
+                    "{name} hardcodes the catalog phrase {fragment:?}"
+                );
+            }
+        }
+    }
+
+    /// The compact Viewport delegates patch reading to the inspector, so the
+    /// catalog must not resurrect the keys of the removed inline fold surface
+    /// or of the sticky reading-position overlay (c-4).
+    #[test]
+    fn test_removed_inline_diff_keys_stay_absent() {
+        let catalog = canonical_catalog();
+        for removed in [
+            "cmd.repl.toggle_file_fold",
+            "repl.sticky_hunk",
+            "repl.sticky_file",
+        ] {
+            assert!(
+                !catalog.iter().any(|item| item.key == removed),
+                "the removed surface must not come back: {removed}"
+            );
         }
     }
 }

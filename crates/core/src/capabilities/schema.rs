@@ -32,10 +32,8 @@ pub(crate) fn message_fragment() -> Value {
 /// The patch strategy decides which fields address the lines a change replaces:
 /// a search-replace change echoes the replaced text, while an anchored change
 /// names the replaced range through the opaque anchors rendered beside every
-/// context line. Every other operation — create, overwrite, delete, and move —
-/// is described identically in both strategies, so only the replaced-line fields
-/// differ. That vocabulary lives in the [`StrategyProfile`] of the strategy, so
-/// the wire schema, the prompt instructions, and the decoding rules of one
+/// context line. The replaced-line vocabulary lives in the [`StrategyProfile`]
+/// of the strategy, so the wire schema and the prompt instructions of one
 /// strategy can never disagree about the fields a change carries.
 pub(crate) fn changes_fragment(patch_strategy: PatchStrategy) -> Value {
     json!({
@@ -51,11 +49,12 @@ pub(crate) fn changes_fragment(patch_strategy: PatchStrategy) -> Value {
 fn change_entry(patch_strategy: PatchStrategy) -> Value {
     let profile = StrategyProfile::of(patch_strategy);
 
-    // The operation, its target, and the move destination address every
-    // strategy identically, so they are declared once, ahead of the fields the
-    // profile owns.
+    // The target and the move destination address every strategy identically,
+    // so they are declared once, ahead of the fields the profile owns. The
+    // operation selector follows the strategy, because the set of operations a
+    // strategy offers is strategy vocabulary rather than a shared shape.
     let mut properties = serde_json::Map::new();
-    properties.insert("op".to_string(), op_property());
+    properties.insert("op".to_string(), op_property(patch_strategy));
     properties.insert("path".to_string(), path_property());
     properties.insert("to".to_string(), destination_property());
     let mut required: Vec<Value> = vec![json!("op"), json!("path"), json!("to")];
@@ -91,12 +90,32 @@ fn string_property(description: &str) -> Value {
     })
 }
 
-/// Schema of the declared operation selector shared by both change shapes.
-fn op_property() -> Value {
+/// Schema of the declared operation selector for a patch strategy.
+///
+/// The line-anchor strategy addresses the replaced lines by a range, so a full
+/// rewrite is a range spanning the whole file and the separate `overwrite`
+/// operation has no meaning there. Advertising it would offer the model two
+/// spellings of one change and a way around the minimal-diff guarantee the
+/// range carries, so the strict enum leaves it out. The search/replace
+/// strategy keeps the operation, because echoing the whole file as `old_text`
+/// is how a full rewrite is expressed there. The selector therefore follows
+/// the same patch strategy that already decides the replaced-line fields, and
+/// the schema never advertises an operation the strategy does not offer.
+fn op_property(patch_strategy: PatchStrategy) -> Value {
+    let (operations, description): (&[&str], &str) = match patch_strategy {
+        PatchStrategy::SearchReplace => (
+            &["replace", "create", "delete", "move", "overwrite"],
+            "Operation type: 'replace' for modifying existing files, 'create' for new files, 'delete' for deleting files, 'move' for moving or renaming files, 'overwrite' for replacing the entire content of an existing file",
+        ),
+        PatchStrategy::LineAnchor => (
+            &["replace", "create", "delete", "move"],
+            "Operation type: 'replace' for modifying existing files, 'create' for new files, 'delete' for deleting files, 'move' for moving or renaming files",
+        ),
+    };
     json!({
         "type": "string",
-        "enum": ["replace", "create", "delete", "move", "overwrite"],
-        "description": "Operation type: 'replace' for modifying existing files, 'create' for new files, 'delete' for deleting files, 'move' for moving or renaming files, 'overwrite' for replacing the entire content of an existing file"
+        "enum": operations,
+        "description": description
     })
 }
 
@@ -612,5 +631,39 @@ mod tests {
             outcome["required"].as_array().map(Vec::len),
             Some(properties.len())
         );
+    }
+
+    /// Reads the operation selector the change-set schema declares.
+    ///
+    /// The selector is the surface that decides which operations the active
+    /// patch strategy offers, so a test reads it instead of restating the enum
+    /// of the strategy it checks.
+    fn operation_selector(patch_strategy: PatchStrategy) -> Value {
+        let fragment = changes_fragment(patch_strategy);
+        fragment["changes"]["items"]["properties"]["op"].clone()
+    }
+
+    #[test]
+    fn the_operation_selector_follows_the_patch_strategy() {
+        // A full rewrite under the line-anchor strategy is a range spanning the
+        // whole file, so the separate operation is absent from the strict enum
+        // and from the description that explains it.
+        let anchored = operation_selector(PatchStrategy::LineAnchor);
+        let anchored_operations = json!(["replace", "create", "delete", "move"]);
+        assert_eq!(anchored["enum"], anchored_operations);
+        let description = anchored["description"]
+            .as_str()
+            .expect("the operation selector states its values");
+        assert!(!description.contains("overwrite"), "{description}");
+
+        // The search/replace strategy keeps the operation, because echoing the
+        // whole file as `old_text` is how a full rewrite is expressed there.
+        let echoed = operation_selector(PatchStrategy::SearchReplace);
+        let echoed_operations = json!(["replace", "create", "delete", "move", "overwrite"]);
+        assert_eq!(echoed["enum"], echoed_operations);
+        let description = echoed["description"]
+            .as_str()
+            .expect("the operation selector states its values");
+        assert!(description.contains("'overwrite'"), "{description}");
     }
 }

@@ -15,7 +15,7 @@ use tauqe_core::providers::{
     create_provider, format_session_id, LlmProvider, StreamEvent, SESSION_PREFIX_REPL,
 };
 use tauqe_core::workflow::{ExecutionMode, SingleExecution};
-use tauqe_protocol::model::{UsageTotals, UsageTotalsSnapshot};
+use tauqe_protocol::model::{TurnWorkContext, UsageTotals, UsageTotalsSnapshot};
 use tauqe_protocol::{
     events, DiscussionTarget, EditFileDoneEvent, EditFileRetryingEvent, EditFileStartedEvent,
     EditFinishedEvent, EditHunkEvent, EditOutcome, EditStartedEvent, Event, GitCommitCreatedEvent,
@@ -115,6 +115,12 @@ struct PreparedTurn {
     /// Whether the turn runs as a member of a batch supervisor. Recorded so the
     /// turn's terminal log can distinguish batch steps from interactive turns.
     is_batch: bool,
+    /// Work the turn executes, declared by the caller that starts it.
+    ///
+    /// The value travels unchanged into `model/started` and the turn's journal
+    /// records, so a client renders the running work from typed fields instead
+    /// of reconstructing it from the stored plans and reviews.
+    work_context: Option<TurnWorkContext>,
     /// Operation backing this turn. A turn that starts on its own owns the
     /// registration; a batch step shares the batch-level registration so the
     /// slot never lapses between steps.
@@ -126,6 +132,14 @@ struct PreparedTurn {
     /// `None` for a turn that carries no dialogue, so an isolated step never
     /// inherits the cache of the interactive session.
     session_id: Option<String>,
+    /// Sink the turn publishes its live phase and toolchain telemetry into.
+    ///
+    /// Both contours of the bounded turn publish it: an interactive turn and a
+    /// batch step alike, so the client's phase pipeline advances during a
+    /// step's staging, verification, and healing rounds instead of waiting for
+    /// the batch result. The phases themselves stay owned by the FSM, which
+    /// remains their single source of truth.
+    phase_out: OutChannel,
 }
 
 /// Builds a real network provider from configuration, mapping failures to a
@@ -165,7 +179,8 @@ pub(crate) fn build_apply_policy(
 /// Resolves the provider and model for a turn, emits `model/started`, and
 /// registers the cancellable active operation. `is_batch` marks turns that run
 /// as members of a batch supervisor so clients can suppress per-step signals.
-///
+/// The declared `work_context` travels unchanged into `model/started` and the
+/// turn's journal record, so the running work is reported from typed fields.///
 /// The collaborators are intentionally threaded as separate parameters: every
 /// turn entry point supplies exactly the subset it owns, so a wrapper struct
 /// would only restate the same fields without removing a single argument.
@@ -175,6 +190,7 @@ async fn prepare_turn(
     intent: TurnIntent,
     custom_selection: Option<tauqe_protocol::ModelSelection>,
     plan_context: Option<tauqe_protocol::ModelTurnPlanContext>,
+    work_context: Option<TurnWorkContext>,
     reasoning_effort: Option<ReasoningEffort>,
     is_batch: bool,
     marker: Option<String>,
@@ -255,6 +271,7 @@ async fn prepare_turn(
         effort = ?effort,
         alias = alias.as_deref().unwrap_or("none"),
         intent = ?intent,
+        work = work_kind(work_context.as_ref()),
         is_batch,
         session = session_id.as_deref().unwrap_or("none"),
         "Model turn started",
@@ -269,6 +286,7 @@ async fn prepare_turn(
             alias,
             effort,
             plan_context,
+            work_context: work_context.clone(),
             is_batch,
         })
         .ok(),
@@ -283,9 +301,13 @@ async fn prepare_turn(
         op_id,
         intent,
         is_batch,
+        work_context,
         operation,
         marker,
         session_id,
+        // The daemon channel is the default telemetry sink; a step endpoint
+        // replaces it with the sink its supervisor supplies.
+        phase_out: state.out.clone(),
     })
 }
 
@@ -379,9 +401,11 @@ async fn run_prepared_turn(
         op_id,
         intent,
         is_batch,
+        work_context,
         operation,
         marker,
         session_id,
+        phase_out,
     } = prepared;
 
     let cancel_rx = operation.cancel_receiver();
@@ -417,10 +441,19 @@ async fn run_prepared_turn(
     let model_clone = model.clone();
     let prompt_clone = prompt.clone();
 
+    // The turn works on a private clone of the shared history manager, exactly
+    // as it does on a private clone of the context: the guard is taken only
+    // long enough to clone. Holding it across the whole bounded turn would
+    // exclude every other history user, and because the request loop awaits its
+    // inline handlers, a single `history/get` would wedge the daemon — the very
+    // `model/cancel` that could interrupt the turn would never be read.
     let workflow_future = async move {
         let _session_guard = state_clone.session_lock.lock().await;
         let mut local_context = state_clone.context.read().await.clone();
-        let mut history = state_clone.history.lock().await;
+        let mut history = {
+            let shared = state_clone.history.lock().await;
+            shared.clone()
+        };
         let res = execution
             .execute(
                 policy.as_mut(),
@@ -435,6 +468,11 @@ async fn run_prepared_turn(
                 wf_rx,
             )
             .await;
+        // Adopt the turn's history back before anything else: the entries it
+        // appended are already in the journal, so the shared manager must carry
+        // the identifier watermark they consumed or the next record would reuse
+        // one of them.
+        state_clone.adopt_history(history).await;
         if let Err(err) = state_clone
             .mutate_context(move |ctx| ctx.merge_turn_context(&local_context))
             .await
@@ -567,7 +605,7 @@ async fn run_prepared_turn(
                 max_rounds,
                 detail,
             } => {
-                state.out.send_event(&Event {
+                phase_out.send_event(&Event {
                     method: events::TURN_PHASE.to_string(),
                     params: serde_json::to_value(tauqe_protocol::TurnPhaseEvent {
                         operation_id: op_id.clone(),
@@ -620,7 +658,7 @@ async fn run_prepared_turn(
                 });
             }
             StreamEvent::ToolchainStarted { command } => {
-                state.out.send_event(&Event {
+                phase_out.send_event(&Event {
                     method: events::TOOLCHAIN_STARTED.to_string(),
                     params: serde_json::to_value(tauqe_protocol::ToolchainStartedEvent {
                         operation_id: op_id.clone(),
@@ -634,7 +672,7 @@ async fn run_prepared_turn(
                 success,
                 message,
             } => {
-                state.out.send_event(&Event {
+                phase_out.send_event(&Event {
                     method: events::TOOLCHAIN_FINISHED.to_string(),
                     params: serde_json::to_value(tauqe_protocol::ToolchainFinishedEvent {
                         operation_id: op_id.clone(),
@@ -741,6 +779,9 @@ async fn run_prepared_turn(
                     error = %join_err,
                     "Cancelled turn's workflow task did not join cleanly",
                 );
+                // The task panicked or was aborted before it could adopt its
+                // history, so the shared manager is rebuilt from the journal.
+                resync_history(state).await;
             }
             Err(_elapsed) => {
                 // Force-aborting is a last resort with a generous grace period,
@@ -769,7 +810,26 @@ async fn run_prepared_turn(
                     // Wait, bounded, for the abort to land: returning while the
                     // task may still sit between abort landing points would
                     // release the slot under a live task.
-                    let _ = tokio::time::timeout(CANCEL_UNWIND_GRACE, wf_task).await;
+                    match tokio::time::timeout(CANCEL_UNWIND_GRACE, wf_task).await {
+                        // The turn settled before the abort landed and adopted
+                        // its own history.
+                        Ok(Ok(_)) => {}
+                        // The abort dropped the turn together with its private
+                        // history clone, so the shared manager is rebuilt from
+                        // the journal the turn may already have appended to.
+                        Ok(Err(join_err)) => {
+                            tracing::warn!(
+                                operation_id = %op_id,
+                                error = %join_err,
+                                "Aborted turn exited without adopting its history",
+                            );
+                            resync_history(state).await;
+                        }
+                        Err(_) => tracing::warn!(
+                            operation_id = %op_id,
+                            "Aborted turn did not settle within the grace period; its history adoption may never run",
+                        ),
+                    }
                 }
             }
         }
@@ -801,6 +861,7 @@ async fn run_prepared_turn(
             status,
             &snapshot.prev,
             error.as_deref(),
+            work_context.as_ref(),
         );
 
         return Ok(ModelTurnResult {
@@ -1029,6 +1090,8 @@ async fn run_prepared_turn(
         Err(join_err) => {
             let snapshot = flush_usage(state, &mut usage_guard).await;
             emit_legacy_usage_event(state, &op_id).await;
+            // A panicked workflow task never reached its history adoption.
+            resync_history(state).await;
             if edit_events_sent && !edit_finished_sent {
                 send_edit_aborted(
                     &state.out,
@@ -1067,9 +1130,26 @@ async fn run_prepared_turn(
         turn_status(&turn_result),
         &final_usage,
         turn_result.error.as_deref(),
+        work_context.as_ref(),
     );
 
     Ok(turn_result)
+}
+/// Rebuilds the shared history manager from the authoritative journal.
+///
+/// A turn that panicked or was force-aborted never reached its adoption step,
+/// so its private history clone — and the identifier watermark it consumed —
+/// was dropped with it while the entries it already appended stay in the
+/// journal. Rebuilding the manager from `<repo_root>/.tauqe/history.jsonl`
+/// restores the watermark the daemon itself derives at startup, so the next
+/// record can never reuse an identifier that is already written.
+async fn resync_history(state: &Arc<AppState>) {
+    if let Err(err) = state.resync_history_from_journal().await {
+        tracing::warn!(
+            error = %err,
+            "Failed to rebuild the shared history manager from the journal"
+        );
+    }
 }
 
 /// Initiates an asynchronous model turn in the background and immediately returns its operation ID.
@@ -1088,6 +1168,10 @@ pub async fn start_model_turn(
         intent,
         custom_selection,
         plan_context,
+        // An interactive turn answers the developer rather than executing
+        // stored work, so it declares itself instead of leaving the running
+        // work anonymous.
+        Some(TurnWorkContext::Interactive),
         None,
         false,
         marker,
@@ -1118,15 +1202,32 @@ pub async fn start_model_turn(
 /// names the turn mode explicitly, so an isolated step is never inferred from
 /// the prompt text. An explicit `session_id` names the long-lived context — a
 /// plan execution or a review audit — whose warm provider prefix the turn
-/// extends; without one an isolated step stays stateless.
+/// extends; without one an isolated step stays stateless. The declared
+/// `work_context` names the work the step executes, so the client renders the
+/// running work from typed fields instead of reconstructing it from the stored
+/// plans and reviews.
 pub struct StepTurnOptions {
     pub intent: TurnIntent,
     pub custom_selection: Option<tauqe_protocol::ModelSelection>,
     pub plan_context: Option<tauqe_protocol::ModelTurnPlanContext>,
+    /// Work the step executes, declared by the caller that starts it.
+    ///
+    /// The value reaches `model/started` unchanged, so the client renders the
+    /// running work: its kind, the entity that owns it, and the active member
+    /// with its position. Nothing is reconstructed from the stored plans and
+    /// reviews.
+    pub work_context: Option<TurnWorkContext>,
     pub reasoning_effort: Option<ReasoningEffort>,
     pub marker: Option<String>,
     pub session_id: Option<String>,
     pub shared_operation: Option<Arc<OperationGuard>>,
+    /// Sink the turn publishes its live phase and toolchain telemetry into.
+    ///
+    /// `None` publishes through the daemon's client channel. A step endpoint
+    /// supplies its own sink when it owns the telemetry surface, so a step's
+    /// staging, verification, and healing rounds advance the client's phase
+    /// pipeline exactly as an interactive turn does.
+    pub phase_out: Option<OutChannel>,
 }
 
 /// Executes an isolated model turn to completion and awaits its outcome.
@@ -1148,10 +1249,12 @@ pub async fn execute_model_turn(
         intent,
         custom_selection,
         plan_context,
+        work_context,
         reasoning_effort,
         marker,
         session_id,
         shared_operation,
+        phase_out,
     } = options;
     // A batch step borrows the batch-level registration, so the operation
     // identity exists before the turn can fail for any reason, including a
@@ -1159,11 +1262,12 @@ pub async fn execute_model_turn(
     let operation_id = shared_operation
         .as_ref()
         .map(|operation| format!("op-{}", operation.id()));
-    let prepared = prepare_turn(
+    let mut prepared = prepare_turn(
         state,
         intent,
         custom_selection,
         plan_context,
+        work_context,
         reasoning_effort,
         true,
         marker,
@@ -1175,6 +1279,12 @@ pub async fn execute_model_turn(
         operation_id,
         error: Box::new(error),
     })?;
+    // A step endpoint that owns the telemetry surface replaces the default
+    // daemon sink, so the step's live phases reach the client through the very
+    // translation an interactive turn uses.
+    if let Some(phase_out) = phase_out {
+        prepared.phase_out = phase_out;
+    }
     run_prepared_turn(state, prompt, prepared, policy)
         .await
         .map_err(TurnError::from)
@@ -1196,6 +1306,22 @@ fn turn_status(result: &ModelTurnResult) -> &'static str {
     }
 }
 
+/// Compact journal label of the work a turn executes.
+///
+/// The journal records the declared kind of work instead of a rendered
+/// description, so the value stays stable, bounded, and free of prompt bodies
+/// and entity titles.
+fn work_kind(work_context: Option<&TurnWorkContext>) -> &'static str {
+    match work_context {
+        None => "none",
+        Some(TurnWorkContext::Interactive) => "interactive",
+        Some(TurnWorkContext::PlanStep { .. }) => "plan_step",
+        Some(TurnWorkContext::ReviewGroupStep { .. }) => "review_group_step",
+        Some(TurnWorkContext::ReviewStep { .. }) => "review_step",
+        Some(TurnWorkContext::ReviewPhase { .. }) => "review_phase",
+    }
+}
+
 /// Records the terminal outcome of a model turn with its aggregated usage.
 ///
 /// Only metadata is logged — identifiers, the final status, and the aggregated
@@ -1210,13 +1336,14 @@ fn log_turn_finished(
     status: &'static str,
     usage: &UsageTotals,
     error: Option<&str>,
+    work_context: Option<&TurnWorkContext>,
 ) {
     if matches!(status, "cancelled" | "error" | "edit_failed") {
         tracing::warn!(
             operation_id = %op_id,
             model = %model,
             is_batch,
-            status,
+            work = work_kind(work_context),            status,
             prompt_tokens = usage.prompt_tokens,
             completion_tokens = usage.completion_tokens,
             total_tokens = usage.total_tokens,
@@ -1230,7 +1357,7 @@ fn log_turn_finished(
             operation_id = %op_id,
             model = %model,
             is_batch,
-            status,
+            work = work_kind(work_context),            status,
             prompt_tokens = usage.prompt_tokens,
             completion_tokens = usage.completion_tokens,
             total_tokens = usage.total_tokens,

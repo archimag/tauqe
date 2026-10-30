@@ -7,8 +7,8 @@
 //! succeeds.
 
 use std::path::Path;
-
-use tauqe_protocol::{EditOutcome, EditProposal, ModelResult};
+use std::time::Duration;
+use tauqe_protocol::{EditOutcome, EditProposal, ModelResult, ProjectConfig};
 use tokio::sync::{mpsc, watch};
 
 use crate::context::ContextManager;
@@ -18,27 +18,97 @@ use crate::workflow::policy::ApplyPolicy;
 
 use super::FsmTurnOutcome;
 
-/// Rolls back an open transaction, logging a failure instead of discarding it.
+/// Number of rollback attempts before a transient failure is treated as fatal.
+const ROLLBACK_ATTEMPTS: usize = 3;
+
+/// Pause between two rollback attempts, long enough for a transient lock held by
+/// an IDE, a language server, or the operating system to clear.
+const ROLLBACK_RETRY_DELAY: Duration = Duration::from_millis(100);
+
+/// Outcome of a rollback attempt against the turn transaction.
+///
+/// The three states are deliberately distinct, because "the tree was restored"
+/// and "the rollback did not fail" answer different questions: the first
+/// decides whether a context change must be published, the second decides
+/// whether the next attempt may start at all. A policy that holds no open
+/// transaction — the direct-write policy of the naive workflow — reports
+/// [`RollbackOutcome::NoTransaction`], which is not a failure: there is simply
+/// nothing it could restore.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum RollbackOutcome {
+    /// The working tree was restored to its pre-turn state.
+    Restored,
+    /// The policy held no open transaction, so nothing needed restoring.
+    NoTransaction,
+    /// Every attempt failed; the working tree may still hold the turn's writes.
+    Failed,
+}
+
+impl RollbackOutcome {
+    /// Whether the working tree was actually restored.
+    pub(crate) fn is_restored(self) -> bool {
+        matches!(self, Self::Restored)
+    }
+
+    /// Whether the rollback failed, leaving the working tree in an unknown
+    /// state.
+    pub(crate) fn is_failed(self) -> bool {
+        matches!(self, Self::Failed)
+    }
+}
+
+/// Rolls back an open transaction, retrying a transient failure and logging a
+/// final one instead of discarding it.
 ///
 /// A failed rollback leaves the working tree modified while the caller reports
 /// that the turn was reverted, so the discrepancy must stay visible rather than
-/// being silently dropped. Returns whether the working tree was actually
-/// restored.
+/// being silently dropped.
+///
+/// A rollback can fail for reasons that are not the repository's fault: an IDE,
+/// a language server such as `rust-analyzer`, or the operating system may hold a
+/// lock on a file for a few milliseconds while it re-reads or re-indexes it. The
+/// helper therefore makes `ROLLBACK_ATTEMPTS` attempts with a pause between
+/// them, so a transient lock clears on its own instead of turning into a dirty
+/// working tree. Only an error that survives the last attempt is reported as a
+/// failed rollback.
 ///
 /// The helper is shared beyond the FSM: the execution-mode supervisors call it
 /// on their turn-error and escalation paths, so no rollback failure is
 /// discarded anywhere in the turn lifecycle.
-pub(crate) async fn rollback_or_log(policy: &mut dyn ApplyPolicy, repo_root: &Path) -> bool {
-    match policy.rollback(repo_root).await {
-        Ok(rolled_back) => rolled_back,
-        Err(err) => {
-            tracing::error!(
-                "Failed to roll back the turn transaction; the working tree may still be modified: {}",
-                err
-            );
-            false
+pub(crate) async fn attempt_rollback(
+    policy: &mut dyn ApplyPolicy,
+    repo_root: &Path,
+) -> RollbackOutcome {
+    let mut attempt = 1;
+    loop {
+        match policy.rollback(repo_root).await {
+            Ok(true) => return RollbackOutcome::Restored,
+            Ok(false) => return RollbackOutcome::NoTransaction,
+            Err(err) if attempt < ROLLBACK_ATTEMPTS => {
+                tracing::warn!(attempt, error = %err, "rollback attempt failed; retrying");
+                tokio::time::sleep(ROLLBACK_RETRY_DELAY).await;
+                attempt += 1;
+            }
+            Err(err) => {
+                tracing::error!(
+                    attempts = ROLLBACK_ATTEMPTS,
+                    error = %err,
+                    "failed to roll back the turn transaction; the working tree may still be modified"
+                );
+                return RollbackOutcome::Failed;
+            }
         }
     }
+}
+
+/// Rolls back an open transaction and reports whether the working tree was
+/// actually restored.
+///
+/// A caller that only needs to know whether the rollback failed reads
+/// [`attempt_rollback`] directly: a policy without an open transaction restores
+/// nothing and therefore reports `false` here without having failed.
+pub(crate) async fn rollback_or_log(policy: &mut dyn ApplyPolicy, repo_root: &Path) -> bool {
+    attempt_rollback(policy, repo_root).await.is_restored()
 }
 
 /// RAII guard that rolls back an open transaction and cleans auto context if
@@ -51,6 +121,8 @@ pub(super) struct TransactionRollbackGuard<'a> {
     policy: &'a mut dyn ApplyPolicy,
     pub(super) context_manager: &'a mut ContextManager,
     repo_root: &'a Path,
+    /// Effective project configuration frozen at the start of the turn.
+    project: &'a ProjectConfig,
     cancel_rx: watch::Receiver<bool>,
     armed: bool,
     /// Working-copy status captured once, at the end of the first change set
@@ -67,12 +139,14 @@ impl<'a> TransactionRollbackGuard<'a> {
         policy: &'a mut dyn ApplyPolicy,
         context_manager: &'a mut ContextManager,
         repo_root: &'a Path,
+        project: &'a ProjectConfig,
         cancel_rx: watch::Receiver<bool>,
     ) -> Self {
         Self {
             policy,
             context_manager,
             repo_root,
+            project,
             cancel_rx,
             armed: false,
             worktree_baseline: None,
@@ -120,7 +194,7 @@ impl<'a> TransactionRollbackGuard<'a> {
     ) -> anyhow::Result<Vec<String>> {
         let mut changed_files = self
             .policy
-            .apply_temporary(self.repo_root, self.context_manager, proposal)
+            .apply_temporary(self.repo_root, self.project, self.context_manager, proposal)
             .await?;
 
         for artifact in self.run_post_hook().await? {
@@ -172,9 +246,13 @@ impl<'a> TransactionRollbackGuard<'a> {
         let repo_root = self.repo_root;
         let before = crate::blocking::run_blocking(|| snapshot_worktree(repo_root));
 
-        let response = crate::toolchain::run_post_hooks(repo_root, Some(&self.cancel_rx))
-            .await
-            .map_err(|err| anyhow::anyhow!("the project post-hook could not run: {err}"))?;
+        let response = crate::toolchain::run_post_hooks_with_config(
+            repo_root,
+            self.project,
+            Some(&self.cancel_rx),
+        )
+        .await
+        .map_err(|err| anyhow::anyhow!("the project post-hook could not run: {err}"))?;
         if !response.success {
             let reason = response
                 .message
@@ -384,6 +462,7 @@ pub(super) async fn finalize_blocked_turn(
 mod tests {
     use super::*;
     use crate::workflow::git_policy::GitTransactionPolicy;
+    use crate::workflow::policy::DirectApplyPolicy;
     use tauqe_protocol::{ContextAccess, EditOperation};
 
     /// Creates a repository holding an editable file and an optional post-hook
@@ -423,7 +502,9 @@ mod tests {
         context.add_file("a.rs", ContextAccess::Editable).unwrap();
         let mut policy = GitTransactionPolicy::new();
         let (_cancel_tx, cancel_rx) = watch::channel(false);
-        let mut guard = TransactionRollbackGuard::new(&mut policy, &mut context, &root, cancel_rx);
+        let project = crate::toolchain::effective_project_config(&root, None).await;
+        let mut guard =
+            TransactionRollbackGuard::new(&mut policy, &mut context, &root, &project, cancel_rx);
 
         let changed = guard.apply_temporary(&replace_edit()).await.unwrap();
 
@@ -438,7 +519,9 @@ mod tests {
         context.add_file("a.rs", ContextAccess::Editable).unwrap();
         let mut policy = GitTransactionPolicy::new();
         let (_cancel_tx, cancel_rx) = watch::channel(false);
-        let mut guard = TransactionRollbackGuard::new(&mut policy, &mut context, &root, cancel_rx);
+        let project = crate::toolchain::effective_project_config(&root, None).await;
+        let mut guard =
+            TransactionRollbackGuard::new(&mut policy, &mut context, &root, &project, cancel_rx);
 
         // Before any change set reaches the disk there is nothing to compare.
         assert!(guard.worktree_changes().is_empty());
@@ -478,7 +561,9 @@ mod tests {
         context.add_file("a.rs", ContextAccess::Editable).unwrap();
         let mut policy = GitTransactionPolicy::new();
         let (_cancel_tx, cancel_rx) = watch::channel(false);
-        let mut guard = TransactionRollbackGuard::new(&mut policy, &mut context, &root, cancel_rx);
+        let project = crate::toolchain::effective_project_config(&root, None).await;
+        let mut guard =
+            TransactionRollbackGuard::new(&mut policy, &mut context, &root, &project, cancel_rx);
 
         let changed = guard.apply_temporary(&replace_edit()).await.unwrap();
 
@@ -500,7 +585,9 @@ mod tests {
         context.add_file("a.rs", ContextAccess::Editable).unwrap();
         let mut policy = GitTransactionPolicy::new();
         let (_cancel_tx, cancel_rx) = watch::channel(false);
-        let mut guard = TransactionRollbackGuard::new(&mut policy, &mut context, &root, cancel_rx);
+        let project = crate::toolchain::effective_project_config(&root, None).await;
+        let mut guard =
+            TransactionRollbackGuard::new(&mut policy, &mut context, &root, &project, cancel_rx);
 
         let err = guard.apply_temporary(&replace_edit()).await.unwrap_err();
 
@@ -512,5 +599,100 @@ mod tests {
             err.to_string().contains("generator crashed"),
             "the hook output must reach the diagnostic: {err}"
         );
+    }
+    /// Policy whose rollback fails a fixed number of times before it succeeds,
+    /// standing in for a file lock that another process releases shortly.
+    ///
+    /// Every phase other than `rollback` delegates to [`DirectApplyPolicy`], so
+    /// the double satisfies the whole `ApplyPolicy` contract instead of leaving
+    /// a panicking branch that the rollback helper never exercises.
+    struct TransientLockPolicy {
+        inner: DirectApplyPolicy,
+        failures_left: usize,
+        attempts: usize,
+    }
+
+    impl TransientLockPolicy {
+        fn new(failures_left: usize) -> Self {
+            Self {
+                inner: DirectApplyPolicy::new(),
+                failures_left,
+                attempts: 0,
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ApplyPolicy for TransientLockPolicy {
+        async fn staging(
+            &mut self,
+            repo_root: &Path,
+            project: &ProjectConfig,
+            context_manager: &ContextManager,
+            edits: &[EditOperation],
+            staged_state: Option<&crate::edits::StagedEditsState>,
+            cancel_rx: Option<&watch::Receiver<bool>>,
+        ) -> crate::edits::StageEditsResult {
+            self.inner
+                .staging(
+                    repo_root,
+                    project,
+                    context_manager,
+                    edits,
+                    staged_state,
+                    cancel_rx,
+                )
+                .await
+        }
+
+        async fn apply_temporary(
+            &mut self,
+            repo_root: &Path,
+            project: &ProjectConfig,
+            context_manager: &mut ContextManager,
+            proposal: &EditProposal,
+        ) -> anyhow::Result<Vec<String>> {
+            self.inner
+                .apply_temporary(repo_root, project, context_manager, proposal)
+                .await
+        }
+
+        async fn apply_final(
+            &mut self,
+            repo_root: &Path,
+            changed_files: &[String],
+            summary: &str,
+        ) -> anyhow::Result<Option<String>> {
+            self.inner
+                .apply_final(repo_root, changed_files, summary)
+                .await
+        }
+
+        async fn rollback(&mut self, _repo_root: &Path) -> anyhow::Result<bool> {
+            self.attempts += 1;
+            if self.failures_left == 0 {
+                return Ok(true);
+            }
+            self.failures_left -= 1;
+            anyhow::bail!("the working tree is locked by another process")
+        }
+    }
+
+    #[tokio::test]
+    async fn rollback_retries_a_transient_lock_until_it_clears() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut policy = TransientLockPolicy::new(2);
+
+        assert!(rollback_or_log(&mut policy, dir.path()).await);
+        assert_eq!(policy.attempts, ROLLBACK_ATTEMPTS);
+    }
+
+    #[tokio::test]
+    async fn rollback_reports_failure_once_every_attempt_is_exhausted() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut policy = TransientLockPolicy::new(ROLLBACK_ATTEMPTS);
+
+        assert!(!rollback_or_log(&mut policy, dir.path()).await);
+        assert_eq!(policy.attempts, ROLLBACK_ATTEMPTS);
     }
 }

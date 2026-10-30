@@ -21,7 +21,8 @@ use crate::dialogs::render::{
     render_confirm_delete_review_popup, render_confirm_detach_focus_popup,
     render_confirm_execute_pipeline_popup, render_confirm_execute_review_popup,
     render_confirm_execute_scope_popup, render_confirm_quit_popup,
-    render_confirm_review_analyze_popup, render_diff_inspector, render_disconnected_popup,
+    render_confirm_remove_context_file_popup, render_confirm_review_analyze_popup,
+    render_confirm_review_truncation_popup, render_diff_inspector, render_disconnected_popup,
     render_help_popup, render_locale_dialog, render_plan_refine_blocked_dialog,
     render_plan_refine_dialog, render_prompt_modal, render_review_dialog, render_selection_dialog,
     render_squash_popup, render_status_dialog, render_usage_summary,
@@ -279,6 +280,9 @@ pub fn render_ui(frame: &mut ratatui::Frame, state: &mut AppState) {
         Some(ActiveModal::BatchCancel) => render_confirm_batch_cancel_popup(frame, state),
         Some(ActiveModal::ClearAuto) => render_confirm_clear_auto_popup(frame, state),
         Some(ActiveModal::ClearUser) => render_confirm_clear_user_popup(frame, state),
+        Some(ActiveModal::RemoveContextFile) => {
+            render_confirm_remove_context_file_popup(frame, state);
+        }
         Some(ActiveModal::ConfirmDetachFocus) => render_confirm_detach_focus_popup(frame, state),
         Some(ActiveModal::ClearHorizon) => {
             if let Some(plan_id) = &state.confirm_clear_horizon {
@@ -310,6 +314,7 @@ pub fn render_ui(frame: &mut ratatui::Frame, state: &mut AppState) {
             }
         }
         Some(ActiveModal::ReviewAnalyze) => render_confirm_review_analyze_popup(frame, state),
+        Some(ActiveModal::ReviewTruncation) => render_confirm_review_truncation_popup(frame, state),
         Some(ActiveModal::ExecuteReview) => render_confirm_execute_review_popup(frame, state),
         Some(ActiveModal::ExecutePipeline) => render_confirm_execute_pipeline_popup(frame, state),
         Some(ActiveModal::ExecuteScope) => render_confirm_execute_scope_popup(frame, state),
@@ -321,15 +326,6 @@ pub fn render_ui(frame: &mut ratatui::Frame, state: &mut AppState) {
         Some(ActiveModal::RefineBlocked) => {
             if let Some(blocked) = &state.plans_view.refine_blocked {
                 render_plan_refine_blocked_dialog(frame, blocked, state.confirm_button);
-            }
-        }
-        Some(ActiveModal::ReviewRefine) => {
-            if let Some(dialog) = &state.review.refine_dialog {
-                crate::dialogs::render::refine::render_review_refine_dialog(
-                    frame,
-                    dialog,
-                    state.tui_config.input.primary_modifier,
-                );
             }
         }
         Some(ActiveModal::Prompt) => {
@@ -351,12 +347,17 @@ pub fn render_ui(frame: &mut ratatui::Frame, state: &mut AppState) {
                 render_selection_dialog(frame, dialog);
             }
         }
-        // The inspector reads the change set it captured when it opened and the
-        // diff cache the Develop viewport already filled, so the audit paints
-        // exactly the rows the REPL laid out (c-3).
+        // The inspector is a live projection of the change set: every
+        // edit-stream event refreshes it, and it paints the rows through the same
+        // diff cache the Develop viewport already filled, so the audit and the
+        // REPL can never disagree about a diff body (c-1, c-3).
         Some(ActiveModal::DiffInspector) => {
+            // The animation frame is read before the inspector borrows the shared
+            // state, so the file the stream currently writes carries the same
+            // spinner here as it does in the Viewport (c-3).
+            let spinner_frame = state.model.spinner_frame;
             if let Some(inspector) = state.diff_inspector.as_mut() {
-                render_diff_inspector(frame, inspector, &mut state.model.diff_cache);
+                render_diff_inspector(frame, inspector, &mut state.model.diff_cache, spinner_frame);
             }
         }
         Some(ActiveModal::ThemeSelector) => {

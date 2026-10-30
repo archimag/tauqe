@@ -79,7 +79,10 @@ pub(crate) fn commit_staged_edits(
     let mut created_dirs: Vec<PathBuf> = Vec::new();
 
     for path in paths {
-        crate::context::verify_path_within_repo(repo_root, path)
+        // The commit writes these paths to disk, so the boundary must be
+        // inspectable; a canonicalization failure refuses the commit rather
+        // than publishing a path the escape check never saw.
+        crate::context::verify_path_within_repo_for_write(repo_root, path)
             .map_err(|err| EditError::InvalidPath(path.clone(), err.to_string()))?;
 
         let final_path = repo_root.join(path);

@@ -275,6 +275,15 @@ impl EditStreamFilter for DiscussionStreamFilter {
     fn finish(mut self: Box<Self>) -> Vec<StreamEvent> {
         self.finish_internal()
     }
+
+    fn reset(&mut self) {
+        self.passthrough = None;
+        self.buffer.clear();
+        self.message_cursor = StringFieldCursor::new();
+        self.message_streamed_bytes = 0;
+        self.message_finished = false;
+        self.response = None;
+    }
 }
 
 #[cfg(test)]
@@ -563,5 +572,37 @@ mod tests {
             }
         }
         assert_eq!(streamed, "Executive summary text");
+    }
+
+    #[test]
+    fn test_reset_discards_the_voided_attempt() {
+        let mut filter = DiscussionStreamFilter::new();
+        // The interrupted attempt leaves an unterminated `message` value behind,
+        // so the scanner would keep reading through the retried payload.
+        let _ = filter.push_chunk(r#"{"message":"First attempt"#);
+
+        filter.reset();
+        let retried = concat!(
+            "{\"message\":\"Second attempt\",\"plan_update\":null,",
+            "\"context_requests\":[],\"user_language\":null}"
+        );
+
+        let mut streamed = String::new();
+        for event in filter.push_chunk(retried) {
+            if let StreamEvent::TextDelta(delta) = event {
+                streamed.push_str(&delta);
+            }
+        }
+        for event in filter.finish_internal() {
+            if let StreamEvent::TextDelta(delta) = event {
+                streamed.push_str(&delta);
+            }
+        }
+
+        assert_eq!(streamed, "Second attempt");
+        assert_eq!(
+            filter.response().map(|response| response.message.as_str()),
+            Some("Second attempt")
+        );
     }
 }

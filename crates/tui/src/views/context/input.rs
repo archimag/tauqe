@@ -3,7 +3,7 @@ use std::sync::Arc;
 use crossterm::event::{KeyCode, KeyEvent};
 use tauqe_protocol::{
     methods, ContextAccess, ContextAddParams, ContextAddPatternParams, ContextLayer,
-    ContextRemoveParams, ContextSetAccessParams,
+    ContextSetAccessParams,
 };
 use tokio::sync::Mutex;
 
@@ -78,12 +78,9 @@ pub static CONTEXT_COMMAND_MAP: CommandMap<ContextAction> = CommandMap::new(&[
         Helpers,
         "cmd.context.refresh",
     ),
-    CommandSpec::new(
-        KeyChord::Bare(KeyCode::Char('d')),
-        ContextAction::Remove,
-        Helpers,
-        "cmd.context.remove",
-    ),
+    // Removing one file is destructive to the curated audit context, so it
+    // stays on the canonical `Delete` reservation and always raises the shared
+    // confirmation card with the safe `Cancel` default (Conventions §4.3, §5.4).
     CommandSpec::new(
         KeyChord::Bare(KeyCode::Delete),
         ContextAction::Remove,
@@ -381,6 +378,19 @@ pub async fn handle_context_key(
             }
             _ => {
                 let is_cmd = st.tui_config.input.primary_modifier.matches(key.modifiers);
+                // A yank reads the system clipboard, a native round trip bounded
+                // at NATIVE_CLIPBOARD_TIMEOUT. The text is read with the state
+                // guard released and inserted afterwards, so the picker never
+                // holds the guard across the wait (c-1).
+                if st.context_view.add_input.takes_yank_chord(key, is_cmd) {
+                    drop(st);
+                    let clipboard = crate::clipboard::get_from_clipboard_async().await;
+                    let mut st = state.lock().await;
+                    st.context_view.add_input.yank_with(clipboard);
+                    st.context_view.selected_candidate_index = 0;
+                    st.update_filtered_candidates();
+                    return Ok(InputResult::Continue);
+                }
                 if st.context_view.add_input.handle_key(key, is_cmd) {
                     st.context_view.selected_candidate_index = 0;
                     st.update_filtered_candidates();
@@ -562,7 +572,11 @@ pub async fn handle_context_key(
 
             if let Some(text) = to_copy {
                 drop(st);
-                let res = crate::clipboard::copy_to_clipboard(&text);
+                // The copy is a native round trip bounded at
+                // NATIVE_CLIPBOARD_TIMEOUT, so it runs off the event loop while
+                // the guard is released; only the typed outcome is reported once
+                // the guard is re-acquired (c-1).
+                let res = crate::clipboard::copy_to_clipboard_async(&text).await;
                 let mut st = state.lock().await;
                 match res {
                     crate::clipboard::CopyResult::Native => {
@@ -648,20 +662,13 @@ pub async fn handle_context_key(
                 if item.layer == ContextLayer::Pinned {
                     st.notify_warning(active_t("notify.pinned_protected_remove"));
                 } else {
-                    let path = item.path.clone();
-                    if st.context_view.cursor_index > 0
-                        && st.context_view.cursor_index >= total_rows.saturating_sub(1)
-                    {
-                        st.context_view.cursor_index -= 1;
-                    }
-                    drop(st);
-                    let params = ContextRemoveParams { path };
-                    send_request(
-                        server_writer,
-                        methods::CONTEXT_REMOVE,
-                        serde_json::to_value(params)?,
-                    )
-                    .await?;
+                    // A destructive context mutation never leaves the client
+                    // on the keystroke: the selected path is recorded and the
+                    // shared confirmation modal owns the request. `Cancel`
+                    // drops the pending path and leaves the layer untouched
+                    // (Conventions §4.3, §5.4).
+                    st.confirm_button = crate::app::ConfirmDialogButton::Cancel;
+                    st.context_view.pending_remove = Some(item.path.clone());
                 }
             }
             Some(ContextRow::Header(ContextLayer::Auto)) => {
@@ -975,5 +982,77 @@ mod tests {
             conn.written().is_empty(),
             "a reference document must never send an access change"
         );
+    }
+    /// Removal is destructive to the curated audit context, so `Delete` only
+    /// raises the shared confirmation: no request leaves the client and the
+    /// safe `Cancel` default owns the focus (Conventions §4.3, §5.4).
+    #[tokio::test]
+    async fn test_delete_on_a_user_file_opens_the_removal_confirmation() {
+        let mut st = test_state();
+        st.view_mode = ViewMode::Context;
+        st.context
+            .items
+            .push(item("src/lib.rs", ContextLayer::User));
+        // Rows: Pinned, Refs, User header, User item, Auto header.
+        st.context_view.cursor_index = 3;
+        st.confirm_button = crate::app::ConfirmDialogButton::Confirm;
+        let state = Arc::new(Mutex::new(st));
+        let mut conn = RpcConnection::new(Vec::<u8>::new());
+
+        let key = KeyEvent::new(KeyCode::Delete, crossterm::event::KeyModifiers::NONE);
+        handle_context_key(key, &state, &mut conn).await.unwrap();
+
+        assert!(
+            conn.written().is_empty(),
+            "the request waits for the confirmation"
+        );
+        let guard = state.lock().await;
+        assert_eq!(
+            guard.context_view.pending_remove.as_deref(),
+            Some("src/lib.rs")
+        );
+        assert_eq!(
+            guard.confirm_button,
+            crate::app::ConfirmDialogButton::Cancel,
+            "the safe cancel button holds the default focus"
+        );
+        assert_eq!(guard.context.items.len(), 1);
+    }
+
+    /// The canonical removal binding is `Delete`; the bare `d` letter no longer
+    /// removes anything, so a stray keystroke cannot even raise the card
+    /// (Conventions §4.3).
+    #[tokio::test]
+    async fn test_bare_d_no_longer_removes_a_context_file() {
+        let mut st = test_state();
+        st.view_mode = ViewMode::Context;
+        st.context
+            .items
+            .push(item("src/lib.rs", ContextLayer::User));
+        st.context_view.cursor_index = 3;
+        let state = Arc::new(Mutex::new(st));
+        let mut conn = RpcConnection::new(Vec::<u8>::new());
+
+        let key = KeyEvent::new(KeyCode::Char('d'), crossterm::event::KeyModifiers::NONE);
+        handle_context_key(key, &state, &mut conn).await.unwrap();
+
+        let guard = state.lock().await;
+        assert!(guard.context_view.pending_remove.is_none());
+        assert_eq!(guard.context.items.len(), 1);
+        drop(guard);
+        assert!(conn.written().is_empty());
+    }
+
+    #[test]
+    fn test_delete_is_the_canonical_removal_chord() {
+        let chords: Vec<(KeyChord, ContextAction)> = CONTEXT_COMMAND_MAP
+            .specs()
+            .iter()
+            .map(|spec| (spec.chord, spec.action))
+            .collect();
+        assert!(chords.contains(&(KeyChord::Bare(KeyCode::Delete), ContextAction::Remove)));
+        assert!(!chords.iter().any(|(chord, action)| {
+            *action == ContextAction::Remove && *chord == KeyChord::Bare(KeyCode::Char('d'))
+        }));
     }
 }

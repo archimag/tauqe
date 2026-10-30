@@ -1,6 +1,7 @@
-use anyhow::{bail, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
+use std::io::{Read, Write};
 use std::path::Path;
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 use crate::config::load_git_config;
 
@@ -32,11 +33,13 @@ pub fn run_git(dir: Option<&Path>, args: &[&str]) -> Result<String> {
 /// Reports which of the supplied paths repository ignore rules exclude.
 ///
 /// The candidate paths are written to `git check-ignore` through stdin in
-/// NUL-separated form. This batches a whole change set into a single Git
-/// subprocess and keeps a path containing a space, a quote, or a newline
-/// intact. Both `.gitignore` files and `.git/info/exclude` take part, because
-/// the answer comes from Git itself rather than from a locally re-implemented
-/// matcher.
+/// NUL-separated form, which keeps a path containing a space, a quote, or a
+/// newline intact. Both `.gitignore` files and `.git/info/exclude` take part,
+/// because the answer comes from Git itself rather than from a locally
+/// re-implemented matcher.
+///
+/// A change set is batched into a handful of invocations rather than one per
+/// path, so the whole list costs a few Git subprocesses instead of hundreds.
 ///
 /// `check-ignore` answers with exit code `1` when none of the supplied paths
 /// matches an ignore rule, which is a valid negative answer rather than a
@@ -48,42 +51,122 @@ pub fn run_git_check_ignore(dir: &Path, paths: &[String]) -> Result<Vec<String>>
     }
 
     crate::blocking::run_blocking(|| {
-        use std::io::Write;
-        use std::process::Stdio;
-
-        let mut child = Command::new("git")
-            .current_dir(dir)
-            .args(["check-ignore", "-z", "--stdin"])
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()?;
-
-        // Dropping the stdin handle at the end of the scope closes the pipe,
-        // so `check-ignore` observes end of input and finishes.
-        {
-            let mut stdin = child.stdin.take().context("Failed to open git stdin")?;
-            for path in paths {
-                stdin.write_all(path.as_bytes())?;
-                stdin.write_all(b"\0")?;
-            }
+        let mut ignored = Vec::new();
+        for batch in check_ignore_batches(paths) {
+            ignored.extend(check_ignore_batch(dir, batch)?);
         }
-
-        let output = child.wait_with_output()?;
-        let code = output.status.code().unwrap_or(-1);
-        match code {
-            0 => Ok(String::from_utf8_lossy(&output.stdout)
-                .split('\0')
-                .filter(|entry| !entry.is_empty())
-                .map(|entry| entry.to_string())
-                .collect()),
-            1 => Ok(Vec::new()),
-            other => bail!(
-                "git check-ignore failed with exit code {other}: {}",
-                String::from_utf8_lossy(&output.stderr).trim()
-            ),
-        }
+        Ok(ignored)
     })
+}
+
+/// Largest candidate payload handed to a single `check-ignore` invocation.
+///
+/// The bound stays well below the capacity of an OS pipe buffer, so one
+/// invocation can never fill the child's pipes on its own, even when a change
+/// set grows beyond the sizes a model-bounded turn produces today.
+const CHECK_IGNORE_BATCH_BYTES: usize = 32 * 1024;
+
+/// Splits a candidate list into batches that respect [`CHECK_IGNORE_BATCH_BYTES`].
+///
+/// A single path longer than the whole budget forms a batch of its own. The
+/// candidates keep their order, so the verdicts of the batches concatenate
+/// into the answer of the whole change set.
+fn check_ignore_batches(paths: &[String]) -> Vec<&[String]> {
+    let mut batches = Vec::new();
+    let mut start = 0;
+    let mut payload = 0;
+    for (index, path) in paths.iter().enumerate() {
+        let entry_bytes = path.len() + 1;
+        if index > start && payload + entry_bytes > CHECK_IGNORE_BATCH_BYTES {
+            batches.push(&paths[start..index]);
+            start = index;
+            payload = 0;
+        }
+        payload += entry_bytes;
+    }
+    if start < paths.len() {
+        batches.push(&paths[start..]);
+    }
+    batches
+}
+
+/// Runs one bounded `check-ignore` invocation over the supplied candidates.
+///
+/// Both child pipes are drained on dedicated threads while the candidate list
+/// is still being written. `check-ignore` streams its verdicts as it consumes
+/// standard input, so writing the whole list first and reading afterwards
+/// would deadlock as soon as the echoed verdicts filled the child's stdout
+/// pipe. The toolchain executor drains its own children the same way.
+fn check_ignore_batch(dir: &Path, paths: &[String]) -> Result<Vec<String>> {
+    let mut child = Command::new("git")
+        .current_dir(dir)
+        .args(["check-ignore", "-z", "--stdin"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+
+    let stdout_drain = spawn_pipe_drain(child.stdout.take());
+    let stderr_drain = spawn_pipe_drain(child.stderr.take());
+
+    // The handle is scoped so that closing it delivers end of input to
+    // `check-ignore` before the child is awaited.
+    let write_result = {
+        let mut stdin = child.stdin.take().context("Failed to open git stdin")?;
+        write_candidate_paths(&mut stdin, paths)
+    };
+
+    let status = child.wait()?;
+    let stdout = join_pipe_drain(stdout_drain)?;
+    let stderr = join_pipe_drain(stderr_drain)?;
+
+    let code = status.code().unwrap_or(-1);
+    if code != 0 && code != 1 {
+        bail!(
+            "git check-ignore failed with exit code {code}: {}",
+            String::from_utf8_lossy(&stderr).trim()
+        );
+    }
+    write_result?;
+    if code == 1 {
+        return Ok(Vec::new());
+    }
+    Ok(String::from_utf8_lossy(&stdout)
+        .split('\0')
+        .filter(|entry| !entry.is_empty())
+        .map(|entry| entry.to_string())
+        .collect())
+}
+
+/// Writes the candidates as a NUL-separated list and closes the stream.
+fn write_candidate_paths(stdin: &mut impl Write, paths: &[String]) -> std::io::Result<()> {
+    for path in paths {
+        stdin.write_all(path.as_bytes())?;
+        stdin.write_all(b"\0")?;
+    }
+    stdin.flush()
+}
+
+/// Drains a child pipe to EOF on its own thread.
+fn spawn_pipe_drain<R>(pipe: Option<R>) -> std::thread::JoinHandle<std::io::Result<Vec<u8>>>
+where
+    R: Read + Send + 'static,
+{
+    std::thread::spawn(move || {
+        let mut buffer = Vec::new();
+        if let Some(mut pipe) = pipe {
+            pipe.read_to_end(&mut buffer)?;
+        }
+        Ok(buffer)
+    })
+}
+
+/// Collects the bytes a drain thread read.
+fn join_pipe_drain(handle: std::thread::JoinHandle<std::io::Result<Vec<u8>>>) -> Result<Vec<u8>> {
+    let read = handle
+        .join()
+        .map_err(|_| anyhow!("a git check-ignore pipe drain thread panicked"))?;
+    read.context("Failed to drain a git check-ignore pipe")
 }
 
 /// Stages the specified list of files into the Git index.
@@ -244,5 +327,31 @@ mod tests {
 
         // An empty change set probes nothing and reports nothing.
         assert!(run_git_check_ignore(root, &[]).unwrap().is_empty());
+    }
+
+    #[test]
+    fn check_ignore_drains_a_candidate_list_larger_than_a_pipe_buffer() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        init_repo(root);
+        std::fs::write(root.join(".gitignore"), "*.log\n").unwrap();
+        run_git(Some(root), &["add", ".gitignore"]).unwrap();
+
+        // More NUL-terminated candidates than an OS pipe buffer holds, with
+        // every path ignored. An implementation that wrote the whole list
+        // before it read the echoed verdicts would block here forever.
+        let candidates: Vec<String> = (0..8_000)
+            .map(|index| format!("generated/build/nested/artifact-{index:05}.log"))
+            .collect();
+        let payload_bytes: usize = candidates.iter().map(|path| path.len() + 1).sum();
+        assert!(payload_bytes > 256 * 1024, "payload: {payload_bytes} bytes");
+        assert!(
+            check_ignore_batches(&candidates).len() > 1,
+            "the stress test must cross several batches"
+        );
+
+        let matched = run_git_check_ignore(root, &candidates).unwrap();
+        assert_eq!(matched.len(), candidates.len());
+        assert_eq!(matched, candidates);
     }
 }

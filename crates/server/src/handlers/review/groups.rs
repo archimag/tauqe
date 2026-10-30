@@ -32,7 +32,6 @@ use std::path::Path;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use tauqe_core::context::ContextFileContent;
 use tauqe_core::edits::stream::json::JsonFieldStreamFilter;
 use tauqe_core::providers::{
     create_provider, format_session_id, ChatMessage, LlmProvider, StreamEvent,
@@ -47,27 +46,15 @@ use tauqe_core::workflow::batch::{
     BatchExecution, BatchReport, BatchStep, BatchStepExecutor, BatchStepOutcome,
 };
 use tauqe_protocol::{
-    events, ContextAccess, GlobPattern, ModelRole, ModelSelection, ModelUsageEvent, ModelUsageInfo,
-    ReviewGroup, ReviewGroupFinishedEvent, ReviewGroupStartedEvent, ReviewSession,
+    events, ModelRole, ModelSelection, ModelUsageEvent, ModelUsageInfo, ReviewGroup,
+    ReviewGroupFinishedEvent, ReviewGroupStartedEvent, ReviewSession,
 };
 use tokio::sync::{mpsc, watch};
 
 use crate::state::{AppState, OperationGuard};
 
 use super::common::{emit, offload_review, publish_review};
-
-/// Context budgets one group expansion obeys, read once per run.
-///
-/// They are the limits discovery and the primary audit already enforce, so a
-/// single group can never drag an unbounded slice of the repository into its
-/// audit window.
-#[derive(Debug, Clone, Copy)]
-struct GroupBudgets {
-    /// Maximum number of matched files one group may load.
-    max_files: usize,
-    /// Maximum estimated tokens the loaded files may occupy.
-    files_tokens: usize,
-}
+use super::window::{expand_window, WindowBudgets, WindowContext};
 
 /// Why one group's audit did not produce findings.
 ///
@@ -94,7 +81,7 @@ struct GroupAuditExecutor<'a> {
     groups: &'a [ReviewGroup],
     /// Provider every group streams through.
     provider: Arc<dyn LlmProvider>,
-    budgets: GroupBudgets,
+    budgets: WindowBudgets,
     /// Registered operation, so a stalled streamed call can be aborted by the
     /// hard-cancel watchdog instead of outliving its turn.
     operation: &'a Arc<OperationGuard>,
@@ -113,33 +100,42 @@ impl GroupAuditExecutor<'_> {
         group: &ReviewGroup,
         cancel_rx: &watch::Receiver<bool>,
     ) -> Result<usize, GroupFailure> {
-        let (files, estimated_tokens, omitted_files) =
-            expand_group_files(self.repo_root, &group.paths, self.budgets)
-                .await
-                .map_err(GroupFailure::Infrastructure)?;
+        // The group audit expands its declared paths through the same shared
+        // projection the plain launch and the read-only preview consume, so a
+        // preset never applies its own selection order or its own limits
+        // (#c-1, #c-5).
+        let expanded = expand_window(
+            self.repo_root,
+            WindowContext::empty(),
+            &group.paths,
+            self.budgets,
+        )
+        .await
+        .map_err(GroupFailure::Infrastructure)?;
 
         emit_group_started(
             self.state,
             &self.operation_id,
             group,
-            files.len(),
-            estimated_tokens,
+            expanded.files.len(),
+            expanded.estimated_tokens,
         );
-        if omitted_files > 0 {
+        if expanded.window.omitted_files > 0 {
             tracing::warn!(
                 review_id = self.session.id.as_str(),
                 group_id = group.id.as_str(),
-                omitted = omitted_files,
-                "review group expansion reached the configured batch or token budget; remaining matched files were not loaded"
+                omitted = expanded.window.omitted_files,
+                "review group expansion exhausted the configured file token budget; remaining matched files were not loaded"
             );
         }
-        if files.is_empty() {
+        if expanded.files.is_empty() {
             return Err(GroupFailure::Domain(format!(
                 "Review group '{}' selected no repository files from paths: {}",
                 group.title,
                 group.paths.join(", ")
             )));
         }
+        let files = expanded.files;
 
         let messages = vec![
             ChatMessage::system(build_review_system_prompt()),
@@ -430,82 +426,6 @@ fn emit_group_finished(
     );
 }
 
-/// Expands the declared audit paths of one group into the files it reads.
-///
-/// A declared path is a glob pattern, so a literal directory (`crates/core/`), a
-/// wildcard (`crates/*/src/`) and an exact file all resolve through the single
-/// matcher the rest of the workspace uses. Listing the repository and reading the
-/// matched files are blocking Git and file-system work, so they run on the
-/// blocking pool.
-///
-/// Returns the loaded files, the tokens they are estimated to occupy, and how
-/// many matched files the budgets kept out of the audit window.
-async fn expand_group_files(
-    repo_root: &Path,
-    paths: &[String],
-    budgets: GroupBudgets,
-) -> Result<(Vec<ContextFileContent>, usize, usize), String> {
-    let patterns: Vec<String> = paths
-        .iter()
-        .map(|path| path.trim().to_string())
-        .filter(|path| !path.is_empty())
-        .collect();
-    if patterns.is_empty() {
-        return Ok((Vec::new(), 0, 0));
-    }
-
-    let root = repo_root.to_path_buf();
-    let (reads, total_matched) = crate::handlers::offload(move || {
-        // A repository Git cannot inspect selects nothing; the group then reports
-        // that it found no file to audit instead of failing the whole run.
-        let available = tauqe_core::git::list_repository_files(Some(&root)).unwrap_or_default();
-        let compiled: Vec<GlobPattern> =
-            patterns.iter().map(|path| GlobPattern::new(path)).collect();
-        let mut matched: Vec<String> = available
-            .into_iter()
-            .filter(|path| compiled.iter().any(|pattern| pattern.matches(path)))
-            .collect();
-        matched.sort();
-        matched.dedup();
-        let total_matched = matched.len();
-        // One group may select a whole tree, so the batch is cut at the configured
-        // pattern limit before any file is read.
-        matched.truncate(budgets.max_files);
-
-        let mut reads = Vec::new();
-        for path in matched {
-            if tauqe_core::context::verify_path_within_repo(&root, &path).is_err() {
-                continue;
-            }
-            if let Ok(content) = std::fs::read_to_string(root.join(&path)) {
-                reads.push((path, content));
-            }
-        }
-        (reads, total_matched)
-    })
-    .await?;
-
-    let mut files = Vec::new();
-    let mut estimated_tokens = 0usize;
-    for (path, content) in reads {
-        let tokens = tauqe_core::prompt::estimate_tokens_from_bytes(content.len() as u64) as usize;
-        // The expansion shares the discovery files token budget, so it stops at the
-        // first file that would push the group window past the configured limit.
-        if estimated_tokens.saturating_add(tokens) > budgets.files_tokens {
-            break;
-        }
-        estimated_tokens += tokens;
-        files.push(ContextFileContent {
-            path,
-            access: ContextAccess::ReadOnly,
-            content,
-        });
-    }
-
-    let omitted = total_matched.saturating_sub(files.len());
-    Ok((files, estimated_tokens, omitted))
-}
-
 /// Audits every group of a session snapshot as an isolated batch member.
 ///
 /// The steps are the session's effective groups, so a session that carries no
@@ -527,8 +447,7 @@ pub(crate) async fn run_group_audits(
 
     let (provider, budgets) = {
         let config = state.config.lock().await.config.clone();
-        let budgets = GroupBudgets {
-            max_files: config.context.max_pattern_batch,
+        let budgets = WindowBudgets {
             files_tokens: config.context.files_token_budget,
         };
         // Deterministic unit tests inject a scripted provider through the state's

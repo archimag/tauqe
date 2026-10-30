@@ -82,14 +82,18 @@ pub enum ActiveModal {
     /// Fatal transport state; blocks every other surface.
     ServerDisconnected,
     Squash,
+    /// Consent to launch a review whose audited window the configured budgets
+    /// truncate. It outranks the launch dialog it returns to, so a pending
+    /// decision is never hidden behind a reopened dialog (c-3).
+    ReviewTruncation,
     Review,
-    /// Review-finding decomposition dialog opened with `r` in the Review view.
-    ReviewRefine,
     ConfirmCancel,
     ConfirmQuit,
     BatchCancel,
     ClearAuto,
     ClearUser,
+    /// A Context file whose removal awaits the shared confirmation card.
+    RemoveContextFile,
     ConfirmDetachFocus,
     /// First tier of the implementation-horizon clear confirmation.
     ClearHorizon,
@@ -333,7 +337,7 @@ impl StatusDialogTarget {
     pub fn options_count(&self) -> usize {
         match self {
             Self::PlanItem { .. } => 6,
-            Self::ReviewItem { .. } => 7,
+            Self::ReviewItem { .. } => 6,
         }
     }
 }
@@ -471,16 +475,64 @@ pub struct ConfirmReviewAnalyzeState {
     pub review_title: String,
 }
 
+/// A review launch whose audited window is being projected.
+///
+/// Confirming the launch dialog consumes it, so the dialog itself and the typed
+/// launch parameters wait here until the projection answers: a refused
+/// projection or a declined truncation returns the exact fields the developer
+/// typed, and an approved window starts exactly these parameters (c-3).
+#[derive(Debug, Clone)]
+pub struct PendingReviewLaunch {
+    /// Launch dialog as the developer left it.
+    pub dialog: ReviewDialogState,
+    /// Typed launch parameters the projection describes.
+    pub params: ReviewStartParams,
+}
+
+/// Audit-window projection awaiting the developer's consent.
+///
+/// The card states the whole window the launch would audit — the context, the
+/// pattern matches, the selection, the omissions split by the limit that
+/// dropped them, and the shared token budget — because narrowing the audited
+/// set is a long autonomous operation whose consent cannot be assumed
+/// (Conventions §5.4, c-3).
+#[derive(Debug, Clone)]
+pub struct ConfirmReviewTruncationState {
+    /// Launch waiting for the decision.
+    pub pending: PendingReviewLaunch,
+    /// Projection the decision is made against.
+    pub window: tauqe_protocol::review::ReviewPreviewWindow,
+}
+
 #[derive(Debug, Clone)]
 pub struct ConfirmExecuteReviewState {
     pub review_id: Option<String>,
     pub review_title: String,
+    /// Identifier of the architectural group whose unified plan is executed.
+    ///
+    /// `None` keeps the finding-level targets: one finding (`item_id`), a
+    /// session queue, or the cross-session queue. A group without a `step_id`
+    /// confirms the whole root-cause plan, while a group with one confirms that
+    /// single step of the plan (c-1, c-4, c-5).
+    pub group_id: Option<String>,
+    /// Display title of that group, captured when the dialog opens.
+    pub group_title: String,
     pub scope_title: String,
     pub item_id: Option<u32>,
     /// Concrete subplan step targeted by point execution, when the developer
-    /// confirmed from a step row.
+    /// confirmed from a finding's step row or from one step of a group plan.
     pub step_id: Option<String>,
     pub items: Vec<tauqe_protocol::ReviewIssue>,
+    /// Whether the confirmation queues the whole review session instead of one
+    /// isolated section of it (c-2).
+    ///
+    /// A whole-session target names only its session: the server resolves the
+    /// queue members — independent findings and architectural root-cause plans
+    /// alike — from the session itself, so no explicit selection of findings
+    /// travels with it. A partial queue (a point finding, one step of a group
+    /// plan, or a simple group) keeps its explicit target list and leaves this
+    /// flag clear.
+    pub whole_session: bool,
     /// Coder-role model selector: configured entries, cyclic navigation, and the
     /// shared embedded-list rendering (concept #c-3).
     pub selector: ModelSelector,
@@ -511,10 +563,13 @@ impl ConfirmExecuteReviewState {
         Self {
             review_id,
             review_title,
+            group_id: None,
+            group_title: String::new(),
             scope_title,
             item_id,
             step_id,
             items,
+            whole_session: false,
             selector: ModelSelector::new(ModelRole::Coder, coder_entries, 0),
             instructions_editor: InputEditor::default(),
             focus: RefineDialogFocus::default(),
@@ -522,17 +577,48 @@ impl ConfirmExecuteReviewState {
         }
     }
 
+    /// Targets the whole session the confirmation belongs to (c-2).
+    ///
+    /// The root of a session launches the implicit whole-session queue: the
+    /// confirmation names the session and lets the server assemble its members,
+    /// exactly as the cross-session batch does for every session at once (c-3).
+    /// Partial queues keep their explicit target list and never call this.
+    pub fn with_whole_session(mut self) -> Self {
+        self.whole_session = true;
+        self
+    }
+    /// Targets the unified plan of one architectural group.
+    ///
+    /// A group owns a single root-cause plan, so the confirmation names the
+    /// group instead of one of its findings. With a `step_id` the same state
+    /// addresses one step of that plan, which keeps the explicit Coder form
+    /// (c-1, c-4, c-5).
+    pub fn with_group(mut self, group_id: String, group_title: String) -> Self {
+        self.group_id = Some(group_id);
+        self.group_title = group_title;
+        self
+    }
+
     /// Currently selected Coder entry, if any.
     pub fn selected_entry(&self) -> Option<&tauqe_protocol::ModelEntry> {
         self.selector.selected_entry()
     }
 
-    /// Whether point execution targets exactly one finding or subplan step.
+    /// Whether point execution targets exactly one finding or one group step.
     ///
     /// Only this shape exposes the Coder selector and the directives editor; a
-    /// batch runs autonomously on the configured role defaults (concept #c-3).
+    /// session queue, the cross-session batch, and the unified plan of an
+    /// architectural group run autonomously on the configured role defaults
+    /// (concept #c-3, #c-4, #c-5). A step of a group plan is a single targeted
+    /// unit of work even though the group owns it, so it keeps the explicit
+    /// Coder choice while the whole group plan renders the binary confirmation.
+    /// A whole-session queue names no single unit of work at all, so the flag
+    /// always keeps it out of the point form (c-2).
     pub fn is_single_target(&self) -> bool {
-        self.review_id.is_some() && self.items.len() == 1
+        if self.whole_session {
+            return false;
+        }
+        (self.item_id.is_some() && self.items.len() == 1) || self.step_id.is_some()
     }
 }
 
@@ -675,20 +761,59 @@ impl StatusDialogState {
     }
 }
 
-/// Snapshot of the change set a developer audits in the fullscreen inspector.
+/// Pane of the diff inspector that currently owns the keyboard.
 ///
-/// The inspector is a reading surface, not a live projection of the stream: the
-/// staged files are captured when the Develop viewport hands them over, so
-/// scrolling, resizing, and re-rendering never depend on edits that are still
-/// arriving. The captured list is the session file list the left pane walks,
-/// while the scroll offset belongs to the isolated diff pane alone (c-3).
+/// The card carries two panes: the audited file list on the left and the
+/// isolated diff read area on the right. Only one of them answers to the
+/// vertical motion chords at a time, so an explicit focus states which one it
+/// is and the renderer accents exactly that pane (Conventions §6, §7; c-2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum DiffInspectorFocus {
+    /// The audited file list on the left.
+    #[default]
+    Files,
+    /// The isolated diff read area on the right.
+    Diff,
+}
+
+impl DiffInspectorFocus {
+    /// Whether the file list owns the keyboard.
+    pub fn is_files(&self) -> bool {
+        matches!(self, Self::Files)
+    }
+
+    /// Whether the diff read area owns the keyboard.
+    pub fn is_diff(&self) -> bool {
+        matches!(self, Self::Diff)
+    }
+
+    /// Moves the focus to the other pane.
+    pub fn toggle(&mut self) {
+        *self = match self {
+            Self::Files => Self::Diff,
+            Self::Diff => Self::Files,
+        };
+    }
+}
+
+/// Live view of the change set a developer audits in the fullscreen inspector.
+///
+/// The inspector is a reading surface, yet it never freezes a stale copy: every
+/// edit-stream event that mutates the staged file list refreshes it in place, so
+/// a file that is still streaming, retrying, or freshly verified reads the same
+/// in the audit as it does in the Viewport. The scroll offset belongs to the
+/// isolated diff pane alone, while the explicit focus states which pane answers
+/// to the vertical motion chords (c-2, c-3).
 pub struct DiffInspectorState {
-    /// Staged files of the audited turn, in Viewport order.
+    /// Staged files of the audited turn, in Viewport order; refreshed by every
+    /// edit-stream event while the audit is open (c-3).
     pub files: Vec<StreamingFileEdit>,
     /// Index of the highlighted file inside [`Self::files`].
     pub selected_file: usize,
     /// Vertical scroll offset of the isolated diff read area.
     pub diff_scroll: u16,
+    /// Pane that currently owns the keyboard.
+    pub focus: DiffInspectorFocus,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1698,6 +1823,10 @@ pub struct AppState {
     pub confirm_delete_review: Option<String>,
     /// Session awaiting confirmation of the costly Architect post-analysis.
     pub confirm_review_analyze: Option<ConfirmReviewAnalyzeState>,
+    /// Review launch awaiting its audit-window projection, when one is in flight.
+    pub pending_review_launch: Option<PendingReviewLaunch>,
+    /// Projection awaiting the developer's consent to a truncated audit window.
+    pub confirm_review_truncation: Option<ConfirmReviewTruncationState>,
     pub confirm_execute_scope: Option<ConfirmExecuteScopeState>,
     pub confirm_execute_pipeline: Option<ConfirmExecutePipelineState>,
     pub confirm_execute_review: Option<ConfirmExecuteReviewState>,
@@ -1790,6 +1919,8 @@ impl AppState {
             confirm_delete_plan_final: None,
             confirm_delete_review: None,
             confirm_review_analyze: None,
+            pending_review_launch: None,
+            confirm_review_truncation: None,
             confirm_execute_scope: None,
             confirm_execute_pipeline: None,
             confirm_execute_review: None,
@@ -1965,11 +2096,13 @@ impl AppState {
         if self.squash_dialog.is_some() {
             return Some(ActiveModal::Squash);
         }
+        // A truncated audit window is a pending consent the developer must
+        // answer, so it outranks the launch dialog it will return to (c-3).
+        if self.confirm_review_truncation.is_some() {
+            return Some(ActiveModal::ReviewTruncation);
+        }
         if self.review_dialog.is_some() {
             return Some(ActiveModal::Review);
-        }
-        if self.review.refine_dialog.is_some() {
-            return Some(ActiveModal::ReviewRefine);
         }
         if self.confirm_cancel {
             return Some(ActiveModal::ConfirmCancel);
@@ -1985,6 +2118,9 @@ impl AppState {
         }
         if self.context_view.confirm_clear_user {
             return Some(ActiveModal::ClearUser);
+        }
+        if self.context_view.pending_remove.is_some() {
+            return Some(ActiveModal::RemoveContextFile);
         }
         if self.confirm_detach_focus {
             return Some(ActiveModal::ConfirmDetachFocus);
@@ -2069,6 +2205,24 @@ impl AppState {
         self.active_modal().is_some() || self.context_view.adding_file
     }
 
+    /// Reports whether the application has active background work or unsubmitted
+    /// input that would be lost on exit.
+    ///
+    /// When this returns `false`, exiting the application is safe and requires no
+    /// confirmation modal.
+    pub fn has_lossy_work(&self) -> bool {
+        self.model.is_busy()
+            || self.review.running
+            || !self.input_editor.is_empty()
+            || self
+                .squash_dialog
+                .as_ref()
+                .is_some_and(|d| d.applying || !d.message_editor.is_empty())
+            || self
+                .prompt_modal
+                .as_ref()
+                .is_some_and(|m| !m.prompt_editor.is_empty())
+    }
     pub fn active_notification(&self) -> Option<&AppNotification> {
         if let Some(ref notif) = self.notification {
             if notif.created_at.elapsed() < notif.ttl {
@@ -2763,6 +2917,7 @@ mod tests {
             files: Vec::new(),
             selected_file: 0,
             diff_scroll: 0,
+            focus: DiffInspectorFocus::Files,
         });
 
         assert_eq!(st.active_modal(), Some(ActiveModal::DiffInspector));
@@ -2793,6 +2948,25 @@ mod tests {
         // Help stays a lower-priority surface than the confirmation.
         st.show_help = true;
         assert_eq!(st.active_modal(), Some(ActiveModal::ClearUser));
+    }
+
+    /// The Context file removal confirmation owns the keyboard while it is open
+    /// and outranks every informational overlay below it (c-1, c-4).
+    #[test]
+    fn test_remove_context_file_confirmation_owns_the_keyboard() {
+        let mut st = test_state();
+        assert_eq!(st.active_modal(), None);
+
+        st.context_view.pending_remove = Some("src/lib.rs".to_string());
+        assert_eq!(st.active_modal(), Some(ActiveModal::RemoveContextFile));
+        assert!(st.has_active_modal());
+
+        // Help stays a lower-priority surface than the confirmation.
+        st.show_help = true;
+        assert_eq!(st.active_modal(), Some(ActiveModal::RemoveContextFile));
+
+        st.context_view.pending_remove = None;
+        assert_eq!(st.active_modal(), Some(ActiveModal::Help));
     }
 
     #[test]
@@ -3321,5 +3495,125 @@ mod tests {
         dialog.path_active = 0;
         assert_eq!(dialog.path_visible_start(3), 0);
         assert_eq!(dialog.path_visible_start(0), 0);
+    }
+    /// A pending consent to a truncated audit window outranks the launch dialog
+    /// it returns to and owns the keyboard until the developer answers it (c-3).
+    #[test]
+    fn test_review_truncation_confirmation_owns_the_keyboard() {
+        let mut st = test_state();
+        st.review_dialog = Some(ReviewDialogState::new(0, 0, Vec::new(), Vec::new()));
+        assert_eq!(st.active_modal(), Some(ActiveModal::Review));
+
+        st.confirm_review_truncation = Some(ConfirmReviewTruncationState {
+            pending: PendingReviewLaunch {
+                dialog: ReviewDialogState::new(0, 0, Vec::new(), Vec::new()),
+                params: ReviewStartParams::default(),
+            },
+            window: tauqe_protocol::review::ReviewPreviewWindow {
+                omitted_files: 3,
+                ..Default::default()
+            },
+        });
+        assert_eq!(st.active_modal(), Some(ActiveModal::ReviewTruncation));
+        assert!(st.has_active_modal());
+
+        // Answering the decision returns the keyboard to the launch dialog.
+        st.confirm_review_truncation = None;
+        assert_eq!(st.active_modal(), Some(ActiveModal::Review));
+    }
+
+    /// The whole plan of an architectural group is a queue and renders the
+    /// binary confirmation, while one step of that plan keeps the explicit Coder
+    /// form (c-4, c-5).
+    #[test]
+    fn test_group_plan_is_binary_while_a_group_step_is_a_form() {
+        let group_plan = ConfirmExecuteReviewState::new(
+            Some("rev-1".to_string()),
+            "Session rev-1".to_string(),
+            "Unified auth guard".to_string(),
+            None,
+            None,
+            Vec::new(),
+            Vec::new(),
+        )
+        .with_group("arch-auth".to_string(), "Unified auth guard".to_string());
+        assert_eq!(group_plan.group_id.as_deref(), Some("arch-auth"));
+        assert_eq!(group_plan.group_title, "Unified auth guard");
+        assert!(
+            !group_plan.is_single_target(),
+            "a whole group plan confirms as a binary card"
+        );
+
+        let group_step = ConfirmExecuteReviewState::new(
+            Some("rev-1".to_string()),
+            "Session rev-1".to_string(),
+            "Unified auth guard".to_string(),
+            None,
+            Some("1.1".to_string()),
+            Vec::new(),
+            Vec::new(),
+        )
+        .with_group("arch-auth".to_string(), "Unified auth guard".to_string());
+        assert!(
+            group_step.is_single_target(),
+            "one step of a group plan keeps the explicit Coder form"
+        );
+        assert!(
+            group_step.is_single_target(),
+            "one step of a group plan keeps the explicit Coder form"
+        );
+    }
+
+    /// A whole-session queue names no single unit of work, so it never renders
+    /// the point-execution form, while a partial queue starts with a clear flag
+    /// (c-2, c-3).
+    #[test]
+    fn test_whole_session_target_is_never_a_point_form() {
+        let session_target = ConfirmExecuteReviewState::new(
+            Some("rev-1".to_string()),
+            "Session rev-1".to_string(),
+            "All remaining TODO findings".to_string(),
+            None,
+            None,
+            Vec::new(),
+            Vec::new(),
+        )
+        .with_whole_session();
+        assert!(session_target.whole_session);
+        assert!(!session_target.is_single_target());
+
+        let partial = ConfirmExecuteReviewState::new(
+            Some("rev-1".to_string()),
+            "Session rev-1".to_string(),
+            "Local Issues".to_string(),
+            None,
+            None,
+            Vec::new(),
+            Vec::new(),
+        );
+        assert!(
+            !partial.whole_session,
+            "a partial queue keeps the flag clear and names its targets"
+        );
+    }
+    #[test]
+    fn test_has_lossy_work() {
+        let mut st = test_state();
+        assert!(!st.has_lossy_work());
+
+        st.input_editor.insert_str("draft prompt");
+        assert!(st.has_lossy_work());
+
+        st.input_editor.clear();
+        assert!(!st.has_lossy_work());
+
+        st.model.status = TurnStatus::Thinking;
+        assert!(st.has_lossy_work());
+
+        st.model.status = TurnStatus::Idle;
+        assert!(!st.has_lossy_work());
+
+        st.review.running = true;
+        assert!(st.has_lossy_work());
     }
 }

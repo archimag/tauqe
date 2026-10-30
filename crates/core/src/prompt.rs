@@ -216,6 +216,37 @@ fn access_attribute(access: ContextAccess) -> &'static str {
     }
 }
 
+/// Renders the opening tag of one `<file>` element of the context block.
+///
+/// The function is the single source of the element markup: the context block
+/// renders the tag through it and [`context_element_overhead_tokens`] measures
+/// the very same bytes, so the price of a wrapper can never drift from the
+/// markup the model reads.
+fn context_element_open_tag(path: &str, access: ContextAccess) -> String {
+    format!(
+        "    <file path=\"{path}\" access=\"{}\">\n",
+        access_attribute(access)
+    )
+}
+
+/// Renders the closing tag of one `<file>` element of the context block.
+fn context_element_close_tag() -> &'static str {
+    "    </file>\n"
+}
+
+/// Estimates the token cost the `<file>` wrapper adds to a context file.
+///
+/// A budget check prices a file as its content plus this wrapper, so a file
+/// pays exactly for the markup that surrounds it: the header carries the path,
+/// so a deep path costs more than a shallow one, and a change to the element
+/// markup changes the estimate with it. Both terms come from the builder that
+/// renders the `<context>` block, so the measured wrapper and the rendered
+/// wrapper cannot diverge.
+pub fn context_element_overhead_tokens(path: &str, access: ContextAccess) -> usize {
+    let open = context_element_open_tag(path, access);
+    estimate_tokens(&open) + estimate_tokens(context_element_close_tag())
+}
+
 /// Renders one `<file>` element of the context block.
 ///
 /// Under [`PatchStrategy::LineAnchor`] the element carries the opaque anchor of
@@ -238,17 +269,15 @@ fn render_context_element(
             anchor_lines(&file.path, &file.content).unwrap_or_else(|| file.content.clone())
         }
     };
-    let mut out = String::with_capacity(content.len() + file.path.len() + 64);
-    out.push_str(&format!(
-        "    <file path=\"{}\" access=\"{}\">\n",
-        file.path,
-        access_attribute(access)
-    ));
+    let open = context_element_open_tag(&file.path, access);
+    let close = context_element_close_tag();
+    let mut out = String::with_capacity(open.len() + content.len() + close.len() + 1);
+    out.push_str(&open);
     out.push_str(&content);
     if !content.ends_with('\n') {
         out.push('\n');
     }
-    out.push_str("    </file>\n");
+    out.push_str(close);
     out
 }
 
@@ -979,7 +1008,7 @@ mod tests {
         assert!(sys.contains("<user_language>"));
         // The code-modification channel travels with the discussion, so the XML
         // contour advertises its edit container as well.
-        assert!(sys.contains("<edits summary"));
+        assert!(sys.contains("<file_edits"));
 
         // The assembly contributes no wire-format knowledge of its own.
         assert!(!sys.contains("Mode: Structured Discussion"));
@@ -1123,6 +1152,33 @@ mod tests {
         assert!(promoted.find("src/a.rs").unwrap() < promoted.find("src/b.rs").unwrap());
     }
 
+    /// The wrapper estimate and the rendered element come from one builder, so
+    /// the price of a file can never disagree with the markup the model reads.
+    #[test]
+    fn test_context_element_wrapper_is_one_builder_for_render_and_estimate() {
+        let file = ContextFileContent {
+            path: "src/deep/nested/module.rs".to_string(),
+            access: ContextAccess::Editable,
+            content: "fn main() {}\n".to_string(),
+        };
+
+        let open = context_element_open_tag(&file.path, file.access);
+        let close = context_element_close_tag();
+        let content = &file.content;
+        let element = render_context_element(&file, file.access, PatchStrategy::SearchReplace);
+        assert_eq!(element, format!("{open}{content}{close}"));
+        assert_eq!(
+            context_element_overhead_tokens(&file.path, file.access),
+            estimate_tokens(&open) + estimate_tokens(close)
+        );
+
+        // The path travels inside the header, so a deep path costs more than a
+        // shallow one even when the content is identical.
+        let deep = context_element_overhead_tokens(&file.path, file.access);
+        let shallow = context_element_overhead_tokens("a.rs", file.access);
+        assert!(deep > shallow);
+    }
+
     #[test]
     fn test_context_block_renders_opaque_anchors_for_every_file() {
         use crate::edits::anchor::encode_anchor;
@@ -1160,8 +1216,9 @@ mod tests {
         // The closing newline of the file is still rendered exactly once.
         assert!(!block.contains(&format!("{} | beta\n\n", encode_anchor("src/a.rs", 1))));
 
-        // The default strategy keeps the raw lines untouched.
-        let plain = PromptAssembly::new(None, 1, files(), "git", EditProtocolKind::Xml, None, None);
+        // The search/replace strategy keeps the raw lines untouched.
+        let plain = PromptAssembly::new(None, 1, files(), "git", EditProtocolKind::Xml, None, None)
+            .with_patch_strategy(PatchStrategy::SearchReplace);
         let raw = plain.format_context_block().unwrap();
         assert!(raw.contains("\nalpha\nbeta\n"));
         assert!(!raw.contains(&format!("{} | ", encode_anchor("src/a.rs", 0))));
@@ -1664,7 +1721,7 @@ mod tests {
         ]));
         let prompt = assembly.build_system_prompt(&*narrowed);
 
-        assert!(prompt.contains("<edits summary"));
+        assert!(prompt.contains("<file_edits"));
         assert!(!prompt.contains("<context_request>"));
         assert!(!prompt.contains("<verify"));
         assert!(!prompt.contains("<scratchpad"));

@@ -76,8 +76,29 @@ fn strip_tags(text: &str, next: fn(&str) -> Option<(usize, usize)>) -> String {
     out
 }
 
+/// Where a byte offset sits relative to the inline code spans of its line.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum InlineCode {
+    /// The offset is outside every inline code span.
+    Outside,
+    /// The offset is inside a span whose extent is already settled.
+    Inside,
+    /// The offset is inside a span the still growing line may yet close.
+    Unsettled,
+}
+
 /// Returns true if byte offset `target_pos` in `text` is inside an inline markdown code span (`...`).
-fn is_inside_inline_code(text: &str, target_pos: usize) -> bool {
+pub(crate) fn is_inside_inline_code(text: &str, target_pos: usize) -> bool {
+    !matches!(inline_code_span(text, target_pos), InlineCode::Outside)
+}
+
+/// Classifies byte offset `target_pos` against the inline code spans of its line.
+///
+/// A span without a closing delimiter is the one case a stream cannot decide yet:
+/// a backtick that has not arrived may still turn the offset into code, or settle
+/// it back into prose. The line boundary settles it, so a span that reaches the
+/// end of a complete line is reported as [`InlineCode::Inside`].
+pub(crate) fn inline_code_span(text: &str, target_pos: usize) -> InlineCode {
     let line_start = text[..target_pos].rfind('\n').map_or(0, |i| i + 1);
     let line_end = text[target_pos..]
         .find('\n')
@@ -98,20 +119,24 @@ fn is_inside_inline_code(text: &str, target_pos: usize) -> bool {
             if let Some(close_rel) = line[i..].find(&delimiter) {
                 let span_end = i + close_rel + bt_len;
                 if rel_pos >= start_bt && rel_pos < span_end {
-                    return true;
+                    return InlineCode::Inside;
                 }
                 i = span_end;
                 continue;
             } else {
                 if rel_pos >= start_bt {
-                    return true;
+                    return if line_end < text.len() {
+                        InlineCode::Inside
+                    } else {
+                        InlineCode::Unsettled
+                    };
                 }
                 break;
             }
         }
         i += 1;
     }
-    false
+    InlineCode::Outside
 }
 
 /// Sorted, non-overlapping byte ranges covered by markdown fenced code blocks.
@@ -142,27 +167,11 @@ impl CodeFences {
                 .find('\n')
                 .map_or(text.len(), |nl| line_start + nl);
             let next_line_start = (line_end + 1).min(text.len());
-            let raw_line = &text[line_start..line_end];
-            let line = raw_line.strip_suffix('\r').unwrap_or(raw_line);
-            let trimmed = line.trim_start();
-            let indent = line.len() - trimmed.len();
-            let marker = if indent <= 3 {
-                fence_marker(trimmed)
-            } else {
-                None
-            };
-
-            match (open, marker) {
-                (Some((open_ch, open_len, start)), Some((ch, len, rest)))
-                    if ch == open_ch && len >= open_len && rest.trim().is_empty() =>
-                {
-                    intervals.push((start, next_line_start));
-                    open = None;
-                }
-                (None, Some((ch, len, _))) => open = Some((ch, len, line_start)),
-                _ => {}
+            if let Some(fence_start) =
+                fold_fence_line(&mut open, &text[line_start..line_end], line_start)
+            {
+                intervals.push((fence_start, next_line_start));
             }
-
             line_start = next_line_start;
         }
 
@@ -203,6 +212,124 @@ fn fence_marker(trimmed: &str) -> Option<(char, usize, &str)> {
         return None;
     }
     Some((ch, len, &trimmed[len..]))
+}
+/// Folds one line into the open-fence state, reporting a fence it just closed.
+///
+/// `line` excludes its terminating newline. The returned offset is the start of
+/// the fence the line closed, so the caller can pair it with its own line
+/// boundary. [`CodeFences`] and [`FenceScan`] both fold through this routine, so
+/// a streamed block is delimited exactly as a complete text would be.
+fn fold_fence_line(
+    open: &mut Option<(char, usize, usize)>,
+    line: &str,
+    line_start: usize,
+) -> Option<usize> {
+    let line = line.strip_suffix('\r').unwrap_or(line);
+    let trimmed = line.trim_start();
+    let indent = line.len() - trimmed.len();
+    let marker = if indent <= 3 {
+        fence_marker(trimmed)
+    } else {
+        None
+    };
+    match (*open, marker) {
+        (Some((open_ch, open_len, fence_start)), Some((ch, len, rest)))
+            if ch == open_ch && len >= open_len && rest.trim().is_empty() =>
+        {
+            *open = None;
+            Some(fence_start)
+        }
+        (None, Some((ch, len, _))) => {
+            *open = Some((ch, len, line_start));
+            None
+        }
+        _ => None,
+    }
+}
+
+/// Incremental CommonMark fenced-code tracker for a growing stream buffer.
+///
+/// [`CodeFences`] indexes a complete text once. A stream cannot afford that shape:
+/// the buffer grows by one provider delta at a time, so re-indexing the whole
+/// buffer per chunk would make every scan quadratic in response length. The
+/// tracker therefore keeps only the fence that is still open plus the offset of
+/// the trailing line it has not classified yet, and each call folds just the lines
+/// appended since the previous one.
+#[derive(Debug, Default)]
+pub(crate) struct FenceScan {
+    /// Blocks that already closed, sorted and disjoint.
+    ///
+    /// The scan must be able to classify a position an earlier chunk already
+    /// passed, so a block that closed later in the same buffer is remembered
+    /// instead of being forgotten: only then does the incremental tracker agree
+    /// with [`CodeFences`] for every position of the buffer.
+    closed: Vec<(usize, usize)>,
+    /// The fence still open: character, length, and the offset where it opened.
+    open: Option<(char, usize, usize)>,
+    /// Offset of the trailing line, whose newline has not arrived yet.
+    scanned: usize,
+}
+
+impl FenceScan {
+    /// Classifies every complete line that starts before `limit`.
+    pub(crate) fn advance_to(&mut self, buf: &str, limit: usize) {
+        while self.scanned < limit {
+            let Some(newline) = buf[self.scanned..].find('\n') else {
+                break;
+            };
+            let line_start = self.scanned;
+            let line_end = line_start + newline;
+            let next_line_start = line_end + 1;
+            if let Some(fence_start) =
+                fold_fence_line(&mut self.open, &buf[line_start..line_end], line_start)
+            {
+                self.closed.push((fence_start, next_line_start));
+            }
+            self.scanned = next_line_start;
+        }
+    }
+
+    /// Reports whether `pos` lies in a fenced block of the streamed buffer.
+    ///
+    /// A position on the trailing, still incomplete line is decided from the bytes
+    /// the line already carries: a fence marker needs at most a few of them, and
+    /// nothing arriving later can turn such a line back into prose.
+    pub(crate) fn is_inside(&self, buf: &str, pos: usize) -> bool {
+        if self.open.is_some_and(|(_, _, start)| pos >= start) {
+            return true;
+        }
+        let preceded = self.closed.partition_point(|&(start, _)| start <= pos);
+        if preceded
+            .checked_sub(1)
+            .and_then(|index| self.closed.get(index))
+            .is_some_and(|&(_, end)| pos < end)
+        {
+            return true;
+        }
+        if pos < self.scanned {
+            return false;
+        }
+        let trailing = buf.get(self.scanned..).unwrap_or_default();
+        let trimmed = trailing.trim_start();
+        let indent = trailing.len() - trimmed.len();
+        indent <= 3 && fence_marker(trimmed).is_some()
+    }
+
+    /// Shifts the tracked offsets after `drained` bytes left the buffer.
+    pub(crate) fn rebase(&mut self, drained: usize) {
+        if drained == 0 {
+            return;
+        }
+        self.scanned = self.scanned.saturating_sub(drained);
+        self.open = self
+            .open
+            .map(|(ch, len, start)| (ch, len, start.saturating_sub(drained)));
+        self.closed.retain(|&(_, end)| end > drained);
+        for interval in &mut self.closed {
+            interval.0 = interval.0.saturating_sub(drained);
+            interval.1 -= drained;
+        }
+    }
 }
 
 /// Returns true if byte offset `target_pos` in `text` is inside a markdown code block.
@@ -493,5 +620,34 @@ Real outcome:
             text, fenced_pos, &fences
         ));
         assert!(!is_inside_markdown_code_with_fences(text, 0, &fences));
+    }
+    #[test]
+    fn fence_scan_agrees_with_the_one_shot_index() {
+        let text = "intro\n```\ncode with <tag>\n```\noutro\n~~~\nopen";
+        let fences = CodeFences::find(text);
+        let mut scan = FenceScan::default();
+        scan.advance_to(text, text.len());
+        for pos in 0..text.len() {
+            assert_eq!(
+                scan.is_inside(text, pos),
+                fences.is_inside(pos),
+                "disagreement at {pos}"
+            );
+        }
+    }
+
+    #[test]
+    fn fence_scan_classifies_only_appended_lines() {
+        let mut scan = FenceScan::default();
+        let mut buffer = String::from("intro\n`");
+        scan.advance_to(&buffer, buffer.len());
+        assert!(!scan.is_inside(&buffer, 7));
+
+        // A fence marker split across two chunks still opens its block once the
+        // rest of the line arrives.
+        buffer.push_str("``\nfenced\n");
+        scan.advance_to(&buffer, buffer.len());
+        let fenced = buffer.find("fenced").expect("the fenced line");
+        assert!(scan.is_inside(&buffer, fenced));
     }
 }

@@ -37,9 +37,9 @@ pub use turn::{
     CancelMode, ModelAskParams, ModelCancelParams, ModelConnectionRetryingEvent, ModelDeltaEvent,
     ModelErrorEvent, ModelEscalatedEvent, ModelFinishedEvent, ModelResult, ModelResultEvent,
     ModelResultProposal, ModelStartedEvent, ModelStreamResetEvent, ModelTurnPlanContext,
-    RepoMapInfoEvent, StructuredAbortProposal, StructuredBlockedProposal,
+    RepoMapInfoEvent, ReviewWorkPhase, StructuredAbortProposal, StructuredBlockedProposal,
     StructuredOutcomeProposal, ToolchainFinishedEvent, ToolchainStartedEvent, TurnPhase,
-    TurnPhaseEvent,
+    TurnPhaseEvent, TurnWorkContext, TurnWorkItem, TurnWorkQueue,
 };
 pub use usage::{
     ModelUsageEvent, ModelUsageInfo, ModelUsageTotalsEvent, UsageTotals, UsageTotalsSnapshot,

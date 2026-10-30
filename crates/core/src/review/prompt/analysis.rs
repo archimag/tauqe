@@ -258,9 +258,6 @@ mod tests {
             recommendations: vec!["Introduce one shared transaction boundary".to_string()],
             files: vec!["crates/core/src/git.rs".to_string()],
             readonly_files: vec!["Conventions.md".to_string()],
-            subplan: Vec::new(),
-            subplan_architect: None,
-            subplan_last_replanned_step: None,
             resolution_notes: None,
             body: "The change set reaches the worktree without one shared boundary.".to_string(),
         }

@@ -9,13 +9,13 @@
 use std::path::Path;
 use std::sync::Arc;
 
+use crate::state::AppState;
+use crate::transport::OutChannel;
 use tauqe_core::edits::protocol::ContextRequest;
 use tauqe_core::workflow::common::apply_context_requests_detailed;
 use tauqe_protocol::discussion::DiscussionTarget;
 use tauqe_protocol::{events, ContextAccess, Event};
-
-use crate::state::AppState;
-use crate::transport::OutChannel;
+use tokio::sync::watch;
 
 /// Emits a server event with an optional serialized parameter payload.
 pub(crate) fn emit(out: &OutChannel, method: &str, params: Option<serde_json::Value>) {
@@ -109,11 +109,45 @@ pub(crate) async fn clear_auto_context(state: &Arc<AppState>) {
     }
 }
 
+/// Resolves as soon as an operation's cancellation signal is raised.
+///
+/// A batch supervisor races its step wait against this future, so a cancel
+/// delivered in the middle of a step unwinds the queue immediately instead of
+/// waiting for the step to finish its verification. The signal stays advisory
+/// until it is raised: an already raised flag resolves at once, and a closed
+/// channel keeps the future pending, because a dropped sender is not a
+/// cancellation request.
+pub(crate) async fn wait_for_cancellation(mut cancel_rx: watch::Receiver<bool>) {
+    if *cancel_rx.borrow() {
+        return;
+    }
+    while cancel_rx.changed().await.is_ok() {
+        if *cancel_rx.borrow() {
+            return;
+        }
+    }
+    std::future::pending::<()>().await;
+}
+
 /// Normalizes a declared plan file path into the repository-relative form used
 /// for context preloading, trimming whitespace and stripping leading `./` and
 /// `/` markers so cosmetic spelling differences collapse to one key.
 pub(crate) fn normalize_preload_path(path: &str) -> &str {
     path.trim().trim_start_matches("./").trim_start_matches('/')
+}
+
+/// Lists the tracked repository files on the blocking pool.
+///
+/// The listing spawns a `git` process, so it is resolved before any exclusive
+/// context guard is taken: a guarded mutation closure must never hold every
+/// context reader behind a process spawn.
+pub(crate) async fn load_repository_files(repo_root: &Path) -> Vec<String> {
+    let root = repo_root.to_path_buf();
+    crate::handlers::offload(move || tauqe_core::git::list_repository_files(Some(&root)))
+        .await
+        .ok()
+        .and_then(|files| files.ok())
+        .unwrap_or_default()
 }
 
 /// Loads declared target and reference files into the read-only auto context
@@ -139,11 +173,8 @@ pub(crate) async fn preload_readonly_files(
     if requests.is_empty() {
         return;
     }
-    let root = repo_root.to_path_buf();
+    let available_files = load_repository_files(repo_root).await;
     let preloaded = crate::handlers::with_context_mutation(state, move |ctx| {
-        let available_files = tauqe_core::git::list_repository_files(Some(&root))
-            .ok()
-            .unwrap_or_default();
         // Declared preload files are never capped by an artificial quota, so both
         // the files budget and the refs budget stay unbounded here.
         let outcome = apply_context_requests_detailed(
@@ -204,4 +235,88 @@ pub(crate) async fn record_synthesis_history(
         let _ = history.record_response(response_message, None, response_summary, Vec::new());
     })
     .await;
+}
+
+/// Test-only helpers shared by the handler regression suites.
+///
+/// They live beside the production helpers so a read-path regression test does
+/// not re-implement scratch-repository setup or tree snapshots in every
+/// subsystem.
+#[cfg(test)]
+pub(crate) mod test_support {
+    use std::path::{Path, PathBuf};
+
+    /// Creates a unique scratch repository root for a handler regression test.
+    pub(crate) fn scratch_root(tag: &str) -> PathBuf {
+        let root = std::env::temp_dir().join(format!(
+            "tauqe-{tag}-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).expect("create the scratch repository root");
+        root
+    }
+
+    /// Snapshots every file under `root` as `(relative path, bytes)`.
+    ///
+    /// Comparing two snapshots proves that a request left the persisted state
+    /// byte-identical — no file created, rewritten, or removed — without
+    /// hard-coding the storage layout of the subsystem under test.
+    pub(crate) fn snapshot_tree(root: &Path) -> Vec<(String, Vec<u8>)> {
+        let mut snapshot = Vec::new();
+        let mut pending = vec![root.to_path_buf()];
+        while let Some(dir) = pending.pop() {
+            let entries = match std::fs::read_dir(&dir) {
+                Ok(entries) => entries,
+                Err(_) => continue,
+            };
+            for entry in entries.filter_map(Result::ok) {
+                let path = entry.path();
+                if path.is_dir() {
+                    pending.push(path);
+                    continue;
+                }
+                let relative = path.strip_prefix(root).map_or_else(
+                    |_| path.to_string_lossy().into_owned(),
+                    |relative| relative.to_string_lossy().replace('\\', "/"),
+                );
+                snapshot.push((relative, std::fs::read(&path).unwrap_or_default()));
+            }
+        }
+        snapshot.sort();
+        snapshot
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use super::*;
+
+    /// The supervisors race a step against this future, so a signal raised
+    /// while they wait must resolve it instead of waiting for the step.
+    #[tokio::test]
+    async fn wait_for_cancellation_resolves_when_the_signal_is_raised() {
+        let (cancel_tx, cancel_rx) = watch::channel(false);
+        let waiter = tokio::spawn(wait_for_cancellation(cancel_rx));
+        cancel_tx.send(true).unwrap();
+
+        tokio::time::timeout(Duration::from_secs(5), waiter)
+            .await
+            .expect("the waiter observes the raised signal")
+            .expect("the waiter task joins");
+    }
+
+    /// A signal raised before the supervision starts resolves at once, so a
+    /// cancel delivered between the request and the wait is never lost.
+    #[tokio::test]
+    async fn wait_for_cancellation_resolves_for_an_already_raised_signal() {
+        let (_cancel_tx, cancel_rx) = watch::channel(true);
+        tokio::time::timeout(Duration::from_secs(5), wait_for_cancellation(cancel_rx))
+            .await
+            .expect("an already raised signal resolves immediately");
+    }
 }

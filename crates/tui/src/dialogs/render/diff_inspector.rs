@@ -7,12 +7,15 @@
 //! isolation, with a line-number gutter and its own scroll offset, so a long
 //! patch is never interrupted by the file list (c-3).
 //!
-//! The diff body comes from the `DiffRenderCache` the Develop viewport already
-//! fills, so the audit paints exactly the rows the REPL laid out and a repeated
-//! frame never recomputes a `similar::TextDiff` (c-1, c-3). Every visible phrase
-//! is resolved through the runtime locale (`crate::i18n::active_t`), so a
-//! hot-swapped locale reaches the inspector without touching the renderer
-//! (Conventions §9, c-4).
+//! The audited set is the live staged list, never a frozen copy: it is refreshed
+//! by every edit-stream event, so a file that is still streaming reads the same
+//! here as in the Viewport, and the file the stream currently writes carries an
+//! animated spinner beside its running badge (c-3). The diff body comes from the
+//! `DiffRenderCache` the Develop viewport already fills, so the audit paints
+//! exactly the rows the REPL laid out and a repeated frame never recomputes a
+//! `similar::TextDiff` (c-1, c-3). Every visible phrase is resolved through the
+//! runtime locale (`crate::i18n::active_t`), so a hot-swapped locale reaches the
+//! inspector without touching the renderer (Conventions §9, c-4).
 
 use ratatui::layout::{Alignment, Rect};
 use ratatui::style::{Style, Stylize};
@@ -27,7 +30,7 @@ use crate::components::modal::{
 use crate::i18n::active_t;
 use crate::theme::engine::{current_engine, ThemeEngine};
 use crate::ui::header::truncate_to_width;
-use crate::views::repl::render::file_op_badge;
+use crate::views::repl::render::{file_op_badge, SPINNER_FRAMES};
 use crate::views::repl::{DiffRenderCache, FileEditStatus, StreamingFileEdit};
 
 /// Renders the inspector card over the Develop viewport.
@@ -35,10 +38,15 @@ use crate::views::repl::{DiffRenderCache, FileEditStatus, StreamingFileEdit};
 /// `cache` is the diff render cache the Develop viewport owns. Sharing it keeps
 /// one rendered patch per file for both surfaces, so the audit and the REPL can
 /// never disagree about a diff body (c-1, c-3).
+///
+/// `spinner_frame` is the animation frame the running turn advanced, so the file
+/// the stream currently writes carries the same spinner here as it does in the
+/// Viewport (c-3).
 pub(crate) fn render_diff_inspector(
     frame: &mut ratatui::Frame,
     inspector: &mut DiffInspectorState,
     cache: &mut DiffRenderCache,
+    spinner_frame: usize,
 ) {
     let engine = current_engine();
     let geometry = diff_inspector_geometry(frame.area());
@@ -49,14 +57,15 @@ pub(crate) fn render_diff_inspector(
         ModalTone::Info,
     );
 
-    // The audited set is captured when the inspector opens, so a shrink is
-    // possible only after a refresh trimmed it; the highlight still has to name
-    // a real file.
+    // The audited set is refreshed by every edit-stream event, so it can grow and
+    // shrink while the audit is open; the highlight still has to name a real file
+    // (c-3).
     if inspector.selected_file >= inspector.files.len() {
         inspector.selected_file = inspector.files.len().saturating_sub(1);
     }
 
-    render_file_pane(frame, inspector, &engine, geometry.files);
+    let spinner = SPINNER_FRAMES[spinner_frame % SPINNER_FRAMES.len()];
+    render_file_pane(frame, inspector, &engine, geometry.files, spinner);
     let (hunk_total, hunk_active) =
         render_diff_pane(frame, inspector, cache, &engine, geometry.diff);
     render_action_bar(
@@ -80,13 +89,14 @@ fn render_file_pane(
     inspector: &DiffInspectorState,
     engine: &ThemeEngine,
     area: Rect,
+    spinner: &str,
 ) {
     let palette = engine.palette();
     // Rows are laid out for the exact column budget of the pane, so a deep
     // repository path truncates instead of pushing the verification badge out
     // of the pane (c-3).
     let inner_width = usize::from(area.width.saturating_sub(2));
-    let rows = file_rows(inspector, engine, inner_width);
+    let rows = file_rows(inspector, engine, inner_width, spinner);
     // The highlight stays visible: the window follows the selected row the way
     // the file list of every other picker does (Conventions §6.2).
     let visible = usize::from(area.height.saturating_sub(2)).max(1);
@@ -97,9 +107,12 @@ fn render_file_pane(
         1,
     );
     let block = Block::default()
-        .title(title)
+        .title(Line::from(Span::styled(
+            title,
+            pane_title_style(engine, inspector.focus.is_files()),
+        )))
         .borders(Borders::ALL)
-        .border_style(engine.fg(palette.border))
+        .border_style(pane_border_style(engine, inspector.focus.is_files()))
         .style(Style::default().bg(engine.color(palette.surface)));
     let paragraph = Paragraph::new(rows)
         .block(block)
@@ -107,16 +120,41 @@ fn render_file_pane(
     frame.render_widget(paragraph, area);
 }
 
+/// Border style of a pane: the focused pane carries the accent role, while the
+/// idle one recedes into the plain border role (Conventions §8.4, c-2).
+fn pane_border_style(engine: &ThemeEngine, focused: bool) -> Style {
+    let palette = engine.palette();
+    if focused {
+        engine.fg(palette.status_info)
+    } else {
+        engine.fg(palette.border)
+    }
+}
+
+/// Title style of a pane, matching the accent of its border so the pane that
+/// owns the keyboard is readable without a textual marker.
+fn pane_title_style(engine: &ThemeEngine, focused: bool) -> Style {
+    let palette = engine.palette();
+    if focused {
+        engine.fg(palette.status_info).bold()
+    } else {
+        engine.fg(palette.text_muted)
+    }
+}
+
 /// Builds one row per audited file: selection marker, operation badge, path,
 /// patch count, and verification status, fitted to `width` columns.
 ///
 /// The operation and verification badges are reserved before the path, so a
 /// deep repository path truncates instead of hiding the status of the file, and
-/// the patch count is dropped only when the row has no columns left (c-3).
+/// the patch count is dropped only when the row has no columns left (c-3). A
+/// file the stream is still writing carries the animation frame beside its
+/// badge, so the audit names the file being edited right now (c-3).
 fn file_rows(
     inspector: &DiffInspectorState,
     engine: &ThemeEngine,
     width: usize,
+    spinner: &str,
 ) -> Vec<Line<'static>> {
     let palette = engine.palette();
     if inspector.files.is_empty() {
@@ -134,7 +172,7 @@ fn file_rows(
             let selected = index == inspector.selected_file;
             let marker = if selected { "▸ " } else { "  " };
             let op_badge = file_op_badge(engine, &file.op_type);
-            let status = status_badge(engine, file.status);
+            let status = status_badge(engine, file.status, spinner);
 
             // Columns the marker, the operation badge, its trailing space, and
             // the last space plus the status badge already claim.
@@ -185,7 +223,12 @@ fn patch_count(file: &StreamingFileEdit) -> String {
 }
 
 /// Resolves the verification status badge of one audited file.
-fn status_badge(engine: &ThemeEngine, status: FileEditStatus) -> Span<'static> {
+///
+/// A file the stream is still writing carries the animation frame beside its
+/// badge, so the audit names the file being edited right now instead of leaving
+/// a static status that could belong to any row (c-3). A settled file renders
+/// its badge alone.
+fn status_badge(engine: &ThemeEngine, status: FileEditStatus, spinner: &str) -> Span<'static> {
     let palette = engine.palette();
     let (key, color) = match status {
         FileEditStatus::Ok => ("dialog.diff_inspector.badge_ok", palette.status_success),
@@ -199,7 +242,12 @@ fn status_badge(engine: &ThemeEngine, status: FileEditStatus) -> Span<'static> {
             palette.status_warning,
         ),
     };
-    Span::styled(active_t(key), engine.fg(color).bold())
+    let label = active_t(key);
+    if matches!(status, FileEditStatus::Running | FileEditStatus::Retrying) {
+        Span::styled(format!("{spinner} {label}"), engine.fg(color).bold())
+    } else {
+        Span::styled(label, engine.fg(color).bold())
+    }
 }
 
 /// Renders the right pane: the isolated diff read area of the highlighted file.
@@ -247,9 +295,12 @@ fn render_diff_pane(
         .min(u16::try_from(max_scroll).unwrap_or(u16::MAX));
 
     let block = Block::default()
-        .title(active_t("dialog.diff_inspector.diff_title"))
+        .title(Line::from(Span::styled(
+            active_t("dialog.diff_inspector.diff_title"),
+            pane_title_style(engine, inspector.focus.is_diff()),
+        )))
         .borders(Borders::ALL)
-        .border_style(engine.fg(palette.border))
+        .border_style(pane_border_style(engine, inspector.focus.is_diff()))
         .style(Style::default().bg(engine.color(palette.surface)));
     let paragraph = Paragraph::new(lines)
         .block(block)
@@ -353,6 +404,7 @@ fn placeholder_line(engine: &ThemeEngine, text: &str) -> Line<'static> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::app::DiffInspectorFocus;
     use crate::views::repl::{EditOp, StreamingHunk};
     use ratatui::backend::TestBackend;
     use ratatui::Terminal;
@@ -373,7 +425,6 @@ mod tests {
                 old_text: patch.0.to_string(),
                 new_text: patch.1.to_string(),
             }],
-            expanded: true,
             retry_info: None,
         }
     }
@@ -382,7 +433,7 @@ mod tests {
     fn rendered(inspector: &mut DiffInspectorState, cache: &mut DiffRenderCache) -> String {
         let mut terminal = Terminal::new(TestBackend::new(140, 40)).expect("test backend");
         terminal
-            .draw(|frame| render_diff_inspector(frame, inspector, cache))
+            .draw(|frame| render_diff_inspector(frame, inspector, cache, 0))
             .expect("the inspector frame draws");
         let buffer = terminal.backend().buffer();
         let mut text = String::new();
@@ -414,6 +465,7 @@ mod tests {
             ],
             selected_file: 0,
             diff_scroll: 0,
+            focus: DiffInspectorFocus::Files,
         };
         let mut cache = DiffRenderCache::default();
 
@@ -438,6 +490,7 @@ mod tests {
             )],
             selected_file: 0,
             diff_scroll: 0,
+            focus: DiffInspectorFocus::Files,
         };
         let mut cache = DiffRenderCache::default();
 
@@ -467,6 +520,7 @@ mod tests {
             ],
             selected_file: 0,
             diff_scroll: u16::MAX,
+            focus: DiffInspectorFocus::Files,
         };
         let mut cache = DiffRenderCache::default();
 
@@ -478,5 +532,59 @@ mod tests {
         );
         assert!(text.contains("File 1/2"), "{text}");
         assert!(text.contains("Hunk 1/1"), "{text}");
+    }
+    /// The active pane is accented through the semantic roles and the idle one
+    /// recedes, so which pane owns the vertical motion is readable without a
+    /// textual marker (Conventions §8.4, c-2).
+    #[test]
+    fn pane_styles_follow_the_focus() {
+        let engine = current_engine();
+
+        assert_ne!(
+            pane_border_style(&engine, true).fg,
+            pane_border_style(&engine, false).fg,
+            "the focused pane carries a distinct border role"
+        );
+        assert_ne!(
+            pane_title_style(&engine, true).fg,
+            pane_title_style(&engine, false).fg,
+            "the focused title carries a distinct text role"
+        );
+    }
+    /// A file the stream is still writing carries the animation frame beside its
+    /// badge, so the audit names the file being edited right now (c-3), while a
+    /// settled file renders its status alone.
+    #[test]
+    fn running_file_carries_the_spinner_and_the_run_badge() {
+        let mut inspector = DiffInspectorState {
+            files: vec![
+                file(
+                    "crates/tui/src/streaming.rs",
+                    EditOp::Replace,
+                    FileEditStatus::Running,
+                    ("let a = 1;", "let a = 2;"),
+                ),
+                file(
+                    "crates/tui/src/settled.rs",
+                    EditOp::Replace,
+                    FileEditStatus::Ok,
+                    ("let b = 1;", "let b = 2;"),
+                ),
+            ],
+            selected_file: 0,
+            diff_scroll: 0,
+            focus: DiffInspectorFocus::Files,
+        };
+        let mut cache = DiffRenderCache::default();
+
+        let text = rendered(&mut inspector, &mut cache);
+
+        let spinner = SPINNER_FRAMES[0];
+        assert!(text.contains(&format!("{spinner} [RUN]")), "{text}");
+        assert!(text.contains("[OK]"), "{text}");
+        assert!(
+            !text.contains(&format!("{spinner} [OK]")),
+            "a settled file never keeps the animation frame: {text}"
+        );
     }
 }

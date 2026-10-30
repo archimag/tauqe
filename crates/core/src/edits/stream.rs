@@ -21,6 +21,14 @@ pub trait EditStreamFilter: Send {
 
     /// Flushes any buffered content at the end of generation.
     fn finish(self: Box<Self>) -> Vec<StreamEvent>;
+
+    /// Discards everything the filter buffered so far.
+    ///
+    /// The transport voids an interrupted attempt and re-issues the request, so
+    /// a filter that already observed that attempt must forget it. Its partial
+    /// fragment would otherwise be completed by the bytes of the replacement
+    /// attempt and reach the preview the client already reset.
+    fn reset(&mut self);
 }
 
 pub(crate) fn resolve_path(candidate: &str, editable_paths: &[String], is_create: bool) -> String {
@@ -87,6 +95,16 @@ impl StagingSimulator {
     pub(crate) fn set_staged_contents(&mut self, staged_contents: HashMap<String, String>) {
         self.original_contents = staged_contents.clone();
         self.staged_contents = staged_contents;
+    }
+
+    /// Restores the staged contents to the snapshot the change set starts from.
+    ///
+    /// A retried attempt re-proposes the whole change set against the same
+    /// rendered context, so the preview must discard the hunks of the voided
+    /// attempt instead of applying the replacement on top of them. The snapshot
+    /// itself is preserved, because the anchors still name the lines it held.
+    pub(crate) fn reset(&mut self) {
+        self.staged_contents = self.original_contents.clone();
     }
 
     /// Returns the content a file had before the change set touched it.

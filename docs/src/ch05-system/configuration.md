@@ -133,7 +133,7 @@ it runs a declared command line and reads its exit status.
 | `[develop]` | edit retries, verification healing budget, replan budget, workflow mode, edit protocol, patch strategy, prompt layout |
 | `[git]` | upstream base and hook bypass |
 | `[history]` | token budget and uncompressed tail length |
-| `[context]` | discovery rounds, file, outline, and external-reference budgets, report caps, pattern cap, pinned patterns |
+| `[context]` | discovery rounds, file, outline, and external-reference budgets, report caps, pinned patterns |
 
 The `[develop]` section also selects the wire format of the model exchange through
 its `protocol` key. The value is `structured` (the default), `xml`, or `mixed`; the
@@ -247,7 +247,6 @@ The workstation file is resolved separately, in `$XDG_CONFIG_HOME/tauqe/tui.toml
 | `context.max_discovery_rounds` | 5 | widening rounds per turn |
 | `context.files_token_budget` | 300,000 | aggregate cost of context files |
 | `context.repomap_token_budget` | 4,000 | the repository outline |
-| `context.max_pattern_batch` | 150 | files admitted by one glob request |
 | `context.refs_token_budget` | 50,000 | the lazily loaded external reference documents |
 | `history.budget_tokens` | 20,000 | session history before compaction |
 | `history.tail_turns` | 10 | turns kept uncompressed |
@@ -260,7 +259,9 @@ alone. A repository may override any documented default, and this repository doe
 (section 3.6). The point is not the numbers but their addressability: a small library
 tolerates a wide context and a monorepo does not, so a hardcoded limit forces either
 a generous default that burns budget or a restrictive one that blocks legitimate
-work.
+work. Volume is measured in tokens only: no parameter bounds how many files a
+request may admit, and each file is priced as its content plus the wrapper its
+`<file>` element renders, so the budget compares what the prompt actually carries.
 
 ---
 
@@ -409,11 +410,15 @@ worth distinguishing from a stale search block.
 ### 3.6 Context budgets and hierarchical pinned resolution
 
 `[context]` sets the discovery round cap, the aggregate file budget, the outline
-budget, the pattern batch cap, and whether the eager symbol map is rendered
-(`include_repo_map`). When the eager map is disabled, the prompt carries the compact
-directory tree instead; the two outlines are mutually exclusive by design. This
-repository widens the documented defaults (8 rounds, 500,000 file tokens, 40,000
-outline tokens), which is exactly why they are configuration rather than constants.
+budget, and whether the eager symbol map is rendered (`include_repo_map`). When the
+eager map is disabled, the prompt carries the compact directory tree instead; the two
+outlines are mutually exclusive by design. This repository widens the documented
+defaults (8 rounds, 500,000 file tokens, 40,000 outline tokens), which is exactly why
+they are configuration rather than constants.
+
+The file budget is the single measure of volume. No key bounds how many files one
+request may admit, and every file is priced as its content plus the wrapper its own
+`<file>` element renders, so the budget is spent on what the prompt actually carries.
 
 `refs_token_budget` (50,000 by default) bounds one more working set: the external
 documents the registry materialized during the task. It is the only ceiling that can drop
@@ -464,10 +469,20 @@ needs instead of front-loading everything.
 
 The harness keeps its own runtime state under `.tauqe/`, which Git ignores, so no
 generated artifact can reach a commit: `history.jsonl` (the interaction journal),
-`plans/{id}.json` and `reviews/{id}.json` (one file per entity), `prompts.history`,
-`usage.json` (project lifetime telemetry), `server.log` (the rotating daemon journal),
+`plans/{id}.json` and `reviews/{id}.json` (one file per entity), `usage.json` (project
+lifetime telemetry), `server.log` (the rotating daemon journal),
 `active-transaction.json` (the open Git transaction, if any), and the project-local
 `credentials.toml`.
+
+The prompt recall list is the one piece of runtime state that deliberately lives
+elsewhere. It once sat beside these files as `.tauqe/prompts.history`, and that
+placement was wrong: a submitted prompt can embed a key, an internal hostname, or a
+fragment of production data, and no file permission prevents a working tree from
+staging what it holds. The editor now resolves the list in the developer's private
+state directory — `$XDG_STATE_HOME/tauqe/prompts.history`, falling back to
+`$HOME/.local/state/tauqe/prompts.history` — so a checkout never receives it, and the
+session keeps prompts in memory only when the environment declares no usable state
+directory.
 
 ### 3.8 Why credentials are never a project setting
 

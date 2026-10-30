@@ -2,10 +2,13 @@ use std::sync::Arc;
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::text::Line;
-use tauqe_protocol::{methods, DiscussionFocus, ModelResult};
+use tauqe_protocol::{methods, DiscussionFocus, ModelResult, ReviewStartParams};
 use tokio::sync::{Mutex, MutexGuard};
 
-use crate::app::{ActiveModal, AppState, BatchCancelButton, HelpTab, ReviewDialogState, ViewMode};
+use crate::app::{
+    ActiveModal, AppState, BatchCancelButton, HelpTab, PendingReviewLaunch, ReviewDialogState,
+    ViewMode,
+};
 use crate::command::dialog::{DialogCommand, DIALOG_COMMAND_MAP};
 use crate::input::{squash, InputResult};
 use crate::rpc::{send_request, RpcConnection};
@@ -21,7 +24,6 @@ mod execute_scope;
 mod locale;
 mod prompt;
 mod refine;
-mod review_refine;
 mod selection;
 mod status;
 
@@ -29,7 +31,6 @@ use confirm::{resolve_batch_cancel, resolve_confirm, BatchCancelOutcome, Confirm
 pub(crate) use locale::click_locale_button;
 pub(crate) use prompt::submit_prompt_modal;
 pub(crate) use refine::{submit_refine_blocked, submit_refine_dialog};
-pub(crate) use review_refine::submit_review_refine_dialog;
 pub(crate) use selection::activate_selection_item;
 pub(crate) use status::apply_status_dialog;
 
@@ -276,6 +277,11 @@ fn begin_plan_refine_turn(st: &mut AppState, plan_id: String) {
 /// the exact same batch turn as `Enter`: the Coder role takes over, `is_batch`
 /// enables the three-way batch-cancel dialog, the discussion focus detaches, and
 /// a rollback snapshot protects the launch.
+///
+/// A group target travels as `group_id`: the server synthesizes the unified
+/// plan of that architectural group just-in-time and executes it as one
+/// coherent change set, so the request never queues the findings the group
+/// collects (c-1, c-2, c-4).
 pub(crate) async fn confirm_execute_review(
     state: &Arc<Mutex<AppState>>,
     st: MutexGuard<'_, AppState>,
@@ -307,19 +313,36 @@ pub(crate) async fn confirm_execute_review(
     } else {
         None
     };
-    // A session or section queue names the findings the confirmation
-    // showed, so the server runs exactly the audited selection instead of
-    // re-deriving a wider queue behind a dialog that promised less
-    // (concept #c-2).
-    let item_ids = if target.review_id.is_some() && target.item_id.is_none() {
+    // A group plan addresses the group itself: its steps are synthesized
+    // just-in-time and executed as one coherent change set, so no per-finding
+    // queue travels with the request. A step of that plan travels only together
+    // with its group, and a finding-level request never names a group (c-1,
+    // c-2, c-4).
+    let group_id = target.group_id.clone();
+    let step_id = target.step_id.clone().filter(|_| group_id.is_some());
+    let item_id = target.item_id.filter(|_| group_id.is_none());
+    // A section queue names the findings the confirmation showed, so the server
+    // runs exactly the audited selection instead of re-deriving a wider queue
+    // behind a dialog that promised less. A whole-session launch is the
+    // opposite contract: it names the session and leaves the members to the
+    // server, so the implicit queue built there subsumes the architectural
+    // groups — executed through their root-cause plans — exactly as the
+    // cross-session batch does, and no finding list may narrow it (concept
+    // #c-1, #c-2).
+    let item_ids = if !target.whole_session
+        && group_id.is_none()
+        && target.review_id.is_some()
+        && item_id.is_none()
+    {
         Some(target.items.iter().map(|issue| issue.id).collect())
     } else {
         None
     };
     let params = tauqe_protocol::ReviewExecuteParams {
         review_id: target.review_id,
-        item_id: target.item_id,
-        step_id: target.step_id,
+        item_id,
+        step_id,
+        group_id,
         item_ids,
         model,
         instructions,
@@ -375,16 +398,18 @@ pub(crate) async fn confirm_execute_scope(
     Ok(())
 }
 
-/// Starts a review session from the review dialog.
+/// Dispatches the audit of a review launch whose window is approved.
 ///
-/// Shared by the keyboard and mouse paths so a failed request rolls the
-/// optimistic UI state back identically on both.
-pub(crate) async fn confirm_start_review(
+/// Shared by an untruncated projection answer and the truncation consent card,
+/// so both paths start exactly the launch parameters the projection described
+/// (c-3).
+pub(crate) async fn launch_review(
     state: &Arc<Mutex<AppState>>,
     st: MutexGuard<'_, AppState>,
     server_writer: &mut RpcConnection,
-    params: serde_json::Value,
+    params: ReviewStartParams,
 ) -> anyhow::Result<()> {
+    let params = serde_json::to_value(params)?;
     start_turn(
         state,
         st,
@@ -406,6 +431,10 @@ pub(crate) async fn confirm_start_review(
 /// fields. An empty field narrows nothing and passes silently. Every keyboard
 /// path that starts a review runs through here, so the accelerators can never
 /// disagree about what a launch means (c-2, c-4).
+///
+/// A launchable dialog does not start the audit by itself: the typed parameters
+/// are projected through `review/preview` first, so the answer decides whether
+/// the run needs an explicit consent step for a truncated window (c-3).
 pub(crate) async fn start_review_from_dialog(
     state: &Arc<Mutex<AppState>>,
     mut st: MutexGuard<'_, AppState>,
@@ -421,8 +450,33 @@ pub(crate) async fn start_review_from_dialog(
         return Ok(());
     }
 
-    let params = serde_json::to_value(dialog.start_params())?;
-    confirm_start_review(state, st, server_writer, params).await
+    let params = dialog.start_params();
+    let preview = tauqe_protocol::review::ReviewPreviewParams {
+        path_patterns: params.path_patterns.clone(),
+        preset: params.preset.clone(),
+    };
+    let payload = serde_json::to_value(preview)?;
+    // The dialog is consumed the moment the developer confirms it, so the typed
+    // launch parameters and the dialog itself wait in the pending launch: a
+    // refused projection or a declined truncation returns exactly these fields
+    // (c-3).
+    st.pending_review_launch = Some(PendingReviewLaunch { dialog, params });
+    st.confirm_button = crate::app::ConfirmDialogButton::Cancel;
+    drop(st);
+
+    // The projection is a read RPC answered before the audit opens: a window the
+    // budgets leave intact launches immediately, while a truncated one asks for
+    // consent first (c-2, c-3).
+    if let Err(error) = send_request(server_writer, methods::REVIEW_PREVIEW, payload).await {
+        let mut st = state.lock().await;
+        if let Some(pending) = st.pending_review_launch.take() {
+            st.review_dialog = Some(pending.dialog);
+        }
+        st.notify_error(
+            crate::i18n::active_t("notify.review_preview_failed").replace("{}", &error.to_string()),
+        );
+    }
+    Ok(())
 }
 
 /// Clears the conversation history.
@@ -621,13 +675,21 @@ pub(crate) async fn apply_batch_cancel(
     Ok(())
 }
 
-/// Reports whether the key is the `Shift+C` mass-clearing chord.
+/// Reports whether the key is the advertised `Shift+C` mass-clearing chord.
 ///
 /// `Shift+C` is the canonical mass-clearing chord, deliberately uppercase so it
 /// never collides with the lowercase `c` copy verb. Both encodings reach it: a
 /// terminal may report the shifted letter as an uppercase code point, or as a
 /// lowercase code point carrying the `Shift` modifier.
+///
+/// A command modifier takes the chord away from this predicate entirely. The
+/// terminal owns `Ctrl+Shift+C` and `Alt+Shift+C` as its own copy chords, and
+/// they arrive as the same uppercase code point, so they must never reach the
+/// durable telemetry reset behind a read-only dialog (Conventions §4.4).
 fn is_mass_clear_chord(key: KeyEvent) -> bool {
+    if key.modifiers.contains(KeyModifiers::CONTROL) || key.modifiers.contains(KeyModifiers::ALT) {
+        return false;
+    }
     match key.code {
         KeyCode::Char('C') => true,
         KeyCode::Char('c') => key.modifiers.contains(KeyModifiers::SHIFT),
@@ -659,22 +721,19 @@ pub(crate) async fn handle_dialog_event(
                         .model_rows
                         .height as usize;
 
-                // The C-M / M-M chord always switches the reviewer; the arrows
-                // browse the list only while the list owns focus, so list
-                // navigation and text editing never fight over the same keys
-                // (c-magit-key-navigation).
-                // The model chord always switches the reviewer; the arrows reach
-                // the selector only when no embedded list owns them, so preset
-                // and model navigation never fight over the same keys
-                // (c-3, c-5, Conventions §8).
-                // The path section edits one row at a time, so its arrows belong
-                // to the completion menu and never switch the reviewer behind
-                // the developer's cursor (c-3, c-5).
-                let arrows_free = !dialog.focus.is_model_list()
-                    && !dialog.focus.is_preset_list()
-                    && !dialog.focus.is_path_editor();
-                if dialog.selector.handle_key(key, primary, meta, arrows_free) {
-                    st.review_dialog = Some(dialog);
+                // The `C-M` / `M-M` chord always switches the reviewer, even
+                // while the instructions editor owns the keyboard. `Up`/`Down`
+                // never switch it: the arrows belong to the section that owns
+                // the keyboard, so the selector declines them here and that
+                // section resolves them — `handle_list_key` browses the
+                // reviewer list, the shared `ListSelector` moves the preset
+                // cursor, the target-path rows move their completion highlight,
+                // and the instruction editor keeps them for cursor movement.
+                // Forwarding `true` states exactly that: an embedded surface
+                // owns the arrows, so only the switch chord is resolved here and
+                // the reviewer never changes behind the developer's cursor
+                // (c-3, c-4, c-5, Conventions §5, §7).
+                if dialog.selector.handle_key(key, primary, meta, true) {
                     return Ok(Some(InputResult::Continue));
                 }
 
@@ -933,6 +992,25 @@ pub(crate) async fn handle_dialog_event(
             }
             return Ok(Some(InputResult::Continue));
         }
+        Some(ActiveModal::ReviewTruncation) => {
+            if let Some(target) = st.confirm_review_truncation.take() {
+                match resolve_confirm(&mut st, key) {
+                    ConfirmOutcome::Toggled => st.confirm_review_truncation = Some(target),
+                    ConfirmOutcome::Dismissed => {
+                        // Declining the truncated window sends nothing and
+                        // returns the launch dialog with its typed fields, so
+                        // the developer can narrow the patterns (c-3).
+                        st.confirm_button = crate::app::ConfirmDialogButton::Cancel;
+                        st.review_dialog = Some(target.pending.dialog);
+                    }
+                    ConfirmOutcome::Accepted => {
+                        st.confirm_button = crate::app::ConfirmDialogButton::Cancel;
+                        launch_review(state, st, server_writer, target.pending.params).await?;
+                    }
+                }
+            }
+            return Ok(Some(InputResult::Continue));
+        }
         Some(ActiveModal::ConfirmCancel) => {
             match resolve_confirm(&mut st, key) {
                 ConfirmOutcome::Toggled => {}
@@ -1014,6 +1092,33 @@ pub(crate) async fn handle_dialog_event(
                         serde_json::to_value(params)?,
                     )
                     .await?;
+                }
+            }
+            return Ok(Some(InputResult::Continue));
+        }
+        Some(ActiveModal::RemoveContextFile) => {
+            // The pending path is the single source of truth: the card names it,
+            // and an explicit confirmation turns exactly that path into the
+            // request (Conventions §4.3, §5.4).
+            if let Some(path) = st.context_view.pending_remove.clone() {
+                match resolve_confirm(&mut st, key) {
+                    ConfirmOutcome::Toggled => {}
+                    ConfirmOutcome::Dismissed => {
+                        st.context_view.pending_remove = None;
+                        st.confirm_button = crate::app::ConfirmDialogButton::Cancel;
+                    }
+                    ConfirmOutcome::Accepted => {
+                        st.context_view.pending_remove = None;
+                        st.confirm_button = crate::app::ConfirmDialogButton::Cancel;
+                        drop(st);
+                        let params = tauqe_protocol::ContextRemoveParams { path };
+                        send_request(
+                            server_writer,
+                            methods::CONTEXT_REMOVE,
+                            serde_json::to_value(params)?,
+                        )
+                        .await?;
+                    }
                 }
             }
             return Ok(Some(InputResult::Continue));
@@ -1195,9 +1300,6 @@ pub(crate) async fn handle_dialog_event(
         }
         Some(ActiveModal::RefineBlocked) => {
             return refine::handle_refine_blocked(key, state, st, server_writer).await;
-        }
-        Some(ActiveModal::ReviewRefine) => {
-            return review_refine::handle_review_refine_dialog(key, state, st, server_writer).await;
         }
         Some(ActiveModal::Prompt) => {
             return prompt::handle_prompt_modal(key, state, st, server_writer).await;
@@ -1392,6 +1494,166 @@ mod tests {
     use super::*;
     use crate::app::{ConfirmDialogButton, ConfirmExecuteReviewState};
 
+    /// Builds a review launch dialog over two configured reviewer entries — the
+    /// production shape in which `ModelSelector::handle_key` is live — with
+    /// `preset_count` review presets and the keyboard on `focus` (c-3, c-4).
+    fn review_dialog_with_reviewers(
+        repo_files: Vec<String>,
+        preset_count: usize,
+        focus: crate::app::ReviewDialogFocus,
+    ) -> ReviewDialogState {
+        let reviewers = ["reviewer-a", "reviewer-b"]
+            .into_iter()
+            .map(|name| {
+                tauqe_protocol::ModelEntry::new(tauqe_protocol::ModelRef::openrouter(name), None)
+            })
+            .collect();
+        let presets = (0..preset_count)
+            .map(|index| tauqe_protocol::ReviewPresetSummary {
+                name: format!("preset-{index}"),
+                title: None,
+            })
+            .collect();
+        let mut dialog = ReviewDialogState::new(1, 10, reviewers, repo_files).with_presets(presets);
+        dialog.focus = focus;
+        dialog
+    }
+
+    /// `Up`/`Down` move the preset cursor while the preset section owns the
+    /// keyboard and never switch the reviewer behind it (c-3, c-5).
+    #[tokio::test]
+    async fn preset_section_keeps_the_arrows_from_the_reviewer_selector() {
+        let mut st = crate::app::test_state();
+        st.view_mode = ViewMode::Review;
+        st.last_frame_area = ratatui::layout::Rect::new(0, 0, 120, 50);
+        let dialog = review_dialog_with_reviewers(
+            vec!["src/lib.rs".to_string()],
+            2,
+            crate::app::ReviewDialogFocus::PresetList,
+        );
+        assert!(dialog.selector.len() > 1, "the reviewer list must be live");
+        st.review_dialog = Some(dialog);
+
+        let state = Arc::new(Mutex::new(st));
+        let mut conn = RpcConnection::new(Vec::<u8>::new());
+        for _ in 0..2 {
+            handle_dialog_event(
+                KeyEvent::new(KeyCode::Down, KeyModifiers::NONE),
+                &state,
+                &mut conn,
+            )
+            .await
+            .expect("in-memory dispatch never fails");
+        }
+        {
+            let guard = state.lock().await;
+            let dialog = guard.review_dialog.as_ref().expect("dialog stays open");
+            assert_eq!(dialog.preset_selector.selected_index(), 2);
+            assert_eq!(
+                dialog.selector.selected_index(),
+                0,
+                "the reviewer selection never moves behind the preset cursor"
+            );
+        }
+
+        handle_dialog_event(
+            KeyEvent::new(KeyCode::Up, KeyModifiers::NONE),
+            &state,
+            &mut conn,
+        )
+        .await
+        .expect("in-memory dispatch never fails");
+        {
+            let guard = state.lock().await;
+            let dialog = guard.review_dialog.as_ref().expect("dialog stays open");
+            assert_eq!(dialog.preset_selector.selected_index(), 1);
+            assert_eq!(dialog.selector.selected_index(), 0);
+        }
+        assert!(
+            conn.written().is_empty(),
+            "moving the preset cursor never talks to the server"
+        );
+    }
+
+    /// `Up`/`Down` walk the directory-completion highlight while the target-path
+    /// rows own the keyboard and never switch the reviewer behind them (c-3,
+    /// c-5).
+    #[tokio::test]
+    async fn path_completion_keeps_the_arrows_from_the_reviewer_selector() {
+        let mut st = crate::app::test_state();
+        st.view_mode = ViewMode::Review;
+        st.last_frame_area = ratatui::layout::Rect::new(0, 0, 120, 50);
+        let mut dialog = review_dialog_with_reviewers(
+            vec![
+                "crates/core/src/lib.rs".to_string(),
+                "src/lib.rs".to_string(),
+            ],
+            0,
+            crate::app::ReviewDialogFocus::PathEditor,
+        );
+        assert!(dialog.selector.len() > 1, "the reviewer list must be live");
+        dialog.path_inputs[0].insert_str("cra");
+        dialog.refresh_path_completion();
+        assert!(dialog.path_completion.is_open(), "the row offers prefixes");
+        st.review_dialog = Some(dialog);
+
+        let state = Arc::new(Mutex::new(st));
+        let mut conn = RpcConnection::new(Vec::<u8>::new());
+        handle_dialog_event(
+            KeyEvent::new(KeyCode::Down, KeyModifiers::NONE),
+            &state,
+            &mut conn,
+        )
+        .await
+        .expect("in-memory dispatch never fails");
+
+        let guard = state.lock().await;
+        let dialog = guard.review_dialog.as_ref().expect("dialog stays open");
+        assert_eq!(dialog.path_completion.selected_index(), 1);
+        assert_eq!(dialog.path_inputs[0].get_text(), "cra");
+        assert_eq!(
+            dialog.selector.selected_index(),
+            0,
+            "the reviewer selection never moves behind the completion cursor"
+        );
+    }
+
+    /// The same arrows keep browsing the reviewer list while it owns the
+    /// keyboard, so the routing is scoped to the focused section (c-3, c-4).
+    #[tokio::test]
+    async fn model_list_still_browses_the_reviewers_with_the_arrows() {
+        let mut st = crate::app::test_state();
+        st.view_mode = ViewMode::Review;
+        st.last_frame_area = ratatui::layout::Rect::new(0, 0, 120, 50);
+        let dialog = review_dialog_with_reviewers(
+            vec!["src/lib.rs".to_string()],
+            1,
+            crate::app::ReviewDialogFocus::ModelList,
+        );
+        assert!(dialog.selector.len() > 1, "the reviewer list must be live");
+        st.review_dialog = Some(dialog);
+
+        let state = Arc::new(Mutex::new(st));
+        let mut conn = RpcConnection::new(Vec::<u8>::new());
+        for (key, expected) in [(KeyCode::Down, 1usize), (KeyCode::Up, 0)] {
+            handle_dialog_event(KeyEvent::new(key, KeyModifiers::NONE), &state, &mut conn)
+                .await
+                .expect("in-memory dispatch never fails");
+            let guard = state.lock().await;
+            let dialog = guard.review_dialog.as_ref().expect("dialog stays open");
+            assert_eq!(dialog.selector.selected_index(), expected);
+            assert_eq!(
+                dialog.preset_selector.selected_index(),
+                0,
+                "the preset cursor never moves behind the reviewer list"
+            );
+        }
+        assert!(
+            conn.written().is_empty(),
+            "browsing the reviewer list never talks to the server"
+        );
+    }
+
     fn plan_item(id: &str, status: tauqe_protocol::PlanItemStatus) -> tauqe_protocol::PlanItem {
         tauqe_protocol::PlanItem {
             id: id.to_string(),
@@ -1414,7 +1676,6 @@ mod tests {
             recommendations: Vec::new(),
             files: Vec::new(),
             readonly_files: Vec::new(),
-            plan: Vec::new(),
             note: None,
         }
     }
@@ -1455,6 +1716,123 @@ mod tests {
             notification,
             guard.confirm_execute_review.is_some(),
         )
+    }
+    /// Drives the ExecuteReview confirmation through `handle_dialog_event` on a
+    /// focused `Confirm` button and returns everything the launch wrote to the
+    /// transport, so both launch shapes of a session are compared under one
+    /// setup (concept #c-1, #c-2).
+    async fn launch_execute_review_payload(target: ConfirmExecuteReviewState) -> String {
+        let mut st = crate::app::test_state();
+        st.view_mode = ViewMode::Review;
+        st.confirm_execute_review = Some(target);
+        st.confirm_button = ConfirmDialogButton::Confirm;
+
+        let state = Arc::new(Mutex::new(st));
+        let mut conn = RpcConnection::new(Vec::<u8>::new());
+        handle_dialog_event(
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            &state,
+            &mut conn,
+        )
+        .await
+        .expect("in-memory dispatch never fails");
+
+        String::from_utf8(conn.written().to_vec()).expect("utf-8 payload")
+    }
+
+    /// A whole-session launch names the session and leaves the members to the
+    /// server, exactly as the cross-session batch does: no finding list travels,
+    /// so the implicit queue subsumes the architectural groups of the session
+    /// instead of refusing them as an explicit selection of their symptoms
+    /// (concept #c-1, #c-3).
+    #[tokio::test]
+    async fn whole_session_launch_omits_the_finding_list() {
+        let target = ConfirmExecuteReviewState::new(
+            Some("rev-1".to_string()),
+            "Session rev-1".to_string(),
+            "All remaining TODO findings".to_string(),
+            None,
+            None,
+            vec![review_issue(1), review_issue(2)],
+            Vec::new(),
+        )
+        .with_whole_session();
+
+        let payload = launch_execute_review_payload(target).await;
+
+        assert!(payload.contains("review/execute"), "{payload}");
+        assert!(payload.contains("\"review_id\":\"rev-1\""), "{payload}");
+        assert!(
+            !payload.contains("item_ids"),
+            "a whole-session launch names the session, not its findings: {payload}"
+        );
+    }
+
+    /// A section queue keeps its explicit finding list, because a simple group
+    /// owns only the findings it collects and must never widen into the whole
+    /// session behind a dialog that promised less (concept #c-2).
+    #[tokio::test]
+    async fn section_launch_keeps_the_finding_list() {
+        let payload = launch_execute_review_payload(execute_review_target()).await;
+
+        assert!(payload.contains("review/execute"), "{payload}");
+        assert!(payload.contains("\"review_id\":\"rev-1\""), "{payload}");
+        assert!(payload.contains("\"item_ids\":[1,2]"), "{payload}");
+    }
+
+    /// Findings that belong to an architectural group are symptoms of one shared
+    /// root cause, so a whole-session launch reads the request as an implicit
+    /// queue: the payload names the session and carries no finding list, the
+    /// shape the server accepts instead of refusing it with
+    /// `ARCHITECTURAL_GROUP_EXECUTION_REQUIRED` (concept #c-1, #c-3).
+    #[tokio::test]
+    async fn whole_session_with_architectural_groups_launches_without_a_finding_list() {
+        let mut items = vec![review_issue(1), review_issue(2)];
+        for item in &mut items {
+            item.group = Some("arch".to_string());
+        }
+        let target = ConfirmExecuteReviewState::new(
+            Some("rev-arch".to_string()),
+            "Session rev-arch".to_string(),
+            "All remaining TODO findings".to_string(),
+            None,
+            None,
+            items,
+            Vec::new(),
+        )
+        .with_whole_session();
+
+        let mut st = crate::app::test_state();
+        st.view_mode = ViewMode::Review;
+        st.confirm_execute_review = Some(target);
+        st.confirm_button = ConfirmDialogButton::Confirm;
+
+        let state = Arc::new(Mutex::new(st));
+        let mut conn = RpcConnection::new(Vec::<u8>::new());
+        handle_dialog_event(
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            &state,
+            &mut conn,
+        )
+        .await
+        .expect("in-memory dispatch never fails");
+
+        let payload = String::from_utf8(conn.written().to_vec()).expect("utf-8 payload");
+        assert!(payload.contains("review/execute"), "{payload}");
+        assert!(payload.contains("\"review_id\":\"rev-arch\""), "{payload}");
+        assert!(
+            !payload.contains("\"item_ids\""),
+            "a whole-session launch never names the symptoms it collects: {payload}"
+        );
+
+        let guard = state.lock().await;
+        assert!(guard.confirm_execute_review.is_none());
+        assert_eq!(guard.view_mode, ViewMode::Repl);
+        assert!(guard.model.is_batch, "the launch runs as a batch");
+        assert!(
+            guard.model.error.is_none(),
+            "the implicit queue starts without a protocol error"
+        );
     }
 
     /// A horizon carrying recorded work must escalate to the second tier
@@ -1781,6 +2159,50 @@ mod tests {
         assert_eq!(guard.view_mode, ViewMode::Repl);
         assert!(guard.model.is_batch);
     }
+    /// Confirming the unified plan of an architectural group dispatches the
+    /// group target instead of a per-finding queue, so no finding of that group
+    /// is ever executed in isolation (c-1, c-4).
+    #[tokio::test]
+    async fn group_plan_execution_dispatches_the_group_target() {
+        let mut st = crate::app::test_state();
+        st.view_mode = ViewMode::Review;
+        st.confirm_execute_review = Some(
+            ConfirmExecuteReviewState::new(
+                Some("rev-1".to_string()),
+                "Session rev-1".to_string(),
+                "Unified auth guard".to_string(),
+                None,
+                None,
+                vec![review_issue(1), review_issue(2)],
+                Vec::new(),
+            )
+            .with_group("arch-auth".to_string(), "Unified auth guard".to_string()),
+        );
+        st.confirm_button = ConfirmDialogButton::Confirm;
+
+        let state = Arc::new(Mutex::new(st));
+        let mut conn = RpcConnection::new(Vec::<u8>::new());
+        handle_dialog_event(
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            &state,
+            &mut conn,
+        )
+        .await
+        .expect("in-memory dispatch never fails");
+
+        let payload = String::from_utf8(conn.written().to_vec()).expect("utf-8 payload");
+        assert!(payload.contains("review/execute"), "{payload}");
+        assert!(payload.contains("\"group_id\":\"arch-auth\""), "{payload}");
+        assert!(
+            !payload.contains("item_ids"),
+            "a group plan never queues the findings it collects: {payload}"
+        );
+        assert!(!payload.contains("\"step_id\""), "{payload}");
+
+        let guard = state.lock().await;
+        assert!(guard.confirm_execute_review.is_none());
+        assert_eq!(guard.view_mode, ViewMode::Repl);
+    }
 
     #[tokio::test]
     async fn help_modal_tab_shortcuts_switch_between_tabs() {
@@ -2043,6 +2465,42 @@ mod tests {
         assert!(state.lock().await.usage_summary.is_some());
     }
 
+    /// A command modifier must never ride along with the mass-clearing chord:
+    /// `Ctrl+Shift+C` and `Alt+Shift+C` reach the dialog as the same uppercase
+    /// code point the advertised `Shift+C` carries, yet the terminal owns them
+    /// as its own copy chords. A durable telemetry reset issued from a
+    /// read-only dialog must not fire on that muscle memory, so the transport
+    /// stays silent and the dialog keeps its totals (Conventions §4.4).
+    #[tokio::test]
+    async fn usage_summary_command_shift_c_does_not_reset_the_telemetry() {
+        for modifiers in [
+            KeyModifiers::SHIFT | KeyModifiers::CONTROL,
+            KeyModifiers::SHIFT | KeyModifiers::ALT,
+        ] {
+            let mut st = crate::app::test_state();
+            st.open_usage_summary();
+            let state = Arc::new(Mutex::new(st));
+            let mut conn = RpcConnection::new(Vec::<u8>::new());
+
+            handle_dialog_event(
+                KeyEvent::new(KeyCode::Char('C'), modifiers),
+                &state,
+                &mut conn,
+            )
+            .await
+            .expect("in-memory dispatch never fails");
+
+            assert!(
+                conn.written().is_empty(),
+                "{modifiers:?} must never reset project telemetry"
+            );
+            assert!(
+                state.lock().await.usage_summary.is_some(),
+                "the read-only dialog stays open"
+            );
+        }
+    }
+
     /// Async sink whose every write fails, standing in for a server pipe that
     /// closed before the turn request reached it.
     struct FailingWriter;
@@ -2229,7 +2687,7 @@ mod tests {
     /// An empty target field narrows nothing, so the launch proceeds and the
     /// request carries no `path_pattern` (c-2, c-4).
     #[tokio::test]
-    async fn review_launch_without_a_target_pattern_reaches_the_daemon() {
+    async fn review_launch_without_a_target_pattern_requests_its_projection() {
         let mut st = crate::app::test_state();
         st.view_mode = ViewMode::Review;
         let mut dialog = ReviewDialogState::new(1, 10, Vec::new(), Vec::new());
@@ -2248,14 +2706,20 @@ mod tests {
         .expect("in-memory dispatch never fails");
 
         let payload = String::from_utf8(conn.written().to_vec()).expect("utf-8 payload");
-        assert!(payload.contains("review/start"), "{payload}");
+        assert!(payload.contains("review/preview"), "{payload}");
         assert!(!payload.contains("path_patterns"), "{payload}");
 
         let guard = state.lock().await;
         assert!(
             guard.review_dialog.is_none(),
-            "a launched review closes its dialog"
+            "a launchable review dialog starts its window projection"
         );
+        let pending = guard
+            .pending_review_launch
+            .as_ref()
+            .expect("the launch awaits its projection");
+        assert!(pending.params.path_patterns.is_empty());
+        assert_eq!(pending.params.preset, None);
     }
 
     /// The preset section navigates through the shared list arithmetic and Enter
@@ -2723,6 +3187,269 @@ mod tests {
                 "crates/core/".to_string(),
                 "crates/core/src/".to_string(),
             ]
+        );
+    }
+    fn user_context_item(path: &str) -> tauqe_protocol::ContextItem {
+        tauqe_protocol::ContextItem {
+            path: path.to_string(),
+            access: tauqe_protocol::ContextAccess::ReadOnly,
+            size_bytes: 128,
+            estimated_tokens: 32,
+            layer: tauqe_protocol::ContextLayer::User,
+            insertion_seq: 0,
+        }
+    }
+
+    /// The safe `Cancel` default never removes the file: `Enter` on the card
+    /// closes it, leaves the context untouched, and writes nothing.
+    #[tokio::test]
+    async fn context_removal_cancel_leaves_the_context_untouched() {
+        let mut st = crate::app::test_state();
+        st.view_mode = ViewMode::Context;
+        st.context.items.push(user_context_item("src/lib.rs"));
+        st.context_view.pending_remove = Some("src/lib.rs".to_string());
+        st.confirm_button = ConfirmDialogButton::Cancel;
+
+        let state = Arc::new(Mutex::new(st));
+        let mut conn = RpcConnection::new(Vec::<u8>::new());
+        handle_dialog_event(
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            &state,
+            &mut conn,
+        )
+        .await
+        .expect("in-memory dispatch never fails");
+
+        assert!(
+            conn.written().is_empty(),
+            "the safe Cancel default never removes the file"
+        );
+        let guard = state.lock().await;
+        assert!(guard.context_view.pending_remove.is_none());
+        assert_eq!(guard.context.items.len(), 1);
+        assert!(guard.context.items.iter().any(|it| it.path == "src/lib.rs"));
+    }
+
+    /// Confirming the card emits the typed `context/remove` request carrying the
+    /// path captured when the dialog opened, then clears the pending slot.
+    #[tokio::test]
+    async fn context_removal_confirm_dispatches_the_pending_path() {
+        let mut st = crate::app::test_state();
+        st.view_mode = ViewMode::Context;
+        st.context.items.push(user_context_item("src/lib.rs"));
+        st.context_view.pending_remove = Some("src/lib.rs".to_string());
+        st.confirm_button = ConfirmDialogButton::Confirm;
+
+        let state = Arc::new(Mutex::new(st));
+        let mut conn = RpcConnection::new(Vec::<u8>::new());
+        handle_dialog_event(
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            &state,
+            &mut conn,
+        )
+        .await
+        .expect("in-memory dispatch never fails");
+
+        let payload = String::from_utf8(conn.written().to_vec()).expect("utf-8 payload");
+        assert!(payload.contains("context/remove"), "{payload}");
+        assert!(payload.contains("src/lib.rs"), "{payload}");
+
+        let guard = state.lock().await;
+        assert!(guard.context_view.pending_remove.is_none());
+        assert_eq!(guard.confirm_button, ConfirmDialogButton::Cancel);
+    }
+
+    /// The `y` / `n` accelerators follow the shared dialog contract: `y`
+    /// confirms immediately and `n` / `Esc` dismiss safely, whatever button
+    /// owns the focus.
+    #[tokio::test]
+    async fn context_removal_accelerators_confirm_and_cancel() {
+        for (key, expected_request) in [
+            (KeyCode::Char('y'), true),
+            (KeyCode::Char('n'), false),
+            (KeyCode::Esc, false),
+        ] {
+            let mut st = crate::app::test_state();
+            st.view_mode = ViewMode::Context;
+            st.context.items.push(user_context_item("src/lib.rs"));
+            st.context_view.pending_remove = Some("src/lib.rs".to_string());
+            st.confirm_button = ConfirmDialogButton::Confirm;
+
+            let state = Arc::new(Mutex::new(st));
+            let mut conn = RpcConnection::new(Vec::<u8>::new());
+            handle_dialog_event(KeyEvent::new(key, KeyModifiers::NONE), &state, &mut conn)
+                .await
+                .expect("in-memory dispatch never fails");
+
+            let written = conn.written().to_vec();
+            assert_eq!(
+                !written.is_empty(),
+                expected_request,
+                "{key:?} produced {written:?}"
+            );
+            assert!(state.lock().await.context_view.pending_remove.is_none());
+        }
+    }
+    /// Builds the pending launch a confirmed dialog leaves behind, over the
+    /// typed parameters the projection describes (c-3).
+    fn pending_launch(path: &str) -> PendingReviewLaunch {
+        let mut dialog = ReviewDialogState::new(1, 10, Vec::new(), Vec::new());
+        dialog.path_inputs[0].insert_str(path);
+        PendingReviewLaunch {
+            dialog,
+            params: tauqe_protocol::ReviewStartParams {
+                path_patterns: vec![path.to_string()],
+                ..Default::default()
+            },
+        }
+    }
+
+    /// Builds the projection of a window the configured budgets truncate.
+    fn truncated_window() -> tauqe_protocol::review::ReviewPreviewWindow {
+        tauqe_protocol::review::ReviewPreviewWindow {
+            matched_files: 9,
+            selected_files: 4,
+            selected_tokens: 40_000,
+            // Truncation is defined by the shared file token budget alone, so
+            // the fixture sets the counter `is_truncated()` reads (c-3). The
+            // aggregate mirrors it in production.
+            omitted_files: 5,
+            omitted_by_budget: 5,
+            files_token_budget: 60_000,
+            ..Default::default()
+        }
+    }
+
+    /// Confirming the truncation card dispatches the audited launch and consumes
+    /// the consent decision, so the approved window is exactly the projected one
+    /// (c-3).
+    #[tokio::test]
+    async fn truncation_confirm_dispatches_the_projected_launch() {
+        let mut st = crate::app::test_state();
+        st.view_mode = ViewMode::Review;
+        st.confirm_review_truncation = Some(crate::app::ConfirmReviewTruncationState {
+            pending: pending_launch("src/"),
+            window: truncated_window(),
+        });
+        st.confirm_button = ConfirmDialogButton::Confirm;
+
+        let state = Arc::new(Mutex::new(st));
+        let mut conn = RpcConnection::new(Vec::<u8>::new());
+        handle_dialog_event(
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            &state,
+            &mut conn,
+        )
+        .await
+        .expect("in-memory dispatch never fails");
+
+        let payload = String::from_utf8(conn.written().to_vec()).expect("utf-8 payload");
+        assert!(payload.contains("review/start"), "{payload}");
+        assert!(payload.contains("src/"), "{payload}");
+
+        let guard = state.lock().await;
+        assert!(guard.confirm_review_truncation.is_none());
+        assert!(guard.review.running);
+    }
+
+    /// Declining the truncated window sends nothing and returns the launch dialog
+    /// with the fields the developer typed (c-3).
+    #[tokio::test]
+    async fn truncation_cancel_returns_the_launch_dialog_without_a_request() {
+        let mut st = crate::app::test_state();
+        st.view_mode = ViewMode::Review;
+        st.confirm_review_truncation = Some(crate::app::ConfirmReviewTruncationState {
+            pending: pending_launch("src/**/*.rs"),
+            window: truncated_window(),
+        });
+        st.confirm_button = ConfirmDialogButton::Confirm;
+
+        let state = Arc::new(Mutex::new(st));
+        let mut conn = RpcConnection::new(Vec::<u8>::new());
+        handle_dialog_event(
+            KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+            &state,
+            &mut conn,
+        )
+        .await
+        .expect("in-memory dispatch never fails");
+
+        assert!(
+            conn.written().is_empty(),
+            "a declined consent launches nothing"
+        );
+        let guard = state.lock().await;
+        assert!(guard.confirm_review_truncation.is_none());
+        let dialog = guard
+            .review_dialog
+            .as_ref()
+            .expect("the launch dialog returns with its fields");
+        assert_eq!(dialog.path_inputs[0].get_text(), "src/**/*.rs");
+        assert_eq!(guard.active_modal(), Some(ActiveModal::Review));
+    }
+    /// The consent card is presentation over the runtime locale, so every label
+    /// it shows resolves through the catalog and a hot-swapped locale reaches it
+    /// without touching the dialog (c-3, Conventions §9).
+    #[tokio::test]
+    async fn truncation_consent_resolves_its_labels_from_the_catalog() {
+        let mut st = crate::app::test_state();
+        st.view_mode = ViewMode::Review;
+        st.confirm_review_truncation = Some(crate::app::ConfirmReviewTruncationState {
+            pending: pending_launch("src/"),
+            window: truncated_window(),
+        });
+        st.confirm_button = ConfirmDialogButton::Cancel;
+
+        let params = crate::dialogs::render::review_truncation_params(&st)
+            .expect("the pending consent describes its card");
+
+        assert_eq!(
+            params.title,
+            crate::i18n::active_t("review.truncation.title")
+        );
+        assert_eq!(
+            params.confirm_label,
+            crate::i18n::active_t("review.truncation.confirm")
+        );
+        assert_eq!(params.cancel_label, crate::i18n::active_t("modal.cancel"));
+        assert_eq!(params.confirm_button, ConfirmDialogButton::Cancel);
+        assert!(
+            !params.body_lines.is_empty(),
+            "the card states the truncated window"
+        );
+    }
+
+    /// The consent card keeps the shared fast-select vocabulary: `y` confirms
+    /// the narrowed window even while the safe `Cancel` default holds focus.
+    #[tokio::test]
+    async fn truncation_consent_confirms_through_the_yes_accelerator() {
+        let mut st = crate::app::test_state();
+        st.view_mode = ViewMode::Review;
+        st.confirm_review_truncation = Some(crate::app::ConfirmReviewTruncationState {
+            pending: pending_launch("src/**/*.rs"),
+            window: truncated_window(),
+        });
+        st.confirm_button = ConfirmDialogButton::Cancel;
+
+        let state = Arc::new(Mutex::new(st));
+        let mut conn = RpcConnection::new(Vec::<u8>::new());
+        handle_dialog_event(
+            KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE),
+            &state,
+            &mut conn,
+        )
+        .await
+        .expect("in-memory dispatch never fails");
+
+        let payload = String::from_utf8(conn.written().to_vec()).expect("utf-8 payload");
+        assert!(payload.contains("review/start"), "{payload}");
+        assert!(payload.contains("src/**/*.rs"), "{payload}");
+
+        let guard = state.lock().await;
+        assert!(guard.confirm_review_truncation.is_none());
+        assert!(
+            guard.review.running,
+            "the confirmed window starts the audit"
         );
     }
 }

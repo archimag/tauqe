@@ -7,12 +7,17 @@
 
 use std::path::Path;
 
-use tauqe_protocol::{ContextAccess, ContextLayer, EditOperation, EditProposal};
+use tauqe_protocol::{ContextAccess, ContextLayer, EditOperation, EditProposal, ProjectConfig};
 
 use crate::context::ContextManager;
 use crate::git::cmd::run_git;
 use crate::workflow::git_policy::GitTransactionPolicy;
 use crate::workflow::policy::{ApplyPolicy, DirectApplyPolicy};
+
+/// Project configuration the policy tests stage under: no formatter, no hook.
+fn project() -> ProjectConfig {
+    ProjectConfig::default()
+}
 
 /// Initializes a temporary repository with a single tracked file `a.rs`.
 fn init_repo(root: &Path) {
@@ -54,14 +59,17 @@ async fn direct_policy_rollback_and_finalize_are_noops() {
 
     let edits = replace_edit();
     let mut policy = DirectApplyPolicy::new();
-    assert!(policy.staging(root, &cm, &edits, None).await.is_success());
+    assert!(policy
+        .staging(root, &project(), &cm, &edits, None, None)
+        .await
+        .is_success());
 
     let proposal = EditProposal {
         summary: "update a.rs".to_string(),
         edits,
     };
     let changed = policy
-        .apply_temporary(root, &mut cm, &proposal)
+        .apply_temporary(root, &project(), &mut cm, &proposal)
         .await
         .unwrap();
     assert_eq!(changed, vec!["a.rs".to_string()]);
@@ -89,14 +97,17 @@ async fn git_policy_finalize_creates_ai_commit() {
 
     let edits = replace_edit();
     let mut policy = GitTransactionPolicy::new();
-    assert!(policy.staging(root, &cm, &edits, None).await.is_success());
+    assert!(policy
+        .staging(root, &project(), &cm, &edits, None, None)
+        .await
+        .is_success());
 
     let proposal = EditProposal {
         summary: "update a.rs".to_string(),
         edits,
     };
     let changed = policy
-        .apply_temporary(root, &mut cm, &proposal)
+        .apply_temporary(root, &project(), &mut cm, &proposal)
         .await
         .unwrap();
     assert_eq!(changed, vec!["a.rs".to_string()]);
@@ -122,14 +133,17 @@ async fn git_policy_rollback_restores_pre_edit_working_tree() {
 
     let edits = replace_edit();
     let mut policy = GitTransactionPolicy::new();
-    assert!(policy.staging(root, &cm, &edits, None).await.is_success());
+    assert!(policy
+        .staging(root, &project(), &cm, &edits, None, None)
+        .await
+        .is_success());
 
     let proposal = EditProposal {
         summary: "update a.rs".to_string(),
         edits,
     };
     policy
-        .apply_temporary(root, &mut cm, &proposal)
+        .apply_temporary(root, &project(), &mut cm, &proposal)
         .await
         .unwrap();
     assert_eq!(std::fs::read_to_string(root.join("a.rs")).unwrap(), "two\n");
@@ -154,14 +168,17 @@ async fn git_policy_rollback_preserves_uncommitted_developer_work() {
     let mut cm = editable_context(root);
     let edits = replace_edit();
     let mut policy = GitTransactionPolicy::new();
-    assert!(policy.staging(root, &cm, &edits, None).await.is_success());
+    assert!(policy
+        .staging(root, &project(), &cm, &edits, None, None)
+        .await
+        .is_success());
 
     let proposal = EditProposal {
         summary: "update a.rs".to_string(),
         edits,
     };
     policy
-        .apply_temporary(root, &mut cm, &proposal)
+        .apply_temporary(root, &project(), &mut cm, &proposal)
         .await
         .unwrap();
     assert_eq!(std::fs::read_to_string(root.join("a.rs")).unwrap(), "two\n");
@@ -239,14 +256,17 @@ async fn applying_a_change_set_preserves_the_owning_layer_of_every_file() {
     ];
 
     let mut policy = DirectApplyPolicy::new();
-    assert!(policy.staging(root, &cm, &edits, None).await.is_success());
+    assert!(policy
+        .staging(root, &project(), &cm, &edits, None, None)
+        .await
+        .is_success());
 
     let proposal = EditProposal {
         summary: "update both files".to_string(),
         edits,
     };
     let changed = policy
-        .apply_temporary(root, &mut cm, &proposal)
+        .apply_temporary(root, &project(), &mut cm, &proposal)
         .await
         .unwrap();
     assert_eq!(
@@ -281,7 +301,7 @@ async fn creating_a_file_joins_the_auto_layer_and_never_the_user_layer() {
 
     let mut policy = DirectApplyPolicy::new();
     let changed = policy
-        .apply_temporary(root, &mut cm, &proposal)
+        .apply_temporary(root, &project(), &mut cm, &proposal)
         .await
         .unwrap();
     assert_eq!(changed, vec!["generated.rs".to_string()]);
@@ -311,14 +331,17 @@ async fn rolling_back_a_change_set_keeps_the_auto_layer_intact() {
     }];
 
     let mut policy = GitTransactionPolicy::new();
-    assert!(policy.staging(root, &cm, &edits, None).await.is_success());
+    assert!(policy
+        .staging(root, &project(), &cm, &edits, None, None)
+        .await
+        .is_success());
 
     let proposal = EditProposal {
         summary: "failed update".to_string(),
         edits,
     };
     policy
-        .apply_temporary(root, &mut cm, &proposal)
+        .apply_temporary(root, &project(), &mut cm, &proposal)
         .await
         .unwrap();
     assert!(policy.rollback(root).await.unwrap());

@@ -223,6 +223,12 @@ impl TurnInputCache {
     }
 
     /// Returns the effective project configuration frozen at the start of the turn.
+    ///
+    /// The first call reads `tauqe.toml` and, when the project declares a task
+    /// runner, runs the runner's dump once. Every later phase of the turn —
+    /// staging, the declared post-hook, verification, and project commands —
+    /// reads this snapshot through `PhaseContext::project`, so a patch retry or
+    /// a healing round never spawns the runner again.
     pub(super) async fn project(
         &mut self,
         repo_root: &Path,

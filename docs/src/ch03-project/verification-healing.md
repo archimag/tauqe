@@ -50,7 +50,9 @@ deterministically. A transcript can only be truncated.
 9. **Selection narrows work, never the gate.** The project may route the change set
    to cheaper checks, but an empty or unrecognized change set selects the complete
    suite.
-
+10. **A cancelled turn does not wait for its verification.** The wait for the
+    verification subprocess races natural exit against the cancellation channel,
+    and a cancellation kills the process group instead of waiting it out.
 ---
 
 ## 2. Mental Model & Ontology ("What")
@@ -141,6 +143,11 @@ wall-clock budget and stops at its exit status. On Unix the command runs in an
 isolated process group, so a timeout or a cancellation tears down the compiler
 and every binary it spawned.
 
+The wait for that child is a choice between two outcomes rather than a blocking
+read: the process exits on its own, or the turn's cancellation channel fires.
+The cancellation path kills the process group through the same reaper the
+timeout path uses, reaps the child, and returns cancellation instead of a
+verification result, so no verification tree survives an abandoned turn.
 The command also receives the turn's authoritative change set on standard input,
 one repository-relative path per line, so a project dispatcher selects the checks
 the change requires. An empty change set writes nothing and the command runs its
@@ -207,7 +214,7 @@ Two variants keep the loop honest:
 | mandatory verification | the declared lifecycle runs after every change set; no flag turns it off |
 | report mode | a model request chooses only whether a passing run is reported |
 | retry budget | bounds the number of healing rounds (`develop.max_retries`) |
-| cancellation | stops verification and rolls the turn back immediately |
+| cancellation | read at every phase boundary; a cancelled run tears the verification process group down and returns cancellation |
 | blocked outcome | bypasses healing entirely and rolls the tree back |
 
 In an isolated step or a batch, verification is strictly determined by project
@@ -229,7 +236,23 @@ transaction is rolled back and the turn advances one rung of the coder ladder:
 deeper reasoning on the same model first, a stronger coder afterwards,
 saturating on the final rung. Escalation never leaves the coder role; the
 architect role is not a repair mechanism for a compile failure.
+### 3.7 Live phases and authoritative cancellation
 
+A verification can run for minutes, and a turn that reports nothing until its
+last phase is indistinguishable from a hung one. Every phase the bounded turn
+enters reaches the interface as it happens, on a plan or review step exactly as
+on an interactive turn: the turn phase, the toolchain start, and the toolchain
+finish travel out through the same channel and are rendered by the same status
+pipeline. A step batch therefore shows the running phase instead of a screen
+frozen in its waiting state, while the coarse batch events still arrive at the
+end as before.
+
+Cancellation is authoritative, not advisory. The channel is read at every phase
+boundary that starts work — before the check begins, between healing rounds, and
+before the staged result is committed — and a signal at a boundary ends the work
+immediately: no further round starts, the batch unwinds without waiting for the
+check to finish, and a hard stop tears the verification subprocess group down.
+Section 3.1 describes how the wait itself is interrupted.
 ---
 
 ## 4. Boundaries & Anti-Patterns ("What it is NOT")
@@ -238,7 +261,9 @@ architect role is not a repair mechanism for a compile failure.
   from typed records.
 - **It is not unbounded retries.** The loop has a configured budget and a
   saturated terminal state.
-- **It is not a model-controlled verification gate.** With automatic verification
+- **It is not a check that outlives the turn.** A cancellation tears the
+  verification process group down and returns cancellation instead of waiting for
+  the check to finish.- **It is not a model-controlled verification gate.** With automatic verification
   enabled, the target comes from configuration.
 - **It is not a linter replacement.** It consumes findings; it does not decide
   which rules a project should enforce.

@@ -1,8 +1,6 @@
 use crate::context::ContextFileContent;
 use crate::escape::{escape_xml_attr, escape_xml_text, single_line};
 use tauqe_protocol::review::ReviewSession;
-use tauqe_protocol::PlanItem;
-
 pub const REVIEW_DISCUSSION_PREFIX: &str = "# Review Discussion:";
 
 /// Formats a targeted prompt for discussing and analyzing review findings in Structured Output mode.
@@ -133,10 +131,6 @@ pub fn format_review_discussion_prompt_items(
                         ));
                     }
                 }
-                if !issue.plan.is_empty() {
-                    out.push_str("  Decomposition Plan:\n");
-                    render_plan_discussion(&mut out, &issue.plan, 0);
-                }
             }
         }
         out.push('\n');
@@ -156,23 +150,6 @@ pub fn format_review_discussion_prompt_items(
     out.push_str("5. If you need to inspect related files to verify your hypothesis, specify them in the `context_requests` array with `access: \"read_only\"`.\n");
 
     out
-}
-
-/// Renders a finding's decomposition plan as an indented outline.
-fn render_plan_discussion(out: &mut String, items: &[PlanItem], depth: usize) {
-    let indent = "  ".repeat(depth + 2);
-    for sub in items {
-        out.push_str(&format!(
-            "{}- #{}: {} ({})\n",
-            indent,
-            sub.id,
-            escape_xml_text(&sub.title),
-            sub.status
-        ));
-        if !sub.children.is_empty() {
-            render_plan_discussion(out, &sub.children, depth + 1);
-        }
-    }
 }
 
 /// Builds the system prompt for the isolated code review session.

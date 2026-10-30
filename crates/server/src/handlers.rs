@@ -20,7 +20,7 @@ use tauqe_protocol::{
     errors, methods, InitializeResult, Request, RequestId, Response, PROTOCOL_VERSION,
 };
 
-use crate::state::AppState;
+use crate::state::{AppState, OperationGuard};
 
 pub async fn handle_request(req: Request, state: &Arc<AppState>) -> Response {
     match req.method.as_str() {
@@ -59,13 +59,13 @@ pub async fn handle_request(req: Request, state: &Arc<AppState>) -> Response {
         methods::LOCALE_GENERATE => locale::handle_locale_generate(req, state).await,
 
         methods::REVIEW_START => review::handle_review_start(req, state).await,
+        methods::REVIEW_PREVIEW => review::handle_review_preview(req, state).await,
         methods::REVIEW_CANCEL => review::handle_review_cancel(req, state).await,
         methods::REVIEW_LIST => review::handle_review_list(req, state).await,
         methods::REVIEW_GET => review::handle_review_get(req, state).await,
         methods::REVIEW_UPDATE_ITEM => review::handle_review_update_item(req, state).await,
         methods::REVIEW_DELETE => review::handle_review_delete(req, state).await,
         methods::REVIEW_EXECUTE => review::handle_review_execute(req, state).await,
-        methods::REVIEW_REFINE_ITEM => review::handle_review_refine_item(req, state).await,
         methods::REVIEW_ANALYZE => review::handle_review_analyze(req, state).await,
 
         methods::PLAN_LIST => plan::handle_plan_list(req, state).await,
@@ -98,14 +98,25 @@ pub async fn handle_request(req: Request, state: &Arc<AppState>) -> Response {
     }
 }
 
-/// Rejects a state-mutating request while a turn, plan batch, or review batch
-/// is active.
+/// Exclusion policy for state-mutating RPCs.
 ///
-/// A running operation holds a clone of the context and history and writes them
-/// back when it finishes, and plan and review batches read and write their
-/// on-disk records directly. A mutation applied in between would be overwritten
-/// or would race the operation's own writes, so mutations are refused for the
-/// duration of the operation instead of being silently lost.
+/// Two shapes exist, and every mutating handler declares which one it uses:
+///
+/// - **Slot-owning** ([`begin_exclusive_operation`]): the handler keeps the
+///   operation slot for the whole mutation. Rebinding a manager set
+///   (`client/initialize`, `repository/init`), rewriting commit history
+///   (`git/squashPreview`, `git/squashApply`), replacing the shared
+///   configuration (`config/set`, `config/reload`, `config/create`,
+///   `credentials/save`, `credentials/create_stub`), and the model operations
+///   themselves all belong here.
+/// - **Slot-observing** ([`reject_if_operation_active`]): the handler performs
+///   one bounded write on a record that is re-read from disk before the write
+///   (`plan/updateItem`, `review/updateItem`, the focus requests), so a turn
+///   running concurrently cannot lose the mutation.
+///
+/// The distinction matters because a bare `is_operation_active()` observation
+/// is not mutual exclusion: a request that registers an operation between the
+/// check and the mutation runs concurrently with it.
 pub(crate) fn reject_if_operation_active(
     req_id: &RequestId,
     state: &Arc<AppState>,
@@ -120,6 +131,29 @@ pub(crate) fn reject_if_operation_active(
     } else {
         None
     }
+}
+
+/// Claims the operation slot for a state-mutating request.
+///
+/// The returned [`OperationGuard`] owns the registration, so the whole mutation
+/// — a configuration rebind, a Git history rewrite, a repository
+/// re-initialization — is mutually exclusive with any concurrently starting
+/// turn or batch instead of merely observing that none was running at the
+/// first instruction. The guard clears the slot on drop, so every early return
+/// path of the handler releases it.
+///
+/// The failure keeps the established wire contract: a request arriving while
+/// another operation runs is answered with `OPERATION_IN_PROGRESS` and the
+/// handler-specific `message`.
+pub(crate) fn begin_exclusive_operation(
+    req_id: &RequestId,
+    state: &Arc<AppState>,
+    message: &str,
+) -> Result<OperationGuard, Box<Response>> {
+    state.try_begin_operation().map_err(|()| {
+        let refusal = Response::err(req_id.clone(), errors::OPERATION_IN_PROGRESS, message);
+        Box::new(refusal)
+    })
 }
 
 /// Executes a blocking closure on the Tokio blocking pool.
@@ -200,17 +234,15 @@ pub(crate) async fn run_preflight_verification(repo_root: &Path) -> Result<(), S
         return Ok(());
     }
 
-    let mut report = String::new();
+    let mut failed_commands = Vec::new();
     for result in results.iter().filter(|r| !r.success) {
-        report.push_str(&format!(
-            "Command `{}` failed:\n```\n{}\n```\n\n",
-            result.command,
-            result.combined_output.trim()
-        ));
+        failed_commands.push(format!("`{}`", result.command));
     }
-    if report.trim().is_empty() {
-        report = "Pre-flight verification failed without diagnostic output.".to_string();
-    }
+    let report = if failed_commands.is_empty() {
+        "Pre-flight verification failed without diagnostic output.".to_string()
+    } else {
+        format!("Command {} failed.", failed_commands.join(", "))
+    };
     Err(report)
 }
 
@@ -219,7 +251,9 @@ pub(crate) async fn run_preflight_verification(repo_root: &Path) -> Result<(), S
 ///
 /// `client/initialize` and `repository/init` both resolve the authoritative
 /// repository root and then must rebind every long-lived manager to it. The
-/// sequence lives here once so the two entry points cannot drift apart.
+/// sequence lives here once so the two entry points cannot drift apart. Both
+/// call it while owning the operation slot, so a rebind can never interleave
+/// with a turn or batch that registered concurrently.
 ///
 /// Each step takes its own short-lived guard: no guard is ever held across
 /// another subsystem's `.await`. Rebuilding the history manager rereads the
@@ -276,16 +310,18 @@ pub(crate) async fn rebind_to_repository(state: &Arc<AppState>, repo_path: &Path
 }
 
 async fn handle_client_initialize(req: Request, state: &Arc<AppState>) -> Response {
-    // Re-initialization rebinds the config, context, and history; refuse it
-    // while a turn or batch is running so the running operation's frozen
-    // snapshot is not overwritten underneath it.
-    if let Some(resp) = reject_if_operation_active(
+    // Re-initialization rebinds the config, context, usage lifetime, and
+    // history, so it claims the operation slot instead of sampling it: a turn
+    // registering right after a plain check would have every one of those
+    // managers swapped underneath it.
+    let _operation = match begin_exclusive_operation(
         &req.id,
         state,
         "Cannot re-initialize the repository while a model operation is in progress",
     ) {
-        return resp;
-    }
+        Ok(guard) => guard,
+        Err(resp) => return *resp,
+    };
 
     // Reading the repository state shells out to git, so it is offloaded and
     // resolved from the authoritative shared root instead of the process CWD.
@@ -436,6 +472,88 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         assert!(result.is_ok(), "got: {:?}", result.err());
     }
+    /// Re-initialization rebinds the configuration, context, usage lifetime,
+    /// and history of a live daemon, so it must own the operation slot instead
+    /// of sampling it once: a turn registering right after a plain check would
+    /// have every one of those managers swapped underneath it.
+    #[tokio::test]
+    async fn test_client_initialize_is_refused_while_an_operation_is_registered() {
+        let dir = std::env::temp_dir().join(format!(
+            "tauqe-test-initialize-exclusive-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        let _ = std::fs::create_dir_all(&dir);
+        tauqe_core::git::init_repository(Some(&dir), true).unwrap();
+
+        let (out, _rx) = OutChannel::new();
+        let (hist_tx, _hist_rx) = tokio::sync::mpsc::unbounded_channel();
+        let state = AppState::new(
+            tauqe_core::config::AppConfig::default(),
+            dir.clone(),
+            hist_tx,
+            out,
+        );
+
+        state
+            .mutate_history(|history| {
+                history
+                    .record_turn("In-flight prompt".to_string(), Vec::new())
+                    .map(|_| ())
+            })
+            .await
+            .expect("recording the turn runs on the blocking pool")
+            .expect("the turn record must persist");
+        let recorded = state
+            .history
+            .lock()
+            .await
+            .get_entries()
+            .expect("history reads back")
+            .len();
+        assert!(recorded > 0, "the turn record must be persisted");
+
+        let operation = state.try_begin_operation().expect("operation slot is free");
+
+        let req = Request {
+            id: RequestId::Number(9),
+            method: methods::CLIENT_INITIALIZE.to_string(),
+            params: None,
+        };
+        let resp = handle_request(req, &state).await;
+        assert_eq!(resp.id, RequestId::Number(9));
+        assert_eq!(
+            resp.error.expect("re-initialization must be refused").code,
+            errors::OPERATION_IN_PROGRESS
+        );
+
+        assert!(
+            state.is_operation_active(),
+            "the running operation must keep owning the slot"
+        );
+        assert_eq!(
+            state
+                .history
+                .lock()
+                .await
+                .get_entries()
+                .expect("history reads back")
+                .len(),
+            recorded,
+            "the running turn's recorded history must survive the refused rebind"
+        );
+
+        drop(operation);
+        assert!(
+            !state.is_operation_active(),
+            "releasing the guard must free the slot"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// `review/analyze` is wired into the dispatcher: an unresolvable session is
     /// answered with the review error code instead of `METHOD_NOT_FOUND`.
     #[tokio::test]

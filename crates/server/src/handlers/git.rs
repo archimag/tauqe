@@ -17,6 +17,34 @@ enum SquashApplyError {
     Squash(anyhow::Error),
 }
 
+/// The rejection message shared by every endpoint that accepts a `base_ref`.
+const INVALID_REVISION: &str =
+    "Invalid base_ref: expected a non-empty revision not starting with '-'";
+
+/// Trims and validates a client-supplied Git revision.
+///
+/// Git parses an argument that begins with `-` as an option rather than as a
+/// revision, so a client-controlled `base_ref` such as `--output=<path>` or
+/// `-x` would be forwarded by `git log`, `git diff`, and `git reset --soft` as
+/// an option: argument injection into the Git invocation, carrying whatever
+/// side effects the reachable options permit, instead of a plain
+/// invalid-revision failure.
+///
+/// The core Git layer provides no conforming revision check the daemon could
+/// rely on instead (Conventions §1.6): `crates/core/src/git/diff.rs` builds its
+/// revision ranges with `format!("{base_ref}..HEAD")` and hands the value to
+/// `git reset --soft` verbatim. The boundary that accepts the untrusted string
+/// is therefore the only place the rule can live, and every handler that takes
+/// a `base_ref` off the wire routes through this single gate, so the same input
+/// is refused identically on all of them.
+fn validate_revision(base_ref: &str) -> Result<String, &'static str> {
+    let trimmed = base_ref.trim();
+    if trimmed.is_empty() || trimmed.starts_with('-') {
+        return Err(INVALID_REVISION);
+    }
+    Ok(trimmed.to_string())
+}
+
 pub async fn handle_repository_get_state(req: Request, state: &Arc<AppState>) -> Response {
     let repo_root = state.repo_root().await;
     match super::offload(move || tauqe_core::git::get_repository_state(Some(repo_root.as_path())))
@@ -28,13 +56,17 @@ pub async fn handle_repository_get_state(req: Request, state: &Arc<AppState>) ->
 }
 
 pub async fn handle_repository_init(req: Request, state: &Arc<AppState>) -> Response {
-    if let Some(resp) = super::reject_if_operation_active(
+    // Initialization rebinds every long-lived manager to the new root, so the
+    // slot is claimed rather than sampled: a turn registering right after a
+    // plain check would run against a context root that moved underneath it.
+    let _operation = match super::begin_exclusive_operation(
         &req.id,
         state,
         "Cannot initialize a repository while a model operation is in progress",
     ) {
-        return resp;
-    }
+        Ok(guard) => guard,
+        Err(resp) => return *resp,
+    };
 
     let params: tauqe_protocol::RepositoryInitParams = req
         .params
@@ -103,22 +135,34 @@ pub async fn handle_git_get_diff(req: Request, state: &Arc<AppState>) -> Respons
 }
 
 pub async fn handle_git_squash_preview(req: Request, state: &Arc<AppState>) -> Response {
-    if state.is_operation_active() {
-        return Response::err(
-            req.id,
-            errors::OPERATION_IN_PROGRESS,
-            "Cannot squash commits while a model operation is in progress",
-        );
-    }
+    // The preview reads the commit list and the cumulative diff a running turn
+    // may be rewriting, so the slot is claimed for the whole read: a torn
+    // preview would report a squash scope that never existed.
+    let _operation = match super::begin_exclusive_operation(
+        &req.id,
+        state,
+        "Cannot squash commits while a model operation is in progress",
+    ) {
+        Ok(guard) => guard,
+        Err(resp) => return *resp,
+    };
 
     let params: Option<tauqe_protocol::GitSquashPreviewParams> =
         req.params.and_then(|p| serde_json::from_value(p).ok());
 
     let repo_root = state.repo_root().await;
     let configured_upstream = state.config.lock().await.config.git.upstream.clone();
-    let requested_base = params
-        .and_then(|p| p.base_ref)
-        .filter(|b| !b.trim().is_empty());
+    // An absent base keeps its meaning: the base is resolved from the session
+    // and upstream state below. A supplied one must pass the shared revision
+    // gate, so identical input is refused identically on every squash endpoint
+    // before any Git plumbing runs.
+    let requested_base = match params.and_then(|p| p.base_ref) {
+        Some(raw) => match validate_revision(&raw) {
+            Ok(revision) => Some(revision),
+            Err(message) => return Response::err(req.id, errors::INVALID_PARAMS, message),
+        },
+        None => None,
+    };
 
     let preview = super::offload(move || {
         let session_base =
@@ -191,8 +235,14 @@ pub async fn handle_git_squash_generate_message(req: Request, state: &Arc<AppSta
             }
         };
 
+    // The revision is gated before it reaches any Git plumbing, so an
+    // option-shaped value is never forwarded to `git log` or `git diff`.
+    let base_ref = match validate_revision(&params.base_ref) {
+        Ok(revision) => revision,
+        Err(message) => return Response::err(req.id, errors::INVALID_PARAMS, message),
+    };
+
     let repo_root = state.repo_root().await;
-    let base_ref = params.base_ref.clone();
 
     let git_data = super::offload(move || {
         let commits = tauqe_core::git::get_commits_ahead(repo_root.as_path(), &base_ref);
@@ -452,13 +502,17 @@ async fn close_squash_usage(
 }
 
 pub async fn handle_git_squash_apply(req: Request, state: &Arc<AppState>) -> Response {
-    if state.is_operation_active() {
-        return Response::err(
-            req.id,
-            errors::OPERATION_IN_PROGRESS,
-            "Cannot squash commits while a model operation is in progress",
-        );
-    }
+    // Squashing rewrites HEAD, so the slot is claimed for the whole rewrite: a
+    // turn that may hold an open Git transaction or be committing session work
+    // must never run concurrently with it.
+    let _operation = match super::begin_exclusive_operation(
+        &req.id,
+        state,
+        "Cannot squash commits while a model operation is in progress",
+    ) {
+        Ok(guard) => guard,
+        Err(resp) => return *resp,
+    };
 
     let params: tauqe_protocol::GitSquashApplyParams =
         match req.params.and_then(|p| serde_json::from_value(p).ok()) {
@@ -482,17 +536,14 @@ pub async fn handle_git_squash_apply(req: Request, state: &Arc<AppState>) -> Res
             "Commit message cannot be empty",
         );
     }
-    let trimmed_base_ref = params.base_ref.trim();
-    if trimmed_base_ref.is_empty() || trimmed_base_ref.starts_with('-') {
-        return Response::err(
-            req.id,
-            errors::INVALID_PARAMS,
-            "Invalid base_ref: expected a non-empty revision not starting with '-'",
-        );
-    }
+    // The revision is gated before any Git mutation: an option-shaped value
+    // would be forwarded to `git reset --soft` as an option, not a revision.
+    let base_ref = match validate_revision(&params.base_ref) {
+        Ok(revision) => revision,
+        Err(message) => return Response::err(req.id, errors::INVALID_PARAMS, message),
+    };
 
     let repo_root = state.repo_root().await;
-    let base_ref = trimmed_base_ref.to_string();
     let message = params.message.clone();
 
     let applied = super::offload(move || {
@@ -760,5 +811,151 @@ mod tests {
         assert!(snapshot.prev.is_empty());
         assert!(snapshot.cur.is_none());
         assert!(!state.is_operation_active());
+    }
+    /// Squashing rewrites HEAD, so it must own the operation slot rather than
+    /// sample it once: a turn registering right after a plain check would be
+    /// committing against history this handler is rewriting.
+    #[tokio::test]
+    async fn squash_apply_is_refused_while_an_operation_is_registered() {
+        let repo = SquashTestRepo::new();
+        let root = repo.path().to_path_buf();
+
+        let (out, _rx) = crate::transport::OutChannel::new();
+        let (history_sender, _history_rx) = tokio::sync::mpsc::unbounded_channel();
+        let state = AppState::new(AppConfig::default(), root.clone(), history_sender, out);
+        let operation = state.try_begin_operation().expect("the slot is free");
+        let head_before = tauqe_core::git::get_repository_state(Some(&root)).head;
+
+        let req = Request {
+            id: RequestId::Number(5),
+            method: methods::GIT_SQUASH_APPLY.to_string(),
+            params: Some(serde_json::json!({
+                "base_ref": "HEAD",
+                "message": "squashed while a turn was running",
+            })),
+        };
+        let resp = handle_git_squash_apply(req, &state).await;
+        assert_eq!(
+            resp.error.expect("the squash must be refused").code,
+            errors::OPERATION_IN_PROGRESS
+        );
+
+        assert_eq!(
+            tauqe_core::git::get_repository_state(Some(&root)).head,
+            head_before,
+            "a refused squash must leave HEAD untouched"
+        );
+        assert!(
+            state.is_operation_active(),
+            "the running operation must keep owning the slot"
+        );
+
+        drop(operation);
+        assert!(!state.is_operation_active());
+    }
+
+    /// Builds one squash request carrying the given `base_ref`.
+    fn squash_base_request(method: &str, base_ref: &str) -> Request {
+        Request {
+            id: RequestId::Number(11),
+            method: method.to_string(),
+            params: Some(serde_json::json!({
+                "base_ref": base_ref,
+                "message": "squashed",
+            })),
+        }
+    }
+
+    /// Asserts that a squash endpoint refused the request as invalid input.
+    fn assert_invalid_params(resp: Response, base_ref: &str) {
+        let error = resp
+            .error
+            .unwrap_or_else(|| panic!("the endpoint accepted the base_ref {base_ref:?}"));
+        assert_eq!(error.code, errors::INVALID_PARAMS, "{base_ref:?}");
+    }
+
+    /// An option-shaped `base_ref` is refused identically on every squash
+    /// endpoint, before any Git plumbing runs.
+    ///
+    /// `--output=<path>` is the sharpest probe: reaching `git log` or
+    /// `git diff` as an option would create the named file, so its absence
+    /// proves the value never left the shared gate.
+    #[tokio::test]
+    async fn option_shaped_base_ref_is_refused_on_every_squash_endpoint() {
+        let repo = SquashTestRepo::new();
+        let root = repo.path().to_path_buf();
+        let probe = root.join("injected-output.txt");
+
+        let (out, _rx) = crate::transport::OutChannel::new();
+        let (history_sender, _history_rx) = tokio::sync::mpsc::unbounded_channel();
+        let state = AppState::new(AppConfig::default(), root, history_sender, out);
+
+        let output_option = format!("--output={}", probe.display());
+        for base_ref in [output_option.as_str(), "-x"] {
+            let preview = handle_git_squash_preview(
+                squash_base_request(methods::GIT_SQUASH_PREVIEW, base_ref),
+                &state,
+            )
+            .await;
+            assert_invalid_params(preview, base_ref);
+
+            let generated = handle_git_squash_generate_message(
+                squash_base_request(methods::GIT_SQUASH_GENERATE_MESSAGE, base_ref),
+                &state,
+            )
+            .await;
+            assert_invalid_params(generated, base_ref);
+
+            let applied = handle_git_squash_apply(
+                squash_base_request(methods::GIT_SQUASH_APPLY, base_ref),
+                &state,
+            )
+            .await;
+            assert_invalid_params(applied, base_ref);
+        }
+
+        assert!(
+            !probe.exists(),
+            "an option-shaped base_ref must never reach git"
+        );
+        assert!(
+            !state.is_operation_active(),
+            "a refused call must release the operation slot"
+        );
+    }
+
+    /// A supplied but empty revision is refused as well, while an absent
+    /// optional base of the preview keeps its automatic meaning.
+    #[tokio::test]
+    async fn blank_base_ref_is_refused_on_every_squash_endpoint() {
+        let repo = SquashTestRepo::new();
+        let root = repo.path().to_path_buf();
+
+        let (out, _rx) = crate::transport::OutChannel::new();
+        let (history_sender, _history_rx) = tokio::sync::mpsc::unbounded_channel();
+        let state = AppState::new(AppConfig::default(), root, history_sender, out);
+
+        for base_ref in ["", "   "] {
+            let preview = handle_git_squash_preview(
+                squash_base_request(methods::GIT_SQUASH_PREVIEW, base_ref),
+                &state,
+            )
+            .await;
+            assert_invalid_params(preview, base_ref);
+
+            let generated = handle_git_squash_generate_message(
+                squash_base_request(methods::GIT_SQUASH_GENERATE_MESSAGE, base_ref),
+                &state,
+            )
+            .await;
+            assert_invalid_params(generated, base_ref);
+
+            let applied = handle_git_squash_apply(
+                squash_base_request(methods::GIT_SQUASH_APPLY, base_ref),
+                &state,
+            )
+            .await;
+            assert_invalid_params(applied, base_ref);
+        }
     }
 }

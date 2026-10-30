@@ -45,11 +45,17 @@ const TOKEN_METRIC_KEYS: &[&str] = &[
     "tokencounts",
 ];
 
+/// Reports whether a JSON object key names a metric whose numeric value is
+/// allowed to stay readable in observability output.
+///
+/// The exemption is keyed on the name only. Whether the bound value may pass
+/// through unredacted is decided separately, because the allowlist exists for
+/// usage counters and must never become a hole through which a string secret
+/// travels.
 fn is_token_metric_key(normalized: &str) -> bool {
     TOKEN_METRIC_KEYS.contains(&normalized)
 }
-
-/// Reports whether a JSON object key names a secret and must be redacted.
+/// Reports whether a JSON object key names a credential field.
 ///
 /// Matching is tolerant of case and separator differences — `api_key`,
 /// `api-key`, `apiKey`, and `openrouter_api_key` all collapse to the same
@@ -57,18 +63,13 @@ fn is_token_metric_key(normalized: &str) -> bool {
 /// fixed whitelist of exact names, so variants such as `access_token`,
 /// `refresh_token`, `client_secret`, `authorization`, and `bearer` cannot slip
 /// through in plaintext.
+///
+/// Usage counters such as `prompt_tokens` or `estimated_tokens` belong to the
+/// same `token` family, so a key name alone never exempts them. The exemption
+/// lives in `redact_sensitive_json`, which applies it only after the bound
+/// value turns out to be a numeric counter.
 fn is_sensitive_key(key: &str) -> bool {
-    // Strip non-alphanumerics so `api_key`, `api-key`, and `apikey` normalize
-    // identically before the suffix and substring tests below.
-    let normalized: String = key
-        .chars()
-        .filter(char::is_ascii_alphanumeric)
-        .map(|c| c.to_ascii_lowercase())
-        .collect();
-
-    if is_token_metric_key(&normalized) {
-        return false;
-    }
+    let normalized = normalize_key(key);
 
     normalized.ends_with("key")
         || normalized.ends_with("keys")
@@ -80,12 +81,29 @@ fn is_sensitive_key(key: &str) -> bool {
         || normalized.contains("bearer")
 }
 
+/// Normalizes a JSON object key into its comparison form.
+///
+/// Non-alphanumeric separators are stripped and ASCII letters are lowercased,
+/// so `api_key`, `api-key`, and `apiKey` collapse to the same string.
+fn normalize_key(key: &str) -> String {
+    key.chars()
+        .filter(char::is_ascii_alphanumeric)
+        .map(|c| c.to_ascii_lowercase())
+        .collect()
+}
+
 fn redact_sensitive_json(value: &serde_json::Value, sensitive_context: bool) -> serde_json::Value {
     match value {
         serde_json::Value::Object(map) => {
             let mut sanitized = serde_json::Map::with_capacity(map.len());
             for (k, v) in map {
-                if sensitive_context || is_sensitive_key(k) {
+                // A metric key exempts only a numeric counter. A string, array,
+                // or object bound to the same key is not a usage measurement and
+                // falls through to the ordinary sensitivity tests, so a secret
+                // cannot ride in under an allowlisted name.
+                let metric_exempt = is_token_metric_key(&normalize_key(k))
+                    && matches!(v, serde_json::Value::Number(_));
+                if sensitive_context || (is_sensitive_key(k) && !metric_exempt) {
                     if v.is_object() || v.is_array() {
                         sanitized.insert(k.clone(), redact_sensitive_json(v, true));
                     } else {
@@ -644,13 +662,19 @@ mod tests {
             assert!(is_sensitive_key(key), "{key} must be treated as sensitive");
         }
 
+        for key in ["path", "method", "model", "name", "keyword", "count"] {
+            assert!(
+                !is_sensitive_key(key),
+                "{key} must not be treated as sensitive"
+            );
+        }
+
+        // Usage metric names sit inside the `token` credential family, so
+        // name-level matching marks them sensitive. They escape redaction only
+        // through the value-level exemption in `redact_sensitive_json`, which
+        // requires a numeric counter.
         for key in [
-            "path",
-            "method",
-            "model",
-            "name",
-            "keyword",
-            "count",
+            "tokens",
             "prompt_tokens",
             "completion_tokens",
             "total_tokens",
@@ -658,11 +682,14 @@ mod tests {
             "cached_tokens",
             "estimated_tokens",
             "added_tokens",
-            "tokens",
         ] {
             assert!(
-                !is_sensitive_key(key),
-                "{key} must not be treated as sensitive"
+                is_token_metric_key(&normalize_key(key)),
+                "{key} must stay on the metric allowlist"
+            );
+            assert!(
+                is_sensitive_key(key),
+                "{key} must match the token credential family"
             );
         }
     }
@@ -781,9 +808,54 @@ mod tests {
         }
         assert!(rendered.contains("<redacted>"));
 
-        // An allowlisted usage metric stays visible so the journal remains
-        // analytically useful.
+        // An allowlisted usage metric stays visible only while it binds a
+        // numeric counter.
         assert!(rendered.contains("2048"));
         assert!(rendered.contains("estimated_tokens"));
+    }
+
+    #[test]
+    fn test_debug_redacts_non_numeric_values_under_metric_keys() {
+        let req = Request {
+            id: RequestId::Number(7),
+            method: "custom/echo".to_string(),
+            params: Some(serde_json::json!({
+                "tokens": "sk-live-string-secret",
+                "estimated_tokens": ["sk-live-array-secret"],
+                "prompt_tokens": {"value": "sk-live-object-secret"},
+                "total_tokens": 4096
+            })),
+        };
+
+        let rendered = format!("{req:?}");
+        for secret in [
+            "sk-live-string-secret",
+            "sk-live-array-secret",
+            "sk-live-object-secret",
+        ] {
+            assert!(!rendered.contains(secret), "{secret} leaked into Debug");
+        }
+        assert!(rendered.contains("<redacted>"));
+
+        // The same key with a numeric counter keeps its value readable, so the
+        // exemption stays useful for usage metrics.
+        assert!(rendered.contains("4096"));
+        assert!(rendered.contains("total_tokens"));
+    }
+
+    #[test]
+    fn test_debug_redacts_non_numeric_values_under_metric_keys_in_event() {
+        let event = Event {
+            method: "model/usage".to_string(),
+            params: Some(serde_json::json!({
+                "tokens": "sk-live-event-secret",
+                "completion_tokens": 45
+            })),
+        };
+
+        let rendered = format!("{event:?}");
+        assert!(!rendered.contains("sk-live-event-secret"));
+        assert!(rendered.contains("<redacted>"));
+        assert!(rendered.contains("45"));
     }
 }

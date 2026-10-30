@@ -48,9 +48,9 @@ contacts a provider.
 9. **The terminal is restored on every exit path**, including panics and signals.
 10. **Auxiliary views never print shortcut banners.** The Help dialog is the single
     discovery surface.
-11. **A patch is never blind.** While the Viewport reads a diff, a sticky band
-    names the file, its operation, and the active hunk, and the whole change set
-    opens as one isolated card on the inspector chord.
+11. **A patch is never blind.** Every staged file keeps one summary row — its
+    operation, path, patch count, and verification mark — and the whole change
+    set opens as one isolated two-pane card on the inspector chord.
 
 ---
 
@@ -73,8 +73,8 @@ modifier (`M-1` … `M-5`), so a terminal without a dedicated Meta key still rea
 every view.
 
 Ancillary surfaces are reached without leaving a view: model selection on `C-M` /
-`M-M`, the theme selector on `M-T`, the interface-language dialog on `M-L`, and the
-usage breakdown on `M-U`.
+`M-M`, the theme selector on `M-T`, the interface-language dialog on `M-L`, the
+usage breakdown on `M-U`, and the diff inspector on `C-V` / `M-V`.
 
 **Model selection is one component, not five.** The picker on `C-M` / `M-M` and the
 four dialogs that choose a model for a role — the review launcher, the plan refinement
@@ -111,10 +111,13 @@ paragraph:
   transcript is held in a rolling window with a hard cap (128 KiB); the cut lands on a
   Unicode boundary and the line counter stays monotonic, so a long turn never appears
   to shrink.
-- **File diffs** are the turn's proposed changes, folded per file, with the active file
-  marked by a cursor. The proposed-edits area belongs to the *current* step: when a
-  batch advances, the previous step's files are already committed and leave the working
-  area.
+- **The proposed change set** is a compact list: one summary row per staged file,
+  carrying its operation badge, path, patch count, and verification mark, with the
+  selected file under a cursor. The canvas never inlines a patch body, so an answer
+  and its diffs read as one dense document instead of an interleaved scroll; the
+  full patch is one chord away in the inspector. The list belongs to the *current*
+  step: when a batch advances, the previous step's files are already committed and
+  leave the working area.
 - **The plan stepper** appears only when the turn carries plan-step metadata: a title
   and one title-only row per step in scope. It never expands diffs or concept nodes,
   and an ad-hoc turn renders without it.
@@ -127,27 +130,30 @@ mean different things in a text buffer and in a diff list.
 - **Editor focus (default).** Every printable character is inserted; Emacs and Readline
   chords move the cursor, kill, and yank; prompt history cycles with the configured
   meta chords.
-- **Viewport focus.** `Ctrl+N` / `Ctrl+P` and the arrows move the reading position. Inside
-  an expanded file they scroll its diff body line by line, and the selection crosses into
-  the next or previous file only once the block boundary is reached: the next file opens
-  at its summary row, the previous one at its last diff line. A collapsed file is crossed
-  in one keystroke, the explicit `Ctrl+[` / `Ctrl+]` chords switch files directly, and
-  with no files at all the keys scroll the response. The fold chords fold a diff. While
-  the viewport holds focus, the prompt border is dimmed and titled `[VIEWPORT]`.
-- **The sticky anchor.** While the reading position sits inside the diff body of
-  an expanded file, the first row of the response names what is being read: the
-  operation badge, the path, the active hunk (`Hunk 2/3`), and the position of
-  the file in the staged set (`File 2/5`). The band appears only once the file's
-  own summary row has scrolled out of view, so a header that is still visible is
-  never duplicated, and it is a pure indicator: it registers no click target and
-  intercepts no key.
-- **The diff inspector.** `Enter` on the selected file, or the bare `v` chord,
-  opens a fullscreen audit of the change set: the audited files on the left with
-  their operation and verification badges, the isolated diff of the highlighted
-  file on the right with a line-number gutter and its own scroll offset. `n` / `p`
-  walk the files, `j` / `k` and the arrows scroll the patch, `PgUp` / `PgDn` page
-  it, and `Esc` or `q` closes the card and returns to the reading position it was
-  opened from. The inspector never mutates the staged set and never starts a turn.
+- **Viewport focus.** `Ctrl+N` / `Ctrl+P` and the arrows walk the compact list of
+  staged files, one summary row per file, and the viewport follows the selection;
+  once the selection sits at the edge of the list the same chord scrolls the
+  response instead. The explicit `Ctrl+[` / `Ctrl+]` chords switch files directly
+  and `Ctrl+L` recenters on the selected row. While the viewport holds focus, the
+  prompt border is dimmed and titled `[VIEWPORT]`.
+- **The diff inspector.** `Ctrl+V` / `Alt+V` — the symmetric command chord — opens a
+  fullscreen audit of the change set from the prompt *and* from the Viewport, so
+  reaching it never requires the focus switch first. In the Viewport, `Enter` on the
+  selected file and the bare `v` chord open the same card. The audited files sit on
+  the left with their operation and verification badges, and the isolated diff of
+  the highlighted file on the right with a line-number gutter and its own scroll
+  offset. `Tab` and `Shift+Tab` switch the active pane, whose border carries the
+  accent; `↑` / `↓` and `n` / `p` then move the file highlight in the list or scroll
+  the patch in the read area, `j` / `k` scroll the patch from either pane, `[` / `]`
+  switch files at any time, `PgUp` / `PgDn` page the patch, and `Esc` or `q` closes
+  the card and returns to the reading position it was opened from. The card reads the
+  live staged set: a file that arrives mid-audit appears, its patch count and status
+  update in place, and the file the stream currently writes carries the animated
+  spinner beside its `[RUN]` badge. The inspector never mutates the staged set and
+  never starts a turn.
+- **One body, one place.** The canvas draws no patch line at all: a patch is read in
+  the inspector, and the Viewport keeps the answer, the reasoning transcript, and the
+  compact file list intact.
 - **Switching.** `Ctrl+Space` or `Shift+Tab` toggles focus and `Esc` returns to the
   prompt. Any key that types or edits text returns focus to the prompt and is applied
   there, so no keystroke is lost.
@@ -251,11 +257,15 @@ dropped, the summary takes the first row, and the preserved tail keeps its order
 
 Three stores back this view and the REPL, and they stay separate: the session journal
 (`.tauqe/history.jsonl`) is the model's dialogue memory, the History view adds the
-running and the discarded records, and the prompt recall list
-(`.tauqe/prompts.history`) holds only what the developer typed. The recall list is
-resolved from the nearest ancestor holding `.tauqe` or `.git`, is written atomically
-with owner-only permissions, and is capped, so a long session neither scatters the
-file across directories nor leaves it world-readable.
+running and the discarded records, and the prompt recall list holds only what the
+developer typed. The recall list lives in the per-user state directory —
+`$XDG_STATE_HOME/tauqe/prompts.history`, falling back to
+`$HOME/.local/state/tauqe/prompts.history` — and never inside a checkout. A prompt may
+embed a key, an internal hostname, or a fragment of production data, and file
+permissions do not protect a file from version control, so the placement itself is the
+guarantee: a working tree cannot stage what it never receives. The file is written
+atomically with owner-only permissions and is capped, and when the environment declares
+no usable state directory the session keeps its prompts in memory only.
 
 ---
 
@@ -406,52 +416,45 @@ holds the prompt at all, so the recall list is the only copy the developer still
 
 ### 3.10 Reading a patch
 
-Two reading surfaces carry a diff: the Viewport itself and the fullscreen
-inspector. Both answer the same question — which file is being read right now —
-and neither is allowed to move anything else.
+One surface carries a patch: the two-pane inspector. The Viewport answers the
+adjacent question — which files the turn staged and whether they verified — in one
+row per file, and neither surface is allowed to move anything else.
 
-**The overlay follows the top edge.** The band is drawn from the geometry the
-frame has just laid out, so it can never disagree with the rows underneath it. It
-appears when three conditions hold together: the file's summary row has scrolled
-past the top edge, the top edge still falls inside that file's diff body, and the
-file is expanded. A collapsed file therefore raises no band, and a wrapped summary
-row stays visible until its last visual row scrolls out. The hunk counter names
-the last hunk header at or above the top edge, so the label changes exactly when
-the reader crosses a hunk boundary.
+**The canvas summarizes, the card reads.** A staged file occupies exactly one
+Viewport row: the operation badge, the path, the patch count, and the verification
+mark. No patch line is ever inlined into the conversation, so a long diff can
+neither bury the answer above it nor interrupt the reading of it.
 
-**Scrolling stops at the block boundaries.** Inside an expanded file one keystroke
-**Scrolling stops at the block boundaries.** Inside an expanded file one keystroke
-moves the reading position one line, and the selection leaves the file only when
-the movement reaches the block edge: downward once the last diff line has reached
-the bottom edge, upward from the first diff line. Crossing forward opens the next
-file at its summary row; crossing backward opens the previous file at its last
-diff line. A single keystroke can therefore never skip a long patch, and a
-collapsed file costs exactly one step of the walk.
+**The walk stops at the list boundaries.** Inside the Viewport one keystroke moves
+the file highlight one row; at the first row and past the last one the same chord
+scrolls the response instead, so the selection never leaves the staged set.
+`Ctrl+L` recenters on the summary row of the selected file through the shared
+center — top — bottom cycle, and manual recentering disables auto-scroll.
 
-**`Ctrl+L` recenters on the selected file block.** The chord reaches the command
-from both the prompt and the Viewport, and repeated presses walk the shared
-center — top — bottom cycle. The block geometry comes from the same layout the
-renderer emits, so the beats land on the rows the developer reads; a block taller
-than the viewport aligns its top edge first, keeping a long expanded diff
-readable from its beginning, and manual recentering disables auto-scroll.
-**The inspector isolates one diff.** Opening the card captures the change set as
-it stands, so reading never depends on edits that are still arriving. The file
-list and the diff pane own separate scroll offsets: scrolling the patch keeps the
-highlight in place, and moving the highlight resets the patch to its beginning, so
-a shorter diff never inherits a stale offset. The action row reports the position
-of the file inside the audited set and the hunk under the top edge of the pane.
-Closing the card returns to the scroll offset and the selected file the audit was
-opened from, because the audit never touched them.
+**The inspector reads the live set.** Opening the card captures the staged list as it
+stands, and every edit-stream event refreshes it in place: a file that arrives
+mid-audit appears, its patch count and verification badge update, and the file the
+stream currently writes carries the animated spinner beside its `[RUN]` badge. The
+reading position never jumps — the list and the patch own separate offsets, and an
+offset left over from a previously highlighted file is clamped to the body that is
+actually drawn.
 
-**Failure states are named, not guessed.** An empty change set and a file without
-a rendered diff each carry their own placeholder inside the pane, and the
-operation and verification badges are reserved before the path, so a deep
-repository path truncates instead of hiding the status of the file.
+**The inspector isolates one diff.** Scrolling the patch keeps the highlight in
+place, and moving the highlight resets the patch to its beginning, so a shorter diff
+never inherits a stale offset. The action row reports the position of the file inside
+the audited set and the hunk under the top edge of the pane. Closing the card returns
+to the scroll offset and the selected file the audit was opened from, because the
+audit never touched them.
 
-**Every label resolves through the catalog.** The operation badge, the titles of
-both panes, the progress counters, the placeholders, the docked hint, and the
-command descriptions behind `v` and `Enter` are catalog entries, so a hot-swapped
-locale reaches the overlay and the inspector without editing a renderer.
+**Failure states are named, not guessed.** An empty change set and a file without a
+rendered diff each carry their own placeholder inside the pane, and the operation and
+verification badges are reserved before the path, so a deep repository path truncates
+instead of hiding the status of the file.
+
+**Every label resolves through the catalog.** The operation badge, the titles of both
+panes, the progress counters, the placeholders, the docked hint, and the command
+descriptions behind `v`, `Enter`, and `Ctrl+V` are catalog entries, so a hot-swapped
+locale reaches the compact list and the inspector without editing a renderer.
 
 ---
 
@@ -482,9 +485,9 @@ locale reaches the overlay and the inspector without editing a renderer.
   stays visible in the first and is deleted from the second.
 - **It is not silent about failure.** A rolled-back turn keeps its record, its reason,
   and a restore hint instead of disappearing from the view.
-- **It is not a blind diff.** The Viewport always names the file under the top
-  edge, and the whole change set is one chord away in an isolated card; a long
-  patch is never scrolled without a header.
+- **It is not a blind diff.** Every staged file keeps one summary row in the
+  Viewport, and the whole change set is one chord away in an isolated two-pane
+  card; a patch is never inlined into the conversation.
 - **It is not an editing surface.** The inspector reads the staged change set. It
   never mutates it, never opens a turn, and never moves the REPL reading position.
 

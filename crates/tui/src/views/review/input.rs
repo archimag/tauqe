@@ -1,8 +1,10 @@
 use std::sync::Arc;
 
 use crossterm::event::{KeyCode, KeyEvent};
+use tauqe_protocol::review::DEFAULT_REVIEW_GROUP_ID;
 use tauqe_protocol::{
-    methods, IssueStatus, ModelRole, ModelSelection, ReviewIssue, ReviewRefineItemParams,
+    methods, IssueStatus, ModelRole, ModelSelection, PlanItem, ReviewGroup, ReviewGroupKind,
+    ReviewIssue, ReviewSession,
 };
 use tokio::sync::Mutex;
 
@@ -13,7 +15,7 @@ use crate::i18n::engine::active_t;
 use crate::input::InputResult;
 use crate::rpc::{send_request, RpcConnection};
 
-use super::{RefineTarget, ReviewRefineDialogState, VisibleReviewRow};
+use super::VisibleReviewRow;
 
 /// Keyboard actions available in the Review view.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -24,8 +26,6 @@ pub enum ReviewAction {
     ExecuteAll,
     RunReview,
     Discuss,
-    Refine,
-    RefineAll,
     Analyze,
     ChangeStatus,
     SetFocus,
@@ -73,30 +73,8 @@ pub static REVIEW_COMMAND_MAP: CommandMap<ReviewAction> = CommandMap::new(&[
         Essential,
         "cmd.review.execute",
     ),
-    // Case-differentiated decomposition chords, declared before the bare `r`.
-    // Lowercase `r` decomposes the selection, uppercase `R` decomposes every
-    // finding that still awaits decomposition (Conventions §4.5).
-    CommandSpec::new(
-        KeyChord::Bare(KeyCode::Char('R')),
-        ReviewAction::RefineAll,
-        Essential,
-        "cmd.review.refine_all",
-    ),
-    CommandSpec::new(
-        KeyChord::Shift(KeyCode::Char('r')),
-        ReviewAction::RefineAll,
-        Essential,
-        "cmd.review.refine_all",
-    ),
-    CommandSpec::new(
-        KeyChord::Bare(KeyCode::Char('r')),
-        ReviewAction::Refine,
-        Essential,
-        "cmd.review.refine",
-    ),
-    // Starting a new review session is a creation verb, so it takes `N`; `r` and
-    // `R` stay reserved for the Architect and refresh keeps the canonical `g`
-    // (Conventions §4.5, §4.6).
+    // Starting a new review session is a creation verb, so it takes `N` and
+    // refresh keeps the canonical `g` (Conventions §4.5, §4.6).
     CommandSpec::new(
         KeyChord::Bare(KeyCode::Char('N')),
         ReviewAction::RunReview,
@@ -370,180 +348,307 @@ pub static REVIEW_COMMAND_MAP: CommandMap<ReviewAction> = CommandMap::new(&[
     ),
 ]);
 
-/// Arms the execution confirmation for a finding, a subplan step, or a session
-/// queue.
+/// Whether a finding can still produce execution work.
 ///
-/// The confirmation state is built through the single constructor shared with
-/// the mouse path, so point execution (one finding or one step) always carries
-/// the Coder selector and the directives editor while a queue runs on the
-/// configured role defaults (concept #c-3).
-fn execute_review_scope_action(
-    st: &mut AppState,
+/// A finding is actionable while it is `TODO` or `IN_PROGRESS`: a finding of a
+/// simple group runs as one isolated turn, while a finding of an architectural
+/// group is resolved only through its group plan and is therefore never queued
+/// on its own (c-1, c-2).
+fn is_actionable(status: IssueStatus) -> bool {
+    matches!(status, IssueStatus::Todo | IssueStatus::InProgress)
+}
+
+/// Number of leaf steps a plan carries.
+///
+/// A container step delegates its work to its children, so the executable work
+/// of a plan is counted at its leaves, exactly as the confirmation card counts
+/// it (c-2, c-5).
+fn plan_leaf_count(steps: &[PlanItem]) -> usize {
+    steps
+        .iter()
+        .map(|step| {
+            if step.is_leaf() {
+                1
+            } else {
+                plan_leaf_count(&step.children)
+            }
+        })
+        .sum()
+}
+
+/// Display title of a review group, falling back to its identifier.
+fn group_display_title(group: &ReviewGroup) -> String {
+    let title = group.title.trim();
+    if title.is_empty() {
+        group.id.clone()
+    } else {
+        title.to_string()
+    }
+}
+/// Execution target of one review group: its class, its display title, and the
+/// unified root-cause plan it owns.
+///
+/// The group class and title travel with the header row, but the unified plan
+/// itself lives in the session, so the group header and its plan branch resolve
+/// their execution target here. An undeclared group id renders through its
+/// protective orphan bucket, so it resolves to a simple group that owns no
+/// plan.
+fn resolve_group_target(
+    state: &AppState,
     session_id: &str,
-    target_item_id: Option<u32>,
-    target_step_id: Option<String>,
-    scope_title: &str,
-) {
+    group_id: &str,
+) -> (ReviewGroupKind, String, Vec<PlanItem>) {
+    match find_session(state, session_id) {
+        Some(session) => session
+            .effective_groups()
+            .into_iter()
+            .find(|group| group.id == group_id)
+            .map(|group| (group.kind, group_display_title(&group), group.subplan))
+            .unwrap_or_else(|| {
+                (
+                    ReviewGroupKind::Simple,
+                    super::projection::orphan_title(group_id),
+                    Vec::new(),
+                )
+            }),
+        None => (ReviewGroupKind::Simple, group_id.to_string(), Vec::new()),
+    }
+}
+/// Resolves a stored review session from the view mirror.
+fn find_session(state: &AppState, session_id: &str) -> Option<ReviewSession> {
+    state
+        .review
+        .sessions
+        .iter()
+        .find(|session| session.id == session_id)
+        .cloned()
+        .or_else(|| {
+            state
+                .review
+                .session
+                .as_ref()
+                .filter(|session| session.id == session_id)
+                .cloned()
+        })
+}
+
+/// Number of architectural root-cause plans an actionable queue carries.
+///
+/// Every architectural group owning at least one actionable finding
+/// contributes exactly one coherent plan to the queue the server executes —
+/// stored already or projected just-in-time — so the confirmation states how
+/// many root causes the run resolves through its groups (c-2, c-4).
+fn architectural_plan_count(session: &ReviewSession, items: &[ReviewIssue]) -> usize {
+    let groups = session.effective_groups();
+    let mut counted: Vec<&str> = Vec::new();
+    for item in items {
+        let group_id = item.group.as_deref().unwrap_or(DEFAULT_REVIEW_GROUP_ID);
+        let architectural = groups
+            .iter()
+            .any(|group| group.id == group_id && group.kind == ReviewGroupKind::Architectural);
+        if architectural && !counted.contains(&group_id) {
+            counted.push(group_id);
+        }
+    }
+    counted.len()
+}
+
+/// Localized description of a mixed review queue.
+///
+/// The queue carries the per-finding work of simple groups plus one root-cause
+/// plan per architectural group, so the plan count is stated beside the scope
+/// and the confirmation card appends the finding count itself (c-2, c-4).
+fn queue_scope_title(group_plans: usize) -> String {
+    let mut scope = active_t("review.session_queue_scope");
+    if group_plans > 0 {
+        scope.push_str(
+            &active_t("dialog.execute_review.group_plans_count").replacen(
+                "{}",
+                &group_plans.to_string(),
+                1,
+            ),
+        );
+    }
+    scope
+}
+
+/// Arms the point-execution confirmation for one finding.
+///
+/// A finding of an architectural group is a symptom of one shared root cause,
+/// so it is never executed on its own: the handler refuses it and points at the
+/// group plan instead (c-1). Any other finding opens the point form with its
+/// own Coder choice and directives (Conventions §6).
+fn execute_review_finding_action(st: &mut AppState, session_id: &str, item_id: u32) {
     if st.model.is_busy() {
         st.notify_warning(active_t("notify.model_busy_esc"));
         return;
     }
 
-    let session = match st
-        .review
-        .sessions
-        .iter()
-        .find(|s| s.id == session_id)
-        .cloned()
-        .or_else(|| {
-            st.review
-                .session
-                .as_ref()
-                .filter(|s| s.id == session_id)
-                .cloned()
-        }) {
-        Some(s) => s,
+    let session = match find_session(st, session_id) {
+        Some(session) => session,
         None => {
             st.notify_error(active_t("notify.review_not_found").replace("{}", session_id));
             return;
         }
     };
 
+    let item = match session.find_item(item_id) {
+        Some(item) => item.clone(),
+        None => {
+            st.notify_error(
+                active_t("notify.review_item_not_found").replace("{}", &item_id.to_string()),
+            );
+            return;
+        }
+    };
+
+    // A finding of an architectural group is a symptom: executing it alone
+    // would fix one manifestation and leave the shared root cause in place
+    // (c-1).
+    let groups = session.effective_groups();
+    let group_id = item.group.as_deref().unwrap_or(DEFAULT_REVIEW_GROUP_ID);
+    if let Some(group) = groups
+        .iter()
+        .find(|group| group.id == group_id && group.kind == ReviewGroupKind::Architectural)
+    {
+        st.notify_warning(
+            active_t("notify.review_item_in_architectural_group")
+                .replacen("{}", &item.id.to_string(), 1)
+                .replacen("{}", &group_display_title(group), 1),
+        );
+        return;
+    }
+
+    match item.status {
+        IssueStatus::Discussion => {
+            st.notify_warning(
+                active_t("notify.review_discussion_status").replace("{}", &item.id.to_string()),
+            );
+        }
+        IssueStatus::Fixed => {
+            st.notify_info(
+                active_t("notify.review_already_fixed").replace("{}", &item.id.to_string()),
+            );
+        }
+        IssueStatus::Skipped => {
+            st.notify_info(
+                active_t("notify.review_skipped_status").replace("{}", &item.id.to_string()),
+            );
+        }
+        IssueStatus::Rejected => {
+            st.notify_warning(
+                active_t("notify.review_rejected_status").replace("{}", &item.id.to_string()),
+            );
+        }
+        // Point execution opens the Coder form so the implementing model and
+        // the directives are chosen before a bounded turn runs (c-2).
+        IssueStatus::Todo | IssueStatus::InProgress => {
+            let session_title = if session.title.trim().is_empty() {
+                session.id.clone()
+            } else {
+                session.title.clone()
+            };
+            let coder_entries = st.coder_entries();
+            st.confirm_button = crate::app::ConfirmDialogButton::Cancel;
+            st.confirm_execute_review = Some(crate::app::ConfirmExecuteReviewState::new(
+                Some(session.id.clone()),
+                session_title,
+                item.title.clone(),
+                Some(item.id),
+                None,
+                vec![ReviewIssue::from(item)],
+                coder_entries,
+            ));
+        }
+    }
+}
+
+/// Arms the execution confirmation for the whole actionable queue of a session.
+///
+/// The queue mixes the per-finding work of simple groups with one root-cause
+/// plan per architectural group, so the server executes an architectural group
+/// as a coherent sequence and projects a missing plan just-in-time (c-2, c-4).
+fn execute_review_session_action(st: &mut AppState, session_id: &str) {
+    if st.model.is_busy() {
+        st.notify_warning(active_t("notify.model_busy_esc"));
+        return;
+    }
+
+    let session = match find_session(st, session_id) {
+        Some(session) => session,
+        None => {
+            st.notify_error(active_t("notify.review_not_found").replace("{}", session_id));
+            return;
+        }
+    };
+
+    let todo_items: Vec<ReviewIssue> = session
+        .items
+        .iter()
+        .filter(|item| is_actionable(item.status))
+        .cloned()
+        .map(ReviewIssue::from)
+        .collect();
+
+    if todo_items.is_empty() {
+        let (total, fixed) = session.stats();
+        if fixed == total && total > 0 {
+            st.notify_info(active_t("notify.review_all_fixed_session"));
+        } else {
+            st.notify_info(active_t("notify.review_no_todo_session"));
+        }
+        return;
+    }
+
+    let scope_title = queue_scope_title(architectural_plan_count(&session, &todo_items));
     let session_title = if session.title.trim().is_empty() {
         session.id.clone()
     } else {
         session.title.clone()
     };
-
-    if let Some(item_id) = target_item_id {
-        let item = match session.find_item(item_id) {
-            Some(i) => i.clone(),
-            None => {
-                st.notify_error(
-                    active_t("notify.review_item_not_found").replace("{}", &item_id.to_string()),
-                );
-                return;
-            }
-        };
-
-        // Every status that can still produce work is dispatched: a `REFINE`
-        // finding is decomposed by the Architect before the first Coder call on
-        // the server, so the client never blocks execution on a missing subplan
-        // (#c-1).
-        match item.status {
-            IssueStatus::Discussion => {
-                st.notify_warning(
-                    active_t("notify.review_discussion_status").replace("{}", &item.id.to_string()),
-                );
-            }
-            IssueStatus::Fixed => {
-                st.notify_info(
-                    active_t("notify.review_already_fixed").replace("{}", &item.id.to_string()),
-                );
-            }
-            IssueStatus::Skipped => {
-                st.notify_info(
-                    active_t("notify.review_skipped_status").replace("{}", &item.id.to_string()),
-                );
-            }
-            IssueStatus::Rejected => {
-                st.notify_warning(
-                    active_t("notify.review_rejected_status").replace("{}", &item.id.to_string()),
-                );
-            }
-            // A `REFINE` finding runs exactly like a planned one: the server
-            // decomposes it with the Architect before the first Coder call, so a
-            // missing subplan never blocks execution (#c-1).
-            IssueStatus::Refine | IssueStatus::Todo | IssueStatus::InProgress => {
-                // Point execution opens the Coder form so the implementing model
-                // and the directives are chosen before a bounded turn runs
-                // (concept #c-3).
-                let coder_entries = st.coder_entries();
-                st.confirm_button = crate::app::ConfirmDialogButton::Cancel;
-                st.confirm_execute_review = Some(crate::app::ConfirmExecuteReviewState::new(
-                    Some(session.id.clone()),
-                    session_title,
-                    scope_title.to_string(),
-                    Some(item.id),
-                    target_step_id.clone(),
-                    vec![ReviewIssue::from(item)],
-                    coder_entries,
-                ));
-            }
-        }
-    } else {
-        // A finding still awaiting architectural decomposition belongs to the
-        // queue too: the server refines it before running its steps (#c-1).
-        let todo_items: Vec<ReviewIssue> = session
-            .items
-            .iter()
-            .filter(|i| {
-                matches!(
-                    i.status,
-                    IssueStatus::Refine | IssueStatus::Todo | IssueStatus::InProgress
-                )
-            })
-            .cloned()
-            .map(ReviewIssue::from)
-            .collect();
-
-        if todo_items.is_empty() {
-            let (total, fixed) = session.stats();
-            if fixed == total && total > 0 {
-                st.notify_info(active_t("notify.review_all_fixed_session"));
-            } else {
-                st.notify_info(active_t("notify.review_no_todo_session"));
-            }
-            return;
-        }
-
-        // A session-wide queue is a batch: it runs autonomously on the configured
-        // Coder defaults, so no model selector is exposed (concept #c-3).
-        let coder_entries = st.coder_entries();
-        st.confirm_button = crate::app::ConfirmDialogButton::Cancel;
-        st.confirm_execute_review = Some(crate::app::ConfirmExecuteReviewState::new(
+    let coder_entries = st.coder_entries();
+    st.confirm_button = crate::app::ConfirmDialogButton::Cancel;
+    // The session root launches the implicit whole-session queue: the flag
+    // records that the confirmation names the session itself and leaves the
+    // member list — architectural root-cause plans and independent findings
+    // alike — to the server, exactly as the cross-session batch does (c-1, c-2,
+    // c-3).
+    st.confirm_execute_review = Some(
+        crate::app::ConfirmExecuteReviewState::new(
             Some(session.id.clone()),
             session_title,
-            format!("All remaining TODO findings ({} items)", todo_items.len()),
+            scope_title,
             None,
             None,
             todo_items,
             coder_entries,
-        ));
-    }
+        )
+        .with_whole_session(),
+    );
 }
-/// Arms the execution confirmation for every actionable finding of one
-/// rendered group.
+
+/// Arms the execution confirmation for one rendered group.
 ///
-/// `x` on a group executes exactly the findings that group renders, filtered
-/// to the
-/// statuses that can still produce work, so the queue never silently widens
-/// to the whole session (concept #c-2).
+/// The class of the group decides the shape. An architectural group owns one
+/// root-cause plan, so it always arms the binary group-plan confirmation and
+/// runs on the configured roles while the Architect projects a missing plan
+/// just-in-time (c-2, c-4). A simple group keeps the per-finding queue it
+/// always had (c-1).
 fn execute_review_group_action(
     st: &mut AppState,
     session_id: &str,
     group_id: &str,
-    scope_title: &str,
+    kind: ReviewGroupKind,
+    group_title: &str,
+    subplan: &[PlanItem],
 ) {
     if st.model.is_busy() {
         st.notify_warning(active_t("notify.model_busy_esc"));
         return;
     }
 
-    let session = match st
-        .review
-        .sessions
-        .iter()
-        .find(|s| s.id == session_id)
-        .cloned()
-        .or_else(|| {
-            st.review
-                .session
-                .as_ref()
-                .filter(|s| s.id == session_id)
-                .cloned()
-        }) {
-        Some(s) => s,
+    let session = match find_session(st, session_id) {
+        Some(session) => session,
         None => {
             st.notify_error(active_t("notify.review_not_found").replace("{}", session_id));
             return;
@@ -554,12 +659,7 @@ fn execute_review_group_action(
         .review
         .group_findings(&session, group_id)
         .into_iter()
-        .filter(|item| {
-            matches!(
-                item.status,
-                IssueStatus::Refine | IssueStatus::Todo | IssueStatus::InProgress
-            )
-        })
+        .filter(|item| is_actionable(item.status))
         .map(ReviewIssue::from)
         .collect();
 
@@ -573,20 +673,47 @@ fn execute_review_group_action(
     } else {
         session.title.clone()
     };
-
     let coder_entries = st.coder_entries();
     st.confirm_button = crate::app::ConfirmDialogButton::Cancel;
-    st.confirm_execute_review = Some(crate::app::ConfirmExecuteReviewState::new(
-        Some(session.id.clone()),
-        session_title,
-        scope_title.to_string(),
-        None,
-        None,
-        items,
-        coder_entries,
-    ));
+
+    let target = match kind {
+        ReviewGroupKind::Architectural => {
+            let scope_title = if subplan.is_empty() {
+                active_t("review.group_plan_scope_jit").replacen("{}", group_title, 1)
+            } else {
+                active_t("review.group_plan_scope")
+                    .replacen("{}", group_title, 1)
+                    .replacen("{}", &plan_leaf_count(subplan).to_string(), 1)
+            };
+            crate::app::ConfirmExecuteReviewState::new(
+                Some(session.id.clone()),
+                session_title,
+                scope_title,
+                None,
+                None,
+                items,
+                coder_entries,
+            )
+            .with_group(group_id.to_string(), group_title.to_string())
+        }
+        ReviewGroupKind::Simple => crate::app::ConfirmExecuteReviewState::new(
+            Some(session.id.clone()),
+            session_title,
+            group_title.to_string(),
+            None,
+            None,
+            items,
+            coder_entries,
+        ),
+    };
+    st.confirm_execute_review = Some(target);
 }
 
+/// Arms the batch confirmation for every actionable finding across all sessions.
+///
+/// The scope states both halves of the mixed queue the server builds: the
+/// per-finding work of simple groups and the architectural root-cause plans it
+/// executes — or projects just-in-time — for the groups (c-2, c-4).
 pub(crate) fn execute_all_reviews_action(st: &mut AppState) {
     if st.model.is_busy() {
         st.notify_warning(active_t("notify.model_busy_esc"));
@@ -600,21 +727,18 @@ pub(crate) fn execute_all_reviews_action(st: &mut AppState) {
     }
 
     let mut todo_items: Vec<ReviewIssue> = Vec::new();
+    let mut group_plans = 0;
     let mut total_items = 0;
     let mut discussion_count = 0;
     let mut fixed_count = 0;
 
     for session in &sessions {
+        let mut session_items: Vec<ReviewIssue> = Vec::new();
         for item in &session.items {
             total_items += 1;
             match item.status {
-                // A finding that still awaits architectural decomposition is
-                // executable: the server refines it with the Architect before
-                // the first Coder call (#c-1), exactly as single-session batch
-                // execution does. Omitting it here silently skipped work under
-                // the cross-session `X` verb.
-                IssueStatus::Refine | IssueStatus::Todo | IssueStatus::InProgress => {
-                    todo_items.push(ReviewIssue::from(item.clone()));
+                IssueStatus::Todo | IssueStatus::InProgress => {
+                    session_items.push(ReviewIssue::from(item.clone()));
                 }
                 IssueStatus::Discussion => {
                     discussion_count += 1;
@@ -625,6 +749,8 @@ pub(crate) fn execute_all_reviews_action(st: &mut AppState) {
                 _ => {}
             }
         }
+        group_plans += architectural_plan_count(session, &session_items);
+        todo_items.extend(session_items);
     }
 
     if todo_items.is_empty() {
@@ -644,11 +770,8 @@ pub(crate) fn execute_all_reviews_action(st: &mut AppState) {
     st.confirm_button = crate::app::ConfirmDialogButton::Cancel;
     st.confirm_execute_review = Some(crate::app::ConfirmExecuteReviewState::new(
         None,
-        "All Review Sessions".to_string(),
-        format!(
-            "All remaining TODO findings across all sessions ({} items)",
-            todo_items.len()
-        ),
+        active_t("review.all_sessions_title"),
+        queue_scope_title(group_plans),
         None,
         None,
         todo_items,
@@ -656,19 +779,70 @@ pub(crate) fn execute_all_reviews_action(st: &mut AppState) {
     ));
 }
 
-/// Title of the finding that owns a subplan step.
+/// Arms the point-execution confirmation for one step of a group plan.
 ///
-/// Executing a step runs the owning finding's bounded turn, so the confirmation
-/// dialog must name the finding instead of the individual step.
-fn finding_scope_title(st: &AppState, session_id: &str, item_id: u32) -> String {
-    st.review
-        .sessions
-        .iter()
-        .chain(st.review.session.iter())
-        .find(|session| session.id == session_id)
-        .and_then(|session| session.items.iter().find(|item| item.id == item_id))
-        .map(|item| item.title.clone())
-        .unwrap_or_else(|| format!("Finding #{}", item_id))
+/// A subplan step belongs to the unified plan of its group, so the confirmation
+/// carries the group target and the concrete step while still addressing one
+/// targeted unit of work: the Coder selector and the directives editor stay
+/// available (c-5, Conventions §6).
+fn execute_review_group_step_action(
+    st: &mut AppState,
+    session_id: &str,
+    group_id: &str,
+    step_id: &str,
+    step_title: &str,
+) {
+    if st.model.is_busy() {
+        st.notify_warning(active_t("notify.model_busy_esc"));
+        return;
+    }
+
+    let session = match find_session(st, session_id) {
+        Some(session) => session,
+        None => {
+            st.notify_error(active_t("notify.review_not_found").replace("{}", session_id));
+            return;
+        }
+    };
+
+    let session_title = if session.title.trim().is_empty() {
+        session.id.clone()
+    } else {
+        session.title.clone()
+    };
+    let group_title = session
+        .effective_groups()
+        .into_iter()
+        .find(|group| group.id == group_id)
+        .map(|group| group_display_title(&group))
+        .unwrap_or_else(|| group_id.to_string());
+
+    let items: Vec<ReviewIssue> = st
+        .review
+        .group_findings(&session, group_id)
+        .into_iter()
+        .filter(|item| is_actionable(item.status))
+        .map(ReviewIssue::from)
+        .collect();
+
+    let scope_title = active_t("review.group_step_scope")
+        .replacen("{}", step_title, 1)
+        .replacen("{}", &group_title, 1);
+
+    let coder_entries = st.coder_entries();
+    st.confirm_button = crate::app::ConfirmDialogButton::Cancel;
+    st.confirm_execute_review = Some(
+        crate::app::ConfirmExecuteReviewState::new(
+            Some(session.id.clone()),
+            session_title,
+            scope_title,
+            None,
+            Some(step_id.to_string()),
+            items,
+            coder_entries,
+        )
+        .with_group(group_id.to_string(), group_title),
+    );
 }
 
 fn format_item_for_clipboard(issue: &ReviewIssue) -> String {
@@ -689,116 +863,6 @@ fn format_item_for_clipboard(issue: &ReviewIssue) -> String {
         text.push_str(issue.description.trim());
     }
     text
-}
-
-/// Dispatches one Architect decomposition request for a finding.
-///
-/// The Architect owns the "what": it decomposes a single finding into an
-/// embedded step plan, and the typed `review/refineItem` response applies the
-/// result. A batch therefore drains one finding per call, so every dispatch goes
-/// through this single point.
-async fn send_refine_request(
-    server_writer: &mut RpcConnection,
-    target: RefineTarget,
-) -> anyhow::Result<()> {
-    let params = ReviewRefineItemParams {
-        review_id: Some(target.review_id),
-        item_id: target.item_id,
-        model: None,
-        instructions: None,
-    };
-    send_request(
-        server_writer,
-        methods::REVIEW_REFINE_ITEM,
-        serde_json::to_value(&params)?,
-    )
-    .await?;
-    Ok(())
-}
-
-/// Opens the Architect decomposition dialog for the finding under the cursor.
-///
-/// The Architect owns the "what", so decomposition is an explicit request with
-/// its own model choice and directives rather than an implicit retry: the dialog
-/// carries the selected architect and the optional instructions into
-/// `review/refineItem`. When more than one architect is configured, focus starts
-/// on the model list for instant selection.
-fn open_refine_dialog(st: &mut AppState) {
-    if st.model.is_busy() || st.review.running || st.review.refining.is_some() {
-        st.notify_warning(active_t("notify.model_busy"));
-        return;
-    }
-
-    let (review_id, item_id, item_title) = match st.review.selected_row() {
-        Some(VisibleReviewRow::ReviewItem {
-            session_id,
-            item_id,
-            title,
-            ..
-        }) => (session_id, item_id, title),
-        _ => {
-            st.notify_info(active_t("notify.review_select_finding"));
-            return;
-        }
-    };
-
-    let review_title = st
-        .review
-        .sessions
-        .iter()
-        .find(|session| session.id == review_id)
-        .map(|session| session.title.clone())
-        .or_else(|| {
-            st.review
-                .session
-                .as_ref()
-                .filter(|session| session.id == review_id)
-                .map(|session| session.title.clone())
-        })
-        .unwrap_or_else(|| review_id.clone());
-
-    let entries = crate::views::plans::architect_entries(st);
-    let mut dialog =
-        ReviewRefineDialogState::new(review_id, review_title, item_id, item_title, entries);
-    if dialog.selector.len() > 1 {
-        dialog.focus = crate::views::plans::RefineDialogFocus::ModelList;
-    }
-    st.review.refine_dialog = Some(dialog);
-}
-
-/// Decomposes every finding that still awaits architectural refinement.
-///
-/// A finding in `REFINE` status has been classified by the Reviewer but not yet
-/// broken into executable steps, so the batch is exactly the set of findings the
-/// Architect still owes a decomposition for. The queue drains one finding per
-/// `review/refineItem` response, and a failed or refused decomposition aborts the
-/// remaining queue instead of spending further tokens.
-async fn refine_all_findings(
-    state: &Arc<Mutex<AppState>>,
-    server_writer: &mut RpcConnection,
-) -> anyhow::Result<()> {
-    let target = {
-        let mut st = state.lock().await;
-        if st.model.is_busy() || st.review.running || st.review.refining.is_some() {
-            st.notify_warning(active_t("notify.model_busy"));
-            return Ok(());
-        }
-        let targets = st.review.pending_refine_targets();
-        if targets.is_empty() {
-            st.notify_info(active_t("notify.review_no_refine_needed"));
-            return Ok(());
-        }
-        st.review.begin_refine_batch(targets)
-    };
-    let Some(target) = target else {
-        return Ok(());
-    };
-    send_refine_request(server_writer, target).await?;
-    state
-        .lock()
-        .await
-        .notify_info(active_t("notify.review_refining"));
-    Ok(())
 }
 
 pub async fn handle_review_key(
@@ -899,12 +963,12 @@ pub async fn handle_review_key(
                     }
                     VisibleReviewRow::SubplanItem {
                         session_id,
-                        item_id,
+                        group_id,
                         step_id,
                         ..
                     } => {
                         st.review
-                            .toggle_subplan_item_expanded(&session_id, item_id, &step_id);
+                            .toggle_subplan_item_expanded(&session_id, &group_id, &step_id);
                         st.review.clamp_selection();
                         st.review.scroll_to_selected();
                     }
@@ -914,6 +978,19 @@ pub async fn handle_review_key(
                         ..
                     } => {
                         st.review.toggle_group_expanded(&session_id, &group_id);
+                        st.review.clamp_selection();
+                        st.review.scroll_to_selected();
+                    }
+                    // The plan branch folds independently of the group header
+                    // above it and of the findings below it, so folding it never
+                    // hides a finding (concept #c-1).
+                    VisibleReviewRow::GroupPlanHeader {
+                        session_id,
+                        group_id,
+                        ..
+                    } => {
+                        st.review
+                            .toggle_plan_branch_expanded(&session_id, &group_id);
                         st.review.clamp_selection();
                         st.review.scroll_to_selected();
                     }
@@ -937,43 +1014,65 @@ pub async fn handle_review_key(
                     VisibleReviewRow::ReviewItem {
                         session_id,
                         item_id,
-                        title,
                         ..
                     } => {
-                        execute_review_scope_action(
-                            &mut st,
-                            &session_id,
-                            Some(item_id),
-                            None,
-                            &title,
-                        );
+                        execute_review_finding_action(&mut st, &session_id, item_id);
                     }
                     VisibleReviewRow::SubplanItem {
                         session_id,
-                        item_id,
+                        group_id,
                         step_id,
+                        title,
                         ..
                     } => {
-                        // Confirming on a step row targets that step, so the
-                        // bounded turn implements exactly the inspected leaf
-                        // (concept #c-4).
-                        let title = finding_scope_title(&st, &session_id, item_id);
-                        execute_review_scope_action(
+                        // Confirming on a step row executes exactly that step of
+                        // the group plan with the configured Coder (c-5).
+                        execute_review_group_step_action(
                             &mut st,
                             &session_id,
-                            Some(item_id),
-                            Some(step_id),
+                            &group_id,
+                            &step_id,
                             &title,
                         );
                     }
+                    // Confirming on a group header resolves through the group
+                    // class: an architectural group arms its root-cause plan,
+                    // while a simple group queues its findings (c-4, c-5). The
+                    // unified plan lives in the session, not in the row.
                     VisibleReviewRow::GroupHeader {
                         session_id,
                         group_id,
                         ..
                     } => {
-                        st.review.toggle_group_expanded(&session_id, &group_id);
-                        st.review.clamp_selection();
-                        st.review.scroll_to_selected();
+                        let (kind, title, subplan) =
+                            resolve_group_target(&st, &session_id, &group_id);
+                        execute_review_group_action(
+                            &mut st,
+                            &session_id,
+                            &group_id,
+                            kind,
+                            &title,
+                            &subplan,
+                        );
+                    }
+                    // The plan branch names the same root-cause plan as the
+                    // group header above it, so both rows arm one target
+                    // (concept #c-1).
+                    VisibleReviewRow::GroupPlanHeader {
+                        session_id,
+                        group_id,
+                        ..
+                    } => {
+                        let (kind, title, subplan) =
+                            resolve_group_target(&st, &session_id, &group_id);
+                        execute_review_group_action(
+                            &mut st,
+                            &session_id,
+                            &group_id,
+                            kind,
+                            &title,
+                            &subplan,
+                        );
                     }
                 }
             }
@@ -985,52 +1084,71 @@ pub async fn handle_review_key(
             let sel_row = st.review.selected_row();
             if let Some(row) = sel_row {
                 match row {
-                    VisibleReviewRow::SessionHeader {
-                        session_id, title, ..
-                    } => {
-                        execute_review_scope_action(&mut st, &session_id, None, None, &title);
-                    }
-                    VisibleReviewRow::SessionSummary { session_id, .. } => {
-                        execute_review_scope_action(&mut st, &session_id, None, None, &session_id);
+                    // A session header or summary queues the whole session, so
+                    // the run covers every simple finding and every group plan
+                    // the server builds from it (c-2, c-4).
+                    VisibleReviewRow::SessionHeader { session_id, .. }
+                    | VisibleReviewRow::SessionSummary { session_id, .. } => {
+                        execute_review_session_action(&mut st, &session_id);
                     }
                     VisibleReviewRow::ReviewItem {
                         session_id,
                         item_id,
-                        title,
                         ..
                     } => {
-                        execute_review_scope_action(
-                            &mut st,
-                            &session_id,
-                            Some(item_id),
-                            None,
-                            &title,
-                        );
+                        execute_review_finding_action(&mut st, &session_id, item_id);
                     }
                     VisibleReviewRow::SubplanItem {
                         session_id,
-                        item_id,
-                        step_id,
-                        ..
-                    } => {
-                        let title = finding_scope_title(&st, &session_id, item_id);
-                        execute_review_scope_action(
-                            &mut st,
-                            &session_id,
-                            Some(item_id),
-                            Some(step_id),
-                            &title,
-                        );
-                    }
-                    // A group executes exactly its own findings, so the queue
-                    // never widens to the whole session (concept #c-3, #c-4).
-                    VisibleReviewRow::GroupHeader {
-                        session_id,
                         group_id,
+                        step_id,
                         title,
                         ..
                     } => {
-                        execute_review_group_action(&mut st, &session_id, &group_id, &title);
+                        execute_review_group_step_action(
+                            &mut st,
+                            &session_id,
+                            &group_id,
+                            &step_id,
+                            &title,
+                        );
+                    }
+                    // A group executes exactly its own scope, never the whole
+                    // session: an architectural group arms its root-cause plan,
+                    // a simple group queues its own findings (c-1, c-4, c-5).
+                    VisibleReviewRow::GroupHeader {
+                        session_id,
+                        group_id,
+                        ..
+                    } => {
+                        let (kind, title, subplan) =
+                            resolve_group_target(&st, &session_id, &group_id);
+                        execute_review_group_action(
+                            &mut st,
+                            &session_id,
+                            &group_id,
+                            kind,
+                            &title,
+                            &subplan,
+                        );
+                    }
+                    // The branch header of a group plan is the group plan, so
+                    // the execution chord arms the identical target (c-1).
+                    VisibleReviewRow::GroupPlanHeader {
+                        session_id,
+                        group_id,
+                        ..
+                    } => {
+                        let (kind, title, subplan) =
+                            resolve_group_target(&st, &session_id, &group_id);
+                        execute_review_group_action(
+                            &mut st,
+                            &session_id,
+                            &group_id,
+                            kind,
+                            &title,
+                            &subplan,
+                        );
                     }
                 }
             }
@@ -1137,10 +1255,9 @@ pub async fn handle_review_key(
                     IssueStatus::Discussion => 0,
                     IssueStatus::Todo => 1,
                     IssueStatus::InProgress => 2,
-                    IssueStatus::Refine => 3,
-                    IssueStatus::Fixed => 4,
-                    IssueStatus::Skipped => 5,
-                    IssueStatus::Rejected => 6,
+                    IssueStatus::Fixed => 3,
+                    IssueStatus::Skipped => 4,
+                    IssueStatus::Rejected => 5,
                 };
                 st.status_dialog = Some(crate::app::StatusDialogState::new(
                     crate::app::StatusDialogTarget::ReviewItem {
@@ -1237,6 +1354,15 @@ pub async fn handle_review_key(
                         1
                     )
                 )),
+                Some(VisibleReviewRow::GroupPlanHeader {
+                    title, done, total, ..
+                }) => Some(format!(
+                    "{} [{}]",
+                    title,
+                    active_t("review.steps_count")
+                        .replacen("{}", &done.to_string(), 1)
+                        .replacen("{}", &total.to_string(), 1)
+                )),
                 None => None,
             };
 
@@ -1309,26 +1435,12 @@ pub async fn handle_review_key(
                 st.review_dialog = Some(dialog);
             }
         }
-        // Decompose the selected finding into an embedded step plan via the
-        // Architect role: the dialog carries the architect model and directives.
-        ReviewAction::Refine => {
-            open_refine_dialog(&mut st);
-        }
-        // Decompose every finding that still awaits architectural refinement.
-        ReviewAction::RefineAll => {
-            drop(st);
-            refine_all_findings(state, server_writer).await?;
-        }
         // Launch the Architect post-analysis over the session the cursor rests
         // on. The classification is a costly LLM layer over immutable findings,
         // so `A` arms a confirmation whose safe default cancels it instead of
         // spending tokens on a stray keystroke (c-4).
         ReviewAction::Analyze => {
-            if st.model.is_busy()
-                || st.review.running
-                || st.review.refining.is_some()
-                || st.review.analyzing
-            {
+            if st.model.is_busy() || st.review.running || st.review.analyzing {
                 st.notify_warning(active_t("notify.model_busy"));
             } else {
                 match st.review.selected_row() {
@@ -1446,7 +1558,7 @@ mod tests {
     }
 
     #[test]
-    fn test_execute_review_scope_action_defaults_to_safe_cancel() {
+    fn test_execute_review_finding_action_defaults_to_safe_cancel() {
         use tauqe_protocol::{IssueStatus, IssueType, ReviewIssue, ReviewSession};
 
         let mut st = crate::app::test_state();
@@ -1474,7 +1586,6 @@ mod tests {
                 recommendations: Vec::new(),
                 files: Vec::new(),
                 readonly_files: Vec::new(),
-                plan: Vec::new(),
                 note: None,
             }
             .into()],
@@ -1486,7 +1597,7 @@ mod tests {
         st.review.sessions = vec![session.clone()];
         st.review.session = Some(session);
 
-        execute_review_scope_action(&mut st, "rev-1", Some(1), None, "Finding");
+        execute_review_finding_action(&mut st, "rev-1", 1);
 
         assert_eq!(
             st.confirm_button,
@@ -1500,6 +1611,10 @@ mod tests {
         assert_eq!(target.review_id, Some("rev-1".to_string()));
         assert_eq!(target.item_id, Some(1));
         assert_eq!(target.items.len(), 1);
+        assert_eq!(
+            target.scope_title, "Finding",
+            "the point form names the finding it resolves"
+        );
     }
 
     #[test]
@@ -1528,7 +1643,6 @@ mod tests {
                     recommendations: Vec::new(),
                     files: Vec::new(),
                     readonly_files: Vec::new(),
-                    plan: Vec::new(),
                     note: None,
                 }
                 .into(),
@@ -1544,7 +1658,6 @@ mod tests {
                     recommendations: Vec::new(),
                     files: Vec::new(),
                     readonly_files: Vec::new(),
-                    plan: Vec::new(),
                     note: None,
                 }
                 .into(),
@@ -1598,7 +1711,6 @@ mod tests {
                     recommendations: Vec::new(),
                     files: Vec::new(),
                     readonly_files: Vec::new(),
-                    plan: Vec::new(),
                     note: None,
                 }
                 .into(),
@@ -1614,7 +1726,6 @@ mod tests {
                     recommendations: Vec::new(),
                     files: Vec::new(),
                     readonly_files: Vec::new(),
-                    plan: Vec::new(),
                     note: None,
                 }
                 .into(),
@@ -1645,7 +1756,6 @@ mod tests {
                     recommendations: Vec::new(),
                     files: Vec::new(),
                     readonly_files: Vec::new(),
-                    plan: Vec::new(),
                     note: None,
                 }
                 .into(),
@@ -1661,7 +1771,6 @@ mod tests {
                     recommendations: Vec::new(),
                     files: Vec::new(),
                     readonly_files: Vec::new(),
-                    plan: Vec::new(),
                     note: None,
                 }
                 .into(),
@@ -1719,7 +1828,6 @@ mod tests {
                 recommendations: Vec::new(),
                 files: Vec::new(),
                 readonly_files: Vec::new(),
-                plan: Vec::new(),
                 note: None,
             }
             .into()],
@@ -1740,12 +1848,12 @@ mod tests {
     }
 
     #[test]
-    fn test_execute_all_reviews_action_includes_refine_findings() {
+    fn test_execute_all_reviews_action_includes_in_progress_findings() {
         let mut st = crate::app::test_state();
-        // A finding awaiting decomposition is executable just like a TODO one:
-        // the server refines it before coding (#c-1).
+        // A finding already under implementation is as executable as a TODO one:
+        // the server keeps it on the same isolated-turn path (c-1).
         st.review.sessions = vec![
-            session_with_status("rev-refine", 1, IssueStatus::Refine),
+            session_with_status("rev-progress", 1, IssueStatus::InProgress),
             todo_session("rev-todo", 2),
         ];
 
@@ -1758,7 +1866,7 @@ mod tests {
         assert_eq!(
             target.items.len(),
             2,
-            "must include both the Refine and the Todo finding"
+            "must include both the InProgress and the Todo finding"
         );
         assert_eq!(target.items[0].title, "Todo Finding");
         assert_eq!(target.items[1].title, "Todo Finding");
@@ -1817,7 +1925,6 @@ mod tests {
                 recommendations: Vec::new(),
                 files: Vec::new(),
                 readonly_files: Vec::new(),
-                plan: Vec::new(),
                 note: None,
             }
             .into()],
@@ -1864,7 +1971,6 @@ mod tests {
                 recommendations: Vec::new(),
                 files: Vec::new(),
                 readonly_files: Vec::new(),
-                plan: Vec::new(),
                 note: None,
             }
             .into()],
@@ -1885,105 +1991,6 @@ mod tests {
             item.status = status;
         }
         session
-    }
-
-    #[tokio::test]
-    async fn test_lowercase_r_opens_the_decomposition_dialog() {
-        let mut st = crate::app::test_state();
-        st.view_mode = ViewMode::Review;
-        st.review.sessions = vec![todo_session("rev-1", 1)];
-        // Row 0 is the session header, row 1 is the default group header, and
-        // row 2 is the finding.
-        st.review.selected_index = 2;
-
-        let state = Arc::new(Mutex::new(st));
-        let mut conn = RpcConnection::new(Vec::<u8>::new());
-
-        let key = KeyEvent::new(KeyCode::Char('r'), crossterm::event::KeyModifiers::NONE);
-        let res = handle_review_key(key, &state, &mut conn).await.unwrap();
-        assert_eq!(res, InputResult::Continue);
-
-        let st = state.lock().await;
-        // The dialog opens instead of dispatching immediately, so the developer
-        // can choose the architect and add directives before spending a turn.
-        let dialog = st
-            .review
-            .refine_dialog
-            .as_ref()
-            .expect("the decomposition dialog must open");
-        assert_eq!(dialog.review_id, "rev-1");
-        assert_eq!(dialog.item_id, 1);
-        assert_eq!(dialog.selector.len(), 1);
-        assert!(st.review.refining.is_none());
-    }
-
-    #[tokio::test]
-    async fn test_lowercase_r_on_session_header_requires_a_finding() {
-        let mut st = crate::app::test_state();
-        st.view_mode = ViewMode::Review;
-        st.review.sessions = vec![todo_session("rev-1", 1)];
-        st.review.selected_index = 0; // session header row
-
-        let state = Arc::new(Mutex::new(st));
-        let mut conn = RpcConnection::new(Vec::<u8>::new());
-
-        let key = KeyEvent::new(KeyCode::Char('r'), crossterm::event::KeyModifiers::NONE);
-        handle_review_key(key, &state, &mut conn).await.unwrap();
-
-        let st = state.lock().await;
-        assert!(st.review.refining.is_none());
-        assert_eq!(
-            st.active_notification().map(|n| n.text.as_str()),
-            Some("Select a finding to decompose into steps (r)")
-        );
-    }
-
-    #[tokio::test]
-    async fn test_capital_r_decomposes_every_finding_awaiting_refinement() {
-        let mut st = crate::app::test_state();
-        st.view_mode = ViewMode::Review;
-        st.review.sessions = vec![
-            session_with_status("rev-1", 1, IssueStatus::Refine),
-            todo_session("rev-2", 2),
-        ];
-        st.review.selected_index = 0;
-
-        let state = Arc::new(Mutex::new(st));
-        let mut conn = RpcConnection::new(Vec::<u8>::new());
-
-        let key = KeyEvent::new(KeyCode::Char('R'), crossterm::event::KeyModifiers::NONE);
-        handle_review_key(key, &state, &mut conn).await.unwrap();
-
-        let st = state.lock().await;
-        // Only the REFINE finding is owed a decomposition, so the batch
-        // dispatches it and leaves nothing queued behind.
-        assert_eq!(st.review.refining.as_deref(), Some("rev-1"));
-        assert!(st.review.refine_queue.is_empty());
-        assert_eq!(
-            st.active_notification().map(|n| n.text.as_str()),
-            Some("Decomposing finding with the Architect...")
-        );
-    }
-
-    #[tokio::test]
-    async fn test_capital_r_without_refinable_findings_notifies() {
-        let mut st = crate::app::test_state();
-        st.view_mode = ViewMode::Review;
-        st.review.sessions = vec![todo_session("rev-1", 1)];
-
-        let state = Arc::new(Mutex::new(st));
-        let mut conn = RpcConnection::new(Vec::<u8>::new());
-
-        let key = KeyEvent::new(KeyCode::Char('R'), crossterm::event::KeyModifiers::NONE);
-        handle_review_key(key, &state, &mut conn).await.unwrap();
-
-        let st = state.lock().await;
-        assert!(st.review.refining.is_none());
-        assert!(st.review.refine_queue.is_empty());
-        assert_eq!(
-            st.active_notification().map(|n| n.text.as_str()),
-            Some("No findings require architectural decomposition")
-        );
     }
 
     /// The post-analysis is a costly LLM operation, so `A` arms the
@@ -2109,7 +2116,6 @@ mod tests {
                         recommendations: Vec::new(),
                         files: Vec::new(),
                         readonly_files: Vec::new(),
-                        plan: Vec::new(),
                         note: None,
                     }
                     .into()
@@ -2120,6 +2126,518 @@ mod tests {
             post_analysis: None,
             launch_config: None,
         }
+    }
+
+    /// A session whose single finding is a symptom of one architectural root
+    /// cause: the group owns the root-cause plan and the finding carries none
+    /// of its own (c-1, c-5).
+    fn architectural_session(
+        id: &str,
+        subplan: Vec<tauqe_protocol::PlanItem>,
+    ) -> tauqe_protocol::ReviewSession {
+        use tauqe_protocol::{ReviewGroup, ReviewGroupKind};
+
+        let mut session = todo_session(id, 1);
+        session.groups = vec![ReviewGroup {
+            id: "arch".to_string(),
+            title: "Shared cause".to_string(),
+            kind: ReviewGroupKind::Architectural,
+            subplan,
+            ..Default::default()
+        }];
+        session.items[0].group = Some("arch".to_string());
+        session
+    }
+
+    /// One plan step without details, files, or children.
+    fn plan_step(id: &str, title: &str) -> tauqe_protocol::PlanItem {
+        tauqe_protocol::PlanItem {
+            id: id.to_string(),
+            title: title.to_string(),
+            ..Default::default()
+        }
+    }
+
+    /// The root-cause plan the routing tests share: a container step with one
+    /// child plus a second top-level step, so it carries two executable leaves.
+    fn root_cause_plan() -> Vec<tauqe_protocol::PlanItem> {
+        vec![
+            tauqe_protocol::PlanItem {
+                children: vec![plan_step("1.1", "Unify the guard")],
+                ..plan_step("1", "Container step")
+            },
+            plan_step("2", "Reuse the guard"),
+        ]
+    }
+
+    /// Presses one bare key through the Review handler.
+    async fn press_review_key(
+        state: &Arc<Mutex<AppState>>,
+        conn: &mut RpcConnection,
+        code: KeyCode,
+    ) {
+        handle_review_key(
+            KeyEvent::new(code, crossterm::event::KeyModifiers::NONE),
+            state,
+            conn,
+        )
+        .await
+        .unwrap();
+    }
+
+    /// `x` on the header of an architectural group arms the binary confirmation
+    /// of its root-cause plan: one root cause is fixed by one coherent change
+    /// set, so the developer never executes its findings one by one (c-1, c-4,
+    /// c-5).
+    #[tokio::test]
+    async fn test_x_on_architectural_group_header_arms_the_root_cause_plan() {
+        let mut st = crate::app::test_state();
+        st.view_mode = ViewMode::Review;
+        st.review.sessions = vec![architectural_session("rev-arch", root_cause_plan())];
+        // Row 0 is the session header and row 1 is the group header.
+        st.review.selected_index = 1;
+
+        let state = Arc::new(Mutex::new(st));
+        let mut conn = RpcConnection::new(Vec::<u8>::new());
+        press_review_key(&state, &mut conn, KeyCode::Char('x')).await;
+
+        let guard = state.lock().await;
+        let target = guard
+            .confirm_execute_review
+            .as_ref()
+            .expect("the group plan confirmation must be armed");
+        assert_eq!(target.review_id.as_deref(), Some("rev-arch"));
+        assert_eq!(target.group_id.as_deref(), Some("arch"));
+        assert_eq!(target.group_title, "Shared cause");
+        assert!(target.item_id.is_none());
+        assert!(target.step_id.is_none());
+        assert!(
+            !target.is_single_target(),
+            "a whole group plan confirms as a binary card"
+        );
+        assert_eq!(
+            target.scope_title,
+            "Root-cause plan of group 'Shared cause' (2 plan step(s))"
+        );
+        assert_eq!(
+            target.items.len(),
+            1,
+            "the group findings travel with its plan"
+        );
+        assert_eq!(
+            guard.confirm_button,
+            crate::app::ConfirmDialogButton::Cancel
+        );
+        assert!(
+            conn.written().is_empty(),
+            "arming the confirmation launches nothing"
+        );
+    }
+
+    /// A group whose plan the Architect has not projected yet announces the
+    /// just-in-time synthesis instead of inventing a step count (c-2).
+    #[tokio::test]
+    async fn test_x_on_architectural_group_without_a_plan_announces_the_jit_projection() {
+        let mut st = crate::app::test_state();
+        st.view_mode = ViewMode::Review;
+        st.review.sessions = vec![architectural_session("rev-arch", Vec::new())];
+        st.review.selected_index = 1;
+
+        let state = Arc::new(Mutex::new(st));
+        let mut conn = RpcConnection::new(Vec::<u8>::new());
+        press_review_key(&state, &mut conn, KeyCode::Char('x')).await;
+
+        let guard = state.lock().await;
+        let target = guard
+            .confirm_execute_review
+            .as_ref()
+            .expect("the group plan confirmation must be armed");
+        assert_eq!(target.group_id.as_deref(), Some("arch"));
+        assert!(target.step_id.is_none());
+        assert_eq!(
+            target.scope_title,
+            "Root-cause plan of group 'Shared cause' (not synthesized yet: projected just-in-time)"
+        );
+    }
+
+    /// A simple group keeps the per-finding queue: its findings are independent
+    /// defects, so each one stays its own isolated turn (c-1).
+    #[tokio::test]
+    async fn test_x_on_a_simple_group_header_keeps_the_per_finding_queue() {
+        use tauqe_protocol::{ReviewGroup, ReviewGroupKind};
+
+        let mut st = crate::app::test_state();
+        st.view_mode = ViewMode::Review;
+        let mut session = todo_session("rev-simple", 1);
+        session.groups = vec![ReviewGroup {
+            id: "local".to_string(),
+            title: "Local Issues".to_string(),
+            kind: ReviewGroupKind::Simple,
+            ..Default::default()
+        }];
+        session.items[0].group = Some("local".to_string());
+        st.review.sessions = vec![session];
+        st.review.selected_index = 1;
+
+        let state = Arc::new(Mutex::new(st));
+        let mut conn = RpcConnection::new(Vec::<u8>::new());
+        press_review_key(&state, &mut conn, KeyCode::Char('x')).await;
+
+        let guard = state.lock().await;
+        let target = guard
+            .confirm_execute_review
+            .as_ref()
+            .expect("the per-finding queue must be armed");
+        assert!(
+            target.group_id.is_none(),
+            "a simple group queues its findings one by one"
+        );
+        assert_eq!(target.scope_title, "Local Issues");
+        assert_eq!(target.items.len(), 1);
+        assert!(
+            !target.whole_session,
+            "a simple group queues only its own findings"
+        );
+    }
+
+    /// `x` on a step of a group plan arms the point form for exactly that step,
+    /// so the developer keeps the Coder choice and the directives editor
+    /// (c-5).
+    #[tokio::test]
+    async fn test_x_on_a_group_plan_step_arms_the_single_step_form() {
+        let mut st = crate::app::test_state();
+        st.view_mode = ViewMode::Review;
+        st.review.sessions = vec![architectural_session("rev-arch", root_cause_plan())];
+        // Row 3 is the first top-level step of the plan branch: the session
+        // header, the group header, and the branch header precede it.
+        st.review.selected_index = 3;
+
+        let state = Arc::new(Mutex::new(st));
+        let mut conn = RpcConnection::new(Vec::<u8>::new());
+        press_review_key(&state, &mut conn, KeyCode::Char('x')).await;
+
+        let guard = state.lock().await;
+        let target = guard
+            .confirm_execute_review
+            .as_ref()
+            .expect("the step confirmation must be armed");
+        assert_eq!(target.group_id.as_deref(), Some("arch"));
+        assert_eq!(target.step_id.as_deref(), Some("1"));
+        assert!(target.is_single_target());
+        assert_eq!(
+            target.scope_title,
+            "Plan step 'Container step' of review group 'Shared cause'"
+        );
+        assert_eq!(target.items.len(), 1);
+        assert_eq!(
+            guard.confirm_button,
+            crate::app::ConfirmDialogButton::Cancel
+        );
+    }
+
+    /// `x` on the plan branch header is equivalent to `x` on the group header
+    /// above it: both name the single root-cause plan the group owns (c-1).
+    #[tokio::test]
+    async fn test_x_on_a_group_plan_branch_arms_the_root_cause_plan() {
+        let mut st = crate::app::test_state();
+        st.view_mode = ViewMode::Review;
+        st.review.sessions = vec![architectural_session("rev-arch", root_cause_plan())];
+        // Row 2 is the plan branch: the session header, the group header, and
+        // the branch that owns the unified plan.
+        st.review.selected_index = 2;
+
+        let state = Arc::new(Mutex::new(st));
+        let mut conn = RpcConnection::new(Vec::<u8>::new());
+        press_review_key(&state, &mut conn, KeyCode::Char('x')).await;
+
+        let guard = state.lock().await;
+        let target = guard
+            .confirm_execute_review
+            .as_ref()
+            .expect("the group plan confirmation must be armed");
+        assert_eq!(target.review_id.as_deref(), Some("rev-arch"));
+        assert_eq!(target.group_id.as_deref(), Some("arch"));
+        assert_eq!(target.group_title, "Shared cause");
+        assert!(target.step_id.is_none());
+        assert_eq!(
+            target.scope_title,
+            "Root-cause plan of group 'Shared cause' (2 plan step(s))"
+        );
+        assert_eq!(
+            guard.confirm_button,
+            crate::app::ConfirmDialogButton::Cancel
+        );
+    }
+
+    /// `Tab` on the plan branch header folds only the branch: its steps
+    /// disappear while the group header stays open and the findings of the
+    /// group stay visible, so the two bands of a group fold independently
+    /// (concept #c-1).
+    #[tokio::test]
+    async fn test_tab_on_a_group_plan_branch_folds_only_the_plan() {
+        let mut st = crate::app::test_state();
+        st.view_mode = ViewMode::Review;
+        st.review.sessions = vec![architectural_session("rev-arch", root_cause_plan())];
+        // Row 2 is the plan branch: the session header and the group header
+        // precede it.
+        st.review.selected_index = 2;
+
+        let state = Arc::new(Mutex::new(st));
+        let mut conn = RpcConnection::new(Vec::<u8>::new());
+        press_review_key(&state, &mut conn, KeyCode::Tab).await;
+
+        let guard = state.lock().await;
+        assert!(
+            guard.review.is_group_expanded("rev-arch", "arch"),
+            "folding the branch must not fold the group"
+        );
+        assert!(!guard.review.is_plan_branch_expanded("rev-arch", "arch"));
+        let rows = guard.review.flatten_rows();
+        assert!(rows.iter().any(|row| matches!(
+            row,
+            VisibleReviewRow::GroupPlanHeader {
+                group_id,
+                is_expanded: false,
+                ..
+            } if group_id == "arch"
+        )));
+        assert!(
+            !rows
+                .iter()
+                .any(|row| matches!(row, VisibleReviewRow::SubplanItem { .. })),
+            "a folded branch hides every step of its plan"
+        );
+        assert!(
+            rows.iter()
+                .any(|row| matches!(row, VisibleReviewRow::ReviewItem { item_id: 1, .. })),
+            "a folded branch keeps the findings of its group visible"
+        );
+        assert!(
+            conn.written().is_empty(),
+            "folding the branch is presentation state only"
+        );
+        drop(guard);
+
+        // The same chord unfolds the branch and reveals its steps again.
+        press_review_key(&state, &mut conn, KeyCode::Tab).await;
+        let guard = state.lock().await;
+        assert!(guard.review.is_plan_branch_expanded("rev-arch", "arch"));
+        let steps: Vec<String> = guard
+            .review
+            .flatten_rows()
+            .into_iter()
+            .filter_map(|row| match row {
+                VisibleReviewRow::SubplanItem { step_id, .. } => Some(step_id),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(steps, vec!["1".to_string(), "2".to_string()]);
+    }
+    /// A finding of an architectural group is never executed on its own: the
+    /// handler refuses it and points at the group plan instead (c-1).
+    #[tokio::test]
+    async fn test_x_on_a_finding_of_an_architectural_group_is_refused() {
+        let mut st = crate::app::test_state();
+        st.view_mode = ViewMode::Review;
+        st.review.sessions = vec![architectural_session("rev-arch", root_cause_plan())];
+        // Row 5 closes the group: its header, the plan branch, two plan steps,
+        // and then the finding.
+        st.review.selected_index = 5;
+
+        let state = Arc::new(Mutex::new(st));
+        let mut conn = RpcConnection::new(Vec::<u8>::new());
+        press_review_key(&state, &mut conn, KeyCode::Char('x')).await;
+
+        let guard = state.lock().await;
+        assert!(guard.confirm_execute_review.is_none());
+        assert!(conn.written().is_empty());
+        assert_eq!(
+            guard.active_notification().map(|n| n.text.as_str()),
+            Some(
+                "Finding #1 belongs to the architectural group 'Shared cause': execute the group \
+                 root-cause plan from its header (x)"
+            )
+        );
+    }
+
+    /// The cross-session batch states its localized scope and counts the
+    /// architectural root-cause plans the queue executes, whether stored or
+    /// projected just-in-time (c-2, c-4).
+    #[tokio::test]
+    async fn test_capital_x_localizes_the_mixed_queue_scope() {
+        let mut st = crate::app::test_state();
+        st.view_mode = ViewMode::Review;
+        st.review.sessions = vec![
+            architectural_session("rev-arch", root_cause_plan()),
+            todo_session("rev-simple", 2),
+        ];
+
+        let state = Arc::new(Mutex::new(st));
+        let mut conn = RpcConnection::new(Vec::<u8>::new());
+        press_review_key(&state, &mut conn, KeyCode::Char('X')).await;
+
+        let guard = state.lock().await;
+        let target = guard
+            .confirm_execute_review
+            .as_ref()
+            .expect("the cross-session queue must be armed");
+        assert!(target.review_id.is_none());
+        assert_eq!(target.review_title, "All Review Sessions");
+        assert_eq!(
+            target.scope_title,
+            "All remaining TODO findings — 1 architectural group plan(s) in the queue"
+        );
+        assert_eq!(target.items.len(), 2);
+    }
+
+    /// The header of one session queues its findings with the localized scope
+    /// and states how many group plans the queue carries (c-2, c-4).
+    #[tokio::test]
+    async fn test_session_queue_scope_counts_the_group_plans() {
+        let mut st = crate::app::test_state();
+        st.view_mode = ViewMode::Review;
+        st.review.sessions = vec![architectural_session("rev-arch", root_cause_plan())];
+        st.review.selected_index = 0;
+
+        let state = Arc::new(Mutex::new(st));
+        let mut conn = RpcConnection::new(Vec::<u8>::new());
+        press_review_key(&state, &mut conn, KeyCode::Char('x')).await;
+
+        let guard = state.lock().await;
+        let target = guard
+            .confirm_execute_review
+            .as_ref()
+            .expect("the session queue must be armed");
+        assert_eq!(target.review_id.as_deref(), Some("rev-arch"));
+        assert!(target.group_id.is_none());
+        assert!(target.item_id.is_none());
+        assert_eq!(
+            target.scope_title,
+            "All remaining TODO findings — 1 architectural group plan(s) in the queue"
+        );
+        assert!(
+            target.whole_session,
+            "the session root queues the whole session, groups included"
+        );
+    }
+
+    /// Launches the queue one bare key arms on the given sessions and returns
+    /// the dispatched payload together with the launch it produced (concept
+    /// #c-1).
+    async fn launch_queue_with(
+        code: KeyCode,
+        sessions: Vec<tauqe_protocol::ReviewSession>,
+        selected: usize,
+    ) -> (String, ViewMode, bool, Option<String>) {
+        let mut st = crate::app::test_state();
+        st.view_mode = ViewMode::Review;
+        st.review.sessions = sessions;
+        st.review.selected_index = selected;
+
+        let state = Arc::new(Mutex::new(st));
+        let mut conn = RpcConnection::new(Vec::<u8>::new());
+        press_review_key(&state, &mut conn, code).await;
+        assert!(
+            conn.written().is_empty(),
+            "arming the confirmation launches nothing"
+        );
+
+        {
+            let mut guard = state.lock().await;
+            guard.confirm_button = crate::app::ConfirmDialogButton::Confirm;
+        }
+        crate::dialogs::input::handle_dialog_event(
+            KeyEvent::new(KeyCode::Enter, crossterm::event::KeyModifiers::NONE),
+            &state,
+            &mut conn,
+        )
+        .await
+        .expect("in-memory dispatch never fails");
+
+        let payload = String::from_utf8(conn.written().to_vec()).expect("utf-8 payload");
+        let guard = state.lock().await;
+        (
+            payload,
+            guard.view_mode,
+            guard.model.is_batch,
+            guard.model.error.clone(),
+        )
+    }
+
+    /// Pressing `x` on the root of a session whose findings are symptoms of
+    /// architectural groups queues that session as an implicit whole-session
+    /// run: the request names the session and carries no finding list, so the
+    /// server builds the group plans itself instead of refusing the launch with
+    /// `ARCHITECTURAL_GROUP_EXECUTION_REQUIRED` (concept #c-1, #c-3).
+    #[tokio::test]
+    async fn test_x_on_the_session_root_of_an_architectural_session_omits_item_ids() {
+        let (payload, view_mode, is_batch, error) = launch_queue_with(
+            KeyCode::Char('x'),
+            vec![architectural_session("rev-arch", root_cause_plan())],
+            0,
+        )
+        .await;
+
+        assert!(payload.contains("review/execute"), "{payload}");
+        assert!(payload.contains("\"review_id\":\"rev-arch\""), "{payload}");
+        assert!(
+            !payload.contains("\"item_ids\""),
+            "the implicit queue never names the symptoms of an architectural group: {payload}"
+        );
+        assert!(!payload.contains("\"group_id\""), "{payload}");
+        assert!(!payload.contains("\"step_id\""), "{payload}");
+        assert_eq!(view_mode, ViewMode::Repl);
+        assert!(is_batch, "a session queue runs as a batch");
+        assert!(error.is_none(), "the launch reports no protocol error");
+    }
+
+    /// The session root and the cross-session batch agree on the request shape
+    /// for the same session: neither narrows the queue with a finding list, so
+    /// its architectural groups are planned identically by both launches
+    /// (concept #c-3).
+    #[tokio::test]
+    async fn test_session_root_queue_matches_the_cross_session_batch_shape() {
+        let session = architectural_session("rev-arch", root_cause_plan());
+        let (session_payload, _, _, _) =
+            launch_queue_with(KeyCode::Char('x'), vec![session.clone()], 0).await;
+        let (batch_payload, _, _, _) =
+            launch_queue_with(KeyCode::Char('X'), vec![session], 0).await;
+
+        assert!(
+            session_payload.contains("\"review_id\":\"rev-arch\""),
+            "{session_payload}"
+        );
+        assert!(
+            !session_payload.contains("\"item_ids\""),
+            "{session_payload}"
+        );
+        assert!(
+            !batch_payload.contains("\"review_id\""),
+            "the cross-session batch names no session: {batch_payload}"
+        );
+        assert!(!batch_payload.contains("\"item_ids\""), "{batch_payload}");
+    }
+    /// `Enter` on a group header resolves through the same routing as `x`, so
+    /// the two execution chords never diverge (Conventions §4.3).
+    #[tokio::test]
+    async fn test_enter_on_a_group_header_arms_the_root_cause_plan() {
+        let mut st = crate::app::test_state();
+        st.view_mode = ViewMode::Review;
+        st.review.sessions = vec![architectural_session("rev-arch", root_cause_plan())];
+        st.review.selected_index = 1;
+
+        let state = Arc::new(Mutex::new(st));
+        let mut conn = RpcConnection::new(Vec::<u8>::new());
+        press_review_key(&state, &mut conn, KeyCode::Enter).await;
+
+        let guard = state.lock().await;
+        assert_eq!(
+            guard
+                .confirm_execute_review
+                .as_ref()
+                .and_then(|target| target.group_id.as_deref()),
+            Some("arch")
+        );
     }
 
     /// Proves the Review handler resolves every chord through the configured

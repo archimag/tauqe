@@ -1,18 +1,18 @@
-//! Architect-driven decomposition of a single review finding into an embedded
-//! subplan.
+//! Architect-driven decomposition of one architectural review group into an
+//! embedded unified subplan.
 //!
-//! Finding decomposition and plan horizon synthesis are the same Architect
+//! Group decomposition and plan horizon synthesis are the same Architect
 //! operation, so both share the multi-round discovery engine in
-//! `handlers::architect` (`run_architect_discovery_loop`). The merged subplan is
-//! persisted through the core domain primitive
-//! `ReviewStorage::replace_uncompleted_subplan`, so no plan-tree manipulation
-//! happens in the server crate.
+//! `handlers::architect` (`run_architect_discovery_loop`). The synthesized
+//! horizon is persisted through the core domain primitive
+//! `ReviewStorage::replace_uncompleted_group_subplan`, so no plan-tree
+//! manipulation happens in the server crate.
 //!
-//! The synthesis itself lives in [`refine_finding_with_architect`], a typed
-//! helper shared by the `review/refineItem` RPC handler, the autonomous
-//! decomposition that runs before coding an `Architecture`-class or `Refine`
-//! finding, and the replanning cycle that reprojects the remaining horizon of a
-//! finding whose sub-step failed (see `step.rs`).
+//! The synthesis itself lives in [`refine_group_with_architect`]. The group plan
+//! walk calls it just in time when an architectural group owns no horizon yet,
+//! and the replanning wave calls it again to reproject the remaining horizon of
+//! a group whose sub-step failed (see `group_exec.rs`). Planning is therefore an
+//! internal phase of executing a group, not a request of its own.
 
 use std::path::Path;
 use std::sync::Arc;
@@ -22,364 +22,214 @@ use tauqe_core::plan::storage::merge_subplan;
 use tauqe_core::providers::{
     format_session_id, JsonSchemaDefinition, ResponseFormat, SESSION_PREFIX_REVIEW,
 };
-use tauqe_core::review::prompt::refine::ReviewRefineDiagnostics;
+use tauqe_core::review::prompt::refine::{
+    build_review_group_refine_system_prompt, build_review_group_refine_user_prompt,
+    ReviewGroupRefineDiagnostics,
+};
 use tauqe_core::review::ReviewStorage;
+use tauqe_protocol::model::{ReviewWorkPhase, TurnWorkContext, TurnWorkQueue};
 use tauqe_protocol::{
     errors, events, IssueStatus, ModelDeltaEvent, ModelRole, ModelSelection, ModelStartedEvent,
-    PlanItem, Request, Response, ResponseError, ReviewIssue, ReviewItem, ReviewRefineItemParams,
-    ReviewRefineItemResult, ReviewSession,
+    PlanItem, ResponseError, ReviewGroup, ReviewGroupKind, ReviewItem, ReviewSession,
+    DEFAULT_REVIEW_GROUP_ID,
 };
 
 use crate::handlers::architect::{
     format_architect_escalation_note, resolve_architect_provider, run_architect_discovery_loop,
     ArchitectDiscoveryError, ArchitectDiscoveryOutcome, ArchitectDiscoveryRequest,
 };
-use crate::handlers::common::record_synthesis_history;
+use crate::handlers::common::{preload_readonly_files, record_synthesis_history};
 use crate::handlers::plan::find_duplicate_item_ids;
 use crate::state::{next_operation_id, AppState, OperationGuard};
 
-use super::common::{
-    clear_auto_context, emit, offload_review, preload_refine_item_files, publish_review,
-    set_item_status,
-};
+use super::common::{clear_auto_context, emit, offload_review, publish_review};
 
-/// Operation title used for finding decomposition telemetry and history.
-const OPERATION_TITLE: &str = "Review Finding Decomposition";
-
-/// Admission rule of a decomposition round, declared by its caller.
-///
-/// Decomposition is reachable from three places — the `review/refineItem` RPC
-/// handler, the autonomous decomposition that runs before a finding is coded,
-/// and the replanning loop that reprojects a stalled horizon — so the status
-/// lifecycle is declared once as a typed rule here instead of being re-derived
-/// by each entry point. Every neighbouring mutation guards the same transition:
-/// `handle_plan_replan` refuses a `Done` step, and `review/execute` refuses
-/// finished, rejected, and untriaged findings.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum RefineAdmission {
-    /// A developer-initiated request through `review/refineItem`.
-    ///
-    /// An untriaged finding is refused: human triage gates autonomous work, and
-    /// a decomposition fixes the architecture of the finding, so it cannot
-    /// precede triage. A `Skipped` finding stays admissible, because that is the
-    /// recovery path for a subplan that stalled.
-    Developer,
-    /// A harness-driven round: the autonomous decomposition before coding, and
-    /// the replanning that reprojects a failed sub-step.
-    ///
-    /// Both callers have already established that the finding is executable —
-    /// `review/execute` refuses untriaged findings before the queue starts, and
-    /// the replanning loop owns the finding it has just interrupted — so only
-    /// the immutable terminal statuses are refused here.
-    Harness,
+/// Builds a typed error for the decomposition helper, mirroring `Response::err`.
+fn refine_error(code: &'static str, message: String) -> ResponseError {
+    ResponseError::new(code, message)
 }
 
-impl RefineAdmission {
-    /// Validates that `item` may be decomposed under this admission rule.
-    ///
-    /// The decision is made before any status is published, so a refused round
-    /// leaves the persisted finding exactly as it was.
-    fn admit(self, item: &ReviewItem) -> Result<(), ResponseError> {
-        match item.status {
-            // Finished work is immutable under the decision-immutability
-            // invariant, exactly as `handle_plan_replan` guards a `Done` step.
-            IssueStatus::Fixed => Err(refine_error(
-                errors::STEP_IMMUTABLE,
-                format!(
-                    "Review item #{} is FIXED and immutable; a completed finding cannot be decomposed",
-                    item.id
-                ),
-            )),
-            IssueStatus::Rejected => Err(refine_error(
-                errors::ITEM_REJECTED,
-                format!(
-                    "Review item #{} is REJECTED and cannot be decomposed",
-                    item.id
-                ),
-            )),
-            // A developer request on an untriaged finding would fix an
-            // architectural decision that triage has not approved yet.
-            IssueStatus::Discussion if self == Self::Developer => Err(refine_error(
-                errors::ITEM_IN_DISCUSSION,
-                format!(
-                    "Review item #{} is in DISCUSSION status and cannot be decomposed until it is triaged (change status to TODO first)",
-                    item.id
-                ),
-            )),
-            _ => Ok(()),
-        }
-    }
-}
-
-/// Handles an Architect-driven decomposition of a single review finding into an
-/// embedded subplan carried by `ReviewItem::subplan`.
+/// Operation title used for group decomposition telemetry and history.
 ///
-/// Plan refinement and finding decomposition are conceptually the same operation:
-/// both dispatch to the Architect role, so the handler mirrors the plan horizon
-/// synthesis flow and reuses its streaming infrastructure through
-/// [`refine_finding_with_architect`].
-pub async fn handle_review_refine_item(req: Request, state: &Arc<AppState>) -> Response {
-    let params: ReviewRefineItemParams =
-        match req.params.and_then(|p| serde_json::from_value(p).ok()) {
-            Some(p) => p,
-            None => {
-                return Response::err(
-                    req.id,
-                    errors::INVALID_PARAMS,
-                    "Missing or invalid review refine item params",
-                );
-            }
-        };
+/// Group decomposition and finding decomposition are two different Architect
+/// operations, so each one names itself in the journal instead of sharing a
+/// title that would leave a log reader guessing which horizon was rewritten.
+#[allow(dead_code)]
+const GROUP_OPERATION_TITLE: &str = "Review Group Decomposition";
 
-    // Strict Review ID isolation: decomposition is scoped to the session the
-    // caller names, never to the process-global active marker.
-    let review_id = match params
-        .review_id
-        .as_deref()
-        .map(str::trim)
-        .filter(|id| !id.is_empty())
-    {
-        Some(id) => id.to_string(),
-        None => {
-            return Response::err(
-                req.id,
-                errors::INVALID_PARAMS,
-                "review_id is required: finding decomposition is scoped to an explicit session",
-            );
-        }
-    };
-
-    let repo_root = state.context.read().await.repo_root().to_path_buf();
-    let load_root = repo_root.clone();
-    let load_id = review_id.clone();
-
-    let session =
-        match offload_review(move || ReviewStorage::load_review(&load_root, &load_id)).await {
-            Ok(Some(s)) => s,
-            Ok(None) => {
-                return Response::err(
-                    req.id,
-                    errors::NOT_FOUND,
-                    format!("Review session '{}' not found", review_id),
-                );
-            }
-            Err(err) => return Response::err(req.id, errors::REVIEW_LOAD_FAILED, err),
-        };
-
-    let item = match session.find_item(params.item_id) {
-        Some(i) => i.clone(),
-        None => {
-            return Response::err(
-                req.id,
-                errors::NOT_FOUND,
-                format!(
-                    "Review item #{} not found in session '{}'",
-                    params.item_id, session.id
-                ),
-            );
-        }
-    };
-
-    // The status lifecycle is validated before the operation slot is taken, so a
-    // finished, rejected, or untriaged finding is refused deterministically and
-    // its persisted status is never touched.
-    if let Err(err) = RefineAdmission::Developer.admit(&item) {
-        return Response {
-            id: req.id,
-            result: None,
-            error: Some(err),
-        };
-    }
-
-    let operation = match state.try_begin_operation() {
-        Ok(guard) => guard,
-        Err(()) => {
-            return Response::err(
-                req.id,
-                errors::OPERATION_IN_PROGRESS,
-                "Another operation is already running",
-            );
-        }
-    };
-
-    match refine_finding_with_architect(
-        state,
-        &repo_root,
-        &session,
-        &item,
-        params.model,
-        params.instructions,
-        None,
-        &operation,
-        RefineAdmission::Developer,
-        // A developer-driven RPC request is a standalone turn that owns its own
-        // notification, so it never claims the batch context.
-        false,
-    )
-    .await
-    {
-        Ok(RefineOutcome::Success { item, explanation }) => Response::ok_typed(
-            req.id,
-            &ReviewRefineItemResult::Success {
-                item,
-                explanation: Some(explanation),
-            },
-        ),
-        Ok(RefineOutcome::Blocked { reason }) => {
-            Response::ok_typed(req.id, &ReviewRefineItemResult::Blocked { reason })
-        }
-        Err(err) => Response {
-            id: req.id,
-            result: None,
-            error: Some(err),
-        },
-    }
-}
-
-/// Typed outcome of an Architect-driven finding decomposition.
+/// Typed outcome of an Architect-driven group decomposition.
 ///
-/// The size difference between the variants is inherent to the outcome: the
-/// success arm carries the complete decomposed finding while the blocked arm
-/// carries only a reason string. The value feeds the wire result
-/// [`ReviewRefineItemResult`], which documents the same allowance, so boxing
-/// the payload would only add indirection through every consumer of the
-/// outcome; the size lint is therefore allowed here.
-#[allow(clippy::large_enum_variant)]
-pub(super) enum RefineOutcome {
-    /// The finding was decomposed and persisted with an embedded subplan.
-    Success {
-        item: ReviewIssue,
-        explanation: String,
-    },
-    /// The Architect reported that the finding cannot be decomposed as stated.
+/// The synthesized horizon itself is not returned: it is persisted on the group
+/// by the core storage primitive, so a caller only learns whether the group now
+/// owns an executable horizon or why the Architect refused to produce one.
+#[allow(dead_code)]
+#[derive(Debug)]
+pub(super) enum GroupRefineOutcome {
+    /// The group was decomposed and its unified subplan was persisted.
+    Success { explanation: String },
+    /// The Architect reported that the root cause cannot be removed as stated.
     Blocked { reason: String },
 }
 
-/// Runs an Architect-driven decomposition of a single review finding.
+/// Resolves every finding that belongs to `group_id`, in stored order.
 ///
-/// Shared by the `review/refineItem` RPC handler and the autonomous
-/// decomposition that runs before coding a `Warning`-severity or `Refine`
-/// finding. The function drives streaming structured communication with the
-/// architect model through the shared [`run_architect_discovery_loop`], runs
-/// multi-round context discovery on `needs_context`, validates the synthesized
-/// subplan, and persists it through the core domain primitive, which preserves
-/// the immutable `Done` foundation and promotes the finding from `Refine` to
-/// `Todo`. Session history is recorded strictly after the subplan is persisted,
-/// so a failed synthesis never poisons the audit trail.
+/// Membership follows the effective group of a finding: a finding that stores no
+/// group belongs to the implicit [`DEFAULT_REVIEW_GROUP_ID`] group, exactly as
+/// the grouped session view and the post-analysis layer resolve it.
+#[allow(dead_code)]
+pub(super) fn group_findings(session: &ReviewSession, group_id: &str) -> Vec<ReviewItem> {
+    session
+        .items
+        .iter()
+        .filter(|item| match item.group.as_deref() {
+            Some(group) => group == group_id,
+            None => group_id == DEFAULT_REVIEW_GROUP_ID,
+        })
+        .cloned()
+        .collect()
+}
+
+/// Collects the declared target files of every finding of a group.
 ///
-/// `diagnostics` carries the failure of an already executed sub-step. Supplying
-/// it turns the same synthesis into horizon replanning: the Architect reprojects
-/// the remaining work around the failed approach, while the immutable `Done`
-/// foundation is preserved by the storage primitive exactly as it is during
-/// initial decomposition. A replanning round also escalates the Architect
-/// configuration recorded on the finding, so the reprojection runs on a stronger
-/// rung than the one whose horizon already failed.
+/// The files are de-duplicated in declaration order, so the preload request list
+/// stays deterministic and a file two findings share is requested once.
+#[allow(dead_code)]
+fn group_target_files(items: &[ReviewItem]) -> Vec<String> {
+    let mut files: Vec<String> = Vec::new();
+    for item in items {
+        for file in &item.files {
+            if !files.iter().any(|known| known == file) {
+                files.push(file.clone());
+            }
+        }
+    }
+    files
+}
+
+/// Validates that a group may be decomposed before anything is published.
 ///
-/// Planning is a lifecycle state of the finding, not an invisible operation: it
-/// is published as `InProgress` for the whole synthesis, and a round that yields
-/// no horizon returns the finding to the status it held before planning started,
-/// so a failed or blocked round never leaves a stuck `InProgress`.
+/// The gate protects two invariants at once. A simple group collects independent
+/// defects and is executed finding by finding, so it never owns a shared horizon
+/// and asking for one is a caller error. An architectural group whose findings
+/// all reached a terminal status has no remaining work to reproject, which is a
+/// different outcome: nothing to execute.
 ///
-/// `admission` declares the lifecycle states this caller may decompose, so the
-/// status gate runs before any status is published and no entry point can
-/// regress a finished finding.
+/// The decision is taken before any status is published and before any provider
+/// is resolved, so a refused round leaves the persisted session exactly as it was
+/// and spends no request.
+#[allow(dead_code)]
+fn admit_group(group: &ReviewGroup, findings: &[ReviewItem]) -> Result<(), ResponseError> {
+    if group.kind != ReviewGroupKind::Architectural {
+        return Err(refine_error(
+            errors::INVALID_PARAMS,
+            format!(
+                "Review group '{}' is a simple group: its findings are executed finding by finding, so it owns no shared horizon to decompose",
+                group.id
+            ),
+        ));
+    }
+
+    if findings.is_empty() {
+        return Err(refine_error(
+            errors::NOTHING_TO_EXECUTE,
+            format!(
+                "Review group '{}' owns no finding, so there is no root cause to decompose",
+                group.id
+            ),
+        ));
+    }
+
+    // The horizon is synthesized for the findings that still have work left in
+    // them, so a group whose findings are all terminal has nothing to reproject.
+    let pending = findings
+        .iter()
+        .any(|item| matches!(item.status, IssueStatus::Todo | IssueStatus::InProgress));
+    if !pending {
+        return Err(refine_error(
+            errors::NOTHING_TO_EXECUTE,
+            format!(
+                "Every finding of review group '{}' is resolved; no remaining horizon can be synthesized",
+                group.id
+            ),
+        ));
+    }
+
+    Ok(())
+}
+
+/// Validates that a synthesized group horizon is executable once merged with the
+/// group's immutable `Done` foundation.
 ///
-/// `is_batch` declares the execution context of the round: `false` for a
-/// standalone turn driven by a developer RPC request, `true` for a member of a
-/// running batch. The flag is copied verbatim into the emitted
-/// `ModelStartedEvent`, so the interface freezes the shared turn and lets the
-/// batch supervisor emit the single terminal signal. Deriving it from
-/// `admission` would conflate the status lifecycle with the execution context.
+/// The merge itself belongs to the engine: `merge_subplan` is the single
+/// authoritative synthesis primitive, shared with plan horizon replacement and
+/// finding decomposition, so the server only maps its verdict into the typed
+/// review error instead of re-deriving the dependency rules locally. A horizon
+/// that names an unknown step, closes a dependency cycle, or leaves no ready step
+/// is refused before it reaches storage, leaving the stored group intact.
+#[allow(dead_code)]
+fn validate_synthesized_group_subplan(
+    existing: &[PlanItem],
+    synthesized: &[PlanItem],
+) -> Result<(), ResponseError> {
+    merge_subplan(existing, synthesized.to_vec())
+        .map(|_| ())
+        .map_err(|err| {
+            refine_error(
+                errors::INVALID_PLAN_TREE,
+                format!("Architect returned an unexecutable group subplan: {}", err),
+            )
+        })
+}
+
+/// Runs an Architect-driven decomposition of one architectural review group.
+///
+/// Plan horizon synthesis, finding decomposition, and group decomposition are the
+/// same Architect operation, so this function drives the shared
+/// [`run_architect_discovery_loop`] and differs only in what it feeds the model
+/// and where the synthesized horizon is persisted.
+///
+/// The group is the operational unit of remediation: its findings are symptoms of
+/// one root cause, so the Architect answers with a single subplan that removes the
+/// cause instead of one plan per symptom. The horizon reaches disk through the
+/// core domain primitive `ReviewStorage::replace_uncompleted_group_subplan`, which
+/// preserves the immutable `Done` foundation, records the Architect configuration
+/// that produced the horizon, and leaves every finding untouched.
+///
+/// The function publishes no finding status. Planning is a lifecycle state of the
+/// execution that runs the horizon, and a round that yields no horizon must leave
+/// every finding exactly as it was stored.
+///
+/// `diagnostics` carries the failure of an already executed sub-step of this
+/// group. Supplying it turns the same synthesis into horizon replanning: the
+/// Architect reprojects the remaining work around the failed approach while the
+/// immutable `Done` foundation is preserved. A replanning round also escalates the
+/// Architect configuration recorded on the group, so the reprojection runs on a
+/// stronger rung than the one whose horizon already failed.
+///
+/// `custom_model` and `instructions` are the developer's explicit override and
+/// directives for this run. `is_batch` declares the execution context of the
+/// round: `false` for a standalone turn, `true` for a member of a running batch.
+/// The flag is copied verbatim into the emitted `ModelStartedEvent`, so the
+/// interface freezes the shared turn and lets the batch supervisor emit the single
+/// terminal signal.
 #[allow(clippy::too_many_arguments)]
-pub(super) async fn refine_finding_with_architect(
+#[allow(dead_code)]
+pub(super) async fn refine_group_with_architect(
     state: &Arc<AppState>,
     repo_root: &Path,
     session: &ReviewSession,
-    item: &ReviewItem,
+    group: &ReviewGroup,
     custom_model: Option<ModelSelection>,
     instructions: Option<String>,
-    diagnostics: Option<ReviewRefineDiagnostics<'_>>,
-    operation: &OperationGuard,
-    admission: RefineAdmission,
-    is_batch: bool,
-) -> Result<RefineOutcome, ResponseError> {
-    // The gate runs before anything is published: a refused round must leave the
-    // stored finding exactly as it was.
-    admission.admit(item)?;
-
-    // Planning is visible in the finding lifecycle. Publishing `InProgress`
-    // before the first generation round lets the interface show planning
-    // instead of an idle finding, and a successful synthesis settles it on
-    // `Todo` inside `replace_uncompleted_subplan`.
-    let previous_status = item.status;
-    set_item_status(
-        state,
-        repo_root,
-        &session.id,
-        item.id,
-        IssueStatus::InProgress,
-    )
-    .await;
-
-    let outcome = refine_finding_with_architect_inner(
-        state,
-        repo_root,
-        session,
-        item,
-        custom_model,
-        instructions,
-        diagnostics,
-        operation,
-        is_batch,
-    )
-    .await;
-
-    // A round that produced no horizon must not leave the finding stuck in
-    // `InProgress`, so it returns to the status it held before planning began.
-    if !matches!(&outcome, Ok(RefineOutcome::Success { .. })) {
-        let restored = status_after_failed_planning(previous_status);
-        tracing::info!(
-            review_id = %session.id,
-            item_id = item.id,
-            previous_status = %previous_status,
-            restored_status = %restored,
-            "review finding planning produced no horizon; status restored"
-        );
-        set_item_status(state, repo_root, &session.id, item.id, restored).await;
-    }
-
-    outcome
-}
-
-/// Status a finding returns to when a planning round yields no horizon.
-///
-/// The planning status must never outlive the planning round, so the finding
-/// returns to the status it held before planning started. A finding that was
-/// itself mid-planning is demoted to `Todo`, which keeps it executable and
-/// distinguishable from finished work.
-fn status_after_failed_planning(previous: IssueStatus) -> IssueStatus {
-    match previous {
-        IssueStatus::InProgress => IssueStatus::Todo,
-        other => other,
-    }
-}
-
-/// Runs the Architect synthesis of a finding horizon.
-///
-/// See [`refine_finding_with_architect`] for the lifecycle contract. This
-/// function performs the synthesis itself and never mutates the finding status.
-#[allow(clippy::too_many_arguments)]
-async fn refine_finding_with_architect_inner(
-    state: &Arc<AppState>,
-    repo_root: &Path,
-    session: &ReviewSession,
-    item: &ReviewItem,
-    custom_model: Option<ModelSelection>,
-    instructions: Option<String>,
-    diagnostics: Option<ReviewRefineDiagnostics<'_>>,
+    diagnostics: Option<ReviewGroupRefineDiagnostics<'_>>,
     operation: &OperationGuard,
     is_batch: bool,
-) -> Result<RefineOutcome, ResponseError> {
+) -> Result<GroupRefineOutcome, ResponseError> {
+    // The gate runs before anything is published or resolved: a refused round
+    // must leave the stored session exactly as it was and spend no request.
+    let group_items = group_findings(session, &group.id);
+    admit_group(group, &group_items)?;
+
     let (
         provider,
         architect_tier,
@@ -394,18 +244,18 @@ async fn refine_finding_with_architect_inner(
     ) = {
         let cfg = state.config.lock().await.config.clone();
         // Tier resolution and the lazy level-up invariant are core-owned domain
-        // policy shared with plan horizon synthesis, so the server never
-        // re-derives the ladder locally.
+        // policy shared with plan horizon synthesis and finding decomposition, so
+        // the server never re-derives the ladder locally.
         let (architect_tier, level_up) = tauqe_core::plan::prompt::resolve_architect_tier(
             &cfg,
-            item.subplan_architect.as_ref(),
+            group.subplan_architect.as_ref(),
             custom_model.as_ref(),
             diagnostics.as_ref().map(|d| d.failed_step_id),
-            item.subplan_last_replanned_step.as_deref(),
+            group.subplan_last_replanned_step.as_deref(),
         );
         let provider =
             match resolve_architect_provider(state, &cfg, architect_tier.model.provider).await {
-                Ok(p) => p,
+                Ok(provider) => provider,
                 Err(err) => return Err(refine_error(errors::NO_API_KEY, err)),
             };
         // A manual run on a configuration the automatic ladder excludes cannot
@@ -429,6 +279,11 @@ async fn refine_finding_with_architect_inner(
     };
     let model = architect_tier.model.clone();
     let reasoning_effort = architect_tier.effort;
+    let group_label = if group.title.trim().is_empty() {
+        group.id.as_str()
+    } else {
+        group.title.trim()
+    };
 
     // A repeated failure of the same sub-step runs on the escalated rung and
     // records it with the reprojected horizon, so the next wave continues up the
@@ -436,10 +291,10 @@ async fn refine_finding_with_architect_inner(
     if let Some(level) = &level_up {
         tracing::warn!(
             review_id = %session.id,
-            item_id = item.id,
+            group_id = %group.id,
             from_tier = ?level.from,
             to_tier = ?level.to,
-            "review finding architect level up"
+            "review group architect level up"
         );
     }
 
@@ -451,13 +306,14 @@ async fn refine_finding_with_architect_inner(
 
     clear_auto_context(state).await;
 
-    // Guarantee baseline visibility: load the finding's target files into the
-    // read-only auto layer before the first generation round so the architect
-    // inspects real code instead of inferring it from the repo map alone.
-    preload_refine_item_files(state, repo_root, &item.files).await;
+    // Guarantee baseline visibility: load the target files every finding of the
+    // group declares into the read-only auto layer before the first generation
+    // round, so the architect inspects the code that manifests the root cause
+    // instead of inferring it from the repo map alone.
+    let group_files = group_target_files(&group_items);
+    preload_readonly_files(state, repo_root, &group_files).await;
 
     let op_id = format!("op-{}", next_operation_id());
-
     emit(
         &state.out,
         events::MODEL_STARTED,
@@ -468,8 +324,16 @@ async fn refine_finding_with_architect_inner(
             alias: None,
             effort: reasoning_effort,
             plan_context: None,
-            // The round belongs to whatever context its caller declared, so a
-            // batch member never settles the shared turn on its own.
+            // The round is the just-in-time decomposition of one review group, so
+            // the running work is declared here instead of being reconstructed
+            // from the stored review; a batch member never settles the shared
+            // turn on its own.
+            work_context: Some(TurnWorkContext::ReviewPhase {
+                review_id: session.id.clone(),
+                review_title: session.title.clone(),
+                phase: ReviewWorkPhase::Decomposition,
+                queue: TurnWorkQueue::default(),
+            }),
             is_batch,
         })
         .ok(),
@@ -477,12 +341,12 @@ async fn refine_finding_with_architect_inner(
 
     let intro_header = match &diagnostics {
         Some(diag) => format!(
-            "# {}: [{}#{}] {}\n*Replanning the finding horizon around failed sub-step `{}`...*{}\n\n---\n\n",
-            OPERATION_TITLE, session.id, item.id, item.title, diag.failed_step_id, level_up_note
+            "# {}: [{}] {}\n*Replanning the group horizon around failed sub-step `{}`...*{}\n\n---\n\n",
+            GROUP_OPERATION_TITLE, session.id, group_label, diag.failed_step_id, level_up_note
         ),
         None => format!(
-            "# {}: [{}#{}] {}\n*Analyzing codebase contours and decomposing the finding into executable sub-steps...*{}\n\n---\n\n",
-            OPERATION_TITLE, session.id, item.id, item.title, level_up_note
+            "# {}: [{}] {}\n*Analyzing codebase contours and decomposing the group root cause into executable sub-steps...*{}\n\n---\n\n",
+            GROUP_OPERATION_TITLE, session.id, group_label, level_up_note
         ),
     };
     emit(
@@ -496,24 +360,26 @@ async fn refine_finding_with_architect_inner(
     );
 
     // The user turn and its response are recorded together once the decomposition
-    // reaches a terminal outcome, so a cancelled, failed, or rejected round
-    // leaves no orphaned user turn in the transcript. The prompt and context
-    // paths are captured here because they describe the state the Architect
-    // actually saw.
+    // reaches a terminal outcome, so a cancelled, failed, or rejected round leaves
+    // no orphaned user turn in the transcript. The prompt and the context paths are
+    // captured here because they describe the state the Architect actually saw.
     let (history_turn_prompt, history_context_paths) = {
         let ctx = state.context.read().await;
         let context_paths: Vec<String> = ctx
             .get_state()
             .items
             .into_iter()
-            .map(|it| it.path)
+            .map(|item| item.path)
             .collect();
         let mut turn_prompt = format!(
-            "# {}: [{}#{}] {}\n",
-            OPERATION_TITLE, session.id, item.id, item.title
+            "# {}: [{}] {}\n\nDecompose the root cause shared by {} finding(s) of this group into one executable subplan.\n",
+            GROUP_OPERATION_TITLE,
+            session.id,
+            group_label,
+            group_items.len()
         );
-        if let Some(ins) = &instructions {
-            let trimmed = ins.trim();
+        if let Some(directives) = &instructions {
+            let trimmed = directives.trim();
             if !trimmed.is_empty() {
                 turn_prompt.push_str(&format!("\nDirectives: {}\n", trimmed));
             }
@@ -530,15 +396,14 @@ async fn refine_finding_with_architect_inner(
             Err(err) => return Err(refine_error(errors::SCHEMA_ERROR, err.to_string())),
         }
     };
-    let system_prompt =
-        tauqe_core::review::prompt::refine::build_review_finding_refine_system_prompt();
+    let system_prompt = build_review_group_refine_system_prompt();
     let discovery = ArchitectDiscoveryRequest {
         repo_root,
         op_id: &op_id,
-        operation_title: OPERATION_TITLE,
+        operation_title: GROUP_OPERATION_TITLE,
         system_prompt: &system_prompt,
         intro_header: &intro_header,
-        budget_hint: "The finding decomposition is too broad and should be scoped down.",
+        budget_hint: "The group decomposition is too broad and should be scoped down.",
         response_format,
         repomap_budget,
         include_repo_map,
@@ -546,20 +411,21 @@ async fn refine_finding_with_architect_inner(
         files_token_budget,
         discovery_limits,
         max_parse_retries,
-        // Decomposition is an isolated design dialogue of one review session:
-        // its cache is keyed by the audit, never by the interactive REPL.
+        // Decomposition is an isolated design dialogue of one review session: its
+        // cache is keyed by the audit, never by the interactive REPL.
         session_id: Some(format_session_id(SESSION_PREFIX_REVIEW, &session.id)),
     };
 
     let build_user_prompt =
         |context_files: &[ContextFileContent], repo_map: Option<&str>, repo_dirs: Option<&str>| {
-            let diagnostics_view = diagnostics.map(|d| ReviewRefineDiagnostics {
+            let diagnostics_view = diagnostics.map(|d| ReviewGroupRefineDiagnostics {
                 failed_step_id: d.failed_step_id,
                 failure_reason: d.failure_reason,
             });
-            tauqe_core::review::prompt::refine::build_review_finding_refine_user_prompt(
+            build_review_group_refine_user_prompt(
                 session,
-                item,
+                group,
+                &group_items,
                 context_files,
                 repo_map,
                 repo_dirs,
@@ -594,17 +460,17 @@ async fn refine_finding_with_architect_inner(
                 warn_msg.clone(),
                 Some(format!(
                     "{}: Token Budget Exceeded ({})",
-                    OPERATION_TITLE, item.title
+                    GROUP_OPERATION_TITLE, group_label
                 )),
             )
             .await;
-            return Ok(RefineOutcome::Blocked { reason: warn_msg });
+            return Ok(GroupRefineOutcome::Blocked { reason: warn_msg });
         }
         Err(ArchitectDiscoveryError::Cancelled) => {
             clear_auto_context(state).await;
             return Err(refine_error(
                 errors::CANCELLED,
-                format!("{} was cancelled", OPERATION_TITLE),
+                format!("{} was cancelled", GROUP_OPERATION_TITLE),
             ));
         }
         Err(ArchitectDiscoveryError::ModelError(err)) => {
@@ -620,25 +486,28 @@ async fn refine_finding_with_architect_inner(
     if output.status.eq_ignore_ascii_case("blocked") {
         let reason = output.reason.unwrap_or(output.explanation);
         let blocked_msg = format!(
-            "Architect reported blockers for review finding [{}#{}]:\n\n{}",
-            session.id, item.id, reason
+            "Architect reported blockers for review group [{}]:\n\n{}",
+            group.id, reason
         );
         record_synthesis_history(
             state,
             history_turn_prompt,
             history_context_paths,
             blocked_msg,
-            Some(format!("{}: Blocked ({})", OPERATION_TITLE, item.title)),
+            Some(format!(
+                "{}: Blocked ({})",
+                GROUP_OPERATION_TITLE, group_label
+            )),
         )
         .await;
-        return Ok(RefineOutcome::Blocked { reason });
+        return Ok(GroupRefineOutcome::Blocked { reason });
     }
 
     if output.status.eq_ignore_ascii_case("needs_context") {
         return Err(refine_error(
             errors::NEEDS_CONTEXT,
             format!(
-                "Architect requested additional context but no discovery rounds remain (limit: {}). Narrow the finding scope or raise the discovery round limit, then refine again",
+                "Architect requested additional context but no discovery rounds remain (limit: {}). Narrow the group scope or raise the discovery round limit, then decompose the group again",
                 max_discovery_rounds
             ),
         ));
@@ -665,25 +534,25 @@ async fn refine_finding_with_architect_inner(
         return Err(refine_error(
             errors::INVALID_PLAN_TREE,
             format!(
-                "Architect returned a subplan with a duplicate or empty step ID: '{}'",
+                "Architect returned a group subplan with a duplicate or empty step ID: '{}'",
                 duplicate
             ),
         ));
     }
 
     // A structurally valid step list can still be unexecutable once merged with
-    // the finding's immutable `Done` foundation: a `depends_on` may name a step
-    // that neither the foundation nor the new horizon provides, and the horizon
-    // may leave no ready step at all. The verdict is taken from the engine's
-    // synthesis primitive here, before anything reaches storage, so a refused
-    // horizon never rewrites the persisted finding.
-    validate_synthesized_subplan(&item.subplan, &output.items)?;
+    // the group's immutable `Done` foundation: a `depends_on` may name a step the
+    // foundation and the new horizon both lack, and the horizon may leave no ready
+    // step at all. The verdict is taken from the engine's synthesis primitive here,
+    // before anything reaches storage, so a refused horizon never rewrites the
+    // persisted group.
+    validate_synthesized_group_subplan(&group.subplan, &output.items)?;
 
-    // Persist the merged subplan through the core domain primitive, which
-    // preserves the immutable `Done` foundation and rejects dependency cycles
-    // before anything reaches disk.
+    // Persist the merged subplan through the core domain primitive, which preserves
+    // the immutable `Done` foundation and rejects dependency cycles before anything
+    // reaches disk.
     let review_id = session.id.clone();
-    let item_id = item.id;
+    let group_id = group.id.clone();
     let explanation = output.explanation;
     let new_subplan = output.items;
     let save_root = repo_root.to_path_buf();
@@ -694,10 +563,10 @@ async fn refine_finding_with_architect_inner(
     // failed a replanning round.
     let subplan_replanned_step = diagnostics.map(|d| d.failed_step_id.to_string());
     let updated = match offload_review(move || {
-        ReviewStorage::replace_uncompleted_subplan(
+        ReviewStorage::replace_uncompleted_group_subplan(
             &save_root,
             &save_review_id,
-            item_id,
+            &group_id,
             new_subplan,
             subplan_architect,
             subplan_replanned_step,
@@ -705,83 +574,51 @@ async fn refine_finding_with_architect_inner(
     })
     .await
     {
-        Ok(Some(issue)) => issue,
+        Ok(Some(updated)) => updated,
         Ok(None) => {
             return Err(refine_error(
                 errors::NOT_FOUND,
                 format!(
-                    "Review item #{} not found in session '{}'",
-                    item_id, review_id
+                    "Review group '{}' not found in session '{}'",
+                    group.id, review_id
                 ),
             ));
         }
         Err(err) => return Err(refine_error(errors::PLAN_SAVE_FAILED, err)),
     };
 
-    let (subplan_total, _) = updated.subplan_stats();
+    let subplan_steps = updated.subplan.len();
     tracing::info!(
         review_id = %review_id,
-        item_id = item_id,
-        subplan_steps = subplan_total,
-        "review finding decomposed"
+        group_id = %updated.id,
+        subplan_steps,
+        findings = group_items.len(),
+        "review group decomposed"
     );
 
     let history_response = format!(
-        "Review finding [{}#{}] decomposed into {} sub-step(s).\n\n{}",
-        review_id, item_id, subplan_total, explanation
+        "Review group [{}] decomposed into {} top-level sub-step(s).\n\n{}",
+        review_id, subplan_steps, explanation
     );
     record_synthesis_history(
         state,
         history_turn_prompt,
         history_context_paths,
         history_response,
-        Some(format!("{}: {}", OPERATION_TITLE, updated.title)),
+        Some(format!("{}: {}", GROUP_OPERATION_TITLE, group_label)),
     )
     .await;
 
     publish_review(state, repo_root, &review_id).await;
 
-    Ok(RefineOutcome::Success {
-        item: updated,
-        explanation,
-    })
+    Ok(GroupRefineOutcome::Success { explanation })
 }
-
-/// Validates that a synthesized finding horizon is executable once merged with
-/// the finding's immutable `Done` foundation.
-///
-/// The merge itself belongs to the engine: `merge_subplan` is the single
-/// authoritative synthesis primitive, shared with plan horizon replacement, so
-/// the server only maps its verdict into the typed review error instead of
-/// re-deriving the dependency rules locally. A horizon that references an
-/// unknown step, closes a dependency cycle, or leaves no ready step is reported
-/// as [`errors::INVALID_PLAN_TREE`] before it reaches storage, so a refused
-/// decomposition leaves the stored finding untouched and the caller receives a
-/// precise diagnostic instead of a generic save failure.
-fn validate_synthesized_subplan(
-    existing: &[PlanItem],
-    synthesized: &[PlanItem],
-) -> Result<(), ResponseError> {
-    merge_subplan(existing, synthesized.to_vec())
-        .map(|_| ())
-        .map_err(|err| {
-            refine_error(
-                errors::INVALID_PLAN_TREE,
-                format!("Architect returned an unexecutable subplan: {}", err),
-            )
-        })
-}
-
-/// Builds a typed error for the decomposition helper, mirroring `Response::err`.
-fn refine_error(code: &'static str, message: String) -> ResponseError {
-    ResponseError::new(code, message)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::handlers::architect::format_architect_tier;
-    use tauqe_protocol::{ArchitectTier, ModelRef, PlanItemStatus, ReasoningEffort};
+    use tauqe_core::config::AppConfig;
+    use tauqe_protocol::{ArchitectTier, ModelRef, ReasoningEffort};
 
     #[test]
     fn architect_tier_banner_renders_its_reasoning_depth() {
@@ -802,190 +639,140 @@ mod tests {
         );
     }
 
-    #[test]
-    fn failed_planning_restores_the_previous_status() {
-        // A finding the developer is still examining keeps its own status: a
-        // failed planning round must never silently queue it for execution.
-        assert_eq!(
-            status_after_failed_planning(IssueStatus::Discussion),
-            IssueStatus::Discussion
-        );
-        assert_eq!(
-            status_after_failed_planning(IssueStatus::Refine),
-            IssueStatus::Refine
-        );
-        // A finding interrupted mid-subplan keeps its diagnostic instead of
-        // losing it to the planning round.
-        assert_eq!(
-            status_after_failed_planning(IssueStatus::Skipped),
-            IssueStatus::Skipped
-        );
-    }
-
-    #[test]
-    fn failed_planning_never_leaves_in_progress() {
-        // The planning status cannot outlive the round that published it.
-        assert_eq!(
-            status_after_failed_planning(IssueStatus::InProgress),
-            IssueStatus::Todo
-        );
-    }
-
-    /// Builds a finding in the given lifecycle state.
-    fn finding_in(status: IssueStatus) -> ReviewItem {
-        ReviewItem::from(ReviewIssue {
-            id: 12,
-            title: "Guard the parser".to_string(),
-            uuid: None,
-            group: None,
-            model: None,
-            issue_type: tauqe_protocol::IssueType::Bug,
-            status,
-            description: String::new(),
-            recommendations: Vec::new(),
-            files: Vec::new(),
-            readonly_files: Vec::new(),
-            plan: Vec::new(),
-            note: None,
-        })
-    }
-
-    #[test]
-    fn developer_decomposition_refuses_untriaged_and_terminal_findings() {
-        // Finished work is immutable, exactly as a `Done` plan step is.
-        let err = RefineAdmission::Developer
-            .admit(&finding_in(IssueStatus::Fixed))
-            .expect_err("a fixed finding must be refused");
-        assert_eq!(err.code, errors::STEP_IMMUTABLE);
-
-        let err = RefineAdmission::Developer
-            .admit(&finding_in(IssueStatus::Rejected))
-            .expect_err("a rejected finding must be refused");
-        assert_eq!(err.code, errors::ITEM_REJECTED);
-
-        // Human triage gates autonomous work, so an untriaged finding cannot be
-        // turned into an executable horizon yet.
-        let err = RefineAdmission::Developer
-            .admit(&finding_in(IssueStatus::Discussion))
-            .expect_err("an untriaged finding must be refused");
-        assert_eq!(err.code, errors::ITEM_IN_DISCUSSION);
-    }
-
-    #[test]
-    fn developer_decomposition_admits_recoverable_findings() {
-        for status in [
-            IssueStatus::Todo,
-            IssueStatus::InProgress,
-            IssueStatus::Refine,
-            // A stalled subplan leaves the finding skipped; asking the Architect
-            // to reproject it stays a legitimate recovery path.
-            IssueStatus::Skipped,
-        ] {
-            assert!(
-                RefineAdmission::Developer
-                    .admit(&finding_in(status))
-                    .is_ok(),
-                "{status} must stay decomposable"
-            );
-        }
-    }
-
-    #[test]
-    fn harness_decomposition_refuses_only_immutable_statuses() {
-        for status in [IssueStatus::Fixed, IssueStatus::Rejected] {
-            assert!(
-                RefineAdmission::Harness.admit(&finding_in(status)).is_err(),
-                "{status} is immutable and must be refused"
-            );
-        }
-
-        // The replanning loop reprojects a finding it has just interrupted, so
-        // `Skipped` must stay admitted on the harness path.
-        for status in [IssueStatus::Skipped, IssueStatus::Refine, IssueStatus::Todo] {
-            assert!(
-                RefineAdmission::Harness.admit(&finding_in(status)).is_ok(),
-                "{status} must stay decomposable by the harness"
-            );
-        }
-    }
-
-    /// Builds a horizon step in the given execution state.
-    fn step(id: &str, status: PlanItemStatus) -> PlanItem {
-        PlanItem {
+    /// Builds a review group of the given class.
+    fn group_of(id: &str, kind: ReviewGroupKind) -> ReviewGroup {
+        ReviewGroup {
             id: id.to_string(),
-            title: format!("Step {id}"),
-            status,
-            // Every executable leaf names its target context, so the fixture
-            // horizon satisfies the leaf-files invariant and each assertion
-            // exercises the dependency rule it is about.
-            files: vec![format!("src/{id}.rs")],
+            title: format!("Group {id}"),
+            kind,
             ..Default::default()
         }
     }
 
-    #[test]
-    fn synthesized_subplan_refuses_dependency_on_an_unknown_step() {
-        let synthesized = vec![PlanItem {
-            depends_on: vec!["ghost".to_string()],
-            ..step("s-2", PlanItemStatus::Todo)
-        }];
+    /// Builds a finding with the given status that belongs to no explicit group.
+    fn finding_in(status: IssueStatus) -> ReviewItem {
+        ReviewItem {
+            id: 1,
+            title: "Finding".to_string(),
+            uuid: None,
+            group: None,
+            model: None,
+            issue_type: tauqe_protocol::IssueType::Quality,
+            severity: tauqe_protocol::ReviewSeverity::Suggestion,
+            status,
+            recommendations: Vec::new(),
+            files: Vec::new(),
+            readonly_files: Vec::new(),
+            resolution_notes: None,
+            body: String::new(),
+        }
+    }
 
-        let err = validate_synthesized_subplan(&[], &synthesized)
-            .expect_err("a horizon depending on an unknown step must be refused");
-        assert_eq!(err.code, errors::INVALID_PLAN_TREE);
+    /// Builds a finding that belongs to the named group.
+    fn finding_of_group(group: Option<&str>, status: IssueStatus) -> ReviewItem {
+        let mut item = finding_in(status);
+        item.group = group.map(str::to_string);
+        item
+    }
+
+    /// Builds a session holding the given findings.
+    fn grouped_session(items: Vec<ReviewItem>) -> ReviewSession {
+        ReviewSession {
+            id: "rev-groups".to_string(),
+            title: "Grouped Audit".to_string(),
+            created_at: 7,
+            model: ModelRef::openrouter("test/architect"),
+            items,
+            ..ReviewSession::default()
+        }
+    }
+
+    #[test]
+    fn group_membership_follows_the_effective_group_of_a_finding() {
+        let session = grouped_session(vec![
+            finding_of_group(Some("arch-1"), IssueStatus::Todo),
+            // A finding stored before grouping existed belongs to the implicit
+            // default group, exactly as the grouped session view resolves it.
+            finding_of_group(None, IssueStatus::Todo),
+        ]);
+
+        assert_eq!(group_findings(&session, "arch-1").len(), 1);
+        assert_eq!(group_findings(&session, DEFAULT_REVIEW_GROUP_ID).len(), 1);
+        assert!(group_findings(&session, "arch-2").is_empty());
+    }
+
+    #[test]
+    fn group_decomposition_admits_an_architectural_group_with_pending_work() {
+        let group = group_of("arch-1", ReviewGroupKind::Architectural);
+        let session = grouped_session(vec![
+            finding_of_group(Some("arch-1"), IssueStatus::Fixed),
+            finding_of_group(Some("arch-1"), IssueStatus::Todo),
+        ]);
+
+        assert!(admit_group(&group, &group_findings(&session, "arch-1")).is_ok());
+    }
+
+    #[test]
+    fn group_decomposition_refuses_a_simple_group() {
+        // A simple group collects independent defects: its findings are executed
+        // finding by finding, so it never owns a shared horizon.
+        let group = group_of("local", ReviewGroupKind::Simple);
+        let findings = vec![finding_of_group(Some("local"), IssueStatus::Todo)];
+
+        let err = admit_group(&group, &findings).expect_err("a simple group has no horizon");
+        assert_eq!(err.code, errors::INVALID_PARAMS);
         assert!(
-            err.message.contains("ghost"),
-            "the diagnostic must name the broken dependency: {}",
+            err.message.contains("simple group"),
+            "the diagnostic must name the class conflict: {}",
             err.message
         );
     }
 
     #[test]
-    fn synthesized_subplan_accepts_dependency_on_the_done_foundation() {
-        // A completed sub-step satisfies the dependency of a new step, so the
-        // reprojected horizon stays executable.
-        let existing = vec![step("s-1", PlanItemStatus::Done)];
-        let synthesized = vec![PlanItem {
-            depends_on: vec!["s-1".to_string()],
-            ..step("s-2", PlanItemStatus::Todo)
-        }];
+    fn group_decomposition_refuses_a_group_without_remaining_work() {
+        let group = group_of("arch-1", ReviewGroupKind::Architectural);
 
-        assert!(validate_synthesized_subplan(&existing, &synthesized).is_ok());
+        // The group owns no member finding at all.
+        let err = admit_group(&group, &[]).expect_err("nothing to decompose");
+        assert_eq!(err.code, errors::NOTHING_TO_EXECUTE);
+
+        // Every finding of the group already reached a terminal status.
+        let findings = vec![
+            finding_of_group(Some("arch-1"), IssueStatus::Fixed),
+            finding_of_group(Some("arch-1"), IssueStatus::Skipped),
+        ];
+        let err = admit_group(&group, &findings).expect_err("nothing is left to reproject");
+        assert_eq!(err.code, errors::NOTHING_TO_EXECUTE);
     }
 
-    #[test]
-    fn synthesized_subplan_refuses_a_horizon_with_no_ready_step() {
-        // Both references resolve, yet the only candidate waits for a step that
-        // can never become `Done`, so nothing in the horizon could ever start.
-        let synthesized = vec![
-            PlanItem {
-                depends_on: vec!["s-1".to_string()],
-                ..step("s-2", PlanItemStatus::Todo)
-            },
-            step("s-1", PlanItemStatus::Cancelled),
-        ];
+    /// The admission gate runs before any publication and before any provider is
+    /// resolved, so a refused round spends no request and leaves the stored session
+    /// exactly as it was. The fixture configures no provider at all, so a gate that
+    /// ran late would surface `NO_API_KEY` instead of the class refusal.
+    #[tokio::test]
+    async fn group_decomposition_refuses_a_simple_group_before_any_provider_call() {
+        let root = std::env::temp_dir().join(format!(
+            "tauqe-review-group-refine-{}-{}",
+            std::process::id(),
+            crate::state::next_operation_id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let (out, _events) = crate::transport::OutChannel::new();
+        let (history_sender, _history_rx) = tokio::sync::mpsc::unbounded_channel();
+        let state = AppState::new(AppConfig::default(), root.clone(), history_sender, out);
 
-        let err = validate_synthesized_subplan(&[], &synthesized)
-            .expect_err("a horizon without a ready step must be refused");
-        assert_eq!(err.code, errors::INVALID_PLAN_TREE);
-        assert!(
-            err.message.contains("cannot start"),
-            "the diagnostic must explain the stalled horizon: {}",
-            err.message
-        );
-    }
+        let session = grouped_session(vec![finding_of_group(Some("local"), IssueStatus::Todo)]);
+        let group = group_of("local", ReviewGroupKind::Simple);
+        let operation = state.try_begin_operation().expect("the slot is free");
 
-    #[test]
-    fn synthesized_subplan_drops_a_collision_with_completed_work() {
-        // A stale identifier that reuses a completed sub-step is dropped by the
-        // merge instead of being reported as a defect, exactly as plan horizon
-        // replacement behaves.
-        let existing = vec![step("s-1", PlanItemStatus::Done)];
-        let synthesized = vec![
-            step("s-1", PlanItemStatus::Todo),
-            step("s-2", PlanItemStatus::Todo),
-        ];
+        let err = refine_group_with_architect(
+            &state, &root, &session, &group, None, None, None, &operation, false,
+        )
+        .await
+        .expect_err("a simple group is never decomposed");
 
-        assert!(validate_synthesized_subplan(&existing, &synthesized).is_ok());
+        assert_eq!(err.code, errors::INVALID_PARAMS);
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

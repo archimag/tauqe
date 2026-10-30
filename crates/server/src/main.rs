@@ -380,7 +380,8 @@ const FORCE_ABORT_BUDGET: std::time::Duration =
 
 /// Methods whose handlers block on long-running work — an LLM turn, a
 /// repository lifecycle request that reloads configuration and rebuilds the
-/// history manager from disk, a Git history rewrite, or the deterministic
+/// history manager from disk, a Git history rewrite, a session-history page
+/// read that runs concurrently with a bounded turn, or the deterministic
 /// pre-flight toolchain verification — and must therefore be offloaded from the
 /// read loop. Offloading keeps the loop free to accept cancels and to observe
 /// stdin EOF. Every other method is short and runs inline to preserve request
@@ -390,14 +391,16 @@ fn is_long_running(method: &str) -> bool {
         method,
         methods::CLIENT_INITIALIZE
             | methods::REPOSITORY_INIT
+            | methods::HISTORY_GET
             | methods::MODEL_ASK
             | methods::PLAN_REFINE
             | methods::PLAN_REPLAN
             | methods::PLAN_EXECUTE
             | methods::PLAN_EXECUTE_PIPELINE
             | methods::REVIEW_START
+            | methods::REVIEW_PREVIEW
             | methods::REVIEW_EXECUTE
-            | methods::REVIEW_REFINE_ITEM
+            | methods::REVIEW_ANALYZE
             | methods::GIT_SQUASH_GENERATE_MESSAGE
             | methods::GIT_SQUASH_APPLY
             | methods::LOCALE_GENERATE
@@ -528,17 +531,21 @@ mod tests {
     use super::*;
 
     /// Repository lifecycle requests reload configuration, re-anchor the
-    /// context, and rebuild the history manager from disk, while
-    /// `git/squashApply` rewrites history and records the result behind an
-    /// `fsync` barrier. All of them must be offloaded, otherwise the stdin
-    /// reader loop stalls and can observe neither cancels nor EOF while they
-    /// run.
+    /// context, and rebuild the history manager from disk, `git/squashApply`
+    /// rewrites history and records the result behind an `fsync` barrier, and a
+    /// `history/get` page read competes with a bounded turn for the session
+    /// journal. All of them must be offloaded, otherwise the stdin reader loop
+    /// stalls and can observe neither cancels nor EOF while they run.
     #[test]
-    fn repository_lifecycle_requests_are_offloaded() {
+    fn long_running_requests_are_offloaded() {
         for method in [
             methods::CLIENT_INITIALIZE,
             methods::REPOSITORY_INIT,
             methods::GIT_SQUASH_APPLY,
+            methods::HISTORY_GET,
+            // The review window projection lists the repository and reads every
+            // matched file, so it is never short enough to run inline.
+            methods::REVIEW_PREVIEW,
         ] {
             assert!(is_long_running(method), "'{method}' must be offloaded");
         }
@@ -546,7 +553,38 @@ mod tests {
         // Short requests stay inline so their responses keep the client's
         // request order.
         assert!(!is_long_running(methods::CONFIG_GET));
-        assert!(!is_long_running(methods::HISTORY_GET));
+    }
+
+    /// Every model-backed request resolves a provider, takes the operation slot,
+    /// and streams a completion across `.await`s, so it is never short enough to
+    /// run inline. The whole set is enumerated here because the classification in
+    /// `is_long_running` is maintained by hand: a handler wired into the dispatcher
+    /// without joining it would otherwise stall the read loop for the entire call —
+    /// exactly how `review/analyze` came to stream a full Architect classification
+    /// inline, where neither a cancel nor stdin EOF could reach it.
+    #[test]
+    fn model_backed_requests_are_offloaded() {
+        for method in [
+            methods::MODEL_ASK,
+            methods::PLAN_REFINE,
+            methods::PLAN_REPLAN,
+            methods::PLAN_EXECUTE,
+            methods::PLAN_EXECUTE_PIPELINE,
+            methods::REVIEW_START,
+            methods::REVIEW_EXECUTE,
+            methods::REVIEW_ANALYZE,
+            methods::LOCALE_GENERATE,
+            methods::GIT_SQUASH_GENERATE_MESSAGE,
+        ] {
+            assert!(is_long_running(method), "'{method}' must be offloaded");
+        }
+
+        // The direct regression for this finding: post-analysis streams a full
+        // Architect completion, so it must never be awaited by the read loop.
+        assert!(
+            is_long_running(methods::REVIEW_ANALYZE),
+            "'review/analyze' runs a full streaming model call and must be offloaded"
+        );
     }
 
     /// Every termination cause carries its own stable journal name, so a look

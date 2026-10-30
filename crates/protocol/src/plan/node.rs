@@ -277,9 +277,8 @@ pub fn compute_items_status(items: &[PlanItem]) -> PlanItemStatus {
 
 /// Counts executable, non-cancelled leaf items and how many of them are `Done`.
 ///
-/// This is the single authoritative leaf-progress metric shared by a full plan
-/// ([`Plan::count_stats`]) and a review finding's embedded subplan
-/// ([`crate::review::ReviewItem::subplan_stats`]). Only leaves carry an explicit,
+/// This is the single authoritative leaf-progress metric of a plan horizon. Only
+/// leaves carry an explicit,
 /// authoritative status; a container's status is derived from its children and
 /// may be stale in memory. Counting leaves never double-counts a container
 /// alongside the children it aggregates, and `Cancelled` leaves are excluded

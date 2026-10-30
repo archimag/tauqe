@@ -146,10 +146,10 @@ impl FromStr for EditProtocolKind {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", try_from = "String")]
 pub enum PatchStrategy {
-    /// Search/replace blocks that echo the replaced lines (default).
-    #[default]
+    /// Search/replace blocks that echo the replaced lines.
     SearchReplace,
-    /// Opaque line anchors naming a range of lines without echoing them.
+    /// Opaque line anchors naming a range of lines without echoing them (default).
+    #[default]
     LineAnchor,
 }
 
@@ -541,7 +541,7 @@ mod tests {
 
     #[test]
     fn test_patch_strategy_serde_default_and_parsing() {
-        assert_eq!(PatchStrategy::default(), PatchStrategy::SearchReplace);
+        assert_eq!(PatchStrategy::default(), PatchStrategy::LineAnchor);
         assert_eq!(
             serde_json::to_string(&PatchStrategy::SearchReplace).unwrap(),
             "\"search_replace\""

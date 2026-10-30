@@ -286,7 +286,7 @@ async fn execute_global_command(
     match command {
         GlobalCommand::Quit => {
             let mut st = state.lock().await;
-            if st.server_disconnected.is_some() {
+            if st.server_disconnected.is_some() || !st.has_lossy_work() {
                 return Ok(InputResult::Exit);
             }
             st.confirm_quit = true;
@@ -569,5 +569,32 @@ mod tests {
         // strictly inside chord matching and never rewrites typed text (c-3).
         handle_paste(&mut st, "тзч");
         assert_eq!(st.input_editor.get_text(), "тзч");
+    }
+
+    #[tokio::test]
+    async fn quit_exits_immediately_when_no_lossy_work() {
+        let st = crate::app::test_state();
+        let state = Arc::new(Mutex::new(st));
+        let mut conn = RpcConnection::new(Vec::<u8>::new());
+
+        let res = execute_global_command(GlobalCommand::Quit, &state, &mut conn)
+            .await
+            .expect("quit command");
+        assert_eq!(res, InputResult::Exit);
+        assert!(!state.lock().await.confirm_quit);
+    }
+
+    #[tokio::test]
+    async fn quit_asks_confirmation_when_lossy_work_present() {
+        let mut st = crate::app::test_state();
+        st.input_editor.insert_str("important draft");
+        let state = Arc::new(Mutex::new(st));
+        let mut conn = RpcConnection::new(Vec::<u8>::new());
+
+        let res = execute_global_command(GlobalCommand::Quit, &state, &mut conn)
+            .await
+            .expect("quit command");
+        assert_eq!(res, InputResult::Continue);
+        assert!(state.lock().await.confirm_quit);
     }
 }

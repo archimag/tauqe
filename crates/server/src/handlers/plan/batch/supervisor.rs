@@ -16,6 +16,7 @@ use tauqe_protocol::{
 };
 use tokio::sync::mpsc;
 
+use crate::handlers::common::wait_for_cancellation;
 use crate::state::{AppState, OperationGuard};
 
 use super::super::common::{clear_auto_context, emit, offload_plan};
@@ -372,9 +373,30 @@ pub(super) async fn run_plan_batch_with(
             model: options.model.as_ref(),
         };
 
-        let report = BatchExecution::new()
-            .run(&steps, &mut executor, &stream_tx, &cancel_rx, &soft_stop_rx)
-            .await;
+        // A cancel delivered while a step runs must unwind the queue at once.
+        // The step itself observes the signal at its own phase boundaries and
+        // kills the verification subprocess; this race is the guarantee that the
+        // batch never waits for the remainder of a long verification. An
+        // abandoned step is never marked DONE and never committed, and its
+        // checkpoint is unwound by the existing rollback contour.
+        let report = {
+            let batch = BatchExecution::new();
+            let run = batch.run(&steps, &mut executor, &stream_tx, &cancel_rx, &soft_stop_rx);
+            tokio::pin!(run);
+            tokio::select! {
+                biased;
+                report = &mut run => Some(report),
+                _ = wait_for_cancellation(cancel_rx.clone()) => None,
+            }
+        };
+        let Some(report) = report else {
+            tracing::warn!(
+                plan_id = plan_id,
+                "plan batch unwound mid-step by cancellation"
+            );
+            final_stop = BatchStop::Cancelled;
+            break;
+        };
 
         let run_executed = report.executed.len();
         total_executed_count += run_executed;

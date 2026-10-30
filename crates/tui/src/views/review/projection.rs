@@ -17,8 +17,11 @@ use std::collections::HashSet;
 use tauqe_protocol::review::DEFAULT_REVIEW_GROUP_ID;
 use tauqe_protocol::{
     ArchitectTier, DiscussionFocus, DiscussionTarget, IssueStatus, IssueType, ModelRef,
-    ModelSelection, PlanItem, PlanItemStatus, ReviewIssue, ReviewItem, ReviewSession,
+    ModelSelection, PlanItem, PlanItemStatus, ReviewGroupKind, ReviewIssue, ReviewItem,
+    ReviewSession,
 };
+
+use crate::i18n::active_t;
 
 use super::ReviewViewState;
 
@@ -49,19 +52,53 @@ pub enum VisibleReviewRow {
     /// Header of one review group.
     ///
     /// A group is either a slice the run audited or a cluster the post-analysis
-    /// derived from a shared root cause, so it also carries the unified
-    /// remediation plan of that cause (concept #c-2, #c-4).
+    /// derived from a shared root cause (concept #c-2, #c-4). The unified
+    /// remediation plan of that cause owns a branch of its own, so the header
+    /// announces it through `has_plan` instead of carrying it.
     GroupHeader {
         session_id: String,
         group_id: String,
+        /// Class of the group, which decides how the group is executed.
+        ///
+        /// A simple group is executed finding by finding, while an
+        /// architectural group is executed exclusively through the unified plan
+        /// its `GroupPlanHeader` branch renders (concept #c-1).
+        kind: ReviewGroupKind,
         title: String,
         /// Explanation of the root cause the findings of this group share.
         description: Option<String>,
         findings_count: usize,
-        /// Unified remediation plan the group owns.
-        subplan: Vec<PlanItem>,
-        /// The Architect configuration that produced `subplan`.
+        /// Whether the group owns a unified plan branch below its header.
+        ///
+        /// A group whose plan the Architect projects just-in-time carries no
+        /// branch until the synthesis lands, so the fold icon of the header
+        /// still reflects every body it can reveal.
+        has_plan: bool,
+        is_expanded: bool,
+    },
+    /// Header of the unified remediation plan a group owns.
+    ///
+    /// The plan is the execution mechanism of a root cause (`How`) while the
+    /// findings are the symptoms that manifest it (`What`), so the plan owns an
+    /// independent branch: its steps render strictly deeper than this header,
+    /// and the findings close the group on their own band (concept #c-1,
+    /// Conventions §4.8).
+    GroupPlanHeader {
+        session_id: String,
+        /// Identifier of the group whose plan the branch renders.
+        group_id: String,
+        /// Display title of the branch.
+        ///
+        /// The localized label travels with the row, so the renderer resolves no
+        /// literal of its own (Conventions §9).
+        title: String,
+        /// Leaf steps already done.
+        done: usize,
+        /// Executable leaf steps of the plan.
+        total: usize,
+        /// The Architect configuration that produced the plan.
         subplan_architect: Option<ArchitectTier>,
+        /// Whether the branch is unfolded.
         is_expanded: bool,
     },
     ReviewItem {
@@ -81,24 +118,21 @@ pub enum VisibleReviewRow {
         /// Concrete, ordered remediation strategy, rendered as a Markdown list.
         recommendations: Vec<String>,
         note: Option<String>,
-        /// Embedded step plan decomposed by the Architect, rendered on expansion.
-        plan: Vec<PlanItem>,
-        /// The Architect configuration that produced `plan`, rendered beside
-        /// the step progress so the decomposition's provenance stays visible.
-        subplan_architect: Option<ArchitectTier>,
         is_expanded: bool,
         /// Whether the active discussion focus anchors on this finding.
         focused: bool,
     },
-    /// One interactive row of an expanded finding's embedded subplan.
+    /// One interactive row of a group's unified remediation plan.
     ///
-    /// Subplan steps are full tree nodes, so the cursor can rest on a single
-    /// step, fold its details and files, and execute the owning finding from it
-    /// (Conventions §4.4).
+    /// A root cause is fixed by one coherent change set, so the steps belong to
+    /// the group and render once under its header instead of being repeated
+    /// under every symptom. Subplan steps are full tree nodes, so the cursor can
+    /// rest on a single step, fold its details and files, and execute exactly
+    /// that step (Conventions §4.4, concept #c-5).
     SubplanItem {
         session_id: String,
-        /// Numeric id of the owning finding inside the session.
-        item_id: u32,
+        /// Identifier of the group whose unified plan owns the step.
+        group_id: String,
         step_id: String,
         title: String,
         details: Option<String>,
@@ -123,6 +157,7 @@ impl VisibleReviewRow {
             Self::SessionHeader { session_id, .. } => session_id,
             Self::SessionSummary { session_id, .. } => session_id,
             Self::GroupHeader { session_id, .. } => session_id,
+            Self::GroupPlanHeader { session_id, .. } => session_id,
             Self::ReviewItem { session_id, .. } => session_id,
             Self::SubplanItem { session_id, .. } => session_id,
         }
@@ -139,37 +174,77 @@ pub(super) fn group_key(session_id: &str, group_id: &str) -> String {
     format!("{}:g:{}", session_id, group_id)
 }
 
-/// Expansion key of one subplan step inside a finding's embedded plan.
+/// Expansion key of the unified plan branch of one group.
 ///
-/// The `s:` segment keeps step keys disjoint from the `session:item` keys that
-/// mark an expanded finding, so the two expansion scopes never collide.
-pub(super) fn subplan_key(session_id: &str, item_id: u32, step_id: &str) -> String {
-    format!("{}:{}:s:{}", session_id, item_id, step_id)
+/// The `:p:` segment keeps a branch key disjoint from the `{session}:g:{group}`
+/// key of a group header, the `{session}:{item}` key of an expanded finding,
+/// and the `{session}:g:{group}:s:{step}` key of an expanded plan step, so
+/// folding the branch never touches the steps or the findings, and clearing one
+/// scope never drops another.
+pub(super) fn plan_branch_key(session_id: &str, group_id: &str) -> String {
+    format!("{}:p:{}", session_id, group_id)
 }
 
-/// Records every subplan step of a finding as expanded.
+/// Executable leaf progress of a unified plan as `(done, total)`.
+///
+/// Mirrors `Plan::count_stats`: only leaves carry an explicit status, cancelled
+/// leaves are excluded from the total, and `done` counts the finished leaves.
+/// The branch header and the renderer therefore report one number.
+fn subplan_progress(items: &[PlanItem]) -> (usize, usize) {
+    fn walk(items: &[PlanItem], total: &mut usize, done: &mut usize) {
+        for item in items {
+            if item.is_leaf() {
+                if item.status == PlanItemStatus::Cancelled {
+                    continue;
+                }
+                *total += 1;
+                if item.status == PlanItemStatus::Done {
+                    *done += 1;
+                }
+            } else {
+                walk(&item.children, total, done);
+            }
+        }
+    }
+
+    let mut total = 0;
+    let mut done = 0;
+    walk(items, &mut total, &mut done);
+    (done, total)
+}
+/// Expansion key of one subplan step inside a group's unified plan.
+///
+/// The `:g:` segment keeps a step key disjoint from the `{session}:{item}` key
+/// of an expanded finding and the `{session}:g:{group}` key of its group
+/// header, so the expansion scopes never collide and clearing one scope never
+/// drops another.
+pub(super) fn subplan_key(session_id: &str, group_id: &str, step_id: &str) -> String {
+    format!("{}:g:{}:s:{}", session_id, group_id, step_id)
+}
+
+/// Records every step of a group plan as expanded.
 pub(super) fn collect_subplan_keys(
     session_id: &str,
-    item_id: u32,
+    group_id: &str,
     steps: &[PlanItem],
     out: &mut HashSet<String>,
 ) {
     for step in steps {
-        out.insert(subplan_key(session_id, item_id, &step.id));
-        collect_subplan_keys(session_id, item_id, &step.children, out);
+        out.insert(subplan_key(session_id, group_id, &step.id));
+        collect_subplan_keys(session_id, group_id, &step.children, out);
     }
 }
 
-/// Whether every subplan step of a finding is expanded.
+/// Whether every step of a group plan is expanded.
 pub(super) fn subplan_all_expanded(
     expanded: &HashSet<String>,
     session_id: &str,
-    item_id: u32,
+    group_id: &str,
     steps: &[PlanItem],
 ) -> bool {
     steps.iter().all(|step| {
-        expanded.contains(&subplan_key(session_id, item_id, &step.id))
-            && subplan_all_expanded(expanded, session_id, item_id, &step.children)
+        expanded.contains(&subplan_key(session_id, group_id, &step.id))
+            && subplan_all_expanded(expanded, session_id, group_id, &step.children)
     })
 }
 
@@ -185,7 +260,7 @@ fn is_closed(status: IssueStatus) -> bool {
 }
 
 /// Title of a protective bucket collecting findings of an unknown group.
-fn orphan_title(group_id: &str) -> String {
+pub(super) fn orphan_title(group_id: &str) -> String {
     if group_id == DEFAULT_REVIEW_GROUP_ID {
         "Default".to_string()
     } else {
@@ -200,9 +275,11 @@ fn orphan_title(group_id: &str) -> String {
 /// re-deriving the grouping twice (concept #c-1, #c-3).
 pub(super) struct GroupBucket<'a> {
     pub(super) id: String,
+    /// Class of the group, which decides how it is executed.
+    kind: ReviewGroupKind,
     title: String,
     description: Option<String>,
-    subplan: Vec<PlanItem>,
+    pub(super) subplan: Vec<PlanItem>,
     subplan_architect: Option<ArchitectTier>,
     pub(super) items: Vec<&'a ReviewItem>,
 }
@@ -253,22 +330,50 @@ impl ReviewViewState {
             }
             for bucket in self.group_buckets(session) {
                 let group_expanded = self.is_group_expanded(&session.id, &bucket.id);
+                let has_plan = !bucket.subplan.is_empty();
                 rows.push(VisibleReviewRow::GroupHeader {
                     session_id: session.id.clone(),
-                    group_id: bucket.id,
+                    group_id: bucket.id.clone(),
+                    kind: bucket.kind,
                     title: bucket.title,
                     description: bucket.description,
                     findings_count: bucket.items.len(),
-                    subplan: bucket.subplan,
-                    subplan_architect: bucket.subplan_architect,
+                    has_plan,
                     is_expanded: group_expanded,
                 });
                 if !group_expanded {
                     continue;
                 }
-                for stored in bucket.items.iter().copied() {
+                // The unified plan of a group is the execution mechanism of its
+                // root cause, so it owns a branch of its own: the branch renders
+                // once under the header, its steps sit strictly deeper, and the
+                // findings close the group on their own band instead of mixing
+                // with the plan (concept #c-1).
+                if has_plan {
+                    let (done, total) = subplan_progress(&bucket.subplan);
+                    let branch_expanded = self.is_plan_branch_expanded(&session.id, &bucket.id);
+                    rows.push(VisibleReviewRow::GroupPlanHeader {
+                        session_id: session.id.clone(),
+                        group_id: bucket.id.clone(),
+                        title: active_t("review.group_plan_branch").to_string(),
+                        done,
+                        total,
+                        subplan_architect: bucket.subplan_architect,
+                        is_expanded: branch_expanded,
+                    });
+                    if branch_expanded {
+                        self.flatten_subplan_rows(
+                            &session.id,
+                            &bucket.id,
+                            &bucket.subplan,
+                            0,
+                            &mut rows,
+                        );
+                    }
+                }
+                for stored in bucket.items {
                     let issue = ReviewIssue::from(stored.clone());
-                    self.push_item_rows(&session.id, &issue, stored, &mut rows);
+                    self.push_item_rows(&session.id, &issue, &mut rows);
                 }
             }
         }
@@ -306,15 +411,16 @@ impl ReviewViewState {
         }
     }
 
-    /// Appends one finding row and, while it is expanded, its subplan steps.
+    /// Appends one finding row of a group.
+    ///
+    /// The finding never owns subplan rows: the unified plan belongs to its
+    /// group and is projected once under the group header (concept #c-5).
     fn push_item_rows(
         &self,
         session_id: &str,
         issue: &ReviewIssue,
-        stored: &ReviewItem,
         rows: &mut Vec<VisibleReviewRow>,
     ) {
-        let item_expanded = self.is_item_expanded(session_id, issue.id);
         rows.push(VisibleReviewRow::ReviewItem {
             session_id: session_id.to_string(),
             item_id: issue.id,
@@ -327,14 +433,9 @@ impl ReviewViewState {
             description: issue.description.clone(),
             recommendations: issue.recommendations.clone(),
             note: issue.note.clone(),
-            plan: issue.plan.clone(),
-            subplan_architect: stored.subplan_architect.clone(),
-            is_expanded: item_expanded,
+            is_expanded: self.is_item_expanded(session_id, issue.id),
             focused: self.is_item_focused(session_id, issue.id),
         });
-        if item_expanded {
-            self.flatten_subplan_rows(session_id, issue.id, &issue.plan, 0, rows);
-        }
     }
 
     /// Groups of one session in render order.
@@ -370,6 +471,7 @@ impl ReviewViewState {
             }
             buckets.push(GroupBucket {
                 id: group.id.clone(),
+                kind: group.kind,
                 title: if group.title.trim().is_empty() {
                     group.id.clone()
                 } else {
@@ -399,6 +501,7 @@ impl ReviewViewState {
         }
         for group_id in orphan_ids {
             buckets.push(GroupBucket {
+                kind: ReviewGroupKind::Simple,
                 title: orphan_title(&group_id),
                 description: None,
                 subplan: Vec::new(),
@@ -438,15 +541,15 @@ impl ReviewViewState {
             .collect()
     }
 
-    /// Flattens an embedded subplan into interactive step rows.
+    /// Flattens the unified plan of a group into interactive step rows.
     ///
-    /// Top-level steps always follow an expanded finding; nested steps appear
-    /// only after their container step is expanded, so the tree stays dense
-    /// until the developer drills into a step.
+    /// Top-level steps always follow an expanded group header; nested steps
+    /// appear only after their container step is expanded, so the tree stays
+    /// dense until the developer drills into a step (concept #c-5).
     fn flatten_subplan_rows(
         &self,
         session_id: &str,
-        item_id: u32,
+        group_id: &str,
         steps: &[PlanItem],
         depth: usize,
         out: &mut Vec<VisibleReviewRow>,
@@ -461,11 +564,11 @@ impl ReviewViewState {
             let has_meta = !step.files.is_empty()
                 || !step.readonly_files.is_empty()
                 || !step.depends_on.is_empty();
-            let is_expanded = self.is_subplan_item_expanded(session_id, item_id, &step.id);
+            let is_expanded = self.is_subplan_item_expanded(session_id, group_id, &step.id);
 
             out.push(VisibleReviewRow::SubplanItem {
                 session_id: session_id.to_string(),
-                item_id,
+                group_id: group_id.to_string(),
                 step_id: step.id.clone(),
                 title: step.title.clone(),
                 details: step.details.clone(),
@@ -480,23 +583,23 @@ impl ReviewViewState {
             });
 
             if has_children && is_expanded {
-                self.flatten_subplan_rows(session_id, item_id, &step.children, depth + 1, out);
+                self.flatten_subplan_rows(session_id, group_id, &step.children, depth + 1, out);
             }
         }
     }
 
-    /// Number of subplan step rows an embedded plan contributes to the tree.
+    /// Number of subplan step rows a group plan contributes to the tree.
     ///
     /// Counts every step plus, while a container step is expanded, the steps of
     /// its children, mirroring `flatten_subplan_rows` branch for branch.
-    fn count_subplan_rows(&self, session_id: &str, item_id: u32, steps: &[PlanItem]) -> usize {
+    fn count_subplan_rows(&self, session_id: &str, group_id: &str, steps: &[PlanItem]) -> usize {
         let mut count = 0;
         for step in steps {
             count += 1;
             if !step.children.is_empty()
-                && self.is_subplan_item_expanded(session_id, item_id, &step.id)
+                && self.is_subplan_item_expanded(session_id, group_id, &step.id)
             {
-                count += self.count_subplan_rows(session_id, item_id, &step.children);
+                count += self.count_subplan_rows(session_id, group_id, &step.children);
             }
         }
         count
@@ -525,12 +628,13 @@ impl ReviewViewState {
             if !self.is_group_expanded(&session.id, &bucket.id) {
                 continue;
             }
-            for item in &bucket.items {
-                count += 1; // The finding row.
-                if self.is_item_expanded(&session.id, item.id) {
-                    count += self.count_subplan_rows(&session.id, item.id, &item.subplan);
+            if !bucket.subplan.is_empty() {
+                count += 1; // The plan branch header.
+                if self.is_plan_branch_expanded(&session.id, &bucket.id) {
+                    count += self.count_subplan_rows(&session.id, &bucket.id, &bucket.subplan);
                 }
             }
+            count += bucket.items.len(); // One finding row per rendered finding.
         }
         count
     }
@@ -580,7 +684,6 @@ mod tests {
             recommendations: Vec::new(),
             files: Vec::new(),
             readonly_files: Vec::new(),
-            plan: vec![],
             note: None,
         }
     }
@@ -619,13 +722,17 @@ mod tests {
     fn row_count_fixture() -> ReviewViewState {
         let mut session = make_session("rev-count", &[1, 2]);
         session.description = Some("Executive summary body.".to_string());
-        session.items[0] = ReviewItem::from(ReviewIssue {
-            plan: vec![PlanItem {
+        session.groups = vec![ReviewGroup {
+            id: "arch".to_string(),
+            title: "Shared cause".to_string(),
+            kind: ReviewGroupKind::Architectural,
+            subplan: vec![PlanItem {
                 children: vec![subplan_step("1.1", "Leaf step", PlanItemStatus::Todo)],
                 ..subplan_step("1", "Container step", PlanItemStatus::Todo)
             }],
-            ..make_item(1)
-        });
+            ..Default::default()
+        }];
+        session.items[0].group = Some("arch".to_string());
         session.items[1] = ReviewItem::from(ReviewIssue {
             status: IssueStatus::Fixed,
             ..make_item(2)
@@ -739,12 +846,13 @@ mod tests {
     }
 
     #[test]
-    fn test_group_header_exposes_the_groups_unified_plan() {
+    fn test_group_plan_owns_a_branch_below_its_group_header() {
         let mut session = make_session("rev-plan", &[1]);
         session.groups = vec![ReviewGroup {
             id: "g1".to_string(),
             title: "Root cause".to_string(),
             description: Some("One cause behind both symptoms.".to_string()),
+            kind: ReviewGroupKind::Architectural,
             subplan: vec![PlanItem {
                 children: vec![subplan_step("1.1", "Leaf", PlanItemStatus::Done)],
                 ..subplan_step("1", "Unify the guard", PlanItemStatus::Todo)
@@ -764,29 +872,80 @@ mod tests {
 
         match &view.flatten_rows()[1] {
             VisibleReviewRow::GroupHeader {
+                kind,
                 group_id,
                 description,
                 findings_count,
-                subplan,
-                subplan_architect,
+                has_plan,
+                is_expanded,
                 ..
             } => {
+                assert_eq!(*kind, ReviewGroupKind::Architectural);
                 assert_eq!(group_id, "g1");
                 assert_eq!(
                     description.as_deref(),
                     Some("One cause behind both symptoms.")
                 );
                 assert_eq!(*findings_count, 1);
-                assert_eq!(subplan.len(), 1);
-                assert_eq!(subplan[0].children.len(), 1);
-                assert!(subplan_architect.is_some());
+                assert!(*has_plan);
+                assert!(*is_expanded);
             }
             other => panic!("expected a group header, got {other:?}"),
         }
         assert_eq!(view.row_count(), view.flatten_rows().len());
 
-        // The plan lives on the group header, so folding the group leaves the
-        // row count unchanged: no step ever becomes an independent row.
+        // The plan owns a branch directly under the group header, and its steps
+        // render strictly deeper than the branch (concept #c-1).
+        let rows = view.flatten_rows();
+        assert!(matches!(
+            &rows[2],
+            VisibleReviewRow::GroupPlanHeader {
+                group_id,
+                done,
+                total,
+                subplan_architect,
+                is_expanded,
+                ..
+            } if group_id == "g1"
+                && *done == 1
+                && *total == 1
+                && subplan_architect.is_some()
+                && *is_expanded
+        ));
+        assert!(matches!(
+            &rows[3],
+            VisibleReviewRow::SubplanItem { group_id, step_id, depth: 0, .. }
+                if group_id == "g1" && step_id == "1"
+        ));
+        assert!(matches!(
+            &rows[4],
+            VisibleReviewRow::ReviewItem { item_id: 1, .. }
+        ));
+        assert!(!rows.iter().any(
+            |row| matches!(row, VisibleReviewRow::SubplanItem { step_id, .. } if step_id == "1.1")
+        ));
+
+        // Folding the branch hides its steps but never the findings of the
+        // group, and the counters mirror the rendered rows (concept #c-4).
+        view.toggle_plan_branch_expanded("rev-plan", "g1");
+        assert_eq!(view.row_count(), view.flatten_rows().len());
+        let rows = view.flatten_rows();
+        assert!(!rows
+            .iter()
+            .any(|row| matches!(row, VisibleReviewRow::SubplanItem { .. })));
+        assert!(rows
+            .iter()
+            .any(|row| matches!(row, VisibleReviewRow::ReviewItem { item_id: 1, .. })));
+        assert_eq!(
+            view.row_count(),
+            4,
+            "a session header, its group, the folded branch, and the finding"
+        );
+        view.toggle_plan_branch_expanded("rev-plan", "g1");
+        assert_eq!(view.row_count(), view.flatten_rows().len());
+
+        // Folding the group hides its whole plan, so no step survives as an
+        // independent row and the tree shrinks back to the header pair.
         view.toggle_group_expanded("rev-plan", "g1");
         assert_eq!(view.row_count(), view.flatten_rows().len());
         assert_eq!(view.row_count(), 2);
@@ -817,12 +976,16 @@ mod tests {
         let mut view = row_count_fixture();
         assert_row_count_matches(&view, "the session is expanded");
 
+        view.toggle_plan_branch_expanded("rev-count", "arch");
+        assert_row_count_matches(&view, "the plan branch is folded");
+        view.toggle_plan_branch_expanded("rev-count", "arch");
+        assert_row_count_matches(&view, "the plan branch is expanded again");
         view.toggle_item_expanded("rev-count", 1);
         assert_row_count_matches(&view, "the finding is expanded");
 
-        view.toggle_subplan_item_expanded("rev-count", 1, "1");
+        view.toggle_subplan_item_expanded("rev-count", "arch", "1");
         assert_row_count_matches(&view, "the container step is expanded");
-        view.toggle_subplan_item_expanded("rev-count", 1, "1");
+        view.toggle_subplan_item_expanded("rev-count", "arch", "1");
         assert_row_count_matches(&view, "the container step is folded");
 
         view.toggle_summary_expanded("rev-count");

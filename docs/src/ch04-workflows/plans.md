@@ -299,6 +299,11 @@ For each scheduled leaf the server:
    status `success` in the structured contour. A prose-only answer without edits and
    without a protocol completion signal does not close the step.
 
+A step reports the phases of its turn while it runs. The turn phase, the
+toolchain start, and the toolchain finish reach the interface as they happen,
+exactly as they do for an interactive turn, so a minute-long verification shows
+the phase that is running instead of a screen that waits for the batch event
+which closes the step.
 Injecting the whole concept tree is what makes the decision explicit to the
 executing model, and it is backed by two independent statements. The step prompt
 names the structures, libraries, interfaces, and concept invariants the step must
@@ -456,8 +461,15 @@ another under a single registered operation.
   notification.
 
 Cancellation is three-way (`Continue`, `Soft Stop`, `Hard Stop`), as specified in
-*Keyboard-First Interface*. A soft stop lets the running step finish its turn,
-verification, and commit before the queue halts; a hard stop aborts it immediately.
+*Keyboard-First Interface*, and both stop degrees act inside the running step
+rather than after it. The supervisor waits on the step and on the cancellation
+channel together, so a signal unwinds the batch immediately. Within the step the
+channel is read at every phase boundary that starts work — before the check,
+between healing rounds, before the staged result is committed — so a soft stop
+halts at the nearest boundary instead of letting the turn run to its natural
+end, and a hard stop additionally tears the verification subprocess group down.
+The interrupted step is never marked `Done` and never committed: the existing
+checkpoint transaction returns the working tree to its pre-turn state.
 
 ### 3.11 Plans view commands
 

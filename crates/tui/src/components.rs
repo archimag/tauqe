@@ -10,11 +10,11 @@ pub mod modal;
 pub mod model_selector;
 pub mod selector;
 
-pub use confirm::{
-    confirm_modal_geometry, render_modal_confirm, ConfirmDialog, ConfirmModalGeometry,
-    ConfirmModalParams,
-};
-pub use editor::{default_prompt_history_path, is_char_typing, TextEditor};
-pub use modal::{render_modal_frame, ModalFrame, ModalFrameParams};
+// The facade exposes component types only: geometry math, per-dialog parameter
+// builders, and helper predicates stay behind their submodule paths, and the
+// dialog renderers reach them through `dialogs::render` (Conventions §3.1).
+pub use confirm::ConfirmDialog;
+pub use editor::TextEditor;
+pub use modal::ModalFrame;
 pub use model_selector::ModelSelector;
 pub use selector::ListSelector;

@@ -1,32 +1,20 @@
 //! Per-finding bounded-turn execution.
 //!
-//! A review finding runs as a single isolated bounded turn, or, when the
-//! Architect has decomposed it, as an ordered walk over its embedded subplan's
-//! leaf sub-steps. Each attempt drives the shared `execute_model_turn` entry
-//! point with the finding's target files preloaded and may escalate along the
-//! coder ladder when `auto_level_up` is enabled. Domain failures are confined to
-//! the current finding, while infrastructure failures abort the batch. Finding
-//! status and the immutable `Done` foundation of a partially completed subplan
-//! are persisted through `ReviewStorage`, so no plan-tree manipulation happens
-//! in the server crate.
+//! A finding of a simple review group runs as one isolated bounded turn: its
+//! target files are preloaded, one attempt drives the shared
+//! `execute_model_turn` entry point, and the coder ladder may be climbed when
+//! `auto_level_up` is enabled. Domain failures are confined to the current
+//! finding, while infrastructure failures abort the batch. Finding status and
+//! the terminal outcome are persisted through `ReviewStorage`, so no plan-tree
+//! manipulation happens in the server crate.
 //!
-//! The subsystem is decomposed into focused submodules: `subplan` walks the
-//! embedded subplan of a decomposed finding one leaf sub-step at a time, and
-//! `replan` reprojects the remaining horizon around a failed sub-step. This
-//! facade keeps the single-finding turn with its retry and escalation ladder.
-//!
-//! Three invariants govern this subsystem:
-//! - #c-1: an `Architecture`-class or `Refine` finding without a subplan is
-//!   decomposed by the Architect autonomously before any coding starts. The
-//!   decision reads the authoritative `issue_type` category, never the coarse
-//!   presentation severity projected from it.
-//! - #c-2: the active leaf sub-step is marked `InProgress` and persisted on disk
-//!   (with a `review/updated` event) for honest telemetry; the finding becomes
-//!   `Fixed` only once every remaining leaf sub-step is `Done`.
-//! - #c-3: a sub-step that fails with a domain failure is replanned up to
-//!   `max_replans` times: the Architect reprojects the remaining horizon from the
-//!   immutable `Done` foundation and the failure diagnostics, and the finding is
-//!   resumed from the synthesized horizon instead of being abandoned.
+//! Two invariants govern this subsystem:
+//! - #c-1: a finding of an architectural review group is a symptom of one shared
+//!   root cause, so it is never executed on its own. The group is remediated
+//!   exclusively through its unified subplan, and this module refuses such a
+//!   finding even though the server queue never routes one here.
+//! - #c-2: a review finding owns no subplan, so no decomposition precedes its
+//!   turn and no sub-step of a finding is ever targeted.
 //!
 //! An unconditional abort (`<abort>`) is a domain outcome rather than a failure:
 //! the host environment needs a developer action — approving a native build,
@@ -34,36 +22,124 @@
 //! is skipped with the exact recommendation recorded and never engages the
 //! Architect, so the batch advances to the next independent finding.
 
-mod replan;
-mod subplan;
-
 use std::path::Path;
 use std::sync::Arc;
-
-use tauqe_core::providers::{format_session_id, SESSION_PREFIX_REVIEW};
-use tauqe_core::review::prompt::ReviewStepFailure;
-use tauqe_protocol::{IssueStatus, IssueType, ModelRole, ModelSelection, TurnIntent};
 
 use crate::handlers::common::append_developer_directives;
 use crate::handlers::model::{execute_model_turn, StepTurnOptions};
 use crate::state::{AppState, OperationGuard};
-
-use self::replan::{reload_finding, run_review_subplan_with_replans};
-use super::common::{
-    clear_auto_context, persist_finding_update, preload_item_files, report_item_failure,
-    set_item_status, set_item_status_checked, skip_finding_with_diagnostic, turn_applied_edits,
+use tauqe_core::providers::{format_session_id, SESSION_PREFIX_REVIEW};
+use tauqe_core::review::prompt::ReviewStepFailure;
+use tauqe_core::review::ReviewStorage;
+use tauqe_protocol::model::{TurnWorkContext, TurnWorkItem, TurnWorkQueue};
+use tauqe_protocol::{
+    IssueStatus, ModelRole, ModelSelection, ReviewGroupKind, ReviewItem, ReviewSession, TurnIntent,
+    DEFAULT_REVIEW_GROUP_ID,
 };
-use super::refine::{refine_finding_with_architect, RefineAdmission, RefineOutcome};
+use tokio::sync::watch;
+
+use super::common::{
+    clear_auto_context, offload_review, persist_finding_update, preload_item_files,
+    report_item_failure, set_item_status, set_item_status_checked, skip_finding_with_diagnostic,
+    turn_applied_edits,
+};
+
+/// Reloads the review session and the target finding from disk.
+///
+/// Execution needs the persisted state of the finding — the status a previous
+/// attempt wrote and the target files its turn preloads — while the session
+/// supplies the effective group that decides whether the finding may run on its
+/// own at all.
+async fn reload_finding(
+    repo_root: &Path,
+    review_id: &str,
+    item_id: u32,
+) -> Result<(ReviewSession, ReviewItem), ReviewStepFailure> {
+    let load_root = repo_root.to_path_buf();
+    let load_id = review_id.to_string();
+    let session =
+        match offload_review(move || ReviewStorage::load_review(&load_root, &load_id)).await {
+            Ok(Some(s)) => s,
+            Ok(None) => {
+                return Err(ReviewStepFailure::infrastructure(format!(
+                    "Review session '{}' not found",
+                    review_id
+                )));
+            }
+            Err(err) => return Err(ReviewStepFailure::infrastructure(err)),
+        };
+    let item = match session.find_item(item_id) {
+        Some(i) => i.clone(),
+        None => {
+            return Err(ReviewStepFailure::infrastructure(format!(
+                "Review item #{} not found in session '{}'",
+                item_id, review_id
+            )));
+        }
+    };
+    Ok((session, item))
+}
+
+/// Rejects a finding that belongs to an architectural review group.
+///
+/// #c-1: the findings of an architectural group are symptoms of one shared root
+/// cause, so the group is remediated exclusively by its unified subplan. The
+/// server queue never schedules such a finding on its own; this check defends
+/// the invariant against a direct call instead of quietly coding one symptom.
+fn ensure_standalone_execution(
+    session: &ReviewSession,
+    item: &ReviewItem,
+) -> Result<(), ReviewStepFailure> {
+    let group_id = item.group.as_deref().unwrap_or(DEFAULT_REVIEW_GROUP_ID);
+    let groups = session.effective_groups();
+    let architectural = groups
+        .iter()
+        .any(|group| group.id == group_id && group.kind == ReviewGroupKind::Architectural);
+    if architectural {
+        return Err(ReviewStepFailure::infrastructure(format!(
+            "Review item #{} belongs to architectural review group '{}' and cannot be executed on its own; the group is remediated through its unified subplan",
+            item.id, group_id
+        )));
+    }
+    Ok(())
+}
+
+/// Builds the declared work context of one finding executed on its own.
+///
+/// The queue lists the findings of the session in stored order, so the client
+/// renders the position `[i/N]` of the running finding and the findings the
+/// session still holds instead of reconstructing them from the stored review.
+fn review_step_work_context(session: &ReviewSession, item: &ReviewItem) -> TurnWorkContext {
+    let queue = TurnWorkQueue {
+        items: session
+            .items
+            .iter()
+            .map(|member| TurnWorkItem {
+                id: member.id.to_string(),
+                title: member.title.clone(),
+            })
+            .collect(),
+        active_index: session
+            .items
+            .iter()
+            .position(|member| member.id == item.id)
+            .unwrap_or_default(),
+    };
+    TurnWorkContext::ReviewStep {
+        review_id: session.id.clone(),
+        review_title: session.title.clone(),
+        queue,
+    }
+}
 
 /// Executes one finding in an isolated turn.
 ///
-/// The finding becomes `Fixed` only when the turn (or its subplan) satisfies the
-/// success contract; on any failure it returns to `Todo`. The transient auto
-/// context layer is always cleared once the step finishes, so a retried attempt
-/// starts from a clean, deterministic basis.
+/// The finding becomes `Fixed` only when the turn satisfies the success
+/// contract; on any failure it returns to `Todo`. The transient auto context
+/// layer is always cleared once the step finishes, so a retried attempt starts
+/// from a clean, deterministic basis.
 ///
-/// `step_id` targets a single leaf sub-step of an already decomposed finding,
-/// `model` overrides the Coder model, and `instructions` are appended to the
+/// `model` overrides the Coder model and `instructions` are appended to the
 /// execution prompt as developer directives.
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn run_review_step(
@@ -71,9 +147,9 @@ pub(super) async fn run_review_step(
     repo_root: &Path,
     review_id: &str,
     item_id: u32,
-    step_id: Option<&str>,
     model: Option<ModelSelection>,
     instructions: Option<String>,
+    cancel_rx: &watch::Receiver<bool>,
     operation: Arc<OperationGuard>,
 ) -> Result<(), ReviewStepFailure> {
     let res = run_review_step_inner(
@@ -81,9 +157,9 @@ pub(super) async fn run_review_step(
         repo_root,
         review_id,
         item_id,
-        step_id,
         model,
         instructions,
+        cancel_rx,
         operation,
     )
     .await;
@@ -97,28 +173,22 @@ async fn run_review_step_inner(
     repo_root: &Path,
     review_id: &str,
     item_id: u32,
-    step_id: Option<&str>,
     model: Option<ModelSelection>,
     instructions: Option<String>,
+    cancel_rx: &watch::Receiver<bool>,
     operation: Arc<OperationGuard>,
 ) -> Result<(), ReviewStepFailure> {
     // Every finding turn of one audit extends the same provider prefix cache, so
     // the session identifier is derived from the review, not from the dialogue.
     let session_id = Some(format_session_id(SESSION_PREFIX_REVIEW, review_id));
-    let (mut session, mut item) = reload_finding(repo_root, review_id, item_id).await?;
+    let (session, item) = reload_finding(repo_root, review_id, item_id).await?;
+
+    // #c-1: a symptom of an architectural group is never executed on its own.
+    ensure_standalone_execution(&session, &item)?;
 
     match item.status {
-        // A finished finding is not re-executed. The sole exception is a targeted
-        // uncompleted sub-step of an interrupted subplan: the finding was marked
-        // `Skipped` after its subplan stalled, yet the developer may resume the
-        // remaining step directly.
-        IssueStatus::Fixed | IssueStatus::Skipped => {
-            let (total, done) = item.subplan_stats();
-            let targeted_incomplete = step_id.is_some() && item.has_subplan() && done < total;
-            if !targeted_incomplete {
-                return Ok(());
-            }
-        }
+        // A finished finding is not re-executed.
+        IssueStatus::Fixed | IssueStatus::Skipped => return Ok(()),
         IssueStatus::Discussion => {
             return Err(ReviewStepFailure::infrastructure(format!(
                 "Review item #{} is in DISCUSSION status and cannot be executed until reviewed",
@@ -131,84 +201,7 @@ async fn run_review_step_inner(
                 item.id
             )));
         }
-        IssueStatus::Refine | IssueStatus::Todo | IssueStatus::InProgress => {}
-    }
-
-    // #c-1: an architecture-class or Refine finding must be decomposed by the
-    // Architect before the Coder touches it. The harness performs the
-    // decomposition autonomously so coding never starts from an undecomposed
-    // finding.
-    let needs_refinement = !item.has_subplan()
-        && (item.issue_type == IssueType::Architecture || item.status == IssueStatus::Refine);
-    if needs_refinement {
-        tracing::info!(
-            review_id = review_id,
-            item_id = item_id,
-            issue_type = %item.issue_type,
-            status = %item.status,
-            "autonomous architect decomposition before coding"
-        );
-        match refine_finding_with_architect(
-            state,
-            repo_root,
-            &session,
-            &item,
-            None,
-            None,
-            None,
-            &operation,
-            RefineAdmission::Harness,
-            // The decomposition runs immediately before this finding's coding
-            // turn, inside the running review batch: it must never settle the
-            // shared turn on its own.
-            true,
-        )
-        .await
-        {
-            Ok(RefineOutcome::Success { explanation, .. }) => {
-                tracing::info!(
-                    review_id = review_id,
-                    item_id = item_id,
-                    explanation = %explanation,
-                    "autonomous decomposition succeeded"
-                );
-            }
-            Ok(RefineOutcome::Blocked { reason }) => {
-                // When the skip record cannot be persisted, the storage failure
-                // becomes the outcome so the batch never advances past a finding
-                // the durable record still shows as InProgress.
-                return Err(
-                    match skip_finding_with_diagnostic(
-                        state, repo_root, review_id, item_id, "", &reason,
-                    )
-                    .await
-                    {
-                        Ok(()) => ReviewStepFailure::domain(reason),
-                        Err(storage_err) => ReviewStepFailure::infrastructure(storage_err),
-                    },
-                );
-            }
-            Err(err) => return Err(ReviewStepFailure::infrastructure(err.message)),
-        }
-        clear_auto_context(state).await;
-        (session, item) = reload_finding(repo_root, review_id, item_id).await?;
-    }
-
-    // A finding decomposed into an embedded subplan executes its sub-steps one by
-    // one instead of a single monolithic turn.
-    if item.has_subplan() {
-        return run_review_subplan_with_replans(
-            state,
-            repo_root,
-            review_id,
-            &session,
-            &item,
-            step_id,
-            model,
-            instructions,
-            operation,
-        )
-        .await;
+        IssueStatus::Todo | IssueStatus::InProgress => {}
     }
 
     preload_item_files(state, repo_root, &item.files).await;
@@ -257,15 +250,29 @@ async fn run_review_step_inner(
     // The selected coder is the starting rung of this finding: an explicit
     // selection runs at its own reasoning depth, and a later escalation
     // continues above it instead of restarting the ladder at its base.
-    let explicit_selection = model.or_else(|| item.model.clone());
-    let mut selection = explicit_selection
-        .clone()
+    let mut selection = model
+        .or_else(|| item.model.clone())
         .unwrap_or(ModelSelection::Role(ModelRole::Coder));
     let mut ladder_idx = models_config.coder_tier_index(Some(&selection));
     let mut reasoning_effort = models_config.resolve_selection_effort(ModelRole::Coder, &selection);
+    // Declare the work every attempt of this step executes: the running finding
+    // and its position among the findings of the session, so the client renders
+    // the work marker from typed fields instead of stored reviews.
+    let work_context = review_step_work_context(&session, &item);
     let mut attempt = 0usize;
 
     loop {
+        // Phase boundary: every attempt is a whole bounded turn, so a cancel
+        // observed here returns the finding to TODO before another turn is
+        // requested. The batch executor reports the resulting failure as a
+        // cancelled step.
+        let cancelled = *cancel_rx.borrow();
+        if cancelled {
+            set_item_status(state, repo_root, review_id, item_id, IssueStatus::Todo).await;
+            return Err(ReviewStepFailure::infrastructure(
+                "Operation cancelled before the finding turn started".to_string(),
+            ));
+        }
         let workflow = state.config.lock().await.config.develop.workflow;
         let policy = crate::handlers::model::build_apply_policy(state, workflow);
 
@@ -277,10 +284,14 @@ async fn run_review_step_inner(
                 intent: TurnIntent::IsolatedStep,
                 custom_selection: Some(selection.clone()),
                 plan_context: None,
+                work_context: Some(work_context.clone()),
                 reasoning_effort,
                 marker: marker.clone(),
                 shared_operation: Some(Arc::clone(&operation)),
                 session_id: session_id.clone(),
+                // A review finding streams the turn's live phases into the
+                // client channel, so verifying one finding stays visible.
+                phase_out: Some(state.out.clone()),
             },
         )
         .await;

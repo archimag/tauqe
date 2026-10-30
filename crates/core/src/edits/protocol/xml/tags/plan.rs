@@ -6,7 +6,7 @@ mod item;
 use super::{is_inside_markdown_code_with_fences, strip_tags, CodeFences};
 use crate::edits::protocol::xml::engine;
 use crate::edits::protocol::xml::{extract_attribute, find_base_tag_start};
-
+use crate::plan::prompt::refine::MAX_PLAN_REFINEMENT_DEPTH;
 use concept::parse_concept_items_with_diagnostics;
 pub use item::ParsedPlanItem;
 use item::{next_item_tag_bounds, parse_plan_items_with_diagnostics};
@@ -96,6 +96,10 @@ fn extract_and_strip_inner_tag(text: &str, base_name: &str) -> (Option<String>, 
 }
 
 /// Parses `<plan ...>...</plan>` blocks and collects syntax and structural diagnostics.
+///
+/// The parsed hierarchy is bounded by [`MAX_PLAN_REFINEMENT_DEPTH`]: `<item>` and
+/// `<concept_item>` entries nested deeper than that budget are dropped and reported
+/// as diagnostics instead of being parsed recursively.
 pub fn parse_plan_tags_with_diagnostics(text: &str) -> (Vec<ParsedPlanTag>, Vec<String>) {
     let fences = CodeFences::find(text);
     let mut plans = Vec::new();
@@ -187,7 +191,7 @@ pub fn parse_plan_tags_with_diagnostics(text: &str) -> (Vec<ParsedPlanTag>, Vec<
 
         let (concept_block, body_without_concept) = extract_and_strip_inner_tag(body, "concept");
         let (concept, concept_errors) = if let Some(ref c_str) = concept_block {
-            parse_concept_items_with_diagnostics(c_str)
+            parse_concept_items_with_diagnostics(c_str, MAX_PLAN_REFINEMENT_DEPTH)
         } else {
             (Vec::new(), Vec::new())
         };
@@ -210,7 +214,8 @@ pub fn parse_plan_tags_with_diagnostics(text: &str) -> (Vec<ParsedPlanTag>, Vec<
             })
         });
 
-        let (mut items, item_errors) = parse_plan_items_with_diagnostics(&body_without_concept);
+        let (mut items, item_errors) =
+            parse_plan_items_with_diagnostics(&body_without_concept, MAX_PLAN_REFINEMENT_DEPTH);
         errors.extend(item_errors);
 
         if action == "save" {
@@ -679,5 +684,77 @@ And outside markdown:
         assert_eq!(items[1].id, "2");
         assert_eq!(items[2].id, "3");
         assert!(errors.is_empty(), "Unexpected errors: {:?}", errors);
+    }
+    /// Builds a plan whose `<item>` chain nests `depth` levels deep.
+    fn nested_item_plan(depth: usize) -> String {
+        let mut text = String::from(
+            "<plan action=\"save\" id=\"deep-items\" title=\"Deep Items\">\n  <concept>\n    <concept_item id=\"c-1\" title=\"Invariant\" />\n  </concept>\n",
+        );
+        for level in 0..depth {
+            text.push_str(&format!("<item id=\"{level}\" title=\"Step {level}\">"));
+        }
+        text.push_str("<item id=\"leaf\" title=\"Leaf\" />");
+        for _ in 0..depth {
+            text.push_str("</item>");
+        }
+        text.push_str("\n</plan>");
+        text
+    }
+
+    #[test]
+    fn test_parse_plan_tags_bounds_item_nesting_depth() {
+        let (plans, errors) = parse_plan_tags_with_diagnostics(&nested_item_plan(10_000));
+        assert_eq!(plans.len(), 1, "errors: {:?}", errors);
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.contains("maximum plan hierarchy depth")),
+            "expected a depth diagnostic, got: {:?}",
+            errors
+        );
+
+        let mut node = &plans[0].items[0];
+        let mut levels = 1;
+        while let Some(child) = node.children.first() {
+            node = child;
+            levels += 1;
+        }
+        assert_eq!(levels, MAX_PLAN_REFINEMENT_DEPTH);
+    }
+
+    #[test]
+    fn test_parse_plan_tags_bounds_concept_nesting_depth() {
+        let depth = 10_000;
+        let mut concept = String::new();
+        for level in 0..depth {
+            concept.push_str(&format!(
+                "<concept_item id=\"c-{level}\" title=\"Concept {level}\">"
+            ));
+        }
+        concept.push_str("<concept_item id=\"c-leaf\" title=\"Leaf\" />");
+        for _ in 0..depth {
+            concept.push_str("</concept_item>");
+        }
+        let text = format!(
+            "<plan action=\"save\" id=\"deep-concepts\" title=\"Deep Concepts\">\n  <concept>\n{concept}\n  </concept>\n  <item id=\"1\" title=\"Step\" status=\"todo\" />\n</plan>"
+        );
+
+        let (plans, errors) = parse_plan_tags_with_diagnostics(&text);
+        assert_eq!(plans.len(), 1, "errors: {:?}", errors);
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.contains("maximum plan hierarchy depth")),
+            "expected a depth diagnostic, got: {:?}",
+            errors
+        );
+
+        let mut node = &plans[0].concept[0];
+        let mut levels = 1;
+        while let Some(child) = node.children.first() {
+            node = child;
+            levels += 1;
+        }
+        assert_eq!(levels, MAX_PLAN_REFINEMENT_DEPTH);
     }
 }

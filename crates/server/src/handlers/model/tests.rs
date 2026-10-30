@@ -6,19 +6,25 @@
 //! targets a pure function, so the suite needs no `AppState`, no provider, and
 //! no repository.
 
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use std::time::Duration;
+
 use tauqe_core::config::AppConfig;
 use tauqe_core::prompt::protocol::PromptProtocol;
+use tauqe_core::providers::{ChatMessage, LlmProvider, ResponseFormat, StreamEvent};
 use tauqe_protocol::discussion::DiscussionPlanAction;
 use tauqe_protocol::{
     DiscussionFocus, DiscussionRequest, DiscussionTarget, EditProtocolKind, LlmCapability,
-    LlmCommand, ModelAskParams, ModelRef, ModelSelection, Plan, Request, TurnIntent,
+    LlmCommand, ModelAskParams, ModelRef, ModelSelection, Plan, ProviderKind, Request, TurnIntent,
 };
+use tokio::sync::{mpsc, watch};
 
-use super::handle_model_select;
 use super::prompt::{build_model_ask_prompt, intent_for_target};
 use super::turn::{resolve_session_id, resolve_turn_protocol};
+use super::{handle_model_cancel, handle_model_select, start_model_turn};
+use crate::handlers::history::handle_history_get;
 use crate::state::AppState;
-
 /// A plan discussion is strictly read-only: the model reasons about the plan
 /// and never touches files.
 #[test]
@@ -545,4 +551,175 @@ async fn preflight_accepts_a_valid_tauqe_toml() {
 async fn preflight_accepts_a_repository_without_a_declaration() {
     let verdict = preflight_with(None).await;
     assert!(verdict.is_ok(), "got: {:?}", verdict.err());
+}
+
+/// Provider that streams one fragment and then parks until the harness cancels
+/// the turn, holding a bounded turn open at a deterministic point.
+struct StallingProvider {
+    /// Signals that the provider is suspended mid-stream.
+    entered: mpsc::UnboundedSender<()>,
+    /// Set while the provider is parked on the cancellation signal.
+    parked: Arc<AtomicBool>,
+}
+
+impl StallingProvider {
+    /// Builds the provider together with the receiver that observes its stall.
+    fn new() -> (Self, mpsc::UnboundedReceiver<()>) {
+        let (entered, receiver) = mpsc::unbounded_channel();
+        (
+            Self {
+                entered,
+                parked: Arc::new(AtomicBool::new(false)),
+            },
+            receiver,
+        )
+    }
+
+    /// Reports whether the provider is currently parked mid-stream.
+    fn is_parked(&self) -> bool {
+        self.parked.load(Ordering::SeqCst)
+    }
+}
+
+#[async_trait::async_trait]
+impl LlmProvider for StallingProvider {
+    fn kind(&self) -> ProviderKind {
+        ProviderKind::OpenRouter
+    }
+
+    async fn stream_chat(
+        &self,
+        _model: &str,
+        _messages: Vec<ChatMessage>,
+        _response_format: Option<ResponseFormat>,
+        tx: mpsc::Sender<StreamEvent>,
+        mut cancel_rx: watch::Receiver<bool>,
+    ) -> anyhow::Result<()> {
+        // Stream a fragment first, so the turn is genuinely mid-stream when the
+        // test dispatches its requests.
+        if tx
+            .send(StreamEvent::TextDelta("Reading the repository".to_string()))
+            .await
+            .is_err()
+        {
+            return Ok(());
+        }
+        self.parked.store(true, Ordering::SeqCst);
+        let _ = self.entered.send(());
+        // Park until the harness cancels the turn: the request loop has to stay
+        // free to deliver `model/cancel` while this stream is open.
+        while !*cancel_rx.borrow() {
+            if cancel_rx.changed().await.is_err() {
+                break;
+            }
+        }
+        self.parked.store(false, Ordering::SeqCst);
+        let _ = tx.send(StreamEvent::Cancelled).await;
+        Ok(())
+    }
+}
+
+/// Builds a `history/get` request for the stored session.
+fn history_get_request() -> Request {
+    Request {
+        id: tauqe_protocol::RequestId::Number(2),
+        method: tauqe_protocol::methods::HISTORY_GET.to_string(),
+        params: None,
+    }
+}
+
+/// Builds an immediate `model/cancel` request.
+fn cancel_request() -> Request {
+    Request {
+        id: tauqe_protocol::RequestId::Number(3),
+        method: tauqe_protocol::methods::MODEL_CANCEL.to_string(),
+        params: None,
+    }
+}
+
+/// A bounded turn must not hold the shared history guard for its duration.
+///
+/// The daemon serves requests from one stdin loop and awaits every inline
+/// handler, so a turn that kept the exclusive history guard would block
+/// `history/get` for minutes and would stop reading `model/cancel` — the only
+/// channel that can interrupt it. The turn therefore works on a private clone
+/// of the manager and adopts it back when it ends.
+#[tokio::test]
+async fn history_read_and_cancellation_are_served_while_a_turn_streams() {
+    let root = scratch_root("turn-history");
+    tauqe_core::git::init_repository(Some(&root), true).expect("initialise the scratch repository");
+    std::fs::write(root.join("README.md"), "# scratch\n").expect("write the repository fixture");
+    tauqe_core::git::cmd::stage_files(&root, &["README.md".to_string()])
+        .expect("stage the fixture");
+    tauqe_core::git::cmd::commit_with_developer_author(&root, "Add fixture", false)
+        .expect("commit the fixture");
+
+    let state = state_over_root(root.clone());
+    let (provider, mut entered) = StallingProvider::new();
+    let provider = Arc::new(provider);
+    let injected: Arc<dyn LlmProvider> = provider.clone();
+    *state.provider_override.lock().await = Some(injected);
+
+    start_model_turn(
+        &state,
+        "Explain the repository".to_string(),
+        TurnIntent::InteractiveRepl,
+        None,
+        None,
+    )
+    .await
+    .expect("the turn starts");
+
+    tokio::time::timeout(Duration::from_secs(10), entered.recv())
+        .await
+        .expect("the turn must reach the provider")
+        .expect("the provider signals that it is parked");
+
+    // The turn is parked mid-stream on no shared guard, so the history read is
+    // answered while the turn runs instead of waiting for it to finish.
+    let read = tokio::time::timeout(
+        Duration::from_secs(10),
+        handle_history_get(history_get_request(), &state),
+    )
+    .await
+    .expect("history/get must not wait for the running turn");
+    assert!(read.error.is_none(), "history/get failed: {:?}", read.error);
+    let page: tauqe_protocol::HistoryGetResult =
+        serde_json::from_value(read.result.expect("history/get result"))
+            .expect("history/get result deserializes");
+    assert!(
+        page.items
+            .iter()
+            .any(|item| item.text == "Explain the repository"),
+        "the running turn's prompt must already be visible in the journal"
+    );
+
+    // Cancellation travels through the same loop and must reach the parked
+    // stream.
+    let cancelled = tokio::time::timeout(
+        Duration::from_secs(10),
+        handle_model_cancel(cancel_request(), &state),
+    )
+    .await
+    .expect("model/cancel must not wait for the running turn");
+    assert!(cancelled.error.is_none(), "model/cancel failed");
+
+    let mut released = false;
+    for _ in 0..500 {
+        if !state.is_operation_active() {
+            released = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(
+        released,
+        "the cancelled turn must release the operation slot"
+    );
+    assert!(
+        !provider.is_parked(),
+        "the provider must observe the cancellation"
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
 }

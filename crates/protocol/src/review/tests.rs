@@ -35,6 +35,7 @@ fn test_review_execute_params_serde() {
         review_id: Some("rev-3".to_string()),
         item_id: Some(5),
         step_id: Some("5.1".to_string()),
+        group_id: None,
         item_ids: None,
         model: Some(ModelSelection::Role(crate::model::ModelRole::Coder)),
         instructions: Some("focus on unit tests".to_string()),
@@ -91,7 +92,6 @@ fn test_review_issue_serde() {
         recommendations: vec!["Acquire lock across turn lifetime".to_string()],
         files: vec!["crates/server/src/state.rs".to_string()],
         readonly_files: vec!["crates/protocol/src/review.rs".to_string()],
-        plan: Vec::new(),
         note: Some("Lock design pending".to_string()),
     };
 
@@ -327,120 +327,6 @@ fn test_review_start_params_path_patterns_backward_compatible() {
 }
 
 #[test]
-fn test_review_issue_without_plan_stays_readable_and_has_none() {
-    // A record without a plan deserializes cleanly with an empty plan vector.
-    let legacy = r#"{
-        "id": 7,
-        "title": "Finding without plan",
-        "type": "architecture",
-        "status": "todo",
-        "files": ["crates/core/src/review.rs"],
-        "description": "Legacy body"
-    }"#;
-    let issue: ReviewIssue = serde_json::from_str(legacy).unwrap();
-    assert!(!issue.has_plan());
-    assert_eq!(issue.plan_stats(), (0, 0));
-
-    // The empty plan is never serialized back, keeping the wire compact.
-    let json = serde_json::to_string(&issue).unwrap();
-    assert!(!json.contains("\"plan\""));
-}
-
-#[test]
-fn test_review_issue_plan_roundtrip_and_stats() {
-    let raw = r#"{
-        "id": 8,
-        "title": "Decomposed finding",
-        "type": "quality",
-        "status": "todo",
-        "plan": [
-            {"id": "1.1", "title": "First", "status": "done"},
-            {"id": "1.2", "title": "Second", "status": "in_progress"},
-            {"id": "1.3", "title": "Dropped", "status": "cancelled"},
-            {"id": "1.4", "title": "Group", "status": "todo", "children": [
-                {"id": "1.4.1", "title": "Nested", "status": "done"}
-            ]}
-        ],
-        "description": "Body"
-    }"#;
-    let issue: ReviewIssue = serde_json::from_str(raw).unwrap();
-    assert!(issue.has_plan());
-    // Leaves 1.1, 1.2, and 1.4.1 count; the cancelled 1.3 is excluded and
-    // the container 1.4 is skipped in favor of its leaves.
-    assert_eq!(issue.plan_stats(), (3, 2));
-
-    let json = serde_json::to_string(&issue).unwrap();
-    assert!(json.contains("\"plan\""));
-    let de: ReviewIssue = serde_json::from_str(&json).unwrap();
-    assert_eq!(de, issue);
-}
-
-#[test]
-fn test_review_refine_item_params_serde() {
-    let params = ReviewRefineItemParams {
-        review_id: Some("rev-1".to_string()),
-        item_id: 3,
-        model: Some(ModelSelection::Role(crate::model::ModelRole::Architect)),
-        instructions: Some("split into two sub-steps".to_string()),
-    };
-    let json = serde_json::to_string(&params).unwrap();
-    assert!(json.contains("\"item_id\":3"));
-    assert!(json.contains("\"instructions\":\"split into two sub-steps\""));
-    let de: ReviewRefineItemParams = serde_json::from_str(&json).unwrap();
-    assert_eq!(de, params);
-
-    // Only `item_id` is mandatory; the remaining fields default to absent.
-    let minimal: ReviewRefineItemParams = serde_json::from_str(r#"{"item_id":1}"#).unwrap();
-    assert!(minimal.review_id.is_none());
-    assert!(minimal.model.is_none());
-    assert!(minimal.instructions.is_none());
-}
-
-#[test]
-fn test_review_refine_item_result_serde_and_helpers() {
-    let item = ReviewIssue {
-        id: 3,
-        title: "Finding".to_string(),
-        uuid: None,
-        group: None,
-        model: None,
-        issue_type: IssueType::Bug,
-        status: IssueStatus::Todo,
-        description: "Body".to_string(),
-        recommendations: Vec::new(),
-        files: Vec::new(),
-        readonly_files: Vec::new(),
-        plan: Vec::new(),
-        note: None,
-    };
-
-    let success = ReviewRefineItemResult::Success {
-        item: item.clone(),
-        explanation: Some("Decomposed".to_string()),
-    };
-    assert!(success.is_success());
-    assert!(!success.is_blocked());
-    assert_eq!(success.item(), Some(&item));
-    assert!(success.reason().is_none());
-    let json = serde_json::to_string(&success).unwrap();
-    assert!(json.contains("\"status\":\"success\""));
-    let de: ReviewRefineItemResult = serde_json::from_str(&json).unwrap();
-    assert_eq!(de, success);
-
-    let blocked = ReviewRefineItemResult::Blocked {
-        reason: "cannot decompose".to_string(),
-    };
-    assert!(blocked.is_blocked());
-    assert!(!blocked.is_success());
-    assert!(blocked.item().is_none());
-    assert_eq!(blocked.reason(), Some("cannot decompose"));
-    let json = serde_json::to_string(&blocked).unwrap();
-    assert!(json.contains("\"status\":\"blocked\""));
-    let de: ReviewRefineItemResult = serde_json::from_str(&json).unwrap();
-    assert_eq!(de, blocked);
-}
-
-#[test]
 fn test_issue_type_methods_and_serde() {
     assert_eq!(IssueType::Bug.as_str(), "bug");
     assert_eq!(IssueType::Bug.display_badge(), "BUG");
@@ -494,37 +380,45 @@ fn test_issue_type_methods_and_serde() {
 }
 
 #[test]
-fn test_issue_status_lifecycle_and_refine() {
+fn test_issue_status_lifecycle_and_legacy_refine_alias() {
     let status = IssueStatus::Discussion;
     assert_eq!(status.next(), IssueStatus::Todo);
     assert_eq!(status.next().next(), IssueStatus::InProgress);
-    assert_eq!(status.next().next().next(), IssueStatus::Refine);
-    assert_eq!(status.next().next().next().next(), IssueStatus::Fixed);
+    assert_eq!(status.next().next().next(), IssueStatus::Fixed);
+    assert_eq!(status.next().next().next().next(), IssueStatus::Skipped);
     assert_eq!(
         status.next().next().next().next().next(),
-        IssueStatus::Skipped
-    );
-    assert_eq!(
-        status.next().next().next().next().next().next(),
         IssueStatus::Rejected
     );
     assert_eq!(
-        status.next().next().next().next().next().next().next(),
+        status.next().next().next().next().next().next(),
         IssueStatus::Discussion
     );
-    assert_eq!(IssueStatus::Refine.to_string(), "REFINE");
+    assert_eq!(IssueStatus::InProgress.to_string(), "IN_PROGRESS");
     assert_eq!(
-        serde_json::to_string(&IssueStatus::Refine).unwrap(),
-        "\"refine\""
+        serde_json::to_string(&IssueStatus::Fixed).unwrap(),
+        "\"fixed\""
     );
     assert_eq!(
+        serde_json::from_str::<IssueStatus>("\"fixed\"").unwrap(),
+        IssueStatus::Fixed
+    );
+
+    // A finding written before the status was retired keeps decoding: the
+    // legacy `refine` spelling migrates to `todo` on read and is never written
+    // back under its retired spelling.
+    assert_eq!(
         serde_json::from_str::<IssueStatus>("\"refine\"").unwrap(),
-        IssueStatus::Refine
+        IssueStatus::Todo
+    );
+    assert_eq!(
+        serde_json::to_string(&IssueStatus::Todo).unwrap(),
+        "\"todo\""
     );
 }
 
 #[test]
-fn test_review_issue_serde_and_plan_stats() {
+fn test_review_issue_serde_carries_its_classification() {
     let issue = ReviewIssue {
         id: 42,
         title: "Memory leak in cache".to_string(),
@@ -532,31 +426,22 @@ fn test_review_issue_serde_and_plan_stats() {
         group: None,
         model: None,
         issue_type: IssueType::Bug,
-        status: IssueStatus::Refine,
+        status: IssueStatus::InProgress,
         description: "Cache entries are never pruned".to_string(),
         recommendations: vec!["Implement LRU eviction".to_string()],
         files: vec!["crates/core/src/cache.rs".to_string()],
         readonly_files: vec!["crates/core/src/traits.rs".to_string()],
-        plan: vec![PlanItem {
-            id: "step-1".to_string(),
-            title: "Eviction helper".to_string(),
-            status: crate::plan::PlanItemStatus::Done,
-            ..Default::default()
-        }],
-        note: Some("Under active refinement".to_string()),
+        note: Some("Under active review".to_string()),
     };
-
-    assert!(issue.has_plan());
-    assert_eq!(issue.plan_stats(), (1, 1));
 
     let json = serde_json::to_string(&issue).unwrap();
     assert!(json.contains("\"type\":\"bug\""));
-    assert!(json.contains("\"status\":\"refine\""));
+    assert!(json.contains("\"status\":\"in_progress\""));
     assert!(json.contains("\"description\":\"Cache entries are never pruned\""));
     assert!(json.contains("\"recommendations\":[\"Implement LRU eviction\"]"));
     assert!(json.contains("\"files\":[\"crates/core/src/cache.rs\"]"));
     assert!(json.contains("\"readonly_files\":[\"crates/core/src/traits.rs\"]"));
-    assert!(json.contains("\"note\":\"Under active refinement\""));
+    assert!(json.contains("\"note\":\"Under active review\""));
 
     let de: ReviewIssue = serde_json::from_str(&json).unwrap();
     assert_eq!(de, issue);
@@ -588,11 +473,6 @@ fn test_review_session_issues_accessor_and_alias() {
     assert_eq!(issues[0].description, "Fix bug");
 }
 
-#[test]
-fn test_item_in_refine_error_constant() {
-    assert_eq!(crate::errors::ITEM_IN_REFINE, "ITEM_IN_REFINE");
-}
-
 fn finding(id: u32, status: IssueStatus) -> ReviewItem {
     ReviewItem {
         id,
@@ -606,9 +486,6 @@ fn finding(id: u32, status: IssueStatus) -> ReviewItem {
         recommendations: Vec::new(),
         files: Vec::new(),
         readonly_files: Vec::new(),
-        subplan: Vec::new(),
-        subplan_architect: None,
-        subplan_last_replanned_step: None,
         resolution_notes: None,
         body: String::new(),
     }
@@ -682,7 +559,6 @@ fn categorized_finding(id: u32, issue_type: IssueType) -> ReviewItem {
         recommendations: Vec::new(),
         files: Vec::new(),
         readonly_files: Vec::new(),
-        plan: Vec::new(),
         note: None,
     })
 }
@@ -768,83 +644,6 @@ fn test_review_item_accepts_legacy_category_spellings() {
     assert_eq!(session.items[3].severity, ReviewSeverity::Suggestion);
     assert_eq!(session.items[4].severity, ReviewSeverity::Critical);
     assert_eq!(session.items[6].severity, ReviewSeverity::Critical);
-}
-
-#[test]
-fn test_review_item_subplan_last_replanned_step_serde_and_backward_compatibility() {
-    // The sub-step whose horizon was reprojected most recently is persisted with
-    // the finding, mirroring `Plan::last_replanned_step`, so a repeated failure
-    // of the same sub-step escalates the Architect exactly once per failed step.
-    let mut item = finding(1, IssueStatus::Todo);
-    item.subplan_last_replanned_step = Some("1.1".to_string());
-    let json = serde_json::to_string(&item).unwrap();
-    assert!(json.contains("\"subplan_last_replanned_step\":\"1.1\""));
-    let de: ReviewItem = serde_json::from_str(&json).unwrap();
-    assert_eq!(de.subplan_last_replanned_step.as_deref(), Some("1.1"));
-    // The category is the persisted classification; the derived severity is
-    // recomputed on read and can never disagree with it.
-    assert_eq!(de.issue_type, IssueType::Bug);
-    assert_eq!(de.severity, ReviewSeverity::Critical);
-
-    // A finding written before the field existed stays readable.
-    let legacy = r#"{
-        "id": 7,
-        "title": "Legacy finding",
-        "type": "architecture",
-        "status": "todo",
-        "body": "Body"
-    }"#;
-    let legacy_item: ReviewItem = serde_json::from_str(legacy).unwrap();
-    assert!(legacy_item.subplan_last_replanned_step.is_none());
-
-    // An unset marker stays absent from the wire form.
-    let fresh = finding(2, IssueStatus::Todo);
-    let fresh_json = serde_json::to_string(&fresh).unwrap();
-    assert!(!fresh_json.contains("subplan_last_replanned_step"));
-}
-
-#[test]
-fn test_review_issue_projection_drops_architect_provenance() {
-    // `ReviewIssue` is the analytical view of a finding: it carries the plan
-    // the Architect produced, never the configuration that produced it. The
-    // reverse conversion therefore drops both escalation markers, so a caller
-    // that persists a finding rebuilt from this view has to decide what
-    // provenance it keeps instead of silently inheriting stale escalation
-    // state.
-    let architect = ArchitectTier::new(ModelRef::openrouter("test/architect"), None);
-    let mut item = finding(1, IssueStatus::Todo);
-    item.subplan = vec![PlanItem {
-        id: "1.1".to_string(),
-        title: "Step".to_string(),
-        status: crate::plan::PlanItemStatus::Todo,
-        ..Default::default()
-    }];
-    item.subplan_architect = Some(architect);
-    item.subplan_last_replanned_step = Some("1.1".to_string());
-
-    let issue = ReviewIssue::from(item.clone());
-    // The plan itself survives the projection; only its provenance does not.
-    assert_eq!(issue.plan, item.subplan);
-
-    let restored = ReviewItem::from(issue);
-    assert!(
-        restored.subplan_architect.is_none(),
-        "the analytical view carries no Architect provenance"
-    );
-    assert!(
-        restored.subplan_last_replanned_step.is_none(),
-        "the analytical view carries no reprojected sub-step marker"
-    );
-
-    // Everything the view does model round-trips unchanged, so the drop above
-    // is exactly the provenance and nothing else.
-    assert_eq!(restored.id, item.id);
-    assert_eq!(restored.title, item.title);
-    assert_eq!(restored.issue_type, item.issue_type);
-    assert_eq!(restored.severity, item.severity);
-    assert_eq!(restored.status, item.status);
-    assert_eq!(restored.subplan, item.subplan);
-    assert_eq!(restored.body, item.body);
 }
 
 #[test]
@@ -1149,4 +948,138 @@ fn test_review_analyze_events_roundtrip() {
     let de: ReviewAnalyzeFinishedEvent = serde_json::from_str(&json).unwrap();
     assert_eq!(de.operation_id, "op-2");
     assert_eq!(de.session, session);
+}
+
+#[test]
+fn test_review_preview_window_reports_truncation_only_from_the_token_budget() {
+    // A window that drops nothing is intact, so the client skips the consent
+    // step and audits exactly what the developer selected.
+    let intact = ReviewPreviewWindow {
+        matched_files: 3,
+        selected_files: 3,
+        selected_tokens: 120,
+        files_token_budget: 10_000,
+        ..Default::default()
+    };
+    assert!(!intact.is_truncated());
+
+    // The budget is the only knife: the files it stops are reported by the
+    // aggregate and by the budget breakdown, so the two counters agree.
+    let truncated = ReviewPreviewWindow {
+        matched_files: 3,
+        selected_files: 1,
+        selected_tokens: 120,
+        omitted_files: 2,
+        omitted_by_budget: 2,
+        files_token_budget: 120,
+        ..Default::default()
+    };
+    assert!(truncated.is_truncated());
+    assert_eq!(truncated.omitted_files, truncated.omitted_by_budget);
+
+    // The verdict is read from the budget breakdown alone, so no count of files
+    // can become a second truncation cause.
+    let budget_only = ReviewPreviewWindow {
+        omitted_by_budget: 1,
+        ..Default::default()
+    };
+    assert!(budget_only.is_truncated());
+}
+
+#[test]
+fn test_review_preview_window_decodes_without_a_batch_counter() {
+    // Counts of files are never limits, so the wire contract carries no batch
+    // counter. A peer that still names the retired key decodes unchanged: the
+    // unknown field is ignored and the verdict stays with the budget.
+    let legacy = r#"{
+        "matched_files": 4,
+        "selected_files": 2,
+        "selected_tokens": 900,
+        "omitted_files": 2,
+        "omitted_by_budget": 2,
+        "omitted_by_batch": 2,
+        "files_token_budget": 900
+    }"#;
+    let window: ReviewPreviewWindow = serde_json::from_str(legacy).unwrap();
+    assert_eq!(window.selected_files, 2);
+    assert_eq!(window.omitted_by_budget, 2);
+    assert!(window.is_truncated());
+
+    // Every counter defaults, so a minimal payload keeps decoding.
+    let minimal: ReviewPreviewWindow = serde_json::from_str("{}").unwrap();
+    assert_eq!(minimal.omitted_by_budget, 0);
+    assert!(!minimal.is_truncated());
+
+    // The window writes the counter a client reads, and the retired key never
+    // returns to the wire.
+    let json = serde_json::to_string(&minimal).unwrap();
+    assert!(json.contains("\"omitted_by_budget\":0"), "got: {json}");
+    assert!(!json.contains("omitted_by_batch"), "got: {json}");
+}
+
+#[test]
+fn test_review_group_kind_is_a_stored_dichotomy() {
+    // The class is stored instead of being derived from the group identifier,
+    // so the wire form names it verbatim.
+    assert_eq!(ReviewGroupKind::default(), ReviewGroupKind::Simple);
+    assert_eq!(
+        serde_json::to_string(&ReviewGroupKind::Simple).unwrap(),
+        "\"simple\""
+    );
+    assert_eq!(
+        serde_json::to_string(&ReviewGroupKind::Architectural).unwrap(),
+        "\"architectural\""
+    );
+    assert_eq!(
+        serde_json::from_str::<ReviewGroupKind>("\"architectural\"").unwrap(),
+        ReviewGroupKind::Architectural
+    );
+
+    // A group written before the field existed carries no class and keeps
+    // decoding as a simple group.
+    let legacy = r#"{"id":"local","title":"Local Issues"}"#;
+    let group: ReviewGroup = serde_json::from_str(legacy).unwrap();
+    assert_eq!(group.kind, ReviewGroupKind::Simple);
+
+    let architectural = ReviewGroup {
+        id: "arch-1".to_string(),
+        title: "Unbounded retry".to_string(),
+        kind: ReviewGroupKind::Architectural,
+        ..Default::default()
+    };
+    let json = serde_json::to_string(&architectural).unwrap();
+    assert!(json.contains("\"kind\":\"architectural\""), "got: {json}");
+    let de: ReviewGroup = serde_json::from_str(&json).unwrap();
+    assert_eq!(de.kind, ReviewGroupKind::Architectural);
+
+    // The implicit group of a single-audit session is simple by construction.
+    assert_eq!(
+        ReviewGroup::single_default(Vec::new()).kind,
+        ReviewGroupKind::Simple
+    );
+}
+
+#[test]
+fn test_review_execute_params_group_target() {
+    // A group run names the group itself: `step_id` then addresses a step of
+    // the group subplan, and the finding targets stay absent.
+    let group_run = ReviewExecuteParams {
+        review_id: Some("rev-1".to_string()),
+        group_id: Some("arch-1".to_string()),
+        step_id: Some("1.1".to_string()),
+        ..Default::default()
+    };
+    let json = serde_json::to_string(&group_run).unwrap();
+    assert!(json.contains("\"group_id\":\"arch-1\""), "got: {json}");
+    let de: ReviewExecuteParams = serde_json::from_str(&json).unwrap();
+    assert_eq!(de, group_run);
+    assert!(de.item_id.is_none());
+    assert!(de.item_ids.is_none());
+
+    // A finding run keeps the old wire shape: the group target stays absent.
+    let finding_run: ReviewExecuteParams =
+        serde_json::from_str(r#"{"review_id":"rev-1","item_id":2}"#).unwrap();
+    assert!(finding_run.group_id.is_none());
+    let json = serde_json::to_string(&finding_run).unwrap();
+    assert!(!json.contains("group_id"), "got: {json}");
 }

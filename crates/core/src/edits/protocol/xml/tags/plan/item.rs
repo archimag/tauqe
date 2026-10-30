@@ -3,7 +3,7 @@
 use super::extract_and_strip_inner_tag;
 use crate::edits::protocol::xml::extract_attribute;
 use crate::edits::protocol::xml::tags::strip_tags;
-
+use crate::plan::prompt::refine::MAX_PLAN_REFINEMENT_DEPTH;
 pub(super) fn next_item_tag_bounds(text: &str) -> Option<(usize, usize)> {
     let mut from = 0;
     while let Some(rel) = text[from..].find("<item") {
@@ -124,8 +124,14 @@ impl From<tauqe_protocol::PlanItem> for ParsedPlanItem {
     }
 }
 
+/// Parses `<item>` entries within a plan block body.
+///
+/// `remaining_depth` bounds how many hierarchy levels this call may still produce,
+/// counted down from the documented plan depth, so model-controlled nesting can
+/// never overflow the thread stack.
 pub(super) fn parse_plan_items_with_diagnostics(
     content: &str,
+    remaining_depth: usize,
 ) -> (Vec<ParsedPlanItem>, Vec<String>) {
     let mut items = Vec::new();
     let mut errors = Vec::new();
@@ -317,7 +323,17 @@ pub(super) fn parse_plan_items_with_diagnostics(
 
             if let (Some(cend), Some(cend_full)) = (close_start, close_end) {
                 let body = &content[header_end..cend];
-                let (children, child_errors) = parse_plan_items_with_diagnostics(body);
+                let (children, child_errors) = if remaining_depth > 1 {
+                    parse_plan_items_with_diagnostics(body, remaining_depth - 1)
+                } else {
+                    if next_item_tag_bounds(body).is_some() {
+                        errors.push(format!(
+                            "Plan step '{}': nesting exceeds the maximum plan hierarchy depth of {MAX_PLAN_REFINEMENT_DEPTH}; deeper <item> entries were ignored",
+                            if id.is_empty() { &raw_title } else { &id }
+                        ));
+                    }
+                    (Vec::new(), Vec::new())
+                };
                 errors.extend(child_errors);
                 let text_only = strip_tags(body, next_item_tag_bounds);
 

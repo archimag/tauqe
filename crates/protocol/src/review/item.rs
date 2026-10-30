@@ -1,7 +1,6 @@
 use serde::{Deserialize, Deserializer, Serialize};
 
-use crate::model::{ArchitectTier, ModelSelection};
-use crate::plan::{count_leaf_stats, PlanItem};
+use crate::model::ModelSelection;
 
 /// Semantic category of a code review issue.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
@@ -46,15 +45,15 @@ impl std::fmt::Display for IssueType {
     }
 }
 
-/// Lifecycle status of a review issue, supporting refinement before resolution.
+/// Lifecycle status of a review issue.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum IssueStatus {
     #[default]
     Discussion,
+    #[serde(alias = "refine")]
     Todo,
     InProgress,
-    Refine,
     #[serde(alias = "done")]
     Fixed,
     Skipped,
@@ -66,8 +65,7 @@ impl IssueStatus {
         match self {
             Self::Discussion => Self::Todo,
             Self::Todo => Self::InProgress,
-            Self::InProgress => Self::Refine,
-            Self::Refine => Self::Fixed,
+            Self::InProgress => Self::Fixed,
             Self::Fixed => Self::Skipped,
             Self::Skipped => Self::Rejected,
             Self::Rejected => Self::Discussion,
@@ -81,7 +79,6 @@ impl std::fmt::Display for IssueStatus {
             Self::Discussion => write!(f, "DISCUSSION"),
             Self::Todo => write!(f, "TODO"),
             Self::InProgress => write!(f, "IN_PROGRESS"),
-            Self::Refine => write!(f, "REFINE"),
             Self::Fixed => write!(f, "FIXED"),
             Self::Skipped => write!(f, "SKIPPED"),
             Self::Rejected => write!(f, "REJECTED"),
@@ -144,7 +141,7 @@ impl From<IssueType> for ReviewSeverity {
     }
 }
 
-/// A structured review issue with classified type, recommendations, and resolution plan.
+/// A structured review issue with a classified type and a remediation strategy.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ReviewIssue {
     pub id: u32,
@@ -175,32 +172,12 @@ pub struct ReviewIssue {
     pub files: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub readonly_files: Vec<String>,
-    #[serde(default, alias = "subplan", skip_serializing_if = "Vec::is_empty")]
-    pub plan: Vec<PlanItem>,
     #[serde(
         default,
         alias = "resolution_notes",
         skip_serializing_if = "Option::is_none"
     )]
     pub note: Option<String>,
-}
-
-impl ReviewIssue {
-    pub fn has_plan(&self) -> bool {
-        !self.plan.is_empty()
-    }
-
-    pub fn plan_stats(&self) -> (usize, usize) {
-        count_leaf_stats(&self.plan)
-    }
-
-    pub fn has_subplan(&self) -> bool {
-        self.has_plan()
-    }
-
-    pub fn subplan_stats(&self) -> (usize, usize) {
-        self.plan_stats()
-    }
 }
 
 /// A review finding stored as an individual item of a review session.
@@ -244,22 +221,6 @@ pub struct ReviewItem {
     pub files: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub readonly_files: Vec<String>,
-    #[serde(default, alias = "plan", skip_serializing_if = "Vec::is_empty")]
-    pub subplan: Vec<PlanItem>,
-    /// The Architect configuration that produced `subplan`.
-    ///
-    /// Planning is the *What* role's output, so the finding records which
-    /// Architect model, at which reasoning depth, decomposed it. A later
-    /// replanning wave reads this back instead of re-deriving a configuration.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub subplan_architect: Option<ArchitectTier>,
-    /// Identifier of the sub-step whose horizon was most recently reprojected.
-    ///
-    /// Mirrors `Plan::last_replanned_step` for the finding's embedded subplan,
-    /// so a repeated failure of the same sub-step is recognized from persisted
-    /// state and escalates the Architect exactly once per failed step.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub subplan_last_replanned_step: Option<String>,
     #[serde(default, alias = "note", skip_serializing_if = "Option::is_none")]
     pub resolution_notes: Option<String>,
     #[serde(default, rename = "body", alias = "description")]
@@ -293,12 +254,6 @@ struct ReviewItemWire {
     files: Vec<String>,
     #[serde(default)]
     readonly_files: Vec<String>,
-    #[serde(default, alias = "plan")]
-    subplan: Vec<PlanItem>,
-    #[serde(default)]
-    subplan_architect: Option<ArchitectTier>,
-    #[serde(default)]
-    subplan_last_replanned_step: Option<String>,
     #[serde(default, alias = "note")]
     resolution_notes: Option<String>,
     #[serde(default, alias = "description")]
@@ -319,9 +274,6 @@ impl From<ReviewItemWire> for ReviewItem {
             recommendations: wire.recommendations,
             files: wire.files,
             readonly_files: wire.readonly_files,
-            subplan: wire.subplan,
-            subplan_architect: wire.subplan_architect,
-            subplan_last_replanned_step: wire.subplan_last_replanned_step,
             resolution_notes: wire.resolution_notes,
             body: wire.body,
         }
@@ -334,16 +286,6 @@ impl<'de> Deserialize<'de> for ReviewItem {
         D: Deserializer<'de>,
     {
         ReviewItemWire::deserialize(deserializer).map(ReviewItem::from)
-    }
-}
-
-impl ReviewItem {
-    pub fn has_subplan(&self) -> bool {
-        !self.subplan.is_empty()
-    }
-
-    pub fn subplan_stats(&self) -> (usize, usize) {
-        count_leaf_stats(&self.subplan)
     }
 }
 
@@ -361,13 +303,6 @@ impl From<ReviewIssue> for ReviewItem {
             recommendations: issue.recommendations,
             files: issue.files,
             readonly_files: issue.readonly_files,
-            subplan: issue.plan,
-            // The issue view carries no Architect provenance, so a finding
-            // rebuilt from it starts without one and the caller records the
-            // configuration that actually produced the plan. The replan
-            // provenance is carried by the caller for the same reason.
-            subplan_architect: None,
-            subplan_last_replanned_step: None,
             resolution_notes: issue.note,
             body: issue.description,
         }
@@ -376,18 +311,9 @@ impl From<ReviewIssue> for ReviewItem {
 
 /// Projects a stored finding into its analytical view.
 ///
-/// The view carries the plan the Architect produced, but not the provenance of
-/// how that plan was produced: `subplan_architect` and
-/// `subplan_last_replanned_step` are deliberately dropped here. Escalation
-/// state belongs to the persisted finding, never to a projection of it, so a
-/// caller that persists a finding rebuilt from this view must decide what
-/// provenance it keeps instead of inheriting a stale escalation marker. The
-/// storage primitives carry both markers over explicitly for exactly that
-/// reason.
-///
-/// The finding identifier and the group that produced it do survive the
-/// projection: they are the identity the post-analysis layer references, so
-/// they must round-trip unchanged.
+/// Every field the view models round-trips unchanged. The finding identifier
+/// and the group that produced it are the identity the post-analysis layer
+/// references, so they survive the projection exactly as stored.
 impl From<ReviewItem> for ReviewIssue {
     fn from(item: ReviewItem) -> Self {
         Self {
@@ -402,7 +328,6 @@ impl From<ReviewItem> for ReviewIssue {
             recommendations: item.recommendations,
             files: item.files,
             readonly_files: item.readonly_files,
-            plan: item.subplan,
             note: item.resolution_notes,
         }
     }

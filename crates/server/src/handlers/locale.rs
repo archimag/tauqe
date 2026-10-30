@@ -88,11 +88,23 @@ pub async fn handle_locale_generate(req: Request, state: &Arc<AppState>) -> Resp
     let cancel_rx = operation.cancel_receiver();
     let (tx, mut rx) = tokio::sync::mpsc::channel(64);
     let model_name = model.name.clone();
+    let stream_cancel = cancel_rx.clone();
     let stream_task = tokio::spawn(async move {
         provider
-            .stream_chat(&model_name, messages, Some(response_format), tx, cancel_rx)
+            .stream_chat(
+                &model_name,
+                messages,
+                Some(response_format),
+                tx,
+                stream_cancel,
+            )
             .await
     });
+    // The streamed provider task is reachable only through the operation slot:
+    // a hard cancel and the shutdown drain abort the call through this handle,
+    // so a provider that ignores the cooperative signal cannot outlive the
+    // request it belongs to.
+    operation.set_abort_handle(stream_task.abort_handle());
 
     let mut raw_text = String::new();
     let mut stream_error = None;
@@ -116,7 +128,16 @@ pub async fn handle_locale_generate(req: Request, state: &Arc<AppState>) -> Resp
         }
     }
 
-    if cancelled {
+    // The event loop has exited, so the slot must stop pointing at the streamed
+    // task: the call is about to be awaited locally, and a hard cancel must not
+    // abort a task that has already finished.
+    operation.clear_abort_handle();
+
+    // A hard cancel is delivered as a signal rather than as a stream event, so
+    // the borrowed signal is consulted as well: an operation aborted through
+    // its handle yields a join error, which must surface as a cancellation
+    // instead of a model failure.
+    if *cancel_rx.borrow() || cancelled {
         stream_task.abort();
         let _ = stream_task.await;
         close_locale_usage(state, usage_guard, &op_id).await;
@@ -195,8 +216,8 @@ async fn resolve_locale_provider(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::transport::OutChannel;
     use async_trait::async_trait;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use tauqe_core::providers::mock::{MockLlmProvider, MockResponse};
     use tauqe_core::providers::ResponseFormat;
     use tauqe_protocol::{events, LocaleCatalogItem, LocaleGenerateResult, RequestId};
@@ -226,7 +247,7 @@ mod tests {
     }
 
     fn bare_state() -> Arc<AppState> {
-        let (out, _rx) = OutChannel::new();
+        let (out, _rx) = crate::transport::OutChannel::new();
         let (hist_tx, _hist_rx) = tokio::sync::mpsc::unbounded_channel();
         AppState::new(
             tauqe_core::config::AppConfig::default(),
@@ -245,7 +266,7 @@ mod tests {
     /// Builds a state together with its wire channel, so a test can inspect the
     /// events the handler publishes.
     fn state_with_wire() -> (Arc<AppState>, tokio::sync::mpsc::UnboundedReceiver<String>) {
-        let (out, rx) = OutChannel::new();
+        let (out, rx) = crate::transport::OutChannel::new();
         let (hist_tx, _hist_rx) = tokio::sync::mpsc::unbounded_channel();
         let state = AppState::new(
             tauqe_core::config::AppConfig::default(),
@@ -556,6 +577,109 @@ mod tests {
             count_legacy_usage_events(&lines),
             1,
             "a cancelled call reports its usage exactly once"
+        );
+    }
+    /// Flips a flag when the spawned provider future is dropped, so a test can
+    /// prove the wedged task really stopped instead of lingering detached.
+    struct ProviderStopMarker(Arc<AtomicBool>);
+
+    impl Drop for ProviderStopMarker {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+
+    /// Provider double that parks forever without observing the cancellation
+    /// signal, modeling a wedged call that only the abort handle registered in
+    /// the operation slot can terminate.
+    struct WedgedProvider {
+        entered: tokio::sync::mpsc::UnboundedSender<()>,
+        stopped: Arc<AtomicBool>,
+    }
+
+    impl WedgedProvider {
+        fn new(stopped: Arc<AtomicBool>) -> (Self, tokio::sync::mpsc::UnboundedReceiver<()>) {
+            let (entered, receiver) = tokio::sync::mpsc::unbounded_channel();
+            (Self { entered, stopped }, receiver)
+        }
+    }
+
+    #[async_trait]
+    impl LlmProvider for WedgedProvider {
+        fn kind(&self) -> tauqe_protocol::ProviderKind {
+            tauqe_protocol::ProviderKind::OpenRouter
+        }
+
+        async fn stream_chat(
+            &self,
+            _model: &str,
+            _messages: Vec<ChatMessage>,
+            _response_format: Option<ResponseFormat>,
+            _tx: tokio::sync::mpsc::Sender<StreamEvent>,
+            _cancel_rx: tokio::sync::watch::Receiver<bool>,
+        ) -> anyhow::Result<()> {
+            // The marker and the sender stay alive across the park: the future
+            // only ever completes by being aborted, exactly like a provider call
+            // that hangs instead of reacting to the cancellation signal.
+            let _marker = ProviderStopMarker(Arc::clone(&self.stopped));
+            let _ = self.entered.send(());
+            std::future::pending::<()>().await;
+            Ok(())
+        }
+    }
+
+    /// A provider call that never ends on its own and never observes the
+    /// cancellation signal is terminated through the abort handle the handler
+    /// registers in the operation slot: the drain aborts it, the call reports a
+    /// cancellation, and the slot is released.
+    #[tokio::test]
+    async fn registers_the_stream_task_so_a_wedged_provider_is_aborted() {
+        let stopped = Arc::new(AtomicBool::new(false));
+        let (provider, mut entered) = WedgedProvider::new(Arc::clone(&stopped));
+        let provider: Arc<dyn LlmProvider> = Arc::new(provider);
+        let state = state_with_provider(provider).await;
+
+        let catalog = params(vec![item("tab.review", "Review", None)]);
+        let handler = {
+            let state = Arc::clone(&state);
+            tokio::spawn(async move { handle_locale_generate(request(&catalog), &state).await })
+        };
+
+        tokio::time::timeout(std::time::Duration::from_secs(10), entered.recv())
+            .await
+            .expect("the handler must reach the provider")
+            .expect("the provider signals that it is parked");
+        assert!(
+            state.is_operation_active(),
+            "the locale call owns the operation slot while its provider streams"
+        );
+
+        // The hard cancel is delivered as a signal, and the drain then aborts
+        // whatever handle the slot holds. Without the registration the abort has
+        // no target and the wedged call keeps the slot alive until it ends.
+        state.cancel_active_operation();
+        state
+            .force_abort_active_operation(std::time::Duration::from_secs(10))
+            .await;
+
+        let response = tokio::time::timeout(std::time::Duration::from_secs(10), handler)
+            .await
+            .expect("the wedged provider must not outlive the abort")
+            .expect("the handler task joins");
+        assert_eq!(
+            response
+                .error
+                .expect("an aborted call must not succeed")
+                .code,
+            errors::CANCELLED
+        );
+        assert!(
+            stopped.load(Ordering::SeqCst),
+            "the wedged provider task must really have stopped"
+        );
+        assert!(
+            !state.is_operation_active(),
+            "the operation slot is released after the abort"
         );
     }
 }

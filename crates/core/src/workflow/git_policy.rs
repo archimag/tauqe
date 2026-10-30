@@ -5,11 +5,15 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use tauqe_protocol::{EditOperation, EditProposal};
+use tauqe_protocol::{EditOperation, EditProposal, ProjectConfig};
+use tokio::sync::watch;
 
 use super::policy::ApplyPolicy;
 use crate::context::ContextManager;
-use crate::edits::{apply_edit_proposal, prepare_staged_edits, StageEditsResult, StagedEditsState};
+use crate::edits::{
+    apply_edit_proposal_with_config, prepare_staged_edits_with_config, StageEditsResult,
+    StagedEditsState,
+};
 use crate::git::{
     create_ai_commit, create_checkpoint, create_step_commit, finalize_ai_commit,
     restore_checkpoint, CheckpointInfo,
@@ -69,16 +73,27 @@ impl ApplyPolicy for GitTransactionPolicy {
     async fn staging(
         &mut self,
         repo_root: &Path,
+        project: &ProjectConfig,
         context_manager: &ContextManager,
         edits: &[EditOperation],
         staged_state: Option<&StagedEditsState>,
+        cancel_rx: Option<&watch::Receiver<bool>>,
     ) -> StageEditsResult {
-        prepare_staged_edits(repo_root, context_manager, edits, staged_state).await
+        prepare_staged_edits_with_config(
+            repo_root,
+            project,
+            context_manager,
+            edits,
+            staged_state,
+            cancel_rx,
+        )
+        .await
     }
 
     async fn apply_temporary(
         &mut self,
         repo_root: &Path,
+        project: &ProjectConfig,
         context_manager: &mut ContextManager,
         proposal: &EditProposal,
     ) -> anyhow::Result<Vec<String>> {
@@ -95,7 +110,8 @@ impl ApplyPolicy for GitTransactionPolicy {
         }
         self.publish_transaction_state();
 
-        let changed_files = apply_edit_proposal(repo_root, context_manager, proposal).await?;
+        let changed_files =
+            apply_edit_proposal_with_config(repo_root, project, context_manager, proposal).await?;
 
         if !changed_files.is_empty() {
             let root = repo_root.to_path_buf();
@@ -160,7 +176,12 @@ impl ApplyPolicy for GitTransactionPolicy {
 mod tests {
     use super::{ApplyPolicy, GitTransactionPolicy};
     use crate::context::ContextManager;
-    use tauqe_protocol::{ContextAccess, EditOperation, EditProposal};
+    use tauqe_protocol::{ContextAccess, EditOperation, EditProposal, ProjectConfig};
+
+    /// Project configuration the policy tests stage under: no formatter, no hook.
+    fn project() -> ProjectConfig {
+        ProjectConfig::default()
+    }
 
     fn init_repo(root: &std::path::Path) {
         crate::git::init_repository(Some(root), true).unwrap();
@@ -192,7 +213,9 @@ mod tests {
 
         let edits = replace_edit();
         let mut policy = GitTransactionPolicy::new();
-        let staged = policy.staging(root, &cm, &edits, None).await;
+        let staged = policy
+            .staging(root, &project(), &cm, &edits, None, None)
+            .await;
         assert!(staged.is_success());
 
         let proposal = EditProposal {
@@ -200,7 +223,7 @@ mod tests {
             edits: edits.clone(),
         };
         let changed = policy
-            .apply_temporary(root, &mut cm, &proposal)
+            .apply_temporary(root, &project(), &mut cm, &proposal)
             .await
             .unwrap();
         assert_eq!(changed, vec!["a.rs".to_string()]);
@@ -228,7 +251,7 @@ mod tests {
             edits: edits.clone(),
         };
         let changed = policy
-            .apply_temporary(root, &mut cm, &proposal)
+            .apply_temporary(root, &project(), &mut cm, &proposal)
             .await
             .unwrap();
         assert_eq!(changed, vec!["a.rs".to_string()]);
@@ -270,7 +293,10 @@ mod tests {
                 new_text: "two\n".to_string(),
             }],
         };
-        policy.apply_temporary(root, &mut cm, &first).await.unwrap();
+        policy
+            .apply_temporary(root, &project(), &mut cm, &first)
+            .await
+            .unwrap();
         assert_eq!(std::fs::read_to_string(root.join("a.rs")).unwrap(), "two\n");
 
         let second = EditProposal {
@@ -282,7 +308,7 @@ mod tests {
             }],
         };
         policy
-            .apply_temporary(root, &mut cm, &second)
+            .apply_temporary(root, &project(), &mut cm, &second)
             .await
             .unwrap();
         assert_eq!(
@@ -318,7 +344,10 @@ mod tests {
                 new_text: "two\n".to_string(),
             }],
         };
-        policy.apply_temporary(root, &mut cm, &first).await.unwrap();
+        policy
+            .apply_temporary(root, &project(), &mut cm, &first)
+            .await
+            .unwrap();
 
         let second = EditProposal {
             summary: "healing attempt".to_string(),
@@ -329,7 +358,7 @@ mod tests {
             }],
         };
         let changed = policy
-            .apply_temporary(root, &mut cm, &second)
+            .apply_temporary(root, &project(), &mut cm, &second)
             .await
             .unwrap();
 
@@ -365,7 +394,10 @@ mod tests {
             summary: "failed attempt".to_string(),
             edits: replace_edit(),
         };
-        policy.apply_temporary(root, &mut cm, &first).await.unwrap();
+        policy
+            .apply_temporary(root, &project(), &mut cm, &first)
+            .await
+            .unwrap();
         assert_eq!(std::fs::read_to_string(root.join("a.rs")).unwrap(), "two\n");
 
         assert!(policy.rollback(root).await.unwrap());
@@ -385,7 +417,7 @@ mod tests {
             }],
         };
         let changed = policy
-            .apply_temporary(root, &mut cm, &second)
+            .apply_temporary(root, &project(), &mut cm, &second)
             .await
             .unwrap();
         assert_eq!(changed, vec!["a.rs".to_string()]);

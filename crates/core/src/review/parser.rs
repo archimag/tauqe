@@ -169,7 +169,6 @@ pub fn parse_review_output(raw: &str) -> (Option<String>, Option<String>, Vec<Re
                         recommendations: normalize_list(finding.recommendations),
                         files,
                         readonly_files: normalize_list(finding.readonly_files),
-                        plan: Vec::new(),
                         note: None,
                     }
                 })
@@ -200,7 +199,6 @@ pub fn parse_review_output(raw: &str) -> (Option<String>, Option<String>, Vec<Re
                         recommendations: Vec::new(),
                         files: Vec::new(),
                         readonly_files: Vec::new(),
-                        plan: Vec::new(),
                         note: None,
                     }],
                 )

@@ -14,7 +14,13 @@ pub async fn handle_history_get(req: Request, state: &Arc<AppState>) -> Response
 
     // Both the token estimate and the page slice touch `history.jsonl`, so the
     // read runs on the blocking pool while the exclusive history guard is held,
-    // keeping it serialized against concurrent appends and compactions.
+    // keeping it serialized against the mutations served through the same
+    // guard. A running turn works on its own clone of the manager and therefore
+    // never holds this guard, so the page reports the journal as it stands —
+    // including the entries the turn has already appended — instead of waiting
+    // for the bounded turn to finish. Compaction and rollback replace the
+    // journal atomically, so a concurrent read sees either the previous or the
+    // next journal, never a partial one.
     let loaded = crate::handlers::with_history_mutation(state, move |history| {
         let estimated_tokens = history.estimated_tokens().unwrap_or(0);
         history

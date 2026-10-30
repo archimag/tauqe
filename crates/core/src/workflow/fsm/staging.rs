@@ -519,6 +519,10 @@ pub(super) async fn run_staging_phase(
         })
         .await;
 
+    // The turn froze its effective project configuration on the first proposal
+    // round, so every staging attempt reads that snapshot instead of re-reading
+    // `tauqe.toml` and re-running a declared task runner dump.
+    let project = ctx.project().await;
     let mut attempt = 0;
     // Append-only repair log: every retry appends its diagnostics to the
     // previous request instead of replacing it, so the round extends the
@@ -531,9 +535,11 @@ pub(super) async fn run_staging_phase(
                 .policy
                 .staging(
                     ctx.repo_root,
+                    &project,
                     ctx.context_manager,
                     &current_edits,
                     staged_state.as_ref(),
+                    Some(ctx.cancel_rx),
                 )
                 .await;
             tracing::info!(

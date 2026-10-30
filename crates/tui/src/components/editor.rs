@@ -8,39 +8,42 @@ use crate::command::editor::{EditorCommand, EDITOR_COMMAND_MAP};
 use crate::config::{active_meta_modifier, active_primary_modifier, InputConfig};
 use crate::theme::engine::current_engine;
 
-/// Walks up from the current directory to the nearest ancestor that looks like
-/// a Tauqe state root (contains `.tauqe` or `.git`). This keeps the prompt
-/// history anchored to the repository root instead of the process working
-/// directory, so launching the TUI from a subdirectory does not scatter or lose
-/// the history. Returns `None` when no such ancestor exists.
-fn find_state_root() -> Option<PathBuf> {
-    let mut dir = std::env::current_dir().ok()?;
-    loop {
-        if dir.join(".tauqe").is_dir() || dir.join(".git").exists() {
-            return Some(dir);
-        }
-        if !dir.pop() {
-            return None;
-        }
-    }
+/// Resolves the prompt recall list inside the developer's private state
+/// directory, or `None` when the environment declares none.
+///
+/// The history may contain secrets, and file permissions do not protect a file
+/// from version control. A recall list anchored to a checkout would therefore
+/// sit in a working tree that Git can stage, share across every branch, and
+/// publish by accident. Resolution is a function of the per-user state
+/// environment alone, so the presence of a repository never moves the file
+/// into one.
+///
+/// The canonical root is `$XDG_STATE_HOME` and the documented fallback is
+/// `$HOME/.local/state`. The XDG base directory specification treats a
+/// relative root as invalid, so it is ignored rather than resolved against the
+/// process working directory.
+fn resolve_prompt_history_path(
+    state_home: Option<PathBuf>,
+    home: Option<PathBuf>,
+) -> Option<PathBuf> {
+    let fallback = home
+        .filter(|dir| dir.is_absolute())
+        .map(|dir| dir.join(".local").join("state"));
+    let state_root = state_home.filter(|dir| dir.is_absolute()).or(fallback)?;
+    Some(state_root.join("tauqe").join("prompts.history"))
 }
 
-pub fn default_prompt_history_path() -> PathBuf {
-    if let Some(root) = find_state_root() {
-        root.join(".tauqe").join("prompts.history")
-    } else if let Ok(state_home) = std::env::var("XDG_STATE_HOME") {
-        PathBuf::from(state_home)
-            .join("tauqe")
-            .join("prompts.history")
-    } else if let Ok(home) = std::env::var("HOME") {
-        PathBuf::from(home)
-            .join(".local")
-            .join("state")
-            .join("tauqe")
-            .join("prompts.history")
-    } else {
-        PathBuf::from(".tauqe/prompts.history")
-    }
+/// Returns the prompt recall list of this developer, resolved from
+/// `$XDG_STATE_HOME` with a `$HOME/.local/state` fallback.
+///
+/// `None` means the environment declares no usable per-user state directory.
+/// The editor then keeps its prompts in memory for the session only, which is
+/// deliberate: any fallback inside the working tree would recreate the file
+/// this resolution exists to keep out of a checkout.
+pub fn default_prompt_history_path() -> Option<PathBuf> {
+    let state_home = std::env::var_os("XDG_STATE_HOME").map(PathBuf::from);
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    resolve_prompt_history_path(state_home, home)
 }
 
 /// Writes `contents` to `path` atomically (sibling temp file + rename) with
@@ -121,6 +124,29 @@ fn active_editor_input_config() -> InputConfig {
         meta_modifier: active_meta_modifier(),
         ..InputConfig::default()
     }
+}
+
+/// Resolves a key press against the shared editor command map.
+///
+/// The map is consulted only for command chords, so a bare key never steals a
+/// character from the buffer (Conventions §5). The map itself is the authority
+/// on which physical modifier satisfies each abstract chord. Raw `Ctrl` chords
+/// (the buffer-boundary `C-Home` / `C-End`) must reach the map even when `Ctrl`
+/// is not the configured command modifier, so the raw modifier joins the
+/// abstract ones in the gate.
+fn resolve_command(key: KeyEvent, is_cmd: bool, input: &InputConfig) -> Option<EditorCommand> {
+    let command_chord = is_cmd
+        || input.is_meta(key.modifiers)
+        || key.modifiers.contains(KeyModifiers::SHIFT)
+        || key.modifiers.contains(KeyModifiers::CONTROL);
+
+    if !command_chord {
+        return None;
+    }
+
+    EDITOR_COMMAND_MAP
+        .resolve(key, input, true)
+        .map(|spec| spec.action)
 }
 
 /// Unified single/multiline text editor component.
@@ -215,9 +241,15 @@ impl TextEditor {
         }
     }
 
+    /// Records `text` as the most recent kill.
+    ///
+    /// The kill ring is editor-local: a kill never writes the OS clipboard, so
+    /// `C-w`, `C-k`, `C-u` and `M-Backspace` cost no native round trip and can
+    /// neither stall the event loop nor clobber the developer's clipboard. Only
+    /// an explicit copy action reaches the OS clipboard, through
+    /// [`crate::clipboard::copy_to_clipboard_async`].
     fn set_kill_ring(&mut self, text: String) {
         if !text.is_empty() {
-            crate::clipboard::copy_to_clipboard(&text);
             self.kill_ring = text;
         }
     }
@@ -454,23 +486,47 @@ impl TextEditor {
     }
 
     pub fn yank(&mut self) {
-        // Consult the system clipboard (detecting the most recently updated
-        // buffer between standard clipboard and Linux Primary Selection) and
-        // fall back to the internal kill-ring when system clipboard is unavailable.
-        let text = if let Some(clip) = crate::clipboard::get_from_clipboard() {
-            if !clip.is_empty() {
-                clip
-            } else {
-                self.kill_ring.clone()
-            }
+        // The kill ring is the editor's own history and therefore wins: a kill
+        // no longer mirrors into the OS clipboard, so restoring a killed region
+        // must not be decided by whatever the clipboard happens to hold. The
+        // system clipboard is consulted only while nothing was killed in this
+        // editor yet.
+        let clipboard = if self.kill_ring.is_empty() {
+            crate::clipboard::get_from_clipboard()
         } else {
-            self.kill_ring.clone()
+            None
+        };
+        self.yank_with(clipboard);
+    }
+
+    /// Inserts the clipboard text the caller read ahead of time, falling back to
+    /// the internal kill ring when it carries nothing.
+    ///
+    /// A caller that holds the application state guard reads the clipboard first
+    /// — outside the guard and awaited rather than blocking — and hands the
+    /// result over here, so this method performs no I/O at all.
+    pub fn yank_with(&mut self, clipboard: Option<String>) {
+        let text = match clipboard {
+            Some(text) if !text.is_empty() => text,
+            _ => self.kill_ring.clone(),
         };
 
         if !text.is_empty() {
             self.kill_ring = text.clone();
             self.insert_paste(&text);
         }
+    }
+
+    /// Reports whether the key press resolves to the yank command.
+    ///
+    /// A caller that is about to release the state guard asks this first: a yank
+    /// reads the system clipboard, so it must be hoisted out of the locked
+    /// region and awaited instead of blocking the event loop.
+    pub fn takes_yank_chord(&self, key: KeyEvent, is_cmd: bool) -> bool {
+        matches!(
+            resolve_command(key, is_cmd, &active_editor_input_config()),
+            Some(EditorCommand::Yank)
+        )
     }
 
     pub fn kill_word_forward(&mut self) {
@@ -650,21 +706,8 @@ impl TextEditor {
     pub fn handle_key(&mut self, key: KeyEvent, is_cmd: bool) -> bool {
         let input = active_editor_input_config();
 
-        // Consult the map only for command chords, so a bare key never steals a
-        // character from the buffer (Conventions §5). The map itself is the
-        // authority on which physical modifier satisfies each abstract chord.
-        // Raw Ctrl chords (the buffer-boundary `C-Home` / `C-End`) must reach
-        // the map even when Ctrl is not the configured command modifier, so the
-        // raw modifier joins the abstract ones in the gate.
-        let command_chord = is_cmd
-            || input.is_meta(key.modifiers)
-            || key.modifiers.contains(KeyModifiers::SHIFT)
-            || key.modifiers.contains(KeyModifiers::CONTROL);
-
-        if command_chord {
-            if let Some(spec) = EDITOR_COMMAND_MAP.resolve(key, &input, true) {
-                return self.apply_editor_command(spec.action);
-            }
+        if let Some(command) = resolve_command(key, is_cmd, &input) {
+            return self.apply_editor_command(command);
         }
 
         match key.code {
@@ -1068,6 +1111,37 @@ mod tests {
     }
 
     #[test]
+    fn yank_with_uses_the_prefetched_clipboard_then_the_kill_ring() {
+        let mut editor = TextEditor::default();
+        editor.set_kill_ring("killed text".to_string());
+
+        editor.yank_with(Some("system text".to_string()));
+        assert_eq!(editor.get_text(), "system text");
+
+        editor.clear();
+        editor.set_kill_ring("killed text".to_string());
+        editor.yank_with(None);
+        assert_eq!(editor.get_text(), "killed text");
+    }
+
+    #[test]
+    fn yank_chord_is_recognized_before_the_state_guard_is_released() {
+        let editor = TextEditor::default();
+
+        let ctrl_y = KeyEvent::new(KeyCode::Char('y'), KeyModifiers::CONTROL);
+        assert!(editor.takes_yank_chord(ctrl_y, true));
+
+        let shift_insert = KeyEvent::new(KeyCode::Insert, KeyModifiers::SHIFT);
+        assert!(editor.takes_yank_chord(shift_insert, false));
+
+        let bare_y = KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE);
+        assert!(
+            !editor.takes_yank_chord(bare_y, false),
+            "a bare letter is typed into the buffer, never treated as a yank"
+        );
+    }
+
+    #[test]
     fn kill_then_yank_uses_internal_kill_ring() {
         let mut editor = TextEditor::default();
         editor.insert_str("alpha beta");
@@ -1200,5 +1274,48 @@ mod tests {
         let ctrl_j = KeyEvent::new(KeyCode::Char('j'), KeyModifiers::CONTROL);
         assert!(!editor.handle_key(ctrl_j, true));
         assert_eq!(editor.get_text(), "line");
+    }
+
+    #[test]
+    fn prompt_history_resolves_under_the_per_user_state_home() {
+        let state_home = std::env::temp_dir().join("tauqe_test_state_home");
+        let home = std::env::temp_dir().join("tauqe_test_home");
+
+        assert_eq!(
+            resolve_prompt_history_path(Some(state_home.clone()), Some(home.clone())),
+            Some(state_home.join("tauqe").join("prompts.history"))
+        );
+        assert_eq!(
+            resolve_prompt_history_path(None, Some(home.clone())),
+            Some(
+                home.join(".local")
+                    .join("state")
+                    .join("tauqe")
+                    .join("prompts.history")
+            )
+        );
+    }
+
+    /// A relative or absent state root must never be resolved against the
+    /// process working directory: that is how a secrets-bearing file ends up
+    /// inside a checkout that Git can stage.
+    #[test]
+    fn prompt_history_requires_an_absolute_state_root() {
+        let home = std::env::temp_dir().join("tauqe_test_home_absolute");
+
+        assert_eq!(
+            resolve_prompt_history_path(Some(PathBuf::from("state")), Some(home.clone())),
+            Some(
+                home.join(".local")
+                    .join("state")
+                    .join("tauqe")
+                    .join("prompts.history")
+            )
+        );
+        assert_eq!(
+            resolve_prompt_history_path(Some(PathBuf::from("state")), None),
+            None
+        );
+        assert_eq!(resolve_prompt_history_path(None, None), None);
     }
 }

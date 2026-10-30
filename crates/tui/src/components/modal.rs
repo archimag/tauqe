@@ -360,9 +360,6 @@ pub struct ModalFrame<'a> {
     pub hint_text: Option<&'a [HintGroup]>,
 }
 
-/// Historical alias for [`ModalFrame`] kept for existing call sites.
-pub type ModalFrameParams<'a> = ModalFrame<'a>;
-
 impl ModalFrame<'_> {
     /// Renders the frame, delegating the central body area to `render_body`.
     pub fn render<F>(&self, frame: &mut ratatui::Frame, render_body: F)

@@ -13,7 +13,11 @@
 //!   `ReviewStorage::regroup_session` substitutes the session groups and
 //!   reassigns every finding in place, so re-running the analysis never rescans
 //!   the audited code and never rewrites a finding.
-//! * Every reference is resolved against the identities the session actually
+//!   the audited code and never rewrites a finding.
+//! * A finding whose type requires planning before execution never lands in the
+//!   group of independent findings: the layer mints a single-element
+//!   architectural group for it, so the requirement holds regardless of how the
+//!   classification described the finding.
 //!   holds. A hallucinated identifier is a typed refusal instead of a group that
 //!   would render a finding nothing can name.
 //!
@@ -21,7 +25,7 @@
 //! the core engine (`tauqe_core::review::analysis`), so this module owns only the
 //! orchestration: provider resolution, streaming, persistence, publication, and
 //! the transcript record.
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::Arc;
 
@@ -34,11 +38,15 @@ use tauqe_core::review::prompt::analysis::{
     build_post_analysis_system_prompt, build_post_analysis_user_prompt,
 };
 use tauqe_core::review::{uuid::generate_uuid_v7, ReviewStorage};
-use tauqe_protocol::review::{ReviewGroup, LOCAL_REVIEW_GROUP_ID, LOCAL_REVIEW_GROUP_TITLE};
+use tauqe_protocol::model::{ReviewWorkPhase, TurnWorkContext, TurnWorkQueue};
+use tauqe_protocol::review::{
+    ReviewGroup, ReviewGroupKind, LOCAL_REVIEW_GROUP_ID, LOCAL_REVIEW_GROUP_TITLE,
+};
 use tauqe_protocol::{
-    errors, events, ModelRole, ModelStartedEvent, ModelUsageEvent, ModelUsageInfo, Request,
-    Response, ResponseError, ReviewAnalyzeFinishedEvent, ReviewAnalyzeParams, ReviewAnalyzeResult,
-    ReviewAnalyzeStartedEvent, ReviewContentDeltaEvent, ReviewReasoningDeltaEvent, ReviewSession,
+    errors, events, IssueType, ModelRole, ModelStartedEvent, ModelUsageEvent, ModelUsageInfo,
+    Request, Response, ResponseError, ReviewAnalyzeFinishedEvent, ReviewAnalyzeParams,
+    ReviewAnalyzeResult, ReviewAnalyzeStartedEvent, ReviewContentDeltaEvent,
+    ReviewReasoningDeltaEvent, ReviewSession,
 };
 use tokio::sync::mpsc;
 
@@ -228,6 +236,15 @@ pub(super) async fn run_review_post_analysis(
             alias: None,
             effort: reasoning_effort,
             plan_context: None,
+            // The round classifies the findings of one stored session, so the
+            // running work names the session phase instead of leaving it
+            // anonymous; a batch member never settles the shared turn itself.
+            work_context: Some(TurnWorkContext::ReviewPhase {
+                review_id: session.id.clone(),
+                review_title: session.title.clone(),
+                phase: ReviewWorkPhase::PostAnalysis,
+                queue: TurnWorkQueue::default(),
+            }),
             is_batch,
         })
         .ok(),
@@ -437,10 +454,13 @@ pub(super) async fn run_review_post_analysis(
 
     // The classification is the session itself, not a projection beside it: the
     // verdict becomes the session summary, the payload clusters become the session
-    // groups, and every finding moves to the group that now owns it.
+    // groups, and every finding moves to the group that now owns it. A finding
+    // whose type requires planning before execution receives a single-element
+    // architectural group instead of the group of independent findings.
     let verdict = output.summary.trim().to_string();
-    let groups = regrouped_groups(&output);
-    let assignments = group_assignments(&output, &known_uuids);
+    let redirects = arch_redirect_groups(&output, session, &known_uuids);
+    let groups = regrouped_groups(&output, &redirects);
+    let assignments = group_assignments(&output, &known_uuids, &redirects);
     let independent_count = output.independent_issues.len();
     let group_count = output.architectural_groups.len();
     let history_response = format!(
@@ -576,11 +596,21 @@ fn architectural_group_id(index: usize) -> String {
 /// Materializes the groups that replace the session groups.
 ///
 /// The classification is the session, so the payload is the group list: one group
-/// per architectural cluster of the findings, plus the group collecting the
+/// per architectural cluster of the findings, one single-element group per finding
+/// whose type requires planning before execution, plus the group collecting the
 /// findings that need no architectural remediation. That group is materialized
 /// even when it turns out empty, so a classified session keeps one uniform shape:
 /// every finding belongs to exactly one rendered group.
-fn regrouped_groups(output: &PostAnalysisOutput) -> Vec<ReviewGroup> {
+///
+/// The class of each group is declared here rather than derived from its
+/// identifier: an architectural cluster and a single-element architectural group
+/// become [`ReviewGroupKind::Architectural`], while the group collecting the
+/// findings that share no root cause becomes [`ReviewGroupKind::Simple`], so
+/// execution never guesses a class from a name.
+fn regrouped_groups(
+    output: &PostAnalysisOutput,
+    redirects: &[(String, ReviewGroup)],
+) -> Vec<ReviewGroup> {
     let mut groups: Vec<ReviewGroup> = output
         .architectural_groups
         .iter()
@@ -589,9 +619,18 @@ fn regrouped_groups(output: &PostAnalysisOutput) -> Vec<ReviewGroup> {
             id: architectural_group_id(index),
             title: group.title.trim().to_string(),
             description: Some(group.description.trim().to_string()),
+            // A cluster is remediated by one shared horizon that removes the root
+            // cause, never finding by finding.
+            kind: ReviewGroupKind::Architectural,
             ..Default::default()
         })
         .collect();
+    // A finding whose type requires planning before execution owns a
+    // single-element group of its own, rendered after the clusters so the layer
+    // keeps one deterministic numbering.
+    for (_, group) in redirects {
+        groups.push(group.clone());
+    }
     groups.push(ReviewGroup {
         id: LOCAL_REVIEW_GROUP_ID.to_string(),
         title: LOCAL_REVIEW_GROUP_TITLE.to_string(),
@@ -599,19 +638,84 @@ fn regrouped_groups(output: &PostAnalysisOutput) -> Vec<ReviewGroup> {
             "Findings that stand on their own: each one is resolved by its own finding subplan, with no shared group horizon."
                 .to_string(),
         ),
+        // The findings that share no root cause stay independent, so the group
+        // collecting them is executed finding by finding.
+        kind: ReviewGroupKind::Simple,
         ..Default::default()
     });
     groups
+}
+
+/// Resolves the findings whose type requires planning before execution, paired
+/// with the architectural group that owns each of them.
+///
+/// `IssueType::Architecture` is a deterministic requirement, not a label: such a
+/// finding is remediated by a plan, and the only sanctioned carrier of a plan is
+/// an architectural group. The group of independent findings is a simple group,
+/// so it may hold no architecture finding at all. A classification that names one
+/// independent, or that does not name it at all, therefore does not decide where
+/// the finding lands; the group is derived here instead, titled after the finding
+/// because the finding is the whole content of its root cause.
+///
+/// A finding the classification placed in a cluster is already owned by an
+/// architectural group and keeps it, so no group of the layer is ever empty. The
+/// numbering continues after the clusters and follows the stored order of the
+/// findings, so a repeated analysis of the same payload mints the same
+/// identifiers.
+fn arch_redirect_groups(
+    output: &PostAnalysisOutput,
+    session: &ReviewSession,
+    known_uuids: &[String],
+) -> Vec<(String, ReviewGroup)> {
+    let clustered: HashSet<String> = output
+        .architectural_groups
+        .iter()
+        .flat_map(|group| group.issue_ids.iter())
+        .filter_map(|identifier| resolve_identity(identifier, known_uuids))
+        .collect();
+    let mut redirects = Vec::new();
+    let mut index = output.architectural_groups.len();
+    for item in &session.items {
+        if item.issue_type != IssueType::Architecture {
+            continue;
+        }
+        let uuid = item.uuid.as_deref().map(str::trim).unwrap_or_default();
+        if uuid.is_empty() || clustered.contains(uuid) {
+            continue;
+        }
+        redirects.push((
+            uuid.to_string(),
+            ReviewGroup {
+                id: architectural_group_id(index),
+                title: item.title.trim().to_string(),
+                description: Some(
+                    "The finding requires a plan before it is executed: the group synthesizes one coherent remediation of its root cause."
+                        .to_string(),
+                ),
+                kind: ReviewGroupKind::Architectural,
+                ..Default::default()
+            },
+        ));
+        index += 1;
+    }
+    redirects
 }
 
 /// Resolves the group that owns every finding the session holds.
 ///
 /// A finding the payload names belongs to the group it named. A finding the payload
 /// does not name would otherwise keep pointing at a group the new layer no longer
-/// declares, so it lands in the group of independent findings. Every assignment
+/// declares, so it lands in the group of independent findings. An architecture
+/// finding never lands there: the single-element architectural group minted for it
+/// replaces the independent assignment, because the group of independent findings
+/// holds no finding that must be planned before it is executed. Every assignment
 /// therefore names a group of [`regrouped_groups`], and no finding is left outside
 /// the rendered tree.
-fn group_assignments(output: &PostAnalysisOutput, known_uuids: &[String]) -> Vec<(String, String)> {
+fn group_assignments(
+    output: &PostAnalysisOutput,
+    known_uuids: &[String],
+    redirects: &[(String, ReviewGroup)],
+) -> Vec<(String, String)> {
     let mut assigned: HashMap<String, String> = HashMap::new();
     for identifier in &output.independent_issues {
         if let Some(known) = resolve_identity(identifier, known_uuids) {
@@ -625,6 +729,11 @@ fn group_assignments(output: &PostAnalysisOutput, known_uuids: &[String]) -> Vec
                 assigned.insert(known, group_id.clone());
             }
         }
+    }
+    // The redirects are applied last, so an architecture finding keeps its own
+    // architectural group even when the payload called it independent.
+    for (uuid, group) in redirects {
+        assigned.insert(uuid.clone(), group.id.clone());
     }
     known_uuids
         .iter()
@@ -696,9 +805,6 @@ mod tests {
             recommendations: vec!["Introduce one shared transaction boundary".to_string()],
             files: vec!["crates/core/src/git.rs".to_string()],
             readonly_files: vec!["Conventions.md".to_string()],
-            subplan: Vec::new(),
-            subplan_architect: None,
-            subplan_last_replanned_step: None,
             resolution_notes: None,
             body: "The change set reaches the worktree without one shared boundary.".to_string(),
         }
@@ -768,21 +874,31 @@ mod tests {
                 .expect("the classification is persisted");
         // The classification is the session itself: the verdict becomes the
         // session description, the payload clusters become the session groups,
-        // and every finding moves to the group that now owns it.
+        // and every finding moves to the group that now owns it. An architecture
+        // finding the classification left on its own receives a single-element
+        // architectural group instead of the group of independent findings.
         assert_eq!(
             first.description.as_deref(),
             Some("One shared transaction boundary explains both findings.")
         );
-        assert_eq!(first.groups.len(), 2);
+        assert_eq!(first.groups.len(), 3);
         assert_eq!(first.groups[0].id, "arch-1");
+        assert_eq!(first.groups[0].kind, ReviewGroupKind::Architectural);
         assert_eq!(first.groups[0].title, "Shared commit boundary");
         assert_eq!(
             first.groups[0].description.as_deref(),
             Some("The systemic root cause behind Shared commit boundary.")
         );
-        assert_eq!(first.groups[1].id, LOCAL_REVIEW_GROUP_ID);
-        assert_eq!(first.groups[1].title, LOCAL_REVIEW_GROUP_TITLE);
-        assert_eq!(first.items[0].group.as_deref(), Some(LOCAL_REVIEW_GROUP_ID));
+        // The architecture finding the classification called independent is
+        // planned before it is executed, so it owns a single-element
+        // architectural group titled after the finding itself.
+        assert_eq!(first.groups[1].id, "arch-2");
+        assert_eq!(first.groups[1].kind, ReviewGroupKind::Architectural);
+        assert_eq!(first.groups[1].title, "Finding 1");
+        assert_eq!(first.groups[2].id, LOCAL_REVIEW_GROUP_ID);
+        assert_eq!(first.groups[2].title, LOCAL_REVIEW_GROUP_TITLE);
+        assert_eq!(first.groups[2].kind, ReviewGroupKind::Simple);
+        assert_eq!(first.items[0].group.as_deref(), Some("arch-2"));
         assert_eq!(first.items[1].group.as_deref(), Some("arch-1"));
         // Findings are immutable input: regrouping reassigns the group of each
         // finding and never rewrites what it reports.
@@ -802,13 +918,13 @@ mod tests {
             second.description.as_deref(),
             Some("The frontend repeats the same boundary defect.")
         );
-        assert_eq!(second.groups.len(), 2);
+        assert_eq!(second.groups.len(), 3);
         assert_eq!(second.groups[0].id, "arch-1");
+        assert_eq!(second.groups[1].id, "arch-2");
+        assert_eq!(second.groups[1].title, "Finding 2");
+        assert_eq!(second.groups[2].id, LOCAL_REVIEW_GROUP_ID);
         assert_eq!(second.items[0].group.as_deref(), Some("arch-1"));
-        assert_eq!(
-            second.items[1].group.as_deref(),
-            Some(LOCAL_REVIEW_GROUP_ID)
-        );
+        assert_eq!(second.items[1].group.as_deref(), Some("arch-2"));
 
         let stored = ReviewStorage::load_review(&fixture.root, "rev-analyze")
             .unwrap()
@@ -817,21 +933,72 @@ mod tests {
             stored.description.as_deref(),
             Some("The frontend repeats the same boundary defect.")
         );
-        assert_eq!(stored.groups.len(), 2);
+        assert_eq!(stored.groups.len(), 3);
         assert_eq!(stored.groups[0].title, "Shared commit boundary");
-        assert_eq!(stored.groups[1].id, LOCAL_REVIEW_GROUP_ID);
-        assert_eq!(stored.groups[1].title, LOCAL_REVIEW_GROUP_TITLE);
+        assert_eq!(stored.groups[1].id, "arch-2");
+        assert_eq!(stored.groups[1].title, "Finding 2");
+        assert_eq!(stored.groups[1].kind, ReviewGroupKind::Architectural);
+        assert_eq!(stored.groups[2].id, LOCAL_REVIEW_GROUP_ID);
+        assert_eq!(stored.groups[2].title, LOCAL_REVIEW_GROUP_TITLE);
+        assert_eq!(stored.groups[2].kind, ReviewGroupKind::Simple);
         assert_eq!(stored.items[0].group.as_deref(), Some("arch-1"));
-        assert_eq!(
-            stored.items[1].group.as_deref(),
-            Some(LOCAL_REVIEW_GROUP_ID)
-        );
+        assert_eq!(stored.items[1].group.as_deref(), Some("arch-2"));
         assert_eq!(stored.items[0].status, IssueStatus::Todo);
         assert_eq!(stored.items[1].status, IssueStatus::Discussion);
         assert_eq!(stored.items[0].uuid.as_deref(), Some(CORE_UUID));
         assert_eq!(stored.items[1].uuid.as_deref(), Some(TUI_UUID));
     }
 
+    /// An architecture finding never lands in the group of independent findings,
+    /// while an independent finding of another type stays exactly where the
+    /// classification placed it.
+    #[tokio::test]
+    async fn post_analysis_keeps_an_independent_architecture_finding_out_of_the_local_group() {
+        let fixture = fixture("arch-redirect");
+        let mut session = session();
+        // The second finding is a quality finding: nothing requires it to be
+        // planned before it is executed.
+        session.items[1].issue_type = IssueType::Quality;
+        session.items[1].severity = ReviewSeverity::from(IssueType::Quality);
+        ReviewStorage::save_session(&fixture.root, &session).unwrap();
+
+        let provider = Arc::new(MockLlmProvider::scripted([MockResponse::text(
+            classification(
+                "Both findings stand on their own.",
+                &[CORE_UUID, TUI_UUID],
+                &[],
+            ),
+        )]));
+        *fixture.state.provider_override.lock().await = Some(provider);
+
+        let operation = fixture.state.try_begin_operation().unwrap();
+        let stored =
+            run_review_post_analysis(&fixture.state, &fixture.root, &session, &operation, false)
+                .await
+                .expect("the classification is persisted");
+
+        // The architecture finding is planned before it is executed, so it owns a
+        // single-element architectural group titled after the finding itself,
+        // while the group of independent findings stays non-architectural.
+        assert_eq!(stored.groups.len(), 2);
+        assert_eq!(stored.groups[0].id, "arch-1");
+        assert_eq!(stored.groups[0].title, "Finding 1");
+        assert_eq!(stored.groups[0].kind, ReviewGroupKind::Architectural);
+        assert_eq!(stored.groups[1].id, LOCAL_REVIEW_GROUP_ID);
+        assert_eq!(stored.groups[1].kind, ReviewGroupKind::Simple);
+        assert_eq!(stored.items[0].group.as_deref(), Some("arch-1"));
+        assert_eq!(
+            stored.items[1].group.as_deref(),
+            Some(LOCAL_REVIEW_GROUP_ID)
+        );
+        // Regrouping reassigns the owning group and never rewrites the finding.
+        assert_eq!(stored.items[0].uuid.as_deref(), Some(CORE_UUID));
+        assert_eq!(stored.items[1].uuid.as_deref(), Some(TUI_UUID));
+        assert_eq!(stored.items[0].title, session.items[0].title);
+        assert_eq!(stored.items[1].title, session.items[1].title);
+        assert_eq!(stored.items[0].status, IssueStatus::Todo);
+        assert_eq!(stored.items[1].status, IssueStatus::Discussion);
+    }
     /// A classification naming an identity the session does not hold is rejected
     /// by name and never reaches disk.
     #[tokio::test]
@@ -918,16 +1085,21 @@ mod tests {
                 .await
                 .expect("a re-spelled identity resolves");
         assert_eq!(stored.description.as_deref(), Some("One shared boundary."));
+        assert_eq!(stored.groups.len(), 3);
         assert_eq!(stored.groups[0].id, "arch-1");
         assert_eq!(stored.groups[0].title, "Shared boundary");
         assert_eq!(stored.items[0].group.as_deref(), Some("arch-1"));
         assert_eq!(stored.items[0].uuid.as_deref(), Some(CORE_UUID));
         // The finding the classification did not name keeps no stale
-        // provenance: it lands in the group of independent findings.
-        assert_eq!(
-            stored.items[1].group.as_deref(),
-            Some(LOCAL_REVIEW_GROUP_ID)
-        );
+        // provenance, and its architecture type still keeps it out of the group
+        // of independent findings: it receives a single-element group of its own.
+        assert_eq!(stored.groups[1].id, "arch-2");
+        assert_eq!(stored.groups[1].title, "Finding 2");
+        assert_eq!(stored.groups[1].kind, ReviewGroupKind::Architectural);
+        assert_eq!(stored.groups[2].id, LOCAL_REVIEW_GROUP_ID);
+        assert_eq!(stored.groups[2].kind, ReviewGroupKind::Simple);
+        assert_eq!(stored.items[1].group.as_deref(), Some("arch-2"));
+        assert_eq!(stored.items[1].uuid.as_deref(), Some(TUI_UUID));
     }
 
     /// The identifier is mandatory: an implicit target would rewrite whichever

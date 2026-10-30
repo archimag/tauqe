@@ -127,7 +127,10 @@ pub fn reconcile_discovery_context(
     let mut outcome = ContextApplicationOutcome::default();
 
     // 1. Identify candidate additions and validate against the repository
-    let mut valid_new_files = Vec::new();
+    // Each candidate keeps the access it will be rendered with, because the
+    // length of the `access` attribute belongs to the token price of its
+    // `<file>` wrapper.
+    let mut valid_new_files: Vec<(String, ContextAccess)> = Vec::new();
 
     for request in requests {
         let Ok(path) = context_manager.normalize_path(&request.path) else {
@@ -163,21 +166,48 @@ pub fn reconcile_discovery_context(
             }
             continue;
         }
-        if !context_manager.contains(&path).unwrap_or(false) && !valid_new_files.contains(&path) {
-            valid_new_files.push(path);
+        if !context_manager.contains(&path).unwrap_or(false) {
+            // A path requested twice is priced once. The editable spelling wins,
+            // because that is the attribute the element renders after the
+            // upgrade, so the wrapper is measured at its widest.
+            if let Some(entry) = valid_new_files
+                .iter_mut()
+                .find(|entry| entry.0.as_str() == path.as_str())
+            {
+                if requested_access == ContextAccess::Editable {
+                    entry.1 = ContextAccess::Editable;
+                }
+            } else {
+                valid_new_files.push((path, requested_access));
+            }
         }
     }
 
     // 2. Check files_token_budget limit
     // Token estimates rely on cached context sizes and file metadata instead of
     // reading full file contents, avoiding heavy blocking I/O on the async worker.
-    let current_tokens: usize = context_manager.get_state().total_estimated_tokens as usize;
+    // Both sides of the comparison are priced the same way. A file already in
+    // context pays its content plus the wrapper its own `<file>` element
+    // renders, so the budget never under-counts the material the model holds.
+    let current_tokens: usize = context_manager
+        .get_state()
+        .items
+        .iter()
+        .map(|item| {
+            item.estimated_tokens as usize
+                + crate::prompt::context_element_overhead_tokens(&item.path, item.access)
+        })
+        .sum();
 
+    // A candidate costs its content plus the same wrapper. Both terms come from
+    // the builder that renders the `<context>` block, so the budget never
+    // measures less than the model reads.
     let mut new_tokens = 0usize;
-    for path in &valid_new_files {
+    for (path, access) in &valid_new_files {
         let full_path = context_manager.repo_root().join(path);
         if let Ok(meta) = std::fs::metadata(&full_path) {
-            new_tokens += crate::prompt::estimate_tokens_from_bytes(meta.len()) as usize;
+            new_tokens += crate::prompt::estimate_tokens_from_bytes(meta.len()) as usize
+                + crate::prompt::context_element_overhead_tokens(path, *access);
         }
     }
 
@@ -186,7 +216,10 @@ pub fn reconcile_discovery_context(
             current_tokens,
             requested_tokens: new_tokens,
             token_budget: files_token_budget,
-            requested_files: valid_new_files,
+            requested_files: valid_new_files
+                .iter()
+                .map(|(path, _)| path.clone())
+                .collect(),
         });
         return outcome;
     }
@@ -1201,6 +1234,89 @@ mod tests {
         let limit = outcome.limit_exceeded.expect("Expected limit_exceeded");
         assert_eq!(limit.token_budget, 2);
         assert!(limit.requested_tokens > 2);
+    }
+
+    #[test]
+    fn test_the_budget_check_charges_the_file_wrapper() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.rs"), "fn a() {}\n").unwrap();
+        let mut cm = ContextManager::new(dir.path().to_path_buf());
+        let available = vec!["a.rs".to_string()];
+        let requests = vec![ContextRequest {
+            path: "a.rs".to_string(),
+            access: ContextAccess::Editable,
+        }];
+
+        let content_tokens = crate::prompt::estimate_tokens("fn a() {}\n");
+        let wrapper =
+            crate::prompt::context_element_overhead_tokens("a.rs", ContextAccess::Editable);
+        assert!(wrapper > 0, "the rendered <file> element costs tokens");
+
+        // A budget that fits the bare content but not the element the model
+        // actually reads refuses the file and reports the priced cost.
+        let outcome = apply_context_requests_detailed(
+            &mut cm,
+            &requests,
+            &available,
+            content_tokens + wrapper - 1,
+            50_000,
+        );
+        let limit = outcome.limit_exceeded.expect("the wrapper must be charged");
+        assert_eq!(limit.requested_tokens, content_tokens + wrapper);
+        assert!(outcome.added.is_empty());
+
+        // One token more admits the very same file.
+        let outcome = apply_context_requests_detailed(
+            &mut cm,
+            &requests,
+            &available,
+            content_tokens + wrapper,
+            50_000,
+        );
+        assert!(outcome.limit_exceeded.is_none());
+        assert_eq!(outcome.added, vec!["a.rs".to_string()]);
+    }
+
+    #[test]
+    fn test_the_budget_check_charges_the_wrapper_of_a_loaded_file() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("loaded.rs"), "fn loaded() {}\n").unwrap();
+        std::fs::write(dir.path().join("next.rs"), "fn next() {}\n").unwrap();
+        let mut cm = ContextManager::new(dir.path().to_path_buf());
+        cm.add_file("loaded.rs", ContextAccess::ReadOnly).unwrap();
+        let available = vec!["loaded.rs".to_string(), "next.rs".to_string()];
+        let requests = vec![ContextRequest {
+            path: "next.rs".to_string(),
+            access: ContextAccess::ReadOnly,
+        }];
+
+        let loaded_tokens = crate::prompt::estimate_tokens("fn loaded() {}\n")
+            + crate::prompt::context_element_overhead_tokens("loaded.rs", ContextAccess::ReadOnly);
+        let next_tokens = crate::prompt::estimate_tokens("fn next() {}\n")
+            + crate::prompt::context_element_overhead_tokens("next.rs", ContextAccess::ReadOnly);
+
+        // The file already in context is priced together with its own wrapper,
+        // so the reported current cost exceeds its bare content.
+        let outcome = apply_context_requests_detailed(
+            &mut cm,
+            &requests,
+            &available,
+            loaded_tokens + next_tokens - 1,
+            50_000,
+        );
+        let limit = outcome.limit_exceeded.expect("the budget is exceeded");
+        assert_eq!(limit.current_tokens, loaded_tokens);
+        assert_eq!(limit.requested_tokens, next_tokens);
+
+        let outcome = apply_context_requests_detailed(
+            &mut cm,
+            &requests,
+            &available,
+            loaded_tokens + next_tokens,
+            50_000,
+        );
+        assert!(outcome.limit_exceeded.is_none());
+        assert_eq!(outcome.added, vec!["next.rs".to_string()]);
     }
 
     #[test]

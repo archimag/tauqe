@@ -23,6 +23,7 @@ pub mod views;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use crate::i18n::active_t;
 use tauqe_protocol::{methods, HistoryGetParams, Message};
 use tokio::sync::Mutex;
 
@@ -73,7 +74,9 @@ async fn main() -> anyhow::Result<()> {
     };
 
     let mut input_editor = InputEditor::default();
-    input_editor.set_history_path(editor::default_prompt_history_path());
+    if let Some(history_path) = editor::default_prompt_history_path() {
+        input_editor.set_history_path(history_path);
+    }
 
     // Load the single custom locale (if any) so the interface starts localized
     // and falls through to English for every missing key (c-4, c-5).
@@ -214,7 +217,8 @@ async fn main() -> anyhow::Result<()> {
                     Ok(InputResult::Exit) => break,
                     Err(err) => {
                         let mut st = state.lock().await;
-                        st.notify_error(format!("Command error: {}", err));
+                        let message = active_t("notify.command_error");
+                        st.notify_error(message.replacen("{}", &err.to_string(), 1));
                         dirty = true;
                     }
                 }
@@ -233,10 +237,11 @@ async fn main() -> anyhow::Result<()> {
                         if st.server_disconnected.is_none() {
                             let exit_status = server_child.try_wait().ok().flatten();
                             let status_text = match exit_status {
-                                Some(status) => format!("Server process terminated ({})", status),
-                                None => "Server disconnected unexpectedly".to_string(),
+                                Some(status) => active_t("notify.server_disconnected.terminated")
+                                    .replacen("{}", &status.to_string(), 1),
+                                None => active_t("notify.server_disconnected.unexpected"),
                             };
-                            let banner = format!("{}. Logs: {}. Press 'q' or Ctrl+Q to exit.", status_text, server_log_path.display());
+                            let banner = server_disconnect_banner(&status_text, &server_log_path);
                             st.server_disconnected = Some(banner.clone());
                             st.notify_error(banner);
                             dirty = true;
@@ -248,7 +253,9 @@ async fn main() -> anyhow::Result<()> {
                 if let Ok(Some(status)) = server_child.try_wait() {
                     let mut st = state.lock().await;
                     if st.server_disconnected.is_none() {
-                        let banner = format!("Server process exited ({}). Logs: {}. Press 'q' or Ctrl+Q to exit.", status, server_log_path.display());
+                        let status_template = active_t("notify.server_disconnected.exited");
+                        let status_text = status_template.replacen("{}", &status.to_string(), 1);
+                        let banner = server_disconnect_banner(&status_text, &server_log_path);
                         st.server_disconnected = Some(banner.clone());
                         st.notify_error(banner);
                         dirty = true;
@@ -300,6 +307,17 @@ async fn dispatch_server_message(
         }
         Message::Request(_) => {}
     }
+}
+/// Renders the daemon disconnect banner shown in the server-disconnected
+/// modal.
+///
+/// The status line arrives pre-localized; the banner appends the log path and
+/// the quit hint from the catalog, so a hot-swapped locale covers the whole
+/// modal (Conventions §9).
+fn server_disconnect_banner(status_text: &str, log_path: &std::path::Path) -> String {
+    active_t("notify.server_disconnected.banner")
+        .replacen("{}", status_text, 1)
+        .replacen("{}", &log_path.display().to_string(), 1)
 }
 
 #[cfg(test)]

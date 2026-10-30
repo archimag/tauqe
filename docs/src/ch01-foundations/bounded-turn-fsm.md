@@ -195,9 +195,11 @@ stand-in for another:
 - **The developer chronicle** — the History view. It renders the journal together
   with the record of the turn that is still running and the record of the turn
   that was rolled back, neither of which the journal holds for long.
-- **The editor prompt history** — `.tauqe/prompts.history`, the prompt buffer's
-  own recall list. It stores submitted prompts only, newest last, deduplicated and
-  capped, and is written with owner-only permissions. It is a typing convenience,
+- **The editor prompt history** — the prompt buffer's own recall list, kept in the
+  developer's private state directory (`$XDG_STATE_HOME/tauqe/prompts.history`,
+  falling back to `$HOME/.local/state/tauqe/prompts.history`) and never inside a
+  checkout. It stores submitted prompts only, newest last, deduplicated and capped,
+  and is written with owner-only permissions. It is a typing convenience,
   not a dialogue: it is never rendered into a prompt and never reaches the model.
 
 The journal answers what the harness and the model exchanged; the editor file
