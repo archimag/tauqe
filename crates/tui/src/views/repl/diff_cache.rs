@@ -28,7 +28,7 @@ struct DiffCacheEntry {
 /// The offsets are relative to `lines`, so the Viewport projects them through
 /// its own visual coordinates and names the hunk under the top edge without
 /// re-deriving the patch layout (c-1).
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Default)]
 pub(crate) struct RenderedDiff {
     pub lines: Vec<Line<'static>>,
     pub hunk_rows: Vec<usize>,
@@ -40,20 +40,27 @@ impl DiffRenderCache {
     /// The Viewport needs those offsets to name the hunk the top edge sits
     /// inside, so the overlay reuses the very rows that were drawn instead of
     /// re-deriving them from the patch text (c-1).
-    pub(crate) fn render(&mut self, file: &StreamingFileEdit) -> RenderedDiff {
+    ///
+    /// The body is served by reference: a cache hit costs one fingerprint pass
+    /// and a borrow, and a freshly rendered body is served straight from the
+    /// entry it was inserted into, so neither path copies the rendered patch
+    /// (c-1).
+    pub(crate) fn render(&mut self, file: &StreamingFileEdit) -> &RenderedDiff {
         let fingerprint = diff_fingerprint(file);
-        if let Some(rendered) = self.cached_render(&file.path, fingerprint) {
-            return rendered;
-        }
-        let rendered = render_expanded_diff(file);
-        self.entries.insert(
-            file.path.clone(),
-            DiffCacheEntry {
+        let entry = self
+            .entries
+            .entry(file.path.clone())
+            .and_modify(|entry| {
+                if entry.fingerprint != fingerprint {
+                    entry.fingerprint = fingerprint;
+                    entry.rendered = render_expanded_diff(file);
+                }
+            })
+            .or_insert_with(|| DiffCacheEntry {
                 fingerprint,
-                rendered: rendered.clone(),
-            },
-        );
-        rendered
+                rendered: render_expanded_diff(file),
+            });
+        &entry.rendered
     }
 
     /// Discards the cached diff body of a single path.
@@ -64,15 +71,6 @@ impl DiffRenderCache {
     /// retried (c-stream-file-reset).
     pub fn invalidate(&mut self, path: &str) {
         self.entries.remove(path);
-    }
-
-    fn cached_render(&self, path: &str, fingerprint: u64) -> Option<RenderedDiff> {
-        let entry = self.entries.get(path)?;
-        if entry.fingerprint == fingerprint {
-            Some(entry.rendered.clone())
-        } else {
-            None
-        }
     }
 }
 
@@ -169,7 +167,7 @@ fn render_expanded_diff(file: &StreamingFileEdit) -> RenderedDiff {
 }
 
 #[cfg(test)]
-mod invalidate_tests {
+mod cache_tests {
     use super::*;
 
     use crate::views::repl::state::{FileEditStatus, StreamingHunk};
@@ -213,5 +211,70 @@ mod invalidate_tests {
         let mut cache = DiffRenderCache::default();
         cache.invalidate("crates/tui/src/never_rendered.rs");
         assert!(cache.entries.is_empty());
+    }
+
+    /// The point of the borrowed return: an unchanged file is served in place,
+    /// so a frame that re-reads the same patch pays one fingerprint pass and a
+    /// borrow instead of a copy of the rendered body (c-1).
+    #[test]
+    fn an_unchanged_file_is_served_by_reference() {
+        let mut cache = DiffRenderCache::default();
+        let file = file_with_hunk("crates/tui/src/main.rs");
+
+        let first = cache.render(&file) as *const RenderedDiff;
+        let second = cache.render(&file) as *const RenderedDiff;
+
+        assert_eq!(
+            first, second,
+            "an unchanged file must be served straight out of its cache entry"
+        );
+        assert_eq!(cache.entries.len(), 1);
+    }
+
+    /// The complementary case guards the refresh path: a changed hunk must be
+    /// re-rendered instead of serving the stale body, and the entry must record
+    /// the fingerprint of the body it now serves (c-1).
+    #[test]
+    fn a_changed_hunk_refreshes_the_stored_diff() {
+        let mut cache = DiffRenderCache::default();
+        let mut file = file_with_hunk("crates/tui/src/app.rs");
+
+        assert!(rendered_text(cache.render(&file)).contains("let a = 2;"));
+        assert_eq!(
+            cache
+                .entries
+                .get("crates/tui/src/app.rs")
+                .map(|entry| entry.fingerprint),
+            Some(diff_fingerprint(&file))
+        );
+
+        file.hunks[0].new_text = "let a = 3;".to_string();
+
+        assert!(
+            rendered_text(cache.render(&file)).contains("let a = 3;"),
+            "the refreshed body must serve the updated hunk"
+        );
+        // The entry keeps its slot across a refresh, so a re-render is observed
+        // through the content it serves and the fingerprint it records, never
+        // through the address of the stored value (c-1).
+        assert_eq!(
+            cache
+                .entries
+                .get("crates/tui/src/app.rs")
+                .map(|entry| entry.fingerprint),
+            Some(diff_fingerprint(&file)),
+            "the refreshed entry must record the new fingerprint"
+        );
+        assert_eq!(cache.entries.len(), 1);
+    }
+
+    /// Concatenated text of every rendered diff row.
+    fn rendered_text(rendered: &RenderedDiff) -> String {
+        rendered
+            .lines
+            .iter()
+            .flat_map(|line| line.spans.iter())
+            .map(|span| span.content.as_ref())
+            .collect()
     }
 }

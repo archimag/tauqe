@@ -1,8 +1,10 @@
 pub mod json;
 pub mod layout;
 pub mod protocol;
+pub mod refine;
 pub mod xml;
 
+use std::borrow::Cow;
 use std::collections::HashMap;
 
 use crate::capabilities::{CapabilityRegistry, ContractContext, PromptRenderContext};
@@ -107,7 +109,7 @@ pub fn history_compaction_response_format() -> ResponseFormat {
             description: Some(
                 "Concise structured summary of compacted session history".to_string(),
             ),
-            schema: history_compaction_response_schema(),
+            schema: Cow::Owned(history_compaction_response_schema()),
             strict: Some(true),
         },
     }
@@ -144,7 +146,7 @@ pub fn squash_commit_response_format() -> ResponseFormat {
         json_schema: JsonSchemaDefinition {
             name: "squash_commit".to_string(),
             description: Some("Squashed commit message synthesis".to_string()),
-            schema: squash_commit_response_schema(),
+            schema: Cow::Owned(squash_commit_response_schema()),
             strict: Some(true),
         },
     }
@@ -184,24 +186,11 @@ fn parse_first_json_object(raw: &str) -> Option<serde_json::Value> {
     value.is_object().then_some(value)
 }
 
-/// Estimates a token count from a raw byte length.
-///
-/// The whole engine shares a single heuristic of roughly four bytes per
-/// token. Basing the estimate on bytes keeps the on-disk sizing (only known
-/// in bytes) and the in-memory sizing consistent, so multi-byte UTF-8
-/// (Cyrillic, CJK, emoji) is never counted two to three times heavier by one
-/// code path than by another.
-pub fn estimate_tokens_from_bytes(byte_len: u64) -> u64 {
-    byte_len.div_ceil(4)
-}
-
-/// Estimates a token count for an in-memory string.
-///
-/// Delegates to [`estimate_tokens_from_bytes`] so that string content and
-/// file metadata share one consistent heuristic.
-pub fn estimate_tokens(text: &str) -> usize {
-    estimate_tokens_from_bytes(text.len() as u64) as usize
-}
+/// The shared token heuristic is a deterministic substrate primitive, so the
+/// definition lives in `tauqe-tools` and this re-export keeps
+/// `crate::prompt::estimate_tokens` resolvable for every prompt and budget
+/// computation of this crate.
+pub use tauqe_tools::tokens::{estimate_tokens, estimate_tokens_from_bytes};
 
 /// Returns the declarative `access` attribute value of a context file.
 ///
@@ -362,26 +351,6 @@ impl ContextBlockCache {
             .map(|cached| cached.element.as_str())
             .unwrap_or_default()
     }
-}
-
-/// Renders the repository outline section of an Architect prompt.
-///
-/// The eager symbol map and the compact directory tree are mutually exclusive
-/// alternatives: the model reads symbol contours whenever a map is available
-/// and falls back to the folder layout only when eager map generation is
-/// disabled or the rendered map is empty. The returned section ends with a
-/// blank line, so a caller appends it as a single block.
-pub(crate) fn format_repository_outline_section(
-    repo_map: Option<&str>,
-    repo_dirs: Option<&str>,
-) -> Option<String> {
-    if let Some(contours) = repo_map.map(str::trim).filter(|text| !text.is_empty()) {
-        return Some(format!(
-            "## Codebase Symbol Contours (<repo_map>):\n{contours}\n\n"
-        ));
-    }
-    let dirs = repo_dirs.map(str::trim).filter(|text| !text.is_empty());
-    dirs.map(|tree| format!("## Repository Directories (<repo_dirs>):\n{tree}\n\n"))
 }
 
 pub struct PromptAssembly {
@@ -1331,21 +1300,19 @@ mod tests {
             Some("crate\n  fn main".to_string()),
         );
         assembly.turn_scratchpad = Some("- verified: prefix is stable".to_string());
-        assembly.active_plan = Some(Plan {
-            id: "prefix-plan".to_string(),
-            last_replanned_step: None,
-            title: "Prefix Plan".to_string(),
-            description: None,
-            created_at: 0,
-            updated_at: 0,
-            architect: None,
-            concept: vec![],
-            items: vec![tauqe_protocol::PlanItem {
+        assembly.active_plan = Some(Plan::from_parts(
+            "prefix-plan".to_string(),
+            "Prefix Plan".to_string(),
+            None,
+            0,
+            0,
+            vec![],
+            vec![tauqe_protocol::PlanItem {
                 id: "1".to_string(),
                 title: "Step".to_string(),
                 ..Default::default()
             }],
-        });
+        ));
 
         let messages = assembly.assemble_chat_messages("Do work", &XmlPromptProtocol);
         let sys = &messages[0].content;
@@ -1494,17 +1461,15 @@ mod tests {
         let mut assembly =
             PromptAssembly::new(None, 1, vec![], "git", EditProtocolKind::Xml, None, None);
         assembly.intent = TurnIntent::IsolatedStep;
-        assembly.active_plan = Some(Plan {
-            id: "plan-test".to_string(),
-            last_replanned_step: None,
-            title: "Test Plan".to_string(),
-            description: None,
-            created_at: 0,
-            updated_at: 0,
-            architect: None,
-            concept: vec![],
-            items: vec![],
-        });
+        assembly.active_plan = Some(Plan::from_parts(
+            "plan-test".to_string(),
+            "Test Plan".to_string(),
+            None,
+            0,
+            0,
+            vec![],
+            vec![],
+        ));
 
         let sys_prompt = assembly.build_system_prompt(&proto);
         assert!(!sys_prompt.contains("Local Engineering Plans"));

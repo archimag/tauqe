@@ -4,36 +4,65 @@ use tokio::sync::{mpsc, watch};
 
 use crate::edits::protocol::{VerifyOnSuccess, VerifyRequest, VerifyTarget};
 use crate::providers::StreamEvent;
+use crate::toolchain::VerificationStatus;
 
+/// Outcome of a whole verification run: the explicit verdict of the pipeline
+/// together with the report the turn records and streams.
+///
+/// The verdict is a status rather than a boolean, because a passed gate and an
+/// absent declaration are different facts about a change set. A repository that
+/// declares no verification lifecycle produces
+/// [`VerificationStatus::NotConfigured`]: its change set may still be
+/// committed, but nothing claims that it was verified.
 pub struct VerificationOutcome {
-    pub success: bool,
-    pub is_cancelled: bool,
+    /// Explicit verdict of the run.
+    pub status: VerificationStatus,
+    /// Human-readable report of the run, empty when nothing needs reporting.
     pub report: String,
 }
 
-/// Records the outcome of a whole verification run as a single structured log record.
+impl VerificationOutcome {
+    /// Whether the run was interrupted by the turn's cancellation signal.
+    ///
+    /// Cancellation is a verdict of its own, so the phase boundary reads it
+    /// from the status instead of a second flag that could disagree with it.
+    pub fn is_cancelled(&self) -> bool {
+        self.status == VerificationStatus::Cancelled
+    }
+
+    /// Whether the change set may be committed under this verdict.
+    pub fn allows_commit(&self) -> bool {
+        self.status.allows_commit()
+    }
+}
+
+/// Records the outcome of a whole verification run as a single structured log
+/// record that names the explicit verdict it reached.
 fn log_verification_outcome(target: &str, duration_ms: u64, outcome: &VerificationOutcome) {
-    match (outcome.is_cancelled, outcome.success) {
-        (true, _) => tracing::warn!(
+    match outcome.status {
+        VerificationStatus::Cancelled => tracing::warn!(
             target = %target,
             duration_ms,
-            success = false,
-            cancelled = true,
+            status = %outcome.status,
             "verification cancelled"
         ),
-        (false, true) => tracing::info!(
+        VerificationStatus::Passed => tracing::info!(
             target = %target,
             duration_ms,
-            success = true,
-            cancelled = false,
+            status = %outcome.status,
             "verification finished"
         ),
-        (false, false) => tracing::warn!(
+        VerificationStatus::Failed => tracing::warn!(
             target = %target,
             duration_ms,
-            success = false,
-            cancelled = false,
+            status = %outcome.status,
             "verification failed"
+        ),
+        VerificationStatus::NotConfigured => tracing::info!(
+            target = %target,
+            duration_ms,
+            status = %outcome.status,
+            "verification skipped: the project declares no verification lifecycle"
         ),
     }
 }
@@ -112,7 +141,7 @@ pub async fn run_workflow_verification_with_config(
         let _ = stream_tx.send(StreamEvent::TextDelta(start_msg)).await;
     }
 
-    let (ok, results) = crate::toolchain::run_verification_pipeline_with_config(
+    let (status, results) = crate::toolchain::run_verification_pipeline_with_config(
         repo_root,
         project,
         changed_files,
@@ -120,7 +149,11 @@ pub async fn run_workflow_verification_with_config(
     )
     .await;
 
-    if results.is_empty() {
+    if status.is_not_configured() {
+        // `[project.verify]` is optional, so an absent declaration is the
+        // project's own statement that it verifies nothing. The change set
+        // stays unverified and the turn records exactly that verdict instead
+        // of a gate the project never declared.
         let note = "⚠️ The project declares no verification command, so the change set was not verified.\n"
             .to_string();
         let _ = stream_tx
@@ -134,16 +167,14 @@ pub async fn run_workflow_verification_with_config(
             let _ = stream_tx.send(StreamEvent::TextDelta(note.clone())).await;
         }
         let outcome = VerificationOutcome {
-            success: true,
-            is_cancelled: false,
+            status,
             report: note,
         };
         log_verification_outcome(target_str, started.elapsed().as_millis() as u64, &outcome);
         return outcome;
     }
 
-    let is_cancelled = results.iter().any(|r| r.is_cancelled);
-    if is_cancelled {
+    if status == VerificationStatus::Cancelled {
         let cancel_msg = format!("Verification (`{}`) cancelled", target_str);
         let _ = stream_tx
             .send(StreamEvent::ToolchainFinished {
@@ -157,20 +188,17 @@ pub async fn run_workflow_verification_with_config(
         if stream_output {
             let _ = stream_tx.send(StreamEvent::TextDelta(report.clone())).await;
         }
-        let outcome = VerificationOutcome {
-            success: false,
-            is_cancelled: true,
-            report,
-        };
+        let outcome = VerificationOutcome { status, report };
         log_verification_outcome(target_str, started.elapsed().as_millis() as u64, &outcome);
         return outcome;
     }
 
+    let passed = status == VerificationStatus::Passed;
     let _ = stream_tx
         .send(StreamEvent::ToolchainFinished {
             command: target_str.to_string(),
-            success: ok,
-            message: if ok {
+            success: passed,
+            message: if passed {
                 Some(format!("Verification (`{}`) passed", target_str))
             } else {
                 Some(format!("Verification (`{}`) failed", target_str))
@@ -179,7 +207,7 @@ pub async fn run_workflow_verification_with_config(
         .await;
 
     let mut report = String::new();
-    if ok {
+    if passed {
         let success_msg = format!("✅ Code verification (`{}`) passed.\n", target_str);
         if stream_output || verify_req.on_success == VerifyOnSuccess::Report {
             let _ = stream_tx
@@ -227,11 +255,7 @@ pub async fn run_workflow_verification_with_config(
         }
     }
 
-    let outcome = VerificationOutcome {
-        success: ok,
-        is_cancelled: false,
-        report,
-    };
+    let outcome = VerificationOutcome { status, report };
     log_verification_outcome(target_str, started.elapsed().as_millis() as u64, &outcome);
     outcome
 }
@@ -249,8 +273,12 @@ mod verification_outcome_tests {
             on_success: VerifyOnSuccess::Silent,
         };
         let outcome = run_workflow_verification(dir.path(), &[], &req, &tx, false, None).await;
-        assert!(outcome.success);
-        assert!(!outcome.is_cancelled);
+        assert_eq!(outcome.status, VerificationStatus::NotConfigured);
+        assert!(!outcome.is_cancelled());
+        assert!(
+            outcome.allows_commit(),
+            "a project that declares no gate is not blocked by its own choice"
+        );
         assert!(outcome
             .report
             .contains("The project declares no verification command"));
@@ -273,7 +301,7 @@ mod verification_outcome_tests {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(
             dir.path().join("tauqe.toml"),
-            "[models]\nprimary = [\"openrouter:a/b\"]\n",
+            "[models]\ncoder = = \"broken\"\n",
         )
         .unwrap();
 
@@ -284,16 +312,16 @@ mod verification_outcome_tests {
         };
         let outcome = run_workflow_verification(dir.path(), &[], &req, &tx, false, None).await;
 
-        assert!(!outcome.success);
-        assert!(!outcome.is_cancelled);
+        assert_eq!(outcome.status, VerificationStatus::Failed);
+        assert!(!outcome.is_cancelled());
         assert!(
             outcome.report.contains("tauqe.toml"),
             "the healing input must name the corrupted file: {}",
             outcome.report
         );
         assert!(
-            outcome.report.contains("verify"),
-            "the healing input must carry the semantic reason: {}",
+            outcome.report.contains("Failed to parse"),
+            "the healing input must carry the syntactic reason: {}",
             outcome.report
         );
     }
@@ -315,8 +343,8 @@ mod verification_outcome_tests {
         };
         let outcome = run_workflow_verification(dir.path(), &[], &req, &tx, false, None).await;
 
-        assert!(!outcome.success);
-        assert!(!outcome.is_cancelled);
+        assert_eq!(outcome.status, VerificationStatus::Failed);
+        assert!(!outcome.is_cancelled());
         assert!(
             outcome
                 .report
@@ -345,7 +373,7 @@ mod verification_outcome_tests {
         let changed = vec!["src/lib.rs".to_string(), "generated.rs".to_string()];
         let outcome = run_workflow_verification(dir.path(), &changed, &req, &tx, false, None).await;
 
-        assert!(outcome.success);
+        assert_eq!(outcome.status, VerificationStatus::Passed);
         assert!(
             outcome.report.contains("src/lib.rs\ngenerated.rs"),
             "the command must read the change set on its standard input: {}",

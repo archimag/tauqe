@@ -4,6 +4,7 @@ pub mod config;
 pub mod context;
 pub mod git;
 pub mod history;
+pub mod host;
 pub mod locale;
 pub mod model;
 pub mod plan;
@@ -12,6 +13,7 @@ pub mod review;
 use std::path::Path;
 use std::sync::Arc;
 
+use crate::state::{AppState, OperationGuard};
 use tauqe_core::context::ContextManager;
 use tauqe_core::edits::EditProtocolFactory;
 use tauqe_core::history::HistoryManager;
@@ -19,8 +21,7 @@ use tauqe_core::workflow::WorkflowFactory;
 use tauqe_protocol::{
     errors, methods, InitializeResult, Request, RequestId, Response, PROTOCOL_VERSION,
 };
-
-use crate::state::{AppState, OperationGuard};
+use tokio::sync::watch;
 
 pub async fn handle_request(req: Request, state: &Arc<AppState>) -> Response {
     match req.method.as_str() {
@@ -103,20 +104,40 @@ pub async fn handle_request(req: Request, state: &Arc<AppState>) -> Response {
 /// Two shapes exist, and every mutating handler declares which one it uses:
 ///
 /// - **Slot-owning** ([`begin_exclusive_operation`]): the handler keeps the
-///   operation slot for the whole mutation. Rebinding a manager set
+///   operation slot for its whole mutation, so no turn or batch can register
+///   between the check and the write. Every handler that mutates state a
+///   running turn merges back or swaps belongs here: rebinding a manager set
 ///   (`client/initialize`, `repository/init`), rewriting commit history
 ///   (`git/squashPreview`, `git/squashApply`), replacing the shared
-///   configuration (`config/set`, `config/reload`, `config/create`,
-///   `credentials/save`, `credentials/create_stub`), and the model operations
-///   themselves all belong here.
+///   configuration and model selection (`config/set`, `config/reload`,
+///   `config/create`, `credentials/save`, `credentials/create_stub`,
+///   `model/select`), discarding the interaction history
+///   (`model/clearHistory`), and mutating the context a turn reasons over
+///   (`context/add`, `context/addPattern`, `context/remove`,
+///   `context/setAccess`, `context/clear`). The turns and batches themselves
+///   (`model/ask`, `plan/execute`, `plan/executePipeline`, `plan/refine`,
+///   `plan/replan`, `review/execute`, `review/analyze`, `locale/generate`)
+///   register the slot from the workflow they spawn, so they are mutually
+///   exclusive with every request above by construction.
 /// - **Slot-observing** ([`reject_if_operation_active`]): the handler performs
-///   one bounded write on a record that is re-read from disk before the write
-///   (`plan/updateItem`, `review/updateItem`, the focus requests), so a turn
-///   running concurrently cannot lose the mutation.
+///   one bounded write on a single record — `plan/save`, `plan/updateItem`,
+///   `plan/clearHorizon`, `plan/delete`, `plan/setActive`, `review/delete`,
+///   `review/updateItem`, `model/usageReset`. None of them mutates the context,
+///   the history, or the shared model selection a running turn clones, merges
+///   back, or swaps when it ends, and each change reaches disk as one atomic
+///   write of that record. A request that lands inside the registration window
+///   is therefore ordered before the operation's own writes to the same record
+///   rather than interleaved with them, and the operation owns the lifecycle of
+///   that record: a batch's terminal step status supersedes a client status
+///   picked for the step it executed, and `model/usageReset` clears only the
+///   lifetime totals, on top of which a turn registering afterwards accumulates
+///   its own completed window.
 ///
 /// The distinction matters because a bare `is_operation_active()` observation
 /// is not mutual exclusion: a request that registers an operation between the
-/// check and the mutation runs concurrently with it.
+/// check and the mutation runs concurrently with it. A handler therefore either
+/// claims the slot for its whole mutation or holds one of the bounded shapes
+/// above; sampling the slot without one of those guarantees is prohibited.
 pub(crate) fn reject_if_operation_active(
     req_id: &RequestId,
     state: &Arc<AppState>,
@@ -207,6 +228,24 @@ where
     state.mutate_history(mutate).await
 }
 
+/// Verdict of the deterministic pre-flight gate shared by server-driven batches.
+///
+/// The gate must separate a repository that does not build from an operation
+/// that was cancelled while the verification still ran. The first is a project
+/// failure the developer has to resolve; the second is the requested
+/// termination of the operation, answered with `CANCELLED` so the caller
+/// releases the operation slot at once instead of reporting a verification
+/// failure of a suite that never ran to completion.
+#[derive(Debug)]
+pub(crate) enum PreflightVerdict {
+    /// The repository verified cleanly; the batch may start its first step.
+    Passed,
+    /// The operation was cancelled before or during the verification.
+    Cancelled,
+    /// The repository does not build; the report names the failed commands.
+    Failed(String),
+}
+
 /// Deterministic pre-flight verification shared by server-driven batches.
 ///
 /// Runs the exact same project verification pipeline that the core executes after
@@ -217,21 +256,49 @@ where
 /// configuration is validated before the pipeline runs, so a `tauqe.toml`
 /// whose model roles or `[project]` command chain are broken is refused
 /// synchronously as well.
-pub(crate) async fn run_preflight_verification(repo_root: &Path) -> Result<(), String> {
+///
+/// `cancel_rx` is the cancellation channel of the operation that already owns the
+/// slot: an already-cancelled operation never launches the pipeline, and a cancel
+/// delivered during the build/test suite is observed by the substrate, which
+/// tears the whole process group of the project command down instead of waiting
+/// the suite out.
+pub(crate) async fn run_preflight_verification(
+    repo_root: &Path,
+    cancel_rx: watch::Receiver<bool>,
+) -> PreflightVerdict {
+    // A cancel delivered before the gate starts must not launch the pipeline at
+    // all: the operation slot is registered and the client waits for its release.
+    if *cancel_rx.borrow() {
+        tracing::info!("pre-flight verification skipped: the operation was already cancelled");
+        return PreflightVerdict::Cancelled;
+    }
+
     // The configuration integrity check runs first: a batch must not launch
     // against a `tauqe.toml` whose model roles or command chain are broken,
     // because its steps would fail mid-flight instead of being refused before
     // any LLM request is spent. The check self-offloads its blocking file
     // reads off the async executor thread, and a repository without a
     // configuration file is governed by built-in defaults and passes.
-    tauqe_core::config::validate_project_config_on_disk(repo_root)?;
+    if let Err(report) = tauqe_core::config::validate_project_config_on_disk(repo_root) {
+        return PreflightVerdict::Failed(report);
+    }
 
     // A pre-flight gate runs before a turn exists, so it has no change set and
-    // the project command conservatively runs its full suite.
-    let (ok, results) =
-        tauqe_core::toolchain::run_verification_pipeline(repo_root, &[], None).await;
-    if ok {
-        return Ok(());
+    // the project command conservatively runs its full suite. The command races
+    // the cancellation signal inside the substrate, which kills the whole
+    // process group and reports an `is_cancelled` result, so no race is
+    // re-implemented here.
+    let (status, results) =
+        tauqe_core::toolchain::run_verification_pipeline(repo_root, &[], Some(&cancel_rx)).await;
+    // A project that declares no verification lifecycle states its own choice,
+    // so the gate passes transparently instead of refusing a batch the project
+    // never asked to verify.
+    if status.allows_commit() {
+        return PreflightVerdict::Passed;
+    }
+    if results.iter().any(|result| result.is_cancelled) {
+        tracing::warn!("pre-flight verification was cancelled by the operation");
+        return PreflightVerdict::Cancelled;
     }
 
     let mut failed_commands = Vec::new();
@@ -243,7 +310,7 @@ pub(crate) async fn run_preflight_verification(repo_root: &Path) -> Result<(), S
     } else {
         format!("Command {} failed.", failed_commands.join(", "))
     };
-    Err(report)
+    PreflightVerdict::Failed(report)
 }
 
 /// Rebinds configuration, context, history, and usage telemetry to a
@@ -427,9 +494,13 @@ mod tests {
                 .as_nanos()
         ));
         let _ = std::fs::create_dir_all(&dir);
-        let result = run_preflight_verification(&dir).await;
+        let (_cancel_tx, cancel_rx) = watch::channel(false);
+        let verdict = run_preflight_verification(&dir, cancel_rx).await;
         let _ = std::fs::remove_dir_all(&dir);
-        assert!(result.is_ok());
+        assert!(
+            matches!(verdict, PreflightVerdict::Passed),
+            "got: {verdict:?}"
+        );
     }
 
     #[tokio::test]
@@ -442,15 +513,40 @@ mod tests {
                 .as_nanos()
         ));
         let _ = std::fs::create_dir_all(&dir);
+        // Verification is declarative: a declaration that only assigns model
+        // roles is complete, so the gate passes it instead of inventing a
+        // toolchain the project never declared.
         std::fs::write(
             dir.join("tauqe.toml"),
             "[models]\nprimary = [\"openrouter:a/b\"]\n",
         )
         .unwrap();
-        let result = run_preflight_verification(&dir).await;
+        let (_cancel_tx, cancel_rx) = watch::channel(false);
+        let verdict = run_preflight_verification(&dir, cancel_rx).await;
+        assert!(
+            matches!(verdict, PreflightVerdict::Passed),
+            "a declaration without verification must pass: {verdict:?}"
+        );
+
+        // A declaration the harness could not run predictably is still refused:
+        // the file routes its verification through a command nobody declares.
+        std::fs::write(
+            dir.join("tauqe.toml"),
+            concat!(
+                "[models]\nprimary = [\"openrouter:a/b\"]\n",
+                "\n[project.verify]\ncommand = \"@missing\"\n",
+            ),
+        )
+        .unwrap();
+        let (_retry_cancel_tx, retry_cancel_rx) = watch::channel(false);
+        let verdict = run_preflight_verification(&dir, retry_cancel_rx).await;
         let _ = std::fs::remove_dir_all(&dir);
-        let err = result.expect_err("an invalid configuration must fail the pre-flight gate");
-        assert!(err.contains("verify"), "got: {err}");
+        match verdict {
+            PreflightVerdict::Failed(report) => {
+                assert!(report.contains("missing"), "got: {report}");
+            }
+            other => panic!("an invalid configuration must be refused: {other:?}"),
+        }
     }
 
     #[tokio::test]
@@ -468,9 +564,69 @@ mod tests {
             "[models]\nprimary = [\"openrouter:a/b\"]\n\n[project.verify]\ncommand = \"true\"\n",
         )
         .unwrap();
-        let result = run_preflight_verification(&dir).await;
+        let (_cancel_tx, cancel_rx) = watch::channel(false);
+        let verdict = run_preflight_verification(&dir, cancel_rx).await;
         let _ = std::fs::remove_dir_all(&dir);
-        assert!(result.is_ok(), "got: {:?}", result.err());
+        assert!(
+            matches!(verdict, PreflightVerdict::Passed),
+            "got: {verdict:?}"
+        );
+    }
+
+    /// A hard cancel delivered while the pre-flight verification runs tears the
+    /// verification down instead of waiting the build/test suite out.
+    ///
+    /// The gate runs after the operation slot is registered, so it must inherit
+    /// the operation's cancellation channel: the substrate kills the whole
+    /// process group of the project command and reports an `is_cancelled`
+    /// result, and the gate answers with its cancelled verdict so the caller
+    /// releases the slot at once.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_preflight_verification_is_torn_down_by_a_cancel_signal() {
+        let dir = std::env::temp_dir().join(format!(
+            "tauqe-test-preflight-cancel-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        let _ = std::fs::create_dir_all(&dir);
+        std::fs::write(
+            dir.join("tauqe.toml"),
+            "[models]\nprimary = [\"openrouter:a/b\"]\n\n[project.verify]\ncommand = \"sh\"\nargs = ['-c', 'printf started > started.marker; sleep 60']\n",
+        )
+        .unwrap();
+
+        let (cancel_tx, cancel_rx) = watch::channel(false);
+        let root = dir.clone();
+        let gate = tokio::spawn(async move { run_preflight_verification(&root, cancel_rx).await });
+
+        // Cancel only once the verification command is demonstrably running, so
+        // the prompt return proves the teardown instead of a slow start.
+        let marker = dir.join("started.marker");
+        let mut running = false;
+        for _ in 0..200 {
+            if marker.exists() {
+                running = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        assert!(running, "the verification command never started");
+
+        let _ = cancel_tx.send(true);
+        let verdict = tokio::time::timeout(std::time::Duration::from_secs(10), gate)
+            .await
+            .expect("the cancelled gate must return instead of waiting the suite out")
+            .expect("the gate task joins");
+
+        assert!(
+            matches!(verdict, PreflightVerdict::Cancelled),
+            "a cancelled verification must report a cancellation, not a failure: {verdict:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
     /// Re-initialization rebinds the configuration, context, usage lifetime,
     /// and history of a live daemon, so it must own the operation slot instead

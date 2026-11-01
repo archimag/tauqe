@@ -104,7 +104,9 @@ parsed:
    languages and data files still appear in the outline.
 6. Sort and deduplicate the tracked entries.
 7. Format symbols and plain paths within the token budget.
-
+The pipeline is deterministic substrate: it lives in `crates/tools/src/repomap.rs`
+and is rendered into the prompt by the engine, which never derives a symbol on
+its own.
 ### 3.2 Compression and the budget ladder
 
 Each file renders as `path (N lines)` followed by its symbols, indented two spaces
@@ -134,7 +136,7 @@ global outline, discovery requests a targeted outline with
 `<repo_map path="crates/core" />`.
 
 - The path is a repository-relative prefix matched on whole components, so
-  `crates/core` covers `crates/core/src/lib.rs` but never `crates/core-utils/`.
+  `crates/tools` covers `crates/tools/src/lib.rs` but never `crates/tools-utils/`.
 - Naming a single file narrows the outline to that file; an empty path names the
   whole repository.
 - The targeted map uses the same budget and degrades through the same ladder.

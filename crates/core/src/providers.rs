@@ -25,7 +25,7 @@ pub const SESSION_PREFIX_REPL: &str = "tauqe-repl";
 pub const SESSION_PREFIX_PLAN: &str = "tauqe-plan";
 /// Architect plan horizon synthesis.
 pub const SESSION_PREFIX_ARCHITECT: &str = "tauqe-architect";
-/// Review audit: findings, refinement, and subplan decomposition.
+/// Review audit: findings, refinement, and group decomposition.
 pub const SESSION_PREFIX_REVIEW: &str = "tauqe-review";
 
 /// Joins a domain prefix with a domain identifier into a wire session id.

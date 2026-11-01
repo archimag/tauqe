@@ -19,9 +19,27 @@ fn tokenize(s: &str) -> Vec<(&str, bool)> {
     tokens
 }
 
-pub fn wrap_line(line: Line<'static>, max_width: usize) -> Vec<Line<'static>> {
+/// Materializes a borrowed line into an owned one.
+///
+/// The wrapping routines accept borrowed input while their output stays
+/// `Line<'static>`, so a caller can wrap a body it still owns — a confirmation
+/// card budgets its height from the wrapped rows and then draws the very same
+/// lines.
+fn into_static_line(line: Line<'_>) -> Line<'static> {
+    Line {
+        style: line.style,
+        alignment: line.alignment,
+        spans: line
+            .spans
+            .into_iter()
+            .map(|span| Span::styled(span.content.into_owned(), span.style))
+            .collect(),
+    }
+}
+
+pub fn wrap_line(line: Line<'_>, max_width: usize) -> Vec<Line<'static>> {
     if max_width == 0 || line.width() <= max_width {
-        return vec![line];
+        return vec![into_static_line(line)];
     }
 
     let mut is_bullet_prefix = false;
@@ -33,7 +51,10 @@ pub fn wrap_line(line: Line<'static>, max_width: usize) -> Vec<Line<'static>> {
                 .all(|c| c.is_whitespace() || c == '│' || c == '▌' || c == '|' || c == '║');
 
         if is_gutter_prefix {
-            let mut prefix = vec![first_span.clone()];
+            let mut prefix = vec![Span::styled(
+                first_span.content.clone().into_owned(),
+                first_span.style,
+            )];
             if let Some(second_span) = line.spans.get(1) {
                 let is_bullet = second_span.content.chars().all(|c| {
                     c == '•' || c == '◦' || c == '▪' || c == '✔' || c == '☐' || c.is_whitespace()
@@ -96,12 +117,12 @@ pub fn wrap_line(line: Line<'static>, max_width: usize) -> Vec<Line<'static>> {
     if skip_count > 0 {
         if let Some(s0) = spans_iter.next() {
             current_width += s0.width();
-            current_spans.push(s0);
+            current_spans.push(Span::styled(s0.content.into_owned(), s0.style));
         }
         if skip_count > 1 {
             if let Some(s1) = spans_iter.next() {
                 current_width += s1.width();
-                current_spans.push(s1);
+                current_spans.push(Span::styled(s1.content.into_owned(), s1.style));
             }
         }
     }
@@ -196,7 +217,7 @@ pub fn wrap_line(line: Line<'static>, max_width: usize) -> Vec<Line<'static>> {
     }
 }
 
-pub fn wrap_lines(lines: Vec<Line<'static>>, max_width: usize) -> Vec<Line<'static>> {
+pub fn wrap_lines(lines: Vec<Line<'_>>, max_width: usize) -> Vec<Line<'static>> {
     let mut out = Vec::with_capacity(lines.len());
     for line in lines {
         out.extend(wrap_line(line, max_width));

@@ -222,21 +222,33 @@ mod tests {
 
     fn make_test_plans() -> Vec<Plan> {
         vec![
-            Plan {
-                id: "jwt-auth".to_string(),
-                title: "JWT Authentication".to_string(),
-                ..Default::default()
-            },
-            Plan {
-                id: "tui-keymaps".to_string(),
-                title: "TUI Keymap Refactor".to_string(),
-                ..Default::default()
-            },
-            Plan {
-                id: "context-layers".to_string(),
-                title: "Layered Context Model".to_string(),
-                ..Default::default()
-            },
+            Plan::from_parts(
+                "jwt-auth".to_string(),
+                "JWT Authentication".to_string(),
+                None,
+                0,
+                0,
+                vec![],
+                vec![],
+            ),
+            Plan::from_parts(
+                "tui-keymaps".to_string(),
+                "TUI Keymap Refactor".to_string(),
+                None,
+                0,
+                0,
+                vec![],
+                vec![],
+            ),
+            Plan::from_parts(
+                "context-layers".to_string(),
+                "Layered Context Model".to_string(),
+                None,
+                0,
+                0,
+                vec![],
+                vec![],
+            ),
         ]
     }
 
@@ -323,16 +335,24 @@ mod tests {
     #[test]
     fn test_resolve_ambiguous() {
         let plans = vec![
-            Plan {
-                id: "plan-1".to_string(),
-                title: "Plan One".to_string(),
-                ..Default::default()
-            },
-            Plan {
-                id: "plan-2".to_string(),
-                title: "Plan Two".to_string(),
-                ..Default::default()
-            },
+            Plan::from_parts(
+                "plan-1".to_string(),
+                "Plan One".to_string(),
+                None,
+                0,
+                0,
+                vec![],
+                vec![],
+            ),
+            Plan::from_parts(
+                "plan-2".to_string(),
+                "Plan Two".to_string(),
+                None,
+                0,
+                0,
+                vec![],
+                vec![],
+            ),
         ];
 
         // "plan" is a prefix for both plan-1 and plan-2

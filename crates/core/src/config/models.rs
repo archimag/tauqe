@@ -121,9 +121,14 @@ impl ModelsConfig {
                         .map_err(|err| format!("[models] {}: {}", role, err))?;
                     // The configured marker travels with the entry, so the
                     // resolved catalog preserves an exclusion declared on disk.
+                    // The generation budget is a property of the model entry as
+                    // well: the resolved entry carries the number configuration
+                    // stated, so each ladder rung keeps the budget of the model
+                    // it names instead of a shared default.
                     Ok(ModelEntry {
                         model,
                         effort: spec.effort,
+                        attempts: spec.attempts,
                         level_up: spec.level_up,
                     })
                 })
@@ -162,6 +167,9 @@ impl ModelsConfig {
     /// `primary` is mandatory because it is the deterministic default source for
     /// every other role; an empty list would leave the harness unable to resolve
     /// a single model.
+    ///
+    /// A role entry that declares a zero generation budget is rejected as well:
+    /// a model allowed zero attempts could never regenerate a rejected patch.
     pub fn validate(&self) -> Result<(), String> {
         if self.primary.is_empty() {
             return Err(
@@ -180,6 +188,25 @@ impl ModelsConfig {
                     "Invalid models configuration: models.{} cannot be an empty list",
                     name
                 ));
+            }
+        }
+        // A role entry allowed zero generation attempts could never regenerate
+        // a rejected patch, so a zero budget is refused instead of turning a
+        // per-entry limit into a silent disable of the capability.
+        for (role, entries) in [
+            ("primary", Some(self.primary.as_slice())),
+            ("coder", self.coder.as_deref()),
+            ("architect", self.architect.as_deref()),
+            ("reviewer", self.reviewer.as_deref()),
+        ] {
+            for entry in entries.into_iter().flatten() {
+                if entry.attempts == Some(0) {
+                    return Err(format!(
+                        "Invalid models configuration: models.{}: {} declares attempts = 0",
+                        role,
+                        entry.model.to_spec()
+                    ));
+                }
             }
         }
 
@@ -446,6 +473,7 @@ impl ModelsConfig {
             .map(|entry| ArchitectTier {
                 model: entry.model.clone(),
                 effort: entry.effort,
+                attempts: entry.attempts,
                 level_up: entry.level_up,
             })
             .collect();

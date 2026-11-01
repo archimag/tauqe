@@ -906,7 +906,8 @@ impl ContextManager {
 
     /// Merges updates produced by a workflow run into the current context manager.
     /// Preserves user layer changes made concurrently. Updates the auto layer,
-    /// syncs file renames/removals, and refreshes metadata.
+    /// syncs file renames/removals, refreshes metadata, and re-establishes the
+    /// `refs_token_budget` bound of the merged Refs layer.
     pub fn merge_turn_context(&mut self, turn_context: &ContextManager) {
         // The prune and the metadata refresh both touch the filesystem, so the
         // whole merge runs off the async executor thread.
@@ -1007,6 +1008,19 @@ impl ContextManager {
                         changed = true;
                     }
                 }
+            }
+
+            // 4b. Re-establish the Refs token budget after the merge. Each side
+            // kept its own layer inside `refs_token_budget` while it ran in
+            // isolation, so their union can exceed the bound, and a document
+            // whose estimate grew during the turn can breach it on its own. The
+            // bound is a property of the layer, so the merge restores it exactly
+            // as `add_refs_file` does: by evicting the least recently requested
+            // documents, ranked by the merged LRU watermarks.
+            if !self.refs.is_empty() {
+                let refs_token_budget =
+                    crate::config::load_context_config(&self.repo_root).refs_token_budget;
+                changed |= self.evict_refs_to_budget(refs_token_budget);
             }
 
             // The turn may have consumed watermarks the primary never saw, so
@@ -1770,5 +1784,101 @@ mod tests {
         assert!(cm.clear_refs(), "removing a document reports a change");
         assert!(!cm.clear_refs(), "a repeated clear reports no change");
         assert!(cm.refs_files().is_empty());
+    }
+
+    fn refs_tokens(cm: &ContextManager) -> u64 {
+        cm.get_state()
+            .items
+            .into_iter()
+            .filter(|item| item.layer == ContextLayer::Refs)
+            .map(|item| item.estimated_tokens)
+            .sum()
+    }
+
+    #[test]
+    fn test_merge_turn_context_re_establishes_the_refs_token_budget() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        for name in ["a.md", "b.md", "c.md"] {
+            std::fs::write(root.join(name), "reference notes\n").unwrap();
+        }
+
+        // The primary admits two documents under a deliberately large explicit
+        // budget, which is what the RPC path does while a turn runs.
+        let mut primary = ContextManager::new(root.clone());
+        let first = primary.add_refs_file("a.md", 10_000).unwrap();
+        let third = primary.add_refs_file("c.md", 10_000).unwrap();
+        assert_eq!(
+            first.estimated_tokens, third.estimated_tokens,
+            "the fixtures are equal-sized"
+        );
+
+        // A budget that fits exactly two equal documents, declared in the
+        // repository configuration the merge reads for itself.
+        let budget = 2 * first.estimated_tokens;
+        std::fs::write(
+            root.join("tauqe.toml"),
+            format!("[context]\nrefs_token_budget = {}\n", budget),
+        )
+        .unwrap();
+
+        // The turn re-requests `a.md` and admits `b.md`, which evicts `c.md` on
+        // the turn side: the two layers are each inside the budget alone.
+        let mut turn = primary.clone();
+        turn.add_refs_file("a.md", budget as usize).unwrap();
+        turn.add_refs_file("b.md", budget as usize).unwrap();
+        assert_eq!(
+            turn.refs_files(),
+            vec!["a.md".to_string(), "b.md".to_string()]
+        );
+
+        primary.merge_turn_context(&turn);
+
+        // The merged watermarks rank the re-requested `a.md` above `c.md`, so
+        // the merged layer drops `c.md` and keeps `a.md` and `b.md`.
+        assert_eq!(
+            primary.refs_files(),
+            vec!["a.md".to_string(), "b.md".to_string()]
+        );
+        let total = refs_tokens(&primary);
+        assert!(
+            total <= budget,
+            "the merged Refs layer must stay within the budget: {total} > {budget}"
+        );
+    }
+
+    #[test]
+    fn test_merge_turn_context_never_evicts_below_the_refs_token_budget() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        for name in ["a.md", "b.md"] {
+            std::fs::write(root.join(name), "reference notes\n").unwrap();
+        }
+
+        let mut primary = ContextManager::new(root.clone());
+        let first = primary.add_refs_file("a.md", 10_000).unwrap();
+        let budget = 2 * first.estimated_tokens;
+        std::fs::write(
+            root.join("tauqe.toml"),
+            format!("[context]\nrefs_token_budget = {}\n", budget),
+        )
+        .unwrap();
+
+        // The two sides hold distinct documents and their union fits, so the
+        // merged layer must keep both instead of evicting on principle.
+        let mut turn = primary.clone();
+        turn.add_refs_file("b.md", budget as usize).unwrap();
+
+        primary.merge_turn_context(&turn);
+
+        assert_eq!(
+            primary.refs_files(),
+            vec!["a.md".to_string(), "b.md".to_string()]
+        );
+        let total = refs_tokens(&primary);
+        assert!(
+            total <= budget,
+            "a merged layer that fits the budget is left intact: {total} <= {budget}"
+        );
     }
 }

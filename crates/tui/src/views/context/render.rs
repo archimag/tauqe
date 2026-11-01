@@ -230,7 +230,10 @@ pub fn render_context_view(
         } else if target_line >= (state.context_view.scroll as usize + inner_height) {
             state.context_view.scroll = (target_line + 1).saturating_sub(inner_height) as u16;
         }
-        let max_scroll = context_lines.len().saturating_sub(inner_height) as u16;
+        // The bound saturates instead of wrapping through a truncated cast, so
+        // a document longer than `u16::MAX` visual lines keeps its offset.
+        let max_scroll =
+            u16::try_from(context_lines.len().saturating_sub(inner_height)).unwrap_or(u16::MAX);
         state.context_view.scroll = state.context_view.scroll.min(max_scroll);
     }
 

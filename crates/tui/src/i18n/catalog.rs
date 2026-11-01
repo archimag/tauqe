@@ -255,10 +255,15 @@ pub fn canonical_catalog() -> Vec<LocaleCatalogItem> {
         item("dialog.execute_review.queue_header", " Findings in execution queue:", "Execute-review queue header", None),
         item("dialog.execute_review.queue_more", "   ... and {} more finding(s)", "Execute-review queue overflow line", None),
         item("dialog.execute_review.note", "TAUQE will resolve each finding in an isolated turn with compiler verification gates.", "Execute-review note about isolated turns", None),
-        item("dialog.execute_review.fail_fast", "Fail-Fast Policy: execution stops and rolls back immediately if any finding fails verification.", "Execute-review fail-fast policy note", None),
-        item("dialog.execute_review.title_point", "Resolve Review Finding", "Title for point execution of a single finding or subplan step", None),
+        item(
+            "dialog.execute_review.fail_fast",
+            "Best-Effort Policy: a finding that fails locally is rolled back to its pre-turn checkpoint and the queue continues; the run halts only when the working tree cannot be restored cleanly.",
+            "Execute-review note stating the best-effort batch policy: a local failure is rolled back to its checkpoint and the queue continues, while an unrestorable working tree halts the whole run",
+            None,
+        ),
+        item("dialog.execute_review.title_point", "Resolve Review Finding", "Title for point execution of a single finding or implementation step", None),
         item("dialog.execute_review.finding_label", " Finding: ", "Execute-review finding field label", None),
-        item("dialog.execute_review.step_label", " Step: ", "Execute-review subplan step field label", None),
+        item("dialog.execute_review.step_label", " Step: ", "Execute-review implementation step field label", None),
         item("dialog.execute_review.model_list_title", " Coder Model ", "Execute-review coder model list title with a single entry", None),
         item("dialog.execute_review.model_list_counter", " Coder Model  [{} of {}] ", "Execute-review coder model list title with a position counter", None),
         item("dialog.execute_review.no_models", "  (no coder models configured)", "Execute-review empty coder model list placeholder", None),
@@ -788,7 +793,7 @@ pub fn canonical_catalog() -> Vec<LocaleCatalogItem> {
         item("cmd.review.toggle_hide_closed", "Toggle the filter between all findings and open findings only", "Review command description", None),
         item("cmd.review.refresh", "Refresh the review sessions from the server", "Review command description", None),
         item("cmd.review.set_focus", "Set the discussion focus to the selection without leaving the view", "Review command description", None),
-        item("cmd.review.activate", "Execute the selected finding, subplan step, or group plan; fold or unfold on session headers", "Review command description", None),
+        item("cmd.review.activate", "Execute the selected finding, implementation step, or group plan; fold or unfold on session headers", "Review command description", None),
         item("cmd.review.discuss", "Discuss the selected finding or the entire session in the REPL", "Review command description", None),
         item("cmd.review.change_status", "Change the finding status", "Review command description", None),
         item("cmd.review.return", "Return to the REPL", "Review command description", None),
@@ -860,6 +865,35 @@ pub fn canonical_catalog() -> Vec<LocaleCatalogItem> {
             "review.participants_count",
             "{} participant(s)",
             "Architectural group badge counting the findings that share its root cause",
+            None,
+        ),
+        // The architectural fork of a group (concept #c-2): the `[BLOCKED]`
+        // badge announces it on the summary row, the blocker panel states the
+        // diagnosis and the chords that reach its resolution as the first
+        // section of the group body, and the decision block records what was
+        // settled once the blocker clears.
+        item(
+            "review.group_blocked_badge",
+            "[BLOCKED]",
+            "Badge marking a review group whose root-cause plan is blocked by an unresolved architectural decision",
+            Some(14),
+        ),
+        item(
+            "review.blocked_label",
+            "Blocker:",
+            "Review group detail label prefixing the reason its root-cause plan cannot proceed",
+            None,
+        ),
+        item(
+            "review.blocked_hint",
+            "Press 'd' to discuss the architectural decision, or 't' to record the resolution",
+            "Review group blocker hint naming the chords that open the group discussion and record the architectural decision",
+            None,
+        ),
+        item(
+            "review.resolution_label",
+            "Recorded decision:",
+            "Review group detail label prefixing the architectural decision already recorded for it",
             None,
         ),
         item(
@@ -1015,6 +1049,12 @@ pub fn canonical_catalog() -> Vec<LocaleCatalogItem> {
         item("notify.review_analyze_started", "Classifying findings with the Architect...", "Review notification while the Architect post-analysis classifies the selected session", None),
         item("notify.review_focus_set", "Discussion focus set to review '{}'", "Review notification confirming a session focus change", None),
         item("notify.review_focus_item_set", "Discussion focus set to {} in review '{}'", "Review notification confirming a finding focus change", None),
+        item(
+            "notify.review_focus_group_set",
+            "Discussion focus set to review group '{}' in review '{}'",
+            "Review notification confirming a focus change onto one architectural review group",
+            None,
+        ),
         item("notify.review_cannot_start_busy", "Cannot start a review while the model is generating", "Review notification rejecting a review while busy", None),
         item("notify.review_pattern_files_omitted", "Pattern matched {} file(s) beyond the configured file token budget; they were not added to the audit", "Review notification when a target pattern expansion is truncated by the file token budget", None),
         item("notify.review_pattern_no_matches", "The target pattern '{}' matches no repository files; correct it or clear the field", "Review notification rejecting a launch whose target pattern selects no repository file", None),
@@ -1105,8 +1145,14 @@ pub fn canonical_catalog() -> Vec<LocaleCatalogItem> {
         item("notify.review_failed_no_payload", "Code review failed without a diagnostic message from the server", "Review error recorded when a review/error event arrives without a usable payload", None),
         item("notify.review_execution_started", "Executing review finding(s): switched to REPL for coder execution", "Notification when a review execution turn starts", None),
         item("notify.squashed_commits", "Squashed commits into {} ('{}')", "Notification after squashing commits", None),
-        item("notify.batch_title", "TAUQE {} batch {}", "Desktop notification title for a finished batch", None),
+        item("notify.batch_title", "TAUQE {} batch {}", "Desktop notification title for a finished batch: the first placeholder receives the batch kind and the second its terminal status", None),
         item("notify.batch_body", "{} '{}': {}/{} steps in {}", "Desktop notification body for a finished batch", None),
+        item(
+            "notify.batch_stats",
+            " — {} fixed, {} deferred (open questions), {} failed locally",
+            "Suffix appended to the completion notification of a review batch: the first placeholder receives the findings the queue fixed, the second the findings the open-questions gate deferred, and the third the members that failed locally",
+            None,
+        ),
         // Batch kind labels and status words: the typed supervisor outcome
         // resolves its localized fragments here instead of the RPC layer
         // forwarding English literals into the templates above.
@@ -1160,6 +1206,18 @@ pub fn canonical_catalog() -> Vec<LocaleCatalogItem> {
         // ------------------------------------------------------------------
         item("dialog.prompt.title_finding", "Discuss Finding: [{}] #{}", "Prompt modal title when discussing one review finding", None),
         item("dialog.prompt.title_review", "Discuss Review Session: [{}]", "Prompt modal title when discussing a whole review session", None),
+        item(
+            "dialog.prompt.title_group_discuss",
+            "Discuss Review Group: [{}]",
+            "Prompt modal title when discussing the shared root cause of one review group",
+            None,
+        ),
+        item(
+            "dialog.prompt.title_group_resolve",
+            "Record Architectural Resolution: [{}]",
+            "Prompt modal title when the developer states the decision that settles a blocked review group",
+            None,
+        ),
         item("dialog.prompt.title_step", "Discuss Step: [{}] #{}", "Prompt modal title when discussing one plan step", None),
         item("dialog.prompt.title_plan", "Discuss Plan: [{}]", "Prompt modal title when discussing a whole plan", None),
         item("dialog.prompt.review_label", " Review: ", "Prompt modal review field label", None),
@@ -1169,12 +1227,48 @@ pub fn canonical_catalog() -> Vec<LocaleCatalogItem> {
         item("dialog.prompt.scope_review_note", " (discussing code quality findings and resolution plan)", "Prompt modal note describing review-session scope", None),
         item("dialog.prompt.scope_plan", "Entire plan", "Prompt modal scope value for a whole plan", None),
         item("dialog.prompt.scope_plan_note", " (discussing architecture and overall strategy)", "Prompt modal note describing plan scope", None),
+        item(
+            "dialog.prompt.scope_group",
+            "Entire root-cause group",
+            "Prompt modal scope value for a whole review group",
+            None,
+        ),
+        item(
+            "dialog.prompt.scope_group_note",
+            " (one shared cause, resolved by one plan)",
+            "Prompt modal note describing review-group scope",
+            None,
+        ),
+        item(
+            "dialog.prompt.group_resolve_note",
+            "Sending records the decision: the harness clears the blocker, stamps the note onto every finding of the group, and moves the group to the decided status.",
+            "Prompt modal note explaining what sending a review-group resolution does",
+            None,
+        ),
         item("dialog.prompt.target_finding_label", " Target finding: ", "Prompt modal target finding field label", None),
         item("dialog.prompt.target_step_label", " Target step: ", "Prompt modal target step field label", None),
         item("dialog.prompt.editor_placeholder", "Enter your comments, questions, or directives for Tauqe AI...", "Prompt modal empty-editor placeholder", None),
+        item(
+            "dialog.prompt.editor_placeholder_resolve",
+            " State the decision that settles this group...",
+            "Prompt modal empty-editor placeholder for a review-group resolution",
+            None,
+        ),
         item("dialog.prompt.editor_title", "Your Comments / Questions (Enter send, Shift+Enter / Alt+Enter / C-J newline)", "Prompt modal editor block title", None),
+        item(
+            "dialog.prompt.editor_title_resolve",
+            "Architectural Decision (Enter record, Shift+Enter / Alt+Enter / C-J newline)",
+            "Prompt modal editor block title while a review-group resolution is stated",
+            None,
+        ),
         item("dialog.prompt.hint_actions", "← / → switch • Tab focus • Enter send • y / n select • Esc dismiss", "Prompt modal footer hint while the action bar has focus", None),
         item("dialog.prompt.hint_editor", "Enter send • Shift+Enter / Alt+Enter / C-J newline • Tab controls • Esc dismiss", "Prompt modal footer hint while the editor has focus", None),
+        item(
+            "dialog.prompt.hint_editor_resolve",
+            "Enter record • Shift+Enter / Alt+Enter / C-J newline • Tab controls • Esc dismiss",
+            "Prompt modal footer hint while a review-group resolution is being written",
+            None,
+        ),
 
         // ------------------------------------------------------------------
         // Plan refinement (architect) dialog and its blocked popup.
@@ -1599,10 +1693,10 @@ pub fn canonical_catalog() -> Vec<LocaleCatalogItem> {
         item("review.stats_summary", "{} session(s), {} finding(s) ({} fixed, {} skipped)", "Review info strip counting sessions, findings, and resolved findings", None),
         item("review.stats_breakdown", "{}/{} fixed ({} todo, {} prog, {} disc, {} skip, {} rej)", "Review session header statistic breakdown", None),
         item("review.folded_suffix", " (folded)", "Review session summary suffix marking a folded summary", None),
-        item("review.step_label", "step #{}", "Review subplan step label naming a step identifier", None),
+        item("review.step_label", "step #{}", "Review implementation step label naming a step identifier", None),
         item("review.readonly_count", "{} readonly", "Review finding badge counting protected read-only files", None),
-        item("review.steps_count", "{}/{} steps", "Review finding badge counting completed subplan steps", None),
-        item("review.depends_on_label", "depends_on: ", "Review subplan label prefixing step dependencies", None),
+        item("review.steps_count", "{}/{} steps", "Review finding badge counting the completed implementation steps of a review group plan", None),
+        item("review.depends_on_label", "depends_on: ", "Review implementation label prefixing step dependencies", None),
 
         // ------------------------------------------------------------------
         // Shared info-strip row counter (Plans and Review).

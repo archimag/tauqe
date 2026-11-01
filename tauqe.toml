@@ -36,6 +36,7 @@ models = [
 # lets the harness escalate onto the rung when verification fails.
 primary = [
   { model = "GLM", effort = "high" },
+  { model = "GLM", effort = "max" },  
   "Gemini Flash"
 ]
 scribe = "Claude Haiku"    # history compaction, git squash commit messages, diff summarization
@@ -73,9 +74,9 @@ reviewer = [
 auto_level_up = true
 
 [develop]
-# Retry budget for failed edit staging, for the verification healing loop, and for the
-# plan step reprompt loop (corrective re-runs of a step turn that produced no verified
-# edits and no terminal success tag).
+# Retry budget for failed edit staging and for the verification healing loop. It bounds
+# the repairs of a single turn; how many content attempts a model tier receives is
+# declared per model entry with `attempts` in the `[models]` section.
 max_retries = 5
 # Maximum automated replanning cycles triggered by a blocked coder step before
 # requiring manual developer intervention (default: 2).
@@ -174,8 +175,8 @@ budget_tokens = 20000  # session history token budget before compaction is trigg
 # tail_turns = 10        # number of recent turns kept uncompressed in original form (default: 10)
 
 [context]
-max_discovery_rounds = 8  # maximum rounds for autonomous context discovery
-files_token_budget = 900000  # token budget for files in active context (default: 300000)
+max_discovery_rounds = 12  # maximum rounds for autonomous context discovery
+files_token_budget = 1000000  # token budget for files in active context (default: 300000)
 repomap_token_budget = 40000  # token budget for the repository map (default: 4000)
 include_repo_map = true  # include the Tree-sitter repository map in turn prompts (default: true, false for on-demand)
 # max_search_requests_per_round = 5    # repository search queries honored per Discovery round (default: 5)
@@ -201,16 +202,32 @@ pinned = [
 # carrying a `name`, `paths`, and an optional `prompt`. An absent section
 # declares no preset, so single-audit sessions stay available. This repository
 # declares none.
-# [[review.presets]]
-# name = "backend"
-# title = "Backend audit"
-# post_analysis = "manual"
-#
-# [[review.presets.groups]]
-# name = "core"
-# paths = ["crates/core/src", "crates/protocol/src"]
-# prompt = "Audit the harness invariants and the wire contract."
-#
-# [[review.presets.groups]]
-# name = "server"
-# paths = ["crates/server/src"]
+[[review.presets]]
+name = "crates"
+title = "Workspace Crates Audit"
+post_analysis = "manual"
+
+[[review.presets.groups]]
+name = "protocol"
+paths = ["crates/protocol/src"]
+prompt = "Audit wire contracts, pure DTOs, and serialization invariants without I/O or async dependencies."
+
+[[review.presets.groups]]
+name = "tools"
+paths = ["crates/tools/src"]
+prompt = "Audit deterministic substrate invariants: virtual staging, atomic writes, Git transactions, process isolation, and repomap extraction."
+
+[[review.presets.groups]]
+name = "core"
+paths = ["crates/core/src"]
+prompt = "Audit harness engine invariants: bounded-turn FSM, capability registry, prompt layout, context, and provider streaming."
+
+[[review.presets.groups]]
+name = "server"
+paths = ["crates/server/src"]
+prompt = "Audit RPC daemon: concurrency control (OperationGuard), request dispatching, and streaming transport."
+
+[[review.presets.groups]]
+name = "tui"
+paths = ["crates/tui/src"]
+prompt = "Audit terminal UI: views, event translation, layout geometry, and client transport without direct disk/git operations."

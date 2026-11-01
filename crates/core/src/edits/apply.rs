@@ -1,7 +1,7 @@
 //! Application of a validated change set to the working tree.
 //!
 //! The change set is staged and formatted in memory first, committed atomically
-//! through the sibling commit policy of [`crate::atomic_write`], and only then
+//! through the sibling commit policy of [`tauqe_tools::atomic_write`], and only then
 //! reconciled with the context layer. A caller outside a bounded turn enters
 //! through [`apply_edit_proposal`], while a bounded turn applies the
 //! configuration it froze through [`apply_edit_proposal_with_config`].
@@ -11,8 +11,8 @@ use std::path::Path;
 use tauqe_protocol::{EditProposal, ProjectConfig};
 
 use super::atomic::commit_staged_edits;
-use super::error::EditError;
-use super::format::prepare_staged_edits_with_config;
+use super::stage::prepare_staged_edits_with_config;
+use super::EditError;
 use crate::context::ContextManager;
 use crate::mockups::is_mockups_path;
 

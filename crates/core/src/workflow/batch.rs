@@ -9,7 +9,9 @@
 //! - end-to-end usage accounting: token and cost totals are accumulated over
 //!   every executed step so callers can report one figure per batch;
 //! - interruption handling: a cancellation request observed between steps stops
-//!   the queue, and a step that cancels itself is recorded as such.
+//!   the queue, and a step that cancels itself is recorded as such;
+//! - skip continuation: a step that filters itself out is recorded with its
+//!   reason, and the queue proceeds to the next scheduled step.
 //!
 //! The supervisor never touches Git, the toolchain, or entity storage. Each
 //! step is delegated to a [`BatchStepExecutor`], which runs one bounded turn and
@@ -47,6 +49,11 @@ impl BatchStep {
 pub enum BatchStepStatus {
     /// The step satisfied its success contract.
     Succeeded,
+    /// The step was excluded from execution by its own preconditions.
+    ///
+    /// A skip is not a failure: the supervisor records the step and continues
+    /// with the next one.
+    Skipped,
     /// The step failed; the supervisor stopped at it.
     Failed,
     /// The step cannot proceed because its preconditions cannot be satisfied.
@@ -66,6 +73,8 @@ pub struct BatchStepOutcome {
     pub error: Option<String>,
     /// Block reason reported for a blocked step, when present.
     pub blocked_reason: Option<String>,
+    /// Skip reason reported for a skipped step, when present.
+    pub skip_reason: Option<String>,
 }
 
 impl BatchStepOutcome {
@@ -76,6 +85,7 @@ impl BatchStepOutcome {
             usage: None,
             error: None,
             blocked_reason: None,
+            skip_reason: None,
         }
     }
 
@@ -86,6 +96,7 @@ impl BatchStepOutcome {
             usage: None,
             error: Some(error.into()),
             blocked_reason: None,
+            skip_reason: None,
         }
     }
 
@@ -96,6 +107,7 @@ impl BatchStepOutcome {
             usage: None,
             error: None,
             blocked_reason: Some(reason.into()),
+            skip_reason: None,
         }
     }
 
@@ -106,6 +118,21 @@ impl BatchStepOutcome {
             usage: None,
             error: None,
             blocked_reason: None,
+            skip_reason: None,
+        }
+    }
+
+    /// Reports a step that its own preconditions excluded from execution.
+    ///
+    /// The step produced no work and failed nothing, so the supervisor records
+    /// it with the reported reason and continues with the next scheduled step.
+    pub fn skipped(reason: impl Into<String>) -> Self {
+        Self {
+            status: BatchStepStatus::Skipped,
+            usage: None,
+            error: None,
+            blocked_reason: None,
+            skip_reason: Some(reason.into()),
         }
     }
 
@@ -252,6 +279,9 @@ impl BatchExecution {
     /// Runs every step in order, aggregating usage and stopping on the first
     /// failure, cancellation, or soft-stop request (server-side fail-fast).
     ///
+    /// A step that reports [`BatchStepStatus::Skipped`] is neither a success nor
+    /// a failure: it is recorded together with its reason, and the queue moves
+    /// on to the next scheduled step.
     /// A cancellation request observed between steps ends the queue before the
     /// next step starts. A soft-stop request observed between steps ends the
     /// queue just as cleanly, but leaves the step that already ran untouched, so
@@ -317,6 +347,7 @@ impl BatchExecution {
 
             match status {
                 BatchStepStatus::Succeeded => {}
+                BatchStepStatus::Skipped => {}
                 BatchStepStatus::Failed => {
                     stop = BatchStop::Failed {
                         step_id: step.id.clone(),
@@ -563,6 +594,89 @@ mod tests {
         assert_eq!(report.stop, BatchStop::Cancelled);
         assert_eq!(report.executed.len(), 1);
         assert_eq!(executor.seen, vec!["1"]);
+    }
+    #[tokio::test]
+    async fn skipped_step_is_recorded_and_queue_continues() {
+        let steps = make_steps(&["1", "2", "3"]);
+        let mut executor = ScriptedExecutor::new(vec![
+            BatchStepOutcome::succeeded(),
+            BatchStepOutcome::skipped("no matching files"),
+            BatchStepOutcome::succeeded(),
+        ]);
+        let (stream_tx, _stream_rx) = channel();
+        let (_cancel_tx, cancel_rx) = watch::channel(false);
+        let (_soft_stop_tx, soft_stop_rx) = watch::channel(false);
+
+        let report = BatchExecution::new()
+            .run(&steps, &mut executor, &stream_tx, &cancel_rx, &soft_stop_rx)
+            .await;
+
+        assert!(report.is_success());
+        assert_eq!(report.stop, BatchStop::Completed);
+        assert_eq!(report.executed.len(), 3);
+        assert_eq!(executor.seen, vec!["1", "2", "3"]);
+        let skipped = &report.executed[1].outcome;
+        assert_eq!(skipped.status, BatchStepStatus::Skipped);
+        assert_eq!(skipped.skip_reason.as_deref(), Some("no matching files"));
+        assert!(!skipped.is_success());
+    }
+
+    #[tokio::test]
+    async fn skipped_step_still_accumulates_usage() {
+        let steps = make_steps(&["1", "2"]);
+        let mut executor = ScriptedExecutor::new(vec![
+            BatchStepOutcome::skipped("filtered").with_usage(usage(7, 3, 0.01)),
+            BatchStepOutcome::succeeded().with_usage(usage(10, 5, 0.02)),
+        ]);
+        let (stream_tx, _stream_rx) = channel();
+        let (_cancel_tx, cancel_rx) = watch::channel(false);
+        let (_soft_stop_tx, soft_stop_rx) = watch::channel(false);
+
+        let report = BatchExecution::new()
+            .run(&steps, &mut executor, &stream_tx, &cancel_rx, &soft_stop_rx)
+            .await;
+
+        assert!(report.is_success());
+        assert_eq!(report.usage.prompt_tokens, 17);
+        assert_eq!(report.usage.completion_tokens, 8);
+        assert_eq!(report.usage.total_tokens, 25);
+        let cost = report.usage.cost.unwrap();
+        assert!((cost - 0.03).abs() < 1e-9);
+    }
+
+    #[test]
+    fn skipped_outcome_carries_reason_without_failure_diagnostics() {
+        let outcome = BatchStepOutcome::skipped("nothing to do");
+        assert_eq!(outcome.status, BatchStepStatus::Skipped);
+        assert_eq!(outcome.skip_reason.as_deref(), Some("nothing to do"));
+        assert!(outcome.usage.is_none());
+        assert!(outcome.error.is_none());
+        assert!(outcome.blocked_reason.is_none());
+        assert!(!outcome.is_success());
+    }
+
+    #[tokio::test]
+    async fn batch_of_skipped_steps_completes() {
+        let steps = make_steps(&["1", "2"]);
+        let mut executor = ScriptedExecutor::new(vec![
+            BatchStepOutcome::skipped("nothing to do"),
+            BatchStepOutcome::skipped("nothing to do"),
+        ]);
+        let (stream_tx, _stream_rx) = channel();
+        let (_cancel_tx, cancel_rx) = watch::channel(false);
+        let (_soft_stop_tx, soft_stop_rx) = watch::channel(false);
+
+        let report = BatchExecution::new()
+            .run(&steps, &mut executor, &stream_tx, &cancel_rx, &soft_stop_rx)
+            .await;
+
+        assert!(report.is_success());
+        assert_eq!(report.stop, BatchStop::Completed);
+        assert_eq!(report.executed.len(), 2);
+        assert!(report
+            .executed
+            .iter()
+            .all(|entry| !entry.outcome.is_success()));
     }
 
     #[tokio::test]

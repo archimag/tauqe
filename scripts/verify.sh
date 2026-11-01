@@ -51,6 +51,7 @@ is_structured_protocol() {
 has_tui=0
 has_server=0
 has_core=0
+has_tools=0
 has_protocol=0
 has_other_rs=0
 has_root=0
@@ -79,6 +80,13 @@ if [ "${#changed[@]}" -ne 0 ]; then
             crates/core/*)
                 case "$path" in
                     *.rs|*/Cargo.toml) has_core=1 ;;
+                    *.md) has_md=1; markdown+=("$path") ;;
+                    *) unknown=1 ;;
+                esac
+                ;;
+            crates/tools/*)
+                case "$path" in
+                    *.rs|*/Cargo.toml) has_tools=1 ;;
                     *.md) has_md=1; markdown+=("$path") ;;
                     *) unknown=1 ;;
                 esac
@@ -130,20 +138,20 @@ if [ "${#changed[@]}" -eq 0 ] || [ "$unknown" -eq 1 ] || [ "$has_protocol" -eq 1
     run_cargo=1
     cargo_args=("--workspace")
 else
-    if [ "$has_core" -eq 1 ]; then
+    # The dependency ladder decides the selection: a change is verified
+    # together with every crate built on top of it, so a regression cannot
+    # escape through a downstream member. `tauqe-tools` sits above
+    # `tauqe-protocol`, `tauqe-core` above `tauqe-tools`, and `tauqe-server`
+    # above `tauqe-core`, so a `tools` change runs the whole ladder while a
+    # `server` change runs alone. `tauqe-tui` depends on `tauqe-protocol` alone
+    # and therefore joins no cascade. The rungs are exclusive, which keeps a
+    # crate from being appended twice.
+    if [ "$has_tools" -eq 1 ]; then
+        cargo_args+=("-p" "tauqe-tools" "-p" "tauqe-core" "-p" "tauqe-server")
+    elif [ "$has_core" -eq 1 ]; then
         cargo_args+=("-p" "tauqe-core" "-p" "tauqe-server")
-    fi
-    if [ "$has_server" -eq 1 ]; then
-        already_has_server=0
-        for ((i=0; i<${#cargo_args[@]}; i+=2)); do
-            if [ "${cargo_args[i+1]}" = "tauqe-server" ]; then
-                already_has_server=1
-                break
-            fi
-        done
-        if [ "$already_has_server" -eq 0 ]; then
-            cargo_args+=("-p" "tauqe-server")
-        fi
+    elif [ "$has_server" -eq 1 ]; then
+        cargo_args+=("-p" "tauqe-server")
     fi
     if [ "$has_tui" -eq 1 ]; then
         cargo_args+=("-p" "tauqe-tui")

@@ -12,8 +12,17 @@
 //! so a decorated spelling of a real identity is accepted while a hallucinated
 //! one is rejected with a diagnostic instead of entering the classification
 //! layer.
+//! layer.
+//!
+//! The payload also routes: `triage` carries the status each finding's
+//! resolution starts from. The routing decides the lifecycle of an already
+//! recorded finding and never rewrites it, so it is validated against the same
+//! identities as the classification.
+pub use tauqe_protocol::review::{
+    IssueStatus, PostAnalysisGroupOutput, PostAnalysisOutput, PostAnalysisTriageOutput,
+};
 
-use serde::Deserialize;
+use std::borrow::Cow;
 
 use crate::edits::stream::json::decode::{balanced_object_end, strip_code_fence};
 use crate::providers::{JsonSchemaDefinition, ResponseFormat};
@@ -27,6 +36,12 @@ use crate::providers::{JsonSchemaDefinition, ResponseFormat};
 /// by their UUIDv7 identity, so the classification is a projection that never
 /// rewrites a finding.
 ///
+/// The same payload routes every finding: a defect with no open fork is sent to
+/// `todo` and can be executed immediately, while a finding whose resolution
+/// depends on a decision only the engineer can make is sent to `discussion`
+/// together with the question that must be answered. Routing belongs to the
+/// analysis because the whole session is in view at that moment.
+///
 /// The schema is deliberately flat: it contains no recursive `$ref` and
 /// declares `additionalProperties: false` on every object, so a Structured
 /// Output engine can enforce it verbatim.
@@ -37,6 +52,33 @@ pub fn post_analysis_response_schema() -> serde_json::Value {
             "summary": {
                 "type": "string",
                 "description": "High-level Markdown narrative of the systemic root causes found across the whole session, in the primary natural language of the user's instructions. Final distilled content only: no chain-of-thought, deliberation, or intermediate reasoning steps."
+            },
+            "triage": {
+                "type": "array",
+                "description": "Initial routing of every finding of the session, one entry per finding. Route a defect with no open fork to `todo` so it can be executed immediately, and route a finding whose resolution depends on a decision only the engineer can make to `discussion` together with the question that must be answered.",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "uuid": {
+                            "type": "string",
+                            "description": "UUIDv7 identifier of the finding this entry routes"
+                        },
+                        "status": {
+                            "type": "string",
+                            "enum": triage_status_enum(),
+                            "description": "`todo` when the finding must be executed without any open decision, `discussion` when it needs an engineering decision first"
+                        },
+                        "discussion_topic": {
+                            "anyOf": [
+                                { "type": "string" },
+                                { "type": "null" }
+                            ],
+                            "description": "The open question the engineer must answer, stated for a `discussion` finding and null for a `todo` finding"
+                        }
+                    },
+                    "required": ["uuid", "status", "discussion_topic"],
+                    "additionalProperties": false
+                }
             },
             "independent_issues": {
                 "type": "array",
@@ -74,9 +116,26 @@ pub fn post_analysis_response_schema() -> serde_json::Value {
                 }
             }
         },
-        "required": ["summary", "independent_issues", "architectural_groups"],
+        "required": ["summary", "triage", "independent_issues", "architectural_groups"],
         "additionalProperties": false
     })
+}
+
+/// Builds the `status` enum of the triage entry from the routing statuses.
+///
+/// Post-analysis routes a finding into one of two states: a defect with no open
+/// fork is queued for execution (`todo`), while a finding that needs a decision
+/// stays in `discussion` together with the question the engineer must answer. The
+/// enum is generated from the typed model, so a routing status cannot drift away
+/// from the schema the model reads.
+fn triage_status_enum() -> serde_json::Value {
+    const STATUSES: &[IssueStatus] = &[IssueStatus::Todo, IssueStatus::Discussion];
+    serde_json::Value::Array(
+        STATUSES
+            .iter()
+            .map(|status| serde_json::Value::String(status.as_str().to_string()))
+            .collect(),
+    )
 }
 
 /// Builds the provider [`ResponseFormat`] that enforces the post-analysis schema.
@@ -88,38 +147,10 @@ pub fn post_analysis_response_format() -> ResponseFormat {
                 "Classification of review findings into independent issues and architectural root-cause groups"
                     .to_string(),
             ),
-            schema: post_analysis_response_schema(),
+            schema: Cow::Owned(post_analysis_response_schema()),
             strict: Some(true),
         },
     }
-}
-
-/// Model-emitted post-analysis payload.
-///
-/// `summary` carries the Architect's global verdict, `independent_issues`
-/// carries the findings that stand on their own, and `architectural_groups`
-/// carries the clusters that share one root cause. Every collection defaults
-/// to empty, so a partial payload still decodes and the caller decides whether
-/// the classification is complete enough to persist.
-#[derive(Debug, Deserialize)]
-pub struct PostAnalysisOutput {
-    #[serde(default)]
-    pub summary: String,
-    #[serde(default)]
-    pub independent_issues: Vec<String>,
-    #[serde(default)]
-    pub architectural_groups: Vec<PostAnalysisGroupOutput>,
-}
-
-/// One model-emitted cluster of findings that share a root cause.
-#[derive(Debug, Deserialize)]
-pub struct PostAnalysisGroupOutput {
-    #[serde(default)]
-    pub title: String,
-    #[serde(default)]
-    pub description: String,
-    #[serde(default)]
-    pub issue_ids: Vec<String>,
 }
 
 /// Parses the model's post-analysis output into a classification payload.
@@ -211,10 +242,21 @@ pub fn resolve_identity<'a>(raw: &str, known_uuids: &'a [String]) -> Option<&'a 
 /// session. Each reference is resolved through [`resolve_identity`], so a
 /// decorated spelling of a real identity is accepted while a reference that
 /// resolves to nothing is reported together with the identifier that caused it.
+/// The routing obeys the same rule: a triage entry that names a finding the
+/// session does not hold is rejected by its own identifier instead of deciding
+/// the lifecycle of nothing.
 pub fn validate_post_analysis(
     output: &PostAnalysisOutput,
     known_uuids: &[String],
 ) -> Result<(), String> {
+    for entry in &output.triage {
+        if resolve_identity(&entry.uuid, known_uuids).is_none() {
+            return Err(format!(
+                "Triage entry references an unknown finding uuid '{}'",
+                normalize_identity(&entry.uuid)
+            ));
+        }
+    }
     for uuid in &output.independent_issues {
         if resolve_identity(uuid, known_uuids).is_none() {
             return Err(format!(
@@ -265,7 +307,12 @@ mod tests {
         assert_eq!(schema["additionalProperties"], serde_json::json!(false));
         assert_eq!(
             schema["required"],
-            serde_json::json!(["summary", "independent_issues", "architectural_groups"])
+            serde_json::json!([
+                "summary",
+                "triage",
+                "independent_issues",
+                "architectural_groups"
+            ])
         );
 
         let group = &schema["properties"]["architectural_groups"]["items"];
@@ -288,18 +335,21 @@ mod tests {
 
         let required = schema["required"].as_array().expect("required array");
         assert_eq!(required[0], serde_json::json!("summary"));
-        assert_eq!(required[1], serde_json::json!("independent_issues"));
-        assert_eq!(required[2], serde_json::json!("architectural_groups"));
+        assert_eq!(required[1], serde_json::json!("triage"));
+        assert_eq!(required[2], serde_json::json!("independent_issues"));
+        assert_eq!(required[3], serde_json::json!("architectural_groups"));
 
         let schema_str = serde_json::to_string(&schema).unwrap();
         let summary_idx = schema_str.find("\"summary\"").expect("summary present");
+        let triage_idx = schema_str.find("\"triage\"").expect("triage present");
         let independent_idx = schema_str
             .find("\"independent_issues\"")
             .expect("independent_issues present");
         let groups_idx = schema_str
             .find("\"architectural_groups\"")
             .expect("architectural_groups present");
-        assert!(summary_idx < independent_idx);
+        assert!(summary_idx < triage_idx);
+        assert!(triage_idx < independent_idx);
         assert!(independent_idx < groups_idx);
     }
 
@@ -309,7 +359,7 @@ mod tests {
             ResponseFormat::JsonSchema { json_schema } => {
                 assert_eq!(json_schema.name, "review_post_analysis");
                 assert_eq!(json_schema.strict, Some(true));
-                assert_eq!(json_schema.schema, post_analysis_response_schema());
+                assert_eq!(*json_schema.schema, post_analysis_response_schema());
             }
             other => panic!("expected a strict JSON schema response format, got {other:?}"),
         }
@@ -348,7 +398,50 @@ Let me know if you need more."#;
         let output = parse_post_analysis(r#"{"summary":"No systemic defect found"}"#).unwrap();
         assert_eq!(output.summary, "No systemic defect found");
         assert!(output.independent_issues.is_empty());
+        assert!(output.triage.is_empty());
+        assert!(output.independent_issues.is_empty());
         assert!(output.architectural_groups.is_empty());
+    }
+
+    #[test]
+    fn test_triage_pins_the_routing_contract() {
+        let schema = post_analysis_response_schema();
+        let items = &schema["properties"]["triage"]["items"];
+        assert_eq!(
+            schema["properties"]["triage"]["type"],
+            serde_json::json!("array")
+        );
+        assert_eq!(items["additionalProperties"], serde_json::json!(false));
+        assert_eq!(
+            items["required"],
+            serde_json::json!(["uuid", "status", "discussion_topic"])
+        );
+
+        let statuses: Vec<&str> = items["properties"]["status"]["enum"]
+            .as_array()
+            .expect("the triage status enum is an array")
+            .iter()
+            .filter_map(|status| status.as_str())
+            .collect();
+        assert_eq!(statuses, vec!["todo", "discussion"]);
+
+        // The payload decodes the routing the schema describes, and a finding the
+        // analysis failed to route stays with the engineer instead of silently
+        // entering execution.
+        let raw = r#"{"summary":"Routed","triage":[{"uuid":"u-1","status":"todo","discussion_topic":null},{"uuid":"u-2","status":"discussion","discussion_topic":"Which API?"}]}"#;
+        let output: PostAnalysisOutput = serde_json::from_str(raw).unwrap();
+        assert_eq!(output.triage.len(), 2);
+        assert_eq!(output.triage[0].status, IssueStatus::Todo);
+        assert_eq!(output.triage[0].discussion_topic, None);
+        assert_eq!(output.triage[1].status, IssueStatus::Discussion);
+        assert_eq!(
+            output.triage[1].discussion_topic.as_deref(),
+            Some("Which API?")
+        );
+
+        let untriaged: PostAnalysisOutput =
+            serde_json::from_str(r#"{"summary":"Routed","triage":[{"uuid":"u-1"}]}"#).unwrap();
+        assert_eq!(untriaged.triage[0].status, IssueStatus::Discussion);
     }
 
     #[test]
@@ -362,6 +455,7 @@ Let me know if you need more."#;
     fn test_validate_post_analysis_accepts_known_references() {
         let output = PostAnalysisOutput {
             summary: "One lock explains both symptoms.".to_string(),
+            triage: Vec::new(),
             independent_issues: vec![FINDING_UUID.to_string()],
             architectural_groups: vec![PostAnalysisGroupOutput {
                 title: "Shared lock order".to_string(),
@@ -374,6 +468,7 @@ Let me know if you need more."#;
         // A session with nothing to classify validates an empty classification.
         let empty = PostAnalysisOutput {
             summary: "No findings".to_string(),
+            triage: Vec::new(),
             independent_issues: Vec::new(),
             architectural_groups: Vec::new(),
         };
@@ -386,6 +481,7 @@ Let me know if you need more."#;
 
         let independent = PostAnalysisOutput {
             summary: "Root cause".to_string(),
+            triage: Vec::new(),
             independent_issues: vec![foreign.to_string()],
             architectural_groups: Vec::new(),
         };
@@ -397,6 +493,7 @@ Let me know if you need more."#;
 
         let grouped = PostAnalysisOutput {
             summary: "Root cause".to_string(),
+            triage: Vec::new(),
             independent_issues: Vec::new(),
             architectural_groups: vec![PostAnalysisGroupOutput {
                 title: "Cluster".to_string(),
@@ -419,6 +516,7 @@ Let me know if you need more."#;
     fn test_validate_post_analysis_accepts_re_spelled_identity() {
         let output = PostAnalysisOutput {
             summary: "Root cause".to_string(),
+            triage: Vec::new(),
             independent_issues: vec![FINDING_UUID.to_ascii_uppercase()],
             architectural_groups: Vec::new(),
         };
@@ -471,6 +569,7 @@ Let me know if you need more."#;
     fn test_validate_post_analysis_accepts_decorated_references() {
         let output = PostAnalysisOutput {
             summary: "One lock explains both symptoms.".to_string(),
+            triage: Vec::new(),
             independent_issues: vec![format!("`{FINDING_UUID}`")],
             architectural_groups: vec![PostAnalysisGroupOutput {
                 title: "Shared lock order".to_string(),
@@ -479,5 +578,47 @@ Let me know if you need more."#;
             }],
         };
         assert!(validate_post_analysis(&output, &known_uuids()).is_ok());
+    }
+    #[test]
+    fn test_validate_post_analysis_checks_triage_references() {
+        let routed = PostAnalysisOutput {
+            summary: "One lock explains both symptoms.".to_string(),
+            triage: vec![
+                PostAnalysisTriageOutput {
+                    uuid: FINDING_UUID.to_string(),
+                    status: IssueStatus::Todo,
+                    discussion_topic: None,
+                },
+                PostAnalysisTriageOutput {
+                    uuid: SECOND_UUID.to_string(),
+                    status: IssueStatus::Discussion,
+                    discussion_topic: Some(
+                        "Which API replaces the removed entry point?".to_string(),
+                    ),
+                },
+            ],
+            independent_issues: Vec::new(),
+            architectural_groups: Vec::new(),
+        };
+        assert!(validate_post_analysis(&routed, &known_uuids()).is_ok());
+
+        // A routing entry naming a finding the session does not hold would decide
+        // the lifecycle of nothing, so it is rejected by its own identifier.
+        let foreign = "018f9c1e-6b3a-7c1e-8b3a-0000000000ff";
+        let stray = PostAnalysisOutput {
+            summary: "Root cause".to_string(),
+            triage: vec![PostAnalysisTriageOutput {
+                uuid: foreign.to_string(),
+                status: IssueStatus::Todo,
+                discussion_topic: None,
+            }],
+            independent_issues: Vec::new(),
+            architectural_groups: Vec::new(),
+        };
+        let error = validate_post_analysis(&stray, &known_uuids()).unwrap_err();
+        assert!(
+            error.contains(foreign),
+            "diagnostic must name the foreign uuid: {error}"
+        );
     }
 }

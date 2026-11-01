@@ -36,6 +36,8 @@ use serde::{Deserialize, Serialize};
 /// - [`TurnIntent::PlanDiscussion`] is an architectural discussion of a plan.
 /// - [`TurnIntent::IsolatedStep`] is the isolated execution of one plan step
 ///   or one review finding.
+/// - [`TurnIntent::ArchitectSynthesis`] is an Architect projecting the
+///   unfinished horizon of a plan from repository evidence.
 ///
 /// The value is `Copy` and freely shareable, because it is a pure mode tag
 /// rather than turn state.
@@ -48,6 +50,10 @@ pub enum TurnIntent {
     PlanDiscussion,
     /// Isolated execution of one plan step or one review finding.
     IsolatedStep,
+    /// Architect horizon synthesis: the Architect projects the unfinished
+    /// horizon of a plan from repository evidence and answers with a typed
+    /// payload instead of code edits.
+    ArchitectSynthesis,
 }
 
 impl TurnIntent {
@@ -65,6 +71,21 @@ impl TurnIntent {
     pub fn is_plan_discussion(self) -> bool {
         matches!(self, Self::PlanDiscussion)
     }
+
+    /// Reports whether this is an Architect horizon synthesis.
+    pub fn is_architect_synthesis(self) -> bool {
+        matches!(self, Self::ArchitectSynthesis)
+    }
+
+    /// Reports whether turns of this regime suppress session history.
+    ///
+    /// An isolated step executes an approved design and an Architect synthesis
+    /// projects a horizon from repository evidence; neither continues the
+    /// developer's dialogue, so neither renders nor records its history.
+    pub fn suppresses_session_history(self) -> bool {
+        matches!(self, Self::IsolatedStep | Self::ArchitectSynthesis)
+    }
+
     /// Returns the regime profile this intent composes.
     ///
     /// The mapping is the single source of truth for the pair of typed lists a
@@ -78,6 +99,7 @@ impl TurnIntent {
             Self::InteractiveRepl => CapabilityProfile::interactive_repl(),
             Self::PlanDiscussion => CapabilityProfile::discussion(),
             Self::IsolatedStep => CapabilityProfile::isolated_step(),
+            Self::ArchitectSynthesis => CapabilityProfile::architect_discovery(),
         }
     }
     /// Narrows a protocol capability set to what this turn intent permits.
@@ -88,7 +110,9 @@ impl TurnIntent {
     /// never be advertised in the instructions while remaining undecodable, nor
     /// accepted by the decoder while being hidden from the instructions.
     ///
-    /// - [`TurnIntent::InteractiveRepl`] keeps the protocol's own surface.
+    /// - [`TurnIntent::InteractiveRepl`] keeps the interactive REPL profile: the
+    ///   dialogue head shared by every interactive contour, without plan
+    ///   mutation.
     /// - [`TurnIntent::PlanDiscussion`] keeps the discussion profile: the
     ///   dialogue head plus the plan mutation the regime authorizes.
     /// - [`TurnIntent::IsolatedStep`] keeps the isolated-step profile and drops
@@ -105,10 +129,15 @@ impl TurnIntent {
     /// surface for a given intent.
     pub fn narrow_capabilities(self, capabilities: &CapabilitySet) -> CapabilitySet {
         match self {
-            Self::InteractiveRepl => capabilities.clone(),
+            Self::InteractiveRepl => {
+                Self::intersect(capabilities, &CapabilitySet::interactive_repl())
+            }
             Self::PlanDiscussion => Self::intersect(capabilities, &CapabilitySet::discussion()),
             Self::IsolatedStep => Self::intersect(capabilities, &CapabilitySet::isolated_step())
                 .without(LlmCapability::ToolchainVerify),
+            Self::ArchitectSynthesis => {
+                Self::intersect(capabilities, &CapabilitySet::architect_discovery())
+            }
         }
     }
 
@@ -127,10 +156,11 @@ impl TurnIntent {
 mod tests {
     use super::*;
 
-    const ALL: [TurnIntent; 3] = [
+    const ALL: [TurnIntent; 4] = [
         TurnIntent::InteractiveRepl,
         TurnIntent::PlanDiscussion,
         TurnIntent::IsolatedStep,
+        TurnIntent::ArchitectSynthesis,
     ];
 
     #[test]
@@ -140,6 +170,7 @@ mod tests {
                 intent.is_interactive_repl(),
                 intent.is_plan_discussion(),
                 intent.is_isolated_step(),
+                intent.is_architect_synthesis(),
             ];
             // Exactly one predicate holds for every variant, which is the
             // contract the execution pipeline relies on when it branches.
@@ -161,6 +192,7 @@ mod tests {
             (TurnIntent::InteractiveRepl, "\"interactive_repl\""),
             (TurnIntent::PlanDiscussion, "\"plan_discussion\""),
             (TurnIntent::IsolatedStep, "\"isolated_step\""),
+            (TurnIntent::ArchitectSynthesis, "\"architect_synthesis\""),
         ];
 
         for (intent, encoded) in cases {
@@ -171,12 +203,75 @@ mod tests {
     }
 
     #[test]
-    fn test_narrow_capabilities_is_identity_for_interactive_repl() {
+    fn test_suppresses_session_history_covers_the_non_dialogue_regimes() {
+        assert!(!TurnIntent::InteractiveRepl.suppresses_session_history());
+        assert!(!TurnIntent::PlanDiscussion.suppresses_session_history());
+        assert!(TurnIntent::IsolatedStep.suppresses_session_history());
+        assert!(TurnIntent::ArchitectSynthesis.suppresses_session_history());
+    }
+
+    #[test]
+    fn test_narrow_capabilities_architect_synthesis_reaches_the_discovery_surface() {
         let advertised = CapabilitySet::from_slice(LlmCapability::ALL);
+        let narrowed = TurnIntent::ArchitectSynthesis.narrow_capabilities(&advertised);
+
+        assert_eq!(narrowed, CapabilitySet::architect_discovery());
+        assert!(narrowed.contains(LlmCapability::Discovery));
+        assert!(narrowed.contains(LlmCapability::PlanCreation));
+        assert!(narrowed.contains(LlmCapability::PlanUpdate));
+        assert!(narrowed.contains(LlmCapability::Scratchpad));
+        assert!(!narrowed.contains(LlmCapability::FileEdits));
+        assert!(!narrowed.contains(LlmCapability::ToolchainVerify));
+    }
+
+    #[test]
+    fn test_narrow_capabilities_is_identity_for_interactive_repl() {
+        // Identity holds over the interactive profile itself: narrowing a
+        // surface that already carries exactly the dialogue head changes
+        // nothing.
+        let interactive = CapabilitySet::interactive_repl();
         assert_eq!(
-            TurnIntent::InteractiveRepl.narrow_capabilities(&advertised),
-            advertised
+            TurnIntent::InteractiveRepl.narrow_capabilities(&interactive),
+            interactive
         );
+    }
+
+    #[test]
+    fn test_narrow_capabilities_interactive_repl_drops_plan_mutation() {
+        // The fully advertised surface carries plan mutation, which a free REPL
+        // dialogue never composes because no plan focus is active. The
+        // narrowing therefore drops it, instead of leaving the decoder accepting
+        // a command that the instructions never advertise.
+        let advertised = CapabilitySet::from_slice(LlmCapability::ALL);
+        let narrowed = TurnIntent::InteractiveRepl.narrow_capabilities(&advertised);
+
+        assert!(!narrowed.contains(LlmCapability::PlanUpdate));
+        assert_eq!(narrowed, CapabilitySet::interactive_repl());
+    }
+
+    #[test]
+    fn test_narrow_capabilities_stays_within_the_regime_surface() {
+        // Whatever a protocol advertises, the narrowed surface stays a subset of
+        // the regime profile's declared surface, so prompt composition and
+        // decoding can never drift apart for any intent.
+        let advertised = [
+            CapabilitySet::from_slice(LlmCapability::ALL),
+            CapabilitySet::interactive_repl(),
+            CapabilitySet::discussion(),
+        ];
+
+        for intent in ALL {
+            let surface = intent.regime_profile().surface();
+            for capabilities in &advertised {
+                let narrowed = intent.narrow_capabilities(capabilities);
+                for capability in narrowed.iter() {
+                    assert!(
+                        surface.contains(*capability),
+                        "intent {intent:?} narrowed to {capability}, outside its regime surface"
+                    );
+                }
+            }
+        }
     }
 
     #[test]
@@ -300,6 +395,10 @@ mod tests {
         assert_eq!(
             TurnIntent::IsolatedStep.regime_profile(),
             CapabilityProfile::isolated_step()
+        );
+        assert_eq!(
+            TurnIntent::ArchitectSynthesis.regime_profile(),
+            CapabilityProfile::architect_discovery()
         );
     }
 

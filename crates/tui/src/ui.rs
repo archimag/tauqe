@@ -357,7 +357,16 @@ pub fn render_ui(frame: &mut ratatui::Frame, state: &mut AppState) {
             // spinner here as it does in the Viewport (c-3).
             let spinner_frame = state.model.spinner_frame;
             if let Some(inspector) = state.diff_inspector.as_mut() {
-                render_diff_inspector(frame, inspector, &mut state.model.diff_cache, spinner_frame);
+                // The audited set is the staged set the Viewport renders: the
+                // audit reads that single owned slice in place, and the three
+                // borrows are disjoint fields of the shared state (c-3).
+                render_diff_inspector(
+                    frame,
+                    inspector,
+                    &state.model.files,
+                    &mut state.model.diff_cache,
+                    spinner_frame,
+                );
             }
         }
         Some(ActiveModal::ThemeSelector) => {

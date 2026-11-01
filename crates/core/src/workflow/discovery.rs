@@ -115,8 +115,9 @@ pub struct ContextApplicationOutcome {
 /// A snapshot is read-only by construction and enters the dedicated Refs layer
 /// through [`ContextManager::add_refs_file`], which applies its own LRU eviction
 /// against `refs_token_budget`; a document that alone exceeds that budget is
-/// reported back instead of widening the context. Requesting an already loaded
-/// snapshot refreshes its LRU watermark only.
+/// reported back instead of widening the context, and its cached snapshot is
+/// removed so a refused document never lingers in the harness cache. Requesting
+/// an already loaded snapshot refreshes its LRU watermark only.
 pub fn reconcile_discovery_context(
     context_manager: &mut ContextManager,
     requests: &[ContextRequest],
@@ -240,6 +241,11 @@ pub fn reconcile_discovery_context(
                     }
                 }
                 Err(err) => {
+                    // A refused document must not linger in the harness cache:
+                    // the snapshot is Git-ignored, so nothing else would ever
+                    // collect it, and a later round would find a file that can
+                    // never enter the context.
+                    discard_refused_snapshot(context_manager, &path);
                     if !outcome.refs_rejected.iter().any(|entry| entry.path == path) {
                         outcome.refs_rejected.push(RefsRejection {
                             path,
@@ -259,6 +265,27 @@ pub fn reconcile_discovery_context(
     }
 
     outcome
+}
+/// Removes the isolated snapshot of a reference document the Refs layer refused.
+///
+/// The cache is Git-ignored and harness-owned, so a refused snapshot has no owner
+/// left: nothing else would ever collect it, and a later round could request a
+/// document that can never enter the context. The removal is best-effort, because
+/// the refusal itself is what the model must learn.
+fn discard_refused_snapshot(context_manager: &ContextManager, path: &str) {
+    if !refs::is_refs_cache_path(path) {
+        return;
+    }
+    let target = context_manager.repo_root().join(path);
+    if let Err(error) = std::fs::remove_file(&target) {
+        if error.kind() != std::io::ErrorKind::NotFound {
+            tracing::warn!(
+                path = path,
+                error = %error,
+                "a refused reference snapshot could not be removed"
+            );
+        }
+    }
 }
 
 /// Reports whether a requested repository path may enter the context.
@@ -1049,9 +1076,12 @@ fn uninspectable_repository_outcome() -> DiscoveryRoundOutcome {
 /// A request that names a declared reference is materialized into the isolated
 /// cache before the blocking phase, so the round widens the context with the
 /// snapshot the registry declares instead of reporting a file that does not
-/// exist on disk. The optional cancel signal is the turn's own, so an abandoned
-/// round stops waiting for a slow reference host, and the diagnostics of a
-/// refused materialization lead the round's feedback.
+/// exist on disk. The transfer is bounded by `limits.refs_token_budget`, so a
+/// declared document that could never enter the Refs layer is abandoned while it
+/// streams instead of after it was fully buffered. The optional cancel signal is
+/// the turn's own, so an abandoned round stops waiting for a slow reference
+/// host, and the diagnostics of a refused materialization lead the round's
+/// feedback.
 #[allow(clippy::too_many_arguments)]
 pub async fn execute_discovery_commands(
     context_manager: &mut ContextManager,
@@ -1071,7 +1101,8 @@ pub async fn execute_discovery_commands(
     // registry requests are resolved into their isolated snapshots first. The
     // pre-step may fetch a remote document, so it runs before the blocking
     // phase that applies the round.
-    let (commands, refs_feedback) = resolve_refs_requests(repo_root, commands, cancel_rx).await;
+    let (commands, refs_feedback) =
+        resolve_refs_requests(repo_root, commands, limits.refs_token_budget, cancel_rx).await;
 
     let needs_file_list = commands.iter().any(|command| {
         matches!(
@@ -1121,10 +1152,12 @@ pub async fn execute_discovery_commands(
 /// command keeps its place. A request the pre-step leaves alone — an existing
 /// registry file, the manifest itself, an undeclared name, or a refused
 /// materialization — therefore keeps its original path and is reported by the
-/// round exactly as before.
+/// round exactly as before. The transfer is bounded by `refs_token_budget`, so a
+/// declared document too large for the Refs layer is abandoned while it streams.
 async fn resolve_refs_requests(
     repo_root: &Path,
     commands: &[LlmCommand],
+    refs_token_budget: usize,
     cancel_rx: Option<&tokio::sync::watch::Receiver<bool>>,
 ) -> (Vec<LlmCommand>, Vec<String>) {
     let requests: Vec<ContextRequest> = commands
@@ -1141,8 +1174,13 @@ async fn resolve_refs_requests(
         return (commands.to_vec(), Vec::new());
     }
 
-    let (resolved, feedback) =
-        crate::refs::materialize::materialize_requests(repo_root, &requests, cancel_rx).await;
+    let (resolved, feedback) = crate::refs::materialize::materialize_requests(
+        repo_root,
+        &requests,
+        refs_token_budget,
+        cancel_rx,
+    )
+    .await;
     let mut substituted = Vec::with_capacity(commands.len());
     let mut resolved = resolved.into_iter();
     for command in commands {
@@ -2034,6 +2072,10 @@ mod tests {
         assert!(feedback.contains("<refs_feedback>"));
         assert!(feedback.contains(cached.as_str()));
         assert!(cm.refs_files().is_empty());
+        assert!(
+            !root.join(&cached).exists(),
+            "a refused document must not linger in the reference cache"
+        );
     }
 
     /// A reference the registry declares becomes visible in the round that asks

@@ -84,20 +84,10 @@ pub fn normalize_search_path(repo_root: &Path, raw_path: &str) -> Result<String,
     Ok(clean)
 }
 
-/// Determines whether a repository relative path belongs to an excluded directory.
-pub fn is_excluded_path(path: &str) -> bool {
-    let p = Path::new(path);
-    for component in p.components() {
-        if let std::path::Component::Normal(name) = component {
-            if let Some(s) = name.to_str() {
-                if matches!(s, ".git" | ".tauqe" | "target" | "node_modules") {
-                    return true;
-                }
-            }
-        }
-    }
-    false
-}
+/// Excluded service directories are a substrate-level path predicate, so the
+/// definition lives in `tauqe-tools` and this re-export keeps
+/// `search::is_excluded_path` resolvable for the discovery layer.
+pub use tauqe_tools::paths::is_excluded_path;
 
 /// Checks if a candidate file matches the scope defined by the normalized search path.
 fn file_matches_scope(candidate: &str, scope: &str) -> bool {

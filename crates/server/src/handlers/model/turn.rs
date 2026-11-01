@@ -17,10 +17,10 @@ use tauqe_core::providers::{
 use tauqe_core::workflow::{ExecutionMode, SingleExecution};
 use tauqe_protocol::model::{TurnWorkContext, UsageTotals, UsageTotalsSnapshot};
 use tauqe_protocol::{
-    events, DiscussionTarget, EditFileDoneEvent, EditFileRetryingEvent, EditFileStartedEvent,
-    EditFinishedEvent, EditHunkEvent, EditOutcome, EditStartedEvent, Event, GitCommitCreatedEvent,
-    LlmCapability, ModelResultEvent, ModelRole, ModelStartedEvent, ReasoningEffort, ResponseError,
-    TurnIntent,
+    events, EditFileDoneEvent, EditFileRetryingEvent, EditFileStartedEvent, EditFinishedEvent,
+    EditHunkEvent, EditOutcome, EditStartedEvent, Event, GitCommitCreatedEvent, LlmCapability,
+    ModelEscalatedEvent, ModelResultEvent, ModelRole, ModelStartedEvent, ReasoningEffort,
+    ResponseError, TurnIntent,
 };
 
 use crate::handlers::common::withdraw_streamed_attempt;
@@ -34,7 +34,6 @@ use crate::usage::UsageGuard;
 pub struct ModelTurnResult {
     pub operation_id: String,
     pub result: Option<tauqe_protocol::ModelResult>,
-    pub assistant_text: String,
     pub is_cancelled: bool,
     pub error: Option<String>,
     pub has_terminal_success: bool,
@@ -75,15 +74,11 @@ impl ModelTurnResult {
 
 /// A programmatic bounded turn that could not be started.
 ///
-/// The operation identity travels with the failure, so a supervisor publishes
-/// its failure event under the operation that actually produced it instead of
-/// minting an identifier that matches no registered operation. The identity is
-/// absent only when the turn was refused before any operation existed — for
-/// example because another operation already held the slot.
+/// A supervisor reads the diagnostic through `error.message`; the identity of
+/// the operation belongs to the batch that owns it, so the failure carries no
+/// identifier of its own.
 #[derive(Debug)]
 pub struct TurnError {
-    /// Identifier of the operation the failed turn belonged to.
-    pub operation_id: Option<String>,
     /// The failure reported to the client.
     ///
     /// The payload is boxed because a bare [`ResponseError`] already fills the
@@ -97,7 +92,6 @@ pub struct TurnError {
 impl From<ResponseError> for TurnError {
     fn from(error: ResponseError) -> Self {
         Self {
-            operation_id: None,
             error: Box::new(error),
         }
     }
@@ -107,7 +101,6 @@ struct PreparedTurn {
     provider: Arc<dyn LlmProvider>,
     model: tauqe_protocol::ModelRef,
     app_config: tauqe_core::config::AppConfig,
-    selection: tauqe_protocol::ModelSelection,
     reasoning_effort: Option<ReasoningEffort>,
     op_id: String,
     /// Semantic mode of the turn, declared by the caller that starts it.
@@ -296,7 +289,6 @@ async fn prepare_turn(
         provider,
         model,
         app_config,
-        selection,
         reasoning_effort: effort,
         op_id,
         intent,
@@ -321,11 +313,14 @@ async fn prepare_turn(
 /// `xml` project advertise the same operational surface for the same intent and
 /// differ only in how those commands travel.
 ///
-/// Plan mutation follows the dialogue anchor rather than the transport. An
-/// interactive turn whose focus is a plan gains the mutation the anchor grants,
-/// and a plan discussion carries it by construction, because its regime is the
-/// discussion profile. An isolated step owns no plan permission at all, so no
-/// focus and no transport can hand it one. The mix runs through
+/// Plan mutation follows the declared intent alone: no focus anchor and no
+/// transport can hand it to a turn. `TurnIntent::narrow_capabilities` is the
+/// single source of truth for the resulting surface, and a plan discussion
+/// carries the mutation by its regime, because `build_model_ask_prompt`
+/// already maps a plan-anchored dialogue onto `TurnIntent::PlanDiscussion`.
+/// An interactive turn therefore composes the interactive profile and never
+/// advertises plan mutation, whatever the focus anchor is, and an isolated
+/// step owns no plan permission at all. The grant runs through
 /// `with_capability_set`, so both encodings advertise and decode the very same
 /// mutation, and the harness keeps validating the mutation itself after
 /// decoding.
@@ -341,7 +336,6 @@ async fn prepare_turn(
 pub(super) fn resolve_turn_protocol(
     intent: TurnIntent,
     develop_protocol: tauqe_protocol::EditProtocolKind,
-    plan_focused: bool,
     marker: Option<&str>,
 ) -> Box<dyn PromptProtocol> {
     let base_protocol: Box<dyn PromptProtocol> = match develop_protocol {
@@ -350,11 +344,10 @@ pub(super) fn resolve_turn_protocol(
             Box::new(XmlPromptProtocol)
         }
     };
-    // A plan discussion owns the mutation by regime; an interactive turn gains
-    // it from the focus anchor. The grant is idempotent, so a protocol that
-    // already advertises the capability keeps it exactly once.
-    let plan_mutation_authorized =
-        intent.is_plan_discussion() || (plan_focused && intent.is_interactive_repl());
+    // A plan discussion owns the mutation by its regime, and the grant is
+    // idempotent: a protocol that already advertises the capability keeps it
+    // exactly once.
+    let plan_mutation_authorized = intent.is_plan_discussion();
     let base_protocol = if plan_mutation_authorized {
         let capabilities = base_protocol
             .capability_set()
@@ -396,7 +389,6 @@ async fn run_prepared_turn(
         provider,
         model,
         app_config,
-        selection,
         reasoning_effort,
         op_id,
         intent,
@@ -411,27 +403,35 @@ async fn run_prepared_turn(
     let cancel_rx = operation.cancel_receiver();
 
     let (tx, mut rx) = tokio::sync::mpsc::channel::<StreamEvent>(100);
-
-    // The dialogue focus is snapshotted before the turn starts, so a concurrent
-    // focus change can never alter the protocol of a turn that is already
-    // running.
-    let plan_focused = matches!(
-        state.discussion_focus().await.target(),
-        Some(DiscussionTarget::Plan { .. })
-    );
-    let protocol = resolve_turn_protocol(
-        intent,
-        app_config.develop.protocol,
-        plan_focused,
-        marker.as_deref(),
-    );
+    let protocol = resolve_turn_protocol(intent, app_config.develop.protocol, marker.as_deref());
 
     let mut workflow_opts = tauqe_core::workflow::WorkflowOptions::from_app_config(&app_config);
     // The prepared effort already carries the role-resolved reasoning depth, so
     // the workflow receives exactly the depth the turn reports instead of
     // resolving it a second time.
     workflow_opts.reasoning_effort = reasoning_effort;
-    workflow_opts.initial_selection = Some(selection);
+    // A dialogue anchored on a review session may record a decision for one of
+    // its findings, so the anchored session identity travels with the turn
+    // options: the engine persists a decoded decision against that explicit
+    // session and never against whichever session the interface happens to
+    // render as active.
+    // A dialogue anchored on a review session may record a decision for one of
+    // its findings. The identity travels with the turn so a decoded decision is
+    // persisted against the session the dialogue discusses, never against an
+    // ambient one. A group dialogue is anchored on the session that declares the
+    // group, because a group identifier is unique only inside its session.
+    let review_session_id = if intent.is_interactive_repl() {
+        match state.discussion_focus().await.target() {
+            Some(tauqe_protocol::DiscussionTarget::Review { id }) => Some(id.clone()),
+            Some(tauqe_protocol::DiscussionTarget::ReviewGroup { session_id, .. }) => {
+                Some(session_id.clone())
+            }
+            _ => None,
+        }
+    } else {
+        None
+    };
+    workflow_opts.review_session_id = review_session_id.clone();
     workflow_opts.session_id = session_id;
     let execution = SingleExecution::new(workflow_opts);
     let (wf_tx, wf_rx) = (tx.clone(), cancel_rx.clone());
@@ -617,36 +617,6 @@ async fn run_prepared_turn(
                     .ok(),
                 });
             }
-            StreamEvent::ModelEscalated {
-                model,
-                role,
-                alias,
-                effort,
-                tier,
-            } => {
-                // The harness promotes the turn to a stronger coder tier of the
-                // same role instead of switching roles. Report the new model
-                // coordinates so the client can relabel the running turn without
-                // waiting for it to finish.
-                tracing::info!(
-                    operation_id = %op_id,
-                    model = %model,
-                    tier,
-                    "Model turn escalated to a stronger tier",
-                );
-                state.out.send_event(&Event {
-                    method: events::MODEL_ESCALATED.to_string(),
-                    params: serde_json::to_value(tauqe_protocol::ModelEscalatedEvent {
-                        operation_id: op_id.clone(),
-                        model,
-                        role,
-                        alias,
-                        effort,
-                        tier,
-                    })
-                    .ok(),
-                });
-            }
             StreamEvent::RepoMapTokens(tokens) => {
                 state.out.send_event(&Event {
                     method: events::TURN_REPOMAP.to_string(),
@@ -679,6 +649,25 @@ async fn run_prepared_turn(
                         command,
                         success,
                         message,
+                    })
+                    .ok(),
+                });
+            }
+            StreamEvent::TierEscalated {
+                tier,
+                model,
+                role,
+                effort,
+            } => {
+                state.out.send_event(&Event {
+                    method: events::MODEL_ESCALATED.to_string(),
+                    params: serde_json::to_value(ModelEscalatedEvent {
+                        operation_id: op_id.clone(),
+                        model,
+                        role: Some(role),
+                        alias: None,
+                        effort,
+                        tier,
                     })
                     .ok(),
                 });
@@ -867,7 +856,6 @@ async fn run_prepared_turn(
         return Ok(ModelTurnResult {
             operation_id: op_id,
             result: None,
-            assistant_text: raw_streamed_text,
             is_cancelled,
             error,
             has_terminal_success: false,
@@ -955,6 +943,15 @@ async fn run_prepared_turn(
                 method: events::CONTEXT_CHANGED.to_string(),
                 params: Some(serde_json::json!({ "state": ctx_state })),
             });
+
+            // A dialogue anchored on a review session may have recorded a
+            // decision for one of its findings. The decision is already durable,
+            // so the refreshed session is published beside the turn's other
+            // state publications instead of being re-derived from the stream.
+            if let Some(review_id) = review_session_id.as_deref() {
+                let review_root = state.repo_root().await;
+                crate::handlers::review::publish_review(state, &review_root, review_id).await;
+            }
 
             let repo_root = state.repo_root().await;
             let (active_id, plans) = offload(move || {
@@ -1049,7 +1046,6 @@ async fn run_prepared_turn(
                 ModelTurnResult {
                     operation_id: op_id,
                     result: Some(wf_result.result),
-                    assistant_text: wf_result.assistant_text,
                     is_cancelled: false,
                     error: turn_error,
                     has_terminal_success,
@@ -1077,7 +1073,6 @@ async fn run_prepared_turn(
                 ModelTurnResult {
                     operation_id: op_id,
                     result: None,
-                    assistant_text: raw_streamed_text,
                     is_cancelled: false,
                     error: Some(err.to_string()),
                     has_terminal_success: false,
@@ -1111,7 +1106,6 @@ async fn run_prepared_turn(
                 ModelTurnResult {
                     operation_id: op_id,
                     result: None,
-                    assistant_text: raw_streamed_text,
                     is_cancelled: false,
                     error: Some(join_err.to_string()),
                     has_terminal_success: false,
@@ -1236,9 +1230,6 @@ pub struct StepTurnOptions {
 /// enabling server-side step orchestration to inspect step success
 /// deterministically. Turns started here always execute inside a batch
 /// supervisor, so they are marked as batch members to let clients suppress
-/// per-step signals. A failure carries the identity of the operation the turn
-/// belonged to, so the caller reports it under a registered operation instead of
-/// an invented one.
 pub async fn execute_model_turn(
     state: &Arc<AppState>,
     prompt: String,
@@ -1256,12 +1247,6 @@ pub async fn execute_model_turn(
         shared_operation,
         phase_out,
     } = options;
-    // A batch step borrows the batch-level registration, so the operation
-    // identity exists before the turn can fail for any reason, including a
-    // failure to construct the provider.
-    let operation_id = shared_operation
-        .as_ref()
-        .map(|operation| format!("op-{}", operation.id()));
     let mut prepared = prepare_turn(
         state,
         intent,
@@ -1275,10 +1260,7 @@ pub async fn execute_model_turn(
         shared_operation,
     )
     .await
-    .map_err(|error| TurnError {
-        operation_id,
-        error: Box::new(error),
-    })?;
+    .map_err(TurnError::from)?;
     // A step endpoint that owns the telemetry surface replaces the default
     // daemon sink, so the step's live phases reach the client through the very
     // translation an interactive turn uses.
@@ -1343,7 +1325,8 @@ fn log_turn_finished(
             operation_id = %op_id,
             model = %model,
             is_batch,
-            work = work_kind(work_context),            status,
+            work = work_kind(work_context),
+            status,
             prompt_tokens = usage.prompt_tokens,
             completion_tokens = usage.completion_tokens,
             total_tokens = usage.total_tokens,
@@ -1357,7 +1340,8 @@ fn log_turn_finished(
             operation_id = %op_id,
             model = %model,
             is_batch,
-            work = work_kind(work_context),            status,
+            work = work_kind(work_context),
+            status,
             prompt_tokens = usage.prompt_tokens,
             completion_tokens = usage.completion_tokens,
             total_tokens = usage.total_tokens,
@@ -1422,6 +1406,7 @@ fn send_edit_aborted(out: &OutChannel, op_id: &str, error: String) {
                 error: Some(error),
                 changed_files: Vec::new(),
                 commit_hash: None,
+                verification: None,
             },
         })
         .ok(),

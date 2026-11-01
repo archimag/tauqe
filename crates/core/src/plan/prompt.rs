@@ -29,25 +29,22 @@ pub use step::{
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::context::ContextFileContent;
     use tauqe_protocol::{EditProtocolKind, Plan, PlanItem, PlanItemStatus};
 
     fn sample_plan() -> Plan {
-        Plan {
-            id: "jwt-auth".to_string(),
-            last_replanned_step: None,
-            title: "JWT Authentication".to_string(),
-            description: Some("Implement secure tokens".to_string()),
-            created_at: 100,
-            updated_at: 200,
-            architect: None,
-            concept: vec![tauqe_protocol::ConceptItem {
+        Plan::from_parts(
+            "jwt-auth".to_string(),
+            "JWT Authentication".to_string(),
+            Some("Implement secure tokens".to_string()),
+            100,
+            200,
+            vec![tauqe_protocol::ConceptItem {
                 id: "c-1".to_string(),
                 title: "Stateless JWT".to_string(),
                 details: Some("Use asymmetric ECDSA".to_string()),
                 children: vec![],
             }],
-            items: vec![
+            vec![
                 PlanItem {
                     id: "1".to_string(),
                     title: "Models".to_string(),
@@ -73,7 +70,7 @@ mod tests {
                     children: vec![],
                 },
             ],
-        }
+        )
     }
 
     #[test]
@@ -144,26 +141,12 @@ mod tests {
         assert!(sys.contains("Reference Files Contract"));
         assert!(sys.contains("DAG Dependency Contract"));
 
-        let ctx_files = vec![ContextFileContent {
-            path: "crates/core/src/lib.rs".to_string(),
-            content: "pub fn init() {}".to_string(),
-            access: tauqe_protocol::ContextAccess::ReadOnly,
-        }];
-        let user_prompt = build_plan_horizon_user_prompt(
-            &plan,
-            &ctx_files,
-            Some("fn generate_token()"),
-            None,
-            None,
-            Some("Focus on EdDSA"),
-        );
+        let user_prompt = build_plan_horizon_user_prompt(&plan, None, Some("Focus on EdDSA"));
         assert!(user_prompt.contains("# Plan Horizon Synthesis: [jwt-auth] JWT Authentication"));
         assert!(user_prompt.contains("Immutable Source of Truth"));
         assert!(user_prompt.contains("## Completed Foundation"));
         assert!(user_prompt.contains("- [x] #1 Models"));
         assert!(user_prompt.contains("Focus on EdDSA"));
-        assert!(user_prompt.contains("crates/core/src/lib.rs"));
-        assert!(user_prompt.contains("fn generate_token()"));
         assert!(user_prompt.contains("readonly_files"));
 
         let schema = plan_refine_response_schema();
@@ -305,12 +288,15 @@ mod tests {
 
     #[test]
     fn test_plan_discussion_prompt_attribute_escaping() {
-        let plan = Plan {
-            id: "auth-v2".to_string(),
-            title: "OAuth & JWT".to_string(),
-            description: Some("Tokens & Refresh".to_string()),
-            ..Default::default()
-        };
+        let plan = Plan::from_parts(
+            "auth-v2".to_string(),
+            "OAuth & JWT".to_string(),
+            Some("Tokens & Refresh".to_string()),
+            0,
+            0,
+            vec![],
+            vec![],
+        );
         let prompt = format_plan_discussion_prompt(&plan, &[], "Clarify signing");
         assert!(prompt.contains("<active_plan id=\"auth-v2\" title=\"OAuth &amp; JWT\""));
     }
@@ -323,8 +309,7 @@ mod tests {
             blocked_reason: Some("Missing crypto dependency"),
             toolchain_status: Some("cargo check: 1 error"),
         };
-        let prompt =
-            build_plan_horizon_user_prompt(&plan, &[], None, None, Some(diagnostics), None);
+        let prompt = build_plan_horizon_user_prompt(&plan, Some(diagnostics), None);
         assert!(prompt.contains("# Plan Horizon Synthesis: [jwt-auth] JWT Authentication"));
         assert!(prompt.contains("## Architectural Concept"));
         assert!(prompt.contains("## Completed Foundation"));
@@ -336,7 +321,7 @@ mod tests {
         assert!(prompt.contains("Architect Instructions"));
 
         // Without diagnostics the failure section is omitted entirely.
-        let plain = build_plan_horizon_user_prompt(&plan, &[], None, None, None, None);
+        let plain = build_plan_horizon_user_prompt(&plan, None, None);
         assert!(!plain.contains("Blocked Step Diagnostics"));
 
         // A plan with no DONE steps reports an empty foundation.
@@ -344,7 +329,7 @@ mod tests {
         for item in &mut no_done.items {
             item.status = PlanItemStatus::Todo;
         }
-        let no_done_prompt = build_plan_horizon_user_prompt(&no_done, &[], None, None, None, None);
+        let no_done_prompt = build_plan_horizon_user_prompt(&no_done, None, None);
         assert!(no_done_prompt.contains("*(No completed steps yet)*"));
     }
 }

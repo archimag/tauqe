@@ -174,6 +174,17 @@ mod tests {
             }
         );
     }
+    #[test]
+    fn test_doc_request_without_topic_decodes_to_all() {
+        // The documented missing-topic fallback holds at the command boundary.
+        let command: LlmCommand = serde_json::from_str(r#"{"type":"doc_request"}"#).unwrap();
+        assert_eq!(
+            command,
+            LlmCommand::DocRequest {
+                topic: DocTopic::All
+            }
+        );
+    }
 
     #[test]
     fn test_doc_topic_all_roundtrips_through_wire_names() {

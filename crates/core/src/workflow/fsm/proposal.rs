@@ -2,31 +2,24 @@
 //!
 //! A proposal round is one atomic model interaction: the prompt is assembled
 //! from the active context, the repo map, and history, sent to the provider, and
-//! decoded into a uniform [`LlmCommand`] vocabulary. This module owns the
-//! per-round proposal value, the turn-wide state accumulated across rounds, and
-//! the helpers that normalize commands into verification targets, terminal
-//! outcomes, and conversational text.
+//! decoded into a uniform [`LlmCommand`] vocabulary. The round executor itself
+//! lives in [`super::kernel`], which owns the frozen turn inputs and the
+//! corrective budget of an empty answer. This module owns the per-round proposal
+//! value, the turn-wide state accumulated across rounds, and the helpers that
+//! normalize commands into verification targets, terminal outcomes, and
+//! conversational text.
 
 use tauqe_protocol::{
-    ContextAccess, DirListRequest, DocTopic, EditOperation, LlmCommand, LlmOutcome, ModelRef,
-    RepoSearchRequest, TurnIntent, VerifyOnSuccess, VerifyTarget,
+    DirListRequest, DocTopic, EditOperation, LlmCommand, LlmOutcome, ModelRef, RepoSearchRequest,
+    VerifyOnSuccess, VerifyTarget,
 };
-use tokio::sync::{mpsc, watch};
 
-use crate::context::{ContextFileContent, ContextManager};
 use crate::edits::protocol::{
     ContextRequest, VerifyOnSuccess as EditVerifyOnSuccess, VerifyRequest as EditVerifyRequest,
     VerifyTarget as EditVerifyTarget,
 };
-use crate::edits::stream::EditStreamFilter;
-use crate::edits::StagedEditsState;
-use crate::history::HistoryManager;
-use crate::prompt::protocol::PromptProtocol;
-use crate::prompt::PromptAssembly;
-use crate::providers::{LlmProvider, StreamEvent};
 use crate::workflow::WorkflowOptions;
 
-use super::cache::TurnInputCache;
 use super::AbortReport;
 
 /// Normalized proposal returned by a single model interaction.
@@ -35,27 +28,38 @@ use super::AbortReport;
 /// every accessor reads pre-collected data instead of rescanning the raw
 /// command list on each call. The explicit buckets also keep the proposal shape
 /// self-documenting and make a new command kind impossible to miss silently.
+///
+/// The kernel assembles a cancelled round through the derived default, so every
+/// field stays visible to the bounded-turn module and its phase executors.
 #[derive(Default)]
 pub(super) struct ProposalStep {
-    commands: Vec<LlmCommand>,
-    text: String,
-    edits: Vec<EditOperation>,
-    context_requests: Vec<ContextRequest>,
-    doc_requests: Vec<DocTopic>,
-    repo_searches: Vec<RepoSearchRequest>,
-    repo_dirs: bool,
-    repo_map_requests: Vec<String>,
-    dir_list_requests: Vec<DirListRequest>,
-    verify_request: Option<EditVerifyRequest>,
-    terminal_outcome: Option<LlmOutcome>,
-    blocked: Option<String>,
-    abort: Option<AbortReport>,
-    scratchpad: Option<String>,
-    language: Option<String>,
-    plans: Vec<tauqe_protocol::DiscussionPlanUpdate>,
-    custom_tools: Vec<LlmCommand>,
-    protocol_errors: Vec<String>,
+    pub(super) commands: Vec<LlmCommand>,
+    pub(super) text: String,
+    pub(super) edits: Vec<EditOperation>,
+    pub(super) context_requests: Vec<ContextRequest>,
+    pub(super) doc_requests: Vec<DocTopic>,
+    pub(super) repo_searches: Vec<RepoSearchRequest>,
+    pub(super) repo_dirs: bool,
+    pub(super) repo_map_requests: Vec<String>,
+    pub(super) dir_list_requests: Vec<DirListRequest>,
+    pub(super) verify_request: Option<EditVerifyRequest>,
+    pub(super) terminal_outcome: Option<LlmOutcome>,
+    pub(super) blocked: Option<String>,
+    pub(super) abort: Option<AbortReport>,
+    pub(super) scratchpad: Option<String>,
+    pub(super) language: Option<String>,
+    pub(super) plans: Vec<tauqe_protocol::DiscussionPlanUpdate>,
+    /// Decisions recorded for review findings, in the order they were stated.
+    pub(super) review_updates: Vec<tauqe_protocol::review::ReviewUpdateProposal>,
+    pub(super) custom_tools: Vec<LlmCommand>,
+    pub(super) protocol_errors: Vec<String>,
     pub(super) is_cancelled: bool,
+    /// Raw assistant text the round was decoded from.
+    ///
+    /// A contour that owns a typed payload decodes it through the single
+    /// deserializer of its own schema, so the round keeps the text it was read
+    /// from instead of reconstructing the payload from decoded commands.
+    pub(super) raw_text: String,
 }
 
 impl ProposalStep {
@@ -63,7 +67,7 @@ impl ProposalStep {
     ///
     /// Singleton commands (verification, terminal outcome, block, scratchpad,
     /// language) keep their first occurrence, matching the previous scan order.
-    fn from_commands(commands: Vec<LlmCommand>) -> Self {
+    pub(super) fn from_commands(commands: Vec<LlmCommand>) -> Self {
         let mut step = ProposalStep::default();
         for command in &commands {
             match command {
@@ -128,6 +132,9 @@ impl ProposalStep {
                     }
                 }
                 LlmCommand::Plan { update } => step.plans.push(update.clone()),
+                LlmCommand::ReviewUpdate { update } => {
+                    step.review_updates.push(update.clone());
+                }
                 // A project command invocation is carried as a typed command and
                 // executed by the harness against the declared allowlist before
                 // anything is staged.
@@ -160,6 +167,17 @@ impl ProposalStep {
     /// Raw decoded command vector preserved from the proposal round.
     pub(super) fn commands(&self) -> &[LlmCommand] {
         &self.commands
+    }
+
+    /// Raw assistant text the round was decoded from.
+    pub(super) fn raw_text(&self) -> &str {
+        &self.raw_text
+    }
+
+    /// Attaches the raw assistant text the round was decoded from.
+    pub(super) fn with_raw_text(mut self, raw_text: String) -> Self {
+        self.raw_text = raw_text;
+        self
     }
 
     /// File edit operations carried by the proposal.
@@ -282,6 +300,7 @@ impl ProposalStep {
             && self.edits.is_empty()
             && self.protocol_errors.is_empty()
             && self.plans.is_empty()
+            && self.review_updates.is_empty()
             && self.verify_request.is_none()
             && !outcome_carries_result(self.terminal_outcome.as_ref())
             && self.blocked.is_none()
@@ -301,7 +320,6 @@ pub(super) struct TurnState {
     pub(super) blocked: Option<String>,
     pub(super) abort: Option<AbortReport>,
     pub(super) plans: Vec<tauqe_protocol::DiscussionPlanUpdate>,
-    pub(super) repo_searches: Vec<RepoSearchRequest>,
 }
 
 impl TurnState {
@@ -326,10 +344,9 @@ impl TurnState {
             self.abort = Some(abort.clone());
         }
         self.plans.extend(step.plans().iter().cloned());
-        self.repo_searches
-            .extend(step.repo_searches().iter().cloned());
     }
 }
+
 /// Reports whether a success summary states what the turn accomplished.
 ///
 /// A summary is the only payload a `success` status carries, so an absent or
@@ -425,323 +442,152 @@ pub(super) fn log_fsm_phase(
     );
 }
 
-/// Drains one proposal stream, forwarding the filtered events to the client.
+/// Applies the review decisions a dialogue round recorded.
 ///
-/// A retried attempt starts from a clean slate: `ResetStream` clears the decoded
-/// accumulator together with the protocol filter, so neither the decoded
-/// commands nor the streamed preview can inherit a fragment of the attempt the
-/// transport voided. The filter keeps what describes the turn rather than the
-/// attempt - the turn marker and the editable path list.
-async fn forward_provider_stream(
-    mut llm_rx: mpsc::Receiver<StreamEvent>,
-    mut stream_filter: Box<dyn EditStreamFilter>,
-    forward_stream_tx: mpsc::Sender<StreamEvent>,
-) -> (String, bool, Option<String>, bool) {
-    let mut assistant_text = String::new();
-    let mut cancelled = false;
-    let mut stream_error = None;
-    let mut completed = false;
-    while let Some(event) = llm_rx.recv().await {
-        match event {
-            StreamEvent::TextDelta(ref delta) => {
-                assistant_text.push_str(delta);
-                for forwarded in stream_filter.push_chunk(delta) {
-                    if forward_stream_tx.send(forwarded).await.is_err() {
-                        break;
+/// A decision is a domain mutation of the review session the turn is anchored
+/// on, so it is applied at the round boundary that decoded it: the session
+/// identity travels as a typed field of the turn options, and the storage engine
+/// applies the amendment under its own lock, so two rounds can never interleave
+/// their read-modify-write cycles. A decision that names a review group settles
+/// the group itself — it ends the blocker, records the resolution, and moves the
+/// whole membership — while a decision that names only a finding updates that
+/// finding. A decision that cannot be persisted — an absent session, a finding
+/// or a group that no longer exists, or a storage failure — is journaled and
+/// never fails the turn: the code the round proposed is still valid, and the
+/// developer keeps the diagnostic in the journal.
+pub(super) fn record_review_decisions(
+    step: &ProposalStep,
+    options: &WorkflowOptions,
+    repo_root: &std::path::Path,
+) {
+    let Some(review_id) = options.review_session_id.as_deref() else {
+        return;
+    };
+    for decision in &step.review_updates {
+        // A decision that names a group belongs to the group, not to one of its
+        // manifestations, so it settles the group as one operational unit.
+        match decision
+            .group_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|group_id| !group_id.is_empty())
+        {
+            Some(group_id) => record_group_decision(repo_root, review_id, group_id, decision),
+            None => record_finding_decision(repo_root, review_id, decision),
+        }
+    }
+}
+
+/// Applies a decision the round recorded for one finding of the anchored session.
+fn record_finding_decision(
+    repo_root: &std::path::Path,
+    review_id: &str,
+    decision: &tauqe_protocol::review::ReviewUpdateProposal,
+) {
+    let item_id = decision.item_id;
+    let root = repo_root.to_path_buf();
+    let anchored_review = review_id.to_string();
+    let decision = decision.clone();
+    let applied = crate::blocking::run_blocking(move || {
+        crate::review::ReviewStorage::apply_decision(&root, &anchored_review, &decision)
+    });
+    match applied {
+        Ok(Some(issue)) => tracing::info!(
+            review_id = %review_id,
+            item_id = issue.id,
+            status = issue.status.as_str(),
+            "review decision recorded in the dialogue",
+        ),
+        Ok(None) => tracing::warn!(
+            review_id = %review_id,
+            item_id,
+            "review decision was not recorded: the finding is absent from the session",
+        ),
+        Err(err) => tracing::warn!(
+            review_id = %review_id,
+            item_id,
+            error = %err,
+            "review decision was not persisted",
+        ),
+    }
+}
+
+/// Applies a decision the round recorded for a whole review group.
+///
+/// A decision taken for a group belongs to the group, not to one of its
+/// manifestations: it ends the recorded blocker, stores the resolution once on
+/// the group, and stamps the same note onto every member finding in one atomic
+/// write, so the group and its findings can never disagree about the decision.
+/// The decided status then moves the whole membership together, because one root
+/// cause is remediated by one coherent change set.
+fn record_group_decision(
+    repo_root: &std::path::Path,
+    review_id: &str,
+    group_id: &str,
+    decision: &tauqe_protocol::review::ReviewUpdateProposal,
+) {
+    let item_id = decision.item_id;
+    let root = repo_root.to_path_buf();
+    let anchored_review = review_id.to_string();
+    let anchored_group = group_id.to_string();
+    let decision = decision.clone();
+    let applied = crate::blocking::run_blocking(move || {
+        // The recorded resolution settles the group itself, and the storage
+        // engine rejects a decision that states no reasoning, so nothing is half
+        // applied when the note is blank.
+        let settled = crate::review::ReviewStorage::apply_group_decision(
+            &root,
+            &anchored_review,
+            &anchored_group,
+            &decision.note,
+        )?;
+        if settled.is_none() {
+            return Ok(None);
+        }
+        let status = tauqe_protocol::IssueStatus::from(decision.status);
+        let recommendations = decision.recommendations.clone();
+        crate::review::ReviewStorage::update_session_group_findings(
+            &root,
+            &anchored_review,
+            &anchored_group,
+            move |issue| {
+                issue.status = status;
+                for recommendation in &recommendations {
+                    let trimmed = recommendation.trim();
+                    if !trimmed.is_empty()
+                        && !issue
+                            .recommendations
+                            .iter()
+                            .any(|existing| existing == trimmed)
+                    {
+                        issue.recommendations.push(trimmed.to_string());
                     }
                 }
-            }
-            StreamEvent::Cancelled => {
-                cancelled = true;
-                let _ = forward_stream_tx.send(StreamEvent::Cancelled).await;
-            }
-            StreamEvent::Error(ref err) => {
-                stream_error = Some(err.clone());
-                let _ = forward_stream_tx
-                    .send(StreamEvent::Error(err.clone()))
-                    .await;
-            }
-            // The transport decorator discarded the fragments of the
-            // interrupted attempt and re-issued the request, so the text
-            // accumulated for decoding is discarded with them. The protocol
-            // filter is reset beside it, because a preview the client already
-            // reset must not be completed by the bytes of the attempt that
-            // replaces it.
-            StreamEvent::ResetStream => {
-                assistant_text.clear();
-                stream_filter.reset();
-                let _ = forward_stream_tx.send(StreamEvent::ResetStream).await;
-            }
-            StreamEvent::Done => {
-                completed = true;
-            }
-            // Events the view does not model are forwarded as-is. A client
-            // that stopped listening only silences the forwarding: the round
-            // keeps draining the provider, so its output is still decoded and
-            // the turn reaches a deterministic outcome instead of being
-            // reported as an interrupted stream.
-            other => {
-                let _ = forward_stream_tx.send(other).await;
-            }
-        }
-    }
-    for forwarded in stream_filter.finish() {
-        let _ = forward_stream_tx.send(forwarded).await;
-    }
-    (assistant_text, cancelled, stream_error, completed)
-}
-
-/// Operation label recorded when an offloaded repository-state read fails.
-const REPOSITORY_STATE_OPERATION: &str = "repository state resolution";
-
-/// Offloads blocking work and records a failed offload before degrading.
-///
-/// The returned `Option` reports whether the offload completed at all: `Some`
-/// wraps whatever the closure produced, while `None` reports a panicked or
-/// cancelled blocking task. The `JoinError` always travels through
-/// [`crate::blocking::log_join_error`] before the caller degrades, so a failed
-/// offload never hides behind a legitimately absent result.
-async fn offload_or_record<T, F>(operation: &str, work: F) -> Option<T>
-where
-    F: FnOnce() -> T + Send + 'static,
-    T: Send + 'static,
-{
-    match crate::blocking::run_blocking_async(work).await {
-        Ok(value) => Some(value),
-        Err(error) => {
-            crate::blocking::log_join_error(&error, operation);
-            None
-        }
-    }
-}
-
-/// Runs a single atomic model interaction and decodes it into commands.
-#[allow(clippy::too_many_arguments)]
-pub(super) async fn run_proposal_step(
-    prompt: &str,
-    provider: &dyn LlmProvider,
-    model: &ModelRef,
-    context_manager: &ContextManager,
-    history_manager: &HistoryManager,
-    protocol: &dyn PromptProtocol,
-    workflow_name: &str,
-    stream_tx: &mpsc::Sender<StreamEvent>,
-    cancel_rx: watch::Receiver<bool>,
-    options: &WorkflowOptions,
-    cache: &mut TurnInputCache,
-    staged_state: Option<&StagedEditsState>,
-    target_language: Option<&str>,
-    turn_scratchpad: Option<&str>,
-    intent: TurnIntent,
-) -> anyhow::Result<ProposalStep> {
-    let repo_root = context_manager.repo_root().to_path_buf();
-
-    // Reading the repository state shells out to git; the call runs off the
-    // async executor thread. A repository that cannot be inspected degrades to
-    // an absent state block instead of failing the turn, and a failed offload
-    // is recorded before the block goes absent, so a panicked read never looks
-    // like a repository that was simply never inspected.
-    let root = repo_root.clone();
-    let repo_state = offload_or_record(REPOSITORY_STATE_OPERATION, move || {
-        crate::git::state::get_repository_state(Some(&root))
-    })
-    .await;
-
-    let ctx_state = context_manager.get_state();
-    let root = repo_root.clone();
-    let items = ctx_state.items.clone();
-    let mut context_files = crate::blocking::run_blocking_async(move || {
-        let mut results = Vec::new();
-        for item in items {
-            let full_path = root.join(&item.path);
-            if let Ok(content) = std::fs::read_to_string(&full_path) {
-                results.push(ContextFileContent {
-                    path: item.path,
-                    access: item.access,
-                    content,
-                });
-            }
-        }
-        results
-    })
-    .await?;
-
-    if let Some(staged) = staged_state {
-        // Staged content is merged in place: a file already present in context
-        // keeps its position, its neighbors keep their tokens, and the round
-        // extends the previous prompt instead of reshaping it. Files created
-        // during the turn are appended after the existing block in path order,
-        // which keeps the appended tail deterministic across rounds.
-        let mut appended = Vec::new();
-        for (path, content) in &staged.staged_files {
-            if let Some(file) = context_files.iter_mut().find(|file| &file.path == path) {
-                file.content = content.clone();
-            } else {
-                appended.push(ContextFileContent {
-                    path: path.clone(),
-                    access: ContextAccess::Editable,
-                    content: content.clone(),
-                });
-            }
-        }
-        appended.sort_by(|a, b| a.path.cmp(&b.path));
-        context_files.extend(appended);
-        context_files.retain(|file| !staged.deleted_paths.contains(&file.path));
-    }
-
-    // Every file an edit may address this turn: the whole context block, not
-    // only the editable layer, because a file marked read-only becomes editable
-    // as soon as an edit proposes a change to it. One list feeds the streaming
-    // filter, the response schema, and the decoder, so the path a preview
-    // reports while streaming is byte-identical to the path carried by the
-    // decoded command.
-    let context_paths: Vec<String> = context_files.iter().map(|file| file.path.clone()).collect();
-
-    // The cache freezes the map on the first round of the turn, so later rounds
-    // receive the identical string even after discovery widened the context.
-    // The eager symbol map and the compact directory outline are mutually
-    // exclusive: the model reads either symbol contours or the folder layout,
-    // never both, so exactly one outline enters the prompt.
-    let (repo_map, repo_dirs) = if options.include_repo_map {
-        let map = cache
-            .repo_map(&repo_root, &context_paths, options.repomap_token_budget)
-            .await;
-        (map, None)
-    } else {
-        (
-            None,
-            cache
-                .repo_dirs(&repo_root, context_manager.pinned_patterns())
-                .await,
+            },
         )
-    };
-
-    let repomap_tokens = repo_map
-        .as_deref()
-        .or(repo_dirs.as_deref())
-        .map(crate::prompt::estimate_tokens)
-        .unwrap_or(0);
-    tracing::info!(
-        workflow = workflow_name,
-        model = %model,
-        isolated_step = intent.is_isolated_step(),
-        repo_map_tokens = repomap_tokens,
-        "proposal round prepared"
-    );
-    let _ = stream_tx
-        .send(StreamEvent::RepoMapTokens(repomap_tokens))
-        .await;
-
-    let history = cache.history_snapshot(history_manager, intent).await;
-    let project = cache.project(&repo_root, Some(&cancel_rx)).await;
-
-    // The declared patch strategy decides how the rendered context addresses the
-    // lines of every file, so it travels from the project configuration into the
-    // assembly instead of being re-derived by the prompt layer.
-    let patch_strategy = options.patch_strategy();
-
-    let mut assembly = PromptAssembly::new(
-        repo_state,
-        ctx_state.revision,
-        context_files,
-        workflow_name,
-        protocol.kind(),
-        history,
-        repo_map,
-    )
-    .with_repo_dirs(repo_dirs)
-    .with_project(Some(project))
-    .with_patch_strategy(patch_strategy);
-    assembly.target_language = target_language.map(|language| language.to_string());
-    assembly.intent = intent;
-    assembly.turn_scratchpad = turn_scratchpad.map(|notes| notes.to_string());
-    assembly.max_scratchpad_chars = options.max_scratchpad_chars;
-    // The layout policy resolved from the governing configuration composes the
-    // message sequence of the round: an interactive dialogue that keeps a
-    // growing history builds the chronological transcript, while every other
-    // intent keeps the semantic block order.
-    assembly.prompt_layout = options.prompt_layout(intent);
-
-    // The declared turn intent narrows the protocol once, so the rendered
-    // instructions, the structured response schema, the stream filter, and the
-    // decoder all observe the same capability surface: nothing is advertised
-    // without being decodable, and nothing is accepted without being advertised.
-    let scoped_protocol = protocol.with_capability_set(assembly.effective_capabilities(protocol));
-    let protocol: &dyn PromptProtocol = scoped_protocol.as_ref();
-
-    // The turn-scoped memo hands back the elements an earlier round already
-    // rendered, so the context block only grows at its tail and the provider
-    // keeps matching the prompt prefix it already cached.
-    let messages =
-        assembly.assemble_chat_messages_with_context_cache(prompt, protocol, cache.context_cache());
-    let response_format = protocol.response_format(&context_paths, patch_strategy);
-
-    let (llm_tx, llm_rx) = mpsc::channel::<StreamEvent>(100);
-    // A session identifier pins the proposal round to one provider backend and
-    // keeps its prompt-prefix cache warm across the discovery, patch-retry, and
-    // healing rounds of the same turn. Without one the provider serves the
-    // request statelessly.
-    let client_call = provider.stream_chat_with_session(
-        &model.name,
-        messages,
-        response_format,
-        options.reasoning_effort,
-        options.session_id.as_deref(),
-        llm_tx,
-        cancel_rx.clone(),
-    );
-
-    let staged_for_filter = staged_state
-        .map(|staged| staged.staged_files.clone())
-        .unwrap_or_default();
-    // The streaming preview receives the same context list as the decoder, so a
-    // reported edit and the staged edit always name the same file.
-    let stream_filter =
-        protocol.create_stream_filter(context_paths.clone(), repo_root, staged_for_filter);
-    let forward_stream_tx = stream_tx.clone();
-
-    // The forwarder owns the protocol filter for the whole round, so it resets
-    // it together with the decoded accumulator whenever the transport voids an
-    // attempt and starts the next one.
-    let forward_task = tokio::spawn(async move {
-        forward_provider_stream(llm_rx, stream_filter, forward_stream_tx).await
     });
-
-    let client_result = client_call.await;
-    let (assistant_text, cancelled, stream_error, completed) =
-        forward_task.await.map_err(|join_error| {
-            tracing::error!(
-                "Proposal streaming task terminated unexpectedly: {}",
-                join_error
-            );
-            anyhow::anyhow!(
-                "Proposal streaming task terminated unexpectedly: {}",
-                join_error
-            )
-        })?;
-    client_result?;
-
-    if let Some(err) = stream_error {
-        anyhow::bail!("LLM stream error: {}", err);
+    match applied {
+        Ok(Some(findings)) => tracing::info!(
+            review_id = %review_id,
+            group_id,
+            item_id,
+            findings,
+            "group decision recorded in the dialogue",
+        ),
+        Ok(None) => tracing::warn!(
+            review_id = %review_id,
+            group_id,
+            item_id,
+            "group decision was not recorded: the group is absent from the session",
+        ),
+        Err(err) => tracing::warn!(
+            review_id = %review_id,
+            group_id,
+            item_id,
+            error = %err,
+            "group decision was not persisted",
+        ),
     }
-
-    if cancelled {
-        return Ok(ProposalStep {
-            is_cancelled: true,
-            ..Default::default()
-        });
-    }
-
-    if !completed {
-        anyhow::bail!("LLM stream closed unexpectedly without completion");
-    }
-
-    // The decoder resolves edit paths against the identical context list the
-    // stream filter received, so a decoded edit names the file the preview
-    // already certified as edited.
-    let commands = protocol.decode(&assistant_text, &context_paths);
-
-    Ok(ProposalStep::from_commands(commands))
 }
 
 #[cfg(test)]
@@ -750,6 +596,8 @@ mod tests {
 
     #[test]
     fn from_commands_preserves_the_decoded_command_vector() {
+        use tauqe_protocol::ContextAccess;
+
         let step = ProposalStep::from_commands(vec![
             LlmCommand::Text {
                 content: "hello".to_string(),
@@ -773,6 +621,8 @@ mod tests {
 
     #[test]
     fn has_discovery_commands_detects_each_discovery_capability() {
+        use tauqe_protocol::ContextAccess;
+
         let text_only = ProposalStep::from_commands(vec![LlmCommand::Text {
             content: "hello".to_string(),
         }]);
@@ -926,203 +776,135 @@ mod tests {
             assert!(!step.is_empty_step());
         }
     }
-    /// Drives one proposal stream over `filter`, returning the events the
-    /// client observed and the text the turn would decode.
-    async fn drive_forward_stream(
-        filter: Box<dyn EditStreamFilter>,
-        events: Vec<StreamEvent>,
-    ) -> (Vec<StreamEvent>, String) {
-        let (llm_tx, llm_rx) = mpsc::channel(64);
-        let (stream_tx, mut stream_rx) = mpsc::channel(64);
-        let forward =
-            tokio::spawn(async move { forward_provider_stream(llm_rx, filter, stream_tx).await });
-        for event in events {
-            llm_tx
-                .send(event)
-                .await
-                .expect("the forwarder is listening");
-        }
-        drop(llm_tx);
+    /// Builds a scratch session whose architectural group carries a blocker and
+    /// whose findings belong to it, returning the root that holds the session.
+    ///
+    /// One finding is stored without a group, so it belongs to the implicit
+    /// default group and must stay untouched by a decision taken for `arch-1`.
+    fn blocked_group_fixture(review_id: &str) -> (tempfile::TempDir, std::path::PathBuf) {
+        use tauqe_protocol::review::{
+            IssueStatus, IssueType, ReviewGroup, ReviewItem, ReviewSession, ReviewSeverity,
+        };
 
-        let (assistant_text, ..) = forward.await.expect("the forward task joins");
-        let mut observed = Vec::new();
-        while let Some(event) = stream_rx.recv().await {
-            observed.push(event);
-        }
-        (observed, assistant_text)
-    }
-
-    /// Returns the events forwarded after the transport reset the stream.
-    fn events_after_reset(events: &[StreamEvent]) -> &[StreamEvent] {
-        let reset_at = events
-            .iter()
-            .position(|event| matches!(event, StreamEvent::ResetStream))
-            .expect("the transport must void the interrupted attempt");
-        &events[reset_at + 1..]
-    }
-
-    /// Concatenates the conversational text of the given events.
-    fn streamed_text(events: &[StreamEvent]) -> String {
-        events
-            .iter()
-            .filter_map(|event| match event {
-                StreamEvent::TextDelta(text) => Some(text.as_str()),
-                _ => None,
-            })
-            .collect()
-    }
-
-    /// Collects the terminal event of every previewed file.
-    fn file_completions(events: &[StreamEvent]) -> Vec<(tauqe_protocol::EditFileStatus, usize)> {
-        events
-            .iter()
-            .filter_map(|event| match event {
-                StreamEvent::EditFileDone {
-                    status,
-                    hunks_count,
-                    ..
-                } => Some((*status, *hunks_count)),
-                _ => None,
-            })
-            .collect()
-    }
-
-    #[tokio::test]
-    async fn a_reset_stream_restarts_the_xml_preview_from_a_clean_filter() {
-        use std::collections::HashMap;
-
-        use crate::edits::stream::XmlStreamFilter;
-
-        let filter = Box::new(
-            XmlStreamFilter::new(vec!["a.rs".to_string()], std::env::temp_dir())
-                .with_staged_contents(HashMap::from([(
-                    "a.rs".to_string(),
-                    "fn old() {}\n".to_string(),
-                )])),
-        );
-
-        // The interrupted attempt opens a file block and stops in the middle of
-        // a replacement, leaving the filter inside the edit container with an
-        // open file and a partially scanned hunk.
-        let interrupted = concat!(
-            "First try.\n",
-            "<tauqe_edits><edit path=\"a.rs\">\n",
-            "<search>\nfn old() {}\n</search>\n<replace>\npartial"
-        );
-        let retried = concat!(
-            "<tauqe_edits><edit path=\"a.rs\">\n",
-            "<search>\nfn old() {}\n</search>\n<replace>\nfn new() {}\n</replace>\n",
-            "</edit></tauqe_edits>\nAll done."
-        );
-
-        let (events, assistant_text) = drive_forward_stream(
-            filter,
-            vec![
-                StreamEvent::TextDelta(interrupted.to_string()),
-                StreamEvent::ResetStream,
-                StreamEvent::TextDelta(retried.to_string()),
-                StreamEvent::Done,
+        let dir = tempfile::tempdir().expect("scratch root");
+        let root = dir.path().to_path_buf();
+        let finding = |id: u32, group: Option<&str>| ReviewItem {
+            id,
+            title: format!("Finding {id}"),
+            uuid: None,
+            group: group.map(str::to_string),
+            model: None,
+            issue_type: IssueType::Architecture,
+            severity: ReviewSeverity::Warning,
+            status: IssueStatus::Todo,
+            recommendations: Vec::new(),
+            files: Vec::new(),
+            readonly_files: Vec::new(),
+            resolution_notes: None,
+            body: format!("Body {id}"),
+        };
+        let session = ReviewSession {
+            id: review_id.to_string(),
+            title: "Grouped Audit".to_string(),
+            created_at: 1,
+            groups: vec![ReviewGroup {
+                id: "arch-1".to_string(),
+                title: "Shared root cause".to_string(),
+                blocked_reason: Some("The lock ordering must be decided first".to_string()),
+                ..Default::default()
+            }],
+            items: vec![
+                finding(1, Some("arch-1")),
+                finding(2, Some("arch-1")),
+                finding(3, None),
             ],
-        )
-        .await;
-
-        // The decoded accumulator restarts with the filter, so the retried
-        // attempt is the only text the turn decodes.
-        assert!(!assistant_text.contains("First try."));
-        assert!(assistant_text.contains("All done."));
-
-        let retried_events = events_after_reset(&events);
-        assert_eq!(streamed_text(retried_events).trim(), "All done.");
-        assert_eq!(
-            file_completions(retried_events),
-            vec![(tauqe_protocol::EditFileStatus::Ok, 1)],
-            "the retried replacement applies to the untouched snapshot"
-        );
-        assert!(!retried_events.iter().any(|event| matches!(
-            event,
-            StreamEvent::EditHunk { new_text, .. } if new_text.contains("partial")
-        )));
+            ..Default::default()
+        };
+        crate::review::ReviewStorage::save_session(&root, &session).expect("save the session");
+        (dir, root)
     }
 
-    #[tokio::test]
-    async fn a_reset_stream_restarts_the_json_preview_from_a_clean_filter() {
-        use std::collections::HashMap;
+    /// Records one group decision over the fixture.
+    fn decide_group(root: &std::path::Path, review_id: &str, note: &str) {
+        use tauqe_protocol::review::{ReviewDecisionStatus, ReviewUpdateProposal};
 
-        use crate::edits::stream::JsonStreamFilter;
-
-        let filter = Box::new(
-            JsonStreamFilter::new(vec!["a.rs".to_string()], std::env::temp_dir())
-                .with_staged_contents(HashMap::from([(
-                    "a.rs".to_string(),
-                    "alpha\nbeta\ngamma\n".to_string(),
-                )])),
+        record_group_decision(
+            root,
+            review_id,
+            "arch-1",
+            &ReviewUpdateProposal {
+                item_id: 1,
+                group_id: Some("arch-1".to_string()),
+                status: ReviewDecisionStatus::Rejected,
+                note: note.to_string(),
+                recommendations: vec!["Document the ordering".to_string()],
+            },
         );
-
-        // The interrupted attempt completes one change and stops inside the
-        // `message` value, so the cascaded cursor and the staging simulator both
-        // carry state of the voided attempt.
-        let interrupted = concat!(
-            "{\"changes\":[{\"op\":\"replace\",\"path\":\"a.rs\",",
-            "\"old_text\":\"alpha\",\"new_text\":\"ALPHA\"}],",
-            "\"message\":\"First try."
-        );
-        let retried = concat!(
-            "{\"message\":\"Second try.\",\"changes\":[{\"op\":\"replace\",",
-            "\"path\":\"a.rs\",\"old_text\":\"alpha\",\"new_text\":\"ALPHA\"}]}"
-        );
-
-        let (events, assistant_text) = drive_forward_stream(
-            filter,
-            vec![
-                StreamEvent::TextDelta(interrupted.to_string()),
-                StreamEvent::ResetStream,
-                StreamEvent::TextDelta(retried.to_string()),
-                StreamEvent::Done,
-            ],
-        )
-        .await;
-
-        assert!(!assistant_text.contains("First try."));
-
-        let retried_events = events_after_reset(&events);
-        assert_eq!(streamed_text(retried_events), "Second try.");
-        assert_eq!(
-            file_completions(retried_events),
-            vec![(tauqe_protocol::EditFileStatus::Ok, 1)],
-            "the retried change applies to the snapshot, not to the voided hunk"
-        );
-        assert!(!retried_events.iter().any(|event| matches!(
-            event,
-            StreamEvent::EditFileDone { status, .. }
-                if *status == tauqe_protocol::EditFileStatus::Error
-        )));
     }
 
-    /// A failed offload must never degrade silently: the record emitted by
-    /// `log_join_error` keeps a panicked repository-state read distinguishable
-    /// from a repository that was never inspected.
-    #[tokio::test]
-    async fn a_failed_offload_leaves_an_observable_record() {
-        let (buffer, _guard) = crate::blocking::log_capture::install();
+    /// A decision that names a review group settles the group itself: one atomic
+    /// write clears the blocker and stamps the note onto every member finding,
+    /// and the whole membership moves to the decided status.
+    #[test]
+    fn a_group_decision_clears_the_blocker_and_moves_every_member() {
+        use tauqe_protocol::review::IssueStatus;
 
-        let state = offload_or_record(REPOSITORY_STATE_OPERATION, || -> u32 {
-            panic!("intentional panic for test")
-        })
-        .await;
+        let (_dir, root) = blocked_group_fixture("rev-group-decision");
+        decide_group(&root, "rev-group-decision", "The cache owns the lock");
 
-        assert!(state.is_none(), "a failed offload degrades to `None`");
-        let logged = crate::blocking::log_capture::contents(&buffer);
+        let stored = crate::review::ReviewStorage::load_review(&root, "rev-group-decision")
+            .expect("load the session")
+            .expect("the session is stored");
+        let group = &stored.groups[0];
         assert!(
-            logged.contains("offloaded blocking task failed"),
-            "the degradation must be observable: {logged}"
+            group.blocked_reason.is_none(),
+            "the decision ends the blocker: {:?}",
+            group.blocked_reason
         );
-        assert!(
-            logged.contains(REPOSITORY_STATE_OPERATION),
-            "the record must name the failed operation: {logged}"
+        assert_eq!(
+            group.resolution_notes.as_deref(),
+            Some("The cache owns the lock")
         );
-        assert!(
-            logged.contains("panicked"),
-            "the record must report the failure kind: {logged}"
+
+        for item in stored.items.iter().filter(|item| item.id != 3) {
+            assert_eq!(item.status, IssueStatus::Rejected);
+            assert_eq!(
+                item.resolution_notes.as_deref(),
+                Some("The cache owns the lock")
+            );
+            assert_eq!(
+                item.recommendations,
+                vec!["Document the ordering".to_string()],
+                "the agreed remediation is appended once"
+            );
+        }
+
+        // A finding of another group is never touched.
+        let untouched = stored.find_item(3).expect("the third finding is stored");
+        assert_eq!(untouched.status, IssueStatus::Todo);
+        assert!(untouched.resolution_notes.is_none());
+    }
+
+    /// A decision must state its own reasoning: the storage engine rejects one
+    /// without a note, so the group keeps its blocker and its membership keeps
+    /// its lifecycle status.
+    #[test]
+    fn a_group_decision_without_its_reasoning_changes_nothing() {
+        use tauqe_protocol::review::IssueStatus;
+
+        let (_dir, root) = blocked_group_fixture("rev-group-blank-decision");
+        decide_group(&root, "rev-group-blank-decision", "   ");
+
+        let stored = crate::review::ReviewStorage::load_review(&root, "rev-group-blank-decision")
+            .expect("load the session")
+            .expect("the session is stored");
+        assert_eq!(
+            stored.groups[0].blocked_reason.as_deref(),
+            Some("The lock ordering must be decided first")
         );
+        assert!(stored.groups[0].resolution_notes.is_none());
+        let member = stored.find_item(1).expect("the finding is stored");
+        assert_eq!(member.status, IssueStatus::Todo);
+        assert!(member.resolution_notes.is_none());
     }
 }

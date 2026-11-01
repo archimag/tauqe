@@ -1,0 +1,839 @@
+//! Structured Architect synthesis contour: Schema Healing and tier escalation.
+//!
+//! Horizon synthesis and review-group decomposition are one Architect operation,
+//! so both drive this contour: the universal turn kernel carries the rounds, the
+//! prompt assembly, the discovery journal, and the corrective budget of an empty
+//! answer, while the contour owns the policy that is specific to a structured
+//! Architect payload.
+//!
+//! The regime is declared, never inferred: the kernel recognizes the turn through
+//! [`TurnIntent::ArchitectSynthesis`], and the wire surface is the typed
+//! [`PlanRefinePromptProtocol`], so the rendered instructions, the response
+//! schema, and the decoder observe one capability surface.
+//!
+//! Three terminal policies live here:
+//!
+//! - *Silence* is a transport-level non-answer, so the kernel's own budget
+//!   resolves it and the running architect rung is never charged for it.
+//! - *An unparsable payload* is a schema violation: the decoding diagnostic travels
+//!   back to the model as the trailing directive of the next request and spends
+//!   one attempt of the rung ([`ArchitectTier::attempts`]). An exhausted rung
+//!   climbs the ladder through [`ModelsConfig::next_architect_tier`], applies the
+//!   promoted rung's reasoning effort to every later round, and rotates the
+//!   provider session identifier with the effective model. A rung served by
+//!   another provider is resolved through the injected [`ProviderResolver`].
+//! - *A breached context budget* and a *`needs_context` answer that can no longer
+//!   be served* are typed terminal outcomes ([`StructuredRefineStatus`]), so a
+//!   caller renders them deterministically instead of reconstructing a verdict
+//!   from prose.
+//!
+//! The contour never records session history: recording a synthesis belongs to the
+//! caller. It does clear the auto context layer it widened, because the material
+//! gathered for a synthesis is the Architect's investigation rather than the
+//! developer's dialogue.
+
+use std::path::Path;
+use std::sync::Arc;
+
+use tauqe_protocol::{ArchitectTier, ModelRole, ProviderKind, TurnIntent, TurnPhase};
+use tokio::sync::{mpsc, watch};
+
+use crate::config::ModelsConfig;
+use crate::context::ContextManager;
+use crate::history::HistoryManager;
+use crate::plan::prompt::{parse_plan_refinement_output, PlanRefinementOutput};
+use crate::plan::storage::PlanMutationMode;
+use crate::prompt::refine::PlanRefinePromptProtocol;
+use crate::providers::{format_session_id, LlmProvider, StreamEvent};
+use crate::workflow::discovery::journal::TurnDiscoveryJournal;
+use crate::workflow::discovery::{
+    execute_discovery_commands, ContextLimitExceeded, DiscoveryRoundOutcome,
+};
+use crate::workflow::policy::DirectApplyPolicy;
+use crate::workflow::WorkflowOptions;
+
+use super::cache::TurnInputCache;
+use super::kernel::{EmptyStepGuard, EmptyStepRetry, TurnKernel};
+use super::proposal::{log_fsm_phase, ProposalStep, TurnState};
+use super::FsmTurnOutcome;
+
+/// Operation label recorded for every round of a synthesis run.
+const WORKFLOW_NAME: &str = "architect";
+
+/// Directive appended to the turn journal when a discovery round produced nothing.
+///
+/// A barren round is neither progress nor a dead end: the harness answered every
+/// request with nothing, so the round is still charged and the model receives an
+/// explicit answer contract instead of an exhausted-budget verdict.
+const BARREN_ROUND_DIRECTIVE: &str = "<response_directive>\nThe previous discovery round produced no new information: no requested file was added to context, nothing is missing, and no search or targeted contour returned a result. Finalize the horizon now with status 'success', report status 'blocked' with the exact reason, or request concrete paths that exist in <repo_map>.\n</response_directive>";
+
+/// Directive appended to the turn journal once the discovery budget is spent.
+const DISCOVERY_LIMIT_DIRECTIVE: &str = "<response_directive>\nThe discovery round limit is exhausted: no further files, repository searches, symbol contours, or documentation will be loaded in this turn. Your investigation is complete. Do not request additional paths. Finalize the horizon with status 'success', or report status 'blocked' with the exact reason when the material you already hold is insufficient.\n</response_directive>";
+
+/// Typed resolver of the provider client that serves another provider.
+///
+/// A provider client is bound to one provider kind, so a rung served by another
+/// provider needs a freshly resolved client instead of a reused one. The
+/// injection keeps the engine free of provider construction policy: the adapter
+/// that owns credentials and transport configuration is the only place that
+/// knows how a client is built.
+pub trait ProviderResolver: Send + Sync {
+    /// Resolves the client of `kind`.
+    ///
+    /// The hook is synchronous because it is consulted from inside a proposal
+    /// round; an adapter whose resolution path is asynchronous bridges the call
+    /// itself. The `Send + Sync` bound lets a contour carry the resolver into
+    /// the task that drives the synthesis, exactly like the client it returns.
+    fn resolve(&self, kind: ProviderKind) -> anyhow::Result<Arc<dyn LlmProvider>>;
+}
+
+/// Static configuration of one structured synthesis run.
+pub struct StructuredRefineConfig<'a> {
+    /// Repository root the synthesis operates in.
+    pub repo_root: &'a Path,
+    /// Frozen operational budgets of the run.
+    pub options: &'a WorkflowOptions,
+    /// Architect ladder consulted once a rung has spent its attempts.
+    pub models: &'a ModelsConfig,
+    /// Rung the synthesis starts on.
+    pub tier: ArchitectTier,
+    /// Resolver of a client served by another provider.
+    pub providers: &'a dyn ProviderResolver,
+    /// Header the synthesis opens with.
+    pub intro_header: &'a str,
+    /// Diagnostic appended when the files token budget is breached.
+    pub budget_hint: &'a str,
+}
+
+/// Typed terminal status of one structured synthesis run.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StructuredRefineStatus {
+    /// The Architect finalized the horizon.
+    Synthesized,
+    /// The Architect demanded more context than `files_token_budget` allows.
+    BudgetExceeded {
+        /// Deterministic report the caller surfaces.
+        diagnostic: String,
+    },
+    /// The synthesis could not finalize within the approved design.
+    Blocked {
+        /// Deterministic reason the caller reports.
+        reason: String,
+    },
+    /// The turn was cancelled before the Architect finalized.
+    Cancelled,
+}
+
+impl StructuredRefineStatus {
+    /// Reports whether the synthesis produced an accepted horizon.
+    pub fn is_synthesized(&self) -> bool {
+        matches!(self, Self::Synthesized)
+    }
+}
+
+/// Result of one structured synthesis run.
+#[derive(Debug, Clone)]
+pub struct StructuredRefineOutcome {
+    /// Typed payload of the round that ended the run, when one parsed.
+    pub output: Option<PlanRefinementOutput>,
+    /// Rung the run ended on.
+    pub tier: ArchitectTier,
+    /// Typed terminal status of the run.
+    pub status: StructuredRefineStatus,
+}
+
+/// Accepted terminal status of one synthesis round.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RoundStatus {
+    /// The Architect finalized the horizon.
+    Success,
+    /// The Architect refused to plan and stated its reason.
+    Blocked,
+    /// The Architect named the evidence it still needs.
+    NeedsContext,
+}
+
+/// Result of one proposal round after the kernel's corrective budget ran.
+enum RoundOutcome {
+    /// The round produced a proposal to interpret.
+    Proposed(Box<ProposalStep>),
+    /// The kernel's corrective budget is spent: the model stayed silent.
+    Silent,
+    /// The turn terminated inside the kernel.
+    Terminated(Box<FsmTurnOutcome>),
+}
+
+/// Runs one structured Architect synthesis on the universal turn kernel.
+///
+/// `task` is the complete task statement of the run: the caller composes it from
+/// the domain framing, the architectural concept, the completed foundation, and
+/// the rendered repository outline. The contour composes every later round from
+/// that statement and the accumulated discovery journal, so the provider keeps
+/// matching the prompt prefix it already cached.
+pub async fn run_structured_refine(
+    context_manager: &mut ContextManager,
+    provider: Arc<dyn LlmProvider>,
+    task: &str,
+    config: StructuredRefineConfig<'_>,
+    stream_tx: mpsc::Sender<StreamEvent>,
+    cancel_rx: watch::Receiver<bool>,
+) -> anyhow::Result<StructuredRefineOutcome> {
+    let repo_root = config.repo_root;
+    let protocol = PlanRefinePromptProtocol::new();
+    // The synthesis renders no session history, so this manager is never read; it
+    // exists because the shared round executor takes the dialogue it would
+    // otherwise freeze for the turn.
+    let history_manager = HistoryManager::new(repo_root.to_path_buf());
+
+    let mut policy = DirectApplyPolicy::new();
+    let mut input_cache = TurnInputCache::default();
+    let mut state = TurnState::default();
+    let mut journal = TurnDiscoveryJournal::default();
+    let mut accumulated_text = String::new();
+    let mut rounds_used = 0usize;
+    let mut empty_steps = EmptyStepGuard::default();
+
+    let base_effort = config.options.reasoning_effort;
+    let base_session = config.options.session_id.clone();
+    let mut options = config.options.clone();
+    let mut provider = provider;
+    let mut tier = config.tier.clone();
+    options.reasoning_effort = tier.effort.or(base_effort);
+    let mut tier_attempts = tier.attempts() as usize;
+    let mut attempts_used = 0usize;
+    let mut phase_diagnostics: Option<String> = None;
+
+    // The opening header reaches the client once, as the first event of the run.
+    if !config.intro_header.trim().is_empty() {
+        let _ = stream_tx
+            .send(StreamEvent::TextDelta(config.intro_header.to_string()))
+            .await;
+    }
+
+    let (output, status) = loop {
+        // A cancel raised during discovery, while a reference document streamed,
+        // or between two provider requests ends the synthesis before another
+        // round is spent.
+        if *cancel_rx.borrow() {
+            break (None, StructuredRefineStatus::Cancelled);
+        }
+
+        // The closing directive is what a model that still needs material reads:
+        // it turns an exhausted budget into an explicit answer contract instead of
+        // leaving the request unanswered.
+        if rounds_used >= options.max_discovery_rounds {
+            journal.push_block(DISCOVERY_LIMIT_DIRECTIVE);
+        }
+
+        let round_prompt = journal.compose_user_prompt(task, phase_diagnostics.as_deref());
+        log_fsm_phase(
+            WORKFLOW_NAME,
+            &tier.model,
+            false,
+            TurnPhase::Proposal,
+            Some(rounds_used + 1),
+            None,
+        );
+        let _ = stream_tx
+            .send(StreamEvent::TurnPhase {
+                phase: TurnPhase::Proposal,
+                round: Some(rounds_used + 1),
+                max_rounds: None,
+                detail: None,
+            })
+            .await;
+
+        // The kernel is re-bound for every round: a promoted rung changes the
+        // effective model, its reasoning effort, and — when the provider changes —
+        // the client itself. The turn-scoped state travels across bindings, so the
+        // journal, the round budget, and the corrective budget of an empty answer
+        // survive the promotion.
+        let round = {
+            let mut kernel = TurnKernel {
+                prompt: task,
+                provider: &*provider,
+                model: &tier.model,
+                protocol: &protocol,
+                history_manager: &history_manager,
+                workflow_name: WORKFLOW_NAME,
+                stream_tx: &stream_tx,
+                cancel_rx: &cancel_rx,
+                options: &options,
+                repo_root,
+                intent: TurnIntent::ArchitectSynthesis,
+                plan_mode: PlanMutationMode::Discussion,
+                policy: &mut policy,
+                context_manager,
+                input_cache: &mut input_cache,
+                state,
+                journal,
+                rounds_used,
+                accumulated_text,
+                empty_steps,
+            };
+            let round = run_round(&mut kernel, &round_prompt).await;
+            state = kernel.state;
+            journal = kernel.journal;
+            rounds_used = kernel.rounds_used;
+            accumulated_text = kernel.accumulated_text;
+            empty_steps = kernel.empty_steps;
+            round?
+        };
+
+        let step = match round {
+            RoundOutcome::Proposed(step) => *step,
+            RoundOutcome::Silent => {
+                let attempts = empty_steps.budget();
+                tracing::warn!(
+                    workflow = WORKFLOW_NAME,
+                    model = %tier.model,
+                    attempts,
+                    "architect produced no payload after every corrective round"
+                );
+                break (
+                    None,
+                    StructuredRefineStatus::Blocked {
+                        reason: format!(
+                            "The model returned an empty response after {attempts} additional attempt(s) and produced no horizon payload."
+                        ),
+                    },
+                );
+            }
+            RoundOutcome::Terminated(turn) => {
+                let turn = *turn;
+                if turn.is_cancelled {
+                    break (None, StructuredRefineStatus::Cancelled);
+                }
+                break (
+                    None,
+                    StructuredRefineStatus::Blocked {
+                        reason: turn.blocked.unwrap_or_else(|| {
+                            "The synthesis terminated without a horizon payload.".to_string()
+                        }),
+                    },
+                );
+            }
+        };
+
+        let parsed = parse_round(&step);
+        let (output, round_status) = match parsed {
+            Ok(parsed) => {
+                // A parseable round is progress, so the running rung regains its
+                // whole attempt budget: a `needs_context` answer must never count
+                // as a failure.
+                attempts_used = 0;
+                phase_diagnostics = None;
+                parsed
+            }
+            Err(err) => {
+                attempts_used += 1;
+                let feedback = schema_healing_feedback(&err, attempts_used, tier_attempts);
+                let banner = format!(
+                    "\n\n---\n⚠️ **[Schema Healing {}/{}]** {}\n\n",
+                    attempts_used, tier_attempts, err
+                );
+                let _ = stream_tx.send(StreamEvent::TextDelta(banner)).await;
+                phase_diagnostics = Some(feedback);
+
+                if attempts_used < tier_attempts {
+                    tracing::warn!(
+                        workflow = WORKFLOW_NAME,
+                        round = rounds_used + 1,
+                        attempt = attempts_used,
+                        max_attempts = tier_attempts,
+                        model = %tier.model,
+                        error = %err,
+                        "architect payload violated the response schema; regenerating the same tier"
+                    );
+                    continue;
+                }
+
+                // The rung spent its whole generation budget. The ladder either
+                // hands out the next configuration or stays where it is, which
+                // means the synthesis cannot climb any further.
+                let next = config.models.next_architect_tier(Some(&tier));
+                if next == tier {
+                    tracing::error!(
+                        workflow = WORKFLOW_NAME,
+                        attempts = attempts_used,
+                        max_attempts = tier_attempts,
+                        model = %tier.model,
+                        error = %err,
+                        "architect ladder is saturated without a payload the schema accepts"
+                    );
+                    break (
+                        None,
+                        StructuredRefineStatus::Blocked {
+                            reason: format!(
+                                "Failed to parse the architect refinement output after {} attempt(s) on {}: {}",
+                                attempts_used,
+                                format_tier(&tier),
+                                err
+                            ),
+                        },
+                    );
+                }
+
+                let promoted_from = format_tier(&tier);
+                let tier_index = config
+                    .models
+                    .architect_tier_index(Some(&next))
+                    .unwrap_or_default();
+                tracing::warn!(
+                    workflow = WORKFLOW_NAME,
+                    round = rounds_used + 1,
+                    attempts = attempts_used,
+                    max_attempts = tier_attempts,
+                    from_model = %tier.model,
+                    to_model = %next.model,
+                    error = %err,
+                    "architect tier exhausted its attempts; escalating the architect ladder"
+                );
+                let _ = stream_tx
+                    .send(StreamEvent::TierEscalated {
+                        tier: tier_index,
+                        model: next.model.clone(),
+                        role: ModelRole::Architect,
+                        effort: next.effort,
+                    })
+                    .await;
+                // A client is bound to one provider kind, so a rung served by
+                // another provider needs a freshly resolved client instead of the
+                // current one.
+                if next.model.provider != tier.model.provider {
+                    provider = config.providers.resolve(next.model.provider)?;
+                }
+                // A promoted model addresses a backend node whose prefix cache was
+                // warmed by that very model, so the session identifier rotates with
+                // it (crates/core/Conventions.md §9.9).
+                if next.model != tier.model {
+                    options.session_id = base_session
+                        .as_ref()
+                        .map(|session| format_session_id(session, &format!("tier{tier_index}")));
+                }
+                options.reasoning_effort = next.effort.or(base_effort);
+                tier = next;
+                tier_attempts = tier.attempts() as usize;
+                attempts_used = 0;
+
+                let banner = format!(
+                    "\n\n> Architect level up: {} → {}\n\n",
+                    promoted_from,
+                    format_tier(&tier)
+                );
+                let _ = stream_tx.send(StreamEvent::TextDelta(banner)).await;
+                continue;
+            }
+        };
+
+        match round_status {
+            RoundStatus::Success => break (Some(output), StructuredRefineStatus::Synthesized),
+            RoundStatus::Blocked => {
+                let reason = blocked_reason(&output);
+                break (Some(output), StructuredRefineStatus::Blocked { reason });
+            }
+            RoundStatus::NeedsContext => {
+                if rounds_used >= options.max_discovery_rounds {
+                    // The budget is spent while the Architect still needs the
+                    // material it names: a typed block, never a payload that
+                    // silently claims to be a horizon.
+                    break (
+                        Some(output),
+                        StructuredRefineStatus::Blocked {
+                            reason: discovery_limit_reason(options.max_discovery_rounds),
+                        },
+                    );
+                }
+
+                let outcome = execute_discovery_commands(
+                    context_manager,
+                    repo_root,
+                    step.commands(),
+                    options.files_token_budget,
+                    options.repomap_token_budget,
+                    options.discovery_limits,
+                    true,
+                    // The round races the turn's own cancel signal, so an
+                    // abandoned request stops waiting for a slow reference host.
+                    Some(&cancel_rx),
+                )
+                .await;
+
+                if let Some(limit) = outcome.limit_exceeded.as_ref() {
+                    let diagnostic = budget_diagnostic(limit, config.budget_hint);
+                    tracing::warn!(
+                        workflow = WORKFLOW_NAME,
+                        token_budget = limit.token_budget,
+                        requested_tokens = limit.requested_tokens,
+                        current_tokens = limit.current_tokens,
+                        "context files token budget exceeded"
+                    );
+                    let banner = format!("\n\n---\n⚠️ {diagnostic}\n\n");
+                    let _ = stream_tx.send(StreamEvent::TextDelta(banner)).await;
+                    break (
+                        Some(output),
+                        StructuredRefineStatus::BudgetExceeded { diagnostic },
+                    );
+                }
+
+                // Every `needs_context` answer is charged as one investigation
+                // round: it is a provider round trip that asked for material,
+                // whether or not it widened anything. A round that produced
+                // nothing is therefore never mistaken for an exhausted budget.
+                rounds_used += 1;
+                let _ = stream_tx
+                    .send(StreamEvent::TurnPhase {
+                        phase: TurnPhase::Discovery,
+                        round: Some(rounds_used),
+                        max_rounds: Some(options.max_discovery_rounds),
+                        detail: Some("Discovery round completed".to_string()),
+                    })
+                    .await;
+                if !outcome.has_progress(true) {
+                    journal.push_block(BARREN_ROUND_DIRECTIVE);
+                }
+                stream_round_banner(&stream_tx, rounds_used, &outcome).await;
+                // The findings join the turn journal, so a later round still reads
+                // the search reports and contours this one paid for.
+                journal.record_outcome(&outcome);
+                continue;
+            }
+        }
+    };
+
+    // The synthesis owns the auto context layer it widened: the material is the
+    // Architect's investigation, not the developer's dialogue, so it never
+    // survives the run. Clearing the layer recomputes pinned files through disk
+    // checks, so the sweep runs off the async executor thread.
+    crate::blocking::run_blocking(|| {
+        context_manager.clear_auto();
+    });
+    let _ = stream_tx.send(StreamEvent::Done).await;
+
+    Ok(StructuredRefineOutcome {
+        output,
+        tier,
+        status,
+    })
+}
+
+/// Executes one proposal round and resolves the kernel's corrective budget.
+///
+/// Silence is a transport-level non-answer, so the kernel's own budget resolves
+/// it: the model tier is never charged for a reply that carried nothing
+/// actionable, which is what keeps an empty generation from consuming an attempt
+/// of the running architect rung.
+async fn run_round(
+    kernel: &mut TurnKernel<'_>,
+    round_prompt: &str,
+) -> anyhow::Result<RoundOutcome> {
+    let mut step = kernel.propose(round_prompt, None).await?;
+    loop {
+        if step.is_cancelled {
+            let accumulated = std::mem::take(&mut kernel.accumulated_text);
+            return Ok(RoundOutcome::Terminated(Box::new(
+                FsmTurnOutcome::cancelled(accumulated),
+            )));
+        }
+        if !step.is_empty_step() {
+            return Ok(RoundOutcome::Proposed(Box::new(step)));
+        }
+        match kernel.reask_after_empty_round().await? {
+            EmptyStepRetry::Proposed(next) => step = *next,
+            EmptyStepRetry::Exhausted => return Ok(RoundOutcome::Silent),
+            EmptyStepRetry::Terminate(outcome) => {
+                return Ok(RoundOutcome::Terminated(outcome));
+            }
+        }
+    }
+}
+
+/// Decodes the typed payload of one round.
+///
+/// The single deserializer of the contour owns both the payload shape and the
+/// accepted status vocabulary, so a payload that violates either is one schema
+/// violation and receives the same healing treatment.
+fn parse_round(step: &ProposalStep) -> Result<(PlanRefinementOutput, RoundStatus), String> {
+    let output = parse_plan_refinement_output(step.raw_text()).map_err(|err| err.to_string())?;
+    let status = match output.status.trim().to_ascii_lowercase().as_str() {
+        "success" => RoundStatus::Success,
+        "blocked" => RoundStatus::Blocked,
+        "needs_context" => RoundStatus::NeedsContext,
+        other => return Err(format!("Unsupported plan refinement status '{other}'")),
+    };
+    Ok((output, status))
+}
+
+/// Renders the model-facing diagnostic of a schema violation.
+fn schema_healing_feedback(err: &str, attempt: usize, budget: usize) -> String {
+    format!(
+        "<response_directive>\nYour previous reply did not satisfy the response schema ({err}). Regenerate the whole payload strictly according to the specified JSON schema: `status`, `explanation`, `reason`, `context_requests`, `repo_searches`, `repo_maps`, and `items` are all required. This was attempt {attempt} of {budget} on the running architect configuration.\n</response_directive>"
+    )
+}
+
+/// Formats an architect rung for a developer-facing message.
+fn format_tier(tier: &ArchitectTier) -> String {
+    match tier.effort {
+        Some(effort) => format!("{} ({effort})", tier.model),
+        None => tier.model.to_string(),
+    }
+}
+
+/// Reads the reason an Architect payload states for its blocker.
+fn blocked_reason(output: &PlanRefinementOutput) -> String {
+    output
+        .reason
+        .as_deref()
+        .map(str::trim)
+        .filter(|reason| !reason.is_empty())
+        .map(str::to_string)
+        .or_else(|| {
+            let explanation = output.explanation.trim();
+            (!explanation.is_empty()).then(|| explanation.to_string())
+        })
+        .unwrap_or_else(|| "The Architect reported a blocker without stating a reason.".to_string())
+}
+
+/// Renders the typed reason of a synthesis that ran out of discovery rounds.
+fn discovery_limit_reason(limit: usize) -> String {
+    format!(
+        "The Architect still required repository material after {limit} discovery round(s), and no further files, searches, contours, or documentation can be loaded in this turn."
+    )
+}
+
+/// Renders the typed report of a breached context budget.
+fn budget_diagnostic(limit: &ContextLimitExceeded, hint: &str) -> String {
+    let mut diagnostic = format!(
+        "Context files token budget exceeded (files_token_budget = {}). The Architect requested {} token(s) in {} new file(s) [{}], but the context already holds {} token(s).",
+        limit.token_budget,
+        limit.requested_tokens,
+        limit.requested_files.len(),
+        limit.requested_files.join(", "),
+        limit.current_tokens
+    );
+    let hint = hint.trim();
+    if !hint.is_empty() {
+        diagnostic.push(' ');
+        diagnostic.push_str(hint);
+    }
+    diagnostic
+}
+
+/// Streams the developer-facing summary of one discovery round.
+async fn stream_round_banner(
+    stream_tx: &mpsc::Sender<StreamEvent>,
+    round: usize,
+    outcome: &DiscoveryRoundOutcome,
+) {
+    let summary = outcome.architect_banner_summary();
+    let summary = summary.trim();
+    let body = if summary.is_empty() {
+        "The requested material produced no new information."
+    } else {
+        summary
+    };
+    let banner = format!("\n\n---\n**[Round {}]** {}\n\n", round, body);
+    let _ = stream_tx.send(StreamEvent::TextDelta(banner)).await;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::providers::mock::{MockLlmProvider, MockResponse};
+    use tauqe_protocol::{ModelRef, ReasoningEffort};
+
+    /// Creates a repository the synthesis can inspect.
+    fn repo() -> (tempfile::TempDir, std::path::PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        crate::git::init_repository(Some(&root), true).unwrap();
+        std::fs::write(root.join("a.rs"), "pub fn alpha() {}\n").unwrap();
+        crate::git::cmd::stage_files(&root, &["a.rs".to_string()]).unwrap();
+        crate::git::cmd::commit_with_developer_author(&root, "Add fixture", false).unwrap();
+        (dir, root)
+    }
+
+    /// Resolver a single-provider synthesis must never consult.
+    struct NoResolver;
+
+    impl ProviderResolver for NoResolver {
+        fn resolve(&self, kind: ProviderKind) -> anyhow::Result<Arc<dyn LlmProvider>> {
+            anyhow::bail!("a single-provider synthesis must not resolve {kind}")
+        }
+    }
+
+    /// Builds a models section declaring the given architect ladder.
+    fn models(architect: &str) -> ModelsConfig {
+        let declaration =
+            format!("[models]\nprimary = [\"openrouter:mock/base\"]\narchitect = [{architect}]\n");
+        let config: crate::config::AppConfig =
+            toml::from_str(&declaration).expect("parse the architect ladder");
+        config.models
+    }
+
+    /// Builds one architect payload with the given status and explanation.
+    fn payload(status: &str, explanation: &str) -> String {
+        serde_json::json!({
+            "status": status,
+            "explanation": explanation,
+            "reason": null,
+            "context_requests": [],
+            "repo_searches": [],
+            "repo_maps": [],
+            "items": []
+        })
+        .to_string()
+    }
+
+    /// A barren `needs_context` round widens nothing, mentions nothing missing,
+    /// and returns no search or contour result. It must be charged as one
+    /// investigation round and answered with a corrective directive instead of
+    /// ending the synthesis with a false exhausted-budget verdict.
+    #[tokio::test]
+    async fn a_barren_needs_context_round_is_charged_and_directed() {
+        let (_dir, root) = repo();
+        let models = models("");
+        let provider = Arc::new(MockLlmProvider::scripted([
+            MockResponse::text(payload("needs_context", "The contract is not verified yet")),
+            MockResponse::text(payload(
+                "success",
+                "Horizon synthesized from the held material",
+            )),
+        ]));
+        let client: Arc<dyn LlmProvider> = provider.clone();
+        let mut context = ContextManager::new(root.clone());
+        let options = WorkflowOptions::default();
+        let (stream_tx, mut stream_rx) = mpsc::channel(256);
+        let collector = tokio::spawn(async move {
+            let mut events = Vec::new();
+            while let Some(event) = stream_rx.recv().await {
+                events.push(event);
+            }
+            events
+        });
+        let (_cancel_tx, cancel_rx) = watch::channel(false);
+
+        let outcome = run_structured_refine(
+            &mut context,
+            client,
+            "Synthesize the unfinished horizon",
+            StructuredRefineConfig {
+                repo_root: &root,
+                options: &options,
+                models: &models,
+                tier: models.architect_tier(0),
+                providers: &NoResolver,
+                intro_header: "",
+                budget_hint: "",
+            },
+            stream_tx,
+            cancel_rx,
+        )
+        .await
+        .expect("the synthesis runs to completion");
+
+        assert_eq!(outcome.status, StructuredRefineStatus::Synthesized);
+        assert!(outcome.output.is_some());
+        assert_eq!(
+            provider.requests().len(),
+            2,
+            "the barren round is charged as one investigation round"
+        );
+
+        let second = &provider.requests()[1];
+        assert!(
+            second
+                .messages
+                .iter()
+                .any(|message| message.content.contains("produced no new information")),
+            "the barren round must be answered with a corrective directive"
+        );
+        assert!(
+            second
+                .messages
+                .iter()
+                .any(|message| message.content.contains("status 'success'")),
+            "the directive must name the final statuses"
+        );
+        assert!(
+            second
+                .messages
+                .iter()
+                .any(|message| message.content.contains("<repo_map>")),
+            "the directive must route a further request to the rendered outline"
+        );
+
+        drop(_cancel_tx);
+        let events = collector.await.expect("the collector joins");
+        assert!(events
+            .iter()
+            .any(|event| matches!(event, StreamEvent::Done)));
+    }
+
+    /// An unparsable payload spends one attempt of the running rung; an exhausted
+    /// rung climbs the architect ladder with the promoted rung's reasoning effort.
+    #[tokio::test]
+    async fn an_exhausted_rung_climbs_the_architect_ladder() {
+        let (_dir, root) = repo();
+        let models = models(
+            "{ model = \"openrouter:mock/base\", attempts = 1 }, \
+             { model = \"openrouter:mock/strong\", attempts = 1, effort = \"high\" }",
+        );
+        let provider = Arc::new(MockLlmProvider::scripted([
+            MockResponse::text("not a refinement payload"),
+            MockResponse::text(payload("success", "Horizon synthesized on the strong rung")),
+        ]));
+        let client: Arc<dyn LlmProvider> = provider.clone();
+        let mut context = ContextManager::new(root.clone());
+        let options = WorkflowOptions::default();
+        let (stream_tx, mut stream_rx) = mpsc::channel(256);
+        let collector = tokio::spawn(async move {
+            let mut events = Vec::new();
+            while let Some(event) = stream_rx.recv().await {
+                events.push(event);
+            }
+            events
+        });
+        let (_cancel_tx, cancel_rx) = watch::channel(false);
+
+        let outcome = run_structured_refine(
+            &mut context,
+            client,
+            "Synthesize the unfinished horizon",
+            StructuredRefineConfig {
+                repo_root: &root,
+                options: &options,
+                models: &models,
+                tier: models.architect_tier(0),
+                providers: &NoResolver,
+                intro_header: "",
+                budget_hint: "",
+            },
+            stream_tx,
+            cancel_rx,
+        )
+        .await
+        .expect("the synthesis runs to completion");
+
+        assert_eq!(outcome.status, StructuredRefineStatus::Synthesized);
+        assert_eq!(outcome.tier.model, ModelRef::openrouter("mock/strong"));
+        assert_eq!(provider.requests().len(), 2, "one attempt per rung");
+        assert_eq!(
+            provider.requests()[1].reasoning_effort,
+            Some(ReasoningEffort::High),
+            "the promoted rung applies its own reasoning effort"
+        );
+
+        drop(_cancel_tx);
+        let events = collector.await.expect("the collector joins");
+        assert!(
+            events.iter().any(|event| matches!(
+                event,
+                StreamEvent::TierEscalated { model, effort, .. }
+                    if *model == ModelRef::openrouter("mock/strong")
+                        && *effort == Some(ReasoningEffort::High)
+            )),
+            "the promotion must travel as a semantic event"
+        );
+    }
+}

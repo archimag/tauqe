@@ -2,10 +2,11 @@
 //!
 //! Once edits are staged, this module applies them into the working tree through
 //! a [`TransactionRollbackGuard`], runs the deterministic toolchain check, and
-//! drives the self-healing loop that feeds compiler diagnostics back to the
-//! model until the build is clean or the retry budget is exhausted. A clean
-//! build is finalized into a Git transaction; any failure rolls the working tree
-//! back to its pre-turn checkpoint.
+//! drives the self-healing loop that feeds diagnostics back to the model until
+//! the declared gate passes or the retry budget is exhausted. A passing gate
+//! and a project that declares no verification lifecycle alike are finalized
+//! into a Git transaction with the explicit verdict preserved; any failure
+//! rolls the working tree back to its pre-turn checkpoint.
 
 use std::path::Path;
 
@@ -20,6 +21,7 @@ use crate::edits::protocol::{
     VerifyTarget as EditVerifyTarget,
 };
 use crate::providers::StreamEvent;
+use crate::toolchain::VerificationStatus;
 use crate::workflow::discovery::execute_discovery_commands;
 use crate::workflow::verification::{
     build_verification_missing_edits_prompt, build_verification_retry_prompt, extract_error_paths,
@@ -27,15 +29,17 @@ use crate::workflow::verification::{
 };
 
 use super::guard::{finish_turn, TransactionRollbackGuard};
+use super::kernel::{propose_round, TurnKernel};
 use super::proposal::{extract_success_summary, log_fsm_phase, merge_text};
-use super::{cancel_requested, propose, FsmTurnOutcome, PhaseContext};
+use super::FsmTurnOutcome;
 
-/// Finalizes a step interrupted at a phase boundary.
+/// Finalizes a cancelled step of the code contour.
 ///
 /// The cancel signal is authoritative on every boundary that would produce more
-/// work, so the open transaction is rolled back, the working tree returns to its
-/// pre-step state, the context change is published, and the turn reports
-/// cancellation instead of a verified result.
+/// work, and it also voids a round that already started, so the open transaction
+/// is rolled back, the working tree returns to its pre-step state, the context
+/// state is published, and the turn reports cancellation instead of a verified
+/// result.
 async fn finish_cancelled_step(
     guard: &mut TransactionRollbackGuard<'_>,
     stream_tx: &mpsc::Sender<StreamEvent>,
@@ -52,12 +56,14 @@ async fn finish_cancelled_step(
 ///
 /// Applies the staged edits into the working tree, resolves the effective
 /// verification request (falling back to the toolchain auto-verify default),
-/// runs the deterministic check, and heals compiler failures by re-prompting the
-/// model up to `max_retries`. A clean build is finalized into a transaction; a
-/// failed or cancelled verification rolls the working tree back. The returned
+/// runs the deterministic check, and heals failures of the declared gate by
+/// re-prompting the model up to `max_retries`. A passing gate and an undeclared
+/// verification lifecycle alike are finalized into a transaction with the
+/// verdict preserved; a failed or cancelled verification rolls the working tree
+/// back. The returned outcome is always terminal for the turn.
 /// outcome is always terminal for the turn.
 pub(super) async fn run_apply_and_verify_phase(
-    ctx: &mut PhaseContext<'_>,
+    ctx: &mut TurnKernel<'_>,
     cumulative_edits: Vec<EditOperation>,
     verify_request: Option<EditVerifyRequest>,
 ) -> anyhow::Result<FsmTurnOutcome> {
@@ -85,7 +91,7 @@ pub(super) async fn run_apply_and_verify_phase(
 
     // Phase boundary: a cancel observed before the change set reaches the disk
     // ends the step here, so no application, verification, or commit follows.
-    if cancel_requested(ctx.cancel_rx) {
+    if *ctx.cancel_rx.borrow() {
         let accumulated = std::mem::take(&mut ctx.accumulated_text);
         return Ok(finish_cancelled_step(&mut guard, ctx.stream_tx, accumulated).await);
     }
@@ -112,6 +118,7 @@ pub(super) async fn run_apply_and_verify_phase(
                     error: Some(error.to_string()),
                     changed_files: Vec::new(),
                     commit_hash: None,
+                    verification: None,
                 },
             };
             return Ok(finish_turn(
@@ -125,11 +132,14 @@ pub(super) async fn run_apply_and_verify_phase(
         }
     };
 
-    // Verification is an inviolable project invariant: the declared
-    // `[project.verify]` lifecycle runs after every change set, so the request
-    // always exists and the model shapes only whether a passing run is reported.
-    // Because the project declares one lifecycle command, the requested target is
-    // a label rather than a command selector and can never weaken the gate.
+    // Verification is a declared project capability, not a universal barrier:
+    // `[project.verify]` is optional, so the request always exists as a label
+    // while the explicit verdict decides whether the change set may be
+    // committed. A project that declares no lifecycle reaches the commit with
+    // its `NotConfigured` verdict intact, and the model shapes only whether a
+    // passing run is reported. Because the project declares one lifecycle
+    // command, the requested target is a label rather than a command selector
+    // and can never weaken the gate.
     let verify_request = verify_request.unwrap_or(EditVerifyRequest {
         target: EditVerifyTarget::All,
         on_success: EditVerifyOnSuccess::Silent,
@@ -141,7 +151,7 @@ pub(super) async fn run_apply_and_verify_phase(
         // Phase boundary: verification is the most expensive phase of a step,
         // so a cancel observed while the change set was applied ends the step
         // before the toolchain starts.
-        if cancel_requested(ctx.cancel_rx) {
+        if *ctx.cancel_rx.borrow() {
             let accumulated = std::mem::take(&mut ctx.accumulated_text);
             return Ok(finish_cancelled_step(&mut guard, ctx.stream_tx, accumulated).await);
         }
@@ -179,30 +189,11 @@ pub(super) async fn run_apply_and_verify_phase(
             Some(ctx.cancel_rx),
         )
         .await;
-        if verify_outcome.is_cancelled {
-            if guard.rollback().await {
-                let ctx_state = guard.context_manager.get_state();
-                let _ = ctx
-                    .stream_tx
-                    .send(StreamEvent::ContextChanged(ctx_state))
-                    .await;
-            }
-            let _ = ctx.stream_tx.send(StreamEvent::Done).await;
-            return Ok(FsmTurnOutcome {
-                assistant_text: std::mem::take(&mut ctx.accumulated_text),
-                result: ModelResult::Answer {
-                    text: String::new(),
-                },
-                is_cancelled: true,
-                blocked: None,
-                abort: None,
-                has_terminal_success: false,
-                plan_saved: false,
-                plan_errors: Vec::new(),
-                skip_reason: None,
-            });
+        if verify_outcome.is_cancelled() {
+            let accumulated = std::mem::take(&mut ctx.accumulated_text);
+            return Ok(finish_cancelled_step(&mut guard, ctx.stream_tx, accumulated).await);
         }
-        if !verify_outcome.success {
+        if verify_outcome.status == VerificationStatus::Failed {
             auto_register_error_files(
                 guard.context_manager,
                 &verify_outcome.report,
@@ -212,18 +203,23 @@ pub(super) async fn run_apply_and_verify_phase(
             .await;
         }
 
-        // The healing loop is bounded by the edit retry budget: a verification
-        // failure always receives the same number of repair rounds as a failed
-        // patch, and a repository can never switch repair off entirely.
+        // Healing repairs a declared gate that failed, and it is bounded by the
+        // edit retry budget: a verification failure always receives the same
+        // number of repair rounds as a failed patch, and a repository can never
+        // switch repair off entirely. A project that declares no verification
+        // lifecycle has nothing to heal, so its change set proceeds to the
+        // commit with the `NotConfigured` verdict untouched.
         let mut healing_attempt = 0;
         let mut missing_edits = false;
         let mut healing_protocol_errors = Vec::new();
-        while !verify_outcome.success && healing_attempt < ctx.options.max_retries {
+        while verify_outcome.status == VerificationStatus::Failed
+            && healing_attempt < ctx.options.max_retries
+        {
             healing_attempt += 1;
             // Phase boundary: a repair round is a whole model turn, so the
             // cancel signal is honoured before it is requested instead of only
             // while its provider stream runs.
-            if cancel_requested(ctx.cancel_rx) {
+            if *ctx.cancel_rx.borrow() {
                 let accumulated = std::mem::take(&mut ctx.accumulated_text);
                 return Ok(finish_cancelled_step(&mut guard, ctx.stream_tx, accumulated).await);
             }
@@ -277,21 +273,21 @@ pub(super) async fn run_apply_and_verify_phase(
             let retry_prompt = ctx
                 .journal
                 .compose_user_prompt(ctx.prompt, Some(&retry_diagnostics));
-            let step_out = propose(
+            let step_out = propose_round(
+                &retry_prompt,
                 ctx.provider,
                 ctx.model,
-                ctx.protocol,
-                ctx.history_manager,
                 &*guard.context_manager,
+                ctx.history_manager,
+                ctx.protocol,
                 ctx.workflow_name,
                 ctx.stream_tx,
                 ctx.cancel_rx,
                 ctx.options,
                 &mut *ctx.input_cache,
-                ctx.state,
-                ctx.intent,
-                &retry_prompt,
                 None,
+                &ctx.state,
+                ctx.intent,
             )
             .await;
 
@@ -314,27 +310,8 @@ pub(super) async fn run_apply_and_verify_phase(
             };
 
             if step_out.is_cancelled {
-                if guard.rollback().await {
-                    let ctx_state = guard.context_manager.get_state();
-                    let _ = ctx
-                        .stream_tx
-                        .send(StreamEvent::ContextChanged(ctx_state))
-                        .await;
-                }
-                let _ = ctx.stream_tx.send(StreamEvent::Done).await;
-                return Ok(FsmTurnOutcome {
-                    assistant_text: std::mem::take(&mut ctx.accumulated_text),
-                    result: ModelResult::Answer {
-                        text: String::new(),
-                    },
-                    is_cancelled: true,
-                    blocked: None,
-                    abort: None,
-                    has_terminal_success: false,
-                    plan_saved: false,
-                    plan_errors: Vec::new(),
-                    skip_reason: None,
-                });
+                let accumulated = std::mem::take(&mut ctx.accumulated_text);
+                return Ok(finish_cancelled_step(&mut guard, ctx.stream_tx, accumulated).await);
             }
             ctx.state.absorb(&step_out);
             let step_text = step_out.text();
@@ -378,6 +355,7 @@ pub(super) async fn run_apply_and_verify_phase(
                         error: Some(abort.to_message()),
                         changed_files: Vec::new(),
                         commit_hash: None,
+                        verification: None,
                     },
                 };
                 let mut outcome = finish_turn(
@@ -409,6 +387,7 @@ pub(super) async fn run_apply_and_verify_phase(
                         error: Some(reason.clone()),
                         changed_files: Vec::new(),
                         commit_hash: None,
+                        verification: None,
                     },
                 };
                 let mut outcome = finish_turn(
@@ -493,30 +472,13 @@ pub(super) async fn run_apply_and_verify_phase(
                         Some(ctx.cancel_rx),
                     )
                     .await;
-                    if verify_outcome.is_cancelled {
-                        if guard.rollback().await {
-                            let ctx_state = guard.context_manager.get_state();
-                            let _ = ctx
-                                .stream_tx
-                                .send(StreamEvent::ContextChanged(ctx_state))
-                                .await;
-                        }
-                        let _ = ctx.stream_tx.send(StreamEvent::Done).await;
-                        return Ok(FsmTurnOutcome {
-                            assistant_text: std::mem::take(&mut ctx.accumulated_text),
-                            result: ModelResult::Answer {
-                                text: String::new(),
-                            },
-                            is_cancelled: true,
-                            blocked: None,
-                            abort: None,
-                            has_terminal_success: false,
-                            plan_saved: false,
-                            plan_errors: Vec::new(),
-                            skip_reason: None,
-                        });
+                    if verify_outcome.is_cancelled() {
+                        let accumulated = std::mem::take(&mut ctx.accumulated_text);
+                        let cancelled =
+                            finish_cancelled_step(&mut guard, ctx.stream_tx, accumulated).await;
+                        return Ok(cancelled);
                     }
-                    if !verify_outcome.success {
+                    if verify_outcome.status == VerificationStatus::Failed {
                         auto_register_error_files(
                             guard.context_manager,
                             &verify_outcome.report,
@@ -542,19 +504,18 @@ pub(super) async fn run_apply_and_verify_phase(
                     );
                     merge_changed_files(&mut total_changed_files, dirty);
                     verify_outcome = VerificationOutcome {
-                        success: false,
-                        is_cancelled: false,
+                        status: VerificationStatus::Failed,
                         report: format!("Failed to apply repair edits: {}", error),
                     };
                 }
             }
         }
 
-        if verify_outcome.success {
+        if verify_outcome.allows_commit() {
             // Phase boundary: the verified change set is about to be committed,
             // so a cancel observed here rolls the transaction back instead of
             // recording a result the developer already aborted.
-            if cancel_requested(ctx.cancel_rx) {
+            if *ctx.cancel_rx.borrow() {
                 let accumulated = std::mem::take(&mut ctx.accumulated_text);
                 return Ok(finish_cancelled_step(&mut guard, ctx.stream_tx, accumulated).await);
             }
@@ -574,7 +535,8 @@ pub(super) async fn run_apply_and_verify_phase(
                 isolated_step = ctx.intent.is_isolated_step(),
                 changed_files = total_changed_files.len(),
                 committed = commit_hash.is_some(),
-                "bounded turn applied and verified edits"
+                verification = %verify_outcome.status,
+                "bounded turn applied the change set"
             );
             let ctx_state = guard.context_manager.get_state();
             let _ = ctx
@@ -591,6 +553,7 @@ pub(super) async fn run_apply_and_verify_phase(
                     error: commit_error,
                     changed_files: total_changed_files,
                     commit_hash,
+                    verification: Some(verify_outcome.status.into()),
                 },
             };
             return Ok(finish_turn(
@@ -632,6 +595,7 @@ pub(super) async fn run_apply_and_verify_phase(
                 )),
                 changed_files,
                 commit_hash: None,
+                verification: Some(verify_outcome.status.into()),
             },
         };
         Ok(finish_turn(

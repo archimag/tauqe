@@ -82,14 +82,21 @@ impl<'de> Deserialize<'de> for ModelReference {
 /// A role entry as written in configuration.
 ///
 /// Pairs the written model reference with the runtime parameters of that role
-/// slot: the reasoning depth and the level-up marker. A display alias is not a
-/// role parameter: it describes the model itself and is declared once in the
-/// provider catalog, so a role entry that carries one is rejected instead of
+/// slot: the reasoning depth, the generation-attempt budget, and the level-up
+/// marker. A display alias is not a role parameter: it describes the model
+/// itself and is declared once in the provider catalog, so a role entry that
+/// carries one is rejected instead of
 /// quietly reinstating a second source of truth for the same label.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct RoleModelSpec {
     pub(super) reference: ModelReference,
     pub(super) effort: Option<ReasoningEffort>,
+    /// Explicit generation-attempt budget, absent by default.
+    ///
+    /// An absent budget keeps the default of the resolved role entry: three
+    /// attempts for a coder rung and two for an Architect tier. A zero budget
+    /// is refused during validation.
+    pub(super) attempts: Option<u32>,
     /// Explicit level-up marker, absent by default.
     ///
     /// An absent marker means the entry participates in ladder escalation, so
@@ -108,7 +115,7 @@ impl<'de> Deserialize<'de> for RoleModelSpec {
             type Value = RoleModelSpec;
 
             fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-                f.write_str("a model string or a { model, effort, level_up } table")
+                f.write_str("a model string or a { model, effort, attempts, level_up } table")
             }
 
             fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
@@ -118,6 +125,7 @@ impl<'de> Deserialize<'de> for RoleModelSpec {
                 Ok(RoleModelSpec {
                     reference: ModelReference::parse_text(value)?,
                     effort: None,
+                    attempts: None,
                     level_up: None,
                 })
             }
@@ -129,6 +137,8 @@ impl<'de> Deserialize<'de> for RoleModelSpec {
                 let mut reference: Option<ModelReference> = None;
                 let mut effort: Option<ReasoningEffort> = None;
                 let mut effort_seen = false;
+                let mut attempts: Option<u32> = None;
+                let mut attempts_seen = false;
                 let mut level_up: Option<bool> = None;
                 let mut level_up_seen = false;
 
@@ -157,6 +167,17 @@ impl<'de> Deserialize<'de> for RoleModelSpec {
                                 _ => None,
                             };
                         }
+                        "attempts" => {
+                            if attempts_seen {
+                                return Err(serde::de::Error::duplicate_field("attempts"));
+                            }
+                            attempts_seen = true;
+                            // The budget is an unsigned integer or absent; a
+                            // negative or non-numeric value is a configuration
+                            // error, and a zero budget is refused during
+                            // validation.
+                            attempts = map.next_value::<Option<u32>>()?;
+                        }
                         "level_up" => {
                             if level_up_seen {
                                 return Err(serde::de::Error::duplicate_field("level_up"));
@@ -170,7 +191,7 @@ impl<'de> Deserialize<'de> for RoleModelSpec {
                         other => {
                             return Err(serde::de::Error::unknown_field(
                                 other,
-                                &["model", "effort", "level_up"],
+                                &["model", "effort", "attempts", "level_up"],
                             ))
                         }
                     }
@@ -184,6 +205,7 @@ impl<'de> Deserialize<'de> for RoleModelSpec {
                 Ok(RoleModelSpec {
                     reference,
                     effort,
+                    attempts,
                     level_up,
                 })
             }

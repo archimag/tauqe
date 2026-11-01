@@ -24,17 +24,15 @@ fn test_plan_refine_types_serde_and_helpers() {
     let de_params: PlanRefineParams = serde_json::from_str(&json_params).unwrap();
     assert_eq!(de_params, params);
 
-    let plan = Plan {
-        id: "core-feature".to_string(),
-        title: "Feature".to_string(),
-        description: None,
-        created_at: 10,
-        updated_at: 20,
-        architect: None,
-        last_replanned_step: None,
-        concept: vec![],
-        items: vec![],
-    };
+    let plan = Plan::from_parts(
+        "core-feature".to_string(),
+        "Feature".to_string(),
+        None,
+        10,
+        20,
+        Vec::new(),
+        Vec::new(),
+    );
 
     let success_res = PlanRefineResult::Success {
         plan: plan.clone(),
@@ -210,17 +208,15 @@ fn test_concept_item_and_two_section_plan_serde() {
     step.files = vec!["crates/core/src/auth.rs".to_string()];
     step.concept_refs = vec!["c-1.1".to_string()];
 
-    let mut plan = Plan {
-        id: "auth-plan".to_string(),
-        title: "Auth Plan".to_string(),
-        description: Some("Architecture & steps".to_string()),
-        created_at: 100,
-        updated_at: 200,
-        architect: None,
-        last_replanned_step: None,
+    let mut plan = Plan::from_parts(
+        "auth-plan".to_string(),
+        "Auth Plan".to_string(),
+        Some("Architecture & steps".to_string()),
+        100,
+        200,
         concept,
-        items: vec![step],
-    };
+        vec![step],
+    );
 
     // Concept navigation
     assert!(plan.find_concept_item("c-1").is_some());
@@ -285,10 +281,6 @@ fn test_plan_item_serde() {
     assert!(legacy_item.readonly_files.is_empty());
     assert!(legacy_item.concept_refs.is_empty());
     assert!(legacy_item.depends_on.is_empty());
-
-    let legacy_plan_json = r#"{"id":"p1","title":"Plan","created_at":1,"updated_at":2,"items":[]}"#;
-    let legacy_plan: Plan = serde_json::from_str(legacy_plan_json).unwrap();
-    assert!(legacy_plan.concept.is_empty());
 }
 
 #[test]
@@ -340,12 +332,15 @@ fn test_plan_roundtrip_keeps_nested_blocked_reasons() {
     let mut clean = item("2", "Clean step", PlanItemStatus::Todo, vec![]);
     clean.blocked_reason = None;
 
-    let plan = Plan {
-        id: "nested-blocked".to_string(),
-        title: "Nested Blocked".to_string(),
-        items: vec![container, clean],
-        ..Default::default()
-    };
+    let plan = Plan::from_parts(
+        "nested-blocked".to_string(),
+        "Nested Blocked".to_string(),
+        None,
+        0,
+        0,
+        Vec::new(),
+        vec![container, clean],
+    );
 
     let json = serde_json::to_string(&plan).unwrap();
     // Exactly one step carries a report, so the key appears once: an
@@ -363,16 +358,14 @@ fn test_plan_roundtrip_keeps_nested_blocked_reasons() {
 
 #[test]
 fn test_plan_stats_and_summary() {
-    let plan = Plan {
-        id: "jwt-auth".to_string(),
-        title: "JWT Authentication".to_string(),
-        description: Some("Replace session cookies".to_string()),
-        created_at: 1700000000,
-        updated_at: 1700000010,
-        architect: None,
-        last_replanned_step: None,
-        concept: vec![],
-        items: vec![
+    let plan = Plan::from_parts(
+        "jwt-auth".to_string(),
+        "JWT Authentication".to_string(),
+        Some("Replace session cookies".to_string()),
+        1700000000,
+        1700000010,
+        Vec::new(),
+        vec![
             item(
                 "1",
                 "Models",
@@ -381,7 +374,7 @@ fn test_plan_stats_and_summary() {
             ),
             item("2", "Endpoint", PlanItemStatus::InProgress, vec![]),
         ],
-    };
+    );
 
     // Progress counts executable leaves only: the "1" container is a conceptual
     // milestone and is not double-counted alongside its "1.1" child.
@@ -399,16 +392,14 @@ fn test_plan_stats_and_summary() {
 
 #[test]
 fn test_count_stats_reports_only_leaves() {
-    let plan = Plan {
-        id: "count-leaves".to_string(),
-        title: "Count Leaves".to_string(),
-        description: None,
-        created_at: 1,
-        updated_at: 1,
-        architect: None,
-        last_replanned_step: None,
-        concept: vec![],
-        items: vec![
+    let plan = Plan::from_parts(
+        "count-leaves".to_string(),
+        "Count Leaves".to_string(),
+        None,
+        1,
+        1,
+        Vec::new(),
+        vec![
             item(
                 "1",
                 "Group",
@@ -420,7 +411,7 @@ fn test_count_stats_reports_only_leaves() {
             ),
             item("2", "Leaf", PlanItemStatus::Todo, vec![]),
         ],
-    };
+    );
 
     // Containers are conceptual and carry no authoritative status, so progress
     // counts the three executable leaves, never the container alongside them.
@@ -432,20 +423,18 @@ fn test_count_stats_reports_only_leaves() {
 
 #[test]
 fn test_count_stats_excludes_cancelled_leaves_and_agrees_with_done_status() {
-    let plan = Plan {
-        id: "done-with-cancelled".to_string(),
-        title: "Done With Cancelled".to_string(),
-        description: None,
-        created_at: 1,
-        updated_at: 1,
-        architect: None,
-        last_replanned_step: None,
-        concept: vec![],
-        items: vec![
+    let plan = Plan::from_parts(
+        "done-with-cancelled".to_string(),
+        "Done With Cancelled".to_string(),
+        None,
+        1,
+        1,
+        Vec::new(),
+        vec![
             item("1", "Done step", PlanItemStatus::Done, vec![]),
             item("2", "Cancelled step", PlanItemStatus::Cancelled, vec![]),
         ],
-    };
+    );
 
     // `compute_items_status` treats the plan as Done because every active
     // (non-cancelled) leaf is Done. The progress metric must agree: the cancelled
@@ -461,21 +450,19 @@ fn test_count_stats_excludes_cancelled_leaves_and_agrees_with_done_status() {
 
 #[test]
 fn test_count_stats_excludes_cancelled_leaves_in_mixed_plan() {
-    let plan = Plan {
-        id: "mixed-cancelled".to_string(),
-        title: "Mixed Cancelled".to_string(),
-        description: None,
-        created_at: 1,
-        updated_at: 1,
-        architect: None,
-        last_replanned_step: None,
-        concept: vec![],
-        items: vec![
+    let plan = Plan::from_parts(
+        "mixed-cancelled".to_string(),
+        "Mixed Cancelled".to_string(),
+        None,
+        1,
+        1,
+        Vec::new(),
+        vec![
             item("1", "Done step", PlanItemStatus::Done, vec![]),
             item("2", "Todo step", PlanItemStatus::Todo, vec![]),
             item("3", "Cancelled step", PlanItemStatus::Cancelled, vec![]),
         ],
-    };
+    );
 
     // A mix of Done and Todo leaves keeps the plan InProgress; the cancelled leaf
     // is excluded from the denominator, so the ratio reflects only executable
@@ -486,20 +473,18 @@ fn test_count_stats_excludes_cancelled_leaves_in_mixed_plan() {
 
 #[test]
 fn test_count_stats_all_cancelled_reports_zero_and_cancelled_status() {
-    let plan = Plan {
-        id: "all-cancelled".to_string(),
-        title: "All Cancelled".to_string(),
-        description: None,
-        created_at: 1,
-        updated_at: 1,
-        architect: None,
-        last_replanned_step: None,
-        concept: vec![],
-        items: vec![
+    let plan = Plan::from_parts(
+        "all-cancelled".to_string(),
+        "All Cancelled".to_string(),
+        None,
+        1,
+        1,
+        Vec::new(),
+        vec![
             item("1", "Cancelled A", PlanItemStatus::Cancelled, vec![]),
             item("2", "Cancelled B", PlanItemStatus::Cancelled, vec![]),
         ],
-    };
+    );
 
     // With every leaf cancelled there is no executable work left, so the metric
     // is `0/0` and the aggregated status is Cancelled rather than a misleading
@@ -510,16 +495,14 @@ fn test_count_stats_all_cancelled_reports_zero_and_cancelled_status() {
 
 #[test]
 fn test_evaluate_scope_reports_only_leaves_for_discussion() {
-    let mut plan = Plan {
-        id: "leaf-only-scope".to_string(),
-        title: "Leaf Only Scope".to_string(),
-        description: None,
-        created_at: 1,
-        updated_at: 1,
-        architect: None,
-        last_replanned_step: None,
-        concept: vec![],
-        items: vec![item(
+    let mut plan = Plan::from_parts(
+        "leaf-only-scope".to_string(),
+        "Leaf Only Scope".to_string(),
+        None,
+        1,
+        1,
+        Vec::new(),
+        vec![item(
             "1",
             "Group",
             PlanItemStatus::Todo,
@@ -528,7 +511,7 @@ fn test_evaluate_scope_reports_only_leaves_for_discussion() {
                 item("1.2", "Discuss", PlanItemStatus::Discussion, vec![]),
             ],
         )],
-    };
+    );
 
     // Refreshing propagates the Discussion child onto its container. Only the
     // offending leaf is reported, never the container as well.
@@ -560,16 +543,14 @@ fn test_evaluate_scope_dependency_uses_derived_container_status() {
     let mut dependent = item("2", "Dependent", PlanItemStatus::Todo, vec![]);
     dependent.depends_on = vec!["1".to_string()];
 
-    let plan = Plan {
-        id: "parent-dep".to_string(),
-        title: "Parent Dep".to_string(),
-        description: None,
-        created_at: 1,
-        updated_at: 1,
-        architect: None,
-        last_replanned_step: None,
-        concept: vec![],
-        items: vec![
+    let plan = Plan::from_parts(
+        "parent-dep".to_string(),
+        "Parent Dep".to_string(),
+        None,
+        1,
+        1,
+        Vec::new(),
+        vec![
             item(
                 "1",
                 "Group",
@@ -578,7 +559,7 @@ fn test_evaluate_scope_dependency_uses_derived_container_status() {
             ),
             dependent,
         ],
-    };
+    );
 
     // The container's stored status is stale (Todo) while all of its children
     // are Done. Readiness derives the container status from its children instead
@@ -594,20 +575,18 @@ fn test_evaluate_scope_dependency_uses_derived_container_status() {
 
 #[test]
 fn test_plan_status_computation() {
-    let mut plan = Plan {
-        id: "status-test".to_string(),
-        title: "Status Test".to_string(),
-        description: None,
-        created_at: 1,
-        updated_at: 1,
-        architect: None,
-        last_replanned_step: None,
-        concept: vec![],
-        items: vec![
+    let mut plan = Plan::from_parts(
+        "status-test".to_string(),
+        "Status Test".to_string(),
+        None,
+        1,
+        1,
+        Vec::new(),
+        vec![
             item("1", "Step 1", PlanItemStatus::Todo, vec![]),
             item("2", "Step 2", PlanItemStatus::Todo, vec![]),
         ],
-    };
+    );
 
     // All Todo -> Todo
     assert_eq!(plan.status(), PlanItemStatus::Todo);
@@ -639,16 +618,14 @@ fn test_plan_status_computation() {
 
 #[test]
 fn test_plan_item_leaf_and_refresh_parent_statuses() {
-    let mut plan = Plan {
-        id: "leaf-test".to_string(),
-        title: "Leaf Test".to_string(),
-        description: None,
-        created_at: 1,
-        updated_at: 1,
-        architect: None,
-        last_replanned_step: None,
-        concept: vec![],
-        items: vec![item(
+    let mut plan = Plan::from_parts(
+        "leaf-test".to_string(),
+        "Leaf Test".to_string(),
+        None,
+        1,
+        1,
+        Vec::new(),
+        vec![item(
             "parent",
             "Parent",
             PlanItemStatus::Todo,
@@ -657,7 +634,7 @@ fn test_plan_item_leaf_and_refresh_parent_statuses() {
                 item("sub-2", "Sub 2", PlanItemStatus::Todo, vec![]),
             ],
         )],
-    };
+    );
 
     assert_eq!(plan.is_leaf_item("parent"), Some(false));
     assert_eq!(plan.is_leaf_item("sub-1"), Some(true));
@@ -712,17 +689,15 @@ fn test_plan_normalize_leaf_files() {
     leaf.files = vec!["src/leaf.rs".to_string()];
     leaf.readonly_files = vec!["src/leaf_ref.rs".to_string()];
 
-    let mut plan = Plan {
-        id: "leaf-files".to_string(),
-        title: "Leaf Files".to_string(),
-        description: None,
-        created_at: 1,
-        updated_at: 1,
-        architect: None,
-        last_replanned_step: None,
-        concept: vec![],
-        items: vec![top, leaf],
-    };
+    let mut plan = Plan::from_parts(
+        "leaf-files".to_string(),
+        "Leaf Files".to_string(),
+        None,
+        1,
+        1,
+        Vec::new(),
+        vec![top, leaf],
+    );
 
     plan.normalize_leaf_files();
 
@@ -767,17 +742,15 @@ fn test_normalize_leaf_files_dedups_readonly_by_canonical_path() {
         "src/ref.rs".to_string(),
     ];
 
-    let mut plan = Plan {
-        id: "leaf-readonly-dedup".to_string(),
-        title: "Leaf Readonly Dedup".to_string(),
-        description: None,
-        created_at: 1,
-        updated_at: 1,
-        architect: None,
-        last_replanned_step: None,
-        concept: vec![],
-        items: vec![leaf],
-    };
+    let mut plan = Plan::from_parts(
+        "leaf-readonly-dedup".to_string(),
+        "Leaf Readonly Dedup".to_string(),
+        None,
+        1,
+        1,
+        Vec::new(),
+        vec![leaf],
+    );
 
     plan.normalize_leaf_files();
 
@@ -787,16 +760,14 @@ fn test_normalize_leaf_files_dedups_readonly_by_canonical_path() {
 
 #[test]
 fn test_plan_evaluate_scope() {
-    let plan = Plan {
-        id: "batch-test".to_string(),
-        title: "Batch Test".to_string(),
-        description: None,
-        created_at: 1,
-        updated_at: 1,
-        architect: None,
-        last_replanned_step: None,
-        concept: vec![],
-        items: vec![
+    let plan = Plan::from_parts(
+        "batch-test".to_string(),
+        "Batch Test".to_string(),
+        None,
+        1,
+        1,
+        Vec::new(),
+        vec![
             item(
                 "1",
                 "Parent Group",
@@ -808,7 +779,7 @@ fn test_plan_evaluate_scope() {
             ),
             item("2", "Step 2", PlanItemStatus::Todo, vec![]),
         ],
-    };
+    );
 
     // 1. Entire plan has step 1.2 in Discussion -> Blocked
     match plan.evaluate_scope(None) {
@@ -868,17 +839,15 @@ fn test_plan_evaluate_scope_dependencies() {
     let mut third = item("3", "Third", PlanItemStatus::Todo, vec![]);
     third.depends_on = vec!["2".to_string()];
 
-    let plan = Plan {
-        id: "dag".to_string(),
-        title: "DAG".to_string(),
-        description: None,
-        created_at: 1,
-        updated_at: 1,
-        architect: None,
-        last_replanned_step: None,
-        concept: vec![],
-        items: vec![first, second, third],
-    };
+    let plan = Plan::from_parts(
+        "dag".to_string(),
+        "DAG".to_string(),
+        None,
+        1,
+        1,
+        Vec::new(),
+        vec![first, second, third],
+    );
 
     // The whole chain is scheduled in dependency order.
     match plan.evaluate_scope(None) {
@@ -912,20 +881,18 @@ fn test_plan_evaluate_scope_dependencies() {
 fn test_plan_evaluate_scope_surfaces_blocked_leaves() {
     // A plan whose remaining leaves are all BLOCKED must not be reported as
     // completed: each blocked leaf is surfaced by ID.
-    let all_blocked = Plan {
-        id: "blocked-all".to_string(),
-        title: "Blocked All".to_string(),
-        description: None,
-        created_at: 1,
-        updated_at: 1,
-        architect: None,
-        last_replanned_step: None,
-        concept: vec![],
-        items: vec![
+    let all_blocked = Plan::from_parts(
+        "blocked-all".to_string(),
+        "Blocked All".to_string(),
+        None,
+        1,
+        1,
+        Vec::new(),
+        vec![
             item("1", "Stuck A", PlanItemStatus::Blocked, vec![]),
             item("2", "Stuck B", PlanItemStatus::Blocked, vec![]),
         ],
-    };
+    );
     match all_blocked.evaluate_scope(None) {
         PlanScopeEvaluation::BlockedByBlockers(items) => {
             assert_eq!(items.len(), 2);
@@ -937,20 +904,18 @@ fn test_plan_evaluate_scope_surfaces_blocked_leaves() {
 
     // A mix of ready and blocked leaves surfaces the blocked ones instead of
     // silently skipping them.
-    let mixed = Plan {
-        id: "blocked-mixed".to_string(),
-        title: "Blocked Mixed".to_string(),
-        description: None,
-        created_at: 1,
-        updated_at: 1,
-        architect: None,
-        last_replanned_step: None,
-        concept: vec![],
-        items: vec![
+    let mixed = Plan::from_parts(
+        "blocked-mixed".to_string(),
+        "Blocked Mixed".to_string(),
+        None,
+        1,
+        1,
+        Vec::new(),
+        vec![
             item("1", "Ready", PlanItemStatus::Todo, vec![]),
             item("2", "Stuck", PlanItemStatus::Blocked, vec![]),
         ],
-    };
+    );
     match mixed.evaluate_scope(None) {
         PlanScopeEvaluation::BlockedByBlockers(items) => {
             assert_eq!(items.len(), 1);
@@ -960,16 +925,14 @@ fn test_plan_evaluate_scope_surfaces_blocked_leaves() {
     }
 
     // Composite scopes surface blocked children the same way.
-    let group = Plan {
-        id: "blocked-group".to_string(),
-        title: "Blocked Group".to_string(),
-        description: None,
-        created_at: 1,
-        updated_at: 1,
-        architect: None,
-        last_replanned_step: None,
-        concept: vec![],
-        items: vec![item(
+    let group = Plan::from_parts(
+        "blocked-group".to_string(),
+        "Blocked Group".to_string(),
+        None,
+        1,
+        1,
+        Vec::new(),
+        vec![item(
             "g",
             "Group",
             PlanItemStatus::Blocked,
@@ -978,7 +941,7 @@ fn test_plan_evaluate_scope_surfaces_blocked_leaves() {
                 item("g.2", "Stuck", PlanItemStatus::Blocked, vec![]),
             ],
         )],
-    };
+    );
     match group.evaluate_scope(Some("g")) {
         PlanScopeEvaluation::BlockedByBlockers(items) => {
             assert_eq!(items.len(), 1);
@@ -990,17 +953,15 @@ fn test_plan_evaluate_scope_surfaces_blocked_leaves() {
 
 #[test]
 fn test_plan_update_item_status_matches_ids_case_insensitively() {
-    let mut plan = Plan {
-        id: "case".to_string(),
-        title: "Case".to_string(),
-        description: None,
-        created_at: 1,
-        updated_at: 1,
-        architect: None,
-        last_replanned_step: None,
-        concept: vec![],
-        items: vec![item("Step-1", "Step", PlanItemStatus::Todo, vec![])],
-    };
+    let mut plan = Plan::from_parts(
+        "case".to_string(),
+        "Case".to_string(),
+        None,
+        1,
+        1,
+        Vec::new(),
+        vec![item("Step-1", "Step", PlanItemStatus::Todo, vec![])],
+    );
 
     // `find_item` and `update_item_status` must agree on the id matching rule.
     assert!(plan.find_item("step-1").is_some());
@@ -1013,22 +974,20 @@ fn test_plan_update_item_status_matches_ids_case_insensitively() {
 
 #[test]
 fn test_plan_update_item_status_rejects_container_targets() {
-    let mut plan = Plan {
-        id: "container-guard".to_string(),
-        title: "Container Guard".to_string(),
-        description: None,
-        created_at: 1,
-        updated_at: 1,
-        architect: None,
-        last_replanned_step: None,
-        concept: vec![],
-        items: vec![item(
+    let mut plan = Plan::from_parts(
+        "container-guard".to_string(),
+        "Container Guard".to_string(),
+        None,
+        1,
+        1,
+        Vec::new(),
+        vec![item(
             "g",
             "Group",
             PlanItemStatus::Todo,
             vec![item("g.1", "Child", PlanItemStatus::Todo, vec![])],
         )],
-    };
+    );
 
     // A container target is rejected: its status is derived from its children, so
     // the assignment would be recomputed away immediately. The caller is told the
@@ -1048,17 +1007,15 @@ fn test_plan_update_item_status_rejects_container_targets() {
 #[test]
 fn test_plan_has_started_or_completed_steps() {
     fn plan_with(concept: Vec<ConceptItem>, items: Vec<PlanItem>) -> Plan {
-        Plan {
-            id: "started-steps".to_string(),
-            title: "Started Steps".to_string(),
-            description: None,
-            created_at: 1,
-            updated_at: 1,
-            architect: None,
-            last_replanned_step: None,
+        Plan::from_parts(
+            "started-steps".to_string(),
+            "Started Steps".to_string(),
+            None,
+            1,
+            1,
             concept,
             items,
-        }
+        )
     }
 
     // A purely conceptual plan carries no implementation steps, so nothing is
@@ -1141,17 +1098,15 @@ fn test_plan_to_markdown() {
     let mut endpoint = item("2", "Endpoint", PlanItemStatus::InProgress, vec![]);
     endpoint.readonly_files = vec!["src/models.rs".to_string()];
 
-    let plan = Plan {
-        id: "jwt-auth".to_string(),
-        title: "JWT Authentication".to_string(),
-        description: Some("Replace session cookies".to_string()),
-        created_at: 1700000000,
-        updated_at: 1700000010,
-        architect: None,
-        last_replanned_step: None,
-        concept: vec![],
-        items: vec![models, endpoint],
-    };
+    let plan = Plan::from_parts(
+        "jwt-auth".to_string(),
+        "JWT Authentication".to_string(),
+        Some("Replace session cookies".to_string()),
+        1700000000,
+        1700000010,
+        Vec::new(),
+        vec![models, endpoint],
+    );
 
     let md = plan.to_markdown();
     assert!(md.contains("# Plan: JWT Authentication"));
@@ -1165,16 +1120,19 @@ fn test_plan_to_markdown() {
 
 #[test]
 fn test_plan_validate_success() {
-    let plan = Plan {
-        id: "valid-plan".to_string(),
-        title: "Valid".to_string(),
-        concept: vec![ConceptItem {
+    let plan = Plan::from_parts(
+        "valid-plan".to_string(),
+        "Valid".to_string(),
+        None,
+        0,
+        0,
+        vec![ConceptItem {
             id: "c-1".to_string(),
             title: "Arch Invariant".to_string(),
             details: None,
             children: vec![],
         }],
-        items: vec![
+        vec![
             item("1", "Step 1", PlanItemStatus::Done, vec![]),
             PlanItem {
                 id: "2".to_string(),
@@ -1186,8 +1144,7 @@ fn test_plan_validate_success() {
                 ..Default::default()
             },
         ],
-        ..Default::default()
-    };
+    );
     assert!(plan.validate().is_ok());
 }
 
@@ -1196,12 +1153,15 @@ fn test_plan_validate_item_errors() {
     // 1. Empty item ID
     let mut empty_id_item = item("  ", "Empty", PlanItemStatus::Todo, vec![]);
     empty_id_item.files = vec!["src/empty.rs".to_string()];
-    let empty_id = Plan {
-        id: "p".to_string(),
-        title: "P".to_string(),
-        items: vec![empty_id_item],
-        ..Default::default()
-    };
+    let empty_id = Plan::from_parts(
+        "p".to_string(),
+        "P".to_string(),
+        None,
+        0,
+        0,
+        Vec::new(),
+        vec![empty_id_item],
+    );
     assert_eq!(
         empty_id.validate().unwrap_err(),
         vec![PlanValidationError::EmptyItemId]
@@ -1212,22 +1172,28 @@ fn test_plan_validate_item_errors() {
     first_dup.files = vec!["src/a.rs".to_string()];
     let mut second_dup = item("step-1", "B", PlanItemStatus::Todo, vec![]);
     second_dup.files = vec!["src/b.rs".to_string()];
-    let dup_id = Plan {
-        id: "p".to_string(),
-        title: "P".to_string(),
-        items: vec![first_dup, second_dup],
-        ..Default::default()
-    };
+    let dup_id = Plan::from_parts(
+        "p".to_string(),
+        "P".to_string(),
+        None,
+        0,
+        0,
+        Vec::new(),
+        vec![first_dup, second_dup],
+    );
     assert_eq!(
         dup_id.validate().unwrap_err(),
         vec![PlanValidationError::DuplicateItemId("step-1".to_string())]
     );
 
     // 2b. Empty concept ID (including whitespace-only and nested)
-    let empty_concept = Plan {
-        id: "p".to_string(),
-        title: "P".to_string(),
-        concept: vec![ConceptItem {
+    let empty_concept = Plan::from_parts(
+        "p".to_string(),
+        "P".to_string(),
+        None,
+        0,
+        0,
+        vec![ConceptItem {
             id: "  ".to_string(),
             title: "Empty root".to_string(),
             details: None,
@@ -1238,8 +1204,8 @@ fn test_plan_validate_item_errors() {
                 children: vec![],
             }],
         }],
-        ..Default::default()
-    };
+        Vec::new(),
+    );
     assert_eq!(
         empty_concept.validate().unwrap_err(),
         vec![
@@ -1249,10 +1215,13 @@ fn test_plan_validate_item_errors() {
     );
 
     // 3. Duplicate concept ID
-    let dup_concept = Plan {
-        id: "p".to_string(),
-        title: "P".to_string(),
-        concept: vec![
+    let dup_concept = Plan::from_parts(
+        "p".to_string(),
+        "P".to_string(),
+        None,
+        0,
+        0,
+        vec![
             ConceptItem {
                 id: "c-1".to_string(),
                 title: "A".to_string(),
@@ -1266,26 +1235,29 @@ fn test_plan_validate_item_errors() {
                 children: vec![],
             },
         ],
-        ..Default::default()
-    };
+        Vec::new(),
+    );
     assert_eq!(
         dup_concept.validate().unwrap_err(),
         vec![PlanValidationError::DuplicateConceptId("C-1".to_string())]
     );
 
     // 4. Missing concept ref
-    let missing_concept = Plan {
-        id: "p".to_string(),
-        title: "P".to_string(),
-        items: vec![PlanItem {
+    let missing_concept = Plan::from_parts(
+        "p".to_string(),
+        "P".to_string(),
+        None,
+        0,
+        0,
+        Vec::new(),
+        vec![PlanItem {
             id: "1".to_string(),
             title: "Step 1".to_string(),
             concept_refs: vec!["c-missing".to_string()],
             files: vec!["src/step1.rs".to_string()],
             ..Default::default()
         }],
-        ..Default::default()
-    };
+    );
     assert_eq!(
         missing_concept.validate().unwrap_err(),
         vec![PlanValidationError::MissingConceptRef {
@@ -1298,18 +1270,21 @@ fn test_plan_validate_item_errors() {
 #[test]
 fn test_plan_validate_dependency_errors() {
     // 1. Missing dependency
-    let missing_dep = Plan {
-        id: "p".to_string(),
-        title: "P".to_string(),
-        items: vec![PlanItem {
+    let missing_dep = Plan::from_parts(
+        "p".to_string(),
+        "P".to_string(),
+        None,
+        0,
+        0,
+        Vec::new(),
+        vec![PlanItem {
             id: "1".to_string(),
             title: "Step 1".to_string(),
             depends_on: vec!["ghost".to_string()],
             files: vec!["src/step1.rs".to_string()],
             ..Default::default()
         }],
-        ..Default::default()
-    };
+    );
     assert_eq!(
         missing_dep.validate().unwrap_err(),
         vec![PlanValidationError::MissingDependency {
@@ -1319,28 +1294,35 @@ fn test_plan_validate_dependency_errors() {
     );
 
     // 2. Self dependency
-    let self_dep = Plan {
-        id: "p".to_string(),
-        title: "P".to_string(),
-        items: vec![PlanItem {
+    let self_dep = Plan::from_parts(
+        "p".to_string(),
+        "P".to_string(),
+        None,
+        0,
+        0,
+        Vec::new(),
+        vec![PlanItem {
             id: "1".to_string(),
             title: "Step 1".to_string(),
             depends_on: vec!["1".to_string()],
             files: vec!["src/step1.rs".to_string()],
             ..Default::default()
         }],
-        ..Default::default()
-    };
+    );
     assert_eq!(
         self_dep.validate().unwrap_err(),
         vec![PlanValidationError::SelfDependency("1".to_string())]
     );
 
     // 3. Cyclic dependency
-    let cyclic = Plan {
-        id: "p".to_string(),
-        title: "P".to_string(),
-        items: vec![
+    let cyclic = Plan::from_parts(
+        "p".to_string(),
+        "P".to_string(),
+        None,
+        0,
+        0,
+        Vec::new(),
+        vec![
             PlanItem {
                 id: "A".to_string(),
                 title: "Step A".to_string(),
@@ -1356,8 +1338,7 @@ fn test_plan_validate_dependency_errors() {
                 ..Default::default()
             },
         ],
-        ..Default::default()
-    };
+    );
     let errs = cyclic.validate().unwrap_err();
     assert_eq!(errs.len(), 1);
     match &errs[0] {
@@ -1391,20 +1372,18 @@ fn test_identifier_normalization_is_consistent_across_validation_lookup_and_read
     dependent.depends_on = vec!["1 ".to_string()];
     dependent.files = vec!["src/dependent.rs".to_string()];
 
-    let plan = Plan {
-        id: "normalized-ids".to_string(),
-        title: "Normalized Ids".to_string(),
-        description: None,
-        created_at: 1,
-        updated_at: 1,
-        architect: None,
-        last_replanned_step: None,
-        concept: vec![],
-        items: vec![
+    let plan = Plan::from_parts(
+        "normalized-ids".to_string(),
+        "Normalized Ids".to_string(),
+        None,
+        1,
+        1,
+        Vec::new(),
+        vec![
             item(" 1 ", "Producer", PlanItemStatus::Done, vec![]),
             dependent,
         ],
-    };
+    );
 
     // Validation accepts the plan: the dependency key collapses onto the item key.
     assert!(plan.validate().is_ok());
@@ -1434,12 +1413,15 @@ fn test_plan_validate_detects_leaf_depending_on_its_own_ancestor() {
     leaf.depends_on = vec!["1".to_string()];
     leaf.files = vec!["src/child.rs".to_string()];
 
-    let plan = Plan {
-        id: "ancestor-dep".to_string(),
-        title: "Ancestor Dep".to_string(),
-        items: vec![item("1", "Group", PlanItemStatus::Todo, vec![leaf])],
-        ..Default::default()
-    };
+    let plan = Plan::from_parts(
+        "ancestor-dep".to_string(),
+        "Ancestor Dep".to_string(),
+        None,
+        0,
+        0,
+        Vec::new(),
+        vec![item("1", "Group", PlanItemStatus::Todo, vec![leaf])],
+    );
 
     let errs = plan.validate().unwrap_err();
     assert_eq!(errs.len(), 1);
@@ -1461,17 +1443,20 @@ fn test_plan_validate_detects_transitive_ancestor_deadlock() {
     deep.depends_on = vec!["1".to_string()];
     deep.files = vec!["src/deep.rs".to_string()];
 
-    let plan = Plan {
-        id: "deep-ancestor-dep".to_string(),
-        title: "Deep Ancestor Dep".to_string(),
-        items: vec![item(
+    let plan = Plan::from_parts(
+        "deep-ancestor-dep".to_string(),
+        "Deep Ancestor Dep".to_string(),
+        None,
+        0,
+        0,
+        Vec::new(),
+        vec![item(
             "1",
             "Top",
             PlanItemStatus::Todo,
             vec![item("1.a", "Mid", PlanItemStatus::Todo, vec![deep])],
         )],
-        ..Default::default()
-    };
+    );
 
     match plan.validate().unwrap_err().as_slice() {
         [PlanValidationError::CyclicDependency(cycle)] => {
@@ -1495,15 +1480,18 @@ fn test_plan_validate_detects_container_cycle_through_dependent_leaf() {
     dependent.depends_on = vec!["1".to_string()];
     dependent.files = vec!["src/dependent.rs".to_string()];
 
-    let plan = Plan {
-        id: "container-cycle".to_string(),
-        title: "Container Cycle".to_string(),
-        items: vec![
+    let plan = Plan::from_parts(
+        "container-cycle".to_string(),
+        "Container Cycle".to_string(),
+        None,
+        0,
+        0,
+        Vec::new(),
+        vec![
             item("1", "Group", PlanItemStatus::Todo, vec![child]),
             dependent,
         ],
-        ..Default::default()
-    };
+    );
 
     let errs = plan.validate().unwrap_err();
     assert_eq!(errs.len(), 1);
@@ -1531,12 +1519,15 @@ fn test_plan_validate_ignores_cancelled_leaf_naming_its_ancestor() {
     cancelled.depends_on = vec!["1".to_string()];
     cancelled.files = vec!["src/child.rs".to_string()];
 
-    let mut plan = Plan {
-        id: "cancelled-ancestor-dep".to_string(),
-        title: "Cancelled Ancestor Dep".to_string(),
-        items: vec![item("1", "Group", PlanItemStatus::Todo, vec![cancelled])],
-        ..Default::default()
-    };
+    let mut plan = Plan::from_parts(
+        "cancelled-ancestor-dep".to_string(),
+        "Cancelled Ancestor Dep".to_string(),
+        None,
+        0,
+        0,
+        Vec::new(),
+        vec![item("1", "Group", PlanItemStatus::Todo, vec![cancelled])],
+    );
     assert!(plan.validate().is_ok());
 
     // Flipping the leaf back to an active status restores the genuine deadlock:
@@ -1555,8 +1546,82 @@ fn test_plan_validate_ignores_cancelled_leaf_naming_its_ancestor() {
 }
 
 #[test]
+fn test_plan_validate_ignores_done_leaf_naming_its_ancestor() {
+    // A `Done` leaf is a satisfied requirement: it is never scheduled again, so
+    // a leftover `depends_on` naming its ancestor cannot deadlock. The implicit
+    // container-to-leaf edge therefore exists only while the leaf still gates
+    // the container's completion.
+    let mut done = item("1.1", "Finished child", PlanItemStatus::Done, vec![]);
+    done.depends_on = vec!["1".to_string()];
+    done.files = vec!["src/child.rs".to_string()];
+
+    let mut plan = Plan::from_parts(
+        "done-ancestor-dep".to_string(),
+        "Done Ancestor Dep".to_string(),
+        None,
+        0,
+        0,
+        Vec::new(),
+        vec![item("1", "Group", PlanItemStatus::Todo, vec![done])],
+    );
+    assert!(plan.validate().is_ok());
+
+    // Flipping the leaf back to an active status restores the genuine deadlock:
+    // the container can only finish once the leaf is `Done`, and the leaf cannot
+    // start before the container.
+    assert!(plan.update_item_status("1.1", PlanItemStatus::Todo));
+    let errs = plan.validate().unwrap_err();
+    assert_eq!(errs.len(), 1);
+    match &errs[0] {
+        PlanValidationError::CyclicDependency(cycle) => {
+            assert!(cycle.contains(&"1".to_string()));
+            assert!(cycle.contains(&"1.1".to_string()));
+        }
+        other => panic!("Expected CyclicDependency, got {:?}", other),
+    }
+}
+
+#[test]
+fn test_plan_validate_ignores_deep_done_leaf_naming_top_ancestor() {
+    // The same status-relative rule holds across nesting levels: a finished deep
+    // leaf closes no implicit edge, so the top ancestor's derived status never
+    // waits on it.
+    let mut deep = item("1.a.1", "Finished deep leaf", PlanItemStatus::Done, vec![]);
+    deep.depends_on = vec!["1".to_string()];
+    deep.files = vec!["src/deep.rs".to_string()];
+
+    let mut plan = Plan::from_parts(
+        "deep-done-ancestor-dep".to_string(),
+        "Deep Done Ancestor Dep".to_string(),
+        None,
+        0,
+        0,
+        Vec::new(),
+        vec![item(
+            "1",
+            "Top",
+            PlanItemStatus::Todo,
+            vec![item("1.a", "Mid", PlanItemStatus::Todo, vec![deep])],
+        )],
+    );
+    assert!(plan.validate().is_ok());
+
+    // Reactivating the leaf restores the deadlock across nesting levels: the top
+    // ancestor can only finish once the deep leaf is `Done`, and the deep leaf
+    // cannot start before the ancestor.
+    assert!(plan.update_item_status("1.a.1", PlanItemStatus::Todo));
+    match plan.validate().unwrap_err().as_slice() {
+        [PlanValidationError::CyclicDependency(cycle)] => {
+            assert!(cycle.contains(&"1".to_string()));
+            assert!(cycle.contains(&"1.a.1".to_string()));
+        }
+        other => panic!("Expected a single CyclicDependency, got {:?}", other),
+    }
+}
+
+#[test]
 fn test_compute_direct_status_aggregation_edge_cases() {
-    use super::node::compute_direct_status;
+    use super::implementation::compute_direct_status;
 
     // An empty set has no active member and defaults to Todo.
     assert_eq!(
@@ -1617,16 +1682,14 @@ fn test_compute_direct_status_aggregation_edge_cases() {
 
 #[test]
 fn test_refresh_parent_statuses_and_scope_on_deep_hierarchy() {
-    let mut plan = Plan {
-        id: "deep-hierarchy".to_string(),
-        title: "Deep Hierarchy".to_string(),
-        description: None,
-        created_at: 1,
-        updated_at: 1,
-        architect: None,
-        last_replanned_step: None,
-        concept: vec![],
-        items: vec![item(
+    let mut plan = Plan::from_parts(
+        "deep-hierarchy".to_string(),
+        "Deep Hierarchy".to_string(),
+        None,
+        1,
+        1,
+        Vec::new(),
+        vec![item(
             "1",
             "Top",
             PlanItemStatus::Todo,
@@ -1643,7 +1706,7 @@ fn test_refresh_parent_statuses_and_scope_on_deep_hierarchy() {
                 item("1.2", "Abandoned", PlanItemStatus::Cancelled, vec![]),
             ],
         )],
-    };
+    );
 
     // Derived container statuses propagate through every nesting level: the
     // partially finished group is InProgress and so is its parent.
@@ -1703,17 +1766,15 @@ fn test_plan_to_markdown_keeps_metadata_on_single_lines() {
     step.readonly_files = vec!["   ".to_string()];
     step.depends_on = vec!["0\r".to_string()];
 
-    let plan = Plan {
-        id: "metadata-lines".to_string(),
-        title: "Metadata Lines".to_string(),
-        description: None,
-        created_at: 1,
-        updated_at: 1,
-        architect: None,
-        last_replanned_step: None,
-        concept: vec![],
-        items: vec![step],
-    };
+    let plan = Plan::from_parts(
+        "metadata-lines".to_string(),
+        "Metadata Lines".to_string(),
+        None,
+        1,
+        1,
+        Vec::new(),
+        vec![step],
+    );
 
     let md = plan.to_markdown();
     assert!(md.contains("    files: src/a.rs, src/b .rs\n"));
@@ -1724,37 +1785,42 @@ fn test_plan_to_markdown_keeps_metadata_on_single_lines() {
 }
 
 #[test]
-fn test_plan_last_replanned_step_serde_and_backward_compatibility() {
-    // The step whose horizon was reprojected most recently is persisted with
-    // the plan, so a repeated failure of the same step is recognized from disk
-    // state instead of in-memory supervisor state, and a manual replan
-    // dispatched through the UI or RPC is accounted for identically.
-    let plan = Plan {
-        id: "replanned".to_string(),
-        title: "Replanned".to_string(),
-        last_replanned_step: Some("2".to_string()),
-        ..Default::default()
-    };
+fn test_plan_implementation_provenance_serde() {
+    // The provenance of a horizon travels with its step graph, so a repeated
+    // failure of the same step is recognized from disk state instead of
+    // in-memory supervisor state, and a manual replan is accounted for
+    // identically.
+    let mut plan = Plan::from_parts(
+        "replanned".to_string(),
+        "Replanned".to_string(),
+        None,
+        0,
+        0,
+        Vec::new(),
+        Vec::new(),
+    );
+    plan.last_replanned_step = Some("2".to_string());
     let json = serde_json::to_string(&plan).unwrap();
     assert!(json.contains("\"last_replanned_step\":\"2\""));
     let de: Plan = serde_json::from_str(&json).unwrap();
     assert_eq!(de.last_replanned_step.as_deref(), Some("2"));
+    assert_eq!(de.implementation, plan.implementation);
 
-    // A record written before the field existed stays readable: the absent
-    // marker simply reports that no step has been reprojected yet.
-    let legacy = r#"{"id":"legacy","title":"Legacy","created_at":1,"updated_at":2,"items":[]}"#;
-    let legacy_plan: Plan = serde_json::from_str(legacy).unwrap();
-    assert!(legacy_plan.last_replanned_step.is_none());
-
-    // An unset marker stays absent from the wire form, so a plan that was never
-    // replanned keeps its compact representation.
-    let fresh = Plan {
-        id: "fresh".to_string(),
-        title: "Fresh".to_string(),
-        ..Default::default()
-    };
+    // An unset marker stays absent from the wire form, so a horizon that was
+    // never replanned keeps its compact representation, while the step graph
+    // itself is always present as its own section.
+    let fresh = Plan::from_parts(
+        "fresh".to_string(),
+        "Fresh".to_string(),
+        None,
+        0,
+        0,
+        Vec::new(),
+        Vec::new(),
+    );
     let fresh_json = serde_json::to_string(&fresh).unwrap();
     assert!(!fresh_json.contains("last_replanned_step"));
+    assert!(fresh_json.contains("\"implementation\":{"), "{fresh_json}");
 }
 
 #[test]
@@ -1763,22 +1829,20 @@ fn test_plan_to_markdown_collapses_line_breaks_in_title_and_ids() {
     // interpolated field. The renderer must keep exactly one heading line and
     // one line per concept and step entry instead of emitting extra lines and
     // shifting the `#id` marker off its line.
-    let plan = Plan {
-        id: "line-breaks".to_string(),
-        title: "Plan\nTitle\rHere".to_string(),
-        description: None,
-        created_at: 1,
-        updated_at: 1,
-        architect: None,
-        last_replanned_step: None,
-        concept: vec![ConceptItem {
+    let plan = Plan::from_parts(
+        "line-breaks".to_string(),
+        "Plan\nTitle\rHere".to_string(),
+        None,
+        1,
+        1,
+        vec![ConceptItem {
             id: "c-1\nx".to_string(),
             title: "Concept\rTitle".to_string(),
             details: None,
             children: vec![],
         }],
-        items: vec![item("1\n2", "Step\rTitle", PlanItemStatus::Todo, vec![])],
-    };
+        vec![item("1\n2", "Step\rTitle", PlanItemStatus::Todo, vec![])],
+    );
 
     let md = plan.to_markdown();
     let lines: Vec<&str> = md.lines().collect();
@@ -1815,11 +1879,16 @@ fn test_plan_to_markdown_collapses_line_breaks_in_title_and_ids() {
 /// finished step, and a cancelled step are exempt from the requirement.
 #[test]
 fn test_plan_validate_requires_target_files_for_executable_leaves() {
-    let plan_with = |status: PlanItemStatus| Plan {
-        id: "leaf-files".to_string(),
-        title: "Leaf Files".to_string(),
-        items: vec![item("1", "Step", status, vec![])],
-        ..Default::default()
+    let plan_with = |status: PlanItemStatus| {
+        Plan::from_parts(
+            "leaf-files".to_string(),
+            "Leaf Files".to_string(),
+            None,
+            0,
+            0,
+            Vec::new(),
+            vec![item("1", "Step", status, vec![])],
+        )
     };
 
     // A pending leaf that declares nothing is rejected and named by its id.
@@ -1848,27 +1917,338 @@ fn test_plan_validate_requires_target_files_for_executable_leaves() {
     reference_only.readonly_files = vec!["src/contract.rs".to_string()];
     let mut creating = item("2", "Step", PlanItemStatus::Blocked, vec![]);
     creating.files = vec!["src/new.rs".to_string()];
-    let plan = Plan {
-        id: "leaf-files".to_string(),
-        title: "Leaf Files".to_string(),
-        items: vec![reference_only, creating],
-        ..Default::default()
-    };
+    let plan = Plan::from_parts(
+        "leaf-files".to_string(),
+        "Leaf Files".to_string(),
+        None,
+        0,
+        0,
+        Vec::new(),
+        vec![reference_only, creating],
+    );
     assert!(plan.validate().is_ok());
 
     // A blank entry names nothing, so it does not satisfy the requirement.
     let mut blank = item("1", "Step", PlanItemStatus::Todo, vec![]);
     blank.files = vec!["   ".to_string()];
-    let plan = Plan {
-        id: "blank-files".to_string(),
-        title: "Blank Files".to_string(),
-        items: vec![blank],
-        ..Default::default()
-    };
+    let plan = Plan::from_parts(
+        "blank-files".to_string(),
+        "Blank Files".to_string(),
+        None,
+        0,
+        0,
+        Vec::new(),
+        vec![blank],
+    );
     assert_eq!(
         plan.validate().unwrap_err(),
         vec![PlanValidationError::MissingLeafFiles {
             item_id: "1".to_string(),
         }]
+    );
+}
+
+/// Every plan is constructed through [`Plan::from_parts`], so the constructor
+/// must leave the decomposition provenance empty and keep the structural parts
+/// exactly as supplied.
+#[test]
+fn test_plan_from_parts_leaves_provenance_empty() {
+    let concept = vec![ConceptItem {
+        id: "c-1".to_string(),
+        title: "Invariant".to_string(),
+        details: None,
+        children: vec![],
+    }];
+    let items = vec![item("1", "Step", PlanItemStatus::Todo, vec![])];
+    let plan = Plan::from_parts(
+        "from-parts".to_string(),
+        "From Parts".to_string(),
+        Some("Single construction point".to_string()),
+        7,
+        9,
+        concept.clone(),
+        items.clone(),
+    );
+
+    assert_eq!(plan.id, "from-parts");
+    assert_eq!(plan.title, "From Parts");
+    assert_eq!(
+        plan.description.as_deref(),
+        Some("Single construction point")
+    );
+    assert_eq!(plan.created_at, 7);
+    assert_eq!(plan.updated_at, 9);
+    assert!(plan.architect.is_none());
+    assert!(plan.last_replanned_step.is_none());
+    assert_eq!(plan.concept, concept);
+    assert_eq!(plan.items, items);
+}
+
+/// The canonical wire form keeps the step graph in its own `implementation`
+/// object: the document header and the horizon are separate sections, and the
+/// nested form round-trips unchanged.
+#[test]
+fn test_plan_wire_form_nests_the_step_graph() {
+    let mut step = item("1", "Step", PlanItemStatus::Todo, vec![]);
+    step.files = vec!["src/a.rs".to_string()];
+    let mut plan = Plan::from_parts(
+        "nested".to_string(),
+        "Nested".to_string(),
+        Some("Nested implementation".to_string()),
+        1,
+        2,
+        Vec::new(),
+        vec![step],
+    );
+    plan.last_replanned_step = Some("1".to_string());
+
+    let json = serde_json::to_string(&plan).unwrap();
+    let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+    let implementation = value
+        .get("implementation")
+        .expect("the step graph is a nested object");
+    assert_eq!(implementation["items"][0]["id"], serde_json::json!("1"));
+    assert_eq!(
+        implementation["last_replanned_step"],
+        serde_json::json!("1")
+    );
+    // The header keeps no copy of the graph, so the two sections can never
+    // disagree about the steps of the horizon.
+    assert!(value.get("items").is_none(), "{json}");
+
+    let decoded: Plan = serde_json::from_str(&json).unwrap();
+    assert_eq!(decoded, plan);
+}
+
+/// The former flat layout is not readable: the nested form is the only accepted
+/// shape, so an old document fails to decode instead of silently becoming a
+/// plan without steps.
+#[test]
+fn test_plan_rejects_the_legacy_flat_form() {
+    let flat =
+        r#"{"id":"legacy","title":"Legacy","created_at":1,"updated_at":2,"concept":[],"items":[]}"#;
+    let decoded: Result<Plan, _> = serde_json::from_str(flat);
+    assert!(
+        decoded.is_err(),
+        "a flat plan document decoded: {decoded:?}"
+    );
+}
+
+/// The graph algebra lives on `PlanImplementation` and reaches a `Plan` through
+/// `Deref`, so one implementation serves both the standalone horizon and the
+/// plan that owns it.
+#[test]
+fn test_plan_implementation_algebra_matches_the_plan_delegation() {
+    let implementation = PlanImplementation {
+        items: vec![item(
+            "1",
+            "Group",
+            PlanItemStatus::Todo,
+            vec![
+                item("1.1", "Done leaf", PlanItemStatus::Done, vec![]),
+                item("1.2", "Pending leaf", PlanItemStatus::Todo, vec![]),
+            ],
+        )],
+        ..PlanImplementation::default()
+    };
+    let mut plan = Plan::from_parts(
+        "parity".to_string(),
+        "Parity".to_string(),
+        None,
+        1,
+        1,
+        Vec::new(),
+        implementation.items.clone(),
+    );
+
+    // Reads resolve to the same values through both entry points.
+    assert_eq!(plan.items, implementation.items);
+    assert_eq!(plan.status(), implementation.status());
+    assert_eq!(plan.count_stats(), implementation.count_stats());
+    assert_eq!(plan.is_leaf_item("1"), implementation.is_leaf_item("1"));
+    assert_eq!(
+        plan.find_item("1.2").map(|item| item.title.as_str()),
+        implementation
+            .find_item("1.2")
+            .map(|item| item.title.as_str())
+    );
+    assert_eq!(
+        plan.has_started_or_completed_steps(),
+        implementation.has_started_or_completed_steps()
+    );
+    assert_eq!(
+        plan.evaluate_scope(None),
+        implementation.evaluate_scope(None)
+    );
+
+    // Mutations reach the same graph, and the derived container status follows.
+    let mut delegated = implementation.clone();
+    assert!(plan.update_item_status("1.2", PlanItemStatus::InProgress));
+    assert!(delegated.update_item_status("1.2", PlanItemStatus::InProgress));
+    assert_eq!(plan.items, delegated.items);
+
+    plan.refresh_parent_statuses();
+    delegated.refresh_parent_statuses();
+    assert_eq!(plan.items, delegated.items);
+
+    // Leaf-only normalization runs on both without diverging.
+    plan.normalize_leaf_files();
+    delegated.normalize_leaf_files();
+    assert_eq!(plan.items, delegated.items);
+
+    // The horizon is a plain nested field, so its provenance is addressable
+    // through the plan itself.
+    plan.architect = None;
+    plan.last_replanned_step = Some("1.2".to_string());
+    assert_eq!(
+        plan.implementation.last_replanned_step.as_deref(),
+        Some("1.2")
+    );
+}
+
+/// The structural validation of a horizon reports identifier, target-file,
+/// dependency, and cycle violations, while the plan composes that report with
+/// its own concept reference check.
+#[test]
+fn test_plan_implementation_validate_structure_matrix() {
+    let mut step = item("1", "Step", PlanItemStatus::Todo, vec![]);
+    step.files = vec!["src/a.rs".to_string()];
+    let implementation = PlanImplementation {
+        items: vec![step],
+        ..PlanImplementation::default()
+    };
+    assert!(implementation.validate_structure().is_ok());
+
+    // An executable leaf must name a target file.
+    let bare = PlanImplementation {
+        items: vec![item("1", "Step", PlanItemStatus::Todo, vec![])],
+        ..PlanImplementation::default()
+    };
+    assert_eq!(
+        bare.validate_structure().unwrap_err(),
+        vec![PlanValidationError::MissingLeafFiles {
+            item_id: "1".to_string(),
+        }]
+    );
+
+    // Only executable work carries the requirement: a draft, a finished step
+    // and a cancelled step are exempt.
+    for status in [
+        PlanItemStatus::Discussion,
+        PlanItemStatus::Done,
+        PlanItemStatus::Cancelled,
+    ] {
+        let exempt = PlanImplementation {
+            items: vec![item("1", "Step", status, vec![])],
+            ..PlanImplementation::default()
+        };
+        assert!(exempt.validate_structure().is_ok(), "{status}");
+    }
+
+    // Identifiers must be non-empty and unique across the whole tree.
+    let empty = PlanImplementation {
+        items: vec![item("  ", "Empty", PlanItemStatus::Done, vec![])],
+        ..PlanImplementation::default()
+    };
+    assert_eq!(
+        empty.validate_structure().unwrap_err(),
+        vec![PlanValidationError::EmptyItemId]
+    );
+
+    let duplicate = PlanImplementation {
+        items: vec![
+            item("Step-1", "A", PlanItemStatus::Done, vec![]),
+            item("step-1", "B", PlanItemStatus::Done, vec![]),
+        ],
+        ..PlanImplementation::default()
+    };
+    assert_eq!(
+        duplicate.validate_structure().unwrap_err(),
+        vec![PlanValidationError::DuplicateItemId("step-1".to_string())]
+    );
+
+    // Dependencies must resolve and a step cannot depend on itself.
+    let mut orphan = item("1", "Orphan", PlanItemStatus::Done, vec![]);
+    orphan.depends_on = vec!["ghost".to_string()];
+    let missing = PlanImplementation {
+        items: vec![orphan],
+        ..PlanImplementation::default()
+    };
+    assert_eq!(
+        missing.validate_structure().unwrap_err(),
+        vec![PlanValidationError::MissingDependency {
+            item_id: "1".to_string(),
+            depends_on: "ghost".to_string(),
+        }]
+    );
+
+    let mut self_dep = item("1", "Self", PlanItemStatus::Done, vec![]);
+    self_dep.depends_on = vec!["1".to_string()];
+    let self_referential = PlanImplementation {
+        items: vec![self_dep],
+        ..PlanImplementation::default()
+    };
+    assert_eq!(
+        self_referential.validate_structure().unwrap_err(),
+        vec![PlanValidationError::SelfDependency("1".to_string())]
+    );
+
+    let mut cyclic_a = item("A", "A", PlanItemStatus::Done, vec![]);
+    cyclic_a.depends_on = vec!["B".to_string()];
+    let mut cyclic_b = item("B", "B", PlanItemStatus::Done, vec![]);
+    cyclic_b.depends_on = vec!["A".to_string()];
+    let cyclic = PlanImplementation {
+        items: vec![cyclic_a, cyclic_b],
+        ..PlanImplementation::default()
+    };
+    match cyclic.validate_structure().unwrap_err().as_slice() {
+        [PlanValidationError::CyclicDependency(cycle)] => {
+            assert!(cycle.contains(&"A".to_string()));
+            assert!(cycle.contains(&"B".to_string()));
+        }
+        other => panic!("Expected CyclicDependency, got {other:?}"),
+    }
+
+    // A container is derived `Done` from the leaves that still gate it, so a
+    // leaf naming its own ancestor is a genuine cycle.
+    let mut child = item("1.1", "Child", PlanItemStatus::Todo, vec![]);
+    child.depends_on = vec!["1".to_string()];
+    child.files = vec!["src/child.rs".to_string()];
+    let ancestor = PlanImplementation {
+        items: vec![item("1", "Group", PlanItemStatus::Todo, vec![child])],
+        ..PlanImplementation::default()
+    };
+    match ancestor.validate_structure().unwrap_err().as_slice() {
+        [PlanValidationError::CyclicDependency(cycle)] => {
+            assert!(cycle.contains(&"1".to_string()));
+            assert!(cycle.contains(&"1.1".to_string()));
+        }
+        other => panic!("Expected CyclicDependency, got {other:?}"),
+    }
+
+    // The plan composes the concept reference check with the structural report
+    // of its implementation, so one call reports both owners.
+    let mut unresolved = item("1", "Unresolved", PlanItemStatus::Todo, vec![]);
+    unresolved.concept_refs = vec!["c-missing".to_string()];
+    let plan = Plan::from_parts(
+        "composed".to_string(),
+        "Composed".to_string(),
+        None,
+        0,
+        0,
+        Vec::new(),
+        vec![unresolved],
+    );
+    assert_eq!(
+        plan.validate().unwrap_err(),
+        vec![
+            PlanValidationError::MissingConceptRef {
+                item_id: "1".to_string(),
+                concept_ref: "c-missing".to_string(),
+            },
+            PlanValidationError::MissingLeafFiles {
+                item_id: "1".to_string(),
+            },
+        ]
     );
 }

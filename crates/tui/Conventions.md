@@ -94,7 +94,7 @@ This document specifies mandatory architectural and UX invariants for the Tauqe 
 
 5. **`N` Creates, `r` / `R` Decompose (New Entity versus Refine Invariant):**
    - Creating a new analysis entity is separated from decomposing an existing one, so the two verbs never compete for a letter. Starting a new Review session over the current context is bound to `N`.
-   - `r` and `R` are reserved for the Architect in Plans and Review: lowercase `r` decomposes the selected item (refining the plan horizon or turning a finding into a subplan), and `R` runs the Architect over every item that requires decomposition.
+    - `r` and `R` are reserved for the Architect in Plans and Review: lowercase `r` decomposes the selected item (refining the plan horizon or turning a finding into an implementation plan), and `R` runs the Architect over every item that requires decomposition.
    - Refresh therefore never claims `r`; it uses the canonical `g` (§4.6).
 
 6. **Navigation Minimum and Canonical Refresh (`g`):**

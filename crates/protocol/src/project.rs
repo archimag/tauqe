@@ -78,17 +78,110 @@ impl fmt::Display for DiagnosticSeverity {
     }
 }
 
-// Tolerant decoding is confined to the wire boundary: a `null`, an absent
-// value, or an unknown spelling resolves to `Error` instead of failing the
-// whole diagnostic list, so one odd severity never discards the remaining
-// findings of a failed verification.
+// Tolerant decoding is confined to the wire boundary and spans the whole JSON
+// value domain: a `null`, an absent field, an unknown spelling, or a non-string
+// severity (a numeric level, a boolean, a container) resolves to `Error`
+// instead of failing the whole diagnostic list, so one odd severity never
+// discards the remaining findings of a failed verification.
 impl<'de> Deserialize<'de> for DiagnosticSeverity {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
         D: Deserializer<'de>,
     {
-        let raw = Option::<String>::deserialize(deserializer)?;
-        Ok(raw.as_deref().map(Self::parse_lossy).unwrap_or_default())
+        deserializer.deserialize_any(DiagnosticSeverityVisitor)
+    }
+}
+
+/// Total visitor behind [`DiagnosticSeverity`]'s decoding.
+///
+/// It never fails: strings map through [`DiagnosticSeverity::parse_lossy`], a
+/// `null` resolves to the default severity, and any other value resolves to
+/// [`DiagnosticSeverity::Error`], so a severity shape the contract does not
+/// name still leaves the diagnostic that carries it intact.
+struct DiagnosticSeverityVisitor;
+
+impl<'de> serde::de::Visitor<'de> for DiagnosticSeverityVisitor {
+    type Value = DiagnosticSeverity;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("a diagnostic severity name or any other JSON value")
+    }
+
+    fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
+    where
+        E: serde::de::Error,
+    {
+        Ok(DiagnosticSeverity::parse_lossy(value))
+    }
+
+    fn visit_string<E>(self, value: String) -> Result<Self::Value, E>
+    where
+        E: serde::de::Error,
+    {
+        self.visit_str(&value)
+    }
+
+    fn visit_unit<E>(self) -> Result<Self::Value, E>
+    where
+        E: serde::de::Error,
+    {
+        Ok(DiagnosticSeverity::default())
+    }
+
+    fn visit_none<E>(self) -> Result<Self::Value, E>
+    where
+        E: serde::de::Error,
+    {
+        Ok(DiagnosticSeverity::default())
+    }
+
+    fn visit_some<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        deserializer.deserialize_any(self)
+    }
+
+    fn visit_bool<E>(self, _value: bool) -> Result<Self::Value, E>
+    where
+        E: serde::de::Error,
+    {
+        Ok(DiagnosticSeverity::Error)
+    }
+
+    fn visit_i64<E>(self, _value: i64) -> Result<Self::Value, E>
+    where
+        E: serde::de::Error,
+    {
+        Ok(DiagnosticSeverity::Error)
+    }
+
+    fn visit_u64<E>(self, _value: u64) -> Result<Self::Value, E>
+    where
+        E: serde::de::Error,
+    {
+        Ok(DiagnosticSeverity::Error)
+    }
+
+    fn visit_f64<E>(self, _value: f64) -> Result<Self::Value, E>
+    where
+        E: serde::de::Error,
+    {
+        Ok(DiagnosticSeverity::Error)
+    }
+
+    fn visit_seq<A>(self, _seq: A) -> Result<Self::Value, A::Error>
+    where
+        A: serde::de::SeqAccess<'de>,
+    {
+        Ok(DiagnosticSeverity::Error)
+    }
+
+    fn visit_map<A>(self, _map: A) -> Result<Self::Value, A::Error>
+    where
+        A: serde::de::MapAccess<'de>,
+    {
+        Ok(DiagnosticSeverity::Error)
     }
 }
 
@@ -381,6 +474,40 @@ mod tests {
         assert!(DiagnosticSeverity::Warning < DiagnosticSeverity::Note);
         assert!(DiagnosticSeverity::Note < DiagnosticSeverity::Help);
         assert_eq!(DiagnosticSeverity::default(), DiagnosticSeverity::Error);
+    }
+
+    #[test]
+    fn test_diagnostic_severity_accepts_non_string_shapes() {
+        // A toolchain may emit a numeric level, a float, a boolean, or a
+        // container where the contract names a severity string. Every shape
+        // resolves to `Error` instead of failing the decode, so the finding
+        // that carries it survives.
+        for payload in ["2", "1.5", "true", "[]", "{}"] {
+            let raw = format!(r#"{{"message":"boom","severity":{payload}}}"#);
+            let diagnostic: Diagnostic = serde_json::from_str(&raw).unwrap();
+            assert_eq!(
+                diagnostic.severity,
+                DiagnosticSeverity::Error,
+                "severity payload {payload}"
+            );
+            assert_eq!(diagnostic.message, "boom");
+        }
+    }
+
+    #[test]
+    fn test_odd_severity_never_discards_the_diagnostic_list() {
+        // One unreadable severity must not abort the whole verification report:
+        // the odd entry degrades to `Error` and its siblings decode untouched.
+        let raw = r#"[
+            {"file":"src/a.rs","message":"mismatched types","severity":2},
+            {"file":"src/b.rs","message":"unused import","severity":"warning"}
+        ]"#;
+        let diagnostics: Vec<Diagnostic> = serde_json::from_str(raw).unwrap();
+        assert_eq!(diagnostics.len(), 2);
+        assert_eq!(diagnostics[0].severity, DiagnosticSeverity::Error);
+        assert_eq!(diagnostics[0].message, "mismatched types");
+        assert_eq!(diagnostics[1].severity, DiagnosticSeverity::Warning);
+        assert_eq!(diagnostics[1].message, "unused import");
     }
 
     #[test]

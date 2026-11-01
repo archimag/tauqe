@@ -7,14 +7,12 @@
 //! evolve independently.
 //!
 //! [`SingleExecution`] runs exactly one bounded turn by composing the
-//! single-turn workflow lifecycle, which performs role escalation
-//! (`auto_level_up`) and cost accounting once per turn.
+//! [`SingleExecution`] runs exactly one bounded turn by composing the
+//! single-turn workflow lifecycle: session bookkeeping, the FSM cycle, and the
+//! recording of the turn response.
 
 use async_trait::async_trait;
-use tauqe_protocol::{
-    EditOutcome, ModelEntry, ModelRef, ModelResult, ModelRole, PatchStrategy, PromptLayoutKind,
-    ReasoningEffort, TurnIntent,
-};
+use tauqe_protocol::{ModelRef, PatchStrategy, PromptLayoutKind, ReasoningEffort, TurnIntent};
 use tokio::sync::mpsc;
 use tokio::sync::watch;
 
@@ -26,10 +24,8 @@ use crate::workflow::policy::ApplyPolicy;
 
 use super::WorkflowExecutionResult;
 use crate::workflow::discovery::DiscoveryLimits;
-use crate::workflow::fsm::guard::{attempt_rollback, rollback_or_log};
-use crate::workflow::fsm::{
-    begin_session_turn, record_session_response, run_fsm_turn_body, AbortReport, FsmTurnOutcome,
-};
+use crate::workflow::fsm::guard::rollback_or_log;
+use crate::workflow::fsm::{begin_session_turn, record_session_response, run_fsm_turn_body};
 
 /// Execution options and token budgets for edit workflows.
 #[derive(Debug, Clone)]
@@ -52,9 +48,6 @@ pub struct WorkflowOptions {
     /// Maximum characters of a turn scratchpad block before safe truncation.
     pub max_scratchpad_chars: usize,
     pub history_model: ModelRef,
-    pub auto_level_up: bool,
-    pub models_config: crate::config::ModelsConfig,
-    pub initial_selection: Option<tauqe_protocol::ModelSelection>,
     pub app_config: Option<crate::config::AppConfig>,
     /// Reasoning effort applied to the current turn, resolved from the active
     /// semantic role. Updated on `auto_level_up` escalation so a
@@ -67,6 +60,13 @@ pub struct WorkflowOptions {
     /// execution, or a review audit each pass their own identifier. `None`
     /// disables affinity and the provider serves every round statelessly.
     pub session_id: Option<String>,
+    /// Review session the dialogue is anchored on, if any.
+    ///
+    /// A dialogue anchored on a review session may record a decision for one of
+    /// its findings. The identity travels with the turn so a decoded decision is
+    /// persisted against the session the dialogue discusses, never against an
+    /// ambient one.
+    pub review_session_id: Option<String>,
 }
 
 impl Default for WorkflowOptions {
@@ -83,12 +83,10 @@ impl Default for WorkflowOptions {
             max_feedback_chars: crate::config::DEFAULT_MAX_FEEDBACK_CHARS,
             max_scratchpad_chars: crate::config::DEFAULT_MAX_SCRATCHPAD_CHARS,
             history_model: ModelRef::openrouter(crate::config::BUILTIN_DEFAULT_SCRIBE_MODEL),
-            auto_level_up: false,
-            models_config: crate::config::ModelsConfig::default(),
-            initial_selection: None,
             app_config: None,
             reasoning_effort: None,
             session_id: None,
+            review_session_id: None,
         }
     }
 }
@@ -109,12 +107,10 @@ impl WorkflowOptions {
             max_feedback_chars: config.context.max_feedback_chars,
             max_scratchpad_chars: config.context.max_scratchpad_chars,
             history_model: config.history_model(),
-            auto_level_up: config.models.auto_level_up,
-            models_config: config.models.clone(),
-            initial_selection: None,
             app_config: Some(config.clone()),
             reasoning_effort: None,
             session_id: None,
+            review_session_id: None,
         }
     }
 
@@ -152,22 +148,6 @@ impl WorkflowOptions {
             .map(|config| config.resolve_prompt_layout(intent))
             .unwrap_or(PromptLayoutKind::Semantic)
     }
-}
-
-/// Advances the coder escalation ladder by one rung.
-///
-/// Returns the next ladder index with its tier, or `None` when the ladder is
-/// already at its strongest rung so escalation terminates deterministically.
-/// A rung counts as an advance when either the model or the reasoning effort
-/// changes, which lets the ladder deepen reasoning on the same model before
-/// switching to a stronger model. The rule itself lives in
-/// `ModelsConfig::next_coder_tier`, so the harness holds one authoritative
-/// definition of an advancing rung.
-fn next_coder_tier(
-    models_config: &crate::config::ModelsConfig,
-    current_idx: usize,
-) -> Option<(usize, ModelEntry)> {
-    models_config.next_coder_tier(current_idx)
 }
 
 /// Strategy governing how bounded turns are executed and supervised.
@@ -231,10 +211,9 @@ impl ExecutionMode for SingleExecution {
         stream_tx: mpsc::Sender<StreamEvent>,
         cancel_rx: watch::Receiver<bool>,
     ) -> anyhow::Result<WorkflowExecutionResult> {
-        // Session bookkeeping runs once for the whole bounded turn. Coder-tier
-        // escalation replays the turn body on a stronger tier, so recording the
-        // prompt and response here, rather than inside every attempt, keeps a
-        // retried turn from leaving duplicate history entries behind.
+        // Session bookkeeping runs once for the whole bounded turn: recording the
+        // prompt and the response here, rather than inside the turn body, keeps a
+        // failed attempt from leaving duplicate history entries behind.
         let turn_id = begin_session_turn(
             prompt,
             intent,
@@ -246,297 +225,84 @@ impl ExecutionMode for SingleExecution {
         )
         .await;
 
-        let current_role = match self.options.initial_selection {
-            Some(tauqe_protocol::ModelSelection::Role(role)) => Some(role),
-            _ => None,
-        };
-        let mut current_model = model.clone();
-        let mut ladder_idx: usize = 0;
-        let mut dynamic_provider: Option<Box<dyn LlmProvider>> = None;
-        let mut turn_options = self.options.clone();
-
-        loop {
-            let active_provider: &dyn LlmProvider = if let Some(ref p) = dynamic_provider {
-                p.as_ref()
-            } else {
-                provider
-            };
-
-            let turn_res = run_fsm_turn_body(
-                prompt,
-                intent,
-                active_provider,
-                &current_model,
-                context_manager,
-                history_manager,
-                protocol,
-                policy,
-                self.name(),
-                stream_tx.clone(),
-                cancel_rx.clone(),
-                &turn_options,
-            )
-            .await;
-
-            let turn = match turn_res {
-                Ok(turn) => turn,
-                Err(err) => {
-                    rollback_or_log(policy, context_manager.repo_root()).await;
-                    // The sweep only drops context paths that no longer exist on
-                    // disk and runs off the async executor thread. The auto layer
-                    // survives a failed attempt so escalation inherits it.
-                    crate::blocking::run_blocking(|| {
-                        context_manager.prune_missing_files();
-                    });
-                    if let Some(id) = turn_id {
-                        let _ = history_manager.rollback_entry(id, format!("Turn failed: {}", err));
-                    }
-                    return Err(err);
-                }
-            };
-
-            let is_blocked = turn.blocked.is_some();
-            let is_error = matches!(
-                &turn.result,
-                ModelResult::Edit { outcome, .. } if outcome.error.is_some() && !outcome.applied
-            );
-            let is_empty_edit = matches!(
-                &turn.result,
-                ModelResult::Edit { edits, outcome, .. }
-                    if edits.is_empty() && outcome.error.is_none()
-            );
-            // A coder that answers without edits and without an explicit
-            // `<success>` signal has not validated the step: escalate it like a
-            // failed or empty edit instead of accepting an idle reply (c-3).
-            let is_unverified_answer = turn.is_unverified_answer();
-
-            if (is_error || is_empty_edit || is_unverified_answer)
-                && !turn.is_cancelled
-                && !is_blocked
-                && turn_options.auto_level_up
-                && current_role == Some(ModelRole::Coder)
-            {
-                if let Some((next_idx, next_tier)) =
-                    next_coder_tier(&turn_options.models_config, ladder_idx)
-                {
-                    let next_m = next_tier.model.clone();
-
-                    // Build the destination provider before committing to the
-                    // escalation. A provider-construction failure must never
-                    // leave the harness retrying a foreign model on the current
-                    // provider, so the escalation is skipped and the failure is
-                    // surfaced as a diagnostic instead of silently reusing the
-                    // previous provider.
-                    let new_provider = if next_m.provider != current_model.provider {
-                        match turn_options.app_config.as_ref().map(|config| {
-                            crate::providers::create_provider(next_m.provider, config)
-                        }) {
-                            Some(Ok(built)) => Some(built),
-                            Some(Err(err)) => {
-                                tracing::error!(
-                                    "Failed to create a provider for escalation tier {} (`{}`): {}. Skipping escalation and returning the current turn outcome.",
-                                    next_idx, next_m, err
-                                );
-                                None
-                            }
-                            None => {
-                                tracing::error!(
-                                    "Cannot escalate to tier {} (`{}`): no application configuration is available to build its provider. Skipping escalation and returning the current turn outcome.",
-                                    next_idx, next_m
-                                );
-                                None
-                            }
-                        }
-                    } else {
-                        None
-                    };
-
-                    let provider_ready =
-                        next_m.provider == current_model.provider || new_provider.is_some();
-                    if provider_ready {
-                        // A failed rollback breaks the clean-tree invariant:
-                        // the next tier would start from a working tree that
-                        // still holds the failed writes, so the ladder stops
-                        // here instead of escalating onto a dirty tree. The
-                        // developer receives the failure together with the
-                        // exact manual diagnostic to run.
-                        // A policy that holds no open transaction restores
-                        // nothing and reports it as such, so only a rollback
-                        // that actually failed stops the ladder.
-                        if attempt_rollback(policy, context_manager.repo_root())
-                            .await
-                            .is_failed()
-                        {
-                            let abort = AbortReport {
-                                reason: format!(
-                                    "The failed attempt on coder tier {} (`{}`) could not be reverted, so the working tree may still hold its writes. Escalating to tier {} (`{}`) would start from a dirty tree.",
-                                    ladder_idx, current_model, next_idx, next_m
-                                ),
-                                recommendation: "Inspect the working tree with `git status` and `git diff`, restore the repository to a clean state (for example `git checkout -- .` or `git stash`), then re-run the step.".to_string(),
-                            };
-                            let message = abort.to_message();
-                            tracing::error!(
-                                from_tier = ladder_idx,
-                                to_tier = next_idx,
-                                from_model = %current_model,
-                                to_model = %next_m,
-                                reason = %abort.reason,
-                                "coder ladder escalation aborted: the failed attempt could not be rolled back"
-                            );
-                            let notice =
-                                format!("\n\n---\n⛔ **[Execution Aborted]**\n\n{}\n\n", message);
-                            let _ = stream_tx.send(StreamEvent::TextDelta(notice)).await;
-                            // Pruning missing files performs filesystem metadata
-                            // checks, so it runs off the async executor thread.
-                            crate::blocking::run_blocking(|| {
-                                context_manager.prune_missing_files();
-                            });
-                            let ctx_state = context_manager.get_state();
-                            let _ = stream_tx.send(StreamEvent::ContextChanged(ctx_state)).await;
-                            let _ = stream_tx.send(StreamEvent::Done).await;
-                            let aborted = FsmTurnOutcome {
-                                assistant_text: turn.assistant_text.clone(),
-                                result: ModelResult::Edit {
-                                    summary: "Execution aborted".to_string(),
-                                    edits: Vec::new(),
-                                    proposal: None,
-                                    outcome: EditOutcome {
-                                        applied: false,
-                                        error: Some(message),
-                                        changed_files: Vec::new(),
-                                        commit_hash: None,
-                                    },
-                                },
-                                is_cancelled: false,
-                                blocked: None,
-                                abort: Some(abort),
-                                has_terminal_success: false,
-                                plan_saved: false,
-                                plan_errors: Vec::new(),
-                                skip_reason: None,
-                            };
-                            record_session_response(history_manager, &aborted);
-                            return Ok(WorkflowExecutionResult {
-                                result: aborted.result,
-                                assistant_text: aborted.assistant_text,
-                                blocked: aborted.blocked,
-                                skip_reason: aborted.skip_reason,
-                                abort: aborted.abort,
-                                plan_saved: aborted.plan_saved,
-                                plan_errors: aborted.plan_errors,
-                            });
-                        }
-                        // Pruning missing files performs filesystem metadata
-                        // checks, so it runs off the async executor thread.
-                        crate::blocking::run_blocking(|| context_manager.prune_missing_files());
-
-                        let reason = if is_error {
-                            match &turn.result {
-                                ModelResult::Edit { outcome, .. } if outcome.error.is_some() => {
-                                    outcome
-                                        .error
-                                        .clone()
-                                        .unwrap_or_else(|| "Unknown error".to_string())
-                                }
-                                _ => "Unknown error".to_string(),
-                            }
-                        } else if is_unverified_answer {
-                            "Unverified answer without edits".to_string()
-                        } else {
-                            "No valid edits".to_string()
-                        };
-
-                        tracing::warn!(
-                            from_tier = ladder_idx,
-                            to_tier = next_idx,
-                            from_model = %current_model,
-                            to_model = %next_m,
-                            effort = ?next_tier.effort,
-                            reason = %reason,
-                            "coder ladder escalation"
-                        );
-                        // The escalation is announced as a typed event before the
-                        // textual notice, so clients carry the active tier from
-                        // structured data instead of parsing prose.
-                        let _ = stream_tx
-                            .send(StreamEvent::ModelEscalated {
-                                model: next_m.clone(),
-                                role: current_role,
-                                alias: None,
-                                effort: next_tier.effort,
-                                tier: next_idx,
-                            })
-                            .await;
-                        let notice = format!(
-                            "\n\n> ⚠️ **Level Up Escalation:** Turn failed on coder tier {} (`{}`, {}). Escalating to tier {} (`{}`)...\n\n",
-                            ladder_idx, current_model, reason, next_idx, next_m
-                        );
-                        let _ = stream_tx.send(StreamEvent::TextDelta(notice)).await;
-
-                        ladder_idx = next_idx;
-                        turn_options.reasoning_effort = next_tier.effort;
-
-                        if let Some(built) = new_provider {
-                            dynamic_provider = Some(built);
-                        }
-                        current_model = next_m;
-                        continue;
-                    }
-                }
-            }
-
-            if turn.is_cancelled {
+        let turn = match run_fsm_turn_body(
+            prompt,
+            intent,
+            provider,
+            model,
+            context_manager,
+            history_manager,
+            protocol,
+            policy,
+            self.name(),
+            stream_tx.clone(),
+            cancel_rx,
+            &self.options,
+        )
+        .await
+        {
+            Ok(turn) => turn,
+            Err(err) => {
+                rollback_or_log(policy, context_manager.repo_root()).await;
+                // The sweep only drops context paths that no longer exist on
+                // disk and runs off the async executor thread. The auto layer
+                // survives a failed attempt so a retry inherits it.
+                crate::blocking::run_blocking(|| {
+                    context_manager.prune_missing_files();
+                });
                 if let Some(id) = turn_id {
-                    let _ = history_manager.rollback_entry(id, "Turn cancelled by the developer");
+                    let _ = history_manager.rollback_entry(id, format!("Turn failed: {}", err));
                 }
-            } else {
-                record_session_response(history_manager, &turn);
+                return Err(err);
             }
-            // A plan mutation the storage engine refused never fails the turn,
-            // but it is a protocol-level rejection the developer must see: the
-            // reason is streamed as a warning banner, and the history record
-            // written above hands it to the model's next explicit round.
-            if let Some(notice) = turn.plan_rejection_notice() {
-                tracing::warn!("{}", notice);
-                let _ = stream_tx
-                    .send(StreamEvent::TextDelta(format!(
-                        "\n\n---\n\u{26a0}\u{fe0f} {}\n\n",
-                        notice
-                    )))
-                    .await;
+        };
+
+        if turn.is_cancelled {
+            if let Some(id) = turn_id {
+                let _ = history_manager.rollback_entry(id, "Turn cancelled by the developer");
             }
-            return Ok(WorkflowExecutionResult {
-                result: turn.result,
-                assistant_text: turn.assistant_text,
-                blocked: turn.blocked,
-                skip_reason: turn.skip_reason,
-                abort: turn.abort,
-                plan_saved: turn.plan_saved,
-                plan_errors: turn.plan_errors,
-            });
+        } else {
+            record_session_response(history_manager, &turn);
         }
+        // A plan mutation the storage engine refused never fails the turn, but it
+        // is a protocol-level rejection the developer must see: the reason is
+        // streamed as a warning banner, and the history record written above hands
+        // it to the model's next explicit round.
+        if let Some(notice) = turn.plan_rejection_notice() {
+            tracing::warn!("{}", notice);
+            let _ = stream_tx
+                .send(StreamEvent::TextDelta(format!(
+                    "\n\n---\n\u{26a0}\u{fe0f} {}\n\n",
+                    notice
+                )))
+                .await;
+        }
+        Ok(WorkflowExecutionResult {
+            result: turn.result,
+            assistant_text: turn.assistant_text,
+            blocked: turn.blocked,
+            skip_reason: turn.skip_reason,
+            abort: turn.abort,
+            plan_saved: turn.plan_saved,
+            plan_errors: turn.plan_errors,
+        })
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use std::path::Path;
-    use tauqe_protocol::{
-        ContextAccess, EditOperation, EditProposal, ModelRef, ModelResult, ProviderKind,
-        ReasoningEffort,
-    };
+    use tauqe_protocol::{ContextAccess, ModelRef, ModelResult, ProviderKind};
     use tokio::sync::{mpsc, watch};
 
     use crate::context::ContextManager;
-    use crate::edits::{StageEditsResult, StagedEditsState};
     use crate::history::HistoryManager;
     use crate::prompt::protocol::PromptProtocol;
     use crate::providers::mock::{MockLlmProvider, MockResponse};
     use crate::providers::{ChatMessage, LlmProvider, ResponseFormat, StreamEvent};
-    use crate::workflow::policy::{ApplyPolicy, DirectApplyPolicy};
+    use crate::workflow::policy::DirectApplyPolicy;
     use crate::workflow::WorkflowOptions;
 
-    use super::{next_coder_tier, ExecutionMode, SingleExecution};
+    use super::{ExecutionMode, SingleExecution};
 
     const MARKER: &str = "EXEC";
 
@@ -579,41 +345,6 @@ mod tests {
     fn single_execution_reports_stable_name() {
         let exec = SingleExecution::new(WorkflowOptions::default());
         assert_eq!(exec.name(), "single");
-    }
-
-    #[test]
-    fn next_coder_tier_deepens_effort_then_model_and_saturates() {
-        // Role lists are decoded through the application configuration, so the
-        // test exercises the same catalog resolution a project config uses.
-        let config: crate::config::AppConfig = toml::from_str(
-            r#"
-[models]
-primary = ["openrouter:base/primary"]
-coder = [
-    "openrouter:base/model",
-    { model = "openrouter:base/model", effort = "high" },
-    { model = "openrouter:strong/model", effort = "xhigh" },
-]
-"#,
-        )
-        .expect("parse coder ladder");
-        let config = config.models;
-
-        let (first_idx, first) = next_coder_tier(&config, 0).expect("deepen reasoning first");
-        assert_eq!(first_idx, 1);
-        assert_eq!(first.model, ModelRef::openrouter("base/model"));
-        assert_eq!(first.effort, Some(ReasoningEffort::High));
-
-        let (second_idx, second) = next_coder_tier(&config, 1).expect("switch to stronger model");
-        assert_eq!(second_idx, 2);
-        assert_eq!(second.model, ModelRef::openrouter("strong/model"));
-        assert_eq!(second.effort, Some(ReasoningEffort::XHigh));
-
-        assert!(next_coder_tier(&config, 2).is_none(), "ladder saturates");
-        assert!(
-            next_coder_tier(&config, 9).is_none(),
-            "beyond the last rung saturates"
-        );
     }
 
     #[tokio::test]
@@ -696,161 +427,13 @@ coder = [
         (dir, repo_root)
     }
 
-    fn coder_ladder_options() -> WorkflowOptions {
-        // A role list resolves through the application configuration, exactly
-        // like a project `tauqe.toml`, so the fixture keeps the real decoding
-        // path instead of hand-building the resolved struct.
-        let config: crate::config::AppConfig = toml::from_str(
-            r#"
-[models]
-primary = ["openrouter:base/primary"]
-coder = [
-    "openrouter:base/model",
-    { model = "openrouter:base/model", effort = "high" },
-]
-"#,
-        )
-        .expect("parse coder ladder");
-        let models_config = config.models;
-        WorkflowOptions {
-            auto_level_up: true,
-            initial_selection: Some(tauqe_protocol::ModelSelection::Role(
-                tauqe_protocol::ModelRole::Coder,
-            )),
-            models_config,
-            ..WorkflowOptions::default()
-        }
-    }
-
-    /// Policy delegating every phase to the direct policy while its rollback
-    /// always fails, to exercise the durability seam of the escalation path.
-    #[derive(Default)]
-    struct FailingRollbackPolicy {
-        inner: DirectApplyPolicy,
-    }
-
-    #[async_trait::async_trait]
-    impl ApplyPolicy for FailingRollbackPolicy {
-        async fn staging(
-            &mut self,
-            repo_root: &Path,
-            project: &tauqe_protocol::ProjectConfig,
-            context_manager: &ContextManager,
-            edits: &[EditOperation],
-            staged_state: Option<&StagedEditsState>,
-            cancel_rx: Option<&watch::Receiver<bool>>,
-        ) -> StageEditsResult {
-            self.inner
-                .staging(
-                    repo_root,
-                    project,
-                    context_manager,
-                    edits,
-                    staged_state,
-                    cancel_rx,
-                )
-                .await
-        }
-
-        async fn apply_temporary(
-            &mut self,
-            repo_root: &Path,
-            project: &tauqe_protocol::ProjectConfig,
-            context_manager: &mut ContextManager,
-            proposal: &EditProposal,
-        ) -> anyhow::Result<Vec<String>> {
-            self.inner
-                .apply_temporary(repo_root, project, context_manager, proposal)
-                .await
-        }
-
-        async fn apply_final(
-            &mut self,
-            repo_root: &Path,
-            changed_files: &[String],
-            summary: &str,
-        ) -> anyhow::Result<Option<String>> {
-            self.inner
-                .apply_final(repo_root, changed_files, summary)
-                .await
-        }
-
-        async fn rollback(&mut self, _repo_root: &Path) -> anyhow::Result<bool> {
-            Err(anyhow::anyhow!("simulated rollback failure"))
-        }
-    }
-
-    /// Policy whose rollback fails a fixed number of times before it succeeds,
-    /// standing in for a file lock that an IDE, a language server, or the
-    /// operating system releases shortly. Every other phase delegates to
-    /// [`DirectApplyPolicy`], so the double satisfies the whole `ApplyPolicy`
-    /// contract instead of leaving a panicking branch the retry seam never
-    /// exercises.
-    struct TransientRollbackPolicy {
-        inner: DirectApplyPolicy,
-        failures_left: usize,
-    }
-
-    #[async_trait::async_trait]
-    impl ApplyPolicy for TransientRollbackPolicy {
-        async fn staging(
-            &mut self,
-            repo_root: &Path,
-            project: &tauqe_protocol::ProjectConfig,
-            context_manager: &ContextManager,
-            edits: &[EditOperation],
-            staged_state: Option<&StagedEditsState>,
-            cancel_rx: Option<&watch::Receiver<bool>>,
-        ) -> StageEditsResult {
-            self.inner
-                .staging(
-                    repo_root,
-                    project,
-                    context_manager,
-                    edits,
-                    staged_state,
-                    cancel_rx,
-                )
-                .await
-        }
-
-        async fn apply_temporary(
-            &mut self,
-            repo_root: &Path,
-            project: &tauqe_protocol::ProjectConfig,
-            context_manager: &mut ContextManager,
-            proposal: &EditProposal,
-        ) -> anyhow::Result<Vec<String>> {
-            self.inner
-                .apply_temporary(repo_root, project, context_manager, proposal)
-                .await
-        }
-
-        async fn apply_final(
-            &mut self,
-            repo_root: &Path,
-            changed_files: &[String],
-            summary: &str,
-        ) -> anyhow::Result<Option<String>> {
-            self.inner
-                .apply_final(repo_root, changed_files, summary)
-                .await
-        }
-
-        /// Fails while the simulated lock is held and reports a restored tree
-        /// once it clears, which is exactly what the retry seam of the
-        /// escalation path must observe before it enters the next tier.
-        async fn rollback(&mut self, _repo_root: &Path) -> anyhow::Result<bool> {
-            if self.failures_left == 0 {
-                return Ok(true);
-            }
-            self.failures_left -= 1;
-            anyhow::bail!("the working tree is locked by another process")
-        }
-    }
-
+    /// A conversational reply without edits and without an explicit `<success>`
+    /// signal is a bare answer. The single bounded turn returns it unchanged:
+    /// the harness no longer climbs the coder ladder inside a turn, so exactly
+    /// one generation is spent and the retry policy of a step executor decides
+    /// what happens next.
     #[tokio::test]
-    async fn single_execution_escalates_coder_on_unverified_answer() {
+    async fn single_execution_returns_an_unverified_answer_without_a_second_attempt() {
         let (_dir, repo_root) = repo_with_target();
         let mut context = ContextManager::new(repo_root.clone());
         context
@@ -861,20 +444,21 @@ coder = [
         let protocol = crate::prompt::xml::XmlPromptProtocol;
         let protocol = protocol.with_turn_marker(MARKER).unwrap();
 
-        let edit = format!(
+        // The spare attempt stays in the script: a turn that answers without edits
+        // must never be replayed on a stronger tier.
+        let spare_edit = format!(
             "<tauqe_edits_{MARKER} summary=\"Set compute to 42\">\n<edit_{MARKER} path=\"target.rs\">\n<search_{MARKER}>\npub fn compute() -> i32 {{ 0 }}\n</search_{MARKER}>\n<replace_{MARKER}>\npub fn compute() -> i32 {{ 42 }}\n</replace_{MARKER}>\n</edit_{MARKER}>\n</tauqe_edits_{MARKER}>"
         );
-        // The first reply is a bare answer: no edits and no <success> signal.
         let provider = MockLlmProvider::scripted([
             MockResponse::text("I need more information before changing the code."),
-            MockResponse::text(edit),
+            MockResponse::text(spare_edit),
         ]);
         let model = ModelRef::openrouter("base/model");
         let (tx, _rx) = mpsc::channel(256);
         let (_cancel_tx, cancel_rx) = watch::channel(false);
         let mut policy = DirectApplyPolicy::new();
 
-        let exec = SingleExecution::new(coder_ladder_options());
+        let exec = SingleExecution::new(WorkflowOptions::default());
         let execution = exec
             .execute(
                 &mut policy,
@@ -889,22 +473,27 @@ coder = [
                 cancel_rx,
             )
             .await
-            .expect("escalating execution runs to completion");
+            .expect("the turn executes");
 
-        match execution.result {
-            ModelResult::Edit { outcome, .. } => {
-                assert!(outcome.applied, "the escalated tier must apply its edits");
-            }
-            other => panic!("expected applied edits after escalation, got {other:?}"),
-        }
+        assert!(
+            matches!(execution.result, ModelResult::Answer { .. }),
+            "an unverified answer is the outcome of the turn: {:?}",
+            execution.result
+        );
+        assert!(execution.abort.is_none(), "no abort report is produced");
         assert_eq!(
             provider.requests().len(),
-            2,
-            "an unverified answer must trigger a second coder-tier attempt"
+            1,
+            "one bounded turn spends exactly one generation"
+        );
+        assert_eq!(
+            provider.remaining(),
+            1,
+            "the spare attempt must never be consumed"
         );
         assert_eq!(
             std::fs::read_to_string(repo_root.join("target.rs")).unwrap(),
-            "pub fn compute() -> i32 { 42 }\n"
+            "pub fn compute() -> i32 { 0 }\n"
         );
     }
 
@@ -927,11 +516,15 @@ coder = [
         // Discussion mode may modify it, so the storage engine refuses this
         // payload and its refusal must stay visible to the model and to the
         // developer.
-        let existing = tauqe_protocol::Plan {
-            id: "existing-plan".to_string(),
-            title: "Existing Plan".to_string(),
-            ..Default::default()
-        };
+        let existing = tauqe_protocol::Plan::from_parts(
+            "existing-plan".to_string(),
+            "Existing Plan".to_string(),
+            None,
+            0,
+            0,
+            vec![],
+            vec![],
+        );
         crate::plan::storage::PlanStorage::save_plan(&repo_root, &existing)
             .expect("seed the established plan");
 
@@ -1021,8 +614,11 @@ coder = [
         );
     }
 
+    /// The turn's telemetry carries no escalation notice: a failed attempt is
+    /// reported to the caller, and the decision to retry or to escalate belongs
+    /// to the step executor, never to the turn itself.
     #[tokio::test]
-    async fn single_execution_emits_typed_escalation_event() {
+    async fn single_execution_streams_no_escalation_notice() {
         let (_dir, repo_root) = repo_with_target();
         let mut context = ContextManager::new(repo_root.clone());
         context
@@ -1033,15 +629,9 @@ coder = [
         let protocol = crate::prompt::xml::XmlPromptProtocol;
         let protocol = protocol.with_turn_marker(MARKER).unwrap();
 
-        let edit = format!(
-            "<tauqe_edits_{MARKER} summary=\"Set compute to 42\">\n<edit_{MARKER} path=\"target.rs\">\n<search_{MARKER}>\npub fn compute() -> i32 {{ 0 }}\n</search_{MARKER}>\n<replace_{MARKER}>\npub fn compute() -> i32 {{ 42 }}\n</replace_{MARKER}>\n</edit_{MARKER}>\n</tauqe_edits_{MARKER}>"
-        );
-        // The first reply is a bare answer, so the ladder advances to its next
-        // rung before the edit finally lands.
-        let provider = MockLlmProvider::scripted([
-            MockResponse::text("I need more information before changing the code."),
-            MockResponse::text(edit),
-        ]);
+        let provider = MockLlmProvider::scripted([MockResponse::text(
+            "I need more information before changing the code.",
+        )]);
         let model = ModelRef::openrouter("base/model");
         let (tx, mut rx) = mpsc::channel(256);
         let (_cancel_tx, cancel_rx) = watch::channel(false);
@@ -1050,14 +640,16 @@ coder = [
         // Drain the stream concurrently: the sender is dropped with the turn, so
         // collecting only afterwards would race the channel shutdown.
         let collector = tokio::spawn(async move {
-            let mut events = Vec::new();
+            let mut streamed = String::new();
             while let Some(event) = rx.recv().await {
-                events.push(event);
+                if let StreamEvent::TextDelta(delta) = event {
+                    streamed.push_str(&delta);
+                }
             }
-            events
+            streamed
         });
 
-        let exec = SingleExecution::new(coder_ladder_options());
+        let exec = SingleExecution::new(WorkflowOptions::default());
         exec.execute(
             &mut policy,
             "Set compute to return 42",
@@ -1071,35 +663,14 @@ coder = [
             cancel_rx,
         )
         .await
-        .expect("escalating execution runs to completion");
+        .expect("the turn executes");
 
-        let events = collector.await.expect("event collector joins");
-        let escalations: Vec<&StreamEvent> = events
-            .iter()
-            .filter(|event| matches!(event, StreamEvent::ModelEscalated { .. }))
-            .collect();
-        assert_eq!(
-            escalations.len(),
-            1,
-            "one ladder advance must emit exactly one typed event"
+        let streamed = collector.await.expect("event collector joins");
+        assert!(
+            !streamed.contains("Level Up Escalation"),
+            "the turn must not announce an escalation it no longer performs: {streamed:?}"
         );
-        let escalated = escalations.first().expect("escalation event is present");
-        match escalated {
-            StreamEvent::ModelEscalated {
-                model,
-                role,
-                alias,
-                effort,
-                tier,
-            } => {
-                assert_eq!(model, &ModelRef::openrouter("base/model"));
-                assert!(matches!(role, Some(tauqe_protocol::ModelRole::Coder)));
-                assert!(alias.is_none(), "the rung configures no alias");
-                assert_eq!(effort, &Some(ReasoningEffort::High));
-                assert_eq!(*tier, 1, "the event names the rung that was entered");
-            }
-            other => panic!("expected a model escalation event, got {other:?}"),
-        }
+        assert_eq!(provider.requests().len(), 1);
     }
 
     #[tokio::test]
@@ -1114,11 +685,10 @@ coder = [
         let protocol = crate::prompt::xml::XmlPromptProtocol;
         let protocol = protocol.with_turn_marker(MARKER).unwrap();
 
-        // A terminal <success> marks the answer as a validated conclusion, so
-        // the coder ladder must not escalate. The tag carries the active turn
-        // marker, matching how the harness binds structural tags to the turn:
-        // an unmarked tag would be treated as literal text and the reply as an
-        // unverified answer.
+        // A terminal <success> marks the answer as a validated conclusion. The
+        // tag carries the active turn marker, matching how the harness binds
+        // structural tags to the turn: an unmarked tag would be treated as
+        // literal text and the reply would stay an unverified answer.
         let success =
             format!("The step is already satisfied.\n<success_{MARKER} summary=\"Verified\" />");
         let provider = MockLlmProvider::scripted([MockResponse::text(success)]);
@@ -1127,7 +697,7 @@ coder = [
         let (_cancel_tx, cancel_rx) = watch::channel(false);
         let mut policy = DirectApplyPolicy::new();
 
-        let exec = SingleExecution::new(coder_ladder_options());
+        let exec = SingleExecution::new(WorkflowOptions::default());
         let execution = exec
             .execute(
                 &mut policy,
@@ -1149,221 +719,6 @@ coder = [
             provider.requests().len(),
             1,
             "a terminal success must not trigger escalation"
-        );
-    }
-
-    #[tokio::test]
-    async fn a_failed_rollback_stops_escalation_and_aborts_the_turn() {
-        let (_dir, repo_root) = repo_with_target();
-        let mut context = ContextManager::new(repo_root.clone());
-        context
-            .add_file("target.rs", ContextAccess::Editable)
-            .expect("add target to context");
-        let mut history = HistoryManager::new(repo_root.clone());
-
-        let protocol = crate::prompt::xml::XmlPromptProtocol;
-        let protocol = protocol.with_turn_marker(MARKER).unwrap();
-
-        let edit = format!(
-            "<tauqe_edits_{MARKER} summary=\"Set compute to 42\">\n<edit_{MARKER} path=\"target.rs\">\n<search_{MARKER}>\npub fn compute() -> i32 {{ 0 }}\n</search_{MARKER}>\n<replace_{MARKER}>\npub fn compute() -> i32 {{ 42 }}\n</replace_{MARKER}>\n</edit_{MARKER}>\n</tauqe_edits_{MARKER}>"
-        );
-        // The first reply is a bare answer, so the ladder would escalate — and
-        // the rollback that precedes the retry fails, so the ladder must stop
-        // instead of starting the next tier from a dirty tree.
-        let provider = MockLlmProvider::scripted([
-            MockResponse::text("I need more information before changing the code."),
-            MockResponse::text(edit),
-        ]);
-        let model = ModelRef::openrouter("base/model");
-        let (tx, mut rx) = mpsc::channel(256);
-        let (_cancel_tx, cancel_rx) = watch::channel(false);
-        let mut policy = FailingRollbackPolicy::default();
-
-        // Drain the stream concurrently: the sender is dropped with the turn, so
-        // collecting only afterwards would race the channel shutdown.
-        let collector = tokio::spawn(async move {
-            let mut events = Vec::new();
-            while let Some(event) = rx.recv().await {
-                events.push(event);
-            }
-            events
-        });
-
-        let exec = SingleExecution::new(coder_ladder_options());
-        let execution = exec
-            .execute(
-                &mut policy,
-                "Set compute to return 42",
-                tauqe_protocol::TurnIntent::InteractiveRepl,
-                &provider,
-                &model,
-                &mut context,
-                &mut history,
-                protocol.as_ref(),
-                tx,
-                cancel_rx,
-            )
-            .await
-            .expect("an aborted escalation still reports its outcome");
-
-        let abort = execution
-            .abort
-            .expect("the abort report rides on the turn result");
-        assert!(
-            abort.reason.contains("could not be reverted"),
-            "the reason must name the failed rollback: {}",
-            abort.reason
-        );
-        assert!(
-            abort.recommendation.contains("git status"),
-            "the recommendation must tell the developer how to diagnose the tree: {}",
-            abort.recommendation
-        );
-        match execution.result {
-            ModelResult::Edit { outcome, .. } => {
-                assert!(!outcome.applied, "an aborted turn applies nothing");
-                assert!(
-                    outcome
-                        .error
-                        .unwrap_or_default()
-                        .contains("Execution aborted"),
-                    "the failure must stay visible on the turn result"
-                );
-            }
-            other => panic!("expected an aborted turn, got {other:?}"),
-        }
-        assert_eq!(
-            provider.requests().len(),
-            1,
-            "no tier may be entered while the working tree is dirty"
-        );
-        assert_eq!(
-            std::fs::read_to_string(repo_root.join("target.rs")).unwrap(),
-            "pub fn compute() -> i32 { 0 }\n",
-            "the aborted turn must leave the working tree untouched"
-        );
-
-        let events = collector.await.expect("event collector joins");
-        assert_eq!(
-            events
-                .iter()
-                .filter(|event| matches!(event, StreamEvent::ModelEscalated { .. }))
-                .count(),
-            0,
-            "the ladder must not announce a tier it refuses to enter"
-        );
-        let streamed: String = events
-            .iter()
-            .filter_map(|event| match event {
-                StreamEvent::TextDelta(text) => Some(text.as_str()),
-                _ => None,
-            })
-            .collect();
-        assert!(
-            streamed.contains("Execution Aborted"),
-            "the developer must see the abort in the streamed diagnostics: {streamed}"
-        );
-    }
-
-    /// A rollback that fails once and then succeeds must not stop the ladder:
-    /// the retry seam absorbs the transient lock, the tree is clean again, and
-    /// the next coder tier enters as if the failed attempt had been reverted
-    /// cleanly on the first try.
-    #[tokio::test]
-    async fn escalation_proceeds_when_a_transient_rollback_failure_clears() {
-        let (_dir, repo_root) = repo_with_target();
-        let mut context = ContextManager::new(repo_root.clone());
-        context
-            .add_file("target.rs", ContextAccess::Editable)
-            .expect("add target to context");
-        let mut history = HistoryManager::new(repo_root.clone());
-
-        let protocol = crate::prompt::xml::XmlPromptProtocol;
-        let protocol = protocol.with_turn_marker(MARKER).unwrap();
-
-        let edit = format!(
-            "<tauqe_edits_{MARKER} summary=\"Set compute to 42\">\n<edit_{MARKER} path=\"target.rs\">\n<search_{MARKER}>\npub fn compute() -> i32 {{ 0 }}\n</search_{MARKER}>\n<replace_{MARKER}>\npub fn compute() -> i32 {{ 42 }}\n</replace_{MARKER}>\n</edit_{MARKER}>\n</tauqe_edits_{MARKER}>"
-        );
-        // The first reply is a bare answer, so the ladder would escalate — and
-        // the rollback that precedes the retry is locked exactly once, so the
-        // retry seam must clear it instead of aborting the turn.
-        let provider = MockLlmProvider::scripted([
-            MockResponse::text("I need more information before changing the code."),
-            MockResponse::text(edit),
-        ]);
-        let model = ModelRef::openrouter("base/model");
-        let (tx, mut rx) = mpsc::channel(256);
-        let (_cancel_tx, cancel_rx) = watch::channel(false);
-        let mut policy = TransientRollbackPolicy {
-            inner: DirectApplyPolicy::new(),
-            failures_left: 1,
-        };
-
-        // Drain the stream concurrently: the sender is dropped with the turn, so
-        // collecting only afterwards would race the channel shutdown.
-        let collector = tokio::spawn(async move {
-            let mut events = Vec::new();
-            while let Some(event) = rx.recv().await {
-                events.push(event);
-            }
-            events
-        });
-
-        let exec = SingleExecution::new(coder_ladder_options());
-        let execution = exec
-            .execute(
-                &mut policy,
-                "Set compute to return 42",
-                tauqe_protocol::TurnIntent::InteractiveRepl,
-                &provider,
-                &model,
-                &mut context,
-                &mut history,
-                protocol.as_ref(),
-                tx,
-                cancel_rx,
-            )
-            .await
-            .expect("a cleared rollback lock lets the escalation finish");
-
-        assert!(
-            execution.abort.is_none(),
-            "a transient lock must not abort the turn: {:?}",
-            execution.abort
-        );
-        match execution.result {
-            ModelResult::Edit { outcome, .. } => {
-                assert!(
-                    outcome.applied,
-                    "the escalated tier must apply its edits: {:?}",
-                    outcome.error
-                );
-            }
-            other => panic!("expected applied edits after escalation, got {other:?}"),
-        }
-        assert_eq!(
-            provider.requests().len(),
-            2,
-            "the retry must reach the next coder tier"
-        );
-        assert_eq!(
-            std::fs::read_to_string(repo_root.join("target.rs")).unwrap(),
-            "pub fn compute() -> i32 { 42 }\n"
-        );
-
-        let events = collector.await.expect("event collector joins");
-        assert!(
-            events
-                .iter()
-                .any(|event| matches!(event, StreamEvent::ModelEscalated { .. })),
-            "the ladder must announce the tier it enters"
-        );
-        assert!(
-            !events.iter().any(|event| matches!(
-                event,
-                StreamEvent::TextDelta(text) if text.contains("Execution Aborted")
-            )),
-            "a cleared transient lock must not surface an abort banner"
         );
     }
 }

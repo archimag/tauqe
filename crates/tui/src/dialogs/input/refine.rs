@@ -128,6 +128,22 @@ pub(super) async fn handle_refine_dialog(
             }
         }
         _ => {
+            if dialog.focus.is_instructions_editor()
+                && dialog.instructions_editor.takes_yank_chord(key, is_cmd)
+            {
+                // The paste buffer is a native round trip bounded at
+                // NATIVE_CLIPBOARD_TIMEOUT, so it is read with the state guard
+                // released and the answer is applied after the re-lock (c-1).
+                st.plans_view.refine_dialog = Some(dialog);
+                drop(st);
+                let clipboard = crate::clipboard::get_from_clipboard_async().await;
+                let mut st = state.lock().await;
+                if let Some(mut dialog) = st.plans_view.refine_dialog.take() {
+                    dialog.instructions_editor.yank_with(clipboard);
+                    st.plans_view.refine_dialog = Some(dialog);
+                }
+                return Ok(Some(InputResult::Continue));
+            }
             if dialog.focus.is_instructions_editor() {
                 crate::input::handle_editor_key(&mut dialog.instructions_editor, key, is_cmd, true);
             }
@@ -290,17 +306,15 @@ mod tests {
 
     fn blocked_state() -> AppState {
         let mut st = test_state();
-        st.plans_view.plans = vec![tauqe_protocol::Plan {
-            id: "plan-1".to_string(),
-            title: "Test Plan".to_string(),
-            description: None,
-            created_at: 0,
-            updated_at: 0,
-            architect: None,
-            last_replanned_step: None,
-            concept: vec![],
-            items: vec![],
-        }];
+        st.plans_view.plans = vec![tauqe_protocol::Plan::from_parts(
+            "plan-1".to_string(),
+            "Test Plan".to_string(),
+            None,
+            0,
+            0,
+            vec![],
+            vec![],
+        )];
         st.plans_view.refine_blocked = Some(PlanRefineBlockedState {
             plan_id: "plan-1".to_string(),
             plan_title: "Test Plan".to_string(),

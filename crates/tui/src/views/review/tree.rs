@@ -29,6 +29,14 @@ fn item_body_key(session_id: &str, item_id: u32) -> String {
     format!("{}:{}:d", session_id, item_id)
 }
 
+/// Cache key of the rendered Executive Summary body of one session.
+///
+/// A session owns exactly one summary body, and the `summary` segment cannot
+/// collide with the numeric finding ids of `item_body_key` or with the `:g:`
+/// group and step keys that share the same cache (c-1).
+fn summary_body_key(session_id: &str) -> String {
+    format!("{}:summary", session_id)
+}
 /// Cache key of the rendered detail body of one step of a group plan.
 fn step_body_key(session_id: &str, group_id: &str, step_id: &str) -> String {
     format!("{}:g:{}:s:{}:d", session_id, group_id, step_id)
@@ -168,21 +176,9 @@ fn focus_badge() -> Span<'static> {
     )
 }
 
-/// Status badge style for a subplan step, mirroring the Plans view vocabulary so
-/// a decomposed finding reads exactly like an implementation step.
-pub(crate) fn plan_status_style(status: PlanItemStatus) -> Style {
-    let engine = current_engine();
-    let palette = engine.palette();
-    let inverse = engine.color(palette.text_inverse);
-    match status {
-        PlanItemStatus::Discussion => engine.bg(palette.button_active_bg).fg(inverse).bold(),
-        PlanItemStatus::Todo => engine.bg(palette.status_warning).fg(inverse).bold(),
-        PlanItemStatus::InProgress => engine.bg(palette.status_info).fg(inverse).bold(),
-        PlanItemStatus::Done => engine.bg(palette.status_success).fg(inverse).bold(),
-        PlanItemStatus::Blocked => engine.bg(palette.status_error).fg(inverse).bold(),
-        PlanItemStatus::Cancelled => engine.bg(palette.text_muted).fg(inverse).bold(),
-    }
-}
+// A subplan step is an implementation step, so its badge reuses the one shared
+// palette mapping instead of restating it (c-5, Conventions §8.4).
+pub(crate) use crate::views::implementation::status_style as plan_status_style;
 
 /// Badge naming the concrete model behind a finding's recorded selection.
 ///
@@ -250,6 +246,36 @@ fn pad_line_to_width(mut line: Line<'static>, width: usize, fill_style: Style) -
             .push(Span::styled(" ".repeat(width - current_width), fill_style));
     }
     line
+}
+
+/// Appends one labelled, multi-line diagnostic block to a rendered row body.
+///
+/// Every line of the payload opens with the same muted body prefix, so a wrapped
+/// diagnostic keeps one left margin and `wrap_lines` derives its hanging indent
+/// from that span instead of from bare spaces (Conventions §4.8).
+fn push_diagnostic_block(
+    lines: &mut Vec<Line<'static>>,
+    prefix: &Span<'static>,
+    label: impl AsRef<str>,
+    payload: &str,
+    label_style: Style,
+    body_style: Style,
+) {
+    let mut payload_lines = payload.trim().lines();
+    let Some(first) = payload_lines.next() else {
+        return;
+    };
+    lines.push(Line::from(vec![
+        prefix.clone(),
+        Span::styled(format!("{} ", label.as_ref()), label_style),
+        Span::styled(first.to_string(), body_style),
+    ]));
+    for line in payload_lines {
+        lines.push(Line::from(vec![
+            prefix.clone(),
+            Span::styled(line.to_string(), body_style),
+        ]));
+    }
 }
 
 /// Renders the flattened Review rows into lines and their row offsets.
@@ -355,9 +381,9 @@ pub(crate) fn compute_unified_review_lines(
                 all_lines.extend(wrap_lines(vec![header_line], width));
             }
             VisibleReviewRow::SessionSummary {
+                session_id,
                 description,
                 is_expanded,
-                ..
             } => {
                 let fold_icon = if *is_expanded { "▼ " } else { "▶ " };
                 let spans = vec![
@@ -374,7 +400,10 @@ pub(crate) fn compute_unified_review_lines(
                 if is_selected {
                     summary_line = pad_line_to_width(summary_line, width, row_style);
                 }
-                let mut row_lines = vec![summary_line];
+                let row_lines = vec![summary_line];
+                // The cached body arrives already wrapped, so it is collected
+                // apart and appended after the short header line (c-1).
+                let mut detail_lines: Vec<Line<'static>> = Vec::new();
 
                 if *is_expanded {
                     let trimmed = description.trim();
@@ -387,25 +416,20 @@ pub(crate) fn compute_unified_review_lines(
                         theme.text_style = engine.fg(palette.text_secondary);
                         theme.hard_breaks = true;
                         theme.compact = true;
-                        theme.line_prefix = Some(body_prefix.clone());
-                        let md = crate::markdown::render_markdown(trimmed, &theme);
-                        if !md.is_empty() {
-                            row_lines.extend(md);
-                        } else {
-                            for line in trimmed.lines() {
-                                row_lines.push(Line::from(vec![
-                                    body_prefix.clone(),
-                                    Span::styled(
-                                        line.to_string(),
-                                        engine.fg(palette.text_secondary),
-                                    ),
-                                ]));
-                            }
-                        }
+                        theme.line_prefix = Some(body_prefix);
+                        let body = cache.lines_for(
+                            &summary_body_key(session_id),
+                            trimmed,
+                            &theme,
+                            Some(width),
+                            theme_mode,
+                        );
+                        detail_lines.extend(body.iter().cloned());
                     }
                 }
 
                 all_lines.extend(wrap_lines(row_lines, width));
+                all_lines.extend(detail_lines);
             }
             VisibleReviewRow::ReviewItem {
                 session_id,
@@ -786,20 +810,28 @@ pub(crate) fn compute_unified_review_lines(
                 kind,
                 title,
                 description,
+                blocked_reason,
+                resolution_notes,
                 findings_count,
                 has_plan,
                 is_expanded,
             } => {
                 // A group owns a body whenever it holds findings, a unified
-                // plan branch, or a documented root cause, so the fold icon
-                // reflects every child it can reveal. A group whose findings are
-                // all filtered out still keeps its plan and its description
-                // reachable instead of hiding them behind a missing fold icon
-                // (Conventions §4.1).
+                // plan branch, a documented root cause, or a recorded
+                // architectural fork, so the fold icon reflects every child it
+                // can reveal. A group whose findings are all filtered out still
+                // keeps its plan, its diagnosis, its recorded decision, and its
+                // description reachable instead of hiding them behind a missing
+                // fold icon (Conventions §4.1, concept #c-2).
                 let has_description = description
                     .as_deref()
                     .is_some_and(|text| !text.trim().is_empty());
-                let fold_icon = if *findings_count > 0 || *has_plan || has_description {
+                let has_body = *findings_count > 0
+                    || *has_plan
+                    || has_description
+                    || blocked_reason.is_some()
+                    || resolution_notes.is_some();
+                let fold_icon = if has_body {
                     if *is_expanded {
                         "▼ "
                     } else {
@@ -814,6 +846,18 @@ pub(crate) fn compute_unified_review_lines(
                     Span::styled(fold_icon, engine.fg(palette.status_warning).bold()),
                     Span::styled(title.clone(), engine.fg(palette.text_primary).bold()),
                 ];
+                // A blocked group advertises its state on the summary row, so
+                // the architectural fork is visible before the group is even
+                // unfolded (concept #c-2).
+                if blocked_reason.is_some() {
+                    spans.push(Span::styled(
+                        format!(" {} ", crate::i18n::active_t("review.group_blocked_badge")),
+                        engine
+                            .bg(palette.status_error)
+                            .fg(engine.color(palette.text_inverse))
+                            .bold(),
+                    ));
+                }
                 if *kind == ReviewGroupKind::Architectural {
                     spans.push(Span::styled(
                         format!(
@@ -841,18 +885,51 @@ pub(crate) fn compute_unified_review_lines(
                 if is_selected {
                     header_line = pad_line_to_width(header_line, width, row_style);
                 }
-                let row_lines = vec![header_line];
+                let mut row_lines = vec![header_line];
                 let mut detail_lines: Vec<Line<'static>> = Vec::new();
 
                 if *is_expanded {
+                    let body_indent = review_body_indent(REVIEW_TOP_LEVEL + 1);
+                    let body_prefix =
+                        Span::styled(format!("{body_indent}│ "), engine.fg(palette.text_muted));
+                    // The architectural fork opens the body of its group: a
+                    // blocked root cause must be resolved before any step of its
+                    // plan can run, so the diagnosis and the chords that reach
+                    // its resolution precede the root cause description
+                    // (concept #c-2).
+                    if let Some(reason) = blocked_reason.as_deref() {
+                        push_diagnostic_block(
+                            &mut row_lines,
+                            &body_prefix,
+                            crate::i18n::active_t("review.blocked_label"),
+                            reason,
+                            engine.fg(palette.status_error).bold(),
+                            engine.fg(palette.text_primary),
+                        );
+                        row_lines.push(Line::from(vec![
+                            body_prefix.clone(),
+                            Span::styled(
+                                crate::i18n::active_t("review.blocked_hint"),
+                                engine.fg(palette.text_muted),
+                            ),
+                        ]));
+                    }
+                    // A recorded decision outlives the blocker it resolved, so
+                    // the group keeps documenting why its plan took this shape.
+                    if let Some(notes) = resolution_notes.as_deref() {
+                        push_diagnostic_block(
+                            &mut row_lines,
+                            &body_prefix,
+                            crate::i18n::active_t("review.resolution_label"),
+                            notes,
+                            engine.fg(palette.status_success).bold(),
+                            engine.fg(palette.text_secondary),
+                        );
+                    }
                     if let Some(description) = description
                         .as_deref()
                         .filter(|text| !text.trim().is_empty())
                     {
-                        let body_prefix = Span::styled(
-                            format!("{}│ ", review_body_indent(REVIEW_TOP_LEVEL + 1)),
-                            engine.fg(palette.text_muted),
-                        );
                         let mut theme = crate::markdown::MarkdownTheme::answer_themed(theme_mode);
                         theme.text_style = engine.fg(palette.text_secondary);
                         theme.hard_breaks = true;
@@ -917,8 +994,8 @@ mod tests {
     use super::*;
     use crate::views::review::ReviewViewState;
     use tauqe_protocol::{
-        ArchitectTier, IssueStatus, IssueType, ModelRef, PlanItem, ReviewGroup, ReviewGroupKind,
-        ReviewIssue, ReviewItem, ReviewSession,
+        ArchitectTier, IssueStatus, IssueType, ModelRef, PlanImplementation, PlanItem, ReviewGroup,
+        ReviewGroupKind, ReviewIssue, ReviewItem, ReviewSession,
     };
 
     fn make_item(id: u32) -> ReviewIssue {
@@ -983,7 +1060,10 @@ mod tests {
             id: id.to_string(),
             title: title.to_string(),
             kind: ReviewGroupKind::Architectural,
-            subplan,
+            implementation: PlanImplementation {
+                items: subplan,
+                ..Default::default()
+            },
             ..Default::default()
         }
     }
@@ -1022,7 +1102,8 @@ mod tests {
             .collect()
     }
 
-    fn find_line(lines: &[Line<'static>], needle: &str) -> usize {
+    fn find_line(lines: &[Line<'static>], needle: impl AsRef<str>) -> usize {
+        let needle = needle.as_ref();
         lines
             .iter()
             .position(|line| line_text(line).contains(needle))
@@ -1136,14 +1217,17 @@ mod tests {
             title: "Alpha slice".to_string(),
             description: Some("One cause behind both symptoms.".to_string()),
             kind: ReviewGroupKind::Architectural,
-            subplan: vec![PlanItem {
-                children: vec![subplan_step("1.1", "Leaf", PlanItemStatus::Done)],
-                ..subplan_step("1", "Unify the guard", PlanItemStatus::Todo)
-            }],
-            subplan_architect: Some(ArchitectTier::new(
-                ModelRef::openrouter("planner/model"),
-                None,
-            )),
+            implementation: PlanImplementation {
+                items: vec![PlanItem {
+                    children: vec![subplan_step("1.1", "Leaf", PlanItemStatus::Done)],
+                    ..subplan_step("1", "Unify the guard", PlanItemStatus::Todo)
+                }],
+                architect: Some(ArchitectTier::new(
+                    ModelRef::openrouter("planner/model"),
+                    None,
+                )),
+                ..Default::default()
+            },
             ..Default::default()
         }];
         session.items[0].group = Some("alpha".to_string());
@@ -1766,10 +1850,13 @@ mod tests {
             title: "Shared cause".to_string(),
             description: Some("Both symptoms share one cause.".to_string()),
             kind: ReviewGroupKind::Architectural,
-            subplan: vec![PlanItem {
-                children: vec![subplan_step("1.1", "Leaf step", PlanItemStatus::Todo)],
-                ..subplan_step("1", "Container step", PlanItemStatus::Todo)
-            }],
+            implementation: PlanImplementation {
+                items: vec![PlanItem {
+                    children: vec![subplan_step("1.1", "Leaf step", PlanItemStatus::Todo)],
+                    ..subplan_step("1", "Container step", PlanItemStatus::Todo)
+                }],
+                ..Default::default()
+            },
             ..Default::default()
         }];
         session.items[0].files = vec!["src/auth.rs".to_string()];
@@ -2057,7 +2144,11 @@ mod tests {
     /// unchanged instead of being parsed again (c-1).
     #[test]
     fn test_navigation_reuses_cached_review_bodies_and_keeps_their_lines() {
-        let mut session = make_session("rev-cache", &[1]);
+        let mut session = make_session_with_description(
+            "rev-cache",
+            "## Overview\n\nThe summary is rendered once.",
+            &[1],
+        );
         session.groups = vec![architectural_group(
             "arch",
             "Shared cause",
@@ -2083,6 +2174,10 @@ mod tests {
         let (first, _) = render_view(&mut view, 1, 120);
         let first_text = first.iter().map(line_text).collect::<Vec<_>>().join("\n");
         assert!(
+            first_text.contains("The summary is rendered once."),
+            "the session summary body must render: {first_text}"
+        );
+        assert!(
             first_text.contains("The guard trusts the request header."),
             "the finding body must render: {first_text}"
         );
@@ -2092,16 +2187,22 @@ mod tests {
         );
         assert_eq!(
             view.markdown_cache.len(),
-            2,
-            "one cached body per rendered description"
+            3,
+            "one cached body per rendered summary and description"
         );
+        let renders = view.markdown_cache.render_count();
 
-        // Moving the cursor re-renders every row but must reuse both bodies.
+        // Moving the cursor re-renders every row but must reuse every body.
         let (second, _) = render_view(&mut view, step_row, 120);
         assert_eq!(
             view.markdown_cache.len(),
-            2,
+            3,
             "navigation must neither add nor drop a cached body"
+        );
+        assert_eq!(
+            view.markdown_cache.render_count(),
+            renders,
+            "navigation must not re-parse a cached body"
         );
         assert_eq!(
             body_lines(&second),
@@ -2144,6 +2245,112 @@ mod tests {
         assert!(
             recs_label_idx < rec_bullet_idx,
             "Recommendations header must precede recommendation items"
+        );
+    }
+    /// A blocked group advertises `[BLOCKED]` on its summary row and opens its
+    /// body with the architectural fork: the diagnosis and the chords that
+    /// reach its resolution precede the root cause description (concept #c-2).
+    #[test]
+    fn test_blocked_group_badges_its_header_and_opens_with_the_blocker_panel() {
+        let mut session = make_session("rev-blocked", &[1]);
+        session.groups = vec![ReviewGroup {
+            id: "alpha".to_string(),
+            title: "Alpha slice".to_string(),
+            description: Some("One cause behind both symptoms.".to_string()),
+            kind: ReviewGroupKind::Architectural,
+            blocked_reason: Some("Two invariants contradict each other.".to_string()),
+            resolution_notes: Some("Reuse the existing policy object.".to_string()),
+            ..Default::default()
+        }];
+        session.items[0].group = Some("alpha".to_string());
+        let mut view = ReviewViewState {
+            sessions: vec![session],
+            ..Default::default()
+        };
+
+        let (lines, _) = render_view(&mut view, usize::MAX, 160);
+        let header = line_text(&lines[find_line(&lines, "Alpha slice")]);
+        assert!(
+            header.contains("[BLOCKED]"),
+            "a blocked group must badge its header: {header}"
+        );
+
+        let blocked_label = crate::i18n::active_t("review.blocked_label");
+        let blocker_idx = find_line(&lines, &blocked_label);
+        let hint_idx = find_line(&lines, crate::i18n::active_t("review.blocked_hint"));
+        let resolution_idx = find_line(&lines, crate::i18n::active_t("review.resolution_label"));
+        let description_idx = find_line(&lines, "One cause behind both symptoms.");
+
+        assert!(
+            line_text(&lines[blocker_idx]).contains("Two invariants contradict each other."),
+            "the fork must state the diagnosis: {:?}",
+            line_text(&lines[blocker_idx])
+        );
+        assert!(
+            line_text(&lines[resolution_idx]).contains("Reuse the existing policy object."),
+            "the recorded decision must render: {:?}",
+            line_text(&lines[resolution_idx])
+        );
+        assert!(
+            blocker_idx < hint_idx && hint_idx < resolution_idx && resolution_idx < description_idx,
+            "the fork must open the group body before the root cause description: \
+             {blocker_idx} / {hint_idx} / {resolution_idx} / {description_idx}"
+        );
+        assert_eq!(
+            leading_indent(&lines[blocker_idx]),
+            leading_indent(&lines[description_idx]),
+            "the fork and the root cause description share the group body band"
+        );
+    }
+
+    /// A group whose findings are all filtered out and which owns no plan still
+    /// keeps its blocker reachable: the fold icon reflects the architectural
+    /// fork, so the diagnosis is never hidden behind a missing icon
+    /// (Conventions §4.1, concept #c-2).
+    #[test]
+    fn test_group_header_stays_foldable_when_only_its_blocker_remains() {
+        let mut session = make_session("rev-blocked-only", &[1]);
+        session.groups = vec![ReviewGroup {
+            id: "alpha".to_string(),
+            title: "Alpha slice".to_string(),
+            kind: ReviewGroupKind::Architectural,
+            blocked_reason: Some("The unified plan cannot be synthesized.".to_string()),
+            ..Default::default()
+        }];
+        session.items[0].group = Some("alpha".to_string());
+        session.items[0].status = IssueStatus::Fixed;
+        let mut view = ReviewViewState {
+            sessions: vec![session],
+            hide_closed: true,
+            ..Default::default()
+        };
+
+        // Expanded: the architectural fork renders below the header of its
+        // group, even though the open-findings filter left no finding and the
+        // group owns no plan.
+        let (lines, _) = render_view(&mut view, usize::MAX, 160);
+        let header = line_text(&lines[find_line(&lines, "Alpha slice")]);
+        assert!(
+            header.contains("▼"),
+            "an expandable group header must carry the fold icon: {header}"
+        );
+        assert!(header.contains("[BLOCKED]"), "{header}");
+        let rendered = lines.iter().map(line_text).collect::<Vec<_>>().join("\n");
+        assert!(
+            rendered.contains("The unified plan cannot be synthesized."),
+            "the blocker must render while the group is expanded: {rendered}"
+        );
+
+        // Folded: only the panel disappears, the badge and the icon stay.
+        view.toggle_group_expanded("rev-blocked-only", "alpha");
+        let (lines, _) = render_view(&mut view, usize::MAX, 160);
+        let header = line_text(&lines[find_line(&lines, "Alpha slice")]);
+        assert!(header.contains("▶"), "{header}");
+        assert!(header.contains("[BLOCKED]"), "{header}");
+        let rendered = lines.iter().map(line_text).collect::<Vec<_>>().join("\n");
+        assert!(
+            !rendered.contains("The unified plan cannot be synthesized."),
+            "a folded group must hide its blocker panel: {rendered}"
         );
     }
 }

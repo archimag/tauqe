@@ -1,8 +1,9 @@
 use super::*;
 use std::path::Path;
 use tauqe_protocol::{
-    ArchitectTier, IssueStatus, IssueType, PlanItem, ReviewGroup, ReviewGroupKind, ReviewIssue,
-    ReviewItem, ReviewSession, ReviewSeverity, DEFAULT_REVIEW_GROUP_ID,
+    ArchitectTier, IssueStatus, IssueType, PlanImplementation, PlanItem, ReviewGroup,
+    ReviewGroupKind, ReviewIssue, ReviewItem, ReviewSession, ReviewSeverity,
+    DEFAULT_REVIEW_GROUP_ID,
 };
 use tempfile::tempdir;
 
@@ -723,7 +724,11 @@ fn test_regroup_session_replaces_groups_and_keeps_findings() {
         "rev-post-analysis",
         "first pass".to_string(),
         local_only.clone(),
-        vec![(FINDING_UUID.to_string(), "local".to_string())],
+        vec![FindingAssignment {
+            uuid: FINDING_UUID.to_string(),
+            group_id: "local".to_string(),
+            status: None,
+        }],
     )
     .unwrap()
     .unwrap();
@@ -745,7 +750,11 @@ fn test_regroup_session_replaces_groups_and_keeps_findings() {
         "rev-post-analysis",
         "second pass".to_string(),
         architectural.clone(),
-        vec![(FINDING_UUID.to_string(), "arch-1".to_string())],
+        vec![FindingAssignment {
+            uuid: FINDING_UUID.to_string(),
+            group_id: "arch-1".to_string(),
+            status: Some(IssueStatus::Todo),
+        }],
     )
     .unwrap()
     .unwrap();
@@ -754,7 +763,9 @@ fn test_regroup_session_replaces_groups_and_keeps_findings() {
     assert_eq!(replaced.items[0].group.as_deref(), Some("arch-1"));
     assert_eq!(replaced.items[0].title, session.items[0].title);
     assert_eq!(replaced.items[0].uuid.as_deref(), Some(FINDING_UUID));
-    assert_eq!(replaced.items[0].status, IssueStatus::Discussion);
+    // The routing travels with the grouping: the second pass also moves the
+    // finding to the status its resolution starts from.
+    assert_eq!(replaced.items[0].status, IssueStatus::Todo);
 
     let loaded = ReviewStorage::load_review(root, "rev-post-analysis")
         .unwrap()
@@ -873,7 +884,10 @@ fn grouped_layer_session(review_id: &str, subplan: Vec<PlanItem>) -> ReviewSessi
             id: "arch-1".to_string(),
             title: "Shared root cause".to_string(),
             description: Some("Both findings manifest one defect.".to_string()),
-            subplan,
+            implementation: PlanImplementation {
+                items: subplan,
+                ..Default::default()
+            },
             ..Default::default()
         }],
         ..Default::default()
@@ -912,18 +926,18 @@ fn test_update_group_subplan_normalizes_derived_container_statuses() {
 
     let updated = ReviewStorage::update_group_subplan(root, review, "arch-1", subplan).unwrap();
     let updated = updated.expect("the group accepts a horizon");
-    assert_eq!(updated.subplan.len(), 1);
+    assert_eq!(updated.implementation.items.len(), 1);
     assert_eq!(
-        updated.subplan[0].status,
+        updated.implementation.items[0].status,
         tauqe_protocol::PlanItemStatus::InProgress
     );
 
     // The horizon belongs to the group, so it survives a reload with the
     // container status already derived from its leaves.
     let stored = ReviewStorage::load_review(root, review).unwrap().unwrap();
-    assert_eq!(stored.groups[0].subplan.len(), 1);
+    assert_eq!(stored.groups[0].implementation.items.len(), 1);
     assert_eq!(
-        stored.groups[0].subplan[0].status,
+        stored.groups[0].implementation.items[0].status,
         tauqe_protocol::PlanItemStatus::InProgress
     );
 
@@ -931,7 +945,7 @@ fn test_update_group_subplan_normalizes_derived_container_statuses() {
     let missing = ReviewStorage::update_group_subplan(root, review, "arch-9", Vec::new());
     assert!(missing.unwrap().is_none());
     let stored = ReviewStorage::load_review(root, review).unwrap().unwrap();
-    assert_eq!(stored.groups[0].subplan.len(), 1);
+    assert_eq!(stored.groups[0].implementation.items.len(), 1);
 }
 
 /// One root cause is fixed by one horizon: a synthesized wave preserves the
@@ -984,23 +998,29 @@ fn test_replace_uncompleted_group_subplan_records_provenance() {
     )
     .unwrap();
     let updated = updated.expect("the group accepts a horizon");
-    assert_eq!(updated.subplan.len(), 2);
-    let finished = &updated.subplan[0];
-    let synthesized = &updated.subplan[1];
+    assert_eq!(updated.implementation.items.len(), 2);
+    let finished = &updated.implementation.items[0];
+    let synthesized = &updated.implementation.items[1];
     assert_eq!(finished.id, "s-1");
     assert_eq!(finished.status, tauqe_protocol::PlanItemStatus::Done);
     assert_eq!(synthesized.id, "s-3");
-    assert_eq!(updated.subplan_architect, Some(test_architect()));
-    assert_eq!(updated.subplan_last_replanned_step.as_deref(), Some("s-2"));
+    assert_eq!(updated.implementation.architect, Some(test_architect()));
+    assert_eq!(
+        updated.implementation.last_replanned_step.as_deref(),
+        Some("s-2")
+    );
 
     // The provenance and the preserved foundation survive a reload, so a
     // later wave derives escalation from disk state.
     let stored = ReviewStorage::load_review(root, review).unwrap().unwrap();
     let group = &stored.groups[0];
-    assert_eq!(group.subplan.len(), 2);
-    assert_eq!(group.subplan[0].id, "s-1");
-    assert_eq!(group.subplan_architect, Some(test_architect()));
-    assert_eq!(group.subplan_last_replanned_step.as_deref(), Some("s-2"));
+    assert_eq!(group.implementation.items.len(), 2);
+    assert_eq!(group.implementation.items[0].id, "s-1");
+    assert_eq!(group.implementation.architect, Some(test_architect()));
+    assert_eq!(
+        group.implementation.last_replanned_step.as_deref(),
+        Some("s-2")
+    );
 
     // An unknown group resolves to nothing instead of accepting a horizon.
     let missing = ReviewStorage::replace_uncompleted_group_subplan(
@@ -1042,13 +1062,16 @@ fn architectural_group(id: &str) -> ReviewGroup {
         title: format!("Root cause {id}"),
         description: Some("One defect explains every member finding.".to_string()),
         kind: ReviewGroupKind::Architectural,
-        subplan: vec![PlanItem {
-            id: "step-1".to_string(),
-            title: "Fix the root cause".to_string(),
-            status: tauqe_protocol::PlanItemStatus::Todo,
-            files: vec!["src/root_cause.rs".to_string()],
+        implementation: PlanImplementation {
+            items: vec![PlanItem {
+                id: "step-1".to_string(),
+                title: "Fix the root cause".to_string(),
+                status: tauqe_protocol::PlanItemStatus::Todo,
+                files: vec!["src/root_cause.rs".to_string()],
+                ..Default::default()
+            }],
             ..Default::default()
-        }],
+        },
         ..Default::default()
     }
 }
@@ -1142,7 +1165,7 @@ fn test_update_session_group_findings_transitions_the_whole_group() {
     );
     assert!(untouched.resolution_notes.is_none());
     // The horizon belongs to the group and stays out of scope of the primitive.
-    assert_eq!(stored.groups[0].subplan.len(), 1);
+    assert_eq!(stored.groups[0].implementation.items.len(), 1);
 }
 
 /// A finding that stores no group belongs to the implicit default group, so the
@@ -1221,4 +1244,305 @@ fn test_update_session_group_findings_rejects_unknown_targets() {
 
     let stored = ReviewStorage::load_review(root, review).unwrap().unwrap();
     assert_eq!(stored.find_item(1).unwrap().status, IssueStatus::Todo);
+}
+
+/// A group states its blocker on itself, and clearing it returns the group to
+/// an unblocked state without touching the findings.
+#[test]
+fn test_set_group_blocked_reason_records_and_clears_the_blocker() {
+    let dir = tempdir().unwrap();
+    let root = dir.path();
+    let review = "rev-group-blocker";
+
+    let session = ReviewSession {
+        id: review.to_string(),
+        title: "Group Blocker".to_string(),
+        created_at: 100,
+        model: tauqe_protocol::ModelRef::openrouter("test-model"),
+        groups: vec![architectural_group("arch-1"), simple_group("local")],
+        items: vec![group_finding(1, Some("arch-1"))],
+        ..Default::default()
+    };
+    ReviewStorage::save_session(root, &session).unwrap();
+
+    let blocked = ReviewStorage::set_group_blocked_reason(
+        root,
+        review,
+        "arch-1",
+        Some("  The lock ordering must be decided first  "),
+    )
+    .unwrap()
+    .expect("the declared group records its blocker");
+    assert_eq!(
+        blocked.blocked_reason.as_deref(),
+        Some("The lock ordering must be decided first")
+    );
+
+    // The blocker belongs to the group, so it survives a reload and leaves
+    // the findings untouched.
+    let stored = ReviewStorage::load_review(root, review).unwrap().unwrap();
+    assert_eq!(
+        stored.groups[0].blocked_reason.as_deref(),
+        Some("The lock ordering must be decided first")
+    );
+    assert!(stored.find_item(1).unwrap().resolution_notes.is_none());
+
+    // A blank reason is not a blocker, so it clears the recorded one exactly
+    // like an explicit `None`.
+    let cleared = ReviewStorage::set_group_blocked_reason(root, review, "arch-1", Some("   "))
+        .unwrap()
+        .expect("the declared group accepts a clear");
+    assert!(cleared.blocked_reason.is_none());
+
+    let reblocked = ReviewStorage::set_group_blocked_reason(root, review, "arch-1", Some("Again"))
+        .unwrap()
+        .expect("the declared group accepts a new blocker");
+    assert_eq!(reblocked.blocked_reason.as_deref(), Some("Again"));
+    let cleared = ReviewStorage::set_group_blocked_reason(root, review, "arch-1", None)
+        .unwrap()
+        .expect("the declared group accepts a clear");
+    assert!(cleared.blocked_reason.is_none());
+
+    // An undeclared group and a missing session change nothing.
+    assert!(
+        ReviewStorage::set_group_blocked_reason(root, review, "arch-9", Some("x"))
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        ReviewStorage::set_group_blocked_reason(root, "rev-missing", "arch-1", Some("x"))
+            .unwrap()
+            .is_none()
+    );
+    assert!(ReviewStorage::load_review(root, "rev-missing")
+        .unwrap()
+        .is_none());
+}
+
+/// A recorded decision ends the blocker, is stored once on the group, and is
+/// stamped onto every finding the group collects.
+#[test]
+fn test_apply_group_decision_clears_the_blocker_and_stamps_the_members() {
+    let dir = tempdir().unwrap();
+    let root = dir.path();
+    let review = "rev-group-decision";
+
+    let blocked_group = ReviewGroup {
+        blocked_reason: Some("Two symptoms, one undecided cause".to_string()),
+        ..architectural_group("arch-1")
+    };
+    let session = ReviewSession {
+        id: review.to_string(),
+        title: "Group Decision".to_string(),
+        created_at: 100,
+        model: tauqe_protocol::ModelRef::openrouter("test-model"),
+        groups: vec![blocked_group, simple_group("local")],
+        items: vec![
+            group_finding(1, Some("arch-1")),
+            group_finding(2, Some("arch-1")),
+            group_finding(3, Some("local")),
+        ],
+        ..Default::default()
+    };
+    ReviewStorage::save_session(root, &session).unwrap();
+
+    // A decision must state what was decided: a blank note is rejected and the
+    // stored session keeps its blocker.
+    let rejected = ReviewStorage::apply_group_decision(root, review, "arch-1", "   ");
+    assert!(rejected.is_err(), "a blank decision is rejected");
+    let stored = ReviewStorage::load_review(root, review).unwrap().unwrap();
+    assert_eq!(
+        stored.groups[0].blocked_reason.as_deref(),
+        Some("Two symptoms, one undecided cause")
+    );
+    assert!(stored.find_item(1).unwrap().resolution_notes.is_none());
+
+    let decided =
+        ReviewStorage::apply_group_decision(root, review, "arch-1", "  The cache owns the lock  ")
+            .unwrap()
+            .expect("the declared group records its decision");
+    assert!(decided.blocked_reason.is_none());
+    assert_eq!(
+        decided.resolution_notes.as_deref(),
+        Some("The cache owns the lock")
+    );
+    // The horizon belongs to the group and stays out of scope of the decision.
+    assert_eq!(decided.implementation.items.len(), 1);
+
+    let stored = ReviewStorage::load_review(root, review).unwrap().unwrap();
+    let group = &stored.groups[0];
+    assert!(group.blocked_reason.is_none());
+    assert_eq!(
+        group.resolution_notes.as_deref(),
+        Some("The cache owns the lock")
+    );
+    for item in stored.items.iter().filter(|item| item.id != 3) {
+        assert_eq!(
+            item.resolution_notes.as_deref(),
+            Some("The cache owns the lock"),
+            "the decision is stamped onto every member finding"
+        );
+        // The round-trip through the canonical `ReviewIssue` model must not
+        // rewrite the content of a finding.
+        assert_eq!(item.title, format!("Finding {}", item.id));
+        assert_eq!(item.body, format!("Body {}", item.id));
+        assert_eq!(item.files, vec![format!("src/file_{}.rs", item.id)]);
+        assert_eq!(
+            item.recommendations,
+            vec![format!("Apply change {}", item.id)]
+        );
+    }
+
+    // A decision settles the architecture; it never starts or finishes the
+    // remediation of the findings, so their lifecycle status stays untouched.
+    let untouched = stored.find_item(3).unwrap();
+    assert!(untouched.resolution_notes.is_none());
+    assert_eq!(untouched.status, IssueStatus::Todo);
+    assert_eq!(stored.find_item(1).unwrap().status, IssueStatus::Todo);
+
+    // An undeclared group and a missing session change nothing.
+    assert!(
+        ReviewStorage::apply_group_decision(root, review, "arch-9", "anything")
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        ReviewStorage::apply_group_decision(root, "rev-missing", "arch-1", "anything")
+            .unwrap()
+            .is_none()
+    );
+    assert!(ReviewStorage::load_review(root, "rev-missing")
+        .unwrap()
+        .is_none());
+}
+
+/// Finding of a grouped session whose lifecycle status and note are stated by
+/// the test, so a completion can be observed against a terminal verdict.
+fn finding_with(
+    id: u32,
+    group: Option<&str>,
+    status: IssueStatus,
+    note: Option<&str>,
+) -> ReviewItem {
+    ReviewItem {
+        status,
+        resolution_notes: note.map(str::to_string),
+        ..group_finding(id, group)
+    }
+}
+
+/// One atomic completion closes every open finding of a group, records the
+/// completion note only where a finding carries none, clears the group blocker,
+/// and preserves the verdicts the developer already stated.
+#[test]
+fn test_close_group_implementation_closes_only_open_findings() {
+    let dir = tempdir().unwrap();
+    let root = dir.path();
+    let review = "rev-group-completion";
+
+    let blocked = ReviewGroup {
+        blocked_reason: Some("The lock ordering must be decided first".to_string()),
+        ..architectural_group("arch-1")
+    };
+    let session = ReviewSession {
+        id: review.to_string(),
+        title: "Group Completion".to_string(),
+        created_at: 100,
+        model: tauqe_protocol::ModelRef::openrouter("test-model"),
+        groups: vec![blocked, simple_group("local")],
+        items: vec![
+            finding_with(1, Some("arch-1"), IssueStatus::Discussion, None),
+            finding_with(2, Some("arch-1"), IssueStatus::Todo, None),
+            finding_with(3, Some("arch-1"), IssueStatus::InProgress, None),
+            finding_with(4, Some("arch-1"), IssueStatus::Skipped, None),
+            finding_with(
+                5,
+                Some("arch-1"),
+                IssueStatus::Rejected,
+                Some("false positive"),
+            ),
+            finding_with(
+                6,
+                Some("arch-1"),
+                IssueStatus::Fixed,
+                Some("already fixed by hand"),
+            ),
+            finding_with(7, Some("local"), IssueStatus::Todo, None),
+        ],
+        ..Default::default()
+    };
+    ReviewStorage::save_session(root, &session).unwrap();
+
+    let closed = ReviewStorage::close_group_implementation(
+        root,
+        review,
+        "arch-1",
+        "Resolved by the completed implementation horizon of the review group",
+    )
+    .unwrap()
+    .expect("the declared group is closed");
+    assert_eq!(closed, 3, "only the open findings of the group are closed");
+
+    let stored = ReviewStorage::load_review(root, review).unwrap().unwrap();
+    for id in [1, 2, 3] {
+        let item = stored.find_item(id).expect("the finding is stored");
+        assert_eq!(item.status, IssueStatus::Fixed, "finding {id}");
+        assert_eq!(
+            item.resolution_notes.as_deref(),
+            Some("Resolved by the completed implementation horizon of the review group"),
+            "the completion note is recorded on a finding that carries none"
+        );
+        // The round-trip through the canonical `ReviewIssue` model must not
+        // rewrite the content of a finding.
+        assert_eq!(item.title, format!("Finding {id}"));
+        assert_eq!(item.body, format!("Body {id}"));
+    }
+
+    // A verdict the developer stated is never revoked by a completion.
+    assert_eq!(stored.find_item(4).unwrap().status, IssueStatus::Skipped);
+    assert!(stored.find_item(4).unwrap().resolution_notes.is_none());
+    assert_eq!(stored.find_item(5).unwrap().status, IssueStatus::Rejected);
+    assert_eq!(
+        stored.find_item(5).unwrap().resolution_notes.as_deref(),
+        Some("false positive")
+    );
+    assert_eq!(stored.find_item(6).unwrap().status, IssueStatus::Fixed);
+    assert_eq!(
+        stored.find_item(6).unwrap().resolution_notes.as_deref(),
+        Some("already fixed by hand")
+    );
+
+    // The blocker belongs to the group and is cleared by the same write.
+    assert!(stored.groups[0].blocked_reason.is_none());
+
+    // Findings of another group are never observed.
+    assert_eq!(stored.find_item(7).unwrap().status, IssueStatus::Todo);
+    assert!(stored.find_item(7).unwrap().resolution_notes.is_none());
+
+    // A repeated completion finds nothing left to close and never rewrites the
+    // note it already recorded.
+    let again = ReviewStorage::close_group_implementation(root, review, "arch-1", "again")
+        .unwrap()
+        .expect("the declared group accepts a repeated completion");
+    assert_eq!(again, 0);
+    let stored = ReviewStorage::load_review(root, review).unwrap().unwrap();
+    assert_eq!(
+        stored.find_item(1).unwrap().resolution_notes.as_deref(),
+        Some("Resolved by the completed implementation horizon of the review group")
+    );
+
+    // An undeclared group and a missing session change nothing.
+    assert!(
+        ReviewStorage::close_group_implementation(root, review, "arch-9", "x")
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        ReviewStorage::close_group_implementation(root, "rev-missing", "arch-1", "x")
+            .unwrap()
+            .is_none()
+    );
+    assert!(ReviewStorage::load_review(root, "rev-missing")
+        .unwrap()
+        .is_none());
 }

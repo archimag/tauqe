@@ -175,39 +175,56 @@ pub fn read_credentials_file(path: &Path) -> Option<Credentials> {
 
 /// Writes `content` to `path`, creating the file with owner-only permissions
 /// before any bytes are written so the secret is never briefly world-readable.
+///
+/// The guarantee is absolute: a target that cannot enforce it refuses the write
+/// through the non-Unix definition below instead of persisting the secret with
+/// the platform's default permissions.
+#[cfg(unix)]
 fn write_private_file(path: &Path, content: &str) -> std::io::Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    use std::os::unix::fs::PermissionsExt;
+
     if let Some(parent) = path.parent() {
         if !parent.as_os_str().is_empty() {
             std::fs::create_dir_all(parent)?;
         }
     }
 
-    #[cfg(unix)]
-    {
-        use std::io::Write;
-        use std::os::unix::fs::OpenOptionsExt;
-        use std::os::unix::fs::PermissionsExt;
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(path)?;
+    file.write_all(content.as_bytes())?;
 
-        let mut file = std::fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .mode(0o600)
-            .open(path)?;
-        file.write_all(content.as_bytes())?;
-
-        // Tighten permissions on a pre-existing file that an earlier version
-        // may have created with a looser mode.
-        let perms = std::fs::Permissions::from_mode(0o600);
-        let _ = std::fs::set_permissions(path, perms);
-    }
-
-    #[cfg(not(unix))]
-    {
-        std::fs::write(path, content)?;
-    }
+    // Tighten permissions on a pre-existing file that an earlier version
+    // may have created with a looser mode.
+    let perms = std::fs::Permissions::from_mode(0o600);
+    let _ = std::fs::set_permissions(path, perms);
 
     Ok(())
+}
+
+/// Targets without a standard-library owner-only permission primitive.
+///
+/// `std` exposes file permissions only on Unix, so no dependency-free
+/// implementation of the guarantee exists for the other targets this crate
+/// builds for. A best-effort write under the platform's default permissions
+/// would silently break the guarantee on a whole platform class, so the write
+/// is refused and the caller reports the reason. The key stays usable through
+/// the `OPENROUTER_API_KEY` environment variable, which no file on disk
+/// carries.
+#[cfg(not(unix))]
+fn write_private_file(_path: &Path, _content: &str) -> std::io::Result<()> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "Owner-only file permissions are enforced on Unix targets only, so \
+         the credentials file would take the platform's default permissions \
+         and the secret could be readable by other accounts. Set \
+         OPENROUTER_API_KEY in the environment instead.",
+    ))
 }
 
 pub fn write_credentials_file(path: &Path, api_key: &str) -> std::io::Result<()> {
@@ -333,6 +350,7 @@ api_key = "sk-or-v1-secret-token"
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn test_write_credentials_file_and_check() {
         let temp_dir = tempfile::tempdir().unwrap();
@@ -355,6 +373,7 @@ api_key = "sk-or-v1-secret-token"
         assert!(has_openrouter_key(&cfg));
     }
 
+    #[cfg(unix)]
     #[test]
     fn test_write_credentials_stub() {
         let temp_dir = tempfile::tempdir().unwrap();
@@ -368,6 +387,7 @@ api_key = "sk-or-v1-secret-token"
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn test_write_credentials_file_escapes_special_characters() {
         let temp_dir = tempfile::tempdir().unwrap();
@@ -394,6 +414,23 @@ api_key = "sk-or-v1-secret-token"
 
         let mode = std::fs::metadata(&creds_path).unwrap().permissions().mode();
         assert_eq!(mode & 0o777, 0o600);
+    }
+
+    /// The owner-only guarantee is the only supported way to persist a secret,
+    /// so a target that cannot enforce it refuses the write instead of leaving
+    /// the key readable by other accounts.
+    #[cfg(not(unix))]
+    #[test]
+    fn test_write_credentials_file_is_refused_without_owner_only_permissions() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let creds_path = temp_dir.path().join(".tauqe").join("credentials.toml");
+
+        let err = write_credentials_file(&creds_path, "sk-secret").unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::Unsupported);
+        assert!(
+            !creds_path.exists(),
+            "a refused write must not leave the secret on disk"
+        );
     }
 
     #[test]

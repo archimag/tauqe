@@ -12,14 +12,16 @@ use crate::i18n::active_t;
 use crate::theme::color::RgbColor;
 use crate::theme::engine::{current_engine, ThemeEngine};
 use crate::ui::geometry;
-use crate::ui::{wrap_line, UiAction};
+use crate::ui::UiAction;
 
 use super::state::ReplFocus;
 
 mod model;
 mod splash;
 
+pub(crate) use self::model::compute_model_lines_with_file_rows;
 pub(crate) use self::model::file_op_badge;
+pub(crate) use self::model::wrap_model_lines;
 use self::splash::render_splash;
 
 pub use self::model::compute_model_lines;
@@ -201,6 +203,31 @@ fn render_discussion_focus_banner(frame: &mut ratatui::Frame, state: &AppState, 
                     active_t("repl.focus_badge_review"),
                     palette.button_active_bg,
                     id.clone(),
+                    title,
+                    focused_items.len(),
+                )
+            }
+            DiscussionTarget::ReviewGroup {
+                session_id,
+                group_id,
+            } => {
+                let title = state
+                    .review
+                    .sessions
+                    .iter()
+                    .find(|session| &session.id == session_id)
+                    .and_then(|session| {
+                        session
+                            .effective_groups()
+                            .into_iter()
+                            .find(|group| group.id == *group_id)
+                            .map(|group| group.title.clone())
+                    })
+                    .unwrap_or_else(|| group_id.clone());
+                (
+                    active_t("repl.focus_badge_review"),
+                    palette.status_warning,
+                    format!("{session_id}/{group_id}"),
                     title,
                     focused_items.len(),
                 )
@@ -687,18 +714,11 @@ fn render_model_pane(frame: &mut ratatui::Frame, state: &mut AppState, area: Rec
     let prefix_count =
         (state.model.error.is_some() as usize) + (state.model.toolchain.is_some() as usize);
 
-    let mut raw_to_visual_start = Vec::with_capacity(raw_lines.len());
-    let mut raw_to_visual_end = Vec::with_capacity(raw_lines.len());
-    let mut model_lines = Vec::with_capacity(raw_lines.len());
-    let mut current_visual = 0;
-    for line in raw_lines {
-        let wrapped = wrap_line(line, content_width);
-        let wrapped_count = wrapped.len();
-        raw_to_visual_start.push(current_visual);
-        raw_to_visual_end.push(current_visual + wrapped_count.saturating_sub(1));
-        current_visual += wrapped_count;
-        model_lines.extend(wrapped);
-    }
+    // The renderer and every scroll derivation wrap the canvas through one
+    // shared pass, so a staged-file row resolved for scrolling is the row the
+    // viewport actually draws (c-1, c-4).
+    let (model_lines, raw_to_visual_start, raw_to_visual_end) =
+        wrap_model_lines(raw_lines, content_width);
 
     for block in &mut state.model.code_blocks {
         let b_raw_start = prefix_count + block.raw_start_line;
@@ -709,10 +729,14 @@ fn render_model_pane(frame: &mut ratatui::Frame, state: &mut AppState, area: Rec
         }
     }
 
-    let total_lines = model_lines.len() as u16;
-    state.model.rendered_lines_count = model_lines.len();
+    let total_lines = model_lines.len();
+    state.model.rendered_lines_count = total_lines;
 
-    let max_scroll = total_lines.saturating_sub(content_height);
+    // The bound saturates instead of wrapping through a truncated cast: a
+    // response longer than `u16::MAX` visual lines keeps the largest
+    // representable offset (c-2).
+    let max_scroll =
+        u16::try_from(total_lines.saturating_sub(content_height as usize)).unwrap_or(u16::MAX);
     if state.model.auto_scroll || state.model.scroll > max_scroll {
         state.model.scroll = max_scroll;
     }

@@ -140,16 +140,16 @@ impl PlanStorage {
                     }
                     let matched_plan =
                         crate::plan::matcher::resolve_plan_id_exact(&tag.id, &all_plans).cloned();
-                    let mut plan = matched_plan.unwrap_or_else(|| Plan {
-                        id: tag.id.clone(),
-                        title: tag.title.clone().unwrap_or_else(|| tag.id.clone()),
-                        description: tag.description.clone(),
-                        created_at: now,
-                        updated_at: now,
-                        architect: None,
-                        last_replanned_step: None,
-                        concept: Vec::new(),
-                        items: Vec::new(),
+                    let mut plan = matched_plan.unwrap_or_else(|| {
+                        Plan::from_parts(
+                            tag.id.clone(),
+                            tag.title.clone().unwrap_or_else(|| tag.id.clone()),
+                            tag.description.clone(),
+                            now,
+                            now,
+                            Vec::new(),
+                            Vec::new(),
+                        )
                     });
                     if let Some(t) = tag.title {
                         plan.title = t;
@@ -558,16 +558,14 @@ Step 1 is done:
         assert!(res_missing.errors[0].contains("Cannot update plan 'non-existent'"));
 
         // 3. Non-existent item on update
-        let valid_plan = Plan {
-            id: "my-plan".to_string(),
-            last_replanned_step: None,
-            title: "P".to_string(),
-            description: None,
-            created_at: 1,
-            updated_at: 1,
-            architect: None,
-            concept: vec![],
-            items: vec![PlanItem {
+        let valid_plan = Plan::from_parts(
+            "my-plan".to_string(),
+            "P".to_string(),
+            None,
+            1,
+            1,
+            vec![],
+            vec![PlanItem {
                 id: "1".to_string(),
                 title: "T".to_string(),
                 details: None,
@@ -579,7 +577,7 @@ Step 1 is done:
                 depends_on: vec![],
                 children: vec![],
             }],
-        };
+        );
         PlanStorage::save_plan(root, &valid_plan).unwrap();
 
         let update_item_missing =
@@ -822,21 +820,19 @@ Step 1 is done:
         let dir = tempdir().unwrap();
         let root = dir.path();
 
-        let plan = Plan {
-            id: "test-plan".to_string(),
-            last_replanned_step: None,
-            title: "Test".to_string(),
-            description: Some("Desc".to_string()),
-            created_at: 100,
-            updated_at: 100,
-            architect: None,
-            concept: vec![],
-            items: vec![PlanItem {
+        let plan = Plan::from_parts(
+            "test-plan".to_string(),
+            "Test".to_string(),
+            Some("Desc".to_string()),
+            100,
+            100,
+            vec![],
+            vec![PlanItem {
                 id: "1".to_string(),
                 title: "Step 1".to_string(),
                 ..Default::default()
             }],
-        };
+        );
         PlanStorage::save_plan(root, &plan).unwrap();
         assert_eq!(
             PlanStorage::load_plan(root, "test-plan")
@@ -878,28 +874,34 @@ Step 1 is done:
         let dir = tempdir().unwrap();
         let root = dir.path();
 
-        let p1 = Plan {
-            id: "feature-alpha".to_string(),
-            title: "Feature Alpha".to_string(),
-            items: vec![PlanItem {
+        let p1 = Plan::from_parts(
+            "feature-alpha".to_string(),
+            "Feature Alpha".to_string(),
+            None,
+            0,
+            0,
+            vec![],
+            vec![PlanItem {
                 id: "1".to_string(),
                 title: "Step 1".to_string(),
                 status: PlanItemStatus::Todo,
                 ..Default::default()
             }],
-            ..Default::default()
-        };
-        let p2 = Plan {
-            id: "feature-beta".to_string(),
-            title: "Feature Beta".to_string(),
-            items: vec![PlanItem {
+        );
+        let p2 = Plan::from_parts(
+            "feature-beta".to_string(),
+            "Feature Beta".to_string(),
+            None,
+            0,
+            0,
+            vec![],
+            vec![PlanItem {
                 id: "1".to_string(),
                 title: "Step 1".to_string(),
                 status: PlanItemStatus::Todo,
                 ..Default::default()
             }],
-            ..Default::default()
-        };
+        );
         PlanStorage::save_plan(root, &p1).unwrap();
         PlanStorage::save_plan(root, &p2).unwrap();
 
@@ -1088,16 +1090,19 @@ Step 1 is done:
         let dir = tempdir().unwrap();
         let root = dir.path();
 
-        let initial_plan = Plan {
-            id: "status-preserve".to_string(),
-            title: "Status Preserve".to_string(),
-            concept: vec![tauqe_protocol::ConceptItem {
+        let initial_plan = Plan::from_parts(
+            "status-preserve".to_string(),
+            "Status Preserve".to_string(),
+            None,
+            0,
+            0,
+            vec![tauqe_protocol::ConceptItem {
                 id: "c-1".to_string(),
                 title: "Concept".to_string(),
                 details: None,
                 children: vec![],
             }],
-            items: vec![
+            vec![
                 PlanItem {
                     id: "1".to_string(),
                     title: "Step 1".to_string(),
@@ -1114,8 +1119,7 @@ Step 1 is done:
                     ..Default::default()
                 },
             ],
-            ..Default::default()
-        };
+        );
         PlanStorage::save_plan(root, &initial_plan).unwrap();
 
         // 1. Partial update without status attribute must NOT regress InProgress or Blocked to Todo

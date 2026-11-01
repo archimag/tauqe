@@ -68,10 +68,22 @@ pub async fn handle_repository_init(req: Request, state: &Arc<AppState>) -> Resp
         Err(resp) => return *resp,
     };
 
-    let params: tauqe_protocol::RepositoryInitParams = req
-        .params
-        .and_then(|p| serde_json::from_value(p).ok())
-        .unwrap_or_default();
+    // A present payload must decode through the typed DTO: silently defaulting
+    // an unparsable one would run a bare init and drop the requested initial
+    // commit, which is the silent degradation the strict wire contract forbids.
+    let params: tauqe_protocol::RepositoryInitParams = match req.params {
+        Some(payload) => match serde_json::from_value(payload) {
+            Ok(params) => params,
+            Err(err) => {
+                return Response::err(
+                    req.id,
+                    errors::INVALID_PARAMS,
+                    format!("Invalid repository init parameters: {}", err),
+                );
+            }
+        },
+        None => tauqe_protocol::RepositoryInitParams::default(),
+    };
 
     let initial_commit = params.initial_commit;
     // The repository must be initialized at the authoritative shared root, not
@@ -118,8 +130,23 @@ pub async fn handle_repository_list_files(req: Request, state: &Arc<AppState>) -
 }
 
 pub async fn handle_git_get_diff(req: Request, state: &Arc<AppState>) -> Response {
-    let params: Option<GitDiffParams> = req.params.and_then(|p| serde_json::from_value(p).ok());
-    let target_path = params.and_then(|p| p.path);
+    // A present payload must decode through the typed DTO: silently dropping an
+    // unparsable one would answer with a whole-repository diff the client never
+    // asked for.
+    let params: GitDiffParams = match req.params {
+        Some(payload) => match serde_json::from_value(payload) {
+            Ok(params) => params,
+            Err(err) => {
+                return Response::err(
+                    req.id,
+                    errors::INVALID_PARAMS,
+                    format!("Invalid git diff parameters: {}", err),
+                );
+            }
+        },
+        None => GitDiffParams::default(),
+    };
+    let target_path = params.path;
 
     let repo_root = state.repo_root().await;
     let diff = super::offload(move || {
@@ -147,8 +174,21 @@ pub async fn handle_git_squash_preview(req: Request, state: &Arc<AppState>) -> R
         Err(resp) => return *resp,
     };
 
-    let params: Option<tauqe_protocol::GitSquashPreviewParams> =
-        req.params.and_then(|p| serde_json::from_value(p).ok());
+    // A present payload must decode through the typed DTO: silently dropping an
+    // unparsable one would resolve a base the client never asked for.
+    let params: tauqe_protocol::GitSquashPreviewParams = match req.params {
+        Some(payload) => match serde_json::from_value(payload) {
+            Ok(params) => params,
+            Err(err) => {
+                return Response::err(
+                    req.id,
+                    errors::INVALID_PARAMS,
+                    format!("Invalid squash preview parameters: {}", err),
+                );
+            }
+        },
+        None => tauqe_protocol::GitSquashPreviewParams::default(),
+    };
 
     let repo_root = state.repo_root().await;
     let configured_upstream = state.config.lock().await.config.git.upstream.clone();
@@ -156,7 +196,7 @@ pub async fn handle_git_squash_preview(req: Request, state: &Arc<AppState>) -> R
     // and upstream state below. A supplied one must pass the shared revision
     // gate, so identical input is refused identically on every squash endpoint
     // before any Git plumbing runs.
-    let requested_base = match params.and_then(|p| p.base_ref) {
+    let requested_base = match params.base_ref {
         Some(raw) => match validate_revision(&raw) {
             Ok(revision) => Some(revision),
             Err(message) => return Response::err(req.id, errors::INVALID_PARAMS, message),
@@ -957,5 +997,86 @@ mod tests {
             .await;
             assert_invalid_params(applied, base_ref);
         }
+    }
+    /// A malformed `initial_commit` must be refused instead of silently running
+    /// a bare init that drops the commit the client asked for.
+    #[tokio::test]
+    async fn repository_init_rejects_malformed_payloads() {
+        let dir = std::env::temp_dir().join(format!(
+            "tauqe-test-init-invalid-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        let _ = std::fs::create_dir_all(&dir);
+
+        let (out, _rx) = crate::transport::OutChannel::new();
+        let (history_sender, _hrx) = tokio::sync::mpsc::unbounded_channel();
+        let state = AppState::new(AppConfig::default(), dir.clone(), history_sender, out);
+
+        let req = Request {
+            id: RequestId::Number(2),
+            method: methods::REPOSITORY_INIT.to_string(),
+            params: Some(serde_json::json!({ "initial_commit": "yes" })),
+        };
+        let resp = handle_repository_init(req, &state).await;
+        assert_eq!(
+            resp.error
+                .expect("the malformed payload must be refused")
+                .code,
+            errors::INVALID_PARAMS
+        );
+        assert!(
+            !dir.join(".git").exists(),
+            "a refused init must not touch the repository"
+        );
+        assert!(
+            !state.is_operation_active(),
+            "a refused init must release the operation slot"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// An unparsable `path` must be refused instead of answering with a
+    /// whole-repository diff the client never asked for.
+    #[tokio::test]
+    async fn git_get_diff_rejects_malformed_payloads() {
+        let repo = SquashTestRepo::new();
+        let root = repo.path().to_path_buf();
+
+        let (out, _rx) = crate::transport::OutChannel::new();
+        let (history_sender, _history_rx) = tokio::sync::mpsc::unbounded_channel();
+        let state = AppState::new(AppConfig::default(), root.clone(), history_sender, out);
+
+        let malformed = Request {
+            id: RequestId::Number(3),
+            method: methods::GIT_GET_DIFF.to_string(),
+            params: Some(serde_json::json!({ "path": 7 })),
+        };
+        let resp = handle_git_get_diff(malformed, &state).await;
+        assert_eq!(
+            resp.error
+                .expect("the malformed payload must be refused")
+                .code,
+            errors::INVALID_PARAMS
+        );
+
+        // An absent payload keeps its documented meaning: the whole worktree.
+        let absent = Request {
+            id: RequestId::Number(4),
+            method: methods::GIT_GET_DIFF.to_string(),
+            params: None,
+        };
+        let resp = handle_git_get_diff(absent, &state).await;
+        assert!(resp.error.is_none(), "unexpected error: {:?}", resp.error);
+        let result: GitDiffResult =
+            serde_json::from_value(resp.result.expect("git/getDiff result")).unwrap();
+        assert_eq!(
+            result.diff,
+            tauqe_core::git::get_diff(root.as_path(), None).expect("the repository diff"),
+            "an absent payload must answer the repository diff"
+        );
     }
 }

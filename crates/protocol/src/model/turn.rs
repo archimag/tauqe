@@ -2,7 +2,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::command::DocTopic;
 use crate::discussion::{
-    deserialize_null_as_default, DiscussionContextRequest, DiscussionRequest, RepoSearchRequest,
+    deserialize_null_as_default, deserialize_repo_search_requests, DiscussionContextRequest,
+    DiscussionRequest, RepoSearchRequest,
 };
 use crate::edit::{EditOperation, EditOutcome, StructuredChangeProposal};
 
@@ -74,7 +75,7 @@ pub struct ModelTurnPlanContext {
 ///
 /// A queue is described by data, not by the interface: a plan step lists the
 /// steps it executes, a review group step lists the sub-steps of the group
-/// subplan, and a review step lists the findings of the session. `id` is the
+/// implementation, and a review step lists the findings of the session. `id` is
 /// identifier the owning subsystem already uses — a plan or sub-step
 /// identifier, or a finding number rendered as text — so one sliding-window
 /// renderer serves every kind of work.
@@ -118,7 +119,7 @@ impl TurnWorkQueue {
 pub enum ReviewWorkPhase {
     /// The audit that produces the findings of a session or one of its groups.
     Audit,
-    /// The just-in-time decomposition of an architectural group into a subplan.
+    /// The just-in-time decomposition of an architectural group into its implementation horizon.
     Decomposition,
     /// The cross-group classification of the produced findings.
     PostAnalysis,
@@ -143,7 +144,7 @@ pub enum TurnWorkContext {
         plan_title: String,
         queue: TurnWorkQueue,
     },
-    /// One sub-step of an architectural review group subplan.
+    /// One sub-step of an architectural review group implementation.
     ReviewGroupStep {
         review_id: String,
         review_title: String,
@@ -316,7 +317,7 @@ pub struct StructuredAbortProposal {
 pub struct ModelResultProposal {
     #[serde(default)]
     pub message: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_null_as_default")]
     pub changes: Vec<StructuredChangeProposal>,
     #[serde(
         default,
@@ -327,7 +328,7 @@ pub struct ModelResultProposal {
     #[serde(
         default,
         alias = "search_requests",
-        deserialize_with = "deserialize_null_as_default",
+        deserialize_with = "deserialize_repo_search_requests",
         skip_serializing_if = "Vec::is_empty"
     )]
     pub repo_searches: Vec<RepoSearchRequest>,
@@ -345,9 +346,9 @@ pub struct ModelResultProposal {
     pub blocked: Option<StructuredBlockedProposal>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub abort: Option<StructuredAbortProposal>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_null_as_default")]
     pub context_drops: Vec<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_null_as_default")]
     pub suggested_actions: Vec<String>,
 }
 
@@ -574,12 +575,14 @@ mod tests {
                 error: None,
                 changed_files: vec!["src/lib.rs".to_string()],
                 commit_hash: Some("abc1234".to_string()),
+                verification: Some(crate::VerificationVerdict::NotConfigured),
             },
         };
         let json = serde_json::to_string(&result).unwrap();
         assert!(json.contains("\"kind\":\"edit\""));
         assert!(json.contains("\"applied\":true"));
         assert!(json.contains("\"commit_hash\":\"abc1234\""));
+        assert!(json.contains("\"verification\":\"not_configured\""));
         assert!(
             !json.contains("outcome"),
             "the shared outcome must serialize inline, not nested: {json}"
@@ -1011,5 +1014,78 @@ mod tests {
         assert_eq!(decoded.operation_id, "op-2");
         assert_eq!(decoded.work_context, event.work_context);
         assert_eq!(decoded.plan_context, event.plan_context);
+    }
+
+    #[test]
+    fn test_model_result_proposal_repo_searches_normalize_paths() {
+        // The proposal applies the same repository-path rules as every sibling
+        // discovery list: a `./` prefix collapses, `.` names the whole
+        // repository, and escaping spellings are dropped instead of reaching
+        // the engine.
+        let raw = r#"{
+            "message": "Search the subsystem",
+            "changes": [],
+            "repo_searches": [
+                {"path": "./crates/core", "regex": "fn run"},
+                {"path": ".", "regex": "pub fn"},
+                {"path": "../escape", "regex": "secret"},
+                {"path": "/etc/passwd", "regex": "root"}
+            ]
+        }"#;
+        let proposal: ModelResultProposal = serde_json::from_str(raw).unwrap();
+        assert_eq!(proposal.repo_searches.len(), 2);
+        assert_eq!(proposal.repo_searches[0].path, "crates/core");
+        assert_eq!(proposal.repo_searches[0].regex, "fn run");
+        assert!(proposal.repo_searches[1].path.is_empty());
+        assert_eq!(proposal.repo_searches[1].regex, "pub fn");
+
+        // The alias decodes through the same normalizer instead of bypassing
+        // it.
+        let raw_alias = r#"{
+            "message": "Alias search",
+            "search_requests": [{"path": "./crates/protocol/", "regex": "enum LlmCommand"}]
+        }"#;
+        let aliased: ModelResultProposal = serde_json::from_str(raw_alias).unwrap();
+        assert_eq!(aliased.repo_searches.len(), 1);
+        assert_eq!(aliased.repo_searches[0].path, "crates/protocol");
+        assert_eq!(aliased.repo_searches[0].regex, "enum LlmCommand");
+    }
+
+    #[test]
+    fn test_model_result_proposal_tolerates_null_array_fields() {
+        // An explicit null on any array field decodes as an empty list, so one
+        // stray null never aborts the whole proposal.
+        let raw = r#"{
+            "message": "Nothing to change",
+            "changes": null,
+            "context_requests": null,
+            "repo_searches": null,
+            "doc_requests": null,
+            "context_drops": null,
+            "suggested_actions": null
+        }"#;
+        let proposal: ModelResultProposal = serde_json::from_str(raw).unwrap();
+        assert_eq!(proposal.message, "Nothing to change");
+        assert!(proposal.changes.is_empty());
+        assert!(proposal.context_requests.is_empty());
+        assert!(proposal.repo_searches.is_empty());
+        assert!(proposal.doc_requests.is_empty());
+        assert!(proposal.context_drops.is_empty());
+        assert!(proposal.suggested_actions.is_empty());
+
+        // The surrounding control fields stay decodable next to the nulls, so
+        // the proposal is never reduced to a parse error by a nulled list.
+        let raw_outcome = r#"{
+            "message": "Done",
+            "changes": null,
+            "context_drops": null,
+            "suggested_actions": null,
+            "outcome": {"status": "success", "summary": "All checks passed"}
+        }"#;
+        let with_outcome: ModelResultProposal = serde_json::from_str(raw_outcome).unwrap();
+        assert!(with_outcome.changes.is_empty());
+        let outcome = with_outcome.outcome.expect("outcome proposal");
+        assert_eq!(outcome.status, "success");
+        assert_eq!(outcome.summary.as_deref(), Some("All checks passed"));
     }
 }

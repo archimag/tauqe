@@ -126,6 +126,15 @@ impl HistoryFileChange {
         }
     }
 
+    /// Builds a record for a directory move from `from` to `to`.
+    pub fn moved_dir(from: impl Into<String>, to: impl Into<String>) -> Self {
+        Self {
+            path: from.into(),
+            op: Some(EditFileOp::MoveDir),
+            to: Some(to.into()),
+        }
+    }
+
     /// Decodes one file entry written by the retired display-prefix format.
     ///
     /// Compatibility note (Conventions §1.5): history records persisted before
@@ -325,7 +334,16 @@ mod tests {
             serde_json::json!({ "path": "src/a.rs", "op": "move", "to": "src/b.rs" })
         );
 
-        for change in [plain, operated, moved] {
+        // A directory move names its source in `path` and its destination in
+        // `to`, exactly like a file move, and is told apart by its operation.
+        let moved_dir = HistoryFileChange::moved_dir("src/old", "src/new");
+        let json = serde_json::to_value(&moved_dir).unwrap();
+        assert_eq!(
+            json,
+            serde_json::json!({ "path": "src/old", "op": "move_dir", "to": "src/new" })
+        );
+
+        for change in [plain, operated, moved, moved_dir] {
             let json = serde_json::to_string(&change).unwrap();
             let parsed: HistoryFileChange = serde_json::from_str(&json).unwrap();
             assert_eq!(parsed, change);

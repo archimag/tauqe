@@ -2,20 +2,17 @@
 
 use std::sync::Arc;
 
-use tauqe_core::context::ContextFileContent;
+use tauqe_core::plan::prompt::PlanHorizonDiagnostics;
 use tauqe_core::plan::storage::PlanStorage;
-use tauqe_core::providers::{
-    format_session_id, JsonSchemaDefinition, ResponseFormat, SESSION_PREFIX_ARCHITECT,
-};
+use tauqe_core::providers::{format_session_id, SESSION_PREFIX_ARCHITECT};
+use tauqe_core::workflow::fsm::structured::{StructuredRefineOutcome, StructuredRefineStatus};
+use tauqe_core::workflow::WorkflowOptions;
 use tauqe_protocol::{
-    errors, events, Event, ModelDeltaEvent, ModelRole, ModelSelection, ModelStartedEvent, Plan,
+    errors, events, ModelFinishedEvent, ModelRole, ModelSelection, ModelStartedEvent, Plan,
     PlanListChangedEvent, PlanRefineResult, PlanUpdatedEvent, Response,
 };
 
-use crate::handlers::architect::{
-    format_architect_escalation_note, resolve_architect_provider, run_architect_discovery_loop,
-    ArchitectDiscoveryError, ArchitectDiscoveryOutcome, ArchitectDiscoveryRequest,
-};
+use crate::handlers::architect::{format_architect_escalation_note, run_contour_synthesis};
 use crate::handlers::common::{
     clear_auto_context, emit, preload_readonly_files, record_synthesis_history,
 };
@@ -26,9 +23,11 @@ pub(super) use super::horizon::{collect_plan_context_files, PlanHorizonDiagnosti
 
 /// Unified engine for architect plan horizon synthesis.
 ///
-/// Drives streaming structured communication with the architect model, runs multi-round
-/// context discovery on `needs_context`, validates the synthesized horizon, and applies it
-/// atomically via `PlanStorage::replace_uncompleted_horizon`.
+/// Drives the structured Architect contour (`run_contour_synthesis`) instead of a
+/// hand-written discovery loop: the contour owns the provider rounds, the schema
+/// healing of an invalid payload, the tier ladder, the discovery journal, and the
+/// typed terminal outcomes, while this adapter owns the RPC response, the repository
+/// persistence, and the session-history transaction.
 ///
 /// Enforces strict session history transactionality: `state.history.record_response` is
 /// called strictly AFTER `replace_uncompleted_horizon` succeeds on disk. Any persistence
@@ -55,18 +54,7 @@ pub(super) async fn execute_plan_horizon_synthesis(
         "plan horizon synthesis started"
     );
 
-    let (
-        provider,
-        architect_tier,
-        level_up,
-        escalation_excluded,
-        repomap_budget,
-        max_discovery_rounds,
-        files_token_budget,
-        max_parse_retries,
-        include_repo_map,
-        discovery_limits,
-    ) = {
+    let (architect_tier, level_up, escalation_excluded, options, models_config) = {
         let cfg = state.config.lock().await.config.clone();
         let (architect_tier, level_up) = tauqe_core::plan::prompt::resolve_architect_tier(
             &cfg,
@@ -75,30 +63,30 @@ pub(super) async fn execute_plan_horizon_synthesis(
             diagnostics.as_ref().map(|d| d.blocked_step_id.as_str()),
             plan.last_replanned_step.as_deref(),
         );
-        let provider =
-            match resolve_architect_provider(state, &cfg, architect_tier.model.provider).await {
-                Ok(p) => p,
-                Err(err) => return Response::err(req_id, errors::NO_API_KEY, err),
-            };
         // A manual run on a configuration the automatic ladder excludes cannot
         // escalate, which the published note states instead of leaving the
         // developer to assume a silent downgrade.
         let escalation_excluded = cfg
             .models
             .excluded_from_escalation(ModelRole::Architect, &architect_tier.model);
+        // Every operational budget of the synthesis — discovery rounds, file and
+        // repomap budgets, the eager-map switch, and the discovery caps — belongs
+        // to the turn, so the contour reads them from one options value instead of
+        // a per-request parameter set.
+        let mut options = WorkflowOptions::from_app_config(&cfg);
+        // Horizon synthesis is an isolated design dialogue: its cache is keyed by
+        // the plan, never by the interactive REPL session. The contour rotates the
+        // identifier itself when it promotes another model (crates/core/Conventions.md §9.9).
+        options.session_id = Some(format_session_id(SESSION_PREFIX_ARCHITECT, &plan.id));
         (
-            provider,
             architect_tier,
             level_up,
             escalation_excluded,
-            cfg.context.repomap_token_budget,
-            cfg.context.max_discovery_rounds,
-            cfg.context.files_token_budget,
-            cfg.develop.max_retries,
-            cfg.context.include_repo_map,
-            tauqe_core::workflow::discovery::DiscoveryLimits::from_context_config(&cfg.context),
+            options,
+            cfg.models.clone(),
         )
     };
+
     // The resolved rung is recorded with the synthesized horizon so a later
     // wave can reproduce or escalate it instead of re-deriving one. A replan
     // wave escalates that recorded configuration rather than retrying the one
@@ -126,48 +114,6 @@ pub(super) async fn execute_plan_horizon_synthesis(
     // the repo map alone.
     let plan_files = collect_plan_context_files(&plan);
     preload_readonly_files(state, &repo_root, &plan_files).await;
-
-    let op_id = format!("op-{}", crate::state::next_operation_id());
-
-    state.out.send_event(&Event {
-        method: events::MODEL_STARTED.to_string(),
-        params: serde_json::to_value(ModelStartedEvent {
-            operation_id: op_id.clone(),
-            model: architect_tier.model.clone(),
-            role: Some(ModelRole::Architect),
-            alias: None,
-            effort: architect_tier.effort,
-            plan_context: None,
-            work_context: None,
-            is_batch,
-        })
-        .ok(),
-    });
-
-    let level_up_note = format_architect_escalation_note(
-        &architect_tier,
-        level_up.as_ref(),
-        escalation_excluded && diagnostics.is_some(),
-    );
-
-    let intro_header = match &diagnostics {
-        Some(diag) => format!(
-            "# {}: [{}] {}\n*Replanning uncompleted horizon around blocked step `{}`...*{}\n\n---\n\n",
-            operation_title, plan.id, plan.title, diag.blocked_step_id, level_up_note
-        ),
-        None => format!(
-            "# {}: [{}] {}\n*Analyzing codebase contours and decomposing architectural plan...*{}\n\n---\n\n",
-            operation_title, plan.id, plan.title, level_up_note
-        ),
-    };
-    state.out.send_event(&Event {
-        method: events::MODEL_TEXT_DELTA.to_string(),
-        params: serde_json::to_value(ModelDeltaEvent {
-            operation_id: op_id.clone(),
-            delta: intro_header.clone(),
-        })
-        .ok(),
-    });
 
     // The user turn and its response are recorded together once the synthesis
     // reaches a terminal outcome, so a cancelled, failed, or rejected round
@@ -199,88 +145,119 @@ pub(super) async fn execute_plan_horizon_synthesis(
         (history_turn_prompt, context_paths)
     };
 
-    let response_format = {
-        let schema_val = tauqe_core::plan::prompt::plan_refine_response_schema_definition();
-        match serde_json::from_value::<JsonSchemaDefinition>(schema_val) {
-            Ok(schema) => ResponseFormat::JsonSchema {
-                json_schema: schema,
-            },
-            Err(err) => return Response::err(req_id, errors::SCHEMA_ERROR, err.to_string()),
-        }
-    };
-    let system_prompt = tauqe_core::plan::prompt::build_plan_horizon_system_prompt();
-    let discovery = ArchitectDiscoveryRequest {
-        repo_root: repo_root.as_path(),
-        op_id: &op_id,
-        operation_title,
-        system_prompt: &system_prompt,
-        intro_header: &intro_header,
-        budget_hint: "The plan is too broad and should be manually decomposed or scoped down.",
-        response_format,
-        repomap_budget,
-        include_repo_map,
-        max_discovery_rounds,
-        files_token_budget,
-        discovery_limits,
-        max_parse_retries,
-        // Horizon synthesis is an isolated design dialogue: its cache is keyed
-        // by the plan, never by the interactive REPL session.
-        session_id: Some(format_session_id(SESSION_PREFIX_ARCHITECT, &plan.id)),
+    // The contour works on its own clone of the context and owns the auto layer it
+    // widens, so the adapter hands it a snapshot and the shared launch skeleton
+    // merges the result back once the synthesis settles.
+    let context_snapshot = state.context.read().await.clone();
+
+    let op_id = format!("op-{}", crate::state::next_operation_id());
+
+    emit(
+        &state.out,
+        events::MODEL_STARTED,
+        serde_json::to_value(ModelStartedEvent {
+            operation_id: op_id.clone(),
+            model: architect_tier.model.clone(),
+            role: Some(ModelRole::Architect),
+            alias: None,
+            effort: architect_tier.effort,
+            plan_context: None,
+            work_context: None,
+            is_batch,
+        })
+        .ok(),
+    );
+
+    let level_up_note = format_architect_escalation_note(
+        &architect_tier,
+        level_up.as_ref(),
+        escalation_excluded && diagnostics.is_some(),
+    );
+
+    let intro_header = match &diagnostics {
+        Some(diag) => format!(
+            "# {}: [{}] {}\n*Replanning uncompleted horizon around blocked step `{}`...*{}\n\n---\n\n",
+            operation_title, plan.id, plan.title, diag.blocked_step_id, level_up_note
+        ),
+        None => format!(
+            "# {}: [{}] {}\n*Analyzing codebase contours and decomposing architectural plan...*{}\n\n---\n\n",
+            operation_title, plan.id, plan.title, level_up_note
+        ),
     };
 
-    let build_user_prompt =
-        |context_files: &[ContextFileContent], repo_map: Option<&str>, repo_dirs: Option<&str>| {
-            let diag_ref =
-                diagnostics
-                    .as_ref()
-                    .map(|d| tauqe_core::plan::prompt::PlanHorizonDiagnostics {
-                        blocked_step_id: &d.blocked_step_id,
-                        blocked_reason: d.blocked_reason.as_deref(),
-                        toolchain_status: d.toolchain_status.as_deref(),
-                    });
-            tauqe_core::plan::prompt::build_plan_horizon_user_prompt(
-                &plan,
-                context_files,
-                repo_map,
-                repo_dirs,
-                diag_ref,
-                instructions.as_deref(),
-            )
-        };
+    // The domain framing of the synthesis is task content, so it precedes the plan
+    // prompt of every round. The protocol carries the response contract, and the turn
+    // kernel renders the context block and the repository outline of each round in its
+    // stable head, so this fragment restates neither of them.
+    let mut task = tauqe_core::plan::prompt::build_plan_horizon_system_prompt();
+    task.push_str("\n\n---\n\n");
+    let diag_ref = diagnostics.as_ref().map(|d| PlanHorizonDiagnostics {
+        blocked_step_id: &d.blocked_step_id,
+        blocked_reason: d.blocked_reason.as_deref(),
+        toolchain_status: d.toolchain_status.as_deref(),
+    });
+    task.push_str(&tauqe_core::plan::prompt::build_plan_horizon_user_prompt(
+        &plan,
+        diag_ref,
+        instructions.as_deref(),
+    ));
 
-    let output = match run_architect_discovery_loop(
+    let budget_hint = "The plan is too broad and should be manually decomposed or scoped down.";
+    let (contour_result, summary) = run_contour_synthesis(
         state,
-        Arc::clone(&provider),
-        &architect_tier.model.name,
-        discovery,
-        build_user_prompt,
-        architect_tier.effort,
         operation,
+        &op_id,
+        task,
+        context_snapshot,
+        options,
+        models_config,
+        architect_tier,
+        intro_header,
+        budget_hint.to_string(),
     )
-    .await
-    {
-        Ok(ArchitectDiscoveryOutcome {
-            output,
-            budget_exceeded: None,
-        }) => output,
-        Ok(ArchitectDiscoveryOutcome {
-            budget_exceeded: Some(warn_msg),
-            ..
-        }) => {
-            record_synthesis_history(
-                state,
-                history_turn_prompt,
-                history_context_paths,
-                warn_msg.clone(),
-                Some(format!(
-                    "{}: Token Budget Exceeded ({})",
-                    operation_title, plan.title
-                )),
-            )
-            .await;
-            return Response::ok_typed(req_id, &PlanRefineResult::Blocked { reason: warn_msg });
+    .await;
+
+    let StructuredRefineOutcome {
+        output,
+        tier,
+        status,
+    } = match contour_result {
+        Ok(outcome) => outcome,
+        Err(err) => {
+            // The contour owns the auto layer it widened and the launch skeleton
+            // merged everything else back, so the transient layer is released
+            // before the turn reports its failure.
+            clear_auto_context(state).await;
+            // A cancellation observed while the contour settled still ends the
+            // turn as a cancellation instead of a provider failure.
+            if summary.cancelled {
+                return Response::err(
+                    req_id,
+                    errors::CANCELLED,
+                    format!("{} was cancelled", operation_title),
+                );
+            }
+            let message = summary.error.unwrap_or_else(|| err.to_string());
+            return Response::err(req_id, errors::MODEL_ERROR, message);
         }
-        Err(ArchitectDiscoveryError::Cancelled) => {
+    };
+
+    if !matches!(status, StructuredRefineStatus::Cancelled) {
+        // The answer the turn relay accumulated is the single source of the
+        // finished text, exactly as the retired manual loop published it.
+        emit(
+            &state.out,
+            events::MODEL_FINISHED,
+            serde_json::to_value(ModelFinishedEvent {
+                operation_id: op_id.clone(),
+                full_text: summary.assistant_text,
+            })
+            .ok(),
+        );
+    }
+
+    match status {
+        StructuredRefineStatus::Cancelled => {
             clear_auto_context(state).await;
             return Response::err(
                 req_id,
@@ -288,62 +265,50 @@ pub(super) async fn execute_plan_horizon_synthesis(
                 format!("{} was cancelled", operation_title),
             );
         }
-        Err(ArchitectDiscoveryError::ModelError(err)) => {
-            clear_auto_context(state).await;
-            return Response::err(req_id, errors::MODEL_ERROR, err);
+        StructuredRefineStatus::Blocked { reason } => {
+            tracing::warn!(
+                plan_id = %plan.id,
+                reason = %reason,
+                "architect reported blockers"
+            );
+            let blocked_msg = format!(
+                "Architect reported blockers for plan [{}]:\n\n{}",
+                plan.id, reason
+            );
+            record_synthesis_history(
+                state,
+                history_turn_prompt,
+                history_context_paths,
+                blocked_msg,
+                Some(format!("{}: Blocked ({})", operation_title, plan.title)),
+            )
+            .await;
+            return Response::ok_typed(req_id, &PlanRefineResult::Blocked { reason });
         }
-        Err(ArchitectDiscoveryError::ParseError(err)) => {
-            clear_auto_context(state).await;
-            return Response::err(req_id, errors::PARSE_ERROR, err);
+        StructuredRefineStatus::BudgetExceeded { diagnostic } => {
+            record_synthesis_history(
+                state,
+                history_turn_prompt,
+                history_context_paths,
+                diagnostic.clone(),
+                Some(format!(
+                    "{}: Token Budget Exceeded ({})",
+                    operation_title, plan.title
+                )),
+            )
+            .await;
+            return Response::ok_typed(req_id, &PlanRefineResult::Blocked { reason: diagnostic });
         }
+        StructuredRefineStatus::Synthesized => {}
+    }
+
+    let Some(output) = output else {
+        return Response::err(
+            req_id,
+            errors::EMPTY_ITEMS,
+            "Model returned success status but no horizon payload",
+        );
     };
-
-    if output.status.eq_ignore_ascii_case("blocked") {
-        let reason = output.reason.unwrap_or(output.explanation);
-        tracing::warn!(
-            plan_id = %plan.id,
-            reason = %reason,
-            "architect reported blockers"
-        );
-        let blocked_msg = format!(
-            "Architect reported blockers for plan [{}]:\n\n{}",
-            plan.id, reason
-        );
-        record_synthesis_history(
-            state,
-            history_turn_prompt,
-            history_context_paths,
-            blocked_msg,
-            Some(format!("{}: Blocked ({})", operation_title, plan.title)),
-        )
-        .await;
-        return Response::ok_typed(req_id, &PlanRefineResult::Blocked { reason });
-    }
-
-    if output.status.eq_ignore_ascii_case("needs_context") {
-        return Response::err(
-            req_id,
-            errors::NEEDS_CONTEXT,
-            format!(
-                "Architect requested additional context but no discovery rounds remain (limit: {}). Narrow the plan scope or raise the discovery round limit, then refine again",
-                max_discovery_rounds
-            ),
-        );
-    }
-
-    // Accept only an explicit success: an unknown status (for example a stray
-    // `needs_context` that survived the round limit) must never be treated as a
-    // completed refinement, or it could overwrite the plan with an unvalidated tree.
-    if !output.status.eq_ignore_ascii_case("success") {
-        return Response::err(
-            req_id,
-            errors::UNEXPECTED_STATUS,
-            format!(
-                "Architect returned unsupported status '{}'; expected 'success' or 'blocked'",
-                output.status
-            ),
-        );
-    }
 
     if output.items.is_empty() {
         return Response::err(
@@ -369,7 +334,9 @@ pub(super) async fn execute_plan_horizon_synthesis(
     let horizon_root = repo_root.clone();
     let horizon_plan_id = plan.id.clone();
     let horizon_items = output.items;
-    let horizon_architect = architect_tier;
+    // The rung that actually produced the horizon is recorded as its provenance, so a
+    // later wave reproduces or escalates it instead of re-deriving one.
+    let horizon_architect = tier;
     // The step whose horizon this wave reprojects is persisted with the new
     // horizon, so the next wave reads from disk whether this step already
     // failed a replanning round.

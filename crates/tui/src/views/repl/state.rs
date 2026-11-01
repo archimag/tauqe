@@ -6,7 +6,7 @@ use tauqe_protocol::{ModelRef, ModelResult};
 
 use super::diff_cache::DiffRenderCache;
 use super::reasoning::ReasoningState;
-use super::render::compute_model_lines;
+use super::render::{compute_model_lines, compute_model_lines_with_file_rows, wrap_model_lines};
 use crate::app::{DiffInspectorFocus, DiffInspectorState};
 use crate::i18n::active_t;
 use crate::views::recenter::RecenterState;
@@ -537,11 +537,17 @@ impl ReplView {
         self.splash_animating() || self.background_active()
     }
 
+    /// Maximum scroll offset of the viewport for a given visible height.
+    ///
+    /// The row count the last frame reported wins, because it is the canvas the
+    /// developer is looking at. Before the first frame of a turn the canvas is
+    /// wrapped on demand, so the fallback measures the rows that will be drawn
+    /// instead of the unwrapped raw lines (c-1, c-4).
     pub fn max_scroll(&mut self, view_height: u16) -> u16 {
         let count = if self.rendered_lines_count > 0 {
             self.rendered_lines_count
         } else {
-            compute_model_lines(self).len()
+            self.wrapped_canvas().0.len()
         };
         u16::try_from(count)
             .unwrap_or(u16::MAX)
@@ -555,68 +561,57 @@ impl ReplView {
         }
     }
 
-    /// Raw line index of the summary row of the staged file at `file_index`.
+    /// Wraps the canvas at the width the renderer derived.
     ///
-    /// The compact file list renders exactly one summary row per staged file,
-    /// so selecting a file, recentering on it, and keeping it visible all
-    /// resolve through this single index. The arithmetic mirrors the rows
-    /// [`compute_model_lines`] emits, which is why the two can never disagree
-    /// about where a file starts (c-4).
-    fn file_row_index(&self, file_index: usize) -> Option<usize> {
-        let mut line_idx = 0;
-        if self.error.is_some() {
-            line_idx += 1;
-        }
-        if self.toolchain.is_some() {
-            line_idx += 1;
-        }
-
-        if !self.markdown_lines.is_empty() {
-            line_idx += self.markdown_lines.len();
-        } else if !self.text.is_empty() {
-            line_idx += self.text.lines().count();
-        }
-
-        if !self.reasoning.is_empty() {
-            if !self.text.is_empty() || line_idx > 0 {
-                line_idx += 1;
-            }
-            line_idx += 1;
-            if self.reasoning.show {
-                if !self.reasoning.lines.is_empty() {
-                    line_idx += self.reasoning.lines.len();
-                } else {
-                    line_idx += self.reasoning.text.lines().count();
-                }
-            }
-        }
-
-        if self.edits_active || !self.files.is_empty() {
-            // Blank separator, the proposed-edits header, and the optional
-            // commit summary row precede the file rows.
-            line_idx += 2;
-            if self.last_commit_summary.is_some() {
-                line_idx += 1;
-            }
-
-            for (idx, file) in self.files.iter().enumerate() {
-                if idx == file_index {
-                    return Some(line_idx);
-                }
-                line_idx += 1;
-                if file.status != FileEditStatus::Ok && file.error.is_some() {
-                    line_idx += 1;
-                }
-            }
-        }
-        None
+    /// The pane stores the content width it laid out, so a scroll target is
+    /// resolved against the same wrapped canvas the viewport draws even before
+    /// the first frame of a turn reported its rendered row count (c-1, c-4).
+    fn wrapped_canvas(&mut self) -> (Vec<Line<'static>>, Vec<usize>, Vec<usize>) {
+        let width = self.content_width.max(10);
+        wrap_model_lines(compute_model_lines(self), width)
     }
 
+    /// Visual span of every staged file summary row, with the canvas height.
+    ///
+    /// The raw summary indices come from the canvas builder and are projected
+    /// through the shared wrapping pass, so the spans name the rows the renderer
+    /// draws. A summary wider than the canvas wraps, so one file can occupy
+    /// several visual rows (c-1, c-4).
+    fn file_summary_layout(&mut self) -> (Vec<(usize, usize)>, usize) {
+        let width = self.content_width.max(10);
+        let (raw, file_rows) = compute_model_lines_with_file_rows(self);
+        let (wrapped, visual_start, visual_end) = wrap_model_lines(raw, width);
+        let spans = file_rows
+            .into_iter()
+            .filter_map(|row| {
+                let start = visual_start.get(row).copied()?;
+                let end = visual_end.get(row).copied().unwrap_or(start);
+                Some((start, end))
+            })
+            .collect();
+        (spans, wrapped.len())
+    }
+
+    /// Visual span of every staged file summary row, in `files` order.
+    ///
+    /// Selecting a file and keeping it visible resolve through this single
+    /// derivation, so no caller reproduces the canvas arithmetic by hand
+    /// (c-1, c-4).
+    pub fn file_summary_visual_rows(&mut self) -> Vec<(usize, usize)> {
+        self.file_summary_layout().0
+    }
+
+    /// Scrolls the viewport just far enough to reveal the selected staged file.
+    ///
+    /// The target is the visual start of the file's summary span in the wrapped
+    /// canvas, so a wrapped summary or a bounded reasoning tail cannot park the
+    /// viewport past the row it is meant to reveal (c-1, c-4).
     pub fn scroll_to_selected_file(&mut self, view_height: u16) {
         if self.files.is_empty() || view_height == 0 {
             return;
         }
-        let Some(row) = self.file_row_index(self.selected_file_index) else {
+        let rows = self.file_summary_visual_rows();
+        let Some(&(row, _)) = rows.get(self.selected_file_index) else {
             return;
         };
         let row = u16::try_from(row).unwrap_or(u16::MAX);
@@ -630,42 +625,44 @@ impl ReplView {
         self.clamp_scroll(view_height);
     }
 
-    /// Recenters the Viewport on the summary row of the selected staged file.
+    /// Recenters the Viewport on the visual span of the selected staged file.
     ///
     /// Repeated presses walk the shared three-beat cycle — center, top, bottom —
     /// and moving the selection restarts the cycle, exactly like the recenter
-    /// command of the cursor-driven views (Conventions.md §5.2). The compact
-    /// file list renders exactly one summary row per file, so the beats land on
-    /// the row the developer selected and no patch body can shift it (c-4).
+    /// command of the cursor-driven views (Conventions.md §5.2). The span comes
+    /// from the same wrapped canvas the viewport draws, so a summary that wraps
+    /// recenters over its whole height and no patch body or reasoning row can
+    /// shift the beats (c-1, c-4).
     pub fn recenter_selected_file(&mut self, view_height: u16) {
         if self.files.is_empty() || view_height == 0 {
             return;
         }
         let selected = self.selected_file_index;
-        let Some(row) = self.file_row_index(selected) else {
+        let (rows, total_lines) = self.file_summary_layout();
+        let Some(&(start, end)) = rows.get(selected) else {
             return;
         };
-        let total_lines = if self.rendered_lines_count > 0 {
-            self.rendered_lines_count
-        } else {
-            compute_model_lines(self).len()
-        };
-        let scroll = self
-            .recenter
-            .recenter(selected, row, row + 1, total_lines, view_height);
+        let scroll = self.recenter.recenter(
+            selected,
+            start,
+            end.saturating_add(1),
+            total_lines,
+            view_height,
+        );
         self.auto_scroll = false;
         self.scroll = scroll;
     }
 
-    /// Captures the staged change set into a fullscreen inspector snapshot.
+    /// Builds the reading position of a fullscreen audit over the staged set.
     ///
     /// The audit is opened by one command chord reachable from the prompt and
-    /// from the Viewport alike, so every entry point builds its snapshot here:
-    /// the same press over the same staged set always opens the same audit
-    /// (c-1). The highlight starts on the file the Viewport had selected, clamped
-    /// into the captured range, and the isolated diff pane opens at its first
-    /// line. An empty staged set yields `None`, so the caller reports the missing
-    /// target instead of drawing an empty card.
+    /// from the Viewport alike, so every entry point builds its reading position
+    /// here: the same press over the same staged set always opens the same audit
+    /// (c-1). The highlight starts on the file the Viewport had selected,
+    /// clamped into the live set, and the isolated diff pane opens at its first
+    /// line. The change set itself is never captured: the audit reads the single
+    /// owned `files` slice in place, so an empty staged set yields `None` and the
+    /// caller reports the missing target instead of drawing an empty card.
     pub fn inspector_snapshot(&self) -> Option<DiffInspectorState> {
         if self.files.is_empty() {
             return None;
@@ -674,7 +671,6 @@ impl ReplView {
             .selected_file_index
             .min(self.files.len().saturating_sub(1));
         Some(DiffInspectorState {
-            files: self.files.clone(),
             selected_file,
             diff_scroll: 0,
             focus: DiffInspectorFocus::Files,
@@ -1091,8 +1087,13 @@ mod splash_tests {
 }
 
 #[cfg(test)]
+#[cfg(test)]
 mod compact_file_list_tests {
     use super::*;
+
+    /// Wide canvas: a rendered summary never wraps, so its visual row equals the
+    /// raw canvas index the layout records.
+    const WIDE: usize = 200;
 
     fn file(path: &str, status: FileEditStatus) -> StreamingFileEdit {
         StreamingFileEdit {
@@ -1109,8 +1110,7 @@ mod compact_file_list_tests {
         }
     }
 
-    /// One answer line, the proposed-edits header, and one summary row per
-    /// file:
+    /// One answer line, the proposed-edits header, and one summary row per file:
     ///
     /// ```text
     /// 0  answer
@@ -1122,11 +1122,53 @@ mod compact_file_list_tests {
     fn view() -> ReplView {
         ReplView {
             text: "answer".to_string(),
+            content_width: WIDE,
             files: vec![
-                file("crates/tui/src/a.rs", FileEditStatus::Ok),
-                file("crates/tui/src/b.rs", FileEditStatus::Ok),
+                file("crates/tui/src/views/repl/a.rs", FileEditStatus::Ok),
+                file("crates/tui/src/views/repl/b.rs", FileEditStatus::Ok),
             ],
             ..ReplView::default()
+        }
+    }
+
+    /// Full text of one rendered row.
+    fn row_text(line: &Line<'static>) -> String {
+        line.spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect()
+    }
+
+    /// The single rendered row whose text contains `needle`.
+    fn rendered_row_of(wrapped: &[Line<'static>], needle: &str) -> usize {
+        let rows: Vec<usize> = wrapped
+            .iter()
+            .enumerate()
+            .filter(|(_, line)| row_text(line).contains(needle))
+            .map(|(index, _)| index)
+            .collect();
+        assert_eq!(rows.len(), 1, "exactly one row must carry {needle}");
+        rows[0]
+    }
+
+    /// Every derived span starts on the row that renders its file summary, stays
+    /// inside the canvas, and never runs backwards.
+    fn assert_derivation_matches_the_canvas(view: &mut ReplView) {
+        let rows = view.file_summary_visual_rows();
+        let (wrapped, _, _) = view.wrapped_canvas();
+        assert_eq!(
+            rows.len(),
+            view.files.len(),
+            "every staged file owns exactly one span"
+        );
+        for (staged, (start, end)) in view.files.iter().zip(rows) {
+            assert!(start <= end, "a span never runs backwards");
+            assert!(end < wrapped.len(), "a span stays inside the canvas");
+            let rendered: String = wrapped[start..=end].iter().map(row_text).collect();
+            assert!(
+                rendered.contains(&staged.path),
+                "the span must start on the rendered summary row: {rendered}"
+            );
         }
     }
 
@@ -1145,11 +1187,51 @@ mod compact_file_list_tests {
     }
 
     #[test]
-    fn the_summary_rows_are_addressable_in_the_compact_list() {
-        let view = view();
-        assert_eq!(view.file_row_index(0), Some(3));
-        assert_eq!(view.file_row_index(1), Some(4));
-        assert_eq!(view.file_row_index(2), None);
+    fn the_summary_rows_are_addressable_in_the_wrapped_canvas() {
+        let mut view = view();
+        assert_eq!(
+            view.file_summary_visual_rows(),
+            vec![(3, 3), (4, 4)],
+            "a wide canvas keeps one visual row per summary"
+        );
+    }
+
+    #[test]
+    fn a_narrow_canvas_reports_a_multi_row_span_for_a_wrapped_summary() {
+        let mut view = view();
+        view.content_width = 16;
+        view.files[0].path = "src/very long module name for the signer.rs".to_string();
+
+        let rows = view.file_summary_visual_rows();
+        let (start, end) = rows[0];
+        assert!(
+            end > start,
+            "a summary wider than the canvas wraps over several rows"
+        );
+
+        let (wrapped, _, _) = view.wrapped_canvas();
+        assert!(end < wrapped.len(), "the span stays inside the canvas");
+        let rendered: String = wrapped[start..=end]
+            .iter()
+            .map(row_text)
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(
+            rendered.contains("signer.rs"),
+            "the span must reach the end of the summary: {rendered}"
+        );
+
+        let outside: String = wrapped
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| *index < start || *index > end)
+            .map(|(_, line)| row_text(line))
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(
+            !outside.contains("signer.rs"),
+            "the span must cover every row of the summary: {outside}"
+        );
     }
 
     #[test]
@@ -1157,11 +1239,12 @@ mod compact_file_list_tests {
         let mut view = view();
         view.files[0].status = FileEditStatus::Error;
         view.files[0].error = Some("hunk did not match the file".to_string());
-        assert_eq!(view.file_row_index(0), Some(3));
+        let rows = view.file_summary_visual_rows();
+        assert_eq!(rows[0], (3, 3));
         assert_eq!(
-            view.file_row_index(1),
-            Some(5),
-            "the diagnostic row shifts the next summary row"
+            rows[1],
+            (5, 5),
+            "the rendered diagnostic row shifts the next summary row"
         );
     }
 
@@ -1188,11 +1271,87 @@ mod compact_file_list_tests {
         view.recenter_selected_file(2);
 
         assert!(!view.auto_scroll);
-        assert!(view.scroll <= view.max_scroll(2));
+        let max = view.max_scroll(2);
+        assert!(
+            view.scroll <= max,
+            "the recentered row stays in the document"
+        );
 
         // Moving the selection restarts the shared recenter cycle.
         view.selected_file_index = 0;
         view.recenter_selected_file(2);
-        assert!(view.scroll <= view.max_scroll(2));
+        let max = view.max_scroll(2);
+        assert!(view.scroll <= max);
+    }
+
+    /// The regression the finding documents: while a reasoning stream is active
+    /// the renderer shows only the bounded tail, so the derived row must not
+    /// track the retained transcript.
+    #[test]
+    fn a_streaming_transcript_never_shifts_the_derived_file_rows() {
+        let mut view = view();
+        view.selected_file_index = 1;
+        for index in 0..40 {
+            view.reasoning
+                .append_delta(&format!("reasoning line {index}\n"));
+        }
+        assert!(
+            view.reasoning.is_streaming(),
+            "the fixture keeps the reasoning stream open"
+        );
+
+        let (wrapped, _, _) = view.wrapped_canvas();
+        let derived = view.file_summary_visual_rows()[1].0;
+        assert_eq!(
+            derived,
+            rendered_row_of(&wrapped, "repl/b.rs"),
+            "the derived row must name the row the canvas draws"
+        );
+
+        // The streaming renderer shows a bounded tail, so a longer transcript
+        // cannot move the row. The full-transcript arithmetic drifted here.
+        for index in 40..120 {
+            view.reasoning
+                .append_delta(&format!("reasoning line {index}\n"));
+        }
+        assert_eq!(
+            view.file_summary_visual_rows()[1].0,
+            derived,
+            "the streaming renderer shows only the bounded tail"
+        );
+    }
+
+    /// A transcript past the retention cap renders one extra marker row, which
+    /// the deleted mirror never counted.
+    #[test]
+    fn a_trimmed_transcript_keeps_the_derived_rows_on_the_drawn_canvas() {
+        let mut view = view();
+        let chunk = "reasoning line with a stable length\n";
+        let appends = (192 * 1024) / chunk.len();
+        for _ in 0..appends {
+            view.reasoning.append_delta(chunk);
+        }
+        assert!(
+            view.reasoning.text.len() < appends * chunk.len(),
+            "the fixture must cross the transcript retention cap"
+        );
+
+        assert_derivation_matches_the_canvas(&mut view);
+    }
+
+    /// The settled, expanded reasoning block renders its whole transcript, and
+    /// the derivation must follow it.
+    #[test]
+    fn a_settled_expanded_transcript_keeps_the_derived_rows_on_the_drawn_canvas() {
+        let mut view = view();
+        for index in 0..30 {
+            view.reasoning
+                .append_delta(&format!("reasoning line {index}\n"));
+        }
+        view.reasoning.finalize();
+        view.reasoning.toggle_fold();
+        assert!(view.reasoning.show, "the settled block is expanded");
+
+        assert_derivation_matches_the_canvas(&mut view);
     }
 }

@@ -82,7 +82,12 @@ pub(super) async fn build_model_ask_prompt(
 pub(super) fn intent_for_target(target: &DiscussionTarget) -> TurnIntent {
     match target {
         DiscussionTarget::Plan { .. } => TurnIntent::PlanDiscussion,
-        DiscussionTarget::Review { .. } => TurnIntent::InteractiveRepl,
+        // A review finding dialogue and a group dialogue both stay interactive:
+        // the developer may ask the model to apply the fix directly, and the
+        // decision recorded for a group travels with the dialogue payload.
+        DiscussionTarget::Review { .. } | DiscussionTarget::ReviewGroup { .. } => {
+            TurnIntent::InteractiveRepl
+        }
     }
 }
 
@@ -102,6 +107,11 @@ fn focus_to_target(focus: &DiscussionFocus) -> Option<(DiscussionTarget, Vec<Str
 
 /// Builds the discussion prompt for a typed target, loading the referenced plan
 /// or review session from storage.
+///
+/// A group target resolves the session that declares the group and renders the
+/// cause the group states, the blocker recorded on it, and every finding that
+/// manifests it, so the dialogue addresses the group as one operational unit
+/// instead of restating its symptoms one by one.
 async fn build_discussion_prompt(
     state: &Arc<AppState>,
     target: &DiscussionTarget,
@@ -151,6 +161,64 @@ async fn build_discussion_prompt(
             Ok(
                 tauqe_core::review::prompt::format_review_discussion_prompt_items(
                     &session, &focused, comment,
+                ),
+            )
+        }
+        DiscussionTarget::ReviewGroup {
+            session_id,
+            group_id,
+        } => {
+            let loaded = {
+                let repo_root = repo_root.clone();
+                let id = session_id.clone();
+                offload(move || {
+                    tauqe_core::review::storage::ReviewStorage::load_review(&repo_root, &id)
+                })
+                .await
+                .map_err(internal_error)?
+            };
+            let session = match loaded {
+                Ok(Some(session)) => session,
+                Ok(None) => {
+                    return Err(not_found(format!(
+                        "Review session '{}' not found",
+                        session_id
+                    )))
+                }
+                Err(err) => return Err(internal_error(format!("{:#}", err))),
+            };
+            let group = match session
+                .effective_groups()
+                .into_iter()
+                .find(|group| group.id == group_id.as_str())
+            {
+                Some(group) => group,
+                None => {
+                    return Err(not_found(format!(
+                        "Review group '{}' not found in session '{}'",
+                        group_id, session_id
+                    )))
+                }
+            };
+            // A group dialogue speaks for the whole group, so it carries every
+            // finding that manifests the cause instead of a selection of them.
+            // Membership follows the effective group of a finding: a finding
+            // that stores no group belongs to the implicit default group.
+            let findings: Vec<tauqe_protocol::review::ReviewItem> = session
+                .items
+                .iter()
+                .filter(|item| {
+                    let owner = item
+                        .group
+                        .as_deref()
+                        .unwrap_or(tauqe_protocol::review::DEFAULT_REVIEW_GROUP_ID);
+                    owner == group_id.as_str()
+                })
+                .cloned()
+                .collect();
+            Ok(
+                tauqe_core::review::prompt::format_review_group_discussion_prompt(
+                    &session, &group, &findings, comment,
                 ),
             )
         }

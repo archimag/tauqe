@@ -49,6 +49,15 @@ fn plan_body_indent(level: usize) -> String {
     format!(" {}", plan_indent(level))
 }
 
+/// Cache key of the body of the plan header description of `plan_id`.
+///
+/// The `p:` prefix and the `:d` suffix keep a plan body disjoint from the
+/// two-segment step keys (`{plan}:{item}`) and the `c:`-prefixed concept keys
+/// that share the same cache.
+fn plan_description_key(plan_id: &str) -> String {
+    format!("p:{}:d", plan_id)
+}
+
 /// Cache key of the body of the concept item `item_id` in `plan_id`.
 ///
 /// The `c:` prefix keeps a concept body apart from a step body that reuses the
@@ -63,20 +72,10 @@ fn step_body_key(plan_id: &str, item_id: &str) -> String {
     format!("{}:{}", plan_id, item_id)
 }
 
-/// Filled badge style for a step lifecycle status.
-pub(crate) fn status_style(status: PlanItemStatus) -> Style {
-    let engine = current_engine();
-    let palette = engine.palette();
-    let inverse = engine.color(palette.text_inverse);
-    match status {
-        PlanItemStatus::Discussion => engine.bg(palette.button_active_bg).fg(inverse).bold(),
-        PlanItemStatus::Todo => engine.bg(palette.status_warning).fg(inverse).bold(),
-        PlanItemStatus::InProgress => engine.bg(palette.status_info).fg(inverse).bold(),
-        PlanItemStatus::Done => engine.bg(palette.status_success).fg(inverse).bold(),
-        PlanItemStatus::Blocked => engine.bg(palette.status_error).fg(inverse).bold(),
-        PlanItemStatus::Cancelled => engine.bg(palette.text_muted).fg(inverse).bold(),
-    }
-}
+// A step badge is one implementation-step projection, so the Plans tree
+// reuses the single shared palette mapping instead of restating it (c-5,
+// Conventions §8.4).
+pub(crate) use crate::views::implementation::status_style;
 
 /// Compact indicator marking the row anchored by the active discussion focus.
 fn focus_badge() -> Span<'static> {
@@ -281,32 +280,19 @@ pub(crate) fn compute_unified_plan_lines(
                         if !prepared.is_empty() {
                             // The plan body renders at the level of its
                             // children, never deeper (Conventions §4.8).
-                            let body_prefix = Span::styled(
-                                format!("{}│ ", plan_body_indent(PLAN_HEADER_LEVEL + 1)),
-                                engine.fg(palette.text_muted),
-                            );
-                            let mut desc_lines = Vec::new();
                             let mut theme =
                                 crate::markdown::MarkdownTheme::answer_themed(theme_mode);
                             theme.text_style = engine.fg(palette.text_secondary);
                             theme.hard_breaks = true;
                             theme.compact = true;
-                            theme.line_prefix = Some(body_prefix.clone());
-                            let md = crate::markdown::render_markdown(&prepared, &theme);
-                            if !md.is_empty() {
-                                desc_lines.extend(md);
-                            } else {
-                                for line in prepared.lines() {
-                                    desc_lines.push(Line::from(vec![
-                                        body_prefix.clone(),
-                                        Span::styled(
-                                            line.to_string(),
-                                            engine.fg(palette.text_secondary),
-                                        ),
-                                    ]));
-                                }
-                            }
-                            all_lines.extend(wrap_lines(desc_lines, width));
+                            theme.line_prefix = Some(Span::styled(
+                                format!("{}│ ", plan_body_indent(PLAN_HEADER_LEVEL + 1)),
+                                engine.fg(palette.text_muted),
+                            ));
+                            let key = plan_description_key(plan_id);
+                            let body =
+                                cache.lines_for(&key, &prepared, &theme, Some(width), theme_mode);
+                            all_lines.extend(body.iter().cloned());
                         }
                     }
                 }
@@ -785,15 +771,18 @@ mod tests {
             plans: vec![Plan {
                 id: "cache-plan".to_string(),
                 title: "Cache Plan".to_string(),
-                description: None,
+                description: Some("One coherent change set per bounded turn.".to_string()),
                 concept: vec![ConceptItem {
                     details: Some(concept_details.to_string()),
                     ..concept_leaf("c-1", "Invariant")
                 }],
-                items: vec![PlanItem {
-                    details: Some(step_details.to_string()),
-                    ..leaf_item("1", "Step")
-                }],
+                implementation: tauqe_protocol::PlanImplementation {
+                    items: vec![PlanItem {
+                        details: Some(step_details.to_string()),
+                        ..leaf_item("1", "Step")
+                    }],
+                    ..Default::default()
+                },
                 ..Default::default()
             }],
             content_width: 200,
@@ -815,6 +804,10 @@ mod tests {
         let (first, _) = render_view(&mut view, 0, 200);
         let first_text = joined_text(&first);
         assert!(
+            first_text.contains("One coherent change set per bounded turn."),
+            "the plan header body must render: {first_text}"
+        );
+        assert!(
             first_text.contains("Tokens must be signed."),
             "the concept body must render: {first_text}"
         );
@@ -824,16 +817,22 @@ mod tests {
         );
         assert_eq!(
             view.markdown_cache.len(),
-            2,
+            3,
             "one cached body per rendered description"
         );
+        let renders_after_first_pass = view.markdown_cache.render_count();
 
-        // Moving the cursor re-renders every row but must reuse both bodies.
+        // Moving the cursor re-renders every row but must reuse all three bodies.
         let (second, _) = render_view(&mut view, step_row, 200);
         assert_eq!(
             view.markdown_cache.len(),
-            2,
+            3,
             "navigation must neither add nor drop a cached body"
+        );
+        assert_eq!(
+            view.markdown_cache.render_count(),
+            renders_after_first_pass,
+            "navigation must not re-parse a body it already rendered"
         );
         assert_eq!(
             body_lines(&second),
@@ -853,8 +852,8 @@ mod tests {
         let (narrow, _) = render_view(&mut view, usize::MAX, 40);
         assert_eq!(
             view.markdown_cache.len(),
-            2,
-            "a new wrap width drops and re-renders both bodies"
+            3,
+            "a new wrap width drops and re-renders every body"
         );
         assert!(
             body_lines(&narrow).len() > body_lines(&wide).len(),
@@ -883,7 +882,7 @@ mod tests {
         assert!(!text.contains("First wording."), "{text}");
         assert_eq!(
             view.markdown_cache.len(),
-            2,
+            3,
             "a rewritten description replaces its own body"
         );
     }
@@ -891,16 +890,14 @@ mod tests {
     #[test]
     fn test_file_badges_render_only_for_leaf_items() {
         let mut view = PlansViewState::default();
-        let plan = Plan {
-            id: "leaf-files".to_string(),
-            title: "Leaf Files".to_string(),
-            description: None,
-            created_at: 0,
-            updated_at: 0,
-            architect: None,
-            last_replanned_step: None,
-            concept: vec![],
-            items: vec![PlanItem {
+        let plan = Plan::from_parts(
+            "leaf-files".to_string(),
+            "Leaf Files".to_string(),
+            None,
+            0,
+            0,
+            vec![],
+            vec![PlanItem {
                 id: "1".to_string(),
                 title: "Phase".to_string(),
                 details: None,
@@ -923,7 +920,7 @@ mod tests {
                     children: vec![],
                 }],
             }],
-        };
+        );
         view.plans = vec![plan];
         view.expand_all();
 
@@ -948,16 +945,14 @@ mod tests {
     #[test]
     fn test_reference_files_badge_and_details() {
         let mut view = PlansViewState::default();
-        let plan = Plan {
-            id: "ref-files".to_string(),
-            title: "Reference Files".to_string(),
-            description: None,
-            created_at: 0,
-            updated_at: 0,
-            architect: None,
-            last_replanned_step: None,
-            concept: vec![],
-            items: vec![PlanItem {
+        let plan = Plan::from_parts(
+            "ref-files".to_string(),
+            "Reference Files".to_string(),
+            None,
+            0,
+            0,
+            vec![],
+            vec![PlanItem {
                 id: "1".to_string(),
                 title: "Wire Auth".to_string(),
                 details: None,
@@ -972,7 +967,7 @@ mod tests {
                 depends_on: vec![],
                 children: vec![],
             }],
-        };
+        );
         view.plans = vec![plan];
         view.expand_all();
 
@@ -1005,12 +1000,15 @@ mod tests {
         item.blocked_reason = Some("Invariant c-model cannot be satisfied.".to_string());
 
         let mut view = PlansViewState {
-            plans: vec![Plan {
-                id: "blocked-plan".to_string(),
-                title: "Blocked Plan".to_string(),
-                items: vec![item],
-                ..Default::default()
-            }],
+            plans: vec![Plan::from_parts(
+                "blocked-plan".to_string(),
+                "Blocked Plan".to_string(),
+                None,
+                0,
+                0,
+                vec![],
+                vec![item],
+            )],
             ..Default::default()
         };
         view.expand_all();
@@ -1056,12 +1054,15 @@ mod tests {
         item.blocked_reason = Some("Waiting on an external contract.".to_string());
 
         let mut view = PlansViewState {
-            plans: vec![Plan {
-                id: "expandable-plan".to_string(),
-                title: "Expandable Plan".to_string(),
-                items: vec![item],
-                ..Default::default()
-            }],
+            plans: vec![Plan::from_parts(
+                "expandable-plan".to_string(),
+                "Expandable Plan".to_string(),
+                None,
+                0,
+                0,
+                vec![],
+                vec![item],
+            )],
             ..Default::default()
         };
         view.expand_all();
@@ -1093,16 +1094,14 @@ mod tests {
     #[test]
     fn test_focus_badge_marks_the_anchored_plan_item() {
         let mut view = PlansViewState::default();
-        let plan = Plan {
-            id: "focus-plan".to_string(),
-            title: "Focus Plan".to_string(),
-            description: None,
-            created_at: 0,
-            updated_at: 0,
-            architect: None,
-            last_replanned_step: None,
-            concept: vec![],
-            items: vec![PlanItem {
+        let plan = Plan::from_parts(
+            "focus-plan".to_string(),
+            "Focus Plan".to_string(),
+            None,
+            0,
+            0,
+            vec![],
+            vec![PlanItem {
                 id: "1".to_string(),
                 title: "Step".to_string(),
                 details: None,
@@ -1114,7 +1113,7 @@ mod tests {
                 depends_on: vec![],
                 children: vec![],
             }],
-        };
+        );
         view.plans = vec![plan];
         view.expand_all();
         view.discussion_focus =
@@ -1142,14 +1141,21 @@ mod tests {
     #[test]
     fn test_plan_header_renders_the_architect_provenance() {
         let mut view = PlansViewState {
-            plans: vec![Plan {
-                id: "arch-plan".to_string(),
-                title: "Arch Plan".to_string(),
-                architect: Some(tauqe_protocol::ArchitectTier::new(
+            plans: vec![{
+                let mut plan = Plan::from_parts(
+                    "arch-plan".to_string(),
+                    "Arch Plan".to_string(),
+                    None,
+                    0,
+                    0,
+                    vec![],
+                    vec![],
+                );
+                plan.architect = Some(tauqe_protocol::ArchitectTier::new(
                     tauqe_protocol::ModelRef::openrouter("planner/model"),
                     Some(tauqe_protocol::ReasoningEffort::High),
-                )),
-                ..Default::default()
+                ));
+                plan
             }],
             ..Default::default()
         };
@@ -1178,16 +1184,24 @@ mod tests {
     fn test_plan_offsets_point_at_their_header_not_the_separator_gap() {
         let mut view = PlansViewState {
             plans: vec![
-                Plan {
-                    id: "plan-a".to_string(),
-                    title: "Plan A".to_string(),
-                    ..Default::default()
-                },
-                Plan {
-                    id: "plan-b".to_string(),
-                    title: "Plan B".to_string(),
-                    ..Default::default()
-                },
+                Plan::from_parts(
+                    "plan-a".to_string(),
+                    "Plan A".to_string(),
+                    None,
+                    0,
+                    0,
+                    vec![],
+                    vec![],
+                ),
+                Plan::from_parts(
+                    "plan-b".to_string(),
+                    "Plan B".to_string(),
+                    None,
+                    0,
+                    0,
+                    vec![],
+                    vec![],
+                ),
             ],
             ..Default::default()
         };
@@ -1227,19 +1241,20 @@ mod tests {
         parent.details = Some("Parent details.".to_string());
 
         let mut view = PlansViewState {
-            plans: vec![Plan {
-                id: "indent-plan".to_string(),
-                title: "Indent Plan".to_string(),
-                description: Some("Plan description.".to_string()),
-                concept: vec![ConceptItem {
+            plans: vec![Plan::from_parts(
+                "indent-plan".to_string(),
+                "Indent Plan".to_string(),
+                Some("Plan description.".to_string()),
+                0,
+                0,
+                vec![ConceptItem {
                     id: "c-1".to_string(),
                     title: "Invariant".to_string(),
                     details: Some("Tokens must be signed.".to_string()),
                     children: vec![concept_leaf("c-1.1", "Nested Invariant")],
                 }],
-                items: vec![parent],
-                ..Default::default()
-            }],
+                vec![parent],
+            )],
             ..Default::default()
         };
         view.expand_all();
@@ -1304,19 +1319,20 @@ mod tests {
         parent.details = Some("Parent details.".to_string());
 
         let mut view = PlansViewState {
-            plans: vec![Plan {
-                id: "state-plan".to_string(),
-                title: "State Plan".to_string(),
-                description: Some("Plan description.".to_string()),
-                concept: vec![ConceptItem {
+            plans: vec![Plan::from_parts(
+                "state-plan".to_string(),
+                "State Plan".to_string(),
+                Some("Plan description.".to_string()),
+                0,
+                0,
+                vec![ConceptItem {
                     id: "c-1".to_string(),
                     title: "Invariant".to_string(),
                     details: Some("Tokens must be signed.".to_string()),
                     children: vec![concept_leaf("c-1.1", "Nested Invariant")],
                 }],
-                items: vec![parent],
-                ..Default::default()
-            }],
+                vec![parent],
+            )],
             ..Default::default()
         };
 

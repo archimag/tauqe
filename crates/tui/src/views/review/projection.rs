@@ -22,6 +22,7 @@ use tauqe_protocol::{
 };
 
 use crate::i18n::active_t;
+use crate::views::implementation::leaf_progress;
 
 use super::ReviewViewState;
 
@@ -67,6 +68,19 @@ pub enum VisibleReviewRow {
         title: String,
         /// Explanation of the root cause the findings of this group share.
         description: Option<String>,
+        /// Reason the unified remediation plan of this group is blocked.
+        ///
+        /// An architectural group whose decomposition could not be synthesized,
+        /// or whose remediation stalled on an unresolved decision, states the
+        /// diagnosis here: the tree badges the header and opens the group body
+        /// with the architectural fork instead of scattering the diagnosis
+        /// across the notes of the findings (concept #c-2).
+        blocked_reason: Option<String>,
+        /// Architectural decision already recorded for this group.
+        ///
+        /// The decision outlives the blocker it resolved, so a later reader
+        /// still sees why the plan of the group took the shape it took.
+        resolution_notes: Option<String>,
         findings_count: usize,
         /// Whether the group owns a unified plan branch below its header.
         ///
@@ -185,33 +199,8 @@ pub(super) fn plan_branch_key(session_id: &str, group_id: &str) -> String {
     format!("{}:p:{}", session_id, group_id)
 }
 
-/// Executable leaf progress of a unified plan as `(done, total)`.
-///
-/// Mirrors `Plan::count_stats`: only leaves carry an explicit status, cancelled
-/// leaves are excluded from the total, and `done` counts the finished leaves.
-/// The branch header and the renderer therefore report one number.
-fn subplan_progress(items: &[PlanItem]) -> (usize, usize) {
-    fn walk(items: &[PlanItem], total: &mut usize, done: &mut usize) {
-        for item in items {
-            if item.is_leaf() {
-                if item.status == PlanItemStatus::Cancelled {
-                    continue;
-                }
-                *total += 1;
-                if item.status == PlanItemStatus::Done {
-                    *done += 1;
-                }
-            } else {
-                walk(&item.children, total, done);
-            }
-        }
-    }
-
-    let mut total = 0;
-    let mut done = 0;
-    walk(items, &mut total, &mut done);
-    (done, total)
-}
+// The leaf progress of a group plan is the same horizon metric the Plans view
+// reports, so the bucket resolves it through the shared projection (c-5).
 /// Expansion key of one subplan step inside a group's unified plan.
 ///
 /// The `:g:` segment keeps a step key disjoint from the `{session}:{item}` key
@@ -268,6 +257,19 @@ pub(super) fn orphan_title(group_id: &str) -> String {
     }
 }
 
+/// Normalizes a model-authored group diagnostic into a renderable value.
+///
+/// The blocker and the recorded decision are authored by the Architect inside a
+/// protocol payload, so a blank or whitespace-only value carries no information
+/// and is dropped before it reaches a row, while a surviving value loses its
+/// surrounding whitespace (Conventions §4.3).
+fn normalized_diagnostic(value: Option<&str>) -> Option<String> {
+    value
+        .map(str::trim)
+        .filter(|text| !text.is_empty())
+        .map(str::to_string)
+}
+
 /// One group of a session, ready to be rendered.
 ///
 /// The bucket owns the group metadata it displays and borrows the findings it
@@ -279,6 +281,16 @@ pub(super) struct GroupBucket<'a> {
     kind: ReviewGroupKind,
     title: String,
     description: Option<String>,
+    /// Reason the group currently cannot proceed.
+    blocked_reason: Option<String>,
+    /// Architectural decision already recorded for the group.
+    resolution_notes: Option<String>,
+    /// Executable leaf progress of the unified plan as `(total, done)`.
+    ///
+    /// The bucket resolves it through the shared implementation projection the
+    /// moment it is built, so the branch header of the group and the header of
+    /// a plan report one number for the same horizon (c-5).
+    progress: (usize, usize),
     pub(super) subplan: Vec<PlanItem>,
     subplan_architect: Option<ArchitectTier>,
     pub(super) items: Vec<&'a ReviewItem>,
@@ -337,6 +349,8 @@ impl ReviewViewState {
                     kind: bucket.kind,
                     title: bucket.title,
                     description: bucket.description,
+                    blocked_reason: bucket.blocked_reason,
+                    resolution_notes: bucket.resolution_notes,
                     findings_count: bucket.items.len(),
                     has_plan,
                     is_expanded: group_expanded,
@@ -350,7 +364,7 @@ impl ReviewViewState {
                 // findings close the group on their own band instead of mixing
                 // with the plan (concept #c-1).
                 if has_plan {
-                    let (done, total) = subplan_progress(&bucket.subplan);
+                    let (total, done) = bucket.progress;
                     let branch_expanded = self.is_plan_branch_expanded(&session.id, &bucket.id);
                     rows.push(VisibleReviewRow::GroupPlanHeader {
                         session_id: session.id.clone(),
@@ -477,14 +491,12 @@ impl ReviewViewState {
                 } else {
                     group.title.clone()
                 },
-                description: group
-                    .description
-                    .as_deref()
-                    .map(str::trim)
-                    .filter(|description| !description.is_empty())
-                    .map(str::to_string),
-                subplan: group.subplan.clone(),
-                subplan_architect: group.subplan_architect.clone(),
+                description: normalized_diagnostic(group.description.as_deref()),
+                blocked_reason: normalized_diagnostic(group.blocked_reason.as_deref()),
+                resolution_notes: normalized_diagnostic(group.resolution_notes.as_deref()),
+                progress: leaf_progress(&group.implementation),
+                subplan: group.implementation.items.clone(),
+                subplan_architect: group.implementation.architect.clone(),
                 items,
             });
         }
@@ -504,6 +516,9 @@ impl ReviewViewState {
                 kind: ReviewGroupKind::Simple,
                 title: orphan_title(&group_id),
                 description: None,
+                blocked_reason: None,
+                resolution_notes: None,
+                progress: (0, 0),
                 subplan: Vec::new(),
                 subplan_architect: None,
                 items: visible
@@ -669,7 +684,7 @@ impl ReviewViewState {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tauqe_protocol::{ReviewGroup, ReviewSession};
+    use tauqe_protocol::{PlanImplementation, ReviewGroup, ReviewSession};
 
     fn make_item(id: u32) -> ReviewIssue {
         ReviewIssue {
@@ -726,10 +741,13 @@ mod tests {
             id: "arch".to_string(),
             title: "Shared cause".to_string(),
             kind: ReviewGroupKind::Architectural,
-            subplan: vec![PlanItem {
-                children: vec![subplan_step("1.1", "Leaf step", PlanItemStatus::Todo)],
-                ..subplan_step("1", "Container step", PlanItemStatus::Todo)
-            }],
+            implementation: PlanImplementation {
+                items: vec![PlanItem {
+                    children: vec![subplan_step("1.1", "Leaf step", PlanItemStatus::Todo)],
+                    ..subplan_step("1", "Container step", PlanItemStatus::Todo)
+                }],
+                ..Default::default()
+            },
             ..Default::default()
         }];
         session.items[0].group = Some("arch".to_string());
@@ -853,14 +871,17 @@ mod tests {
             title: "Root cause".to_string(),
             description: Some("One cause behind both symptoms.".to_string()),
             kind: ReviewGroupKind::Architectural,
-            subplan: vec![PlanItem {
-                children: vec![subplan_step("1.1", "Leaf", PlanItemStatus::Done)],
-                ..subplan_step("1", "Unify the guard", PlanItemStatus::Todo)
-            }],
-            subplan_architect: Some(ArchitectTier::new(
-                ModelRef::openrouter("planner/model"),
-                None,
-            )),
+            implementation: PlanImplementation {
+                items: vec![PlanItem {
+                    children: vec![subplan_step("1.1", "Leaf", PlanItemStatus::Done)],
+                    ..subplan_step("1", "Unify the guard", PlanItemStatus::Todo)
+                }],
+                architect: Some(ArchitectTier::new(
+                    ModelRef::openrouter("planner/model"),
+                    None,
+                )),
+                ..Default::default()
+            },
             ..Default::default()
         }];
         session.items[0].group = Some("g1".to_string());
@@ -1019,5 +1040,72 @@ mod tests {
             4,
             "a header, its summary, one group header, and one finding"
         );
+    }
+    /// A blocked group states its diagnosis and its recorded decision on the
+    /// header row, so the tree can badge the header and open the architectural
+    /// fork as the first section of the group body (concept #c-2).
+    #[test]
+    fn test_group_header_carries_the_blocker_and_the_recorded_decision() {
+        fn diagnostic_session(
+            id: &str,
+            blocked: Option<&str>,
+            resolution: Option<&str>,
+        ) -> ReviewSession {
+            let mut session = make_session(id, &[1]);
+            session.groups = vec![ReviewGroup {
+                id: "arch".to_string(),
+                title: "Shared cause".to_string(),
+                kind: ReviewGroupKind::Architectural,
+                blocked_reason: blocked.map(str::to_string),
+                resolution_notes: resolution.map(str::to_string),
+                ..Default::default()
+            }];
+            session.items[0].group = Some("arch".to_string());
+            session
+        }
+
+        let blocked = ReviewViewState {
+            sessions: vec![diagnostic_session(
+                "rev-blocked",
+                Some("  Two invariants contradict each other.  "),
+                Some("\nReuse the existing policy object.\n"),
+            )],
+            ..Default::default()
+        };
+        match &blocked.flatten_rows()[1] {
+            VisibleReviewRow::GroupHeader {
+                blocked_reason,
+                resolution_notes,
+                ..
+            } => {
+                assert_eq!(
+                    blocked_reason.as_deref(),
+                    Some("Two invariants contradict each other.")
+                );
+                assert_eq!(
+                    resolution_notes.as_deref(),
+                    Some("Reuse the existing policy object.")
+                );
+            }
+            other => panic!("expected a group header, got {other:?}"),
+        }
+
+        // A whitespace-only payload carries no information, so a blank
+        // diagnostic never badges a healthy group.
+        let healthy = ReviewViewState {
+            sessions: vec![diagnostic_session("rev-healthy", Some("   "), None)],
+            ..Default::default()
+        };
+        match &healthy.flatten_rows()[1] {
+            VisibleReviewRow::GroupHeader {
+                blocked_reason,
+                resolution_notes,
+                ..
+            } => {
+                assert!(blocked_reason.is_none());
+                assert!(resolution_notes.is_none());
+            }
+            other => panic!("expected a group header, got {other:?}"),
+        }
     }
 }

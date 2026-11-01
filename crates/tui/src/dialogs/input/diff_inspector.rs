@@ -147,8 +147,10 @@ pub(super) static INSPECTOR_COMMAND_MAP: CommandMap<InspectorCommand> = CommandM
 ///
 /// The reading position of the Develop viewport is never touched, so closing the
 /// dialog returns the developer to the exact spot the audit was opened from
-/// (c-3). The selected file keeps its own scroll offset, and moving the
-/// highlight resets it so a shorter patch never inherits a stale offset.
+/// (c-3). The audited set has exactly one owner — the Develop view's staged files
+/// — so the file walk clamps against that live length instead of a copy, and
+/// moving the highlight resets the isolated diff scroll so a shorter patch never
+/// inherits a stale offset.
 ///
 /// The vertical motion is focus aware: the file list walks its highlight while it
 /// owns the keyboard, and the diff read area scrolls its own body once `Tab`
@@ -171,6 +173,9 @@ pub(super) fn handle_diff_inspector_key(key: KeyEvent, st: &mut AppState) {
         return;
     }
 
+    // The live staged set is the only owner of the audited payload, so its length
+    // is read before the reading position is borrowed (c-3).
+    let file_count = st.model.files.len();
     let Some(inspector) = st.diff_inspector.as_mut() else {
         return;
     };
@@ -180,15 +185,15 @@ pub(super) fn handle_diff_inspector_key(key: KeyEvent, st: &mut AppState) {
         InspectorCommand::Close => {}
         InspectorCommand::ToggleFocus => inspector.focus.toggle(),
         InspectorCommand::MoveForward => match inspector.focus {
-            DiffInspectorFocus::Files => step_file(inspector, true),
+            DiffInspectorFocus::Files => step_file(inspector, file_count, true),
             DiffInspectorFocus::Diff => scroll_diff(inspector, 1, true),
         },
         InspectorCommand::MoveBackward => match inspector.focus {
-            DiffInspectorFocus::Files => step_file(inspector, false),
+            DiffInspectorFocus::Files => step_file(inspector, file_count, false),
             DiffInspectorFocus::Diff => scroll_diff(inspector, 1, false),
         },
-        InspectorCommand::NextFile => step_file(inspector, true),
-        InspectorCommand::PrevFile => step_file(inspector, false),
+        InspectorCommand::NextFile => step_file(inspector, file_count, true),
+        InspectorCommand::PrevFile => step_file(inspector, file_count, false),
         InspectorCommand::ScrollUp => scroll_diff(inspector, 1, false),
         InspectorCommand::ScrollDown => scroll_diff(inspector, 1, true),
         InspectorCommand::PageUp => scroll_diff(inspector, INSPECTOR_PAGE_STEP, false),
@@ -196,10 +201,11 @@ pub(super) fn handle_diff_inspector_key(key: KeyEvent, st: &mut AppState) {
     }
 }
 
-/// Moves the audited-file highlight by one row, resetting the isolated diff read
-/// area so a shorter patch never inherits a stale offset.
-fn step_file(inspector: &mut DiffInspectorState, forward: bool) {
-    let last = inspector.files.len().saturating_sub(1);
+/// Moves the audited-file highlight by one row inside a live set of `file_count`
+/// files, resetting the isolated diff read area so a shorter patch never inherits
+/// a stale offset.
+fn step_file(inspector: &mut DiffInspectorState, file_count: usize, forward: bool) {
+    let last = file_count.saturating_sub(1);
     let target = if forward {
         (inspector.selected_file + 1).min(last)
     } else {
@@ -247,7 +253,6 @@ mod tests {
         st.model.selected_file_index = 1;
         st.model.scroll = 7;
         st.diff_inspector = Some(DiffInspectorState {
-            files: st.model.files.clone(),
             selected_file: st.model.selected_file_index,
             diff_scroll: 0,
             focus: DiffInspectorFocus::Files,
@@ -279,6 +284,29 @@ mod tests {
         let inspector = st.diff_inspector.as_ref().expect("the dialog stays open");
         assert_eq!(inspector.selected_file, 1);
         assert_eq!(inspector.diff_scroll, 0, "the last file caps the walk");
+    }
+
+    /// The walk reads the live staged set the Develop view owns: shrinking it
+    /// clamps the highlight on the next file chord, with no refresh event and no
+    /// captured copy to go stale (c-3).
+    #[test]
+    fn file_walk_reads_the_live_staged_set() {
+        let mut st = state_with_inspector();
+        st.model.files.truncate(1);
+        if let Some(inspector) = st.diff_inspector.as_mut() {
+            inspector.selected_file = 1;
+        }
+
+        press(&mut st, KeyCode::Char('n'));
+
+        let inspector = st.diff_inspector.as_ref().expect("the dialog stays open");
+        assert_eq!(inspector.selected_file, 0);
+        assert_eq!(inspector.diff_scroll, 0);
+        assert_eq!(
+            st.model.files.len(),
+            1,
+            "the audit never re-creates the set it reads"
+        );
     }
 
     /// `Tab` and both spellings of `Shift+Tab` hand the keyboard to the other

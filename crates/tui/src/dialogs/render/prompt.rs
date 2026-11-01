@@ -129,8 +129,86 @@ pub fn render_prompt_modal(frame: &mut ratatui::Frame, modal: &crate::app::Promp
             }
             (title, ModalTone::Info, lines)
         }
+        crate::app::PromptModalTarget::ReviewGroup {
+            session_id,
+            group_id,
+            group_title,
+            blocked_reason,
+            purpose,
+        } => {
+            // A group is the operational unit of remediation, so its dialogue
+            // names the shared root cause and, in the resolution form, states
+            // exactly what sending the comment will do (c-3, c-4).
+            let resolve = matches!(purpose, crate::app::GroupDialoguePurpose::Resolve);
+            let title = if resolve {
+                active_t("dialog.prompt.title_group_resolve").replacen("{}", group_id, 1)
+            } else {
+                active_t("dialog.prompt.title_group_discuss").replacen("{}", group_id, 1)
+            };
+            let max_w = area.width.saturating_sub(22) as usize;
+            let mut lines = vec![Line::from(vec![
+                Span::styled(
+                    active_t("dialog.execute_review.group_label"),
+                    engine.fg(palette.text_muted),
+                ),
+                Span::styled(group_title.clone(), engine.fg(palette.text_primary).bold()),
+                Span::styled(format!(" [{}] ", session_id), engine.fg(palette.text_muted)),
+            ])];
+            lines.push(Line::from(vec![
+                Span::styled(
+                    active_t("dialog.prompt.scope_label"),
+                    engine.fg(palette.text_muted),
+                ),
+                Span::styled(
+                    active_t("dialog.prompt.scope_group"),
+                    engine.fg(palette.status_warning).bold(),
+                ),
+                Span::styled(
+                    truncate_to_width(&active_t("dialog.prompt.scope_group_note"), max_w),
+                    engine.fg(palette.text_muted),
+                ),
+            ]));
+            if let Some(reason) = blocked_reason
+                .as_deref()
+                .map(str::trim)
+                .filter(|reason| !reason.is_empty())
+            {
+                lines.push(Line::from(vec![
+                    Span::styled(
+                        active_t("review.blocked_label"),
+                        engine.fg(palette.status_error).bold(),
+                    ),
+                    Span::styled(
+                        truncate_to_width(reason, max_w),
+                        engine.fg(palette.text_primary),
+                    ),
+                ]));
+            }
+            if resolve {
+                lines.push(Line::from(Span::styled(
+                    truncate_to_width(&active_t("dialog.prompt.group_resolve_note"), max_w),
+                    engine.fg(palette.text_muted),
+                )));
+            }
+            let tone = if resolve {
+                ModalTone::Warning
+            } else {
+                ModalTone::Accent
+            };
+            (title, tone, lines)
+        }
     };
 
+    // A resolution dialogue records a decision instead of asking a question, so
+    // its editor speaks in the decision vocabulary: the placeholder asks for the
+    // resolution and the hint names what sending does (c-3, c-4).
+    let is_group_resolution = matches!(
+        &modal.target,
+        crate::app::PromptModalTarget::ReviewGroup {
+            purpose: crate::app::GroupDialoguePurpose::Resolve,
+            ..
+        }
+    );
     let is_actions_focused = modal.focus.is_actions();
     let confirm_label = active_t("modal.send");
     let cancel_label = active_t("modal.cancel");
@@ -139,6 +217,8 @@ pub fn render_prompt_modal(frame: &mut ratatui::Frame, modal: &crate::app::Promp
     // emphasized, verbs read as descriptions, and separators recede.
     let hint = verb_hint(if is_actions_focused {
         active_t("dialog.prompt.hint_actions")
+    } else if is_group_resolution {
+        active_t("dialog.prompt.hint_editor_resolve")
     } else {
         active_t("dialog.prompt.hint_editor")
     });
@@ -172,7 +252,14 @@ pub fn render_prompt_modal(frame: &mut ratatui::Frame, modal: &crate::app::Promp
             editor_content.push(Line::from(vec![
                 Span::styled(cursor, engine.fg(palette.status_warning)),
                 Span::styled(
-                    format!(" {}", active_t("dialog.prompt.editor_placeholder")),
+                    format!(
+                        " {}",
+                        if is_group_resolution {
+                            active_t("dialog.prompt.editor_placeholder_resolve")
+                        } else {
+                            active_t("dialog.prompt.editor_placeholder")
+                        }
+                    ),
                     engine.fg(palette.text_muted),
                 ),
             ]));
@@ -187,7 +274,14 @@ pub fn render_prompt_modal(frame: &mut ratatui::Frame, modal: &crate::app::Promp
         };
 
         let editor_block = Block::default()
-            .title(format!(" {} ", active_t("dialog.prompt.editor_title")))
+            .title(format!(
+                " {} ",
+                if is_group_resolution {
+                    active_t("dialog.prompt.editor_title_resolve")
+                } else {
+                    active_t("dialog.prompt.editor_title")
+                }
+            ))
             .borders(Borders::ALL)
             .border_style(editor_border_style)
             .style(Style::default().bg(engine.color(palette.surface)));

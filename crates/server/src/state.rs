@@ -564,6 +564,18 @@ impl AppState {
         .await
         .map_err(|err| format!("blocking task failed: {}", err))
     }
+
+    /// Returns the token estimate the history manager maintains for the journal.
+    ///
+    /// The manager keeps the value current as it appends, compacts, rolls back,
+    /// and clears records, so this read neither re-reads `history.jsonl` nor
+    /// needs the exclusive mutation guard. A forwarding task can therefore
+    /// price every mutation it publishes while `history/get` page reads and a
+    /// finishing turn's adoption proceed concurrently, instead of excluding
+    /// them for the duration of a journal-wide recount.
+    pub async fn history_token_estimate(&self) -> u64 {
+        self.history.lock().await.estimated_tokens()
+    }
     /// Adopts the history manager a bounded turn worked with.
     ///
     /// A turn never holds this guard: it clones the manager, records its prompt,

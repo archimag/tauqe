@@ -5,24 +5,37 @@ use tauqe_protocol::{errors, HistoryGetParams, HistoryGetResult, Request, Respon
 use crate::state::AppState;
 
 pub async fn handle_history_get(req: Request, state: &Arc<AppState>) -> Response {
-    let params: HistoryGetParams = req
-        .params
-        .and_then(|p| serde_json::from_value(p).ok())
-        .unwrap_or_default();
+    // A present payload must decode through the typed DTO: silently defaulting
+    // an unparsable one would page the journal from the default window instead
+    // of reporting the mistake.
+    let params: HistoryGetParams = match req.params {
+        Some(payload) => match serde_json::from_value(payload) {
+            Ok(params) => params,
+            Err(err) => {
+                return Response::err(
+                    req.id,
+                    errors::INVALID_PARAMS,
+                    format!("Invalid history get parameters: {}", err),
+                );
+            }
+        },
+        None => HistoryGetParams::default(),
+    };
     let limit = params.limit.unwrap_or(10);
     let before_id = params.before_id;
 
-    // Both the token estimate and the page slice touch `history.jsonl`, so the
-    // read runs on the blocking pool while the exclusive history guard is held,
-    // keeping it serialized against the mutations served through the same
-    // guard. A running turn works on its own clone of the manager and therefore
-    // never holds this guard, so the page reports the journal as it stands —
-    // including the entries the turn has already appended — instead of waiting
-    // for the bounded turn to finish. Compaction and rollback replace the
-    // journal atomically, so a concurrent read sees either the previous or the
-    // next journal, never a partial one.
+    // The page slice reads `history.jsonl`, so it runs on the blocking pool
+    // while the exclusive history guard is held, keeping it serialized against
+    // the mutations served through the same guard. The token estimate is
+    // maintained by the manager as it appends, so pricing the page costs no
+    // extra journal read here. A running turn works on its own clone of the
+    // manager and therefore never holds this guard, so the page reports the
+    // journal as it stands — including the entries the turn has already
+    // appended — instead of waiting for the bounded turn to finish. Compaction
+    // and rollback replace the journal atomically, so a concurrent read sees
+    // either the previous or the next journal, never a partial one.
     let loaded = crate::handlers::with_history_mutation(state, move |history| {
-        let estimated_tokens = history.estimated_tokens().unwrap_or(0);
+        let estimated_tokens = history.estimated_tokens();
         history
             .get_ui_slice(limit, before_id)
             .map(|(items, has_more, total_count)| (items, has_more, total_count, estimated_tokens))
@@ -210,5 +223,49 @@ mod tests {
                 ids
             );
         }
+    }
+    /// A malformed pagination field must be refused instead of silently paging
+    /// with defaults: the client asked for a window it will never receive.
+    #[tokio::test]
+    async fn test_history_get_rejects_malformed_payloads() {
+        let dir = TestDir::new();
+        let state = test_state(&dir);
+        {
+            let mut history = state.history.lock().await;
+            history.record_turn("Task".to_string(), Vec::new()).unwrap();
+        }
+
+        for payload in [
+            serde_json::json!({ "limit": "ten" }),
+            serde_json::json!({ "limit": -1 }),
+            serde_json::json!({ "before_id": "later" }),
+        ] {
+            let req = Request {
+                id: RequestId::Number(9),
+                method: methods::HISTORY_GET.to_string(),
+                params: Some(payload.clone()),
+            };
+            let res = handle_history_get(req, &state).await;
+            let error = res
+                .error
+                .unwrap_or_else(|| panic!("the malformed payload {payload} was accepted"));
+            assert_eq!(error.code, errors::INVALID_PARAMS, "{payload}");
+        }
+
+        // An absent payload keeps its documented meaning: the newest page.
+        let res = handle_history_get(
+            Request {
+                id: RequestId::Number(10),
+                method: methods::HISTORY_GET.to_string(),
+                params: None,
+            },
+            &state,
+        )
+        .await;
+        assert!(res.error.is_none(), "unexpected error: {:?}", res.error);
+        let result = parse_result(&res);
+        assert_eq!(result.total_count, 1);
+        assert_eq!(result.items.len(), 1);
+        assert!(!result.has_more);
     }
 }

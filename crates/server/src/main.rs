@@ -8,12 +8,13 @@ use std::sync::Arc;
 
 use tauqe_core::history::HistoryMutation;
 use tauqe_protocol::{
-    errors, events, methods, Event, HistoryCompactedEvent, HistoryEntryAddedEvent,
+    errors, events, Event, HistoryCompactedEvent, HistoryEntryAddedEvent,
     HistoryEntryRolledBackEvent, Request, RequestId, Response, CLIENT_SHUTDOWN_WAIT,
     SHUTDOWN_DRAIN_BUDGET,
 };
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, BufReader};
 
+mod dispatch;
 mod handlers;
 mod logging;
 mod state;
@@ -70,7 +71,10 @@ async fn main() -> anyhow::Result<()> {
         });
 
     let (history_tx, mut history_rx) = tokio::sync::mpsc::unbounded_channel::<HistoryMutation>();
-    let (out, mut out_rx) = OutChannel::new();
+    let (out, outbound_rx) = OutChannel::new();
+    // The writer shares the channel's liveness state, so the request loop can
+    // observe a dead sink and stop instead of turning blind.
+    let outbound = out.writer(outbound_rx);
 
     let state = AppState::new(config, repo_path, history_tx, out);
 
@@ -84,20 +88,17 @@ async fn main() -> anyhow::Result<()> {
     let state_for_history = Arc::clone(&state);
     tokio::spawn(async move {
         while let Some(mutation) = history_rx.recv().await {
-            // The token estimate reads the persisted journal from disk, so the
-            // probe goes through the owned-guard blocking-pool helper instead
-            // of stalling the async worker thread on a synchronous read.
-            let estimated_tokens = state_for_history
-                .mutate_history(|h| h.estimated_tokens().ok())
-                .await
-                .ok()
-                .flatten();
+            // The manager maintains the estimate as it appends, compacts,
+            // rolls back, and clears, so the probe reads a value instead of
+            // re-reading the journal per event and never takes the exclusive
+            // mutation guard away from page reads or a turn's adoption.
+            let estimated_tokens = state_for_history.history_token_estimate().await;
             let ev = match mutation {
                 HistoryMutation::Appended { item } => Event {
                     method: events::HISTORY_ENTRY_ADDED.to_string(),
                     params: serde_json::to_value(HistoryEntryAddedEvent {
                         item,
-                        estimated_tokens,
+                        estimated_tokens: Some(estimated_tokens),
                     })
                     .ok(),
                 },
@@ -112,7 +113,7 @@ async fn main() -> anyhow::Result<()> {
                             summary,
                             tail_ids,
                             total_count,
-                            estimated_tokens: estimated_tokens.unwrap_or(0),
+                            estimated_tokens,
                         })
                         .ok(),
                     }
@@ -130,16 +131,11 @@ async fn main() -> anyhow::Result<()> {
         }
     });
 
-    // Single dedicated stdout writer task guaranteeing atomic line output without interleaving
-    tokio::spawn(async move {
-        let mut stdout = tokio::io::stdout();
-        while let Some(line) = out_rx.recv().await {
-            if stdout.write_all(line.as_bytes()).await.is_err() {
-                break;
-            }
-            let _ = stdout.flush().await;
-        }
-    });
+    // Single dedicated stdout writer task guaranteeing atomic line output
+    // without interleaving. It owns the outbound queue and records a dead sink
+    // on the shared channel state instead of exiting silently, so the request
+    // loop below stops the daemon once nothing it produces can be delivered.
+    tokio::spawn(outbound.run());
 
     let stdin = tokio::io::stdin();
     let mut reader = BufReader::new(stdin).lines();
@@ -151,22 +147,29 @@ async fn main() -> anyhow::Result<()> {
     let shutdown_watch = shutdown_signal();
     tokio::pin!(shutdown_watch);
 
-    // Requests whose handlers block on long-running work (LLM turns, the
-    // deterministic pre-flight verification) are offloaded so the read loop
-    // keeps draining stdin and can observe cancels and EOF. Every other request
-    // is handled inline, which serializes state mutations in the exact order
-    // the client sent them and keeps responses ordered.
+    // A client that closes its read end makes every write fail. The writer
+    // records that loss on the channel, and the future below turns it into the
+    // same cancel-and-drain exit as stdin EOF, so the daemon never keeps
+    // turning while its whole output is discarded.
+    let transport_lost = state.out.sink_lost();
+    tokio::pin!(transport_lost);
+    // The dispatch classification decides where a request runs. Every method
+    // the dispatch module has not curated as inline is offloaded here, so this
+    // loop keeps draining stdin and can observe cancels and EOF while a turn, a
+    // batch, or a subprocess-heavy probe runs. Inline methods are the reviewed
+    // short handlers: awaiting them serializes their state mutations in the
+    // exact order the client sent them and keeps responses ordered.
     let mut offloaded = tokio::task::JoinSet::new();
 
     let shutdown_reason = loop {
         let line = tokio::select! {
-            line = reader.next_line() => match line {
-                Ok(Some(line)) => line,
-                Ok(None) => break ShutdownReason::StdinEof,
-                Err(err) => break ShutdownReason::StdinFailed(err.to_string()),
-            },
-            reason = &mut shutdown_watch => break reason,
-        };
+        line = reader.next_line() => match line {
+            Ok(Some(line)) => line,
+            Ok(None) => break ShutdownReason::StdinEof,
+            Err(err) => break ShutdownReason::StdinFailed(err.to_string()),
+        },
+        reason = &mut shutdown_watch => break reason,
+        () = &mut transport_lost => break ShutdownReason::TransportClosed,        };
         let line = line.trim();
         if line.is_empty() {
             continue;
@@ -216,7 +219,7 @@ async fn main() -> anyhow::Result<()> {
             "RPC request received",
         );
 
-        if is_long_running(&request.method) {
+        if dispatch::dispatch_class(&request.method) == dispatch::DispatchClass::Offload {
             let state_for_req = Arc::clone(&state);
             offloaded.spawn(async move {
                 let started = std::time::Instant::now();
@@ -255,7 +258,11 @@ enum ShutdownReason {
     /// Reading stdin failed, which is a defect rather than a controlled end.
     StdinFailed(String),
     /// The operating system delivered a termination signal.
+    /// The operating system delivered a termination signal.
     Signal(ShutdownSignal),
+    /// The client's end of the output pipe is gone, so no response and no
+    /// event can reach it any more.
+    TransportClosed,
 }
 
 impl ShutdownReason {
@@ -268,6 +275,7 @@ impl ShutdownReason {
             Self::StdinEof => "stdin-eof",
             Self::StdinFailed(_) => "stdin-read-error",
             Self::Signal(signal) => signal.label(),
+            Self::TransportClosed => "transport-closed",
         }
     }
 
@@ -282,6 +290,10 @@ impl ShutdownReason {
                 reason = reason,
                 error = %error,
                 "beginning graceful shutdown",
+            ),
+            Self::TransportClosed => tracing::warn!(
+                reason = reason,
+                "beginning graceful shutdown: the client transport is gone",
             ),
             _ => tracing::info!(reason = reason, "beginning graceful shutdown"),
         }
@@ -377,35 +389,6 @@ const SHUTDOWN_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_mi
 /// the deferral protects.
 const FORCE_ABORT_BUDGET: std::time::Duration =
     CLIENT_SHUTDOWN_WAIT.saturating_sub(SHUTDOWN_DRAIN_BUDGET);
-
-/// Methods whose handlers block on long-running work — an LLM turn, a
-/// repository lifecycle request that reloads configuration and rebuilds the
-/// history manager from disk, a Git history rewrite, a session-history page
-/// read that runs concurrently with a bounded turn, or the deterministic
-/// pre-flight toolchain verification — and must therefore be offloaded from the
-/// read loop. Offloading keeps the loop free to accept cancels and to observe
-/// stdin EOF. Every other method is short and runs inline to preserve request
-/// ordering.
-fn is_long_running(method: &str) -> bool {
-    matches!(
-        method,
-        methods::CLIENT_INITIALIZE
-            | methods::REPOSITORY_INIT
-            | methods::HISTORY_GET
-            | methods::MODEL_ASK
-            | methods::PLAN_REFINE
-            | methods::PLAN_REPLAN
-            | methods::PLAN_EXECUTE
-            | methods::PLAN_EXECUTE_PIPELINE
-            | methods::REVIEW_START
-            | methods::REVIEW_PREVIEW
-            | methods::REVIEW_EXECUTE
-            | methods::REVIEW_ANALYZE
-            | methods::GIT_SQUASH_GENERATE_MESSAGE
-            | methods::GIT_SQUASH_APPLY
-            | methods::LOCALE_GENERATE
-    )
-}
 
 /// Cancels the active operation and waits for in-flight work to finish so the
 /// process never exits mid-transaction.
@@ -530,63 +513,6 @@ fn log_request_outcome(
 mod tests {
     use super::*;
 
-    /// Repository lifecycle requests reload configuration, re-anchor the
-    /// context, and rebuild the history manager from disk, `git/squashApply`
-    /// rewrites history and records the result behind an `fsync` barrier, and a
-    /// `history/get` page read competes with a bounded turn for the session
-    /// journal. All of them must be offloaded, otherwise the stdin reader loop
-    /// stalls and can observe neither cancels nor EOF while they run.
-    #[test]
-    fn long_running_requests_are_offloaded() {
-        for method in [
-            methods::CLIENT_INITIALIZE,
-            methods::REPOSITORY_INIT,
-            methods::GIT_SQUASH_APPLY,
-            methods::HISTORY_GET,
-            // The review window projection lists the repository and reads every
-            // matched file, so it is never short enough to run inline.
-            methods::REVIEW_PREVIEW,
-        ] {
-            assert!(is_long_running(method), "'{method}' must be offloaded");
-        }
-
-        // Short requests stay inline so their responses keep the client's
-        // request order.
-        assert!(!is_long_running(methods::CONFIG_GET));
-    }
-
-    /// Every model-backed request resolves a provider, takes the operation slot,
-    /// and streams a completion across `.await`s, so it is never short enough to
-    /// run inline. The whole set is enumerated here because the classification in
-    /// `is_long_running` is maintained by hand: a handler wired into the dispatcher
-    /// without joining it would otherwise stall the read loop for the entire call —
-    /// exactly how `review/analyze` came to stream a full Architect classification
-    /// inline, where neither a cancel nor stdin EOF could reach it.
-    #[test]
-    fn model_backed_requests_are_offloaded() {
-        for method in [
-            methods::MODEL_ASK,
-            methods::PLAN_REFINE,
-            methods::PLAN_REPLAN,
-            methods::PLAN_EXECUTE,
-            methods::PLAN_EXECUTE_PIPELINE,
-            methods::REVIEW_START,
-            methods::REVIEW_EXECUTE,
-            methods::REVIEW_ANALYZE,
-            methods::LOCALE_GENERATE,
-            methods::GIT_SQUASH_GENERATE_MESSAGE,
-        ] {
-            assert!(is_long_running(method), "'{method}' must be offloaded");
-        }
-
-        // The direct regression for this finding: post-analysis streams a full
-        // Architect completion, so it must never be awaited by the read loop.
-        assert!(
-            is_long_running(methods::REVIEW_ANALYZE),
-            "'review/analyze' runs a full streaming model call and must be offloaded"
-        );
-    }
-
     /// Every termination cause carries its own stable journal name, so a look
     /// at `.tauqe/server.log` answers why the daemon left on its own instead of
     /// showing an unexplained disappearance.
@@ -597,6 +523,7 @@ mod tests {
             ShutdownReason::StdinFailed("broken pipe".to_string()),
             ShutdownReason::Signal(ShutdownSignal::Hangup),
             ShutdownReason::Signal(ShutdownSignal::Terminate),
+            ShutdownReason::TransportClosed,
         ];
 
         let mut labels: Vec<&str> = Vec::new();
@@ -720,6 +647,118 @@ mod tests {
         assert!(
             !state.is_operation_active(),
             "the aborted operation must release its registration"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Records how a stalled task that holds an open git transaction exited.
+    ///
+    /// The drop runs when the owning task future is torn down — the only
+    /// moment the drain's force-abort can be observed from inside the task —
+    /// so it records whether the abort landed while the transaction was
+    /// still open.
+    struct TransactionExitMarker {
+        /// Set once the owning task future is dropped.
+        exited: Arc<std::sync::atomic::AtomicBool>,
+        /// Set when the abort landed while the git transaction was still open.
+        aborted_while_open: Arc<std::sync::atomic::AtomicBool>,
+        /// The transaction flag the stalled task holds.
+        transaction: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl Drop for TransactionExitMarker {
+        fn drop(&mut self) {
+            self.aborted_while_open.store(
+                self.transaction.load(std::sync::atomic::Ordering::SeqCst),
+                std::sync::atomic::Ordering::SeqCst,
+            );
+            self.exited.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    /// The shutdown drain defers its force-abort while the registered task
+    /// holds an open git transaction, and completes only after that task has
+    /// exited.
+    ///
+    /// A parked task that ignores the cancel signal keeps the operation slot
+    /// registered; aborting it while its transaction is still open would
+    /// strand a half-finished commit, so the drain waits the transaction out,
+    /// force-aborts through the slot afterwards, and never returns while the
+    /// slot is still held.
+    #[tokio::test]
+    async fn drain_defers_the_force_abort_over_an_open_git_transaction() {
+        let (state, root) = test_state("defer-transaction");
+
+        let exited = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let aborted_while_open = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let transaction = Arc::clone(&state.git_transaction_active);
+
+        let guard = Arc::new(state.try_begin_operation().expect("the slot is free"));
+        let task = {
+            let guard = Arc::clone(&guard);
+            let marker = TransactionExitMarker {
+                exited: Arc::clone(&exited),
+                aborted_while_open: Arc::clone(&aborted_while_open),
+                transaction: Arc::clone(&transaction),
+            };
+            let transaction = Arc::clone(&transaction);
+            tokio::spawn(async move {
+                let _guard = guard;
+                let _marker = marker;
+                // Hold the transaction open past the drain's expired budget,
+                // then park with the transaction closed: the force-abort must
+                // be deferred over the open window, never dropped.
+                transaction.store(true, std::sync::atomic::Ordering::SeqCst);
+                tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+                transaction.store(false, std::sync::atomic::Ordering::SeqCst);
+                std::future::pending::<()>().await
+            })
+        };
+        guard.set_abort_handle(task.abort_handle());
+        drop(guard);
+
+        // The transaction is provably open before the drain starts, so the
+        // deferral below is exercised instead of racing a task that has not
+        // started yet.
+        let mut transaction_open = false;
+        for _ in 0..2000 {
+            if transaction.load(std::sync::atomic::Ordering::SeqCst) {
+                transaction_open = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        assert!(
+            transaction_open,
+            "the stalled task must open its transaction before the drain starts"
+        );
+
+        let mut offloaded = tokio::task::JoinSet::new();
+        let started = std::time::Instant::now();
+        drain_in_flight_with_budget(
+            &state,
+            &mut offloaded,
+            std::time::Duration::from_millis(30),
+            std::time::Duration::from_secs(2),
+        )
+        .await;
+
+        assert!(
+            exited.load(std::sync::atomic::Ordering::SeqCst),
+            "the drain must force-abort the stalled task through the slot"
+        );
+        assert!(
+            !aborted_while_open.load(std::sync::atomic::Ordering::SeqCst),
+            "the force-abort must never land while the git transaction is open"
+        );
+        assert!(
+            !state.is_operation_active(),
+            "the drain must observe the slot released after the task exited"
+        );
+        assert!(
+            started.elapsed() >= std::time::Duration::from_millis(150),
+            "the drain must not complete while the task holds the open transaction"
         );
 
         let _ = std::fs::remove_dir_all(&root);

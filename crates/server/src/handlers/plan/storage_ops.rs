@@ -453,11 +453,15 @@ mod tests {
     #[tokio::test]
     async fn plan_get_resolves_without_persisting_an_active_pointer() {
         let root = scratch_root("plan-get-read-only");
-        let plan = Plan {
-            id: "plan-1".to_string(),
-            title: "Read Only".to_string(),
-            ..Default::default()
-        };
+        let plan = Plan::from_parts(
+            "plan-1".to_string(),
+            "Read Only".to_string(),
+            None,
+            0,
+            0,
+            Vec::new(),
+            Vec::new(),
+        );
         PlanStorage::save_plan(&root, &plan).expect("save the stored plan");
         // Persisting a plan promotes the first stored one so a client always
         // has a marker to render. The read path is what must never promote,
@@ -503,11 +507,15 @@ mod tests {
     async fn plan_get_preserves_an_existing_active_pointer() {
         let root = scratch_root("plan-get-preserve");
         for id in ["plan-a", "plan-b"] {
-            let plan = Plan {
-                id: id.to_string(),
-                title: id.to_string(),
-                ..Default::default()
-            };
+            let plan = Plan::from_parts(
+                id.to_string(),
+                id.to_string(),
+                None,
+                0,
+                0,
+                Vec::new(),
+                Vec::new(),
+            );
             PlanStorage::save_plan(&root, &plan).expect("save a stored plan");
         }
         PlanStorage::save_active_id(&root, Some("plan-b")).expect("store the active id");

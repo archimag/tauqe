@@ -1,67 +1,97 @@
-//! Deterministic project command execution.
+//! Project environment resolution for the deterministic command substrate.
 //!
-//! The harness carries no knowledge of a language, a compiler, or a build
-//! system: every technology-specific operation is declared in `tauqe.toml` and
-//! runs as an ordinary project process in the repository root.
+//! Command execution is deterministic substrate and lives in
+//! `tauqe_tools::toolchain`: it runs from the `ProjectConfig` of the wire
+//! contract, reads no configuration file of its own, and never learns about the
+//! harness configuration.
 //!
-//! - `[project.verify]` is the mandatory verification lifecycle. Its command
-//!   line runs in its own process group with a wall-clock budget, receives the
-//!   turn's change set on standard input, and its output is parsed into typed
-//!   diagnostics.
-//! - `[project.format]` is the in-memory filter that rewrites staged content
-//!   through standard input and output before any byte reaches disk. When the
-//!   entry is omitted, the `format` recipe the declared task runner exports
-//!   fills the role; a declaration always keeps precedence over that export.
-//! - `[project.post_hook]` is the disk-side step that runs strictly after the
-//!   change set is written and before verification.
-//!
-//! Nothing is detected here: a repository either declares the commands it runs
-//! or runs nothing at all.
-
-mod commands;
-mod diagnostics;
-mod exec;
-mod fmt;
-mod report;
-pub mod runner;
+//! This module owns the one step that does need the harness. The `[project]`
+//! section is declared inside `tauqe.toml`, the file that also carries the model
+//! roles and the budgets, so resolving the declared commands into a
+//! `ProjectConfig`, and validating the file itself before any declared command
+//! runs, belongs here. Every entry point that starts from the repository is a
+//! thin wrapper that resolves the configuration once and delegates; a bounded
+//! turn that already froze its configuration calls the `*_with_config` variants
+//! directly.
 
 use std::collections::BTreeMap;
 use std::path::Path;
 
-use tauqe_protocol::{
-    Diagnostic, ProjectConfig, ProjectHookOutcome, ProjectParameterSpec, ProjectPostHookResponse,
-};
+use tauqe_protocol::{ProjectConfig, ProjectPostHookResponse, VerificationVerdict};
 use tokio::sync::watch;
 
-pub(crate) use fmt::format_with_project_config;
-pub use fmt::{format_staged_content, InMemoryFormatOutcome};
-pub use runner::merge_manifest;
-
-/// Wall-clock budget of a single project command, in seconds.
-///
-/// Applied whenever the executed entry declares no `timeout_secs` of its own. A
-/// real test suite routinely needs more than a minute, which is why the fallback
-/// is generous.
-pub const DEFAULT_PROJECT_TIMEOUT_SECS: u64 = 600;
+pub use tauqe_tools::toolchain::{
+    format_with_project_config, merge_manifest, run_post_hooks_with_config,
+    run_project_command_with_config, run_toolchain_check, run_toolchain_check_with_timeout, runner,
+    InMemoryFormatOutcome, ToolchainCheckResult, DEFAULT_PROJECT_TIMEOUT_SECS,
+};
 
 /// Name of the configuration file whose integrity the verification pipeline
 /// checks before any declared project command runs.
 const PROJECT_CONFIG_FILE: &str = "tauqe.toml";
 
-/// Outcome of a single project command.
-#[derive(Debug, Clone)]
-pub struct ToolchainCheckResult {
-    pub success: bool,
-    pub is_cancelled: bool,
-    pub command: String,
-    pub stdout: String,
-    pub stderr: String,
-    pub combined_output: String,
-    /// Findings parsed from the command output, empty when the command reported
-    /// nothing addressable.
-    pub diagnostics: Vec<Diagnostic>,
+/// Explicit verdict of a project verification run.
+///
+/// The verdict is a status rather than a boolean, because a passed gate and an
+/// absent declaration are different facts about a change set: a repository that
+/// declares no verification lifecycle produces
+/// [`VerificationStatus::NotConfigured`], and its change set may still be
+/// committed while nothing claims that it was verified.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VerificationStatus {
+    /// The project declares a verification lifecycle and its command passed.
+    Passed,
+    /// The project declares a verification lifecycle and its command failed.
+    Failed,
+    /// The project declares no verification lifecycle, so nothing ran.
+    NotConfigured,
+    /// The run was interrupted by the turn's cancellation signal.
+    Cancelled,
 }
 
+impl VerificationStatus {
+    /// Whether the change set may be committed under this verdict.
+    ///
+    /// A project that declares no verification lifecycle states its own choice,
+    /// so an unverified change set is not blocked by a gate the project never
+    /// declared.
+    pub fn allows_commit(self) -> bool {
+        matches!(self, Self::Passed | Self::NotConfigured)
+    }
+
+    /// Whether the project declared no verification lifecycle at all.
+    pub fn is_not_configured(self) -> bool {
+        self == Self::NotConfigured
+    }
+}
+
+impl std::fmt::Display for VerificationStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let name = match self {
+            Self::Passed => "passed",
+            Self::Failed => "failed",
+            Self::NotConfigured => "not_configured",
+            Self::Cancelled => "cancelled",
+        };
+        f.write_str(name)
+    }
+}
+
+/// Maps the engine verdict onto the wire verdict of a change set.
+///
+/// Both vocabularies describe the same four outcomes, so the conversion is
+/// declared once beside the engine status instead of being restated by every
+/// caller that reports a change set.
+impl From<VerificationStatus> for VerificationVerdict {
+    fn from(status: VerificationStatus) -> Self {
+        match status {
+            VerificationStatus::Passed => Self::Passed,
+            VerificationStatus::Failed => Self::Failed,
+            VerificationStatus::NotConfigured => Self::NotConfigured,
+            VerificationStatus::Cancelled => Self::Cancelled,
+        }
+    }
+}
 /// Resolves the effective project configuration, merging any declared task runner.
 ///
 /// If a task runner is declared in `[project]`, its exported manifest is loaded
@@ -109,7 +139,7 @@ pub async fn run_verification_pipeline(
     repo_root: &Path,
     changed_files: &[String],
     cancel_rx: Option<&watch::Receiver<bool>>,
-) -> (bool, Vec<ToolchainCheckResult>) {
+) -> (VerificationStatus, Vec<ToolchainCheckResult>) {
     let project = effective_project_config(repo_root, cancel_rx).await;
     run_verification_pipeline_with_config(repo_root, &project, changed_files, cancel_rx).await
 }
@@ -117,78 +147,38 @@ pub async fn run_verification_pipeline(
 /// Runs the declared verification lifecycle under an already resolved project
 /// configuration, stopping at the first failure.
 ///
-/// The pipeline opens with phase zero: `tauqe.toml` itself is validated on
-/// disk, because it is the declaration every later step obeys. A change set or
-/// a post-hook that leaves the file malformed or semantically unsound fails the
+/// The pipeline opens with phase zero: `tauqe.toml` itself is validated on disk,
+/// because it is the declaration every later step obeys. A change set or a
+/// post-hook that leaves the file malformed or semantically unsound fails the
 /// verification immediately, and no declared command is spawned against an
-/// environment the harness can no longer trust.
+/// environment the harness can no longer trust. The verdict belongs here rather
+/// than in the substrate, because the file also carries the model roles and the
+/// budgets the cognitive crate owns.
 ///
-/// `[project.verify]` is the single authority on how the repository verifies, so
-/// its command line is the whole pipeline: the harness runs it once with its own
-/// wall-clock budget and takes the exit status as the verdict. A repository that
-/// declares no verification command resolves no step at all and reports a clean
-/// empty run instead of running an unintended program. A failing command's
-/// output is parsed into typed diagnostics, so a healing round reasons about
-/// locations instead of a transcript.
-/// The turn's authoritative change set reaches the command on its standard
-/// input, one path per line, so a project dispatcher selects the checks from the
-/// files the turn actually touched. The command never derives that list itself:
-/// while the transaction is open the working copy also holds post-hook artifacts
-/// and the developer's uncommitted work. An empty change set sends no input at
-/// all, so the command conservatively runs its full suite.
-///
-/// `project` is the configuration a bounded turn froze on its first proposal
-/// round, so no verification round re-reads `tauqe.toml` or runs a declared task
-/// runner's dump again.
+/// The declared command lines themselves run in `tauqe_tools::toolchain`, and
+/// their outcome is folded into an explicit [`VerificationStatus`]: a project
+/// that resolves no step reports [`VerificationStatus::NotConfigured`] instead
+/// of a fabricated success.
 pub async fn run_verification_pipeline_with_config(
     repo_root: &Path,
     project: &ProjectConfig,
     changed_files: &[String],
     cancel_rx: Option<&watch::Receiver<bool>>,
-) -> (bool, Vec<ToolchainCheckResult>) {
+) -> (VerificationStatus, Vec<ToolchainCheckResult>) {
     let config_check = check_project_config(repo_root);
     if !config_check.success {
-        return (false, vec![config_check]);
+        return (VerificationStatus::Failed, vec![config_check]);
     }
 
-    let steps = commands::resolve_verification_plan(project);
-    let mut results = Vec::new();
-    let change_set = change_set_payload(changed_files);
-
-    for step in steps {
-        let mut result = exec::run_command(
-            repo_root,
-            &step.command,
-            step.timeout_secs,
-            change_set.as_deref(),
-            cancel_rx,
-        )
-        .await;
-        if !result.success && !result.is_cancelled {
-            result.diagnostics = diagnostics::parse_diagnostics(&result.combined_output);
-        }
-        let success = result.success;
-        results.push(result);
-        if !success {
-            return (false, results);
-        }
-    }
-
-    (true, results)
-}
-
-/// Renders the turn's authoritative change set as a command's standard input.
-///
-/// One repository-relative path per line, so a project dispatcher reads the list
-/// with a plain line loop. An empty change set produces no input at all: the
-/// command then runs its full suite instead of an empty selection.
-fn change_set_payload(changed_files: &[String]) -> Option<String> {
-    if changed_files.is_empty() {
-        return None;
-    }
-    let mut payload = changed_files.join("\n");
-    payload.push('\n');
-    Some(payload)
+    let (passed, results) = tauqe_tools::toolchain::run_verification_pipeline_with_config(
+        repo_root,
+        project,
+        changed_files,
+        cancel_rx,
+    )
+    .await;
+    let status = classify_status(passed, &results);
+    (status, results)
 }
 
 /// Validates the project configuration file as the zeroth verification step.
@@ -213,29 +203,24 @@ fn check_project_config(repo_root: &Path) -> ToolchainCheckResult {
     }
 }
 
-/// Executes a project command with the default wall-clock timeout.
-pub async fn run_toolchain_check(repo_root: &Path, command_str: &str) -> ToolchainCheckResult {
-    run_toolchain_check_with_timeout(repo_root, command_str, DEFAULT_PROJECT_TIMEOUT_SECS, None)
-        .await
-}
-
-/// Executes a project command in repo root with a wall-clock timeout and cancellation.
+/// Folds a substrate run into the explicit verdict of the pipeline.
 ///
-/// The command string is tokenized with shell-style quoting so arguments that
-/// contain spaces survive intact. On Unix platforms, the child process is launched
-/// in an isolated process group (`process_group(0)`) so that timeouts or client
-/// cancellations terminate the entire process hierarchy (e.g. `rustc` and test binaries).
-///
-/// The wall-clock duration and outcome are recorded as a single structured log
-/// record so execution timing is observable without duplicating orchestration.
-pub async fn run_toolchain_check_with_timeout(
-    repo_root: &Path,
-    command_str: &str,
-    timeout_secs: u64,
-    cancel_rx: Option<&watch::Receiver<bool>>,
-) -> ToolchainCheckResult {
-    let command = exec::CommandLine::tokenized(command_str);
-    exec::run_command(repo_root, &command, timeout_secs, None, cancel_rx).await
+/// Cancellation wins over every other outcome, because an interrupted run is a
+/// verdict of its own rather than a failed gate. A successful run that resolved
+/// no command means the project declared no lifecycle, which is exactly
+/// [`VerificationStatus::NotConfigured`].
+fn classify_status(passed: bool, results: &[ToolchainCheckResult]) -> VerificationStatus {
+    if results.iter().any(|result| result.is_cancelled) {
+        return VerificationStatus::Cancelled;
+    }
+    if !passed {
+        return VerificationStatus::Failed;
+    }
+    if results.is_empty() {
+        VerificationStatus::NotConfigured
+    } else {
+        VerificationStatus::Passed
+    }
 }
 
 /// Runs the disk-side post-hook declared by `[project.post_hook]`.
@@ -251,54 +236,6 @@ pub async fn run_post_hooks(
 ) -> Result<ProjectPostHookResponse, String> {
     let project = effective_project_config(repo_root, cancel_rx).await;
     run_post_hooks_with_config(repo_root, &project, cancel_rx).await
-}
-
-/// Runs the disk-side post-hook declared by `[project.post_hook]` under an
-/// already resolved project configuration.
-///
-/// A bounded turn passes the configuration it froze on its first proposal
-/// round, so the hook is never preceded by a second task runner dump.
-pub async fn run_post_hooks_with_config(
-    repo_root: &Path,
-    project: &ProjectConfig,
-    cancel_rx: Option<&watch::Receiver<bool>>,
-) -> Result<ProjectPostHookResponse, String> {
-    let Some(spec) = project.post_hook.as_ref() else {
-        return Ok(ProjectPostHookResponse {
-            success: true,
-            executed_hooks: Vec::new(),
-            message: None,
-        });
-    };
-
-    let resolved = project
-        .resolve("post_hook", spec)
-        .map_err(|err| err.to_string())?;
-    let timeout_secs = resolved
-        .timeout_secs
-        .filter(|secs| *secs > 0)
-        .unwrap_or(DEFAULT_PROJECT_TIMEOUT_SECS);
-    let command = exec::CommandLine::new(resolved.command, resolved.args);
-    let outcome = exec::run_command(repo_root, &command, timeout_secs, None, cancel_rx).await;
-
-    if outcome.is_cancelled {
-        return Err("the project post-hook was cancelled".to_string());
-    }
-
-    let message = if outcome.success {
-        None
-    } else {
-        Some(compact_failure(&outcome))
-    };
-    Ok(ProjectPostHookResponse {
-        success: outcome.success,
-        executed_hooks: vec![ProjectHookOutcome {
-            name: "post_hook".to_string(),
-            success: outcome.success,
-            message: message.clone(),
-        }],
-        message,
-    })
 }
 
 /// Runs one project command the model may address by name.
@@ -322,119 +259,20 @@ pub async fn run_project_command(
     run_project_command_with_config(repo_root, &project, name, arguments, cancel_rx).await
 }
 
-/// Runs one project command the model may address by name, under an already
-/// resolved project configuration.
+/// Streams `content` through the in-memory formatter of the project.
 ///
-/// A bounded turn passes the configuration it froze on its first proposal
-/// round, so an invocation validates its declaration against one snapshot
-/// instead of re-reading `tauqe.toml` and re-running a task runner dump.
-pub async fn run_project_command_with_config(
+/// The filter comes from the effective project configuration: a declared
+/// `[project.format]` entry, or the `format` recipe the declared task runner
+/// exports when the entry is omitted. A declaration always keeps precedence over
+/// the export of the same role, so a project can pin the filter in `tauqe.toml`
+/// or delegate it to its justfile without changing the bounded turn.
+pub async fn format_staged_content(
     repo_root: &Path,
-    project: &ProjectConfig,
-    name: &str,
-    arguments: &BTreeMap<String, String>,
+    content: &str,
     cancel_rx: Option<&watch::Receiver<bool>>,
-) -> Result<ToolchainCheckResult, String> {
-    let name = name.trim();
-    if name.is_empty() {
-        return Err("the invocation names no project command".to_string());
-    }
-
-    let Some(spec) = project.commands.get(name) else {
-        return Err(format!(
-            "the project declares no command named `{}`; invoke one of: [{}]",
-            name,
-            project
-                .commands
-                .keys()
-                .map(String::as_str)
-                .collect::<Vec<_>>()
-                .join(", ")
-        ));
-    };
-
-    let resolved = project
-        .resolve(&format!("commands.{}", name), spec)
-        .map_err(|err| err.to_string())?;
-    let timeout_secs = resolved
-        .timeout_secs
-        .filter(|secs| *secs > 0)
-        .unwrap_or(DEFAULT_PROJECT_TIMEOUT_SECS);
-
-    let mut args = resolved.args;
-    args.extend(bind_parameters(name, &resolved.parameters, arguments)?);
-    let command = exec::CommandLine::new(resolved.command, args);
-    Ok(exec::run_command(repo_root, &command, timeout_secs, None, cancel_rx).await)
-}
-
-/// Binds one invocation onto the declared parameter contract.
-///
-/// The declaration is the whole contract: a name it does not carry is refused
-/// instead of being forwarded to a process, and a declared parameter that the
-/// caller left out takes its default. A parameter with neither a supplied value
-/// nor a default cannot be bound, so it is reported instead of silently shifting
-/// the positional arguments that follow it. The result keeps declaration order,
-/// which is exactly how a task runner binds positional arguments, and every value
-/// stays one literal argument: it is never split, expanded, or interpreted.
-fn bind_parameters(
-    name: &str,
-    parameters: &[ProjectParameterSpec],
-    arguments: &BTreeMap<String, String>,
-) -> Result<Vec<String>, String> {
-    for supplied in arguments.keys() {
-        if !parameters
-            .iter()
-            .any(|parameter| parameter.name == *supplied)
-        {
-            let declared = parameters
-                .iter()
-                .map(|parameter| parameter.name.as_str())
-                .collect::<Vec<_>>()
-                .join(", ");
-            return Err(format!(
-                "the command `{name}` declares no parameter `{supplied}`; declared parameters: [{declared}]"
-            ));
-        }
-    }
-
-    let mut bound = Vec::with_capacity(parameters.len());
-    for parameter in parameters {
-        let value = match arguments.get(&parameter.name) {
-            Some(value) => value.clone(),
-            None => match parameter.default.as_deref() {
-                Some(default) => default.to_string(),
-                None => {
-                    return Err(format!(
-                        "the command `{name}` requires the parameter `{}`; supply it as a named argument",
-                        parameter.name
-                    ));
-                }
-            },
-        };
-        if value.contains('\0') {
-            return Err(format!(
-                "the parameter `{}` carries a value that cannot reach a process",
-                parameter.name
-            ));
-        }
-        bound.push(value);
-    }
-    Ok(bound)
-}
-
-/// Collapses a failed command into one compact report line.
-fn compact_failure(outcome: &ToolchainCheckResult) -> String {
-    let output = if outcome.combined_output.trim().is_empty() {
-        outcome.stderr.trim()
-    } else {
-        outcome.combined_output.trim()
-    };
-    let collapsed = output.split_whitespace().collect::<Vec<&str>>().join(" ");
-    if collapsed.is_empty() {
-        format!("`{}` exited with a failure status", outcome.command)
-    } else {
-        collapsed
-    }
+) -> Option<InMemoryFormatOutcome> {
+    let project = effective_project_config(repo_root, cancel_rx).await;
+    format_with_project_config(repo_root, &project, content, cancel_rx).await
 }
 
 #[cfg(test)]
@@ -451,20 +289,43 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_a_corrupted_project_configuration_fails_phase_zero() {
-        // The file parses as TOML but declares no verification command, so the
-        // environment itself is unsound: the pipeline must report that verdict
-        // instead of resolving a project step from it.
+    async fn test_a_configuration_without_verification_stays_valid() {
+        // The file declares only model roles, so the environment is sound:
+        // verification is declarative, and a project that declares none runs no
+        // verification step instead of failing validation.
         let dir = repo(Some("[models]\nprimary = [\"openrouter:a/b\"]\n"));
 
-        let (ok, results) = run_verification_pipeline(dir.path(), &[], None).await;
+        let (status, results) = run_verification_pipeline(dir.path(), &[], None).await;
 
-        assert!(!ok, "a corrupted configuration fails verification");
+        assert_eq!(
+            status,
+            VerificationStatus::NotConfigured,
+            "a configuration without a verification command must stay valid"
+        );
+        assert!(
+            results.is_empty(),
+            "no command may be invented for a project that declares none"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_a_corrupted_project_configuration_fails_phase_zero() {
+        // The file is malformed, so the environment itself is unsound: the
+        // pipeline reports that verdict instead of resolving a project step.
+        let dir = repo(Some("[models]\ncoder = = \"broken\"\n"));
+
+        let (status, results) = run_verification_pipeline(dir.path(), &[], None).await;
+
+        assert_eq!(
+            status,
+            VerificationStatus::Failed,
+            "a corrupted configuration fails verification"
+        );
         assert_eq!(results.len(), 1, "only the phase-zero verdict is reported");
         assert!(!results[0].success);
         assert_eq!(results[0].command, PROJECT_CONFIG_FILE);
         assert!(
-            results[0].combined_output.contains("verify"),
+            results[0].combined_output.contains("Failed to parse"),
             "the verdict names the broken invariant: {}",
             results[0].combined_output
         );
@@ -476,9 +337,9 @@ mod tests {
             "[models]\nprimary = [\"openrouter:a/b\"]\n[project.verify]\ncommand = \"sh\"\nargs = ['-c', 'exit 0']\n",
         ));
 
-        let (ok, results) = run_verification_pipeline(dir.path(), &[], None).await;
+        let (status, results) = run_verification_pipeline(dir.path(), &[], None).await;
 
-        assert!(ok);
+        assert_eq!(status, VerificationStatus::Passed);
         assert_eq!(
             results.len(),
             1,
@@ -495,10 +356,38 @@ mod tests {
     async fn test_a_project_without_a_verification_declaration_runs_no_step() {
         let dir = repo(None);
 
-        let (ok, results) = run_verification_pipeline(dir.path(), &[], None).await;
+        let (status, results) = run_verification_pipeline(dir.path(), &[], None).await;
 
-        assert!(ok, "a repository that declares nothing verifies cleanly");
+        assert_eq!(
+            status,
+            VerificationStatus::NotConfigured,
+            "a repository that declares nothing verifies cleanly"
+        );
         assert!(results.is_empty(), "no command may be invented");
+    }
+
+    #[tokio::test]
+    async fn test_a_project_without_a_declaration_has_no_in_memory_formatter() {
+        let dir = repo(None);
+
+        assert!(
+            format_staged_content(dir.path(), "fn main() {}\n", None)
+                .await
+                .is_none(),
+            "a repository that declares nothing has no in-memory formatter"
+        );
+
+        std::fs::write(
+            dir.path().join("tauqe.toml"),
+            "[project.verify]\ncommand = \"cargo\"\nargs = [\"test\"]\n",
+        )
+        .unwrap();
+        assert!(
+            format_staged_content(dir.path(), "fn main() {}\n", None)
+                .await
+                .is_none(),
+            "a project that declares no in-memory formatter has none"
+        );
     }
 
     #[tokio::test]
@@ -585,29 +474,5 @@ mod tests {
             .expect_err("a required parameter cannot be invented");
 
         assert!(err.contains("requires the parameter `who`"), "error: {err}");
-    }
-
-    #[test]
-    fn test_bind_parameters_rejects_a_value_that_cannot_reach_a_process() {
-        let parameters = [ProjectParameterSpec {
-            name: "n".to_string(),
-            default: None,
-            doc: None,
-        }];
-        let arguments = BTreeMap::from([("n".to_string(), "a\u{0}b".to_string())]);
-
-        let err = bind_parameters("log-tail", &parameters, &arguments)
-            .expect_err("a NUL byte never reaches a process");
-
-        assert!(err.contains("cannot reach a process"), "error: {err}");
-    }
-
-    #[test]
-    fn test_change_set_payload_renders_one_path_per_line() {
-        assert_eq!(change_set_payload(&[]), None);
-        assert_eq!(
-            change_set_payload(&["src/lib.rs".to_string(), "generated.rs".to_string()]),
-            Some("src/lib.rs\ngenerated.rs\n".to_string())
-        );
     }
 }

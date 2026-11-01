@@ -8,6 +8,7 @@ use tauqe_protocol::{
 use crate::app::AppState;
 use crate::components::model_selector::ModelSelector;
 use crate::markdown::MarkdownBodyCache;
+use crate::views::implementation::leaf_progress;
 use crate::views::recenter::RecenterState;
 
 pub mod input;
@@ -440,7 +441,7 @@ impl PlansViewState {
         let mut index = 0usize;
         for plan in &self.plans {
             let is_expanded = self.is_plan_expanded(&plan.id);
-            let (total, completed) = plan.count_stats();
+            let (total, completed) = leaf_progress(&plan.implementation);
 
             let header = VisiblePlanRow::PlanHeader {
                 plan_id: plan.id.clone(),
@@ -1227,16 +1228,14 @@ mod tests {
     #[test]
     fn test_plans_collapsed_by_default() {
         let mut view = PlansViewState::default();
-        let plan = Plan {
-            id: "test-plan".to_string(),
-            last_replanned_step: None,
-            title: "Test Plan".to_string(),
-            description: None,
-            created_at: 0,
-            updated_at: 0,
-            architect: None,
-            concept: vec![],
-            items: vec![PlanItem {
+        let plan = Plan::from_parts(
+            "test-plan".to_string(),
+            "Test Plan".to_string(),
+            None,
+            0,
+            0,
+            vec![],
+            vec![PlanItem {
                 id: "1".to_string(),
                 title: "Step 1".to_string(),
                 details: None,
@@ -1248,7 +1247,7 @@ mod tests {
                 depends_on: vec![],
                 children: vec![],
             }],
-        };
+        );
         view.plans = vec![plan];
 
         // By default, plans are collapsed
@@ -1283,21 +1282,19 @@ mod tests {
     #[test]
     fn test_two_section_plan_flatten_and_toggles() {
         let mut view = PlansViewState::default();
-        let plan = Plan {
-            id: "auth-feature".to_string(),
-            last_replanned_step: None,
-            title: "Authentication".to_string(),
-            description: None,
-            created_at: 0,
-            updated_at: 0,
-            architect: None,
-            concept: vec![ConceptItem {
+        let plan = Plan::from_parts(
+            "auth-feature".to_string(),
+            "Authentication".to_string(),
+            None,
+            0,
+            0,
+            vec![ConceptItem {
                 id: "c-1".to_string(),
                 title: "JWT Token Spec".to_string(),
                 details: Some("Tokens must be signed".to_string()),
                 children: vec![],
             }],
-            items: vec![PlanItem {
+            vec![PlanItem {
                 id: "s-1".to_string(),
                 title: "Create JWT Signer".to_string(),
                 details: None,
@@ -1309,7 +1306,7 @@ mod tests {
                 depends_on: vec![],
                 children: vec![],
             }],
-        };
+        );
         view.plans = vec![plan];
 
         view.toggle_plan_expanded("auth-feature");
@@ -1356,15 +1353,13 @@ mod tests {
     #[test]
     fn test_accordion_navigation_navigates_strictly_across_leaves() {
         let mut view = PlansViewState::default();
-        let plan = Plan {
-            id: "nested-plan".to_string(),
-            last_replanned_step: None,
-            title: "Nested Plan".to_string(),
-            description: None,
-            created_at: 0,
-            updated_at: 0,
-            architect: None,
-            concept: vec![ConceptItem {
+        let plan = Plan::from_parts(
+            "nested-plan".to_string(),
+            "Nested Plan".to_string(),
+            None,
+            0,
+            0,
+            vec![ConceptItem {
                 id: "c-1".to_string(),
                 title: "Concept Root".to_string(),
                 details: None,
@@ -1383,7 +1378,7 @@ mod tests {
                     },
                 ],
             }],
-            items: vec![
+            vec![
                 PlanItem {
                     id: "1".to_string(),
                     title: "Parent Step 1".to_string(),
@@ -1445,7 +1440,7 @@ mod tests {
                     }],
                 },
             ],
-        };
+        );
         view.plans = vec![plan];
 
         // 1. Initial navigation forward lands on the first leaf: c-1.1
@@ -1515,17 +1510,19 @@ mod tests {
     #[test]
     fn test_accordion_crosses_concept_implementation_boundary_and_expands_ancestors() {
         let mut view = PlansViewState::default();
-        let plan = Plan {
-            id: "cross-plan".to_string(),
-            title: "Cross Plan".to_string(),
-            concept: vec![concept_leaf("c-1", "Concept 1")],
-            items: vec![parent_item(
+        let plan = Plan::from_parts(
+            "cross-plan".to_string(),
+            "Cross Plan".to_string(),
+            None,
+            0,
+            0,
+            vec![concept_leaf("c-1", "Concept 1")],
+            vec![parent_item(
                 "1",
                 "Parent Step",
                 vec![leaf_item("1.1", "Nested Step")],
             )],
-            ..Default::default()
-        };
+        );
         view.plans = vec![plan];
         view.expand_all();
 
@@ -1557,16 +1554,18 @@ mod tests {
     #[test]
     fn test_accordion_from_implementation_header_reaches_adjacent_extreme_leaves() {
         let mut view = PlansViewState::default();
-        let plan = Plan {
-            id: "header-plan".to_string(),
-            title: "Header Plan".to_string(),
-            concept: vec![
+        let plan = Plan::from_parts(
+            "header-plan".to_string(),
+            "Header Plan".to_string(),
+            None,
+            0,
+            0,
+            vec![
                 concept_leaf("c-1", "Concept 1"),
                 concept_leaf("c-2", "Concept 2"),
             ],
-            items: vec![leaf_item("1", "Step 1"), leaf_item("2", "Step 2")],
-            ..Default::default()
-        };
+            vec![leaf_item("1", "Step 1"), leaf_item("2", "Step 2")],
+        );
         view.plans = vec![plan];
         view.expand_all();
 
@@ -1598,16 +1597,18 @@ mod tests {
     fn test_accordion_from_implementation_header_with_empty_implementation_reaches_last_concept_leaf(
     ) {
         let mut view = PlansViewState::default();
-        let plan = Plan {
-            id: "concept-only".to_string(),
-            title: "Concept Only".to_string(),
-            concept: vec![
+        let plan = Plan::from_parts(
+            "concept-only".to_string(),
+            "Concept Only".to_string(),
+            None,
+            0,
+            0,
+            vec![
                 concept_leaf("c-1", "Concept 1"),
                 concept_leaf("c-2", "Concept 2"),
             ],
-            items: vec![],
-            ..Default::default()
-        };
+            vec![],
+        );
         view.plans = vec![plan];
         view.expand_all();
 
@@ -1629,16 +1630,18 @@ mod tests {
     #[test]
     fn test_accordion_from_concept_header_reaches_first_concept_leaf() {
         let mut view = PlansViewState::default();
-        let plan = Plan {
-            id: "concept-only".to_string(),
-            title: "Concept Only".to_string(),
-            concept: vec![
+        let plan = Plan::from_parts(
+            "concept-only".to_string(),
+            "Concept Only".to_string(),
+            None,
+            0,
+            0,
+            vec![
                 concept_leaf("c-1", "Concept 1"),
                 concept_leaf("c-2", "Concept 2"),
             ],
-            items: vec![],
-            ..Default::default()
-        };
+            vec![],
+        );
         view.plans = vec![plan];
         view.expand_all();
 
@@ -1658,17 +1661,15 @@ mod tests {
     #[test]
     fn test_focus_badge_marks_the_anchored_whole_plan() {
         let mut view = PlansViewState::default();
-        let plan = Plan {
-            id: "focus-plan".to_string(),
-            last_replanned_step: None,
-            title: "Focus Plan".to_string(),
-            description: None,
-            created_at: 0,
-            updated_at: 0,
-            architect: None,
-            concept: vec![],
-            items: vec![],
-        };
+        let plan = Plan::from_parts(
+            "focus-plan".to_string(),
+            "Focus Plan".to_string(),
+            None,
+            0,
+            0,
+            vec![],
+            vec![],
+        );
         view.plans = vec![plan];
         view.discussion_focus = tauqe_protocol::DiscussionFocus::plan("focus-plan", vec![]);
 
@@ -1682,16 +1683,24 @@ mod tests {
     #[test]
     fn test_focus_plan_header_collapses_others_and_selects_the_target() {
         let mut view = PlansViewState::default();
-        let first = Plan {
-            id: "plan-a".to_string(),
-            title: "Plan A".to_string(),
-            ..Default::default()
-        };
-        let second = Plan {
-            id: "plan-b".to_string(),
-            title: "Plan B".to_string(),
-            ..Default::default()
-        };
+        let first = Plan::from_parts(
+            "plan-a".to_string(),
+            "Plan A".to_string(),
+            None,
+            0,
+            0,
+            vec![],
+            vec![],
+        );
+        let second = Plan::from_parts(
+            "plan-b".to_string(),
+            "Plan B".to_string(),
+            None,
+            0,
+            0,
+            vec![],
+            vec![],
+        );
         view.plans = vec![first, second];
         // Both plans start expanded before the focus request.
         view.expand_all();
@@ -1712,11 +1721,15 @@ mod tests {
     #[test]
     fn test_focus_plan_header_is_a_noop_for_unknown_plan() {
         let mut view = PlansViewState {
-            plans: vec![Plan {
-                id: "plan-a".to_string(),
-                title: "Plan A".to_string(),
-                ..Default::default()
-            }],
+            plans: vec![Plan::from_parts(
+                "plan-a".to_string(),
+                "Plan A".to_string(),
+                None,
+                0,
+                0,
+                vec![],
+                vec![],
+            )],
             ..Default::default()
         };
         view.expand_all();
@@ -1733,23 +1746,24 @@ mod tests {
     /// carry expansion state, so every branch of the row walk is exercised.
     fn row_count_fixture() -> PlansViewState {
         PlansViewState {
-            plans: vec![Plan {
-                id: "count-plan".to_string(),
-                title: "Count Plan".to_string(),
-                description: Some("Plan description.".to_string()),
-                concept: vec![ConceptItem {
+            plans: vec![Plan::from_parts(
+                "count-plan".to_string(),
+                "Count Plan".to_string(),
+                Some("Plan description.".to_string()),
+                0,
+                0,
+                vec![ConceptItem {
                     id: "c-1".to_string(),
                     title: "Invariant".to_string(),
                     details: Some("Tokens must be signed.".to_string()),
                     children: vec![concept_leaf("c-1.1", "Nested Invariant")],
                 }],
-                items: vec![parent_item(
+                vec![parent_item(
                     "1",
                     "Parent Step",
                     vec![leaf_item("1.1", "Leaf Step")],
                 )],
-                ..Default::default()
-            }],
+            )],
             ..Default::default()
         }
     }
@@ -1798,12 +1812,15 @@ mod tests {
     #[test]
     fn test_clamp_selection_clamps_against_the_row_count() {
         let mut view = PlansViewState {
-            plans: vec![Plan {
-                id: "clamp-plan".to_string(),
-                title: "Clamp Plan".to_string(),
-                items: vec![leaf_item("1", "Step")],
-                ..Default::default()
-            }],
+            plans: vec![Plan::from_parts(
+                "clamp-plan".to_string(),
+                "Clamp Plan".to_string(),
+                None,
+                0,
+                0,
+                vec![],
+                vec![leaf_item("1", "Step")],
+            )],
             ..Default::default()
         };
 
@@ -1864,10 +1881,16 @@ mod tests {
     fn recenter_plans_fixture(selected: usize) -> PlansViewState {
         PlansViewState {
             plans: (1..=20)
-                .map(|i| Plan {
-                    id: format!("plan-{i}"),
-                    title: format!("Plan {i}"),
-                    ..Default::default()
+                .map(|i| {
+                    Plan::from_parts(
+                        format!("plan-{i}"),
+                        format!("Plan {i}"),
+                        None,
+                        0,
+                        0,
+                        vec![],
+                        vec![],
+                    )
                 })
                 .collect(),
             selected_index: selected,
@@ -2005,14 +2028,17 @@ mod tests {
     /// A plan holding twenty single-line steps, so every row fits the viewport.
     fn scroll_fixture(view_height: u16) -> PlansViewState {
         PlansViewState {
-            plans: vec![Plan {
-                id: "scroll-plan".to_string(),
-                title: "Scroll Plan".to_string(),
-                items: (1..=20)
+            plans: vec![Plan::from_parts(
+                "scroll-plan".to_string(),
+                "Scroll Plan".to_string(),
+                None,
+                0,
+                0,
+                vec![],
+                (1..=20)
                     .map(|i| leaf_item(&i.to_string(), &format!("Step {i}")))
                     .collect(),
-                ..Default::default()
-            }],
+            )],
             view_height,
             content_width: 80,
             ..Default::default()
@@ -2073,14 +2099,17 @@ mod tests {
     /// cursor off screen.
     fn tall_scroll_fixture(view_height: u16) -> PlansViewState {
         PlansViewState {
-            plans: vec![Plan {
-                id: "scroll-plan".to_string(),
-                title: "Scroll Plan".to_string(),
-                items: (1..=60)
+            plans: vec![Plan::from_parts(
+                "scroll-plan".to_string(),
+                "Scroll Plan".to_string(),
+                None,
+                0,
+                0,
+                vec![],
+                (1..=60)
                     .map(|i| leaf_item(&i.to_string(), &format!("Step {i}")))
                     .collect(),
-                ..Default::default()
-            }],
+            )],
             view_height,
             content_width: 80,
             ..Default::default()
@@ -2284,12 +2313,14 @@ mod tests {
     fn test_render_bounds_match_the_rendered_offsets_of_every_row() {
         let mut view = PlansViewState {
             plans: vec![
-                Plan {
-                    id: "plan-a".to_string(),
-                    title: "Plan A".to_string(),
-                    description: Some("First plan.".to_string()),
-                    concept: vec![concept_leaf("c-1", "Invariant")],
-                    items: vec![
+                Plan::from_parts(
+                    "plan-a".to_string(),
+                    "Plan A".to_string(),
+                    Some("First plan.".to_string()),
+                    0,
+                    0,
+                    vec![concept_leaf("c-1", "Invariant")],
+                    vec![
                         leaf_item("1", "First step"),
                         PlanItem {
                             details: Some(
@@ -2301,14 +2332,16 @@ mod tests {
                             ..leaf_item("2", "Tall step")
                         },
                     ],
-                    ..Default::default()
-                },
-                Plan {
-                    id: "plan-b".to_string(),
-                    title: "Plan B".to_string(),
-                    items: vec![leaf_item("1", "Step")],
-                    ..Default::default()
-                },
+                ),
+                Plan::from_parts(
+                    "plan-b".to_string(),
+                    "Plan B".to_string(),
+                    None,
+                    0,
+                    0,
+                    vec![],
+                    vec![leaf_item("1", "Step")],
+                ),
             ],
             view_height: 8,
             content_width: 60,

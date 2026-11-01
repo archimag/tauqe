@@ -27,9 +27,9 @@ happens to do* disappears.
 
 Harness policy and project commands answer different questions. Policy answers *how
 patient, how safe, and how expensive* the environment is: discovery rounds, retry
-budgets, model roles, the verification gate. A project command answers *how this
-repository is built*: which formatter claims a file, which generator must run after
-a write, which command decides that the tree is correct.
+budgets, model roles, and the verdict a change set commits under. A project command
+answers *how this repository is built*: which formatter claims a file, which
+generator must run after a write, which command decides that the tree is correct.
 
 Both live in `tauqe.toml`, in different sections, and the section boundary is
 load-bearing:
@@ -60,8 +60,10 @@ follow:
    only description of what the harness may run for this repository.
 3. **Literal arguments.** A command line is spawned directly, never through a shell,
    so a path with spaces or metacharacters is never interpreted.
-4. **Verification is mandatory.** A repository that declares no verification command
-   has no accepted change set.
+4. **Verification is declared, never assumed.** The `[project.verify]` declaration is
+   optional: a repository that declares no verification lifecycle runs no step and
+   commits its change set under the explicit unverified verdict, because the project
+   stated its own choice.
 5. **One request, one process.** Every phase is one invocation with its own
    wall-clock budget and its own process group; nothing survives it.
 6. **The exit status is the verdict.** Zero means the operation succeeded; a non-zero
@@ -121,7 +123,7 @@ follow:
 | Section | Declares | Required |
 | --- | --- | --- |
 | `[project.runner]` | external task runner: `just` or `none` | optional |
-| `[project.verify]` | the verification command line | mandatory (unless runner exports `verify`) |
+| `[project.verify]` | the verification command line | optional |
 | `[project.format]` | the in-memory stream filter | optional |
 | `[project.post_hook]` | the disk-side step after the write | optional |
 | `[project.commands]` | named allowlisted commands | optional |
@@ -169,7 +171,9 @@ never a command selector.
 
 The harness keeps no legacy chain and no manifest auto-detection: a repository
 that declares no verification command resolves no step, so the change set is
-reported as unverified instead of running a command nobody declared.
+reported as unverified instead of running a command nobody declared. Such a change
+set still commits, because the project stated its own choice and no verdict is
+invented for a gate that was never declared.
 
 ### 2.5 The explicit runner choice
 
@@ -227,8 +231,8 @@ state of its own, because the working copy also holds post-hook artifacts and th
 developer's uncommitted work while the transaction is open; and it duplicates no
 command line, because it only invokes declared recipes. The recipes behind it stay
 internal — they carry no allowlist group — so the model can narrow the work of the
-mandatory gate but can never address a second, lighter verification channel
-beside it.
+declared gate but can never address a second, lighter verification channel beside
+it.
 
 ---
 
@@ -283,6 +287,10 @@ banner is written for a terminal, and a model pays for every escape sequence and
 every duplicated note in it. Output that no parser recognizes still yields one
 unstructured finding, which is better than discarding the only evidence of a
 failure.
+
+A project that declares no verification command contributes no step at all, so no
+exit status decides anything and the change set commits under the explicit
+unverified verdict instead of a fabricated pass.
 
 ### 3.4 Timeouts, cancellation, and teardown
 
@@ -399,10 +407,14 @@ prompt bytes stay stable across turns.
   it; a `justfile` on disk is inert until the declaration opts in.
 - **It is not a second command surface.** A runner supplements `[project.commands]`;
   an exported recipe never overrides a declared command.
-- **It is not harness policy.** Timeouts, the verification gate, and retry budgets
-  belong to the harness sections; the `[project]` declaration holds only what runs.
+- **It is not harness policy.** Retry budgets, context limits, and model roles belong
+  to the harness sections; the `[project]` declaration holds only what runs.
 - **It is not an optional optimization.** Formatting and verification are delegated
-  through it, not duplicated beside it.
+  through it, not duplicated beside it, and a project that runs them declares them
+  once.
+- **It is not an obligation.** A repository that declares no verification command
+  stays valid: its change set commits under the explicit unverified verdict and is
+  never dressed up as a gate that passed.
 - **It does not trust the declaration blindly.** Every invocation is bounded by a
   timeout, isolated in a process group, validated against the declaration, and
   answered with its real exit status.
@@ -410,7 +422,7 @@ prompt bytes stay stable across turns.
   paths on standard input; a command that read Git instead would also see post-hook
   artifacts and the developer's uncommitted work.
 - **It is not a second verification channel.** The internal checks a dispatcher
-  composes stay unpublished, so the mandatory gate can be made cheaper but never
+  composes stay unpublished, so the declared gate can be made cheaper but never
   swapped for a lighter one.
 
 ---

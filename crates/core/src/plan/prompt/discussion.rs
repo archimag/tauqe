@@ -169,10 +169,12 @@ pub fn format_plan_discussion_prompt(
     out.push_str("2. Reins Invariant: Never mutate the plan (keep `plan_update: null`) without an explicit user instruction to modify it. Questions, analysis, trade-off reviews, and critique must be answered strictly in conversational text in `message`.\n");
     out.push_str("3. When explicitly instructed to update the plan, explain the proposed modifications in `message` and populate the structured `plan_update` field.\n");
     out.push_str("4. Plan Action Semantics: Use `action: \"save\"` to create a plan or to replace its implementation tree as a whole (mandatory `concept` tree defining architectural intent, optional implementation `items`). A `save` is a full replacement, so every step already in `Done` status must be reproduced verbatim — same status, title, details, files, readonly_files, concept_refs, and depends_on — otherwise the completed-step immutability check rejects the whole mutation. Use `action: \"update\"` for a delta: it patches the steps and concept nodes whose IDs already exist and appends steps whose IDs are new as leaf items of the plan root, without altering unmentioned nodes; an `update` adds leaf steps only, because restructuring the tree belongs to `save`. Use `action: \"delete\"` to remove the plan. A mutation rejected by storage reports its reason back as a diagnostic, so a later round must repair the payload instead of repeating it.\n");
+    out.push_str("5. Disjunction Prohibition Invariant: Every concept node and every step must state exactly one definite decision, so unresolved disjunctive alternatives such as 'either X or Y' or 'use library A or write your own structure B' are strictly prohibited. The architectural choice ('What') is fixed by the Primary or Architect role, or clarified with the developer in this dialogue before the plan is approved; the step executor owns 'How' only and never decides the architecture.\n");
+    out.push_str("6. Automated Verification Invariant: The harness runs full toolchain verification (compilation, linters, and tests) automatically and deterministically after every individual leaf step and rolls the turn back when it fails. Dedicated steps that only run tests, check the build status, or inspect the codebase without changing code are strictly prohibited, because the executor has no shell. Tests are created and modified inside the steps that implement the corresponding functionality.\n");
     out.push_str(
-        "5. Keep explanations clear, rigorous, and directly aligned with codebase design.\n",
+        "7. Keep explanations clear, rigorous, and directly aligned with codebase design.\n",
     );
-    out.push_str("6. Language Consistency Directive: Detect the natural language of the plan title and description. Formulate all plan titles, descriptions, step titles, step details, and conversational explanations strictly in that same language.\n");
+    out.push_str("8. Language Consistency Directive: Detect the natural language of the plan title and description. Formulate all plan titles, descriptions, step titles, step details, and conversational explanations strictly in that same language.\n");
 
     out
 }
@@ -283,4 +285,39 @@ pub fn format_active_plan_context(plan: &Plan) -> Option<String> {
     out.push_str("</active_plan>");
 
     Some(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Plan carrying nothing but the identity the instruction block renders.
+    fn sample_plan() -> Plan {
+        Plan::from_parts(
+            "auth".to_string(),
+            "Authentication".to_string(),
+            Some("Secure the API".to_string()),
+            0,
+            0,
+            vec![],
+            vec![],
+        )
+    }
+
+    #[test]
+    fn the_instruction_block_forbids_disjunctions_and_verification_only_steps() {
+        let prompt = format_plan_discussion_prompt(&sample_plan(), &[], "Review the plan");
+
+        // A node states one definite decision, so the executor never resolves an
+        // open architectural alternative on its own.
+        assert!(prompt.contains("Disjunction Prohibition Invariant"));
+        assert!(prompt.contains("exactly one definite decision"));
+        assert!(prompt.contains("either X or Y"));
+
+        // The harness owns the toolchain, so a step whose only work is running it
+        // is forbidden: the executor has no shell.
+        assert!(prompt.contains("Automated Verification Invariant"));
+        assert!(prompt.contains("without changing code"));
+        assert!(prompt.contains("no shell"));
+    }
 }

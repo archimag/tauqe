@@ -9,6 +9,7 @@ use std::sync::Arc;
 use tauqe_core::plan::storage::PlanStorage;
 use tauqe_protocol::{errors, PlanExecutePipelineParams, PlanScopeEvaluation, Request, Response};
 
+use crate::handlers::PreflightVerdict;
 use crate::state::AppState;
 
 use super::super::common::offload_plan;
@@ -106,12 +107,26 @@ pub async fn handle_plan_execute_pipeline(req: Request, state: &Arc<AppState>) -
 
     // Pre-flight verification runs while the pipeline is already registered, so
     // no competing mutation can slip in between verification and the first turn.
-    if let Err(report) = crate::handlers::run_preflight_verification(&repo_root).await {
-        let message = format!(
-            "Pre-flight verification failed: the repository does not build cleanly. Pipeline execution was blocked before starting any plan.\n\n{}",
-            report
-        );
-        return Response::err(req.id, errors::PREFLIGHT_VERIFICATION_FAILED, message);
+    // The gate inherits the operation's cancellation channel, so a hard cancel
+    // tears the verification down instead of waiting the build/test suite out.
+    let preflight =
+        crate::handlers::run_preflight_verification(&repo_root, operation.cancel_receiver()).await;
+    match preflight {
+        PreflightVerdict::Passed => {}
+        PreflightVerdict::Cancelled => {
+            return Response::err(
+                req.id,
+                errors::CANCELLED,
+                "Pre-flight verification was cancelled; pipeline execution did not start",
+            );
+        }
+        PreflightVerdict::Failed(report) => {
+            let message = format!(
+                "Pre-flight verification failed: the repository does not build cleanly. Pipeline execution was blocked before starting any plan.\n\n{}",
+                report
+            );
+            return Response::err(req.id, errors::PREFLIGHT_VERIFICATION_FAILED, message);
+        }
     }
 
     // Execution hands control to the Coder role, so no discussion anchor

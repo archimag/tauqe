@@ -322,19 +322,14 @@ pub async fn handle_context_key(
                             access,
                         }))
                     }
+                    // The highlighted row decides the commit: a concrete file
+                    // row adds exactly that file, never the typed glob.
                     Some(ContextCandidate::File(path)) => {
-                        if is_glob_direct {
-                            Some(PickerCommit::Pattern(ContextAddPatternParams {
-                                pattern: raw_input,
-                                access,
-                            }))
-                        } else {
-                            Some(PickerCommit::File(ContextAddParams {
-                                path,
-                                access,
-                                layer: Some(ContextLayer::User),
-                            }))
-                        }
+                        Some(PickerCommit::File(ContextAddParams {
+                            path,
+                            access,
+                            layer: Some(ContextLayer::User),
+                        }))
                     }
                     None if is_glob_direct => {
                         Some(PickerCommit::Pattern(ContextAddPatternParams {
@@ -901,6 +896,35 @@ mod tests {
             serde_json::from_slice(conn.written()).expect("a single JSON request line");
         assert_eq!(request["method"], methods::CONTEXT_ADD_PATTERN);
         assert_eq!(request["params"]["pattern"], "*.rs");
+    }
+
+    /// A glob query never overrides the highlighted row: the safe default sits
+    /// on the first concrete file, so `Enter` adds exactly that file instead of
+    /// mass-adding every match of the typed pattern.
+    #[tokio::test]
+    async fn enter_on_a_glob_query_with_a_file_row_highlighted_adds_that_file() {
+        let mut st = test_state();
+        st.view_mode = ViewMode::Context;
+        st.all_repo_files = vec!["a.rs".to_string(), "b.rs".to_string()];
+        st.context_view.adding_file = true;
+        st.context_view.add_input.insert_str("*.rs");
+        st.update_filtered_candidates();
+
+        // The safe default highlights the first concrete file, not the bulk row.
+        assert_eq!(st.context_view.selected_candidate_index, 1);
+
+        let state = Arc::new(Mutex::new(st));
+        let mut conn = RpcConnection::new(Vec::<u8>::new());
+
+        let enter = KeyEvent::new(KeyCode::Enter, crossterm::event::KeyModifiers::NONE);
+        handle_context_key(enter, &state, &mut conn).await.unwrap();
+
+        assert!(!state.lock().await.context_view.adding_file);
+
+        let request: serde_json::Value =
+            serde_json::from_slice(conn.written()).expect("a single JSON request line");
+        assert_eq!(request["method"], methods::CONTEXT_ADD);
+        assert_eq!(request["params"]["path"], "a.rs");
     }
 
     #[tokio::test]

@@ -60,6 +60,15 @@ pub(crate) fn current_file_content(
 // the protocol node normalizer is the single implementation for both paths.
 pub(crate) use crate::edits::protocol::utils::normalize_content as normalize_hunk;
 
+/// Diagnostic a streaming filter reports for an edit the response never closed.
+///
+/// A filter announces a file as soon as its header arrives, which is earlier
+/// than the authoritative decoder accepts anything. When the response ends
+/// inside that edit, the decoder refuses or drops it, so the terminal preview
+/// event reports this diagnostic instead of certifying a change the turn will
+/// not deliver.
+pub(crate) const TRUNCATED_EDIT_DIAGNOSTIC: &str =
+    "edit block truncated before its closing tag: the response ended inside the edit";
 /// Shared in-memory staging simulator for the streaming edit filters.
 ///
 /// Both the XML and JSON filters must report edit status exactly as the final

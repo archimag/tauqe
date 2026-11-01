@@ -261,10 +261,11 @@ mod tests {
     #[test]
     fn test_rect_contains_and_check_confirm_hit() {
         let term = Rect::new(0, 0, 100, 30);
+        let body: Vec<ratatui::text::Line> = vec![ratatui::text::Line::raw(""); 5];
         let geom = crate::dialogs::render::confirm_modal_geometry(
             term,
             58,
-            5,
+            &body,
             "Interrupt (Y)",
             "Cancel (Esc)",
         );
@@ -314,16 +315,14 @@ mod tests {
         let mut st = crate::app::test_state();
         st.view_mode = ViewMode::Plans;
         st.last_frame_area = Rect::new(0, 0, 100, 30);
-        st.plans_view.plans = vec![tauqe_protocol::Plan {
-            id: "plan-1".to_string(),
-            title: "Test Plan".to_string(),
-            description: None,
-            created_at: 0,
-            updated_at: 0,
-            architect: None,
-            last_replanned_step: None,
-            concept: vec![],
-            items: vec![tauqe_protocol::PlanItem {
+        st.plans_view.plans = vec![tauqe_protocol::Plan::from_parts(
+            "plan-1".to_string(),
+            "Test Plan".to_string(),
+            None,
+            0,
+            0,
+            vec![],
+            vec![tauqe_protocol::PlanItem {
                 id: "1".to_string(),
                 title: "Step".to_string(),
                 details: None,
@@ -335,7 +334,7 @@ mod tests {
                 depends_on: vec![],
                 children: vec![],
             }],
-        }];
+        )];
         st.status_dialog = Some(crate::app::StatusDialogState::new(
             crate::app::StatusDialogTarget::PlanItem {
                 plan_id: "plan-1".to_string(),
@@ -547,16 +546,14 @@ mod tests {
         let mut st = crate::app::test_state();
         st.view_mode = ViewMode::Plans;
         st.last_frame_area = Rect::new(0, 0, 100, 30);
-        st.plans_view.plans = vec![tauqe_protocol::Plan {
-            id: "plan-1".to_string(),
-            title: "Test Plan".to_string(),
-            description: None,
-            created_at: 0,
-            updated_at: 0,
-            architect: None,
-            last_replanned_step: None,
-            concept: vec![],
-            items: vec![tauqe_protocol::PlanItem {
+        st.plans_view.plans = vec![tauqe_protocol::Plan::from_parts(
+            "plan-1".to_string(),
+            "Test Plan".to_string(),
+            None,
+            0,
+            0,
+            vec![],
+            vec![tauqe_protocol::PlanItem {
                 id: "1".to_string(),
                 title: "Step".to_string(),
                 details: None,
@@ -568,7 +565,7 @@ mod tests {
                 depends_on: vec![],
                 children: vec![],
             }],
-        }];
+        )];
         st.status_dialog = Some(crate::app::StatusDialogState::new(
             crate::app::StatusDialogTarget::PlanItem {
                 plan_id: "plan-1".to_string(),

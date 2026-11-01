@@ -10,17 +10,6 @@ pub const DEFAULT_HISTORY_BUDGET_TOKENS: u64 = 20_000;
 /// Default count of user turns to preserve in detailed form in the tail.
 pub const DEFAULT_TAIL_TURNS_COUNT: usize = 10;
 
-/// Estimates tokens used by history entries using the project standard (bytes + 3) / 4.
-pub fn estimate_entries_tokens(entries: &[HistoryEntry]) -> u64 {
-    let mut total_bytes = 0u64;
-    for entry in entries {
-        if let Ok(line) = entry.to_jsonl_line() {
-            total_bytes += (line.len() + 1) as u64; // + 1 for newline
-        }
-    }
-    total_bytes.div_ceil(4)
-}
-
 /// Partitions entries into `(head, tail)` based on preserving the last `keep_tail_turns` user turns.
 ///
 /// A turn boundary starts with `HistoryEntry::Turn`. Everything from the target turn to

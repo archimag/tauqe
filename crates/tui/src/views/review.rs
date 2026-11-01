@@ -516,7 +516,9 @@ impl ReviewViewState {
             // pinned to the row's first screenful (c-2).
             scroll.clamp(start, end.saturating_sub(height))
         };
-        self.scroll = new_scroll as u16;
+        // Saturate instead of wrapping: a document longer than `u16::MAX`
+        // visual lines must not jump to a truncated row (c-2).
+        self.scroll = u16::try_from(new_scroll).unwrap_or(u16::MAX);
     }
 
     /// Positions the viewport around the selected review row using the three-beat
@@ -809,8 +811,8 @@ impl ReviewViewState {
 mod tests {
     use super::*;
     use tauqe_protocol::{
-        IssueStatus, IssueType, ModelRef, PlanItemStatus, ReviewGroup, ReviewGroupKind,
-        ReviewIssue, ReviewSession,
+        IssueStatus, IssueType, ModelRef, PlanImplementation, PlanItemStatus, ReviewGroup,
+        ReviewGroupKind, ReviewIssue, ReviewSession,
     };
     fn make_item(id: u32) -> ReviewIssue {
         ReviewIssue {
@@ -1019,13 +1021,16 @@ mod tests {
             id: "arch".to_string(),
             title: "Shared cause".to_string(),
             kind: ReviewGroupKind::Architectural,
-            subplan: vec![
-                PlanItem {
-                    children: vec![subplan_step("1.1", "Leaf one", PlanItemStatus::Todo)],
-                    ..subplan_step("1", "Container", PlanItemStatus::Todo)
-                },
-                subplan_step("2", "Second top step", PlanItemStatus::Todo),
-            ],
+            implementation: PlanImplementation {
+                items: vec![
+                    PlanItem {
+                        children: vec![subplan_step("1.1", "Leaf one", PlanItemStatus::Todo)],
+                        ..subplan_step("1", "Container", PlanItemStatus::Todo)
+                    },
+                    subplan_step("2", "Second top step", PlanItemStatus::Todo),
+                ],
+                ..Default::default()
+            },
             ..Default::default()
         }];
         session.items[0].group = Some("arch".to_string());
@@ -1113,6 +1118,36 @@ mod tests {
         assert_eq!(view.max_scroll(), u16::MAX);
     }
 
+    /// A rendered document longer than the `u16` viewport unit must saturate
+    /// the scroll offset instead of wrapping it: selecting a row that begins
+    /// past line 65 535 keeps the largest representable offset and never jumps
+    /// to a truncated row near the document top (c-2).
+    #[test]
+    fn test_scroll_to_selected_saturates_past_the_u16_viewport_unit() {
+        let item_ids: Vec<u32> = (1..=70_000).collect();
+        let mut view = ReviewViewState {
+            sessions: vec![make_session("rev-huge", &item_ids)],
+            view_height: 10,
+            content_width: 80,
+            ..Default::default()
+        };
+
+        // The rows are the session header, the group header, and every finding,
+        // so the last finding begins past the largest representable offset.
+        let last = view.row_count() - 1;
+        assert!(
+            last > usize::from(u16::MAX),
+            "the document must exceed the u16 viewport unit: {last} rows"
+        );
+
+        view.selected_index = last;
+        view.scroll_to_selected();
+        assert_eq!(
+            view.scroll,
+            u16::MAX,
+            "the viewport offset must saturate instead of wrapping through a truncated cast"
+        );
+    }
     /// Expected `Center`, `Top`, and `Bottom` viewport offsets for a row that
     /// spans `start..end` inside a `height`-row viewport (Conventions §5.2).
     fn recenter_beats(start: usize, end: usize, total: usize, height: u16) -> [u16; 3] {
@@ -1287,10 +1322,13 @@ mod tests {
             id: "arch".to_string(),
             title: "Shared cause".to_string(),
             kind: ReviewGroupKind::Architectural,
-            subplan: vec![PlanItem {
-                details: Some(long_details),
-                ..subplan_step("1.1", "Tall step", PlanItemStatus::Todo)
-            }],
+            implementation: PlanImplementation {
+                items: vec![PlanItem {
+                    details: Some(long_details),
+                    ..subplan_step("1.1", "Tall step", PlanItemStatus::Todo)
+                }],
+                ..Default::default()
+            },
             ..Default::default()
         }];
         session.items[0].group = Some("arch".to_string());

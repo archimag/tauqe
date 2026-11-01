@@ -416,7 +416,12 @@ fn settle_failed_turn(st: &mut AppState, message: &str) {
 }
 
 /// Restores the optimistic state a rejected request had already replaced.
-fn apply_optimistic_rollback(st: &mut AppState, rollback: OptimisticRollback) {
+///
+/// This is the single implementation of "undo one optimistic mutation": the
+/// error-response path and the transport-write-failure path both call it, so a
+/// request the daemon refused and a request that never left the client are
+/// reverted by the same code (c-3).
+pub(crate) fn apply_optimistic_rollback(st: &mut AppState, rollback: OptimisticRollback) {
     match rollback {
         OptimisticRollback::ActiveModel {
             prev_model,

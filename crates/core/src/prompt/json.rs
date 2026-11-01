@@ -6,6 +6,8 @@
 //! logic and delegates concrete parsing to the structured edit protocol so the
 //! schema keeps a single source of truth.
 
+use std::borrow::Cow;
+
 use crate::edits::protocol::structured::StructuredEditProtocol;
 use crate::edits::protocol::TerminalOutcome;
 use crate::edits::stream::discussion::DiscussionStreamFilter;
@@ -282,6 +284,16 @@ impl PromptProtocol for JsonPromptProtocol {
             Err(message) => commands.push(LlmCommand::ProtocolError { message }),
         }
 
+        // Decision recorded for one review finding, decoded from the structured
+        // `review_update` field. The decision is a dialogue mutation, so it
+        // travels as a typed command and the engine persists it against the
+        // review session the turn is anchored on.
+        match structured.parse_review_update(raw_text) {
+            Ok(Some(update)) => commands.push(LlmCommand::ReviewUpdate { update }),
+            Ok(None) => {}
+            Err(message) => commands.push(LlmCommand::ProtocolError { message }),
+        }
+
         // Typed project command invocations decoded from the structured
         // `custom_tools` field, falling back to `<custom_tool>` control tags.
         for (name, args) in structured.parse_custom_tools(raw_text) {
@@ -375,7 +387,7 @@ impl PromptProtocol for JsonPromptProtocol {
                             "Structured response for discussion and planning modes".to_string(),
                         ),
                         strict: Some(true),
-                        schema: tauqe_protocol::discussion_response_schema(),
+                        schema: Cow::Borrowed(tauqe_protocol::discussion_response_schema()),
                     },
                 })
             }
@@ -1308,5 +1320,50 @@ mod tests {
             decoded_outcomes(&protocol.decode("<skip />\n", &[])),
             vec![unstated_skip]
         );
+    }
+    #[test]
+    fn test_decode_review_update_from_structured_json() {
+        // A dialogue anchored on a review session records the decision the
+        // engineer reached as an atomic payload, so the decision travels as a
+        // typed command instead of being folded into the conversational text.
+        let protocol = JsonPromptProtocol::discussion();
+        let output = r#"{
+            "message": "Recording the decision.",
+            "review_update": {
+                "item_id": 7,
+                "status": "rejected",
+                "note": "The guard is released after the await",
+                "recommendations": ["Cover the retry path"]
+            }
+        }"#;
+        let decision = protocol
+            .decode(output, &[])
+            .into_iter()
+            .find_map(|command| match command {
+                LlmCommand::ReviewUpdate { update } => Some(update),
+                _ => None,
+            })
+            .expect("a review decision command");
+        assert_eq!(decision.item_id, 7);
+        assert_eq!(
+            decision.status,
+            tauqe_protocol::review::ReviewDecisionStatus::Rejected
+        );
+        assert_eq!(decision.note, "The guard is released after the await");
+
+        // An idle field states no decision at all.
+        let idle = r#"{"message":"Nothing to record","review_update":null}"#;
+        assert!(!protocol
+            .decode(idle, &[])
+            .iter()
+            .any(|command| matches!(command, LlmCommand::ReviewUpdate { .. })));
+
+        // A payload the DTO cannot hold is reported as a protocol error, so the
+        // bounded turn can repeat generation with the diagnostics attached.
+        let malformed = r#"{"message":"Bad","review_update":{"item_id":"seven"}}"#;
+        assert!(protocol
+            .decode(malformed, &[])
+            .iter()
+            .any(|command| matches!(command, LlmCommand::ProtocolError { .. })));
     }
 }

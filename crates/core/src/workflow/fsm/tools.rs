@@ -20,8 +20,9 @@ use crate::providers::StreamEvent;
 use crate::toolchain::ToolchainCheckResult;
 
 use super::guard::{finalize_blocked_turn, finish_turn};
+use super::kernel::TurnKernel;
 use super::proposal::{log_fsm_phase, merge_text, ProposalStep};
-use super::{propose, FsmTurnOutcome, PhaseContext};
+use super::FsmTurnOutcome;
 
 /// Outcome of the project-command phase of one proposal round.
 pub(super) enum CustomToolPhase {
@@ -49,7 +50,7 @@ struct InvocationAnswer {
 /// join the turn journal and one answer round is requested, so the model
 /// continues from the real output.
 pub(super) async fn run_custom_tool_phase(
-    ctx: &mut PhaseContext<'_>,
+    ctx: &mut TurnKernel<'_>,
     step: ProposalStep,
 ) -> anyhow::Result<CustomToolPhase> {
     let invocations: Vec<(String, Value)> = step
@@ -67,13 +68,11 @@ pub(super) async fn run_custom_tool_phase(
     // Project commands and discovery share one round budget: both widen what the
     // model knows and both cost a provider round trip, so a turn that keeps
     // asking for either without proposing a change is stopped deterministically.
-    if ctx.rounds_used >= ctx.options.max_discovery_rounds {
+    let Some(round) = ctx.spend_investigation_round() else {
         return Ok(CustomToolPhase::Terminate(Box::new(
             finish_budget_exhausted(ctx).await,
         )));
-    }
-    ctx.rounds_used += 1;
-    let round = ctx.rounds_used;
+    };
 
     log_fsm_phase(
         ctx.workflow_name,
@@ -132,23 +131,7 @@ pub(super) async fn run_custom_tool_phase(
     // The invocation output is answered through the journal, so the answer round
     // extends the previous request instead of reshaping the cached prefix.
     let round_prompt = ctx.journal.compose_user_prompt(ctx.prompt, None);
-    let next = propose(
-        ctx.provider,
-        ctx.model,
-        ctx.protocol,
-        ctx.history_manager,
-        &*ctx.context_manager,
-        ctx.workflow_name,
-        ctx.stream_tx,
-        ctx.cancel_rx,
-        ctx.options,
-        &mut *ctx.input_cache,
-        ctx.state,
-        ctx.intent,
-        &round_prompt,
-        None,
-    )
-    .await?;
+    let next = ctx.propose(&round_prompt, None).await?;
 
     if next.is_cancelled {
         let _ = ctx.stream_tx.send(StreamEvent::Done).await;
@@ -321,7 +304,7 @@ fn render_stream(text: &str, max_feedback_chars: usize) -> Option<String> {
 }
 
 /// Builds the outcome of a turn interrupted while a project command ran.
-fn cancelled_turn(ctx: &mut PhaseContext<'_>) -> FsmTurnOutcome {
+fn cancelled_turn(ctx: &mut TurnKernel<'_>) -> FsmTurnOutcome {
     FsmTurnOutcome {
         assistant_text: std::mem::take(&mut ctx.accumulated_text),
         result: ModelResult::Answer {
@@ -339,7 +322,7 @@ fn cancelled_turn(ctx: &mut PhaseContext<'_>) -> FsmTurnOutcome {
 
 /// Finalizes the turn when the shared investigation budget is exhausted and the
 /// model keeps asking for more knowledge instead of proposing a change.
-async fn finish_budget_exhausted(ctx: &mut PhaseContext<'_>) -> FsmTurnOutcome {
+async fn finish_budget_exhausted(ctx: &mut TurnKernel<'_>) -> FsmTurnOutcome {
     tracing::warn!(
         workflow = ctx.workflow_name,
         model = %ctx.model,
@@ -365,6 +348,7 @@ async fn finish_budget_exhausted(ctx: &mut PhaseContext<'_>) -> FsmTurnOutcome {
             )),
             changed_files: Vec::new(),
             commit_hash: None,
+            verification: None,
         },
     };
     finish_turn(

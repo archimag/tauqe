@@ -119,7 +119,8 @@ impl TurnInputCache {
 
     /// Returns the interaction records frozen at the start of the turn.
     ///
-    /// An isolated step never injects history and freezes an empty snapshot.
+    /// A regime that suppresses session history never injects it and freezes an
+    /// empty snapshot: an isolated step and an Architect synthesis both qualify.
     /// For regular turns the first call reads the session records off the
     /// executor thread and freezes them; every later round reuses that exact
     /// vector without hitting disk or re-parsing JSONL records. The freeze is
@@ -146,7 +147,7 @@ impl TurnInputCache {
         history_manager: &HistoryManager,
         intent: TurnIntent,
     ) -> HistorySnapshot {
-        if intent.is_isolated_step() {
+        if intent.suppresses_session_history() {
             return HistorySnapshot::default();
         }
 
@@ -227,7 +228,7 @@ impl TurnInputCache {
     /// The first call reads `tauqe.toml` and, when the project declares a task
     /// runner, runs the runner's dump once. Every later phase of the turn —
     /// staging, the declared post-hook, verification, and project commands —
-    /// reads this snapshot through `PhaseContext::project`, so a patch retry or
+    /// reads this snapshot through `TurnKernel::project`, so a patch retry or
     /// a healing round never spawns the runner again.
     pub(super) async fn project(
         &mut self,
@@ -459,6 +460,20 @@ mod tests {
             .is_none());
         assert!(cache
             .history_snapshot(&history_manager, TurnIntent::IsolatedStep)
+            .await
+            .is_none());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn architect_synthesis_freezes_none_history() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        let mut history_manager = HistoryManager::new(root);
+        history_manager.record_turn("Prompt", vec![]).unwrap();
+
+        let mut cache = TurnInputCache::default();
+        assert!(cache
+            .history_snapshot(&history_manager, TurnIntent::ArchitectSynthesis)
             .await
             .is_none());
     }

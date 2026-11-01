@@ -700,6 +700,73 @@ mod tests {
         assert_eq!(rejected, 9, "a busy worker must reject without waiting");
     }
 
+    /// Proves the contract every hoisted call site relies on: the blocking
+    /// native round trip runs on the blocking pool, so the event loop keeps
+    /// processing frames while the paste buffer is read.
+    ///
+    /// The fixture proves the interleaving instead of assuming it. The
+    /// clipboard job parks on the worker until a concurrently scheduled frame
+    /// task has painted, and only then answers with the pasted text. A read
+    /// performed on the caller's own task would block that frame forever and
+    /// fail both assertions below.
+    #[tokio::test]
+    async fn test_awaited_paste_read_keeps_the_event_loop_processing() {
+        let worker = spawn_test_worker();
+        let job_started = Arc::new(AtomicBool::new(false));
+        let frame_painted = Arc::new(AtomicBool::new(false));
+
+        let read = {
+            let job_started = Arc::clone(&job_started);
+            let frame_painted = Arc::clone(&frame_painted);
+            run_bounded_async(
+                move || {
+                    run_worker_job(
+                        &worker,
+                        move |_clipboard: &mut ClipboardHandle| {
+                            job_started.store(true, Ordering::Release);
+                            // Park until the event loop proves it is still
+                            // running. The deadline stays well below the
+                            // caller's timeout, so a regressed implementation
+                            // fails the assertions instead of hanging.
+                            let deadline = std::time::Instant::now() + NATIVE_CLIPBOARD_TIMEOUT / 4;
+                            while !frame_painted.load(Ordering::Acquire)
+                                && std::time::Instant::now() < deadline
+                            {
+                                std::thread::sleep(Duration::from_millis(1));
+                            }
+                            Some("pasted".to_string())
+                        },
+                        None,
+                    )
+                },
+                None,
+            )
+        };
+
+        let frame = tokio::spawn({
+            let job_started = Arc::clone(&job_started);
+            let frame_painted = Arc::clone(&frame_painted);
+            async move {
+                while !job_started.load(Ordering::Acquire) {
+                    tokio::task::yield_now().await;
+                }
+                frame_painted.store(true, Ordering::Release);
+            }
+        });
+
+        let paste = read.await;
+        frame.await.expect("the frame task never fails");
+
+        assert_eq!(
+            paste,
+            Some("pasted".to_string()),
+            "the awaited read returns the worker answer"
+        );
+        assert!(
+            frame_painted.load(Ordering::Acquire),
+            "the event loop processed a frame while the clipboard read was in flight"
+        );
+    }
     /// The awaited accessors degrade to `None` on a headless host instead of
     /// panicking, exactly like the synchronous ones.
     #[tokio::test]

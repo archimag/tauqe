@@ -1,9 +1,15 @@
 //! Path normalization shared by the discussion wire payloads.
+//!
+//! Every wire boundary applies the same rules: a request whose path cannot
+//! identify a location inside the repository is dropped instead of being
+//! forwarded to the engine. `context_requests`, `repo_maps`, `dir_lists`, and
+//! `repo_searches` therefore all decode through the shared normalizers of this
+//! module rather than through per-field logic of their own.
 
 use serde::Deserialize;
 
 use crate::context::ContextAccess;
-use crate::discussion::{DirListRequest, DiscussionContextRequest};
+use crate::discussion::{DirListRequest, DiscussionContextRequest, RepoSearchRequest};
 use crate::edit::normalize_repo_path;
 
 pub(crate) fn deserialize_null_as_default<'de, D, T>(deserializer: D) -> Result<T, D::Error>
@@ -15,14 +21,15 @@ where
     Ok(opt.unwrap_or_default())
 }
 
-/// Normalizes a single targeted repository map request.
+/// Normalizes a single repository-path request of the model-output boundary.
 ///
-/// An empty path, `.`, or `./` names the whole repository and normalizes to an
-/// empty string. Any other path is validated through [`normalize_repo_path`],
-/// so a request can never address a location outside the repository; such a
-/// path yields `None` and the request is dropped. This is the crate's single
-/// shared normalizer for map requests, so every wire boundary applies the same
-/// rules.
+/// One rule serves every discovery list alike: the targeted repository map
+/// requests, the directory listings, and the repository searches. An empty
+/// path, `.`, or `./` names the whole repository and normalizes to an empty
+/// string. Any other path is validated through [`normalize_repo_path`], so a
+/// request can never address a location outside the repository; such a path
+/// yields `None` and the request is dropped. This is the crate's single shared
+/// normalizer for these paths, so every wire boundary applies the same rules.
 pub fn normalize_repo_map_path(raw: &str) -> Option<String> {
     let trimmed = raw.trim().trim_matches('`').trim();
     if trimmed.is_empty() || trimmed == "." || trimmed == "./" {
@@ -69,6 +76,26 @@ where
         .collect())
 }
 
+/// Deserializes the `repo_searches` field of
+/// [`DiscussionResponse`](crate::discussion::DiscussionResponse).
+///
+/// A `null` payload yields an empty list, and every entry is normalized through
+/// [`RepoSearchRequest::normalized`], so a directly decoded response can no
+/// longer carry an unvalidated or escaping search path.
+pub(crate) fn deserialize_repo_search_requests<'de, D>(
+    deserializer: D,
+) -> Result<Vec<RepoSearchRequest>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let requests = Option::<Vec<RepoSearchRequest>>::deserialize(deserializer)?;
+    Ok(requests
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(RepoSearchRequest::normalized)
+        .collect())
+}
+
 /// Deserializes the `context_requests` field of
 /// [`DiscussionResponse`](crate::discussion::DiscussionResponse), normalizing
 /// every path through [`normalize_repo_path`].
@@ -102,7 +129,7 @@ where
 mod tests {
     use super::*;
     use crate::context::ContextAccess;
-    use crate::discussion::{DirListRequest, DiscussionResponse};
+    use crate::discussion::{DirListRequest, DiscussionResponse, RepoSearchRequest};
 
     #[test]
     fn test_discussion_response_normalizes_context_request_paths() {
@@ -215,5 +242,50 @@ mod tests {
         assert_eq!(shallow, DirListRequest::new("src", false));
         let json = serde_json::to_string(&DiscussionResponse::new("x")).unwrap();
         assert!(!json.contains("dir_lists"));
+    }
+
+    #[test]
+    fn test_discussion_repo_searches_normalize_paths() {
+        let raw = r#"{
+            "message": "Search the subsystem",
+            "repo_searches": [
+                {"path": "./crates/core/", "regex": "fn run"},
+                {"path": ".", "regex": "pub fn"},
+                {"path": "../escape", "regex": "secret"},
+                {"path": "/etc/passwd", "regex": "root"}
+            ]
+        }"#;
+        let resp: DiscussionResponse = serde_json::from_str(raw).unwrap();
+        // `./` collapses, `.` names the repository root, and the traversal and
+        // absolute entries are dropped instead of escaping the repository.
+        assert_eq!(resp.repo_searches.len(), 2);
+        assert_eq!(resp.repo_searches[0].path, "crates/core");
+        assert_eq!(resp.repo_searches[0].regex, "fn run");
+        assert_eq!(resp.repo_searches[1].path, "");
+        assert_eq!(resp.repo_searches[1].regex, "pub fn");
+
+        // A `null` payload still yields an empty list.
+        let null_resp: DiscussionResponse =
+            serde_json::from_str(r#"{"message":"x","repo_searches":null}"#).unwrap();
+        assert!(null_resp.repo_searches.is_empty());
+
+        // The builder applies the same normalization as the decoder.
+        let built = DiscussionResponse::new("x").with_repo_searches(vec![
+            RepoSearchRequest::new("./crates/core/", "fn run"),
+            RepoSearchRequest::new("../escape", "secret"),
+        ]);
+        assert_eq!(
+            built.repo_searches,
+            vec![RepoSearchRequest::new("crates/core", "fn run")]
+        );
+
+        // An accepted request survives a full round-trip unchanged.
+        let valid = RepoSearchRequest::new("crates/protocol", r"pub fn \w+");
+        let encoded = serde_json::to_string(
+            &DiscussionResponse::new("x").with_repo_searches(vec![valid.clone()]),
+        )
+        .unwrap();
+        let decoded: DiscussionResponse = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(decoded.repo_searches, vec![valid]);
     }
 }

@@ -5,13 +5,12 @@
 //! stable UUIDv7 identifier and the identifier of the group that produced it,
 //! while the post-analysis layer classifies the findings by reference instead
 //! of rewriting them. The group itself is the operational unit of remediation:
-//! it owns the unified subplan synthesized for its root cause, so the symptoms
-//! of one cause are fixed by one coherent change set.
+//! it owns the unified implementation horizon synthesized for its root cause, so
+//! the symptoms of one cause are fixed by one coherent change set.
 
 use serde::{Deserialize, Serialize};
 
-use crate::model::ArchitectTier;
-use crate::plan::PlanItem;
+use crate::plan::PlanImplementation;
 
 /// Stable identifier of the implicit group a single-audit session audits.
 pub const DEFAULT_REVIEW_GROUP_ID: &str = "default";
@@ -36,8 +35,8 @@ pub const LOCAL_REVIEW_GROUP_TITLE: &str = "Local Issues";
 /// A simple group collects independent defects, so each of its findings is
 /// addressed by its own isolated execution. An architectural group collects
 /// manifestations of one shared root cause: its findings are symptoms, so the
-/// group is executed exclusively through its unified `subplan`, and a finding
-/// of such a group is never executed on its own.
+/// group is executed exclusively through its unified `implementation`, and a
+/// finding of such a group is never executed on its own.
 ///
 /// The class is a stored field rather than a property derived from the shape
 /// of a group `id`: a prefix is a guess, not a contract.
@@ -72,8 +71,8 @@ pub enum PostAnalysisMode {
 ///
 /// The same structure also represents a group the post-analysis derived from a
 /// shared architectural root cause: it then names that cause in `description`,
-/// collects the findings that manifest it, and owns the single subplan that
-/// resolves them all.
+/// collects the findings that manifest it, and owns the single implementation
+/// horizon that resolves them all.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct ReviewGroup {
     /// Identifier of the group, unique within a session.
@@ -97,36 +96,36 @@ pub struct ReviewGroup {
     /// member list.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
+    /// Reason this group is currently blocked, if any.
+    ///
+    /// An architectural group whose unified subplan could not be synthesized,
+    /// or whose remediation stalled on an invariant conflict, records the
+    /// diagnosis here instead of scattering it across the notes of its
+    /// findings: the blocker belongs to the group that has to resolve it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub blocked_reason: Option<String>,
+    /// Recorded resolution of the architectural decision this group posed.
+    ///
+    /// Recording a resolution clears `blocked_reason` and stamps the same note
+    /// onto the findings that depend on the decision, so a later decomposition
+    /// recognizes the decision as already made instead of reopening it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolution_notes: Option<String>,
     /// Class of this group, which decides how the group is executed.
     ///
     /// The class is stored, never derived: a simple group is executed finding
     /// by finding, while an architectural group is executed exclusively
-    /// through its unified `subplan`. A record written before the field
+    /// through its unified `implementation`. A record written before the field
     /// existed carries no class and decodes as [`ReviewGroupKind::Simple`].
     #[serde(default)]
     pub kind: ReviewGroupKind,
-    /// Unified remediation plan for the whole group.
+    /// Execution graph and decomposition provenance of the group horizon.
     ///
-    /// A root cause is fixed by one coherent change set, so the group owns a
-    /// single subplan instead of one isolated plan per manifestation. The
-    /// findings it collects stay untouched: the plan belongs to the group, and
-    /// the findings merely describe what the group manifests.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub subplan: Vec<PlanItem>,
-    /// The Architect configuration that produced `subplan`.
-    ///
-    /// Planning is the *What* role's output, so the group records which
-    /// Architect model, at which reasoning depth, decomposed it. A later
-    /// replanning wave reads this back instead of re-deriving a configuration.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub subplan_architect: Option<ArchitectTier>,
-    /// Identifier of the sub-step whose horizon was most recently reprojected.
-    ///
-    /// Mirrors `Plan::last_replanned_step`, so a repeated failure of the same
-    /// sub-step is recognized from persisted state and escalates the Architect
-    /// exactly once per failed step.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub subplan_last_replanned_step: Option<String>,
+    /// A root cause is fixed by one coherent change set, so the group owns one
+    /// [`PlanImplementation`] instead of one isolated plan per manifestation.
+    /// The findings it collects stay untouched: the horizon belongs to the
+    /// group, and the findings merely describe what the group manifests.
+    pub implementation: PlanImplementation,
 }
 
 impl ReviewGroup {
@@ -144,10 +143,10 @@ impl ReviewGroup {
             paths,
             prompt: None,
             description: None,
+            blocked_reason: None,
+            resolution_notes: None,
             kind: ReviewGroupKind::Simple,
-            subplan: Vec::new(),
-            subplan_architect: None,
-            subplan_last_replanned_step: None,
+            implementation: PlanImplementation::default(),
         }
     }
 }
@@ -155,8 +154,8 @@ impl ReviewGroup {
 /// A cluster of findings that share one architectural root cause.
 ///
 /// The cluster is the operational unit of remediation: one root cause is fixed
-/// by one coherent change set, so the group owns a unified subplan instead of
-/// leaving every symptom to be fixed in isolation.
+/// by one coherent change set, so the cluster owns a unified implementation
+/// horizon instead of leaving every symptom to be fixed in isolation.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct ArchitecturalIssueGroup {
     /// Identifier of the cluster, unique within one post-analysis layer.
@@ -171,28 +170,13 @@ pub struct ArchitecturalIssueGroup {
     /// Identifiers of the findings in this cluster.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub issue_ids: Vec<String>,
-    /// Unified remediation plan for every finding of the cluster.
+    /// Execution graph and decomposition provenance of the cluster horizon.
     ///
-    /// A root cause is fixed by one coherent change set, so the group owns a
-    /// single subplan instead of one isolated plan per symptom. The findings it
-    /// references stay untouched: the plan belongs to the cluster, and the
-    /// findings merely describe what the cluster manifests.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub subplan: Vec<PlanItem>,
-    /// The Architect configuration that produced `subplan`.
-    ///
-    /// Planning is the *What* role's output, so the group records which
-    /// Architect model, at which reasoning depth, decomposed it. A later
-    /// replanning wave reads this back instead of re-deriving a configuration.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub subplan_architect: Option<ArchitectTier>,
-    /// Identifier of the sub-step whose horizon was most recently reprojected.
-    ///
-    /// Mirrors `Plan::last_replanned_step`, so a repeated failure of the same
-    /// sub-step is recognized from persisted state and escalates the Architect
-    /// exactly once per failed step.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub subplan_last_replanned_step: Option<String>,
+    /// A root cause is fixed by one coherent change set, so the cluster owns one
+    /// [`PlanImplementation`] instead of one isolated plan per symptom. The
+    /// findings it references stay untouched: the horizon belongs to the
+    /// cluster, and the findings merely describe what the cluster manifests.
+    pub implementation: PlanImplementation,
 }
 
 /// The post-analysis layer of a session.

@@ -314,6 +314,15 @@ and `y` only place content in the clipboard, while a mass clear requires `Shift+
 a confirmation whose default focus is `Cancel`. A view with nothing to clear leaves
 `Shift+C` unbound rather than borrowing a destructive chord for a copy.
 
+The same chords address a review group when the cursor rests on its header, because a
+group is the operational unit of remediation. `d` anchors the dialogue on the shared root
+cause, `t` / `s` open that dialogue in the resolution vocabulary that records the
+engineering decision, `f` sets the focus without opening the prompt, and `x` runs the
+group root-cause plan. A group stopped by an unresolved question is badged `[BLOCKED]` on
+its header, and unfolding it opens with the architectural fork — the diagnosis, the chords
+that reach its resolution, and the decision already recorded — before the root cause
+description.
+
 ### 3.3 Dialog interaction
 
 - `Tab` and `Shift+Tab` cycle focus, `←` / `→` step between adjacent buttons, and
@@ -337,6 +346,10 @@ a confirmation whose default focus is `Cancel`. A view with nothing to clear lea
 - Status is assigned intentionally through a status dialog (Plans: discussion, todo, in
   progress, done, blocked, cancelled; Review: discussion, todo, in progress, fixed,
   rejected), never by an accidental cycle.
+- A review group has no status of its own to cycle: `t` / `s` on its header open the
+  resolution form, and the decision it records — the status, the reasoning, and the agreed
+  remediation — is applied by the structured payload of that round, so the persisted
+  session and the dialogue can never diverge.
 
 ### 3.4 The three-way batch stop
 
@@ -370,10 +383,14 @@ A single interactive turn notifies as soon as it finishes. A batch does not: one
 runs many steps and the developer waits for the whole queue, so intermediate steps raise
 no banner and the supervisor emits exactly one typed completion event carrying the final
 status (`Completed`, `Failed`, `Blocked`, `Cancelled`, or `Stopped`), the executed versus
-scheduled counts, and the elapsed time. Delivery is gated by the workstation file
-(`sound`, `desktop`, `desktop_protocol`, `only_unfocused`, `min_duration_seconds`, and an
-optional `command` hook), so batching changes *when* the signal fires, never *how* it is
-delivered.
+scheduled counts, the elapsed time, and the counters of the night run: the findings the
+queue repaired, the findings the readiness gate deferred for an engineering decision, and
+the members that failed locally while the queue continued. Delivery is gated by the
+workstation file (`sound`, `desktop`, `desktop_protocol`, `only_unfocused`,
+`min_duration_seconds`, and an optional `command` hook), so batching changes *when* the
+signal fires, never *how* it is delivered. A run that repaired a dozen findings and
+stopped short on one group therefore explains itself in a single banner instead of a
+per-step stream.
 
 ### 3.7 Terminal restoration
 

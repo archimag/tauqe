@@ -79,7 +79,14 @@ input. Verifying before the generator runs checks a tree that is not final.
     guidance, and the strategy-dependent diagnostics are read from one strategy
     profile, so no consumer restates them and no two surfaces can disagree about
     what a change entry carries.
-
+13. **A directory moves as one atomic member.** A directory rename names the
+    source directory and the destination directory and never enumerates the files
+    it relocates: the staging engine expands it into the per-file moves of the
+    tracked files under the source. A destination inside the source, a source that
+    holds no tracked file, and a destination that already exists are refused
+    before the first file moves, the trusted boundaries are asked on both sides of
+    every expanded pair, and a refusal restores every path the member addressed,
+    so no half-moved directory survives.
 ---
 
 ## 2. Mental Model & Ontology ("What")
@@ -115,7 +122,10 @@ input. Verifying before the generator runs checks a tree that is not final.
   contributes: the fields that address a replaced range, the schema descriptions
   and prompt instructions that name them, the contract invariant of a
   replacement, and the wording of its diagnostics.
-
+- **Directory move** — one change entry that names a source directory and a
+  destination directory and relocates the whole subtree between them. The entry
+  carries no line range and no payload: the files it moves are the tracked files
+  the engine finds under the source, never a list the model enumerates.
 ### 2.3 Exactly one formatting surface
 
 Formatting has a single contour: the declared `[project.format]` filter rewrites
@@ -123,6 +133,9 @@ staged content on its way from virtual staging to disk. There is no second pass 
 the working tree, so a formatter can never introduce a diff the turn did not propose,
 and no compensation layer has to restore verified content afterwards.
 
+The filter runner and the atomic commit of the staged change set live in
+`crates/tools/src/edits/`; the engine resolves the declaration and hands the
+substrate the staged text.
 ### 2.4 The change set is the single truth of a turn
 
 Verification, the final commit, and the reported result all read one list. It is
@@ -164,16 +177,18 @@ XML or Structured Output JSON, the same two strategies are available: the transp
 decides the encoding of a change, the strategy decides the fields that address its
 range.
 
+A directory move names two directories and no lines, so it addresses no replaced
+range at all: both strategies accept it, and neither expects a range or a payload
+for it.
 An anchor is a permutation of the line index seeded by the file's repository
 path, not a counter. Neighbouring lines produce unrelated tokens, and the same
 line of two files carries unrelated tokens too, so the model cannot count its
 way to a line and has to copy the token from the context block of the very file
-it edits. Resolution happens during in-memory staging,
-before formatting and before any byte reaches disk: every range is validated
-against one snapshot of the file, and the validated ranges are applied from the
-bottom of the file upwards, so replacing a lower range never moves the lines a
-higher range already named.
-higher range already named.
+it edits. Resolution happens during in-memory staging, before formatting and
+before any byte reaches disk: every range is validated against one snapshot of
+the file, and the validated ranges are applied from the bottom of the file
+upwards, so replacing a lower range never moves the lines a higher range already
+named.
 
 ### 2.6 One owner for the strategy vocabulary
 
@@ -304,7 +319,11 @@ unverified instead of running a command nobody declared.
   same change set already addresses is rejected during in-memory staging. The
   diagnostic names the file, the anchor, and the file's line count, so the model
   repairs the range within the turn instead of aborting it.
-- **Format failure** — the authored content is kept and the turn continues.
+- **Directory move refusal** — a destination that already holds a file, a source
+  that names no directory or holds no tracked file, and a destination inside the
+  source are reported during in-memory staging. The diagnostic names the
+  offending path, so the model chooses a free destination within the same turn
+  and nothing moves until the whole subtree is accepted.- **Format failure** — the authored content is kept and the turn continues.
 - **No declared formatter** — the file is written exactly as authored; this is the
   normal outcome for documentation and configuration.
 - **Post-hook failure** — the change set is aborted and the turn fails with the
@@ -325,7 +344,27 @@ Every phase is one invocation with a wall-clock budget, an isolated process grou
 a teardown that reaps the child. A formatter that spawns a compiler, a hook that spawns
 a generator, and a verification command that spawns a test binary are torn down together
 when the budget expires or the developer cancels.
+### 3.8 Directory moves
 
+A directory move is expressed as one operation, never as a list of files. The
+entry names the source directory and the destination directory, and the staging
+engine expands it into the per-file moves of the tracked files under the source.
+The expansion lives in `crates/tools/src/edits/staging.rs`.That expansion set is deliberate: an ignored artifact inside the subtree is not
+part of the repository, so a build directory never travels with the rename.
+
+The whole expansion is one atomic member of the change set. A source that names
+no directory, a source directory that holds no tracked file, a destination inside
+the source, and a destination that already holds a file are all refused before
+the first file stages, and the refusal restores every path the member addressed.
+The trusted boundaries are asked on both sides of every expanded pair, so a move
+can neither carry a protected file out of the directory that guards it nor drop
+one into it.
+
+The commit writes the destinations, records the removals through the Git index,
+and prunes the source directories the change set emptied, so a rename reaches Git
+as one change instead of a leftover empty directory tree. Because the member is
+atomic, a cancelled or failed turn rolls the whole subtree back: the sources
+return and the destinations disappear together.
 ---
 
 ## 4. Boundaries & Anti-Patterns ("What it is NOT")
@@ -350,7 +389,10 @@ when the budget expires or the developer cancels.
   into the wire schema, the prompt, the retry request, and the diagnostics, so no
   consumer infers it from text it was parsing or from the shape of a change set it
   received.
-- **It is not a post-verification disk pass.** Formatting runs once, before the
+- **It is not a recursive file enumeration.** A directory move names two
+  directories, and the engine expands the subtree from the tracked files it owns.
+  The model never lists the files it moves, so the operation stays one atomic
+  member instead of a list of independent renames.- **It is not a post-verification disk pass.** Formatting runs once, before the
   change set reaches disk; nothing reformats a verified tree afterwards, so no
   compensation layer has to restore it.
 - **It is not an escape hatch around ignore rules.** A path the repository ignore

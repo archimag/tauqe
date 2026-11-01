@@ -156,6 +156,22 @@ pub(super) async fn handle_execute_review_dialog(
             Ok(Some(InputResult::Continue))
         }
         _ => {
+            if target.focus.is_instructions_editor()
+                && target.instructions_editor.takes_yank_chord(key, is_cmd)
+            {
+                // The paste buffer is a native round trip bounded at
+                // NATIVE_CLIPBOARD_TIMEOUT, so it is read with the state guard
+                // released and the answer is applied after the re-lock (c-1).
+                st.confirm_execute_review = Some(target);
+                drop(st);
+                let clipboard = crate::clipboard::get_from_clipboard_async().await;
+                let mut st = state.lock().await;
+                if let Some(mut target) = st.confirm_execute_review.take() {
+                    target.instructions_editor.yank_with(clipboard);
+                    st.confirm_execute_review = Some(target);
+                }
+                return Ok(Some(InputResult::Continue));
+            }
             if target.focus.is_instructions_editor() {
                 crate::input::handle_editor_key(&mut target.instructions_editor, key, is_cmd, true);
             }
@@ -202,8 +218,8 @@ mod tests {
     }
 
     /// Finding-level point target: it names the finding itself, so it never
-    /// carries a subplan step — a step id travels only with a group target
-    /// (c-4, c-5).
+    /// carries an implementation step — a step id travels only with a group
+    /// target (c-4, c-5).
     fn state_with_target() -> AppState {
         let mut st = test_state();
         st.view_mode = ViewMode::Review;
@@ -212,8 +228,8 @@ mod tests {
             "Session rev-1".to_string(),
             "Finding 1".to_string(),
             Some(1),
-            // A finding-level target names the finding itself; a subplan step
-            // travels only together with a group target (c-4, c-5).
+            // A finding-level target names the finding itself; an implementation
+            // step travels only together with a group target (c-4, c-5).
             None,
             vec![finding(1)],
             vec![coder("coder-a"), coder("coder-b")],
@@ -278,7 +294,7 @@ mod tests {
         assert!(payload.contains("\"item_id\":1"), "{payload}");
         assert!(
             !payload.contains("\"step_id\""),
-            "a finding-level target never carries a subplan step: {payload}"
+            "a finding-level target never carries an implementation step: {payload}"
         );
 
         let guard = state.lock().await;

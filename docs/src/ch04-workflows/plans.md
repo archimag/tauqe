@@ -48,8 +48,8 @@ Roles and the Coder Ladder* owns that boundary. A plan is where it becomes visib
    files changed, or be regressed to an earlier status.
 6. **Completed work is preserved, uncompleted work is replaceable.** Synthesis
    splices a new horizon onto the verified foundation instead of editing it.
-7. **The server owns the queue.** Step statuses and advancement belong to the
-   daemon, not to a client that can disconnect.
+7. **The daemon owns the queue.** Step statuses and advancement belong to the
+   server-side pipeline, not to a client that can disconnect.
 8. **A plan refuses to guess.** An unsatisfiable precondition is reported as a
    blocker, never repaired by silently weakening the requirement.
 9. **A step never renegotiates its decision.** The Architect fixed *what* the step
@@ -60,6 +60,10 @@ Roles and the Coder Ladder* owns that boundary. A plan is where it becomes visib
 10. **Verification is not model-configurable.** A scope is gated before its first
     turn, and each turn is verified by the project toolchain, not by a model's
     opinion.
+11. **The step graph is one shared structure.** A plan, an architectural review
+    group, and a single review finding execute the same `PlanImplementation`, so
+    readiness, aggregation, leaf normalization, and dependency validation are
+    defined once and cannot drift between workflows.
 
 ---
 
@@ -72,26 +76,45 @@ A plan is a two-section document:
 | Section | Content | Mutability during synthesis |
 | --- | --- | --- |
 | **Concept tree** (`concept`) | nested architectural nodes: requirements, invariants, boundaries | immutable input |
-| **Implementation tree** (`items`) | status-bearing steps with dependencies, concept references, and leaf files | replaceable above the `Done` foundation |
+| **Implementation horizon** (`implementation`) | the step graph (`items`) with dependencies, leaf files, and decomposition provenance | replaceable above the `Done` foundation |
 
 ```text
 plan
 ├── concept            # the "what": nested, never executed
 │   ├── protocol shape
 │   └── storage invariants
-└── items              # the "how": ordered, DAG-linked, leaf-executable
-    ├── [Done]        add the wire type            (done foundation)
-    ├── group         persist and publish          (container, no files)
-    │   ├── [Todo]    write the storage layer
-    │   └── [Todo]    wire the RPC handler
-    └── [Todo]        cover it with tests
+└── implementation     # the "how": the step graph and its provenance
+    ├── items          # ordered, DAG-linked, leaf-executable
+    │   ├── [Done]     add the wire type            (done foundation)
+    │   ├── group      persist and publish          (container, no files)
+    │   │   ├── [Todo] write the storage layer
+    │   │   └── [Todo] wire the RPC handler
+    │   └── [Todo]     cover it with tests
+    ├── architect      # the model and effort that produced this horizon
+    └── last_replanned_step
 ```
+
+`implementation` is a plain nested field, and `PlanImplementation` is the single owner
+of the step graph and of its provenance. Every graph query is a method of that
+structure — readiness by dependency, aggregate status, leaf progress, leaf-only file
+normalization, structural validation — so no consumer restates the algebra and no two
+workflows can disagree about what a ready step is.
+
+The nested form is the only accepted shape. The field carries neither `serde(flatten)`
+nor `serde(default)`, so a document written in the former flat layout fails to decode
+instead of being silently read as a plan without steps. There is no migration path, and
+the legacy `subplan*` names of a review group are not resurrected either (*Structured
+Code Review* §2.1).
 
 ### 2.2 Terms
 
 - **Plan** — the persisted document: identity (`id`), `title`, `description`, the
-  concept tree, the implementation tree, and the recorded Architect provenance of
-  the current horizon.
+  concept tree, and the nested `implementation` that owns the step graph together with
+  the recorded Architect provenance of the current horizon.
+- **Step graph (`PlanImplementation`)** — the nested structure holding `items`, the
+  `architect` configuration that produced the horizon, and `last_replanned_step`. It is
+  the single source of truth for every graph query, and a review group owns the same
+  structure, so a plan step and a group step are evaluated by one algebra.
 - **Concept item** — a node of the concept tree; it carries intent and may nest,
   but it is never scheduled, never verified, and never binds files.
 - **Plan item** — a node of the implementation tree. It carries a status, its
@@ -106,9 +129,10 @@ plan
 - **Horizon** — the uncompleted remainder of the implementation tree. It is
   replaceable as a whole.
 - **Scope** — the requested execution set: one leaf, one group, or the entire plan.
-- **Provenance** — the Architect configuration (model plus optional reasoning
-  effort) that produced the current horizon, recorded on the plan so a later wave
-  can reproduce or escalate it.
+- **Provenance** — the Architect configuration (model plus optional reasoning effort)
+  that produced the current horizon, recorded as `implementation.architect` together
+  with `implementation.last_replanned_step`, so a later wave reproduces or escalates
+  that configuration instead of re-deriving one.
 
 ### 2.3 Status vocabulary
 
@@ -123,6 +147,10 @@ work is the storage-level immutability check, not the cycler.
 
 - **One file per plan.** `.tauqe/plans/{id}.json`, so one damaged document cannot
   corrupt another.
+- **Canonical nested shape.** The horizon travels under `implementation` with its
+  provenance, in the single form described in §2.1. A file written in the former flat
+  layout is reported as a decode failure rather than migrated, so a stale document never
+  reaches execution as a plan without steps.
 - **Active pointer.** `.tauqe/plans/active` records the last inspected plan, so a
   client reconnect restores the developer's context. It is a view pointer only and
   never steers a mutation.
@@ -143,14 +171,23 @@ Planning and execution are different regimes and use different wire contours:
 
 Declaring the message first lets the interface stream the rationale while the
 plan payload is still arriving. A discussion touches a plan only when the
-developer explicitly asks for a change; the payload carries the intent, so nothing
-is inferred from the wording of a prompt. The turn renders the composite response
-schema of the capability registry, so the discussion message and the plan payload
-travel together in every contour and the plan change keeps one shape. Its regime
-delta — the plan mutation capability that a plan discussion adds to the shared
-dialogue surface — travels in the leading block of the turn's trailing message,
-ahead of the plan snapshot itself, so refining the payload never moves the
-byte-stable head
+developer explicitly asks for a change; the payload carries the requested change,
+so the action is never inferred from the wording of a prompt. The turn renders
+the composite response schema of the capability registry, so the discussion
+message and the plan payload travel together in every contour and the plan change
+keeps one shape.
+
+Plan mutation belongs to exactly one turn regime. Whatever the contour, decoding
+narrows the advertised set to the capability surface of the declared intent: a
+dialogue anchored on a plan is mapped onto `TurnIntent::PlanDiscussion` and gains
+the plan-mutation delta that a plan discussion adds to the shared dialogue
+surface, while an interactive dialogue carries the dialogue head without plan
+mutation, whatever focus anchor is active. Asking for a new plan is not mutation
+— plan creation stays in the dialogue head, so a developer may request a plan at
+any moment of a dialogue, while changing an existing plan requires the
+plan-discussion regime. The delta travels in the leading block of the turn's
+trailing message, ahead of the plan snapshot itself, so refining the payload
+never moves the byte-stable head
 ([The Autonomous Bounded Turn FSM](../ch01-foundations/bounded-turn-fsm.md)).
 
 ### 2.6 The two mutation actions
@@ -242,15 +279,62 @@ conversational history and honours five rules:
   structured blocked result, which the interface presents together with an option to
   replan or to discuss the conflict.
 
-Each synthesis records its provenance — the Architect model and reasoning effort —
-on the plan. The Plans tree renders it as a compact `[ARC model effort]` badge, so
-the document itself states which *what* role produced the current horizon.
+The pass is not a loop of its own. It runs on the shared turn kernel, which owns
+the rounds, the byte-stable prompt head, the rendered repository outline, the
+discovery journal, and the corrective budget of an empty answer, while the
+structured Architect contour owns what is specific to a horizon. The domain
+framing of a synthesis — the plan identity, the immutable concept, the `Done`
+foundation, a blocked step, and the developer directives — travels in the task
+fragment of the user message, so the protocol states the response contract and
+the kernel renders the material of each round.
 
-### 3.3 Execution: scope evaluation and the server-owned queue
+A payload that violates the response schema never reaches storage. Schema
+Healing returns the decoding diagnostic to the model as the trailing directive
+of the next request and spends one generation attempt of the running rung,
+whose budget the rung declares itself. Only an exhausted rung climbs the
+architect ladder, and the promoted rung applies its own reasoning effort to
+every later round and rotates the provider session identifier with the
+effective model, so a cached prefix is never reused across a model change.
+
+The synthesis therefore ends in a typed status instead of in prose: a
+synthesized horizon, a blocker that names the contradiction, an exceeded
+context budget, or a cancellation. A saturated ladder ends it as a blocker,
+never as a fabricated horizon, and an empty `items` list beside a success
+status is refused as a protocol defect. The interface sees the pass while it
+runs: the contour reports its rounds, its promotions, and its outline size as
+kernel events, and the server bridge turns them into the turn-phase,
+model-escalation, and outline telemetry a client already renders.
+
+Each synthesis records its provenance — the rung that actually produced the
+horizon, model plus reasoning effort — on the plan, together with the step whose
+failure triggered a replanning wave. The Plans tree renders the rung as a
+compact `[ARC model effort]` badge, so the document itself states which *what*
+role produced the current horizon.
+
+### 3.3 Execution: a typed scope and one shared pipeline
 
 Execution is requested as a scope: `plan/execute` with a plan identifier and an
-optional step identifier. The server evaluates the scope, owns the queue, and
-advances from step to step.
+optional step identifier. The request resolves to `ExecutionScope::Plan { plan_id }`,
+one variant of the closed enumeration that names every source of a step graph — a
+local plan, an architectural review group, and a single review finding. The set is
+closed on purpose: exactly three workflows own a horizon, each resolves by identifier
+from the storage that owns it, and a caller never supplies a horizon of its own.
+
+The resolved frame is the stored plan itself. From there the pipeline owns the queue:
+`PlanImplementationPipeline` schedules the ready leaves over the shared `BatchExecution`
+supervisor, `PlanImplementationStepExecutor` drives one leaf, and every graph decision
+— readiness by dependency, stall classification, persistence of a status — reads and
+writes the storage that owns the horizon. Review groups and findings reach the same
+machinery through their own scope variant (*Structured Code Review* §3.7), so a step
+graph never acquires a private scheduler.
+
+**The turn seam.** The engine owns *what* a step does; the daemon owns *how* one turn
+of it executes. That boundary is one trait, `ImplementationHost`, with exactly two
+operations: `run_step` executes one bounded step turn and classifies its terminal
+outcome, while `run_refinement` executes one Architect wave that reprojects a horizon.
+Provider telemetry, usage windows, streamed events, and Git transactions live behind
+the seam and are never observed by the engine — the same rule that governs
+`ApplyPolicy` and `ProviderResolver`.
 
 Evaluation decides the outcome before anything runs:
 
@@ -282,22 +366,36 @@ refused synchronously — before any model request, before any status change, an
 zero token cost — with the compiler or test output attached. Repositories without a
 detected toolchain skip the gate transparently.
 
+The gate runs while the operation slot stays registered, and it inherits that
+operation's cancellation channel. A hard cancel or a shutdown drain therefore tears
+the verification subprocess group down instead of waiting the build out, and the
+slot is released within a bounded interval: the cancellation is answered when the
+teardown completes, not when the suite would have finished. The gate reports that
+outcome as a cancellation, never as a verification failure of a suite that never
+ran to completion.
 ### 3.5 The per-step bounded turn
 
-For each scheduled leaf the server:
+For each scheduled leaf the pipeline persists the step as `InProgress` in the storage
+that owns the horizon and hands one turn request to the seam. The daemon executes it:
 
-1. marks the step `InProgress`;
-2. preloads `files` as editable context and `readonly_files` as read-only reference
-   context, which removes discovery latency for the files the plan already names;
-3. injects the whole concept tree and the completed milestones, and suppresses the
-   conversational history so the turn reasons about the plan instead of the chat;
-4. runs one streaming bounded turn, as described in *The Autonomous Bounded Turn
-   FSM*;
-5. marks the step `Done` only if the turn succeeded — edits applied and the
-   toolchain clean — or if the model declared completion through the active
-   protocol: the terminal success tag of the XML contour, or an `outcome` field with
-   status `success` in the structured contour. A prose-only answer without edits and
-   without a protocol completion signal does not close the step.
+1. it clears the transient context layer a previous step left behind, then preloads
+   `files` as editable context and `readonly_files` as read-only reference context,
+   which removes discovery latency for the files the plan already names;
+2. it runs one streaming bounded turn under `TurnIntent::IsolatedStep`, as described in
+   *The Autonomous Bounded Turn FSM*, with the whole concept tree and the completed
+   milestones injected and the conversational history suppressed, so the turn reasons
+   about the plan instead of the chat;
+3. it classifies the terminal outcome into the failure taxonomy: a semantic block
+   travels as its own verdict so the Architect engages instead of the coder ladder, an
+   unconditional abort stops the queue without spending a wave, a change set that was
+   never rolled back is an unreverted failure, and a turn that produced no model result
+   is an infrastructure failure rather than a content verdict.
+
+The pipeline then closes the lifecycle: the step becomes `Done` only if the turn
+succeeded — edits applied and the toolchain clean — or if the model declared completion
+through the active protocol: the terminal success tag of the XML contour, or an
+`outcome` field with status `success` in the structured contour. A prose-only answer
+without edits and without a protocol completion signal does not close the step.
 
 A step reports the phases of its turn while it runs. The turn phase, the
 toolchain start, and the toolchain finish reach the interface as they happen,
@@ -337,9 +435,19 @@ place of a protocol operation.
 Between attempts the basis is reset deterministically: the failed turn's own file
 changes are rolled back by the Git workflow checkpoint, the transient auto context
 is cleared, and the stable step files are re-loaded. Each attempt therefore starts
-from the same clean basis instead of an accreted, contaminated one. The attempt
-budget is `develop.max_retries`, which is finite by design; once it is exhausted the
-step returns to `Todo` and the batch stops.
+from the same clean basis instead of an accreted, contaminated one. A reset that did
+not actually return the tree to the checkpoint is never retried over: the step
+reports the failure instead of generating against a working tree that still carries
+the previous attempt, because the next round would reason about code it did not
+write.
+
+The reprompt budget is the per-tier budget, `develop.max_tier_attempts` (3 by
+default), and not an independent counter. The step is re-asked on the same coder rung
+while that budget lasts, and only an exhausted tier lets `models.auto_level_up`
+advance the ladder, where the next rung receives a fresh budget of its own. A
+saturated ladder returns the step to `Todo` and stops the batch. The staging retries
+and healing rounds inside one attempt stay bounded by `develop.max_retries`, which is
+a different limit and escalates nothing.
 
 The terminal tag carries a dynamic per-turn marker. A marked tag is preferred, and
 an unmarked terminal tag outside Markdown code fences is accepted as a fallback when
@@ -368,6 +476,11 @@ replaces the uncompleted horizon as a whole:
 Horizon = Architect(Concept, DoneFoundation, RepositoryContext, Diagnostics)
 ```
 
+The wave itself travels through the seam: the pipeline sends a refinement request that
+names the failed step, its diagnostic, the Architect configuration of the wave, and the
+developer's directives, and `run_refinement` answers with a synthesized horizon or with
+a blocker. A synthesized result then reaches storage as one operation:
+
 1. the concept tree arrives unchanged;
 2. the `Done` foundation arrives unchanged, so it is never re-emitted;
 3. the diagnostic packet names what failed and why;
@@ -375,7 +488,9 @@ Horizon = Architect(Concept, DoneFoundation, RepositoryContext, Diagnostics)
 5. the resulting horizon is spliced atomically onto the foundation by
    `replace_uncompleted_horizon`, which preserves completed steps verbatim,
    disambiguates identifiers that collide with the foundation, and leaves no
-   orphaned prerequisite identifiers;
+   orphaned prerequisite identifiers, while the same write records the rung in
+   `implementation.architect` and the failed step in
+   `implementation.last_replanned_step`;
 6. the merged plan is validated — including dependency-cycle rejection — before it
    reaches disk, and the replanning dialogue is recorded in session history only
    after that successful persistence, so a failed attempt leaves no phantom record;
@@ -409,8 +524,10 @@ position.
 **Coder ladder escalation** is the parallel, intra-role mechanism for execution
 failures (*Model Roles and the Coder Ladder*). With `models.auto_level_up` enabled,
 a step that still fails after healing is rolled back to its pre-step checkpoint and
-restarted on the next coder rung; files found during discovery stay in context.
-Escalation never crosses the role boundary.
+re-asked on the same coder rung, up to `develop.max_tier_attempts` attempts; files
+found during discovery stay in context. Only an exhausted tier advances one rung, and
+the new rung starts with a fresh budget of its own. Escalation never crosses the role
+boundary, and it saturates: the last rung is the last attempt.
 
 ### 3.8 Just-in-time horizon synthesis
 
@@ -462,14 +579,27 @@ another under a single registered operation.
 
 Cancellation is three-way (`Continue`, `Soft Stop`, `Hard Stop`), as specified in
 *Keyboard-First Interface*, and both stop degrees act inside the running step
-rather than after it. The supervisor waits on the step and on the cancellation
-channel together, so a signal unwinds the batch immediately. Within the step the
-channel is read at every phase boundary that starts work — before the check,
-between healing rounds, before the staged result is committed — so a soft stop
-halts at the nearest boundary instead of letting the turn run to its natural
-end, and a hard stop additionally tears the verification subprocess group down.
-The interrupted step is never marked `Done` and never committed: the existing
-checkpoint transaction returns the working tree to its pre-turn state.
+rather than after it. The queue is awaited cooperatively: the supervisor hands the
+cancellation and soft-stop channels to the step and keeps awaiting it, instead of
+racing the queue against a cancellation branch and dropping the unfinished future.
+A hard cancel observed while a step runs therefore unwinds the queue through that
+step itself — the provider races the signal at every await and the toolchain tears
+its verification subprocess group down at the cancel boundary — and the operation
+slot is never released while a spawned task is still running. Dropping the future
+instead would detach the task the step had already spawned and release the slot
+together with its abort handle, leaving an unsupervised task holding the session
+lock and possibly an open Git transaction. Within the step the channel is read at
+every phase boundary that starts work — before the check, between healing rounds,
+before the staged result is committed — so a soft stop halts at the nearest
+boundary instead of letting the turn run to its natural end. The interrupted step
+is never marked `Done` and never committed: the existing checkpoint transaction
+returns the working tree to its pre-turn state.
+
+A cancel that no running phase observes on its own is resolved by the
+deferred-abort watchdog, the sanctioned force-termination path: it defers the abort
+while the task still holds an open Git transaction and aborts once that transaction
+has closed. The operation registration therefore outlives every task spawned under
+it, and the slot stays registered for as long as one of them runs.
 
 ### 3.11 Plans view commands
 
@@ -535,6 +665,11 @@ keeps naming a plan that no longer exists (*Discussion Focus* §3.4).
   in the chat.
 - **It is not a graph the client schedules.** The daemon owns statuses and
   advancement; the interface only starts a scope and renders events.
+- **It is not an owner of its own executor.** A plan, an architectural review group, and
+  a single review finding execute the same pipeline over the same step graph, so a
+  workflow never acquires a private scheduler.
+- **It is not a legacy format to migrate.** A plan document is read only in its
+  canonical nested shape, so the harness never guesses a horizon out of a stale layout.
 - **It is not deleted silently.** A plan that still carries uncompleted steps
   leaves only through the two-tier confirmation, and both tiers default to
   `Cancel`.
@@ -544,8 +679,8 @@ keeps naming a plan that no longer exists (*Discussion Focus* §3.4).
 - **It is not a local patcher.** A failed assumption reprojects the whole
   uncompleted horizon; grafting one node leaves the steps built on the broken
   assumption in place.
-- **It is not an endless retry machine.** Retries, replans, and both escalation
-  ladders are finite and configured.
+- **It is not an endless retry machine.** Retries, replans, per-tier attempts, and
+  both escalation ladders are finite and configured.
 - **It is not a design negotiation.** The architecture of a step is fixed by the
   plan. The executing turn owns the implementation and reports a conflict through
   the blocked outcome instead of substituting another design.
@@ -573,6 +708,7 @@ keeps naming a plan that no longer exists (*Discussion Focus* §3.4).
   on a plan node.
 - [Git Safety & Transactions](../ch03-project/git-transactions.md) — the checkpoint a
   blocked or failed step returns to.
-- [Structured Code Review](review.md) — the second workflow that produces plans.
+- [Structured Code Review](review.md) — the second workflow that produces plans, and
+  executes them through the same pipeline.
 - [Configuration and Project Preparation](../ch05-system/configuration.md) —
   `develop.max_retries`, `develop.max_replans`, and model roles.

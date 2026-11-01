@@ -16,6 +16,7 @@ use tauqe_protocol::{methods, DiscussionFocus};
 use tokio::sync::{Mutex, MutexGuard};
 
 use crate::app::{ActiveModal, AppState, HelpTab, LocaleDialogButton};
+use crate::dialogs::input::activate_selection_item;
 use crate::input::InputResult;
 use crate::rpc::{send_request, RpcConnection};
 
@@ -57,7 +58,7 @@ fn geometry_of(
     crate::dialogs::render::confirm_modal_geometry(
         term,
         params.width,
-        params.body_lines.len(),
+        &params.body_lines,
         &params.confirm_label,
         &params.cancel_label,
     )
@@ -1008,9 +1009,12 @@ pub async fn handle_modal_click(
                 // the dismiss path.
                 if rect_contains(apply_btn, mouse.column, mouse.row) {
                     let chosen = dialog.selector.selected_index();
-                    // The guard travels by value: the helper releases it before
-                    // the update request leaves the loop (c-1).
-                    crate::dialogs::input::apply_status_dialog(st, chosen, server_writer).await?;
+                    // The guard travels by value: the helper reverts the
+                    // optimistic mutation at the site that owns it when the
+                    // write fails, and releases the guard before the request
+                    // leaves the loop (c-1, c-3).
+                    crate::dialogs::input::apply_status_dialog(state, st, chosen, server_writer)
+                        .await?;
                 } else if rect_contains(cancel_btn, mouse.column, mouse.row) {
                     st.status_dialog = None;
                 } else if rect_contains(options_area, mouse.column, mouse.row) {
@@ -1021,8 +1025,13 @@ pub async fn handle_modal_click(
                     let clicked_row =
                         dialog.selector.scroll_offset() + (mouse.row - options_area.y) as usize;
                     if clicked_row < options_count {
-                        crate::dialogs::input::apply_status_dialog(st, clicked_row, server_writer)
-                            .await?;
+                        crate::dialogs::input::apply_status_dialog(
+                            state,
+                            st,
+                            clicked_row,
+                            server_writer,
+                        )
+                        .await?;
                     }
                 } else if !rect_contains(area, mouse.column, mouse.row) {
                     st.status_dialog = None;
@@ -1048,8 +1057,7 @@ pub async fn handle_modal_click(
                     .and_then(|dialog| dialog.selector.selected_entry())
                     .cloned();
                 if let Some(entry) = selected {
-                    crate::dialogs::input::activate_selection_item(st, entry, server_writer)
-                        .await?;
+                    activate_selection_item(state, st, entry, server_writer).await?;
                 }
                 return Ok(InputResult::Continue);
             }
@@ -1085,8 +1093,7 @@ pub async fn handle_modal_click(
                     }
                 });
                 if let Some(entry) = clicked {
-                    crate::dialogs::input::activate_selection_item(st, entry, server_writer)
-                        .await?;
+                    activate_selection_item(state, st, entry, server_writer).await?;
                 }
             }
         }

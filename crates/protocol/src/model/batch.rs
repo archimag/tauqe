@@ -39,6 +39,28 @@ pub struct BatchFinishSummary {
     pub elapsed_seconds: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    /// Findings the batch actually fixed.
+    ///
+    /// Only a queue that classifies its members reports the counter; a batch
+    /// that cannot distinguish fixed members leaves the field absent instead of
+    /// publishing an invented zero.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fixed_count: Option<usize>,
+    /// Findings of the architectural groups deferred by the unresolved-questions
+    /// gate.
+    ///
+    /// A group whose findings still carry discussion questions is not ready for
+    /// autonomous execution, so it is postponed for the developer and counted
+    /// here rather than silently dropped from the queue.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deferred_count: Option<usize>,
+    /// Members that failed locally while the queue continued.
+    ///
+    /// A best-effort traversal keeps walking after a domain failure whose Git
+    /// transaction was rolled back cleanly, so the counter separates a member
+    /// that stopped early from a queue that never reached it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failed_count: Option<usize>,
 }
 
 /// Emitted once when a plan batch supervisor terminates.
@@ -73,5 +95,64 @@ mod tests {
             let de: BatchFinishStatus = serde_json::from_str(wire).unwrap();
             assert_eq!(de, status);
         }
+    }
+    /// Builds a completed summary carrying whichever finding counters the case
+    /// under test needs, so a `None` counter stays distinguishable from zero.
+    fn summary_with_counters(
+        fixed_count: Option<usize>,
+        deferred_count: Option<usize>,
+        failed_count: Option<usize>,
+    ) -> BatchFinishSummary {
+        BatchFinishSummary {
+            owner_id: "rev-1".to_string(),
+            status: BatchFinishStatus::Completed,
+            executed_count: 4,
+            total_count: 6,
+            elapsed_seconds: 120,
+            error: None,
+            fixed_count,
+            deferred_count,
+            failed_count,
+        }
+    }
+
+    #[test]
+    fn test_batch_finish_summary_serializes_the_finding_counters() {
+        let summary = summary_with_counters(Some(2), Some(1), Some(1));
+        let json = serde_json::to_value(&summary).unwrap();
+
+        assert_eq!(json["fixed_count"], serde_json::json!(2));
+        assert_eq!(json["deferred_count"], serde_json::json!(1));
+        assert_eq!(json["failed_count"], serde_json::json!(1));
+
+        let decoded: BatchFinishSummary = serde_json::from_value(json).unwrap();
+        assert_eq!(decoded, summary);
+    }
+
+    #[test]
+    fn test_batch_finish_summary_omits_absent_finding_counters() {
+        let summary = summary_with_counters(None, None, None);
+        let json = serde_json::to_value(&summary).unwrap();
+        let object = json.as_object().unwrap();
+        for key in ["fixed_count", "deferred_count", "failed_count"] {
+            assert!(
+                !object.contains_key(key),
+                "{key} must stay absent from the wire form"
+            );
+        }
+
+        // A plan batch published before the counters existed still decodes.
+        let legacy = serde_json::json!({
+            "owner_id": "plan-1",
+            "status": "completed",
+            "executed_count": 2,
+            "total_count": 2,
+            "elapsed_seconds": 30,
+        });
+        let decoded: BatchFinishSummary = serde_json::from_value(legacy).unwrap();
+        assert_eq!(decoded.fixed_count, None);
+        assert_eq!(decoded.deferred_count, None);
+        assert_eq!(decoded.failed_count, None);
+        assert_eq!(decoded.error, None);
     }
 }

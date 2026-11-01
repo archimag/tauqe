@@ -130,20 +130,31 @@ the number of recovery rungs.
 
 When `auto_level_up` is enabled and a bounded turn ends with an unresolved failure
 — a staging error, a verification error that healing could not repair, or a
-proposal that produced no valid edits — the harness does not repeat the same
-request and does not change the role:
+proposal that produced no valid edits — the harness keeps the role and works
+through two independent mechanisms in a fixed order: the per-tier attempt budget
+first, one rung of the ladder second.
 
-1. The failed turn's transaction is rolled back and the transient discovery context
-   is pruned, so every rung starts from the same clean pre-turn state.
-2. The turn advances exactly one rung. A rung counts as an advance whenever the
+1. The failed attempt's transaction is rolled back and the transient discovery
+   context is pruned, so every attempt starts from the same clean pre-turn state.
+2. The same rung receives the next attempt until `develop.max_tier_attempts`
+   content attempts (3 by default) are spent. Every attempt is a fresh generation
+   over a rolled-back working tree, so a failed patch never accumulates into the
+   next one.
+3. Only an exhausted tier advances the ladder, exactly one rung, and that rung
+   starts with a fresh budget of its own. A rung counts as an advance whenever the
    model *or* the reasoning depth changes, so recovery can first deepen reasoning
    on the same model and only then switch to a stronger one.
-3. The ladder saturates on its final rung, so escalation always terminates.
+4. The ladder saturates on its final rung. When that rung has spent its budget, the
+   failure is terminal for the step: it is reported as a failure or a blocker and
+   no further attempt is made.
 
-A terminal blocked report short-circuits escalation entirely: no rung is consumed
-and the failure is reported instead of retried. Plan step reprompting and review
-finding repair use the same ladder, so recovery behaves identically wherever a
-coder turn runs.
+Transport failures are not content attempts. A timeout, a reset connection, or a
+server-error status is retried by the network layer and never consumes a tier
+attempt, so a degraded link shortens no rung. A terminal blocked report
+short-circuits both mechanisms: no attempt and no rung are consumed, and the
+conflict is reported instead of retried. Plan step reprompting and review finding
+repair use the same budget and the same ladder, so recovery behaves identically
+wherever a coder turn runs.
 
 #### The level-up opt-out
 
@@ -186,6 +197,24 @@ on the same model and only then promotes to a stronger one, and the rung actuall
 used is recorded back onto the plan. Escalation saturates on the last rung; a
 recorded configuration that no longer exists in configuration restarts from the base
 rung instead of guessing a position.
+
+A structural failure is answered inside a rung, not across rungs. A horizon that
+fails schema validation, breaks off mid-output, or arrives as an incomplete JSON
+or XML structure produced no decision to escalate from, so the same architect
+configuration is asked again, within the generation budget the rung itself
+declares (`attempts`, 2 by default). Only an exhausted rung calls
+`next_architect_tier`. Transport failures consume no attempt here either: the
+network layer retries them transparently, and an empty answer is answered by the
+turn kernel's own corrective budget, so silence never charges a rung either.
+
+Escalation travels as an event rather than as prose. The contour reports the
+promoted rung — its model, its reasoning effort, and its ladder position — and
+the server bridge translates that report into `MODEL_ESCALATED`, so the
+interface renders the promotion without parsing a message. A ladder that
+saturates ends the synthesis with a typed `Blocked` outcome carrying the reason,
+and each caller renders that verdict deterministically: a plan synthesis answers
+with a blocked refine result, while a review group records the blocker on the
+group itself.
 
 Escalation is deliberately **lazy**. A first replan of a failing step is not
 evidence that the current architect configuration is inadequate; it is only evidence
@@ -328,6 +357,12 @@ the exact role-list entry the developer chose.
   provider catalog; it is never a duplicate of the configured primary models.
 - **The ladder is not an infinite retry.** It is a finite ordered list that
   saturates, so escalation has a deterministic terminus.
+- **A rung is not one attempt.** Each rung spends its own configured budget of
+  content attempts before the ladder moves, so an attempt inside a tier is neither
+  an escalation nor a repeated rung.
+- **A transport failure is not a failed attempt.** A timeout or a reset connection is
+  retried by the network layer and never burns a rung, so a degraded link cannot
+  promote a model that has not failed on content.
 - **`level_up = false` is not a ban.** The marker removes a model from
   automatic escalation only; the model stays in the role catalog and remains
   reachable through an explicit selection by hand.

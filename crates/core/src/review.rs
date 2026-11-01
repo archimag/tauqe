@@ -7,7 +7,7 @@ pub mod uuid;
 pub use crate::plan::merge_subplan;
 pub use analysis::{
     parse_post_analysis, post_analysis_response_format, post_analysis_response_schema,
-    validate_post_analysis, PostAnalysisGroupOutput, PostAnalysisOutput,
+    validate_post_analysis, PostAnalysisGroupOutput, PostAnalysisOutput, PostAnalysisTriageOutput,
 };
 pub use parser::{parse_review_findings, parse_review_output, review_findings_response_format};
 pub use prompt::{

@@ -3,12 +3,13 @@ use serde::{Deserialize, Serialize};
 use crate::context::{default_context_access, ContextAccess};
 use crate::edit::normalize_repo_path;
 use crate::plan::{ConceptItem, PlanItem};
+use crate::review::ReviewUpdateProposal;
 use normalize::{
     deserialize_context_access, deserialize_context_requests, deserialize_dir_list_requests,
     deserialize_repo_map_paths,
 };
 
-pub(crate) use normalize::deserialize_null_as_default;
+pub(crate) use normalize::{deserialize_null_as_default, deserialize_repo_search_requests};
 
 pub mod normalize;
 pub mod schema;
@@ -76,6 +77,22 @@ impl RepoSearchRequest {
             path: path.into(),
             regex: regex.into(),
         }
+    }
+
+    /// Normalizes the requested search path through the shared repository path
+    /// rules.
+    ///
+    /// An empty path, `.`, or `./` names the whole repository and normalizes to
+    /// an empty string. Any other path is validated through
+    /// [`normalize_repo_map_path`], so a repository search can never address a
+    /// location outside the repository; such a path yields `None` and the
+    /// request is dropped instead of being allowed to escape. The search
+    /// `regex` is preserved.
+    pub fn normalized(self) -> Option<Self> {
+        normalize_repo_map_path(&self.path).map(|path| Self {
+            path,
+            regex: self.regex,
+        })
     }
 }
 
@@ -162,14 +179,19 @@ impl DiscussionContextRequest {
     ///
     /// Accepts a bare repository-relative path (read-only), a `read_only:`
     /// prefixed path, or an `editable:` prefixed path, tolerating surrounding
-    /// whitespace, backticks, and a leading `./`. The path is normalized and
-    /// validated through [`normalize_repo_path`], so an empty, absolute, or
-    /// traversal path yields `None` instead of an escape attempt.
+    /// whitespace, backticks, and a leading `./`. Both prefixes are recognized
+    /// in any letter case, so a producer that capitalizes them still reaches
+    /// the access level it asked for; only the prefix is case-folded, never the
+    /// path. The path is normalized and validated through
+    /// [`normalize_repo_path`], so an empty, absolute, or traversal path yields
+    /// `None` instead of an escape attempt.
     pub fn parse_spec(spec: &str) -> Option<Self> {
-        let spec = spec.trim();
-        let (access, rest) = if let Some(rest) = spec.strip_prefix("editable:") {
+        // A producer may wrap the whole specification in backticks, so the
+        // surrounding markup is removed before the access prefix is read.
+        let spec = spec.trim().trim_matches('`').trim();
+        let (access, rest) = if let Some(rest) = strip_access_prefix(spec, "editable:") {
             (ContextAccess::Editable, rest)
-        } else if let Some(rest) = spec.strip_prefix("read_only:") {
+        } else if let Some(rest) = strip_access_prefix(spec, "read_only:") {
             (ContextAccess::ReadOnly, rest)
         } else {
             (ContextAccess::ReadOnly, spec)
@@ -178,6 +200,19 @@ impl DiscussionContextRequest {
         let path = normalize_repo_path(cleaned).ok()?;
         Some(Self { path, access })
     }
+}
+
+/// Consumes an access prefix regardless of its letter case.
+///
+/// Only the prefix is compared case-insensitively; the returned remainder keeps
+/// its original bytes, so a path is never case-folded. A missing prefix, or a
+/// specification too short to contain it, yields `None`.
+fn strip_access_prefix<'a>(spec: &'a str, prefix: &str) -> Option<&'a str> {
+    let head = spec.get(..prefix.len())?;
+    if !head.eq_ignore_ascii_case(prefix) {
+        return None;
+    }
+    spec.get(prefix.len()..)
 }
 
 /// Active focus anchor for continuous multi-turn discussion in REPL.
@@ -303,6 +338,15 @@ pub enum DiscussionTarget {
     Plan { id: String },
     /// Discussion focused on a review session, addressed by session identifier.
     Review { id: String },
+    /// Discussion focused on one group of a review session.
+    ///
+    /// An architectural group owns the root cause that blocks it, so the
+    /// dialogue addresses the group by the pair of its session and its own
+    /// identifier: a group identifier is unique only inside one session.
+    ReviewGroup {
+        session_id: String,
+        group_id: String,
+    },
 }
 
 /// Structured input of a discussion turn.
@@ -327,6 +371,19 @@ pub struct DiscussionResponse {
     pub message: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub plan_update: Option<DiscussionPlanUpdate>,
+    /// Decision recorded for one finding of the discussed review session.
+    ///
+    /// The dialogue is where an engineer actually decides what a finding is
+    /// worth, so the decision travels with the dialogue payload: the turn that
+    /// produces it records the status transition together with the reasoning
+    /// behind it, instead of leaving the developer to re-enter the outcome by
+    /// hand in the review interface afterwards.
+    ///
+    /// A decision is not an edit: it never carries the fix, which travels through
+    /// the ordinary finding workflow and owns the transition to `fixed`. Null
+    /// when the turn recorded no decision.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub review_update: Option<ReviewUpdateProposal>,
     #[serde(
         default,
         deserialize_with = "deserialize_context_requests",
@@ -336,7 +393,7 @@ pub struct DiscussionResponse {
     #[serde(
         default,
         alias = "search_requests",
-        deserialize_with = "deserialize_null_as_default",
+        deserialize_with = "deserialize_repo_search_requests",
         skip_serializing_if = "Vec::is_empty"
     )]
     pub repo_searches: Vec<RepoSearchRequest>,
@@ -363,6 +420,7 @@ impl DiscussionResponse {
         Self {
             message: message.into(),
             plan_update: None,
+            review_update: None,
             context_requests: Vec::new(),
             repo_searches: Vec::new(),
             repo_dirs: None,
@@ -377,13 +435,21 @@ impl DiscussionResponse {
         self
     }
 
+    pub fn with_review_update(mut self, review_update: ReviewUpdateProposal) -> Self {
+        self.review_update = Some(review_update);
+        self
+    }
+
     pub fn with_context_requests(mut self, requests: Vec<DiscussionContextRequest>) -> Self {
         self.context_requests = requests;
         self
     }
 
     pub fn with_repo_searches(mut self, searches: Vec<RepoSearchRequest>) -> Self {
-        self.repo_searches = searches;
+        self.repo_searches = searches
+            .into_iter()
+            .filter_map(RepoSearchRequest::normalized)
+            .collect();
         self
     }
 
@@ -418,6 +484,7 @@ impl DiscussionResponse {
 mod tests {
     use super::*;
     use crate::plan::PlanItemStatus;
+    use crate::review::ReviewDecisionStatus;
 
     #[test]
     fn test_discussion_context_request_parse_spec() {
@@ -435,6 +502,39 @@ mod tests {
         assert!(DiscussionContextRequest::parse_spec("../escape.rs").is_none());
         assert!(DiscussionContextRequest::parse_spec("editable:a/../b").is_none());
         assert!(DiscussionContextRequest::parse_spec("a\0b").is_none());
+    }
+
+    #[test]
+    fn test_discussion_context_request_parse_spec_folds_prefix_case() {
+        // A capitalized access prefix selects the access level it names instead
+        // of falling through to the bare read-only branch with the prefix still
+        // attached to the decoded path.
+        let editable = DiscussionContextRequest::parse_spec("Editable:src/b.rs").unwrap();
+        assert_eq!(editable.access, ContextAccess::Editable);
+        assert_eq!(editable.path, "src/b.rs");
+
+        let read_only = DiscussionContextRequest::parse_spec("READ_ONLY: src/a.rs").unwrap();
+        assert_eq!(read_only.access, ContextAccess::ReadOnly);
+        assert_eq!(read_only.path, "src/a.rs");
+
+        // Backtick markup around the whole specification, or around the path
+        // alone, never hides the prefix or leaks into the decoded path.
+        let wrapped = DiscussionContextRequest::parse_spec("`Editable:src/c.rs`").unwrap();
+        assert_eq!(wrapped.access, ContextAccess::Editable);
+        assert_eq!(wrapped.path, "src/c.rs");
+        let inner = DiscussionContextRequest::parse_spec("editable:`src/d.rs`").unwrap();
+        assert_eq!(inner.access, ContextAccess::Editable);
+        assert_eq!(inner.path, "src/d.rs");
+
+        // Only the prefix is case-folded; the path keeps its exact case.
+        let mixed = DiscussionContextRequest::parse_spec("Editable:Src/CaseSensitive.rs").unwrap();
+        assert_eq!(mixed.access, ContextAccess::Editable);
+        assert_eq!(mixed.path, "Src/CaseSensitive.rs");
+
+        // An unprefixed path still defaults to read-only.
+        let bare = DiscussionContextRequest::parse_spec("./src/e.rs").unwrap();
+        assert_eq!(bare.access, ContextAccess::ReadOnly);
+        assert_eq!(bare.path, "src/e.rs");
     }
 
     #[test]
@@ -541,6 +641,27 @@ mod tests {
     }
 
     #[test]
+    fn test_discussion_target_review_group_serde() {
+        let target = DiscussionTarget::ReviewGroup {
+            session_id: "rev-1".to_string(),
+            group_id: "arch-group".to_string(),
+        };
+        let json = serde_json::to_string(&target).unwrap();
+        assert_eq!(
+            json,
+            r#"{"kind":"review_group","session_id":"rev-1","group_id":"arch-group"}"#
+        );
+        let de: DiscussionTarget = serde_json::from_str(&json).unwrap();
+        assert_eq!(de, target);
+
+        // A focus anchors the same pair, so the group is addressed inside the
+        // one session whose group list defines it.
+        let focus = DiscussionFocus::from_target(target.clone(), vec!["7".to_string()]);
+        assert_eq!(focus.target(), Some(&target));
+        assert_eq!(focus.focused_items(), ["7".to_string()].as_slice());
+    }
+
+    #[test]
     fn test_discussion_plan_action_display_and_serde() {
         assert_eq!(DiscussionPlanAction::Update.to_string(), "update");
         assert_eq!(DiscussionPlanAction::Save.to_string(), "save");
@@ -573,6 +694,33 @@ mod tests {
         assert!(resp.repo_maps.is_empty());
         assert!(resp.dir_lists.is_empty());
         assert!(resp.user_language.is_none());
+        assert!(resp.review_update.is_none());
+    }
+
+    #[test]
+    fn test_discussion_response_review_update_roundtrip() {
+        let response =
+            DiscussionResponse::new("Decision recorded").with_review_update(ReviewUpdateProposal {
+                item_id: 7,
+                group_id: Some("arch-group".to_string()),
+                status: ReviewDecisionStatus::Rejected,
+                note: "The reported race cannot happen: the guard is released after the await"
+                    .to_string(),
+                recommendations: Vec::new(),
+            });
+
+        let json = serde_json::to_string(&response).unwrap();
+        assert!(json.contains("\"review_update\":{"), "got: {json}");
+        assert!(json.contains("\"status\":\"rejected\""), "got: {json}");
+        assert!(json.contains("\"item_id\":7"), "got: {json}");
+        assert!(json.contains("\"group_id\":\"arch-group\""), "got: {json}");
+        let de: DiscussionResponse = serde_json::from_str(&json).unwrap();
+        assert_eq!(de, response);
+
+        // A turn that records no decision states it explicitly and keeps the
+        // field out of the wire form, exactly like an absent plan update.
+        let idle = serde_json::to_string(&DiscussionResponse::new("Hello")).unwrap();
+        assert!(!idle.contains("review_update"), "got: {idle}");
     }
 
     #[test]
@@ -580,6 +728,7 @@ mod tests {
         let raw = r#"{
             "message": "Acknowledged",
             "plan_update": null,
+            "review_update": null,
             "context_requests": null,
             "repo_searches": null,
             "repo_dirs": null,
@@ -590,6 +739,7 @@ mod tests {
         let resp: DiscussionResponse = serde_json::from_str(raw).unwrap();
         assert_eq!(resp.message, "Acknowledged");
         assert!(resp.plan_update.is_none());
+        assert!(resp.review_update.is_none());
         assert!(resp.context_requests.is_empty());
         assert!(resp.repo_searches.is_empty());
         assert!(resp.repo_dirs.is_none());

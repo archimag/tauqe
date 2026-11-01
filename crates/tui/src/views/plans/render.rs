@@ -62,14 +62,33 @@ pub fn render_plans_view(
     // window on the cursor every frame would snap it back (c-render-scroll-decoupling).
     // Positioning the viewport is `scroll_to_selected`'s job and runs only when
     // the selection moves.
-    let max_scroll = (lines.len() as u16).saturating_sub(height);
+    // The bound saturates instead of wrapping through a truncated cast, so a
+    // document longer than `u16::MAX` visual lines keeps its offset
+    // (c-render-scroll-decoupling).
+    let max_scroll = u16::try_from(
+        state
+            .plans_view
+            .rendered_lines
+            .saturating_sub(height as usize),
+    )
+    .unwrap_or(u16::MAX);
     if state.plans_view.scroll > max_scroll {
         state.plans_view.scroll = max_scroll;
     }
 
-    let tree_widget = Paragraph::new(lines)
-        .block(block)
-        .scroll((state.plans_view.scroll, 0));
+    // `Paragraph` scrolls through a `u16` offset, so the widget itself can
+    // neither reach a row past line 65 535 nor add a saturated offset to the
+    // viewport height without overflowing its own arithmetic. The visible
+    // window is therefore sliced in `usize` and handed over already positioned,
+    // which keeps a legitimate deep offset renderable instead of panicking or
+    // jumping to a wrapped row.
+    let window_start = state.plans_view.scroll as usize;
+    let window = lines
+        .into_iter()
+        .skip(window_start)
+        .take(height as usize)
+        .collect::<Vec<_>>();
+    let tree_widget = Paragraph::new(window).block(block);
     frame.render_widget(tree_widget, main_area);
 
     let mut status_spans = Vec::new();
@@ -282,10 +301,14 @@ mod tests {
     /// the tree can be scrolled far beyond the first screenful.
     fn tall_plan_state() -> crate::app::AppState {
         let mut state = crate::app::test_state();
-        state.plans_view.plans = vec![Plan {
-            id: "tall-plan".to_string(),
-            title: "Tall Plan".to_string(),
-            items: vec![PlanItem {
+        state.plans_view.plans = vec![Plan::from_parts(
+            "tall-plan".to_string(),
+            "Tall Plan".to_string(),
+            None,
+            0,
+            0,
+            vec![],
+            vec![PlanItem {
                 id: "1".to_string(),
                 title: "Tall step".to_string(),
                 details: Some(
@@ -297,8 +320,7 @@ mod tests {
                 status: PlanItemStatus::Todo,
                 ..Default::default()
             }],
-            ..Default::default()
-        }];
+        )];
         state.plans_view.toggle_plan_expanded("tall-plan");
         state.plans_view.toggle_item_expanded("tall-plan", "1");
         state

@@ -11,10 +11,7 @@ use std::marker::PhantomData;
 
 use serde::Deserialize;
 
-use super::decode::{
-    decode_json_string_body_incremental, find_json_string_end_from, find_string_field_value_start,
-    prepare_json_payload,
-};
+use super::decode::{extract_streamed_string_field, prepare_json_payload, StringFieldCursor};
 
 /// Generic streaming filter for a single top-level string field of a JSON
 /// Structured Output payload.
@@ -29,9 +26,7 @@ use super::decode::{
 pub struct JsonFieldStreamFilter<T> {
     target_field: String,
     buffer: String,
-    value_start: Option<usize>,
-    raw_decoded_pos: usize,
-    end_scanned_pos: usize,
+    cursor: StringFieldCursor,
     finished: bool,
     _marker: PhantomData<fn() -> T>,
 }
@@ -45,9 +40,7 @@ where
         Self {
             target_field: target_field.into(),
             buffer: String::new(),
-            value_start: None,
-            raw_decoded_pos: 0,
-            end_scanned_pos: 0,
+            cursor: StringFieldCursor::new(),
             finished: false,
             _marker: PhantomData,
         }
@@ -65,26 +58,12 @@ where
         if self.finished {
             return None;
         }
-        if self.value_start.is_none() {
-            self.value_start = find_string_field_value_start(&self.buffer, &self.target_field);
-        }
-        let val_start = self.value_start?;
-        let content_slice = &self.buffer[val_start..];
-        let (raw_body, is_finished) =
-            match find_json_string_end_from(content_slice, &mut self.end_scanned_pos) {
-                Some(end) => (&content_slice[..end], true),
-                None => (content_slice, false),
-            };
-
-        let delta = decode_json_string_body_incremental(raw_body, &mut self.raw_decoded_pos);
-        if is_finished && self.raw_decoded_pos >= raw_body.len() {
+        let (delta, is_finished) =
+            extract_streamed_string_field(&self.buffer, &self.target_field, &mut self.cursor);
+        if is_finished {
             self.finished = true;
         }
-        if delta.is_empty() {
-            None
-        } else {
-            Some(delta)
-        }
+        delta
     }
 
     /// Returns the accumulated raw JSON buffer received so far.

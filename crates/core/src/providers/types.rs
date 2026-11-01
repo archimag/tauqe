@@ -1,3 +1,5 @@
+use std::borrow::Cow;
+
 use serde::{Deserialize, Serialize};
 use tauqe_protocol::{EditFileOp, EditFileStatus, ModelRef, ModelRole, ModelUsageInfo};
 
@@ -73,7 +75,7 @@ pub struct JsonSchemaDefinition {
     pub name: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
-    pub schema: serde_json::Value,
+    pub schema: Cow<'static, serde_json::Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub strict: Option<bool>,
 }
@@ -118,20 +120,23 @@ pub enum StreamEvent {
         max_rounds: Option<usize>,
         detail: Option<String>,
     },
-    /// The running role escalated to a stronger model tier.
-    ///
-    /// Emitted when deterministic verification keeps rejecting the same change
-    /// set and the harness promotes the turn along the coder ladder of the same
-    /// role instead of switching the role. `tier` is the zero-based index of the
-    /// tier the turn has entered.
-    ModelEscalated {
-        model: ModelRef,
-        role: Option<ModelRole>,
-        alias: Option<String>,
-        effort: Option<ReasoningEffort>,
-        tier: usize,
-    },
     RepoMapTokens(usize),
+    /// The turn advanced to the next rung of the model ladder.
+    ///
+    /// A promoted rung changes the effective model, its reasoning effort, and
+    /// the session affinity every later request addresses, so the runner reports
+    /// the promotion as a semantic event instead of leaving the client to infer
+    /// it from a model name it never sees.
+    TierEscalated {
+        /// Ladder position the turn moved to, as declared by the configuration.
+        tier: usize,
+        /// Model that now serves the turn.
+        model: ModelRef,
+        /// Semantic role the ladder belongs to.
+        role: ModelRole,
+        /// Reasoning effort of the promoted rung.
+        effort: Option<ReasoningEffort>,
+    },
     ToolchainStarted {
         command: String,
     },

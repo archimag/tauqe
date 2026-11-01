@@ -110,16 +110,14 @@ mod tests {
         let dir = tempdir().unwrap();
         let root = dir.path();
 
-        let plan = Plan {
-            id: "done-plan".to_string(),
-            title: "Done Plan".to_string(),
-            description: None,
-            created_at: 10,
-            updated_at: 10,
-            architect: None,
-            last_replanned_step: None,
-            concept: vec![],
-            items: vec![
+        let plan = Plan::from_parts(
+            "done-plan".to_string(),
+            "Done Plan".to_string(),
+            None,
+            10,
+            10,
+            vec![],
+            vec![
                 PlanItem {
                     id: "1".to_string(),
                     title: "Step 1".to_string(),
@@ -133,26 +131,24 @@ mod tests {
                     ..Default::default()
                 },
             ],
-        };
+        );
         PlanStorage::save_plan(root, &plan).unwrap();
 
         // Attempt to remove Step 1
-        let truncated = Plan {
-            id: "done-plan".to_string(),
-            title: "Done Plan".to_string(),
-            description: None,
-            created_at: 10,
-            updated_at: 20,
-            architect: None,
-            last_replanned_step: None,
-            concept: vec![],
-            items: vec![PlanItem {
+        let truncated = Plan::from_parts(
+            "done-plan".to_string(),
+            "Done Plan".to_string(),
+            None,
+            10,
+            20,
+            vec![],
+            vec![PlanItem {
                 id: "2".to_string(),
                 title: "Step 2".to_string(),
                 status: PlanItemStatus::Todo,
                 ..Default::default()
             }],
-        };
+        );
         let err = PlanStorage::save_plan(root, &truncated).unwrap_err();
         assert!(err.to_string().contains("Cannot remove completed step '1'"));
     }
@@ -162,16 +158,14 @@ mod tests {
         let dir = tempdir().unwrap();
         let root = dir.path();
 
-        let plan = Plan {
-            id: "done-plan".to_string(),
-            title: "Done Plan".to_string(),
-            description: None,
-            created_at: 10,
-            updated_at: 10,
-            architect: None,
-            last_replanned_step: None,
-            concept: vec![],
-            items: vec![PlanItem {
+        let plan = Plan::from_parts(
+            "done-plan".to_string(),
+            "Done Plan".to_string(),
+            None,
+            10,
+            10,
+            vec![],
+            vec![PlanItem {
                 id: "1".to_string(),
                 title: "Original Title".to_string(),
                 details: Some("Original Details".to_string()),
@@ -182,7 +176,7 @@ mod tests {
                 depends_on: vec!["0".to_string()],
                 ..Default::default()
             }],
-        };
+        );
         PlanStorage::save_plan(root, &plan).unwrap();
 
         // 1. Status regression

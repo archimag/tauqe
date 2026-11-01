@@ -1,32 +1,31 @@
-//! Ordered, fail-fast traversal of a review batch.
+//! Review batch outcomes: the queue stops, the fixes it completed, and the
+//! members it had to leave behind.
 //!
-//! The supervisor runs the findings of one session in the order the client
-//! listed them and stops at the first infrastructure failure, so a finding
-//! whose turn could not even start must never keep the transient
-//! `InProgress` status after the batch has terminated.
-//!
-//! A member is dispatched by its identifier: a group member reaches the
-//! group walk through `group_exec`, and a finding member the isolated
-//! finding turn, so a group is never executed as a finding and vice versa.
+//! Every member is executed by the engine's unified implementation pipeline, so
+//! these cases assert the batch framing only: which scope reached the provider,
+//! what the queue did with the verdict, and what the terminal event reports.
 
 use std::sync::Arc;
 
-use super::{make_tasks, test_item, test_session, test_state, TestDir};
+use super::{
+    architecture_edit, init_repo_with_file, make_tasks, save_grouped_session, subplan_item,
+    test_config, test_item, test_session, test_state, test_state_with_provider, TestDir,
+};
 
 use super::super::batch::{
-    run_review_batch, run_review_batch_with_options, BatchOutcome, FailedMember,
+    group_member_id, run_review_batch, run_review_batch_with_options, BatchOutcome, BatchTelemetry,
+    FailedMember,
 };
-use super::super::group_exec::group_step_id;
 
 use crate::state::AppState;
 use crate::transport::OutChannel;
 
 use tauqe_core::config::AppConfig;
+use tauqe_core::providers::mock::{MockLlmProvider, MockResponse};
 use tauqe_core::review::ReviewStorage;
-use tauqe_protocol::{events, IssueStatus};
+use tauqe_protocol::{events, IssueStatus, PlanItemStatus};
 
-/// Saves a session whose findings carry the given statuses in declaration
-/// order.
+/// Saves a session whose findings carry the given statuses in declaration order.
 fn save_session(dir: &TestDir, review_id: &str, statuses: &[IssueStatus]) {
     let items = statuses
         .iter()
@@ -47,8 +46,10 @@ fn stored_statuses(dir: &TestDir, review_id: &str) -> Vec<IssueStatus> {
         .collect()
 }
 
+/// A member the queue cannot run stops it: without credentials the first turn
+/// never starts, so the second member is never scheduled.
 #[tokio::test]
-async fn batch_fails_fast_and_returns_the_started_finding_to_todo() {
+async fn batch_fails_fast_when_a_member_cannot_run() {
     let dir = TestDir::new();
     save_session(
         &dir,
@@ -57,8 +58,6 @@ async fn batch_fails_fast_and_returns_the_started_finding_to_todo() {
     );
     let state = test_state(&dir);
 
-    // Without credentials the first finding's turn cannot start, so the batch
-    // must stop there instead of scheduling the second one.
     let operation = Arc::new(
         state
             .try_begin_operation()
@@ -87,19 +86,23 @@ async fn batch_fails_fast_and_returns_the_started_finding_to_todo() {
         }
         other => panic!("Expected Failed, got {:?}", other),
     }
+
+    // The engine settles the member it could not implement and never touches
+    // the member the queue did not reach.
     assert_eq!(
         stored_statuses(&dir, "rev-fail-fast"),
-        vec![IssueStatus::Todo, IssueStatus::Todo]
+        vec![IssueStatus::Skipped, IssueStatus::Todo]
     );
 }
 
+/// A soft stop requested before the queue starts ends it before the first member.
 #[tokio::test]
-async fn batch_skips_a_finished_finding_and_stops_on_a_rejected_one() {
+async fn batch_stops_gracefully_on_a_soft_stop() {
     let dir = TestDir::new();
     save_session(
         &dir,
-        "rev-skip",
-        &[IssueStatus::Fixed, IssueStatus::Rejected],
+        "rev-soft-stop",
+        &[IssueStatus::Todo, IssueStatus::Todo],
     );
     let state = test_state(&dir);
 
@@ -108,34 +111,100 @@ async fn batch_skips_a_finished_finding_and_stops_on_a_rejected_one() {
             .try_begin_operation()
             .expect("register batch operation"),
     );
+    state.soft_stop_active_operation();
+
     let outcome = run_review_batch(
         &state,
-        "rev-skip",
-        make_tasks("rev-skip", &[1, 2]),
+        "rev-soft-stop",
+        make_tasks("rev-soft-stop", &[1, 2]),
         operation,
     )
     .await;
 
-    match outcome {
-        BatchOutcome::Failed {
-            completed,
-            member,
-            reason,
-        } => {
-            assert_eq!(completed, 1);
-            assert_eq!(
-                member,
-                FailedMember::Finding {
-                    session_id: "rev-skip".to_string(),
-                    item_id: 2,
-                }
-            );
-            assert!(reason.contains("REJECTED"), "unexpected reason: {reason}");
+    assert_eq!(
+        outcome,
+        BatchOutcome::Stopped {
+            completed: 0,
+            telemetry: BatchTelemetry::default(),
         }
-        other => panic!("Expected Failed, got {:?}", other),
-    }
+    );
+    assert_eq!(
+        stored_statuses(&dir, "rev-soft-stop"),
+        vec![IssueStatus::Todo, IssueStatus::Todo]
+    );
 }
 
+/// A group member is decoded as a group and executed through the unified
+/// implementation pipeline, which closes every finding the group collects.
+#[tokio::test]
+async fn batch_dispatches_a_group_member_through_the_implementation_pipeline() {
+    let dir = TestDir::new();
+    init_repo_with_file(&dir, "src/target.rs");
+    save_grouped_session(
+        &dir,
+        "rev-group-run",
+        "arch-1",
+        vec![subplan_item(
+            "s-1",
+            "Step 1",
+            PlanItemStatus::Todo,
+            vec!["src/target.rs"],
+        )],
+    );
+
+    let marker = "REVIEWGROUPRUN1";
+    let provider = Arc::new(MockLlmProvider::scripted([MockResponse::text(
+        architecture_edit(marker, "pub fn target() { let value = 9; }"),
+    )]));
+    let state = test_state_with_provider(&dir, test_config(), provider).await;
+    *state.marker_override.lock().await = Some(marker.to_string());
+
+    let operation = Arc::new(
+        state
+            .try_begin_operation()
+            .expect("register batch operation"),
+    );
+    let outcome = run_review_batch_with_options(
+        &state,
+        "rev-group-run",
+        vec![group_member_id("rev-group-run", "arch-1")],
+        None,
+        0,
+        None,
+        None,
+        operation,
+    )
+    .await;
+
+    assert_eq!(
+        outcome,
+        BatchOutcome::Completed {
+            items: 1,
+            telemetry: BatchTelemetry {
+                fixed: 1,
+                deferred: 0,
+                failed: 0,
+            },
+        }
+    );
+
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("src/target.rs")).unwrap(),
+        "pub fn target() { let value = 9; }\n"
+    );
+    let stored = ReviewStorage::load_review(dir.path(), "rev-group-run")
+        .unwrap()
+        .expect("the session is stored");
+    assert_eq!(stored.find_item(1).unwrap().status, IssueStatus::Fixed);
+    let group = stored
+        .groups
+        .iter()
+        .find(|group| group.id == "arch-1")
+        .expect("the group is stored");
+    assert_eq!(group.implementation.items[0].status, PlanItemStatus::Done);
+}
+
+/// The supervisor publishes a single typed completion event for the whole batch.
 #[tokio::test]
 async fn batch_emits_a_single_finished_event() {
     let dir = TestDir::new();
@@ -161,10 +230,11 @@ async fn batch_emits_a_single_finished_event() {
         operation,
     )
     .await;
-    assert!(matches!(outcome, BatchOutcome::Failed { .. }));
+    match &outcome {
+        BatchOutcome::Failed { .. } => {}
+        other => panic!("Expected Failed, got {:?}", other),
+    }
 
-    // The supervisor publishes a single typed completion event for the whole
-    // batch, carrying the aggregate status and the owning session.
     let mut raw_events = Vec::new();
     while let Ok(raw) = rx.try_recv() {
         raw_events.push(raw);
@@ -174,90 +244,9 @@ async fn batch_emits_a_single_finished_event() {
         .find(|event| event.contains(events::REVIEW_BATCH_FINISHED))
         .expect("review/batch_finished must be emitted");
     assert!(finished.contains("rev-emit"));
-    assert!(finished.contains("\"failed\""));
-}
-
-#[tokio::test]
-async fn batch_stops_gracefully_on_a_soft_stop() {
-    let dir = TestDir::new();
-    save_session(
-        &dir,
-        "rev-soft-stop",
-        &[IssueStatus::Todo, IssueStatus::Todo],
-    );
-    let state = test_state(&dir);
-
-    let operation = Arc::new(
-        state
-            .try_begin_operation()
-            .expect("register batch operation"),
-    );
-    // A soft stop requested before the queue starts ends it before the first
-    // finding runs.
-    state.soft_stop_active_operation();
-
-    let outcome = run_review_batch(
-        &state,
-        "rev-soft-stop",
-        make_tasks("rev-soft-stop", &[1, 2]),
-        operation,
-    )
-    .await;
-
-    assert_eq!(outcome, BatchOutcome::Stopped { completed: 0 });
-    assert_eq!(
-        stored_statuses(&dir, "rev-soft-stop"),
-        vec![IssueStatus::Todo, IssueStatus::Todo]
-    );
-}
-
-#[tokio::test]
-async fn batch_dispatches_a_group_member_through_the_group_walk() {
-    let dir = TestDir::new();
-    save_session(&dir, "rev-groups", &[IssueStatus::Todo]);
-    let state = test_state(&dir);
-
-    // The session exists but the group does not: the executor must decode the
-    // member as a group, fail to reload it from the durable record, and
-    // report the failed step instead of executing a finding as if the member
-    // were one.
-    let operation = Arc::new(
-        state
-            .try_begin_operation()
-            .expect("register batch operation"),
-    );
-    let outcome = run_review_batch_with_options(
-        &state,
-        "rev-groups",
-        vec![group_step_id("rev-groups", "ghost-group")],
-        None,
-        None,
-        None,
-        operation,
-    )
-    .await;
-
-    match outcome {
-        BatchOutcome::Failed {
-            completed,
-            member,
-            reason,
-        } => {
-            assert_eq!(completed, 0);
-            // A group member carries no finding ordinal, so the failure must
-            // name the group instead of reporting a finding number.
-            assert_eq!(
-                member,
-                FailedMember::Group {
-                    session_id: "rev-groups".to_string(),
-                    group_id: "ghost-group".to_string(),
-                }
-            );
-            assert!(
-                reason.contains("Review group 'ghost-group' not found"),
-                "unexpected reason: {reason}"
-            );
-        }
-        other => panic!("Expected Failed, got {:?}", other),
-    }
+    // Every counter is published explicitly, so a client never has to guess
+    // which figure is absent.
+    assert!(finished.contains("\"fixed_count\":0"), "{finished}");
+    assert!(finished.contains("\"deferred_count\":0"), "{finished}");
+    assert!(finished.contains("\"failed_count\":0"), "{finished}");
 }

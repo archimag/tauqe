@@ -1,3 +1,5 @@
+use std::borrow::Cow;
+
 use serde::Deserialize;
 use tauqe_protocol::{IssueStatus, IssueType, ReviewIssue};
 
@@ -84,7 +86,7 @@ pub fn review_findings_response_format() -> ResponseFormat {
                 "Structured code review findings with a typed category, a remediation strategy, and file locations"
                     .to_string(),
             ),
-            schema: review_findings_response_schema(),
+            schema: Cow::Owned(review_findings_response_schema()),
             strict: Some(true),
         },
     }

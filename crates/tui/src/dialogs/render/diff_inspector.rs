@@ -7,15 +7,17 @@
 //! isolation, with a line-number gutter and its own scroll offset, so a long
 //! patch is never interrupted by the file list (c-3).
 //!
-//! The audited set is the live staged list, never a frozen copy: it is refreshed
-//! by every edit-stream event, so a file that is still streaming reads the same
-//! here as in the Viewport, and the file the stream currently writes carries an
-//! animated spinner beside its running badge (c-3). The diff body comes from the
-//! `DiffRenderCache` the Develop viewport already fills, so the audit paints
-//! exactly the rows the REPL laid out and a repeated frame never recomputes a
-//! `similar::TextDiff` (c-1, c-3). Every visible phrase is resolved through the
-//! runtime locale (`crate::i18n::active_t`), so a hot-swapped locale reaches the
+//! The audited set is the live staged list the Develop viewport owns, observed in
+//! place rather than copied: an edit-stream event needs no refresh call, a file
+//! that is still streaming reads the same here as in the Viewport, and the file
+//! the stream currently writes carries an animated spinner beside its running
+//! badge (c-3). The diff body comes from the `DiffRenderCache` the Develop
+//! viewport already fills, so the audit paints exactly the rows the REPL laid out
+//! and a repeated frame never recomputes a `similar::TextDiff` nor copies the
+//! stored body (c-1, c-3). Every visible phrase is resolved through the runtime
+//! locale (`crate::i18n::active_t`), so a hot-swapped locale reaches the
 //! inspector without touching the renderer (Conventions §9, c-4).
+use std::borrow::Cow;
 
 use ratatui::layout::{Alignment, Rect};
 use ratatui::style::{Style, Stylize};
@@ -35,6 +37,10 @@ use crate::views::repl::{DiffRenderCache, FileEditStatus, StreamingFileEdit};
 
 /// Renders the inspector card over the Develop viewport.
 ///
+/// `audited` is the live staged set the Viewport owns: the audit observes that
+/// slice in place, so it never holds a copy of the change set and cannot drift
+/// from the surface it describes (c-3).
+///
 /// `cache` is the diff render cache the Develop viewport owns. Sharing it keeps
 /// one rendered patch per file for both surfaces, so the audit and the REPL can
 /// never disagree about a diff body (c-1, c-3).
@@ -45,6 +51,7 @@ use crate::views::repl::{DiffRenderCache, FileEditStatus, StreamingFileEdit};
 pub(crate) fn render_diff_inspector(
     frame: &mut ratatui::Frame,
     inspector: &mut DiffInspectorState,
+    audited: &[StreamingFileEdit],
     cache: &mut DiffRenderCache,
     spinner_frame: usize,
 ) {
@@ -57,20 +64,18 @@ pub(crate) fn render_diff_inspector(
         ModalTone::Info,
     );
 
-    // The audited set is refreshed by every edit-stream event, so it can grow and
-    // shrink while the audit is open; the highlight still has to name a real file
-    // (c-3).
-    if inspector.selected_file >= inspector.files.len() {
-        inspector.selected_file = inspector.files.len().saturating_sub(1);
-    }
+    // The owned set can grow and shrink while the audit is open, so the highlight
+    // is clamped against the live length before anything is drawn (c-3).
+    inspector.clamp_selection(audited.len());
 
     let spinner = SPINNER_FRAMES[spinner_frame % SPINNER_FRAMES.len()];
-    render_file_pane(frame, inspector, &engine, geometry.files, spinner);
+    render_file_pane(frame, inspector, audited, &engine, geometry.files, spinner);
     let (hunk_total, hunk_active) =
-        render_diff_pane(frame, inspector, cache, &engine, geometry.diff);
+        render_diff_pane(frame, inspector, audited, cache, &engine, geometry.diff);
     render_action_bar(
         frame,
         inspector,
+        audited,
         hunk_total,
         hunk_active,
         &engine,
@@ -87,6 +92,7 @@ pub(crate) fn render_diff_inspector(
 fn render_file_pane(
     frame: &mut ratatui::Frame,
     inspector: &DiffInspectorState,
+    audited: &[StreamingFileEdit],
     engine: &ThemeEngine,
     area: Rect,
     spinner: &str,
@@ -96,16 +102,13 @@ fn render_file_pane(
     // repository path truncates instead of pushing the verification badge out
     // of the pane (c-3).
     let inner_width = usize::from(area.width.saturating_sub(2));
-    let rows = file_rows(inspector, engine, inner_width, spinner);
+    let rows = file_rows(audited, inspector, engine, inner_width, spinner);
     // The highlight stays visible: the window follows the selected row the way
     // the file list of every other picker does (Conventions §6.2).
     let visible = usize::from(area.height.saturating_sub(2)).max(1);
     let offset = (inspector.selected_file + 1).saturating_sub(visible);
-    let title = active_t("dialog.diff_inspector.files_title").replacen(
-        "{}",
-        &inspector.files.len().to_string(),
-        1,
-    );
+    let title =
+        active_t("dialog.diff_inspector.files_title").replacen("{}", &audited.len().to_string(), 1);
     let block = Block::default()
         .title(Line::from(Span::styled(
             title,
@@ -151,21 +154,21 @@ fn pane_title_style(engine: &ThemeEngine, focused: bool) -> Style {
 /// file the stream is still writing carries the animation frame beside its
 /// badge, so the audit names the file being edited right now (c-3).
 fn file_rows(
+    audited: &[StreamingFileEdit],
     inspector: &DiffInspectorState,
     engine: &ThemeEngine,
     width: usize,
     spinner: &str,
 ) -> Vec<Line<'static>> {
     let palette = engine.palette();
-    if inspector.files.is_empty() {
+    if audited.is_empty() {
         return vec![placeholder_line(
             engine,
             &active_t("dialog.diff_inspector.no_files"),
         )];
     }
 
-    inspector
-        .files
+    audited
         .iter()
         .enumerate()
         .map(|(index, file)| {
@@ -252,21 +255,26 @@ fn status_badge(engine: &ThemeEngine, status: FileEditStatus, spinner: &str) -> 
 
 /// Renders the right pane: the isolated diff read area of the highlighted file.
 ///
-/// It returns the hunk count of the rendered patch together with the one-based
-/// number of the hunk under the top edge, so the action bar names the same
-/// geometry the pane just drew (c-1).
+/// The file is resolved from the live staged set, so the pane always reads the
+/// patch the Viewport currently holds. It returns the hunk count of the rendered
+/// patch together with the one-based number of the hunk under the top edge, so
+/// the action bar names the same geometry the pane just drew (c-1).
 fn render_diff_pane(
     frame: &mut ratatui::Frame,
     inspector: &mut DiffInspectorState,
+    audited: &[StreamingFileEdit],
     cache: &mut DiffRenderCache,
     engine: &ThemeEngine,
     area: Rect,
 ) -> (usize, Option<usize>) {
     let palette = engine.palette();
-    let mut hunk_rows: Vec<usize> = Vec::new();
-    let mut lines: Vec<Line<'static>> = Vec::new();
+    // The cache serves the rendered patch by reference, so a hit costs one
+    // fingerprint pass and a borrow instead of a copy of the body, and the pane
+    // numbers the very rows the cache stores (c-1, c-3).
+    let mut hunk_rows: &[usize] = &[];
+    let mut lines = Vec::new();
 
-    if let Some(file) = inspector.files.get(inspector.selected_file) {
+    if let Some(file) = audited.get(inspector.selected_file) {
         let rendered = cache.render(file);
         if rendered.lines.is_empty() {
             lines.push(placeholder_line(
@@ -274,7 +282,7 @@ fn render_diff_pane(
                 &active_t("dialog.diff_inspector.no_diff"),
             ));
         } else {
-            hunk_rows = rendered.hunk_rows;
+            hunk_rows = rendered.hunk_rows.as_slice();
             lines = numbered_diff_lines(&rendered.lines, engine);
         }
     } else {
@@ -309,7 +317,7 @@ fn render_diff_pane(
 
     (
         hunk_rows.len(),
-        active_hunk(&hunk_rows, inspector.diff_scroll),
+        active_hunk(hunk_rows, inspector.diff_scroll),
     )
 }
 
@@ -317,7 +325,11 @@ fn render_diff_pane(
 ///
 /// The rows themselves are reused unchanged, so the audit reads exactly the
 /// patch the cache rendered and the gutter never re-derives a diff (c-3).
-fn numbered_diff_lines(lines: &[Line<'static>], engine: &ThemeEngine) -> Vec<Line<'static>> {
+///
+/// The returned rows borrow the cached body: only the gutter string is copied,
+/// so a frame over a large patch costs one small allocation per row instead of
+/// a deep copy of every span (c-1).
+fn numbered_diff_lines<'a>(lines: &'a [Line<'static>], engine: &ThemeEngine) -> Vec<Line<'a>> {
     let number_style = engine.fg(engine.palette().text_muted);
     lines
         .iter()
@@ -325,7 +337,13 @@ fn numbered_diff_lines(lines: &[Line<'static>], engine: &ThemeEngine) -> Vec<Lin
         .map(|(index, line)| {
             let mut spans = Vec::with_capacity(line.spans.len() + 1);
             spans.push(Span::styled(format!("{:>4} ", index + 1), number_style));
-            spans.extend(line.spans.iter().cloned());
+            spans.extend(line.spans.iter().map(|span| {
+                let content: &'a str = match &span.content {
+                    Cow::Borrowed(text) => text,
+                    Cow::Owned(text) => text.as_str(),
+                };
+                Span::styled(content, span.style)
+            }));
             let mut numbered = Line::from(spans);
             numbered.style = line.style;
             numbered
@@ -344,18 +362,19 @@ fn active_hunk(hunk_rows: &[usize], scroll: u16) -> Option<usize> {
         .next_back()
 }
 
-/// Renders the action row: the highlighted file position and the hunk under the
-/// top edge of the read area.
+/// Renders the action row: the position of the highlighted file in the live
+/// staged set and the hunk under the top edge of the read area.
 fn render_action_bar(
     frame: &mut ratatui::Frame,
     inspector: &DiffInspectorState,
+    audited: &[StreamingFileEdit],
     hunk_total: usize,
     hunk_active: Option<usize>,
     engine: &ThemeEngine,
     area: Rect,
 ) {
     let palette = engine.palette();
-    let file_total = inspector.files.len();
+    let file_total = audited.len();
     let file_position = if file_total == 0 {
         0
     } else {
@@ -400,7 +419,6 @@ fn placeholder_line(engine: &ThemeEngine, text: &str) -> Line<'static> {
         engine.fg(engine.palette().text_muted),
     ))
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -429,11 +447,24 @@ mod tests {
         }
     }
 
-    /// Draws one inspector frame and flattens the whole grid into text.
-    fn rendered(inspector: &mut DiffInspectorState, cache: &mut DiffRenderCache) -> String {
+    /// Reading position of an audit opened on the first file of the live set.
+    fn reading_position() -> DiffInspectorState {
+        DiffInspectorState {
+            selected_file: 0,
+            diff_scroll: 0,
+            focus: DiffInspectorFocus::Files,
+        }
+    }
+
+    /// Draws one inspector frame over `files` and flattens the grid into text.
+    fn rendered(
+        files: &[StreamingFileEdit],
+        inspector: &mut DiffInspectorState,
+        cache: &mut DiffRenderCache,
+    ) -> String {
         let mut terminal = Terminal::new(TestBackend::new(140, 40)).expect("test backend");
         terminal
-            .draw(|frame| render_diff_inspector(frame, inspector, cache, 0))
+            .draw(|frame| render_diff_inspector(frame, inspector, files, cache, 0))
             .expect("the inspector frame draws");
         let buffer = terminal.backend().buffer();
         let mut text = String::new();
@@ -448,28 +479,24 @@ mod tests {
 
     #[test]
     fn file_list_shows_operation_and_verification_badges() {
-        let mut inspector = DiffInspectorState {
-            files: vec![
-                file(
-                    "crates/tui/src/app.rs",
-                    EditOp::Replace,
-                    FileEditStatus::Ok,
-                    ("let a = 1;", "let a = 2;"),
-                ),
-                file(
-                    "crates/tui/src/new.rs",
-                    EditOp::Create,
-                    FileEditStatus::Error,
-                    ("", "fn added() {}"),
-                ),
-            ],
-            selected_file: 0,
-            diff_scroll: 0,
-            focus: DiffInspectorFocus::Files,
-        };
+        let files = vec![
+            file(
+                "crates/tui/src/app.rs",
+                EditOp::Replace,
+                FileEditStatus::Ok,
+                ("let a = 1;", "let a = 2;"),
+            ),
+            file(
+                "crates/tui/src/new.rs",
+                EditOp::Create,
+                FileEditStatus::Error,
+                ("", "fn added() {}"),
+            ),
+        ];
+        let mut inspector = reading_position();
         let mut cache = DiffRenderCache::default();
 
-        let text = rendered(&mut inspector, &mut cache);
+        let text = rendered(&files, &mut inspector, &mut cache);
 
         assert!(text.contains("[EDIT]"), "{text}");
         assert!(text.contains("[NEW]"), "{text}");
@@ -481,20 +508,16 @@ mod tests {
 
     #[test]
     fn read_area_numbers_every_rendered_diff_row() {
-        let mut inspector = DiffInspectorState {
-            files: vec![file(
-                "crates/tui/src/app.rs",
-                EditOp::Replace,
-                FileEditStatus::Ok,
-                ("let a = 1;", "let a = 2;"),
-            )],
-            selected_file: 0,
-            diff_scroll: 0,
-            focus: DiffInspectorFocus::Files,
-        };
+        let files = vec![file(
+            "crates/tui/src/app.rs",
+            EditOp::Replace,
+            FileEditStatus::Ok,
+            ("let a = 1;", "let a = 2;"),
+        )];
+        let mut inspector = reading_position();
         let mut cache = DiffRenderCache::default();
 
-        let text = rendered(&mut inspector, &mut cache);
+        let text = rendered(&files, &mut inspector, &mut cache);
 
         assert!(text.contains("   1   @@ diff @@"), "{text}");
         assert!(text.contains("   2   - let a = 1;"), "{text}");
@@ -503,28 +526,27 @@ mod tests {
 
     #[test]
     fn scroll_offset_is_clamped_and_the_action_bar_names_the_progress() {
+        let files = vec![
+            file(
+                "crates/tui/src/app.rs",
+                EditOp::Replace,
+                FileEditStatus::Ok,
+                ("let a = 1;", "let a = 2;"),
+            ),
+            file(
+                "crates/tui/src/main.rs",
+                EditOp::Replace,
+                FileEditStatus::Ok,
+                ("let b = 1;", "let b = 2;"),
+            ),
+        ];
         let mut inspector = DiffInspectorState {
-            files: vec![
-                file(
-                    "crates/tui/src/app.rs",
-                    EditOp::Replace,
-                    FileEditStatus::Ok,
-                    ("let a = 1;", "let a = 2;"),
-                ),
-                file(
-                    "crates/tui/src/main.rs",
-                    EditOp::Replace,
-                    FileEditStatus::Ok,
-                    ("let b = 1;", "let b = 2;"),
-                ),
-            ],
-            selected_file: 0,
             diff_scroll: u16::MAX,
-            focus: DiffInspectorFocus::Files,
+            ..reading_position()
         };
         let mut cache = DiffRenderCache::default();
 
-        let text = rendered(&mut inspector, &mut cache);
+        let text = rendered(&files, &mut inspector, &mut cache);
 
         assert!(
             inspector.diff_scroll < u16::MAX,
@@ -533,6 +555,30 @@ mod tests {
         assert!(text.contains("File 1/2"), "{text}");
         assert!(text.contains("Hunk 1/1"), "{text}");
     }
+
+    /// A highlight left over from a longer set is clamped against the live length
+    /// before the frame is drawn, so the audit never points past the set it reads
+    /// (c-3).
+    #[test]
+    fn a_stale_highlight_is_clamped_to_the_live_set() {
+        let files = vec![file(
+            "crates/tui/src/app.rs",
+            EditOp::Replace,
+            FileEditStatus::Ok,
+            ("let a = 1;", "let a = 2;"),
+        )];
+        let mut inspector = DiffInspectorState {
+            selected_file: 5,
+            ..reading_position()
+        };
+        let mut cache = DiffRenderCache::default();
+
+        let text = rendered(&files, &mut inspector, &mut cache);
+
+        assert_eq!(inspector.selected_file, 0);
+        assert!(text.contains("File 1/1"), "{text}");
+    }
+
     /// The active pane is accented through the semantic roles and the idle one
     /// recedes, so which pane owns the vertical motion is readable without a
     /// textual marker (Conventions §8.4, c-2).
@@ -556,28 +602,24 @@ mod tests {
     /// settled file renders its status alone.
     #[test]
     fn running_file_carries_the_spinner_and_the_run_badge() {
-        let mut inspector = DiffInspectorState {
-            files: vec![
-                file(
-                    "crates/tui/src/streaming.rs",
-                    EditOp::Replace,
-                    FileEditStatus::Running,
-                    ("let a = 1;", "let a = 2;"),
-                ),
-                file(
-                    "crates/tui/src/settled.rs",
-                    EditOp::Replace,
-                    FileEditStatus::Ok,
-                    ("let b = 1;", "let b = 2;"),
-                ),
-            ],
-            selected_file: 0,
-            diff_scroll: 0,
-            focus: DiffInspectorFocus::Files,
-        };
+        let files = vec![
+            file(
+                "crates/tui/src/streaming.rs",
+                EditOp::Replace,
+                FileEditStatus::Running,
+                ("let a = 1;", "let a = 2;"),
+            ),
+            file(
+                "crates/tui/src/settled.rs",
+                EditOp::Replace,
+                FileEditStatus::Ok,
+                ("let b = 1;", "let b = 2;"),
+            ),
+        ];
+        let mut inspector = reading_position();
         let mut cache = DiffRenderCache::default();
 
-        let text = rendered(&mut inspector, &mut cache);
+        let text = rendered(&files, &mut inspector, &mut cache);
 
         let spinner = SPINNER_FRAMES[0];
         assert!(text.contains(&format!("{spinner} [RUN]")), "{text}");

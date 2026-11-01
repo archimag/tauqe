@@ -78,14 +78,27 @@ pub fn render_review_view(
     // window on the cursor every frame would snap it back (c-1). Positioning
     // the viewport is `scroll_to_selected`'s job and runs only when the
     // selection moves (c-2).
-    let max_scroll = (lines.len() as u16).saturating_sub(height);
+    // The view owns the saturating bound: a document longer than `u16::MAX`
+    // visual lines must never be clamped to an offset wrapped by a truncated
+    // cast (c-2).
+    let max_scroll = state.review.max_scroll();
     if state.review.scroll > max_scroll {
         state.review.scroll = max_scroll;
     }
 
-    let tree_widget = Paragraph::new(lines)
-        .block(block)
-        .scroll((state.review.scroll, 0));
+    // `Paragraph` scrolls through a `u16` offset, so the widget itself can
+    // neither reach a row past line 65 535 nor add a saturated offset to the
+    // viewport height without overflowing its own arithmetic. The visible
+    // window is therefore sliced in `usize` and handed over already positioned,
+    // which keeps a legitimate deep offset renderable instead of panicking or
+    // jumping to a wrapped row (c-2).
+    let window_start = state.review.scroll as usize;
+    let window = lines
+        .into_iter()
+        .skip(window_start)
+        .take(height as usize)
+        .collect::<Vec<_>>();
+    let tree_widget = Paragraph::new(window).block(block);
     frame.render_widget(tree_widget, main_area);
 
     let effective = state.review.effective_sessions();
@@ -424,6 +437,17 @@ mod tests {
     use ratatui::backend::TestBackend;
     use ratatui::Terminal;
 
+    fn render_once(terminal: &mut Terminal<TestBackend>, state: &mut crate::app::AppState) {
+        terminal
+            .draw(|f| {
+                let area = f.area();
+                let main_area = Rect::new(0, 0, area.width, area.height.saturating_sub(1));
+                let info_area = Rect::new(0, area.height.saturating_sub(1), area.width, 1);
+                render_review_view(f, state, main_area, info_area);
+            })
+            .unwrap();
+    }
+
     #[test]
     fn describe_review_row_surfaces_session_description() {
         let row = VisibleReviewRow::SessionHeader {
@@ -632,20 +656,9 @@ mod tests {
     #[test]
     fn render_review_view_keeps_a_deep_free_scroll_and_clamps_only_the_tail() {
         use tauqe_protocol::{
-            IssueStatus, IssueType, PlanItem, PlanItemStatus, ReviewGroup, ReviewGroupKind,
-            ReviewIssue, ReviewItem, ReviewSession,
+            IssueStatus, IssueType, PlanImplementation, PlanItem, PlanItemStatus, ReviewGroup,
+            ReviewGroupKind, ReviewIssue, ReviewItem, ReviewSession,
         };
-
-        fn render_once(terminal: &mut Terminal<TestBackend>, state: &mut crate::app::AppState) {
-            terminal
-                .draw(|f| {
-                    let area = f.area();
-                    let main_area = Rect::new(0, 0, area.width, area.height.saturating_sub(1));
-                    let info_area = Rect::new(0, area.height.saturating_sub(1), area.width, 1);
-                    render_review_view(f, state, main_area, info_area);
-                })
-                .unwrap();
-        }
 
         let long_details = (0..120)
             .map(|line| format!("Invariant line {line}."))
@@ -680,13 +693,16 @@ mod tests {
                 id: "arch".to_string(),
                 title: "Shared cause".to_string(),
                 kind: ReviewGroupKind::Architectural,
-                subplan: vec![PlanItem {
-                    id: "1.1".to_string(),
-                    title: "Tall step".to_string(),
-                    details: Some(long_details),
-                    status: PlanItemStatus::Todo,
+                implementation: PlanImplementation {
+                    items: vec![PlanItem {
+                        id: "1.1".to_string(),
+                        title: "Tall step".to_string(),
+                        details: Some(long_details),
+                        status: PlanItemStatus::Todo,
+                        ..Default::default()
+                    }],
                     ..Default::default()
-                }],
+                },
                 ..Default::default()
             }],
             post_analysis: None,
@@ -719,6 +735,72 @@ mod tests {
             state.review.scroll, max,
             "the renderer clamps the viewport by the document length only"
         );
+    }
+
+    /// A rendered document longer than the `u16` viewport unit must be bounded
+    /// by the saturating maximum: a legitimate offset past line 65 535 survives
+    /// the redraw instead of being clamped to a wrapped row near the document
+    /// top (c-2).
+    #[test]
+    fn render_review_view_saturates_the_viewport_bound_past_the_u16_unit() {
+        use tauqe_protocol::{IssueStatus, IssueType, ReviewIssue, ReviewItem, ReviewSession};
+
+        let items: Vec<ReviewItem> = (1..=70_000)
+            .map(|id| {
+                ReviewItem::from(ReviewIssue {
+                    id,
+                    title: format!("Finding {id}"),
+                    uuid: None,
+                    group: None,
+                    model: None,
+                    issue_type: IssueType::Architecture,
+                    status: IssueStatus::Todo,
+                    description: String::new(),
+                    recommendations: Vec::new(),
+                    files: Vec::new(),
+                    readonly_files: Vec::new(),
+                    note: None,
+                })
+            })
+            .collect();
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        let mut state = crate::app::test_state();
+        state.review.sessions = vec![ReviewSession {
+            id: "rev-huge".to_string(),
+            title: "Huge".to_string(),
+            created_at: 0,
+            model: tauqe_protocol::ModelRef::openrouter("test-model"),
+            description: None,
+            user_prompt: None,
+            target_files: Vec::new(),
+            items,
+            raw_markdown: String::new(),
+            groups: Vec::new(),
+            post_analysis: None,
+            launch_config: None,
+        }];
+        // The cursor rests on the first row while the developer scrolls deep
+        // into the tree.
+        state.review.selected_index = 0;
+        state.review.scroll = 60_000;
+
+        render_once(&mut terminal, &mut state);
+
+        assert!(
+            state.review.rendered_lines > usize::from(u16::MAX),
+            "the document must exceed the u16 viewport unit"
+        );
+        assert_eq!(
+            state.review.scroll, 60_000,
+            "a redraw must keep a legitimate offset past line 65 535"
+        );
+
+        // An offset above the saturating maximum clamps to the largest
+        // representable offset instead of wrapping through a truncated cast
+        // (c-2).
+        state.review.scroll = u16::MAX;
+        render_once(&mut terminal, &mut state);
+        assert_eq!(state.review.scroll, u16::MAX);
     }
 
     fn rendered_status_line(state: &mut crate::app::AppState) -> String {

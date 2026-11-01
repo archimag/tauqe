@@ -198,9 +198,14 @@ composition, so a retry differs from its earlier attempt only in the trailing
 diagnostics. Discovery knowledge paid for once remains available for the whole
 turn.
 
-The same dispatcher serves the architect discovery loop during plan refinement and
-finding decomposition; that loop enables the already-satisfied explanation and is
-described in *Local Plans* and *Structured Code Review*.
+The same dispatcher serves the structured Architect synthesis contour in
+`crates/core`, which projects plan horizons and decomposes review groups. That
+contour is a policy layer on the shared turn kernel, so its rounds are the
+kernel's rounds and its findings land in the same journal; the already-satisfied
+explanation is enabled there, because a re-request is a legitimate signal that
+the Architect is still reasoning over what it holds. The server no longer runs a
+discovery loop of its own: it resolves the provider, relays the contour's
+events, and records the outcome.
 
 ### 3.7 Failure feedback and termination
 

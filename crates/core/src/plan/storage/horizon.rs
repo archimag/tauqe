@@ -37,15 +37,20 @@ pub fn merge_subplan(
         );
     }
 
-    let mut wrapper = Plan {
-        items: combined,
-        ..Default::default()
-    };
+    let mut wrapper = Plan::from_parts(
+        String::new(),
+        String::new(),
+        None,
+        0,
+        0,
+        Vec::new(),
+        combined,
+    );
     wrapper.normalize_leaf_files();
     wrapper.refresh_parent_statuses();
     validate_synthesized_horizon(&wrapper)?;
 
-    Ok(wrapper.items)
+    Ok(wrapper.implementation.items)
 }
 
 /// Rejects a synthesized horizon that is structurally invalid or dead on arrival.
@@ -508,10 +513,14 @@ mod tests {
         let dir = tempdir().unwrap();
         let root = dir.path();
 
-        let plan = Plan {
-            id: "horizon-plan".to_string(),
-            title: "Horizon Plan".to_string(),
-            items: vec![
+        let plan = Plan::from_parts(
+            "horizon-plan".to_string(),
+            "Horizon Plan".to_string(),
+            None,
+            0,
+            0,
+            vec![],
+            vec![
                 PlanItem {
                     id: "1".to_string(),
                     title: "Foundation".to_string(),
@@ -525,8 +534,7 @@ mod tests {
                     ..Default::default()
                 },
             ],
-            ..Default::default()
-        };
+        );
         PlanStorage::save_plan(root, &plan).unwrap();
 
         let new_horizon = vec![
@@ -582,11 +590,15 @@ mod tests {
         let dir = tempdir().unwrap();
         let root = dir.path();
 
-        let plan = Plan {
-            id: "empty-plan".to_string(),
-            title: "Empty".to_string(),
-            ..Default::default()
-        };
+        let plan = Plan::from_parts(
+            "empty-plan".to_string(),
+            "Empty".to_string(),
+            None,
+            0,
+            0,
+            vec![],
+            vec![],
+        );
         PlanStorage::save_plan(root, &plan).unwrap();
 
         let new_horizon = vec![PlanItem {
@@ -617,17 +629,20 @@ mod tests {
         let dir = tempdir().unwrap();
         let root = dir.path();
 
-        let plan = Plan {
-            id: "collision-plan".to_string(),
-            title: "Collision".to_string(),
-            items: vec![PlanItem {
+        let plan = Plan::from_parts(
+            "collision-plan".to_string(),
+            "Collision".to_string(),
+            None,
+            0,
+            0,
+            vec![],
+            vec![PlanItem {
                 id: "1".to_string(),
                 title: "Completed".to_string(),
                 status: PlanItemStatus::Done,
                 ..Default::default()
             }],
-            ..Default::default()
-        };
+        );
         PlanStorage::save_plan(root, &plan).unwrap();
 
         // A stale model id reuses the completed step with a pending status.
@@ -669,10 +684,14 @@ mod tests {
         let dir = tempdir().unwrap();
         let root = dir.path();
 
-        let plan = Plan {
-            id: "hoist-plan".to_string(),
-            title: "Hoist".to_string(),
-            items: vec![PlanItem {
+        let plan = Plan::from_parts(
+            "hoist-plan".to_string(),
+            "Hoist".to_string(),
+            None,
+            0,
+            0,
+            vec![],
+            vec![PlanItem {
                 id: "1".to_string(),
                 title: "Container".to_string(),
                 status: PlanItemStatus::Todo,
@@ -692,8 +711,7 @@ mod tests {
                 ],
                 ..Default::default()
             }],
-            ..Default::default()
-        };
+        );
         PlanStorage::save_plan(root, &plan).unwrap();
 
         let new_horizon = vec![PlanItem {
@@ -726,11 +744,15 @@ mod tests {
         let dir = tempdir().unwrap();
         let root = dir.path();
 
-        let plan = Plan {
-            id: "cycle-plan".to_string(),
-            title: "Cycle".to_string(),
-            ..Default::default()
-        };
+        let plan = Plan::from_parts(
+            "cycle-plan".to_string(),
+            "Cycle".to_string(),
+            None,
+            0,
+            0,
+            vec![],
+            vec![],
+        );
         PlanStorage::save_plan(root, &plan).unwrap();
 
         let new_horizon = vec![
@@ -774,17 +796,20 @@ mod tests {
         let dir = tempdir().unwrap();
         let root = dir.path();
 
-        let plan = Plan {
-            id: "dangling-plan".to_string(),
-            title: "Dangling".to_string(),
-            items: vec![PlanItem {
+        let plan = Plan::from_parts(
+            "dangling-plan".to_string(),
+            "Dangling".to_string(),
+            None,
+            0,
+            0,
+            vec![],
+            vec![PlanItem {
                 id: "1".to_string(),
                 title: "Foundation".to_string(),
                 status: PlanItemStatus::Done,
                 ..Default::default()
             }],
-            ..Default::default()
-        };
+        );
         PlanStorage::save_plan(root, &plan).unwrap();
 
         // The synthesized step names a dependency no stored step provides, so
@@ -830,11 +855,15 @@ mod tests {
         let dir = tempdir().unwrap();
         let root = dir.path();
 
-        let plan = Plan {
-            id: "dead-plan".to_string(),
-            title: "Dead on arrival".to_string(),
-            ..Default::default()
-        };
+        let plan = Plan::from_parts(
+            "dead-plan".to_string(),
+            "Dead on arrival".to_string(),
+            None,
+            0,
+            0,
+            vec![],
+            vec![],
+        );
         PlanStorage::save_plan(root, &plan).unwrap();
 
         // Structurally valid but unexecutable: the only pending step waits for
@@ -897,26 +926,27 @@ mod tests {
         let dir = tempdir().unwrap();
         let root = dir.path();
 
-        let plan = Plan {
-            id: "clear-plan".to_string(),
-            title: "Clear Plan".to_string(),
-            updated_at: 10,
-            architect: Some(test_architect()),
-            last_replanned_step: Some("1".to_string()),
-            concept: vec![tauqe_protocol::ConceptItem {
+        let mut plan = Plan::from_parts(
+            "clear-plan".to_string(),
+            "Clear Plan".to_string(),
+            None,
+            0,
+            10,
+            vec![tauqe_protocol::ConceptItem {
                 id: "c-1".to_string(),
                 title: "Invariant".to_string(),
                 details: None,
                 children: vec![],
             }],
-            items: vec![PlanItem {
+            vec![PlanItem {
                 id: "1".to_string(),
                 title: "Pending step".to_string(),
                 status: PlanItemStatus::Todo,
                 ..Default::default()
             }],
-            ..Default::default()
-        };
+        );
+        plan.architect = Some(test_architect());
+        plan.last_replanned_step = Some("1".to_string());
         PlanStorage::save_plan(root, &plan).unwrap();
 
         let cleared = PlanStorage::clear_horizon(root, "clear-plan")
@@ -947,25 +977,29 @@ mod tests {
         let dir = tempdir().unwrap();
         let root = dir.path();
 
-        let plan = Plan {
-            id: "clear-done-plan".to_string(),
-            title: "Clear Done".to_string(),
-            items: vec![PlanItem {
+        let plan = Plan::from_parts(
+            "clear-done-plan".to_string(),
+            "Clear Done".to_string(),
+            None,
+            0,
+            0,
+            vec![],
+            vec![PlanItem {
                 id: "1".to_string(),
                 title: "Finished".to_string(),
                 status: PlanItemStatus::Done,
                 ..Default::default()
             }],
-            ..Default::default()
-        };
+        );
         PlanStorage::save_plan(root, &plan).unwrap();
 
         // Saving the same plan without its completed step is rejected...
-        let truncated = Plan {
-            items: Vec::new(),
-            ..plan.clone()
-        };
-        assert!(PlanStorage::save_plan(root, &truncated).is_err());
+        let mut truncated = plan.clone();
+        truncated.items = Vec::new();
+        assert!(
+            PlanStorage::save_plan(root, &truncated).is_err(),
+            "a plain save must not discard a completed step"
+        );
 
         // ...but clearing the horizon is the explicit, user-authorized removal.
         let cleared = PlanStorage::clear_horizon(root, "clear-done-plan")

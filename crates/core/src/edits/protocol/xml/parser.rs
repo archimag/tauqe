@@ -305,6 +305,14 @@ pub(super) fn parse_xml_edits(
                     to: target_to,
                 });
             }
+            EditFileOp::MoveDir => {
+                // The search/replace grammar declares no directory tag, so a
+                // block that realizes a directory move is refused instead of
+                // being guessed from its attributes.
+                return Err(String::from(
+                    "The search/replace edit grammar carries no directory move; express the subtree as one move_dir entry of the anchored change set",
+                ));
+            }
             EditFileOp::Delete => {
                 let path_attr = extract_attribute(header, "path").ok_or_else(|| {
                     format!(

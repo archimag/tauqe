@@ -19,6 +19,7 @@ use tauqe_core::workflow::{
 };
 use tauqe_protocol::{
     ContextAccess, ModelRef, ModelResult, Plan, PlanItem, PlanItemStatus, PlanScopeEvaluation,
+    VerificationVerdict,
 };
 use tokio::sync::{mpsc, watch};
 
@@ -73,6 +74,13 @@ fn init_repo() -> (tempfile::TempDir, std::path::PathBuf) {
     let dir = tempfile::tempdir().expect("create temporary directory");
     let repo_root = dir.path().to_path_buf();
     tauqe_core::git::init_repository(Some(&repo_root), true).expect("initialize repository");
+    // A bound repository hides its own journal, history, and plans under
+    // `.tauqe/`, and a turn installs those ignore rules when it opens its Git
+    // transaction. A turn refused during in-memory staging never opens one, so
+    // the fixture establishes the same boundary up front: a refusal is then
+    // asserted against a working copy that reports no residue at all.
+    tauqe_core::git::checkpoint::ensure_tauqe_ignored(&repo_root)
+        .expect("install the harness state exclusion");
     (dir, repo_root)
 }
 
@@ -946,6 +954,11 @@ async fn git_workflow_runs_no_compiler_without_a_verification_declaration() {
     match execution.result {
         ModelResult::Edit { outcome, .. } => {
             assert!(outcome.error.is_none());
+            assert_eq!(
+                outcome.verification,
+                Some(VerificationVerdict::NotConfigured),
+                "an undeclared repository reports its change set as unverified"
+            );
             assert!(
                 outcome.applied,
                 "an undeclared repository applies its edits without guessing a compiler"
@@ -1589,19 +1602,19 @@ async fn plan_semantic_recovery_lifecycle_end_to_end() {
         ..Default::default()
     };
 
-    let plan = Plan {
-        id: "recovery-plan".to_string(),
-        title: "Recovery Plan".to_string(),
-        created_at: 10,
-        updated_at: 10,
-        concept: vec![],
-        items: vec![
+    let plan = Plan::from_parts(
+        "recovery-plan".to_string(),
+        "Recovery Plan".to_string(),
+        None,
+        10,
+        10,
+        vec![],
+        vec![
             foundation.clone(),
             blocked_step.clone(),
             dependent_step.clone(),
         ],
-        ..Default::default()
-    };
+    );
 
     // 1. Save plan to storage
     tauqe_core::plan::storage::PlanStorage::save_plan(&repo_root, &plan)
@@ -3897,10 +3910,14 @@ async fn project_verification_reports_structured_diagnostics_for_healing() {
     );
     commit_fixture(&repo_root, &["src.rs", "tauqe.toml"]);
 
-    let (ok, results) =
+    let (status, results) =
         tauqe_core::toolchain::run_verification_pipeline(&repo_root, &[], None).await;
 
-    assert!(!ok, "the failing verification must report a failure");
+    assert_eq!(
+        status,
+        tauqe_core::toolchain::VerificationStatus::Failed,
+        "the failing verification must report a failure"
+    );
     assert_eq!(results.len(), 1);
     assert_eq!(results[0].diagnostics.len(), 1);
     let report = tauqe_protocol::format_diagnostics(&results[0].diagnostics);
@@ -4829,6 +4846,7 @@ async fn auto_context_survives_a_failed_verification() {
     match &output.result {
         ModelResult::Edit { outcome, .. } => {
             assert!(!outcome.applied, "a failed verification must not commit");
+            assert_eq!(outcome.verification, Some(VerificationVerdict::Failed));
             assert!(outcome
                 .error
                 .as_deref()
@@ -6825,8 +6843,9 @@ async fn answer_request_round_error_terminates_the_turn_as_an_unapplied_edit() {
     .expect("fsm turn executes");
 
     assert!(
-        !outcome.is_unverified_answer(),
-        "a declared terminal error must not look like an unverified answer"
+        matches!(outcome.result, ModelResult::Edit { .. }),
+        "a declared terminal error must end the turn as an unapplied edit: {:?}",
+        outcome.result
     );
     match outcome.result {
         ModelResult::Edit { outcome, edits, .. } => {
@@ -6907,8 +6926,9 @@ async fn project_command_answer_round_error_terminates_the_turn_as_an_unapplied_
     .expect("fsm turn executes");
 
     assert!(
-        !outcome.is_unverified_answer(),
-        "a declared terminal error must not look like an unverified answer"
+        matches!(outcome.result, ModelResult::Edit { .. }),
+        "a declared terminal error must end the turn as an unapplied edit: {:?}",
+        outcome.result
     );
     match outcome.result {
         ModelResult::Edit { outcome, edits, .. } => {
@@ -7090,14 +7110,646 @@ async fn single_execution_reports_the_tool_round_error_as_a_terminal_failure() {
         "the declared error must not spend a further coder-tier attempt"
     );
 
-    let mut saw_escalation = false;
+    let mut streamed = String::new();
     while let Ok(event) = stream_rx.try_recv() {
-        if matches!(event, StreamEvent::ModelEscalated { .. }) {
-            saw_escalation = true;
+        if let StreamEvent::TextDelta(delta) = event {
+            streamed.push_str(&delta);
         }
     }
     assert!(
-        !saw_escalation,
-        "a declared error must never escalate the coder ladder"
+        !streamed.contains("Level Up Escalation"),
+        "a declared error must never announce an escalation: {streamed:?}"
+    );
+}
+
+/// Builds the structured change set that renames one directory subtree.
+///
+/// The entry names the source and the destination directory only. The range
+/// bounds and the payload the anchored strategy declares for a line replacement
+/// stay empty, because a directory addresses no line of a file.
+fn dir_move_response(from: &str, to: &str) -> String {
+    serde_json::json!({
+        "message": format!("Rename the directory `{from}` to `{to}`."),
+        "changes": [{
+            "op": "move_dir",
+            "path": from,
+            "to": to,
+            "start": "",
+            "end": "",
+            "content": ""
+        }],
+        "context_requests": [],
+    })
+    .to_string()
+}
+
+/// A directory move reaches Git as one commit: the destinations are added, the
+/// sources are removed, the emptied source directories are pruned, and the
+/// working tree is clean once the turn ends.
+#[cfg(unix)]
+#[tokio::test]
+async fn structured_dir_move_turn_commits_the_whole_subtree() {
+    let (_dir, repo_root) = init_repo();
+    std::fs::create_dir_all(repo_root.join("src/old/nested")).expect("create the source subtree");
+    std::fs::write(repo_root.join("src/old/a.rs"), "pub fn a() {}\n").expect("write the file");
+    std::fs::write(repo_root.join("src/old/nested/b.rs"), "pub fn b() {}\n")
+        .expect("write the nested file");
+    commit_fixture(&repo_root, &["src/old/a.rs", "src/old/nested/b.rs"]);
+
+    let mut context = ContextManager::new(repo_root.clone());
+    context
+        .add_file("src/old/a.rs", ContextAccess::Editable)
+        .expect("add the moved file to context");
+    let mut history = HistoryManager::new(repo_root.clone());
+
+    let provider =
+        MockLlmProvider::scripted([MockResponse::text(dir_move_response("src/old", "src/new"))]);
+    let model = ModelRef::openrouter("mock/model");
+    let protocol = tauqe_core::prompt::json::JsonPromptProtocol::edits();
+    let (stream_tx, cancel_rx) = event_channel();
+
+    let baseline = commit_count(&repo_root);
+    let mut policy = GitTransactionPolicy::new();
+    let exec = SingleExecution::new(WorkflowOptions::default());
+    let execution = exec
+        .execute(
+            &mut policy,
+            "Move the module directory src/old to src/new",
+            tauqe_protocol::TurnIntent::InteractiveRepl,
+            &provider,
+            &model,
+            &mut context,
+            &mut history,
+            &protocol,
+            stream_tx,
+            cancel_rx,
+        )
+        .await
+        .expect("workflow execution succeeds");
+
+    match execution.result {
+        ModelResult::Edit { outcome, .. } => {
+            assert!(
+                outcome.error.is_none(),
+                "unexpected error: {:?}",
+                outcome.error
+            );
+            assert!(
+                outcome.applied,
+                "the directory move must reach the single turn commit"
+            );
+            assert!(
+                outcome.commit_hash.is_some(),
+                "the turn must commit its change set"
+            );
+            // The reported change set names the destinations the commit records.
+            assert!(outcome.changed_files.contains(&"src/new/a.rs".to_string()));
+            assert!(outcome
+                .changed_files
+                .contains(&"src/new/nested/b.rs".to_string()));
+        }
+        other => panic!("expected applied edits, got {other:?}"),
+    }
+    assert_eq!(
+        provider.requests().len(),
+        1,
+        "one proposal round must be enough for a directory move"
+    );
+
+    assert_eq!(
+        std::fs::read_to_string(repo_root.join("src/new/a.rs")).expect("read the moved file"),
+        "pub fn a() {}\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(repo_root.join("src/new/nested/b.rs"))
+            .expect("read the nested file"),
+        "pub fn b() {}\n"
+    );
+    assert!(
+        !repo_root.join("src/old").exists(),
+        "an emptied source tree must be pruned"
+    );
+    assert!(
+        repo_root.join("src").is_dir(),
+        "a directory that still holds a file survives the prune"
+    );
+
+    // The rename reaches Git as one change set: the destinations are added and
+    // the sources are removed. Rename detection is disabled on purpose, so the
+    // test observes the exact paths the commit records.
+    let status = tauqe_core::git::cmd::run_git(
+        Some(&repo_root),
+        &[
+            "show",
+            "--name-status",
+            "--no-renames",
+            "--pretty=format:",
+            "HEAD",
+        ],
+    )
+    .expect("read the committed change set");
+    let mut changes: Vec<&str> = status
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect();
+    changes.sort();
+    assert_eq!(
+        changes,
+        vec![
+            "A\tsrc/new/a.rs",
+            "A\tsrc/new/nested/b.rs",
+            "D\tsrc/old/a.rs",
+            "D\tsrc/old/nested/b.rs",
+        ]
+    );
+    assert_eq!(
+        commit_count(&repo_root),
+        baseline + 1,
+        "one bounded turn produces exactly one commit"
+    );
+    assert!(
+        worktree_status(&repo_root).is_empty(),
+        "the turn must not leave unaccounted files behind"
+    );
+}
+
+/// A failed verification rolls the whole subtree back: the sources return, the
+/// destinations disappear, and no commit records the attempt.
+#[cfg(unix)]
+#[tokio::test]
+async fn dir_move_turn_rolls_back_a_failed_verification() {
+    let (_dir, repo_root) = init_repo();
+    std::fs::create_dir_all(repo_root.join("src/old")).expect("create the source directory");
+    std::fs::write(repo_root.join("src/old/a.rs"), "pub fn a() {}\n").expect("write the file");
+    write_project_config(
+        &repo_root,
+        concat!(
+            "[models]\n",
+            "primary = [\"openrouter:mock/model\"]\n",
+            "\n",
+            "[project.verify]\n",
+            "command = \"sh\"\n",
+            "args = [\"-c\", \"exit 1\"]\n",
+        ),
+    );
+    commit_fixture(&repo_root, &["src/old/a.rs", "tauqe.toml"]);
+
+    let mut context = ContextManager::new(repo_root.clone());
+    context
+        .add_file("src/old/a.rs", ContextAccess::Editable)
+        .expect("add the moved file to context");
+    let mut history = HistoryManager::new(repo_root.clone());
+
+    let provider =
+        MockLlmProvider::scripted([MockResponse::text(dir_move_response("src/old", "src/new"))]);
+    let model = ModelRef::openrouter("mock/model");
+    let protocol = tauqe_core::prompt::json::JsonPromptProtocol::edits();
+    let (stream_tx, cancel_rx) = event_channel();
+
+    let baseline = commit_count(&repo_root);
+    let mut policy = GitTransactionPolicy::new();
+    let options = WorkflowOptions {
+        max_retries: 0,
+        ..WorkflowOptions::default()
+    };
+    let exec = SingleExecution::new(options);
+    let execution = exec
+        .execute(
+            &mut policy,
+            "Move the module directory src/old to src/new",
+            tauqe_protocol::TurnIntent::InteractiveRepl,
+            &provider,
+            &model,
+            &mut context,
+            &mut history,
+            &protocol,
+            stream_tx,
+            cancel_rx,
+        )
+        .await
+        .expect("workflow execution succeeds");
+
+    match execution.result {
+        ModelResult::Edit { outcome, .. } => {
+            assert!(!outcome.applied, "a failed verification must not commit");
+            let error = outcome.error.unwrap_or_default();
+            assert!(
+                error.contains("Code verification failed"),
+                "unexpected error: {error}"
+            );
+        }
+        other => panic!("expected a failed verification, got {other:?}"),
+    }
+    assert_eq!(provider.requests().len(), 1);
+
+    assert_eq!(
+        std::fs::read_to_string(repo_root.join("src/old/a.rs")).expect("read the restored file"),
+        "pub fn a() {}\n",
+        "the rollback must restore the source file"
+    );
+    assert!(
+        !repo_root.join("src/new").exists(),
+        "the rollback must remove the destination subtree"
+    );
+    assert_eq!(
+        commit_count(&repo_root),
+        baseline,
+        "a rolled-back turn produces no commit"
+    );
+    assert!(
+        worktree_status(&repo_root).is_empty(),
+        "the rollback must leave a clean working tree"
+    );
+}
+
+/// A destination that already holds a file is refused during in-memory staging,
+/// and the retry names the colliding path instead of moving half of the subtree.
+#[cfg(unix)]
+#[tokio::test]
+async fn dir_move_turn_refuses_to_overwrite_an_existing_destination() {
+    let (_dir, repo_root) = init_repo();
+    std::fs::create_dir_all(repo_root.join("src/old")).expect("create the source directory");
+    std::fs::write(repo_root.join("src/old/a.rs"), "pub fn a() {}\n")
+        .expect("write the source file");
+    std::fs::create_dir_all(repo_root.join("src/new")).expect("create the destination directory");
+    std::fs::write(repo_root.join("src/new/a.rs"), "pub fn taken() {}\n")
+        .expect("write the occupying file");
+    commit_fixture(&repo_root, &["src/old/a.rs", "src/new/a.rs"]);
+
+    let mut context = ContextManager::new(repo_root.clone());
+    let mut history = HistoryManager::new(repo_root.clone());
+
+    let response = dir_move_response("src/old", "src/new");
+    let provider = MockLlmProvider::scripted([
+        MockResponse::text(response.clone()),
+        MockResponse::text(response),
+    ]);
+    let model = ModelRef::openrouter("mock/model");
+    let protocol = tauqe_core::prompt::json::JsonPromptProtocol::edits();
+    let (stream_tx, cancel_rx) = event_channel();
+
+    let baseline = commit_count(&repo_root);
+    let mut policy = GitTransactionPolicy::new();
+    let options = WorkflowOptions {
+        max_retries: 1,
+        ..WorkflowOptions::default()
+    };
+    let exec = SingleExecution::new(options);
+    let execution = exec
+        .execute(
+            &mut policy,
+            "Move the module directory src/old to src/new",
+            tauqe_protocol::TurnIntent::InteractiveRepl,
+            &provider,
+            &model,
+            &mut context,
+            &mut history,
+            &protocol,
+            stream_tx,
+            cancel_rx,
+        )
+        .await
+        .expect("workflow execution succeeds");
+
+    match execution.result {
+        ModelResult::Edit { outcome, edits, .. } => {
+            assert!(!outcome.applied, "a refused directory move must not apply");
+            assert!(edits.is_empty());
+            let error = outcome.error.unwrap_or_default();
+            assert!(
+                error.contains("Failed to apply edits after 1 retries"),
+                "unexpected error: {error}"
+            );
+        }
+        other => panic!("expected a refused change set, got {other:?}"),
+    }
+    assert_eq!(
+        provider.requests().len(),
+        2,
+        "the retry budget must be spent on the refusal"
+    );
+
+    let retry = provider.requests()[1]
+        .messages
+        .last()
+        .map(|message| message.content.clone())
+        .unwrap_or_default();
+    assert!(retry.contains("Failed files and errors:"), "{retry}");
+    assert!(
+        retry.contains("src/new/a.rs") && retry.contains("already exists"),
+        "the retry must name the collision: {retry}"
+    );
+
+    assert_eq!(
+        std::fs::read_to_string(repo_root.join("src/old/a.rs")).expect("read the source file"),
+        "pub fn a() {}\n",
+        "a refused change set must never reach the working tree"
+    );
+    assert_eq!(
+        std::fs::read_to_string(repo_root.join("src/new/a.rs")).expect("read the occupying file"),
+        "pub fn taken() {}\n"
+    );
+    assert_eq!(commit_count(&repo_root), baseline);
+    let status = worktree_status(&repo_root);
+    assert!(
+        status.is_empty(),
+        "a refused directory move must leave a clean working tree: {status:?}"
+    );
+}
+
+/// A move that would carry a file across a declared boundary is refused before
+/// any byte moves, and the retry names the declaration that guards the path.
+#[cfg(unix)]
+#[tokio::test]
+async fn dir_move_turn_refuses_a_protected_subtree() {
+    let (_dir, repo_root) = init_repo();
+    std::fs::create_dir_all(repo_root.join("docs/specs")).expect("create the guarded directory");
+    std::fs::write(repo_root.join("docs/specs/auth.md"), "# Auth spec\n")
+        .expect("write the guarded file");
+    write_project_config(
+        &repo_root,
+        concat!(
+            "[models]\n",
+            "primary = [\"openrouter:mock/model\"]\n",
+            "\n",
+            "[project.boundaries]\n",
+            "protected = [\"docs/specs/**\"]\n",
+        ),
+    );
+    commit_fixture(&repo_root, &["docs/specs/auth.md", "tauqe.toml"]);
+
+    let mut context = ContextManager::new(repo_root.clone());
+    let mut history = HistoryManager::new(repo_root.clone());
+
+    let response = dir_move_response("docs/specs", "docs/archive");
+    let provider = MockLlmProvider::scripted([
+        MockResponse::text(response.clone()),
+        MockResponse::text(response),
+    ]);
+    let model = ModelRef::openrouter("mock/model");
+    let protocol = tauqe_core::prompt::json::JsonPromptProtocol::edits();
+    let (stream_tx, cancel_rx) = event_channel();
+
+    let baseline = commit_count(&repo_root);
+    let mut policy = GitTransactionPolicy::new();
+    let options = WorkflowOptions {
+        max_retries: 1,
+        ..WorkflowOptions::default()
+    };
+    let exec = SingleExecution::new(options);
+    let execution = exec
+        .execute(
+            &mut policy,
+            "Move the specification directory docs/specs to docs/archive",
+            tauqe_protocol::TurnIntent::InteractiveRepl,
+            &provider,
+            &model,
+            &mut context,
+            &mut history,
+            &protocol,
+            stream_tx,
+            cancel_rx,
+        )
+        .await
+        .expect("workflow execution succeeds");
+
+    match execution.result {
+        ModelResult::Edit { outcome, edits, .. } => {
+            assert!(!outcome.applied, "a guarded subtree must never move");
+            assert!(edits.is_empty());
+            let error = outcome.error.unwrap_or_default();
+            assert!(
+                error.contains("Failed to apply edits after 1 retries"),
+                "unexpected error: {error}"
+            );
+        }
+        other => panic!("expected a refused change set, got {other:?}"),
+    }
+    assert_eq!(provider.requests().len(), 2);
+
+    let retry = provider.requests()[1]
+        .messages
+        .last()
+        .map(|message| message.content.clone())
+        .unwrap_or_default();
+    assert!(
+        retry.contains("[project.boundaries.protected]"),
+        "the retry must name the declaration: {retry}"
+    );
+    assert!(
+        retry.contains("docs/specs"),
+        "the retry must name the guarded path: {retry}"
+    );
+
+    assert_eq!(
+        std::fs::read_to_string(repo_root.join("docs/specs/auth.md"))
+            .expect("read the guarded file"),
+        "# Auth spec\n"
+    );
+    assert!(!repo_root.join("docs/archive").exists());
+    assert_eq!(commit_count(&repo_root), baseline);
+    let status = worktree_status(&repo_root);
+    assert!(
+        status.is_empty(),
+        "a guarded subtree must never move: {status:?}"
+    );
+}
+
+/// A project that writes a `tauqe.toml` without a `[project.verify]` section
+/// states its own lifecycle choice: the turn runs no verification step, the
+/// change set is committed once, and the result carries the explicit
+/// `not_configured` verdict instead of a fabricated success.
+#[cfg(unix)]
+#[tokio::test]
+async fn git_workflow_reports_not_configured_when_the_declaration_omits_verification() {
+    let (_dir, repo_root) = init_repo();
+    std::fs::write(
+        repo_root.join("target.rs"),
+        "pub fn compute() -> i32 { 0 }\n",
+    )
+    .expect("write target fixture");
+    write_project_config(
+        &repo_root,
+        "[models]\nprimary = [\"openrouter:mock/model\"]\n",
+    );
+    commit_fixture(&repo_root, &["target.rs", "tauqe.toml"]);
+
+    let mut context = ContextManager::new(repo_root.clone());
+    context
+        .add_file("target.rs", ContextAccess::Editable)
+        .expect("add target to context");
+    let mut history = HistoryManager::new(repo_root.clone());
+
+    let edit = edit_block(
+        "Change compute to 42",
+        "target.rs",
+        "pub fn compute() -> i32 { 0 }",
+        "pub fn compute() -> i32 { 42 }",
+    );
+    let provider = MockLlmProvider::scripted([MockResponse::text(edit)]);
+    let model = ModelRef::openrouter("mock/model");
+    let protocol = tauqe_core::prompt::xml::XmlPromptProtocol
+        .with_turn_marker(MARKER)
+        .expect("marker-bound protocol");
+    let (stream_tx, cancel_rx) = event_channel();
+
+    let baseline = commit_count(&repo_root);
+    let mut policy = GitTransactionPolicy::new();
+    let exec = SingleExecution::new(WorkflowOptions::default());
+    let execution = exec
+        .execute(
+            &mut policy,
+            "Change compute to return 42",
+            tauqe_protocol::TurnIntent::InteractiveRepl,
+            &provider,
+            &model,
+            &mut context,
+            &mut history,
+            protocol.as_ref(),
+            stream_tx,
+            cancel_rx,
+        )
+        .await
+        .expect("workflow execution succeeds");
+
+    match execution.result {
+        ModelResult::Edit { outcome, .. } => {
+            assert!(
+                outcome.error.is_none(),
+                "unexpected error: {:?}",
+                outcome.error
+            );
+            assert!(
+                outcome.applied,
+                "a project that declares no gate still commits its change set"
+            );
+            assert_eq!(
+                outcome.verification,
+                Some(VerificationVerdict::NotConfigured),
+                "the result must state that nothing verified the change set"
+            );
+            assert_eq!(outcome.changed_files, vec!["target.rs".to_string()]);
+            assert!(outcome.commit_hash.is_some());
+        }
+        other => panic!("expected applied edits, got {other:?}"),
+    }
+    assert_eq!(
+        provider.requests().len(),
+        1,
+        "an absent verification lifecycle must not trigger a healing round"
+    );
+    assert_eq!(
+        std::fs::read_to_string(repo_root.join("target.rs")).expect("read target fixture"),
+        "pub fn compute() -> i32 { 42 }\n"
+    );
+    assert_eq!(commit_paths(&repo_root), vec!["target.rs".to_string()]);
+    assert_eq!(
+        commit_count(&repo_root),
+        baseline + 1,
+        "one bounded turn produces exactly one commit"
+    );
+    assert!(
+        worktree_status(&repo_root).is_empty(),
+        "the turn must not leave unaccounted files behind"
+    );
+}
+
+/// A repository that declares `[project.verify]` runs the declared command before
+/// committing, so the result records a passed gate next to the single commit it
+/// accepted.
+#[cfg(unix)]
+#[tokio::test]
+async fn git_workflow_reports_passed_verification_for_a_declared_command() {
+    let (_dir, repo_root) = init_repo();
+    std::fs::write(
+        repo_root.join("target.rs"),
+        "pub fn compute() -> i32 { 0 }\n",
+    )
+    .expect("write target fixture");
+    write_project_config(
+        &repo_root,
+        concat!(
+            "[models]\n",
+            "primary = [\"openrouter:mock/model\"]\n",
+            "\n",
+            "[project.verify]\n",
+            "command = \"grep\"\n",
+            "args = [\"-q\", \"pub fn compute() -> i32 { 42 }\", \"target.rs\"]\n",
+        ),
+    );
+    commit_fixture(&repo_root, &["target.rs", "tauqe.toml"]);
+
+    let mut context = ContextManager::new(repo_root.clone());
+    context
+        .add_file("target.rs", ContextAccess::Editable)
+        .expect("add target to context");
+    let mut history = HistoryManager::new(repo_root.clone());
+
+    let edit = edit_block(
+        "Change compute to 42",
+        "target.rs",
+        "pub fn compute() -> i32 { 0 }",
+        "pub fn compute() -> i32 { 42 }",
+    );
+    let provider = MockLlmProvider::scripted([MockResponse::text(edit)]);
+    let model = ModelRef::openrouter("mock/model");
+    let protocol = tauqe_core::prompt::xml::XmlPromptProtocol
+        .with_turn_marker(MARKER)
+        .expect("marker-bound protocol");
+    let (stream_tx, cancel_rx) = event_channel();
+
+    let baseline = commit_count(&repo_root);
+    let mut policy = GitTransactionPolicy::new();
+    let exec = SingleExecution::new(WorkflowOptions::default());
+    let execution = exec
+        .execute(
+            &mut policy,
+            "Change compute to return 42",
+            tauqe_protocol::TurnIntent::InteractiveRepl,
+            &provider,
+            &model,
+            &mut context,
+            &mut history,
+            protocol.as_ref(),
+            stream_tx,
+            cancel_rx,
+        )
+        .await
+        .expect("workflow execution succeeds");
+
+    match execution.result {
+        ModelResult::Edit { outcome, .. } => {
+            assert!(
+                outcome.error.is_none(),
+                "unexpected error: {:?}",
+                outcome.error
+            );
+            assert!(outcome.applied, "the verified change set must be committed");
+            assert_eq!(
+                outcome.verification,
+                Some(VerificationVerdict::Passed),
+                "the result must record the declared gate that accepted it"
+            );
+        }
+        other => panic!("expected applied edits, got {other:?}"),
+    }
+    assert_eq!(
+        provider.requests().len(),
+        1,
+        "a passing declaration must verify on the first attempt"
+    );
+    assert_eq!(
+        std::fs::read_to_string(repo_root.join("target.rs")).expect("read target fixture"),
+        "pub fn compute() -> i32 { 42 }\n"
+    );
+    assert_eq!(
+        commit_count(&repo_root),
+        baseline + 1,
+        "one bounded turn produces exactly one commit"
+    );
+    assert!(
+        worktree_status(&repo_root).is_empty(),
+        "the turn must not leave unaccounted files behind"
     );
 }

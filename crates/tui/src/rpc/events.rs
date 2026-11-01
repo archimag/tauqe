@@ -71,23 +71,6 @@ fn mark_files_awaiting_healing(model: &mut ReplView) {
         file.error = None;
     }
 }
-/// Refreshes the audited file list of the open diff inspector.
-///
-/// The inspector is a live projection of the staged change set, never a frozen
-/// copy: every event that mutates `st.model.files` — a file start, a streamed
-/// hunk, a retry, a verification verdict, or a terminal reconciliation —
-/// republishes the slice it audits, so the reading surface never shows an edit
-/// the Viewport has already moved past (c-3). The highlight is clamped to the
-/// refreshed set, because a reconciliation may shrink it.
-fn sync_diff_inspector(st: &mut AppState) {
-    let Some(inspector) = st.diff_inspector.as_mut() else {
-        return;
-    };
-    inspector.files.clone_from(&st.model.files);
-    if inspector.selected_file >= inspector.files.len() {
-        inspector.selected_file = inspector.files.len().saturating_sub(1);
-    }
-}
 pub async fn handle_event(ev: Event, state: &Arc<Mutex<AppState>>, is_reasoning: &mut bool) {
     let mut st = state.lock().await;
     match ev.method.as_str() {
@@ -110,7 +93,6 @@ pub async fn handle_event(ev: Event, state: &Arc<Mutex<AppState>>, is_reasoning:
                         f.error = None;
                         f.retry_info = None;
                     }
-                    sync_diff_inspector(&mut st);
                 }
             }
         }
@@ -278,7 +260,6 @@ pub async fn handle_event(ev: Event, state: &Arc<Mutex<AppState>>, is_reasoning:
                     // steps can never accumulate the payload of the
                     // previous member.
                     st.model.reset_turn_buffers();
-                    sync_diff_inspector(&mut st);
                     st.model.scroll = 0;
                     st.model.status = TurnStatus::Awaiting;
                     st.model.plan_context = data.plan_context;
@@ -334,7 +315,6 @@ pub async fn handle_event(ev: Event, state: &Arc<Mutex<AppState>>, is_reasoning:
                     // (c-healing-phase-visual).
                     if data.phase == tauqe_protocol::TurnPhase::Healing {
                         mark_files_awaiting_healing(&mut st.model);
-                        sync_diff_inspector(&mut st);
                     }
                 }
             }
@@ -381,7 +361,6 @@ pub async fn handle_event(ev: Event, state: &Arc<Mutex<AppState>>, is_reasoning:
                     // streams its replacements (c-healing-phase-visual).
                     if failed {
                         mark_files_awaiting_healing(&mut st.model);
-                        sync_diff_inspector(&mut st);
                     }
                 }
             }
@@ -509,7 +488,6 @@ pub async fn handle_event(ev: Event, state: &Arc<Mutex<AppState>>, is_reasoning:
                         st.model.selected_file_index = st.model.files.len() - 1;
                     }
                     scroll_to_stream_end(&mut st);
-                    sync_diff_inspector(&mut st);
                 }
             }
         }
@@ -525,7 +503,6 @@ pub async fn handle_event(ev: Event, state: &Arc<Mutex<AppState>>, is_reasoning:
                         });
                     }
                     scroll_to_stream_end(&mut st);
-                    sync_diff_inspector(&mut st);
                 }
             }
         }
@@ -541,7 +518,6 @@ pub async fn handle_event(ev: Event, state: &Arc<Mutex<AppState>>, is_reasoning:
                         }
                     }
                     scroll_to_stream_end(&mut st);
-                    sync_diff_inspector(&mut st);
                 }
             }
         }
@@ -569,7 +545,6 @@ pub async fn handle_event(ev: Event, state: &Arc<Mutex<AppState>>, is_reasoning:
                         st.model.selected_file_index = st.model.files.len() - 1;
                     }
                     scroll_to_stream_end(&mut st);
-                    sync_diff_inspector(&mut st);
                 }
             }
         }
@@ -606,7 +581,6 @@ pub async fn handle_event(ev: Event, state: &Arc<Mutex<AppState>>, is_reasoning:
                             }
                         }
                     }
-                    sync_diff_inspector(&mut st);
                 }
             }
         }
@@ -661,7 +635,6 @@ pub async fn handle_event(ev: Event, state: &Arc<Mutex<AppState>>, is_reasoning:
                         }
                         _ => {}
                     }
-                    sync_diff_inspector(&mut st);
                     st.model.result = Some(data.result);
                     if st.model.auto_scroll {
                         let h = st.last_model_height;
@@ -737,7 +710,6 @@ pub async fn handle_event(ev: Event, state: &Arc<Mutex<AppState>>, is_reasoning:
                 );
                 st.notify_success(msg);
             }
-            sync_diff_inspector(&mut st);
         }
         events::MODEL_CANCELLED => {
             *is_reasoning = false;
@@ -755,7 +727,6 @@ pub async fn handle_event(ev: Event, state: &Arc<Mutex<AppState>>, is_reasoning:
             fail_safe_reject_edits(&mut st.model, &active_t("notify.cancelled_before_edits"));
             let h = st.last_model_height;
             st.model.clamp_scroll(h);
-            sync_diff_inspector(&mut st);
         }
         events::MODEL_ERROR => {
             // The failure message is optional enrichment: the event method is
@@ -804,7 +775,6 @@ pub async fn handle_event(ev: Event, state: &Arc<Mutex<AppState>>, is_reasoning:
             st.model.error = Some(message);
             let h = st.last_model_height;
             st.model.clamp_scroll(h);
-            sync_diff_inspector(&mut st);
         }
         events::REVIEW_STARTED => {
             st.review.running = true;
@@ -1241,6 +1211,11 @@ fn notify_batch_finished(st: &mut AppState, kind: BatchKind, summary: &BatchFini
 
 /// Builds the title and body for a batch completion notification from its
 /// aggregate outcome, progress counters, and elapsed time.
+///
+/// A review batch additionally appends the counters of its night run — the
+/// findings it fixed, the findings the open-questions gate deferred, and the
+/// members that failed locally — whenever the daemon reported all three, so
+/// the morning report never states an invented zero (c-4).
 fn format_batch_summary(kind: BatchKind, summary: &BatchFinishSummary) -> (String, String) {
     let kind_key = match kind {
         BatchKind::Plan => "notify.batch_kind.plan",
@@ -1264,11 +1239,37 @@ fn format_batch_summary(kind: BatchKind, summary: &BatchFinishSummary) -> (Strin
         .replacen("{}", &summary.executed_count.to_string(), 1)
         .replacen("{}", &summary.total_count.to_string(), 1)
         .replacen("{}", &format_elapsed(summary.elapsed_seconds), 1);
+    push_review_stats(&mut body, kind, summary);
     if let Some(first_line) = summary.error.as_deref().and_then(first_non_empty_line) {
         body.push_str(" - ");
         body.push_str(&first_line);
     }
     (title, body)
+}
+
+/// Appends the night-run telemetry of a review batch to its notification body.
+///
+/// The daemon leaves the counters absent for a plan batch and for a review
+/// batch that cannot distinguish fixed, deferred, and failed members, so the
+/// suffix appears exactly when all three are present and the morning report
+/// never states an invented zero (c-4). The error line, when there is one, is
+/// appended after the suffix and stays the final fragment of the body.
+fn push_review_stats(body: &mut String, kind: BatchKind, summary: &BatchFinishSummary) {
+    if !matches!(kind, BatchKind::Review) {
+        return;
+    }
+    if let (Some(fixed), Some(deferred), Some(failed)) = (
+        summary.fixed_count,
+        summary.deferred_count,
+        summary.failed_count,
+    ) {
+        body.push_str(
+            &active_t("notify.batch_stats")
+                .replacen("{}", &fixed.to_string(), 1)
+                .replacen("{}", &deferred.to_string(), 1)
+                .replacen("{}", &failed.to_string(), 1),
+        );
+    }
 }
 
 /// Formats the in-app completion message for a finished model turn, including
@@ -1329,6 +1330,9 @@ mod tests {
             total_count: total,
             elapsed_seconds: elapsed,
             error: None,
+            fixed_count: None,
+            deferred_count: None,
+            failed_count: None,
         }
     }
 
@@ -1359,6 +1363,64 @@ mod tests {
         assert!(body.contains("1m 30s"));
         assert!(body.contains("compiler error"));
         assert!(!body.contains("long details"));
+    }
+
+    #[test]
+    fn test_review_batch_summary_reports_the_night_run_counters() {
+        let mut summary = batch_summary(BatchFinishStatus::Completed, 4, 6, 120);
+        summary.owner_id = "rev-1".to_string();
+        summary.fixed_count = Some(2);
+        summary.deferred_count = Some(1);
+        summary.failed_count = Some(3);
+
+        let (_, body) = format_batch_summary(BatchKind::Review, &summary);
+
+        assert!(
+            body.contains("2 fixed"),
+            "the morning report must name the fixed findings: {body}"
+        );
+        assert!(
+            body.contains("1 deferred (open questions)"),
+            "the morning report must name the deferred findings: {body}"
+        );
+        assert!(
+            body.contains("3 failed locally"),
+            "the morning report must name the members that failed locally: {body}"
+        );
+    }
+
+    #[test]
+    fn test_plan_batch_summary_never_reports_the_review_counters() {
+        let mut summary = batch_summary(BatchFinishStatus::Completed, 4, 6, 120);
+        summary.fixed_count = Some(2);
+        summary.deferred_count = Some(1);
+        summary.failed_count = Some(3);
+
+        let (_, body) = format_batch_summary(BatchKind::Plan, &summary);
+
+        assert!(
+            !body.contains("fixed"),
+            "a plan batch carries no review counters: {body}"
+        );
+        assert!(
+            !body.contains("deferred"),
+            "a plan batch carries no review counters: {body}"
+        );
+    }
+
+    #[test]
+    fn test_review_batch_summary_without_all_counters_stays_silent() {
+        let mut summary = batch_summary(BatchFinishStatus::Completed, 4, 6, 120);
+        summary.owner_id = "rev-1".to_string();
+        summary.fixed_count = Some(2);
+        summary.failed_count = Some(0);
+
+        let (_, body) = format_batch_summary(BatchKind::Review, &summary);
+
+        assert!(
+            !body.contains("fixed") && !body.contains("deferred"),
+            "an incomplete counter set must not invent a zero: {body}"
+        );
     }
 
     fn review_started_event() -> ReviewStartedEvent {
@@ -1944,11 +2006,15 @@ mod tests {
             method: events::PLAN_UPDATED.to_string(),
             params: Some(
                 serde_json::to_value(tauqe_protocol::PlanUpdatedEvent {
-                    plan: tauqe_protocol::Plan {
-                        id: "plan-x".to_string(),
-                        title: "Plan X".to_string(),
-                        ..Default::default()
-                    },
+                    plan: tauqe_protocol::Plan::from_parts(
+                        "plan-x".to_string(),
+                        "Plan X".to_string(),
+                        None,
+                        0,
+                        0,
+                        vec![],
+                        vec![],
+                    ),
                     is_save: true,
                 })
                 .unwrap(),
@@ -1966,11 +2032,15 @@ mod tests {
     }
 
     fn plan_with_id(id: &str) -> tauqe_protocol::Plan {
-        tauqe_protocol::Plan {
-            id: id.to_string(),
-            title: format!("Plan {}", id),
-            ..Default::default()
-        }
+        tauqe_protocol::Plan::from_parts(
+            id.to_string(),
+            format!("Plan {}", id),
+            None,
+            0,
+            0,
+            vec![],
+            vec![],
+        )
     }
 
     fn plan_list_changed_event(plans: Vec<tauqe_protocol::Plan>) -> Event {
@@ -3054,14 +3124,14 @@ mod tests {
         );
         assert!(guard.active_notification().is_none());
     }
-    /// The inspector is a live projection of the staged change set: a file that
-    /// starts streaming, receives a hunk, and settles must appear in an already
-    /// open audit exactly as the Viewport sees it (c-3).
+    /// The inspector owns no payload: it reads the live staged set the Develop
+    /// view renders, so a streamed start, its hunks, and a settlement need no
+    /// refresh event, and shrinking the set clamps the highlight through the same
+    /// method the renderer applies (c-3).
     #[tokio::test]
-    async fn test_open_diff_inspector_mirrors_the_streamed_edit_set() {
+    async fn test_open_diff_inspector_observes_the_live_staged_set() {
         let mut st = crate::app::test_state();
         st.diff_inspector = Some(crate::app::DiffInspectorState {
-            files: Vec::new(),
             selected_file: 0,
             diff_scroll: 0,
             focus: crate::app::DiffInspectorFocus::Files,
@@ -3075,33 +3145,18 @@ mod tests {
             &mut is_reasoning,
         )
         .await;
-        {
-            let guard = state.lock().await;
-            let inspector = guard
-                .diff_inspector
-                .as_ref()
-                .expect("the audit stays open across the stream");
-            assert_eq!(inspector.files.len(), 1);
-            assert_eq!(inspector.files[0].path, STREAMED_PATH);
-            assert_eq!(inspector.files[0].status, FileEditStatus::Running);
-        }
-
         handle_event(
             first_hunk_event(STREAMED_PATH, "let a = 1;", "let a = 2;"),
             &state,
             &mut is_reasoning,
         )
         .await;
-        {
-            let guard = state.lock().await;
-            let inspector = guard
-                .diff_inspector
-                .as_ref()
-                .expect("the audit stays open across the stream");
-            assert_eq!(inspector.files[0].hunks.len(), 1);
-            assert_eq!(inspector.files[0].hunks[0].new_text, "let a = 2;");
-        }
-
+        handle_event(
+            first_hunk_event(STREAMED_PATH, "let b = 1;", "let b = 2;"),
+            &state,
+            &mut is_reasoning,
+        )
+        .await;
         handle_event(
             edit_file_done_event(STREAMED_PATH, tauqe_protocol::EditFileStatus::Ok, None),
             &state,
@@ -3109,11 +3164,36 @@ mod tests {
         )
         .await;
 
-        let guard = state.lock().await;
+        {
+            let guard = state.lock().await;
+            assert!(
+                guard.diff_inspector.is_some(),
+                "the audit stays open across the whole stream"
+            );
+            // The change set exists exactly once, on the view the Viewport draws
+            // from; the audit reads that slice instead of holding a copy of it.
+            assert_eq!(guard.model.files.len(), 1);
+            assert_eq!(guard.model.files[0].path, STREAMED_PATH);
+            assert_eq!(guard.model.files[0].status, FileEditStatus::Ok);
+            assert_eq!(
+                guard.model.files[0].hunks.len(),
+                2,
+                "every streamed hunk accumulates on the single owned set"
+            );
+            assert_eq!(guard.model.files[0].hunks[1].new_text, "let b = 2;");
+        }
+
+        // The set shrinks without any refresh event: the renderer clamps the
+        // highlight against the live length, so the audit can never point past
+        // the set it reads.
+        let mut guard = state.lock().await;
+        guard.model.files.clear();
+        let file_count = guard.model.files.len();
         let inspector = guard
             .diff_inspector
-            .as_ref()
-            .expect("the audit stays open across the stream");
-        assert_eq!(inspector.files[0].status, FileEditStatus::Ok);
+            .as_mut()
+            .expect("the audit stays open across the whole stream");
+        inspector.clamp_selection(file_count);
+        assert_eq!(inspector.selected_file, 0);
     }
 }

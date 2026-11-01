@@ -1,7 +1,7 @@
 //! Transactional on-disk commit of a validated change set.
 //!
 //! A validated change set is written all-or-nothing through the sibling commit
-//! policy of [`crate::atomic_write`], the single authoritative implementation
+//! policy of [`tauqe_tools::atomic_write`], the single authoritative implementation
 //! of the staging rules: new content is synced into a unique sibling file, any
 //! existing target is moved aside to a unique backup sibling, and the staged
 //! content is renamed into place. Every step is a rename on a single
@@ -12,7 +12,7 @@
 use std::path::{Path, PathBuf};
 
 use super::{EditError, StagedEditsState};
-use crate::atomic_write::SiblingCommit;
+use tauqe_tools::atomic_write::SiblingCommit;
 
 /// Drops the staged content of changes that never reached their commit.
 fn discard_staged(changes: &[SiblingCommit]) {
@@ -59,6 +59,22 @@ fn remove_created_dirs(created: &[PathBuf]) {
     }
 }
 
+/// Removes the source directories a change set emptied.
+///
+/// A path the commit wrote no staged content for is a removal: a deleted file,
+/// or the source of a move. Git tracks files rather than directories, so the
+/// emptied directory would otherwise stay in the working tree and surface in
+/// every later status query as an unexplained artifact. Pruning runs strictly
+/// after the whole change set reached disk, because a directory that still
+/// receives a file of the same change set has to survive.
+fn prune_removed_dirs(repo_root: &Path, staged: &StagedEditsState, paths: &[String]) {
+    for path in paths {
+        if staged.staged_files.contains_key(path) {
+            continue;
+        }
+        tauqe_tools::atomic_write::prune_empty_parents(repo_root, &repo_root.join(path));
+    }
+}
 /// Commits a fully validated change set to disk with all-or-nothing semantics.
 ///
 /// New contents are first materialized in unique sibling files and synced, so a
@@ -67,7 +83,7 @@ fn remove_created_dirs(created: &[PathBuf]) {
 /// targets are moved aside to unique backup siblings rather than read into
 /// memory, so the commit does not duplicate large files and rollback restores
 /// permissions, timestamps and symlinks exactly. Each rename is flushed to its
-/// parent directory by the shared staging policy of [`crate::atomic_write`]. A
+/// parent directory by the shared staging policy of [`tauqe_tools::atomic_write`]. A
 /// rare rename or removal failure rolls the working tree back to its pre-commit
 /// state, including any directories this commit created.
 pub(crate) fn commit_staged_edits(
@@ -140,6 +156,12 @@ pub(crate) fn commit_staged_edits(
     for change in prepared {
         change.finish();
     }
+
+    // The files a move or a deletion removed leave their source directories
+    // behind with no member inside them, and Git cannot record a directory it
+    // never tracked. Pruning runs strictly after every member reached disk, so
+    // a directory that still receives a file of the same change set survives.
+    prune_removed_dirs(repo_root, staged, paths);
     Ok(())
 }
 
@@ -156,7 +178,7 @@ mod tests {
 
     /// Names of the staging siblings currently present in `dir`.
     fn leftover_siblings(dir: &Path) -> Vec<String> {
-        use crate::atomic_write::{staging_backup_original_name, staging_temp_original_name};
+        use tauqe_tools::atomic_write::{staging_backup_original_name, staging_temp_original_name};
 
         std::fs::read_dir(dir)
             .unwrap()
@@ -416,5 +438,56 @@ mod tests {
             leftover_siblings(&root).is_empty(),
             "no staging sibling may survive a commit"
         );
+    }
+
+    #[test]
+    fn a_committed_move_prunes_the_emptied_source_directories() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("src/old/nested")).unwrap();
+        std::fs::write(root.join("src/old/a.rs"), "pub fn a() {}\n").unwrap();
+        std::fs::write(root.join("src/old/nested/b.rs"), "pub fn b() {}\n").unwrap();
+
+        let mut staged = StagedEditsState::default();
+        staged
+            .staged_files
+            .insert("src/new/a.rs".to_string(), "pub fn a() {}\n".to_string());
+        staged.staged_files.insert(
+            "src/new/nested/b.rs".to_string(),
+            "pub fn b() {}\n".to_string(),
+        );
+        staged.deleted_paths.insert("src/old/a.rs".to_string());
+        staged
+            .deleted_paths
+            .insert("src/old/nested/b.rs".to_string());
+
+        // The sources keep their place in the reported change set because they
+        // still exist on disk when the change set is staged, so the commit has a
+        // file to remove for each of them.
+        let paths = vec![
+            "src/old/a.rs".to_string(),
+            "src/new/a.rs".to_string(),
+            "src/old/nested/b.rs".to_string(),
+            "src/new/nested/b.rs".to_string(),
+        ];
+        commit_staged_edits(root, &staged, &paths).unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(root.join("src/new/a.rs")).unwrap(),
+            "pub fn a() {}\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join("src/new/nested/b.rs")).unwrap(),
+            "pub fn b() {}\n"
+        );
+        assert!(
+            !root.join("src/old").exists(),
+            "a directory the move emptied must be pruned"
+        );
+        assert!(
+            root.join("src").is_dir(),
+            "a directory that still holds a file survives"
+        );
+        assert!(leftover_siblings(root).is_empty());
     }
 }

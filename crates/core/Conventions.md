@@ -94,10 +94,8 @@ The interaction protocol between Tauqe and large language models is strictly div
    - If an artifact can be resolved from Git, Tree-sitter, project manifests, or compiler output, resolve it through deterministic Rust routines, never LLM generation.
 2. **Fail-Fast on Verification Failure:**
    - Autonomous execution pipelines must abort immediately upon encountering compiler errors or test failures, rolling back dirty working trees to the pre-turn Git checkpoint.
-3. **Fail-Fast on Ignored Paths:**
-   - A patch that would create, overwrite, or move onto a path excluded by `.gitignore` or `.git/info/exclude` is rejected during in-memory staging with `EditError::IgnoredByGit`, before any byte reaches disk and before `git add` runs. Writing such a path would otherwise surface only after the whole change set is applied, where a refused `git add` aborts the Git transaction instead of the edit.
-   - The check is batched through `git check-ignore`, so one subprocess answers for the whole change set and a repository Git cannot inspect degrades to "nothing is ignored" rather than blocking an otherwise valid turn.
-   - Post-hook artifacts are exempt by construction: they are discovered through a Git status differential that honors the same ignore rules, so a generated build file is absent from the change set instead of breaking the transaction. The separation of responsibility is deliberate — the model may not write ignored paths, while a declared external generator may produce them freely.
+3. **Rejected Paths Are Reported, Never Retried Blindly:**
+   - A change set the substrate refuses because a path is excluded by the repository ignore rules never reaches disk, so the engine reports the typed rejection to the model and lets it choose a tracked path within the same turn. The staging rules themselves are declared once in `crates/tools/Conventions.md`.
 
 ---
 
@@ -105,10 +103,14 @@ The interaction protocol between Tauqe and large language models is strictly div
 
 1. **Cancellation Before Response Headers:**
    - A provider network request (`http_client.send().await`) must race the turn cancellation signal (`cancel_rx`) through `tokio::select!` while awaiting the HTTP response headers, not only while consuming the streamed body.
-2. **Rationale (Why):**
+2. **The Completion Path Inherits the Same Discipline:**
+   - A phase that runs after the streamed body has been delivered is still part of the turn. The best-effort generation-stats fetch that resolves the reported cost races the same `cancel_rx` and carries its own short per-request `.timeout()`, sized well below the shared client's read budget.
+   - The fetch is optional by contract: a cancelled, slow, hung, or unreachable endpoint yields no enrichment and the stream completes normally. It must never be the reason a turn waits.
+3. **Rationale (Why):**
    - While a model is reasoning during the `Proposal` and `Awaiting` phases, no body bytes have arrived yet. A request that observes cancellation only once the body starts streaming forces the developer to wait for the provider to finish before the turn can abort. Racing the initial send against `cancel_rx` makes interruption immediate in every phase.
-3. **Uniform Reporting:**
-   - When cancellation wins the race before headers arrive, the provider emits the same `StreamEvent::Cancelled` used everywhere else and returns cleanly, so callers never branch on a provider-specific cancellation path.
+   - The same argument holds after the last delta. The answer is already delivered, so a post-stream fetch that ignores the cancellation signal and inherits a multi-minute read budget turns a finished result into an unresponsive turn, and a hard cancel into a request nobody can stop.
+4. **Uniform Reporting:**
+   - When cancellation wins the race before headers arrive, or while the completion path runs, the provider emits the same `StreamEvent::Cancelled` used everywhere else and returns cleanly, so callers never branch on a provider-specific cancellation path.
 
 ---
 
@@ -347,27 +349,18 @@ The interaction protocol between Tauqe and large language models is strictly div
 
 ---
 
-## 11. Single In-Memory Formatting Contour
+## 11. Substrate Boundaries
 
-1. **One Formatting Surface:**
-   - Formatting is declared once — by `[project.format]` in `tauqe.toml`, or by the
-     `format` recipe the declared task runner exports when that entry is omitted —
-     and it runs exclusively while the change set lives in virtual staging.
-   - The filter receives the staged text of one file on standard input and returns
-     the rewritten text on standard output, so the file is formatted before any byte
-     reaches disk and before Git observes the change set.
-2. **No Disk Formatting Stage:**
-   - Nothing reformats a verified working tree: there is no formatting stage after
-     the change set is written, and no compensation layer that would restore
-     formatter modifications afterwards. A formatter that ran later would introduce
-     a diff the turn never proposed.
-3. **Fail-Safe Outcome:**
-   - A non-zero exit status, a timeout, a cancellation, an unresolvable declaration,
-     or a filter that emits nothing while the staged text was not empty keeps the
-     authored content and reports a compact reason. The turn continues, and the
-     failure never re-prompts the model.
-4. **Rationale (Why):**
-   - Formatting improves the shape of a change; it never proves its correctness. It
-     therefore cannot sit on the verification gate, and confining it to staging
-     keeps one set of bytes — the formatted ones — travelling into verification and
-     into the atomic commit.
+1. **Deterministic Substrate Lives in `crates/tools`:**
+   - Virtual staging and its patch algorithms, atomic file writes, Git
+     transactions and checkpoints, the toolchain command runners and the
+     task-runner integration, and the Tree-sitter repository map are executed by
+     `tauqe-tools`.
+   - The engine adapts configuration into that substrate and reports its typed
+     results; it never restates or re-implements an operation the substrate owns.
+2. **Single Declaration of Substrate Invariants:**
+   - Staging transactionality, atomic-write durability, process isolation, the
+     repository ignore rules, and the single in-memory formatting contour are
+     declared once in `crates/tools/Conventions.md`.
+   - A core rule describes only the engine-side consequence of a substrate
+     decision, so the two documents can never disagree about the same invariant.

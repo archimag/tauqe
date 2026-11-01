@@ -1,6 +1,8 @@
 use crate::context::ContextFileContent;
 use crate::escape::{escape_xml_attr, escape_xml_text, single_line};
-use tauqe_protocol::review::ReviewSession;
+use tauqe_protocol::review::{ReviewGroup, ReviewIssue, ReviewItem, ReviewSession};
+
+use super::refine::render_path_list;
 pub const REVIEW_DISCUSSION_PREFIX: &str = "# Review Discussion:";
 
 /// Formats a targeted prompt for discussing and analyzing review findings in Structured Output mode.
@@ -86,51 +88,7 @@ pub fn format_review_discussion_prompt_items(
         out.push_str("### Items Focused by User for Discussion:\n");
         for id in focused_item_ids {
             if let Some(issue) = issues.iter().find(|i| i.id == *id) {
-                out.push_str(&format!(
-                    "- **#{} [{}] {}** (status: {})\n",
-                    issue.id,
-                    issue.issue_type,
-                    escape_xml_text(&issue.title),
-                    issue.status
-                ));
-                if !issue.files.is_empty() {
-                    let joined = issue
-                        .files
-                        .iter()
-                        .map(|f| format!("`{}`", escape_xml_text(f)))
-                        .collect::<Vec<_>>()
-                        .join(", ");
-                    out.push_str(&format!("  Files: {}\n", joined));
-                }
-                if !issue.readonly_files.is_empty() {
-                    let joined = issue
-                        .readonly_files
-                        .iter()
-                        .map(|f| format!("`{}`", escape_xml_text(f)))
-                        .collect::<Vec<_>>()
-                        .join(", ");
-                    out.push_str(&format!("  Protected Contracts (readonly): {}\n", joined));
-                }
-                if !issue.description.trim().is_empty() {
-                    out.push_str(&format!(
-                        "  Description: {}\n",
-                        escape_xml_text(issue.description.trim())
-                    ));
-                }
-                if !issue.recommendations.is_empty() {
-                    out.push_str("  Recommendations:\n");
-                    for (index, rec) in issue.recommendations.iter().enumerate() {
-                        out.push_str(&format!("    {}. {}\n", index + 1, escape_xml_text(rec)));
-                    }
-                }
-                if let Some(note) = &issue.note {
-                    if !note.trim().is_empty() {
-                        out.push_str(&format!(
-                            "  Resolution Note: {}\n",
-                            escape_xml_text(note.trim())
-                        ));
-                    }
-                }
+                push_issue_details(&mut out, issue);
             }
         }
         out.push('\n');
@@ -148,6 +106,186 @@ pub fn format_review_discussion_prompt_items(
     out.push_str("3. If the review findings or their statuses should be updated based on this discussion, explain the proposed modifications clearly in conversational text in `message`; the developer applies status changes through the review interface.\n");
     out.push_str("4. Treat every file listed as a protected contract as immutable: rely on its interfaces and invariants, but never modify it.\n");
     out.push_str("5. If you need to inspect related files to verify your hypothesis, specify them in the `context_requests` array with `access: \"read_only\"`.\n");
+
+    out
+}
+
+/// Renders one finding as detailed discussion material.
+///
+/// The description states the defect, the recommendations carry the remediation
+/// strategy, and the protected contracts define what a fix must rely on
+/// unchanged, so a dialogue over one finding and a dialogue over a whole group
+/// present the same finding the same way.
+fn push_issue_details(out: &mut String, issue: &ReviewIssue) {
+    out.push_str(&format!(
+        "- **#{} [{}] {}** (status: {})\n",
+        issue.id,
+        issue.issue_type,
+        escape_xml_text(&issue.title),
+        issue.status
+    ));
+    if !issue.files.is_empty() {
+        out.push_str(&format!("  Files: {}\n", render_path_list(&issue.files)));
+    }
+    if !issue.readonly_files.is_empty() {
+        out.push_str(&format!(
+            "  Protected Contracts (readonly): {}\n",
+            render_path_list(&issue.readonly_files)
+        ));
+    }
+    if !issue.description.trim().is_empty() {
+        out.push_str(&format!(
+            "  Description: {}\n",
+            escape_xml_text(issue.description.trim())
+        ));
+    }
+    if !issue.recommendations.is_empty() {
+        out.push_str("  Recommendations:\n");
+        for (index, rec) in issue.recommendations.iter().enumerate() {
+            out.push_str(&format!("    {}. {}\n", index + 1, escape_xml_text(rec)));
+        }
+    }
+    if let Some(note) = &issue.note {
+        if !note.trim().is_empty() {
+            out.push_str(&format!(
+                "  Resolution Note: {}\n",
+                escape_xml_text(note.trim())
+            ));
+        }
+    }
+}
+
+/// Formats a targeted prompt for discussing the architectural root cause of one
+/// review group in Structured Output mode.
+///
+/// A group is the operational unit of remediation: its findings manifest one
+/// shared cause and its blocker belongs to the group itself. The dialogue
+/// therefore renders the cause, the active blocker, the recorded decision, and
+/// every manifestation, and it instructs the model to record the settled
+/// decision through the structured protocol instead of leaving the engineer to
+/// re-enter the outcome by hand in the review interface.
+pub fn format_review_group_discussion_prompt(
+    session: &ReviewSession,
+    group: &ReviewGroup,
+    findings: &[ReviewItem],
+    user_comment: &str,
+) -> String {
+    // Findings are rendered through the enriched domain view, exactly as a
+    // focused finding dialogue renders them, so both contours of the review
+    // discussion present a finding the same way.
+    let issues: Vec<ReviewIssue> = findings.iter().cloned().map(ReviewIssue::from).collect();
+    let mut out = String::new();
+    let clean_group_title = single_line(&group.title);
+    let group_title = if clean_group_title.is_empty() {
+        single_line(&group.id)
+    } else {
+        clean_group_title
+    };
+    let clean_session_title = single_line(&session.title);
+    let session_title = if clean_session_title.is_empty() {
+        session.id.as_str()
+    } else {
+        clean_session_title.as_str()
+    };
+    out.push_str(&format!(
+        "# Review Group Discussion: [{}] {}\n\n",
+        single_line(&session.id),
+        escape_xml_text(&group_title)
+    ));
+
+    if let Some(desc) = &session.description {
+        let trimmed = desc.trim();
+        if !trimmed.is_empty() {
+            out.push_str(&format!(
+                "## Review Scope & Description:\n{}\n\n",
+                escape_xml_text(trimmed)
+            ));
+        }
+    }
+
+    out.push_str("## Target Review Group:\n");
+    out.push_str(&format!("- **ID**: `{}`\n", escape_xml_text(&group.id)));
+    out.push_str(&format!("- **Title**: {}\n", escape_xml_text(&group_title)));
+    let root_cause = group
+        .description
+        .as_deref()
+        .map(str::trim)
+        .filter(|cause| !cause.is_empty());
+    if let Some(root_cause) = root_cause {
+        out.push_str(&format!(
+            "- **Root Cause**:\n{}\n",
+            escape_xml_text(root_cause)
+        ));
+    }
+    let blocker = group
+        .blocked_reason
+        .as_deref()
+        .map(str::trim)
+        .filter(|reason| !reason.is_empty());
+    match blocker {
+        Some(blocker) => out.push_str(&format!(
+            "- **Current Blocker**:\n{}\n",
+            escape_xml_text(blocker)
+        )),
+        // The dialogue states the absence explicitly, so the model never reads a
+        // missing section as a blocker it has to guess.
+        None => out.push_str("- **Current Blocker**: none recorded\n"),
+    }
+    let decision = group
+        .resolution_notes
+        .as_deref()
+        .map(str::trim)
+        .filter(|note| !note.is_empty());
+    if let Some(decision) = decision {
+        out.push_str(&format!(
+            "- **Recorded Decision**:\n{}\n",
+            escape_xml_text(decision)
+        ));
+    }
+    out.push('\n');
+
+    out.push_str("## Target Review Session Context:\n");
+    let (total, fixed) = session.stats();
+    out.push_str(&format!(
+        "<active_review id=\"{}\" title=\"{}\" progress=\"{}/{} fixed\">\n",
+        escape_xml_attr(&session.id),
+        escape_xml_attr(session_title),
+        fixed,
+        total
+    ));
+    for issue in &issues {
+        let loc = if issue.files.is_empty() {
+            String::new()
+        } else {
+            format!(" ({})", render_path_list(&issue.files))
+        };
+        out.push_str(&format!(
+            "  - #{}: [{}] {}{}\n",
+            issue.id,
+            issue.issue_type,
+            escape_xml_text(&issue.title),
+            loc
+        ));
+    }
+    out.push_str("</active_review>\n\n");
+
+    out.push_str("### Findings the Group Collects:\n");
+    for issue in &issues {
+        push_issue_details(&mut out, issue);
+    }
+    out.push('\n');
+
+    out.push_str("## Developer Comment / Instructions:\n");
+    out.push_str(user_comment.trim());
+    out.push_str("\n\n");
+
+    out.push_str("## Instructions for Model:\n");
+    out.push_str("1. Address the developer's question or feedback regarding the group's shared root cause and the findings that manifest it.\n");
+    out.push_str("2. Select the response mode that the developer's request calls for. When the developer is reasoning about the cause, analyze the problem, its edge cases, and potential solutions conceptually. When the developer asks you to resolve it, apply the required code changes directly instead of only describing them, while preserving the surrounding review context.\n");
+    out.push_str("3. Record the decision once the developer has reached it: populate `review_update` with `group_id` naming this group, `item_id` naming the finding that carried the discussion, `status` naming what the group moves to (`todo` queues it for execution, `skipped` records that it is not reproducible, `rejected` records a false positive or an accepted trade-off), `note` stating the decision itself in the developer's words, and `recommendations` for the remediation the discussion agreed. The harness clears the group blocker, stamps the note onto every finding of the group, and moves the whole group to the decided status.\n");
+    out.push_str("4. Keep `review_update` null while the decision is still open: a question, an analysis, or a trade-off review is not a decision, and a recorded decision is never restated as an open question later.\n");
+    out.push_str("5. Treat every file listed as a protected contract as immutable: rely on its interfaces and invariants, but never modify it.\n");
+    out.push_str("6. If you need to inspect related files to verify your hypothesis, specify them in the `context_requests` array with `access: \"read_only\"`.\n");
 
     out
 }

@@ -6,13 +6,11 @@
 
 use std::sync::Arc;
 
-use super::handle_review_execute;
-
 use crate::state::AppState;
 use crate::transport::OutChannel;
 use tauqe_core::providers::{ChatMessage, LlmProvider, ResponseFormat, StreamEvent};
 use tauqe_core::review::ReviewStorage;
-use tauqe_protocol::{IssueStatus, PlanItemStatus, Request, ReviewItem, ReviewSession};
+use tauqe_protocol::{IssueStatus, PlanItemStatus, ReviewItem, ReviewSession};
 use tokio::sync::{mpsc, watch};
 
 mod batch;
@@ -21,9 +19,7 @@ mod execute;
 mod patterns;
 mod preview;
 mod start;
-mod step;
 mod storage_ops;
-mod subplan;
 
 /// Repository scratch directory owned by a test and removed on drop.
 struct TestDir(std::path::PathBuf);
@@ -179,32 +175,6 @@ fn subplan_item(
     }
 }
 
-/// Builds a subplan container (non-leaf) node from its children.
-fn subplan_container(
-    id: &str,
-    title: &str,
-    children: Vec<tauqe_protocol::PlanItem>,
-) -> tauqe_protocol::PlanItem {
-    tauqe_protocol::PlanItem {
-        id: id.to_string(),
-        title: title.to_string(),
-        children,
-        ..Default::default()
-    }
-}
-
-/// Builds a leaf sub-step that declares the given dependencies.
-fn dependent_subplan_item(id: &str, title: &str, deps: &[&str]) -> tauqe_protocol::PlanItem {
-    tauqe_protocol::PlanItem {
-        id: id.to_string(),
-        title: title.to_string(),
-        status: PlanItemStatus::Todo,
-        files: vec!["src/target.rs".to_string()],
-        depends_on: deps.iter().map(|d| d.to_string()).collect(),
-        ..Default::default()
-    }
-}
-
 /// Saves a session whose architectural group carries the given unified
 /// subplan and collects one finding.
 fn save_grouped_session(
@@ -220,7 +190,10 @@ fn save_grouped_session(
         id: group_id.to_string(),
         title: format!("Group {group_id}"),
         kind: tauqe_protocol::review::ReviewGroupKind::Architectural,
-        subplan,
+        implementation: tauqe_protocol::PlanImplementation {
+            items: subplan,
+            ..Default::default()
+        },
         ..Default::default()
     }];
     ReviewStorage::save_session(dir.path(), &session).unwrap();
@@ -238,25 +211,6 @@ fn architectural_session(review_id: &str, group_id: &str) -> ReviewSession {
         ..Default::default()
     }];
     session
-}
-
-/// Sends a `review/execute` request targeting a single sub-step of a group.
-async fn execute_group_substep(
-    state: &Arc<AppState>,
-    review_id: &str,
-    group_id: &str,
-    step_id: &str,
-) -> tauqe_protocol::Response {
-    let req = Request {
-        id: tauqe_protocol::RequestId::Number(1),
-        method: tauqe_protocol::methods::REVIEW_EXECUTE.to_string(),
-        params: Some(serde_json::json!({
-            "review_id": review_id,
-            "group_id": group_id,
-            "step_id": step_id,
-        })),
-    };
-    handle_review_execute(req, state).await
 }
 
 /// Provider whose first attempt streams a prefix of its answer and then breaks

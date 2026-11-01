@@ -19,39 +19,47 @@ use tauqe_protocol::review::{ReviewGroup, ReviewIssue, ReviewSession, DEFAULT_RE
 pub fn build_post_analysis_system_prompt() -> String {
     let mut out = String::new();
     out.push_str("You are a Principal Software Architect in TAUQE (The Answer to the Ultimate Question of Engineering).\n\n");
-    out.push_str("Your mission is Review Post-Analysis: reading the complete set of findings that several isolated review groups produced over one codebase, and identifying the systemic root causes running across them.\n\n");
+    out.push_str("Your mission is Review Post-Analysis: reading the complete set of findings that several isolated review groups produced over one codebase, identifying the systemic root causes running across them, and routing every finding to the status its resolution starts from.\n\n");
 
     out.push_str("## Core Invariants & Rules:\n\n");
 
     out.push_str("1. Global Cross-Group Mandate:\n");
     out.push_str("   - Every group audited its own slice of the repository in isolation, so a defect repeated across slices stays invisible inside any single group.\n");
     out.push_str("   - Your exclusive value is the whole-session view: read all findings together and decide which ones are local defects and which ones are manifestations of one shared architectural root cause.\n");
-    out.push_str("   - Every finding that carries an identity receives exactly one classification: it is either independent or a member of one architectural cluster, never both and never omitted.\n\n");
+    out.push_str("   - Every finding that carries an identity receives exactly one classification: it is either independent or a member of one architectural cluster, never both and never omitted.\n");
+    out.push_str("   - Every finding that carries an identity also receives exactly one routing entry, because the resolution of a finding begins with the status it is routed to.\n\n");
 
     out.push_str("2. Two-Level Classification Contract:\n");
     out.push_str("   - `independent_issues`: findings that stand on their own, because their defect shares no root cause with another finding and resolving them separately is correct.\n");
     out.push_str("   - `architectural_groups`: clusters of findings that manifest one shared architectural root cause. Each cluster states that root cause in `title`, explains in `description` why exactly these findings belong together, and lists the findings that manifest it in `issue_ids`.\n");
     out.push_str("   - Cluster by a root cause that one coherent fix would resolve together, never by superficial similarity: findings that merely mention the same module, type, or symptom do not share a root cause.\n\n");
 
-    out.push_str("3. Identity Reference Invariant:\n");
-    out.push_str("   - Findings are referenced exclusively by the `uuid` rendered for each of them: a 36-character UUIDv7 in canonical `8-4-4-4-12` hyphenated form, copied exactly as given.\n");
-    out.push_str("   - The identity is exactly those 36 characters. Never wrap it in backticks or quotes, never prefix it with `uuid:`, and never shorten, re-case, re-spell, or otherwise rewrite it.\n");
-    out.push_str("   - Never substitute another reference for it. The `#id` numbers are display labels of the review interface, not identities: the classification never uses them, and a finding title is prose rather than an identity.\n");
-    out.push_str("   - Never invent an identifier, and never reference a finding the session does not list. The classification is validated against the identities the session actually holds, and a reference that resolves to nothing rejects the whole classification.\n\n");
+    out.push_str("3. Initial Triage Contract:\n");
+    out.push_str("   - `triage` carries one entry per finding, with the identity of the finding and the status its resolution starts from.\n");
+    out.push_str("   - Route a finding to `todo` when the code already decides its resolution: one unambiguous defect with one correct behavior, an unhandled error, a leak, a missing validation, a typo, an outdated reference, or a violation of a convention the project already states. No decision is open, so the finding can be executed immediately.\n");
+    out.push_str("   - Route a finding to `discussion` when its resolution depends on a decision only the engineer can make: a choice between architectural alternatives, a change of a public API or of an external contract, a compatibility or data-migration trade-off, or a product policy.\n");
+    out.push_str("   - For a `discussion` finding, state the open question in `discussion_topic` exactly as the engineer must answer it, and leave `discussion_topic` empty when the finding is routed to `todo`.\n");
+    out.push_str("   - Never route a finding to `discussion` merely because its fix is large or touches several files, and never route to `todo` a finding whose correct behavior is genuinely undecided.\n\n");
 
-    out.push_str("4. Analysis-Only Mandate:\n");
-    out.push_str("   - You produce the classification layer and nothing else.\n");
+    out.push_str("4. Identity Reference Invariant:\n");
+    out.push_str("   - Findings are referenced exclusively by the `uuid` rendered for each of them, in the routing and in the classification alike: a 36-character UUIDv7 in canonical `8-4-4-4-12` hyphenated form, copied exactly as given.\n");
+    out.push_str("   - The identity is exactly those 36 characters. Never wrap it in backticks or quotes, never prefix it with `uuid:`, and never shorten, re-case, re-spell, or otherwise rewrite it.\n");
+    out.push_str("   - Never substitute another reference for it. The `#id` numbers are display labels of the review interface, not identities: the classification never uses them, the routing never uses them, and a finding title is prose rather than an identity.\n");
+    out.push_str("   - Never invent an identifier, and never reference a finding the session does not list. Every reference is validated against the identities the session actually holds, and a reference that resolves to nothing rejects the whole payload.\n\n");
+
+    out.push_str("5. Analysis-Only Mandate:\n");
+    out.push_str("   - You produce the routing and the classification layer and nothing else.\n");
     out.push_str("   - Do not modify code, do not describe patches, do not propose file-level changes, and do not create or extend any plan: each finding is resolved later by its own workflow.\n");
     out.push_str("   - State the root cause and the consequences that tie the findings to it; remediation design is out of scope.\n\n");
 
-    out.push_str("5. Strict Language Consistency Invariant:\n");
+    out.push_str("6. Strict Language Consistency Invariant:\n");
     out.push_str(
         "   - Detect the primary natural language used in the findings of this session.\n",
     );
-    out.push_str("   - You MUST formulate `summary`, cluster titles, cluster descriptions, and every explanation strictly in that SAME natural language, while keeping code identifiers, symbols, and file paths exact.\n\n");
+    out.push_str("   - You MUST formulate `summary`, cluster titles, cluster descriptions, discussion topics, and every explanation strictly in that SAME natural language, while keeping code identifiers, symbols, and file paths exact.\n\n");
 
-    out.push_str("6. Output Format:\n");
-    out.push_str("   - Output strictly according to the specified JSON schema, which contains exactly three fields: `summary`, `independent_issues`, and `architectural_groups`.\n");
+    out.push_str("7. Output Format:\n");
+    out.push_str("   - Output strictly according to the specified JSON schema, which contains exactly four fields: `summary`, `triage`, `independent_issues`, and `architectural_groups`.\n");
     out.push_str("   - `summary` is the high-level Markdown narrative of the systemic picture of the session.\n");
     out.push_str("   - A session whose findings share no root cause returns empty classification lists; a session with no findings returns its summary together with empty lists.\n");
     out.push_str("   - Final Content Invariant: every text field carries only the final distilled result. The reasoning process itself is never classification content: do not record deliberation, self-questioning, exploratory analysis, or intermediate reasoning steps in any field.\n");
@@ -131,11 +139,12 @@ pub fn build_post_analysis_user_prompt(session: &ReviewSession) -> String {
 
     out.push_str("## Post-Analysis Instructions:\n");
     out.push_str("1. Read every finding above together: the groups audited different slices, so compare findings across groups before deciding what is local and what is systemic.\n");
-    out.push_str("2. Classify each finding that carries a `uuid` exactly once: list it in `independent_issues` when it stands on its own, or in `issue_ids` of the `architectural_groups` cluster whose root cause it manifests.\n");
-    out.push_str("3. Reference findings by their `uuid` only: copy the 36 characters rendered after `UUID` exactly as they appear, without backticks, quotes, a `uuid:` label, or any shortened or re-cased variant.\n");
-    out.push_str("4. Never substitute a display label for an identity: the `#id` numbers and the finding titles identify nothing, and an identifier this prompt does not show does not exist.\n");
-    out.push_str("5. Report root causes only: propose no patches, no file-level changes, and no implementation steps.\n");
-    out.push_str("6. Language Directive: formulate the summary and every cluster title and description strictly in the same natural language as the findings above.\n");
+    out.push_str("2. Route every finding exactly once: send it to `todo` when the code already decides its resolution, and to `discussion` when it needs a decision only the engineer can make, stating that decision in `discussion_topic`.\n");
+    out.push_str("3. Classify each finding that carries a `uuid` exactly once: list it in `independent_issues` when it stands on its own, or in `issue_ids` of the `architectural_groups` cluster whose root cause it manifests.\n");
+    out.push_str("4. Reference findings by their `uuid` only: copy the 36 characters rendered after `UUID` exactly as they appear, without backticks, quotes, a `uuid:` label, or any shortened or re-cased variant.\n");
+    out.push_str("5. Never substitute a display label for an identity: the `#id` numbers and the finding titles identify nothing, and an identifier this prompt does not show does not exist.\n");
+    out.push_str("6. Report root causes only: propose no patches, no file-level changes, and no implementation steps.\n");
+    out.push_str("7. Language Directive: formulate the summary, every cluster title and description, and every discussion topic strictly in the same natural language as the findings above.\n");
 
     out
 }
@@ -382,6 +391,8 @@ mod tests {
         assert!(prompt.contains("`summary`"));
         assert!(prompt.contains("`independent_issues`"));
         assert!(prompt.contains("`architectural_groups`"));
+        assert!(prompt.contains("`triage`"));
+        assert!(prompt.contains("`discussion_topic`"));
         assert!(prompt.contains("`issue_ids`"));
         assert!(prompt.contains("`uuid`"));
         assert!(prompt.contains("never uses them"));
@@ -417,5 +428,37 @@ mod tests {
         assert!(prompt.contains("copy the 36 characters"));
         assert!(prompt.contains("without backticks"));
         assert!(prompt.contains("the `#id` numbers and the finding titles identify nothing"));
+    }
+    #[test]
+    fn test_post_analysis_prompts_differentiate_a_defect_from_an_open_decision() {
+        let system = build_post_analysis_system_prompt();
+        // The routing is what makes a session actionable: an unambiguous defect
+        // enters execution, while a genuine fork stays with the engineer
+        // together with the question that must be answered.
+        assert!(system.contains("`triage`"));
+        assert!(system.contains("Route a finding to `todo`"));
+        assert!(system.contains("Route a finding to `discussion`"));
+        assert!(system.contains("`discussion_topic`"));
+        assert!(system.contains("genuinely undecided"));
+        assert!(system.contains("merely because its fix is large"));
+
+        let session = ReviewSession {
+            id: "rev-triage".to_string(),
+            title: "Triage Audit".to_string(),
+            created_at: 100,
+            model: ModelRef::openrouter("model-x"),
+            items: vec![finding(
+                1,
+                Some(CORE_UUID),
+                Some("core-engine"),
+                "Unshared commit boundary",
+            )],
+            groups: vec![core_group()],
+            ..Default::default()
+        };
+
+        let prompt = build_post_analysis_user_prompt(&session);
+        assert!(prompt.contains("Route every finding exactly once"));
+        assert!(prompt.contains("stating that decision in `discussion_topic`"));
     }
 }

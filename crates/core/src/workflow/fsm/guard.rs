@@ -49,12 +49,6 @@ impl RollbackOutcome {
     pub(crate) fn is_restored(self) -> bool {
         matches!(self, Self::Restored)
     }
-
-    /// Whether the rollback failed, leaving the working tree in an unknown
-    /// state.
-    pub(crate) fn is_failed(self) -> bool {
-        matches!(self, Self::Failed)
-    }
 }
 
 /// Rolls back an open transaction, retrying a transient failure and logging a
@@ -451,6 +445,7 @@ pub(super) async fn finalize_blocked_turn(
             error: Some(reason.clone()),
             changed_files: Vec::new(),
             commit_hash: None,
+            verification: None,
         },
     };
     let mut outcome = finish_turn(accumulated_text, result, repo_root, plans, mode).await;

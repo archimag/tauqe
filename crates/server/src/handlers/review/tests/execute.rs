@@ -273,3 +273,40 @@ async fn execute_refuses_a_finished_finding() {
         );
     }
 }
+
+#[tokio::test]
+async fn execute_refuses_a_group_that_still_poses_an_open_question() {
+    let dir = TestDir::new();
+    // A finding that still waits for an engineering decision keeps its group out
+    // of the queue, so an explicit launch is refused before the targeted
+    // sub-step is even validated.
+    let mut item = test_item(1, IssueStatus::Discussion, "src/target.rs");
+    item.group = Some("arch-1".to_string());
+    let mut session = test_session("rev-open", vec![item]);
+    session.groups = vec![tauqe_protocol::ReviewGroup {
+        id: "arch-1".to_string(),
+        title: "Group arch-1".to_string(),
+        kind: tauqe_protocol::review::ReviewGroupKind::Architectural,
+        ..Default::default()
+    }];
+    ReviewStorage::save_session(dir.path(), &session).unwrap();
+    let state = test_state(&dir);
+
+    for params in [
+        serde_json::json!({"review_id": "rev-open", "group_id": "arch-1"}),
+        serde_json::json!({"review_id": "rev-open", "group_id": "arch-1", "step_id": "1"}),
+    ] {
+        let res = handle_review_execute(execute_request(params), &state).await;
+        let err = res.error.expect("an unanswered question is refused");
+        assert_eq!(err.code, errors::GROUP_UNRESOLVED_QUESTIONS);
+        assert!(
+            err.message.contains("arch-1"),
+            "the diagnostic must name the group: {}",
+            err.message
+        );
+    }
+    assert!(
+        !state.is_operation_active(),
+        "a refused request never claims the operation slot"
+    );
+}

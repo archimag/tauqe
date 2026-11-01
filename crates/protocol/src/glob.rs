@@ -64,6 +64,8 @@
 /// - A wildcard pattern without `/` matches the basename at any depth and does
 ///   not act as a directory prefix (use a trailing slash such as `build*/` to
 ///   match all paths beneath matching directories).
+/// - A pattern naming only the repository root (`.`, `./`, `/`, `\`) matches
+///   every path inside the repository rather than nothing.
 ///
 /// Leading, trailing and repeated separators (both `/` and `\`), as well as
 /// interior `.` segments, are normalized before matching, so `"/src//lib.rs"`,
@@ -85,6 +87,8 @@ pub fn matches_glob_pattern(pattern: &str, path: &str) -> bool {
 /// `GlobPattern` and call [`GlobPattern::matches`] per path.
 pub struct GlobPattern {
     clean: String,
+    /// Pattern names the repository root and matches every path inside it.
+    universal: bool,
     trailing_slash: bool,
     has_meta: bool,
     has_slash: bool,
@@ -98,6 +102,11 @@ impl GlobPattern {
     pub fn new(pattern: &str) -> Self {
         let trimmed = pattern.trim();
         let clean = normalize_path(trimmed);
+        // A pattern naming nothing but the root (`.`, `./`, `/`, `\`) normalizes
+        // to an empty path and would otherwise match nothing at all. It names
+        // the repository root instead, so it is the universal matcher and
+        // selects every path beneath that root.
+        let universal = !trimmed.is_empty() && clean.is_empty();
         let trailing_slash = trimmed.ends_with('/') || trimmed.ends_with('\\');
         let has_meta = contains_glob_meta(&clean);
         let has_slash = clean.contains('/');
@@ -113,6 +122,7 @@ impl GlobPattern {
 
         Self {
             clean,
+            universal,
             trailing_slash,
             has_meta,
             has_slash,
@@ -126,7 +136,15 @@ impl GlobPattern {
     pub fn matches(&self, path: &str) -> bool {
         let clean_path = normalize_path(path);
 
-        if self.clean.is_empty() || clean_path.is_empty() {
+        if clean_path.is_empty() {
+            return false;
+        }
+        // The repository root contains every path, so its matcher accepts each
+        // of them instead of rejecting them all.
+        if self.universal {
+            return true;
+        }
+        if self.clean.is_empty() {
             return false;
         }
 
@@ -465,6 +483,36 @@ mod tests {
     }
 
     #[test]
+    fn test_root_denoting_patterns_are_universal() {
+        // A pattern naming nothing but the repository root selects every path
+        // inside it, so a protection entry written this way cannot fail open.
+        for pattern in [".", "./", "/", "\\", "././", "//", " . "] {
+            assert!(
+                matches_glob_pattern(pattern, "Justfile"),
+                "pattern {pattern:?} matched nothing"
+            );
+            assert!(matches_glob_pattern(pattern, "src/lib.rs"), "{pattern:?}");
+            assert!(
+                matches_glob_pattern(pattern, "docs/specs/auth.md"),
+                "{pattern:?}"
+            );
+        }
+
+        // The compiled pattern answers the same way.
+        let root = GlobPattern::new(".");
+        assert!(root.matches("Justfile"));
+        assert!(root.matches("crates/protocol/src/glob.rs"));
+
+        // The root is not itself a path inside the repository.
+        assert!(!matches_glob_pattern(".", ""));
+        assert!(!matches_glob_pattern("./", "."));
+        assert!(!matches_glob_pattern("/", "//"));
+
+        // A blank pattern stays inert instead of becoming universal.
+        assert!(!GlobPattern::new("").matches("src/lib.rs"));
+        assert!(!GlobPattern::new("   ").matches("src/lib.rs"));
+    }
+    #[test]
     fn test_leading_repeated_and_dot_slash_normalization() {
         assert!(matches_glob_pattern("/src/lib.rs", "src/lib.rs"));
         assert!(matches_glob_pattern("src/lib.rs", "/src/lib.rs"));
@@ -528,6 +576,7 @@ mod tests {
             "crates/*/",
             "build*",
             "src/lib.rs",
+            ".",
         ];
         let paths = [
             "src/lib.rs",

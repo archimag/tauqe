@@ -9,13 +9,13 @@
 use crossterm::event::KeyEvent;
 use ratatui::layout::{Alignment, Rect};
 use ratatui::text::Line;
-use ratatui::widgets::{Paragraph, Wrap};
+use ratatui::widgets::Paragraph;
 
 use crate::app::{ConfirmDialogButton, ModalActionsState};
 use crate::command::dialog::{DialogCommand, DIALOG_COMMAND_MAP};
-use crate::components::modal::{ModalFrame, ModalTone};
+use crate::components::modal::{modal_action_buttons, modal_geometry, ModalFrame, ModalTone};
 use crate::config::InputConfig;
-use crate::ui::centered_rect;
+use crate::ui::{centered_rect, wrap_line, wrap_lines};
 
 /// Outcome of resolving a key press inside a confirmation dialog.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -126,35 +126,93 @@ pub struct ConfirmModalGeometry {
 }
 
 /// Computes the geometry and button bounds for a confirmation modal so that
-/// rendering and mouse hit-testing agree on the same layout.
-pub fn confirm_modal_geometry(
-    term: Rect,
-    width: u16,
-    body_lines_count: usize,
-    confirm_label: &str,
-    cancel_label: &str,
-) -> ConfirmModalGeometry {
-    // Grow with the body so long confirmation bodies (queue previews, policy
-    // notes) are never clipped: `needed_height` already reserves the borders
-    // (2) and the actions bar (3). The height percentage is capped at 90 so the
-    // modal keeps a small margin on short terminals while still fitting.
-    //
-    // The body length is model-controllable (an Architect refusal reason, a
-    // queue preview), so the whole computation runs in `usize` with saturating
-    // arithmetic and only then narrows back into `u16`. Neither the `* 100`
-    // scaling nor the body count can overflow, truncate, or panic on a long
-    // body (Conventions §4).
-    let needed_height = body_lines_count.saturating_add(7).max(10);
+/// Nominal card width the percentage split implies before it rounds.
+///
+/// `width_percent` is a percentage of the terminal, exactly as [`centered_rect`]
+/// reads it, so the first budgeting pass needs the column count it stands for.
+fn nominal_card_width(term: Rect, width_percent: u16) -> u16 {
+    let columns = u32::from(term.width) * u32::from(width_percent.min(100)) / 100;
+    u16::try_from(columns).unwrap_or(u16::MAX).max(4)
+}
+
+/// Width of the band the shared modal frame hands the body of a `card_width`
+/// card: the two border columns and the one-column horizontal padding on each
+/// side carry no content (Conventions §6.8).
+fn body_inner_width(card_width: u16) -> usize {
+    usize::from(card_width.saturating_sub(4)).max(1)
+}
+
+/// Visual rows the body occupies once wrapped at `inner_width`.
+///
+/// A logical line wider than the band becomes several visual rows, so counting
+/// logical lines under-budgets the card by exactly the rows the rendering wrap
+/// adds.
+fn wrapped_body_rows(body_lines: &[Line<'_>], inner_width: usize) -> usize {
+    let inner_width = inner_width.max(1);
+    body_lines
+        .iter()
+        .map(|line| {
+            if line.width() <= inner_width {
+                1
+            } else {
+                wrap_line(line.clone(), inner_width).len()
+            }
+        })
+        .sum()
+}
+
+/// Card area for a body occupying `rows` visual rows.
+///
+/// `needed_height` already reserves the borders (2), the title inset, the
+/// pre-action spacer, the action bar, and the docked hint strip. The height
+/// percentage is capped at 90 so the modal keeps a small margin on short
+/// terminals while still fitting.
+///
+/// The body length is model-controllable (an Architect refusal reason, a queue
+/// preview), so the whole computation runs in `usize` with saturating arithmetic
+/// and only then narrows back into `u16` (Conventions §4).
+fn confirm_card_area(term: Rect, width_percent: u16, rows: usize) -> Rect {
+    let needed_height = rows.saturating_add(7).max(10);
     let term_height = usize::from(term.height).max(1);
     let ratio = needed_height.saturating_mul(100) / term_height;
     let height_percent = u16::try_from(ratio).unwrap_or(u16::MAX).clamp(25, 90);
-    let area = centered_rect(width, height_percent, term);
+    centered_rect(width_percent, height_percent, term)
+}
+
+/// Computes the geometry and button bounds for a confirmation modal so that
+/// rendering and mouse hit-testing agree on the same layout.
+///
+/// The height is budgeted from the *wrapped* body, and the renderer draws exactly
+/// the lines counted here at exactly the band width counted here, so the sizing
+/// model and the rendering model are one artifact instead of two independent
+/// approximations (Conventions §1.3).
+pub fn confirm_modal_geometry(
+    term: Rect,
+    width: u16,
+    body_lines: &[Line<'_>],
+    confirm_label: &str,
+    cancel_label: &str,
+) -> ConfirmModalGeometry {
+    // Pass 1 budgets the card from the nominal card width the requested
+    // percentage stands for.
+    let nominal_inner = body_inner_width(nominal_card_width(term, width));
+    let area = confirm_card_area(term, width, wrapped_body_rows(body_lines, nominal_inner));
+
+    // Pass 2 re-budgets at the band the shared frame actually hands the body:
+    // the percentage split can round the drawn card away from the nominal one.
+    // Only the height can change here — the card width is a pure function of the
+    // terminal width and the width percent — so one re-budget converges.
+    let body_width = modal_geometry(area).body.width;
+    let area = confirm_card_area(
+        term,
+        width,
+        wrapped_body_rows(body_lines, usize::from(body_width)),
+    );
 
     // Delegate to the shared modal geometry so the confirmation buttons and the
     // reusable modal frame derive their bounds from a single source of truth and
     // cannot drift (Conventions §6, §7).
-    let (confirm_button, cancel_button) =
-        crate::components::modal::modal_action_buttons(area, confirm_label, cancel_label);
+    let (confirm_button, cancel_button) = modal_action_buttons(area, confirm_label, cancel_label);
 
     ConfirmModalGeometry {
         area,
@@ -192,10 +250,13 @@ pub fn render_modal_confirm(frame: &mut ratatui::Frame, params: ConfirmModalPara
         width,
     } = params;
 
+    // The card is sized from the wrapped body and then drawn with the very same
+    // lines at the very same band width, so `Paragraph` can never add a row the
+    // budget did not reserve (Conventions §1.3, §6.7).
     let geom = confirm_modal_geometry(
         frame.area(),
         width,
-        body_lines.len(),
+        &body_lines,
         &confirm_label,
         &cancel_label,
     );
@@ -217,9 +278,11 @@ pub fn render_modal_confirm(frame: &mut ratatui::Frame, params: ConfirmModalPara
     };
 
     modal.render(frame, |f, body_area| {
-        let body_widget = Paragraph::new(body_lines)
-            .alignment(Alignment::Center)
-            .wrap(Wrap { trim: false });
+        // The budget counted the body at exactly this band width, so drawing the
+        // pre-wrapped lines needs no second wrap and the drawn rows are the
+        // counted rows.
+        let wrapped = wrap_lines(body_lines, usize::from(body_area.width));
+        let body_widget = Paragraph::new(wrapped).alignment(Alignment::Center);
         f.render_widget(body_widget, body_area);
     });
 }
@@ -229,7 +292,7 @@ mod tests {
     use super::{confirm_modal_geometry, ConfirmDialog, ConfirmOutcome};
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use ratatui::layout::Rect;
-
+    use ratatui::text::Line;
     fn key(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::NONE)
     }
@@ -294,7 +357,8 @@ mod tests {
     fn large_body_geometry_stays_within_terminal() {
         let term = Rect::new(0, 0, 100, 40);
         for lines in [648usize, 656, 700, 10_000, 70_000] {
-            let geom = confirm_modal_geometry(term, 70, lines, " [ Confirm ] ", " [ Cancel ] ");
+            let body: Vec<Line> = vec![Line::raw("body"); lines];
+            let geom = confirm_modal_geometry(term, 70, &body, " [ Confirm ] ", " [ Cancel ] ");
             assert!(geom.area.height <= term.height, "card exceeds the terminal");
             assert!(
                 geom.area.bottom() <= term.bottom(),
@@ -307,6 +371,30 @@ mod tests {
             assert!(geom.confirm_button.right() <= geom.area.right());
             assert!(geom.cancel_button.right() <= geom.area.right());
         }
+    }
+
+    /// The card must grow with the *wrapped* visual count, not the logical line
+    /// count: the renderer draws the wrapped rows, so a logical-only budget
+    /// clips exactly the rows wrapping adds (finding #42, Conventions §6.7).
+    #[test]
+    fn wrapped_body_grows_the_card_instead_of_clipping_it() {
+        let term = Rect::new(0, 0, 80, 60);
+        let logical: Vec<Line> = vec![Line::raw("short line"); 6];
+        let wide: Vec<Line> = (0..6).map(|_| Line::raw("x".repeat(200))).collect();
+
+        let compact = confirm_modal_geometry(term, 58, &logical, "Confirm", "Cancel");
+        let tall = confirm_modal_geometry(term, 58, &wide, "Confirm", "Cancel");
+
+        assert!(
+            tall.area.height > compact.area.height,
+            "a wrapped body must claim more rows than a logical one: {} vs {}",
+            tall.area.height,
+            compact.area.height
+        );
+        assert!(
+            tall.area.bottom() <= term.bottom(),
+            "card bottom is clipped"
+        );
     }
 
     #[test]

@@ -26,7 +26,7 @@ pub struct ArchitectLevelUp {
     pub to: ArchitectTier,
 }
 
-/// Canonical comparison key for a plan or subplan step identifier.
+/// Canonical comparison key for a plan or review group step identifier.
 ///
 /// A blocked step identifier arrives from a failed turn, while the recorded
 /// identifier was authored by the Architect, so the two may differ by case or

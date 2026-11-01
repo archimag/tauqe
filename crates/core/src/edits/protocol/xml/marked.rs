@@ -387,6 +387,10 @@ impl MarkedXmlEditProtocol {
                             *from = restore_xml_literals(from, &self.marker);
                             *to = restore_xml_literals(to, &self.marker);
                         }
+                        EditOperation::MoveDir { from, to } => {
+                            *from = restore_xml_literals(from, &self.marker);
+                            *to = restore_xml_literals(to, &self.marker);
+                        }
                         EditOperation::LineAnchor {
                             path,
                             start,

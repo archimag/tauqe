@@ -208,6 +208,7 @@ impl XmlEditProtocol {
                             error: None,
                             changed_files: Vec::new(),
                             commit_hash: None,
+                            verification: None,
                         },
                     }
                 }
@@ -221,6 +222,7 @@ impl XmlEditProtocol {
                     error: Some(err_msg),
                     changed_files: Vec::new(),
                     commit_hash: None,
+                    verification: None,
                 },
             },
         }

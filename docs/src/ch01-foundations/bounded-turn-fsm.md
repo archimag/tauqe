@@ -24,8 +24,9 @@ known recovery path.
    file.
 2. **Every turn terminates in exactly one declared outcome** — success, error,
    blocked, or skip.
-3. **A turn is transactional.** It ends as one verified commit, or the working tree
-   returns to its pre-turn state.
+3. **A turn is transactional.** It ends as one commit that carries the explicit
+   verdict of its verification run, or the working tree returns to its pre-turn
+   state.
 4. **Every phase is bounded.** Discovery rounds, patch retries, healing rounds, and
    replanning cycles all have finite budgets.
 5. **The process is deterministic; the content is generative.** The model chooses
@@ -48,17 +49,39 @@ token is generated:
 - `InteractiveRepl` — free interactive dialogue started from the REPL,
   including a dialogue anchored on a review finding;
 - `PlanDiscussion` — architectural discussion of a plan;
-- `IsolatedStep` — execution of one plan step or one review finding.
+- `IsolatedStep` — execution of one plan step or one review finding;
+- `ArchitectSynthesis` — the Architect projects the unfinished horizon of a
+  plan from repository evidence.
 
 The intent is derived from typed request parameters, never from prompt text. It
 narrows the capability set, chooses the plan mutation mode, and decides whether
-the turn enters session history. The transport is declared separately from the
+the turn enters session history. Narrowing is a typed intersection: whatever a
+protocol advertises is cut down to the regime profile of the declared intent, so
+the prompt and the decoder observe one surface — a capability is never
+advertised while remaining undecodable, nor decoded while hidden from the
+instructions. The interactive REPL regime carries the dialogue head without plan
+mutation, and an isolated step carries no plan permission at all. Plan mutation
+reaches a turn exclusively through the plan-discussion regime, which is the
+regime the server assigns to a dialogue anchored on a plan. Plan creation is not
+mutation: it stays in the dialogue head, so a developer may request a plan at
+any moment of a dialogue. The transport is declared separately from the
 intent: a specialised plan discussion pins the structured discussion transport,
 while a develop or step turn keeps the transport configured in `tauqe.toml` —
 `structured` by default, `xml`, or `mixed`. The transport changes the encoding
 only, never the capability surface: an XML turn and a structured turn advertise
 and decode the very same operational commands. No default value exists, so a
 forgotten argument cannot silently substitute a mode.
+
+An Architect synthesis declares `ArchitectSynthesis`. Its surface is the
+architect discovery profile — discovery, plan creation, plan update, and the
+scratchpad — with no file-edit capability and no toolchain verification,
+because a synthesis produces a horizon rather than a patch; like an isolated
+step it suppresses session history, so recording a synthesis belongs to the
+caller that started it. The regime is what puts the synthesis on the same
+machine as every other turn: the structured Architect contour is a policy layer
+over the shared turn kernel (§3.3.9), so it inherits the rounds, the prompt
+head, the discovery journal, the corrective budget of an empty answer, and the
+transport retries instead of re-implementing them.
 
 ### 3.2.2 TurnPhase
 
@@ -142,7 +165,8 @@ inspect stack traces, and adapt its subsequent code edits.
 
 Four typed tags close a turn:
 
-- success — the objective was implemented, staged, and verified;
+- success — the objective was implemented, staged, and committed under an explicit
+  verification verdict;
 - error — an insurmountable contradiction or unresolvable failure;
 - blocked — a deliberate semantic assertion that the step's preconditions cannot be
   satisfied as stated;
@@ -354,38 +378,54 @@ replacing it, and the loop is bounded by `develop.max_retries`.
 
 ### 3.3.6 Verification
 
-Once staging converges, edits are applied atomically to disk and verification runs
-through the declared project commands in three phases: in-memory formatting of
-staged source text, disk-side post-hooks after the write, and the mandatory
-verification command. The suite
-reports typed diagnostics — file, line, column, severity, message — instead of a
-compiler transcript, which is what lets the healing round reason about a location
-instead of paying for ANSI escapes in its context window.
+Once staging converges, edits are applied atomically to disk and the declared
+project lifecycle runs in three phases: in-memory formatting of staged source
+text, disk-side post-hooks after the write, and the verification command, when the
+project declares one. The suite reports typed diagnostics — file, line, column,
+severity, message — instead of a compiler transcript, which is what lets the
+healing round reason about a location instead of paying for ANSI escapes in its
+context window.
 
-A verification request names its target (all, check, test, or a lint pass); a
-repository without a detected toolchain skips the gate transparently instead of
-failing.
+Verification is a declared capability, not a universal barrier. `[project.verify]`
+is optional, so a repository may legitimately describe no verification at all: the
+turn then runs no step, records the explicit `not_configured` verdict, and still
+commits its change set, because the project stated its own choice. No verdict is
+ever fabricated: a change set is reported as `passed`, `failed`,
+`not_configured`, or `cancelled`, and only a real run produces the first two. Only
+a declared gate that failed enters the healing loop.
+
+A verification request names its target (all, check, test, or a lint pass); the
+declared command is authoritative for every target, so a request can never weaken
+the gate the project declared. A repository that declares nothing runs nothing and
+skips the gate transparently instead of failing.
 
 ### 3.3.7 Healing and intra-role escalation
 
-A failed check enters a targeted healing round: the diagnostics are formatted into
-a clean report, missing error paths are staged into the context, and the prompt goes
-to the active role. Healing repeats while the budget lasts.
+A failed check enters a targeted healing round: the diagnostics are formatted into a
+clean report, missing error paths are staged into the context, and the prompt goes to
+the active role. Healing repeats while `develop.max_retries` lasts, and it stays
+inside one attempt of the current coder tier.
 
-When it does not converge, the harness does not abandon the *what*. With ladder
-escalation enabled, the failed transaction is rolled back, the transient discovery
-context is pruned, and the turn advances one rung of the coder ladder — deeper
-reasoning on the same model first, a stronger coder afterwards, saturating on the
-final rung. Escalation never leaves the coder role; *Model Roles and the Coder
-Ladder* owns that boundary. A blocked report bypasses the ladder entirely.
+When it does not converge, the turn reports its outcome and stops there. Retry and
+escalation belong to the step supervisor, not to the turn: the failed transaction is
+rolled back to the step's pre-turn checkpoint, the transient discovery context is
+pruned, and the step is re-asked on the same coder tier until
+`develop.max_tier_attempts` content attempts are spent. Only an exhausted tier
+advances one rung of the coder ladder — deeper reasoning on the same model first, a
+stronger coder afterwards — and that rung starts with a fresh budget of its own.
+Escalation never leaves the coder role and saturates on the final rung, where the
+step ends as a reported failure; *Model Roles and the Coder Ladder* owns that
+boundary. A blocked report consumes neither an attempt nor a rung and bypasses the
+ladder entirely.
 
 ### 3.3.8 Finalize or roll back
 
-A converged, verified turn is finalized as one isolated commit authored by the
-developer, marked with a co-author trailer so the harness can recognize its own
-work. Intermediate step commits exist only so healing can converge phase by phase
-and are squashed away, so history never exposes the healing noise of a recovered
-turn.
+A converged turn is finalized as one isolated commit authored by the developer,
+marked with a co-author trailer so the harness can recognize its own work, and
+carrying the explicit verdict of its verification run: `passed` when the declared
+gate accepted the tree, `not_configured` when the project declares no lifecycle.
+Intermediate step commits exist only so healing can converge phase by phase and
+are squashed away, so history never exposes the healing noise of a recovered turn.
 
 Anything else — an unresolved failure, an exhausted ladder, a cancellation, a
 blocked report — restores the working tree to the checkpoint taken before the turn
@@ -434,6 +474,15 @@ what makes it testable without a network:
 | Apply policy | staging, temporary commit, finalize, rollback |
 | Provider | transport, streaming, cancellation; a retrying decorator wraps every provider |
 
+The cycle itself is one reusable kernel (`TurnKernel`). It carries the rounds,
+the prompt assembly of each round, the discovery journal, the corrective budget
+of an empty answer, and the observation of cancellation, so a contour supplies
+only the prompt protocol and the policy of its own payload. The Architect
+synthesis is exactly that: the same kernel driven by `PlanRefinePromptProtocol`
+and the structured Architect contour, which adds Schema Healing of an unparsable
+answer, escalation along the architect ladder, and typed terminal outcomes — a
+synthesized horizon, a blocker, an exceeded context budget, or a cancellation.
+
 A scripted provider satisfies this contract without a network call, so multi-round
 scenarios — discovery, a compiler failure, a successful healing patch, a
 cancellation — run deterministically in milliseconds.
@@ -470,11 +519,13 @@ intent does not change between rounds.
 
 The head renders the main capability list of the intent and the shared part of
 the regime trunk, so it is byte-identical for the free REPL, the plan discussion,
-and the review discussion. What a dialogue narrows further — the plan mutation
-delta of a plan discussion, and the empty profile delta of a review discussion —
-travels in the regime delta instead. The invariant that a capability is
-advertised exactly when it is decoded survives, because head and delta are read
-from the same typed profile.
+and the review discussion. What a regime adds beyond that head travels in the
+regime delta instead: a plan discussion adds its plan mutation there, while a
+review discussion adds nothing, so its delta is empty. The invariant that a
+capability is advertised exactly when it is decoded survives, because the head,
+the delta, and the decoder are all read from the same typed profile — an
+interactive turn intersects the advertised set with the interactive regime and
+rejects plan mutation even when its protocol declares it.
 
 | Material | Semantic | Chronological |
 | --- | --- | --- |
@@ -529,12 +580,25 @@ the pause races the cancellation signal so an interrupt aborts it immediately.
 A failure before any token is transparent; a failure after partial output resets the
 accumulated fragments, so two attempts are never stitched into one answer.
 
+Those retries are transport-level and neutral to the tier attempt budget. A turn that
+ends with no result because its stream broke, its request timed out, or the provider
+answered with a rate-limit or server-error status is classified as an infrastructure
+failure: the decorator already answered it, no content attempt of the current tier is
+consumed, and no rung of the ladder is advanced. Only a turn that produced a result
+the harness judged as a failure spends an attempt.
+
 A retry policy guards a transport that fails, not one that keeps working. A model
 caught in a reasoning loop streams indefinitely, so one attempt's cumulative output
 is metered against a hard ceiling. Crossing it aborts the attempt, discards the
 partial output, and reports a terminal error that is deliberately not retried: the
 same request would reproduce the same loop.
 
+Cancellation reaches the completion path as well. The answer is already delivered,
+so a phase that runs after the last delta is optional work: the generation-stats
+fetch that resolves the reported cost races the operation's cancellation signal and
+carries its own short per-request timeout. A cancelled, slow, or unreachable
+endpoint costs the turn the enrichment and nothing else, because a best-effort
+fetch can never be the reason a finished turn waits.
 ### 3.3.12 The process container
 
 The turn runs inside a daemon that is a child of the client. The daemon opens no
@@ -551,6 +615,16 @@ wait are declared together, with the wait strictly greater than the budget, so t
 client never kills a daemon that is still rolling back. A detached lifetime is
 deliberately absent: it would introduce a second lifecycle that no turn depends on.
 
+Cancellation is a property of the operation, not of the chat request. Every phase
+an operation creates inherits it: the pre-flight verification gate runs while the
+slot is registered, reads the same channel, and tears its toolchain subprocess
+group down; the provider request and its completion path race the signal at every
+await; and every task spawned under the slot keeps the registration — with its
+abort handle — alive until the task has truly exited. A supervisor that dropped the
+future of a running step would break that last clause, so a queue unwinds through
+the member rather than around it. A phase that cannot observe the signal on its own
+is terminated by the deferred-abort watchdog, which defers while the operation still
+holds an open Git transaction and aborts once that transaction has closed.
 ### 3.3.13 Guards and budgets
 
 | Guard | Setting |
@@ -558,7 +632,9 @@ deliberately absent: it would introduce a second lifecycle that no turn depends 
 | Discovery rounds per turn | `context.max_discovery_rounds` |
 | Context files budget | `context.files_token_budget` |
 | Repository outline budget | `context.repomap_token_budget` |
-| Patch retries | `develop.max_retries` |
+| Patch retries and healing rounds | `develop.max_retries` |
+| Content attempts per coder tier | `develop.max_tier_attempts` |
+| Generation attempts per architect rung | `attempts` on the architect entry (2 by default) |
 | Automated replans | `develop.max_replans` |
 | Outlines per discovery round | fixed request cap |
 
@@ -600,7 +676,15 @@ learns what to decompose instead of watching a turn fail anonymously.
   rolled back are typed states, never a phrase inside a message.
 - **It does not confuse prompt recall with dialogue memory.** The editor list is a
   typing convenience backed by its own file, not a second transcript.
-
+- **It does not fabricate a verification verdict.** A project that declares no
+  lifecycle states its own choice, so the change set is reported as unverified
+  instead of being dressed up as a passed gate.
+- **An attempt on a tier is not an escalation.** Re-asking the same tier is finite
+  and configured by `develop.max_tier_attempts`; only an exhausted tier advances the
+  ladder, and a saturated ladder ends the step instead of retrying it again.
+- **A broken connection does not burn a rung.** Transport failures are answered by
+  the network layer and consume no content attempt, so a degraded link never promotes
+  a model that has not failed on content.
 ---
 
 ## 3.5 Related Chapters

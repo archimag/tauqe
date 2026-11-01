@@ -60,6 +60,14 @@ pub(crate) struct StrategyProfile {
     pub(crate) replaced_line_fields: &'static [ReplacedLineField],
     /// Description the schema publishes for the `content` property.
     pub(crate) content_description: &'static str,
+    /// Base name of the change-set vehicle the strategy advertises.
+    ///
+    /// A strategy that carries its whole change set in one tagged vehicle names
+    /// that tag here, so the operational-tag contract lists it exactly where the
+    /// strategy teaches it. A strategy that addresses the replaced lines without
+    /// a vehicle declares none, and the contract then enumerates only the
+    /// capability control tags.
+    pub(crate) change_set_vehicle: Option<&'static str>,
     /// Instruction of the XML code-modification contour.
     xml_instruction: XmlInstructionRenderer,
     /// Instruction of the structured-output contour.
@@ -112,6 +120,17 @@ impl StrategyProfile {
             other => other.to_string(),
         }
     }
+
+    /// Reports whether `tag` belongs in this strategy's operational tag list.
+    ///
+    /// Every control tag is listed by every strategy, because the capability
+    /// surface of a turn does not depend on how a change set addresses the lines
+    /// it replaces. A change-set vehicle is the one exception: it is taught by
+    /// exactly one strategy, so only the profile that declares it lists it and a
+    /// rule never advertises a command its own strategy does not mention.
+    pub(crate) fn advertises_operational_tag(&self, tag: &str) -> bool {
+        self.change_set_vehicle == Some(tag) || !is_change_set_vehicle(tag)
+    }
 }
 
 /// Fields of a change entry that echoes the replaced text.
@@ -143,9 +162,9 @@ static LINE_ANCHOR_FIELDS: &[ReplacedLineField] = &[
 static SEARCH_REPLACE: StrategyProfile = StrategyProfile {
     replaced_line_fields: SEARCH_REPLACE_FIELDS,
     content_description: "Complete file content (required for 'create' and 'overwrite', empty string otherwise)",
-    xml_instruction: search_replace_xml_instruction,
-    structured_instruction: "- `changes`: array of edit operations with `op` ('replace'|'create'|'delete'|'move'|'overwrite') plus `path`, `to`, `old_text`, `new_text`, and `content`.",
-    empty_field_guidance: "Every field of a change is required: use an empty string \"\" for fields that do not apply to the operation (e.g. `old_text`/`new_text` for 'create'/'delete', `content` for 'replace').\n\n",
+    change_set_vehicle: None,    xml_instruction: search_replace_xml_instruction,
+    structured_instruction: "- `changes`: array of edit operations with `op` ('replace'|'create'|'delete'|'move'|'move_dir'|'overwrite') plus `path`, `to`, `old_text`, `new_text`, and `content`. A 'move_dir' entry names the source directory in `path` and the destination in `to`, moves the whole subtree, and leaves `old_text`, `new_text`, and `content` empty.",
+    empty_field_guidance: "Every field of a change is required: use an empty string \"\" for fields that do not apply to the operation (e.g. `old_text`/`new_text` for 'create'/'delete', `old_text`/`new_text`/`content` for 'move' and 'move_dir', `content` for 'replace').\n\n",
     replace_invariant: "For 'replace', `old_text` must match EXACTLY ONE location in the target file, including indentation and whitespace.\n",
     no_match_hint: "Search block not found (0 matches). Verify exact line content, indentation, and context.",
     no_range_hint: SEARCH_REPLACE_NO_RANGE_HINT,
@@ -157,15 +176,26 @@ static SEARCH_REPLACE: StrategyProfile = StrategyProfile {
 static LINE_ANCHOR: StrategyProfile = StrategyProfile {
     replaced_line_fields: LINE_ANCHOR_FIELDS,
     content_description: "Complete replacement of the addressed line range for 'replace' (the replaced lines are never echoed back), complete file content for 'create', empty string otherwise",
-    xml_instruction: line_anchor_xml_instruction,
-    structured_instruction: "- `changes`: array of edit operations with `op` ('replace'|'create'|'delete'|'move') plus `path`, `to`, `start`, `end`, and `content`. A 'replace' entry names the replaced lines by the opaque anchors rendered beside every context line, `start` for the first replaced line and `end` for the last one, and carries the complete replacement of that range in `content`; both anchors must be copied character for character, and the replaced lines are never echoed back. 'create' carries the whole file in `content`, 'move' names its destination in `to`, and both leave `start` and `end` empty. A whole-file rewrite is a 'replace' entry whose range spans the file from its first line to its last one.",
-    empty_field_guidance: "Every field of a change is required: use an empty string \"\" for fields that do not apply to the operation (e.g. `start`/`end` for 'create'/'delete', `to` for every operation except 'move').\n\n",
+    change_set_vehicle: Some("file_edits"),    xml_instruction: line_anchor_xml_instruction,
+    structured_instruction: "- `changes`: array of edit operations with `op` ('replace'|'create'|'delete'|'move'|'move_dir') plus `path`, `to`, `start`, `end`, and `content`. A 'replace' entry names the replaced lines by the opaque anchors rendered beside every context line, `start` for the first replaced line and `end` for the last one, and carries the complete replacement of that range in `content`; both anchors must be copied character for character, and the replaced lines are never echoed back. 'create' carries the whole file in `content`, 'move' names its destination in `to`, and both leave `start` and `end` empty. A 'move_dir' entry names the source directory in `path` and the destination in `to`, moves the whole subtree, and leaves `start`, `end`, and `content` empty. A whole-file rewrite is a 'replace' entry whose range spans the file from its first line to its last one.",
+    empty_field_guidance: "Every field of a change is required: use an empty string \"\" for fields that do not apply to the operation (e.g. `start`/`end` for 'create', `start`/`end`/`content` for 'delete', `content` for 'move' and 'move_dir', and `to` for every operation except 'move' and 'move_dir').\n\n",
     replace_invariant: "For 'replace', `start` and `end` MUST be anchors rendered in <context> for that same file, the named range MUST NOT overlap another entry, and `content` replaces exactly the addressed lines.\n",
     no_match_hint: "The change set addressed no line of the file. Copy the anchor of the first and of the last replaced line from the <context> block of that same file.",
     no_range_hint: LINE_ANCHOR_NO_RANGE_HINT,
     ambiguous_match_hint: line_anchor_ambiguous_match_hint,
     retry_instruction: "Re-read the <context> block and copy the `start` and `end` anchors character for character: an anchor names a line only in the file it was rendered for, and the ranges of one change set must not overlap.",
 };
+
+/// Reports whether `tag` names a change-set vehicle declared by a strategy.
+///
+/// The two profiles are the exhaustive set of strategies, so the classification
+/// is derived from the declarations themselves instead of a second list of tag
+/// names: a tag is a vehicle exactly when a strategy declares it as one.
+fn is_change_set_vehicle(tag: &str) -> bool {
+    [&SEARCH_REPLACE, &LINE_ANCHOR]
+        .iter()
+        .any(|profile| profile.change_set_vehicle == Some(tag))
+}
 
 /// Explanation of a change set that addresses no replaced line, in the
 /// search/replace dialect.
@@ -210,7 +240,7 @@ fn search_replace_xml_instruction(tag_name: &dyn Fn(&str) -> String) -> String {
 /// Renders the XML instruction of the opaque line-anchor strategy.
 fn line_anchor_xml_instruction(tag_name: &dyn Fn(&str) -> String) -> String {
     let file_edits = tag_name("file_edits");
-    format!("- Code edits: send the whole change set as one JSON array inside <{file_edits}>...</{file_edits}>, as in <{file_edits}>[{{\"op\":\"replace\",\"path\":\"src/lib.rs\",\"to\":\"\",\"start\":\"<first-anchor>\",\"end\":\"<last-anchor>\",\"content\":\"<complete replacement>\"}}]</{file_edits}>.\n  - Every entry names its operation in `op` ('replace', 'create', 'delete', or 'move'), its file in `path`, and, for 'move', its destination in `to`.\n  - A 'replace' entry names the replaced lines by the opaque anchors rendered beside every context line: `start` is the anchor of the first replaced line, `end` the anchor of the last one, and `content` is the complete replacement of that range. Copy both anchors character for character from <context>: they are decoded deterministically, so a re-typed, reordered, or reformatted anchor names a different line and is rejected with a diagnostic. Never echo the replaced text and never renumber the file yourself.\n  - A 'create' entry carries the whole file content in `content`, 'move' names its destination in `to`, and 'delete' needs neither; these operations leave `start` and `end` empty. A whole-file rewrite is a 'replace' entry whose range spans the file from its first line to its last one.\n  - Files inside <context> declare their status through the `access` attribute: `access=\"editable\"` files may be modified directly, while a file marked `access=\"read_only\"` is provided for reference and becomes editable automatically once you propose a change to it. A 'replace' entry `path` MUST match a file present in <context>, while a 'create' path MUST be a valid repository-relative path.\n  - Ranges of one change set MUST NOT overlap; they are applied from the bottom of the file upwards, so every anchor stays valid while the rest of the change set is applied.\n  - The array MUST be valid JSON: a trailing comma or a comment makes the whole change set undecodable.\n  - If no code changes are needed, answer in plain text without the change-set tag.")
+    format!("- Code edits: send the whole change set as one JSON array inside <{file_edits}>...</{file_edits}>, as in <{file_edits}>[{{\"op\":\"replace\",\"path\":\"src/lib.rs\",\"to\":\"\",\"start\":\"<first-anchor>\",\"end\":\"<last-anchor>\",\"content\":\"<complete replacement>\"}}]</{file_edits}>.\n  - Every entry names its operation in `op` ('replace', 'create', 'delete', 'move', or 'move_dir'), its file or directory in `path`, and, for 'move' and 'move_dir', its destination in `to`.\n  - A 'replace' entry names the replaced lines by the opaque anchors rendered beside every context line: `start` is the anchor of the first replaced line, `end` the anchor of the last one, and `content` is the complete replacement of that range. Copy both anchors character for character from <context>: they are decoded deterministically, so a re-typed, reordered, or reformatted anchor names a different line and is rejected with a diagnostic. Never echo the replaced text and never renumber the file yourself.\n  - A 'create' entry carries the whole file content in `content`, 'move' names its destination in `to`, and 'delete' needs neither; these operations leave `start` and `end` empty. A 'move_dir' entry names the source directory in `path` and the destination in `to`, moves the whole subtree as one operation, and leaves `start`, `end`, and `content` empty. A whole-file rewrite is a 'replace' entry whose range spans the file from its first line to its last one.\n  - Files inside <context> declare their status through the `access` attribute: `access=\"editable\"` files may be modified directly, while a file marked `access=\"read_only\"` is provided for reference and becomes editable automatically once you propose a change to it. A 'replace' entry `path` MUST match a file present in <context>, while a 'create' path MUST be a valid repository-relative path.\n  - Ranges of one change set MUST NOT overlap; they are applied from the bottom of the file upwards, so every anchor stays valid while the rest of the change set is applied.\n  - The array MUST be valid JSON: a trailing comma or a comment makes the whole change set undecodable.\n  - If no code changes are needed, answer in plain text without the change-set tag.")
 }
 
 #[cfg(test)]
@@ -445,6 +475,57 @@ mod tests {
                 prompt.contains(&reason),
                 "{strategy} stated divergent wordings: {prompt}"
             );
+        }
+    }
+
+    #[test]
+    fn a_directory_move_is_advertised_without_a_line_range() {
+        let anchored = StrategyProfile::of(PatchStrategy::LineAnchor);
+        let echoed = StrategyProfile::of(PatchStrategy::SearchReplace);
+        let anchored_xml = anchored.render_xml_instruction(&bare_tag);
+        let echoed_xml = echoed.render_xml_instruction(&bare_tag);
+
+        // A directory rename names two directories and no lines, so both
+        // structured strategies advertise it beside the operations they define.
+        for text in [
+            anchored.structured_instruction,
+            anchored.empty_field_guidance,
+            anchored_xml.as_str(),
+            echoed.structured_instruction,
+            echoed.empty_field_guidance,
+        ] {
+            assert!(text.contains("move_dir"), "text omits move_dir: {text}");
+        }
+
+        // The search/replace XML grammar declares no directory tag, so its
+        // instruction never advertises an operation it cannot decode.
+        assert!(!echoed_xml.contains("move_dir"), "{echoed_xml}");
+    }
+
+    #[test]
+    fn only_the_strategy_that_teaches_the_vehicle_advertises_it() {
+        let anchored = StrategyProfile::of(PatchStrategy::LineAnchor);
+        assert_eq!(anchored.change_set_vehicle, Some("file_edits"));
+        assert!(anchored.advertises_operational_tag("file_edits"));
+
+        // The vehicle the profile advertises operationally is the container its
+        // instruction teaches, so the contract and the instruction can never
+        // describe different vehicles.
+        assert!(anchored
+            .render_xml_instruction(&bare_tag)
+            .contains("<file_edits>"));
+
+        // Every other control tag is advertised by every strategy, because the
+        // capability surface does not depend on the patch strategy.
+        for tag in ["verify", "success", "scratchpad", "custom_tool"] {
+            assert!(anchored.advertises_operational_tag(tag), "{tag}");
+        }
+
+        let echoed = StrategyProfile::of(PatchStrategy::SearchReplace);
+        assert_eq!(echoed.change_set_vehicle, None);
+        assert!(!echoed.advertises_operational_tag("file_edits"));
+        for tag in ["verify", "success", "scratchpad", "custom_tool"] {
+            assert!(echoed.advertises_operational_tag(tag), "{tag}");
         }
     }
 }

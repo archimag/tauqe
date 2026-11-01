@@ -27,7 +27,12 @@ const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 /// Maximum idle time between reads on an open stream. Bounds a stalled
 /// provider so a hung connection cannot block the turn indefinitely.
 const READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
-
+/// Budget of the best-effort generation-stats enrichment fetch.
+///
+/// The fetch only enriches the reported cost, so it must never dominate the
+/// completion of an otherwise delivered stream: a single request is attempted
+/// under this ceiling, sized well below the shared client's read budget.
+const GENERATION_STATS_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 pub struct OpenRouterProvider {
     api_key: String,
     base_url: String,
@@ -56,6 +61,12 @@ impl OpenRouterProvider {
         self
     }
 
+    /// Fetches the generation cost OpenRouter reports for `generation_id`.
+    ///
+    /// The fetch only enriches the usage report, so it makes a single attempt
+    /// under `GENERATION_STATS_TIMEOUT`: a slow, hung, or unreachable
+    /// generation endpoint yields `None` instead of stalling the caller inside
+    /// the shared client's much larger read budget.
     pub async fn get_generation_stats(
         &self,
         generation_id: &str,
@@ -71,48 +82,58 @@ impl OpenRouterProvider {
             HeaderValue::from_str(&format!("Bearer {}", self.api_key.trim()))?,
         );
 
-        for attempt in 0..3 {
-            if attempt > 0 {
-                tokio::time::sleep(tokio::time::Duration::from_millis(250)).await;
-            }
-
-            let resp = match self
-                .http_client
-                .get(&url)
-                .headers(headers.clone())
-                .send()
-                .await
-            {
-                Ok(r) => r,
-                Err(err) => {
-                    tracing::warn!("OpenRouter generation stats request failed: {}", err);
-                    continue;
-                }
-            };
-
-            let status = resp.status();
-            if status.is_client_error() {
+        let response = match self
+            .http_client
+            .get(&url)
+            .headers(headers)
+            .timeout(GENERATION_STATS_TIMEOUT)
+            .send()
+            .await
+        {
+            Ok(response) => response,
+            Err(err) => {
+                tracing::warn!(
+                    is_timeout = err.is_timeout(),
+                    error = %err,
+                    "openrouter generation stats request failed"
+                );
                 return Ok(None);
             }
+        };
 
-            if status.is_success() {
-                if let Ok(gen_resp) = resp.json::<GenerationResponse>().await {
-                    if let Some(data) = gen_resp.data {
-                        if data.total_cost.is_some() {
-                            return Ok(Some(GenerationStats {
-                                total_cost: data.total_cost,
-                                prompt_tokens: data.tokens_prompt.or(data.native_tokens_prompt),
-                                completion_tokens: data
-                                    .tokens_completion
-                                    .or(data.native_tokens_completion),
-                            }));
-                        }
-                    }
-                }
-            }
+        let status = response.status();
+        if !status.is_success() {
+            tracing::warn!(
+                status_code = status.as_u16(),
+                "openrouter generation stats request was not successful"
+            );
+            return Ok(None);
         }
 
-        Ok(None)
+        let generation = match response.json::<GenerationResponse>().await {
+            Ok(generation) => generation,
+            Err(err) => {
+                tracing::warn!(
+                    is_timeout = err.is_timeout(),
+                    error = %err,
+                    "openrouter generation stats response was not readable"
+                );
+                return Ok(None);
+            }
+        };
+
+        let Some(data) = generation.data else {
+            return Ok(None);
+        };
+        if data.total_cost.is_none() {
+            return Ok(None);
+        }
+
+        Ok(Some(GenerationStats {
+            total_cost: data.total_cost,
+            prompt_tokens: data.tokens_prompt.or(data.native_tokens_prompt),
+            completion_tokens: data.tokens_completion.or(data.native_tokens_completion),
+        }))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -442,7 +463,24 @@ impl OpenRouterProvider {
         if let Some(gen_id) = generation_id {
             let needs_cost = latest_usage.as_ref().is_none_or(|u| u.cost.is_none());
             if needs_cost {
-                if let Ok(Some(stats)) = self.get_generation_stats(&gen_id).await {
+                // The enrichment is best-effort, so it inherits the turn's
+                // cancellation discipline: the stats fetch races the turn
+                // cancellation signal exactly like the request path does. A
+                // dropped cancellation sender surfaces as `Err`, so the branch
+                // parks instead of firing and the fetch proceeds.
+                let stats = tokio::select! {
+                    _ = async {
+                        if cancel_rx.wait_for(|cancelled| *cancelled).await.is_err() {
+                            std::future::pending::<()>().await;
+                        }
+                    } => {
+                        let _ = tx.send(StreamEvent::Cancelled).await;
+                        return Ok(());
+                    }
+                    stats = self.get_generation_stats(&gen_id) => stats,
+                };
+
+                if let Ok(Some(stats)) = stats {
                     let mut usage = latest_usage.clone().unwrap_or_default();
                     if usage.cost.is_none() {
                         usage.cost = stats.total_cost;
@@ -537,6 +575,8 @@ impl LlmProvider for OpenRouterProvider {
 
 #[cfg(test)]
 mod tests {
+    use std::borrow::Cow;
+
     use super::sse::{
         find_sse_event_boundary, truncate_response_body, MAX_SSE_EVENT_BYTES,
         RESPONSE_BODY_LOG_CHARS,
@@ -663,7 +703,153 @@ mod tests {
         assert_eq!(usage.completion_tokens, 5);
         assert_eq!(usage.cost, Some(0.00045));
     }
+    /// A stalled generation-stats endpoint must not delay a stream whose body
+    /// has already been delivered: the enrichment request times out on its own.
+    #[tokio::test]
+    async fn test_generation_stats_timeout_does_not_block_stream_completion() {
+        let mock_server = MockServer::start().await;
 
+        let sse_body = "data: {\"id\":\"gen-slow\",\"choices\":[{\"delta\":{\"content\":\"Hi\"}}]}\n\n\
+                        data: {\"id\":\"gen-slow\",\"choices\":[],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":5,\"total_tokens\":15}}\n\n\
+                        data: [DONE]\n\n";
+
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_raw(sse_body, "text/event-stream"),
+            )
+            .mount(&mock_server)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path("/generation"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "application/json")
+                    .set_delay(std::time::Duration::from_secs(60))
+                    .set_body_string(r#"{"data":{"id":"gen-slow","total_cost":0.00045}}"#),
+            )
+            .mount(&mock_server)
+            .await;
+
+        let provider =
+            OpenRouterProvider::new("test-api-key".to_string()).with_base_url(mock_server.uri());
+
+        let (tx, mut rx) = mpsc::channel(10);
+        let (_cancel_tx, cancel_rx) = watch::channel(false);
+
+        let provider_task = tokio::spawn(async move {
+            provider
+                .stream_text("test-model", vec![ChatMessage::user("Hi")], tx, cancel_rx)
+                .await
+        });
+
+        let drain = async {
+            let mut got_done = false;
+            while let Some(event) = rx.recv().await {
+                if matches!(event, StreamEvent::Done) {
+                    got_done = true;
+                }
+            }
+            got_done
+        };
+
+        let (result, got_done) = tokio::time::timeout(std::time::Duration::from_secs(30), async {
+            tokio::join!(provider_task, drain)
+        })
+        .await
+        .expect("the enrichment fetch must not stall the stream past its own timeout");
+
+        assert!(result.expect("task join failed").is_ok());
+        assert!(
+            got_done,
+            "the stream must still report Done after the enrichment timed out"
+        );
+    }
+
+    /// A cancellation raised while the enrichment fetch is in flight must end
+    /// the stream instead of waiting out the generation-stats endpoint.
+    #[tokio::test]
+    async fn test_generation_stats_fetch_yields_to_cancellation() {
+        let mock_server = MockServer::start().await;
+
+        let sse_body = "data: {\"id\":\"gen-cancelled\",\"choices\":[{\"delta\":{\"content\":\"Hi\"}}]}\n\n\
+                        data: {\"id\":\"gen-cancelled\",\"choices\":[],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":5,\"total_tokens\":15}}\n\n\
+                        data: [DONE]\n\n";
+
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_raw(sse_body, "text/event-stream"),
+            )
+            .mount(&mock_server)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path("/generation"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "application/json")
+                    .set_delay(std::time::Duration::from_secs(60))
+                    .set_body_string(r#"{"data":{"id":"gen-cancelled","total_cost":0.00045}}"#),
+            )
+            .mount(&mock_server)
+            .await;
+
+        let provider =
+            OpenRouterProvider::new("test-api-key".to_string()).with_base_url(mock_server.uri());
+
+        let (tx, mut rx) = mpsc::channel(10);
+        let (cancel_tx, cancel_rx) = watch::channel(false);
+
+        let provider_task = tokio::spawn(async move {
+            provider
+                .stream_text("test-model", vec![ChatMessage::user("Hi")], tx, cancel_rx)
+                .await
+        });
+
+        let mut saw_usage = false;
+        let mut saw_cancelled = false;
+        let mut got_done = false;
+
+        let collected = tokio::time::timeout(std::time::Duration::from_secs(30), async {
+            while let Some(event) = rx.recv().await {
+                match event {
+                    StreamEvent::Usage(_) => {
+                        if !saw_usage {
+                            saw_usage = true;
+                            // The usage chunk closes the SSE body, so the
+                            // provider is either inside the enrichment phase
+                            // already or one step away from it.
+                            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                            let _ = cancel_tx.send(true);
+                        }
+                    }
+                    StreamEvent::Cancelled => saw_cancelled = true,
+                    StreamEvent::Done => got_done = true,
+                    _ => {}
+                }
+            }
+        })
+        .await;
+        collected.expect("a cancelled enrichment must resolve promptly");
+
+        let result = provider_task.await.expect("task join failed");
+        assert!(result.is_ok());
+        assert!(
+            saw_usage,
+            "the SSE body must be delivered before the cancellation"
+        );
+        assert!(
+            saw_cancelled,
+            "the cancellation raised during enrichment must be reported"
+        );
+        assert!(!got_done, "a cancelled turn must not report Done");
+    }
     #[tokio::test]
     async fn test_stream_chat_json_schema_requires_parameters() {
         use super::super::types::JsonSchemaDefinition;
@@ -692,7 +878,7 @@ mod tests {
             json_schema: JsonSchemaDefinition {
                 name: "model_result".to_string(),
                 description: None,
-                schema: serde_json::json!({"type": "object"}),
+                schema: Cow::Owned(serde_json::json!({"type": "object"})),
                 strict: Some(true),
             },
         });
@@ -744,7 +930,7 @@ mod tests {
             json_schema: JsonSchemaDefinition {
                 name: "model_result".to_string(),
                 description: None,
-                schema: serde_json::json!({"type": "object"}),
+                schema: Cow::Owned(serde_json::json!({"type": "object"})),
                 strict: Some(true),
             },
         });
@@ -1316,7 +1502,7 @@ mod tests {
             json_schema: JsonSchemaDefinition {
                 name: "model_result".to_string(),
                 description: None,
-                schema: serde_json::json!({"type": "object"}),
+                schema: Cow::Owned(serde_json::json!({"type": "object"})),
                 strict: Some(true),
             },
         });

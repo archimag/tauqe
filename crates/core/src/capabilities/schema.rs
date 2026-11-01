@@ -101,15 +101,19 @@ fn string_property(description: &str) -> Value {
 /// is how a full rewrite is expressed there. The selector therefore follows
 /// the same patch strategy that already decides the replaced-line fields, and
 /// the schema never advertises an operation the strategy does not offer.
+///
+/// A directory move names two directories and no lines, so it addresses no
+/// replaced-lines vocabulary at all and both strategies offer it: the strict
+/// enum declares it beside the operations the strategy itself defines.
 fn op_property(patch_strategy: PatchStrategy) -> Value {
     let (operations, description): (&[&str], &str) = match patch_strategy {
         PatchStrategy::SearchReplace => (
-            &["replace", "create", "delete", "move", "overwrite"],
-            "Operation type: 'replace' for modifying existing files, 'create' for new files, 'delete' for deleting files, 'move' for moving or renaming files, 'overwrite' for replacing the entire content of an existing file",
+            &["replace", "create", "delete", "move", "move_dir", "overwrite"],
+            "Operation type: 'replace' for modifying existing files, 'create' for new files, 'delete' for deleting files, 'move' for moving or renaming files, 'move_dir' for moving or renaming a directory subtree, 'overwrite' for replacing the entire content of an existing file",
         ),
         PatchStrategy::LineAnchor => (
-            &["replace", "create", "delete", "move"],
-            "Operation type: 'replace' for modifying existing files, 'create' for new files, 'delete' for deleting files, 'move' for moving or renaming files",
+            &["replace", "create", "delete", "move", "move_dir"],
+            "Operation type: 'replace' for modifying existing files, 'create' for new files, 'delete' for deleting files, 'move' for moving or renaming files, 'move_dir' for moving or renaming a directory subtree",
         ),
     };
     json!({
@@ -123,7 +127,7 @@ fn op_property(patch_strategy: PatchStrategy) -> Value {
 fn path_property() -> Value {
     json!({
         "type": "string",
-        "description": "Relative repository path to the target file (source file for 'move')"
+        "description": "Relative repository path to the target file (the source file for 'move', the source directory for 'move_dir')"
     })
 }
 
@@ -131,7 +135,7 @@ fn path_property() -> Value {
 fn destination_property() -> Value {
     json!({
         "type": "string",
-        "description": "Target repository path for 'move' operation (empty string otherwise)"
+        "description": "Target repository path for 'move' and 'move_dir' operations (empty string otherwise)"
     })
 }
 
@@ -329,10 +333,13 @@ pub(crate) fn user_language_fragment() -> Value {
 /// code-modification and the discussion contours at once, and no silent fallback
 /// can degrade the property into an empty object. The payload admits `null`
 /// because a turn that leaves the plan untouched carries none at all, which is
-/// the idle representation of a property the strict schema still requires.
+/// The builder serves its cached schema by reference, so the fragment takes the
+/// single owned copy the composed edit schema needs. That copy is unavoidable:
+/// the registry composes a fresh schema on every composition, and the fragment
+/// becomes part of it.
 pub(crate) fn plan_update_fragment() -> Value {
     json!({
-        "plan_update": tauqe_protocol::discussion::schema::plan_update_schema()
+        "plan_update": tauqe_protocol::discussion::schema::plan_update_schema().clone()
     })
 }
 
@@ -342,9 +349,10 @@ pub(crate) fn plan_update_fragment() -> Value {
 /// kind, so their schemas cannot be inlined into the fragment without the
 /// fragment containing itself. The definitions come from the authoritative
 /// builder of `crates/protocol` and are lifted to the root of the composed
-/// schema by the registry, which is where `#/$defs/<Name>` resolves.
+/// The builder serves its cached definitions by reference, so lifting them into
+/// the composed schema takes the one owned copy that composition needs.
 pub(crate) fn plan_update_definitions() -> Value {
-    tauqe_protocol::discussion::schema::plan_schema_definitions()
+    tauqe_protocol::discussion::schema::plan_schema_definitions().clone()
 }
 
 /// Schema fragment of the structured abort property.
@@ -494,7 +502,7 @@ mod tests {
         // discussion contour describe one identical payload.
         assert_eq!(
             plan_update,
-            &tauqe_protocol::discussion::schema::plan_update_schema()
+            tauqe_protocol::discussion::schema::plan_update_schema()
         );
 
         let variants = plan_update["anyOf"]
@@ -523,7 +531,7 @@ mod tests {
         // of being sliced out of a sibling schema.
         let definitions = plan_update_definitions();
         assert_eq!(
-            definitions,
+            &definitions,
             tauqe_protocol::discussion::schema::plan_schema_definitions()
         );
         let names = definitions
@@ -649,21 +657,32 @@ mod tests {
         // whole file, so the separate operation is absent from the strict enum
         // and from the description that explains it.
         let anchored = operation_selector(PatchStrategy::LineAnchor);
-        let anchored_operations = json!(["replace", "create", "delete", "move"]);
+        let anchored_operations = json!(["replace", "create", "delete", "move", "move_dir"]);
         assert_eq!(anchored["enum"], anchored_operations);
         let description = anchored["description"]
             .as_str()
             .expect("the operation selector states its values");
         assert!(!description.contains("overwrite"), "{description}");
+        // A directory move addresses no replaced lines, so it addresses no
+        // strategy vocabulary either and both strategies offer it.
+        assert!(description.contains("'move_dir'"), "{description}");
 
         // The search/replace strategy keeps the operation, because echoing the
         // whole file as `old_text` is how a full rewrite is expressed there.
         let echoed = operation_selector(PatchStrategy::SearchReplace);
-        let echoed_operations = json!(["replace", "create", "delete", "move", "overwrite"]);
+        let echoed_operations = json!([
+            "replace",
+            "create",
+            "delete",
+            "move",
+            "move_dir",
+            "overwrite"
+        ]);
         assert_eq!(echoed["enum"], echoed_operations);
         let description = echoed["description"]
             .as_str()
             .expect("the operation selector states its values");
         assert!(description.contains("'overwrite'"), "{description}");
+        assert!(description.contains("'move_dir'"), "{description}");
     }
 }

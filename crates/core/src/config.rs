@@ -52,10 +52,11 @@ pub struct AppConfig {
     /// The `[project]` section: the commands this repository declares.
     ///
     /// It is the single surface that tells the harness how to verify, format,
-    /// and post-process the project, and which named commands the model may call
-    /// as typed custom tools. An empty section declares nothing and is rejected
-    /// by [`AppConfig::validate`], because a turn that cannot verify its own
-    /// result must not run.
+    /// and post-process the project, and which named commands the model may
+    /// call as typed custom tools. Verification is declarative: a project that
+    /// declares no `verify` command is valid and simply runs no verification
+    /// step, while every command the section does declare must resolve to a
+    /// runnable command line.
     pub project: ProjectConfig,
     pub context: ContextConfig,
     pub git: GitConfig,
@@ -253,11 +254,13 @@ impl AppConfig {
 
     /// Validates application configuration invariants.
     ///
-    /// Two layers are checked before a configuration may drive a turn: the
-    /// semantic model roles must resolve, and the `[project]` declaration must
-    /// name a verification command whose reference chain is sound. An invalid
-    /// configuration is rejected as a whole instead of degrading silently,
-    /// because a turn that cannot verify its own result must not run.
+    /// Each section is validated before a configuration may drive a turn: the
+    /// semantic model roles must resolve and every command the `[project]`
+    /// declaration names must resolve through a sound reference chain.
+    /// Verification is optional — a project that declares no `verify` command
+    /// is valid and runs no verification step — so what remains rejected is a
+    /// declaration the harness could not run predictably. An invalid
+    /// configuration is rejected as a whole instead of degrading silently.
     pub fn validate(&self) -> Result<(), String> {
         self.models.validate()?;
         self.project
@@ -278,8 +281,9 @@ impl AppConfig {
     ///   and share one byte-stable head, so both build the chronological
     ///   transcript: its append-only growth keeps the provider prefix cache warm
     ///   across dialogue focus switches.
-    /// - An isolated step carries no growing history to interleave, so it keeps
-    ///   the semantic block order.
+    /// - An isolated step and an Architect synthesis carry no growing dialogue
+    ///   history to interleave — both suppress it — so they keep the semantic
+    ///   block order.
     pub fn resolve_prompt_layout(&self, intent: TurnIntent) -> PromptLayoutKind {
         if let Some(explicit) = self.develop.prompt_layout {
             return explicit;
@@ -289,7 +293,7 @@ impl AppConfig {
             TurnIntent::InteractiveRepl | TurnIntent::PlanDiscussion => {
                 PromptLayoutKind::Chronological
             }
-            TurnIntent::IsolatedStep => PromptLayoutKind::Semantic,
+            TurnIntent::IsolatedStep | TurnIntent::ArchitectSynthesis => PromptLayoutKind::Semantic,
         }
     }
 }
@@ -419,7 +423,9 @@ pub fn load_context_config(repo_root: &Path) -> ContextConfig {
 /// budgets, and the command lines the harness may execute. Two layers are
 /// checked — the TOML syntax of the file and the semantic invariants enforced by
 /// [`AppConfig::validate`] (resolvable model roles and a sound `[project]`
-/// command chain).
+/// command chain). A file that declares no verification command passes this
+/// check: verification is optional, and the harness never invents a toolchain a
+/// project did not declare.
 ///
 /// A repository without a configuration file is valid: built-in defaults govern
 /// it, exactly as they do for [`load_config`]. Reading and parsing the file is
@@ -1051,6 +1057,20 @@ args = ["test"]
     }
 
     #[test]
+    fn test_validate_project_config_on_disk_accepts_models_only_config() {
+        // Verification is declarative, so a file that only assigns model roles
+        // is a complete declaration.
+        let temp_dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            temp_dir.path().join("tauqe.toml"),
+            "[models]\nprimary = [\"openrouter:a/b\"]\n",
+        )
+        .unwrap();
+
+        assert!(validate_project_config_on_disk(temp_dir.path()).is_ok());
+    }
+
+    #[test]
     fn test_validate_project_config_on_disk_rejects_malformed_toml() {
         let temp_dir = tempfile::tempdir().unwrap();
         std::fs::write(
@@ -1066,33 +1086,40 @@ args = ["test"]
 
     #[test]
     fn test_validate_project_config_on_disk_rejects_semantically_invalid_config() {
-        // The file parses as TOML but declares no verification command, so the
-        // semantic layer must reject it.
+        // The file parses as TOML but routes its verification through a command
+        // nobody declares, so the semantic layer must reject it.
         let temp_dir = tempfile::tempdir().unwrap();
         std::fs::write(
             temp_dir.path().join("tauqe.toml"),
-            "[models]\nprimary = [\"openrouter:a/b\"]\n",
+            concat!(
+                "[models]\nprimary = [\"openrouter:a/b\"]\n",
+                "\n[project.verify]\ncommand = \"@missing\"\n",
+            ),
         )
         .unwrap();
 
         let err = validate_project_config_on_disk(temp_dir.path())
-            .expect_err("a configuration without verification must be rejected");
+            .expect_err("a broken command chain must be rejected");
         assert!(err.contains("Invalid configuration"), "got: {err}");
-        assert!(err.contains("verify"), "got: {err}");
+        assert!(err.contains("missing"), "got: {err}");
     }
 
     #[test]
-    fn test_project_section_verification_is_mandatory() {
-        let missing: AppConfig =
+    fn test_project_section_verification_is_optional() {
+        // A configuration that only assigns model roles is complete:
+        // verification is a declared capability, not a mandatory barrier.
+        let models_only: AppConfig =
             toml::from_str("[models]\nprimary = [\"openrouter:a/b\"]\n").expect("parse config");
-        let err = missing
-            .validate()
-            .expect_err("a configuration without verification must be rejected");
         assert!(
-            err.contains("verify"),
-            "the diagnostic must name the missing command: {err}"
+            models_only.validate().is_ok(),
+            "a configuration without a verification command must be valid"
+        );
+        assert!(
+            models_only.project.verify.is_none(),
+            "the project section declares no verification"
         );
 
+        // A declared verification command still resolves through its chain.
         let declared: AppConfig = toml::from_str(
             r#"
 [models]
@@ -1190,6 +1217,10 @@ args = ["check", "--all-targets"]
             default_cfg.resolve_prompt_layout(TurnIntent::IsolatedStep),
             PromptLayoutKind::Semantic
         );
+        assert_eq!(
+            default_cfg.resolve_prompt_layout(TurnIntent::ArchitectSynthesis),
+            PromptLayoutKind::Semantic
+        );
 
         // A declared value overrides the resolution for every intent.
         for (declared, expected) in [
@@ -1202,6 +1233,7 @@ args = ["check", "--all-targets"]
                 TurnIntent::InteractiveRepl,
                 TurnIntent::PlanDiscussion,
                 TurnIntent::IsolatedStep,
+                TurnIntent::ArchitectSynthesis,
             ] {
                 assert_eq!(
                     config.resolve_prompt_layout(intent),

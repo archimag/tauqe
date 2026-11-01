@@ -1,10 +1,10 @@
 use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
 
-use crate::atomic_write::write_atomic;
 use std::sync::{Mutex, MutexGuard};
 use std::time::SystemTime;
 use tauqe_protocol::{Plan, PlanItem, PlanItemStatus, PlanSummary};
+use tauqe_tools::atomic_write::write_atomic;
 
 mod apply;
 mod horizon;
@@ -560,16 +560,14 @@ mod tests {
         let dir = tempdir().unwrap();
         let root = dir.path();
 
-        let plan = Plan {
-            id: "auth-flow".to_string(),
-            last_replanned_step: None,
-            title: "Authentication Flow".to_string(),
-            description: Some("OAuth2 + JWT".to_string()),
-            created_at: 100,
-            updated_at: 100,
-            architect: None,
-            concept: vec![],
-            items: vec![
+        let plan = Plan::from_parts(
+            "auth-flow".to_string(),
+            "Authentication Flow".to_string(),
+            Some("OAuth2 + JWT".to_string()),
+            100,
+            100,
+            vec![],
+            vec![
                 PlanItem {
                     id: "1".to_string(),
                     title: "Models".to_string(),
@@ -606,7 +604,7 @@ mod tests {
                     children: vec![],
                 },
             ],
-        };
+        );
 
         // 1. Save
         PlanStorage::save_plan(root, &plan).unwrap();
@@ -650,22 +648,20 @@ mod tests {
         let dir = tempdir().unwrap();
         let root = dir.path();
 
-        let plan = Plan {
-            id: "arch-plan".to_string(),
-            last_replanned_step: None,
-            title: "Arch Plan".to_string(),
-            description: None,
-            created_at: 100,
-            updated_at: 100,
-            architect: None,
-            concept: vec![tauqe_protocol::ConceptItem {
+        let plan = Plan::from_parts(
+            "arch-plan".to_string(),
+            "Arch Plan".to_string(),
+            None,
+            100,
+            100,
+            vec![tauqe_protocol::ConceptItem {
                 id: "c-1".to_string(),
                 title: "Original title".to_string(),
                 details: None,
                 children: vec![],
             }],
-            items: vec![],
-        };
+            vec![],
+        );
         PlanStorage::save_plan(root, &plan).unwrap();
 
         let updated = PlanStorage::update_concept_item(
@@ -687,16 +683,14 @@ mod tests {
         let dir = tempdir().unwrap();
         let root = dir.path();
 
-        let plan = Plan {
-            id: "leaf-only".to_string(),
-            last_replanned_step: None,
-            title: "Leaf Only".to_string(),
-            description: None,
-            created_at: 1,
-            updated_at: 1,
-            architect: None,
-            concept: vec![],
-            items: vec![PlanItem {
+        let plan = Plan::from_parts(
+            "leaf-only".to_string(),
+            "Leaf Only".to_string(),
+            None,
+            1,
+            1,
+            vec![],
+            vec![PlanItem {
                 id: "1".to_string(),
                 title: "Parent".to_string(),
                 status: PlanItemStatus::Todo,
@@ -710,7 +704,7 @@ mod tests {
                 }],
                 ..Default::default()
             }],
-        };
+        );
 
         PlanStorage::save_plan(root, &plan).unwrap();
 
@@ -766,19 +760,27 @@ mod tests {
         let dir = tempdir().unwrap();
         let root = dir.path();
 
-        let first = Plan {
-            id: "team/auth".to_string(),
-            title: "Team Auth".to_string(),
-            ..Default::default()
-        };
+        let first = Plan::from_parts(
+            "team/auth".to_string(),
+            "Team Auth".to_string(),
+            None,
+            0,
+            0,
+            vec![],
+            vec![],
+        );
         PlanStorage::save_plan(root, &first).unwrap();
 
         // "team-auth" sanitizes to the same storage name as "team/auth".
-        let colliding = Plan {
-            id: "team-auth".to_string(),
-            title: "Team Auth Alternate".to_string(),
-            ..Default::default()
-        };
+        let colliding = Plan::from_parts(
+            "team-auth".to_string(),
+            "Team Auth Alternate".to_string(),
+            None,
+            0,
+            0,
+            vec![],
+            vec![],
+        );
         let err = PlanStorage::save_plan(root, &colliding).unwrap_err();
         assert!(err.to_string().contains("already used by plan 'team/auth'"));
 
@@ -793,11 +795,15 @@ mod tests {
         let dir = tempdir().unwrap();
         let root = dir.path();
 
-        let valid = Plan {
-            id: "valid-plan".to_string(),
-            title: "Valid".to_string(),
-            ..Default::default()
-        };
+        let valid = Plan::from_parts(
+            "valid-plan".to_string(),
+            "Valid".to_string(),
+            None,
+            0,
+            0,
+            vec![],
+            vec![],
+        );
         PlanStorage::save_plan(root, &valid).unwrap();
 
         let corrupt_path = PlanStorage::plans_dir(root).join("broken.json");
@@ -821,20 +827,24 @@ mod tests {
         // was modified most recently, while the newer plan was never touched
         // after creation. Creation time must decide the order, so a freshly
         // edited plan never climbs above a newly created one.
-        let older = Plan {
-            id: "older".to_string(),
-            title: "Older".to_string(),
-            created_at: 100,
-            updated_at: 900,
-            ..Default::default()
-        };
-        let newer = Plan {
-            id: "newer".to_string(),
-            title: "Newer".to_string(),
-            created_at: 200,
-            updated_at: 200,
-            ..Default::default()
-        };
+        let older = Plan::from_parts(
+            "older".to_string(),
+            "Older".to_string(),
+            None,
+            100,
+            900,
+            vec![],
+            vec![],
+        );
+        let newer = Plan::from_parts(
+            "newer".to_string(),
+            "Newer".to_string(),
+            None,
+            200,
+            200,
+            vec![],
+            vec![],
+        );
         PlanStorage::save_plan(root, &older).unwrap();
         PlanStorage::save_plan(root, &newer).unwrap();
 
@@ -860,12 +870,15 @@ mod tests {
             })
             .collect();
 
-        let plan = Plan {
-            id: "concurrent-plan".to_string(),
-            title: "Concurrent".to_string(),
+        let plan = Plan::from_parts(
+            "concurrent-plan".to_string(),
+            "Concurrent".to_string(),
+            None,
+            0,
+            0,
+            vec![],
             items,
-            ..Default::default()
-        };
+        );
         PlanStorage::save_plan(&root, &plan).unwrap();
 
         let handles: Vec<_> = (0..16)
@@ -903,11 +916,15 @@ mod tests {
         let dir = tempdir().unwrap();
         let root = dir.path();
 
-        let first = Plan {
-            id: "Tauqe-Server".to_string(),
-            title: "First".to_string(),
-            ..Default::default()
-        };
+        let first = Plan::from_parts(
+            "Tauqe-Server".to_string(),
+            "First".to_string(),
+            None,
+            0,
+            0,
+            vec![],
+            vec![],
+        );
         PlanStorage::save_plan(root, &first).unwrap();
         assert!(PlanStorage::plans_dir(root)
             .join("Tauqe-Server.json")
@@ -915,11 +932,15 @@ mod tests {
 
         // A casing change yields a different sanitized file name; the existing file
         // must be reused instead of writing a second `tauqe-server.json`.
-        let second = Plan {
-            id: "tauqe-server".to_string(),
-            title: "Second".to_string(),
-            ..Default::default()
-        };
+        let second = Plan::from_parts(
+            "tauqe-server".to_string(),
+            "Second".to_string(),
+            None,
+            0,
+            0,
+            vec![],
+            vec![],
+        );
         PlanStorage::save_plan(root, &second).unwrap();
 
         let json_files: Vec<_> = std::fs::read_dir(PlanStorage::plans_dir(root))
@@ -944,11 +965,15 @@ mod tests {
         let dir = tempdir().unwrap();
         let root = dir.path();
 
-        let plan = Plan {
-            id: "Legacy Name".to_string(),
-            title: "Legacy".to_string(),
-            ..Default::default()
-        };
+        let plan = Plan::from_parts(
+            "Legacy Name".to_string(),
+            "Legacy".to_string(),
+            None,
+            0,
+            0,
+            vec![],
+            vec![],
+        );
         PlanStorage::save_plan(root, &plan).unwrap();
         let stored = PlanStorage::plans_dir(root).join("Legacy-Name.json");
         assert!(stored.is_file());
@@ -965,11 +990,15 @@ mod tests {
         let dir = tempdir().unwrap();
         let root = dir.path();
 
-        let plan = Plan {
-            id: "team/auth".to_string(),
-            title: "Team Auth".to_string(),
-            ..Default::default()
-        };
+        let plan = Plan::from_parts(
+            "team/auth".to_string(),
+            "Team Auth".to_string(),
+            None,
+            0,
+            0,
+            vec![],
+            vec![],
+        );
         PlanStorage::save_plan(root, &plan).unwrap();
 
         // Loading a non-existent colliding ID must return None rather than the
@@ -990,11 +1019,15 @@ mod tests {
         let dir = tempdir().unwrap();
         let root = dir.path();
 
-        let plan = Plan {
-            id: "atomic-plan".to_string(),
-            title: "Atomic".to_string(),
-            ..Default::default()
-        };
+        let plan = Plan::from_parts(
+            "atomic-plan".to_string(),
+            "Atomic".to_string(),
+            None,
+            0,
+            0,
+            vec![],
+            vec![],
+        );
         PlanStorage::save_plan(root, &plan).unwrap();
         PlanStorage::save_active_id(root, Some("atomic-plan")).unwrap();
 
@@ -1019,23 +1052,25 @@ mod tests {
         let dir = tempdir().unwrap();
         let root = dir.path().to_path_buf();
 
-        let plan = Plan {
-            id: "runtime-plan".to_string(),
-            title: "Runtime Plan".to_string(),
-            concept: vec![tauqe_protocol::ConceptItem {
+        let plan = Plan::from_parts(
+            "runtime-plan".to_string(),
+            "Runtime Plan".to_string(),
+            None,
+            0,
+            0,
+            vec![tauqe_protocol::ConceptItem {
                 id: "c-1".to_string(),
                 title: "Invariant".to_string(),
                 details: None,
                 children: vec![],
             }],
-            items: vec![PlanItem {
+            vec![PlanItem {
                 id: "1".to_string(),
                 title: "Step".to_string(),
                 status: PlanItemStatus::Todo,
                 ..Default::default()
             }],
-            ..Default::default()
-        };
+        );
 
         PlanStorage::save_plan(&root, &plan).unwrap();
         assert!(PlanStorage::plans_dir(&root)
@@ -1085,17 +1120,20 @@ mod tests {
         let dir = tempdir().unwrap();
         let root = dir.path();
 
-        let plan = Plan {
-            id: "blocked-plan".to_string(),
-            title: "Blocked".to_string(),
-            items: vec![PlanItem {
+        let plan = Plan::from_parts(
+            "blocked-plan".to_string(),
+            "Blocked".to_string(),
+            None,
+            0,
+            0,
+            vec![],
+            vec![PlanItem {
                 id: "1".to_string(),
                 title: "Step".to_string(),
                 status: PlanItemStatus::Todo,
                 ..Default::default()
             }],
-            ..Default::default()
-        };
+        );
         PlanStorage::save_plan(root, &plan).unwrap();
 
         // Entering BLOCKED persists the reported diagnostic, trimmed so the

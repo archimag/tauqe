@@ -19,6 +19,7 @@ use tauqe_protocol::{
     PlanScopeEvaluation, Request, Response,
 };
 
+use crate::handlers::PreflightVerdict;
 use crate::state::AppState;
 
 use super::common::offload_plan;
@@ -134,12 +135,26 @@ pub async fn handle_plan_execute(req: Request, state: &Arc<AppState>) -> Respons
     // Pre-flight verification runs while the batch operation stays registered,
     // so the slot is never briefly free and a concurrent `config/set`,
     // `git/undo`, or a second `plan/execute` cannot slip in mid-verification.
-    if let Err(report) = crate::handlers::run_preflight_verification(&repo_root).await {
-        let message = format!(
-            "Pre-flight verification failed: the repository does not build cleanly. Batch execution was blocked before starting any step.\n\n{}",
-            report
-        );
-        return Response::err(req.id, errors::PREFLIGHT_VERIFICATION_FAILED, message);
+    // The gate inherits the operation's cancellation channel, so a hard cancel
+    // tears the verification down instead of waiting the build/test suite out.
+    let preflight =
+        crate::handlers::run_preflight_verification(&repo_root, operation.cancel_receiver()).await;
+    match preflight {
+        PreflightVerdict::Passed => {}
+        PreflightVerdict::Cancelled => {
+            return Response::err(
+                req.id,
+                errors::CANCELLED,
+                "Pre-flight verification was cancelled; batch execution did not start",
+            );
+        }
+        PreflightVerdict::Failed(report) => {
+            let message = format!(
+                "Pre-flight verification failed: the repository does not build cleanly. Batch execution was blocked before starting any step.\n\n{}",
+                report
+            );
+            return Response::err(req.id, errors::PREFLIGHT_VERIFICATION_FAILED, message);
+        }
     }
 
     // Execution hands control to the Coder role: the discussion focus is reset

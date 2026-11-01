@@ -693,17 +693,20 @@ mod tests {
         // mutation of stored work, which Develop mode refuses. The turn regime
         // authorizes plan creation rather than plan update, so `save` is the
         // payload a corrective round can actually emit and have rejected.
-        let existing = tauqe_protocol::Plan {
-            id: "develop-plan".to_string(),
-            title: "Develop Plan".to_string(),
-            items: vec![tauqe_protocol::PlanItem {
+        let existing = tauqe_protocol::Plan::from_parts(
+            "develop-plan".to_string(),
+            "Develop Plan".to_string(),
+            None,
+            0,
+            0,
+            Vec::new(),
+            vec![tauqe_protocol::PlanItem {
                 id: "1".to_string(),
                 title: "Step 1".to_string(),
                 status: tauqe_protocol::PlanItemStatus::Todo,
                 ..Default::default()
             }],
-            ..Default::default()
-        };
+        );
         crate::plan::storage::PlanStorage::save_plan(&repo_root, &existing)
             .expect("seed the established plan");
 

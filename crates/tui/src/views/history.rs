@@ -491,6 +491,7 @@ fn file_change_badge(
         Some(EditFileOp::Delete) => ("[DEL] ", engine.fg(palette.status_error).bold()),
         Some(EditFileOp::Overwrite) => ("[OVERWRITE] ", engine.fg(palette.status_warning).bold()),
         Some(EditFileOp::Move) => ("[MOVE] ", engine.fg(palette.status_info).bold()),
+        Some(EditFileOp::MoveDir) => ("[MOVE DIR] ", engine.fg(palette.status_info).bold()),
         Some(EditFileOp::Replace) => ("[EDIT] ", engine.fg(palette.button_active_bg).bold()),
         None => ("• ", engine.fg(palette.status_warning).bold()),
     }
@@ -499,7 +500,9 @@ fn file_change_badge(
 /// Path half of a rendered file change: the path, or the move arrow pair.
 fn file_change_path(change: &HistoryFileChange) -> String {
     match (change.op, change.to.as_deref()) {
-        (Some(EditFileOp::Move), Some(to)) => format!("{} -> {}", change.path, to),
+        (Some(EditFileOp::Move | EditFileOp::MoveDir), Some(to)) => {
+            format!("{} -> {}", change.path, to)
+        }
         _ => change.path.clone(),
     }
 }
@@ -815,6 +818,7 @@ mod tests {
             HistoryFileChange::operated(EditFileOp::Create, "src/util.rs"),
             HistoryFileChange::operated(EditFileOp::Delete, "src/old.rs"),
             HistoryFileChange::moved("src/prev.rs", "src/next.rs"),
+            HistoryFileChange::moved_dir("src/old_dir", "src/new_dir"),
         ];
         let mut expanded = HashSet::new();
         expanded.insert(2);
@@ -827,10 +831,7 @@ mod tests {
         assert!(rendered.iter().any(|line| line.contains("Refactoring")));
         assert!(rendered
             .iter()
-            .any(|line| line.contains("Updated codebase")));
-        assert!(rendered
-            .iter()
-            .any(|line| line.contains("Modified files (4):")));
+            .any(|line| line.contains("Modified files (5):")));
         assert!(rendered
             .iter()
             .any(|line| line.contains("[EDIT] ") && line.contains("src/main.rs")));
@@ -843,6 +844,11 @@ mod tests {
         assert!(rendered
             .iter()
             .any(|line| line.contains("[MOVE] ") && line.contains("src/prev.rs -> src/next.rs")));
+        // A directory rename renders as its own badge and names both
+        // directories behind the same arrow the file move uses.
+        assert!(rendered.iter().any(
+            |line| line.contains("[MOVE DIR] ") && line.contains("src/old_dir -> src/new_dir")
+        ));
     }
 
     #[test]

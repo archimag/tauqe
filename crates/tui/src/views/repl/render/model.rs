@@ -1,5 +1,6 @@
 use crate::theme::engine::{current_engine, ThemeEngine};
 use crate::ui::format::format_tokens;
+use crate::ui::wrap_line;
 use ratatui::style::{Style, Stylize};
 use ratatui::text::{Line, Span};
 
@@ -19,7 +20,7 @@ pub(crate) fn file_op_badge(engine: &ThemeEngine, op: &EditOp) -> Span<'static> 
     let (key, color) = match op {
         EditOp::Create => ("repl.op.create", palette.status_success),
         EditOp::Delete => ("repl.op.delete", palette.status_error),
-        EditOp::Move => ("repl.op.move", palette.status_info),
+        EditOp::Move | EditOp::MoveDir => ("repl.op.move", palette.status_info),
         EditOp::Overwrite => ("repl.op.overwrite", palette.status_warning),
         EditOp::Replace => ("repl.op.replace", palette.button_active_bg),
     };
@@ -29,12 +30,50 @@ pub(crate) fn file_op_badge(engine: &ThemeEngine, op: &EditOp) -> Span<'static> 
     )
 }
 
+/// Wraps the canvas into the rows the viewport draws.
+///
+/// Every raw line yields at least one visual row, so the returned offsets are
+/// indexed by the raw line index and name the exact visual span that line
+/// occupies. The renderer and every scroll derivation wrap through this single
+/// pass, so a row resolved for scrolling is the row the viewport draws (c-1, c-4).
+pub(crate) fn wrap_model_lines(
+    raw: Vec<Line<'static>>,
+    width: usize,
+) -> (Vec<Line<'static>>, Vec<usize>, Vec<usize>) {
+    let mut wrapped = Vec::with_capacity(raw.len());
+    let mut visual_start = Vec::with_capacity(raw.len());
+    let mut visual_end = Vec::with_capacity(raw.len());
+    let mut current_visual = 0usize;
+    for line in raw {
+        let line_rows = wrap_line(line, width);
+        let row_count = line_rows.len();
+        visual_start.push(current_visual);
+        visual_end.push(current_visual + row_count.saturating_sub(1));
+        current_visual += row_count;
+        wrapped.extend(line_rows);
+    }
+    (wrapped, visual_start, visual_end)
+}
+
 pub fn compute_model_lines(model: &mut ReplView) -> Vec<Line<'static>> {
+    compute_model_lines_with_file_rows(model).0
+}
+
+/// Builds the canvas and records the raw index of every staged file summary row.
+///
+/// The compact file list renders exactly one summary row per staged file, and
+/// that index is recorded while the canvas is built instead of being re-derived
+/// by a second arithmetic. Selecting a file, keeping it visible, and recentering
+/// on it therefore resolve through the layout that is actually drawn (c-1, c-4).
+/// Callers that need no indices use [`compute_model_lines`].
+pub fn compute_model_lines_with_file_rows(
+    model: &mut ReplView,
+) -> (Vec<Line<'static>>, Vec<usize>) {
     let engine = current_engine();
     let palette = engine.palette();
 
     let mut model_lines: Vec<Line<'static>> = Vec::new();
-
+    let mut file_rows: Vec<usize> = Vec::new();
     if let Some(err) = &model.error {
         model_lines.push(Line::from(vec![
             Span::raw(crate::i18n::active_t("repl.error_label")),
@@ -194,7 +233,7 @@ pub fn compute_model_lines(model: &mut ReplView) -> Vec<Line<'static>> {
 
             let hunk_count = file.hunks.len();
             let hunk_label = match file.op_type {
-                EditOp::Move => crate::i18n::active_t("repl.hunk_renamed"),
+                EditOp::Move | EditOp::MoveDir => crate::i18n::active_t("repl.hunk_renamed"),
                 EditOp::Overwrite => crate::i18n::active_t("repl.hunk_rewritten"),
                 EditOp::Delete => crate::i18n::active_t("repl.hunk_deleted"),
                 EditOp::Create => {
@@ -247,6 +286,7 @@ pub fn compute_model_lines(model: &mut ReplView) -> Vec<Line<'static>> {
                 }
             }
 
+            file_rows.push(model_lines.len());
             model_lines.push(Line::from(file_spans).style(file_line_style));
 
             if file.status != FileEditStatus::Ok {
@@ -313,7 +353,7 @@ pub fn compute_model_lines(model: &mut ReplView) -> Vec<Line<'static>> {
         model_lines.push(Line::from(usage_spans));
     }
 
-    model_lines
+    (model_lines, file_rows)
 }
 
 #[cfg(test)]

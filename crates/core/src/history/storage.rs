@@ -1,11 +1,11 @@
 use anyhow::{Context, Result};
 use std::fs::{create_dir_all, File, OpenOptions};
 
-use crate::atomic_write::write_atomic;
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
+use tauqe_tools::atomic_write::write_atomic;
 
-use super::entry::HistoryEntry;
+use super::entry::{line_bytes, HistoryEntry};
 
 /// Manages persistent JSONL session history in `.tauqe/history.jsonl`.
 #[derive(Debug, Clone)]
@@ -30,8 +30,14 @@ impl SessionStorage {
         self.tauqe_dir().join("history.jsonl")
     }
 
-    pub fn append_entry(&self, entry: &HistoryEntry) -> Result<()> {
+    /// Appends one record to the journal and reports the bytes it wrote.
+    ///
+    /// The reported size is the space the record occupies on disk, newline
+    /// included, so the caller carries the journal footprint forward without
+    /// re-reading the file it just grew.
+    pub fn append_entry(&self, entry: &HistoryEntry) -> Result<u64> {
         let line = entry.to_jsonl_line()?;
+        let written = line_bytes(&line);
         let dir = self.tauqe_dir();
         let file_path = self.history_path();
 
@@ -57,7 +63,8 @@ impl SessionStorage {
                 .with_context(|| format!("Failed to sync history file: {:?}", file_path))?;
 
             Ok(())
-        })
+        })?;
+        Ok(written)
     }
 
     pub fn read_entries(&self) -> Result<Vec<HistoryEntry>> {
@@ -111,13 +118,17 @@ impl SessionStorage {
     }
 
     /// Atomically rewrites the history file with the provided entries.
-    pub fn rewrite_entries(&self, entries: &[HistoryEntry]) -> Result<()> {
+    ///
+    /// Returns the size of the payload it published, so the caller adopts the
+    /// new journal footprint instead of re-deriving it from the file.
+    pub fn rewrite_entries(&self, entries: &[HistoryEntry]) -> Result<u64> {
         let mut payload = String::new();
         for entry in entries {
             let line = entry.to_jsonl_line()?;
             payload.push_str(&line);
             payload.push('\n');
         }
+        let written = payload.len() as u64;
 
         let dir = self.tauqe_dir();
         let target_path = self.history_path();
@@ -131,7 +142,8 @@ impl SessionStorage {
             create_dir_all(&dir)
                 .with_context(|| format!("Failed to create .tauqe directory: {:?}", dir))?;
             write_atomic(&target_path, payload.as_bytes())
-        })
+        })?;
+        Ok(written)
     }
 
     pub fn clear(&self) -> Result<()> {

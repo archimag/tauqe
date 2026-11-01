@@ -6,9 +6,11 @@
 //! custom-locale file and reverts the engine, a purely client-side operation
 //! (c-4, c-5).
 
+use std::sync::Arc;
+
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use tauqe_protocol::{methods, LocaleGenerateParams};
-use tokio::sync::MutexGuard;
+use tokio::sync::{Mutex, MutexGuard};
 
 use crate::app::{AppState, LocaleDialogButton, LocaleDialogFocus, LocaleDialogState};
 use crate::i18n::{active_t, canonical_catalog, delete_custom_locale};
@@ -23,6 +25,7 @@ use crate::rpc::{send_request, RpcConnection};
 /// dialog without a change.
 pub(super) async fn handle_locale_dialog(
     key: KeyEvent,
+    state: &Arc<Mutex<AppState>>,
     mut st: MutexGuard<'_, AppState>,
     server_writer: &mut RpcConnection,
 ) -> anyhow::Result<Option<InputResult>> {
@@ -98,6 +101,20 @@ pub(super) async fn handle_locale_dialog(
             synthesize(st, dialog, server_writer).await
         }
         _ => {
+            if dialog.language_editor.takes_yank_chord(key, is_cmd) {
+                // The paste buffer is a native round trip bounded at
+                // NATIVE_CLIPBOARD_TIMEOUT, so it is read with the state guard
+                // released and the answer is applied after the re-lock (c-1).
+                st.locale_dialog = Some(dialog);
+                drop(st);
+                let clipboard = crate::clipboard::get_from_clipboard_async().await;
+                let mut st = state.lock().await;
+                if let Some(mut dialog) = st.locale_dialog.take() {
+                    dialog.language_editor.yank_with(clipboard);
+                    st.locale_dialog = Some(dialog);
+                }
+                return Ok(Some(InputResult::Continue));
+            }
             crate::input::handle_editor_key(&mut dialog.language_editor, key, is_cmd, false);
             st.locale_dialog = Some(dialog);
             Ok(Some(InputResult::Continue))
@@ -241,7 +258,7 @@ mod tests {
     ) -> anyhow::Result<Option<InputResult>> {
         let mut conn = RpcConnection::new(Vec::<u8>::new());
         let guard = state.lock().await;
-        handle_locale_dialog(key, guard, &mut conn).await
+        handle_locale_dialog(key, state, guard, &mut conn).await
     }
 
     #[tokio::test]

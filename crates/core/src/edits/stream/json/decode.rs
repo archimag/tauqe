@@ -107,92 +107,228 @@ pub(crate) fn prepare_json_payload(buffer: &str) -> String {
     }
 }
 
-/// Locates the byte offset right after the opening quote of a top-level string value
-/// with the given `target_field` name. The scan is depth- and string-aware.
+/// Locates the byte offset right after the opening quote of a top-level string
+/// value with the given `target_field` name.
+///
+/// This is the one-shot form of [`FieldLocator`]: it walks a complete payload in
+/// one pass. Streaming callers hold a [`StringFieldCursor`], whose locator resumes
+/// the same walk across chunks instead of restarting it.
 pub fn find_string_field_value_start(buffer: &str, target_field: &str) -> Option<usize> {
-    let bytes = buffer.as_bytes();
-    let start = buffer.find('{')?;
-    let len = bytes.len();
-    let mut i = start;
-    let mut depth = 0usize;
-    let mut expect_key = false;
+    FieldLocator::default().locate(buffer, target_field)
+}
 
-    while i < len {
-        match bytes[i] {
-            b'{' | b'[' => {
-                depth += 1;
-                if depth == 1 {
-                    expect_key = true;
+/// What the incremental field locator is currently looking for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum LocatePhase {
+    /// Scanning for the opening `{` of the payload.
+    #[default]
+    Header,
+    /// Walking the object body for the top-level key that names the field.
+    Body,
+    /// The key matched; the `:` of its value is still to be read.
+    Colon,
+    /// The `:` arrived; the opening quote of the value is still to be read.
+    Value,
+}
+
+/// Incremental locator for a top-level string field of a streaming JSON object.
+///
+/// The locator never re-reads a byte it has already classified: the scan offset,
+/// the brace depth, the key expectation, and the string and escape state all
+/// travel between chunks. A field that appears late in the payload — after a large
+/// `changes` array, for instance — therefore costs one pass over the whole document
+/// instead of one pass per provider delta.
+#[derive(Debug, Default)]
+struct FieldLocator {
+    /// What the locator is currently looking for.
+    phase: LocatePhase,
+    /// Absolute offset of the next byte to classify.
+    pos: usize,
+    /// Nesting depth relative to the opening `{` of the payload.
+    depth: usize,
+    /// Whether the next depth-1 string is an object key.
+    expect_key: bool,
+    /// Whether the locator is inside a string literal.
+    in_string: bool,
+    /// Absolute offset of the opening quote of the string being scanned.
+    string_start: usize,
+    /// Absolute offset from which the in-progress string body is resumed.
+    string_scan_from: usize,
+    /// Whether the string scan stopped right after a lone escape byte.
+    string_escaped: bool,
+    /// Offset just past the opening quote of the located value.
+    value_start: Option<usize>,
+    /// Whether the field is permanently absent from the payload.
+    exhausted: bool,
+}
+
+impl FieldLocator {
+    /// Advances the walk over `buffer` and returns the value offset once located.
+    ///
+    /// `None` reports that the payload has not delivered the field yet or that it
+    /// never will. The walk keeps its progress either way, so the next chunk
+    /// resumes from the byte it stopped at.
+    fn locate(&mut self, buffer: &str, field_name: &str) -> Option<usize> {
+        if self.value_start.is_some() {
+            return self.value_start;
+        }
+        if self.exhausted {
+            return None;
+        }
+
+        let bytes = buffer.as_bytes();
+        if self.phase == LocatePhase::Header {
+            // A `{` is a single byte, so the bytes searched once never have to be
+            // searched again even when the payload opens after leading prose.
+            match buffer.get(self.pos..).and_then(|rest| rest.find('{')) {
+                Some(offset) => {
+                    self.pos += offset;
+                    self.phase = LocatePhase::Body;
                 }
-                i += 1;
-            }
-            b'}' | b']' => {
-                depth = depth.saturating_sub(1);
-                i += 1;
-                if depth == 0 {
+                None => {
+                    self.pos = buffer.len();
                     return None;
                 }
             }
-            b',' => {
-                if depth == 1 {
-                    expect_key = true;
+        }
+
+        while self.pos < bytes.len() {
+            if self.in_string {
+                if !self.advance_string(bytes) {
+                    return None;
                 }
-                i += 1;
+                self.in_string = false;
+                if self.after_string(buffer, field_name) {
+                    self.phase = LocatePhase::Colon;
+                }
+                continue;
             }
-            b'"' => {
-                let str_start = i + 1;
-                let mut j = str_start;
-                let mut closed = false;
-                while j < len {
-                    match bytes[j] {
-                        b'\\' => j += 2,
-                        b'"' => {
-                            closed = true;
-                            break;
+            let byte = *bytes.get(self.pos)?;
+            match self.phase {
+                LocatePhase::Body => match byte {
+                    b'"' => self.begin_string(),
+                    b'{' | b'[' => {
+                        self.depth += 1;
+                        if self.depth == 1 {
+                            self.expect_key = true;
                         }
-                        _ => j += 1,
+                        self.pos += 1;
                     }
-                }
-                if !closed {
-                    return None;
-                }
-                if depth == 1 && expect_key {
-                    expect_key = false;
-                    if &bytes[str_start..j] == target_field.as_bytes() {
-                        let mut k = j + 1;
-                        while k < len && bytes[k].is_ascii_whitespace() {
-                            k += 1;
-                        }
-                        if k >= len || bytes[k] != b':' {
+                    b'}' | b']' => {
+                        self.depth = self.depth.saturating_sub(1);
+                        self.pos += 1;
+                        if self.depth == 0 {
+                            // The object closed without the field: no later chunk
+                            // can make it appear.
+                            self.exhausted = true;
                             return None;
                         }
-                        k += 1;
-                        while k < len && bytes[k].is_ascii_whitespace() {
-                            k += 1;
+                    }
+                    b',' => {
+                        if self.depth == 1 {
+                            self.expect_key = true;
                         }
-                        if k < len && bytes[k] == b'"' {
-                            return Some(k + 1);
-                        }
+                        self.pos += 1;
+                    }
+                    _ => self.pos += 1,
+                },
+                LocatePhase::Colon => match byte {
+                    b':' => {
+                        self.phase = LocatePhase::Value;
+                        self.pos += 1;
+                    }
+                    b if b.is_ascii_whitespace() => self.pos += 1,
+                    _ => {
+                        // The key names a value that is not a plain string, so the
+                        // field can never be streamed out of this payload.
+                        self.exhausted = true;
                         return None;
                     }
-                }
-                i = j + 1;
+                },
+                LocatePhase::Value => match byte {
+                    b'"' => {
+                        self.value_start = Some(self.pos + 1);
+                        return self.value_start;
+                    }
+                    b if b.is_ascii_whitespace() => self.pos += 1,
+                    _ => {
+                        self.exhausted = true;
+                        return None;
+                    }
+                },
+                // The header is resolved above, before the body walk starts.
+                LocatePhase::Header => return None,
             }
-            _ => i += 1,
         }
+        None
     }
-    None
+
+    /// Enters the string literal that opens at the current position.
+    fn begin_string(&mut self) {
+        self.in_string = true;
+        self.string_start = self.pos;
+        self.string_scan_from = self.pos + 1;
+        self.string_escaped = false;
+        self.pos += 1;
+    }
+
+    /// Advances an in-progress string body, reporting whether it closed.
+    fn advance_string(&mut self, bytes: &[u8]) -> bool {
+        let mut index = self.string_scan_from;
+        let mut escaped = self.string_escaped;
+        while let Some(&byte) = bytes.get(index) {
+            if escaped {
+                escaped = false;
+                index += 1;
+                continue;
+            }
+            match byte {
+                b'\\' => {
+                    escaped = true;
+                    index += 1;
+                }
+                b'"' => {
+                    self.pos = index + 1;
+                    self.string_scan_from = index + 1;
+                    self.string_escaped = false;
+                    return true;
+                }
+                _ => index += 1,
+            }
+        }
+        self.string_scan_from = index;
+        self.string_escaped = escaped;
+        self.pos = index;
+        false
+    }
+
+    /// Records what a completed string was, reporting whether it named the field.
+    ///
+    /// Only a string that closed at the top level while a key was expected can name
+    /// the field, so the same text inside another value never matches.
+    fn after_string(&mut self, buffer: &str, field_name: &str) -> bool {
+        if self.depth != 1 || !self.expect_key {
+            return false;
+        }
+        self.expect_key = false;
+        let body = buffer
+            .get(self.string_start.saturating_add(1)..self.pos.saturating_sub(1))
+            .unwrap_or_default();
+        body == field_name
+    }
 }
 
 /// Incremental cursor for streaming a single top-level JSON string field.
 ///
-/// It records where the field value starts and how far the closing-quote scan
-/// and the escape decode have progressed. Successive chunks therefore extend
-/// the existing scan and decode instead of restarting from byte zero, so a long
-/// streamed field stays linear in the number of received bytes.
+/// It records where the field value starts and how far the field lookup, the
+/// closing-quote scan, and the escape decode have progressed. Successive chunks
+/// therefore extend the existing scans and decode instead of restarting from byte
+/// zero, so a long streamed field stays linear in the number of received bytes even
+/// when it follows a large preceding payload.
 #[derive(Debug, Default)]
 pub struct StringFieldCursor {
-    value_start: Option<usize>,
+    /// Locates the field inside the payload the chunks accumulate.
+    locator: FieldLocator,
     end_scanned_pos: usize,
     raw_decoded_pos: usize,
 }
@@ -218,14 +354,9 @@ pub fn extract_streamed_string_field(
     field_name: &str,
     cursor: &mut StringFieldCursor,
 ) -> (Option<String>, bool) {
-    if cursor.value_start.is_none() {
-        cursor.value_start = find_string_field_value_start(buffer, field_name);
-    }
-    let val_start = match cursor.value_start {
-        Some(idx) => idx,
-        None => return (None, false),
+    let Some(val_start) = cursor.locator.locate(buffer, field_name) else {
+        return (None, false);
     };
-
     let content_slice = &buffer[val_start..];
     let (raw_body, is_finished) =
         match find_json_string_end_from(content_slice, &mut cursor.end_scanned_pos) {
@@ -449,5 +580,69 @@ mod tests {
         let (delta, finished) = extract_streamed_string_field(json, "message", &mut cursor);
         assert!(finished);
         assert_eq!(delta.unwrap_or_default(), "a\u{FFFD}b\u{FFFD}c\u{FFFD}d");
+    }
+
+    #[test]
+    fn test_incremental_field_location_matches_the_one_shot_scan() {
+        // Every split point must locate the same field at the same offset: the
+        // resumable walk may not depend on how the provider split its deltas.
+        let json = concat!(
+            r#"{"alpha":1,"changes":[{"op":"create","path":"a.rs","content":"#,
+            r#""{\"message\":\"inner\"}"}],"message":"Late \u0041 value"}"#,
+        );
+        let expected = find_string_field_value_start(json, "message");
+        assert!(expected.is_some());
+
+        for split in json
+            .char_indices()
+            .map(|(index, _)| index)
+            .chain(std::iter::once(json.len()))
+        {
+            let mut cursor = StringFieldCursor::new();
+            let mut streamed = String::new();
+            if let (Some(delta), _) =
+                extract_streamed_string_field(&json[..split], "message", &mut cursor)
+            {
+                streamed.push_str(&delta);
+            }
+            let (delta, finished) = extract_streamed_string_field(json, "message", &mut cursor);
+            if let Some(delta) = delta {
+                streamed.push_str(&delta);
+            }
+            assert_eq!(streamed, "Late A value", "split {split}");
+            assert!(finished, "split {split}");
+            assert_eq!(cursor.locator.value_start, expected, "split {split}");
+        }
+    }
+
+    #[test]
+    fn test_late_field_location_follows_the_appended_bytes() {
+        // The field arrives after a large preceding value. A locator that restarts
+        // from byte zero on every delta pays a full buffer pass per chunk; one that
+        // resumes from the recorded offsets pays one pass over the whole payload.
+        let json = format!(
+            "{{\"reasoning\":\"{}\",\"message\":\"Late answer\"}}",
+            "x".repeat(400_000)
+        );
+        let chars: Vec<char> = json.chars().collect();
+        let mut buffer = String::new();
+        let mut streamed = String::new();
+        let mut cursor = StringFieldCursor::new();
+        let started = std::time::Instant::now();
+        for chunk in chars.chunks(5) {
+            buffer.extend(chunk);
+            let (delta, _) = extract_streamed_string_field(&buffer, "message", &mut cursor);
+            if let Some(delta) = delta {
+                streamed.push_str(&delta);
+            }
+        }
+        let elapsed = started.elapsed();
+
+        assert_eq!(streamed, "Late answer");
+        assert!(
+            elapsed < std::time::Duration::from_secs(20),
+            "locating a late field in a {} byte payload took {elapsed:?}; the per-chunk cost must follow the appended bytes",
+            json.len()
+        );
     }
 }

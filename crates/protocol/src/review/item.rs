@@ -71,6 +71,23 @@ impl IssueStatus {
             Self::Rejected => Self::Discussion,
         }
     }
+
+    /// Wire spelling of the status, identical to its serialized form.
+    ///
+    /// The match is exhaustive, so a new lifecycle variant fails compilation
+    /// until its spelling is declared here, and a test pins every declared
+    /// spelling to the serde representation, which is what actually travels on
+    /// the wire.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Discussion => "discussion",
+            Self::Todo => "todo",
+            Self::InProgress => "in_progress",
+            Self::Fixed => "fixed",
+            Self::Skipped => "skipped",
+            Self::Rejected => "rejected",
+        }
+    }
 }
 
 impl std::fmt::Display for IssueStatus {
@@ -221,9 +238,26 @@ pub struct ReviewItem {
     pub files: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub readonly_files: Vec<String>,
-    #[serde(default, alias = "note", skip_serializing_if = "Option::is_none")]
+    /// Resolution note recorded on the finding.
+    ///
+    /// Serialized as `note`, the single canonical wire name of the datum,
+    /// shared with [`ReviewIssue`]. The retired `resolution_notes` spelling is
+    /// still accepted on read, so a session stored by an older daemon keeps
+    /// decoding, and it is never written back under that spelling.
+    #[serde(
+        default,
+        rename = "note",
+        alias = "resolution_notes",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub resolution_notes: Option<String>,
-    #[serde(default, rename = "body", alias = "description")]
+    /// The finding's prose, serialized under the canonical `description` key.
+    ///
+    /// Serialized as `description`, the single canonical wire name of the
+    /// datum, shared with [`ReviewIssue`]. The retired `body` spelling is
+    /// still accepted on read, so a session stored by an older daemon keeps
+    /// decoding, and it is never written back under that spelling.
+    #[serde(default, rename = "description", alias = "body")]
     pub body: String,
 }
 
@@ -233,7 +267,10 @@ pub struct ReviewItem {
 /// a coarse `severity` spelling. The shadow accepts every historical key for the
 /// category (`type`, `severity`, `issue_type`) and lets the item recompute its
 /// presentation severity from it, so exactly one classification is read and a
-/// session file can never desynchronize the two.
+/// session file can never desynchronize the two. Every datum that once carried
+/// a second spelling is read under both the canonical name and the retired one:
+/// the note under `note` and `resolution_notes`, the body under `description`
+/// and `body`.
 #[derive(Deserialize)]
 struct ReviewItemWire {
     id: u32,
@@ -254,8 +291,11 @@ struct ReviewItemWire {
     files: Vec<String>,
     #[serde(default)]
     readonly_files: Vec<String>,
-    #[serde(default, alias = "note")]
-    resolution_notes: Option<String>,
+    #[serde(default, alias = "resolution_notes")]
+    note: Option<String>,
+    /// The finding's prose. Both spellings read into one datum: the canonical
+    /// `description` and the retired `body`. The item writes the datum back
+    /// under `description`, never under the retired spelling.
     #[serde(default, alias = "description")]
     body: String,
 }
@@ -274,7 +314,7 @@ impl From<ReviewItemWire> for ReviewItem {
             recommendations: wire.recommendations,
             files: wire.files,
             readonly_files: wire.readonly_files,
-            resolution_notes: wire.resolution_notes,
+            resolution_notes: wire.note,
             body: wire.body,
         }
     }
@@ -331,4 +371,81 @@ impl From<ReviewItem> for ReviewIssue {
             note: item.resolution_notes,
         }
     }
+}
+
+/// Status a review discussion may move a finding to once the engineer decided.
+///
+/// The vocabulary is deliberately narrower than [`IssueStatus`]: a discussion
+/// records what the engineer decided, so it may queue a finding for execution
+/// (`todo`), dismiss it as not reproducible (`skipped`), or reject it as a false
+/// positive (`rejected`). It can never declare a finding `fixed`, because a fix
+/// becomes true only after the harness verifies it and commits the change, and it
+/// can never start one, because execution belongs to the finding workflow.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReviewDecisionStatus {
+    /// The finding must be executed.
+    Todo,
+    /// The finding is not reproducible or was already addressed.
+    Skipped,
+    /// The finding is a false positive or an accepted trade-off.
+    Rejected,
+}
+
+impl ReviewDecisionStatus {
+    /// Wire spelling of the decision, identical to its serialized form.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Todo => "todo",
+            Self::Skipped => "skipped",
+            Self::Rejected => "rejected",
+        }
+    }
+}
+
+impl From<ReviewDecisionStatus> for IssueStatus {
+    fn from(status: ReviewDecisionStatus) -> Self {
+        match status {
+            ReviewDecisionStatus::Todo => IssueStatus::Todo,
+            ReviewDecisionStatus::Skipped => IssueStatus::Skipped,
+            ReviewDecisionStatus::Rejected => IssueStatus::Rejected,
+        }
+    }
+}
+
+/// Decision recorded from a discussion of one review finding.
+///
+/// The dialogue is where an engineer actually decides what a finding is worth:
+/// whether it is a real defect that must be executed, whether it is not
+/// reproducible, or whether it is a false positive. Recording that decision in
+/// the dialogue payload keeps the reasoning and the resulting state transition in
+/// one turn, instead of leaving the developer to re-enter the outcome by hand in
+/// the review interface afterwards.
+///
+/// A decision is not an edit: it never carries the fix itself. The fix travels
+/// through the ordinary finding workflow, which verifies the change and owns the
+/// transition to `fixed`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReviewUpdateProposal {
+    /// Identifier of the finding inside the discussed review session.
+    pub item_id: u32,
+    /// Identifier of the review group the decision is recorded for.
+    ///
+    /// A decision taken for an architectural group belongs to the group, not to
+    /// one of its manifestations: the dialogue names the group here alongside
+    /// the finding whose text carried the discussion, so the turn records the
+    /// resolution once on the group instead of once per symptom. Null when the
+    /// decision addresses the finding alone.
+    #[serde(default)]
+    pub group_id: Option<String>,
+    /// Status the finding moves to once the decision is applied.
+    pub status: ReviewDecisionStatus,
+    /// The decision itself, in the engineer's words.
+    ///
+    /// Serialized as `note`, the single canonical wire name of the datum shared
+    /// with [`ReviewIssue`] and [`ReviewItem`].
+    pub note: String,
+    /// Additional remediation recommendations agreed in the discussion.
+    #[serde(default)]
+    pub recommendations: Vec<String>,
 }

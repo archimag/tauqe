@@ -10,6 +10,112 @@ fn parse_models_with_catalog(raw: &str, catalog: &[ModelCatalogEntry]) -> Models
 }
 
 #[test]
+fn test_role_entries_parse_attempts_and_reach_the_ladder() {
+    let config = parse_models(
+        r#"
+primary = ["openrouter:base/primary"]
+coder = [
+    "openrouter:base/coder",
+    { model = "openrouter:cheap/coder", effort = "low", attempts = 5 },
+]
+architect = [{ model = "openrouter:planner/one", attempts = 1 }]
+"#,
+    );
+
+    // A rung without a budget keeps the coder default of three attempts.
+    let ladder = config.coder_ladder();
+    assert_eq!(ladder.len(), 2);
+    assert_eq!(ladder[0].attempts, None);
+    assert_eq!(ladder[0].attempts(), 3);
+
+    // A configured budget travels with the rung, so escalation switches the
+    // limit to the budget of the tier it enters.
+    assert_eq!(ladder[1].attempts, Some(5));
+    assert_eq!(ladder[1].attempts(), 5);
+    assert_eq!(config.coder_tier(1).attempts(), 5);
+
+    let architect = config.architect_ladder();
+    assert_eq!(architect.len(), 1);
+    assert_eq!(architect[0].attempts, Some(1));
+    assert_eq!(architect[0].attempts(), 1);
+
+    // The role catalog keeps the declaration, so a selection dialog renders
+    // the budget the role actually runs within.
+    let catalog = config.role_entries(ModelRole::Coder);
+    assert_eq!(catalog[1].attempts, Some(5));
+}
+
+#[test]
+fn test_zero_attempts_is_rejected_by_validation() {
+    // A model allowed zero attempts could never regenerate a rejected patch,
+    // so the configuration is refused instead of silently disabling the
+    // capability for that tier.
+    let config = parse_models(
+        r#"
+primary = ["openrouter:base/primary"]
+coder = [{ model = "openrouter:cheap/coder", attempts = 0 }]
+"#,
+    );
+    let err = config
+        .validate()
+        .expect_err("a zero budget must be rejected");
+    assert!(err.contains("coder"), "got: {err}");
+    assert!(err.contains("attempts = 0"), "got: {err}");
+
+    let config = parse_models(
+        r#"
+primary = ["openrouter:base/primary"]
+architect = [{ model = "openrouter:planner/one", attempts = 0 }]
+"#,
+    );
+    let err = config
+        .validate()
+        .expect_err("a zero budget must be rejected");
+    assert!(err.contains("architect"), "got: {err}");
+    assert!(err.contains("attempts = 0"), "got: {err}");
+}
+
+#[test]
+fn test_role_entry_rejects_a_non_integer_attempts_value() {
+    // The budget is an unsigned integer, so a negative or textual value is a
+    // configuration error instead of a silently ignored annotation.
+    for raw in [
+        r#"
+primary = [{ model = "openrouter:base/primary", attempts = -1 }]
+"#,
+        r#"
+primary = [{ model = "openrouter:base/primary", attempts = "3" }]
+"#,
+    ] {
+        let err = toml::from_str::<ModelsConfigRaw>(raw)
+            .expect_err("a non-integer budget must be rejected")
+            .to_string();
+        assert!(err.contains("attempts"), "got: {err}");
+    }
+}
+
+#[test]
+fn test_attempts_survive_a_configuration_round_trip() {
+    let config = parse_models(
+        r#"
+primary = ["openrouter:base/primary"]
+coder = [{ model = "openrouter:cheap/coder", effort = "low", attempts = 5 }]
+architect = [{ model = "openrouter:planner/one", attempts = 1 }]
+"#,
+    );
+
+    // Writing the section back preserves the budget, so a round-trip through
+    // disk never resets a rung to a default the developer did not choose.
+    let serialized = toml::to_string(&config).expect("serialize models config");
+    let raw: ModelsConfigRaw = toml::from_str(&serialized).expect("re-parse models config");
+    let restored = ModelsConfig::resolve(raw, &[]).expect("resolve models config");
+
+    assert_eq!(restored.coder_ladder(), config.coder_ladder());
+    assert_eq!(restored.coder_tier(0).attempts(), 5);
+    assert_eq!(restored.architect_tier(0).attempts(), 1);
+}
+
+#[test]
 fn test_resolve_effort_defaults_to_none() {
     let config = ModelsConfig::default();
     for role in [

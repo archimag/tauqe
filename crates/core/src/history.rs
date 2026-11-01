@@ -6,10 +6,13 @@ use anyhow::Result;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tauqe_protocol::{HistoryEntryStatus, HistoryFileChange, UiHistoryItem, UiHistoryKind};
+use tauqe_tools::tokens::estimate_tokens_from_bytes;
+
+use self::entry::record_bytes;
 
 pub use compaction::{
-    build_compacted_history, estimate_entries_tokens, partition_head_tail,
-    DEFAULT_HISTORY_BUDGET_TOKENS, DEFAULT_TAIL_TURNS_COUNT,
+    build_compacted_history, partition_head_tail, DEFAULT_HISTORY_BUDGET_TOKENS,
+    DEFAULT_TAIL_TURNS_COUNT,
 };
 pub use entry::HistoryEntry;
 pub use storage::SessionStorage;
@@ -130,27 +133,41 @@ pub struct HistoryManager {
     storage: SessionStorage,
     listener: Option<HistoryEntryListener>,
     current_max_id: u64,
+    /// Bytes the persisted journal occupies, maintained as the manager mutates it.
+    ///
+    /// Every append grows the value by the bytes the storage reported writing,
+    /// and a wholesale rewrite — compaction or rollback — adopts the payload
+    /// size it replaced the journal with. The token estimate derives from this
+    /// value, so pricing the session never re-reads `history.jsonl` and never
+    /// needs the exclusive guard a mutation holds.
+    journal_bytes: u64,
 }
 
 impl HistoryManager {
     pub fn new(repo_root: PathBuf) -> Self {
         let storage = SessionStorage::new(repo_root);
-        let current_max_id = storage
-            .read_entries()
-            .map(|entries| {
-                entries
-                    .iter()
-                    .enumerate()
-                    .map(|(idx, e)| e.id().unwrap_or((idx + 1) as u64))
-                    .max()
-                    .unwrap_or(0)
-            })
-            .unwrap_or(0);
+        let mut current_max_id = 0;
+        let mut journal_bytes = 0;
+        match storage.read_entries() {
+            Ok(entries) => {
+                for (idx, entry) in entries.iter().enumerate() {
+                    current_max_id = current_max_id.max(entry.id().unwrap_or((idx + 1) as u64));
+                    journal_bytes += record_bytes(entry);
+                }
+            }
+            // A journal that cannot be read is not an empty journal: the
+            // degradation is recorded before the estimate is seeded as absent.
+            Err(error) => tracing::warn!(
+                error = %error,
+                "failed to read the session journal; the token estimate starts empty"
+            ),
+        }
 
         Self {
             storage,
             listener: None,
             current_max_id,
+            journal_bytes,
         }
     }
 
@@ -265,19 +282,42 @@ impl HistoryManager {
         self.storage.repo_root()
     }
 
+    /// Records a turn prompt without an observed context watermark.
+    ///
+    /// A turn records the context it started with, so only a caller that holds
+    /// that context can supply the watermark. This entry point states the
+    /// absence explicitly and delegates the recording itself to
+    /// [`HistoryManager::record_turn_with_watermark`].
     pub fn record_turn(
         &mut self,
         prompt: impl Into<String>,
         context_files: Vec<String>,
+    ) -> Result<HistoryEntry> {
+        self.record_turn_with_watermark(prompt, context_files, None)
+    }
+
+    /// Records a turn prompt together with the context watermark it observed.
+    ///
+    /// `context_watermark` is the highest `ContextItem::insertion_seq` the
+    /// context carried when the turn started, or `None` when the turn observed no
+    /// context item. Persisting it is what lets a chronological transcript place
+    /// a file after the turn that introduced it; a recorder that always stored
+    /// `None` would leave that placement signal permanently absent.
+    pub fn record_turn_with_watermark(
+        &mut self,
+        prompt: impl Into<String>,
+        context_files: Vec<String>,
+        context_watermark: Option<u64>,
     ) -> Result<HistoryEntry> {
         self.current_max_id += 1;
         let entry = HistoryEntry::Turn {
             id: Some(self.current_max_id),
             prompt: prompt.into(),
             context: context_files,
-            context_watermark: None,
+            context_watermark,
         };
-        self.storage.append_entry(&entry)?;
+        let written = self.storage.append_entry(&entry)?;
+        self.journal_bytes = self.journal_bytes.saturating_add(written);
         self.notify_entry(&entry, HistoryEntryStatus::Active);
         Ok(entry)
     }
@@ -297,7 +337,8 @@ impl HistoryManager {
             summary,
             files,
         };
-        self.storage.append_entry(&entry)?;
+        let written = self.storage.append_entry(&entry)?;
+        self.journal_bytes = self.journal_bytes.saturating_add(written);
         self.notify_entry(&entry, HistoryEntryStatus::Committed);
         Ok(entry)
     }
@@ -319,7 +360,8 @@ impl HistoryManager {
             findings_count,
             summary,
         };
-        self.storage.append_entry(&entry)?;
+        let written = self.storage.append_entry(&entry)?;
+        self.journal_bytes = self.journal_bytes.saturating_add(written);
         self.notify_entry(&entry, HistoryEntryStatus::Committed);
         Ok(entry)
     }
@@ -362,13 +404,20 @@ impl HistoryManager {
         Ok((items, has_more, total_count))
     }
 
-    pub fn estimated_tokens(&self) -> Result<u64> {
-        let entries = self.get_entries()?;
-        Ok(estimate_entries_tokens(&entries))
+    /// Estimated token footprint of the persisted session journal.
+    ///
+    /// The value is maintained while the manager mutates the journal, so this
+    /// read never touches `history.jsonl` and never needs the exclusive guard a
+    /// mutation holds. A forwarding task can therefore price every mutation it
+    /// publishes while a page read and a finishing turn's adoption proceed
+    /// concurrently.
+    pub fn estimated_tokens(&self) -> u64 {
+        estimate_tokens_from_bytes(self.journal_bytes)
     }
 
-    pub fn needs_compaction(&self, budget_tokens: u64) -> Result<bool> {
-        Ok(self.estimated_tokens()? > budget_tokens)
+    /// Reports whether the session outgrew `budget_tokens`.
+    pub fn needs_compaction(&self, budget_tokens: u64) -> bool {
+        self.estimated_tokens() > budget_tokens
     }
 
     /// Formats the session history directly inside `<history>...</history>` for LLM prompt injection.
@@ -412,7 +461,8 @@ impl HistoryManager {
             .map(|id| id.saturating_sub(1));
         let tail_ids: Vec<u64> = tail.iter().filter_map(|entry| entry.id()).collect();
         let compacted = build_compacted_history(summary_id, summary_text.into(), tail);
-        self.storage.rewrite_entries(&compacted)?;
+        let written = self.storage.rewrite_entries(&compacted)?;
+        self.journal_bytes = written;
         if let Some(listener) = &self.listener {
             if let Some(summary_entry) = compacted.first() {
                 let id = summary_entry.id().unwrap_or(1);
@@ -435,7 +485,8 @@ impl HistoryManager {
         let mut entries = self.storage.read_entries()?;
         if let Some(pos) = entries.iter().rposition(|e| e.id() == Some(entry_id)) {
             let discarded = entries.remove(pos);
-            self.storage.rewrite_entries(&entries)?;
+            let written = self.storage.rewrite_entries(&entries)?;
+            self.journal_bytes = written;
             self.current_max_id = entries
                 .iter()
                 .enumerate()
@@ -453,8 +504,10 @@ impl HistoryManager {
     }
 
     pub fn clear(&mut self) -> Result<()> {
+        self.storage.clear()?;
         self.current_max_id = 0;
-        self.storage.clear()
+        self.journal_bytes = 0;
+        Ok(())
     }
 }
 
@@ -792,5 +845,65 @@ mod tests {
             }
             other => panic!("expected a compaction mutation, got {:?}", other),
         }
+    }
+
+    /// The estimate is maintained in memory, so pricing the session must not
+    /// depend on the journal still being readable. Deleting the file behind the
+    /// manager's back leaves the value intact instead of dropping it to zero.
+    #[test]
+    fn test_estimated_tokens_does_not_reread_the_journal() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        let mut hm = HistoryManager::new(root.clone());
+
+        hm.record_turn("Refactor the parser", vec![]).unwrap();
+        hm.record_response("Refactored the parser", None, None, vec![])
+            .unwrap();
+        let warm = hm.estimated_tokens();
+        assert!(warm > 0, "a recorded session must be priced");
+
+        std::fs::remove_file(SessionStorage::new(root).history_path()).unwrap();
+        assert_eq!(
+            hm.estimated_tokens(),
+            warm,
+            "the probe must read the maintained value, not the journal"
+        );
+    }
+
+    /// Every mutation that changes the journal moves the maintained value with
+    /// it, so it always equals the value a fresh manager derives from the same
+    /// file. Compaction, rollback, and clear rewrite the journal wholesale, so
+    /// each of those paths is measured here.
+    #[test]
+    fn test_maintained_estimate_matches_a_fresh_derivation() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        let mut hm = HistoryManager::new(root.clone());
+
+        for i in 1..=4 {
+            hm.record_turn(format!("Task {}", i), vec![]).unwrap();
+            hm.record_response(format!("Done {}", i), None, None, vec![])
+                .unwrap();
+        }
+        let fresh = || HistoryManager::new(root.clone()).estimated_tokens();
+        assert_eq!(hm.estimated_tokens(), fresh());
+
+        let (_, tail) = hm.prepare_compaction(2).unwrap().unwrap();
+        hm.apply_compaction("Earlier tasks summarized.", tail)
+            .unwrap();
+        assert_eq!(hm.estimated_tokens(), fresh());
+
+        let last_id = hm
+            .get_entries()
+            .unwrap()
+            .last()
+            .and_then(HistoryEntry::id)
+            .expect("the retention tail keeps records");
+        hm.rollback_entry(last_id, "Turn cancelled").unwrap();
+        assert_eq!(hm.estimated_tokens(), fresh());
+
+        hm.clear().unwrap();
+        assert_eq!(hm.estimated_tokens(), 0);
+        assert_eq!(hm.estimated_tokens(), fresh());
     }
 }

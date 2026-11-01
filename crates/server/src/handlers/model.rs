@@ -62,13 +62,19 @@ pub async fn handle_model_ask(req: Request, state: &Arc<AppState>) -> Response {
 }
 
 pub async fn handle_model_select(req: Request, state: &Arc<AppState>) -> Response {
-    if state.is_operation_active() {
-        return Response::err(
-            req.id,
-            tauqe_protocol::errors::OPERATION_IN_PROGRESS,
-            "Cannot change model while an operation is in progress",
-        );
-    }
+    // The mutation replaces the shared model selection and rotates the dialogue
+    // session — the very state `config/set` protects by claiming the slot — so
+    // the identical state change is guarded with the identical strength.
+    // Sampling the slot once would let a turn register between the check and the
+    // write and then run against a selection it never resolved.
+    let _operation = match crate::handlers::begin_exclusive_operation(
+        &req.id,
+        state,
+        "Cannot change model while an operation is in progress",
+    ) {
+        Ok(guard) => guard,
+        Err(resp) => return *resp,
+    };
 
     let params: tauqe_protocol::ModelSelectParams =
         match req.params.and_then(|p| serde_json::from_value(p).ok()) {
@@ -162,6 +168,12 @@ pub async fn handle_model_current(req: Request, state: &Arc<AppState>) -> Respon
 /// session appear free. The request is refused while an operation is active,
 /// because the running turn flushes its own window on completion and would
 /// immediately re-accumulate into the freshly cleared total.
+///
+/// The slot is sampled rather than claimed because the mutation is one bounded
+/// write on the telemetry document (exclusion policy in [`crate::handlers`]): it
+/// destroys only the lifetime totals it was asked to clear, and a turn that
+/// registers afterwards contributes its own completed window on top of the
+/// cleared floor instead of resurrecting a cleared record.
 pub async fn handle_usage_reset(req: Request, state: &Arc<AppState>) -> Response {
     if let Some(resp) = crate::handlers::reject_if_operation_active(
         &req.id,
@@ -240,15 +252,21 @@ pub async fn handle_model_cancel(req: Request, state: &Arc<AppState>) -> Respons
 }
 
 pub async fn handle_model_clear_history(req: Request, state: &Arc<AppState>) -> Response {
-    // Clearing history while a turn is compacting or recording it would race
-    // the running operation, so the mutation is refused for its duration.
-    if let Some(resp) = crate::handlers::reject_if_operation_active(
+    // A bounded turn records its result against a private clone of the history
+    // manager and adopts that clone back when it ends. A turn that registered
+    // between an advisory check and the truncation would therefore swap the
+    // pre-truncation clone over the cleared journal, resurrecting every removed
+    // record and a stale identifier watermark, while the session rotation below
+    // raced its session resolution. The slot is claimed instead of sampled, so a
+    // running turn and this mutation are mutually exclusive by construction.
+    let _operation = match crate::handlers::begin_exclusive_operation(
         &req.id,
         state,
         "Cannot clear history while a model operation is in progress",
     ) {
-        return resp;
-    }
+        Ok(guard) => guard,
+        Err(resp) => return *resp,
+    };
 
     // Clearing the history truncates `history.jsonl` behind an `fsync` barrier,
     // so the mutation runs on the blocking pool with the exclusive history

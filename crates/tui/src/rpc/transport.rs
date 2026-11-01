@@ -97,11 +97,11 @@ impl RpcConnection {
         let mut bytes = Vec::with_capacity(line.len() + 1);
         bytes.extend_from_slice(line.as_bytes());
         bytes.push(b'\n');
-        #[cfg(test)]
-        self.written.extend_from_slice(&bytes);
         let writer = self.writer.as_mut();
         writer.write_all(&bytes).await?;
         writer.flush().await?;
+        #[cfg(test)]
+        self.written.extend_from_slice(&bytes);
         Ok(())
     }
 
@@ -120,9 +120,13 @@ impl RpcConnection {
     pub fn take_optimistic_rollback(&mut self, id: u64) -> Option<OptimisticRollback> {
         self.tracker.take_rollback(id)
     }
-
     /// Registers an optimistic rollback to apply if the matching request fails.
-    pub fn record_optimistic_rollback(&mut self, id: u64, rollback: OptimisticRollback) {
+    ///
+    /// This is the internal recorder used by [`send_request_with_rollback`] and
+    /// by the tracker unit tests. Production code records a rollback exclusively
+    /// through [`send_request_with_rollback`], so an entry exists only after the
+    /// request actually reached the server.
+    pub(crate) fn record_optimistic_rollback(&mut self, id: u64, rollback: OptimisticRollback) {
         self.tracker.record_rollback(id, rollback);
     }
 }
@@ -278,7 +282,31 @@ pub async fn send_request(
     send_request_with_id(conn, id, method, params).await?;
     Ok(id)
 }
-
+/// Writes one request and records the optimistic rollback it may need.
+///
+/// Both tracker entries — the in-flight method and the rollback — are recorded
+/// only after the request actually reached the server, mirroring the ordering
+/// rule of [`send_request_with_id`]: a failed write leaves no tracker state
+/// behind, because no response will ever arrive for that id. The caller keeps
+/// ownership of the rollback value (hence the reference) and applies it inline
+/// when this returns an error, so the optimistic mutation it already made is
+/// reverted at the site that owns it.
+///
+/// # Locking invariant
+///
+/// Callers must not hold the `AppState` guard across this `await`, exactly as
+/// for [`send_request_with_id`].
+pub async fn send_request_with_rollback(
+    conn: &mut RpcConnection,
+    id: u64,
+    method: &str,
+    params: serde_json::Value,
+    rollback: &OptimisticRollback,
+) -> anyhow::Result<()> {
+    send_request_with_id(conn, id, method, params).await?;
+    conn.record_optimistic_rollback(id, rollback.clone());
+    Ok(())
+}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -376,5 +404,91 @@ mod tests {
             size_at_drop, size_later,
             "the spawned process kept running after its handle was dropped"
         );
+    }
+    /// Async sink whose every write fails, standing in for a server pipe that
+    /// closed before the request reached it.
+    struct BrokenPipeWriter;
+
+    impl tokio::io::AsyncWrite for BrokenPipeWriter {
+        fn poll_write(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+            _buf: &[u8],
+        ) -> std::task::Poll<std::io::Result<usize>> {
+            std::task::Poll::Ready(Err(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "server pipe closed",
+            )))
+        }
+
+        fn poll_flush(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
+    fn active_model_rollback(name: &str) -> OptimisticRollback {
+        OptimisticRollback::ActiveModel {
+            prev_model: ModelRef::openrouter(name),
+            prev_selection: tauqe_protocol::ModelSelection::default(),
+        }
+    }
+
+    /// A rollback registered for a request that never left the client would leak
+    /// in the tracker for the whole process lifetime, and the in-flight entry
+    /// would misroute a later response: both exist only after a successful write
+    /// (c-3).
+    #[tokio::test]
+    async fn send_request_with_rollback_records_nothing_when_the_write_fails() {
+        let mut conn = RpcConnection::new(BrokenPipeWriter);
+        let rollback = active_model_rollback("previous-model");
+
+        let result = send_request_with_rollback(
+            &mut conn,
+            4100,
+            "model/select",
+            serde_json::json!({}),
+            &rollback,
+        )
+        .await;
+
+        assert!(result.is_err(), "a closed pipe fails the write");
+        assert!(conn.take_pending_request(4100).is_none());
+        assert!(conn.take_optimistic_rollback(4100).is_none());
+        assert!(conn.written().is_empty(), "the transport accepted no bytes");
+    }
+
+    /// A successful write records the in-flight request together with the
+    /// rollback the response path would apply (c-3).
+    #[tokio::test]
+    async fn send_request_with_rollback_records_both_entries_after_a_successful_write() {
+        let mut conn = test_connection();
+        let rollback = active_model_rollback("previous-model");
+
+        send_request_with_rollback(
+            &mut conn,
+            4101,
+            "model/select",
+            serde_json::json!({}),
+            &rollback,
+        )
+        .await
+        .expect("an in-memory sink never fails to write");
+
+        assert_eq!(
+            conn.take_pending_request(4101).as_deref(),
+            Some("model/select")
+        );
+        assert!(conn.take_optimistic_rollback(4101).is_some());
+        assert!(!conn.written().is_empty());
     }
 }

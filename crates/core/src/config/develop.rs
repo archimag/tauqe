@@ -1,8 +1,8 @@
 use serde::{Deserialize, Serialize};
 use tauqe_protocol::{EditProtocolKind, PatchStrategy, PromptLayoutKind, WorkflowKind};
 
-/// Development profile: workflow engine, edit protocol, patch strategy and
-/// retry policy.
+/// Development profile: workflow engine, edit protocol, patch strategy, and the
+/// retry and replanning budgets of a turn.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DevelopConfig {
     #[serde(default)]
@@ -25,6 +25,11 @@ pub struct DevelopConfig {
     /// declared value pins one policy for every turn.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prompt_layout: Option<PromptLayoutKind>,
+    /// Retry budget of one turn: failed edit staging and verification healing.
+    ///
+    /// It bounds how often a single attempt may repair its own change set, and
+    /// says nothing about how many attempts a model tier receives: that is the
+    /// separate budget declared on each model entry under `[models]`.
     #[serde(default = "default_max_retries")]
     pub max_retries: usize,
     #[serde(default = "default_max_replans")]
@@ -41,7 +46,6 @@ fn default_max_retries() -> usize {
 fn default_max_replans() -> usize {
     2
 }
-
 impl Default for DevelopConfig {
     fn default() -> Self {
         Self {

@@ -4,7 +4,10 @@ use std::path::PathBuf;
 
 use tauqe_protocol::{EditFileOp, EditFileStatus, EditOperation, StructuredChangeProposal};
 
-use super::{normalize_hunk, resolve_path, EditStreamFilter, OwnedAnchor, StagingSimulator};
+use super::{
+    normalize_hunk, resolve_path, EditStreamFilter, OwnedAnchor, StagingSimulator,
+    TRUNCATED_EDIT_DIAGNOSTIC,
+};
 use crate::edits::staging::AnchorEdit;
 use crate::providers::StreamEvent;
 
@@ -65,6 +68,14 @@ pub struct JsonStreamFilter {
     anchor_batches: HashMap<String, Vec<OwnedAnchor>>,
     /// Element whose header the early preview has already reported.
     peeked_element: Option<usize>,
+    /// Whether the open file was announced by a header peek whose element has
+    /// not completed yet.
+    ///
+    /// The peek reports a file before its payload arrives, so the terminal event
+    /// of such a file must know whether the element ever closed: an element the
+    /// response left unterminated is dropped by the authoritative decoder, and
+    /// the preview reports the truncation instead of certifying it.
+    open_file_unterminated: bool,
 }
 
 impl JsonStreamFilter {
@@ -83,6 +94,7 @@ impl JsonStreamFilter {
             open_file_display: String::new(),
             anchor_batches: HashMap::new(),
             peeked_element: None,
+            open_file_unterminated: false,
         }
     }
 
@@ -94,9 +106,13 @@ impl JsonStreamFilter {
     /// Emits the pending `EditFileDone` for the currently open file, if any.
     ///
     /// Buffering the completion until the file changes or the array closes is
-    /// what lets several `replace` operations against one file collapse into a
     /// single terminal event with the exact hunks count, matching the XML filter.
+    ///
+    /// The status follows the element rather than the announcement: a file whose
+    /// element never completed reaches this flush only from `finish`, and it
+    /// reports the truncation instead of a success the turn will not deliver.
     fn flush_open_file(&mut self, events: &mut Vec<StreamEvent>) {
+        let unterminated = std::mem::take(&mut self.open_file_unterminated);
         if let Some(open_path) = self.open_file_path.take() {
             let hunks_count = self.file_hunk_counts.remove(&open_path).unwrap_or(0);
             let display = std::mem::take(&mut self.open_file_display);
@@ -105,10 +121,18 @@ impl JsonStreamFilter {
             } else {
                 display
             };
+            let (status, error) = if unterminated {
+                (
+                    EditFileStatus::Error,
+                    Some(TRUNCATED_EDIT_DIAGNOSTIC.to_string()),
+                )
+            } else {
+                (EditFileStatus::Ok, None)
+            };
             events.push(StreamEvent::EditFileDone {
                 path: final_path,
-                status: EditFileStatus::Ok,
-                error: None,
+                status,
+                error,
                 hunks_count,
             });
         }
@@ -183,6 +207,9 @@ impl JsonStreamFilter {
         });
         self.open_file_path = Some(resolved.clone());
         self.open_file_display = resolved;
+        // The element is still streaming, so the file it announces is confirmed
+        // only when `process_completed_change` sees the element close.
+        self.open_file_unterminated = true;
     }
 
     /// Opens `path` as the file the following hunks belong to.
@@ -229,6 +256,7 @@ impl JsonStreamFilter {
         self.file_hunk_counts.remove(&path);
         self.open_file_path = None;
         self.open_file_display.clear();
+        self.open_file_unterminated = false;
     }
 
     /// Applies one completed `changes[i]` element and emits the corresponding
@@ -245,6 +273,9 @@ impl JsonStreamFilter {
         change: &StructuredChangeProposal,
         events: &mut Vec<StreamEvent>,
     ) {
+        // The element closed, so the file its header announced is confirmed and
+        // its terminal event reports a delivered edit rather than truncation.
+        self.open_file_unterminated = false;
         if !self.has_emitted_edit_started {
             events.push(StreamEvent::EditStarted);
             self.has_emitted_edit_started = true;
@@ -307,6 +338,17 @@ impl JsonStreamFilter {
                 let resolved_to = resolve_path(&to, &self.editable_paths, true);
                 self.open_file(&resolved_from, EditFileOp::Move, events);
                 self.staging.apply_move(&resolved_from, &resolved_to);
+                self.open_file_display = format!("{} -> {}", resolved_from, resolved_to);
+                self.file_hunk_counts.entry(resolved_from).or_insert(0);
+            }
+            EditOperation::MoveDir { from, to } => {
+                let resolved_from = resolve_path(&from, &self.editable_paths, false);
+                let resolved_to = resolve_path(&to, &self.editable_paths, true);
+                self.open_file(&resolved_from, EditFileOp::MoveDir, events);
+                // The preview reports the directory pair as one unit: the
+                // subtree expands into per-file moves while the change set is
+                // staged, so the stream announces the rename instead of
+                // inventing files the payload never named.
                 self.open_file_display = format!("{} -> {}", resolved_from, resolved_to);
                 self.file_hunk_counts.entry(resolved_from).or_insert(0);
             }
@@ -491,6 +533,7 @@ impl EditStreamFilter for JsonStreamFilter {
         self.open_file_display.clear();
         self.anchor_batches.clear();
         self.peeked_element = None;
+        self.open_file_unterminated = false;
         self.staging.reset();
     }
 }
@@ -744,7 +787,6 @@ fn resolve_array_opener(buffer: &str, from: usize) -> OpenerOutcome {
     OpenerOutcome::Pending
 }
 
-/// Reads the `op` and `path` fields named by a streaming element header.
 /// Reads the `op` and `path` fields named by a streaming element header.
 ///
 /// The walk is depth- and string-aware, so a `path` mentioned inside the payload
@@ -1369,5 +1411,106 @@ mod tests {
         assert_eq!(status, EditFileStatus::Error);
         let error = error.expect("the rejection must carry its diagnostic");
         assert!(error.contains("names no line"), "{error}");
+    }
+    #[test]
+    fn test_unterminated_changes_element_never_reports_success() {
+        let path = "a.rs";
+        // The array opens an element that names the file and then ends inside
+        // its payload: the element never balances, so the authoritative decoder
+        // drops it while the preview already announced the file.
+        let truncated = concat!(
+            "{\"message\":\"Editing\",\"changes\":[",
+            "{\"op\":\"create\",\"path\":\"a.rs\",\"to\":\"\",",
+            "\"start\":\"\",\"end\":\"\",\"content\":\"BETA"
+        );
+        let boundaries: Vec<usize> = truncated
+            .char_indices()
+            .map(|(idx, _)| idx)
+            .chain(std::iter::once(truncated.len()))
+            .collect();
+        for split in boundaries {
+            let mut filter = JsonStreamFilter::new(vec![path.to_string()], std::env::temp_dir());
+            let mut events = filter.push_chunk(&truncated[..split]);
+            events.extend(filter.push_chunk(&truncated[split..]));
+            events.extend(Box::new(filter).finish());
+
+            let terminals: Vec<(EditFileStatus, Option<String>, usize)> = events
+                .iter()
+                .filter_map(|event| match event {
+                    StreamEvent::EditFileDone {
+                        status,
+                        error,
+                        hunks_count,
+                        ..
+                    } => Some((*status, error.clone(), *hunks_count)),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(terminals.len(), 1, "split {split}: {terminals:?}");
+            let (status, error, hunks_count) = &terminals[0];
+            assert_eq!(*status, EditFileStatus::Error, "split {split}");
+            assert_eq!(*hunks_count, 0, "split {split}");
+            let error = error
+                .as_deref()
+                .expect("the truncation must carry its diagnostic");
+            assert!(error.contains("truncated"), "split {split}: {error}");
+        }
+    }
+
+    #[test]
+    fn test_late_message_field_streams_after_a_large_anchored_change_set() {
+        // `message` arrives after the whole `changes` array, so the field lookup
+        // runs against a buffer that grows to the size of the change set. It must
+        // follow the appended bytes instead of rescanning the array per delta.
+        let count = 4_000usize;
+        let paths: Vec<String> = (0..count)
+            .map(|index| format!("src/file_{index}.rs"))
+            .collect();
+        let changes: Vec<serde_json::Value> = paths
+            .iter()
+            .map(|path| anchored_change(path, 0, 0, "ALPHA\n"))
+            .collect();
+        let input = serde_json::json!({
+            "changes": changes,
+            "message": "Rewritten",
+        })
+        .to_string();
+        let staged: HashMap<String, String> = paths
+            .iter()
+            .map(|path| (path.clone(), "alpha\nbeta\n".to_string()))
+            .collect();
+        let chars: Vec<char> = input.chars().collect();
+
+        let mut filter =
+            JsonStreamFilter::new(paths, std::env::temp_dir()).with_staged_contents(staged);
+        let started = std::time::Instant::now();
+        let mut events = Vec::new();
+        for chunk in chars.chunks(5) {
+            let text: String = chunk.iter().collect();
+            events.extend(filter.push_chunk(&text));
+        }
+        events.extend(Box::new(filter).finish());
+        let elapsed = started.elapsed();
+
+        let text: String = events
+            .iter()
+            .filter_map(|event| match event {
+                StreamEvent::TextDelta(delta) => Some(delta.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(text, "Rewritten");
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, StreamEvent::EditFileStarted { .. }))
+                .count(),
+            count
+        );
+        assert!(
+            elapsed < std::time::Duration::from_secs(20),
+            "streaming a {} byte payload took {elapsed:?}; locating `message` must follow the appended bytes",
+            input.len()
+        );
     }
 }

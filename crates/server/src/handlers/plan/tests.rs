@@ -2,13 +2,15 @@ use super::batch::{
     handle_plan_execute, handle_plan_execute_pipeline, handle_plan_refine, handle_plan_replan,
     run_plan_batch, BatchOutcome, PlanBatchOptions,
 };
-use super::common::{turn_applied_edits, unmet_dependencies};
+use crate::handlers::common::turn_applied_edits;
 use crate::state::AppState;
 use crate::transport::OutChannel;
 use std::sync::Arc;
 use tauqe_core::plan::storage::PlanStorage;
 use tauqe_core::providers::mock::{MockLlmProvider, MockResponse};
-use tauqe_protocol::{errors, events, ContextAccess, Plan, PlanItemStatus, Request};
+use tauqe_protocol::{
+    errors, events, ContextAccess, Plan, PlanItemStatus, PlanRefineResult, Request,
+};
 
 struct TestDir(std::path::PathBuf);
 impl TestDir {
@@ -42,6 +44,15 @@ fn test_item(id: &str, status: PlanItemStatus) -> tauqe_protocol::PlanItem {
     }
 }
 
+/// Declares one rung of a model role ladder that receives `attempts` content
+/// attempts before the ladder escalates to the next rung.
+fn tier_with_attempts(model: &str, attempts: u32) -> tauqe_protocol::ModelEntry {
+    let mut entry =
+        tauqe_protocol::ModelEntry::new(tauqe_protocol::ModelRef::openrouter(model), None);
+    entry.attempts = Some(attempts);
+    entry
+}
+
 fn test_state(dir: &TestDir) -> Arc<AppState> {
     let (out, _rx) = OutChannel::new();
     let (hist_tx, _hist_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -68,17 +79,18 @@ async fn test_state_with_provider(
 #[tokio::test]
 async fn test_plan_batch_fail_fast_resets_status() {
     let dir = TestDir::new();
-    let plan = Plan {
-        id: "batch".to_string(),
-        title: "Batch".to_string(),
-        created_at: 1,
-        updated_at: 1,
-        items: vec![
+    let plan = Plan::from_parts(
+        "batch".to_string(),
+        "Batch".to_string(),
+        None,
+        1,
+        1,
+        Vec::new(),
+        vec![
             test_item("1", PlanItemStatus::Todo),
             test_item("2", PlanItemStatus::Todo),
         ],
-        ..Default::default()
-    };
+    );
     PlanStorage::save_plan(dir.path(), &plan).unwrap();
     let state = test_state(&dir);
 
@@ -122,17 +134,18 @@ async fn test_plan_batch_fail_fast_resets_status() {
 #[tokio::test]
 async fn test_plan_batch_emits_finished_event() {
     let dir = TestDir::new();
-    let plan = Plan {
-        id: "emit".to_string(),
-        title: "Emit".to_string(),
-        created_at: 1,
-        updated_at: 1,
-        items: vec![
+    let plan = Plan::from_parts(
+        "emit".to_string(),
+        "Emit".to_string(),
+        None,
+        1,
+        1,
+        Vec::new(),
+        vec![
             test_item("1", PlanItemStatus::Todo),
             test_item("2", PlanItemStatus::Todo),
         ],
-        ..Default::default()
-    };
+    );
     PlanStorage::save_plan(dir.path(), &plan).unwrap();
 
     let (out, mut rx) = OutChannel::new();
@@ -177,17 +190,18 @@ async fn test_plan_batch_emits_finished_event() {
 #[tokio::test]
 async fn test_plan_batch_skips_done_and_stops_on_discussion() {
     let dir = TestDir::new();
-    let plan = Plan {
-        id: "skip".to_string(),
-        title: "Skip".to_string(),
-        created_at: 1,
-        updated_at: 1,
-        items: vec![
+    let plan = Plan::from_parts(
+        "skip".to_string(),
+        "Skip".to_string(),
+        None,
+        1,
+        1,
+        Vec::new(),
+        vec![
             test_item("1", PlanItemStatus::Done),
             test_item("2", PlanItemStatus::Discussion),
         ],
-        ..Default::default()
-    };
+    );
     PlanStorage::save_plan(dir.path(), &plan).unwrap();
     let state = test_state(&dir);
 
@@ -206,10 +220,17 @@ async fn test_plan_batch_skips_done_and_stops_on_discussion() {
     .await;
     match outcome {
         BatchOutcome::Failed {
-            completed, step_id, ..
+            completed, reason, ..
         } => {
-            assert_eq!(completed, 1);
-            assert_eq!(step_id, "2");
+            assert_eq!(completed, 0, "a stalled scope executes no step");
+            assert!(
+                reason.contains("DISCUSSION"),
+                "the diagnostic must name the lifecycle stall: {reason}"
+            );
+            assert!(
+                reason.contains('2'),
+                "the diagnostic must name the stalled step: {reason}"
+            );
         }
         other => panic!("Expected Failed, got {:?}", other),
     }
@@ -223,18 +244,19 @@ async fn test_plan_batch_skips_done_and_stops_on_discussion() {
 #[tokio::test]
 async fn test_plan_batch_skips_done_and_stops_on_blocked() {
     let dir = TestDir::new();
-    let plan = Plan {
-        id: "blocked-batch".to_string(),
-        title: "Blocked Batch".to_string(),
-        created_at: 1,
-        updated_at: 1,
-        items: vec![
+    let plan = Plan::from_parts(
+        "blocked-batch".to_string(),
+        "Blocked Batch".to_string(),
+        None,
+        1,
+        1,
+        Vec::new(),
+        vec![
             test_item("1", PlanItemStatus::Done),
             test_item("2", PlanItemStatus::Blocked),
             test_item("3", PlanItemStatus::Todo),
         ],
-        ..Default::default()
-    };
+    );
     PlanStorage::save_plan(dir.path(), &plan).unwrap();
     let state = test_state(&dir);
 
@@ -253,13 +275,14 @@ async fn test_plan_batch_skips_done_and_stops_on_blocked() {
     .await;
     match outcome {
         BatchOutcome::Failed {
-            completed,
-            step_id,
-            reason,
+            completed, reason, ..
         } => {
-            assert_eq!(completed, 1);
-            assert_eq!(step_id, "2");
-            assert!(reason.contains("BLOCKED"));
+            assert_eq!(completed, 0, "a stalled scope executes no step");
+            assert!(reason.contains("BLOCKED"), "got: {reason}");
+            assert!(
+                reason.contains('2'),
+                "the diagnostic must name the blocked step: {reason}"
+            );
         }
         other => panic!("Expected Failed on blocked step, got {:?}", other),
     }
@@ -299,20 +322,21 @@ async fn test_handle_plan_execute_validation() {
     let mut dep_item = test_item("5", PlanItemStatus::Todo);
     dep_item.depends_on = vec!["1".to_string()];
 
-    let plan = Plan {
-        id: "val".to_string(),
-        title: "Validation".to_string(),
-        created_at: 1,
-        updated_at: 1,
-        items: vec![
+    let plan = Plan::from_parts(
+        "val".to_string(),
+        "Validation".to_string(),
+        None,
+        1,
+        1,
+        Vec::new(),
+        vec![
             test_item("1", PlanItemStatus::Discussion),
             test_item("2", PlanItemStatus::Cancelled),
             test_item("3", PlanItemStatus::Done),
             test_item("4", PlanItemStatus::Blocked),
             dep_item,
         ],
-        ..Default::default()
-    };
+    );
     PlanStorage::save_plan(dir.path(), &plan).unwrap();
 
     let cases = [
@@ -419,14 +443,15 @@ async fn test_handle_plan_get_parses_payload_strictly() {
 #[tokio::test]
 async fn test_handle_plan_refine_defaults_to_architect_role() {
     let dir = TestDir::new();
-    let plan = Plan {
-        id: "refine-role".to_string(),
-        title: "Refine Role".to_string(),
-        created_at: 1,
-        updated_at: 1,
-        items: vec![test_item("1", PlanItemStatus::Todo)],
-        ..Default::default()
-    };
+    let plan = Plan::from_parts(
+        "refine-role".to_string(),
+        "Refine Role".to_string(),
+        None,
+        1,
+        1,
+        Vec::new(),
+        vec![test_item("1", PlanItemStatus::Todo)],
+    );
     PlanStorage::save_plan(dir.path(), &plan).unwrap();
 
     let mut config = tauqe_core::config::AppConfig::default();
@@ -436,9 +461,26 @@ async fn test_handle_plan_refine_defaults_to_architect_role() {
     .into()]);
     config.models.primary = vec![tauqe_protocol::ModelRef::openrouter("test/primary-model").into()];
 
-    let (out, _rx) = OutChannel::new();
-    let (hist_tx, _hist_rx) = tokio::sync::mpsc::unbounded_channel();
-    let state = AppState::new(config, dir.path().to_path_buf(), hist_tx, out);
+    let refine_output = serde_json::json!({
+        "status": "success",
+        "explanation": "Synthesized the horizon",
+        "items": [
+            {
+                "id": "1",
+                "title": "Refined step 1",
+                "status": "todo",
+                "files": ["src.rs"],
+                "readonly_files": [],
+                "concept_refs": [],
+                "depends_on": [],
+                "children": []
+            }
+        ]
+    });
+    let provider = Arc::new(MockLlmProvider::scripted([MockResponse::text(
+        refine_output.to_string(),
+    )]));
+    let state = test_state_with_provider(&dir, config, provider.clone()).await;
 
     let req = Request {
         id: tauqe_protocol::RequestId::Number(1),
@@ -446,8 +488,13 @@ async fn test_handle_plan_refine_defaults_to_architect_role() {
         params: Some(serde_json::json!({ "plan_id": "refine-role" })),
     };
     let res = handle_plan_refine(req, &state).await;
-    let err = res.error.expect("should fail without api key");
-    assert_eq!(err.code, "NO_API_KEY");
+    assert!(res.error.is_none(), "refine failed: {:?}", res.error);
+
+    // A request that names no model runs the Architect role's configured base
+    // rung, never the primary model of the interactive dialogue.
+    let requests = provider.requests();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].model, "test/architect-model");
 }
 
 #[tokio::test]
@@ -486,14 +533,15 @@ async fn test_handle_plan_refine_validation() {
 #[tokio::test]
 async fn test_handle_plan_refine_clears_auto_context() {
     let dir = TestDir::new();
-    let plan = Plan {
-        id: "refine-auto".to_string(),
-        title: "Refine Auto".to_string(),
-        created_at: 1,
-        updated_at: 1,
-        items: vec![test_item("1", PlanItemStatus::Todo)],
-        ..Default::default()
-    };
+    let plan = Plan::from_parts(
+        "refine-auto".to_string(),
+        "Refine Auto".to_string(),
+        None,
+        1,
+        1,
+        Vec::new(),
+        vec![test_item("1", PlanItemStatus::Todo)],
+    );
     PlanStorage::save_plan(dir.path(), &plan).unwrap();
     std::fs::write(dir.path().join("file.rs"), "pub fn foo() {}\n").unwrap();
 
@@ -545,17 +593,18 @@ async fn test_handle_plan_refine_clears_auto_context() {
 #[tokio::test]
 async fn test_plan_execute_blocked_by_failed_preflight() {
     let dir = TestDir::new();
-    let plan = Plan {
-        id: "preflight".to_string(),
-        title: "Preflight".to_string(),
-        created_at: 1,
-        updated_at: 1,
-        items: vec![
+    let plan = Plan::from_parts(
+        "preflight".to_string(),
+        "Preflight".to_string(),
+        None,
+        1,
+        1,
+        Vec::new(),
+        vec![
             test_item("1", PlanItemStatus::Todo),
             test_item("2", PlanItemStatus::Todo),
         ],
-        ..Default::default()
-    };
+    );
     PlanStorage::save_plan(dir.path(), &plan).unwrap();
     // A failing verification command makes the deterministic pipeline fail.
     std::fs::write(
@@ -589,6 +638,92 @@ async fn test_plan_execute_blocked_by_failed_preflight() {
         .all(|i| i.status == PlanItemStatus::Todo));
 }
 
+/// A hard cancel tears the pre-flight verification down while the operation
+/// slot is registered.
+///
+/// The gate inherits the operation's cancellation channel, so the substrate
+/// kills the whole process group of the project command at the cancel
+/// boundary: the request answers its cancelled verdict promptly instead of
+/// waiting a minutes-long build out, the slot is released at once, and no
+/// step was started.
+#[cfg(unix)]
+#[tokio::test]
+async fn test_plan_execute_preflight_is_torn_down_by_a_hard_cancel() {
+    let dir = TestDir::new();
+    let plan = Plan::from_parts(
+        "preflight-cancel".to_string(),
+        "Preflight Cancel".to_string(),
+        None,
+        1,
+        1,
+        Vec::new(),
+        vec![test_item("1", PlanItemStatus::Todo)],
+    );
+    PlanStorage::save_plan(dir.path(), &plan).unwrap();
+    // A verification command that blocks for a minute: a gate that ignored
+    // the operation's cancellation channel would keep the slot registered
+    // for the whole duration after a hard cancel.
+    std::fs::write(
+        dir.path().join("tauqe.toml"),
+        "[models]\nprimary = [\"openrouter:a/b\"]\n\n[project.verify]\ncommand = \"sh\"\nargs = ['-c', 'printf started > started.marker; sleep 60']\n",
+    )
+    .unwrap();
+    let state = test_state(&dir);
+
+    let req = Request {
+        id: tauqe_protocol::RequestId::Number(1),
+        method: tauqe_protocol::methods::PLAN_EXECUTE.to_string(),
+        params: Some(serde_json::json!({ "plan_id": "preflight-cancel" })),
+    };
+    let state_for_req = Arc::clone(&state);
+    let handler = tokio::spawn(async move { handle_plan_execute(req, &state_for_req).await });
+
+    // Cancel only once the verification command is demonstrably running, so
+    // the prompt return proves the teardown instead of a slow start.
+    let marker = dir.path().join("started.marker");
+    let mut running = false;
+    for _ in 0..200 {
+        if marker.exists() {
+            running = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+    assert!(running, "the verification command never started");
+
+    state.hard_cancel_active_operation();
+
+    let res = tokio::time::timeout(std::time::Duration::from_secs(10), handler)
+        .await
+        .expect("the cancelled pre-flight must return instead of waiting the suite out")
+        .expect("the handler task joins");
+    assert_eq!(res.error.unwrap().code, errors::CANCELLED);
+
+    // The cancelled gate released the slot at once, so the next mutation is
+    // not refused behind a verification that never completes.
+    let mut released = false;
+    for _ in 0..1000 {
+        if !state.is_operation_active() {
+            released = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert!(
+        released,
+        "the cancelled pre-flight must release the operation slot"
+    );
+
+    // No step was started: every status stays TODO.
+    let reloaded = PlanStorage::load_plan(dir.path(), "preflight-cancel")
+        .unwrap()
+        .unwrap();
+    assert!(reloaded
+        .items
+        .iter()
+        .all(|i| i.status == PlanItemStatus::Todo));
+}
+
 #[test]
 fn test_turn_applied_edits_requires_applied_change() {
     use crate::handlers::model::ModelTurnResult;
@@ -604,9 +739,9 @@ fn test_turn_applied_edits_requires_applied_change() {
                 error: None,
                 changed_files: vec!["src/lib.rs".to_string()],
                 commit_hash: Some("abc".to_string()),
+                verification: None,
             },
         }),
-        assistant_text: "done".to_string(),
         is_cancelled: false,
         error: None,
         has_terminal_success: false,
@@ -623,7 +758,6 @@ fn test_turn_applied_edits_requires_applied_change() {
         result: Some(tauqe_protocol::ModelResult::Answer {
             text: "Nothing to change.".to_string(),
         }),
-        assistant_text: "Nothing to change.".to_string(),
         is_cancelled: false,
         error: None,
         has_terminal_success: true,
@@ -644,9 +778,9 @@ fn test_turn_applied_edits_requires_applied_change() {
                 error: Some("compiler error".to_string()),
                 changed_files: vec![],
                 commit_hash: None,
+                verification: None,
             },
         }),
-        assistant_text: String::new(),
         is_cancelled: false,
         error: Some("compiler error".to_string()),
         has_terminal_success: false,
@@ -654,32 +788,6 @@ fn test_turn_applied_edits_requires_applied_change() {
         abort: None,
     };
     assert!(!turn_applied_edits(&failed));
-}
-
-#[test]
-fn test_unmet_dependencies_reports_prerequisites_not_done() {
-    let done = test_item("1", PlanItemStatus::Done);
-    let in_progress = test_item("2", PlanItemStatus::InProgress);
-    let mut dependent = test_item("3", PlanItemStatus::Todo);
-    dependent.depends_on = vec!["1".to_string(), "2".to_string(), "missing".to_string()];
-
-    let plan = Plan {
-        id: "deps".to_string(),
-        title: "Deps".to_string(),
-        created_at: 1,
-        updated_at: 1,
-        items: vec![done, in_progress],
-        ..Default::default()
-    };
-
-    assert_eq!(
-        unmet_dependencies(&plan, &dependent),
-        vec!["#2".to_string(), "#missing".to_string()]
-    );
-
-    let mut satisfied = test_item("4", PlanItemStatus::Todo);
-    satisfied.depends_on = vec!["1".to_string()];
-    assert!(unmet_dependencies(&plan, &satisfied).is_empty());
 }
 
 #[tokio::test]
@@ -714,18 +822,19 @@ async fn test_handle_plan_replan_validation() {
         children: vec![test_item("3.1", PlanItemStatus::Todo)],
         ..Default::default()
     };
-    let plan = Plan {
-        id: "replan".to_string(),
-        title: "Replan".to_string(),
-        created_at: 1,
-        updated_at: 1,
-        items: vec![
+    let plan = Plan::from_parts(
+        "replan".to_string(),
+        "Replan".to_string(),
+        None,
+        1,
+        1,
+        Vec::new(),
+        vec![
             test_item("1", PlanItemStatus::Done),
             test_item("2", PlanItemStatus::Blocked),
             parent,
         ],
-        ..Default::default()
-    };
+    );
     PlanStorage::save_plan(dir.path(), &plan).unwrap();
 
     // Missing step id.
@@ -816,17 +925,18 @@ async fn test_handle_plan_replan_rejects_malformed_payloads() {
 #[tokio::test]
 async fn test_handle_plan_replan_with_mock_provider() {
     let dir = TestDir::new();
-    let plan = Plan {
-        id: "replan-mock".to_string(),
-        title: "Replan Mock".to_string(),
-        created_at: 1,
-        updated_at: 1,
-        items: vec![
+    let plan = Plan::from_parts(
+        "replan-mock".to_string(),
+        "Replan Mock".to_string(),
+        None,
+        1,
+        1,
+        Vec::new(),
+        vec![
             test_item("1", PlanItemStatus::Done),
             test_item("2", PlanItemStatus::Blocked),
         ],
-        ..Default::default()
-    };
+    );
     PlanStorage::save_plan(dir.path(), &plan).unwrap();
 
     let replan_output = serde_json::json!({
@@ -899,14 +1009,15 @@ async fn test_handle_plan_replan_preloads_blocked_step_files() {
     blocked.files = vec!["src/target.rs".to_string()];
     blocked.readonly_files = vec!["src/reference.rs".to_string()];
 
-    let plan = Plan {
-        id: "replan-preload".to_string(),
-        title: "Replan Preload".to_string(),
-        created_at: 1,
-        updated_at: 1,
-        items: vec![test_item("1", PlanItemStatus::Done), blocked],
-        ..Default::default()
-    };
+    let plan = Plan::from_parts(
+        "replan-preload".to_string(),
+        "Replan Preload".to_string(),
+        None,
+        1,
+        1,
+        Vec::new(),
+        vec![test_item("1", PlanItemStatus::Done), blocked],
+    );
     PlanStorage::save_plan(dir.path(), &plan).unwrap();
 
     let replan_output = serde_json::json!({
@@ -946,15 +1057,15 @@ async fn test_handle_plan_replan_preloads_blocked_step_files() {
     assert!(res.error.is_none(), "replan failed: {:?}", res.error);
 
     // The blocked step's declared target and reference files are preloaded into
-    // the architect prompt before the very first generation round.
+    // the context block of the architect prompt before the very first generation
+    // round.
     let requests = mock_provider.requests();
     assert_eq!(requests.len(), 1);
-    let user_prompt = &requests[0].messages[1].content;
-    assert!(user_prompt.contains("## Active Context Files:"));
-    assert!(user_prompt.contains("### File: `src/target.rs`"));
-    assert!(user_prompt.contains("### File: `src/reference.rs`"));
-    assert!(user_prompt.contains("pub fn target() {}"));
-    assert!(user_prompt.contains("pub fn reference_helper() -> u64 { 7 }"));
+    let system_prompt = &requests[0].messages[0].content;
+    assert!(system_prompt.contains("<file path=\"src/target.rs\""));
+    assert!(system_prompt.contains("<file path=\"src/reference.rs\""));
+    assert!(system_prompt.contains("pub fn target() {}"));
+    assert!(system_prompt.contains("pub fn reference_helper() -> u64 { 7 }"));
 }
 
 #[tokio::test]
@@ -970,14 +1081,15 @@ async fn test_handle_plan_replan_retries_when_requested_files_already_loaded() {
     blocked.title = "Blocked step".to_string();
     blocked.files = vec!["src/target.rs".to_string()];
 
-    let plan = Plan {
-        id: "replan-satisfied".to_string(),
-        title: "Replan Satisfied".to_string(),
-        created_at: 1,
-        updated_at: 1,
-        items: vec![test_item("1", PlanItemStatus::Done), blocked],
-        ..Default::default()
-    };
+    let plan = Plan::from_parts(
+        "replan-satisfied".to_string(),
+        "Replan Satisfied".to_string(),
+        None,
+        1,
+        1,
+        Vec::new(),
+        vec![test_item("1", PlanItemStatus::Done), blocked],
+    );
     PlanStorage::save_plan(dir.path(), &plan).unwrap();
 
     // Round 1: the architect asks for a file that preloading already placed in
@@ -1044,14 +1156,15 @@ async fn test_handle_plan_replan_retries_when_requested_files_already_loaded() {
 #[tokio::test]
 async fn test_plan_refine_binds_the_architect_session() {
     let dir = TestDir::new();
-    let plan = Plan {
-        id: "arch-session".to_string(),
-        title: "Architect Session".to_string(),
-        created_at: 1,
-        updated_at: 1,
-        items: vec![test_item("1", PlanItemStatus::Todo)],
-        ..Default::default()
-    };
+    let plan = Plan::from_parts(
+        "arch-session".to_string(),
+        "Architect Session".to_string(),
+        None,
+        1,
+        1,
+        Vec::new(),
+        vec![test_item("1", PlanItemStatus::Todo)],
+    );
     PlanStorage::save_plan(dir.path(), &plan).unwrap();
 
     let refine_output = serde_json::json!({
@@ -1109,14 +1222,15 @@ async fn test_plan_step_binds_the_plan_session() {
     let mut item = test_item("1", PlanItemStatus::Todo);
     item.title = "Step 1".to_string();
     item.files = vec!["src.rs".to_string()];
-    let plan = Plan {
-        id: "plan-session".to_string(),
-        title: "Plan Session".to_string(),
-        created_at: 1,
-        updated_at: 1,
-        items: vec![item],
-        ..Default::default()
-    };
+    let plan = Plan::from_parts(
+        "plan-session".to_string(),
+        "Plan Session".to_string(),
+        None,
+        1,
+        1,
+        Vec::new(),
+        vec![item],
+    );
     PlanStorage::save_plan(dir.path(), &plan).unwrap();
 
     let response = "<tauqe_edits summary=\"Set value\">\n<edit path=\"src.rs\">\n<search>\npub fn value() -> i32 { 0 }\n</search>\n<replace>\npub fn value() -> i32 { 1 }\n</replace>\n</edit>\n<success summary=\"done\" />\n</tauqe_edits>";
@@ -1170,14 +1284,15 @@ fn test_collect_plan_context_files_dedups_and_recurses() {
     top.files = vec!["src/shared.rs".to_string()];
     top.readonly_files = vec!["src/ref.rs".to_string()];
 
-    let plan = Plan {
-        id: "collect".to_string(),
-        title: "Collect".to_string(),
-        created_at: 1,
-        updated_at: 1,
-        items: vec![top, parent],
-        ..Default::default()
-    };
+    let plan = Plan::from_parts(
+        "collect".to_string(),
+        "Collect".to_string(),
+        None,
+        1,
+        1,
+        Vec::new(),
+        vec![top, parent],
+    );
 
     // Recurses into children, collapses normalized duplicates across `files`
     // and `readonly_files`, and preserves first-seen order.
@@ -1216,14 +1331,15 @@ async fn test_handle_plan_refine_preloads_all_existing_step_files() {
     let mut step2 = test_item("2", PlanItemStatus::Todo);
     step2.files = vec!["src/b.rs".to_string()];
 
-    let plan = Plan {
-        id: "refine-preload".to_string(),
-        title: "Refine Preload".to_string(),
-        created_at: 1,
-        updated_at: 1,
-        items: vec![step1, step2],
-        ..Default::default()
-    };
+    let plan = Plan::from_parts(
+        "refine-preload".to_string(),
+        "Refine Preload".to_string(),
+        None,
+        1,
+        1,
+        Vec::new(),
+        vec![step1, step2],
+    );
     PlanStorage::save_plan(dir.path(), &plan).unwrap();
 
     let refine_output = serde_json::json!({
@@ -1258,30 +1374,32 @@ async fn test_handle_plan_refine_preloads_all_existing_step_files() {
 
     // Deep planning preloads every existing step's declared target and
     // reference files before the architect's first generation round, not just a
-    // single blocked step's.
+    // single blocked step's. The turn kernel renders them as `<file>` elements
+    // of the context block in the stable head of the round, so the task fragment
+    // never restates a file it does not own.
     let requests = mock_provider.requests();
     assert_eq!(requests.len(), 1);
-    let user_prompt = &requests[0].messages[1].content;
-    assert!(user_prompt.contains("## Active Context Files:"));
-    assert!(user_prompt.contains("### File: `src/a.rs`"));
-    assert!(user_prompt.contains("### File: `src/b.rs`"));
-    assert!(user_prompt.contains("### File: `src/ref.rs`"));
-    assert!(user_prompt.contains("pub fn a() {}"));
-    assert!(user_prompt.contains("pub fn b() {}"));
-    assert!(user_prompt.contains("pub fn r() -> u64 { 1 }"));
+    let system_prompt = &requests[0].messages[0].content;
+    assert!(system_prompt.contains("<file path=\"src/a.rs\""));
+    assert!(system_prompt.contains("<file path=\"src/b.rs\""));
+    assert!(system_prompt.contains("<file path=\"src/ref.rs\""));
+    assert!(system_prompt.contains("pub fn a() {}"));
+    assert!(system_prompt.contains("pub fn b() {}"));
+    assert!(system_prompt.contains("pub fn r() -> u64 { 1 }"));
 }
 
 #[tokio::test]
 async fn test_plan_horizon_synthesis_history_transactionality() {
     let dir = TestDir::new();
-    let plan = Plan {
-        id: "tx-history".to_string(),
-        title: "Tx History".to_string(),
-        created_at: 1,
-        updated_at: 1,
-        items: vec![test_item("1", PlanItemStatus::Todo)],
-        ..Default::default()
-    };
+    let plan = Plan::from_parts(
+        "tx-history".to_string(),
+        "Tx History".to_string(),
+        None,
+        1,
+        1,
+        Vec::new(),
+        vec![test_item("1", PlanItemStatus::Todo)],
+    );
     PlanStorage::save_plan(dir.path(), &plan).unwrap();
 
     // Synthesize an invalid horizon that introduces a circular dependency
@@ -1348,14 +1466,15 @@ async fn test_plan_step_execution_uses_turn_marker() {
     let mut item = test_item("1", PlanItemStatus::Todo);
     item.title = "Implement compute".to_string();
     item.files = vec!["src.rs".to_string()];
-    let plan = Plan {
-        id: "marker-plan".to_string(),
-        title: "Marker Plan".to_string(),
-        created_at: 1,
-        updated_at: 1,
-        items: vec![item],
-        ..Default::default()
-    };
+    let plan = Plan::from_parts(
+        "marker-plan".to_string(),
+        "Marker Plan".to_string(),
+        None,
+        1,
+        1,
+        Vec::new(),
+        vec![item],
+    );
     PlanStorage::save_plan(dir.path(), &plan).unwrap();
 
     let marker = "TESTMARKER1";
@@ -1426,14 +1545,15 @@ async fn test_plan_batch_automated_replanning_on_blocked_step() {
     let mut item = test_item("1", PlanItemStatus::Todo);
     item.title = "Step 1".to_string();
     item.files = vec!["src.rs".to_string()];
-    let plan = Plan {
-        id: "auto-replan".to_string(),
-        title: "Auto Replan".to_string(),
-        created_at: 1,
-        updated_at: 1,
-        items: vec![item],
-        ..Default::default()
-    };
+    let plan = Plan::from_parts(
+        "auto-replan".to_string(),
+        "Auto Replan".to_string(),
+        None,
+        1,
+        1,
+        Vec::new(),
+        vec![item],
+    );
     PlanStorage::save_plan(dir.path(), &plan).unwrap();
 
     let marker = "AUTOREPLANM1";
@@ -1521,14 +1641,15 @@ async fn test_plan_batch_defers_architect_escalation_until_repeated_failure() {
     let mut item = test_item("1", PlanItemStatus::Todo);
     item.title = "Step 1".to_string();
     item.files = vec!["src.rs".to_string()];
-    let plan = Plan {
-        id: "lazy-level-up".to_string(),
-        title: "Lazy Level Up".to_string(),
-        created_at: 1,
-        updated_at: 1,
-        items: vec![item],
-        ..Default::default()
-    };
+    let plan = Plan::from_parts(
+        "lazy-level-up".to_string(),
+        "Lazy Level Up".to_string(),
+        None,
+        1,
+        1,
+        Vec::new(),
+        vec![item],
+    );
     PlanStorage::save_plan(dir.path(), &plan).unwrap();
 
     let marker = "LAZYUP1";
@@ -1625,14 +1746,15 @@ async fn test_plan_batch_automated_replanning_limit_exhausted() {
     let mut item = test_item("1", PlanItemStatus::Todo);
     item.title = "Step 1".to_string();
     item.files = vec!["src.rs".to_string()];
-    let plan = Plan {
-        id: "limit-replan".to_string(),
-        title: "Limit Replan".to_string(),
-        created_at: 1,
-        updated_at: 1,
-        items: vec![item],
-        ..Default::default()
-    };
+    let plan = Plan::from_parts(
+        "limit-replan".to_string(),
+        "Limit Replan".to_string(),
+        None,
+        1,
+        1,
+        Vec::new(),
+        vec![item],
+    );
     PlanStorage::save_plan(dir.path(), &plan).unwrap();
 
     let marker = "LIMITREPLANM1";
@@ -1697,11 +1819,15 @@ async fn test_plan_batch_automated_replanning_limit_exhausted() {
             assert_eq!(completed, 0);
             assert_eq!(step_id, "1.1");
             assert!(
-                reason.contains("Automated replanning limit reached (max_replans = 1)"),
+                reason.contains("Replanning budget exhausted (max_replans = 1)"),
                 "unexpected block reason: {}",
                 reason
             );
-            assert!(reason.contains("Manual developer intervention required"));
+            assert!(
+                reason.contains("Second blocker"),
+                "the diagnostic must keep the cause: {}",
+                reason
+            );
         }
         other => panic!(
             "Expected Blocked outcome with limit reached, got {:?}",
@@ -1732,14 +1858,15 @@ async fn test_plan_batch_stops_on_abort_without_replanning() {
     let mut second = test_item("2", PlanItemStatus::Todo);
     second.title = "Step 2".to_string();
     second.files = vec!["src.rs".to_string()];
-    let plan = Plan {
-        id: "abort-batch".to_string(),
-        title: "Abort Batch".to_string(),
-        created_at: 1,
-        updated_at: 1,
-        items: vec![first, second],
-        ..Default::default()
-    };
+    let plan = Plan::from_parts(
+        "abort-batch".to_string(),
+        "Abort Batch".to_string(),
+        None,
+        1,
+        1,
+        Vec::new(),
+        vec![first, second],
+    );
     PlanStorage::save_plan(dir.path(), &plan).unwrap();
 
     let marker = "ABORTBATCHM1";
@@ -1833,17 +1960,18 @@ async fn test_plan_batch_stops_on_abort_without_replanning() {
 #[tokio::test]
 async fn test_plan_batch_stops_gracefully_on_soft_stop() {
     let dir = TestDir::new();
-    let plan = Plan {
-        id: "soft-stop".to_string(),
-        title: "Soft Stop".to_string(),
-        created_at: 1,
-        updated_at: 1,
-        items: vec![
+    let plan = Plan::from_parts(
+        "soft-stop".to_string(),
+        "Soft Stop".to_string(),
+        None,
+        1,
+        1,
+        Vec::new(),
+        vec![
             test_item("1", PlanItemStatus::Todo),
             test_item("2", PlanItemStatus::Todo),
         ],
-        ..Default::default()
-    };
+    );
     PlanStorage::save_plan(dir.path(), &plan).unwrap();
 
     let (out, mut rx) = OutChannel::new();
@@ -1926,14 +2054,15 @@ impl tauqe_core::providers::LlmProvider for StreamCancellingProvider {
 #[tokio::test]
 async fn test_plan_refine_reports_cancellation_from_stream_event() {
     let dir = TestDir::new();
-    let plan = Plan {
-        id: "cancel-refine".to_string(),
-        title: "Cancel Refine".to_string(),
-        created_at: 1,
-        updated_at: 1,
-        items: vec![test_item("1", PlanItemStatus::Todo)],
-        ..Default::default()
-    };
+    let plan = Plan::from_parts(
+        "cancel-refine".to_string(),
+        "Cancel Refine".to_string(),
+        None,
+        1,
+        1,
+        Vec::new(),
+        vec![test_item("1", PlanItemStatus::Todo)],
+    );
     PlanStorage::save_plan(dir.path(), &plan).unwrap();
 
     let provider: Arc<dyn tauqe_core::providers::LlmProvider> = Arc::new(StreamCancellingProvider);
@@ -1962,19 +2091,20 @@ async fn test_plan_batch_projects_conceptual_horizon_just_in_time() {
     tauqe_core::git::cmd::commit_with_developer_author(dir.path(), "Initial", false).unwrap();
 
     // A plan carrying only its architectural concept has no leaf to schedule.
-    let plan = Plan {
-        id: "jit-horizon".to_string(),
-        title: "JIT Horizon".to_string(),
-        created_at: 1,
-        updated_at: 1,
-        concept: vec![tauqe_protocol::ConceptItem {
+    let plan = Plan::from_parts(
+        "jit-horizon".to_string(),
+        "JIT Horizon".to_string(),
+        None,
+        1,
+        1,
+        vec![tauqe_protocol::ConceptItem {
             id: "c-1".to_string(),
             title: "Invariant".to_string(),
             details: None,
             children: Vec::new(),
         }],
-        ..Default::default()
-    };
+        Vec::new(),
+    );
     PlanStorage::save_plan(dir.path(), &plan).unwrap();
 
     let marker = "JITHORIZONM1";
@@ -2075,14 +2205,15 @@ async fn test_handle_plan_execute_pipeline_validation() {
     assert_eq!(res.error.unwrap().code, "NOT_FOUND");
 
     // A queue whose plans are all finished has no leaf to schedule.
-    let plan = Plan {
-        id: "done-pipeline".to_string(),
-        title: "Done Pipeline".to_string(),
-        created_at: 1,
-        updated_at: 1,
-        items: vec![test_item("1", PlanItemStatus::Done)],
-        ..Default::default()
-    };
+    let plan = Plan::from_parts(
+        "done-pipeline".to_string(),
+        "Done Pipeline".to_string(),
+        None,
+        1,
+        1,
+        Vec::new(),
+        vec![test_item("1", PlanItemStatus::Done)],
+    );
     PlanStorage::save_plan(dir.path(), &plan).unwrap();
 
     let res = handle_plan_execute_pipeline(
@@ -2102,14 +2233,15 @@ async fn test_handle_plan_execute_pipeline_validation() {
 #[tokio::test]
 async fn test_plan_pipeline_blocked_by_failed_preflight() {
     let dir = TestDir::new();
-    let plan = Plan {
-        id: "pipeline-preflight".to_string(),
-        title: "Pipeline Preflight".to_string(),
-        created_at: 1,
-        updated_at: 1,
-        items: vec![test_item("1", PlanItemStatus::Todo)],
-        ..Default::default()
-    };
+    let plan = Plan::from_parts(
+        "pipeline-preflight".to_string(),
+        "Pipeline Preflight".to_string(),
+        None,
+        1,
+        1,
+        Vec::new(),
+        vec![test_item("1", PlanItemStatus::Todo)],
+    );
     PlanStorage::save_plan(dir.path(), &plan).unwrap();
     // A failing verification command makes the deterministic pipeline fail.
     std::fs::write(
@@ -2150,14 +2282,15 @@ async fn test_handle_plan_refine_renders_targeted_repo_map_feedback() {
     tauqe_core::git::cmd::stage_files(dir.path(), &["src/target.rs".to_string()]).unwrap();
     tauqe_core::git::cmd::commit_with_developer_author(dir.path(), "Add src", false).unwrap();
 
-    let plan = Plan {
-        id: "refine-repomap".to_string(),
-        title: "Refine RepoMap".to_string(),
-        created_at: 1,
-        updated_at: 1,
-        items: vec![test_item("1", PlanItemStatus::Todo)],
-        ..Default::default()
-    };
+    let plan = Plan::from_parts(
+        "refine-repomap".to_string(),
+        "Refine RepoMap".to_string(),
+        None,
+        1,
+        1,
+        Vec::new(),
+        vec![test_item("1", PlanItemStatus::Todo)],
+    );
     PlanStorage::save_plan(dir.path(), &plan).unwrap();
 
     // Round 1: the architect requests the symbol contour of a subsystem it has
@@ -2237,14 +2370,15 @@ async fn test_handle_plan_refine_renders_directory_outline_when_repo_map_disable
     tauqe_core::git::cmd::stage_files(dir.path(), &["src/nested/helper.rs".to_string()]).unwrap();
     tauqe_core::git::cmd::commit_with_developer_author(dir.path(), "Add src", false).unwrap();
 
-    let plan = Plan {
-        id: "refine-dirs".to_string(),
-        title: "Refine Dirs".to_string(),
-        created_at: 1,
-        updated_at: 1,
-        items: vec![test_item("1", PlanItemStatus::Todo)],
-        ..Default::default()
-    };
+    let plan = Plan::from_parts(
+        "refine-dirs".to_string(),
+        "Refine Dirs".to_string(),
+        None,
+        1,
+        1,
+        Vec::new(),
+        vec![test_item("1", PlanItemStatus::Todo)],
+    );
     PlanStorage::save_plan(dir.path(), &plan).unwrap();
 
     let success = serde_json::json!({
@@ -2285,26 +2419,27 @@ async fn test_handle_plan_refine_renders_directory_outline_when_repo_map_disable
 
     // With eager symbol maps disabled the architect still learns where the
     // subsystems live from the compact directory tree, never from an absent
-    // contour section.
+    // contour section: the turn kernel renders exactly one outline in the stable
+    // head of the round.
     let requests = mock_provider.requests();
     assert_eq!(requests.len(), 1);
-    let user_prompt = &requests[0].messages[1].content;
-    assert!(user_prompt.contains("## Repository Directories (<repo_dirs>):"));
-    assert!(user_prompt.contains("src\n  nested"));
-    assert!(!user_prompt.contains("## Codebase Symbol Contours"));
+    let system_prompt = &requests[0].messages[0].content;
+    assert!(system_prompt.contains("src\n  nested"));
+    assert!(!system_prompt.contains("## Codebase Symbol Contours"));
 }
 
 #[tokio::test]
 async fn test_plan_refine_regenerates_round_after_unparsable_response() {
     let dir = TestDir::new();
-    let plan = Plan {
-        id: "parse-retry".to_string(),
-        title: "Parse Retry".to_string(),
-        created_at: 1,
-        updated_at: 1,
-        items: vec![test_item("1", PlanItemStatus::Todo)],
-        ..Default::default()
-    };
+    let plan = Plan::from_parts(
+        "parse-retry".to_string(),
+        "Parse Retry".to_string(),
+        None,
+        1,
+        1,
+        Vec::new(),
+        vec![test_item("1", PlanItemStatus::Todo)],
+    );
     PlanStorage::save_plan(dir.path(), &plan).unwrap();
 
     // The first round is cut off mid-JSON, the second one is complete.
@@ -2334,8 +2469,10 @@ async fn test_plan_refine_regenerates_round_after_unparsable_response() {
         MockResponse::text(complete.to_string()),
     ]));
 
-    let mut config = tauqe_core::config::AppConfig::default();
-    config.develop.max_retries = 2;
+    let config = tauqe_core::config::AppConfig::default();
+    // The architect tier budget counts every generation of a round, the first
+    // one included: the default budget of the rung is two attempts, so the
+    // truncated first round is regenerated on the same rung.
     let state = test_state_with_provider(&dir, config, mock_provider.clone()).await;
 
     let req = Request {
@@ -2359,14 +2496,15 @@ async fn test_plan_refine_regenerates_round_after_unparsable_response() {
 #[tokio::test]
 async fn test_plan_refine_recovers_from_a_transport_break() {
     let dir = TestDir::new();
-    let plan = Plan {
-        id: "stream-break".to_string(),
-        title: "Stream Break".to_string(),
-        created_at: 1,
-        updated_at: 1,
-        items: vec![test_item("1", PlanItemStatus::Todo)],
-        ..Default::default()
-    };
+    let plan = Plan::from_parts(
+        "stream-break".to_string(),
+        "Stream Break".to_string(),
+        None,
+        1,
+        1,
+        Vec::new(),
+        vec![test_item("1", PlanItemStatus::Todo)],
+    );
     PlanStorage::save_plan(dir.path(), &plan).unwrap();
 
     let refine_output = serde_json::json!({
@@ -2427,26 +2565,30 @@ async fn test_plan_refine_recovers_from_a_transport_break() {
 }
 
 #[tokio::test]
-async fn test_plan_refine_fails_after_parse_retries_are_exhausted() {
+async fn test_plan_refine_blocks_after_the_tier_budget_is_spent() {
     let dir = TestDir::new();
-    let plan = Plan {
-        id: "parse-exhausted".to_string(),
-        title: "Parse Exhausted".to_string(),
-        created_at: 1,
-        updated_at: 1,
-        items: vec![test_item("1", PlanItemStatus::Todo)],
-        ..Default::default()
-    };
+    let plan = Plan::from_parts(
+        "parse-exhausted".to_string(),
+        "Parse Exhausted".to_string(),
+        None,
+        1,
+        1,
+        Vec::new(),
+        vec![test_item("1", PlanItemStatus::Todo)],
+    );
     PlanStorage::save_plan(dir.path(), &plan).unwrap();
 
-    // Both the round and its single retry answer with an empty payload.
+    // The empty generation is a transport-level non-answer, so the kernel re-asks
+    // on its own corrective budget without spending the rung's single attempt. The
+    // invalid payload that follows spends it, and the saturated ladder turns the
+    // failure into a typed block instead of an RPC error.
     let mock_provider = Arc::new(MockLlmProvider::scripted([
         MockResponse::text(""),
-        MockResponse::text("   "),
+        MockResponse::text("not a refinement payload"),
     ]));
 
     let mut config = tauqe_core::config::AppConfig::default();
-    config.develop.max_retries = 1;
+    config.models.architect = Some(vec![tier_with_attempts("planner/one", 1)]);
     let state = test_state_with_provider(&dir, config, mock_provider.clone()).await;
 
     let req = Request {
@@ -2455,14 +2597,31 @@ async fn test_plan_refine_fails_after_parse_retries_are_exhausted() {
         params: Some(serde_json::json!({ "plan_id": "parse-exhausted" })),
     };
     let res = handle_plan_refine(req, &state).await;
+    let value = res
+        .result
+        .expect("an exhausted tier budget is a typed outcome");
+    let result: PlanRefineResult =
+        serde_json::from_value(value).expect("the refinement result decodes");
+    match result {
+        PlanRefineResult::Blocked { reason } => {
+            assert!(
+                reason.contains("Failed to parse"),
+                "the reason must name the schema failure: {reason}"
+            );
+            assert!(
+                reason.contains("planner/one"),
+                "the reason must name the rung that spent its budget: {reason}"
+            );
+        }
+        other => panic!("expected a typed block, got {other:?}"),
+    }
+    assert_eq!(
+        mock_provider.requests().len(),
+        2,
+        "silence is re-asked by the kernel, the invalid payload spends the rung"
+    );
 
-    // The retry budget is bounded: an exhausted budget terminates the synthesis
-    // instead of looping forever.
-    let err = res.error.expect("an exhausted retry budget must fail");
-    assert_eq!(err.code, errors::PARSE_ERROR);
-    assert_eq!(mock_provider.requests().len(), 2);
-
-    // A failed synthesis leaves the stored plan untouched.
+    // A blocked synthesis leaves the stored plan untouched.
     let reloaded = PlanStorage::load_plan(dir.path(), "parse-exhausted")
         .unwrap()
         .unwrap();
@@ -2473,18 +2632,116 @@ async fn test_plan_refine_fails_after_parse_retries_are_exhausted() {
     );
 }
 
+/// An architect tier that spends its whole generation budget climbs the
+/// architect ladder instead of failing the synthesis: the round is regenerated
+/// on the next rung, the escalation is published, and the applied horizon
+/// records the rung that actually produced it as its provenance.
+#[tokio::test]
+async fn test_plan_refine_escalates_the_architect_ladder_after_a_spent_tier_budget() {
+    let dir = TestDir::new();
+    let plan = Plan::from_parts(
+        "architect-ladder".to_string(),
+        "Architect Ladder".to_string(),
+        None,
+        1,
+        1,
+        Vec::new(),
+        vec![test_item("1", PlanItemStatus::Todo)],
+    );
+    PlanStorage::save_plan(dir.path(), &plan).unwrap();
+
+    // The first rung is cut off mid-JSON and spends its single attempt, so the
+    // round continues on the next rung, which answers with a complete horizon.
+    let truncated = "{\"status\": \"success\", \"explanation\": \"Decomposed";
+    let complete = serde_json::json!({
+        "status": "success",
+        "explanation": "Decomposed on the escalated rung",
+        "reason": null,
+        "context_requests": [],
+        "repo_searches": [],
+        "repo_maps": [],
+        "items": [
+            {
+                "id": "1.1",
+                "title": "Refined step 1.1",
+                "status": "todo",
+                "files": ["src.rs"],
+                "readonly_files": [],
+                "concept_refs": [],
+                "depends_on": [],
+                "children": []
+            }
+        ]
+    });
+    let mock_provider = Arc::new(MockLlmProvider::scripted([
+        MockResponse::text(truncated),
+        MockResponse::text(complete.to_string()),
+    ]));
+
+    let mut config = tauqe_core::config::AppConfig::default();
+    config.models.architect = Some(vec![
+        tier_with_attempts("planner/one", 1),
+        tier_with_attempts("planner/two", 1),
+    ]);
+
+    let (out, mut rx) = OutChannel::new();
+    let (hist_tx, _hist_rx) = tokio::sync::mpsc::unbounded_channel();
+    let state = AppState::new(config, dir.path().to_path_buf(), hist_tx, out);
+    let provider: Arc<dyn tauqe_core::providers::LlmProvider> = mock_provider.clone();
+    *state.provider_override.lock().await = Some(provider);
+
+    let req = Request {
+        id: tauqe_protocol::RequestId::Number(1),
+        method: tauqe_protocol::methods::PLAN_REFINE.to_string(),
+        params: Some(serde_json::json!({ "plan_id": "architect-ladder" })),
+    };
+    let res = handle_plan_refine(req, &state).await;
+    assert!(res.error.is_none(), "refine failed: {:?}", res.error);
+
+    // The spent rung hands the round to the next rung of the ladder, so the
+    // regeneration runs on a stronger configuration instead of the failed one.
+    let requests = mock_provider.requests();
+    assert_eq!(requests.len(), 2);
+    assert_eq!(requests[0].model, "planner/one");
+    assert_eq!(requests[1].model, "planner/two");
+
+    // The transition is published, so the developer sees which rung answered.
+    let mut emitted = Vec::new();
+    while let Ok(raw) = rx.try_recv() {
+        emitted.push(raw);
+    }
+    assert!(
+        emitted
+            .iter()
+            .any(|event| event.contains(events::MODEL_ESCALATED)),
+        "the escalation must be published to the client: {emitted:?}"
+    );
+
+    // The synthesized horizon is applied and records the rung that produced it,
+    // so a later replanning wave keeps climbing from that configuration.
+    let reloaded = PlanStorage::load_plan(dir.path(), "architect-ladder")
+        .unwrap()
+        .unwrap();
+    assert!(reloaded.find_item("1.1").is_some());
+    assert_eq!(
+        reloaded.architect.as_ref().map(|tier| tier.model.clone()),
+        Some(tauqe_protocol::ModelRef::openrouter("planner/two"))
+    );
+}
+
 #[tokio::test]
 async fn test_handle_plan_delete_clears_focus_anchored_on_the_deleted_plan() {
     let dir = TestDir::new();
     for id in ["focus-del", "focus-keep", "focus-other"] {
-        let plan = Plan {
-            id: id.to_string(),
-            title: id.to_string(),
-            created_at: 1,
-            updated_at: 1,
-            items: vec![test_item("1", PlanItemStatus::Done)],
-            ..Default::default()
-        };
+        let plan = Plan::from_parts(
+            id.to_string(),
+            id.to_string(),
+            None,
+            1,
+            1,
+            Vec::new(),
+            vec![test_item("1", PlanItemStatus::Done)],
+        );
         PlanStorage::save_plan(dir.path(), &plan).unwrap();
     }
 
@@ -2548,14 +2805,15 @@ async fn test_handle_plan_delete_clears_focus_anchored_on_the_deleted_plan() {
 #[tokio::test]
 async fn test_handle_plan_delete_broadcasts_typed_focus_release() {
     let dir = TestDir::new();
-    let plan = Plan {
-        id: "typed-focus".to_string(),
-        title: "Typed Focus".to_string(),
-        created_at: 1,
-        updated_at: 1,
-        items: vec![test_item("1", PlanItemStatus::Done)],
-        ..Default::default()
-    };
+    let plan = Plan::from_parts(
+        "typed-focus".to_string(),
+        "Typed Focus".to_string(),
+        None,
+        1,
+        1,
+        Vec::new(),
+        vec![test_item("1", PlanItemStatus::Done)],
+    );
     PlanStorage::save_plan(dir.path(), &plan).unwrap();
 
     let (out, mut rx) = OutChannel::new();
@@ -2607,14 +2865,15 @@ async fn test_handle_plan_delete_broadcasts_typed_focus_release() {
 #[tokio::test]
 async fn test_plan_batch_finished_carries_the_registered_operation_id() {
     let dir = TestDir::new();
-    let plan = Plan {
-        id: "op-id".to_string(),
-        title: "Operation Id".to_string(),
-        created_at: 1,
-        updated_at: 1,
-        items: vec![test_item("1", PlanItemStatus::Todo)],
-        ..Default::default()
-    };
+    let plan = Plan::from_parts(
+        "op-id".to_string(),
+        "Operation Id".to_string(),
+        None,
+        1,
+        1,
+        Vec::new(),
+        vec![test_item("1", PlanItemStatus::Todo)],
+    );
     PlanStorage::save_plan(dir.path(), &plan).unwrap();
 
     let (out, mut rx) = OutChannel::new();
@@ -2672,14 +2931,15 @@ async fn test_plan_batch_persists_the_blocked_reason_on_disk() {
     let mut item = test_item("1", PlanItemStatus::Todo);
     item.title = "Step 1".to_string();
     item.files = vec!["src.rs".to_string()];
-    let plan = Plan {
-        id: "blocked-reason".to_string(),
-        title: "Blocked Reason".to_string(),
-        created_at: 1,
-        updated_at: 1,
-        items: vec![item],
-        ..Default::default()
-    };
+    let plan = Plan::from_parts(
+        "blocked-reason".to_string(),
+        "Blocked Reason".to_string(),
+        None,
+        1,
+        1,
+        Vec::new(),
+        vec![item],
+    );
     PlanStorage::save_plan(dir.path(), &plan).unwrap();
 
     let marker = "BLOCKEDREASONM1";
@@ -2759,14 +3019,15 @@ async fn test_plan_step_structured_protocol_execution() {
     let mut item = test_item("1", PlanItemStatus::Todo);
     item.title = "Set the value".to_string();
     item.files = vec!["src.rs".to_string()];
-    let plan = Plan {
-        id: "structured-step".to_string(),
-        title: "Structured Step".to_string(),
-        created_at: 1,
-        updated_at: 1,
-        items: vec![item],
-        ..Default::default()
-    };
+    let plan = Plan::from_parts(
+        "structured-step".to_string(),
+        "Structured Step".to_string(),
+        None,
+        1,
+        1,
+        Vec::new(),
+        vec![item],
+    );
     PlanStorage::save_plan(dir.path(), &plan).unwrap();
 
     let response = serde_json::json!({
@@ -2853,19 +3114,21 @@ async fn test_plan_batch_starts_ladder_from_the_selected_coder_tier() {
     let mut item = test_item("1", PlanItemStatus::Todo);
     item.title = "Step 1".to_string();
     item.files = vec!["src.rs".to_string()];
-    let plan = Plan {
-        id: "start-tier".to_string(),
-        title: "Start Tier".to_string(),
-        created_at: 1,
-        updated_at: 1,
-        items: vec![item],
-        ..Default::default()
-    };
+    let plan = Plan::from_parts(
+        "start-tier".to_string(),
+        "Start Tier".to_string(),
+        None,
+        1,
+        1,
+        Vec::new(),
+        vec![item],
+    );
     PlanStorage::save_plan(dir.path(), &plan).unwrap();
 
     let marker = "STARTTIERM1";
-    // Round 1 answers without a change set, so the step escalates one rung
-    // above the selected tier. Round 2 applies the edit and completes.
+    // Round 1 answers without a change set, so the single-attempt tier budget is
+    // spent at once and the step escalates one rung above the selected tier.
+    // Round 2 applies the edit and completes.
     let success = format!(
         "<tauqe_edits_{m} summary=\"Fix value\">\n<edit_{m} path=\"src.rs\">\n<search_{m}>\npub fn value() -> i32 {{ 0 }}\n</search_{m}>\n<replace_{m}>\npub fn value() -> i32 {{ 9 }}\n</replace_{m}>\n</edit_{m}>\n<success_{m} summary=\"done\" />\n</tauqe_edits_{m}>",
         m = marker
@@ -2878,13 +3141,12 @@ async fn test_plan_batch_starts_ladder_from_the_selected_coder_tier() {
     let mut config = tauqe_core::config::AppConfig::default();
     config.develop.workflow = tauqe_protocol::WorkflowKind::Naive;
     config.develop.protocol = tauqe_protocol::EditProtocolKind::Xml;
-    config.develop.max_retries = 2;
     config.models.auto_level_up = true;
     config.models.primary = vec![tauqe_protocol::ModelRef::openrouter("coder/one").into()];
     config.models.coder = Some(vec![
-        tauqe_protocol::ModelEntry::new(tauqe_protocol::ModelRef::openrouter("coder/one"), None),
-        tauqe_protocol::ModelEntry::new(tauqe_protocol::ModelRef::openrouter("coder/mid"), None),
-        tauqe_protocol::ModelEntry::new(tauqe_protocol::ModelRef::openrouter("coder/strong"), None),
+        tier_with_attempts("coder/one", 1),
+        tier_with_attempts("coder/mid", 1),
+        tier_with_attempts("coder/strong", 1),
     ]);
 
     let state = test_state_with_provider(&dir, config, provider.clone()).await;
@@ -2944,14 +3206,15 @@ async fn test_plan_batch_selected_coder_rung_completes_on_the_first_attempt() {
     let mut item = test_item("1", PlanItemStatus::Todo);
     item.title = "Step 1".to_string();
     item.files = vec!["src.rs".to_string()];
-    let plan = Plan {
-        id: "mid-tier-plan".to_string(),
-        title: "Mid Tier Plan".to_string(),
-        created_at: 1,
-        updated_at: 1,
-        items: vec![item],
-        ..Default::default()
-    };
+    let plan = Plan::from_parts(
+        "mid-tier-plan".to_string(),
+        "Mid Tier Plan".to_string(),
+        None,
+        1,
+        1,
+        Vec::new(),
+        vec![item],
+    );
     PlanStorage::save_plan(dir.path(), &plan).unwrap();
 
     let marker = "MIDTIERPLAN1";
@@ -3018,8 +3281,8 @@ async fn test_plan_batch_selected_coder_rung_completes_on_the_first_attempt() {
 
 /// A step the developer starts manually on a coder model excluded from the
 /// automatic ladder (`level_up = false`) runs on exactly that model and fails
-/// terminally: the ladder is already saturated, so the failing attempt is never
-/// retried and no stronger tier is entered.
+/// terminally: the ladder is already saturated, so the whole tier budget is
+/// spent on that rung and no stronger tier is ever entered.
 #[tokio::test]
 async fn test_plan_batch_manual_excluded_coder_ends_without_escalation() {
     let dir = TestDir::new();
@@ -3031,26 +3294,28 @@ async fn test_plan_batch_manual_excluded_coder_ends_without_escalation() {
     let mut item = test_item("1", PlanItemStatus::Todo);
     item.title = "Step 1".to_string();
     item.files = vec!["src.rs".to_string()];
-    let plan = Plan {
-        id: "manual-saturated".to_string(),
-        title: "Manual Saturated".to_string(),
-        created_at: 1,
-        updated_at: 1,
-        items: vec![item],
-        ..Default::default()
-    };
+    let plan = Plan::from_parts(
+        "manual-saturated".to_string(),
+        "Manual Saturated".to_string(),
+        None,
+        1,
+        1,
+        Vec::new(),
+        vec![item],
+    );
     PlanStorage::save_plan(dir.path(), &plan).unwrap();
 
-    // The turn answers without a change set, so the step cannot complete and the
-    // harness would otherwise look for a stronger coder tier.
-    let mock_provider = Arc::new(MockLlmProvider::scripted([MockResponse::text(
-        "The step looks complete.",
-    )]));
+    // Every attempt answers without a change set, so the step can never
+    // complete: the whole default tier budget is spent on the manual rung.
+    let mock_provider = Arc::new(MockLlmProvider::scripted([
+        MockResponse::text("The step looks complete."),
+        MockResponse::text("The step looks complete."),
+        MockResponse::text("The step looks complete."),
+    ]));
 
     let mut config = tauqe_core::config::AppConfig::default();
     config.develop.workflow = tauqe_protocol::WorkflowKind::Naive;
     config.develop.protocol = tauqe_protocol::EditProtocolKind::Xml;
-    config.develop.max_retries = 3;
     config.models.auto_level_up = true;
     config.models.primary = vec![tauqe_protocol::ModelRef::openrouter("coder/one").into()];
     let manual_model = tauqe_protocol::ModelRef::openrouter("coder/manual");
@@ -3104,16 +3369,17 @@ async fn test_plan_batch_manual_excluded_coder_ends_without_escalation() {
         }
         other => panic!("Expected a failed outcome without escalation, got {other:?}"),
     }
-
-    // The manual rung ran the step exactly once: a saturated ladder never repeats
-    // the failing attempt on another model.
+    // The manual rung spends the whole default tier budget: three attempts, all
+    // on the excluded model, and never another rung.
     let requests = mock_provider.requests();
     assert_eq!(
         requests.len(),
-        1,
-        "a saturated ladder must not retry the step"
+        3,
+        "a saturated ladder spends the tier budget and never retries on another model"
     );
-    assert_eq!(requests[0].model, "coder/manual");
+    assert!(requests
+        .iter()
+        .all(|request| request.model == "coder/manual"));
 
     let mut emitted = Vec::new();
     while let Ok(raw) = rx.try_recv() {
@@ -3134,4 +3400,372 @@ async fn test_plan_batch_manual_excluded_coder_ends_without_escalation() {
         reloaded.find_item("1").unwrap().status,
         PlanItemStatus::Todo
     );
+}
+
+/// A content failure that stays inside the tier budget retries the very model
+/// the step already runs on: the ladder is consulted only once the whole budget
+/// of the current tier is spent, so one unverified answer never promotes it.
+#[tokio::test]
+async fn test_plan_batch_retries_the_same_tier_within_the_attempt_budget() {
+    let dir = TestDir::new();
+    tauqe_core::git::init_repository(Some(dir.path()), true).unwrap();
+    std::fs::write(dir.path().join("src.rs"), "pub fn value() -> i32 { 0 }\n").unwrap();
+    tauqe_core::git::cmd::stage_files(dir.path(), &["src.rs".to_string()]).unwrap();
+    tauqe_core::git::cmd::commit_with_developer_author(dir.path(), "Initial", false).unwrap();
+
+    let mut item = test_item("1", PlanItemStatus::Todo);
+    item.title = "Step 1".to_string();
+    item.files = vec!["src.rs".to_string()];
+    let plan = Plan::from_parts(
+        "same-tier".to_string(),
+        "Same Tier".to_string(),
+        None,
+        1,
+        1,
+        Vec::new(),
+        vec![item],
+    );
+    PlanStorage::save_plan(dir.path(), &plan).unwrap();
+
+    let marker = "SAMETIERM1";
+    // Round 1 answers without a change set, so the step spends one attempt and
+    // retries the same tier. Round 2 applies the edit and completes.
+    let success = format!(
+        "<tauqe_edits_{m} summary=\"Fix value\">\n<edit_{m} path=\"src.rs\">\n<search_{m}>\npub fn value() -> i32 {{ 0 }}\n</search_{m}>\n<replace_{m}>\npub fn value() -> i32 {{ 11 }}\n</replace_{m}>\n</edit_{m}>\n<success_{m} summary=\"done\" />\n</tauqe_edits_{m}>",
+        m = marker
+    );
+    let mock_provider = Arc::new(MockLlmProvider::scripted([
+        MockResponse::text("The step looks complete."),
+        MockResponse::text(success),
+    ]));
+
+    let mut config = tauqe_core::config::AppConfig::default();
+    config.develop.workflow = tauqe_protocol::WorkflowKind::Naive;
+    config.develop.protocol = tauqe_protocol::EditProtocolKind::Xml;
+    config.models.auto_level_up = true;
+    config.models.primary = vec![tauqe_protocol::ModelRef::openrouter("coder/one").into()];
+    config.models.coder = Some(vec![
+        tauqe_protocol::ModelEntry::new(tauqe_protocol::ModelRef::openrouter("coder/one"), None),
+        tauqe_protocol::ModelEntry::new(tauqe_protocol::ModelRef::openrouter("coder/strong"), None),
+    ]);
+
+    let (out, mut rx) = OutChannel::new();
+    let (hist_tx, _hist_rx) = tokio::sync::mpsc::unbounded_channel();
+    let state = AppState::new(config, dir.path().to_path_buf(), hist_tx, out);
+    let provider: Arc<dyn tauqe_core::providers::LlmProvider> = mock_provider.clone();
+    *state.provider_override.lock().await = Some(provider);
+    *state.marker_override.lock().await = Some(marker.to_string());
+
+    let operation = Arc::new(
+        state
+            .try_begin_operation()
+            .expect("register batch operation"),
+    );
+    let outcome = run_plan_batch(
+        &state,
+        "same-tier",
+        vec!["1".to_string()],
+        operation,
+        PlanBatchOptions::default(),
+    )
+    .await;
+    assert_eq!(outcome, BatchOutcome::Completed { steps: 1 });
+
+    // Both attempts run on the tier the step started on: the budget is not yet
+    // spent, so the ladder is never consulted.
+    let requests = mock_provider.requests();
+    assert_eq!(requests.len(), 2);
+    assert!(requests.iter().all(|request| request.model == "coder/one"));
+
+    let mut emitted = Vec::new();
+    while let Ok(raw) = rx.try_recv() {
+        emitted.push(raw);
+    }
+    assert!(
+        !emitted
+            .iter()
+            .any(|event| event.contains(events::MODEL_ESCALATED)),
+        "the same tier must be retried without an escalation event: {emitted:?}"
+    );
+
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("src.rs")).unwrap(),
+        "pub fn value() -> i32 { 11 }\n"
+    );
+    let reloaded = PlanStorage::load_plan(dir.path(), "same-tier")
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        reloaded.find_item("1").unwrap().status,
+        PlanItemStatus::Done
+    );
+}
+
+/// A transport failure produces no model result, so it is neutral to the tier
+/// budget: the step ends on the original cause without spending an attempt,
+/// consulting the ladder, or retrying another model.
+#[tokio::test]
+async fn test_plan_batch_transport_failure_ends_without_spending_an_attempt() {
+    let dir = TestDir::new();
+    tauqe_core::git::init_repository(Some(dir.path()), true).unwrap();
+    std::fs::write(dir.path().join("src.rs"), "pub fn value() -> i32 { 0 }\n").unwrap();
+    tauqe_core::git::cmd::stage_files(dir.path(), &["src.rs".to_string()]).unwrap();
+    tauqe_core::git::cmd::commit_with_developer_author(dir.path(), "Initial", false).unwrap();
+
+    let mut item = test_item("1", PlanItemStatus::Todo);
+    item.title = "Step 1".to_string();
+    item.files = vec!["src.rs".to_string()];
+    let plan = Plan::from_parts(
+        "transport-failure".to_string(),
+        "Transport Failure".to_string(),
+        None,
+        1,
+        1,
+        Vec::new(),
+        vec![item],
+    );
+    PlanStorage::save_plan(dir.path(), &plan).unwrap();
+
+    // The upstream breaks before any model content arrives; a single round is
+    // scripted, so a retry would exhaust the script instead of passing.
+    let mock_provider = Arc::new(MockLlmProvider::scripted([MockResponse::error(
+        "OpenRouter HTTP error 503: upstream unavailable",
+    )]));
+
+    let mut config = tauqe_core::config::AppConfig::default();
+    config.develop.workflow = tauqe_protocol::WorkflowKind::Naive;
+    config.develop.protocol = tauqe_protocol::EditProtocolKind::Xml;
+    config.models.auto_level_up = true;
+    config.models.primary = vec![tauqe_protocol::ModelRef::openrouter("coder/one").into()];
+    config.models.coder = Some(vec![
+        tauqe_protocol::ModelEntry::new(tauqe_protocol::ModelRef::openrouter("coder/one"), None),
+        tauqe_protocol::ModelEntry::new(tauqe_protocol::ModelRef::openrouter("coder/strong"), None),
+    ]);
+
+    let (out, mut rx) = OutChannel::new();
+    let (hist_tx, _hist_rx) = tokio::sync::mpsc::unbounded_channel();
+    let state = AppState::new(config, dir.path().to_path_buf(), hist_tx, out);
+    let provider: Arc<dyn tauqe_core::providers::LlmProvider> = mock_provider.clone();
+    *state.provider_override.lock().await = Some(provider);
+
+    let operation = Arc::new(
+        state
+            .try_begin_operation()
+            .expect("register batch operation"),
+    );
+    let outcome = run_plan_batch(
+        &state,
+        "transport-failure",
+        vec!["1".to_string()],
+        operation,
+        PlanBatchOptions::default(),
+    )
+    .await;
+
+    match outcome {
+        BatchOutcome::Failed {
+            completed,
+            step_id,
+            reason,
+        } => {
+            assert_eq!(completed, 0);
+            assert_eq!(step_id, "1");
+            assert!(
+                reason.contains("503"),
+                "the original transport cause must survive: {reason}"
+            );
+        }
+        other => panic!("Expected a failed outcome on a transport failure, got {other:?}"),
+    }
+
+    // A transport failure is never retried and never promotes the model.
+    let requests = mock_provider.requests();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].model, "coder/one");
+
+    let mut emitted = Vec::new();
+    while let Ok(raw) = rx.try_recv() {
+        emitted.push(raw);
+    }
+    assert!(
+        !emitted
+            .iter()
+            .any(|event| event.contains(events::MODEL_ESCALATED)),
+        "a transport failure must not escalate the model: {emitted:?}"
+    );
+
+    // The step returns to TODO and the working tree stays untouched.
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("src.rs")).unwrap(),
+        "pub fn value() -> i32 { 0 }\n"
+    );
+    let reloaded = PlanStorage::load_plan(dir.path(), "transport-failure")
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        reloaded.find_item("1").unwrap().status,
+        PlanItemStatus::Todo
+    );
+}
+
+/// Provider double whose streams park forever, ignoring the cancellation
+/// watch entirely.
+///
+/// It reproduces a provider wedged in a non-cooperative stretch — exactly the
+/// situation the force-termination machinery exists for: the entry signal
+/// proves the stream started, and `pending` keeps the workflow task running
+/// until the sanctioned abort path tears it down.
+struct ParkingProvider {
+    /// Signals that a stream call was entered.
+    entered: tokio::sync::mpsc::UnboundedSender<()>,
+}
+
+#[async_trait::async_trait]
+impl tauqe_core::providers::LlmProvider for ParkingProvider {
+    fn kind(&self) -> tauqe_protocol::ProviderKind {
+        tauqe_protocol::ProviderKind::OpenRouter
+    }
+
+    async fn stream_chat(
+        &self,
+        _model: &str,
+        _messages: Vec<tauqe_core::providers::ChatMessage>,
+        _response_format: Option<tauqe_core::providers::ResponseFormat>,
+        _tx: tokio::sync::mpsc::Sender<tauqe_core::providers::StreamEvent>,
+        _cancel_rx: tokio::sync::watch::Receiver<bool>,
+    ) -> anyhow::Result<()> {
+        let _ = self.entered.send(());
+        std::future::pending::<()>().await;
+        Ok(())
+    }
+}
+
+/// A hard cancel never abandons the step task a batch has already spawned.
+///
+/// The supervisor awaits its queue cooperatively instead of dropping it, so a
+/// step parked in a provider that ignores the cancel watch keeps the
+/// operation slot registered — together with the abort handle its turn
+/// installed — until the sanctioned force-termination path aborts it. Only
+/// then does the batch report its cancelled outcome, release the slot, and
+/// leave the session lock free for the next turn.
+#[tokio::test]
+async fn test_plan_batch_hard_cancel_never_abandons_the_step_task() {
+    let dir = TestDir::new();
+    tauqe_core::git::init_repository(Some(dir.path()), true).unwrap();
+    std::fs::write(dir.path().join("src.rs"), "pub fn value() -> i32 { 0 }\n").unwrap();
+    tauqe_core::git::cmd::stage_files(dir.path(), &["src.rs".to_string()]).unwrap();
+    tauqe_core::git::cmd::commit_with_developer_author(dir.path(), "Initial", false).unwrap();
+
+    let mut item = test_item("1", PlanItemStatus::Todo);
+    item.title = "Step 1".to_string();
+    item.files = vec!["src.rs".to_string()];
+    let plan = Plan::from_parts(
+        "hard-cancel".to_string(),
+        "Hard Cancel".to_string(),
+        None,
+        1,
+        1,
+        Vec::new(),
+        vec![item],
+    );
+    PlanStorage::save_plan(dir.path(), &plan).unwrap();
+
+    let (entered_tx, mut entered_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
+    let provider: Arc<dyn tauqe_core::providers::LlmProvider> = Arc::new(ParkingProvider {
+        entered: entered_tx,
+    });
+
+    let mut config = tauqe_core::config::AppConfig::default();
+    config.develop.workflow = tauqe_protocol::WorkflowKind::Naive;
+    config.develop.protocol = tauqe_protocol::EditProtocolKind::Xml;
+    // A hard cancel is classified in the turn-classification branch, before the
+    // tier budget is consulted: the raised cancel signal ends the step as
+    // cancelled instead of spending an attempt on the aborted turn.
+    config.models.auto_level_up = false;
+    let state = test_state_with_provider(&dir, config, provider).await;
+
+    let operation = Arc::new(
+        state
+            .try_begin_operation()
+            .expect("register batch operation"),
+    );
+    let op_id = operation.id();
+
+    let state_for_batch = Arc::clone(&state);
+    let batch = tokio::spawn(async move {
+        run_plan_batch(
+            &state_for_batch,
+            "hard-cancel",
+            vec!["1".to_string()],
+            operation,
+            PlanBatchOptions::default(),
+        )
+        .await
+    });
+
+    // The step is demonstrably in flight: its turn reached the parked
+    // provider and ignores the cancellation watch.
+    tokio::time::timeout(std::time::Duration::from_secs(10), entered_rx.recv())
+        .await
+        .expect("the step turn must reach the provider")
+        .expect("the provider signals that its stream was entered");
+
+    // A hard cancel is delivered while the step task is parked. The
+    // supervisor must not resolve the queue by dropping it: the slot stays
+    // registered together with the abort handle, so the force-termination
+    // machinery can still reach the task.
+    state.hard_cancel_active_operation();
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    assert!(
+        state.is_operation_active(),
+        "the slot must stay registered while the parked step task still runs"
+    );
+
+    // The sanctioned force-termination path makes the parked task exit; the
+    // batch then reports its cancelled outcome.
+    state.abort_stalled_operation(op_id).await;
+    let outcome = tokio::time::timeout(std::time::Duration::from_secs(10), batch)
+        .await
+        .expect("the cancelled batch must resolve once its step task exited")
+        .expect("the batch task joins");
+    assert_eq!(outcome, BatchOutcome::Cancelled { completed: 0 });
+
+    let mut released = false;
+    for _ in 0..1000 {
+        if !state.is_operation_active() {
+            released = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert!(
+        released,
+        "the cancelled batch must release the operation slot"
+    );
+
+    // The interrupted step returned to TODO so the developer can retry it.
+    let reloaded = PlanStorage::load_plan(dir.path(), "hard-cancel")
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        reloaded.find_item("1").unwrap().status,
+        PlanItemStatus::Todo
+    );
+
+    // The exited step task no longer holds the session lock: a subsequent
+    // interactive turn reaches the provider within a bounded timeout instead
+    // of blocking indefinitely behind the abandoned step.
+    crate::handlers::model::start_model_turn(
+        &state,
+        "Probe the session lock".to_string(),
+        tauqe_protocol::TurnIntent::InteractiveRepl,
+        None,
+        None,
+    )
+    .await
+    .expect("the probe turn starts once the operation slot is free");
+    tokio::time::timeout(std::time::Duration::from_secs(10), entered_rx.recv())
+        .await
+        .expect("the probe turn must acquire the session lock and reach the provider")
+        .expect("the provider signals that its probe stream was entered");
 }

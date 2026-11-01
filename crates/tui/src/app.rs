@@ -7,6 +7,7 @@ use tauqe_protocol::{
 use crate::components::model_selector::ModelSelector;
 use crate::components::ListSelector;
 use crate::config::TuiConfig;
+use crate::dialogs::pattern::PatternMatchMemo;
 use crate::editor::InputEditor;
 use crate::i18n::{active_t, I18nEngine};
 use crate::theme::presets::ThemePreset;
@@ -15,7 +16,7 @@ use crate::ui::HitRegistry;
 use crate::views::context::ContextViewState;
 use crate::views::history::HistoryViewState;
 use crate::views::plans::{PlansViewState, RefineDialogFocus};
-use crate::views::repl::{ReplView, StreamingFileEdit, TurnStatus};
+use crate::views::repl::{ReplView, TurnStatus};
 use crate::views::review::ReviewViewState;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -519,7 +520,7 @@ pub struct ConfirmExecuteReviewState {
     pub group_title: String,
     pub scope_title: String,
     pub item_id: Option<u32>,
-    /// Concrete subplan step targeted by point execution, when the developer
+    /// Concrete implementation step targeted by point execution, when the developer
     /// confirmed from a finding's step row or from one step of a group plan.
     pub step_id: Option<String>,
     pub items: Vec<tauqe_protocol::ReviewIssue>,
@@ -549,7 +550,7 @@ impl ConfirmExecuteReviewState {
     ///
     /// One constructor serves both shapes: point execution (one finding or one
     /// subplan step, which exposes the Coder selector and the directives editor)
-    /// and the batch queue, so the state definition cannot drift between them
+    /// implementation step, which exposes the Coder selector and the directives editor)
     /// (concept #c-3).
     pub fn new(
         review_id: Option<String>,
@@ -648,6 +649,39 @@ pub enum PromptModalTarget {
         plan_title: String,
         focused_items: Vec<(String, String)>,
     },
+    /// Dialogue anchored on one review group.
+    ///
+    /// A group is the operational unit of remediation: its findings manifest one
+    /// shared root cause and its blocker belongs to the group itself, so the
+    /// dialogue addresses the group as one entity instead of restating its
+    /// symptoms one by one (c-3).
+    ReviewGroup {
+        /// Session that declares the group.
+        session_id: String,
+        /// Identifier of the group inside that session.
+        group_id: String,
+        /// Display title of the group, captured when the dialogue opens.
+        group_title: String,
+        /// Reason the unified plan of the group currently cannot proceed.
+        blocked_reason: Option<String>,
+        /// Whether the dialogue analyses the cause or records the decision.
+        purpose: GroupDialoguePurpose,
+    },
+}
+
+/// Intent of the dialogue anchored on one review group.
+///
+/// Both forms travel through the group dialogue, because the structured
+/// `review_update` payload it produces is the only sanctioned wire path that
+/// settles a group: the harness clears the blocker, records the resolution on
+/// the group, and moves the group to the decided status in one atomic write
+/// (c-3, c-4).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GroupDialoguePurpose {
+    /// Reason about the shared root cause without recording a decision.
+    Discuss,
+    /// Record the decision that settles the group and clears its blocker.
+    Resolve,
 }
 
 #[derive(Debug, Clone)]
@@ -796,24 +830,35 @@ impl DiffInspectorFocus {
     }
 }
 
-/// Live view of the change set a developer audits in the fullscreen inspector.
+/// Live reading position of the fullscreen inspector over the staged change set.
 ///
-/// The inspector is a reading surface, yet it never freezes a stale copy: every
-/// edit-stream event that mutates the staged file list refreshes it in place, so
-/// a file that is still streaming, retrying, or freshly verified reads the same
-/// in the audit as it does in the Viewport. The scroll offset belongs to the
-/// isolated diff pane alone, while the explicit focus states which pane answers
-/// to the vertical motion chords (c-2, c-3).
+/// The audit owns no payload: the staged change set has exactly one owner,
+/// `ReplView::files`, and the inspector reads that live slice in place. An
+/// edit-stream event therefore needs no refresh call and costs no copy, and a
+/// mirror can never drift from the Viewport it is meant to describe. The state
+/// keeps only what the reading position needs: the highlighted file, the scroll
+/// offset of the isolated diff pane, and the pane that owns the keyboard (c-2,
+/// c-3).
 pub struct DiffInspectorState {
-    /// Staged files of the audited turn, in Viewport order; refreshed by every
-    /// edit-stream event while the audit is open (c-3).
-    pub files: Vec<StreamingFileEdit>,
-    /// Index of the highlighted file inside [`Self::files`].
+    /// Index of the highlighted file inside the live staged set.
     pub selected_file: usize,
     /// Vertical scroll offset of the isolated diff read area.
     pub diff_scroll: u16,
     /// Pane that currently owns the keyboard.
     pub focus: DiffInspectorFocus,
+}
+
+impl DiffInspectorState {
+    /// Clamps the highlight into a staged set of `file_count` files.
+    ///
+    /// The set is owned by the view, so it can shrink while the audit is open:
+    /// a new turn releases it. The renderer applies this before drawing, so the
+    /// audit can never point past the set it reads (c-3).
+    pub fn clamp_selection(&mut self, file_count: usize) {
+        if self.selected_file >= file_count {
+            self.selected_file = file_count.saturating_sub(1);
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1111,7 +1156,15 @@ pub struct ReviewDialogState {
     /// never re-walks the whole file list to rebuild the prefix tree (c-5).
     pub path_directories: Vec<String>,
     /// Contextual directory completion of the active path row (c-5).
+    /// Contextual directory completion of the active path row (c-5).
     pub path_completion: PathCompletion,
+    /// Memoized union match count of the path rows (#47).
+    ///
+    /// The count derives from the row texts and the construction-fixed
+    /// `repo_files`; the selected preset short-circuits only
+    /// `is_pattern_launchable`, so the signature of the rows covers exactly the
+    /// mutable input and a served count can never be stale.
+    pattern_match_memo: PatternMatchMemo,
     pub prompt_editor: InputEditor,
     /// Section that currently owns the keyboard.
     pub focus: ReviewDialogFocus,
@@ -1144,6 +1197,7 @@ impl ReviewDialogState {
             path_active: 0,
             path_directories,
             path_completion: PathCompletion::default(),
+            pattern_match_memo: PatternMatchMemo::default(),
             prompt_editor: InputEditor::default(),
             focus: ReviewDialogFocus::default(),
             confirm_button: ConfirmDialogButton::Cancel,
@@ -1394,14 +1448,10 @@ impl ReviewDialogState {
         }
     }
 
-    /// Number of repository files the entered path rows select together.
-    ///
-    /// The rows form a union: a file is counted once no matter how many rows
-    /// select it. The value is always computed from the live row texts, so the
-    /// counter can never drift from what a launch would send: `None` means the
-    /// rows narrow nothing, `Some(0)` means they match nothing (c-6).
+    /// Memoized union match count of the path rows (#47).
     pub fn pattern_match_count(&self) -> Option<usize> {
-        crate::dialogs::pattern::count_multi_matches(&self.path_patterns(), &self.repo_files)
+        self.pattern_match_memo
+            .count_for(&self.path_patterns(), &self.repo_files)
     }
 
     /// Whether a launch may proceed with the entered path rows.
@@ -2914,7 +2964,6 @@ mod tests {
     fn test_diff_inspector_stacks_below_confirmations() {
         let mut st = test_state();
         st.diff_inspector = Some(DiffInspectorState {
-            files: Vec::new(),
             selected_file: 0,
             diff_scroll: 0,
             focus: DiffInspectorFocus::Files,
@@ -3431,6 +3480,47 @@ mod tests {
         assert!(!dialog.is_pattern_launchable());
     }
 
+    /// The union match count is memoized on a signature of the path rows: the
+    /// per-frame counter read, focus cycling, and selection changes re-serve the
+    /// stored count, and only a real row edit recomputes (#47).
+    #[test]
+    fn test_pattern_match_count_is_memoized_on_the_row_signature() {
+        let mut dialog =
+            review_dialog_with(&["src/lib.rs", "crates/tui/src/main.rs", "README.md"], 2)
+                .with_presets(vec![tauqe_protocol::ReviewPresetSummary {
+                    name: "backend".to_string(),
+                    title: None,
+                }]);
+
+        dialog.path_inputs[0].insert_str("*.rs");
+        assert_eq!(dialog.pattern_match_count(), Some(2));
+        assert_eq!(dialog.pattern_match_memo.computations(), 1);
+
+        // Focus cycling, the reviewer highlight, and a preset round trip leave
+        // the rows untouched, so every read re-serves the stored count without
+        // recompiling the globs or rescanning the repository file list (#47).
+        dialog.cycle_focus_next();
+        dialog.selector.select_next();
+        let preset_rows = dialog.preset_selector.item_count();
+        dialog.preset_selector.select_index(1, preset_rows);
+        dialog.preset_selector.select_index(0, preset_rows);
+        assert_eq!(dialog.pattern_match_count(), Some(2));
+        assert_eq!(dialog.pattern_match_memo.computations(), 1);
+
+        // A row edit changes the signature: `*.rsx` selects no repository file
+        // and the launch gate refuses the custom audit.
+        dialog.path_inputs[0].clear();
+        dialog.path_inputs[0].insert_str("*.rsx");
+        assert_eq!(dialog.pattern_match_count(), Some(0));
+        assert_eq!(dialog.pattern_match_memo.computations(), 2);
+        assert!(!dialog.is_pattern_launchable());
+
+        // A second row enlarges the union, and one recount serves both edits.
+        assert!(dialog.append_path_row());
+        dialog.path_inputs[1].insert_str("README.md");
+        assert_eq!(dialog.pattern_match_count(), Some(1));
+        assert_eq!(dialog.pattern_match_memo.computations(), 3);
+    }
     /// Typing narrows the repository directory completions of the active row and
     /// accepting one fills the row with the full prefix (c-5).
     #[test]

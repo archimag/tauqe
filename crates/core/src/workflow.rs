@@ -4,6 +4,7 @@ pub mod discovery;
 pub mod execution;
 pub mod fsm;
 pub mod git_policy;
+pub mod implementation;
 pub mod loops;
 pub mod policy;
 pub(crate) mod retry;

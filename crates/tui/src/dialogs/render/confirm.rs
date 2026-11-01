@@ -177,7 +177,7 @@ fn group_plan_steps(state: &AppState, review_id: Option<&str>, group_id: &str) -
                 .into_iter()
                 .find(|group| group.id == group_id)
         })
-        .map(|group| count_leaves(&group.subplan))
+        .map(|group| count_leaves(&group.implementation.items))
         .unwrap_or(0)
 }
 
@@ -506,15 +506,27 @@ fn plan_display_title(state: &AppState, plan_id: &str) -> String {
         .unwrap_or_else(|| plan_id.to_string())
 }
 
-/// Plan field shared by both plan-deletion confirmations:
-/// `Plan: <title> (<id>)`.
+/// Widest a model- or user-authored identifier may grow inside a confirmation
+/// body before it is truncated, matching the queue-row budgets of this file.
+///
+/// Truncation keeps a card compact; the wrapped-height budget of
+/// `confirm_modal_geometry` remains the correctness guarantee that no row clips,
+/// whatever the string length.
+const CONFIRM_FIELD_WIDTH: usize = 36;
+
+/// Plan field shared by both plan-deletion confirmations and both horizon
+/// confirmations: `Plan: <title> (<id>)`.
 fn delete_plan_line(state: &AppState, plan_id: &str) -> Line<'static> {
     let engine = current_engine();
     let palette = engine.palette();
     Line::from(vec![
         Span::raw(active_t("dialog.delete_plan.plan_label")),
         Span::styled(
-            format!("{} ({})", plan_display_title(state, plan_id), plan_id),
+            format!(
+                "{} ({})",
+                truncate_to_width(&plan_display_title(state, plan_id), CONFIRM_FIELD_WIDTH),
+                plan_id
+            ),
             engine.fg(palette.status_info).bold(),
         ),
     ])
@@ -681,7 +693,11 @@ pub fn delete_review_params<'a>(state: &'a AppState, session_id: &str) -> Confir
         Line::from(vec![
             Span::raw(active_t("dialog.delete_review.review_label")),
             Span::styled(
-                format!("{} ({})", review_title, session_id),
+                format!(
+                    "{} ({})",
+                    truncate_to_width(&review_title, CONFIRM_FIELD_WIDTH),
+                    session_id
+                ),
                 engine.fg(palette.status_info).bold(),
             ),
         ]),
@@ -884,7 +900,10 @@ pub fn remove_context_file_params(state: &AppState) -> Option<ConfirmModalParams
                 active_t("dialog.remove_context_file.file_label"),
                 engine.fg(palette.text_muted),
             ),
-            Span::styled(path, engine.fg(palette.status_info).bold()),
+            Span::styled(
+                truncate_to_width(path, CONFIRM_FIELD_WIDTH),
+                engine.fg(palette.status_info).bold(),
+            ),
         ]),
         Line::from(Span::styled(
             active_t("dialog.remove_context_file.note"),
@@ -953,19 +972,6 @@ const CLEAR_HORIZON_WIDTH: u16 = 62;
 /// Width of the two-tier clear-horizon confirmation.
 const CLEAR_HORIZON_FINAL_WIDTH: u16 = 64;
 
-/// Plan field of both clear-horizon confirmations: `Plan: <title> (<id>)`.
-fn clear_horizon_plan_line(state: &AppState, plan_id: &str) -> Line<'static> {
-    let engine = current_engine();
-    let palette = engine.palette();
-    Line::from(vec![
-        Span::raw(active_t("dialog.delete_plan.plan_label")),
-        Span::styled(
-            format!("{} ({})", plan_display_title(state, plan_id), plan_id),
-            engine.fg(palette.status_info).bold(),
-        ),
-    ])
-}
-
 /// Presentation parameters for the first tier of the clear-horizon confirmation.
 ///
 /// The first tier states what survives the reset: only the implementation steps
@@ -982,7 +988,7 @@ pub fn clear_horizon_params<'a>(state: &'a AppState, plan_id: &str) -> ConfirmMo
             engine.fg(palette.status_warning).bold(),
         )),
         Line::raw(""),
-        clear_horizon_plan_line(state, plan_id),
+        delete_plan_line(state, plan_id),
         Line::from(Span::styled(
             active_t("dialog.clear_horizon.note"),
             engine.fg(palette.text_secondary),
@@ -1020,7 +1026,7 @@ pub fn clear_horizon_final_params<'a>(
             engine.fg(palette.status_error).bold(),
         )),
         Line::raw(""),
-        clear_horizon_plan_line(state, plan_id),
+        delete_plan_line(state, plan_id),
         Line::from(Span::styled(
             active_t("dialog.clear_horizon_final.git_note"),
             engine.fg(palette.status_warning).bold(),
@@ -1227,18 +1233,18 @@ mod tests {
             destructive: true,
             width: 66,
         };
-        let body_count = params.body_lines.len();
-
-        let mut terminal = Terminal::new(TestBackend::new(term.width, term.height)).unwrap();
-        terminal.draw(|f| render_modal_confirm(f, params)).unwrap();
-
+        // The geometry is derived from the very body the renderer draws, so the
+        // budget and the drawn rows are one artifact (Conventions §1.3, §6.7).
         let geom = crate::components::confirm::confirm_modal_geometry(
             term,
             66,
-            body_count,
+            &params.body_lines,
             "Resolve (Enter)",
             "Cancel (Esc)",
         );
+
+        let mut terminal = Terminal::new(TestBackend::new(term.width, term.height)).unwrap();
+        terminal.draw(|f| render_modal_confirm(f, params)).unwrap();
         let buffer = terminal.backend().buffer();
 
         let confirm_text: String = (geom.confirm_button.x
@@ -1295,15 +1301,18 @@ mod tests {
     #[test]
     fn test_delete_plan_params_report_unfinished_work() {
         let mut st = crate::app::test_state();
-        st.plans_view.plans = vec![tauqe_protocol::Plan {
-            id: "plan-open".to_string(),
-            title: "Open Plan".to_string(),
-            items: vec![
+        st.plans_view.plans = vec![tauqe_protocol::Plan::from_parts(
+            "plan-open".to_string(),
+            "Open Plan".to_string(),
+            None,
+            0,
+            0,
+            vec![],
+            vec![
                 plan_item("1", "Done step", tauqe_protocol::PlanItemStatus::Done),
                 plan_item("2", "Todo step", tauqe_protocol::PlanItemStatus::Todo),
             ],
-            ..Default::default()
-        }];
+        )];
 
         let params = delete_plan_params(&st, "plan-open");
         assert_eq!(params.title, "Delete Plan");
@@ -1337,10 +1346,14 @@ mod tests {
     #[test]
     fn test_delete_plan_final_params_are_dangerous() {
         let mut st = crate::app::test_state();
-        st.plans_view.plans = vec![tauqe_protocol::Plan {
-            id: "plan-wip".to_string(),
-            title: "Work In Progress".to_string(),
-            items: vec![
+        st.plans_view.plans = vec![tauqe_protocol::Plan::from_parts(
+            "plan-wip".to_string(),
+            "Work In Progress".to_string(),
+            None,
+            0,
+            0,
+            vec![],
+            vec![
                 plan_item("1", "Done step", tauqe_protocol::PlanItemStatus::Done),
                 plan_item(
                     "2",
@@ -1348,8 +1361,7 @@ mod tests {
                     tauqe_protocol::PlanItemStatus::InProgress,
                 ),
             ],
-            ..Default::default()
-        }];
+        )];
 
         let params = delete_plan_final_params(&st, "plan-wip");
         assert_eq!(params.title, "Confirm Deleting Active Plan");
@@ -1379,16 +1391,19 @@ mod tests {
     fn delete_plan_buttons_match_hit_geometry() {
         let term = Rect::new(0, 0, 100, 40);
         let mut st = crate::app::test_state();
-        st.plans_view.plans = vec![tauqe_protocol::Plan {
-            id: "plan-geom".to_string(),
-            title: "Geometry Plan".to_string(),
-            items: vec![plan_item(
+        st.plans_view.plans = vec![tauqe_protocol::Plan::from_parts(
+            "plan-geom".to_string(),
+            "Geometry Plan".to_string(),
+            None,
+            0,
+            0,
+            vec![],
+            vec![plan_item(
                 "1",
                 "Todo step",
                 tauqe_protocol::PlanItemStatus::Todo,
             )],
-            ..Default::default()
-        }];
+        )];
 
         let cases = [
             (delete_plan_params(&st, "plan-geom"), DELETE_PLAN_WIDTH),
@@ -1401,17 +1416,17 @@ mod tests {
         for (params, width) in cases {
             let confirm_label = params.confirm_label.clone();
             let cancel_label = params.cancel_label.clone();
-            let body_count = params.body_lines.len();
-            let mut terminal = Terminal::new(TestBackend::new(term.width, term.height)).unwrap();
-            terminal.draw(|f| render_modal_confirm(f, params)).unwrap();
-
+            // The geometry is derived from the body and the labels the renderer
+            // receives, so the drawn buttons and the clickable buttons coincide.
             let geom = crate::components::confirm::confirm_modal_geometry(
                 term,
                 width,
-                body_count,
+                &params.body_lines,
                 &confirm_label,
                 &cancel_label,
             );
+            let mut terminal = Terminal::new(TestBackend::new(term.width, term.height)).unwrap();
+            terminal.draw(|f| render_modal_confirm(f, params)).unwrap();
             let buffer = terminal.backend().buffer();
             let read = |rect: Rect| -> String {
                 (rect.x..rect.x + rect.width)
@@ -1497,17 +1512,15 @@ mod tests {
         ];
 
         for (params, confirm_label, width) in cases {
-            let body_count = params.body_lines.len();
-            let mut terminal = Terminal::new(TestBackend::new(term.width, term.height)).unwrap();
-            terminal.draw(|f| render_modal_confirm(f, params)).unwrap();
-
             let geom = crate::components::confirm::confirm_modal_geometry(
                 term,
                 width,
-                body_count,
+                &params.body_lines,
                 confirm_label,
                 "Cancel",
             );
+            let mut terminal = Terminal::new(TestBackend::new(term.width, term.height)).unwrap();
+            terminal.draw(|f| render_modal_confirm(f, params)).unwrap();
             let buffer = terminal.backend().buffer();
             let read = |rect: Rect| -> String {
                 (rect.x..rect.x + rect.width)
@@ -1646,7 +1659,10 @@ mod tests {
             groups: vec![tauqe_protocol::ReviewGroup {
                 id: group_id.to_string(),
                 title: "Unified auth guard".to_string(),
-                subplan,
+                implementation: tauqe_protocol::PlanImplementation {
+                    items: subplan,
+                    ..Default::default()
+                },
                 ..Default::default()
             }],
             ..Default::default()
@@ -1771,5 +1787,81 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
         assert!(joined.contains("Finding 1"), "{joined}");
+    }
+    /// A model- or user-authored string can push a body line past the card's
+    /// inner width, so the body occupies more visual rows than it has logical
+    /// lines. The wrapped budget must keep every one of those rows inside the
+    /// card — most importantly the trailing consent line (§5.4, §6.7).
+    #[test]
+    fn wrapped_body_keeps_the_trailing_note_inside_the_card() {
+        // A terminal height that divides 100 exactly keeps the percentage split
+        // lossless, so the assertions measure the budget rather than the
+        // rounding of `centered_rect`.
+        let term = Rect::new(0, 0, 60, 50);
+        let mut st = crate::app::test_state();
+        st.plans_view.plans = vec![tauqe_protocol::Plan::from_parts(
+            "plan-long-title".to_string(),
+            "W".repeat(400),
+            None,
+            0,
+            0,
+            vec![],
+            vec![plan_item(
+                "1",
+                "Todo step",
+                tauqe_protocol::PlanItemStatus::Todo,
+            )],
+        )];
+
+        let params = delete_plan_params(&st, "plan-long-title");
+        let note = params
+            .body_lines
+            .last()
+            .map(|line| line.to_string())
+            .expect("the card carries a trailing note");
+        let geom = crate::components::confirm::confirm_modal_geometry(
+            term,
+            params.width,
+            &params.body_lines,
+            &params.confirm_label,
+            &params.cancel_label,
+        );
+
+        let body = crate::components::modal::modal_geometry(geom.area).body;
+        let rows: usize = params
+            .body_lines
+            .iter()
+            .map(|line| crate::ui::wrap_line(line.clone(), usize::from(body.width)).len())
+            .sum();
+        assert!(
+            usize::from(body.height) >= rows,
+            "the card reserves {} rows for {rows} wrapped rows",
+            body.height
+        );
+
+        let mut terminal = Terminal::new(TestBackend::new(term.width, term.height)).unwrap();
+        terminal.draw(|f| render_modal_confirm(f, params)).unwrap();
+
+        let buffer = terminal.backend().buffer();
+        let card: String = (geom.area.y..geom.area.bottom())
+            .map(|row| {
+                (geom.area.x..geom.area.right())
+                    .map(|column| buffer[(column, row)].symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let tail: String = note
+            .chars()
+            .rev()
+            .take(12)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect();
+        assert!(
+            card.contains(&tail),
+            "the trailing note must stay inside the card, tail {tail:?}:\n{card}"
+        );
     }
 }

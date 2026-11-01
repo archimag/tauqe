@@ -13,7 +13,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::context::ContextAccess;
-use crate::discussion::{DiscussionPlanAction, DiscussionPlanUpdate};
+use crate::discussion::{normalize_repo_map_path, DiscussionPlanAction, DiscussionPlanUpdate};
 use crate::edit::EditOperation;
 
 pub mod capability;
@@ -43,7 +43,21 @@ pub enum LlmCommand {
     /// A request to add a file to the context at a given access level.
     ContextRequest { path: String, access: ContextAccess },
     /// A search request across repository files using Rust/ripgrep regex.
-    RepoSearch { path: String, regex: String },
+    ///
+    /// `path` is repository-relative and confines the search to that subtree;
+    /// an empty path names the whole repository. The serde boundary
+    /// normalizes a benign spelling such as `./src` to `src` and rejects a
+    /// spelling that escapes the repository, because an enum variant cannot
+    /// silently drop itself: a malformed search surfaces as a decode failure
+    /// instead of reaching the engine. A programmatic producer hands over an
+    /// already-normalized path, and the engine still confines the path at
+    /// execution, exactly as
+    /// [`normalize_repo_path`](crate::edit::normalize_repo_path) documents.
+    RepoSearch {
+        #[serde(deserialize_with = "deserialize_repo_search_command_path")]
+        path: String,
+        regex: String,
+    },
     /// A request for the compact repository directory tree.
     RepoDirs,
     /// A request for the targeted symbol map of one subdirectory.
@@ -59,7 +73,14 @@ pub enum LlmCommand {
     /// keeping the default request shallow.
     DirList { path: String, recursive: bool },
     /// A request for system documentation by topic.
-    DocRequest { topic: DocTopic },
+    ///
+    /// The topic may be omitted: a `doc_request` payload without one decodes
+    /// to [`DocTopic::All`], so the documented missing-topic fallback holds on
+    /// this boundary as well.
+    DocRequest {
+        #[serde(default)]
+        topic: DocTopic,
+    },
     /// A request to run deterministic toolchain verification.
     Verify {
         target: VerifyTarget,
@@ -67,6 +88,15 @@ pub enum LlmCommand {
     },
     /// A plan creation or modification payload.
     Plan { update: DiscussionPlanUpdate },
+    /// A decision recorded for one finding of a review session.
+    ///
+    /// A review decision is authorized by the dialogue anchor rather than by a
+    /// capability module: only a dialogue anchored on a review session may
+    /// record one, so the harness applies it against the session the turn names
+    /// and never against whichever session happens to be active.
+    ReviewUpdate {
+        update: crate::review::ReviewUpdateProposal,
+    },
     /// Ephemeral working-memory notes.
     Scratchpad { notes: String },
     /// Explicit terminal outcome of a turn.
@@ -101,7 +131,8 @@ pub enum LlmCommand {
 
 impl LlmCommand {
     /// Capability that this command realizes, or `None` when the command is a
-    /// protocol diagnostic rather than an enabled capability.
+    /// protocol diagnostic, or a review decision the dialogue anchor
+    /// authorizes rather than a capability module.
     pub fn capability(&self) -> Option<LlmCapability> {
         match self {
             Self::Text { .. } => Some(LlmCapability::TextMessage),
@@ -125,6 +156,7 @@ impl LlmCommand {
             Self::Abort { .. } => Some(LlmCapability::Abort),
             Self::UserLanguage { .. } => Some(LlmCapability::UserLanguage),
             Self::CustomTool { .. } => Some(LlmCapability::CustomTools),
+            Self::ReviewUpdate { .. } => None,
             Self::ProtocolError { .. } => None,
         }
     }
@@ -134,6 +166,22 @@ impl LlmCommand {
     pub fn phase(&self) -> Option<CapabilityPhase> {
         self.capability().map(LlmCapability::phase)
     }
+}
+/// Deserializes the `path` of an [`LlmCommand::RepoSearch`] through the shared
+/// repository-path rules.
+///
+/// The discovery lists of the discussion boundary drop an escaping entry,
+/// while an enum variant cannot silently drop itself, so a malformed search
+/// path surfaces as a decode failure naming the rejected path instead of
+/// reaching the engine.
+fn deserialize_repo_search_command_path<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let raw = String::deserialize(deserializer)?;
+    normalize_repo_map_path(&raw).ok_or_else(|| {
+        serde::de::Error::custom(format!("Search path '{raw}' must be repository-relative"))
+    })
 }
 
 /// Deterministic toolchain verification target requested by the model.
@@ -248,6 +296,69 @@ mod tests {
         assert!(json.contains("\"path\":\"crates/core\""));
         assert!(json.contains("\"recursive\":true"));
         assert_eq!(serde_json::from_str::<LlmCommand>(&json).unwrap(), dir_list);
+    }
+    #[test]
+    fn test_repo_search_command_path_is_normalized_or_rejected() {
+        // A benign spelling decodes to its normalized repository-relative form.
+        let normalized: LlmCommand = serde_json::from_value(serde_json::json!({
+            "type": "repo_search",
+            "path": "./src",
+            "regex": "fn main",
+        }))
+        .expect("a benign search path must decode");
+        assert_eq!(
+            normalized,
+            LlmCommand::RepoSearch {
+                path: "src".to_string(),
+                regex: "fn main".to_string(),
+            }
+        );
+
+        // An empty path, `.`, and `./` all name the whole repository.
+        for spelling in ["", ".", "./"] {
+            let whole_repository: LlmCommand = serde_json::from_value(serde_json::json!({
+                "type": "repo_search",
+                "path": spelling,
+                "regex": "fn main",
+            }))
+            .expect("a whole-repository search path must decode");
+            assert_eq!(
+                whole_repository,
+                LlmCommand::RepoSearch {
+                    path: String::new(),
+                    regex: "fn main".to_string(),
+                },
+                "spelling '{spelling}' must name the whole repository"
+            );
+        }
+
+        // An escaping spelling fails the command decode instead of reaching the
+        // engine, because an enum variant cannot silently drop itself.
+        for spelling in ["../escape", "/etc/passwd", "a/../b", r"C:\Windows"] {
+            let error = serde_json::from_value::<LlmCommand>(serde_json::json!({
+                "type": "repo_search",
+                "path": spelling,
+                "regex": "fn main",
+            }))
+            .expect_err("an escaping search path must be rejected");
+            assert!(
+                error.to_string().contains("must be repository-relative"),
+                "diagnostic for '{spelling}' must name the rejected path: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_doc_request_without_topic_decodes_to_all() {
+        // The documented missing-topic fallback holds at the command boundary.
+        let command: LlmCommand = serde_json::from_str(r#"{"type":"doc_request"}"#)
+            .expect("a doc_request without a topic must decode");
+        assert_eq!(
+            command,
+            LlmCommand::DocRequest {
+                topic: DocTopic::All
+            }
+        );
     }
 
     #[test]
@@ -528,5 +639,26 @@ mod tests {
                 args: serde_json::Value::Null,
             }
         );
+    }
+    #[test]
+    fn test_llm_command_review_update_serde_roundtrip() {
+        let command = LlmCommand::ReviewUpdate {
+            update: crate::review::ReviewUpdateProposal {
+                item_id: 7,
+                group_id: None,
+                status: crate::review::ReviewDecisionStatus::Rejected,
+                note: "The reported race cannot happen".to_string(),
+                recommendations: vec!["Document the ordering".to_string()],
+            },
+        };
+        let json = serde_json::to_string(&command).unwrap();
+        assert!(json.contains("\"type\":\"review_update\""));
+        assert!(json.contains("\"status\":\"rejected\""));
+        assert_eq!(serde_json::from_str::<LlmCommand>(&json).unwrap(), command);
+
+        // The dialogue anchor authorizes a decision, not a capability module,
+        // so the command carries neither a capability nor a phase of its own.
+        assert_eq!(command.capability(), None);
+        assert_eq!(command.phase(), None);
     }
 }

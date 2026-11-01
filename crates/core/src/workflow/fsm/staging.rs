@@ -1,16 +1,14 @@
-//! Discovery and staging phase executors for the FSM bounded turn.
+//! Staging phase executor for the FSM bounded turn.
 //!
-//! Discovery resolves the model's context-file and documentation requests
-//! against the repository before any patch is proposed, enforcing the
-//! `files_token_budget` guard so a single request cannot exhaust the context
-//! window. Staging validates the proposed edits purely in memory and drives the
+//! Staging validates the proposed edits purely in memory and drives the
 //! patch-retry loop that repairs pattern-matching discrepancies, tracking the
-//! residual failures for the caller to interpret. Both phases operate on the
-//! shared [`PhaseContext`] and never touch Git or the working tree directly.
+//! residual failures for the caller to interpret. The phase operates on the
+//! shared [`TurnKernel`] and never touches Git or the working tree directly;
+//! discovery and the corrective budget of an empty answer belong to the kernel.
 
 use std::collections::{HashMap, HashSet};
 
-use tauqe_protocol::{EditOperation, ModelResult, TurnPhase};
+use tauqe_protocol::{EditOperation, TurnPhase};
 
 use crate::edits::{EditError, StagedEditsState};
 use crate::providers::StreamEvent;
@@ -20,452 +18,9 @@ use crate::workflow::retry::{
 };
 
 use super::guard::finalize_blocked_turn;
+use super::kernel::TurnKernel;
 use super::proposal::{log_fsm_phase, merge_text, ProposalStep};
-use super::{propose, FsmTurnOutcome, PhaseContext};
-
-/// Outcome of the FSM discovery phase.
-pub(super) enum DiscoveryPhase {
-    /// Discovery finished; carries the final proposal round to stage.
-    ///
-    /// The proposal is boxed so this variant stays small relative to
-    /// `Terminate`, keeping the enum compact.
-    Continue(Box<ProposalStep>),
-    /// The turn must terminate immediately with the carried outcome.
-    Terminate(Box<FsmTurnOutcome>),
-}
-
-/// Reports whether discovery stopped only because the round limit was spent.
-///
-/// The loop leaves for several reasons; only an exhausted limit deserves a
-/// warning, and only when the model still asked for repository material that
-/// will never arrive. A round that carries edits or protocol errors is a
-/// proposal the harness can act upon, not a truncated investigation.
-fn discovery_limit_reached(ctx: &PhaseContext<'_>, step: &ProposalStep) -> bool {
-    ctx.rounds_used >= ctx.options.max_discovery_rounds
-        && step.edits().is_empty()
-        && step.protocol_errors().is_empty()
-        && step.has_discovery_commands()
-}
-
-/// Runs the discovery phase: resolves context and documentation requests.
-///
-/// Each round folds the model's requested files into the auto context layer and
-/// injects requested documentation before re-asking the provider for a proposal,
-/// feeding back the list of missing paths. A round that only repeats requests the
-/// context already satisfies is not a dead end: it delivers the aggregate hint
-/// and one bounded round asks the model for the analysis it owes. The phase
-/// returns the last proposal round so the caller can stage its edits. A breached
-/// file token budget, a cancellation, or a semantic block terminates the turn
-/// instead.
-pub(super) async fn run_discovery_phase(
-    ctx: &mut PhaseContext<'_>,
-    initial: ProposalStep,
-) -> anyhow::Result<DiscoveryPhase> {
-    let mut step = initial;
-    let mut satisfied_rounds = 0usize;
-
-    while ctx.rounds_used < ctx.options.max_discovery_rounds
-        && step.edits().is_empty()
-        && step.protocol_errors().is_empty()
-    {
-        let has_discovery = !step.context_requests().is_empty()
-            || !step.doc_requests().is_empty()
-            || !step.repo_searches().is_empty()
-            || !step.repo_maps().is_empty()
-            || !step.dir_list_requests().is_empty()
-            || step.repo_dirs();
-        if !has_discovery {
-            break;
-        }
-
-        let outcome = crate::workflow::discovery::execute_discovery_commands(
-            ctx.context_manager,
-            ctx.repo_root,
-            step.commands(),
-            ctx.options.files_token_budget,
-            ctx.options.repomap_token_budget,
-            ctx.options.discovery_limits,
-            // A repeated request that the context already satisfies still
-            // teaches the model something: the aggregate note explains that the
-            // files are visible, so such a round can be answered instead of
-            // being mistaken for a dead end.
-            true,
-            // The round races the turn's own cancel signal, so an abandoned
-            // discovery request stops waiting for a slow reference host.
-            Some(ctx.cancel_rx),
-        )
-        .await;
-
-        if let Some(limit) = &outcome.limit_exceeded {
-            let warn = format!(
-                "Context files token budget exceeded (files_token_budget = {}). The model requested {} tokens in new file(s) [{}], but the context already contains {} tokens. Scope the task down or decompose it into a plan.",
-                limit.token_budget,
-                limit.requested_tokens,
-                limit.requested_files.join(", "),
-                limit.current_tokens
-            );
-            tracing::warn!("{}", warn);
-            let _ = ctx
-                .stream_tx
-                .send(StreamEvent::TextDelta(format!("\n\n⚠️ {}", warn)))
-                .await;
-            let _ = ctx.stream_tx.send(StreamEvent::Done).await;
-            return Ok(DiscoveryPhase::Terminate(Box::new(FsmTurnOutcome {
-                assistant_text: warn.clone(),
-                result: ModelResult::Answer { text: warn },
-                is_cancelled: false,
-                blocked: None,
-                abort: None,
-                has_terminal_success: false,
-                plan_saved: false,
-                plan_errors: Vec::new(),
-                skip_reason: None,
-            })));
-        }
-
-        let widened = outcome.has_progress(false);
-        // Repeating a request the context already satisfies widens nothing, yet
-        // the model still deserves the explanation that those files are visible.
-        // The round is only answered when it left no readable text: a model that
-        // already wrote its analysis has concluded, and buying another provider
-        // round trip for it would spend the turn on a repeated conclusion.
-        let hint_only = !widened
-            && !outcome.already_satisfied_files.is_empty()
-            && step.text().trim().is_empty()
-            && ctx.accumulated_text.trim().is_empty();
-        if !widened && !hint_only {
-            break;
-        }
-        if hint_only {
-            // One explanation is enough to deliver the hint, so a later
-            // repetition of the same requests closes the phase and leaves the
-            // written answer to the turn itself.
-            if satisfied_rounds >= MAX_SATISFIED_DISCOVERY_ROUNDS {
-                break;
-            }
-            satisfied_rounds += 1;
-        }
-
-        ctx.rounds_used += 1;
-        let discovery_round = ctx.rounds_used;
-        log_fsm_phase(
-            ctx.workflow_name,
-            ctx.model,
-            ctx.intent.is_isolated_step(),
-            TurnPhase::Discovery,
-            Some(discovery_round),
-            Some(ctx.options.max_discovery_rounds),
-        );
-        tracing::info!(
-            workflow = ctx.workflow_name,
-            model = %ctx.model,
-            round = discovery_round,
-            added = outcome.added_files.len(),
-            missing = outcome.missing_files.len(),
-            searches = outcome.searches_executed.len(),
-            doc_topics = outcome.doc_topics_loaded.len(),
-            "context discovery round completed"
-        );
-        let _ = ctx
-            .stream_tx
-            .send(StreamEvent::TurnPhase {
-                phase: TurnPhase::Discovery,
-                round: Some(discovery_round),
-                max_rounds: Some(ctx.options.max_discovery_rounds),
-                detail: None,
-            })
-            .await;
-
-        // Discovery findings are not repository files, so they accumulate in
-        // the turn-scoped journal, an append-only epistemic tail of the user
-        // message, instead of being folded into the context that the patching
-        // phase reads.
-        ctx.journal.record_outcome(&outcome);
-        if hint_only {
-            // The repeated request leaves nothing new to inspect, so the next
-            // round owes an answer. The directive joins the journal, where it
-            // stays visible for the remaining rounds of the turn.
-            ctx.journal.push_block(ALREADY_SATISFIED_DIRECTIVE);
-        }
-
-        let ctx_state = ctx.context_manager.get_state();
-        let _ = ctx
-            .stream_tx
-            .send(StreamEvent::ContextChanged(ctx_state))
-            .await;
-
-        let banner_text = outcome.fsm_banner_summary();
-
-        let banner = format!(
-            "\n\n---\n**[Round {}]** {}\n\n",
-            discovery_round + 1,
-            banner_text
-        );
-        let _ = ctx
-            .stream_tx
-            .send(StreamEvent::TextDelta(banner.clone()))
-            .await;
-        log_fsm_phase(
-            ctx.workflow_name,
-            ctx.model,
-            ctx.intent.is_isolated_step(),
-            TurnPhase::Proposal,
-            Some(discovery_round + 1),
-            None,
-        );
-        let _ = ctx
-            .stream_tx
-            .send(StreamEvent::TurnPhase {
-                phase: TurnPhase::Proposal,
-                round: Some(discovery_round + 1),
-                max_rounds: None,
-                detail: None,
-            })
-            .await;
-
-        let round_prompt = ctx.journal.compose_user_prompt(ctx.prompt, None);
-        step = propose(
-            ctx.provider,
-            ctx.model,
-            ctx.protocol,
-            ctx.history_manager,
-            &*ctx.context_manager,
-            ctx.workflow_name,
-            ctx.stream_tx,
-            ctx.cancel_rx,
-            ctx.options,
-            &mut *ctx.input_cache,
-            ctx.state,
-            ctx.intent,
-            &round_prompt,
-            None,
-        )
-        .await?;
-
-        if step.is_cancelled {
-            let _ = ctx.stream_tx.send(StreamEvent::Done).await;
-            return Ok(DiscoveryPhase::Terminate(Box::new(FsmTurnOutcome {
-                assistant_text: std::mem::take(&mut ctx.accumulated_text),
-                result: ModelResult::Answer {
-                    text: String::new(),
-                },
-                is_cancelled: true,
-                blocked: None,
-                abort: None,
-                has_terminal_success: false,
-                plan_saved: false,
-                plan_errors: Vec::new(),
-                skip_reason: None,
-            })));
-        }
-
-        ctx.state.absorb(&step);
-        let step_text = step.text();
-        ctx.accumulated_text = merge_text(
-            std::mem::take(&mut ctx.accumulated_text),
-            &banner,
-            step_text,
-        );
-
-        if let Some(reason) = ctx.state.blocked.clone() {
-            let accumulated = std::mem::take(&mut ctx.accumulated_text);
-            let outcome = finalize_blocked_turn(
-                ctx.policy,
-                ctx.context_manager,
-                ctx.stream_tx,
-                ctx.repo_root,
-                reason,
-                accumulated,
-                &ctx.state.plans,
-                ctx.plan_mode,
-            )
-            .await;
-            return Ok(DiscoveryPhase::Terminate(Box::new(outcome)));
-        }
-    }
-
-    if discovery_limit_reached(ctx, &step) {
-        let warn = format!(
-            "Discovery round limit reached (max_discovery_rounds = {}). The model asked for more repository material, but no further files, searches, listings, or documentation will be loaded in this turn.",
-            ctx.options.max_discovery_rounds
-        );
-        tracing::warn!(
-            workflow = ctx.workflow_name,
-            model = %ctx.model,
-            rounds_used = ctx.rounds_used,
-            max_discovery_rounds = ctx.options.max_discovery_rounds,
-            "discovery round limit reached; no further material will be loaded"
-        );
-        let banner = format!("\n\n---\n⚠️ {}\n\n", warn);
-        let _ = ctx
-            .stream_tx
-            .send(StreamEvent::TextDelta(banner.clone()))
-            .await;
-        ctx.accumulated_text = merge_text(std::mem::take(&mut ctx.accumulated_text), &banner, "");
-        // The directive is what the following rounds read: it closes the phase
-        // with an answer contract instead of leaving the request unanswered.
-        ctx.journal.push_block(DISCOVERY_LIMIT_DIRECTIVE);
-    }
-
-    Ok(DiscoveryPhase::Continue(Box::new(step)))
-}
-
-/// Number of additional proposal attempts granted to a model that produced an
-/// empty round: no text, no edits, and no protocol command.
-pub(super) const MAX_EMPTY_STEP_RETRIES: usize = 2;
-
-/// Maximum number of Discovery rounds granted to a proposal that only repeated
-/// requests the context already satisfied.
-///
-/// Such a round widens nothing, but the model still deserves the explanation
-/// that the files are visible. One round is enough to deliver it: repeating the
-/// hint would spend provider round trips without teaching the model anything new.
-pub(super) const MAX_SATISFIED_DISCOVERY_ROUNDS: usize = 1;
-
-/// Directive appended to the journal when a round only repeated requests the
-/// context already satisfied.
-///
-/// It turns a dead-end repetition into an explicit answer contract, so the next
-/// proposal round concludes with prose instead of asking for the same files again.
-pub(super) const ALREADY_SATISFIED_DIRECTIVE: &str = "<response_directive>\nEvery file you requested is already loaded in <context>. Do not request those paths again: answer the task from the material you already hold. Write the analysis or the conclusion in plain conversational text, and emit file edits only when the code itself must change.\n</response_directive>";
-
-/// Directive appended to the journal when the discovery round limit is
-/// exhausted while the model still asked for more repository material.
-///
-/// It turns the stop condition into an explicit answer contract: the next
-/// proposal round must conclude from the material already gathered instead of
-/// requesting paths the harness will no longer load.
-pub(super) const DISCOVERY_LIMIT_DIRECTIVE: &str = "<response_directive>\nThe discovery round limit is exhausted: no further files, repository searches, directory listings, or documentation will be loaded in this turn. Your investigation for this turn is complete. Do not request additional paths. Answer the task from the material you already hold, stating the conclusions or emitting the file edits the gathered context supports.\n</response_directive>";
-
-/// Corrective suffix appended to the request after an empty proposal round.
-///
-/// The suffix extends the previous request instead of replacing it, so the
-/// corrective round keeps the provider-cached prompt prefix and the model keeps
-/// the original task statement in view. It names the plain-text analysis as a
-/// valid conclusion, so a model that has finished its investigation answers the
-/// task instead of believing that only file edits count as a result, and it
-/// states the payload contract of a terminal outcome, because a status without
-/// its payload is as empty as a reply without content.
-pub(super) const EMPTY_STEP_REMINDER: &str = "\n\nYour previous reply was empty: it carried no text, no file edits, no discovery command, and no terminal outcome with its payload, so nothing could be acted upon. Respond again with a concrete result: when the context you already hold answers the task, write the analysis or the conclusion in plain conversational text; when the code must change, emit the file edits; otherwise declare an explicit terminal outcome and state the payload of the status you declare, because a terminal status without its payload is a protocol defect rather than a result.";
-
-/// Outcome of the corrective proposal round requested after an empty round.
-pub(super) enum EmptyStepRetry {
-    /// The model answered the corrective request; carries the new round.
-    Proposed(Box<ProposalStep>),
-    /// The turn must terminate immediately with the carried outcome.
-    Terminate(Box<FsmTurnOutcome>),
-}
-
-/// Re-asks the model after it produced a round with nothing actionable.
-///
-/// An empty generation is a transport-level non-answer, so decoding it as a
-/// validated `ModelResult::Answer` would record silence as a conclusion. The
-/// helper appends a corrective reminder to `prompt` and asks once more, folding
-/// the new round into the accumulated turn state and the accumulated text. A
-/// cancellation or a semantic block terminates the turn instead.
-pub(super) async fn reask_after_empty_round(
-    ctx: &mut PhaseContext<'_>,
-    prompt: &str,
-    attempt: usize,
-) -> anyhow::Result<EmptyStepRetry> {
-    tracing::warn!(
-        workflow = ctx.workflow_name,
-        model = %ctx.model,
-        attempt = attempt,
-        max_retries = MAX_EMPTY_STEP_RETRIES,
-        "empty proposal round; re-asking the model"
-    );
-
-    let detail = format!(
-        "Empty response retry {}/{}",
-        attempt, MAX_EMPTY_STEP_RETRIES
-    );
-    let banner = format!(
-        "\n\n---\n**[Empty Response {}/{}]** The previous reply carried nothing actionable; asking for a concrete proposal...\n\n",
-        attempt, MAX_EMPTY_STEP_RETRIES
-    );
-    let _ = ctx
-        .stream_tx
-        .send(StreamEvent::TextDelta(banner.clone()))
-        .await;
-    log_fsm_phase(
-        ctx.workflow_name,
-        ctx.model,
-        ctx.intent.is_isolated_step(),
-        TurnPhase::Proposal,
-        Some(attempt),
-        Some(MAX_EMPTY_STEP_RETRIES),
-    );
-    let _ = ctx
-        .stream_tx
-        .send(StreamEvent::TurnPhase {
-            phase: TurnPhase::Proposal,
-            round: Some(attempt),
-            max_rounds: Some(MAX_EMPTY_STEP_RETRIES),
-            detail: Some(detail),
-        })
-        .await;
-
-    let step = propose(
-        ctx.provider,
-        ctx.model,
-        ctx.protocol,
-        ctx.history_manager,
-        &*ctx.context_manager,
-        ctx.workflow_name,
-        ctx.stream_tx,
-        ctx.cancel_rx,
-        ctx.options,
-        &mut *ctx.input_cache,
-        ctx.state,
-        ctx.intent,
-        prompt,
-        None,
-    )
-    .await?;
-
-    if step.is_cancelled {
-        let _ = ctx.stream_tx.send(StreamEvent::Done).await;
-        return Ok(EmptyStepRetry::Terminate(Box::new(FsmTurnOutcome {
-            assistant_text: std::mem::take(&mut ctx.accumulated_text),
-            result: ModelResult::Answer {
-                text: String::new(),
-            },
-            is_cancelled: true,
-            blocked: None,
-            abort: None,
-            has_terminal_success: false,
-            plan_saved: false,
-            plan_errors: Vec::new(),
-            skip_reason: None,
-        })));
-    }
-
-    ctx.state.absorb(&step);
-    ctx.accumulated_text = merge_text(
-        std::mem::take(&mut ctx.accumulated_text),
-        &banner,
-        step.text(),
-    );
-
-    if let Some(reason) = ctx.state.blocked.clone() {
-        let accumulated = std::mem::take(&mut ctx.accumulated_text);
-        let outcome = finalize_blocked_turn(
-            ctx.policy,
-            ctx.context_manager,
-            ctx.stream_tx,
-            ctx.repo_root,
-            reason,
-            accumulated,
-            &ctx.state.plans,
-            ctx.plan_mode,
-        )
-        .await;
-        return Ok(EmptyStepRetry::Terminate(Box::new(outcome)));
-    }
-
-    Ok(EmptyStepRetry::Proposed(Box::new(step)))
-}
+use super::FsmTurnOutcome;
 
 /// Outcome of the FSM staging phase.
 pub(super) enum StagingPhase {
@@ -491,7 +46,7 @@ pub(super) struct StagingOutcome {
 /// terminates the turn; otherwise the accumulated edits and residual failures
 /// are returned for the caller to finalize.
 pub(super) async fn run_staging_phase(
-    ctx: &mut PhaseContext<'_>,
+    ctx: &mut TurnKernel<'_>,
     step: &ProposalStep,
 ) -> anyhow::Result<StagingPhase> {
     let mut current_edits = step.edits().to_vec();
@@ -643,39 +198,13 @@ pub(super) async fn run_staging_phase(
         let retry_prompt = ctx
             .journal
             .compose_user_prompt(ctx.prompt, Some(&retry_log));
-        let step_out = propose(
-            ctx.provider,
-            ctx.model,
-            ctx.protocol,
-            ctx.history_manager,
-            &*ctx.context_manager,
-            ctx.workflow_name,
-            ctx.stream_tx,
-            ctx.cancel_rx,
-            ctx.options,
-            &mut *ctx.input_cache,
-            ctx.state,
-            ctx.intent,
-            &retry_prompt,
-            staged_state.as_ref(),
-        )
-        .await?;
+        let step_out = ctx.propose(&retry_prompt, staged_state.as_ref()).await?;
 
         if step_out.is_cancelled {
             let _ = ctx.stream_tx.send(StreamEvent::Done).await;
-            return Ok(StagingPhase::Terminate(Box::new(FsmTurnOutcome {
-                assistant_text: std::mem::take(&mut ctx.accumulated_text),
-                result: ModelResult::Answer {
-                    text: String::new(),
-                },
-                is_cancelled: true,
-                blocked: None,
-                abort: None,
-                has_terminal_success: false,
-                plan_saved: false,
-                plan_errors: Vec::new(),
-                skip_reason: None,
-            })));
+            return Ok(StagingPhase::Terminate(Box::new(
+                FsmTurnOutcome::cancelled(std::mem::take(&mut ctx.accumulated_text)),
+            )));
         }
         ctx.state.absorb(&step_out);
         let step_text = step_out.text();
@@ -2407,16 +1936,174 @@ args = ["-c", "printf 'formatter failed' >&2; exit 3"]
             "verification must read the change set without the sandbox: {captured:?}"
         );
     }
-    #[test]
-    fn the_empty_step_reminder_requires_a_result_not_a_silent_status() {
-        // The corrective round owes a result, and a payload-free terminal status
-        // is named as a non-result, so a model cannot satisfy the reminder by
-        // declaring an empty outcome.
-        assert!(super::EMPTY_STEP_REMINDER.contains("Your previous reply was empty"));
-        assert!(super::EMPTY_STEP_REMINDER.contains("plain conversational text"));
-        assert!(super::EMPTY_STEP_REMINDER.contains("emit the file edits"));
-        assert!(super::EMPTY_STEP_REMINDER.contains("terminal outcome"));
-        assert!(super::EMPTY_STEP_REMINDER.contains("payload"));
-        assert!(super::EMPTY_STEP_REMINDER.contains("protocol defect"));
+    /// A later discovery round that only repeats requests the context already
+    /// satisfies still delivers the aggregate hint.
+    ///
+    /// The guard that decides whether such a round deserves another provider
+    /// round trip asks whether the model itself wrote prose. Reading the
+    /// accumulated turn text instead answers "yes" from the second round
+    /// onward, because that text also carries the harness round banners, so the
+    /// directive would be unreachable for every turn that performs more than
+    /// one discovery round.
+    #[tokio::test]
+    async fn a_repeated_satisfied_request_delivers_the_directive_in_a_later_round() {
+        let (_dir, root) = setup_repo(&[
+            ("a.rs", TARGET),
+            ("helper.rs", "pub const ANSWER: i32 = 42;\n"),
+        ]);
+        let mut context = context_with_target(&root);
+        let mut history = HistoryManager::new(root.clone());
+
+        let provider = MockLlmProvider::scripted([
+            // Round one widens the context and writes no prose.
+            MockResponse::text("<context_request path=\"helper.rs\" access=\"read_only\" />"),
+            // Round two only repeats a request the context already satisfies.
+            MockResponse::text("<context_request path=\"helper.rs\" access=\"read_only\" />"),
+            // Round three answers from the material already gathered.
+            MockResponse::text("The helper holds the answer: 42."),
+        ]);
+        let model = ModelRef::openrouter("mock/model");
+        let protocol = XmlPromptProtocol;
+        let mut policy = DirectApplyPolicy::new();
+        let options = WorkflowOptions {
+            max_discovery_rounds: 4,
+            ..Default::default()
+        };
+        let (stream_tx, rx) = mpsc::channel(256);
+        drop(rx);
+        let (_cancel_tx, cancel_rx) = watch::channel(false);
+
+        let outcome = run_fsm_turn(
+            "Use the helper constant",
+            &provider,
+            &model,
+            &mut context,
+            &mut history,
+            &protocol,
+            &mut policy,
+            "git",
+            stream_tx,
+            cancel_rx,
+            &options,
+        )
+        .await
+        .unwrap();
+
+        match &outcome.result {
+            ModelResult::Answer { text } => {
+                assert!(
+                    text.contains("The helper holds the answer: 42."),
+                    "the turn must record the model's conclusion: {text:?}"
+                );
+            }
+            other => panic!("expected a written answer, got {other:?}"),
+        }
+        assert_eq!(
+            provider.requests().len(),
+            3,
+            "the directive round must conclude without an extra reminder round"
+        );
+
+        // The repeated request is answered with the specific directive, so the
+        // model learns why the round widened nothing.
+        let directive_round = &provider.requests()[2].messages[1];
+        assert_eq!(directive_round.role, "user");
+        assert!(
+            directive_round
+                .content
+                .contains("Every file you requested is already loaded in <context>"),
+            "the directive must reach the next proposal round: {}",
+            directive_round.content
+        );
+        assert!(directive_round.content.contains("<response_directive>"));
+        assert!(
+            !directive_round
+                .content
+                .contains("Your investigation for this turn is complete"),
+            "the generic answer reminder belongs to the withheld-hint path only"
+        );
+    }
+
+    /// The satisfied-only directive is withheld once the model wrote prose.
+    ///
+    /// A model that already stated its analysis has concluded, so a later round
+    /// that only repeats a loaded path must not buy another provider round trip
+    /// on the strength of the aggregate hint: the turn falls through to the
+    /// generic written-answer request instead.
+    #[tokio::test]
+    async fn the_satisfied_directive_is_withheld_after_the_model_wrote_prose() {
+        let (_dir, root) = setup_repo(&[
+            ("a.rs", TARGET),
+            ("helper.rs", "pub const ANSWER: i32 = 42;\n"),
+        ]);
+        let mut context = context_with_target(&root);
+        let mut history = HistoryManager::new(root.clone());
+
+        let provider = MockLlmProvider::scripted([
+            // Round one states an intention and widens the context.
+            MockResponse::text(
+                "I need the helper before I answer.\n<context_request path=\"helper.rs\" access=\"read_only\" />",
+            ),
+            // Round two only repeats a request the context already satisfies.
+            MockResponse::text("<context_request path=\"helper.rs\" access=\"read_only\" />"),
+            // The answer request is answered from the material already held.
+            MockResponse::text("The helper holds the answer: 42."),
+        ]);
+        let model = ModelRef::openrouter("mock/model");
+        let protocol = XmlPromptProtocol;
+        let mut policy = DirectApplyPolicy::new();
+        let options = WorkflowOptions {
+            max_discovery_rounds: 4,
+            ..Default::default()
+        };
+        let (stream_tx, rx) = mpsc::channel(256);
+        drop(rx);
+        let (_cancel_tx, cancel_rx) = watch::channel(false);
+
+        let outcome = run_fsm_turn(
+            "Use the helper constant",
+            &provider,
+            &model,
+            &mut context,
+            &mut history,
+            &protocol,
+            &mut policy,
+            "git",
+            stream_tx,
+            cancel_rx,
+            &options,
+        )
+        .await
+        .unwrap();
+
+        match &outcome.result {
+            ModelResult::Answer { text } => {
+                assert!(
+                    text.contains("The helper holds the answer: 42."),
+                    "the turn must record the model's conclusion: {text:?}"
+                );
+            }
+            other => panic!("expected a written answer, got {other:?}"),
+        }
+        assert_eq!(
+            provider.requests().len(),
+            3,
+            "the withheld hint costs one written-answer request, not a satisfied-hint round"
+        );
+
+        let answer_round = &provider.requests()[2].messages[1];
+        assert!(
+            answer_round
+                .content
+                .contains("Your investigation for this turn is complete"),
+            "a prose-writing model receives the generic answer request: {}",
+            answer_round.content
+        );
+        assert!(
+            !answer_round
+                .content
+                .contains("Every file you requested is already loaded in <context>"),
+            "the satisfied-hint directive must stay withheld after the model wrote prose"
+        );
     }
 }

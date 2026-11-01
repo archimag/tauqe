@@ -131,7 +131,7 @@ fn write_document(path: &Path, lifetime: &UsageTotals, operations: u64) -> Resul
         std::fs::create_dir_all(parent)
             .map_err(|err| format!("Failed to create {}: {}", parent.display(), err))?;
     }
-    tauqe_core::atomic_write::write_atomic(path, &payload).map_err(|err| format!("{:#}", err))
+    tauqe_tools::atomic_write::write_atomic(path, &payload).map_err(|err| format!("{:#}", err))
 }
 
 /// Persists the project lifetime totals off the async worker pool.

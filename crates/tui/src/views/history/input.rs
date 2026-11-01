@@ -364,7 +364,7 @@ pub async fn handle_history_key(
                     .cloned();
                 if let Some(block) = maybe_block {
                     drop(st);
-                    let res = crate::clipboard::copy_to_clipboard(&block.code);
+                    let res = crate::clipboard::copy_to_clipboard_async(&block.code).await;
                     let mut st = state.lock().await;
                     match res {
                         crate::clipboard::CopyResult::Native => {
@@ -391,7 +391,7 @@ pub async fn handle_history_key(
                     }
                 } else if !item_text.is_empty() {
                     drop(st);
-                    let res = crate::clipboard::copy_to_clipboard(&item_text);
+                    let res = crate::clipboard::copy_to_clipboard_async(&item_text).await;
                     let mut st = state.lock().await;
                     match res {
                         crate::clipboard::CopyResult::Native => {
@@ -430,7 +430,7 @@ pub async fn handle_history_key(
             if let Some((item_id, item_text)) = item_info {
                 if !item_text.is_empty() {
                     drop(st);
-                    let res = crate::clipboard::copy_to_clipboard(&item_text);
+                    let res = crate::clipboard::copy_to_clipboard_async(&item_text).await;
                     let mut st = state.lock().await;
                     match res {
                         crate::clipboard::CopyResult::Native => {

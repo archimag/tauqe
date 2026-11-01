@@ -170,6 +170,11 @@ impl CapabilityModule for FileEditsModule {
                 "overwrite",
                 "delete",
                 "move",
+                // The anchored change-set vehicle is owned by this module, so
+                // the registry resolves it, and the capability-scoped cleaning
+                // strips it, through this declaration rather than the engine
+                // registry alone.
+                "file_edits",
             ],
         )
     }
@@ -573,15 +578,16 @@ fn plan_tag_to_command(tag: ParsedPlanTag) -> LlmCommand {
     }
 }
 
-/// Contract rule body used when plans are discussed through structured output.
 /// Intent-independent trunk of the structured plan rule.
 ///
 /// It states only the invariants every plan carries — the mandatory concept
 /// tree, the file attribute contract and its leaf-only restriction, the step
-/// formulation contract, the plan creation invariant, and language consistency —
-/// so it renders byte-identically whichever dialogue regime authors the plan.
-/// The actions a regime authorizes live in the delta constants below.
-const PLAN_STRUCTURED_CORE_BODY: &str = "Every plan travels as one structured `plan_update` field carrying `action`, plan `id`, `title`, `description`, `concept`, and `items`. Conceptual Foundation Invariant: Every plan MUST contain an architectural concept tree in `concept` defining the core requirements, design decisions, and system invariants ('What'). Inside `concept`, define architectural nodes carrying an `id` (`c-...`), a `title`, and their `details`. Plan creation without `concept` containing at least one concept node is strictly prohibited. Implementation steps in `items` define 'How', may be included with `concept_refs` (`c-...`), `files`, and `readonly_files`, or omitted if awaiting deep refinement. File Attributes Contract: `files` lists target files to create or modify (loaded as editable context), while `readonly_files` lists reference or contract files such as subsystem conventions, protocol types, and interfaces (loaded as read-only context and never modified). Leaf-Only Files Invariant: `files` and `readonly_files` must be specified exclusively for executable leaf steps without children; parent container items and task groups must never carry files. Step Formulation Contract: Formulate each step around an engineering objective and operational invariants rather than detailed procedural micro-instructions; define what state must be achieved and what invariants preserved. Always provide a clear `description` explaining the overall architecture, boundaries, and rationale. Plan Creation Invariant: Only create a plan when explicitly instructed or confirmed by the user. Whenever you propose a new plan, you MUST precede the payload with a concise conversational explanation of the proposed plan, and you MUST populate `plan_update` in the same response, carrying both `concept` (mandatory) and optional `items`. Language Consistency: Formulate the plan title, description, concept nodes, step titles, and step details in the same language as the user's request.";
+/// formulation contract, the prohibition on unresolved alternatives, the
+/// prohibition on verification-only steps, the plan creation invariant, and
+/// language consistency — so it renders byte-identically whichever dialogue
+/// regime authors the plan. The actions a regime authorizes live in the delta
+/// constants below.
+const PLAN_STRUCTURED_CORE_BODY: &str = "Every plan travels as one structured `plan_update` field carrying `action`, plan `id`, `title`, `description`, `concept`, and `items`. Conceptual Foundation Invariant: Every plan MUST contain an architectural concept tree in `concept` defining the core requirements, design decisions, and system invariants ('What'). Inside `concept`, define architectural nodes carrying an `id` (`c-...`), a `title`, and their `details`. Plan creation without `concept` containing at least one concept node is strictly prohibited. Implementation steps in `items` define 'How', may be included with `concept_refs` (`c-...`), `files`, and `readonly_files`, or omitted if awaiting deep refinement. File Attributes Contract: `files` lists target files to create or modify (loaded as editable context), while `readonly_files` lists reference or contract files such as subsystem conventions, protocol types, and interfaces (loaded as read-only context and never modified). Leaf-Only Files Invariant: `files` and `readonly_files` must be specified exclusively for executable leaf steps without children; parent container items and task groups must never carry files. Step Formulation Contract: Formulate each step around an engineering objective and operational invariants rather than detailed procedural micro-instructions; define what state must be achieved and what invariants preserved. Disjunction Prohibition Invariant: Every concept node and every step must state exactly one definite decision, so unresolved disjunctive alternatives such as 'either X or Y' or 'use library A or write your own structure B' are strictly prohibited. The architectural choice ('What') is fixed by the Primary or Architect role, or clarified with the developer in dialogue before the plan is approved; the step executor owns 'How' only and never decides the architecture. Automated Verification Invariant: The harness runs full toolchain verification (compilation, linters, and tests) automatically and deterministically after every individual leaf step and rolls the turn back when it fails. Dedicated steps that only run tests, check the build status, or inspect the codebase without changing code are strictly prohibited, because the executor has no shell. Tests are created and modified inside the steps that implement the corresponding functionality. Always provide a clear `description` explaining the overall architecture, boundaries, and rationale. Plan Creation Invariant: Only create a plan when explicitly instructed or confirmed by the user. Whenever you propose a new plan, you MUST precede the payload with a concise conversational explanation of the proposed plan, and you MUST populate `plan_update` in the same response, carrying both `concept` (mandatory) and optional `items`. Language Consistency: Formulate the plan title, description, concept nodes, step titles, and step details in the same language as the user's request.";
 
 /// Regime delta of the structured plan rule for a develop turn.
 ///
@@ -608,7 +614,7 @@ fn plan_xml_core(ctx: &ContractContext<'_>, plan: &str) -> String {
     let details = ctx.tag_name("details");
     let item = ctx.tag_name("item");
     format!(
-        "Every plan travels as one structured <{plan} action=\"save\" id=\"plan-id\" title=\"Plan Title\">...</{plan}> container. Conceptual Foundation Invariant: Every plan MUST contain an architectural concept tree in <{concept}>...</{concept}> defining the core requirements, design decisions, and system invariants ('What'). Inside <{concept}>, define architectural nodes using structured <{concept_item} id=\"c-...\" title=\"...\"><{details}>...</{details}></{concept_item}> tags. Plan creation without <{concept}> containing at least one <{concept_item}> is strictly prohibited. Implementation steps in <{item}> define 'How', may be included with concept_refs=\"c-...\", files=\"...\", and readonly=\"...\", or omitted if awaiting deep refinement. File Attributes Contract: the `files` attribute lists target files to create or modify (loaded as editable context), while the `readonly` attribute lists reference or contract files such as subsystem conventions, protocol types, and interfaces (loaded as read-only context and never modified). Leaf-Only Files Invariant: the `files` and `readonly` attributes must be specified exclusively for executable leaf steps without child items; parent container items and task groups must never have files. Step Formulation Contract: Formulate each step around an engineering objective and operational invariants rather than detailed procedural micro-instructions; define what state must be achieved and what invariants preserved. Always provide a clear <{description}> explaining the overall architecture, boundaries, and rationale. Plan Creation Invariant: Only create a plan when explicitly instructed or confirmed by the user. Whenever you propose a new plan, you MUST precede the tag with a concise conversational explanation of the proposed plan, and you MUST emit the structured <{plan} action=\"save\" ...> tag in the same response containing both <{concept}> (mandatory) and optional <{item}> elements. Language Consistency: Formulate the plan title, description, concept nodes, step titles, and step details in the same language as the user's request.\nStructured Plan XML Format:\n<{plan} action=\"save\" id=\"plan-id\" title=\"Plan Title\">\n  <{description}>Overall architecture and rationale</{description}>\n  <{concept}>\n    <{concept_item} id=\"c-1\" title=\"Core Invariant\">\n      <{details}>Design rationale and invariants</{details}>\n    </{concept_item}>\n  </{concept}>\n  <{item} id=\"1\" title=\"Step Title\" concept_refs=\"c-1\" files=\"path/to/file.rs\" readonly=\"path/to/contract.rs\">\n    <{details}>Engineering objective and verification criteria</{details}>\n  </{item}>\n</{plan}>"
+        "Every plan travels as one structured <{plan} action=\"save\" id=\"plan-id\" title=\"Plan Title\">...</{plan}> container. Conceptual Foundation Invariant: Every plan MUST contain an architectural concept tree in <{concept}>...</{concept}> defining the core requirements, design decisions, and system invariants ('What'). Inside <{concept}>, define architectural nodes using structured <{concept_item} id=\"c-...\" title=\"...\"><{details}>...</{details}></{concept_item}> tags. Plan creation without <{concept}> containing at least one <{concept_item}> is strictly prohibited. Implementation steps in <{item}> define 'How', may be included with concept_refs=\"c-...\", files=\"...\", and readonly=\"...\", or omitted if awaiting deep refinement. File Attributes Contract: the `files` attribute lists target files to create or modify (loaded as editable context), while the `readonly` attribute lists reference or contract files such as subsystem conventions, protocol types, and interfaces (loaded as read-only context and never modified). Leaf-Only Files Invariant: the `files` and `readonly` attributes must be specified exclusively for executable leaf steps without child items; parent container items and task groups must never have files. Step Formulation Contract: Formulate each step around an engineering objective and operational invariants rather than detailed procedural micro-instructions; define what state must be achieved and what invariants preserved. Disjunction Prohibition Invariant: Every <{concept_item}> node and every <{item}> step must state exactly one definite decision, so unresolved disjunctive alternatives such as 'either X or Y' or 'use library A or write your own structure B' are strictly prohibited. The architectural choice ('What') is fixed by the Primary or Architect role, or clarified with the developer in dialogue before the plan is approved; the step executor owns 'How' only and never decides the architecture. Automated Verification Invariant: The harness runs full toolchain verification (compilation, linters, and tests) automatically and deterministically after every individual leaf <{item}> and rolls the turn back when it fails. Dedicated <{item}> elements that only run tests, check the build status, or inspect the codebase without changing code are strictly prohibited, because the executor has no shell. Tests are created and modified inside the <{item}> elements that implement the corresponding functionality. Always provide a clear <{description}> explaining the overall architecture, boundaries, and rationale. Plan Creation Invariant: Only create a plan when explicitly instructed or confirmed by the user. Whenever you propose a new plan, you MUST precede the tag with a concise conversational explanation of the proposed plan, and you MUST emit the structured <{plan} action=\"save\" ...> tag in the same response containing both <{concept}> (mandatory) and optional <{item}> elements. Language Consistency: Formulate the plan title, description, concept nodes, step titles, and step details in the same language as the user's request.\nStructured Plan XML Format:\n<{plan} action=\"save\" id=\"plan-id\" title=\"Plan Title\">\n  <{description}>Overall architecture and rationale</{description}>\n  <{concept}>\n    <{concept_item} id=\"c-1\" title=\"Core Invariant\">\n      <{details}>Design rationale and invariants</{details}>\n    </{concept_item}>\n  </{concept}>\n  <{item} id=\"1\" title=\"Step Title\" concept_refs=\"c-1\" files=\"path/to/file.rs\" readonly=\"path/to/contract.rs\">\n    <{details}>Engineering objective and verification criteria</{details}>\n  </{item}>\n</{plan}>"
     )
 }
 
@@ -1910,6 +1916,7 @@ mod tests {
         "<abort",
         "<user_language",
         "<custom_tool",
+        "<file_edits",
         "<edits",
         "<edit",
         "<create",
@@ -2033,6 +2040,8 @@ mod tests {
         assert!(xml.body.contains("<plan action=\"save\""));
         assert!(xml.body.contains("<concept>"));
         assert!(xml.body.contains("Structured Plan XML Format:"));
+        assert!(xml.body.contains("Disjunction Prohibition Invariant"));
+        assert!(xml.body.contains("Automated Verification Invariant"));
 
         let structured = rule_in(&module, EditProtocolKind::Structured);
         assert_eq!(structured.title, "Local Engineering Plans");
@@ -2047,6 +2056,8 @@ mod tests {
             "File Attributes Contract",
             "Leaf-Only Files Invariant",
             "Step Formulation Contract",
+            "Disjunction Prohibition Invariant",
+            "Automated Verification Invariant",
             "Plan Creation Invariant",
             "Language Consistency",
         ] {
@@ -2057,6 +2068,35 @@ mod tests {
         assert!(!structured.body.contains("ONLY propose new plans"));
         assert!(!structured.body.contains("Planning Objective"));
         assert!(!structured.body.contains("Structured Plan XML Format"));
+        assert_no_operational_tags(&structured);
+    }
+
+    #[test]
+    fn the_plan_contracts_forbid_disjunctions_and_verification_only_steps() {
+        let module = PlanCreationModule;
+
+        // Both contours remove the two freedoms a coder must never take: it
+        // never resolves an open architectural alternative, and it never owns a
+        // step whose only work is the toolchain the harness already runs.
+        for protocol in [EditProtocolKind::Xml, EditProtocolKind::Structured] {
+            let rule = rule_in(&module, protocol);
+            for invariant in [
+                "Disjunction Prohibition Invariant",
+                "Automated Verification Invariant",
+            ] {
+                assert!(rule.body.contains(invariant), "{protocol}: {invariant}");
+            }
+            assert!(rule.body.contains("exactly one definite decision"));
+            assert!(rule.body.contains("no shell"));
+        }
+
+        // The XML trunk names the elements the prohibition applies to, so the
+        // reader never has to infer which step the rule addresses.
+        let xml = rule_in(&module, EditProtocolKind::Xml);
+        assert!(xml.body.contains("Dedicated <item> elements"));
+
+        // The structured trunk names no control tag at all.
+        let structured = rule_in(&module, EditProtocolKind::Structured);
         assert_no_operational_tags(&structured);
     }
 

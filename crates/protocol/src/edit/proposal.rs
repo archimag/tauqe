@@ -25,6 +25,15 @@ pub enum EditOperation {
         from: String,
         to: String,
     },
+    /// Moves a directory subtree, naming the source and the destination.
+    ///
+    /// A directory rename is one operation rather than one entry per file: the
+    /// staging engine expands it into the per-file moves of the subtree under
+    /// `from`. No replaced lines, range bounds, or payload belong to it.
+    MoveDir {
+        from: String,
+        to: String,
+    },
     Overwrite {
         path: String,
         content: String,
@@ -162,9 +171,14 @@ impl StructuredChangeProposal {
     /// Converts the proposal into a concrete edit operation, keeping the
     /// rejection typed.
     ///
-    /// A proposal that names both anchor bounds addresses a line range instead
-    /// of a text block, so it becomes [`EditOperation::LineAnchor`] and the
-    /// strategy that rendered the anchors decides how the range is applied.
+    /// A `replace` proposal that names both anchor bounds addresses a line
+    /// range instead of a text block, so it becomes
+    /// [`EditOperation::LineAnchor`] and the strategy that rendered the anchors
+    /// decides how the range is applied. Anchors address replaced lines only,
+    /// so every other operation keeps its own payload whatever bounds it
+    /// carries: a `move_dir` still renames two directories, a `move` still
+    /// keeps its destination, and a `create` or `overwrite` still keeps its
+    /// content.
     ///
     /// The decision made here never differs from the one of
     /// [`Self::to_edit_operation`]: only the rejection a caller observes is
@@ -174,7 +188,11 @@ impl StructuredChangeProposal {
         if let (Some(start), Some(end)) = (self.start.as_deref(), self.end.as_deref()) {
             let start = start.trim();
             let end = end.trim();
-            if !start.is_empty() && !end.is_empty() {
+            // Anchors address the lines of a replaced range, so only a
+            // `replace` may take this fast path. A stray bound on any other
+            // operation falls through to its own branch instead of being
+            // coerced into a destructive range replacement.
+            if self.op == EditFileOp::Replace && !start.is_empty() && !end.is_empty() {
                 return Ok(EditOperation::LineAnchor {
                     path,
                     start: start.to_string(),
@@ -219,6 +237,15 @@ impl StructuredChangeProposal {
                 })?;
                 let to = normalize_repo_path(to).map_err(ChangeConversionError::Other)?;
                 Ok(EditOperation::Move { from: path, to })
+            }
+            EditFileOp::MoveDir => {
+                let to = self.to.as_deref().ok_or_else(|| {
+                    ChangeConversionError::Other(
+                        "Change 'move_dir' requires a 'to' field".to_string(),
+                    )
+                })?;
+                let to = normalize_repo_path(to).map_err(ChangeConversionError::Other)?;
+                Ok(EditOperation::MoveDir { from: path, to })
             }
             EditFileOp::Replace => {
                 let old_text = self
@@ -519,6 +546,55 @@ mod tests {
             EditOperation::Replace { .. }
         ));
     }
+    #[test]
+    fn test_stray_bounds_never_coerce_other_ops_into_a_line_range() {
+        // Anchors address replaced lines only, so a bound carried by any other
+        // operation is ignored instead of turning that operation into a
+        // destructive range replacement.
+        let mut moved = proposal(EditFileOp::Move, "src/a.rs");
+        moved.to = Some("src/b.rs".to_string());
+        moved.start = Some("K1".to_string());
+        moved.end = Some("K2".to_string());
+        match moved.to_edit_operation_typed() {
+            Ok(EditOperation::Move { from, to }) => {
+                assert_eq!(from, "src/a.rs");
+                assert_eq!(to, "src/b.rs");
+            }
+            other => panic!("Expected a move that keeps its destination, got {other:?}"),
+        }
+
+        let mut created = proposal(EditFileOp::Create, "src/new.rs");
+        created.content = Some("fn new() {}\n".to_string());
+        created.start = Some("K1".to_string());
+        created.end = Some("K2".to_string());
+        match created.to_edit_operation_typed() {
+            Ok(EditOperation::Create { path, content }) => {
+                assert_eq!(path, "src/new.rs");
+                assert_eq!(content, "fn new() {}\n");
+            }
+            other => panic!("Expected a create that keeps its content, got {other:?}"),
+        }
+
+        let mut deleted = proposal(EditFileOp::Delete, "src/gone.rs");
+        deleted.start = Some("K1".to_string());
+        deleted.end = Some("K2".to_string());
+        match deleted.to_edit_operation_typed() {
+            Ok(EditOperation::Delete { path }) => assert_eq!(path, "src/gone.rs"),
+            other => panic!("Expected a delete that keeps its path, got {other:?}"),
+        }
+
+        let mut overwritten = proposal(EditFileOp::Overwrite, "src/a.rs");
+        overwritten.content = Some("whole file\n".to_string());
+        overwritten.start = Some("K1".to_string());
+        overwritten.end = Some("K2".to_string());
+        match overwritten.to_edit_operation_typed() {
+            Ok(EditOperation::Overwrite { path, content }) => {
+                assert_eq!(path, "src/a.rs");
+                assert_eq!(content, "whole file\n");
+            }
+            other => panic!("Expected an overwrite that keeps its content, got {other:?}"),
+        }
+    }
 
     #[test]
     fn test_replace_without_range_is_rejected_typed() {
@@ -620,5 +696,75 @@ mod tests {
             traversal.to_edit_operation(),
             Err("Change path '../escape.rs' must not contain '..' components".to_string())
         );
+    }
+
+    #[test]
+    fn test_move_dir_proposal_names_two_directories_and_no_payload() {
+        let mut change = proposal(EditFileOp::MoveDir, " ./src/old ");
+        change.to = Some("  ./src/new ".to_string());
+        // A directory move names two directories. A stray bound or payload
+        // must be ignored instead of turning the move into a range
+        // replacement, because a directory never addresses a line.
+        change.start = Some("Kf9Q".to_string());
+        change.end = Some("Tq2W".to_string());
+        change.content = Some("ignored".to_string());
+
+        match change.to_edit_operation_typed() {
+            Ok(EditOperation::MoveDir { from, to }) => {
+                assert_eq!(from, "src/old");
+                assert_eq!(to, "src/new");
+            }
+            other => panic!("Expected a directory move, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_move_dir_requires_a_destination() {
+        // The source and the destination are the whole payload of a directory
+        // move, so an absent destination is rejected instead of degrading into
+        // a rename of the directory onto itself.
+        let change = proposal(EditFileOp::MoveDir, "src/old");
+        assert_eq!(
+            change.to_edit_operation_typed(),
+            Err(ChangeConversionError::Other(
+                "Change 'move_dir' requires a 'to' field".to_string()
+            ))
+        );
+        assert_eq!(
+            change.to_edit_operation(),
+            Err("Change 'move_dir' requires a 'to' field".to_string())
+        );
+
+        // The destination obeys the same repository-relative rules as the
+        // source, and an empty destination is rejected as well.
+        let mut traversal = proposal(EditFileOp::MoveDir, "src/old");
+        traversal.to = Some("../escape".to_string());
+        assert_eq!(
+            traversal.to_edit_operation(),
+            Err("Change path '../escape' must not contain '..' components".to_string())
+        );
+
+        let mut empty = proposal(EditFileOp::MoveDir, "src/old");
+        empty.to = Some("   ".to_string());
+        assert_eq!(
+            empty.to_edit_operation(),
+            Err("Change path must not be empty".to_string())
+        );
+    }
+
+    #[test]
+    fn test_move_dir_operation_serde() {
+        let op = EditOperation::MoveDir {
+            from: "src/old".to_string(),
+            to: "src/new".to_string(),
+        };
+        let json = serde_json::to_string(&op).unwrap();
+        assert_eq!(
+            json,
+            r#"{"type":"move_dir","from":"src/old","to":"src/new"}"#
+        );
+
+        let decoded: EditOperation = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded, op);
     }
 }

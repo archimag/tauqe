@@ -1,27 +1,29 @@
 //! Orthogonal FSM turn facade built on normalized [`LlmCommand`] values.
 //!
 //! This module owns the bounded-turn lifecycle: session bookkeeping, the
-//! orchestration that sequences the phases, and the shared [`PhaseContext`]
-//! threaded through the phase executors. Discovery and staging live in
-//! [`staging`]; verification and healing live in [`healing`]. Transactional
+//! orchestration that sequences the phases, and the shared [`TurnKernel`]
+//! threaded through the phase executors. The round executor, discovery, and the
+//! corrective budget of an empty answer live in [`kernel`], staging lives in
+//! [`staging`], and verification and healing live in [`healing`]. Transactional
 //! persistence is delegated to an [`ApplyPolicy`], so the FSM never touches Git
 //! directly and stays independent of any single wire format.
 
 mod cache;
 pub(crate) mod guard;
 mod healing;
+mod kernel;
 mod proposal;
 mod staging;
+pub mod structured;
 mod tools;
 
 use std::collections::HashMap;
-use std::path::Path;
 
 use tauqe_protocol::{EditOperation, EditOutcome, ModelRef, ModelResult, TurnIntent};
 use tokio::sync::{mpsc, watch};
 
 use crate::context::ContextManager;
-use crate::edits::{EditError, StagedEditsState};
+use crate::edits::EditError;
 use crate::history::HistoryManager;
 use crate::plan::storage::PlanMutationMode;
 use crate::prompt::protocol::PromptProtocol;
@@ -36,14 +38,12 @@ use crate::workflow::WorkflowOptions;
 use cache::TurnInputCache;
 use guard::{finalize_blocked_turn, finish_turn, rollback_or_log};
 use healing::run_apply_and_verify_phase;
+use kernel::{DiscoveryPhase, EmptyStepGuard, EmptyStepRetry, TurnKernel, MAX_EMPTY_STEP_RETRIES};
 use proposal::{
-    extract_error_message, log_fsm_phase, merge_text, outcome_carries_result, run_proposal_step,
-    ProposalStep, TurnState,
+    extract_error_message, log_fsm_phase, merge_text, outcome_carries_result, ProposalStep,
+    TurnState,
 };
-use staging::{
-    reask_after_empty_round, run_discovery_phase, run_staging_phase, DiscoveryPhase,
-    EmptyStepRetry, StagingPhase, EMPTY_STEP_REMINDER, MAX_EMPTY_STEP_RETRIES,
-};
+use staging::{run_staging_phase, StagingPhase};
 use tools::{run_custom_tool_phase, CustomToolPhase};
 
 /// Result of a single FSM turn executed by [`run_fsm_turn`].
@@ -151,17 +151,6 @@ impl FsmTurnOutcome {
             skip_reason: None,
         }
     }
-    /// Whether the turn produced a conversational answer without edits and
-    /// without an explicit terminal success signal.
-    ///
-    /// Such a turn is an unverified reply rather than a validated conclusion:
-    /// with coder-ladder escalation enabled the harness re-runs it on a
-    /// stronger tier instead of accepting the empty answer.
-    pub fn is_unverified_answer(&self) -> bool {
-        matches!(self.result, ModelResult::Answer { .. })
-            && !self.has_terminal_success
-            && self.skip_reason.is_none()
-    }
 
     /// Renders the plan mutations the storage engine refused, if any.
     ///
@@ -185,115 +174,6 @@ impl FsmTurnOutcome {
         }
         Some(notice)
     }
-}
-
-/// Shared, mutable state threaded through the FSM phase executors.
-///
-/// The phase executors in [`staging`] and [`healing`] operate purely on this
-/// context so they can drive discovery, staging, verification, and healing
-/// without re-deriving collaborators or threading a long positional argument
-/// list. The owned [`PhaseContext::accumulated_text`] accumulates the streamed
-/// conversational text across every proposal round of the turn.
-struct PhaseContext<'a> {
-    prompt: &'a str,
-    provider: &'a dyn LlmProvider,
-    model: &'a ModelRef,
-    protocol: &'a dyn PromptProtocol,
-    history_manager: &'a HistoryManager,
-    workflow_name: &'a str,
-    stream_tx: &'a mpsc::Sender<StreamEvent>,
-    cancel_rx: &'a watch::Receiver<bool>,
-    options: &'a WorkflowOptions,
-    repo_root: &'a Path,
-    intent: TurnIntent,
-    plan_mode: PlanMutationMode,
-    policy: &'a mut dyn ApplyPolicy,
-    context_manager: &'a mut ContextManager,
-    input_cache: &'a mut TurnInputCache,
-    state: &'a mut TurnState,
-    /// Cumulative epistemic tail of the turn.
-    ///
-    /// Discovery findings are not repository files, so they never enter the
-    /// context block. They accumulate here and are replayed with the staging
-    /// and healing rounds, so a later phase keeps the knowledge an earlier
-    /// phase already paid for.
-    journal: TurnDiscoveryJournal,
-    /// Investigation rounds consumed by the turn so far.
-    ///
-    /// Discovery and project-command execution widen what the model knows and
-    /// therefore draw from one shared budget: the model may freely alternate
-    /// file requests, searches, documentation, and diagnostic command runs
-    /// without one kind of investigation starving the other.
-    rounds_used: usize,
-    accumulated_text: String,
-}
-
-impl PhaseContext<'_> {
-    /// Returns the project configuration frozen at the start of the turn.
-    ///
-    /// The first proposal round resolves the effective configuration — reading
-    /// `tauqe.toml` and, when a task runner is declared, running its dump once —
-    /// and the turn cache freezes that result. Every later phase reads the same
-    /// snapshot, so a patch retry, a healing round, and a project-command round
-    /// never re-read the declaration or re-run the runner.
-    async fn project(&mut self) -> tauqe_protocol::ProjectConfig {
-        self.input_cache
-            .project(self.repo_root, Some(self.cancel_rx))
-            .await
-    }
-}
-
-/// Whether the step's cancel signal is already raised.
-///
-/// Phase boundaries that are about to produce work read it, so a cancellation
-/// observed inside a phase ends the step before the next phase starts instead
-/// of only interrupting the provider stream.
-fn cancel_requested(cancel_rx: &watch::Receiver<bool>) -> bool {
-    *cancel_rx.borrow()
-}
-/// Runs a single proposal round with the turn's accumulated language and
-/// scratchpad context.
-///
-/// The phase executors call this helper instead of [`run_proposal_step`]
-/// directly so the turn-scoped language and scratchpad are always injected
-/// without repeating the extraction at every call site.
-#[allow(clippy::too_many_arguments)]
-async fn propose(
-    provider: &dyn LlmProvider,
-    model: &ModelRef,
-    protocol: &dyn PromptProtocol,
-    history_manager: &HistoryManager,
-    context_manager: &ContextManager,
-    workflow_name: &str,
-    stream_tx: &mpsc::Sender<StreamEvent>,
-    cancel_rx: &watch::Receiver<bool>,
-    options: &WorkflowOptions,
-    input_cache: &mut TurnInputCache,
-    state: &TurnState,
-    intent: TurnIntent,
-    prompt: &str,
-    staged: Option<&StagedEditsState>,
-) -> anyhow::Result<ProposalStep> {
-    let language = state.language.clone();
-    let scratchpad = state.scratchpad.clone();
-    run_proposal_step(
-        prompt,
-        provider,
-        model,
-        context_manager,
-        history_manager,
-        protocol,
-        workflow_name,
-        stream_tx,
-        cancel_rx.clone(),
-        options,
-        input_cache,
-        staged,
-        language.as_deref(),
-        scratchpad.as_deref(),
-        intent,
-    )
-    .await
 }
 
 /// Runs the orthogonal FSM turn: discovery, staging, verification, and healing.
@@ -421,13 +301,15 @@ pub(super) async fn begin_session_turn(
         return None;
     }
 
-    let context_paths: Vec<String> = context_manager
-        .get_state()
-        .items
-        .iter()
-        .map(|item| item.path.clone())
-        .collect();
-    let turn_id = match history_manager.record_turn(prompt, context_paths) {
+    // One state read yields both halves of the record — the paths the turn
+    // observed and the highest insertion watermark it observed — so they can
+    // never disagree. The watermark is the placement signal a chronological
+    // transcript reads to put a file after the turn that introduced it, so a
+    // recorder that holds the context must persist it instead of dropping it.
+    let state = context_manager.get_state();
+    let paths: Vec<String> = state.items.iter().map(|item| item.path.clone()).collect();
+    let watermark = state.items.iter().map(|item| item.insertion_seq).max();
+    let turn_id = match history_manager.record_turn_with_watermark(prompt, paths, watermark) {
         Ok(entry) => entry.id(),
         Err(err) => {
             tracing::warn!(
@@ -582,62 +464,12 @@ pub(super) async fn run_fsm_turn_body(
         })
         .await;
 
-    let mut state = TurnState::default();
     let mut input_cache = TurnInputCache::default();
-    let step = run_proposal_step(
-        prompt,
-        provider,
-        model,
-        context_manager,
-        history_manager,
-        protocol,
-        workflow_name,
-        &stream_tx,
-        cancel_rx.clone(),
-        options,
-        &mut input_cache,
-        None,
-        None,
-        None,
-        intent,
-    )
-    .await?;
-
-    if step.is_cancelled {
-        let _ = stream_tx.send(StreamEvent::Done).await;
-        return Ok(FsmTurnOutcome {
-            assistant_text: String::new(),
-            result: ModelResult::Answer {
-                text: String::new(),
-            },
-            is_cancelled: true,
-            blocked: None,
-            abort: None,
-            has_terminal_success: false,
-            plan_saved: false,
-            plan_errors: Vec::new(),
-            skip_reason: None,
-        });
-    }
-
-    state.absorb(&step);
-    let accumulated_text = step.text().to_string();
-
-    if let Some(reason) = state.blocked.clone() {
-        return Ok(finalize_blocked_turn(
-            policy,
-            context_manager,
-            &stream_tx,
-            &repo_root,
-            reason,
-            accumulated_text,
-            &state.plans,
-            plan_mode,
-        )
-        .await);
-    }
-
-    let mut ctx = PhaseContext {
+    // The kernel owns the turn-scoped state, the discovery journal, the frozen
+    // inputs, and the corrective budget of an empty answer, so every phase below
+    // drives the model through one executor instead of re-deriving the
+    // collaborators on each round.
+    let mut ctx = TurnKernel {
         prompt,
         provider,
         model,
@@ -653,26 +485,78 @@ pub(super) async fn run_fsm_turn_body(
         policy,
         context_manager,
         input_cache: &mut input_cache,
-        state: &mut state,
+        state: TurnState::default(),
         journal: TurnDiscoveryJournal::default(),
         rounds_used: 0,
-        accumulated_text,
+        accumulated_text: String::new(),
+        empty_steps: EmptyStepGuard::default(),
     };
+
+    let step = ctx.propose(prompt, None).await?;
+
+    if step.is_cancelled {
+        let _ = ctx.stream_tx.send(StreamEvent::Done).await;
+        return Ok(FsmTurnOutcome::cancelled(String::new()));
+    }
+
+    ctx.state.absorb(&step);
+    ctx.accumulated_text = step.text().to_string();
+
+    if let Some(reason) = ctx.state.blocked.clone() {
+        return Ok(finalize_blocked_turn(
+            ctx.policy,
+            ctx.context_manager,
+            ctx.stream_tx,
+            ctx.repo_root,
+            reason,
+            std::mem::take(&mut ctx.accumulated_text),
+            &ctx.state.plans,
+            ctx.plan_mode,
+        )
+        .await);
+    }
 
     if let Some(outcome) = finish_on_abort_outcome(&mut ctx).await {
         return Ok(outcome);
     }
 
     let mut pending = step;
-    let mut empty_retries = 0;
-    // Corrective reminders accumulate across the empty rounds of the turn. The
-    // corrective request is composed from the task and the turn journal every
-    // time, so the findings Discovery and the project commands already produced
-    // are never dropped by a re-ask.
-    let mut empty_reminders = String::new();
     let step = loop {
-        let step = match run_discovery_phase(&mut ctx, pending).await? {
+        let step = match ctx.run_discovery_phase(pending).await? {
             DiscoveryPhase::Terminate(outcome) => return Ok(*outcome),
+            DiscoveryPhase::BudgetExceeded(limit) => {
+                let warn = format!(
+                    "Context files token budget exceeded (files_token_budget = {}). The model requested {} tokens in new file(s) [{}], but the context already contains {} tokens. Scope the task down or decompose it into a plan.",
+                    limit.token_budget,
+                    limit.requested_tokens,
+                    limit.requested_files.join(", "),
+                    limit.current_tokens
+                );
+                tracing::warn!(
+                    workflow = ctx.workflow_name,
+                    model = %ctx.model,
+                    token_budget = limit.token_budget,
+                    requested_tokens = limit.requested_tokens,
+                    current_tokens = limit.current_tokens,
+                    "context files token budget exceeded"
+                );
+                let _ = ctx
+                    .stream_tx
+                    .send(StreamEvent::TextDelta(format!("\n\n⚠️ {}", warn)))
+                    .await;
+                let _ = ctx.stream_tx.send(StreamEvent::Done).await;
+                return Ok(FsmTurnOutcome {
+                    assistant_text: warn.clone(),
+                    result: ModelResult::Answer { text: warn },
+                    is_cancelled: false,
+                    blocked: None,
+                    abort: None,
+                    has_terminal_success: false,
+                    plan_saved: false,
+                    plan_errors: Vec::new(),
+                    skip_reason: None,
+                });
+            }
             DiscoveryPhase::Continue(step) => *step,
         };
         if let Some(outcome) = finish_on_abort_outcome(&mut ctx).await {
@@ -716,20 +600,13 @@ pub(super) async fn run_fsm_turn_body(
             break step;
         }
         // An empty round carries no text, no edits, and no command, so it can
-        // never be recorded as a validated answer. Re-ask with a corrective
-        // reminder and surface a failure only once the budget is spent.
-        if empty_retries >= MAX_EMPTY_STEP_RETRIES {
-            return Ok(finish_empty_step(&mut ctx).await);
-        }
-        empty_retries += 1;
-        empty_reminders.push_str(EMPTY_STEP_REMINDER);
-        // The corrective round keeps the knowledge the turn already paid for:
-        // the task first, the accumulated journal next, the reminder last.
-        let retry_prompt = ctx
-            .journal
-            .compose_user_prompt(ctx.prompt, Some(&empty_reminders));
-        pending = match reask_after_empty_round(&mut ctx, &retry_prompt, empty_retries).await? {
+        // never be recorded as a validated answer. The kernel owns the corrective
+        // budget and composes each re-ask from the task and the accumulated
+        // journal, so the findings Discovery and the project commands already
+        // produced are never dropped.
+        pending = match ctx.reask_after_empty_round().await? {
             EmptyStepRetry::Proposed(step) => *step,
+            EmptyStepRetry::Exhausted => return Ok(finish_empty_step(&mut ctx).await),
             EmptyStepRetry::Terminate(outcome) => return Ok(*outcome),
         };
     };
@@ -766,7 +643,7 @@ pub(super) async fn run_fsm_turn_body(
 
     // Phase boundary: staging is about to validate the change set, so a cancel
     // observed during discovery ends the turn before staging produces work.
-    if cancel_requested(ctx.cancel_rx) {
+    if ctx.cancel_requested() {
         let _ = ctx.stream_tx.send(StreamEvent::Done).await;
         let accumulated = std::mem::take(&mut ctx.accumulated_text);
         return Ok(FsmTurnOutcome::cancelled(accumulated));
@@ -808,7 +685,7 @@ pub(super) async fn run_fsm_turn_body(
 /// returns to its pre-turn checkpoint, the auto context is cleared, and the
 /// turn surfaces an unapplied edit carrying the error message. Returns `None`
 /// when no terminal error outcome is present so the caller can continue.
-async fn finish_on_error_outcome(ctx: &mut PhaseContext<'_>) -> Option<FsmTurnOutcome> {
+async fn finish_on_error_outcome(ctx: &mut TurnKernel<'_>) -> Option<FsmTurnOutcome> {
     let message = extract_error_message(ctx.state.terminal_outcome.as_ref())?;
     tracing::error!(
         workflow = ctx.workflow_name,
@@ -839,6 +716,7 @@ async fn finish_on_error_outcome(ctx: &mut PhaseContext<'_>) -> Option<FsmTurnOu
             error: Some(message),
             changed_files: Vec::new(),
             commit_hash: None,
+            verification: None,
         },
     };
     Some(
@@ -861,7 +739,7 @@ async fn finish_on_error_outcome(ctx: &mut PhaseContext<'_>) -> Option<FsmTurnOu
 /// command to run, and the report rides on the outcome so a supervisor stops
 /// its queue without architect escalation. Returns `None` when no abort is
 /// present so the caller can continue.
-async fn finish_on_abort_outcome(ctx: &mut PhaseContext<'_>) -> Option<FsmTurnOutcome> {
+async fn finish_on_abort_outcome(ctx: &mut TurnKernel<'_>) -> Option<FsmTurnOutcome> {
     let abort = ctx.state.abort.clone()?;
     Some(finish_aborted_turn(ctx, abort).await)
 }
@@ -872,7 +750,7 @@ async fn finish_on_abort_outcome(ctx: &mut PhaseContext<'_>) -> Option<FsmTurnOu
 /// satisfy it, so the working tree returns to its pre-turn checkpoint. The auto
 /// context keeps the material the turn already gathered, because the developer
 /// resumes the work after performing the requested host action.
-async fn finish_aborted_turn(ctx: &mut PhaseContext<'_>, abort: AbortReport) -> FsmTurnOutcome {
+async fn finish_aborted_turn(ctx: &mut TurnKernel<'_>, abort: AbortReport) -> FsmTurnOutcome {
     let message = abort.to_message();
     tracing::error!(
         workflow = ctx.workflow_name,
@@ -902,6 +780,7 @@ async fn finish_aborted_turn(ctx: &mut PhaseContext<'_>, abort: AbortReport) -> 
             error: Some(message),
             changed_files: Vec::new(),
             commit_hash: None,
+            verification: None,
         },
     };
     let mut outcome = finish_turn(
@@ -923,7 +802,7 @@ async fn finish_aborted_turn(ctx: &mut PhaseContext<'_>, abort: AbortReport) -> 
 /// verification round reads the project configuration the turn froze on its
 /// first proposal round, so it never re-reads `tauqe.toml` or re-runs a
 /// declared task runner's dump.
-async fn finish_answer_without_edits(ctx: &mut PhaseContext<'_>) -> FsmTurnOutcome {
+async fn finish_answer_without_edits(ctx: &mut TurnKernel<'_>) -> FsmTurnOutcome {
     // A terminal error that reaches the answer-only finisher keeps its declared
     // semantics instead of degrading into a plain answer. This finisher is the
     // single exit every answer-only path must pass through, so the invariant no
@@ -959,21 +838,9 @@ async fn finish_answer_without_edits(ctx: &mut PhaseContext<'_>) -> FsmTurnOutco
             Some(ctx.cancel_rx),
         )
         .await;
-        if outcome.is_cancelled {
+        if outcome.is_cancelled() {
             let _ = ctx.stream_tx.send(StreamEvent::Done).await;
-            return FsmTurnOutcome {
-                assistant_text: answer_text,
-                result: ModelResult::Answer {
-                    text: String::new(),
-                },
-                is_cancelled: true,
-                blocked: None,
-                abort: None,
-                has_terminal_success: false,
-                plan_saved: false,
-                plan_errors: Vec::new(),
-                skip_reason: None,
-            };
+            return FsmTurnOutcome::cancelled(answer_text);
         }
         if !outcome.report.trim().is_empty() {
             if answer_text.trim().is_empty() {
@@ -1043,7 +910,7 @@ enum WrittenAnswer {
 /// that declared a terminal outcome carrying its result, or that answered
 /// with a concrete proposal, is returned unchanged.
 async fn ensure_written_answer(
-    ctx: &mut PhaseContext<'_>,
+    ctx: &mut TurnKernel<'_>,
     step: ProposalStep,
 ) -> anyhow::Result<WrittenAnswer> {
     if !step.text().trim().is_empty()
@@ -1091,39 +958,13 @@ async fn ensure_written_answer(
     let answer_prompt = ctx
         .journal
         .compose_user_prompt(ctx.prompt, Some(MISSING_ANSWER_REMINDER));
-    let next = propose(
-        ctx.provider,
-        ctx.model,
-        ctx.protocol,
-        ctx.history_manager,
-        &*ctx.context_manager,
-        ctx.workflow_name,
-        ctx.stream_tx,
-        ctx.cancel_rx,
-        ctx.options,
-        &mut *ctx.input_cache,
-        ctx.state,
-        ctx.intent,
-        &answer_prompt,
-        None,
-    )
-    .await?;
+    let next = ctx.propose(&answer_prompt, None).await?;
 
     if next.is_cancelled {
         let _ = ctx.stream_tx.send(StreamEvent::Done).await;
-        return Ok(WrittenAnswer::Terminate(Box::new(FsmTurnOutcome {
-            assistant_text: std::mem::take(&mut ctx.accumulated_text),
-            result: ModelResult::Answer {
-                text: String::new(),
-            },
-            is_cancelled: true,
-            blocked: None,
-            abort: None,
-            has_terminal_success: false,
-            plan_saved: false,
-            plan_errors: Vec::new(),
-            skip_reason: None,
-        })));
+        return Ok(WrittenAnswer::Terminate(Box::new(
+            FsmTurnOutcome::cancelled(std::mem::take(&mut ctx.accumulated_text)),
+        )));
     }
 
     ctx.state.absorb(&next);
@@ -1167,7 +1008,7 @@ async fn ensure_written_answer(
 /// rejected change set is described in the dialect the turn actually speaks: an
 /// anchored project never receives a search/replace diagnosis.
 async fn finish_patch_failure(
-    ctx: &mut PhaseContext<'_>,
+    ctx: &mut TurnKernel<'_>,
     cumulative_edits: Vec<EditOperation>,
     last_failed_errors: &HashMap<String, EditError>,
     current_protocol_errors: &[String],
@@ -1209,6 +1050,7 @@ async fn finish_patch_failure(
             error: Some(error_desc),
             changed_files: Vec::new(),
             commit_hash: None,
+            verification: None,
         },
     };
     finish_turn(
@@ -1222,7 +1064,7 @@ async fn finish_patch_failure(
 }
 
 /// Finalizes the turn when no edits were successfully staged.
-async fn finish_no_edits(ctx: &mut PhaseContext<'_>) -> FsmTurnOutcome {
+async fn finish_no_edits(ctx: &mut TurnKernel<'_>) -> FsmTurnOutcome {
     tracing::warn!(
         workflow = ctx.workflow_name,
         model = %ctx.model,
@@ -1242,6 +1084,7 @@ async fn finish_no_edits(ctx: &mut PhaseContext<'_>) -> FsmTurnOutcome {
             error: Some("No edits were successfully applied".to_string()),
             changed_files: Vec::new(),
             commit_hash: None,
+            verification: None,
         },
     };
     finish_turn(
@@ -1261,7 +1104,7 @@ async fn finish_no_edits(ctx: &mut PhaseContext<'_>) -> FsmTurnOutcome {
 /// turn surfaces it as a failed edit, which is what the coder ladder escalates
 /// and what the batch supervisor reports as a failed step, instead of accepting
 /// silence as a conclusion.
-async fn finish_empty_step(ctx: &mut PhaseContext<'_>) -> FsmTurnOutcome {
+async fn finish_empty_step(ctx: &mut TurnKernel<'_>) -> FsmTurnOutcome {
     tracing::warn!(
         workflow = ctx.workflow_name,
         model = %ctx.model,
@@ -1285,6 +1128,7 @@ async fn finish_empty_step(ctx: &mut PhaseContext<'_>) -> FsmTurnOutcome {
             )),
             changed_files: Vec::new(),
             commit_hash: None,
+            verification: None,
         },
     };
     finish_turn(
@@ -1303,6 +1147,7 @@ mod tests {
     use crate::prompt::xml::XmlPromptProtocol;
     use crate::providers::mock::{MockLlmProvider, MockResponse};
     use crate::workflow::policy::DirectApplyPolicy;
+    use std::path::Path;
     use tauqe_protocol::ContextAccess;
 
     const TARGET: &str = "pub fn compute() -> i32 { 0 }\n";
@@ -1666,6 +1511,51 @@ mod tests {
         assert_eq!(request.session_id.as_deref(), Some("tauqe-repl-session"));
     }
 
+    /// A turn persists the context watermark it observed, so the placement
+    /// signal a chronological transcript reads is present in production instead
+    /// of being permanently absent.
+    #[tokio::test]
+    async fn turn_records_the_observed_context_watermark() {
+        let (_dir, root) =
+            setup_repo(&[("a.rs", TARGET), ("b.rs", "pub fn other() -> i32 { 7 }\n")]);
+        let mut context = context_with_target(&root);
+        context.add_file("b.rs", ContextAccess::ReadOnly).unwrap();
+
+        // The watermark is the highest insertion sequence the context carries
+        // when the turn starts, so the newest arrival decides it.
+        let observed = context
+            .get_state()
+            .items
+            .iter()
+            .map(|item| item.insertion_seq)
+            .max()
+            .expect("the populated context carries a watermark");
+
+        let mut history = HistoryManager::new(root.clone());
+        let provider = MockLlmProvider::scripted([MockResponse::text("unused")]);
+        let options = WorkflowOptions::default();
+        let (_cancel_tx, cancel_rx) = watch::channel(false);
+
+        let turn_id = begin_session_turn(
+            "Change compute to 42",
+            tauqe_protocol::TurnIntent::InteractiveRepl,
+            &context,
+            &mut history,
+            &provider,
+            &cancel_rx,
+            &options,
+        )
+        .await;
+        assert!(turn_id.is_some(), "the turn prompt reaches the chronicle");
+
+        let snapshot = history.snapshot().unwrap();
+        assert_eq!(
+            snapshot.watermark(),
+            Some(observed),
+            "the turn must persist the watermark the context carried when it started"
+        );
+    }
+
     #[tokio::test]
     async fn stream_error_during_proposal_aborts_and_rolls_back() {
         let (_dir, root) = setup_repo(&[("a.rs", TARGET)]);
@@ -1709,12 +1599,12 @@ mod tests {
         let mut context = context_with_target(&root);
         let mut history = HistoryManager::new(root.clone());
 
-        // A configuration that parses but declares no verification command
-        // is semantically invalid, so the turn must be refused before any
-        // provider request is spent.
+        // A configuration that parses but routes its verification through a
+        // command nobody declares is semantically invalid, so the turn must be
+        // refused before any provider request is spent.
         std::fs::write(
             root.join("tauqe.toml"),
-            "[models]\nprimary = [\"openrouter:a/b\"]\n",
+            "[models]\nprimary = [\"openrouter:a/b\"]\n\n[project.verify]\ncommand = \"@missing\"\n",
         )
         .unwrap();
 
@@ -1834,22 +1724,20 @@ mod tests {
         let mut history = HistoryManager::new(root.clone());
 
         // First save a plan
-        let existing = tauqe_protocol::Plan {
-            id: "develop-plan".to_string(),
-            title: "Develop Plan".to_string(),
-            description: None,
-            created_at: 1,
-            updated_at: 1,
-            architect: None,
-            last_replanned_step: None,
-            concept: vec![],
-            items: vec![tauqe_protocol::PlanItem {
+        let existing = tauqe_protocol::Plan::from_parts(
+            "develop-plan".to_string(),
+            "Develop Plan".to_string(),
+            None,
+            1,
+            1,
+            vec![],
+            vec![tauqe_protocol::PlanItem {
                 id: "1".to_string(),
                 title: "Step 1".to_string(),
                 status: tauqe_protocol::PlanItemStatus::Todo,
                 ..Default::default()
             }],
-        };
+        );
         crate::plan::storage::PlanStorage::save_plan(&root, &existing).unwrap();
 
         // Model in develop mode attempts to update the plan

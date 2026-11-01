@@ -8,7 +8,8 @@ pub use handshake::initialize_connection;
 pub use responses::handle_response;
 pub use transport::{
     allocate_request_id, find_server_binary, send_request, send_request_with_id,
-    spawn_message_reader, start_server, OptimisticRollback, RpcConnection,
+    send_request_with_rollback, spawn_message_reader, start_server, OptimisticRollback,
+    RpcConnection,
 };
 
 #[cfg(test)]

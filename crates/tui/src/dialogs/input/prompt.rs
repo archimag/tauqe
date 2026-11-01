@@ -87,6 +87,20 @@ pub(super) async fn handle_prompt_modal(
             return submit_prompt_modal(state, st, modal, server_writer).await;
         }
         _ => {
+            if modal.prompt_editor.takes_yank_chord(key, is_cmd) {
+                // The paste buffer is a native round trip bounded at
+                // NATIVE_CLIPBOARD_TIMEOUT, so it is read with the state guard
+                // released and the answer is applied after the re-lock (c-1).
+                st.prompt_modal = Some(modal);
+                drop(st);
+                let clipboard = crate::clipboard::get_from_clipboard_async().await;
+                let mut st = state.lock().await;
+                if let Some(mut modal) = st.prompt_modal.take() {
+                    modal.prompt_editor.yank_with(clipboard);
+                    st.prompt_modal = Some(modal);
+                }
+                return Ok(Some(InputResult::Continue));
+            }
             crate::input::handle_editor_key(&mut modal.prompt_editor, key, is_cmd, true);
             st.prompt_modal = Some(modal);
             Ok(Some(InputResult::Continue))
@@ -149,6 +163,22 @@ pub(crate) async fn submit_prompt_modal(
                 ids.clone(),
                 DiscussionFocus::plan(plan_id.clone(), ids),
             )
+        }
+        // A review group is addressed by the pair of its session and its own
+        // identifier, because a group identifier is unique only inside one
+        // session (c-3). The dialogue it starts is the sanctioned path that
+        // records the architectural decision (c-4).
+        PromptModalTarget::ReviewGroup {
+            session_id,
+            group_id,
+            ..
+        } => {
+            let target = DiscussionTarget::ReviewGroup {
+                session_id: session_id.clone(),
+                group_id: group_id.clone(),
+            };
+            let focus = DiscussionFocus::from_target(target.clone(), Vec::new());
+            (target, Vec::new(), focus)
         }
     };
 

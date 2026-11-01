@@ -11,6 +11,7 @@
 //! budget is either intelligently shortened with an ellipsis or reverted to the
 //! canonical English term, so the terminal grid is never broken.
 
+use std::borrow::Cow;
 use std::collections::BTreeMap;
 
 use serde::Deserialize;
@@ -103,7 +104,7 @@ pub fn locale_response_format() -> ResponseFormat {
             description: Some(
                 "Localized interface strings keyed by the canonical catalog keys".to_string(),
             ),
-            schema: locale_response_schema(),
+            schema: Cow::Owned(locale_response_schema()),
             strict: Some(true),
         },
     }

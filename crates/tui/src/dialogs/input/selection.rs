@@ -1,14 +1,24 @@
+use std::sync::Arc;
+
 use crossterm::event::{KeyCode, KeyEvent};
-use tokio::sync::MutexGuard;
+use tokio::sync::{Mutex, MutexGuard};
 
 use crate::app::AppState;
 use crate::input::InputResult;
-use crate::rpc::{allocate_request_id, send_request_with_id, OptimisticRollback, RpcConnection};
+use crate::rpc::{
+    allocate_request_id, send_request_with_rollback, OptimisticRollback, RpcConnection,
+};
 use tauqe_protocol::{methods, ModelEntry, ModelSelectParams, ModelSelection};
 
-/// Applies a model choice optimistically and registers a rollback so that a failed
-/// `model/select` restores the previously active selection.
+/// Applies a model choice optimistically, sends the selection, and reverts the
+/// header inside this function when the request never reaches the transport.
+///
+/// The rollback travels with the request only once the write succeeds; when the
+/// write fails the same value is applied inline, because the daemon never saw the
+/// request and no response will ever undo the mutation. The failure is reported
+/// once, at the site that owns the revert, mirroring `start_turn` (c-1, c-3).
 async fn apply_model_selection(
+    state: &Arc<Mutex<AppState>>,
     mut st: MutexGuard<'_, AppState>,
     selection: ModelSelection,
     server_writer: &mut RpcConnection,
@@ -19,23 +29,32 @@ async fn apply_model_selection(
     if let Some(effective) = st.model_choice.resolve(&selection) {
         st.active_model = effective;
     }
+    let rollback = OptimisticRollback::ActiveModel {
+        prev_model,
+        prev_selection,
+    };
     let req_id = allocate_request_id();
-    server_writer.record_optimistic_rollback(
-        req_id,
-        OptimisticRollback::ActiveModel {
-            prev_model,
-            prev_selection,
-        },
-    );
+    let params = serde_json::to_value(ModelSelectParams { selection })?;
     drop(st);
-    let params = ModelSelectParams { selection };
-    send_request_with_id(
+
+    let result = send_request_with_rollback(
         server_writer,
         req_id,
         methods::MODEL_SELECT,
-        serde_json::to_value(params)?,
+        params,
+        &rollback,
     )
-    .await
+    .await;
+    if let Err(error) = result {
+        // The request never reached the daemon, so no response will ever undo the
+        // optimistic mutation: revert it here and report the failure once, at the
+        // site that owns the revert, mirroring `start_turn` (c-1, c-3).
+        let mut st = state.lock().await;
+        crate::rpc::responses::apply_optimistic_rollback(&mut st, rollback);
+        let message = crate::i18n::active_t("notify.command_error");
+        st.notify_error(message.replacen("{}", &error.to_string(), 1));
+    }
+    Ok(())
 }
 
 /// Applies the chosen primary rung, shared by the keyboard and mouse paths.
@@ -45,12 +64,16 @@ async fn apply_model_selection(
 /// depth it was configured with — and the label on screen is exactly the value
 /// that reaches the resolver (c-1, c-3). Collapsing it to `Specific` would drop
 /// the effort and make the second entry of the same model resolve like the first.
+/// A rung whose request never reaches the transport is reverted inside the shared
+/// helper, so the header never keeps a model the server did not accept.
 pub(crate) async fn activate_selection_item(
+    state: &Arc<Mutex<AppState>>,
     st: MutexGuard<'_, AppState>,
     entry: ModelEntry,
     server_writer: &mut RpcConnection,
 ) -> anyhow::Result<()> {
     apply_model_selection(
+        state,
         st,
         ModelSelection::Tier {
             model: entry.model,
@@ -70,6 +93,7 @@ pub(crate) async fn activate_selection_item(
 /// `Space`) and dismissal (`Esc`, `q`), so it never intercepts edited text.
 pub(super) async fn handle_selection_dialog_key(
     key: KeyEvent,
+    state: &Arc<Mutex<AppState>>,
     mut st: MutexGuard<'_, AppState>,
     server_writer: &mut RpcConnection,
 ) -> anyhow::Result<Option<InputResult>> {
@@ -95,7 +119,7 @@ pub(super) async fn handle_selection_dialog_key(
     // with the mouse click, so the picker cannot activate a row two ways.
     if matches!(key.code, KeyCode::Enter | KeyCode::Char(' ')) {
         if let Some(entry) = dialog.selector.selected_entry().cloned() {
-            activate_selection_item(st, entry, server_writer).await?;
+            activate_selection_item(state, st, entry, server_writer).await?;
             return Ok(Some(InputResult::Continue));
         }
     }
@@ -113,13 +137,12 @@ mod tests {
     use std::sync::Arc;
 
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-    use tauqe_protocol::{ModelEntry, ModelRef, ReasoningEffort};
+    use tauqe_protocol::{ModelEntry, ModelRef, ModelRole, ModelSelection, ReasoningEffort};
     use tokio::sync::Mutex;
 
-    use crate::app::{test_state, SelectionDialogState};
-    use crate::rpc::RpcConnection;
-
     use super::{activate_selection_item, handle_selection_dialog_key};
+    use crate::app::{test_state, NotificationLevel, SelectionDialogState};
+    use crate::rpc::{allocate_request_id, RpcConnection};
 
     /// Three rungs of one model at distinct reasoning depths, so a test can
     /// prove which coordinate of the picker reached the wire (c-3).
@@ -149,7 +172,7 @@ mod tests {
         let mut conn = RpcConnection::new(Vec::<u8>::new());
 
         let guard = state.lock().await;
-        activate_selection_item(guard, entry, &mut conn)
+        activate_selection_item(&state, guard, entry, &mut conn)
             .await
             .expect("activation writes the model selection request");
 
@@ -174,6 +197,7 @@ mod tests {
         let guard = state.lock().await;
         let handled = handle_selection_dialog_key(
             KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            &state,
             guard,
             &mut conn,
         )
@@ -205,6 +229,7 @@ mod tests {
             let guard = state.lock().await;
             handle_selection_dialog_key(
                 KeyEvent::new(KeyCode::Char('3'), KeyModifiers::NONE),
+                &state,
                 guard,
                 &mut conn,
             )
@@ -228,6 +253,7 @@ mod tests {
             let guard = state.lock().await;
             handle_selection_dialog_key(
                 KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+                &state,
                 guard,
                 &mut conn,
             )
@@ -266,11 +292,93 @@ mod tests {
         };
 
         let guard = state.lock().await;
-        activate_selection_item(guard, entry, &mut conn)
+        activate_selection_item(&state, guard, entry, &mut conn)
             .await
             .expect("activation writes the request");
 
         let written = String::from_utf8_lossy(conn.written()).to_string();
         assert!(written.contains("\"effort\":\"high\""), "got: {written}");
+    }
+    /// Async sink whose every write fails, standing in for a server pipe that
+    /// closed before the selection reached it.
+    struct FailingWriter;
+
+    impl tokio::io::AsyncWrite for FailingWriter {
+        fn poll_write(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+            _buf: &[u8],
+        ) -> std::task::Poll<std::io::Result<usize>> {
+            std::task::Poll::Ready(Err(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "server pipe closed",
+            )))
+        }
+
+        fn poll_flush(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
+    /// A selection whose request never reaches the transport reverts the header
+    /// to the previously active model, so the interface keeps no model the server
+    /// never accepted, and it leaves no tracker entry whose id will never receive
+    /// a response (c-3).
+    #[tokio::test]
+    async fn failed_model_selection_reverts_the_optimistic_update() {
+        let mut st = test_state();
+        let previous_model = ModelRef::openrouter("openai/gpt-4o-mini");
+        st.active_model = previous_model.clone();
+        st.model_choice.selection = ModelSelection::Role(ModelRole::Coder);
+        st.selection_dialog = Some(SelectionDialogState::new(same_model_rungs(), 2));
+
+        let state = Arc::new(Mutex::new(st));
+        let mut conn = RpcConnection::new(FailingWriter);
+
+        // The request id is allocated inside the activation, so the tracked
+        // window is bracketed by two client-side allocations (c-3).
+        let window_start = allocate_request_id();
+        {
+            let guard = state.lock().await;
+            let entry = guard
+                .selection_dialog
+                .as_ref()
+                .and_then(|dialog| dialog.selector.selected_entry())
+                .cloned()
+                .expect("the seeded highlight resolves to a rung");
+            activate_selection_item(&state, guard, entry, &mut conn)
+                .await
+                .expect("a failed write is reported in the interface, not as a dispatch error");
+        }
+        let window_end = allocate_request_id();
+
+        assert!(conn.written().is_empty(), "the transport accepted no bytes");
+        for id in window_start..window_end {
+            assert!(
+                conn.take_optimistic_rollback(id).is_none(),
+                "request {id} leaked a rollback entry"
+            );
+        }
+
+        let guard = state.lock().await;
+        assert_eq!(guard.active_model, previous_model);
+        assert!(matches!(
+            guard.model_choice.selection,
+            ModelSelection::Role(ModelRole::Coder)
+        ));
+        let notification = guard
+            .active_notification()
+            .expect("the failed write explains itself");
+        assert_eq!(notification.level, NotificationLevel::Error);
     }
 }

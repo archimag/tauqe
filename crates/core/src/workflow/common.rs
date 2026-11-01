@@ -35,7 +35,7 @@ pub async fn compact_history_if_needed_with_budget(
     budget_tokens: u64,
     tail_turns: usize,
 ) -> anyhow::Result<()> {
-    if !history_manager.needs_compaction(budget_tokens)? {
+    if !history_manager.needs_compaction(budget_tokens) {
         return Ok(());
     }
 
@@ -212,6 +212,9 @@ pub fn record_workflow_response(
                     EditOperation::Move { from, to } => {
                         HistoryFileChange::moved(from.clone(), to.clone())
                     }
+                    EditOperation::MoveDir { from, to } => {
+                        HistoryFileChange::moved_dir(from.clone(), to.clone())
+                    }
                 };
                 if seen.insert(entry.clone()) {
                     files.push(entry);
@@ -341,6 +344,7 @@ mod tests {
                 error: None,
                 changed_files: vec!["src/a.rs".to_string()],
                 commit_hash: Some("1234567".to_string()),
+                verification: None,
             },
         };
 
@@ -387,6 +391,7 @@ mod tests {
                 error: None,
                 changed_files: vec!["a.rs".to_string()],
                 commit_hash: Some("abcdef1".to_string()),
+                verification: None,
             },
         };
 
@@ -443,6 +448,7 @@ mod tests {
                 error: None,
                 changed_files: vec!["src/parser.rs".to_string()],
                 commit_hash: Some("1122334".to_string()),
+                verification: None,
             },
         };
 

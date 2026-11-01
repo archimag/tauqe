@@ -6,24 +6,25 @@ use tauqe_protocol::{
     RequestId, Response,
 };
 
-use crate::state::AppState;
+use crate::state::{AppState, OperationGuard};
 
-/// Rejects a context mutation while a turn, plan batch, or review batch is active.
+/// Claims the operation slot for a context mutation.
 ///
 /// Every turn reasons over a clone of the context and merges that clone back when
-/// it finishes. A mutation applied in between would be overwritten (or resurrected
-/// from the turn's frozen snapshot), so mutations are refused for the duration of
-/// the operation instead of being silently lost.
-fn reject_if_busy(req_id: &RequestId, state: &Arc<AppState>) -> Option<Response> {
-    if state.is_operation_active() {
-        Some(Response::err(
-            req_id.clone(),
-            errors::OPERATION_IN_PROGRESS,
-            "Context cannot be modified while a turn or batch is running",
-        ))
-    } else {
-        None
-    }
+/// it finishes, so a mutation applied in between would be overwritten, or
+/// resurrected from the turn's frozen snapshot. Sampling the slot once cannot
+/// prevent that: a turn registering between the check and the mutation races it.
+/// The mutation therefore claims the slot instead of observing it, which makes the
+/// refusal and the mutation one atomic decision.
+fn claim_context_mutation(
+    req_id: &RequestId,
+    state: &Arc<AppState>,
+) -> Result<OperationGuard, Box<Response>> {
+    super::begin_exclusive_operation(
+        req_id,
+        state,
+        "Context cannot be modified while a turn or batch is running",
+    )
 }
 
 pub async fn handle_context_get(req: Request, state: &Arc<AppState>) -> Response {
@@ -33,9 +34,10 @@ pub async fn handle_context_get(req: Request, state: &Arc<AppState>) -> Response
 }
 
 pub async fn handle_context_add(req: Request, state: &Arc<AppState>) -> Response {
-    if let Some(resp) = reject_if_busy(&req.id, state) {
-        return resp;
-    }
+    let _operation = match claim_context_mutation(&req.id, state) {
+        Ok(guard) => guard,
+        Err(resp) => return *resp,
+    };
 
     let params: ContextAddParams = match req.params.and_then(|p| serde_json::from_value(p).ok()) {
         Some(p) => p,
@@ -93,9 +95,10 @@ pub async fn handle_context_add(req: Request, state: &Arc<AppState>) -> Response
 }
 
 pub async fn handle_context_add_pattern(req: Request, state: &Arc<AppState>) -> Response {
-    if let Some(resp) = reject_if_busy(&req.id, state) {
-        return resp;
-    }
+    let _operation = match claim_context_mutation(&req.id, state) {
+        Ok(guard) => guard,
+        Err(resp) => return *resp,
+    };
 
     let params: ContextAddPatternParams =
         match req.params.and_then(|p| serde_json::from_value(p).ok()) {
@@ -169,9 +172,10 @@ pub async fn handle_context_add_pattern(req: Request, state: &Arc<AppState>) -> 
 }
 
 pub async fn handle_context_remove(req: Request, state: &Arc<AppState>) -> Response {
-    if let Some(resp) = reject_if_busy(&req.id, state) {
-        return resp;
-    }
+    let _operation = match claim_context_mutation(&req.id, state) {
+        Ok(guard) => guard,
+        Err(resp) => return *resp,
+    };
 
     let params: ContextRemoveParams = match req.params.and_then(|p| serde_json::from_value(p).ok())
     {
@@ -204,9 +208,10 @@ pub async fn handle_context_remove(req: Request, state: &Arc<AppState>) -> Respo
 }
 
 pub async fn handle_context_set_access(req: Request, state: &Arc<AppState>) -> Response {
-    if let Some(resp) = reject_if_busy(&req.id, state) {
-        return resp;
-    }
+    let _operation = match claim_context_mutation(&req.id, state) {
+        Ok(guard) => guard,
+        Err(resp) => return *resp,
+    };
 
     let params: ContextSetAccessParams =
         match req.params.and_then(|p| serde_json::from_value(p).ok()) {
@@ -243,9 +248,10 @@ pub async fn handle_context_set_access(req: Request, state: &Arc<AppState>) -> R
 }
 
 pub async fn handle_context_clear(req: Request, state: &Arc<AppState>) -> Response {
-    if let Some(resp) = reject_if_busy(&req.id, state) {
-        return resp;
-    }
+    let _operation = match claim_context_mutation(&req.id, state) {
+        Ok(guard) => guard,
+        Err(resp) => return *resp,
+    };
 
     // Params are optional (a bare clear clears the User and Auto layers), but a
     // present payload must parse cleanly: a malformed payload must never silently
@@ -687,12 +693,17 @@ mod tests {
         assert_eq!(res.error.unwrap().code, errors::SET_ACCESS_FAILED);
     }
 
+    /// A mutation that a running turn would overwrite or resurrect is refused for
+    /// the operation's whole duration, and the refusal is the mutation's own slot
+    /// claim rather than a sample of the slot: the running operation keeps the
+    /// slot, the context is never touched, and the same request succeeds as soon
+    /// as the slot is free.
     #[tokio::test]
-    async fn test_reject_if_busy_blocks_mutations() {
+    async fn test_operation_slot_refuses_context_mutations() {
         let dir = TestDir::new();
         let (state, _rx) = test_state(&dir);
 
-        let _op = state.try_begin_operation().expect("begin op");
+        let operation = state.try_begin_operation().expect("begin op");
 
         let make_req = |method: &str, params: Option<serde_json::Value>| Request {
             id: RequestId::Number(1),
@@ -745,6 +756,34 @@ mod tests {
         // Read query still succeeds while busy
         let res = handle_context_get(make_req(methods::CONTEXT_GET, None), &state).await;
         assert!(res.error.is_none());
+
+        // Every refusal came from the mutation's own claim, so the running
+        // operation still owns the slot and no mutation reached the manager.
+        assert!(
+            state.is_operation_active(),
+            "the running operation must keep owning the slot"
+        );
+        assert!(
+            state.context.read().await.get_state().items.is_empty(),
+            "a refused context mutation must not reach the manager"
+        );
+
+        // Releasing the slot lets the same request through: the refusal is the
+        // claim, not a permanent exclusion.
+        drop(operation);
+        std::fs::write(dir.path().join("fresh.rs"), "fn fresh() {}\n").unwrap();
+        let fresh_params = serde_json::to_value(ContextAddParams {
+            path: "fresh.rs".to_string(),
+            access: ContextAccess::ReadOnly,
+            layer: None,
+        })
+        .ok();
+        let res = handle_context_add(make_req(methods::CONTEXT_ADD, fresh_params), &state).await;
+        assert!(
+            res.error.is_none(),
+            "the mutation must succeed once the slot is free: {:?}",
+            res.error
+        );
     }
     #[tokio::test]
     async fn test_handle_context_add_rejects_the_refs_layer() {

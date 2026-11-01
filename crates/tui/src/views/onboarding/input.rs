@@ -90,7 +90,14 @@ pub async fn handle_onboarding_key(
                 | KeyCode::Char('V')
                 | KeyCode::Char('y')
                 | KeyCode::Char('Y') => {
-                    match crate::clipboard::get_from_clipboard() {
+                    // The paste buffer is a native round trip bounded at
+                    // NATIVE_CLIPBOARD_TIMEOUT. The guard is released while it
+                    // is read, so a hung clipboard owner can never freeze
+                    // rendering or block another locker of the state (c-1).
+                    drop(st);
+                    let clipboard = crate::clipboard::get_from_clipboard_async().await;
+                    let mut st = state.lock().await;
+                    match clipboard {
                         Some(clip_text) => {
                             st.onboarding.input_buffer.insert_str(clip_text.trim());
                         }
@@ -155,6 +162,17 @@ pub async fn handle_onboarding_key(
                 }
             }
             _ => {
+                if st.onboarding.input_buffer.takes_yank_chord(key, is_cmd) {
+                    // The paste buffer is a native round trip bounded at
+                    // NATIVE_CLIPBOARD_TIMEOUT, so it is read with the state
+                    // guard released and the answer is applied afterwards
+                    // (c-1).
+                    drop(st);
+                    let clipboard = crate::clipboard::get_from_clipboard_async().await;
+                    let mut st = state.lock().await;
+                    st.onboarding.input_buffer.yank_with(clipboard);
+                    return Ok(InputResult::Continue);
+                }
                 st.onboarding.input_buffer.handle_key(key, is_cmd);
             }
         }
@@ -251,8 +269,14 @@ pub async fn handle_onboarding_key(
                             st.onboarding.input_active = true;
                             st.onboarding.input_buffer.clear();
                             st.onboarding.show_key = false;
-                            let key_in_clipboard = crate::clipboard::get_from_clipboard()
+                            // The paste buffer is a native round trip bounded at
+                            // NATIVE_CLIPBOARD_TIMEOUT, so it is read with the guard
+                            // released and the answer is applied afterwards (c-1).
+                            drop(st);
+                            let key_in_clipboard = crate::clipboard::get_from_clipboard_async()
+                                .await
                                 .is_some_and(|text| text.trim().starts_with("sk-or-"));
+                            let mut st = state.lock().await;
                             if key_in_clipboard {
                                 let primary_chord = format!(
                                     "{}V",

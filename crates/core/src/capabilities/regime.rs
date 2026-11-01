@@ -126,20 +126,26 @@ pub fn intent_delta_rules(
     let structured = ctx.protocol != EditProtocolKind::Xml;
     let mut rules: Vec<ContractRule> = Vec::new();
 
-    rules.push(ContractRule::new(
-        "Read-Only Scope",
-        "files inside <context> carry a declarative `access` attribute. Files marked `access=\"read_only\"` are provided for reference, context, and structural comprehension; prefer modifying files marked `access=\"editable\"`. If completing the task requires editing a read-only file, you may propose edits to it directly without an extra discovery round — the environment will automatically promote it to editable upon applying the changes.",
-    ));
-    let editable_scope = if structured {
-        "files inside <context> marked `access=\"editable\"` are permitted for modification. You may also create new files by appending an entry to the `changes` array whose `op` is 'create', or move and rename files with an entry whose `op` is 'move', when required by the task.".to_string()
-    } else {
-        format!(
-            "files inside <context> marked `access=\"editable\"` are permitted for modification. You may also create new files using <{create} path=\"...\"> or move/rename files using <{moved} from=\"...\" to=\"...\" /> when required by the task.",
-            create = ctx.tag_name("create"),
-            moved = ctx.tag_name("move"),
-        )
-    };
-    rules.push(ContractRule::new("Editable Scope", editable_scope));
+    // The context-scope rules describe what an edit may address, so they travel
+    // with the edit capability: a contour that cannot modify a file is never told
+    // which files it may modify, and therefore never advertises a command its
+    // decoder would reject.
+    if capabilities.contains(LlmCapability::FileEdits) {
+        rules.push(ContractRule::new(
+            "Read-Only Scope",
+            "files inside <context> carry a declarative `access` attribute. Files marked `access=\"read_only\"` are provided for reference, context, and structural comprehension; prefer modifying files marked `access=\"editable\"`. If completing the task requires editing a read-only file, you may propose edits to it directly without an extra discovery round — the environment will automatically promote it to editable upon applying the changes.",
+        ));
+        let editable_scope = if structured {
+            "files inside <context> marked `access=\"editable\"` are permitted for modification. You may also create new files by appending an entry to the `changes` array whose `op` is 'create', or move and rename files with an entry whose `op` is 'move', when required by the task.".to_string()
+        } else {
+            format!(
+                "files inside <context> marked `access=\"editable\"` are permitted for modification. You may also create new files using <{create} path=\"...\"> or move/rename files using <{moved} from=\"...\" to=\"...\" /> when required by the task.",
+                create = ctx.tag_name("create"),
+                moved = ctx.tag_name("move"),
+            )
+        };
+        rules.push(ContractRule::new("Editable Scope", editable_scope));
+    }
 
     // A file-editing turn is guarded by the authorization rule wherever it can
     // actually write: an interactive dialogue, a review dialogue, and a plan
@@ -273,7 +279,7 @@ mod tests {
             .collect()
     }
 
-    /// Returns the three regimes the trunk renders for.
+    /// Returns the regimes the trunk renders for.
     fn regimes() -> Vec<(TurnIntent, CapabilitySet)> {
         vec![
             (
@@ -282,6 +288,10 @@ mod tests {
             ),
             (TurnIntent::PlanDiscussion, CapabilitySet::discussion()),
             (TurnIntent::IsolatedStep, CapabilitySet::isolated_step()),
+            (
+                TurnIntent::ArchitectSynthesis,
+                CapabilitySet::architect_discovery(),
+            ),
         ]
     }
 
@@ -1202,6 +1212,25 @@ mod tests {
             None,
         );
         assert!(!titles(&rules).contains(&"Environment Ontology"));
+    }
+
+    #[test]
+    fn the_architect_synthesis_delta_states_no_edit_scope() {
+        let rules = delta(
+            TurnIntent::ArchitectSynthesis,
+            &CapabilitySet::architect_discovery(),
+            EditProtocolKind::Structured,
+            None,
+        );
+        let names = titles(&rules);
+
+        // The Architect produces a typed horizon, so it is never told which files
+        // it may modify: the scope rules travel with the edit capability.
+        assert!(!names.contains(&"Read-Only Scope"));
+        assert!(!names.contains(&"Editable Scope"));
+        assert!(!names.contains(&"Action Authorization"));
+        assert!(!names.contains(&"Plan-First Proposal"));
+        assert!(names.contains(&"Environment Ontology"));
     }
 
     #[test]

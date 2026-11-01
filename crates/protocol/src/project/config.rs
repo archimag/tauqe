@@ -3,8 +3,10 @@
 //! `tauqe.toml` is the single configuration surface of the harness, so the
 //! commands a repository knows how to run are declared there as well:
 //!
-//! - `verify` is the mandatory verification command. A change set the harness
-//!   cannot verify is never accepted.
+//! - `verify` is the optional verification command. A project that declares it
+//!   gains the verification-healing lifecycle, while a project that omits it
+//!   stays valid and simply runs no verification step: the harness reports the
+//!   change set as unverified instead of inventing a toolchain.
 //! - `format` is the optional in-memory filter that rewrites staged content
 //!   through standard input and output before any byte reaches disk.
 //! - `post_hook` is the optional disk-side step that runs strictly after the
@@ -123,7 +125,8 @@ pub struct ResolvedProjectCommand {
 /// Rejection reason of an invalid `[project]` declaration.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ProjectConfigError {
-    /// The mandatory `verify` command is absent.
+    /// [`ProjectConfig::verify_command`] was asked for a command the section
+    /// does not declare.
     MissingVerify,
     /// An entry names neither an executable nor a declared command.
     BlankCommand { operation: String },
@@ -146,7 +149,7 @@ pub enum ProjectConfigError {
 impl fmt::Display for ProjectConfigError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::MissingVerify => f.write_str("the section must declare a `verify` command"),
+            Self::MissingVerify => f.write_str("the section declares no `verify` command"),
             Self::BlankCommand { operation } => {
                 write!(f, "`{operation}` names neither an executable nor a command")
             }
@@ -199,7 +202,9 @@ impl std::error::Error for ProjectConfigError {}
 /// the generated sources belong here, so an implementation step cannot rewrite
 /// the contract it is verified against. Each pattern uses the glob syntax of
 /// [`crate::glob::GlobPattern`]; this crate only declares it, while compilation
-/// and enforcement belong to the engine.
+/// and enforcement belong to the engine. A pattern is never silently empty: a
+/// blank entry is rejected by [`ProjectConfig::validate`], while a root-denoting
+/// entry such as `.` or `/` is the universal boundary that protects every path.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct ProjectBoundaries {
     /// Repository glob patterns no turn may modify.
@@ -217,8 +222,11 @@ impl ProjectBoundaries {
 /// The `[project]` section of `tauqe.toml`.
 ///
 /// Every field is optional on the wire so a partially authored section still
-/// decodes, but [`ProjectConfig::validate`] rejects a declaration that leaves
-/// verification undefined.
+/// decodes, and [`ProjectConfig::validate`] rejects only what the harness could
+/// not run predictably: a blank executable, an undeclared command, a reference
+/// cycle, or a parameter contract a caller could not address. Verification is
+/// declarative, so a section that declares nothing beyond, say, boundaries or
+/// named commands stays valid.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct ProjectConfig {
     /// External task runner providing project commands, when one is declared.
@@ -252,7 +260,11 @@ impl ProjectConfig {
             && self.commands.is_empty()
     }
 
-    /// Resolves the mandatory verification command.
+    /// Resolves the declared verification command.
+    ///
+    /// An absent declaration is reported as
+    /// [`ProjectConfigError::MissingVerify`] rather than guessed, because a
+    /// project may legitimately declare no verification at all.
     pub fn verify_command(&self) -> Result<ResolvedProjectCommand, ProjectConfigError> {
         let spec = self
             .verify
@@ -340,17 +352,19 @@ impl ProjectConfig {
 
     /// Validates the whole declaration.
     ///
-    /// Verification is mandatory, and every declared entry must resolve to a
-    /// runnable command line with an addressable parameter contract, so an
-    /// invalid declaration is rejected as a whole instead of degrading into an
-    /// unverified turn.
+    /// Verification is declarative: a project that declares no `verify` command
+    /// is valid, and a turn in such a project simply runs no verification step.
+    /// Every entry the section does declare — `verify` included, when present —
+    /// must resolve to a runnable command line with an addressable parameter
+    /// contract, so a broken declaration is rejected as a whole instead of
+    /// degrading into a command nobody can predict.
     ///
     /// A protected pattern must name something as well, so a blank entry is
-    /// rejected instead of silently protecting nothing.
+    /// rejected instead of silently protecting nothing. A root-denoting entry
+    /// is not blank: it names the whole repository and is accepted as the
+    /// universal boundary.
     pub fn validate(&self) -> Result<(), ProjectConfigError> {
-        if self.runner.is_none() {
-            self.verify_command()?;
-        } else if let Some(verify) = &self.verify {
+        if let Some(verify) = &self.verify {
             self.resolve("verify", verify)?;
         }
 
@@ -544,16 +558,24 @@ mod tests {
     }
 
     #[test]
-    fn test_project_config_requires_verification() {
+    fn test_project_config_accepts_an_absent_verification_command() {
+        // Verification is declarative, so a section that declares nothing is
+        // valid, and asking for the command reports the absence instead of
+        // inventing one.
         let config = ProjectConfig::default();
         assert!(config.is_empty());
-        assert_eq!(config.validate(), Err(ProjectConfigError::MissingVerify));
+        assert!(config.validate().is_ok());
         assert_eq!(
             config.verify_command(),
             Err(ProjectConfigError::MissingVerify)
         );
 
-        // An empty executable is not a verification command either.
+        // The same holds for a section that declares something else entirely.
+        let without_verification = parse(r#"{"boundaries":{"protected":["Justfile"]}}"#);
+        assert!(without_verification.validate().is_ok());
+
+        // A declared but blank command is a broken declaration, not an absent
+        // one.
         let blank = parse(r#"{"verify":{"command":"   "}}"#);
         assert!(matches!(
             blank.validate(),
@@ -928,6 +950,36 @@ mod tests {
     }
 
     #[test]
+    fn test_a_root_boundary_protects_the_whole_repository() {
+        // A developer who writes the root as `.` or `/` declares a universal
+        // boundary. Validation accepts it, and the matcher it compiles to
+        // selects every path, so a declaration can never be accepted while
+        // protecting nothing.
+        for root in [".", "./", "/"] {
+            let config = parse(&format!(
+                r#"{{"verify":{{"command":"cargo"}},"boundaries":{{"protected":["{root}"]}}}}"#
+            ));
+            assert!(
+                config.validate().is_ok(),
+                "the root pattern {root:?} was rejected"
+            );
+            let pattern = config
+                .boundaries
+                .protected
+                .first()
+                .expect("the declaration carries the root pattern");
+            assert!(
+                crate::glob::matches_glob_pattern(pattern, "Justfile"),
+                "the root pattern {pattern:?} protected nothing"
+            );
+            assert!(crate::glob::matches_glob_pattern(
+                pattern,
+                "docs/specs/auth.md"
+            ));
+        }
+    }
+
+    #[test]
     fn test_project_boundaries_reject_blank_patterns() {
         for source in [
             r#"{"verify":{"command":"cargo"},"boundaries":{"protected":[""]}}"#,
@@ -949,25 +1001,25 @@ mod tests {
             }
         }
 
-        // A blank pattern alone still makes the section non-empty, and the
-        // mandatory verification command takes precedence over the pattern.
+        // A blank pattern alone still makes the section non-empty, and it is
+        // reported on its own: a section that declares no verification command
+        // is valid, so nothing else can mask the unusable pattern.
         let config = parse(r#"{"boundaries":{"protected":[" "]}}"#);
         assert!(!config.is_empty());
-        assert_eq!(config.validate(), Err(ProjectConfigError::MissingVerify));
-
-        // Once verification is declared, the blank pattern itself is reported,
-        // so a section never silently protects nothing.
-        let config = parse(r#"{"verify":{"command":"cargo"},"boundaries":{"protected":[" "]}}"#);
-        assert!(matches!(
-            config.validate(),
-            Err(ProjectConfigError::InvalidName { .. })
-        ));
+        assert!(
+            matches!(
+                config.validate(),
+                Err(ProjectConfigError::InvalidName { operation, .. })
+                    if operation == "boundaries.protected"
+            ),
+            "an unusable pattern must be reported on its own"
+        );
     }
 
     #[test]
     fn test_project_boundaries_make_the_section_non_empty() {
         let config = parse(r#"{"boundaries":{"protected":["Justfile"]}}"#);
         assert!(!config.is_empty());
-        assert_eq!(config.validate(), Err(ProjectConfigError::MissingVerify));
+        assert!(config.validate().is_ok());
     }
 }

@@ -57,19 +57,36 @@ fn is_token_metric_key(normalized: &str) -> bool {
 }
 /// Reports whether a JSON object key names a credential field.
 ///
-/// Matching is tolerant of case and separator differences — `api_key`,
-/// `api-key`, `apiKey`, and `openrouter_api_key` all collapse to the same
-/// normalized form — and recognizes credential key *families* rather than a
-/// fixed whitelist of exact names, so variants such as `access_token`,
-/// `refresh_token`, `client_secret`, `authorization`, and `bearer` cannot slip
-/// through in plaintext.
+/// The key is split on every non-alphanumeric separator and each component is
+/// tested against the credential families, so a separator-delimited suffix
+/// cannot hide a credential: `api_key`, `api-key`, `apiKey`, `api_key_v2`,
+/// `ssh_key_prod`, and `openrouter_key_1` are all recognized. Recognition is
+/// family-based rather than a fixed whitelist of exact names, so variants such
+/// as `access_token`, `refresh_token`, `client_secret`, `authorization`, and
+/// `bearer` cannot slip through in plaintext.
+///
+/// Testing components instead of the whole collapsed key keeps ordinary words
+/// readable: `keyword` and `keyword_v2` carry no credential component and stay
+/// non-sensitive.
 ///
 /// Usage counters such as `prompt_tokens` or `estimated_tokens` belong to the
 /// same `token` family, so a key name alone never exempts them. The exemption
 /// lives in `redact_sensitive_json`, which applies it only after the bound
 /// value turns out to be a numeric counter.
 fn is_sensitive_key(key: &str) -> bool {
-    let normalized = normalize_key(key);
+    key.split(|c: char| !c.is_alphanumeric())
+        .any(is_sensitive_component)
+}
+
+/// Reports whether one alphanumeric component of a JSON object key names a
+/// credential.
+///
+/// `apiKey` and `apikey` reach this function as a single component, so the
+/// family test keeps its suffix and substring matching on the lowercased
+/// component. An empty component, produced by adjacent or leading separators,
+/// matches no family.
+fn is_sensitive_component(component: &str) -> bool {
+    let normalized = component.to_ascii_lowercase();
 
     normalized.ends_with("key")
         || normalized.ends_with("keys")
@@ -313,6 +330,19 @@ where
     RequestId::deserialize(deserializer).map(Some)
 }
 
+/// Deserializes a `method` field that is present in the wire payload.
+///
+/// Serde invokes this only when the `method` key exists, so a JSON `null`
+/// surfaces as a type error instead of collapsing into `None`. `None` stays
+/// reserved for an absent key, which the request/event/response classification
+/// depends on.
+fn deserialize_present_method<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    String::deserialize(deserializer).map(Some)
+}
+
 /// Permissive capture of every field a wire message may carry.
 ///
 /// A message is classified by field presence rather than by untagged
@@ -324,7 +354,7 @@ where
 struct RawMessage {
     #[serde(default, deserialize_with = "deserialize_present_id")]
     id: Option<RequestId>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_present_method")]
     method: Option<String>,
     #[serde(default)]
     params: Option<serde_json::Value>,
@@ -486,6 +516,11 @@ mod tests {
         // error rather than being silently absorbed by the response shape.
         assert!(serde_json::from_str::<Message>(r#"{"id":1,"method":123}"#).is_err());
 
+        // A present `method` key spelled as JSON `null` is equally malformed:
+        // collapsing it into `None` would absorb the payload as a vacuous
+        // response instead of reporting `PARSE_ERROR` to the peer.
+        assert!(serde_json::from_str::<Message>(r#"{"id":1,"method":null}"#).is_err());
+        assert!(serde_json::from_str::<Message>(r#"{"method":null}"#).is_err());
         // A request carrying an explicitly null id is still a request: the
         // server then rejects it deterministically instead of silently dropping
         // it, so a malformed client is never left waiting.
@@ -658,11 +693,23 @@ mod tests {
             "access_tokens",
             "refresh_tokens",
             "id_tokens",
+            "api_key_v2",
+            "api_keys_v2",
+            "ssh_key_prod",
+            "openrouter_key_1",
         ] {
             assert!(is_sensitive_key(key), "{key} must be treated as sensitive");
         }
 
-        for key in ["path", "method", "model", "name", "keyword", "count"] {
+        for key in [
+            "path",
+            "method",
+            "model",
+            "name",
+            "keyword",
+            "keyword_v2",
+            "count",
+        ] {
             assert!(
                 !is_sensitive_key(key),
                 "{key} must not be treated as sensitive"
@@ -781,6 +828,45 @@ mod tests {
         assert!(rendered.contains("<redacted>"));
     }
 
+    #[test]
+    fn test_debug_redacts_suffixed_credential_keys() {
+        let req = Request {
+            id: RequestId::Number(8),
+            method: "custom/echo".to_string(),
+            params: Some(serde_json::json!({
+                "api_key_v2": "sk-suffixed-version",
+                "ssh_key_prod": "sk-suffixed-environment",
+                "openrouter_key_1": "sk-suffixed-index",
+                "deploy_token_v2": "sk-suffixed-token",
+                "keyword_v2": "visible_keyword"
+            })),
+        };
+
+        let request_rendered = format!("{req:?}");
+        for secret in [
+            "sk-suffixed-version",
+            "sk-suffixed-environment",
+            "sk-suffixed-index",
+            "sk-suffixed-token",
+        ] {
+            assert!(
+                !request_rendered.contains(secret),
+                "{secret} leaked into Debug"
+            );
+        }
+        assert!(request_rendered.contains("<redacted>"));
+        assert!(request_rendered.contains("visible_keyword"));
+
+        let event = Event {
+            method: "model/usage".to_string(),
+            params: Some(serde_json::json!({
+                "api_key_v2": "sk-suffixed-event"
+            })),
+        };
+        let event_rendered = format!("{event:?}");
+        assert!(!event_rendered.contains("sk-suffixed-event"));
+        assert!(event_rendered.contains("<redacted>"));
+    }
     #[test]
     fn test_debug_redacts_plural_credential_keys() {
         let req = Request {

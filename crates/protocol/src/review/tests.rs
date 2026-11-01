@@ -1,7 +1,7 @@
 use super::*;
 
 use crate::model::{ArchitectTier, CancelMode, ModelRef, ModelSelection, ReasoningEffort};
-use crate::plan::{PlanItem, PlanItemStatus};
+use crate::plan::{PlanImplementation, PlanItem, PlanItemStatus};
 
 #[test]
 fn test_review_execute_params_serde() {
@@ -735,18 +735,20 @@ fn test_review_launch_snapshot_and_post_analysis_roundtrip() {
                 "0192f0aa-0000-7000-8000-000000000002".to_string(),
                 "0192f0aa-0000-7000-8000-000000000003".to_string(),
             ],
-            subplan: vec![PlanItem {
-                id: "1.1".to_string(),
-                title: "Introduce one shared retry budget".to_string(),
-                status: PlanItemStatus::Todo,
-                files: vec!["crates/core/src/providers/retry.rs".to_string()],
-                ..Default::default()
-            }],
-            subplan_architect: Some(ArchitectTier::new(
-                ModelRef::openrouter("test/architect"),
-                Some(ReasoningEffort::High),
-            )),
-            subplan_last_replanned_step: Some("1.1".to_string()),
+            implementation: PlanImplementation {
+                items: vec![PlanItem {
+                    id: "1.1".to_string(),
+                    title: "Introduce one shared retry budget".to_string(),
+                    status: PlanItemStatus::Todo,
+                    files: vec!["crates/core/src/providers/retry.rs".to_string()],
+                    ..Default::default()
+                }],
+                architect: Some(ArchitectTier::new(
+                    ModelRef::openrouter("test/architect"),
+                    Some(ReasoningEffort::High),
+                )),
+                last_replanned_step: Some("1.1".to_string()),
+            },
         }],
     };
 
@@ -768,8 +770,8 @@ fn test_review_launch_snapshot_and_post_analysis_roundtrip() {
 
     // Explicit groups win over the implicit single-audit group.
     assert_eq!(restored.effective_groups(), restored.groups);
-    // A freshly classified group carries no horizon, so the new fields stay
-    // absent from the wire form instead of being written as empty values.
+    // A freshly classified group carries no horizon yet, but the mandatory
+    // nested implementation field is always part of the canonical wire form.
     let fresh = ArchitecturalIssueGroup {
         id: "arch-2".to_string(),
         title: "Fresh root cause".to_string(),
@@ -777,6 +779,10 @@ fn test_review_launch_snapshot_and_post_analysis_roundtrip() {
         ..Default::default()
     };
     let fresh_json = serde_json::to_string(&fresh).unwrap();
+    assert!(
+        fresh_json.contains("\"implementation\":{}"),
+        "got: {fresh_json}"
+    );
     assert!(!fresh_json.contains("subplan"), "got: {fresh_json}");
 }
 
@@ -1035,11 +1041,13 @@ fn test_review_group_kind_is_a_stored_dichotomy() {
         ReviewGroupKind::Architectural
     );
 
-    // A group written before the field existed carries no class and keeps
-    // decoding as a simple group.
-    let legacy = r#"{"id":"local","title":"Local Issues"}"#;
+    // A group written before the class field existed carries no `kind` and
+    // keeps decoding as a simple group. The nested `implementation` stays
+    // mandatory, so the record still names its horizon explicitly.
+    let legacy = r#"{"id":"local","title":"Local Issues","implementation":{}}"#;
     let group: ReviewGroup = serde_json::from_str(legacy).unwrap();
     assert_eq!(group.kind, ReviewGroupKind::Simple);
+    assert!(group.implementation.items.is_empty());
 
     let architectural = ReviewGroup {
         id: "arch-1".to_string(),
@@ -1056,6 +1064,74 @@ fn test_review_group_kind_is_a_stored_dichotomy() {
     assert_eq!(
         ReviewGroup::single_default(Vec::new()).kind,
         ReviewGroupKind::Simple
+    );
+}
+
+#[test]
+fn test_review_group_implementation_roundtrip() {
+    let group = ReviewGroup {
+        id: "arch-1".to_string(),
+        title: "Unbounded retry".to_string(),
+        kind: ReviewGroupKind::Architectural,
+        implementation: PlanImplementation {
+            items: vec![PlanItem {
+                id: "1.1".to_string(),
+                title: "Introduce one shared retry budget".to_string(),
+                status: PlanItemStatus::Todo,
+                files: vec!["crates/core/src/providers/retry.rs".to_string()],
+                ..Default::default()
+            }],
+            architect: Some(ArchitectTier::new(
+                ModelRef::openrouter("test/architect"),
+                Some(ReasoningEffort::High),
+            )),
+            last_replanned_step: Some("1.1".to_string()),
+        },
+        ..Default::default()
+    };
+
+    let json = serde_json::to_string(&group).unwrap();
+    assert!(json.contains("\"implementation\":{"), "got: {json}");
+    assert!(json.contains("\"items\":[{\"id\":\"1.1\""), "got: {json}");
+    assert!(!json.contains("subplan"), "got: {json}");
+
+    let restored: ReviewGroup = serde_json::from_str(&json).unwrap();
+    assert_eq!(restored, group);
+}
+
+/// The nested `implementation` field is mandatory: a record written with the
+/// retired `subplan*` keys carries no canonical horizon and is refused instead
+/// of being read as a group without steps.
+#[test]
+fn test_review_group_refuses_legacy_subplan_keys() {
+    let legacy_group = r#"{
+        "id": "arch-1",
+        "title": "Unbounded retry",
+        "subplan": [{"id": "1.1", "title": "Retry budget", "status": "todo"}],
+        "subplan_architect": null,
+        "subplan_last_replanned_step": null
+    }"#;
+    let group_err = serde_json::from_str::<ReviewGroup>(legacy_group)
+        .unwrap_err()
+        .to_string();
+    assert!(
+        group_err.contains("missing field `implementation`"),
+        "got: {group_err}"
+    );
+
+    let legacy_cluster = r#"{
+        "id": "arch-1",
+        "title": "Unbounded retry",
+        "description": "Retries lack a shared budget",
+        "issue_ids": ["0192f0aa-0000-7000-8000-000000000001"],
+        "subplan": [{"id": "1.1", "title": "Retry budget", "status": "todo"}]
+    }"#;
+    let cluster_err = serde_json::from_str::<ArchitecturalIssueGroup>(legacy_cluster)
+        .unwrap_err()
+        .to_string();
+    assert!(
+        cluster_err.contains("missing field `implementation`"),
+        "got: {cluster_err}"
     );
 }
 
@@ -1082,4 +1158,191 @@ fn test_review_execute_params_group_target() {
     assert!(finding_run.group_id.is_none());
     let json = serde_json::to_string(&finding_run).unwrap();
     assert!(!json.contains("group_id"), "got: {json}");
+}
+
+/// The note datum of a finding has exactly one wire spelling: the analytical
+/// view and the stored representation agree on it, so a session persisted from
+/// one and read through the other never carries two keys for the same value.
+#[test]
+fn test_review_note_serializes_under_one_canonical_key() {
+    let issue = ReviewIssue {
+        id: 1,
+        title: "Note key".to_string(),
+        uuid: None,
+        group: None,
+        model: None,
+        issue_type: IssueType::Quality,
+        status: IssueStatus::Todo,
+        description: "Body".to_string(),
+        recommendations: Vec::new(),
+        files: Vec::new(),
+        readonly_files: Vec::new(),
+        note: Some("Resolved upstream".to_string()),
+    };
+    let item = ReviewItem::from(issue.clone());
+
+    let issue_json = serde_json::to_string(&issue).unwrap();
+    let item_json = serde_json::to_string(&item).unwrap();
+    assert!(issue_json.contains("\"note\":"), "got: {issue_json}");
+    assert!(item_json.contains("\"note\":"), "got: {item_json}");
+    assert!(
+        !issue_json.contains("resolution_notes"),
+        "got: {issue_json}"
+    );
+    assert!(!item_json.contains("resolution_notes"), "got: {item_json}");
+
+    // A session written by an older daemon keeps decoding through the retired
+    // spelling and is rewritten under the canonical key, so the datum cannot
+    // travel under two names depending on which type wrote it.
+    let legacy = r#"{"id":1,"title":"Legacy","resolution_notes":"Resolved upstream"}"#;
+    let legacy_item: ReviewItem = serde_json::from_str(legacy).unwrap();
+    assert_eq!(
+        legacy_item.resolution_notes.as_deref(),
+        Some("Resolved upstream")
+    );
+    let rewritten = serde_json::to_string(&legacy_item).unwrap();
+    assert!(
+        rewritten.contains("\"note\":\"Resolved upstream\""),
+        "got: {rewritten}"
+    );
+    assert!(!rewritten.contains("resolution_notes"), "got: {rewritten}");
+
+    // The analytical view accepts the retired spelling as well, so both
+    // representations read every session ever stored.
+    let legacy_issue: ReviewIssue = serde_json::from_str(
+        r#"{"id":1,"title":"Legacy","type":"quality","resolution_notes":"Resolved upstream"}"#,
+    )
+    .unwrap();
+    assert_eq!(legacy_issue.note.as_deref(), Some("Resolved upstream"));
+}
+
+/// The body datum of a finding has exactly one wire spelling: the analytical
+/// view and the stored representation agree on it, so a session persisted from
+/// one and read through the other never carries two keys for the same value.
+#[test]
+fn test_review_body_serializes_under_one_canonical_key() {
+    let issue = ReviewIssue {
+        id: 1,
+        title: "Body key".to_string(),
+        uuid: None,
+        group: None,
+        model: None,
+        issue_type: IssueType::Quality,
+        status: IssueStatus::Todo,
+        description: "Lock released early".to_string(),
+        recommendations: Vec::new(),
+        files: Vec::new(),
+        readonly_files: Vec::new(),
+        note: None,
+    };
+    let item = ReviewItem::from(issue.clone());
+
+    let issue_json = serde_json::to_string(&issue).unwrap();
+    let item_json = serde_json::to_string(&item).unwrap();
+    assert!(
+        issue_json.contains("\"description\":\"Lock released early\""),
+        "got: {issue_json}"
+    );
+    assert!(
+        item_json.contains("\"description\":\"Lock released early\""),
+        "got: {item_json}"
+    );
+    assert!(!issue_json.contains("\"body\":"), "got: {issue_json}");
+    assert!(!item_json.contains("\"body\":"), "got: {item_json}");
+
+    // A session written by an older daemon keeps decoding through the retired
+    // spelling and is rewritten under the canonical key, so the prose cannot
+    // travel under two names depending on which type wrote it.
+    let legacy = r#"{"id":1,"title":"Legacy","body":"Old body"}"#;
+    let legacy_item: ReviewItem = serde_json::from_str(legacy).unwrap();
+    assert_eq!(legacy_item.body, "Old body");
+    let rewritten = serde_json::to_string(&legacy_item).unwrap();
+    assert!(
+        rewritten.contains("\"description\":\"Old body\""),
+        "got: {rewritten}"
+    );
+    assert!(!rewritten.contains("\"body\":"), "got: {rewritten}");
+
+    // The analytical view accepts the retired spelling as well, so both
+    // representations read every session ever stored.
+    let legacy_issue: ReviewIssue =
+        serde_json::from_str(r#"{"id":1,"title":"Legacy","type":"quality","body":"Old body"}"#)
+            .unwrap();
+    assert_eq!(legacy_issue.description, "Old body");
+}
+#[test]
+fn test_issue_status_as_str_matches_the_wire_spelling() {
+    for status in [
+        IssueStatus::Discussion,
+        IssueStatus::Todo,
+        IssueStatus::InProgress,
+        IssueStatus::Fixed,
+        IssueStatus::Skipped,
+        IssueStatus::Rejected,
+    ] {
+        assert_eq!(
+            serde_json::to_value(status).unwrap(),
+            serde_json::Value::String(status.as_str().to_string()),
+            "{status:?} drifted from its wire spelling"
+        );
+    }
+}
+
+#[test]
+fn test_review_decision_status_moves_a_finding_into_a_decided_status() {
+    for (decision, expected) in [
+        (ReviewDecisionStatus::Todo, IssueStatus::Todo),
+        (ReviewDecisionStatus::Skipped, IssueStatus::Skipped),
+        (ReviewDecisionStatus::Rejected, IssueStatus::Rejected),
+    ] {
+        assert_eq!(IssueStatus::from(decision), expected);
+        assert_eq!(
+            serde_json::to_value(decision).unwrap(),
+            serde_json::Value::String(decision.as_str().to_string())
+        );
+    }
+
+    // The decision vocabulary never reaches a status the harness owns: a fix is
+    // declared only after verification, and execution start belongs to the
+    // finding workflow.
+    for decision in [
+        ReviewDecisionStatus::Todo,
+        ReviewDecisionStatus::Skipped,
+        ReviewDecisionStatus::Rejected,
+    ] {
+        let status = IssueStatus::from(decision);
+        assert_ne!(status, IssueStatus::Fixed);
+        assert_ne!(status, IssueStatus::InProgress);
+    }
+}
+
+#[test]
+fn test_review_update_proposal_serde() {
+    let update = ReviewUpdateProposal {
+        item_id: 3,
+        group_id: Some("arch-1".to_string()),
+        status: ReviewDecisionStatus::Todo,
+        note: "The lock must be held across the turn".to_string(),
+        recommendations: vec!["Extend the guard".to_string()],
+    };
+    let json = serde_json::to_string(&update).unwrap();
+    assert!(json.contains("\"status\":\"todo\""), "got: {json}");
+    assert!(json.contains("\"group_id\":\"arch-1\""), "got: {json}");
+    assert!(
+        json.contains("\"note\":\"The lock must be held across the turn\""),
+        "got: {json}"
+    );
+    let de: ReviewUpdateProposal = serde_json::from_str(&json).unwrap();
+    assert_eq!(de, update);
+
+    // The decision, the status it moves the finding to, and the group it is
+    // recorded for are the payload; only the recommendations may be absent.
+    let minimal = r#"{"item_id":3,"status":"skipped","note":"Not reproducible"}"#;
+    let de: ReviewUpdateProposal = serde_json::from_str(minimal).unwrap();
+    assert_eq!(de.status, ReviewDecisionStatus::Skipped);
+    assert!(de.recommendations.is_empty());
+    assert!(de.group_id.is_none());
+    assert!(
+        serde_json::from_str::<ReviewUpdateProposal>(r#"{"item_id":3,"status":"todo"}"#).is_err()
+    );
 }

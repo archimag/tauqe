@@ -9,11 +9,16 @@
 //! Two invariants shape the orchestration:
 //!
 //! * The classification is the session itself, not a projection beside it.
-//!   Findings keep their identity, their content, and their status, while
+//!   Findings keep their identity and their content, while
 //!   `ReviewStorage::regroup_session` substitutes the session groups and
 //!   reassigns every finding in place, so re-running the analysis never rescans
 //!   the audited code and never rewrites a finding.
-//!   the audited code and never rewrites a finding.
+//! * The routing is the same layer: the status every finding starts from is
+//!   applied by the same write, so a finding enters execution, or stays with the
+//!   engineer until the open decision is taken, exactly as the analysis decided.
+//!   A finding that is already being executed, or that already finished, keeps
+//!   the lifecycle state it earned, because re-running the analysis never
+//!   reopens a taken decision.
 //! * A finding whose type requires planning before execution never lands in the
 //!   group of independent findings: the layer mints a single-element
 //!   architectural group for it, so the requirement holds regardless of how the
@@ -37,15 +42,16 @@ use tauqe_core::review::analysis::{
 use tauqe_core::review::prompt::analysis::{
     build_post_analysis_system_prompt, build_post_analysis_user_prompt,
 };
+use tauqe_core::review::storage::FindingAssignment;
 use tauqe_core::review::{uuid::generate_uuid_v7, ReviewStorage};
 use tauqe_protocol::model::{ReviewWorkPhase, TurnWorkContext, TurnWorkQueue};
 use tauqe_protocol::review::{
     ReviewGroup, ReviewGroupKind, LOCAL_REVIEW_GROUP_ID, LOCAL_REVIEW_GROUP_TITLE,
 };
 use tauqe_protocol::{
-    errors, events, IssueType, ModelRole, ModelStartedEvent, ModelUsageEvent, ModelUsageInfo,
-    Request, Response, ResponseError, ReviewAnalyzeFinishedEvent, ReviewAnalyzeParams,
-    ReviewAnalyzeResult, ReviewAnalyzeStartedEvent, ReviewContentDeltaEvent,
+    errors, events, IssueStatus, IssueType, ModelRole, ModelStartedEvent, ModelUsageEvent,
+    ModelUsageInfo, Request, Response, ResponseError, ReviewAnalyzeFinishedEvent,
+    ReviewAnalyzeParams, ReviewAnalyzeResult, ReviewAnalyzeStartedEvent, ReviewContentDeltaEvent,
     ReviewReasoningDeltaEvent, ReviewSession,
 };
 use tokio::sync::mpsc;
@@ -460,12 +466,21 @@ pub(super) async fn run_review_post_analysis(
     let verdict = output.summary.trim().to_string();
     let redirects = arch_redirect_groups(&output, session, &known_uuids);
     let groups = regrouped_groups(&output, &redirects);
-    let assignments = group_assignments(&output, &known_uuids, &redirects);
+    let triage = triage_statuses(&output, &known_uuids);
+    let assignments = group_assignments(&output, &known_uuids, session, &triage, &redirects);
     let independent_count = output.independent_issues.len();
     let group_count = output.architectural_groups.len();
+    let todo_count = assignments
+        .iter()
+        .filter(|assignment| assignment.status == Some(IssueStatus::Todo))
+        .count();
+    let discussion_count = assignments
+        .iter()
+        .filter(|assignment| assignment.status == Some(IssueStatus::Discussion))
+        .count();
     let history_response = format!(
-        "Review session [{}] post-analysis regrouped {} finding(s) into {} independent issue(s) and {} architectural group(s).\n\n{}",
-        session.id, findings_count, independent_count, group_count, verdict,
+        "Review session [{}] post-analysis regrouped {} finding(s) into {} independent issue(s) and {} architectural group(s), routing {} to todo and {} to discussion.\n\n{}",
+        session.id, findings_count, independent_count, group_count, todo_count, discussion_count, verdict,
     );
 
     // One layer is rewritten in place: the findings are never rescanned and never
@@ -496,6 +511,8 @@ pub(super) async fn run_review_post_analysis(
         findings = findings_count,
         independent_issues = independent_count,
         architectural_groups = group_count,
+        routed_todo = todo_count,
+        routed_discussion = discussion_count,
         model = %model,
         "review post-analysis persisted"
     );
@@ -504,7 +521,7 @@ pub(super) async fn run_review_post_analysis(
     // is durable, so a cancelled, failed, or rejected round leaves no orphaned user
     // turn in the transcript. The audited files describe what the Architect saw.
     let history_turn_prompt = format!(
-        "# Review Post-Analysis: [{}] {}\n\nClassify the {} finding(s) of the session into independent issues and architectural root-cause groups.",
+        "# Review Post-Analysis: [{}] {}\n\nClassify the {} finding(s) of the session into independent issues and architectural root-cause groups, and route every finding to the status its resolution starts from.",
         session.id, session.title, findings_count,
     );
     record_synthesis_history(
@@ -582,6 +599,52 @@ fn resolve_identity(identifier: &str, known_uuids: &[String]) -> Option<String> 
         .iter()
         .find(|known| known.eq_ignore_ascii_case(trimmed))
         .cloned()
+}
+
+/// Resolves the lifecycle status each finding is routed to, keyed by identity.
+///
+/// The routing is the decision about where a finding starts, so it is keyed by
+/// the authoritative spelling the session stores. An entry naming an identity the
+/// session does not hold is ignored here: the payload was already validated
+/// against the session by name, so a stray entry is not a reason to abandon the
+/// layer.
+fn triage_statuses(
+    output: &PostAnalysisOutput,
+    known_uuids: &[String],
+) -> HashMap<String, IssueStatus> {
+    let mut statuses = HashMap::new();
+    for entry in &output.triage {
+        if let Some(known) = resolve_identity(&entry.uuid, known_uuids) {
+            statuses.insert(known, entry.status);
+        }
+    }
+    statuses
+}
+
+/// Statuses the post-analysis may still route a finding out of.
+///
+/// A finding that is already being executed, or that already reached a terminal
+/// outcome, keeps the lifecycle state it earned: re-running the analysis rewrites
+/// the routing of the findings that are still open and never reopens a decision
+/// that was already taken.
+fn triageable(status: IssueStatus) -> bool {
+    matches!(status, IssueStatus::Discussion | IssueStatus::Todo)
+}
+
+/// Resolves the status one finding is routed to, if it may still be routed.
+fn routed_status(
+    uuid: &str,
+    session: &ReviewSession,
+    triage: &HashMap<String, IssueStatus>,
+) -> Option<IssueStatus> {
+    let item = session
+        .items
+        .iter()
+        .find(|item| item.uuid.as_deref() == Some(uuid))?;
+    if !triageable(item.status) {
+        return None;
+    }
+    triage.get(uuid).copied()
 }
 
 /// Identifier of the architectural cluster emitted at one payload position.
@@ -714,8 +777,10 @@ fn arch_redirect_groups(
 fn group_assignments(
     output: &PostAnalysisOutput,
     known_uuids: &[String],
+    session: &ReviewSession,
+    triage: &HashMap<String, IssueStatus>,
     redirects: &[(String, ReviewGroup)],
-) -> Vec<(String, String)> {
+) -> Vec<FindingAssignment> {
     let mut assigned: HashMap<String, String> = HashMap::new();
     for identifier in &output.independent_issues {
         if let Some(known) = resolve_identity(identifier, known_uuids) {
@@ -742,7 +807,11 @@ fn group_assignments(
                 .get(uuid)
                 .cloned()
                 .unwrap_or_else(|| LOCAL_REVIEW_GROUP_ID.to_string());
-            (uuid.clone(), group_id)
+            FindingAssignment {
+                uuid: uuid.clone(),
+                group_id,
+                status: routed_status(uuid, session, triage),
+            }
         })
         .collect()
 }
@@ -1118,5 +1187,82 @@ mod tests {
             response.error.expect("the request is refused").code,
             errors::INVALID_PARAMS
         );
+    }
+    /// The routing is the first lifecycle state a finding holds: an unambiguous
+    /// defect becomes executable, while a genuine fork stays with the engineer
+    /// until the decision is taken.
+    #[tokio::test]
+    async fn post_analysis_routes_every_finding_by_the_triage() {
+        let fixture = fixture("triage");
+        let mut session = session();
+        for item in &mut session.items {
+            item.status = IssueStatus::Todo;
+        }
+        ReviewStorage::save_session(&fixture.root, &session).unwrap();
+
+        let payload = serde_json::json!({
+            "summary": "One defect is unambiguous, one decision is open.",
+            "triage": [
+                {"uuid": CORE_UUID, "status": "todo", "discussion_topic": null},
+                {"uuid": TUI_UUID, "status": "discussion", "discussion_topic": "Which API replaces the removed entry point?"},
+            ],
+            "independent_issues": [],
+            "architectural_groups": [{
+                "title": "Shared transaction boundary",
+                "description": "Both findings manifest one defect.",
+                "issue_ids": [CORE_UUID, TUI_UUID],
+            }],
+        })
+        .to_string();
+        let provider = Arc::new(MockLlmProvider::scripted([MockResponse::text(payload)]));
+        *fixture.state.provider_override.lock().await = Some(provider);
+
+        let operation = fixture.state.try_begin_operation().unwrap();
+        let stored =
+            run_review_post_analysis(&fixture.state, &fixture.root, &session, &operation, false)
+                .await
+                .expect("the classification is persisted");
+
+        assert_eq!(stored.items[0].status, IssueStatus::Todo);
+        assert_eq!(stored.items[1].status, IssueStatus::Discussion);
+        let reloaded = ReviewStorage::load_review(&fixture.root, "rev-analyze")
+            .unwrap()
+            .expect("the session is stored");
+        assert_eq!(reloaded.items[0].status, IssueStatus::Todo);
+        assert_eq!(reloaded.items[1].status, IssueStatus::Discussion);
+    }
+
+    /// A finished finding keeps the lifecycle state it earned: re-running the
+    /// analysis rewrites the grouping and never reopens a taken decision.
+    #[tokio::test]
+    async fn post_analysis_never_reopens_a_finished_finding() {
+        let fixture = fixture("triage-terminal");
+        let mut session = session();
+        session.items[0].status = IssueStatus::Fixed;
+        ReviewStorage::save_session(&fixture.root, &session).unwrap();
+
+        let payload = serde_json::json!({
+            "summary": "The defect is still unambiguous.",
+            "triage": [{"uuid": CORE_UUID, "status": "todo", "discussion_topic": null}],
+            "independent_issues": [],
+            "architectural_groups": [{
+                "title": "Shared transaction boundary",
+                "description": "One defect.",
+                "issue_ids": [CORE_UUID],
+            }],
+        })
+        .to_string();
+        let provider = Arc::new(MockLlmProvider::scripted([MockResponse::text(payload)]));
+        *fixture.state.provider_override.lock().await = Some(provider);
+
+        let operation = fixture.state.try_begin_operation().unwrap();
+        let stored =
+            run_review_post_analysis(&fixture.state, &fixture.root, &session, &operation, false)
+                .await
+                .expect("the classification is persisted");
+
+        assert_eq!(stored.items[0].status, IssueStatus::Fixed);
+        assert_eq!(stored.items[0].group.as_deref(), Some("arch-1"));
+        assert_eq!(stored.items[1].status, IssueStatus::Discussion);
     }
 }

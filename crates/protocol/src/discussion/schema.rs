@@ -8,6 +8,12 @@
 //! fails the build whenever a field, required key, or enum variant drifts away
 //! from `DiscussionResponse` and its nested types.
 //!
+//! Every schema is assembled once into a process-wide cache and served by
+//! shared reference, so a caller composes or serializes through the value the
+//! cache holds instead of paying a per-call deep copy of the tree. The
+//! accessors therefore return `&'static serde_json::Value`: a consumer that
+//! needs an owned tree clones the reference explicitly, and embedding one
+//! schema into another does exactly that once, while the cache is initialized.
 //! Property order is part of the wire contract: `message` must remain the first
 //! property so a language model emits the conversational answer before the
 //! heavier structural fields, letting the interface stream text immediately.
@@ -20,11 +26,12 @@
 use std::sync::OnceLock;
 
 use crate::plan::PlanItemStatus;
+use crate::review::ReviewDecisionStatus;
 
 /// Process-wide cache of the assembled discussion schema.
 ///
 /// The schema is immutable and depends only on compile-time structure, so it is
-/// assembled once and cloned per call rather than rebuilt on every request.
+/// assembled once and served by reference for the rest of the process.
 static DISCUSSION_RESPONSE_SCHEMA: OnceLock<serde_json::Value> = OnceLock::new();
 
 /// Process-wide cache of the structured plan payload property.
@@ -32,6 +39,9 @@ static PLAN_UPDATE_SCHEMA: OnceLock<serde_json::Value> = OnceLock::new();
 
 /// Process-wide cache of the shared definitions the plan payload references.
 static PLAN_SCHEMA_DEFINITIONS: OnceLock<serde_json::Value> = OnceLock::new();
+
+/// Process-wide cache of the assembled structured-output wrapper.
+static DISCUSSION_RESPONSE_SCHEMA_DEFINITION: OnceLock<serde_json::Value> = OnceLock::new();
 
 /// Generates the structured plan payload property of the plan contract.
 ///
@@ -43,9 +53,15 @@ static PLAN_SCHEMA_DEFINITIONS: OnceLock<serde_json::Value> = OnceLock::new();
 /// re-declares the shape.
 ///
 /// The property admits `null` because a turn that leaves the plan untouched
-/// carries no payload at all, which is the idle representation of a property a
-/// strict schema still requires.
-pub fn plan_update_schema() -> serde_json::Value {
+/// carries no payload at all, which is the idle representation of a property
+/// the strict schema requires.
+///
+/// The payload is assembled once and served by a shared reference, so a caller
+/// that composes or serializes it pays no per-call deep copy of the tree.
+/// Embedding it elsewhere clones the reference explicitly, which is why the
+/// accessor hands workspace consumers a `&'static serde_json::Value` instead of
+/// an owned tree.
+pub fn plan_update_schema() -> &'static serde_json::Value {
     PLAN_UPDATE_SCHEMA
         .get_or_init(|| {
             serde_json::json!({
@@ -105,7 +121,6 @@ pub fn plan_update_schema() -> serde_json::Value {
                 "description": "Optional plan update or creation to be applied at the end of the turn"
             })
         })
-        .clone()
 }
 
 /// Generates the shared definitions [`plan_update_schema`] references.
@@ -120,8 +135,10 @@ pub fn plan_update_schema() -> serde_json::Value {
 /// that owns it, so a nested tree of any depth validates against the very same
 /// contract as its root. Every field of `ConceptItem` and `PlanItem` appears
 /// exactly once, and the `status` enum is generated from [`PlanItemStatus`], so
-/// a new variant cannot be forgotten here.
-pub fn plan_schema_definitions() -> serde_json::Value {
+/// The definitions are assembled once and served by a shared reference, so a
+/// consumer that embeds them clones the reference once instead of paying a
+/// per-call deep copy of both trees.
+pub fn plan_schema_definitions() -> &'static serde_json::Value {
     PLAN_SCHEMA_DEFINITIONS
         .get_or_init(|| {
             serde_json::json!({
@@ -220,7 +237,6 @@ pub fn plan_schema_definitions() -> serde_json::Value {
                 }
             })
         })
-        .clone()
 }
 
 /// Builds the `status` enum of the plan item definition from [`PlanItemStatus`].
@@ -259,13 +275,34 @@ fn plan_item_status_wire(status: PlanItemStatus) -> &'static str {
     }
 }
 
+/// Builds the `status` enum of the review update from [`ReviewDecisionStatus`].
+///
+/// The vocabulary is exactly the decision a discussion may record, so the enum is
+/// generated from the typed model instead of being copied here: a decision that
+/// gains or loses a variant cannot drift away from the schema the model reads.
+fn review_decision_status_enum() -> serde_json::Value {
+    const DECISIONS: &[ReviewDecisionStatus] = &[
+        ReviewDecisionStatus::Todo,
+        ReviewDecisionStatus::Skipped,
+        ReviewDecisionStatus::Rejected,
+    ];
+    serde_json::Value::Array(
+        DECISIONS
+            .iter()
+            .map(|decision| serde_json::Value::String(decision.as_str().to_string()))
+            .collect(),
+    )
+}
+
 /// Generates a strict JSON Schema representing `DiscussionResponse`.
 ///
 /// Guarantees that the `message` string property is listed first in `properties`
 /// and `required` so language models emit conversational text before plan
 /// updates or context requests. The ordering relies on `serde_json`'s
-/// `preserve_order` feature; see the module documentation.
-pub fn discussion_response_schema() -> serde_json::Value {
+/// The schema is assembled once and served by a shared reference, so the
+/// discussion request path composes its payload by borrowing this value instead
+/// of deep-copying the whole tree, `$defs` included.
+pub fn discussion_response_schema() -> &'static serde_json::Value {
     DISCUSSION_RESPONSE_SCHEMA
         .get_or_init(|| {
             serde_json::json!({
@@ -275,7 +312,50 @@ pub fn discussion_response_schema() -> serde_json::Value {
                         "type": "string",
                         "description": "Conversational response, reasoning, and answers formatted in Markdown. This field is streamed immediately to the user interface."
                     },
-                    "plan_update": plan_update_schema(),
+                    "plan_update": plan_update_schema().clone(),
+                    "review_update": {
+                        "anyOf": [
+                            {
+                                "type": "object",
+                                "description": "Decision recorded for one finding of the discussed review session. Null unless the discussion is anchored on a review session and the engineer has reached a final decision.",
+                                "properties": {
+                                    "item_id": {
+                                        "type": "integer",
+                                        "description": "Identifier of the finding inside the discussed review session"
+                                    },
+                                    "group_id": {
+                                        "anyOf": [
+                                            { "type": "string" },
+                                            { "type": "null" }
+                                        ],
+                                        "description": "Identifier of the review group the decision is recorded for; null when the decision addresses the finding alone"
+                                    },
+                                    "status": {
+                                        "type": "string",
+                                        "enum": review_decision_status_enum(),
+                                        "description": "Status the finding moves to: 'todo' queues it for execution, 'skipped' records that the finding is not reproducible, and 'rejected' records a false positive or an accepted trade-off"
+                                    },
+                                    "note": {
+                                        "type": "string",
+                                        "description": "The decision itself, in the engineer's words: the recorded resolution of the finding"
+                                    },
+                                    "recommendations": {
+                                        "type": "array",
+                                        "description": "Additional remediation recommendations agreed in the discussion; empty when the decision adds none",
+                                        "items": {
+                                            "type": "string"
+                                        }
+                                    }
+                                },
+                                "required": ["item_id", "group_id", "status", "note", "recommendations"],
+                                "additionalProperties": false
+                            },
+                            {
+                                "type": "null"
+                            }
+                        ],
+                        "description": "Optional decision recorded for one review finding at the end of the turn"
+                    },
                     "context_requests": {
                         "type": "array",
                         "description": "Files to request into context for inspection or editable access",
@@ -356,21 +436,28 @@ pub fn discussion_response_schema() -> serde_json::Value {
                         "description": "Detected primary natural language of the user prompt"
                     }
                 },
-                "required": ["message", "plan_update", "context_requests", "repo_searches", "repo_dirs", "repo_maps", "dir_lists", "user_language"],
+                "required": ["message", "plan_update", "review_update", "context_requests", "repo_searches", "repo_dirs", "repo_maps", "dir_lists", "user_language"],
                 "additionalProperties": false,
-                "$defs": plan_schema_definitions()
+                "$defs": plan_schema_definitions().clone()
             })
         })
-        .clone()
 }
 
-/// Generates a complete JSON schema wrapper object for OpenAI/OpenRouter structured outputs.
-pub fn discussion_response_schema_definition() -> serde_json::Value {
-    serde_json::json!({
-        "name": "discussion_response",
-        "description": "Structured response for discussion and planning modes",
-        "strict": true,
-        "schema": discussion_response_schema()
+/// Generates the complete JSON schema wrapper object for OpenAI/OpenRouter
+/// structured outputs.
+///
+/// The wrapper embeds the whole discussion schema, so it is assembled once into
+/// its own process-wide cache and served by a shared reference: composing a
+/// request from it borrows the cached wrapper instead of rebuilding it and
+/// deep-copying the schema tree it carries.
+pub fn discussion_response_schema_definition() -> &'static serde_json::Value {
+    DISCUSSION_RESPONSE_SCHEMA_DEFINITION.get_or_init(|| {
+        serde_json::json!({
+            "name": "discussion_response",
+            "description": "Structured response for discussion and planning modes",
+            "strict": true,
+            "schema": discussion_response_schema().clone()
+        })
     })
 }
 
@@ -414,6 +501,7 @@ mod tests {
         DiscussionResponse, RepoSearchRequest,
     };
     use crate::plan::{ConceptItem, PlanItem, PlanItemStatus};
+    use crate::review::{IssueStatus, ReviewDecisionStatus, ReviewUpdateProposal};
 
     #[test]
     fn test_custom_tool_call_schema_pins_the_invocation_contract() {
@@ -457,6 +545,9 @@ mod tests {
         let plan_idx = schema_str
             .find("\"plan_update\"")
             .expect("plan_update found");
+        let review_idx = schema_str
+            .find("\"review_update\"")
+            .expect("review_update found");
         let ctx_idx = schema_str
             .find("\"context_requests\"")
             .expect("context_requests found");
@@ -471,7 +562,8 @@ mod tests {
             .expect("user_language found");
 
         assert!(msg_idx < plan_idx);
-        assert!(plan_idx < ctx_idx);
+        assert!(plan_idx < review_idx);
+        assert!(review_idx < ctx_idx);
         assert!(ctx_idx < search_idx);
         assert!(search_idx < dirs_idx);
         assert!(dirs_idx < maps_idx);
@@ -508,8 +600,8 @@ mod tests {
     #[test]
     fn test_plan_payload_is_generated_once() {
         let schema = discussion_response_schema();
-        assert_eq!(schema["properties"]["plan_update"], plan_update_schema());
-        assert_eq!(schema["$defs"], plan_schema_definitions());
+        assert_eq!(&schema["properties"]["plan_update"], plan_update_schema());
+        assert_eq!(&schema["$defs"], plan_schema_definitions());
 
         let payload = plan_update_schema();
         let variants = payload["anyOf"]
@@ -644,13 +736,20 @@ mod tests {
                 concept: vec![ConceptItem::default()],
                 items: vec![PlanItem::default()],
             })
+            .with_review_update(ReviewUpdateProposal {
+                item_id: 1,
+                group_id: None,
+                status: ReviewDecisionStatus::Todo,
+                note: "The lock must be held across the turn".to_string(),
+                recommendations: vec!["Extend the guard".to_string()],
+            })
             .with_context_requests(vec![DiscussionContextRequest::read_only("a.rs")])
             .with_repo_searches(vec![RepoSearchRequest::new("crates/core", "regex")])
             .with_repo_dirs(true)
             .with_repo_maps(vec!["crates/core".to_string()])
             .with_dir_lists(vec![DirListRequest::new("crates/core", true)])
             .with_user_language("English");
-        let (props, required) = field_sets(&schema);
+        let (props, required) = field_sets(schema);
         assert_eq!(props, keys(&serde_json::to_value(&response).unwrap()));
         assert_eq!(
             required, props,
@@ -662,6 +761,14 @@ mod tests {
         assert_eq!(
             props,
             keys(&serde_json::to_value(response.plan_update.clone().unwrap()).unwrap())
+        );
+        assert_eq!(required, props);
+
+        // 2b. Nested review_update object.
+        let (props, required) = field_sets(&schema["properties"]["review_update"]["anyOf"][0]);
+        assert_eq!(
+            props,
+            keys(&serde_json::to_value(response.review_update.clone().unwrap()).unwrap())
         );
         assert_eq!(required, props);
 
@@ -773,6 +880,39 @@ mod tests {
             assert!(
                 action_enum.contains(wire),
                 "plan_update.action enum is missing variant {wire}"
+            );
+        }
+
+        // 8b. Every decision a discussion may record is expressible in the
+        //     review_update.status enum, and no status owned by verification or
+        //     by execution is.
+        let decision_enum: BTreeSet<String> = schema["properties"]["review_update"]["anyOf"][0]
+            ["properties"]["status"]["enum"]
+            .as_array()
+            .map(|a| {
+                a.iter()
+                    .filter_map(|v| v.as_str().map(String::from))
+                    .collect()
+            })
+            .unwrap_or_default();
+        for decision in [
+            ReviewDecisionStatus::Todo,
+            ReviewDecisionStatus::Skipped,
+            ReviewDecisionStatus::Rejected,
+        ] {
+            assert!(
+                decision_enum.contains(decision.as_str()),
+                "review_update.status enum is missing variant {decision:?}"
+            );
+        }
+        for status in [
+            IssueStatus::Discussion,
+            IssueStatus::InProgress,
+            IssueStatus::Fixed,
+        ] {
+            assert!(
+                !decision_enum.contains(status.as_str()),
+                "review_update.status enum must not admit {status:?}"
             );
         }
 

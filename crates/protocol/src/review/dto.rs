@@ -202,10 +202,10 @@ pub struct ReviewExecuteParams {
     pub item_id: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub step_id: Option<String>,
-    /// Identifier of the review group whose unified subplan is executed.
+    /// Identifier of the review group whose unified implementation is executed.
     ///
     /// A group run addresses the group itself, never one of its findings:
-    /// `step_id` then names a step of the group subplan. The field is a target
+    /// `step_id` then names a step of the group implementation. The field is a target
     /// of its own, so a request names either a group or findings, and the
     /// server rejects a request that mixes `group_id` with `item_id` or
     /// `item_ids`.

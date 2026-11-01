@@ -11,7 +11,10 @@
 //! applies, so a preview can never predict a selection the server resolves
 //! differently.
 
+use std::cell::Cell;
+use std::collections::hash_map::DefaultHasher;
 use std::collections::BTreeSet;
+use std::hash::{Hash, Hasher};
 
 use tauqe_protocol::glob::GlobPattern;
 
@@ -96,6 +99,71 @@ pub fn count_matches(pattern: &str, repo_files: &[String]) -> Option<usize> {
     count_multi_matches(&patterns, repo_files)
 }
 
+/// Memoized union match count of the review-launch path rows (#47).
+///
+/// The live match counter and the launch gate ask the same question — how many
+/// repository files the entered rows select together — and the render path asks
+/// it again on every frame, including the spinner ticks of a streaming turn. The
+/// answer is fully determined by the row texts, so it is kept against a
+/// signature of those rows instead of being recomputed from scratch.
+///
+/// The repository file list is deliberately absent from the signature: the
+/// dialog installs it once at construction and never replaces it, so the row
+/// texts are the only mutable input. An edited, appended, or removed row changes
+/// the signature and recomputes exactly once.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct PatternMatchMemo {
+    /// Last served entry: the signature of the rows and the count it produced.
+    entry: Cell<Option<(u64, Option<usize>)>>,
+    /// Number of real computations served, so a regression test can pin that
+    /// redraws, focus moves, and selection changes never recompute.
+    computations: Cell<u64>,
+}
+
+impl PatternMatchMemo {
+    /// Returns the union count of `patterns` over `repo_files`.
+    ///
+    /// The stored count is served while the signature of the rows is unchanged;
+    /// otherwise the union is recomputed once through [`count_multi_matches`]
+    /// and the fresh signature and count replace it.
+    pub(crate) fn count_for(&self, patterns: &[String], repo_files: &[String]) -> Option<usize> {
+        let signature = patterns_signature(patterns);
+        match self.entry.get() {
+            Some((cached, count)) if cached == signature => count,
+            _ => {
+                let count = count_multi_matches(patterns, repo_files);
+                self.entry.set(Some((signature, count)));
+                let computations = self.computations.get();
+                self.computations.set(computations.saturating_add(1));
+                count
+            }
+        }
+    }
+
+    /// Number of real computations served since the dialog was built.
+    ///
+    /// Only the regression test reads this, exactly like `render_count` of
+    /// `crate::markdown::cache`, so the allowance keeps the zero-warning gate
+    /// green instead of widening the module surface for a counter.
+    #[allow(dead_code)]
+    pub(crate) fn computations(&self) -> u64 {
+        self.computations.get()
+    }
+}
+
+/// Fingerprint of the pattern rows behind a memoized match count.
+///
+/// Mirroring `content_signature` in `crate::markdown::cache`, the row count and
+/// every row's bytes are folded into one hash, so an edited, appended, or
+/// removed row is detectable without holding the rows twice.
+fn patterns_signature(patterns: &[String]) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    patterns.len().hash(&mut hasher);
+    for pattern in patterns {
+        pattern.hash(&mut hasher);
+    }
+    hasher.finish()
+}
 #[cfg(test)]
 mod tests {
     use super::*;

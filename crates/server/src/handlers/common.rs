@@ -15,7 +15,6 @@ use tauqe_core::edits::protocol::ContextRequest;
 use tauqe_core::workflow::common::apply_context_requests_detailed;
 use tauqe_protocol::discussion::DiscussionTarget;
 use tauqe_protocol::{events, ContextAccess, Event};
-use tokio::sync::watch;
 
 /// Emits a server event with an optional serialized parameter payload.
 pub(crate) fn emit(out: &OutChannel, method: &str, params: Option<serde_json::Value>) {
@@ -72,6 +71,25 @@ pub(crate) fn turn_applied_edits(turn: &crate::handlers::model::ModelTurnResult)
     }
 }
 
+/// Whether a completed turn left changes in the working tree that the failed
+/// attempt never reverted.
+///
+/// A failed edit turn rolls its Git transaction back to the step checkpoint, and
+/// the FSM empties `changed_files` once that rollback succeeded. A change set the
+/// FSM refused to apply while still naming modified files is therefore the single
+/// signal that the working tree carries the bytes of an aborted attempt: an empty
+/// change set never touched disk, and a turn without an edit result owns no
+/// change set at all. A supervisor ends the step with a recovery instruction on
+/// this signal instead of retrying on a dirty tree.
+pub fn turn_left_unreverted_changes(turn: &crate::handlers::model::ModelTurnResult) -> bool {
+    match &turn.result {
+        Some(tauqe_protocol::ModelResult::Edit { outcome, .. }) => {
+            !outcome.applied && !outcome.changed_files.is_empty()
+        }
+        _ => false,
+    }
+}
+
 /// Releases the active discussion focus when it anchors the deleted entity.
 ///
 /// A focus anchor may never address a non-existent entity, so deleting a plan
@@ -109,26 +127,6 @@ pub(crate) async fn clear_auto_context(state: &Arc<AppState>) {
     }
 }
 
-/// Resolves as soon as an operation's cancellation signal is raised.
-///
-/// A batch supervisor races its step wait against this future, so a cancel
-/// delivered in the middle of a step unwinds the queue immediately instead of
-/// waiting for the step to finish its verification. The signal stays advisory
-/// until it is raised: an already raised flag resolves at once, and a closed
-/// channel keeps the future pending, because a dropped sender is not a
-/// cancellation request.
-pub(crate) async fn wait_for_cancellation(mut cancel_rx: watch::Receiver<bool>) {
-    if *cancel_rx.borrow() {
-        return;
-    }
-    while cancel_rx.changed().await.is_ok() {
-        if *cancel_rx.borrow() {
-            return;
-        }
-    }
-    std::future::pending::<()>().await;
-}
-
 /// Normalizes a declared plan file path into the repository-relative form used
 /// for context preloading, trimming whitespace and stripping leading `./` and
 /// `/` markers so cosmetic spelling differences collapse to one key.
@@ -150,29 +148,47 @@ pub(crate) async fn load_repository_files(repo_root: &Path) -> Vec<String> {
         .unwrap_or_default()
 }
 
-/// Loads declared target and reference files into the read-only auto context
-/// layer before an Architect synthesis, so the real code of every existing step
-/// is visible on the first generation round. Declared target files are never
-/// capped by the files token budget, matching the step-execution preload
-/// contract.
-pub(crate) async fn preload_readonly_files(
+/// Loads declared context files into the transient auto layer before a turn.
+///
+/// Target files are registered as editable and reference files as read-only.
+/// Declared files are never capped by an artificial quota: the caller that
+/// declares them already decided they are required, so both the files budget and
+/// the refs budget stay unbounded. One implementation serves the step turn of the
+/// implementation host and the read-only preload of an Architect synthesis, so the
+/// two surfaces cannot drift apart.
+pub(crate) async fn preload_declared_files(
     state: &Arc<AppState>,
     repo_root: &Path,
     files: &[String],
+    readonly_files: &[String],
 ) {
-    let requests: Vec<ContextRequest> = files
-        .iter()
-        .map(String::as_str)
-        .map(normalize_preload_path)
-        .filter(|p| !p.is_empty())
-        .map(|p| ContextRequest {
-            path: p.to_string(),
-            access: ContextAccess::ReadOnly,
-        })
-        .collect();
+    let mut requests: Vec<ContextRequest> = Vec::with_capacity(files.len() + readonly_files.len());
+    requests.extend(
+        files
+            .iter()
+            .map(String::as_str)
+            .map(normalize_preload_path)
+            .filter(|p| !p.is_empty())
+            .map(|p| ContextRequest {
+                path: p.to_string(),
+                access: ContextAccess::Editable,
+            }),
+    );
+    requests.extend(
+        readonly_files
+            .iter()
+            .map(String::as_str)
+            .map(normalize_preload_path)
+            .filter(|p| !p.is_empty())
+            .map(|p| ContextRequest {
+                path: p.to_string(),
+                access: ContextAccess::ReadOnly,
+            }),
+    );
     if requests.is_empty() {
         return;
     }
+
     let available_files = load_repository_files(repo_root).await;
     let preloaded = crate::handlers::with_context_mutation(state, move |ctx| {
         // Declared preload files are never capped by an artificial quota, so both
@@ -198,6 +214,17 @@ pub(crate) async fn preload_readonly_files(
             );
         }
     }
+}
+
+/// Loads declared target and reference files into the read-only auto context
+/// layer before an Architect synthesis, so the real code of every existing step
+/// is visible on the first generation round.
+pub(crate) async fn preload_readonly_files(
+    state: &Arc<AppState>,
+    repo_root: &Path,
+    files: &[String],
+) {
+    preload_declared_files(state, repo_root, &[], files).await;
 }
 
 /// Appends the developer directives section to an execution prompt when present.
@@ -292,31 +319,66 @@ pub(crate) mod test_support {
 
 #[cfg(test)]
 mod tests {
-    use std::time::Duration;
-
     use super::*;
+    use crate::handlers::model::ModelTurnResult;
 
-    /// The supervisors race a step against this future, so a signal raised
-    /// while they wait must resolve it instead of waiting for the step.
-    #[tokio::test]
-    async fn wait_for_cancellation_resolves_when_the_signal_is_raised() {
-        let (cancel_tx, cancel_rx) = watch::channel(false);
-        let waiter = tokio::spawn(wait_for_cancellation(cancel_rx));
-        cancel_tx.send(true).unwrap();
-
-        tokio::time::timeout(Duration::from_secs(5), waiter)
-            .await
-            .expect("the waiter observes the raised signal")
-            .expect("the waiter task joins");
+    /// Builds a completed turn carrying the given model result.
+    fn completed_turn(result: Option<tauqe_protocol::ModelResult>) -> ModelTurnResult {
+        ModelTurnResult {
+            operation_id: "op-test".to_string(),
+            result,
+            is_cancelled: false,
+            error: None,
+            has_terminal_success: false,
+            blocked: None,
+            abort: None,
+        }
     }
 
-    /// A signal raised before the supervision starts resolves at once, so a
-    /// cancel delivered between the request and the wait is never lost.
-    #[tokio::test]
-    async fn wait_for_cancellation_resolves_for_an_already_raised_signal() {
-        let (_cancel_tx, cancel_rx) = watch::channel(true);
-        tokio::time::timeout(Duration::from_secs(5), wait_for_cancellation(cancel_rx))
-            .await
-            .expect("an already raised signal resolves immediately");
+    /// Builds an edit result with the given verdict and reported files.
+    fn edit_result(applied: bool, changed_files: Vec<String>) -> tauqe_protocol::ModelResult {
+        tauqe_protocol::ModelResult::Edit {
+            summary: "edit".to_string(),
+            edits: Vec::new(),
+            proposal: None,
+            outcome: tauqe_protocol::EditOutcome {
+                applied,
+                error: if applied {
+                    None
+                } else {
+                    Some("edit rejected".to_string())
+                },
+                changed_files,
+                commit_hash: None,
+                verification: None,
+            },
+        }
+    }
+
+    #[test]
+    fn test_turn_left_unreverted_changes_reports_only_a_change_that_reached_disk() {
+        // An applied change set went through the turn's own transaction.
+        let applied = completed_turn(Some(edit_result(true, vec!["src/lib.rs".to_string()])));
+        assert!(!turn_left_unreverted_changes(&applied));
+
+        // A rejected change set that rolled back cleanly reports no files: the
+        // FSM empties `changed_files` once the transaction is restored.
+        let clean = completed_turn(Some(edit_result(false, Vec::new())));
+        assert!(!turn_left_unreverted_changes(&clean));
+
+        // A rejected change set that still names modified files means the
+        // rollback never reached the step checkpoint.
+        let dirty = completed_turn(Some(edit_result(false, vec!["src/lib.rs".to_string()])));
+        assert!(turn_left_unreverted_changes(&dirty));
+
+        // A conversational answer touches no bytes.
+        let answer = completed_turn(Some(tauqe_protocol::ModelResult::Answer {
+            text: "Nothing to change.".to_string(),
+        }));
+        assert!(!turn_left_unreverted_changes(&answer));
+
+        // A turn that produced no result at all owns no change set.
+        let no_result = completed_turn(None);
+        assert!(!turn_left_unreverted_changes(&no_result));
     }
 }

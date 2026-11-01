@@ -9,10 +9,11 @@ use crate::app::AppState;
 use crate::command::CommandCategory::{Essential, Helpers, Interface};
 use crate::command::{CommandMap, CommandSpec, KeyChord};
 use crate::config::InputConfig;
-use crate::i18n::engine::active_t;
+use crate::dialogs::input::TurnLaunchSnapshot;
+use crate::i18n::active_t;
 use crate::input::InputResult;
 use crate::rpc::{send_request, RpcConnection};
-use crate::views::repl::{ReplFocus, ReplView, TurnStatus};
+use crate::views::repl::{ReplFocus, ReplView};
 
 /// Time window within which a second `Esc` confirms clearing a non-empty prompt.
 const ESC_CLEAR_WINDOW: Duration = Duration::from_secs(2);
@@ -710,7 +711,14 @@ pub async fn handle_repl_key(
             st.input_editor.move_word_forward();
         }
         ReplAction::Yank => {
-            st.input_editor.yank();
+            // The paste buffer is a native round trip bounded at
+            // NATIVE_CLIPBOARD_TIMEOUT. It is read with the state guard released
+            // and applied afterwards, so a hung clipboard owner can never freeze
+            // rendering or block another locker of the state (c-1).
+            drop(st);
+            let clipboard = crate::clipboard::get_from_clipboard_async().await;
+            let mut st = state.lock().await;
+            st.input_editor.yank_with(clipboard);
         }
         ReplAction::ClearPromptSaving => {
             if st.model.is_batch && st.model.is_busy() {
@@ -739,6 +747,11 @@ pub async fn handle_repl_key(
         }
         ReplAction::SendPrompt => {
             st.model.focus = ReplFocus::Editor;
+            // The pre-send snapshot travels with the prompt: a write that never
+            // reaches the daemon has to return the viewport the turn it never
+            // replaced, exactly as the dialog launch paths restore through
+            // `start_turn` (Conventions §3, c-1).
+            let snapshot = TurnLaunchSnapshot::capture(&st);
             if let Some(prompt) = st.take_prompt() {
                 drop(st);
                 let params = ModelAskParams::Prompt {
@@ -752,9 +765,14 @@ pub async fn handle_repl_key(
                 .await
                 {
                     let mut st = state.lock().await;
+                    snapshot.restore(&mut st);
+                    // A failed send never started a turn: no instant may survive
+                    // into the next turn through the `MODEL_STARTED`
+                    // `get_or_insert_with`, inflate its measured duration, or arm
+                    // the completion notification (c-1).
+                    st.turn_started_at = None;
                     st.input_editor.clear();
                     st.input_editor.insert_str(&prompt);
-                    st.model.status = TurnStatus::Error;
                     st.notify_error(
                         active_t("notify.prompt_send_failed").replace("{}", &err.to_string()),
                     );
@@ -775,7 +793,7 @@ pub async fn handle_repl_key(
             } else {
                 let text = st.model.text.clone();
                 drop(st);
-                let res = crate::clipboard::copy_to_clipboard(&text);
+                let res = crate::clipboard::copy_to_clipboard_async(&text).await;
                 let mut st = state.lock().await;
                 match res {
                     crate::clipboard::CopyResult::Native => {
@@ -933,6 +951,7 @@ mod tests {
     use crossterm::event::KeyModifiers;
 
     use crate::config::{LayoutPreset, MetaModifier, PrimaryModifier};
+    use crate::views::repl::TurnStatus;
 
     fn key(code: KeyCode, modifiers: KeyModifiers) -> KeyEvent {
         KeyEvent::new(code, modifiers)
@@ -1570,6 +1589,121 @@ mod tests {
             "the same chord folds the window back into the breadcrumb"
         );
     }
+
+    /// Proves the hoisted yank still reaches the prompt: `C-y` reads the paste
+    /// buffer with the state guard released and applies it through
+    /// `yank_with`, so the editor receives either the clipboard text or the
+    /// kill ring it holds (c-1).
+    #[tokio::test]
+    async fn prompt_yank_applies_the_hoisted_paste_buffer() {
+        let mut st = crate::app::test_state();
+        st.input_editor.kill_ring = "killed text".to_string();
+        let state = Arc::new(Mutex::new(st));
+        let mut conn = RpcConnection::new(Vec::<u8>::new());
+
+        handle_repl_key(
+            KeyEvent::new(KeyCode::Char('y'), KeyModifiers::CONTROL),
+            &state,
+            &mut conn,
+        )
+        .await
+        .expect("the yank is dispatched");
+
+        assert!(
+            !state.lock().await.input_editor.is_empty(),
+            "the hoisted read applies the paste buffer or the kill ring"
+        );
+    }
+    /// Async sink whose every write fails, standing in for a server pipe that
+    /// closed before the prompt request reached it.
+    struct BrokenPipeWriter;
+
+    impl tokio::io::AsyncWrite for BrokenPipeWriter {
+        fn poll_write(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+            _buf: &[u8],
+        ) -> std::task::Poll<std::io::Result<usize>> {
+            std::task::Poll::Ready(Err(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "server pipe closed",
+            )))
+        }
+
+        fn poll_flush(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
+    /// A prompt whose request never reaches the transport must return the
+    /// previous turn: the answer, its rendered markdown, the reasoning
+    /// transcript, the commit trail, and the reading position survive, the typed
+    /// prompt returns to the editor, and no started-turn instant survives into
+    /// the next turn to inflate its measured duration or arm the completion
+    /// notification (c-1).
+    #[tokio::test]
+    async fn failed_prompt_send_restores_the_previous_answer_and_timestamp() {
+        let mut st = crate::app::test_state();
+        st.model.text = "previous answer".to_string();
+        st.model.update_markdown();
+        st.model.reasoning.append_delta("previous reasoning");
+        st.model.last_commit_hash = Some("abc1234".to_string());
+        st.model.scroll = 7;
+        st.model.auto_scroll = false;
+        st.model.status = TurnStatus::Done;
+        st.input_editor.insert_str("a new prompt");
+
+        let state = Arc::new(Mutex::new(st));
+        let mut conn = RpcConnection::new(BrokenPipeWriter);
+        handle_repl_key(
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            &state,
+            &mut conn,
+        )
+        .await
+        .expect("a failed write is reported in the interface, not as a dispatch error");
+
+        let st = state.lock().await;
+        assert_eq!(st.model.text, "previous answer");
+        assert!(
+            !st.model.markdown_lines.is_empty(),
+            "the rendered answer survives the failed send"
+        );
+        assert_eq!(st.model.reasoning.text, "previous reasoning");
+        assert_eq!(st.model.last_commit_hash.as_deref(), Some("abc1234"));
+        assert_eq!(st.model.scroll, 7);
+        assert!(
+            !st.model.auto_scroll,
+            "the manual reading position survives the failed send"
+        );
+        assert!(
+            matches!(st.model.status, TurnStatus::Done),
+            "the pre-send status survives the failed send"
+        );
+        assert_eq!(
+            st.input_editor.get_text(),
+            "a new prompt",
+            "the prompt returns to the editor"
+        );
+        assert!(
+            st.turn_started_at.is_none(),
+            "a failed send never started a turn"
+        );
+        assert_eq!(
+            st.active_notification().map(|n| n.level),
+            Some(crate::app::NotificationLevel::Error)
+        );
+    }
 }
 
 #[cfg(test)]
@@ -1599,6 +1733,10 @@ mod viewport_scroll_tests {
 
     /// One answer line, the proposed-edits header, and one summary row per file:
     ///
+    /// The fixture declares a wide canvas, so no rendered row wraps and a summary
+    /// occupies exactly one visual row: a raw canvas index and its projected visual
+    /// row coincide, and the expected scroll offsets stay readable (c-1, c-4).
+    ///
     /// ```text
     /// 0  answer
     /// 1  blank
@@ -1609,6 +1747,7 @@ mod viewport_scroll_tests {
     fn viewport_model() -> ReplView {
         ReplView {
             text: "answer".to_string(),
+            content_width: 200,
             files: vec![
                 diff_file("crates/tui/src/a.rs"),
                 diff_file("crates/tui/src/b.rs"),
@@ -1735,7 +1874,7 @@ mod viewport_scroll_tests {
     }
 
     /// Proves the dedicated chord opens the audit while the prompt owns the
-    /// keyboard, capturing the staged set and the Viewport highlight (c-1).
+    /// keyboard, reading the staged set the view owns and the Viewport highlight (c-1).
     #[tokio::test]
     async fn the_inspector_chord_opens_the_audit_from_the_prompt() {
         let mut st = crate::app::test_state();
@@ -1762,7 +1901,11 @@ mod viewport_scroll_tests {
             "the prompt keeps the keyboard while the audit opens over it"
         );
         let inspector = st.diff_inspector.as_ref().expect("the audit must open");
-        assert_eq!(inspector.files.len(), 2);
+        assert_eq!(
+            st.model.files.len(),
+            2,
+            "the audit reads the staged set the Develop view owns"
+        );
         assert_eq!(
             inspector.selected_file, 1,
             "the highlight follows the file the Viewport had selected"

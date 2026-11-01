@@ -485,18 +485,18 @@ impl TextEditor {
         }
     }
 
+    /// Inserts the most recent kill.
+    ///
+    /// The editor never reads the system clipboard on its own. A read is a
+    /// native round trip bounded at `NATIVE_CLIPBOARD_TIMEOUT`, and the editor
+    /// handles keys while its caller holds the application state guard, so the
+    /// read would block the event loop and every other locker of that guard. A
+    /// surface that wants the paste buffer asks [`Self::takes_yank_chord`]
+    /// first, reads it with the guard released, and applies the answer through
+    /// [`Self::yank_with`]; `crate::views::context::input` is the reference
+    /// implementation. An empty kill ring therefore inserts nothing.
     pub fn yank(&mut self) {
-        // The kill ring is the editor's own history and therefore wins: a kill
-        // no longer mirrors into the OS clipboard, so restoring a killed region
-        // must not be decided by whatever the clipboard happens to hold. The
-        // system clipboard is consulted only while nothing was killed in this
-        // editor yet.
-        let clipboard = if self.kill_ring.is_empty() {
-            crate::clipboard::get_from_clipboard()
-        } else {
-            None
-        };
-        self.yank_with(clipboard);
+        self.yank_with(None);
     }
 
     /// Inserts the clipboard text the caller read ahead of time, falling back to
@@ -1124,6 +1124,32 @@ mod tests {
         assert_eq!(editor.get_text(), "killed text");
     }
 
+    /// The `Yank` command restores the editor's own kill ring and performs no
+    /// clipboard I/O: a native read is a bounded blocking round trip, and the
+    /// editor handles keys while its caller holds the state guard, so the read
+    /// is hoisted by the surface that owns the buffer (c-1).
+    ///
+    /// An empty kill ring therefore inserts nothing, even when the host
+    /// clipboard holds text; the caller supplies it through
+    /// [`TextEditor::yank_with`] after [`TextEditor::takes_yank_chord`]
+    /// recognized the press.
+    #[test]
+    fn yank_command_restores_the_kill_ring_and_never_reads_the_clipboard() {
+        let mut editor = TextEditor::default();
+        let ctrl_y = KeyEvent::new(KeyCode::Char('y'), KeyModifiers::CONTROL);
+
+        editor.kill_ring = "killed text".to_string();
+        assert!(editor.handle_key(ctrl_y, true));
+        assert_eq!(editor.get_text(), "killed text");
+
+        let mut empty = TextEditor::default();
+        assert!(empty.handle_key(ctrl_y, true));
+        assert!(
+            empty.is_empty(),
+            "the command touches only the kill ring: the surface hoists the paste buffer"
+        );
+        assert!(empty.takes_yank_chord(ctrl_y, true));
+    }
     #[test]
     fn yank_chord_is_recognized_before_the_state_guard_is_released() {
         let editor = TextEditor::default();

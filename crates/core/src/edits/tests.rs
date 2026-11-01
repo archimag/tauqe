@@ -885,25 +885,47 @@ fn staged_project_config_syntax_error_is_rejected() {
 }
 
 #[test]
-fn staged_project_config_without_verification_is_rejected() {
+fn staged_project_config_without_verification_is_accepted() {
     let dir = tempdir().unwrap();
     let root = dir.path();
     std::fs::write(root.join("tauqe.toml"), VALID_CONFIG).unwrap();
     let mut cm = ContextManager::new(root.to_path_buf());
     cm.add_file("tauqe.toml", ContextAccess::Editable).unwrap();
 
-    // Syntactically valid, but the mandatory verification command is gone.
+    // Verification is declarative, so dropping the command leaves a complete
+    // declaration: the staged configuration is accepted and nothing reaches
+    // disk before the change set is applied.
     let dropped_verify = EditOperation::Overwrite {
         path: "tauqe.toml".into(),
         content: "[models]\nprimary = [\"openrouter:a/b\"]\n".into(),
     };
     let result = stage_and_validate_edits(root, &cm, std::slice::from_ref(&dropped_verify), None);
+    assert!(result.is_success(), "{:?}", result.failed_files);
+    assert_eq!(
+        result.staged_state.staged_files["tauqe.toml"],
+        "[models]\nprimary = [\"openrouter:a/b\"]\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(root.join("tauqe.toml")).unwrap(),
+        VALID_CONFIG,
+        "staging must never write the configuration to disk"
+    );
+
+    // A declaration the harness could not run predictably is still rejected:
+    // the file routes its verification through a command nobody declares.
+    let broken_chain = EditOperation::Overwrite {
+        path: "tauqe.toml".into(),
+        content:
+            "[models]\nprimary = [\"openrouter:a/b\"]\n\n[project.verify]\ncommand = \"@missing\"\n"
+                .into(),
+    };
+    let result = stage_and_validate_edits(root, &cm, std::slice::from_ref(&broken_chain), None);
     assert!(!result.is_success());
     match &result.failed_files[0].error {
         EditError::InvalidConfig { message, .. } => {
             assert!(
-                message.contains("verify"),
-                "a semantic rejection must name the missing invariant: {message}"
+                message.contains("missing"),
+                "a semantic rejection must name the broken reference: {message}"
             );
         }
         other => panic!("expected a semantic configuration rejection, got {other:?}"),
@@ -941,18 +963,21 @@ fn staged_dot_prefixed_project_config_is_validated_too() {
         "a rejected configuration must not reach the staged state"
     );
 
-    // The semantic layer guards the second spelling as well.
-    let dropped_verify = EditOperation::Overwrite {
+    // The semantic layer guards the second spelling as well: the file routes
+    // its verification through a command nobody declares.
+    let broken_chain = EditOperation::Overwrite {
         path: ".tauqe.toml".into(),
-        content: "[models]\nprimary = [\"openrouter:a/b\"]\n".into(),
+        content:
+            "[models]\nprimary = [\"openrouter:a/b\"]\n\n[project.verify]\ncommand = \"@missing\"\n"
+                .into(),
     };
-    let result = stage_and_validate_edits(root, &cm, std::slice::from_ref(&dropped_verify), None);
+    let result = stage_and_validate_edits(root, &cm, std::slice::from_ref(&broken_chain), None);
     assert!(!result.is_success());
     match &result.failed_files[0].error {
         EditError::InvalidConfig { message, .. } => {
             assert!(
-                message.contains("verify"),
-                "a semantic rejection must name the missing invariant: {message}"
+                message.contains("missing"),
+                "a semantic rejection must name the broken reference: {message}"
             );
         }
         other => panic!("expected a semantic configuration rejection, got {other:?}"),
@@ -1562,4 +1587,316 @@ fn the_boundary_rejection_reaches_the_retry_request_verbatim() {
         );
         assert!(prompt.contains(&message), "{strategy}: {prompt}");
     }
+}
+
+/// Initializes a repository whose working tree holds the supplied fixtures.
+///
+/// A directory move expands into the tracked files of the subtree, so the
+/// fixtures are committed before the change set is staged.
+fn setup_tracked_repo(files: &[(&str, &str)]) -> tempfile::TempDir {
+    let dir = tempdir().unwrap();
+    let root = dir.path();
+    for (path, content) in files {
+        let full = root.join(path);
+        if let Some(parent) = full.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        std::fs::write(full, content).unwrap();
+    }
+    crate::git::init_repository(Some(root), true).unwrap();
+    dir
+}
+
+#[test]
+fn a_directory_move_expands_into_the_moves_of_its_subtree() {
+    let dir = setup_tracked_repo(&[
+        ("src/old/a.rs", "pub fn a() {}\n"),
+        ("src/old/nested/b.rs", "pub fn b() {}\n"),
+    ]);
+    let root = dir.path();
+    let cm = ContextManager::new(root.to_path_buf());
+
+    let edit = EditOperation::MoveDir {
+        from: "src/old".into(),
+        to: "src/new".into(),
+    };
+    let result = stage_and_validate_edits(root, &cm, std::slice::from_ref(&edit), None);
+
+    assert!(result.is_success(), "{:?}", result.failed_files);
+    assert_eq!(result.successful_edits, vec![edit]);
+    assert_eq!(
+        result.successful_paths,
+        vec![
+            "src/old/a.rs",
+            "src/new/a.rs",
+            "src/old/nested/b.rs",
+            "src/new/nested/b.rs",
+        ]
+    );
+    assert_eq!(
+        result.staged_state.staged_files["src/new/a.rs"],
+        "pub fn a() {}\n"
+    );
+    assert_eq!(
+        result.staged_state.staged_files["src/new/nested/b.rs"],
+        "pub fn b() {}\n"
+    );
+    assert!(result.staged_state.deleted_paths.contains("src/old/a.rs"));
+    assert!(result
+        .staged_state
+        .deleted_paths
+        .contains("src/old/nested/b.rs"));
+
+    // The subtree is relocated in memory only, so the working tree never sees a
+    // half-moved directory.
+    assert!(root.join("src/old/a.rs").exists());
+    assert!(!root.join("src/new").exists());
+}
+
+#[test]
+fn a_directory_move_into_its_own_subtree_is_rejected() {
+    let dir = setup_tracked_repo(&[("src/old/a.rs", "pub fn a() {}\n")]);
+    let root = dir.path();
+    let cm = ContextManager::new(root.to_path_buf());
+
+    // A destination equal to the source and a destination inside the source
+    // both ask a rename to relocate the directory into a path it is moving away
+    // from.
+    for to in ["src/old", "src/old/inner"] {
+        let edit = EditOperation::MoveDir {
+            from: "src/old".into(),
+            to: to.into(),
+        };
+        let result = stage_and_validate_edits(root, &cm, std::slice::from_ref(&edit), None);
+        assert!(
+            !result.is_success(),
+            "the destination '{to}' must be rejected"
+        );
+        assert!(matches!(
+            &result.failed_files[0].error,
+            EditError::DirMoveIntoSelf { .. }
+        ));
+        assert!(result.staged_state.staged_files.is_empty());
+        assert!(result.staged_state.deleted_paths.is_empty());
+    }
+    assert!(root.join("src/old/a.rs").exists());
+}
+
+#[test]
+fn a_directory_move_without_a_source_directory_is_rejected() {
+    let dir = setup_tracked_repo(&[("src/old/a.rs", "pub fn a() {}\n")]);
+    let root = dir.path();
+    let cm = ContextManager::new(root.to_path_buf());
+
+    let missing = EditOperation::MoveDir {
+        from: "src/missing".into(),
+        to: "src/new".into(),
+    };
+    let result = stage_and_validate_edits(root, &cm, std::slice::from_ref(&missing), None);
+    assert!(!result.is_success());
+    assert!(matches!(
+        &result.failed_files[0].error,
+        EditError::DirMoveSourceMissing { .. }
+    ));
+
+    // A directory that holds no file the change set could relocate has nothing
+    // to expand into.
+    std::fs::create_dir_all(root.join("src/empty")).unwrap();
+    let empty = EditOperation::MoveDir {
+        from: "src/empty".into(),
+        to: "src/new".into(),
+    };
+    let result = stage_and_validate_edits(root, &cm, std::slice::from_ref(&empty), None);
+    assert!(!result.is_success());
+    assert!(matches!(
+        &result.failed_files[0].error,
+        EditError::DirMoveSourceEmpty { .. }
+    ));
+    assert!(result.staged_state.staged_files.is_empty());
+    assert_eq!(
+        std::fs::read_to_string(root.join("src/old/a.rs")).unwrap(),
+        "pub fn a() {}\n"
+    );
+}
+
+#[test]
+fn a_directory_move_that_would_overwrite_a_file_rolls_back_whole() {
+    let dir = setup_tracked_repo(&[
+        ("src/old/a.rs", "pub fn a() {}\n"),
+        ("src/old/b.rs", "pub fn b() {}\n"),
+        ("src/new/b.rs", "pub fn taken() {}\n"),
+    ]);
+    let root = dir.path();
+    let cm = ContextManager::new(root.to_path_buf());
+
+    let edit = EditOperation::MoveDir {
+        from: "src/old".into(),
+        to: "src/new".into(),
+    };
+    let result = stage_and_validate_edits(root, &cm, std::slice::from_ref(&edit), None);
+
+    assert!(!result.is_success());
+    assert_eq!(result.failed_files.len(), 1);
+    assert!(matches!(
+        &result.failed_files[0].error,
+        EditError::DestinationExists(path) if path == "src/new/b.rs"
+    ));
+    // The member is atomic: the file that could move is restored together with
+    // the one that collided, so no half-moved directory survives the refusal.
+    assert!(result.staged_state.staged_files.is_empty());
+    assert!(result.staged_state.deleted_paths.is_empty());
+    assert!(root.join("src/old/a.rs").exists());
+    assert!(!root.join("src/new/a.rs").exists());
+}
+
+#[test]
+fn a_directory_move_across_a_declared_boundary_is_refused() {
+    let dir = setup_tracked_repo(&[
+        ("docs/specs/auth.md", "# Auth spec\n"),
+        ("src/old/auth.md", "# Draft spec\n"),
+    ]);
+    let root = dir.path();
+    // The declaration names one file, so the refusal is deterministic: a
+    // literal pattern matches neither of the two directory names.
+    declare_protected_patterns(root, &["docs/specs/auth.md"]);
+    let cm = ContextManager::new(root.to_path_buf());
+
+    // The guarded specification is the source of the move.
+    let away = EditOperation::MoveDir {
+        from: "docs/specs".into(),
+        to: "docs/archive".into(),
+    };
+    let result = stage_and_validate_edits(root, &cm, std::slice::from_ref(&away), None);
+    assert!(!result.is_success());
+    assert!(matches!(
+        &result.failed_files[0].error,
+        EditError::ProtectedPath(path) if path == "docs/specs/auth.md"
+    ));
+    assert!(result.staged_state.staged_files.is_empty());
+    assert!(result.staged_state.deleted_paths.is_empty());
+
+    // The guarded path is the destination of the move, and the boundary is
+    // asked before the collision with the file already there.
+    let into_guard = EditOperation::MoveDir {
+        from: "src/old".into(),
+        to: "docs/specs".into(),
+    };
+    let result = stage_and_validate_edits(root, &cm, std::slice::from_ref(&into_guard), None);
+    assert!(!result.is_success());
+    assert!(matches!(
+        &result.failed_files[0].error,
+        EditError::ProtectedPath(path) if path == "docs/specs/auth.md"
+    ));
+    assert!(result.staged_state.staged_files.is_empty());
+    assert!(result.staged_state.deleted_paths.is_empty());
+
+    // Nothing above reached disk.
+    assert_eq!(
+        std::fs::read_to_string(root.join("docs/specs/auth.md")).unwrap(),
+        "# Auth spec\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(root.join("src/old/auth.md")).unwrap(),
+        "# Draft spec\n"
+    );
+    assert!(!root.join("docs/archive").exists());
+}
+
+/// A directory move must not write through a symbolic link that leaves the
+/// repository, even while the destination itself resolves inside it.
+#[test]
+#[cfg(unix)]
+fn a_directory_move_never_writes_through_a_symlink_that_leaves_the_repository() {
+    let dir = setup_tracked_repo(&[("src/old/a.rs", "pub fn a() {}\n")]);
+    let outside = tempdir().unwrap();
+    let root = dir.path();
+    // The destination directory is inside the repository, yet the file the
+    // move would write is a dangling link onto a path outside it: writing
+    // there would create the file beyond the boundary.
+    std::fs::create_dir_all(root.join("src/new")).unwrap();
+    std::os::unix::fs::symlink(
+        outside.path().join("nowhere/a.rs"),
+        root.join("src/new/a.rs"),
+    )
+    .unwrap();
+    let cm = ContextManager::new(root.to_path_buf());
+
+    let edit = EditOperation::MoveDir {
+        from: "src/old".into(),
+        to: "src/new".into(),
+    };
+    let result = stage_and_validate_edits(root, &cm, std::slice::from_ref(&edit), None);
+
+    assert!(!result.is_success());
+    assert!(matches!(
+        &result.failed_files[0].error,
+        EditError::InvalidPath(path, _) if path == "src/new/a.rs"
+    ));
+    assert!(result.staged_state.staged_files.is_empty());
+    assert!(result.staged_state.deleted_paths.is_empty());
+    assert!(!outside.path().join("nowhere/a.rs").exists());
+}
+
+#[tokio::test]
+async fn a_directory_move_lands_on_disk_and_reconciles_the_context() {
+    let dir = setup_tracked_repo(&[
+        ("src/old/a.rs", "pub fn a() {}\n"),
+        ("src/old/nested/b.rs", "pub fn b() {}\n"),
+    ]);
+    let root = dir.path();
+    let mut cm = ContextManager::new(root.to_path_buf());
+    cm.add_file("src/old/a.rs", ContextAccess::Editable)
+        .unwrap();
+
+    let proposal = EditProposal {
+        summary: "Rename the module directory".into(),
+        edits: vec![EditOperation::MoveDir {
+            from: "src/old".into(),
+            to: "src/new".into(),
+        }],
+    };
+    let changed = apply_edit_proposal(root, &mut cm, &proposal).await.unwrap();
+
+    // The change set names both sides of every expanded pair, so the commit that
+    // records it can add the destination and remove the source in one step.
+    assert_eq!(
+        changed,
+        vec![
+            "src/old/a.rs",
+            "src/new/a.rs",
+            "src/old/nested/b.rs",
+            "src/new/nested/b.rs",
+        ]
+    );
+
+    assert_eq!(
+        std::fs::read_to_string(root.join("src/new/a.rs")).unwrap(),
+        "pub fn a() {}\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(root.join("src/new/nested/b.rs")).unwrap(),
+        "pub fn b() {}\n"
+    );
+    assert!(
+        !root.join("src/old").exists(),
+        "the emptied source tree must be pruned"
+    );
+    assert!(
+        root.join("src").is_dir(),
+        "a directory that still holds a file survives the prune"
+    );
+
+    // The reconciled context follows the move: the source leaves it and the
+    // destinations join the transient auto layer instead of the user layer.
+    assert!(!cm.contains("src/old/a.rs").unwrap());
+    assert!(cm.is_editable("src/new/a.rs").unwrap());
+    let mut auto = cm.auto_files();
+    auto.sort();
+    assert_eq!(
+        auto,
+        vec![
+            "src/new/a.rs".to_string(),
+            "src/new/nested/b.rs".to_string(),
+        ]
+    );
 }

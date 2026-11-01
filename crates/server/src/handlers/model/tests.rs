@@ -22,8 +22,11 @@ use tokio::sync::{mpsc, watch};
 
 use super::prompt::{build_model_ask_prompt, intent_for_target};
 use super::turn::{resolve_session_id, resolve_turn_protocol};
-use super::{handle_model_cancel, handle_model_select, start_model_turn};
+use super::{
+    handle_model_cancel, handle_model_clear_history, handle_model_select, start_model_turn,
+};
 use crate::handlers::history::handle_history_get;
+use crate::handlers::PreflightVerdict;
 use crate::state::AppState;
 /// A plan discussion is strictly read-only: the model reasons about the plan
 /// and never touches files.
@@ -149,49 +152,13 @@ fn decoded_plan_actions(protocol: &dyn PromptProtocol, raw: &str) -> Vec<Discuss
         .collect()
 }
 
-/// A dialogue anchored on a plan may modify it: the focused interactive turn
-/// advertises and decodes the mutation in both encodings.
-#[test]
-fn plan_focus_grants_plan_update_to_an_interactive_turn() {
-    let xml = resolve_turn_protocol(
-        TurnIntent::InteractiveRepl,
-        EditProtocolKind::Xml,
-        true,
-        None,
-    );
-    assert!(xml.capability_set().contains(LlmCapability::PlanUpdate));
-    assert_eq!(
-        decoded_plan_actions(xml.as_ref(), PLAN_UPDATE_XML),
-        vec![DiscussionPlanAction::Update]
-    );
-
-    let structured = resolve_turn_protocol(
-        TurnIntent::InteractiveRepl,
-        EditProtocolKind::Structured,
-        true,
-        None,
-    );
-    assert!(structured
-        .capability_set()
-        .contains(LlmCapability::PlanUpdate));
-    assert_eq!(
-        decoded_plan_actions(structured.as_ref(), PLAN_UPDATE_JSON),
-        vec![DiscussionPlanAction::Update]
-    );
-}
-
 /// A plan discussion is a dialogue like any other: the configured transport
 /// encodes it, and the transport never shrinks its surface. Both encodings
 /// therefore advertise the edit capability and decode the very same plan
 /// mutation, which the discussion authorizes by its regime.
 #[test]
 fn plan_discussion_follows_the_configured_transport() {
-    let xml = resolve_turn_protocol(
-        TurnIntent::PlanDiscussion,
-        EditProtocolKind::Xml,
-        false,
-        None,
-    );
+    let xml = resolve_turn_protocol(TurnIntent::PlanDiscussion, EditProtocolKind::Xml, None);
     assert_eq!(xml.kind(), EditProtocolKind::Xml);
     assert!(xml.capability_set().contains(LlmCapability::FileEdits));
     assert!(xml.capability_set().contains(LlmCapability::PlanUpdate));
@@ -203,7 +170,6 @@ fn plan_discussion_follows_the_configured_transport() {
     let structured = resolve_turn_protocol(
         TurnIntent::PlanDiscussion,
         EditProtocolKind::Structured,
-        false,
         None,
     );
     assert_eq!(structured.kind(), EditProtocolKind::Structured);
@@ -219,17 +185,13 @@ fn plan_discussion_follows_the_configured_transport() {
     );
 }
 
-/// Without a plan focus the mutation is filtered out, while plan authorship
-/// stays available, because a user may ask for a plan at any moment of a
-/// dialogue.
+/// The declared intent alone decides plan mutation: an interactive turn
+/// composes the interactive regime profile on both transports, so the mutation
+/// is neither advertised nor decoded, while plan authorship stays available,
+/// because a user may ask for a plan at any moment of a dialogue.
 #[test]
-fn interactive_turn_without_plan_focus_filters_plan_update() {
-    let xml = resolve_turn_protocol(
-        TurnIntent::InteractiveRepl,
-        EditProtocolKind::Xml,
-        false,
-        None,
-    );
+fn interactive_turn_never_carries_plan_mutation() {
+    let xml = resolve_turn_protocol(TurnIntent::InteractiveRepl, EditProtocolKind::Xml, None);
     assert!(!xml.capability_set().contains(LlmCapability::PlanUpdate));
     assert!(xml.capability_set().contains(LlmCapability::PlanCreation));
     assert!(decoded_plan_actions(xml.as_ref(), PLAN_UPDATE_XML).is_empty());
@@ -241,7 +203,6 @@ fn interactive_turn_without_plan_focus_filters_plan_update() {
     let structured = resolve_turn_protocol(
         TurnIntent::InteractiveRepl,
         EditProtocolKind::Structured,
-        false,
         None,
     );
     assert!(!structured
@@ -254,13 +215,13 @@ fn interactive_turn_without_plan_focus_filters_plan_update() {
     );
 }
 
-/// Asserts the plan permissions of one isolated step under one focus state.
+/// Asserts the plan permissions of one isolated step.
 ///
-/// The focus is applied to the resolved protocol and the turn-intent narrowing
-/// runs afterwards, exactly as the bounded-turn FSM narrows the decoder, so the
-/// assertion covers the end-to-end surface of the step.
-fn assert_step_has_no_plan_permission(develop: EditProtocolKind, plan_focused: bool) {
-    let protocol = resolve_turn_protocol(TurnIntent::IsolatedStep, develop, plan_focused, None);
+/// The turn-intent narrowing runs after protocol resolution, exactly as the
+/// bounded-turn FSM narrows the decoder, so the assertion covers the
+/// end-to-end surface of the step.
+fn assert_step_has_no_plan_permission(develop: EditProtocolKind) {
+    let protocol = resolve_turn_protocol(TurnIntent::IsolatedStep, develop, None);
     assert!(!protocol
         .capability_set()
         .contains(LlmCapability::PlanUpdate));
@@ -287,14 +248,12 @@ fn assert_step_has_no_plan_permission(develop: EditProtocolKind, plan_focused: b
     }
 }
 
-/// An isolated step keeps the plan immutable: neither the mutation granted by a
-/// focus nor plan authorship survives, whatever the focus state and transport.
+/// An isolated step keeps the plan immutable: neither the mutation a discussion
+/// anchor grants nor plan authorship survives, whatever the transport.
 #[test]
-fn isolated_step_carries_no_plan_permission_under_any_focus() {
-    assert_step_has_no_plan_permission(EditProtocolKind::Xml, false);
-    assert_step_has_no_plan_permission(EditProtocolKind::Xml, true);
-    assert_step_has_no_plan_permission(EditProtocolKind::Structured, false);
-    assert_step_has_no_plan_permission(EditProtocolKind::Structured, true);
+fn isolated_step_carries_no_plan_permission() {
+    assert_step_has_no_plan_permission(EditProtocolKind::Xml);
+    assert_step_has_no_plan_permission(EditProtocolKind::Structured);
 }
 /// Constructs an [`AppState`] over a scratch repository root, isolating each
 /// focus test's stored plans and history from every other test.
@@ -505,12 +464,13 @@ fn scratch_root(tag: &str) -> std::path::PathBuf {
 
 /// Runs the deterministic pre-flight gate over a scratch repository that
 /// declares `config`, then removes it.
-async fn preflight_with(config: Option<&str>) -> Result<(), String> {
+async fn preflight_with(config: Option<&str>) -> PreflightVerdict {
     let dir = scratch_root("integrity");
     if let Some(config) = config {
         std::fs::write(dir.join("tauqe.toml"), config).expect("write the project declaration");
     }
-    let verdict = crate::handlers::run_preflight_verification(&dir).await;
+    let (_cancel_tx, cancel_rx) = watch::channel(false);
+    let verdict = crate::handlers::run_preflight_verification(&dir, cancel_rx).await;
     let _ = std::fs::remove_dir_all(&dir);
     verdict
 }
@@ -519,20 +479,44 @@ async fn preflight_with(config: Option<&str>) -> Result<(), String> {
 /// starts against a configuration the engine cannot even parse.
 #[tokio::test]
 async fn preflight_rejects_malformed_tauqe_toml() {
-    let err = preflight_with(Some("[models\nprimary = \"broken\"\n"))
-        .await
-        .expect_err("malformed TOML must be refused before any model call");
-    assert!(err.contains("tauqe.toml"), "got: {err}");
+    match preflight_with(Some("[models\nprimary = \"broken\"\n")).await {
+        PreflightVerdict::Failed(report) => {
+            assert!(report.contains("tauqe.toml"), "got: {report}");
+        }
+        other => panic!("malformed TOML must be refused before any model call: {other:?}"),
+    }
 }
 
 /// The gate refuses a declaration that parses as TOML but violates a semantic
-/// invariant, here the absence of the mandatory verification lifecycle.
+/// invariant: here the verification lifecycle routes through a command nobody
+/// declares. A missing `[project.verify]` section is not such a violation,
+/// because verification is a declared capability rather than a mandatory
+/// barrier.
 #[tokio::test]
 async fn preflight_rejects_semantically_invalid_tauqe_toml() {
-    let err = preflight_with(Some("[models]\nprimary = [\"openrouter:a/b\"]\n"))
-        .await
-        .expect_err("a configuration without verification must be refused");
-    assert!(err.contains("verify"), "got: {err}");
+    match preflight_with(Some(concat!(
+        "[models]\nprimary = [\"openrouter:a/b\"]\n",
+        "\n[project.verify]\ncommand = \"@missing\"\n",
+    )))
+    .await
+    {
+        PreflightVerdict::Failed(report) => {
+            assert!(report.contains("missing"), "got: {report}");
+        }
+        other => panic!("a broken command chain must be refused: {other:?}"),
+    }
+}
+
+/// A declaration that only assigns model roles is complete: verification is
+/// optional, so the gate passes it instead of demanding a barrier the project
+/// never declared.
+#[tokio::test]
+async fn preflight_accepts_a_declaration_without_verification() {
+    let verdict = preflight_with(Some("[models]\nprimary = [\"openrouter:a/b\"]\n")).await;
+    assert!(
+        matches!(verdict, PreflightVerdict::Passed),
+        "a declaration without verification must pass: {verdict:?}"
+    );
 }
 
 /// A declaration whose verification command resolves passes the gate untouched.
@@ -542,7 +526,10 @@ async fn preflight_accepts_a_valid_tauqe_toml() {
         "[models]\nprimary = [\"openrouter:a/b\"]\n\n[project.verify]\ncommand = \"true\"\n",
     ))
     .await;
-    assert!(verdict.is_ok(), "got: {:?}", verdict.err());
+    assert!(
+        matches!(verdict, PreflightVerdict::Passed),
+        "got: {verdict:?}"
+    );
 }
 
 /// A repository without a declaration is governed by built-in defaults, so the
@@ -550,7 +537,10 @@ async fn preflight_accepts_a_valid_tauqe_toml() {
 #[tokio::test]
 async fn preflight_accepts_a_repository_without_a_declaration() {
     let verdict = preflight_with(None).await;
-    assert!(verdict.is_ok(), "got: {:?}", verdict.err());
+    assert!(
+        matches!(verdict, PreflightVerdict::Passed),
+        "got: {verdict:?}"
+    );
 }
 
 /// Provider that streams one fragment and then parks until the harness cancels
@@ -719,6 +709,134 @@ async fn history_read_and_cancellation_are_served_while_a_turn_streams() {
     assert!(
         !provider.is_parked(),
         "the provider must observe the cancellation"
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// Builds a `model/clearHistory` request.
+fn clear_history_request() -> Request {
+    Request {
+        id: tauqe_protocol::RequestId::Number(4),
+        method: tauqe_protocol::methods::MODEL_CLEAR_HISTORY.to_string(),
+        params: None,
+    }
+}
+
+/// `model/select` mutates the shared selection and rotates the dialogue session
+/// that `config/set` protects by claiming the slot, so the identical state change
+/// is guarded with the identical strength: while an operation owns the slot the
+/// switch is refused and the selection a running turn resolved stays as it was.
+#[tokio::test]
+async fn model_select_is_refused_while_an_operation_is_registered() {
+    let mut cfg = AppConfig::default();
+    cfg.models.primary = vec![
+        ModelRef::openrouter("alpha/model").into(),
+        ModelRef::openrouter("beta/model").into(),
+    ];
+
+    let (out, _rx) = crate::transport::OutChannel::new();
+    let (history_sender, _hrx) = tokio::sync::mpsc::unbounded_channel();
+    let state = AppState::new(cfg, std::env::temp_dir(), history_sender, out);
+
+    let operation = state
+        .try_begin_operation()
+        .expect("operation slot must be free");
+    let before = state.config.lock().await.selection.clone();
+
+    let refused = handle_model_select(
+        select_request(ModelSelection::Specific(ModelRef::openrouter("beta/model"))),
+        &state,
+    )
+    .await;
+    assert_eq!(
+        refused.error.expect("the switch must be refused").code,
+        tauqe_protocol::errors::OPERATION_IN_PROGRESS
+    );
+    assert_eq!(
+        state.config.lock().await.selection,
+        before,
+        "a refused switch must not change the selection"
+    );
+    assert!(
+        state.is_operation_active(),
+        "the running operation must keep owning the slot"
+    );
+
+    drop(operation);
+    assert!(!state.is_operation_active());
+}
+
+/// Clearing the journal truncates `history.jsonl` and rotates the dialogue
+/// session. A turn records its result against a private clone of the history
+/// manager and adopts that clone back when it ends, so a turn that registered in
+/// an advisory check's window would swap the pre-truncation clone over the
+/// cleared journal and resurrect every removed record. The handler claims the
+/// slot instead, which makes the two mutually exclusive: while the turn is
+/// registered the clear is refused, the journal stays intact for the turn's
+/// adoption, and the same request succeeds once the slot is free.
+#[tokio::test]
+async fn model_clear_history_is_refused_and_never_resurrects_a_cleared_journal() {
+    let root = scratch_root("clear-history-exclusive");
+    let state = state_over_root(root.clone());
+
+    state
+        .mutate_history(|history| history.record_turn("Keep me", Vec::new()).map(|_| ()))
+        .await
+        .expect("the record runs on the blocking pool")
+        .expect("the record must persist");
+
+    // A bounded turn works on a private clone of the manager and adopts it back
+    // when it ends, so this clone is exactly what a running turn holds.
+    let turn_clone = state.history.lock().await.clone();
+    let session = state.session_uuid().await;
+    let operation = state
+        .try_begin_operation()
+        .expect("operation slot must be free");
+
+    let refused = handle_model_clear_history(clear_history_request(), &state).await;
+    assert_eq!(
+        refused.error.expect("the clear must be refused").code,
+        tauqe_protocol::errors::OPERATION_IN_PROGRESS
+    );
+
+    // The journal was never truncated, so the turn's adoption cannot resurrect a
+    // cleared transcript, and the session the turn resolved is still current.
+    state.adopt_history(turn_clone).await;
+    let entries = state
+        .history
+        .lock()
+        .await
+        .get_entries()
+        .expect("history reads back");
+    assert_eq!(
+        entries.len(),
+        1,
+        "the refused clear must leave the recorded turn in place"
+    );
+    assert_eq!(session, state.session_uuid().await);
+
+    drop(operation);
+
+    let cleared = handle_model_clear_history(clear_history_request(), &state).await;
+    assert!(
+        cleared.error.is_none(),
+        "the clear must succeed once the slot is free: {:?}",
+        cleared.error
+    );
+    assert!(
+        state
+            .history
+            .lock()
+            .await
+            .get_entries()
+            .expect("history reads back")
+            .is_empty(),
+        "the clear must truncate the journal once it owns the slot"
+    );
+    assert_ne!(
+        session,
+        state.session_uuid().await,
+        "a completed clear rotates the dialogue session"
     );
 
     let _ = std::fs::remove_dir_all(&root);

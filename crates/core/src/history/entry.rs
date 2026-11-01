@@ -113,6 +113,25 @@ impl HistoryEntry {
     }
 }
 
+/// Bytes one JSONL record occupies in the session journal.
+///
+/// The record occupies its serialized line plus the newline that terminates it,
+/// so the journal size on disk and the in-memory footprint of the same record
+/// share one definition instead of each path adding its own terminator.
+pub fn line_bytes(line: &str) -> u64 {
+    (line.len() + 1) as u64
+}
+
+/// Journal bytes one record occupies, derived from its serialized form.
+///
+/// A record that cannot be serialized contributes nothing, exactly as it
+/// contributes no line to the journal.
+pub fn record_bytes(entry: &HistoryEntry) -> u64 {
+    match entry.to_jsonl_line() {
+        Ok(line) => line_bytes(&line),
+        Err(_) => 0,
+    }
+}
 #[cfg(test)]
 mod tests {
     use super::*;

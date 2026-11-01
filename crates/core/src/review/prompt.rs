@@ -5,38 +5,39 @@
 //! produced), `discussion` (review Q&A and full-session audit prompts),
 //! `refine` (Architect decomposition of an architectural group into one
 //! remediation plan), `step` (isolated finding resolution, retry, and skip
-//! handling), and `subplan` (the architectural-context scaffolding a group
-//! hands to its sub-steps).
+//! handling), and `group_context` (the architectural-context scaffolding a
+//! group hands to its sub-steps).
 //! Every public item is re-exported here so callers keep using the stable
 //! `review::prompt::*` paths.
 
 pub mod analysis;
 pub mod discussion;
+pub mod group_context;
 pub mod refine;
 pub mod step;
-pub mod subplan;
 
 #[cfg(test)]
 mod group_prompt_tests;
 pub use analysis::{build_post_analysis_system_prompt, build_post_analysis_user_prompt};
 pub use discussion::{
     build_review_system_prompt, build_review_user_prompt, format_review_discussion_prompt,
-    format_review_discussion_prompt_items, REVIEW_DISCUSSION_PREFIX,
+    format_review_discussion_prompt_items, format_review_group_discussion_prompt,
+    REVIEW_DISCUSSION_PREFIX,
 };
+pub use group_context::apply_group_architectural_context;
 pub use refine::{
     build_review_group_refine_system_prompt, build_review_group_refine_user_prompt,
-    ReviewGroupRefineDiagnostics, MAX_REVIEW_SUBPLAN_DEPTH,
+    ReviewGroupRefineDiagnostics, MAX_REVIEW_IMPLEMENTATION_DEPTH,
 };
 pub use step::{
     format_review_step_execution_prompt, format_review_step_failure_note,
-    format_review_step_retry_prompt, ReviewStepFailure, REVIEW_STEP_EXECUTION_PREFIX,
-    REVIEW_STEP_RETRY_PREFIX,
+    format_review_step_retry_prompt, REVIEW_STEP_EXECUTION_PREFIX, REVIEW_STEP_RETRY_PREFIX,
 };
-pub use subplan::apply_group_architectural_context;
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::workflow::implementation::StepFailure;
     use tauqe_protocol::review::ReviewSession;
     use tauqe_protocol::EditProtocolKind;
 
@@ -181,11 +182,11 @@ mod tests {
 
     #[test]
     fn test_review_step_failure_classification_and_note() {
-        let domain = ReviewStepFailure::domain("compiler error");
+        let domain = StepFailure::domain("compiler error");
         assert!(domain.is_domain());
         assert_eq!(domain.reason(), "compiler error");
 
-        let infra = ReviewStepFailure::infrastructure("429 rate limit");
+        let infra = StepFailure::infrastructure("429 rate limit");
         assert!(!infra.is_domain());
         assert_eq!(infra.into_reason(), "429 rate limit");
 

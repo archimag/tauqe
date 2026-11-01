@@ -846,7 +846,7 @@ pub async fn handle_plans_key(
                 if let Some(plan) = st.plans_view.plans.iter().find(|p| p.id == plan_id) {
                     let md = plan.to_markdown();
                     drop(st);
-                    let res = crate::clipboard::copy_to_clipboard(&md);
+                    let res = crate::clipboard::copy_to_clipboard_async(&md).await;
                     let mut st = state.lock().await;
                     match res {
                         crate::clipboard::CopyResult::Native => {
@@ -980,17 +980,20 @@ mod tests {
 
     fn blocked_plan_state() -> crate::app::AppState {
         let mut st = crate::app::test_state();
-        let plan = tauqe_protocol::Plan {
-            id: "plan-blocked".to_string(),
-            title: "Blocked Plan".to_string(),
-            items: vec![tauqe_protocol::PlanItem {
+        let plan = tauqe_protocol::Plan::from_parts(
+            "plan-blocked".to_string(),
+            "Blocked Plan".to_string(),
+            None,
+            0,
+            0,
+            vec![],
+            vec![tauqe_protocol::PlanItem {
                 id: "1".to_string(),
                 title: "Failing step".to_string(),
                 status: tauqe_protocol::PlanItemStatus::Blocked,
                 ..Default::default()
             }],
-            ..Default::default()
-        };
+        );
         st.plans_view.plans = vec![plan];
         st.plans_view.expand_all();
         st.plans_view.selected_index = 1; // Step 1
@@ -1054,10 +1057,16 @@ mod tests {
         let mut st = crate::app::test_state();
         st.view_mode = ViewMode::Plans;
         st.plans_view.plans = (1..=15)
-            .map(|i| tauqe_protocol::Plan {
-                id: format!("plan-{i}"),
-                title: format!("Plan {i}"),
-                ..Default::default()
+            .map(|i| {
+                tauqe_protocol::Plan::from_parts(
+                    format!("plan-{i}"),
+                    format!("Plan {i}"),
+                    None,
+                    0,
+                    0,
+                    vec![],
+                    vec![],
+                )
             })
             .collect();
         st.plans_view.selected_index = 8;
@@ -1099,10 +1108,14 @@ mod tests {
     #[tokio::test]
     async fn test_uppercase_x_opens_whole_plan_pipeline_confirmation() {
         let mut st = crate::app::test_state();
-        let plan = tauqe_protocol::Plan {
-            id: "plan-ready".to_string(),
-            title: "Ready Plan".to_string(),
-            items: vec![
+        let plan = tauqe_protocol::Plan::from_parts(
+            "plan-ready".to_string(),
+            "Ready Plan".to_string(),
+            None,
+            0,
+            0,
+            vec![],
+            vec![
                 tauqe_protocol::PlanItem {
                     id: "1".to_string(),
                     title: "First step".to_string(),
@@ -1116,8 +1129,7 @@ mod tests {
                     ..Default::default()
                 },
             ],
-            ..Default::default()
-        };
+        );
         st.plans_view.plans = vec![plan];
         st.plans_view.expand_all();
 
@@ -1147,27 +1159,33 @@ mod tests {
     async fn test_uppercase_x_queues_concept_only_plan_for_jit_synthesis() {
         let mut st = crate::app::test_state();
         st.plans_view.plans = vec![
-            tauqe_protocol::Plan {
-                id: "plan-concept".to_string(),
-                title: "Concept Plan".to_string(),
-                concept: vec![tauqe_protocol::ConceptItem {
+            tauqe_protocol::Plan::from_parts(
+                "plan-concept".to_string(),
+                "Concept Plan".to_string(),
+                None,
+                0,
+                0,
+                vec![tauqe_protocol::ConceptItem {
                     id: "c1".to_string(),
                     title: "Invariant".to_string(),
                     ..Default::default()
                 }],
-                ..Default::default()
-            },
-            tauqe_protocol::Plan {
-                id: "plan-ready".to_string(),
-                title: "Ready Plan".to_string(),
-                items: vec![tauqe_protocol::PlanItem {
+                vec![],
+            ),
+            tauqe_protocol::Plan::from_parts(
+                "plan-ready".to_string(),
+                "Ready Plan".to_string(),
+                None,
+                0,
+                0,
+                vec![],
+                vec![tauqe_protocol::PlanItem {
                     id: "1".to_string(),
                     title: "First step".to_string(),
                     status: tauqe_protocol::PlanItemStatus::Todo,
                     ..Default::default()
                 }],
-                ..Default::default()
-            },
+            ),
         ];
         st.plans_view.expand_all();
 
@@ -1197,16 +1215,19 @@ mod tests {
     #[tokio::test]
     async fn test_executing_concept_only_plan_arms_jit_confirmation() {
         let mut st = crate::app::test_state();
-        st.plans_view.plans = vec![tauqe_protocol::Plan {
-            id: "plan-concept".to_string(),
-            title: "Concept Plan".to_string(),
-            concept: vec![tauqe_protocol::ConceptItem {
+        st.plans_view.plans = vec![tauqe_protocol::Plan::from_parts(
+            "plan-concept".to_string(),
+            "Concept Plan".to_string(),
+            None,
+            0,
+            0,
+            vec![tauqe_protocol::ConceptItem {
                 id: "c1".to_string(),
                 title: "Invariant".to_string(),
                 ..Default::default()
             }],
-            ..Default::default()
-        }];
+            vec![],
+        )];
         st.plans_view.expand_all();
 
         let state = Arc::new(Mutex::new(st));
@@ -1232,17 +1253,20 @@ mod tests {
     #[tokio::test]
     async fn test_clear_horizon_arms_level_one_when_steps_exist() {
         let mut st = crate::app::test_state();
-        st.plans_view.plans = vec![tauqe_protocol::Plan {
-            id: "plan-steps".to_string(),
-            title: "Steps Plan".to_string(),
-            items: vec![tauqe_protocol::PlanItem {
+        st.plans_view.plans = vec![tauqe_protocol::Plan::from_parts(
+            "plan-steps".to_string(),
+            "Steps Plan".to_string(),
+            None,
+            0,
+            0,
+            vec![],
+            vec![tauqe_protocol::PlanItem {
                 id: "1".to_string(),
                 title: "Todo step".to_string(),
                 status: tauqe_protocol::PlanItemStatus::Todo,
                 ..Default::default()
             }],
-            ..Default::default()
-        }];
+        )];
         st.plans_view.expand_all();
 
         let state = Arc::new(Mutex::new(st));
@@ -1266,11 +1290,15 @@ mod tests {
     #[tokio::test]
     async fn test_clear_horizon_on_empty_plan_notifies_without_arming() {
         let mut st = crate::app::test_state();
-        st.plans_view.plans = vec![tauqe_protocol::Plan {
-            id: "plan-empty".to_string(),
-            title: "Empty Plan".to_string(),
-            ..Default::default()
-        }];
+        st.plans_view.plans = vec![tauqe_protocol::Plan::from_parts(
+            "plan-empty".to_string(),
+            "Empty Plan".to_string(),
+            None,
+            0,
+            0,
+            vec![],
+            vec![],
+        )];
         st.plans_view.expand_all();
 
         let state = Arc::new(Mutex::new(st));
@@ -1462,10 +1490,14 @@ mod tests {
     fn tall_plan_state() -> crate::app::AppState {
         let mut st = crate::app::test_state();
         st.view_mode = ViewMode::Plans;
-        st.plans_view.plans = vec![tauqe_protocol::Plan {
-            id: "plan-nav".to_string(),
-            title: "Navigation Plan".to_string(),
-            items: (1..=60)
+        st.plans_view.plans = vec![tauqe_protocol::Plan::from_parts(
+            "plan-nav".to_string(),
+            "Navigation Plan".to_string(),
+            None,
+            0,
+            0,
+            vec![],
+            (1..=60)
                 .map(|i| tauqe_protocol::PlanItem {
                     id: i.to_string(),
                     title: format!("Step {i}"),
@@ -1473,8 +1505,7 @@ mod tests {
                     ..Default::default()
                 })
                 .collect(),
-            ..Default::default()
-        }];
+        )];
         st.plans_view.expand_all();
         st.plans_view.view_height = 10;
         st.plans_view.content_width = 80;

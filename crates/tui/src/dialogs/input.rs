@@ -88,7 +88,7 @@ fn begin_review_execution_turn(st: &mut AppState) {
 /// the discussion anchor. Restoring only the coordinates would leave a failed
 /// launch showing an empty turn, arming a batch no supervisor owns, and
 /// dropping the local anchor the daemon still holds.
-struct TurnLaunchSnapshot {
+pub(crate) struct TurnLaunchSnapshot {
     develop_status: TurnStatus,
     turn_started_at: Option<std::time::Instant>,
     review_running: bool,
@@ -117,7 +117,7 @@ struct TurnLaunchSnapshot {
 }
 
 impl TurnLaunchSnapshot {
-    fn capture(st: &AppState) -> Self {
+    pub(crate) fn capture(st: &AppState) -> Self {
         let model = &st.model;
         Self {
             develop_status: model.status,
@@ -148,7 +148,7 @@ impl TurnLaunchSnapshot {
         }
     }
 
-    fn restore(self, st: &mut AppState) {
+    pub(crate) fn restore(self, st: &mut AppState) {
         st.turn_started_at = self.turn_started_at;
         st.review.running = self.review_running;
         st.view_mode = self.view_mode;
@@ -708,7 +708,7 @@ pub(crate) async fn handle_dialog_event(
     // renders is always the surface that receives keystrokes.
     match st.active_modal() {
         Some(ActiveModal::Squash) => {
-            return squash::handle_squash_key(key, st, server_writer)
+            return squash::handle_squash_key(key, state, st, server_writer)
                 .await
                 .map(Some);
         }
@@ -966,6 +966,37 @@ pub(crate) async fn handle_dialog_event(
                         // Safe cancel dismisses without re-attaching the dialog.
                     }
                     _ => {
+                        // A yank reads the system clipboard, a native round trip
+                        // bounded at NATIVE_CLIPBOARD_TIMEOUT. Both text fields are
+                        // edited while the state guard is held, so the read is
+                        // hoisted: the dialog returns to the state, the paste
+                        // buffer is awaited, and the answer is applied through
+                        // `yank_with` after the re-lock (c-1).
+                        let yank_chord = if dialog.focus.is_prompt_editor() {
+                            dialog.prompt_editor.takes_yank_chord(key, is_cmd)
+                        } else if dialog.focus.is_path_editor() {
+                            dialog
+                                .active_path_editor()
+                                .is_some_and(|editor| editor.takes_yank_chord(key, is_cmd))
+                        } else {
+                            false
+                        };
+                        if yank_chord {
+                            st.review_dialog = Some(dialog);
+                            drop(st);
+                            let clipboard = crate::clipboard::get_from_clipboard_async().await;
+                            let mut st = state.lock().await;
+                            if let Some(mut dialog) = st.review_dialog.take() {
+                                if dialog.focus.is_prompt_editor() {
+                                    dialog.prompt_editor.yank_with(clipboard);
+                                } else if let Some(editor) = dialog.active_path_editor_mut() {
+                                    editor.yank_with(clipboard);
+                                    dialog.refresh_path_completion();
+                                }
+                                st.review_dialog = Some(dialog);
+                            }
+                            return Ok(Some(InputResult::Continue));
+                        }
                         if dialog.focus.is_prompt_editor() {
                             crate::input::handle_editor_key(
                                 &mut dialog.prompt_editor,
@@ -1305,7 +1336,7 @@ pub(crate) async fn handle_dialog_event(
             return prompt::handle_prompt_modal(key, state, st, server_writer).await;
         }
         Some(ActiveModal::Locale) => {
-            return locale::handle_locale_dialog(key, st, server_writer).await;
+            return locale::handle_locale_dialog(key, state, st, server_writer).await;
         }
         Some(ActiveModal::ClearHistory) => {
             match resolve_confirm(&mut st, key) {
@@ -1339,13 +1370,13 @@ pub(crate) async fn handle_dialog_event(
                         let chosen = c as usize - '1' as usize;
                         st.status_dialog = Some(dialog);
                         if chosen < total_options {
-                            apply_status_dialog(st, chosen, server_writer).await?;
+                            apply_status_dialog(state, st, chosen, server_writer).await?;
                         }
                     }
                     KeyCode::Enter | KeyCode::Char(' ') => {
                         let chosen = dialog.selector.selected_index();
                         st.status_dialog = Some(dialog);
-                        apply_status_dialog(st, chosen, server_writer).await?;
+                        apply_status_dialog(state, st, chosen, server_writer).await?;
                     }
                     _ => {
                         st.status_dialog = Some(dialog);
@@ -1355,7 +1386,7 @@ pub(crate) async fn handle_dialog_event(
             return Ok(Some(InputResult::Continue));
         }
         Some(ActiveModal::Selection) => {
-            return selection::handle_selection_dialog_key(key, st, server_writer).await;
+            return selection::handle_selection_dialog_key(key, state, st, server_writer).await;
         }
         Some(ActiveModal::ThemeSelector) => {
             let visible = crate::theme::selector::theme_selector_visible_height(st.last_frame_area);
@@ -1840,17 +1871,20 @@ mod tests {
     #[tokio::test]
     async fn clear_horizon_escalates_to_final_tier_when_work_recorded() {
         let mut st = crate::app::test_state();
-        st.plans_view.plans = vec![tauqe_protocol::Plan {
-            id: "plan-h".to_string(),
-            title: "Horizon Plan".to_string(),
-            items: vec![tauqe_protocol::PlanItem {
+        st.plans_view.plans = vec![tauqe_protocol::Plan::from_parts(
+            "plan-h".to_string(),
+            "Horizon Plan".to_string(),
+            None,
+            0,
+            0,
+            vec![],
+            vec![tauqe_protocol::PlanItem {
                 id: "1".to_string(),
                 title: "Done step".to_string(),
                 status: tauqe_protocol::PlanItemStatus::Done,
                 ..Default::default()
             }],
-            ..Default::default()
-        }];
+        )];
         st.confirm_clear_horizon = Some("plan-h".to_string());
         st.confirm_button = ConfirmDialogButton::Confirm;
 
@@ -1875,17 +1909,20 @@ mod tests {
     #[tokio::test]
     async fn clear_horizon_confirm_without_recorded_work_clears_via_rpc() {
         let mut st = crate::app::test_state();
-        st.plans_view.plans = vec![tauqe_protocol::Plan {
-            id: "plan-clear".to_string(),
-            title: "Clear Plan".to_string(),
-            items: vec![tauqe_protocol::PlanItem {
+        st.plans_view.plans = vec![tauqe_protocol::Plan::from_parts(
+            "plan-clear".to_string(),
+            "Clear Plan".to_string(),
+            None,
+            0,
+            0,
+            vec![],
+            vec![tauqe_protocol::PlanItem {
                 id: "1".to_string(),
                 title: "Todo step".to_string(),
                 status: tauqe_protocol::PlanItemStatus::Todo,
                 ..Default::default()
             }],
-            ..Default::default()
-        }];
+        )];
         st.confirm_clear_horizon = Some("plan-clear".to_string());
         st.confirm_button = ConfirmDialogButton::Confirm;
 
@@ -1938,17 +1975,20 @@ mod tests {
     #[tokio::test]
     async fn delete_plan_escalates_when_unfinished_work_remains() {
         let mut st = crate::app::test_state();
-        st.plans_view.plans = vec![tauqe_protocol::Plan {
-            id: "plan-open".to_string(),
-            title: "Open Plan".to_string(),
-            items: vec![tauqe_protocol::PlanItem {
+        st.plans_view.plans = vec![tauqe_protocol::Plan::from_parts(
+            "plan-open".to_string(),
+            "Open Plan".to_string(),
+            None,
+            0,
+            0,
+            vec![],
+            vec![tauqe_protocol::PlanItem {
                 id: "1".to_string(),
                 title: "Todo step".to_string(),
                 status: tauqe_protocol::PlanItemStatus::Todo,
                 ..Default::default()
             }],
-            ..Default::default()
-        }];
+        )];
         st.confirm_delete_plan = Some("plan-open".to_string());
         st.confirm_button = ConfirmDialogButton::Confirm;
 
@@ -1986,15 +2026,18 @@ mod tests {
             tauqe_protocol::PlanItemStatus::InProgress,
         ] {
             let mut st = crate::app::test_state();
-            st.plans_view.plans = vec![tauqe_protocol::Plan {
-                id: "plan-wip".to_string(),
-                title: "Work In Progress".to_string(),
-                items: vec![
+            st.plans_view.plans = vec![tauqe_protocol::Plan::from_parts(
+                "plan-wip".to_string(),
+                "Work In Progress".to_string(),
+                None,
+                0,
+                0,
+                vec![],
+                vec![
                     plan_item("1", tauqe_protocol::PlanItemStatus::Done),
                     plan_item("2", status),
                 ],
-                ..Default::default()
-            }];
+            )];
             st.confirm_delete_plan = Some("plan-wip".to_string());
             st.confirm_button = ConfirmDialogButton::Confirm;
 
@@ -2031,29 +2074,39 @@ mod tests {
     fn plan_delete_escalation_follows_the_leaf_metric() {
         let mut st = crate::app::test_state();
         st.plans_view.plans = vec![
-            tauqe_protocol::Plan {
-                id: "open".to_string(),
-                title: "Open".to_string(),
-                items: vec![
+            tauqe_protocol::Plan::from_parts(
+                "open".to_string(),
+                "Open".to_string(),
+                None,
+                0,
+                0,
+                vec![],
+                vec![
                     plan_item("1", tauqe_protocol::PlanItemStatus::Done),
                     plan_item("2", tauqe_protocol::PlanItemStatus::Blocked),
                 ],
-                ..Default::default()
-            },
-            tauqe_protocol::Plan {
-                id: "closed".to_string(),
-                title: "Closed".to_string(),
-                items: vec![
+            ),
+            tauqe_protocol::Plan::from_parts(
+                "closed".to_string(),
+                "Closed".to_string(),
+                None,
+                0,
+                0,
+                vec![],
+                vec![
                     plan_item("1", tauqe_protocol::PlanItemStatus::Done),
                     plan_item("2", tauqe_protocol::PlanItemStatus::Cancelled),
                 ],
-                ..Default::default()
-            },
-            tauqe_protocol::Plan {
-                id: "concept-only".to_string(),
-                title: "Concept Only".to_string(),
-                ..Default::default()
-            },
+            ),
+            tauqe_protocol::Plan::from_parts(
+                "concept-only".to_string(),
+                "Concept Only".to_string(),
+                None,
+                0,
+                0,
+                vec![],
+                vec![],
+            ),
         ];
 
         assert!(plan_delete_needs_escalation(&st, "open"));
@@ -2068,17 +2121,20 @@ mod tests {
     #[tokio::test]
     async fn delete_plan_sends_request_when_all_steps_finished() {
         let mut st = crate::app::test_state();
-        st.plans_view.plans = vec![tauqe_protocol::Plan {
-            id: "plan-done".to_string(),
-            title: "Done Plan".to_string(),
-            items: vec![tauqe_protocol::PlanItem {
+        st.plans_view.plans = vec![tauqe_protocol::Plan::from_parts(
+            "plan-done".to_string(),
+            "Done Plan".to_string(),
+            None,
+            0,
+            0,
+            vec![],
+            vec![tauqe_protocol::PlanItem {
                 id: "1".to_string(),
                 title: "Done step".to_string(),
                 status: tauqe_protocol::PlanItemStatus::Done,
                 ..Default::default()
             }],
-            ..Default::default()
-        }];
+        )];
         st.confirm_delete_plan = Some("plan-done".to_string());
         st.confirm_button = ConfirmDialogButton::Confirm;
 

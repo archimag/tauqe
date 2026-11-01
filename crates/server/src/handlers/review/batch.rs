@@ -1,74 +1,152 @@
-//! Review findings batch supervisor and execution entry point.
+//! Review batch supervisor and execution entry point.
 //!
 //! `handle_review_execute` resolves the members to run (an architectural
 //! group, a single session's findings, a single finding, or every actionable
 //! finding across all sessions), performs a deterministic pre-flight
 //! verification, and hands control to the core `BatchExecution` supervisor
-//! through `ReviewBatchExecutor`. The supervisor enforces ordered, fail-fast
-//! traversal; findings fixed before the first failure stay `Fixed`. Once it
+//! through `ReviewBatchExecutor`. The supervisor enforces ordered traversal;
+//! findings repaired before a member stops the queue stay `Fixed`. Once it
 //! terminates, a typed `review/batch_finished` event carries the aggregate
 //! status, finding counters, and elapsed time, so clients can raise a single
 //! notice for the whole batch.
 //!
 //! A batch member addresses either a finding or a group, and the member
 //! identifier is the addressing contract: a group member carries
-//! `{session}:g:{group}` and runs the group's unified subplan through
-//! `group_exec`, while a finding member carries `{session}:{item}` and runs
-//! its isolated turn. A finding of an architectural group is a symptom of
-//! one shared root cause, so it is never executed on its own: an explicit
-//! selection that names one is refused, and the implicit queues subsume the
-//! findings a group collects into a single group member.
+//! `{session}:g:{group}` and runs the group's unified horizon through
+//! `ExecutionScope::ReviewGroup`, while a finding member carries
+//! `{session}:{item}` and runs its degenerate one-step horizon through
+//! `ExecutionScope::ReviewFinding`. A finding of an architectural group is a
+//! symptom of one shared root cause, so it is never executed on its own: an
+//! explicit selection that names one is refused, and the implicit queues
+//! subsume the findings a group collects into a single group member.
 //!
-//! A caller may target a single leaf sub-step by `step_id` and supply a Coder
-//! model override plus developer directives.
-//! A finding that reports an unconditional abort (`<abort>`) is skipped with
-//! its host recommendation recorded, because the remediation lies outside
-//! the repository; the Architect is never engaged for it and the queue
-//! continues.
+//! The member runner implements nothing of the execution itself. Every step
+//! turn, every Architect wave, every ladder rung, and every durable status
+//! transition belongs to the engine's unified implementation pipeline
+//! (`tauqe_core::workflow::implementation`), which this module drives through
+//! `ServerImplementationHost`. The server contributes the batch framing only:
+//! it decodes the addressing contract, resolves the scope, and maps the
+//! terminal report onto the supervisor's step outcome, so a review run and a
+//! plan run cannot drift apart in how they reach a provider, how they escalate
+//! a ladder, or when they settle an entity.
 
-use std::collections::HashSet;
 use std::path::Path;
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use tauqe_core::config::AppConfig;
 use tauqe_core::providers::StreamEvent;
+use tauqe_core::review::prompt::refine::has_recorded_decision;
 use tauqe_core::review::ReviewStorage;
 use tauqe_core::workflow::batch::{
-    BatchExecution, BatchReport, BatchStep, BatchStepExecutor, BatchStepOutcome, BatchStop,
-    BatchUsage,
+    BatchExecution, BatchReport, BatchStep, BatchStepExecutor, BatchStepOutcome, BatchStepStatus,
+    BatchStop,
+};
+use tauqe_core::workflow::implementation::{
+    ExecutionScope, PlanImplementationOptions, PlanImplementationPipeline,
+    PlanImplementationReport, PlanImplementationStop,
 };
 use tauqe_protocol::{
     errors, events, BatchFinishStatus, BatchFinishSummary, IssueStatus, IssueType, ModelSelection,
-    Plan, PlanScopeEvaluation, Request, Response, ResponseError, ReviewBatchFinishedEvent,
-    ReviewExecuteParams, ReviewGroup, ReviewItem, ReviewSession,
+    Request, Response, ResponseError, ReviewBatchFinishedEvent, ReviewExecuteParams, ReviewItem,
+    ReviewSession,
 };
 use tokio::sync::{mpsc, watch};
 
-use crate::handlers::common::wait_for_cancellation;
+use crate::handlers::host::ServerImplementationHost;
+use crate::handlers::PreflightVerdict;
 use crate::state::{AppState, OperationGuard};
 
-use super::common::{clear_auto_context, emit, offload_review, persist_finding_update};
-use super::group_exec::{
-    group_step_id, parse_group_step_id, reload_group, run_group_plan_with_replans,
-};
-use super::step::run_review_step;
+use super::common::{clear_auto_context, emit, offload_review};
+
+/// Separator binding the session identifier to the group identifier of a
+/// group-member batch target.
+const GROUP_STEP_SEPARATOR: &str = ":g:";
+
+/// Encodes the batch-member identifier of one architectural group horizon.
+pub(super) fn group_member_id(session_id: &str, group_id: &str) -> String {
+    format!("{session_id}{GROUP_STEP_SEPARATOR}{group_id}")
+}
+
+/// Decodes a group-member identifier into the session and the group it names.
+///
+/// A finding member carries no separator and resolves to `None`, so a
+/// supervisor routes a queue member without knowing how it was minted. Neither
+/// identifier may contain the separator: both are minted by the harness.
+fn parse_group_member(member_id: &str) -> Option<(&str, &str)> {
+    let (session_id, group_id) = member_id.split_once(GROUP_STEP_SEPARATOR)?;
+    if session_id.is_empty() || group_id.is_empty() {
+        return None;
+    }
+    Some((session_id, group_id))
+}
+
+/// Decodes the execution scope a batch member addresses.
+fn member_scope(member_id: &str) -> Option<ExecutionScope> {
+    if let Some((review_id, group_id)) = parse_group_member(member_id) {
+        return Some(ExecutionScope::ReviewGroup {
+            review_id: review_id.to_string(),
+            group_id: group_id.to_string(),
+        });
+    }
+    let (review_id, item_part) = member_id.split_once(':')?;
+    let item_id = item_part.parse::<u32>().ok()?;
+    Some(ExecutionScope::ReviewFinding {
+        review_id: review_id.to_string(),
+        item_id,
+    })
+}
+
+/// Statistics of one review batch run, reported with its terminal outcome.
+///
+/// The counters separate what a queue achieved from what it merely survived: a
+/// repaired finding is counted from the members that completed their horizon, a
+/// group postponed by the readiness gate is counted from the resolved queue, and
+/// a member whose failure was confined to it is counted from the local skips the
+/// supervisor recorded.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(super) struct BatchTelemetry {
+    /// Findings the batch repaired.
+    pub(super) fixed: usize,
+    /// Findings postponed until the questions of their group are decided.
+    pub(super) deferred: usize,
+    /// Members that failed locally while the queue continued.
+    pub(super) failed: usize,
+}
+
+/// Builds the terminal telemetry of a finished batch run.
+fn batch_telemetry(report: &BatchReport, fixed: usize, deferred: usize) -> BatchTelemetry {
+    BatchTelemetry {
+        fixed,
+        deferred,
+        failed: report
+            .executed
+            .iter()
+            .filter(|step| step.outcome.status == BatchStepStatus::Skipped)
+            .count(),
+    }
+}
 
 /// Outcome of a server-driven batch of review findings.
 #[derive(Debug, PartialEq, Eq)]
 pub(super) enum BatchOutcome {
     Completed {
         items: usize,
+        telemetry: BatchTelemetry,
     },
     Failed {
         completed: usize,
         member: FailedMember,
         reason: String,
+        telemetry: BatchTelemetry,
     },
     Cancelled {
         completed: usize,
+        telemetry: BatchTelemetry,
     },
     Stopped {
         completed: usize,
+        telemetry: BatchTelemetry,
     },
 }
 
@@ -83,7 +161,7 @@ pub(super) enum BatchOutcome {
 pub(super) enum FailedMember {
     /// A single finding of one review session.
     Finding { session_id: String, item_id: u32 },
-    /// An architectural group, executed through its unified subplan.
+    /// An architectural group, executed through its unified horizon.
     Group {
         session_id: String,
         group_id: String,
@@ -101,7 +179,7 @@ impl FailedMember {
     /// neither form keeps its text instead of borrowing an ordinal: a member
     /// the harness never minted has no finding number to report.
     fn decode(step_id: &str) -> Self {
-        if let Some((session_id, group_id)) = parse_group_step_id(step_id) {
+        if let Some((session_id, group_id)) = parse_group_member(step_id) {
             return Self::Group {
                 session_id: session_id.to_string(),
                 group_id: group_id.to_string(),
@@ -130,75 +208,13 @@ impl std::fmt::Display for FailedMember {
             Self::Finding {
                 session_id,
                 item_id,
-            } => {
-                write!(f, "finding #{} in session '{}'", item_id, session_id)
-            }
+            } => write!(f, "finding #{} in session '{}'", item_id, session_id),
             Self::Group {
                 session_id,
                 group_id,
-            } => {
-                write!(f, "review group '{}' in session '{}'", group_id, session_id)
-            }
+            } => write!(f, "review group '{}' in session '{}'", group_id, session_id),
             Self::Unresolved { member_id } => write!(f, "review member '{}'", member_id),
         }
-    }
-}
-
-/// Prefix of the resolution note recorded on a finding whose batch stopped.
-const BATCH_STOP_NOTE_PREFIX: &str = "Batch stopped after execution failure";
-
-/// Renders the resolution note recorded when a batch stops on a finding.
-///
-/// A stop is a durable fact of the session, so the diagnostic is written into
-/// the finding's resolution notes. A note describing the finding itself — a
-/// discussion resolution or a skip diagnostic — is preserved above the new
-/// diagnostic, while a note left by an earlier stop is superseded instead of
-/// accumulating.
-fn failure_note(existing: Option<&str>, reason: &str) -> String {
-    let diagnostic = match reason.trim() {
-        "" => format!("{BATCH_STOP_NOTE_PREFIX} without diagnostics"),
-        trimmed => format!("{BATCH_STOP_NOTE_PREFIX}: {trimmed}"),
-    };
-    match existing.map(str::trim).filter(|note| !note.is_empty()) {
-        Some(note) if !note.starts_with(BATCH_STOP_NOTE_PREFIX) => {
-            format!("{note}\n\n{diagnostic}")
-        }
-        _ => diagnostic,
-    }
-}
-
-/// Records the failure that stopped a batch in the finding it addressed.
-///
-/// The diagnostic travels with the durable session and is published through
-/// `publish_review`, so the Review tree explains the stop after the daemon
-/// restarts. The write is best-effort: the failure itself is already reported
-/// to the caller, so a storage problem must never replace it.
-async fn record_finding_stop(
-    state: &Arc<AppState>,
-    repo_root: &Path,
-    review_id: &str,
-    item_id: u32,
-    reason: &str,
-) {
-    let reason = reason.to_string();
-    let result = persist_finding_update(
-        state,
-        repo_root,
-        review_id,
-        item_id,
-        "batch stop diagnostic",
-        move |it| {
-            it.note = Some(failure_note(it.note.as_deref(), &reason));
-        },
-    )
-    .await;
-    if let Err(err) = result {
-        tracing::warn!(
-            review_id = review_id,
-            item_id = item_id,
-            error = %err,
-            "the review batch stop diagnostic was not persisted"
-        );
     }
 }
 
@@ -220,7 +236,7 @@ fn is_actionable(item: &ReviewItem) -> bool {
 ///
 /// A `Simple` group collects independent defects, so its findings stay
 /// individually executable. Only an `Architectural` group subsumes its
-/// findings: they are symptoms of the one root cause its unified subplan
+/// findings: they are symptoms of the one root cause its unified horizon
 /// resolves, so running one on its own is refused and the group runs instead.
 fn architectural_group_of<'a>(session: &ReviewSession, item: &'a ReviewItem) -> Option<&'a str> {
     let group_id = item.group.as_deref()?;
@@ -230,6 +246,43 @@ fn architectural_group_of<'a>(session: &ReviewSession, item: &'a ReviewItem) -> 
     architectural.then_some(group_id)
 }
 
+/// Collects the open questions an architectural group still poses.
+///
+/// A finding that is still in `DISCUSSION` without a recorded engineering
+/// decision is a question the engineer has not answered yet: running the group
+/// would force the harness to answer it, so the group is not ready for an
+/// autonomous run.
+fn group_open_questions<'a>(session: &'a ReviewSession, group_id: &str) -> Vec<&'a ReviewItem> {
+    session
+        .items
+        .iter()
+        .filter(|item| item.group.as_deref() == Some(group_id))
+        .filter(|item| item.status == IssueStatus::Discussion)
+        .filter(|item| !has_recorded_decision(item))
+        .collect()
+}
+
+/// Whether an architectural group can be executed without the engineer.
+fn group_ready_for_autonomous_run(session: &ReviewSession, group_id: &str) -> bool {
+    group_open_questions(session, group_id).is_empty()
+}
+
+/// Builds the typed refusal of a group that still poses open questions.
+fn group_unresolved_questions_error(group_id: &str, open: &[&ReviewItem]) -> ResponseError {
+    let ids = open
+        .iter()
+        .map(|item| format!("#{}", item.id))
+        .collect::<Vec<_>>()
+        .join(", ");
+    response_error(
+        errors::GROUP_UNRESOLVED_QUESTIONS,
+        format!(
+            "Review group '{}' still poses open question(s) on finding(s) {}: record an engineering decision on them or move them to TODO before executing the group",
+            group_id, ids
+        ),
+    )
+}
+
 /// Whether an actionable architecture finding has no architectural group to be
 /// planned through.
 ///
@@ -237,8 +290,8 @@ fn architectural_group_of<'a>(session: &ReviewSession, item: &'a ReviewItem) -> 
 /// remediated by a plan, and the only sanctioned carrier of a plan is an
 /// architectural group. A finding whose effective group is `Simple`, or which
 /// the stored group list does not declare at all, has no plan carrier, so it is
-/// never executed as one isolated Coder turn: the post-analysis stage must
-/// regroup it first.
+/// never executed as one isolated turn: the post-analysis stage must regroup it
+/// first.
 fn is_unplanned_architecture_finding(session: &ReviewSession, item: &ReviewItem) -> bool {
     is_actionable(item)
         && item.issue_type == IssueType::Architecture
@@ -247,10 +300,6 @@ fn is_unplanned_architecture_finding(session: &ReviewSession, item: &ReviewItem)
 
 /// Builds the typed refusal of a finding that must be planned before it is
 /// executed.
-///
-/// The refusal names the missing stage instead of reporting an execution
-/// failure: grouping is the duty of the post-analysis, not a manual
-/// decomposition ritual performed by the developer.
 fn unplanned_architecture_error(item: &ReviewItem) -> ResponseError {
     response_error(
         errors::ARCHITECTURAL_GROUP_EXECUTION_REQUIRED,
@@ -262,11 +311,17 @@ fn unplanned_architecture_error(item: &ReviewItem) -> ResponseError {
 }
 
 /// Renders the refusal of an implicit queue that has nothing to schedule.
-///
-/// A queue emptied by architecture findings is not an empty queue: the findings
-/// exist, they simply have no plan carrier yet. The diagnostic then names the
-/// missing post-analysis instead of reporting a session with no work.
-fn empty_queue_message(scope: &str, pending_architecture: usize) -> String {
+fn empty_queue_message(
+    scope: &str,
+    pending_architecture: usize,
+    deferred_findings: usize,
+) -> String {
+    if deferred_findings > 0 {
+        return format!(
+            "No executable findings {}: {} finding(s) are deferred because an architectural group still poses an open question; record an engineering decision on those findings or move them to TODO",
+            scope, deferred_findings
+        );
+    }
     if pending_architecture == 0 {
         format!("No TODO findings to execute {}", scope)
     } else {
@@ -278,11 +333,6 @@ fn empty_queue_message(scope: &str, pending_architecture: usize) -> String {
 }
 
 /// Resolves a client-ordered selection of finding ids against one session.
-///
-/// The ids are kept verbatim in the given order; ids that are unknown,
-/// duplicated, or no longer actionable are dropped instead of guessed at, so
-/// the queue runs exactly the findings the client saw in the section it
-/// launched.
 fn resolve_session_queue(session: &ReviewSession, item_ids: &[u32]) -> Vec<u32> {
     let mut resolved: Vec<u32> = Vec::new();
     for id in item_ids {
@@ -300,242 +350,161 @@ fn resolve_session_queue(session: &ReviewSession, item_ids: &[u32]) -> Vec<u32> 
     resolved
 }
 
-/// Evaluates a targeted sub-step of a plan-backed remediation horizon and
-/// maps a stall onto the typed protocol error the request is refused with.
-///
-/// Both horizons a batch may target — a finding's embedded subplan and a
-/// group's unified plan — are walks over a [`Plan`], so the readiness verdict
-/// is derived once here through the shared scope evaluator instead of being
-/// re-implemented per subject.
-fn validate_plan_step_target(
-    plan: &Plan,
-    step_id: &str,
-    subject: &str,
-) -> Result<(), ResponseError> {
-    let target = plan.find_item(step_id).ok_or_else(|| {
-        response_error(
-            errors::NOT_FOUND,
-            format!("Sub-step '{}' not found in {}", step_id, subject),
-        )
-    })?;
-    if !target.is_leaf() {
-        return Err(response_error(
-            errors::INVALID_PARAMS,
-            format!(
-                "Sub-step '{}' is not a leaf item and cannot be executed directly",
-                target.id
-            ),
-        ));
-    }
-    let step_id = target.id.clone();
-
-    match plan.evaluate_scope(Some(step_id.as_str())) {
-        PlanScopeEvaluation::Ready(_) => Ok(()),
-        PlanScopeEvaluation::AllCompleted => Err(response_error(
-            errors::NOTHING_TO_EXECUTE,
-            format!("Sub-step '{}' is already DONE", step_id),
-        )),
-        PlanScopeEvaluation::Cancelled => Err(response_error(
-            errors::NOTHING_TO_EXECUTE,
-            format!("Sub-step '{}' is CANCELLED and cannot be executed", step_id),
-        )),
-        PlanScopeEvaluation::StepBlocked => Err(response_error(
-            errors::STEP_BLOCKED,
-            format!("Sub-step '{}' is BLOCKED and cannot be executed", step_id),
-        )),
-        PlanScopeEvaluation::BlockedByDependencies(blocked) => Err(response_error(
-            errors::STEP_BLOCKED_BY_DEPENDENCIES,
-            format!(
-                "Sub-step '{}' depends on unfinished sub-step(s): {}",
-                step_id,
-                blocked.join(", ")
-            ),
-        )),
-        PlanScopeEvaluation::BlockedByBlockers(blocked) => Err(response_error(
-            errors::STEP_BLOCKED,
-            format!(
-                "Sub-step '{}' cannot run while blocked sub-step(s) remain: {}",
-                step_id,
-                blocked.join(", ")
-            ),
-        )),
-        PlanScopeEvaluation::BlockedByDiscussion(discussion) => Err(response_error(
-            errors::STEP_IN_DISCUSSION,
-            format!(
-                "Sub-step '{}' is in DISCUSSION status and cannot be executed until reviewed: {}",
-                step_id,
-                discussion.join(", ")
-            ),
-        )),
-        PlanScopeEvaluation::NotFound => Err(response_error(
-            errors::NOT_FOUND,
-            format!("Sub-step '{}' not found in {}", step_id, subject),
-        )),
-    }
+/// One session's contribution to an implicit review batch queue.
+struct SessionContribution {
+    /// Batch members the session contributes, in client order.
+    members: Vec<String>,
+    /// Findings the scheduled members address.
+    addressed: Vec<u32>,
+    /// Findings postponed until the questions of their group are decided.
+    deferred_findings: usize,
+    /// Architecture findings no architectural group can plan yet.
+    pending_architecture: usize,
 }
 
-/// Validates that a targeted sub-step of a group's unified subplan exists,
-/// is an executable leaf, and is ready to run before a group batch starts.
-///
-/// A group without a subplan is synthesized just in time by the Architect,
-/// so a step target cannot be validated against a horizon that does not
-/// exist yet: the request is refused instead of deferring the verdict to
-/// the walk.
-fn validate_group_step_target(group: &ReviewGroup, step_id: &str) -> Result<(), ResponseError> {
-    if group.subplan.is_empty() {
-        return Err(response_error(
-            errors::INVALID_PARAMS,
-            format!(
-                "Review group '{}' has no subplan yet; cannot target sub-step '{}'",
-                group.id, step_id
-            ),
-        ));
-    }
-    let plan = Plan {
-        items: group.subplan.clone(),
-        ..Default::default()
+/// Resolves what one session contributes to an implicit queue.
+fn session_contribution(session: &ReviewSession) -> SessionContribution {
+    let mut contribution = SessionContribution {
+        members: Vec::new(),
+        addressed: Vec::new(),
+        deferred_findings: 0,
+        pending_architecture: 0,
     };
-    validate_plan_step_target(&plan, step_id, &format!("review group '{}'", group.id))
-}
-
-/// Enumerates the batch members one session contributes to an implicit queue.
-///
-/// An architectural group is scheduled once through its unified subplan,
-/// subsuming the actionable findings it collects; every other actionable
-/// finding is scheduled on its own. The group member takes the position of
-/// the group's first actionable finding, so the traversal order a client saw
-/// in its section is preserved.
-///
-/// An architecture finding with no architectural group is scheduled by neither
-/// form: it must be planned before it is executed, so the post-analysis owns it
-/// until it is regrouped.
-fn session_members(session: &ReviewSession) -> Vec<String> {
-    let mut members: Vec<String> = Vec::new();
-    let mut scheduled_groups: HashSet<String> = HashSet::new();
+    let mut scheduled_groups: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut deferred_groups: std::collections::HashSet<String> = std::collections::HashSet::new();
     for item in session.items.iter().filter(|item| is_actionable(item)) {
         if let Some(group_id) = architectural_group_of(session, item) {
-            let member = group_step_id(&session.id, group_id);
-            if scheduled_groups.insert(member.clone()) {
-                members.push(member);
+            if deferred_groups.contains(group_id) {
+                continue;
             }
+            if !group_ready_for_autonomous_run(session, group_id) {
+                if deferred_groups.insert(group_id.to_string()) {
+                    contribution.deferred_findings += session
+                        .items
+                        .iter()
+                        .filter(|member| member.group.as_deref() == Some(group_id))
+                        .count();
+                }
+                continue;
+            }
+            let member = group_member_id(&session.id, group_id);
+            if scheduled_groups.insert(member.clone()) {
+                contribution.members.push(member);
+            }
+            contribution.addressed.push(item.id);
             continue;
         }
         if is_unplanned_architecture_finding(session, item) {
+            contribution.pending_architecture += 1;
             continue;
         }
-        members.push(format!("{}:{}", session.id, item.id));
+        contribution
+            .members
+            .push(format!("{}:{}", session.id, item.id));
+        contribution.addressed.push(item.id);
     }
-    members
+    contribution
 }
 
-/// Accumulates the implicit queue every stored session contributes.
-///
-/// The queue is the concatenation of the per-session queues in stored order, so
-/// a cross-session run preserves the order a client rendered. The addressed
-/// findings travel back beside it, and architecture findings that no
-/// architectural group can plan are counted instead of scheduled: they are the
-/// reason a session with actionable findings can contribute an empty queue.
-fn accumulate_implicit_queues(sessions: &[ReviewSession]) -> (Vec<String>, Vec<u32>, usize) {
-    let mut tasks: Vec<String> = Vec::new();
-    let mut item_ids: Vec<u32> = Vec::new();
-    let mut pending_architecture = 0;
+/// The implicit queue every stored session contributes.
+struct ImplicitQueues {
+    /// Batch members to run, in stored order.
+    members: Vec<String>,
+    /// Findings the scheduled members address.
+    addressed: Vec<u32>,
+    /// Findings postponed until the questions of their group are decided.
+    deferred: usize,
+    /// Architecture findings no architectural group can plan yet.
+    pending_architecture: usize,
+}
+
+/// Accumulates the implicit queue of every stored session.
+fn accumulate_implicit_queues(sessions: &[ReviewSession]) -> ImplicitQueues {
+    let mut queues = ImplicitQueues {
+        members: Vec::new(),
+        addressed: Vec::new(),
+        deferred: 0,
+        pending_architecture: 0,
+    };
     for session in sessions {
-        for item in &session.items {
-            if is_unplanned_architecture_finding(session, item) {
-                pending_architecture += 1;
-            } else if is_actionable(item) {
-                item_ids.push(item.id);
-            }
-        }
-        tasks.extend(session_members(session));
+        let contribution = session_contribution(session);
+        queues.members.extend(contribution.members);
+        queues.addressed.extend(contribution.addressed);
+        queues.deferred += contribution.deferred_findings;
+        queues.pending_architecture += contribution.pending_architecture;
     }
-    (tasks, item_ids, pending_architecture)
+    queues
 }
 
 /// Renders the supervisor diagnostic label of one batch member.
-fn member_label(member_id: &str, step_id: Option<&str>) -> String {
-    if let Some((session_id, group_id)) = parse_group_step_id(member_id) {
-        return match step_id {
-            Some(step) => format!(
-                "Fix sub-step '{}' of review group '{}' in session '{}'",
-                step, group_id, session_id
-            ),
-            None => format!(
-                "Fix review group '{}' in session '{}'",
-                group_id, session_id
-            ),
-        };
+fn member_label(member_id: &str) -> String {
+    if let Some((session_id, group_id)) = parse_group_member(member_id) {
+        return format!(
+            "Fix the root cause of review group '{}' in session '{}'",
+            group_id, session_id
+        );
     }
     let Some((session_id, item_id)) = member_id.split_once(':') else {
         return format!("Execute review member '{}'", member_id);
     };
-    match step_id {
-        Some(step) => format!(
-            "Fix sub-step '{}' of review finding #{} in session '{}",
-            step, item_id, session_id
-        ),
-        None => format!(
-            "Fix review finding #{} in session '{}'",
-            item_id, session_id
-        ),
-    }
+    format!(
+        "Fix review finding #{} in session '{}'",
+        item_id, session_id
+    )
 }
-/// A resolved `review/execute` selection: the batch members to run, the
-/// finding ids the run addresses, and the optional targeted sub-step.
-type ResolvedSelection = Result<(Vec<String>, Vec<u32>, Option<String>), ResponseError>;
+
+/// A resolved `review/execute` selection.
+#[derive(Debug)]
+struct ResolvedQueue {
+    /// Batch members to run, in the order the client addressed them.
+    members: Vec<String>,
+    /// Findings the members address.
+    addressed: Vec<u32>,
+    /// Findings postponed until the questions of their group are decided.
+    deferred: usize,
+}
+
+type ResolvedSelection = Result<ResolvedQueue, ResponseError>;
+
 /// Resolves the members a group-scoped request runs.
 ///
-/// A group run addresses the group itself: its unified subplan is the unit of
-/// work, `step_id` names a step of that subplan, and no finding of the
-/// session is scheduled beside it. The findings the group collects are the
-/// work the run addresses, so they travel back as the addressed finding ids.
+/// A group run addresses the group itself: its unified horizon is the unit of
+/// work, and no finding is scheduled beside it. The findings the group collects
+/// are the work the run addresses, so they travel back as the addressed ids.
 fn resolve_group_selection(
     session: &ReviewSession,
     review_id: &str,
     group_id: &str,
-    params: &ReviewExecuteParams,
 ) -> ResolvedSelection {
-    let group = match session.groups.iter().find(|group| group.id == group_id) {
-        Some(group) => group,
-        None => {
-            return Err(response_error(
-                errors::NOT_FOUND,
-                format!(
-                    "Review group '{}' not found in session '{}'",
-                    group_id, review_id
-                ),
-            ));
-        }
-    };
-    let step_id = match params
-        .step_id
-        .as_deref()
-        .map(str::trim)
-        .filter(|step| !step.is_empty())
-    {
-        Some(step) => {
-            validate_group_step_target(group, step)?;
-            Some(step.to_string())
-        }
-        None => None,
-    };
+    if !session.groups.iter().any(|group| group.id == group_id) {
+        return Err(response_error(
+            errors::NOT_FOUND,
+            format!(
+                "Review group '{}' not found in session '{}'",
+                group_id, review_id
+            ),
+        ));
+    }
+    // The readiness gate runs before anything is scheduled: a group that still
+    // poses an open question is not executed at all.
+    let open_questions = group_open_questions(session, group_id);
+    if !open_questions.is_empty() {
+        return Err(group_unresolved_questions_error(group_id, &open_questions));
+    }
     let item_ids: Vec<u32> = session
         .items
         .iter()
         .filter(|item| item.group.as_deref() == Some(group_id))
         .map(|item| item.id)
         .collect();
-    Ok((vec![group_step_id(review_id, group_id)], item_ids, step_id))
+    Ok(ResolvedQueue {
+        members: vec![group_member_id(review_id, group_id)],
+        addressed: item_ids,
+        deferred: 0,
+    })
 }
 
 /// Resolves the members a finding-scoped request runs.
-///
-/// Returns the batch members, the addressed finding ids, and the optional
-/// targeted sub-step of a finding's embedded subplan. The architectural
-/// dichotomy is enforced here: a finding of an architectural group is a
-/// symptom of one root cause, so an explicit selection that names one is
-/// refused, while the implicit queues subsume such findings into a single
-/// group member.
 fn resolve_finding_selection(
     session: &ReviewSession,
     review_id: &str,
@@ -562,8 +531,6 @@ fn resolve_finding_selection(
                     ));
                 }
             };
-            // A symptom of an architectural group is never executed on its
-            // own: the group's unified subplan is the unit of remediation.
             if let Some(group_id) = architectural_group_of(session, item) {
                 return Err(response_error(
                     errors::ARCHITECTURAL_GROUP_EXECUTION_REQUIRED,
@@ -573,29 +540,8 @@ fn resolve_finding_selection(
                     ),
                 ));
             }
-
-            // An architecture finding is planned before it is executed, and
-            // only an architectural group carries a plan: without one the
-            // finding is refused here instead of being run as a bare turn.
             if is_unplanned_architecture_finding(session, item) {
                 return Err(unplanned_architecture_error(item));
-            }
-            // #c-1/#c-2: a review finding executes as one isolated turn and owns
-            // no subplan, so a targeted sub-step can only name a step of an
-            // architectural group horizon.
-            if let Some(step) = params
-                .step_id
-                .as_deref()
-                .map(str::trim)
-                .filter(|step| !step.is_empty())
-            {
-                return Err(response_error(
-                    errors::INVALID_PARAMS,
-                    format!(
-                        "Sub-step '{}' cannot be targeted on review item #{}: a review finding executes as one isolated turn and owns no subplan",
-                        step, item.id
-                    ),
-                ));
             }
             match item.status {
                 IssueStatus::Discussion => Err(response_error(
@@ -607,10 +553,7 @@ fn resolve_finding_selection(
                 )),
                 IssueStatus::Rejected => Err(response_error(
                     errors::ITEM_REJECTED,
-                    format!(
-                        "Review item #{} is REJECTED and cannot be executed",
-                        item.id
-                    ),
+                    format!("Review item #{} is REJECTED and cannot be executed", item.id),
                 )),
                 IssueStatus::Fixed => Err(response_error(
                     errors::NOTHING_TO_EXECUTE,
@@ -620,153 +563,143 @@ fn resolve_finding_selection(
                     errors::NOTHING_TO_EXECUTE,
                     format!("Review item #{} is already SKIPPED", item.id),
                 )),
-                IssueStatus::Todo | IssueStatus::InProgress => {
-                    Ok((vec![member_of(item_id)], vec![item_id], None))
-                }
+                IssueStatus::Todo | IssueStatus::InProgress => Ok(ResolvedQueue {
+                    members: vec![member_of(item_id)],
+                    addressed: vec![item_id],
+                    deferred: 0,
+                }),
             }
         }
-        None => {
-            if params.step_id.is_some() {
-                return Err(response_error(
-                    errors::INVALID_PARAMS,
-                    "step_id requires both review_id and item_id",
-                ));
-            }
-            match params.item_ids.as_deref() {
-                Some(selected) => {
-                    for id in selected {
-                        // An explicit selection names findings, and a symptom
-                        // of an architectural group is not one of them: the
-                        // whole selection is refused instead of silently
-                        // dropping work the client believes it scheduled.
-                        if let Some(item) = session.find_item(*id) {
-                            if let Some(group_id) = architectural_group_of(session, item) {
-                                return Err(response_error(
-                                    errors::ARCHITECTURAL_GROUP_EXECUTION_REQUIRED,
-                                    format!(
-                                        "Review item #{} is a symptom of architectural group '{}' and cannot be executed on its own; execute the group instead",
-                                        item.id, group_id
-                                    ),
-                                ));
-                            }
-                            // An architecture finding without an architectural
-                            // group has no plan carrier, so scheduling it as a
-                            // bare turn is refused for the whole selection.
-                            if is_unplanned_architecture_finding(session, item) {
-                                return Err(unplanned_architecture_error(item));
-                            }
+        None => match params.item_ids.as_deref() {
+            Some(selected) => {
+                for id in selected {
+                    if let Some(item) = session.find_item(*id) {
+                        if let Some(group_id) = architectural_group_of(session, item) {
+                            return Err(response_error(
+                                errors::ARCHITECTURAL_GROUP_EXECUTION_REQUIRED,
+                                format!(
+                                    "Review item #{} is a symptom of architectural group '{}' and cannot be executed on its own; execute the group instead",
+                                    item.id, group_id
+                                ),
+                            ));
+                        }
+                        if is_unplanned_architecture_finding(session, item) {
+                            return Err(unplanned_architecture_error(item));
                         }
                     }
-                    let ids = resolve_session_queue(session, selected);
-                    if ids.is_empty() {
-                        return Err(response_error(
-                            errors::NOTHING_TO_EXECUTE,
-                            "No TODO findings to execute in this review session",
-                        ));
-                    }
-                    let tasks = ids.iter().map(|id| member_of(*id)).collect();
-                    Ok((tasks, ids, None))
                 }
-                None => {
-                    // The implicit queue subsumes the findings an
-                    // architectural group collects into one group member,
-                    // while every other actionable finding runs on its own.
-                    // An architecture finding that no architectural group can
-                    // plan is scheduled by neither form, so a session made only
-                    // of such findings yields an empty queue and is refused
-                    // with a diagnostic naming the missing post-analysis.
-                    let (tasks, item_ids, pending_architecture) =
-                        accumulate_implicit_queues(std::slice::from_ref(session));
-                    if tasks.is_empty() {
-                        return Err(response_error(
-                            errors::NOTHING_TO_EXECUTE,
-                            empty_queue_message("in this review session", pending_architecture),
-                        ));
-                    }
-                    Ok((tasks, item_ids, None))
+                let ids = resolve_session_queue(session, selected);
+                if ids.is_empty() {
+                    return Err(response_error(
+                        errors::NOTHING_TO_EXECUTE,
+                        "No TODO findings to execute in this review session",
+                    ));
                 }
+                let members = ids.iter().map(|id| member_of(*id)).collect();
+                Ok(ResolvedQueue {
+                    members,
+                    addressed: ids,
+                    deferred: 0,
+                })
             }
-        }
+            None => {
+                let queues = accumulate_implicit_queues(std::slice::from_ref(session));
+                if queues.members.is_empty() {
+                    return Err(response_error(
+                        errors::NOTHING_TO_EXECUTE,
+                        empty_queue_message(
+                            "in this review session",
+                            queues.pending_architecture,
+                            queues.deferred,
+                        ),
+                    ));
+                }
+                Ok(ResolvedQueue {
+                    members: queues.members,
+                    addressed: queues.addressed,
+                    deferred: queues.deferred,
+                })
+            }
+        },
     }
 }
 
-/// Adapter that executes one review batch member as a [`BatchStepExecutor`]
-/// step: a finding through its isolated turn, or an architectural group
-/// through its unified subplan.
+/// Adapter that drives one review batch member through the engine's unified
+/// implementation pipeline as a [`BatchStepExecutor`] step.
 ///
 /// The member identifier is the addressing contract: it is minted by
 /// `handle_review_execute` and decoded here through the same sanctioned
-/// parsers, so a group member never reaches the finding path. Finding status
-/// synchronization (InProgress/Fixed/Todo) and file preloading stay inside
-/// the executor, keeping the batch supervisor agnostic of review storage.
-/// Each finding member carries `{session}:{item}` to allow seamless traversal
-/// across multiple review sessions; a group member carries
-/// `{session}:g:{group}`.
+/// parsers, so a group member never reaches the finding path. The pipeline owns
+/// the horizon resolution, the just-in-time Architect synthesis, the ordered
+/// leaf walk, the coder ladder, the replanning waves, and the durable status
+/// transitions, so the supervisor stays agnostic of review storage.
+///
+/// The executor also counts the findings the queue repaired, because the
+/// terminal telemetry cannot be reconstructed by the supervisor: the pipeline
+/// reports the leaves it executed, while a queue is measured in findings.
 struct ReviewBatchExecutor<'a> {
     state: &'a Arc<AppState>,
     repo_root: &'a Path,
     operation: &'a Arc<OperationGuard>,
-    step_id: Option<&'a str>,
+    config: AppConfig,
     model: Option<ModelSelection>,
     instructions: Option<String>,
+    /// Findings the completed members repaired.
+    fixed_items: usize,
 }
 
 impl ReviewBatchExecutor<'_> {
-    /// Executes one architectural group through its unified subplan.
+    /// Counts the findings a completed member repaired.
     ///
-    /// The walk itself is owned by `group_exec`: just-in-time Architect
-    /// synthesis, ordered leaf traversal, and reprojecting replans around a
-    /// failed sub-step. The executor contributes the batch framing only: it
-    /// switches the active session, decodes the durable group state, and
-    /// maps the walk's verdict onto the supervisor's step outcome.
-    ///
-    /// A walk that exhausted its replanning budget leaves the group's
-    /// findings in `Todo` with the interruption note, so the step reports the
-    /// failure instead of claiming a completion the durable record does not
-    /// hold.
-    async fn execute_group(
-        &self,
-        review_id: &str,
-        group_id: &str,
-        cancel_rx: &watch::Receiver<bool>,
-    ) -> BatchStepOutcome {
-        // Switch the active review session to match the group being executed.
-        let save_root = self.repo_root.to_path_buf();
-        let review_id_owned = review_id.to_string();
-        let _ = offload_review(move || {
-            ReviewStorage::save_active_id(&save_root, Some(&review_id_owned))
-        })
-        .await;
-
-        let (session, group) = match reload_group(self.repo_root, review_id, group_id).await {
-            Ok(loaded) => loaded,
-            Err(failure) => return BatchStepOutcome::failed(failure.into_reason()),
+    /// A group horizon repairs every finding the group collects, so the count is
+    /// read from the durable membership instead of being guessed from the number
+    /// of leaves; a degenerate finding run repairs exactly its own finding.
+    async fn repaired_findings(&self, member_id: &str) -> usize {
+        let Some((review_id, group_id)) = parse_group_member(member_id) else {
+            return 1;
         };
+        let load_root = self.repo_root.to_path_buf();
+        let load_id = review_id.to_string();
+        let group_id = group_id.to_string();
+        offload_review(move || ReviewStorage::load_review(&load_root, &load_id))
+            .await
+            .ok()
+            .flatten()
+            .map(|session| {
+                session
+                    .items
+                    .iter()
+                    .filter(|item| item.group.as_deref() == Some(group_id.as_str()))
+                    .count()
+            })
+            .unwrap_or(0)
+    }
 
-        let walked = run_group_plan_with_replans(
-            self.state,
-            self.repo_root,
-            review_id,
-            &session,
-            &group,
-            self.step_id,
-            self.model.clone(),
-            self.instructions.clone(),
-            Arc::clone(self.operation),
-        )
-        .await;
-
-        match walked {
-            Ok(()) => BatchStepOutcome::succeeded(),
-            Err(failure) => {
-                // A failure that coincides with the batch's cancel signal is
-                // a cancelled step, not a failed one: the supervisor then
-                // stops the queue as `Cancelled` instead of reporting a group
-                // that never had the chance to run.
-                if *cancel_rx.borrow() {
-                    return BatchStepOutcome::cancelled();
-                }
-                BatchStepOutcome::failed(failure.into_reason())
+    /// Maps the terminal report of one member onto the supervisor's step outcome.
+    ///
+    /// The engine settles the entity of every member it ends, so a member that
+    /// could not be implemented as stated is a local skip of the queue instead
+    /// of a fatal stop: the remaining findings are independent of it. A
+    /// cancellation and a failure the engine could not repair stop the queue,
+    /// because the next member must never build on a state nobody verified.
+    async fn map_report(
+        &mut self,
+        member_id: &str,
+        report: &PlanImplementationReport,
+    ) -> BatchStepOutcome {
+        match &report.stop {
+            PlanImplementationStop::Completed => {
+                self.fixed_items += self.repaired_findings(member_id).await;
+                BatchStepOutcome::succeeded()
+            }
+            PlanImplementationStop::Cancelled | PlanImplementationStop::Stopped => {
+                BatchStepOutcome::cancelled()
+            }
+            PlanImplementationStop::Blocked { reason, .. } => {
+                BatchStepOutcome::skipped(reason.clone())
+            }
+            PlanImplementationStop::Failed { reason, .. } => {
+                BatchStepOutcome::failed(reason.clone())
             }
         }
     }
@@ -777,91 +710,51 @@ impl BatchStepExecutor for ReviewBatchExecutor<'_> {
     async fn execute_step(
         &mut self,
         step: &BatchStep,
-        _stream_tx: mpsc::Sender<StreamEvent>,
+        stream_tx: mpsc::Sender<StreamEvent>,
         cancel_rx: watch::Receiver<bool>,
     ) -> anyhow::Result<BatchStepOutcome> {
-        // A group member addresses the group's unified subplan: it is decoded
-        // and executed as one, never as a finding.
-        if let Some((review_id, group_id)) = parse_group_step_id(&step.id) {
-            return Ok(self.execute_group(review_id, group_id, &cancel_rx).await);
-        }
-
-        let (session_id, item_id) = if let Some((sess, item_part)) = step.id.split_once(':') {
-            match item_part.parse::<u32>() {
-                Ok(id) => (sess.to_string(), id),
-                Err(_) => {
-                    return Ok(BatchStepOutcome::failed(format!(
-                        "Invalid review item id: {}",
-                        step.id
-                    )));
-                }
-            }
-        } else {
+        let Some(scope) = member_scope(&step.id) else {
             return Ok(BatchStepOutcome::failed(format!(
-                "Invalid review step id (missing session prefix): {}",
+                "Invalid review step id: {}",
                 step.id
             )));
         };
 
-        // Switch the active review session to match the finding being executed.
-        let save_root = self.repo_root.to_path_buf();
-        let session_id_owned = session_id.clone();
-        let _ = offload_review(move || {
-            ReviewStorage::save_active_id(&save_root, Some(&session_id_owned))
-        })
-        .await;
-
-        match run_review_step(
-            self.state,
-            self.repo_root,
-            &session_id,
-            item_id,
-            self.model.clone(),
-            self.instructions.clone(),
-            &cancel_rx,
+        // Every member is a whole bounded turn of its own, so it mints its own
+        // marker before the pipeline resolves the horizon it executes.
+        let marker = self.state.next_turn_marker().await;
+        let host = ServerImplementationHost::new(
+            Arc::clone(self.state),
             Arc::clone(self.operation),
-        )
-        .await
-        {
-            Ok(()) => Ok(BatchStepOutcome::succeeded()),
-            Err(failure) => {
-                if failure.is_domain() {
-                    // The finding is already marked `Skipped` with diagnostics.
-                    // Report the step as successful so the supervisor advances
-                    // to the next finding instead of aborting the queue. An
-                    // unconditional abort travels this same path: its
-                    // recommendation is stored on the finding and no Architect
-                    // replanning is engaged for it.
-                    Ok(BatchStepOutcome::succeeded())
-                } else {
-                    // A failure that coincides with the batch's cancel signal is
-                    // a cancelled step, not a failed one: the supervisor then
-                    // stops the queue as `Cancelled` instead of reporting a
-                    // finding that never had a chance to run.
-                    let cancelled = *cancel_rx.borrow();
-                    if cancelled {
-                        return Ok(BatchStepOutcome::cancelled());
-                    }
-                    // The stop is a durable fact of the session: the diagnostic
-                    // is recorded on the finding it stopped before the queue
-                    // reports the failure, so the Review tree explains the stop
-                    // after the daemon restarts.
-                    let reason = failure.into_reason();
-                    record_finding_stop(self.state, self.repo_root, &session_id, item_id, &reason)
-                        .await;
-                    Ok(BatchStepOutcome::failed(reason))
-                }
-            }
-        }
+            self.config.clone(),
+            self.repo_root.to_path_buf(),
+        );
+        let options = PlanImplementationOptions {
+            selection: self.model.clone(),
+            instructions: self.instructions.clone(),
+            marker,
+        };
+        // The queue itself owns the graceful drain between members, so the
+        // member pipeline runs without a soft-stop of its own while the sender
+        // stays alive for the whole call.
+        let (_soft_stop_tx, soft_stop_rx) = watch::channel(false);
+        let pipeline = PlanImplementationPipeline::new(
+            self.repo_root,
+            scope,
+            &host,
+            self.config.clone(),
+            options,
+        );
+        let report = pipeline.run(&stream_tx, &cancel_rx, &soft_stop_rx).await;
+        Ok(self.map_report(&step.id, &report).await)
     }
 }
 
-/// Runs the review members through the core [`BatchExecution`] supervisor
-/// with explicit execution options (targeted sub-step, model override,
-/// directives).
+/// Runs the review members through the core [`BatchExecution`] supervisor with
+/// explicit execution options (model override, directives, deferred findings).
 ///
-/// Ordered, fail-fast traversal is preserved; findings fixed before the
-/// first failure stay FIXED. Once the supervisor terminates, a typed
+/// Ordered traversal is preserved; findings repaired before a member stops the
+/// queue stay `Fixed`. Once the supervisor terminates, a typed
 /// `review/batch_finished` event carries the aggregate status, finding
 /// counters, and elapsed time, so clients can raise a single notice for the
 /// whole batch.
@@ -870,12 +763,14 @@ pub(super) async fn run_review_batch_with_options(
     state: &Arc<AppState>,
     owner_id: &str,
     tasks: Vec<String>,
-    step_id: Option<String>,
+    _step_id: Option<String>,
+    deferred: usize,
     model: Option<ModelSelection>,
     instructions: Option<String>,
     operation: Arc<OperationGuard>,
 ) -> BatchOutcome {
     let repo_root = state.context.read().await.repo_root().to_path_buf();
+    let config = state.config.lock().await.config.clone();
     if owner_id != "all" {
         let save_root = repo_root.clone();
         let owner_owned = owner_id.to_string();
@@ -889,22 +784,17 @@ pub(super) async fn run_review_batch_with_options(
 
     let steps: Vec<BatchStep> = tasks
         .iter()
-        .map(|member_id| {
-            BatchStep::new(
-                member_id.clone(),
-                member_label(member_id, step_id.as_deref()),
-            )
-        })
+        .map(|member_id| BatchStep::new(member_id.clone(), member_label(member_id)))
         .collect();
 
     let (stream_tx, _stream_rx) = mpsc::channel::<StreamEvent>(1);
     // The whole batch shares one operation and one cancel channel: a cancel
-    // delivered between members is honored instead of being lost, and the
-    // slot stays registered for the batch's entire lifetime.
+    // delivered between members is honored instead of being lost, and the slot
+    // stays registered for the batch's entire lifetime.
     let cancel_rx = operation.cancel_receiver();
     // Soft stop ends the queue gracefully after the current member: the
     // operation owns the signal, and a `model/cancel` request with
-    // `mode: "soft"` raises it so the current member finishes its turn,
+    // `mode: "soft"` raises it so the current member finishes its horizon,
     // verification, and commit before the queue stops.
     let soft_stop_rx = operation.soft_stop_receiver();
 
@@ -912,38 +802,21 @@ pub(super) async fn run_review_batch_with_options(
         state,
         repo_root: &repo_root,
         operation: &operation,
-        step_id: step_id.as_deref(),
+        config,
         model,
         instructions,
+        fixed_items: 0,
     };
 
-    // A cancel delivered while a member runs must unwind the queue at once.
-    // The member itself observes the signal at its own phase boundaries and
-    // kills the verification subprocess; this race is the guarantee that the
-    // batch never waits for the remainder of a long verification. An
-    // abandoned finding is never marked FIXED and never committed, and its
-    // checkpoint is unwound by the existing rollback contour.
-    let report = {
-        let batch = BatchExecution::new();
-        let run = batch.run(&steps, &mut executor, &stream_tx, &cancel_rx, &soft_stop_rx);
-        tokio::pin!(run);
-        tokio::select! {
-            biased;
-            report = &mut run => Some(report),
-            _ = wait_for_cancellation(cancel_rx.clone()) => None,
-        }
-    };
-    // An unwound run carries no step result, so it publishes the same
-    // terminal report as a batch cancelled between members.
-    let report = report.unwrap_or_else(|| BatchReport {
-        executed: Vec::new(),
-        scheduled: steps.len(),
-        stop: BatchStop::Cancelled,
-        usage: BatchUsage::default(),
-    });
+    let report = BatchExecution::new()
+        .run(&steps, &mut executor, &stream_tx, &cancel_rx, &soft_stop_rx)
+        .await;
 
     let executed_count = report.executed.len();
     let total_count = report.scheduled;
+    let telemetry = batch_telemetry(&report, executor.fixed_items, deferred);
+    let fixed_count = telemetry.fixed;
+    let failed_count = telemetry.failed;
     let (status, error) = match &report.stop {
         BatchStop::Completed => (BatchFinishStatus::Completed, None),
         BatchStop::Failed { .. } => (
@@ -957,18 +830,18 @@ pub(super) async fn run_review_batch_with_options(
     let outcome = match report.stop {
         BatchStop::Completed => BatchOutcome::Completed {
             items: executed_count,
+            telemetry,
         },
         BatchStop::Cancelled => BatchOutcome::Cancelled {
             completed: executed_count,
+            telemetry,
         },
         BatchStop::Stopped => BatchOutcome::Stopped {
             completed: executed_count,
+            telemetry,
         },
         BatchStop::Failed { step_id } => {
             let completed = executed_count.saturating_sub(1);
-            // The stop is attributed to the member the supervisor reports,
-            // through the same identifier the batch was minted with: a group
-            // is named as a group and never as a finding number.
             let member = FailedMember::decode(&step_id);
             let reason = error
                 .clone()
@@ -977,17 +850,17 @@ pub(super) async fn run_review_batch_with_options(
                 completed,
                 member,
                 reason,
+                telemetry,
             }
         }
         BatchStop::Blocked { step_id, reason } => {
-            // Review findings have no blocked status; a semantic block stops
-            // the batch and is reported as a failed member.
             let completed = executed_count.saturating_sub(1);
             let member = FailedMember::decode(&step_id);
             BatchOutcome::Failed {
                 completed,
                 member,
                 reason,
+                telemetry,
             }
         }
     };
@@ -1006,6 +879,9 @@ pub(super) async fn run_review_batch_with_options(
                 total_count,
                 elapsed_seconds: started_at.elapsed().as_secs(),
                 error,
+                fixed_count: Some(fixed_count),
+                deferred_count: Some(deferred),
+                failed_count: Some(failed_count),
             },
         })
         .ok(),
@@ -1014,8 +890,8 @@ pub(super) async fn run_review_batch_with_options(
     outcome
 }
 
-/// Convenience entry point used by tests: runs a batch of findings without
-/// targeted sub-step selection, model override, or developer directives.
+/// Convenience entry point used by tests: runs a batch of findings without a
+/// model override or developer directives.
 #[cfg(test)]
 pub(super) async fn run_review_batch(
     state: &Arc<AppState>,
@@ -1027,7 +903,7 @@ pub(super) async fn run_review_batch(
         .into_iter()
         .map(|(session_id, item_id)| format!("{}:{}", session_id, item_id))
         .collect();
-    run_review_batch_with_options(state, owner_id, members, None, None, None, operation).await
+    run_review_batch_with_options(state, owner_id, members, None, 0, None, None, operation).await
 }
 
 pub async fn handle_review_execute(req: Request, state: &Arc<AppState>) -> Response {
@@ -1056,7 +932,7 @@ pub async fn handle_review_execute(req: Request, state: &Arc<AppState>) -> Respo
         );
     }
 
-    let (owner_id, tasks, item_ids, step_id) = match params.review_id.as_deref() {
+    let (owner_id, queue) = match params.review_id.as_deref() {
         Some(review_id) => {
             let load_root = repo_root.clone();
             let load_id = review_id.to_string();
@@ -1076,17 +952,12 @@ pub async fn handle_review_execute(req: Request, state: &Arc<AppState>) -> Respo
                 Err(err) => return Response::err(req.id, errors::REVIEW_LOAD_FAILED, err),
             };
 
-            // The dichotomy inside one session: a request resolves either
-            // the group it names or a finding selection, and every refusal
-            // happens here, before the operation slot is claimed.
             let selection = match params.group_id.as_deref() {
-                Some(group_id) => resolve_group_selection(&session, review_id, group_id, &params),
+                Some(group_id) => resolve_group_selection(&session, review_id, group_id),
                 None => resolve_finding_selection(&session, review_id, &params),
             };
-            match selection {
-                Ok((members, addressed, target_step)) => {
-                    (review_id.to_string(), members, addressed, target_step)
-                }
+            let queue = match selection {
+                Ok(queue) => queue,
                 Err(err) => {
                     return Response {
                         id: req.id,
@@ -1094,18 +965,31 @@ pub async fn handle_review_execute(req: Request, state: &Arc<AppState>) -> Respo
                         error: Some(err),
                     }
                 }
+            };
+            // A single sub-step of a horizon is never addressed on its own: the
+            // implementation pipeline executes the whole remaining horizon of the
+            // entity it is given, so a partial target has no meaning here. The
+            // entity resolves first, so a group that still poses an open question
+            // is refused by its readiness gate before that target is validated.
+            if params.step_id.is_some() {
+                return Response::err(
+                    req.id,
+                    errors::INVALID_PARAMS,
+                    "step_id cannot be targeted: the implementation horizon of the addressed review entity is executed as a whole",
+                );
             }
+            (review_id.to_string(), queue)
         }
         None => {
             if params.item_id.is_some()
-                || params.step_id.is_some()
                 || params.item_ids.is_some()
                 || params.group_id.is_some()
+                || params.step_id.is_some()
             {
                 return Response::err(
                     req.id,
                     errors::INVALID_PARAMS,
-                    "item_id, step_id, item_ids, and group_id cannot be specified when review_id is omitted",
+                    "item_id, item_ids, group_id, and step_id cannot be specified when review_id is omitted",
                 );
             }
             let list_root = repo_root.clone();
@@ -1113,24 +997,33 @@ pub async fn handle_review_execute(req: Request, state: &Arc<AppState>) -> Respo
                 Ok(s) => s,
                 Err(err) => return Response::err(req.id, errors::REVIEW_LOAD_FAILED, err),
             };
-            // Every session contributes its implicit queue: architectural
-            // groups are scheduled once through their unified subplans,
-            // subsuming the findings they collect, while every other
-            // actionable finding runs on its own.
-            // An architecture finding that no architectural group can plan is
-            // scheduled by neither form, so a queue made only of such findings
-            // is refused with a diagnostic naming the missing post-analysis.
-            let (tasks, item_ids, pending_architecture) = accumulate_implicit_queues(&sessions);
-            if tasks.is_empty() {
+            let queues = accumulate_implicit_queues(&sessions);
+            if queues.members.is_empty() {
                 return Response::err(
                     req.id,
                     errors::NOTHING_TO_EXECUTE,
-                    empty_queue_message("across all review sessions", pending_architecture),
+                    empty_queue_message(
+                        "across all review sessions",
+                        queues.pending_architecture,
+                        queues.deferred,
+                    ),
                 );
             }
-            ("all".to_string(), tasks, item_ids, None)
+            (
+                "all".to_string(),
+                ResolvedQueue {
+                    members: queues.members,
+                    addressed: queues.addressed,
+                    deferred: queues.deferred,
+                },
+            )
         }
     };
+    let ResolvedQueue {
+        members,
+        addressed,
+        deferred,
+    } = queue;
 
     let operation = match state.try_begin_operation() {
         Ok(guard) => Arc::new(guard),
@@ -1146,12 +1039,24 @@ pub async fn handle_review_execute(req: Request, state: &Arc<AppState>) -> Respo
     // Pre-flight verification runs while the batch operation stays registered,
     // so the slot is never briefly free and a concurrent `config/set`,
     // `git/undo`, or a second `review/execute` cannot slip in mid-verification.
-    if let Err(report) = crate::handlers::run_preflight_verification(&repo_root).await {
-        let message = format!(
-            "Pre-flight verification failed: the repository does not build cleanly. Batch execution was blocked before starting any finding.\n\n{}",
-            report
-        );
-        return Response::err(req.id, errors::PREFLIGHT_VERIFICATION_FAILED, message);
+    let preflight =
+        crate::handlers::run_preflight_verification(&repo_root, operation.cancel_receiver()).await;
+    match preflight {
+        PreflightVerdict::Passed => {}
+        PreflightVerdict::Cancelled => {
+            return Response::err(
+                req.id,
+                errors::CANCELLED,
+                "Pre-flight verification was cancelled; batch execution did not start",
+            );
+        }
+        PreflightVerdict::Failed(report) => {
+            let message = format!(
+                "Pre-flight verification failed: the repository does not build cleanly. Batch execution was blocked before starting any finding.\n\n{}",
+                report
+            );
+            return Response::err(req.id, errors::PREFLIGHT_VERIFICATION_FAILED, message);
+        }
     }
 
     // Execution hands control to the Coder role: the discussion focus is
@@ -1161,14 +1066,11 @@ pub async fn handle_review_execute(req: Request, state: &Arc<AppState>) -> Respo
 
     let model_selection = params.model.clone();
     let developer_instructions = params.instructions.clone();
-    // The registered operation runs the whole batch, so its identity travels
-    // with the acknowledgement and every event of the run, including the
-    // terminal `review/batch_finished`, carries the same identifier.
     let response = Response::ok(
         req.id,
         serde_json::json!({
             "review_id": params.review_id,
-            "item_ids": item_ids,
+            "item_ids": addressed,
             "operation_id": format!("op-{}", operation.id()),
         }),
     );
@@ -1178,46 +1080,66 @@ pub async fn handle_review_execute(req: Request, state: &Arc<AppState>) -> Respo
         match run_review_batch_with_options(
             &state,
             &owner_id,
-            tasks,
-            step_id,
+            members,
+            None,
+            deferred,
             model_selection,
             developer_instructions,
             operation,
         )
         .await
         {
-            BatchOutcome::Completed { items } => {
+            BatchOutcome::Completed { items, telemetry } => {
                 tracing::info!(
-                    "Review batch '{}' completed: {} finding(s)",
+                    "Review batch '{}' completed: {} member(s), fixed: {}, deferred: {}, failed: {}",
                     owner_id,
-                    items
+                    items,
+                    telemetry.fixed,
+                    telemetry.deferred,
+                    telemetry.failed
                 );
             }
             BatchOutcome::Failed {
                 completed,
                 member,
                 reason,
+                telemetry,
             } => {
                 tracing::warn!(
-                    "Review batch '{}' stopped at {} after {} fixed finding(s): {}",
+                    "Review batch '{}' stopped at {} after {} completed member(s): {} (fixed: {}, deferred: {}, failed: {})",
                     owner_id,
                     member,
                     completed,
-                    reason
+                    reason,
+                    telemetry.fixed,
+                    telemetry.deferred,
+                    telemetry.failed
                 );
             }
-            BatchOutcome::Cancelled { completed } => {
+            BatchOutcome::Cancelled {
+                completed,
+                telemetry,
+            } => {
                 tracing::warn!(
-                    "Review batch '{}' cancelled after {} fixed finding(s)",
+                    "Review batch '{}' cancelled after {} completed member(s) (fixed: {}, deferred: {}, failed: {})",
                     owner_id,
-                    completed
+                    completed,
+                    telemetry.fixed,
+                    telemetry.deferred,
+                    telemetry.failed
                 );
             }
-            BatchOutcome::Stopped { completed } => {
+            BatchOutcome::Stopped {
+                completed,
+                telemetry,
+            } => {
                 tracing::info!(
-                    "Review batch '{}' stopped gracefully after {} fixed finding(s)",
+                    "Review batch '{}' stopped gracefully after {} completed member(s) (fixed: {}, deferred: {}, failed: {})",
                     owner_id,
-                    completed
+                    completed,
+                    telemetry.fixed,
+                    telemetry.deferred,
+                    telemetry.failed
                 );
             }
         }
@@ -1229,13 +1151,10 @@ pub async fn handle_review_execute(req: Request, state: &Arc<AppState>) -> Respo
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tauqe_protocol::{IssueType, ModelRef, ReviewIssue};
+    use tauqe_core::workflow::batch::{BatchStepReport, BatchUsage};
+    use tauqe_protocol::{ModelRef, ReviewIssue};
 
     /// Builds a finding of the given semantic category.
-    ///
-    /// The category decides whether a finding may be executed as a bare turn,
-    /// so every fixture names it explicitly instead of inheriting one by
-    /// accident.
     fn typed_finding(
         id: u32,
         status: IssueStatus,
@@ -1268,8 +1187,7 @@ mod tests {
         typed_finding(id, status, group, IssueType::Quality)
     }
 
-    /// Builds an architecture finding: it must be planned before execution, so
-    /// only an architectural group may carry it.
+    /// Builds an architecture finding: it must be planned before execution.
     fn architecture_finding(id: u32, status: IssueStatus, group: Option<&str>) -> ReviewItem {
         typed_finding(id, status, group, IssueType::Architecture)
     }
@@ -1285,8 +1203,11 @@ mod tests {
         }
     }
 
-    fn group_of(id: &str, kind: tauqe_protocol::review::ReviewGroupKind) -> ReviewGroup {
-        ReviewGroup {
+    fn group_of(
+        id: &str,
+        kind: tauqe_protocol::review::ReviewGroupKind,
+    ) -> tauqe_protocol::ReviewGroup {
+        tauqe_protocol::ReviewGroup {
             id: id.to_string(),
             title: format!("Group {id}"),
             kind,
@@ -1294,10 +1215,9 @@ mod tests {
         }
     }
 
-    /// The queue resolver is the contract between the section-scoped launch
-    /// and the supervisor: client order wins, stale and unknown ids are
-    /// dropped, and duplicates collapse to their first occurrence, so the
-    /// batch runs exactly the findings the confirmation showed.
+    /// The queue resolver is the contract between the section-scoped launch and
+    /// the supervisor: client order wins, stale and unknown ids are dropped, and
+    /// duplicates collapse to their first occurrence.
     #[test]
     fn test_resolve_session_queue_keeps_client_order_and_drops_stale_ids() {
         let session = session_with(vec![
@@ -1315,9 +1235,9 @@ mod tests {
         assert!(resolve_session_queue(&session, &[]).is_empty());
     }
 
-    /// The implicit queue subsumes the findings an architectural group
-    /// collects into a single group member, while a simple group's findings
-    /// and ungrouped findings stay individually scheduled.
+    /// The implicit queue subsumes the findings an architectural group collects
+    /// into a single member, while a simple group's findings and ungrouped
+    /// findings stay individually scheduled.
     #[test]
     fn session_members_subsume_architectural_groups_once() {
         let session = ReviewSession {
@@ -1344,7 +1264,7 @@ mod tests {
         };
 
         assert_eq!(
-            session_members(&session),
+            session_contribution(&session).members,
             vec![
                 "rev-x:g:arch-1".to_string(),
                 "rev-x:3".to_string(),
@@ -1354,8 +1274,7 @@ mod tests {
         );
     }
 
-    /// Only the stored `Architectural` kind subsumes a finding: a simple or
-    /// unknown group leaves it individually executable.
+    /// Only the stored `Architectural` kind subsumes a finding.
     #[test]
     fn architectural_resolution_follows_the_stored_group_kind() {
         let session = ReviewSession {
@@ -1388,10 +1307,8 @@ mod tests {
         assert_eq!(architectural_group_of(&session, &session.items[3]), None);
     }
 
-    /// An architecture finding an architectural group carries is subsumed by
-    /// the group member, while an architecture finding with no such group is
-    /// scheduled by neither form: the post-analysis must regroup it before it
-    /// can be executed.
+    /// An architecture finding with no architectural group is scheduled by
+    /// neither form: the post-analysis must regroup it before it can run.
     #[test]
     fn session_members_never_schedule_unplanned_architecture_findings() {
         let session = ReviewSession {
@@ -1417,84 +1334,13 @@ mod tests {
         };
 
         assert_eq!(
-            session_members(&session),
+            session_contribution(&session).members,
             vec!["rev-arch:g:arch-1".to_string(), "rev-arch:7".to_string()]
         );
     }
 
-    /// The implicit session queue schedules the findings it can execute, so an
-    /// unplanned architecture finding appears in neither the members nor the
-    /// addressed findings.
-    #[test]
-    fn implicit_session_queue_skips_unplanned_architecture_findings() {
-        let session = ReviewSession {
-            id: "rev-queue".to_string(),
-            groups: vec![group_of(
-                "arch-1",
-                tauqe_protocol::review::ReviewGroupKind::Architectural,
-            )],
-            items: vec![
-                architecture_finding(1, IssueStatus::Todo, Some("arch-1")),
-                finding(2, IssueStatus::Todo),
-                architecture_finding(3, IssueStatus::Todo, None),
-            ],
-            ..Default::default()
-        };
-        let params = ReviewExecuteParams {
-            review_id: Some("rev-queue".to_string()),
-            ..Default::default()
-        };
-
-        let (tasks, item_ids, step) = resolve_finding_selection(&session, "rev-queue", &params)
-            .expect("the queued findings are executable");
-
-        assert_eq!(
-            tasks,
-            vec!["rev-queue:g:arch-1".to_string(), "rev-queue:2".to_string()]
-        );
-        assert_eq!(item_ids, vec![1, 2]);
-        assert!(step.is_none());
-    }
-
-    /// A session whose only actionable findings are architecture findings
-    /// without an architectural group has nothing the queue can schedule, so
-    /// it is refused instead of being dispatched with zero members.
-    #[test]
-    fn implicit_session_queue_refuses_a_session_of_unplanned_architecture_findings() {
-        let session = ReviewSession {
-            id: "rev-queue".to_string(),
-            groups: vec![group_of(
-                "grp-simple",
-                tauqe_protocol::review::ReviewGroupKind::Simple,
-            )],
-            items: vec![
-                architecture_finding(1, IssueStatus::Todo, None),
-                architecture_finding(2, IssueStatus::InProgress, Some("grp-simple")),
-                finding(3, IssueStatus::Fixed),
-            ],
-            ..Default::default()
-        };
-        let params = ReviewExecuteParams::default();
-
-        let err = resolve_finding_selection(&session, "rev-queue", &params)
-            .expect_err("the queue has nothing to execute");
-
-        assert_eq!(err.code, errors::NOTHING_TO_EXECUTE);
-        assert!(
-            err.message.contains("2 ARCHITECTURE"),
-            "the diagnostic must count the pending findings: {}",
-            err.message
-        );
-        assert!(
-            err.message.contains("post-analysis"),
-            "the diagnostic must name the missing stage: {}",
-            err.message
-        );
-    }
-
     /// The cross-session queue concatenates the per-session queues in stored
-    /// order, reports the findings the run addresses, and counts the
-    /// architecture findings that no architectural group can plan.
+    /// order and counts the architecture findings no group can plan.
     #[test]
     fn implicit_queues_accumulate_across_sessions() {
         let clustered = ReviewSession {
@@ -1519,25 +1365,22 @@ mod tests {
             ..Default::default()
         };
 
-        let (tasks, item_ids, pending_architecture) =
-            accumulate_implicit_queues(&[clustered, plain]);
+        let queues = accumulate_implicit_queues(&[clustered, plain]);
 
         assert_eq!(
-            tasks,
+            queues.members,
             vec![
                 "rev-a:g:arch-1".to_string(),
                 "rev-a:2".to_string(),
                 "rev-b:4".to_string()
             ]
         );
-        assert_eq!(item_ids, vec![1, 2, 4]);
-        assert_eq!(pending_architecture, 1);
+        assert_eq!(queues.addressed, vec![1, 2, 4]);
+        assert_eq!(queues.pending_architecture, 1);
+        assert_eq!(queues.deferred, 0);
     }
 
-    /// An architecture finding is planned before it is executed, so an explicit
-    /// selection of one that has no architectural group is refused with the
-    /// typed error directing the developer to the post-analysis, while a
-    /// finished finding of the same type keeps reporting its terminal status.
+    /// An explicit selection of an unplanned architecture finding is refused.
     #[test]
     fn explicit_selection_refuses_an_unplanned_architecture_finding() {
         let session = session_with(vec![
@@ -1554,11 +1397,7 @@ mod tests {
         let err = resolve_finding_selection(&session, "rev-queue", &targeted)
             .expect_err("an unplanned architecture finding is refused");
         assert_eq!(err.code, errors::ARCHITECTURAL_GROUP_EXECUTION_REQUIRED);
-        assert!(
-            err.message.contains("post-analysis"),
-            "the diagnostic must name the missing stage: {}",
-            err.message
-        );
+        assert!(err.message.contains("post-analysis"));
 
         let selected = ReviewExecuteParams {
             review_id: Some("rev-queue".to_string()),
@@ -1579,8 +1418,7 @@ mod tests {
         assert_eq!(err.code, errors::NOTHING_TO_EXECUTE);
     }
 
-    /// A group member carries no finding ordinal, so it is decoded as the group
-    /// it names instead of a finding number that never existed.
+    /// A group member carries no finding ordinal, so it is decoded as the group.
     #[test]
     fn failed_member_decodes_a_group_member() {
         assert_eq!(
@@ -1596,10 +1434,10 @@ mod tests {
         );
     }
 
-    /// A finding member is decoded by the audit ordinal the batch was addressed
-    /// with.
+    /// A finding member keeps its audit ordinal; an unminted identifier keeps
+    /// its text instead of borrowing the ordinal of an unrelated member.
     #[test]
-    fn failed_member_decodes_a_finding_member() {
+    fn failed_member_decodes_findings_and_keeps_unknown_identifiers() {
         assert_eq!(
             FailedMember::decode("rev-42:7"),
             FailedMember::Finding {
@@ -1611,42 +1449,107 @@ mod tests {
             FailedMember::decode("rev-42:7").to_string(),
             "finding #7 in session 'rev-42'"
         );
-    }
-
-    /// An identifier the harness never minted keeps its text instead of
-    /// borrowing the ordinal of an unrelated member.
-    #[test]
-    fn failed_member_keeps_an_unrecognized_identifier() {
-        let member = FailedMember::decode("rev-42:g:");
         assert_eq!(
-            member,
+            FailedMember::decode("rev-42:g:"),
             FailedMember::Unresolved {
                 member_id: "rev-42:g:".to_string(),
             }
         );
-        assert_eq!(member.to_string(), "review member 'rev-42:g:'");
     }
-    /// A batch stop is recorded on the finding it stopped: the diagnostic
-    /// names the failure, a note describing the finding itself survives above
-    /// it, and an earlier stop is superseded instead of accumulating.
+
+    /// The readiness gate postpones an architectural group while one of its
+    /// findings still poses an unanswered question.
     #[test]
-    fn failure_note_records_the_stop_and_preserves_the_finding_note() {
-        let fresh = failure_note(None, "provider error");
-        assert!(fresh.starts_with(BATCH_STOP_NOTE_PREFIX));
-        assert!(fresh.contains("provider error"));
+    fn session_contribution_defers_a_group_with_an_open_question() {
+        let open = grouped_finding(1, IssueStatus::Discussion, Some("arch-1"));
+        let pending = grouped_finding(2, IssueStatus::Todo, Some("arch-1"));
+        let standalone = finding(3, IssueStatus::Todo);
+        let session = ReviewSession {
+            id: "rev-gate".to_string(),
+            groups: vec![group_of(
+                "arch-1",
+                tauqe_protocol::review::ReviewGroupKind::Architectural,
+            )],
+            items: vec![open, pending, standalone],
+            ..Default::default()
+        };
 
-        let silent = failure_note(Some("   "), "  ");
+        let contribution = session_contribution(&session);
+
+        assert_eq!(contribution.members, vec!["rev-gate:3".to_string()]);
+        assert_eq!(contribution.addressed, vec![3]);
+        assert_eq!(contribution.deferred_findings, 2);
+        assert_eq!(contribution.pending_architecture, 0);
+    }
+
+    /// A recorded engineering decision answers the question, so the group leaves
+    /// the gate and is scheduled through its unified horizon again.
+    #[test]
+    fn a_recorded_decision_lifts_the_deferral() {
+        let mut decided = grouped_finding(1, IssueStatus::Discussion, Some("arch-1"));
+        decided.resolution_notes = Some("Keep the public API stable".to_string());
+        let pending = grouped_finding(2, IssueStatus::Todo, Some("arch-1"));
+        let session = ReviewSession {
+            id: "rev-gate".to_string(),
+            groups: vec![group_of(
+                "arch-1",
+                tauqe_protocol::review::ReviewGroupKind::Architectural,
+            )],
+            items: vec![decided, pending],
+            ..Default::default()
+        };
+
+        assert!(group_ready_for_autonomous_run(&session, "arch-1"));
+
+        let contribution = session_contribution(&session);
+
+        assert_eq!(contribution.members, vec!["rev-gate:g:arch-1".to_string()]);
+        assert_eq!(contribution.deferred_findings, 0);
+    }
+
+    /// The empty-queue diagnostic names the postponed findings before the
+    /// missing post-analysis.
+    #[test]
+    fn empty_queue_message_names_deferred_findings_first() {
+        let deferred = empty_queue_message("in this review session", 0, 2);
+        assert!(deferred.contains("2 finding(s) are deferred"));
+        assert!(!deferred.contains("post-analysis"));
+
+        let planned = empty_queue_message("in this review session", 3, 0);
+        assert!(planned.contains("3 ARCHITECTURE"));
+        assert!(planned.contains("post-analysis"));
+
         assert_eq!(
-            silent,
-            format!("{BATCH_STOP_NOTE_PREFIX} without diagnostics")
+            empty_queue_message("in this review session", 0, 0),
+            "No TODO findings to execute in this review session"
         );
+    }
 
-        let preserved = failure_note(Some("Keep the signature stable."), "provider error");
-        assert!(preserved.starts_with("Keep the signature stable."));
-        assert!(preserved.contains("provider error"));
+    /// An isolated member failure is counted in the terminal telemetry while the
+    /// queue still completes, so a night run reports what it left behind.
+    #[test]
+    fn isolated_member_failure_is_counted_in_the_terminal_telemetry() {
+        let report = BatchReport {
+            executed: vec![
+                BatchStepReport {
+                    id: "rev-queue:g:arch-1".to_string(),
+                    outcome: BatchStepOutcome::skipped("the root cause was not decomposed"),
+                },
+                BatchStepReport {
+                    id: "rev-queue:2".to_string(),
+                    outcome: BatchStepOutcome::succeeded(),
+                },
+            ],
+            scheduled: 2,
+            stop: BatchStop::Completed,
+            usage: BatchUsage::default(),
+        };
 
-        let superseded = failure_note(Some(&fresh), "second failure");
-        assert!(superseded.contains("second failure"));
-        assert!(!superseded.contains("provider error"));
+        let telemetry = batch_telemetry(&report, 1, 0);
+
+        assert_eq!(telemetry.fixed, 1);
+        assert_eq!(telemetry.deferred, 0);
+        assert_eq!(telemetry.failed, 1);
+        assert!(report.is_success());
     }
 }

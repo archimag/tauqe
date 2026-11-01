@@ -97,7 +97,10 @@ to verify instead of a guessed toolchain.
 The declared command may itself be a dispatcher that reads the delivered change set
 and routes the work, but the harness never composes, narrows, or rewrites the
 command line: it spawns what the declaration names and reads the exit status.
-
+The runner that spawns the declaration, the process-group teardown, and the
+parser that turns its output into typed diagnostics are deterministic substrate
+and live in `crates/tools/src/toolchain/`. The engine resolves the configuration
+that names the command and drives the healing loop around the result.
 ### 2.4 The healing round
 
 A healing round is one bounded model interaction that receives the verification

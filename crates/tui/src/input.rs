@@ -61,6 +61,13 @@ pub fn is_keyboard_quit(key: &KeyEvent) -> bool {
 /// the squash message are multiline buffers, while a path or a language field
 /// stays a single-line input whose `Enter` confirms the dialog instead of
 /// inserting a newline.
+///
+/// The router performs no I/O, so a caller may route keys while it holds the
+/// application state guard: the editor restores its own kill ring and never
+/// reads the system clipboard. A surface that wants the paste-buffer fallback
+/// for a yank asks [`InputEditor::takes_yank_chord`] first, reads the buffer
+/// with the guard released, and applies it through [`InputEditor::yank_with`];
+/// `views::context::input` is the reference implementation.
 pub fn handle_editor_key(editor: &mut InputEditor, key: KeyEvent, is_cmd: bool, multiline: bool) {
     editor.multiline = multiline;
     editor.handle_key(key, is_cmd);

@@ -1,8 +1,10 @@
+use std::sync::Arc;
+
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use tauqe_protocol::{
     methods, GitSquashApplyParams, GitSquashGenerateMessageParams, GitSquashPreviewParams,
 };
-use tokio::sync::MutexGuard;
+use tokio::sync::{Mutex, MutexGuard};
 
 use crate::app::{
     AppState, ConfirmDialogButton, SquashBaseMode, SquashConfirm, SquashDialogFocus,
@@ -15,6 +17,8 @@ use crate::rpc::{send_request, RpcConnection};
 /// Side effect requested by a key press; performed after the state lock is released.
 enum SquashAction {
     None,
+    /// A yank press: the paste buffer is read outside the state guard (c-1).
+    Yank,
     Close,
     Preview(String),
     Generate(String),
@@ -42,6 +46,7 @@ pub(crate) fn apply_chord_label() -> String {
 
 pub async fn handle_squash_key(
     key: KeyEvent,
+    state: &Arc<Mutex<AppState>>,
     mut st: MutexGuard<'_, AppState>,
     server_writer: &mut RpcConnection,
 ) -> anyhow::Result<InputResult> {
@@ -53,6 +58,22 @@ pub async fn handle_squash_key(
 
     match handle_key(dialog, key, primary, meta) {
         SquashAction::None => {}
+        SquashAction::Yank => {
+            // The paste buffer is a native round trip bounded at
+            // NATIVE_CLIPBOARD_TIMEOUT. It is read with the state guard released
+            // and applied afterwards, so a hung clipboard owner can never freeze
+            // rendering or block another locker of the state (c-1).
+            drop(st);
+            let clipboard = crate::clipboard::get_from_clipboard_async().await;
+            let mut st = state.lock().await;
+            if let Some(dialog) = st.squash_dialog.as_mut() {
+                if dialog.custom_input_active {
+                    dialog.custom_editor.yank_with(clipboard);
+                } else if dialog.focus == SquashDialogFocus::MessageEditor {
+                    dialog.message_editor.yank_with(clipboard);
+                }
+            }
+        }
         SquashAction::Close => st.squash_dialog = None,
         SquashAction::Preview(base_ref) => {
             drop(st);
@@ -155,6 +176,11 @@ fn handle_custom_input(
     key: KeyEvent,
     is_cmd: bool,
 ) -> SquashAction {
+    // The paste buffer is read outside the state guard, so the press is
+    // reported upward instead of being resolved here (c-1).
+    if dialog.custom_editor.takes_yank_chord(key, is_cmd) {
+        return SquashAction::Yank;
+    }
     match key.code {
         KeyCode::Esc => {
             dialog.custom_input_active = false;
@@ -186,6 +212,11 @@ fn handle_message_editor(
     is_cmd: bool,
     is_meta: bool,
 ) -> SquashAction {
+    // The paste buffer is read outside the state guard, so the press is
+    // reported upward instead of being resolved here (c-1).
+    if dialog.message_editor.takes_yank_chord(key, is_cmd) {
+        return SquashAction::Yank;
+    }
     match key.code {
         KeyCode::Esc | KeyCode::Tab => dialog.focus = SquashDialogFocus::FileList,
         KeyCode::Enter | KeyCode::Char('s') if is_cmd => request_apply_confirm(dialog),

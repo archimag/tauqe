@@ -70,9 +70,9 @@ it runs a declared command line and reads its exit status.
    no second engineering manifest exists.
 2. **The harness never parses the build system.** It runs a declared command, a
    declared stream filter, or a declared post-hook, and nothing else.
-3. **Verification is mandatory.** A configuration that declares no verification
-   command is rejected as a whole, because a turn that cannot verify its own result
-   must not run.
+3. **Verification is declared, never assumed.** A configuration that declares no
+   verification command stays valid: the turn runs no step, records an explicit
+   unverified verdict, and commits, because the project stated its own choice.
 4. **Resolution is first-existing-wins over a fixed candidate list**, and an explicit
    path short-circuits the search entirely.
 5. **A missing file is a valid state.** Documented defaults apply, so a repository
@@ -130,8 +130,7 @@ it runs a declared command line and reads its exit status.
 | --- | --- |
 | `[providers.openrouter]` | the native model catalog the picker may offer |
 | `[models]` | semantic roles, their entries, and `auto_level_up` |
-| `[develop]` | edit retries, verification healing budget, replan budget, workflow mode, edit protocol, patch strategy, prompt layout |
-| `[git]` | upstream base and hook bypass |
+| `[develop]` | edit retries, verification healing budget, replan budget, per-tier coder and architect attempt budgets, workflow mode, edit protocol, patch strategy, prompt layout |
 | `[history]` | token budget and uncompressed tail length |
 | `[context]` | discovery rounds, file, outline, and external-reference budgets, report caps, pinned patterns |
 
@@ -194,7 +193,7 @@ onboarding.
 | Section | Declares | Required | Moment |
 | --- | --- | --- | --- |
 | `[project.runner]` | the external task runner: `just` or `none` | optional | when the command surface is queried |
-| `[project.verify]` | the verification command line | mandatory | after every other phase |
+| `[project.verify]` | the verification command line | optional | after every other phase |
 | `[project.format]` | the in-memory stream filter | optional | before the write |
 | `[project.post_hook]` | the disk-side step | optional | after the write |
 | `[project.commands]` | named allowlisted commands | optional | on an explicit invocation |
@@ -250,8 +249,10 @@ The workstation file is resolved separately, in `$XDG_CONFIG_HOME/tauqe/tui.toml
 | `context.refs_token_budget` | 50,000 | the lazily loaded external reference documents |
 | `history.budget_tokens` | 20,000 | session history before compaction |
 | `history.tail_turns` | 10 | turns kept uncompressed |
-| `develop.max_retries` | 5 | staging retries, verification healing rounds, and corrective step re-runs |
+| `develop.max_retries` | 5 | staging retries and verification healing rounds within one turn |
 | `develop.max_replans` | 2 | automated replans after a blocked step |
+| `develop.max_tier_attempts` | 3 | content attempts one coder tier receives before the ladder escalates |
+| `develop.max_architect_attempts` | 2 | generation attempts one architect tier receives before the architect ladder escalates |
 | project entry `timeout_secs` | 600 | one verification, format, post-hook, or named-command invocation |
 
 A project entry's own `timeout_secs` overrides the harness budget for that entry
@@ -314,27 +315,31 @@ A single string yields a one-rung ladder; an ordered array yields an explicit la
 whose rungs differ by model or by reasoning depth, so the same model can run
 shallowly in one role and deeply in another without a duplicate catalog entry.
 
-Two ladders exist and they never cross. `coder` answers a failed *how* and is consumed
-by staging retries, verification healing, and corrective step re-runs; `architect`
-answers a failed *what* and is consumed by replanning a broken horizon. `auto_level_up`
-enables the coder ladder; without it, a failing turn rolls back and reports instead of
-escalating. The escalation rules themselves belong to *Model Roles and the Coder
-Ladder*; this chapter declares only where the rungs live.
+Two ladders exist and they never cross. `coder` answers a failed *how*: its
+`max_tier_attempts` (3 by default) bounds how many content attempts one rung receives
+before the ladder escalates, while the staging retries and verification healing rounds
+inside one attempt stay bounded by `max_retries`. `architect` answers a failed *what*:
+its `max_architect_attempts` (2 by default) bounds how many generation attempts one rung
+receives before `next_architect_tier` promotes the work, and the ladder is consumed by
+replanning a broken horizon. `auto_level_up` enables the coder ladder; without it, a
+failing turn rolls back and reports instead of escalating. The escalation rules
+themselves belong to *Model Roles and the Coder Ladder*; this chapter declares only the
+budgets those rules consume.
 
 ### 3.3 Verification: one declared lifecycle
 
-`[project.verify]` is the verification lifecycle, and it is mandatory: a configuration
-that declares neither a verification command nor a task runner exporting one is
-rejected as a whole (section 3.5), because a change set the harness cannot verify is
-never accepted.
+`[project.verify]` is the verification lifecycle, and it is declared rather than
+assumed: a configuration that declares neither a command nor a task runner recipe
+stays valid, because a project may legitimately verify nothing. Its turns then run
+no step, report the explicit unverified verdict, and commit the change set.
 
-The declaration *is* the pipeline. The harness carries no knowledge of a compiler or a
-build system, so it runs the declared command line once per change set and nothing
-else: there is no switch that disables verification, no automatic-healing toggle, no
-verification target that selects a different set of commands, and no manifest
-auto-detection. A repository that declares no command — or whose reference chain is
-broken — resolves no step, and the change set is reported as unverified instead of
-running an unintended program.
+The declaration *is* the pipeline. The harness carries no knowledge of a compiler
+or a build system, so it runs the declared command line once per change set and
+nothing else: there is no automatic-healing toggle, no verification target that
+selects a different set of commands, and no manifest auto-detection. A repository
+that declares no command resolves no step, and its change set is reported as
+unverified; a declaration whose reference chain is broken is refused by
+validation instead of being silently skipped.
 
 The wall-clock budget comes from the entry's `timeout_secs`, and the fallback is 600
 seconds, which a real test suite routinely needs. Healing is bounded by the edit retry
@@ -397,8 +402,8 @@ it still lives in virtual staging:
 1. **Syntactic validation.** The staged bytes are parsed as TOML. A malformed file is
    rejected immediately.
 2. **Semantic validation.** The parsed declaration is validated as a whole: the model
-   roles must resolve, and the `[project]` declaration must name a verification
-   command whose reference chain is sound.
+   roles must resolve, and every declared command line must have a sound reference
+   chain, `[project.verify]` included whenever the project declares one.
 
 A rejected stage is not a crash and not a commit: the failure surfaces as an ordinary
 staged-file error, which activates the patch-retry loop, so the model receives the
@@ -455,8 +460,9 @@ what is already known.
   format. Every proposed patch is judged against it.
 - **Subsystem conventions supplement it.** A `Conventions.md` next to the code carries
   local invariants and is resolved into the Pinned layer hierarchically (section 3.6).
-- **`[project.verify]` states how the tree is proven.** It is mandatory, so a
-  repository is prepared only when its verification command is declared. The
+- **`[project.verify]` states how the tree is proven.** It is optional, so a
+  repository is prepared either way: a declared command gives the change set a
+  verdict, while an absent declaration commits it as unverified. The
   `[project.format]`, `[project.post_hook]`, and `[project.commands]` entries are
   optional and describe the operations this repository actually has.
 - **`docs/src/SUMMARY.md` is the conceptual index.** Listing a chapter is what makes

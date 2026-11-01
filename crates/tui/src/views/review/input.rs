@@ -1,19 +1,21 @@
 use std::sync::Arc;
 
-use crossterm::event::{KeyCode, KeyEvent};
-use tauqe_protocol::review::DEFAULT_REVIEW_GROUP_ID;
-use tauqe_protocol::{
-    methods, IssueStatus, ModelRole, ModelSelection, PlanItem, ReviewGroup, ReviewGroupKind,
-    ReviewIssue, ReviewSession,
+use crate::app::{
+    AppState, ConfirmReviewAnalyzeState, GroupDialoguePurpose, PromptModalState, PromptModalTarget,
+    ReviewDialogState, ViewMode,
 };
-use tokio::sync::Mutex;
-
-use crate::app::{AppState, ConfirmReviewAnalyzeState, ReviewDialogState, ViewMode};
 use crate::command::CommandCategory::{Essential, Helpers, Interface};
 use crate::command::{CommandMap, CommandSpec, KeyChord};
 use crate::i18n::engine::active_t;
 use crate::input::InputResult;
 use crate::rpc::{send_request, RpcConnection};
+use crossterm::event::{KeyCode, KeyEvent};
+use tauqe_protocol::review::DEFAULT_REVIEW_GROUP_ID;
+use tauqe_protocol::{
+    methods, DiscussionFocus, DiscussionTarget, IssueStatus, ModelRole, ModelSelection, PlanItem,
+    ReviewGroup, ReviewGroupKind, ReviewIssue, ReviewSession,
+};
+use tokio::sync::Mutex;
 
 use super::VisibleReviewRow;
 
@@ -403,7 +405,13 @@ fn resolve_group_target(
             .effective_groups()
             .into_iter()
             .find(|group| group.id == group_id)
-            .map(|group| (group.kind, group_display_title(&group), group.subplan))
+            .map(|group| {
+                (
+                    group.kind,
+                    group_display_title(&group),
+                    group.implementation.items,
+                )
+            })
             .unwrap_or_else(|| {
                 (
                     ReviewGroupKind::Simple,
@@ -1156,6 +1164,27 @@ pub async fn handle_review_key(
         ReviewAction::Discuss => {
             let sel_row = st.review.selected_row();
             if let Some(row) = sel_row {
+                // A group is discussed as one operational unit: the dialogue
+                // addresses the shared root cause itself, so the payload names
+                // the group instead of restating its symptoms one by one (c-3).
+                if let VisibleReviewRow::GroupHeader {
+                    session_id,
+                    group_id,
+                    title,
+                    blocked_reason,
+                    ..
+                } = &row
+                {
+                    st.prompt_modal = Some(PromptModalState::new(PromptModalTarget::ReviewGroup {
+                        session_id: session_id.clone(),
+                        group_id: group_id.clone(),
+                        group_title: title.clone(),
+                        blocked_reason: blocked_reason.clone(),
+                        purpose: GroupDialoguePurpose::Discuss,
+                    }));
+                    return Ok(InputResult::Continue);
+                }
+
                 let session_id = row.session_id().to_string();
                 let session_opt = st
                     .review
@@ -1172,25 +1201,19 @@ pub async fn handle_review_key(
                     });
 
                 if let Some(session) = session_opt {
+                    // A finding dialogue anchors on that very finding; every
+                    // other row keeps the whole-session scope of its header.
                     let focused: Vec<(u32, String)> = match &row {
                         VisibleReviewRow::ReviewItem { item_id, title, .. } => {
                             vec![(*item_id, title.clone())]
                         }
-                        VisibleReviewRow::GroupHeader { group_id, .. } => st
-                            .review
-                            .group_findings(&session, group_id)
-                            .into_iter()
-                            .map(|item| (item.id, item.title))
-                            .collect(),
                         _ => Vec::new(),
                     };
-                    st.prompt_modal = Some(crate::app::PromptModalState::new(
-                        crate::app::PromptModalTarget::Review {
-                            review_id: session.id.clone(),
-                            review_title: session.title.clone(),
-                            focused_items: focused,
-                        },
-                    ));
+                    st.prompt_modal = Some(PromptModalState::new(PromptModalTarget::Review {
+                        review_id: session.id.clone(),
+                        review_title: session.title.clone(),
+                        focused_items: focused,
+                    }));
                 }
             }
         }
@@ -1212,22 +1235,43 @@ pub async fn handle_review_key(
                             .map(|s| s.title.clone())
                     })
                     .unwrap_or_else(|| session_id.clone());
-                let (focused, target_label) = match &row {
-                    VisibleReviewRow::ReviewItem { item_id, title, .. } => (
-                        vec![item_id.to_string()],
-                        Some(format!("finding #{} '{}'", item_id, title)),
+                // A group anchor names the pair of its session and its own
+                // identifier, because a group identifier is unique only inside
+                // one session (c-3).
+                let focus = match &row {
+                    VisibleReviewRow::ReviewItem { item_id, .. } => {
+                        DiscussionFocus::review(session_id.clone(), vec![item_id.to_string()])
+                    }
+                    VisibleReviewRow::GroupHeader { group_id, .. } => DiscussionFocus::from_target(
+                        DiscussionTarget::ReviewGroup {
+                            session_id: session_id.clone(),
+                            group_id: group_id.clone(),
+                        },
+                        Vec::new(),
                     ),
-                    _ => (Vec::new(), None),
+                    _ => DiscussionFocus::review(session_id.clone(), Vec::new()),
                 };
-                let focus = tauqe_protocol::DiscussionFocus::review(session_id, focused);
+                let message = match &row {
+                    VisibleReviewRow::ReviewItem { item_id, title, .. } => {
+                        active_t("notify.review_focus_item_set")
+                            .replacen(
+                                "{}",
+                                &format!("finding #{} '{}'", item_id, title.as_str()),
+                                1,
+                            )
+                            .replacen("{}", review_title.as_str(), 1)
+                    }
+                    VisibleReviewRow::GroupHeader { title, .. } => {
+                        active_t("notify.review_focus_group_set")
+                            .replacen("{}", title.as_str(), 1)
+                            .replacen("{}", review_title.as_str(), 1)
+                    }
+                    _ => {
+                        active_t("notify.review_focus_set").replacen("{}", review_title.as_str(), 1)
+                    }
+                };
                 st.discussion_focus = focus.clone();
                 let params = tauqe_protocol::DiscussionSetFocusParams { focus };
-                let message = match target_label {
-                    Some(label) => active_t("notify.review_focus_item_set")
-                        .replacen("{}", &label, 1)
-                        .replace("{}", &review_title),
-                    None => active_t("notify.review_focus_set").replace("{}", &review_title),
-                };
                 drop(st);
                 send_request(
                     server_writer,
@@ -1241,6 +1285,26 @@ pub async fn handle_review_key(
         }
         ReviewAction::ChangeStatus => {
             let sel_row = st.review.selected_row();
+            // A group has no status of its own to cycle: its resolution is an
+            // architectural decision, so `t` opens the dialogue that records it
+            // and the harness applies the decision atomically (c-3, c-4).
+            if let Some(VisibleReviewRow::GroupHeader {
+                session_id,
+                group_id,
+                title,
+                blocked_reason,
+                ..
+            }) = sel_row.as_ref()
+            {
+                st.prompt_modal = Some(PromptModalState::new(PromptModalTarget::ReviewGroup {
+                    session_id: session_id.clone(),
+                    group_id: group_id.clone(),
+                    group_title: title.clone(),
+                    blocked_reason: blocked_reason.clone(),
+                    purpose: GroupDialoguePurpose::Resolve,
+                }));
+                return Ok(InputResult::Continue);
+            }
             if let Some(VisibleReviewRow::ReviewItem {
                 session_id,
                 item_id,
@@ -1288,7 +1352,7 @@ pub async fn handle_review_key(
         }
         ReviewAction::Copy => {
             let sel_row = st.review.selected_row();
-            let text = match sel_row {
+            let text: String = match sel_row {
                 Some(VisibleReviewRow::ReviewItem {
                     session_id,
                     item_id,
@@ -1303,6 +1367,7 @@ pub async fn handle_review_key(
                     s_opt
                         .and_then(|s| s.items.iter().find(|i| i.id == item_id))
                         .map(|item| format_item_for_clipboard(&ReviewIssue::from(item.clone())))
+                        .unwrap_or_default()
                 }
                 Some(VisibleReviewRow::SessionHeader { session_id, .. }) => {
                     let s_opt = st
@@ -1311,9 +1376,9 @@ pub async fn handle_review_key(
                         .iter()
                         .find(|s| s.id == session_id)
                         .or(st.review.session.as_ref());
-                    s_opt.map(|s| s.raw_markdown.clone())
+                    s_opt.map(|s| s.raw_markdown.clone()).unwrap_or_default()
                 }
-                Some(VisibleReviewRow::SessionSummary { description, .. }) => Some(description),
+                Some(VisibleReviewRow::SessionSummary { description, .. }) => description.clone(),
                 Some(VisibleReviewRow::SubplanItem {
                     step_id,
                     title,
@@ -1339,13 +1404,13 @@ pub async fn handle_review_key(
                             text.push_str(trimmed);
                         }
                     }
-                    Some(text)
+                    text
                 }
                 Some(VisibleReviewRow::GroupHeader {
                     title,
                     findings_count,
                     ..
-                }) => Some(format!(
+                }) => format!(
                     "{} ({})",
                     title,
                     active_t("review.group_findings_count").replacen(
@@ -1353,22 +1418,22 @@ pub async fn handle_review_key(
                         &findings_count.to_string(),
                         1
                     )
-                )),
+                ),
                 Some(VisibleReviewRow::GroupPlanHeader {
                     title, done, total, ..
-                }) => Some(format!(
+                }) => format!(
                     "{} [{}]",
                     title,
                     active_t("review.steps_count")
                         .replacen("{}", &done.to_string(), 1)
                         .replacen("{}", &total.to_string(), 1)
-                )),
-                None => None,
+                ),
+                None => String::new(),
             };
 
-            if let Some(text) = text {
+            if !text.is_empty() {
                 drop(st);
-                let res = crate::clipboard::copy_to_clipboard(&text);
+                let res = crate::clipboard::copy_to_clipboard_async(&text).await;
                 let mut st = state.lock().await;
                 match res {
                     crate::clipboard::CopyResult::Native => {
@@ -2135,14 +2200,17 @@ mod tests {
         id: &str,
         subplan: Vec<tauqe_protocol::PlanItem>,
     ) -> tauqe_protocol::ReviewSession {
-        use tauqe_protocol::{ReviewGroup, ReviewGroupKind};
+        use tauqe_protocol::{PlanImplementation, ReviewGroup, ReviewGroupKind};
 
         let mut session = todo_session(id, 1);
         session.groups = vec![ReviewGroup {
             id: "arch".to_string(),
             title: "Shared cause".to_string(),
             kind: ReviewGroupKind::Architectural,
-            subplan,
+            implementation: PlanImplementation {
+                items: subplan,
+                ..Default::default()
+            },
             ..Default::default()
         }];
         session.items[0].group = Some("arch".to_string());

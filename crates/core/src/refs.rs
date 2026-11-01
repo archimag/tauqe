@@ -40,10 +40,16 @@ pub mod materialize;
 use std::path::Path;
 
 /// Repository-relative path of the registry manifest.
-pub const REFS_MANIFEST: &str = ".tauqe/refs/refs.md";
+///
+/// The declaration lives beside the ignore scheme that protects it
+/// (`tauqe_tools::git::checkpoint`), because the tracked registry is the one
+/// artifact inside the harness state directory that must stay reachable while
+/// every sibling stays excluded. The registry is re-exported here as the
+/// location it reads.
+pub use tauqe_tools::git::checkpoint::REFS_MANIFEST;
 
 /// Repository-relative directory holding the tracked registry material.
-pub const REFS_DIR: &str = ".tauqe/refs";
+pub use tauqe_tools::git::checkpoint::REFS_DIR;
 
 /// Repository-relative directory holding the isolated, Git-ignored snapshot.
 pub const REFS_CACHE_DIR: &str = ".tauqe/cache/refs";

@@ -269,17 +269,19 @@ mod tests {
 
     /// Builds a plan whose single leaf step addresses one concept invariant.
     fn leaf_plan() -> Plan {
-        Plan {
-            id: "P-1".to_string(),
-            title: "Harden the scanner".to_string(),
-            description: Some("Introduce a bounded emit window.".to_string()),
-            concept: vec![ConceptItem {
+        Plan::from_parts(
+            "P-1".to_string(),
+            "Harden the scanner".to_string(),
+            Some("Introduce a bounded emit window.".to_string()),
+            0,
+            0,
+            vec![ConceptItem {
                 id: "c-1".to_string(),
                 title: "Decision Immutability".to_string(),
                 details: Some("The step owns only how the decision is implemented.".to_string()),
                 children: Vec::new(),
             }],
-            items: vec![PlanItem {
+            vec![PlanItem {
                 id: "1".to_string(),
                 title: "Bound the emit length".to_string(),
                 details: Some("Reuse the existing scanner.".to_string()),
@@ -291,8 +293,7 @@ mod tests {
                 depends_on: Vec::new(),
                 children: Vec::new(),
             }],
-            ..Default::default()
-        }
+        )
     }
 
     #[test]

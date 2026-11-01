@@ -14,19 +14,19 @@ use tauqe_protocol::{
     TurnIntent,
 };
 
-use crate::edits::protocol::xml::engine::{self, XmlTagSpec};
-use crate::edits::protocol::xml::normalize_marked_xml;
-use crate::edits::protocol::xml::tags::ParsedPlanTag;
-use crate::edits::protocol::{
-    ContextRequest, MarkedXmlEditProtocol, TerminalOutcome, VerifyRequest, XmlEditProtocol,
-};
-
 use super::builtin::{
     context_surface_rule, AbortModule, BlockedModule, CustomToolsModule, DiscoveryModule,
     DocRequestModule, FileEditsModule, OutcomeModule, PlanCreationModule, PlanUpdateModule,
     ScratchpadModule, TextMessageModule, ToolchainVerifyModule, UserLanguageModule,
 };
 use super::regime;
+use crate::edits::protocol::xml::engine::{self, XmlTagSpec};
+use crate::edits::protocol::xml::normalize_marked_xml;
+use crate::edits::protocol::xml::tags::ParsedPlanTag;
+use crate::edits::protocol::{
+    ContextRequest, MarkedXmlEditProtocol, TerminalOutcome, VerifyRequest, XmlEditProtocol,
+};
+use crate::edits::strategy::StrategyProfile;
 
 /// Splitting a regime surface into the byte-stable head and the contour delta.
 ///
@@ -905,8 +905,12 @@ impl CapabilityRegistry {
 
     /// Collects the control tag names the enabled modules may emit.
     ///
-    /// Only control tags are returned; code-edit tags are omitted because the
-    /// operational tag list describes protocol control tags, not edit blocks.
+    /// Only control tags are returned; the tags that describe an edit block are
+    /// omitted because the operational tag list enumerates protocol commands
+    /// rather than patch syntax. The enumeration is a pure projection of the
+    /// module declarations, so it stays independent of the patch strategy:
+    /// whether a change-set vehicle is advertised to the model is decided where
+    /// the rule is rendered ([`Self::operational_tags_rule`]).
     pub fn operational_xml_tags(&self, set: &CapabilitySet) -> Vec<String> {
         let mut tags: Vec<String> = Vec::new();
         for module in self.enabled(set) {
@@ -925,14 +929,27 @@ impl CapabilityRegistry {
 
     /// Builds the operational tag rule from the enabled capability set.
     ///
-    /// The rule is skipped when the set exposes no control tags, so a narrowed
+    /// The enumeration is filtered through the active patch strategy, because a
+    /// change-set vehicle is taught only by the strategy that carries it: a turn
+    /// whose change set names the replaced lines by anchors lists the vehicle
+    /// beside its control tags, while a turn that echoes the replaced text back
+    /// lists nothing that strategy never mentions. The exclusion is declared by
+    /// [`StrategyProfile`], so the rule holds no strategy branch and no tag
+    /// literal of its own.
+    ///
+    /// The rule is skipped when the set exposes no control tag, so a narrowed
     /// surface never advertises an operational protocol it cannot accept.
     fn operational_tags_rule(
         &self,
         set: &CapabilitySet,
         ctx: &ContractContext<'_>,
     ) -> Option<ContractRule> {
-        let tags = self.operational_xml_tags(set);
+        let profile = StrategyProfile::of(ctx.render.patch_strategy);
+        let tags: Vec<String> = self
+            .operational_xml_tags(set)
+            .into_iter()
+            .filter(|tag| profile.advertises_operational_tag(tag))
+            .collect();
         if tags.is_empty() {
             return None;
         }
@@ -1184,6 +1201,9 @@ mod tests {
         assert_eq!(
             develop,
             vec![
+                // The edit module precedes discovery in the registry, and the
+                // anchored change-set vehicle is the only control tag it owns.
+                "file_edits".to_string(),
                 "context_request".to_string(),
                 "repo_search".to_string(),
                 "repo_dirs".to_string(),
@@ -1256,12 +1276,15 @@ mod tests {
         let registry = CapabilityRegistry::global();
         let narrowed =
             CapabilitySet::from_slice(&[LlmCapability::TextMessage, LlmCapability::FileEdits]);
-        // File-edit tags are not control tags, so the operational rule is
-        // skipped instead of advertising an empty protocol surface. The
+        // The edit module owns one control tag — the anchored change-set
+        // vehicle — but the default context composes the echoing strategy, which
+        // teaches no vehicle. The operational rule is therefore skipped instead
+        // of advertising a command that strategy never mentions. The
         // context-surface rule describes payload rather than a command, so it
         // stays and keeps the numbering dense.
         let core = registry.compose_core_contract_rules(&narrowed, &plain_context());
         assert!(!core.contains("Operational Protocol Tags"));
+        assert!(!core.contains("file_edits"));
         assert_eq!(rule_numbers(&core), vec![1, 2, 3, 4, 5, 6]);
         assert!(core.contains("1. Authoritative Source: "));
         assert!(core.contains("2. Context Surface: "));
@@ -1412,6 +1435,38 @@ mod tests {
         assert_eq!(numbers, (1..=numbers.len()).collect::<Vec<_>>());
     }
 
+    #[test]
+    fn the_operational_rule_advertises_the_vehicle_only_under_its_own_strategy() {
+        let registry = CapabilityRegistry::global();
+        let set = CapabilitySet::interactive_repl();
+
+        let composed = |strategy: PatchStrategy| {
+            let render = PromptRenderContext::new(&[], None).with_patch_strategy(strategy);
+            let ctx =
+                ContractContext::new(TurnIntent::InteractiveRepl, EditProtocolKind::Xml, render);
+            registry.compose_core_contract_rules(&set, &ctx)
+        };
+
+        // The anchored strategy teaches the vehicle, so its contract states where
+        // the tag belongs and how to quote it in prose.
+        let anchored = composed(PatchStrategy::LineAnchor);
+        assert!(anchored.contains("Operational Protocol Tags"));
+        assert!(anchored.contains("<file_edits>"), "{anchored}");
+        assert!(anchored.contains("`<file_edits ...>`"), "{anchored}");
+        // The remaining control tags keep their declaration order behind it.
+        assert!(
+            anchored.contains("<file_edits>, <context_request>"),
+            "{anchored}"
+        );
+
+        // The echoing strategy carries no vehicle, so its rule states exactly
+        // what it stated before the vehicle existed and advertises nothing it
+        // does not teach.
+        let echoed = composed(PatchStrategy::SearchReplace);
+        assert!(echoed.contains("Operational Protocol Tags"));
+        assert!(!echoed.contains("file_edits"), "{echoed}");
+        assert!(echoed.contains("<context_request>"), "{echoed}");
+    }
     #[test]
     fn contract_rules_apply_the_turn_marker() {
         let registry = CapabilityRegistry::global();
@@ -1704,6 +1759,22 @@ mod tests {
         assert!(cleaned.contains("success"));
     }
 
+    #[test]
+    fn clean_text_strips_the_change_set_vehicle_with_its_body() {
+        let registry = CapabilityRegistry::global();
+        // A surface without the textual response takes the capability-scoped
+        // fallback, which strips exactly the tags the enabled modules declare —
+        // including the anchored change-set vehicle and the JSON array it
+        // carries.
+        let set = CapabilitySet::from_slice(&[LlmCapability::FileEdits]);
+        let raw = "Rewriting the branch.\n<file_edits>[{\"op\":\"delete\",\"path\":\"src/a.rs\"}]</file_edits>\nDone.";
+
+        let cleaned = registry.clean_text(&set, raw, None);
+        assert!(!cleaned.contains("file_edits"), "{cleaned}");
+        assert!(!cleaned.contains("src/a.rs"), "{cleaned}");
+        assert!(cleaned.contains("Rewriting the branch."), "{cleaned}");
+        assert!(cleaned.contains("Done."), "{cleaned}");
+    }
     #[test]
     fn json_property_names_are_exposed_for_structured_capabilities() {
         let registry = CapabilityRegistry::global();
@@ -2031,6 +2102,60 @@ mod tests {
         assert_eq!(registry.capability_for_tag(""), None);
     }
 
+    #[test]
+    fn every_engine_declared_capability_tag_resolves_through_the_registry() {
+        let registry = CapabilityRegistry::global();
+        let mut checked = 0;
+
+        for spec in engine::XML_TAG_SPECS {
+            let Some(capability) = spec.capability else {
+                continue;
+            };
+            checked += 1;
+            let base = spec.base_name;
+
+            // The owning module declares the tag, so every registry lookup
+            // resolves it instead of answering `None` for a tag the engine
+            // itself declares.
+            let module = match registry.module(capability) {
+                Some(module) => module,
+                None => panic!("missing module for {capability}"),
+            };
+            assert!(
+                module
+                    .xml_tag_specs()
+                    .iter()
+                    .any(|declared| declared.base_name == base),
+                "{capability} declares {base} in the engine but not in its own spec list"
+            );
+            assert_eq!(
+                registry.tag_spec(base).map(|resolved| resolved.base_name),
+                Some(base),
+                "the registry cannot resolve the {base} tag specification"
+            );
+            // Two modules may share one spelling — plan creation and plan update
+            // both own the plan container — so presence is asserted instead of a
+            // particular owner.
+            assert!(
+                registry.capability_for_tag(base).is_some(),
+                "the {base} tag names no declaring module"
+            );
+
+            // The operational surface follows the same declaration, so a
+            // capability control tag the engine declares is never invisible to
+            // the contract that enumerates it.
+            let set = CapabilitySet::from_slice(&[capability]);
+            assert!(
+                registry
+                    .operational_xml_tags(&set)
+                    .iter()
+                    .any(|tag| tag == base),
+                "the {base} tag is absent from the operational surface"
+            );
+        }
+
+        assert!(checked > 0, "the engine declares no capability tag");
+    }
     #[test]
     fn tag_lookup_exposes_the_declared_delivery_mode() {
         let registry = CapabilityRegistry::global();

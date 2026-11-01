@@ -128,7 +128,11 @@ normalized before matching, so a trailing separator, a backslash separator, or a
 `.` segment never changes the answer. `**` matches zero or more whole segments, so
 `docs/specs/**` covers `docs/specs/auth.md` without a second entry. A non-wildcard pattern
 matches itself or acts as a directory prefix, so `Justfile` protects a `Justfile/` subtree
-but not `Justfile.bak`.
+but not `Justfile.bak`. A fourth answers the degenerate case: a pattern written with nothing
+but `.` and separators — `.`, `./`, `/`, `\` — names the repository root, so it is the
+universal boundary and covers every path rather than nothing. A boundary that normalized
+away would fail open, which is why this shape is universal while a blank entry is rejected
+by configuration validation.
 
 The matcher is deliberately the shared one. A boundary compiled by a second, private matcher
 would drift from the patterns a developer sees everywhere else, and one path would then mean

@@ -1,17 +1,30 @@
 //! Architect role subsystem.
 //!
-//! Provider resolution, tier rendering, streaming structured-chat turns, and the
-//! multi-round discovery loop are shared by plan horizon synthesis and review
-//! finding decomposition: both are the same Architect operation, so they run on
+//! Provider resolution, tier rendering, and the launch skeleton of the shared
+//! structured contour are the three seams plan horizon synthesis and review group
+//! decomposition share: both are the same Architect operation, so they run on
 //! exactly one implementation here instead of a copy per subsystem.
+//!
+//! The contour itself — the proposal rounds, the discovery journal, the schema
+//! healing, the empty-answer budget, and the tier ladder — lives in `crates/core`,
+//! so the daemon carries no domain logic of a synthesis. This module keeps only the
+//! adapter-side seams: the provider client a promoted rung is resolved through, the
+//! developer-facing rendering of an architect configuration, and the bridge that
+//! translates contour telemetry into the wire events a client renders.
 //!
 //! Tier resolution and the lazy level-up escalation invariant are domain policy
 //! owned by the core engine (`tauqe_core::plan::prompt::resolve_architect_tier`),
 //! so this module renders the configuration that policy hands back and never
 //! re-derives the ladder itself.
 
-mod discovery;
-mod stream;
+mod bridge;
+
+// Both Architect contours of the daemon run on the shared launch skeleton of the
+// bridge, which owns the provider seam, the telemetry relay, and the context
+// merge. The resolver and the relay summary travel with it so an adapter can name
+// the seam it implements instead of reconstructing the type.
+#[allow(unused_imports)]
+pub(crate) use bridge::{run_contour_synthesis, ArchitectProviderResolver, ContourRelaySummary};
 
 use std::sync::Arc;
 
@@ -21,11 +34,6 @@ use tauqe_core::providers::{create_provider, LlmProvider};
 use tauqe_protocol::ArchitectTier;
 
 use crate::state::AppState;
-
-pub(crate) use discovery::{
-    run_architect_discovery_loop, ArchitectDiscoveryError, ArchitectDiscoveryOutcome,
-    ArchitectDiscoveryRequest,
-};
 
 /// Resolves the LLM provider for architect plan operations (refine and replan),
 /// consulting the test override in test configurations before falling back to

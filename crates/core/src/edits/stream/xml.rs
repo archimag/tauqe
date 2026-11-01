@@ -3,7 +3,10 @@ use std::path::PathBuf;
 
 use tauqe_protocol::{EditFileOp, EditFileStatus, EditOperation};
 
-use super::{normalize_hunk, resolve_path, EditStreamFilter, OwnedAnchor, StagingSimulator};
+use super::{
+    normalize_hunk, resolve_path, EditStreamFilter, OwnedAnchor, StagingSimulator,
+    TRUNCATED_EDIT_DIAGNOSTIC,
+};
 use crate::edits::protocol::xml::engine::{OpenTag, ScanStep, TextScan};
 use crate::edits::protocol::xml::{is_valid_turn_marker, FileBlockTag, XmlEditProtocol};
 use crate::edits::staging::AnchorEdit;
@@ -523,6 +526,14 @@ impl ChangeSetPreview {
                 staging.apply_move(&from, &to);
                 self.hunk_counts.entry(from).or_insert(0);
             }
+            EditOperation::MoveDir { from, to } => {
+                let display = format!("{} -> {}", from, to);
+                self.open(&from, &display, EditFileOp::MoveDir, events);
+                // The subtree expands into per-file moves while the change set
+                // is staged, so the preview announces the rename as one unit
+                // and reports no hunk of its own.
+                self.hunk_counts.entry(from).or_insert(0);
+            }
             EditOperation::Replace {
                 path,
                 old_text,
@@ -620,24 +631,26 @@ impl EditStreamFilter for XmlStreamFilter {
             let remaining = activate_unmarked_hidden_tags(&delta, marker);
             events.extend(self.push_normalized_chunk(&remaining));
         }
-        if !self.buffer.is_empty() {
-            if let Some(curr) = self.current_file.take() {
-                events.push(StreamEvent::EditFileDone {
-                    path: curr.path,
-                    status: EditFileStatus::Ok,
-                    error: None,
-                    hunks_count: self.file_hunks_count,
-                });
+        // A file block the response never closed is not a delivered edit: the
+        // authoritative decoder refuses the same text, so the preview reports
+        // the truncation instead of certifying a change the turn will discard.
+        // The branch stays outside the buffer guard, because a response may end
+        // exactly after the opening tag of the block and leave no buffered byte.
+        if let Some(curr) = self.current_file.take() {
+            events.push(StreamEvent::EditFileDone {
+                path: curr.path,
+                status: EditFileStatus::Error,
+                error: Some(TRUNCATED_EDIT_DIAGNOSTIC.to_string()),
+                hunks_count: self.file_hunks_count,
+            });
+        }
+        if !self.buffer.trim().is_empty() {
+            let cleaned = crate::edits::protocol::xml::extract_conversational_text(&self.buffer);
+            let cleaned = self.restore_content(&cleaned);
+            if !cleaned.trim().is_empty() {
+                events.push(StreamEvent::TextDelta(cleaned));
             }
-            if !self.buffer.trim().is_empty() {
-                let cleaned =
-                    crate::edits::protocol::xml::extract_conversational_text(&self.buffer);
-                let cleaned = self.restore_content(&cleaned);
-                if !cleaned.trim().is_empty() {
-                    events.push(StreamEvent::TextDelta(cleaned));
-                }
-                self.buffer.clear();
-            }
+            self.buffer.clear();
         }
         self.restore_events(&mut events);
         events
@@ -1266,5 +1279,69 @@ mod tests {
             "streaming a {} byte payload took {elapsed:?}; the per-chunk cost must follow the appended bytes",
             input.len()
         );
+    }
+    #[test]
+    fn test_unterminated_edit_block_never_reports_success() {
+        let path = "a.rs";
+        // The response ends inside the file block: the hunk itself closes, but
+        // neither the block nor its container ever does, so the authoritative
+        // decoder refuses the whole text while the preview already announced
+        // the file.
+        let truncated = concat!(
+            "Editing.\n",
+            "<edits>",
+            "<edit path=\"a.rs\">",
+            "<search>\nalpha\n</search>",
+            "<replace>\nBETA\n</replace>"
+        );
+        let staged = HashMap::from([(path.to_string(), "alpha\nbeta\n".to_string())]);
+        let boundaries: Vec<usize> = truncated
+            .char_indices()
+            .map(|(idx, _)| idx)
+            .chain(std::iter::once(truncated.len()))
+            .collect();
+        for split in boundaries {
+            let mut filter = XmlStreamFilter::new(vec![path.to_string()], std::env::temp_dir())
+                .with_staged_contents(staged.clone());
+            let mut events = filter.push_chunk(&truncated[..split]);
+            events.extend(filter.push_chunk(&truncated[split..]));
+            events.extend(Box::new(filter).finish());
+
+            let terminals: Vec<(EditFileStatus, Option<String>)> = events
+                .iter()
+                .filter_map(|event| match event {
+                    StreamEvent::EditFileDone { status, error, .. } => {
+                        Some((*status, error.clone()))
+                    }
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(terminals.len(), 1, "split {split}: {terminals:?}");
+            let (status, error) = &terminals[0];
+            assert_eq!(*status, EditFileStatus::Error, "split {split}");
+            let error = error
+                .as_deref()
+                .expect("the truncation must carry its diagnostic");
+            assert!(error.contains("truncated"), "split {split}: {error}");
+        }
+    }
+
+    #[test]
+    fn test_edit_block_open_with_no_payload_reports_truncation() {
+        // The response ends exactly after the opening tag, leaving no buffered
+        // byte at all: the truncation branch must sit outside the buffer guard,
+        // otherwise the terminal event of the announced file is dropped.
+        let mut filter = XmlStreamFilter::new(vec!["a.rs".to_string()], std::env::temp_dir());
+        let mut events = filter.push_chunk("<edits><edit path=\"a.rs\">");
+        events.extend(Box::new(filter).finish());
+
+        assert_eq!(completions(&events), vec![(EditFileStatus::Error, 0)]);
+        assert!(events.iter().any(|event| matches!(
+            event,
+            StreamEvent::EditFileDone {
+                error: Some(message),
+                ..
+            } if message.contains("truncated")
+        )));
     }
 }

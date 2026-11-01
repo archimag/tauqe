@@ -99,7 +99,7 @@ pub fn retain_retried_failed_files(
                     .unwrap_or_else(|_| path.clone());
                 retried_paths.insert(clean);
             }
-            EditOperation::Move { from, to } => {
+            EditOperation::Move { from, to } | EditOperation::MoveDir { from, to } => {
                 let clean_from = context_manager
                     .normalize_path(from)
                     .unwrap_or_else(|_| from.clone());
@@ -136,7 +136,7 @@ pub fn prepare_staged_for_retry(
                     .unwrap_or_else(|_| path.clone());
                 touched_paths.insert(clean);
             }
-            EditOperation::Move { from, to } => {
+            EditOperation::Move { from, to } | EditOperation::MoveDir { from, to } => {
                 let clean_from = context_manager
                     .normalize_path(from)
                     .unwrap_or_else(|_| from.clone());
@@ -157,7 +157,7 @@ pub fn prepare_staged_for_retry(
     while changed {
         changed = false;
         for op in cumulative_edits.iter() {
-            if let EditOperation::Move { from, to } = op {
+            if let EditOperation::Move { from, to } | EditOperation::MoveDir { from, to } = op {
                 let clean_from = context_manager
                     .normalize_path(from)
                     .unwrap_or_else(|_| from.clone());
@@ -189,7 +189,7 @@ pub fn prepare_staged_for_retry(
                 .unwrap_or_else(|_| path.clone());
             !touched_paths.contains(&op_path)
         }
-        EditOperation::Move { from, to } => {
+        EditOperation::Move { from, to } | EditOperation::MoveDir { from, to } => {
             let clean_from = context_manager
                 .normalize_path(from)
                 .unwrap_or_else(|_| from.clone());

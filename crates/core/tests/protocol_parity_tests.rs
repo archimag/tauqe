@@ -48,6 +48,7 @@ const OPERATIONAL_TAGS: &[&str] = &[
     "<move",
     "<overwrite",
     "<delete",
+    "<file_edits",
     "<edits",
     "<edit",
     "<plan",
@@ -203,7 +204,7 @@ fn generated_schema_documents_decode_into_the_rust_plan_model() {
         })
         .expect("the plan payload declares an object branch");
 
-    let generated = generate_from_schema(active, &definitions, GENERATED_TREE_DEPTH);
+    let generated = generate_from_schema(active, definitions, GENERATED_TREE_DEPTH);
     let update: tauqe_protocol::DiscussionPlanUpdate = serde_json::from_value(generated.clone())
         .expect("a document generated from the schema decodes into the plan payload");
 
@@ -242,7 +243,7 @@ fn generated_discussion_response_decodes_into_the_wire_dto() {
         .cloned()
         .unwrap_or(serde_json::Value::Null);
 
-    let generated = generate_from_schema(&schema, &definitions, GENERATED_TREE_DEPTH);
+    let generated = generate_from_schema(schema, &definitions, GENERATED_TREE_DEPTH);
     let response: tauqe_protocol::DiscussionResponse = serde_json::from_value(generated.clone())
         .expect("a document generated from the discussion schema decodes into the DTO");
 
@@ -250,6 +251,7 @@ fn generated_discussion_response_decodes_into_the_wire_dto() {
     // response carries the payload of each enabled capability.
     assert_eq!(response.message, "generated");
     assert!(response.plan_update.is_some());
+    assert!(response.review_update.is_some());
     assert!(!response.context_requests.is_empty());
     assert!(!response.repo_searches.is_empty());
     assert_eq!(response.repo_dirs, Some(false));
@@ -355,6 +357,13 @@ fn discussion_schema_declares_exactly_the_fields_of_the_response_dto() {
     let response = tauqe_protocol::DiscussionResponse {
         message: "message".to_string(),
         plan_update: Some(tauqe_protocol::DiscussionPlanUpdate::default()),
+        review_update: Some(tauqe_protocol::review::ReviewUpdateProposal {
+            item_id: 1,
+            group_id: Some("arch-1".to_string()),
+            status: tauqe_protocol::review::ReviewDecisionStatus::Todo,
+            note: "The lock must be held across the turn".to_string(),
+            recommendations: vec!["Extend the guard".to_string()],
+        }),
         context_requests: vec![tauqe_protocol::DiscussionContextRequest::read_only(
             "src/a.rs",
         )],
@@ -366,7 +375,7 @@ fn discussion_schema_declares_exactly_the_fields_of_the_response_dto() {
     };
 
     assert_eq!(
-        schema_fields(&schema),
+        schema_fields(schema),
         dto_fields(&response),
         "discussion schema and DiscussionResponse diverged"
     );
@@ -381,16 +390,16 @@ fn discussion_schema_declares_exactly_the_fields_of_the_response_dto() {
         })
         .unwrap_or_default();
     required.sort();
-    assert_eq!(required, schema_fields(&schema));
+    assert_eq!(required, schema_fields(schema));
 
     // The plan payload embedded in the discussion contract is the very
     // definition the plan contour publishes, so one shape serves both.
     assert_eq!(
-        schema["properties"]["plan_update"],
+        &schema["properties"]["plan_update"],
         tauqe_protocol::discussion::schema::plan_update_schema()
     );
     assert_eq!(
-        schema["$defs"],
+        &schema["$defs"],
         tauqe_protocol::discussion::schema::plan_schema_definitions()
     );
 }

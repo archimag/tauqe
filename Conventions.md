@@ -48,7 +48,7 @@ This document specifies mandatory engineering and architectural conventions for 
 
 ## 2. Workspace Architecture and Crate Responsibilities
 
-The TAUQE workspace is decomposed into four specialized crates with strict, unidirectional dependency boundaries. Code must never drift across these boundaries:
+The TAUQE workspace is decomposed into five specialized crates with strict, unidirectional dependency boundaries. Dependencies flow one way only (`tui` -> `protocol`, `server` -> `core` -> `tools` -> `protocol`), and code must never drift across these boundaries:
 
 1. **`crates/protocol` (Pure Wire Contract and Shared Domain DTOs):**
    - **Mandate:** Authoritative single source of truth for all external and inter-process communication contracts. Contains JSON-RPC request, response, and event data structures, protocol commands (`LlmCommand`), capability flags, error codes, and pure data transfer objects (DTOs).
@@ -57,25 +57,30 @@ The TAUQE workspace is decomposed into four specialized crates with strict, unid
    - **Documented Exception — Plan Evaluation Surface:** A small, pure surface of plan and review computations lives in `protocol` even though it resembles domain logic. It comprises the read-only plan queries (`Plan::evaluate_scope`, `Plan::compute_items_status`, `Plan::count_stats`), the derived-state normalizers that recompute a value from existing structure (`Plan::normalize_leaf_files`, `Plan::refresh_parent_statuses`), and the leaf-scoped assignment helper used for optimistic UI updates (`Plan::update_item_status`). The `tui` crate depends only on `protocol` and must render plan readiness, progress, leaf file badges, and optimistic status changes without an RPC round-trip, so these deterministic, allocation-only functions over the shared plan DTOs are allowed here. They perform no I/O and never touch disk, Git, or the network. All durable plan transitions, persistence, and `Done` immutability enforcement remain in `core`.
    - **Status Cycling Is Presentation-Only:** The `PlanItemStatus::next` and `ReviewItemStatus::next` helpers define the UI cycle order for the status picker and intentionally allow transitions such as `Done -> Blocked`. They are not a permission model. The authoritative guard against mutating or regressing a finished step lives in `core` (`validate_done_immutability`), never in the protocol cycler.
 
-2. **`crates/core` (Deterministic Harness and Domain Engine):**
-   - **Mandate:** The headless engine implementing the literal harness paradigm. Owns the bounded turn FSM, virtual staging and fuzzy patching, Git transactions and checkpoints, LLM provider communication and streaming, Tree-sitter repo map generation, toolchain verification runners, prompt assembly, and plan/review storage engines.
-   - **Allowed:** Interacting with Git, the file system, toolchain processes, and provider HTTP endpoints. Exposing domain traits (`PromptProtocol`, `LlmProvider`, `ApplyPolicy`) and headless domain workflows.
+2. **`crates/tools` (Deterministic Substrate):**
+   - **Mandate:** Every operation the harness performs without model judgement. Owns virtual staging and its patch algorithms, atomic file writes, Git transactions and checkpoints, the toolchain command runners and task-runner integration, and the Tree-sitter repository map.
+   - **Allowed:** Interacting with Git, the file system, and toolchain processes, and consuming the shared wire contract from `protocol`. It holds no cognitive state and drives no turn.
+   - **Strict Prohibitions:** NO dependency on `core`, NO LLM provider client, NO bounded turn FSM, NO prompt assembly, NO history or context management.
+
+3. **`crates/core` (Deterministic Harness and Domain Engine):**
+   - **Mandate:** The headless engine implementing the literal harness paradigm. Owns the bounded turn FSM, model-facing protocol decoding, prompt assembly, context and history management, LLM provider communication and streaming, plan and review storage engines, and the adapters that hand the substrate its declared inputs.
+   - **Allowed:** Driving the substrate against Git, the file system, and toolchain processes, and calling provider HTTP endpoints. Exposing domain traits (`PromptProtocol`, `LlmProvider`, `ApplyPolicy`) and headless domain workflows.
    - **Strict Prohibitions:** Strictly headless; NO presentation or terminal UI dependencies (`ratatui`, `crossterm`). NO RPC transport server or socket listening code.
 
-3. **`crates/server` (RPC Daemon and Orchestration Gateway):**
+4. **`crates/server` (RPC Daemon and Orchestration Gateway):**
    - **Mandate:** Persistent background daemon bridging client frontends with the core engine. Manages RPC transport (stdin/stdout or socket), client handshake, concurrency control (`OperationGuard`), request dispatching, and event streaming via `OutChannel`.
    - **Allowed:** Routing protocol requests to `core` workflows, translating operation lifecycles into protocol events, and managing active process state.
    - **Strict Prohibitions:** Must NEVER duplicate or re-implement domain logic (such as plan status evaluation, patch retry loops, prompt assembly, or Git diff computation). Domain transitions belong exclusively in `core`. Must NEVER contain terminal UI code.
 
-4. **`crates/tui` (Interactive Terminal Presentation and Client Frontend):**
+5. **`crates/tui` (Interactive Terminal Presentation and Client Frontend):**
    - **Mandate:** High-density keyboard-driven terminal frontend inspired by Magit and SLIME. Owns terminal views (Develop, Context, Review, Plans, History, Onboarding), layout geometry, keyboard navigation, input event translation, and local text editor state.
    - **Allowed:** Ratatui and crossterm integration, local UI state management, and RPC transport communication with `tauqe-server`.
    - **Strict Prohibitions:** Strictly a client frontend. Must NEVER run Git commands directly, touch LLM provider APIs, execute toolchain verifications, or manipulate working tree files directly on disk. All domain operations must be dispatched through RPC requests to the server daemon.
 
-5. **Anti-Drift Architectural Invariants:**
+6. **Anti-Drift Architectural Invariants:**
    - **Single Source of Wire Types:** All wire events, RPC parameter types, and model protocol objects must be defined in `crates/protocol`. Writing ad-hoc JSON structs or re-parsing raw wire payloads in `server` or `tui` is strictly forbidden.
-   - **Unidirectional Dependency Flow:** Dependencies strictly flow downward (`tui` -> `protocol`, `server` -> `core` -> `protocol`). Cyclic dependencies or reverse couplings are forbidden.
-   - **Strict Separation of Presentation and Domain:** Presentation logic belongs exclusively in `tui`; domain execution belongs exclusively in `core`.
+   - **Unidirectional Dependency Flow:** Dependencies strictly flow downward (`tui` -> `protocol`, `server` -> `core` -> `tools` -> `protocol`). Cyclic dependencies or reverse couplings are forbidden.
+   - **Strict Separation of Presentation and Domain:** Presentation logic belongs exclusively in `tui`; domain execution belongs exclusively in `core`; deterministic substrate belongs exclusively in `tools`.
 
 ---
 
@@ -224,7 +229,8 @@ All commits must follow the **Conventional Commits** specification:
 
 Subsystems may define local conventions that supplement these repository-wide rules:
 - **Terminal UI (`crates/tui`):** `crates/tui/Conventions.md` (layout semantics, Magit/Readline navigation, modal dialog architecture, and focus model).
-- **Core Engine (`crates/core`):** `crates/core/Conventions.md` (dual-contour structured output and storage persistence invariants).
+- **Core Engine (`crates/core`):** `crates/core/Conventions.md` (dual-contour structured output, prompt architecture, and storage persistence invariants).
+- **Deterministic Substrate (`crates/tools`):** `crates/tools/Conventions.md` (virtual staging, atomic writes, process execution, Git transactions, and the repository map).
 
 Subsystem conventions are resolved and included in the Pinned context layer automatically by the harness whenever files within that subsystem are loaded into context.
 
@@ -293,7 +299,7 @@ Subsystem conventions are resolved and included in the Pinned context layer auto
      workspace already declares.
    - A dependency used by exactly one crate may stay in that crate's manifest,
      but it must never introduce a second version of a crate the workspace
-     already declares. The pinned Tree-sitter grammars owned by `crates/core`
+     already declares. The pinned Tree-sitter grammars owned by `crates/tools`
      are the canonical example of such a single-consumer entry.
    - Features that Cargo unifies across the whole workspace — such as
      `serde_json`'s `preserve_order` — are declared on the workspace entry, not
@@ -310,7 +316,7 @@ Subsystem conventions are resolved and included in the Pinned context layer auto
      `serde` and `serde_json`, carries no workspace dependency, and pulls in no
      file-system, process, network, or async runtime crate.
    - Introducing any dependency that performs I/O into `crates/protocol` is
-     forbidden; such work belongs to `core` or `server`.
+     forbidden; such work belongs to `tools`, `core`, or `server`.
    - Rationale (Why): the wire contract must stay the cheapest crate to compile
      and the fastest to load, because every other crate depends on it and the
      client frontend links it directly.

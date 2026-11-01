@@ -1,3 +1,5 @@
+use std::borrow::Cow;
+
 use tauqe_protocol::discussion::normalize_repo_map_path;
 use tauqe_protocol::{
     CapabilitySet, DirListRequest, DocTopic, EditFileOp, EditOperation, EditOutcome, LlmCapability,
@@ -69,6 +71,7 @@ impl StructuredEditProtocol {
                             error: Some(message),
                             changed_files: Vec::new(),
                             commit_hash: None,
+                            verification: None,
                         },
                     };
                 }
@@ -94,6 +97,9 @@ impl StructuredEditProtocol {
                 EditOperation::Create { path, .. } => format!("Create {}", path),
                 EditOperation::Delete { path } => format!("Delete {}", path),
                 EditOperation::Move { from, to } => format!("Move {} to {}", from, to),
+                EditOperation::MoveDir { from, to } => {
+                    format!("Move directory {} to {}", from, to)
+                }
                 EditOperation::Overwrite { path, .. } => format!("Overwrite {}", path),
                 EditOperation::LineAnchor { path, .. } => {
                     format!("Replace anchored range in {}", path)
@@ -112,6 +118,7 @@ impl StructuredEditProtocol {
                 error: None,
                 changed_files: Vec::new(),
                 commit_hash: None,
+                verification: None,
             },
         }
     }
@@ -200,7 +207,7 @@ impl StructuredEditProtocol {
             json_schema: JsonSchemaDefinition {
                 name: "tauqe_edit_proposal".to_string(),
                 description: Some("Structured code modification proposal and response".to_string()),
-                schema: Self::schema_for(capabilities, patch_strategy),
+                schema: Cow::Owned(Self::schema_for(capabilities, patch_strategy)),
                 strict: Some(true),
             },
         })
@@ -551,6 +558,32 @@ impl StructuredEditProtocol {
         Ok(tags.into_iter().map(plan_tag_to_update).collect())
     }
 
+    /// Extracts a decision recorded for one review finding.
+    ///
+    /// The decision is a dialogue mutation rather than a code change: it states
+    /// the status the engineer settled on for one finding together with the
+    /// reasoning behind it. The field is declared nullable, so the idle form
+    /// records no decision. A payload that cannot be deserialized into
+    /// [`tauqe_protocol::review::ReviewUpdateProposal`] is reported as an error
+    /// instead of being silently swallowed, so the bounded turn can repeat
+    /// generation with the decoding diagnostics attached.
+    pub fn parse_review_update(
+        &self,
+        raw_text: &str,
+    ) -> Result<Option<tauqe_protocol::review::ReviewUpdateProposal>, String> {
+        let field = match parse_json_object(raw_text) {
+            Some(value) => value.get("review_update").cloned(),
+            None => None,
+        };
+        let Some(payload) = field.filter(|review_update| !review_update.is_null()) else {
+            return Ok(None);
+        };
+        let decoded: Result<tauqe_protocol::review::ReviewUpdateProposal, _> =
+            serde_json::from_value(payload);
+        let decision = decoded.map_err(|error| format!("invalid review_update: {error}"))?;
+        Ok(Some(decision))
+    }
+
     /// Cleans model output for presentation and history.
     pub fn clean_assistant_text(&self, raw_text: &str) -> String {
         clean_raw_json_or_text(raw_text)
@@ -619,14 +652,31 @@ fn parse_proposal(raw: &str) -> Option<ModelResultProposal> {
 /// wire vehicles — the structured `changes` field and the anchored change-set
 /// tag of the XML contour — travel through this routine, so a change is
 /// validated identically whichever encoding carried it.
+///
+/// A directory move is the one entry that names no file of the context block: a
+/// directory is never rendered as one, so its source is only normalized here
+/// and the collisions of the subtree it fans out into are decided while the
+/// change set is staged.
 fn change_to_operation(
     change: &StructuredChangeProposal,
     editable_paths: &[String],
 ) -> Result<EditOperation, String> {
     let is_create = change.op == EditFileOp::Create;
-    let target_path = resolve_target_path_for_op(&change.path, editable_paths, is_create)?;
+    // Resolving a directory against the permitted files would let a suffix of
+    // a context path stand in for the directory the model named, so the source
+    // of a directory move is normalized instead of resolved.
+    let moves_directory = change.op == EditFileOp::MoveDir;
+    let target_path = if moves_directory {
+        tauqe_protocol::edit::normalize_repo_path(&change.path)?
+    } else {
+        resolve_target_path_for_op(&change.path, editable_paths, is_create)?
+    };
 
-    if !editable_paths.is_empty() && !is_create && !editable_paths.contains(&target_path) {
+    if !moves_directory
+        && !editable_paths.is_empty()
+        && !is_create
+        && !editable_paths.contains(&target_path)
+    {
         return Err(format!(
             "File '{}' is not present in context. To edit it, request it first via context_requests. Permitted files in context: {}",
             target_path,
@@ -1105,7 +1155,35 @@ mod tests {
             other => panic!("expected anchored edits, got {other:?}"),
         }
     }
+    #[test]
+    fn test_structured_protocol_parses_a_directory_move() {
+        let proto = StructuredEditProtocol;
+        let editable = vec!["src/old".to_string()];
+        let json = r#"{
+            "message": "Rename the module directory",
+            "changes": [{
+                "op": "move_dir",
+                "path": "src/old",
+                "to": "src/new"
+            }]
+        }"#;
 
+        // A directory is never a file of the context block, so the move is
+        // resolved as two directory paths instead of a context membership.
+        match proto.parse_output(json, &editable) {
+            ModelResult::Edit { edits, outcome, .. } => {
+                assert!(outcome.error.is_none(), "{:?}", outcome.error);
+                assert_eq!(
+                    edits,
+                    vec![EditOperation::MoveDir {
+                        from: "src/old".to_string(),
+                        to: "src/new".to_string(),
+                    }]
+                );
+            }
+            other => panic!("expected a directory move, got {other:?}"),
+        }
+    }
     #[test]
     fn test_anchor_change_set_vehicle_decodes_shared_entries() {
         let editable = vec!["src/lib.rs".to_string()];
@@ -1780,5 +1858,44 @@ mod tests {
             }
             other => panic!("expected a JSON schema response format, got {other:?}"),
         }
+    }
+    #[test]
+    fn test_structured_protocol_parse_review_update() {
+        let proto = StructuredEditProtocol;
+        let json = r#"{
+            "message": "Decision recorded",
+            "review_update": {
+                "item_id": 7,
+                "status": "skipped",
+                "note": "  Not reproducible  ",
+                "recommendations": ["Cover the retry path"]
+            }
+        }"#;
+        let decision = proto
+            .parse_review_update(json)
+            .expect("a decodable payload")
+            .expect("a recorded decision");
+        assert_eq!(decision.item_id, 7);
+        assert_eq!(
+            decision.status,
+            tauqe_protocol::review::ReviewDecisionStatus::Skipped
+        );
+        assert_eq!(decision.note, "  Not reproducible  ");
+        assert_eq!(
+            decision.recommendations,
+            vec!["Cover the retry path".to_string()]
+        );
+
+        // The field is nullable and optional, so both idle forms record nothing.
+        assert_eq!(
+            proto.parse_review_update(r#"{"message":"x","review_update":null}"#),
+            Ok(None)
+        );
+        assert_eq!(proto.parse_review_update(r#"{"message":"x"}"#), Ok(None));
+
+        // A payload the DTO cannot hold is reported instead of being swallowed.
+        let malformed =
+            proto.parse_review_update(r#"{"message":"x","review_update":{"item_id":"seven"}}"#);
+        assert!(malformed.is_err(), "{malformed:?}");
     }
 }

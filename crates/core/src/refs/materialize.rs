@@ -12,10 +12,12 @@
 //! copy, which keeps the material the model reasoned about stable and keeps
 //! repeated Discovery rounds free of redundant downloads.
 //!
-//! A remote source is fetched over HTTP with the project wall-clock budget and
-//! races the turn cancellation signal, so a slow reference never outlives the
-//! turn that requested it. A local source is copied from its absolute path. Both
-//! write through [`crate::atomic_write::write_atomic`], so a reader observes
+//! A remote source is fetched over HTTP with the project wall-clock budget,
+//! bounded by the configured reference budget, and races the turn cancellation
+//! signal: a slow reference never outlives the turn that requested it, and an
+//! oversized one is abandoned while it streams. A local source has its size
+//! inspected before it is read. Both
+//! write through [`tauqe_tools::atomic_write::write_atomic`], so a reader observes
 //! either the previous complete snapshot or the new one, never a truncated file,
 //! and every filesystem operation runs off the async executor thread through
 //! [`crate::blocking`]. A reference that cannot be materialized returns a compact
@@ -67,13 +69,15 @@ fn http_client() -> Result<reqwest::Client, String> {
 /// so a repeated request never re-downloads and never re-copies it.
 ///
 /// A remote source is fetched with the project wall-clock budget and abandoned
-/// when the turn is cancelled; a local source is copied from its absolute path.
-/// Both land through [`crate::atomic_write::write_atomic`], so a crash can never
-/// publish a truncated snapshot. A failure returns a compact reason instead of a
-/// panic, so an unreachable host degrades into a diagnostic.
+/// when the turn is cancelled or the document passes the reference budget,
+/// which is applied while the body streams; a local source has its size
+/// inspected before it is read. Both land through
+/// [`tauqe_tools::atomic_write::write_atomic`], so a crash can never publish a
+/// truncated snapshot, and an unreachable host degrades into a diagnostic.
 pub async fn materialize_entry(
     repo_root: &Path,
     entry: &RefsEntry,
+    refs_token_budget: usize,
     cancel_rx: Option<&watch::Receiver<bool>>,
 ) -> Result<String, String> {
     let cache_path = cache_path_for(&entry.name);
@@ -93,13 +97,18 @@ pub async fn materialize_entry(
         return Ok(cache_path);
     }
 
+    // The transfer is bounded by the same estimate `add_refs_file` applies on
+    // admission, so a document that could never enter the Refs layer is
+    // abandoned while it streams instead of after it was fully buffered.
+    let max_bytes = byte_ceiling(refs_token_budget);
+
     match &entry.source {
         RefsSource::Url(url) => {
-            let bytes = fetch_url(url, cancel_rx).await?;
+            let bytes = fetch_url(url, max_bytes, cancel_rx).await?;
             store_snapshot(repo_root, &cache_path, &entry.name, bytes).await?;
         }
         RefsSource::LocalPath(source) => {
-            let bytes = read_local_source(source).await?;
+            let bytes = read_local_source(source, max_bytes).await?;
             store_snapshot(repo_root, &cache_path, &entry.name, bytes).await?;
         }
     }
@@ -125,9 +134,14 @@ pub async fn materialize_entry(
 /// learns why the declared document could not be loaded instead of waiting for a
 /// file that will never appear. The answers are aligned with the requests: one
 /// resolved request per input, in the order the round declared them.
+///
+/// Every transfer is bounded by `refs_token_budget`, the budget the Refs layer
+/// applies on admission, so an oversized document is abandoned while it
+/// streams instead of after it was fully buffered.
 pub async fn materialize_requests(
     repo_root: &Path,
     requests: &[ContextRequest],
+    refs_token_budget: usize,
     cancel_rx: Option<&watch::Receiver<bool>>,
 ) -> (Vec<ContextRequest>, Vec<String>) {
     let mut resolved: Vec<ContextRequest> = Vec::with_capacity(requests.len());
@@ -164,7 +178,7 @@ pub async fn materialize_requests(
             resolved.push(request.clone());
             continue;
         };
-        match materialize_entry(repo_root, &entry, cancel_rx).await {
+        match materialize_entry(repo_root, &entry, refs_token_budget, cancel_rx).await {
             Ok(cache_path) => resolved.push(ContextRequest {
                 path: cache_path,
                 access: ContextAccess::ReadOnly,
@@ -222,10 +236,40 @@ async fn cache_file_exists(target: &Path, name: &str) -> Result<bool, String> {
         })
 }
 
-/// Downloads `url` into memory, honouring the turn cancellation signal.
+/// Byte length of one estimated token, matching `estimate_tokens_from_bytes`.
 ///
+/// The Refs layer prices a document at `ceil(bytes / 4)` tokens, so the same
+/// ratio inverts into the largest snapshot one token budget admits.
+const BYTES_PER_TOKEN: u64 = 4;
+
+/// Converts a reference token budget into the byte ceiling of one snapshot.
+///
+/// A snapshot at or below the result is priced at no more than
+/// `refs_token_budget` tokens by the estimate the Refs layer applies, so the
+/// transfer-side bound and the admission check agree on the same document.
+fn byte_ceiling(refs_token_budget: usize) -> u64 {
+    (refs_token_budget as u64).saturating_mul(BYTES_PER_TOKEN)
+}
+
+/// Renders the diagnostic of a document abandoned for exceeding the budget.
+fn oversized(url: &str, max_bytes: u64) -> String {
+    let refs_token_budget = max_bytes / BYTES_PER_TOKEN;
+    format!(
+        "the reference `{url}` exceeds the configured refs budget of {refs_token_budget} tokens, so the transfer was abandoned instead of buffering the document"
+    )
+}
+
+/// Downloads `url` into memory, honouring the size ceiling and the turn
+/// cancellation signal.
+///
+/// The body is streamed instead of buffered in one call: the transfer stops as
+/// soon as the accumulated bytes pass `max_bytes`, so a host that serves an
+/// oversized document is abandoned while it streams instead of after it has
+/// exhausted process memory. The request timeout bounds duration only, which is
+/// why the size is bounded here as well.
 async fn fetch_url(
     url: &str,
+    max_bytes: u64,
     cancel_rx: Option<&watch::Receiver<bool>>,
 ) -> Result<Vec<u8>, String> {
     if cancel_requested(cancel_rx) {
@@ -236,7 +280,7 @@ async fn fetch_url(
     // Cancellation covers the whole exchange, the response headers and the body,
     // so an abandoned turn stops waiting for a slow host immediately.
     let request = async {
-        let response = client
+        let mut response = client
             .get(url)
             .timeout(Duration::from_secs(DEFAULT_PROJECT_TIMEOUT_SECS))
             .send()
@@ -249,11 +293,19 @@ async fn fetch_url(
                 status.as_u16()
             ));
         }
-        response
-            .bytes()
+        let mut body: Vec<u8> = Vec::new();
+        while let Some(chunk) = response
+            .chunk()
             .await
-            .map(|body| body.to_vec())
-            .map_err(|error| format!("the reference `{url}` could not be read: {error}"))
+            .map_err(|error| format!("the reference `{url}` could not be read: {error}"))?
+        {
+            let accumulated = (body.len() as u64).saturating_add(chunk.len() as u64);
+            if accumulated > max_bytes {
+                return Err(oversized(url, max_bytes));
+            }
+            body.extend_from_slice(&chunk);
+        }
+        Ok(body)
     };
 
     tokio::select! {
@@ -263,18 +315,26 @@ async fn fetch_url(
 }
 
 /// Reads a local reference source from its absolute path.
-async fn read_local_source(source: &str) -> Result<Vec<u8>, String> {
+///
+/// The metadata is inspected inside the blocking phase, before the file is
+/// read, so a document that could never enter the Refs layer is rejected
+/// without being loaded into memory.
+async fn read_local_source(source: &str, max_bytes: u64) -> Result<Vec<u8>, String> {
     let path = PathBuf::from(source);
     let display = source.to_string();
-    crate::blocking::run_blocking_async(move || std::fs::read(&path))
-        .await
-        .map_err(|error| {
-            crate::blocking::log_join_error(&error, "reference source read");
-            format!("the local reference source `{display}` could not be read")
-        })?
-        .map_err(|error| {
-            format!("the local reference source `{display}` could not be read: {error}")
-        })
+    crate::blocking::run_blocking_async(move || -> anyhow::Result<Vec<u8>> {
+        let metadata = std::fs::metadata(&path)?;
+        if metadata.len() > max_bytes {
+            anyhow::bail!("refusing to load a document larger than the configured refs budget");
+        }
+        Ok(std::fs::read(&path)?)
+    })
+    .await
+    .map_err(|error| {
+        crate::blocking::log_join_error(&error, "reference source read");
+        format!("the local reference source `{display}` could not be read")
+    })?
+    .map_err(|error| format!("the local reference source `{display}` could not be read: {error}"))
 }
 
 /// Writes one snapshot into the isolated cache through the atomic replacement.
@@ -289,7 +349,7 @@ async fn store_snapshot(
         if let Some(parent) = target.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        crate::atomic_write::write_atomic(&target, &bytes)
+        tauqe_tools::atomic_write::write_atomic(&target, &bytes)
     })
     .await
     .map_err(|error| {
@@ -333,7 +393,7 @@ fn cancelled(url: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{materialize_entry, materialize_requests};
+    use super::{byte_ceiling, materialize_entry, materialize_requests};
     use crate::edits::protocol::ContextRequest;
     use crate::refs::{
         cache_path_for, is_refs_cache_path, RefsEntry, RefsSource, REFS_CACHE_DIR, REFS_DIR,
@@ -346,6 +406,9 @@ mod tests {
     use tokio::sync::watch;
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    /// Reference budget the fixtures that do not exercise the bound fit into.
+    const TEST_REFS_BUDGET: usize = 50_000;
 
     /// A declared remote reference.
     fn url_entry(name: &str, url: &str) -> RefsEntry {
@@ -377,7 +440,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let entry = url_entry("vendor/api.md", &format!("{}/llm.txt", server.uri()));
 
-        let cache_path = materialize_entry(dir.path(), &entry, None)
+        let cache_path = materialize_entry(dir.path(), &entry, TEST_REFS_BUDGET, None)
             .await
             .expect("the declared reference materializes");
 
@@ -402,13 +465,17 @@ mod tests {
         let dir = tempdir().unwrap();
         let entry = url_entry("vendor/api.md", &format!("{}/llm.txt", server.uri()));
 
-        let first = materialize_entry(dir.path(), &entry, None).await.unwrap();
+        let first = materialize_entry(dir.path(), &entry, TEST_REFS_BUDGET, None)
+            .await
+            .unwrap();
 
         // Rewriting the cached snapshot proves a second materialization reads it
         // instead of the network: the file keeps bytes the origin never served.
         std::fs::write(dir.path().join(&first), "kept snapshot").unwrap();
 
-        let second = materialize_entry(dir.path(), &entry, None).await.unwrap();
+        let second = materialize_entry(dir.path(), &entry, TEST_REFS_BUDGET, None)
+            .await
+            .unwrap();
 
         assert_eq!(second, first);
         let stored = std::fs::read_to_string(dir.path().join(&second)).unwrap();
@@ -429,7 +496,9 @@ mod tests {
         let dir = tempdir().unwrap();
         let entry = local_entry("vendor/protocol.md", &source);
 
-        let cache_path = materialize_entry(dir.path(), &entry, None).await.unwrap();
+        let cache_path = materialize_entry(dir.path(), &entry, TEST_REFS_BUDGET, None)
+            .await
+            .unwrap();
 
         assert_eq!(cache_path, cache_path_for("vendor/protocol.md"));
         let stored = std::fs::read_to_string(dir.path().join(&cache_path)).unwrap();
@@ -451,7 +520,7 @@ mod tests {
             &format!("{}/missing.txt", server.uri()),
         );
 
-        let error = materialize_entry(dir.path(), &entry, None)
+        let error = materialize_entry(dir.path(), &entry, TEST_REFS_BUDGET, None)
             .await
             .expect_err("a failing download surfaces a diagnostic");
 
@@ -470,7 +539,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let entry = local_entry("vendor/absent.md", &missing);
 
-        let error = materialize_entry(dir.path(), &entry, None)
+        let error = materialize_entry(dir.path(), &entry, TEST_REFS_BUDGET, None)
             .await
             .expect_err("an unreadable source surfaces a diagnostic");
 
@@ -498,7 +567,7 @@ mod tests {
 
         let materialization = tokio::spawn(async move {
             let entry = url_entry("vendor/slow.md", &url);
-            materialize_entry(&root, &entry, Some(&cancel_rx)).await
+            materialize_entry(&root, &entry, TEST_REFS_BUDGET, Some(&cancel_rx)).await
         });
 
         // Let the request reach the server before the turn is cancelled.
@@ -522,7 +591,7 @@ mod tests {
         let entry = url_entry("vendor/api.md", &format!("{}/llm.txt", server.uri()));
         let (_cancel_tx, cancel_rx) = watch::channel(true);
 
-        let error = materialize_entry(dir.path(), &entry, Some(&cancel_rx))
+        let error = materialize_entry(dir.path(), &entry, TEST_REFS_BUDGET, Some(&cancel_rx))
             .await
             .expect_err("a cancelled turn materializes nothing");
 
@@ -539,7 +608,9 @@ mod tests {
         let dir = tempdir().unwrap();
         let entry = local_entry("vendor/nested/api.md", &source);
 
-        let cache_path = materialize_entry(dir.path(), &entry, None).await.unwrap();
+        let cache_path = materialize_entry(dir.path(), &entry, TEST_REFS_BUDGET, None)
+            .await
+            .unwrap();
 
         let target = dir.path().join(&cache_path);
         assert!(
@@ -586,7 +657,8 @@ mod tests {
         write_manifest(dir.path(), "vendor/api.md", &url);
         let request = registry_request(".tauqe/refs/vendor/api.md");
 
-        let (resolved, feedback) = materialize_requests(dir.path(), &[request], None).await;
+        let (resolved, feedback) =
+            materialize_requests(dir.path(), &[request], TEST_REFS_BUDGET, None).await;
 
         assert!(feedback.is_empty(), "unexpected diagnostics: {feedback:?}");
         assert_eq!(resolved.len(), 1);
@@ -610,10 +682,12 @@ mod tests {
         write_manifest(dir.path(), "vendor/api.md", &url);
         let request = registry_request(".tauqe/refs/vendor/api.md");
 
+        let requests = std::slice::from_ref(&request);
         let (first, feedback) =
-            materialize_requests(dir.path(), std::slice::from_ref(&request), None).await;
+            materialize_requests(dir.path(), requests, TEST_REFS_BUDGET, None).await;
         assert!(feedback.is_empty());
-        let (second, feedback) = materialize_requests(dir.path(), &[request], None).await;
+        let (second, feedback) =
+            materialize_requests(dir.path(), &[request], TEST_REFS_BUDGET, None).await;
         assert!(feedback.is_empty());
 
         assert_eq!(first[0].path, second[0].path);
@@ -638,8 +712,9 @@ mod tests {
         write_manifest(dir.path(), "vendor/missing.md", &url);
         let request = registry_request(".tauqe/refs/vendor/missing.md");
 
+        let requests = std::slice::from_ref(&request);
         let (resolved, feedback) =
-            materialize_requests(dir.path(), std::slice::from_ref(&request), None).await;
+            materialize_requests(dir.path(), requests, TEST_REFS_BUDGET, None).await;
 
         assert_eq!(resolved, vec![request]);
         assert_eq!(feedback.len(), 1);
@@ -659,8 +734,9 @@ mod tests {
         write_manifest(dir.path(), "vendor/api.md", &url);
         let request = registry_request(".tauqe/refs/vendor/other.md");
 
+        let requests = std::slice::from_ref(&request);
         let (resolved, feedback) =
-            materialize_requests(dir.path(), std::slice::from_ref(&request), None).await;
+            materialize_requests(dir.path(), requests, TEST_REFS_BUDGET, None).await;
 
         assert_eq!(resolved, vec![request]);
         assert!(feedback.is_empty());
@@ -675,8 +751,9 @@ mod tests {
         let declared = write_manifest(dir.path(), "vendor/api.md", &url);
         let request = registry_request(".tauqe/refs/refs.md");
 
+        let requests = std::slice::from_ref(&request);
         let (resolved, feedback) =
-            materialize_requests(dir.path(), std::slice::from_ref(&request), None).await;
+            materialize_requests(dir.path(), requests, TEST_REFS_BUDGET, None).await;
 
         assert_eq!(resolved, vec![request]);
         assert!(feedback.is_empty());
@@ -685,5 +762,66 @@ mod tests {
             std::fs::read_to_string(dir.path().join(REFS_MANIFEST)).unwrap(),
             declared
         );
+    }
+
+    /// A declared document whose body passes the reference budget is abandoned
+    /// while it streams: the materialization reports a compact reason instead of
+    /// buffering the document, and no snapshot is left in the isolated cache.
+    #[tokio::test]
+    async fn test_an_oversized_remote_reference_aborts_before_it_is_buffered() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/huge.txt"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("x".repeat(8192)))
+            .mount(&server)
+            .await;
+
+        let dir = tempdir().unwrap();
+        let entry = url_entry("vendor/huge.md", &format!("{}/huge.txt", server.uri()));
+
+        // One token admits four bytes, so the transfer is abandoned long before
+        // the whole body could be accumulated in memory.
+        let error = materialize_entry(dir.path(), &entry, 1, None)
+            .await
+            .expect_err("an oversized body surfaces a diagnostic");
+
+        assert!(error.contains("refs budget"), "unexpected reason: {error}");
+        assert!(!dir.path().join(cache_path_for("vendor/huge.md")).exists());
+    }
+
+    /// A local source is inspected before it is read, so a document larger than
+    /// the budget is refused without ever being loaded into memory.
+    #[tokio::test]
+    async fn test_an_oversized_local_reference_is_refused_before_it_is_read() {
+        let outside = tempdir().unwrap();
+        let source = outside.path().join("huge.md");
+        std::fs::write(&source, "x".repeat(8192)).unwrap();
+
+        let dir = tempdir().unwrap();
+        let entry = local_entry("vendor/huge.md", &source);
+
+        let error = materialize_entry(dir.path(), &entry, 1, None)
+            .await
+            .expect_err("an oversized source surfaces a diagnostic");
+
+        assert!(error.contains("refs budget"), "unexpected reason: {error}");
+        assert!(!dir.path().join(cache_path_for("vendor/huge.md")).exists());
+    }
+
+    /// The transfer ceiling and the admission estimate agree on the same
+    /// document, so the streaming bound never admits a snapshot the Refs layer
+    /// would refuse immediately afterwards.
+    #[test]
+    fn test_the_transfer_ceiling_matches_the_admission_estimate() {
+        for refs_token_budget in [0usize, 1, 7, 50_000] {
+            let ceiling = byte_ceiling(refs_token_budget);
+            assert_eq!(
+                crate::prompt::estimate_tokens_from_bytes(ceiling) as usize,
+                refs_token_budget
+            );
+            assert!(
+                crate::prompt::estimate_tokens_from_bytes(ceiling + 1) as usize > refs_token_budget
+            );
+        }
     }
 }

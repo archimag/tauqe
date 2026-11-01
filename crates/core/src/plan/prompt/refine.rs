@@ -1,6 +1,4 @@
-use crate::context::ContextFileContent;
 use crate::edits::stream::json::decode::{first_json_object_str, strip_code_fence};
-use crate::prompt::format_repository_outline_section;
 use serde::{Deserialize, Serialize};
 use tauqe_protocol::discussion::normalize_repo_map_path;
 use tauqe_protocol::{ConceptItem, Plan, PlanItem, PlanItemStatus, RepoSearchRequest};
@@ -288,6 +286,8 @@ pub fn build_plan_horizon_system_prompt() -> String {
     out.push_str("   - You MUST set `status: \"blocked\"`, provide empty `items: []`, and document a comprehensive, rigorous technical explanation in `reason` detailing the exact contradiction, codebase evidence, and recommended developer action.\n\n");
     out.push_str("4. Step Granularity, Grouping and Compilability Invariants:\n");
     out.push_str("   - Execution Lifecycle Contract: EVERY leaf step is executed in an isolated turn with its own toolchain verification gates (check, clippy, test).\n");
+    out.push_str("   - Disjunction Prohibition Invariant: Every concept node and every step must state exactly one definite decision, so unresolved disjunctive alternatives such as 'either X or Y' or 'use library A or write your own structure B' are strictly prohibited. The architectural choice ('What') is fixed by the concept tree and the developer, and a genuine ambiguity is reported through `status: \"blocked\"` instead of being resolved by offering alternatives; a step owns 'How' only and never decides the architecture.\n");
+    out.push_str("   - Automated Verification Invariant: The harness runs full toolchain verification (compilation, linters, and tests) automatically and deterministically after every individual leaf step. Dedicated steps that only run tests, check the build status, or inspect the codebase without changing code are strictly prohibited, because the executor has no shell. Tests are created and modified inside the steps that implement the corresponding functionality.\n");
     out.push_str("   - Target File Precision (Leaf-Only Files Invariant): For every executable leaf step, you MUST populate `files: [\"path/to/file\"]` with exact repository-relative file paths. Parent items and task groups are conceptual containers and MUST have empty `files: []`. Only leaf steps (`children: []`) pre-load files into context upon execution.\n");
     out.push_str("   - Reference Files Contract (Read-Only Context): For every executable leaf step, identify and populate `readonly_files: [\"path/to/reference\"]` with existing interfaces, protocol types, or subsystem conventions needed as context during implementation. These files are pre-loaded as read-only context during step execution. Invariant: parent items must have empty `readonly_files: []`.\n");
     out.push_str("   - Concept Traceability: For each step, link it to the relevant architectural concept IDs via `concept_refs: [\"concept_id\"]`.\n");
@@ -342,17 +342,16 @@ pub struct PlanHorizonDiagnostics<'a> {
 /// Builds the unified user prompt for Architect horizon synthesis.
 ///
 /// Structures the input in a fixed order: the immutable architectural concept, the
-/// completed (DONE) foundation, the optional diagnostics of a blocked step, the codebase
-/// outline — symbol contours (`<repo_map>`) or, when eager map generation is disabled,
-/// the compact directory tree (`<repo_dirs>`) — active context files, and the
+/// completed (DONE) foundation, the optional diagnostics of a blocked step, and the
 /// developer's directives. The Architect returns only the NEW unfinished horizon; the
 /// harness preserves the DONE foundation and concatenates it ahead of the synthesized
 /// steps.
+///
+/// The task fragment carries domain framing only: the active context files and the
+/// repository outline belong to the stable head of the round, which the turn kernel
+/// renders for every contour, so a task builder never restates them.
 pub fn build_plan_horizon_user_prompt(
     plan: &Plan,
-    context_files: &[ContextFileContent],
-    repo_map: Option<&str>,
-    repo_dirs: Option<&str>,
     diagnostics: Option<PlanHorizonDiagnostics<'_>>,
     instructions: Option<&str>,
 ) -> String {
@@ -455,23 +454,6 @@ pub fn build_plan_horizon_user_prompt(
         out.push('\n');
     }
 
-    // The eager symbol map and the compact directory tree are mutually
-    // exclusive: the Architect reads either symbol contours or the folder
-    // layout, never both.
-    if let Some(outline) = format_repository_outline_section(repo_map, repo_dirs) {
-        out.push_str(&outline);
-    }
-
-    if !context_files.is_empty() {
-        out.push_str("## Active Context Files:\n");
-        for file in context_files {
-            out.push_str(&format!(
-                "### File: `{}`\n```\n{}\n```\n\n",
-                file.path, file.content
-            ));
-        }
-    }
-
     if let Some(ins) = instructions {
         let trimmed = ins.trim();
         if !trimmed.is_empty() {
@@ -487,7 +469,9 @@ pub fn build_plan_horizon_user_prompt(
     out.push_str("3. Follow the Architect Discovery Protocol: before designing any step that touches an existing interface, type, trait, module, or crate, verify its real contract by requesting the relevant source files or searching for symbols via `status: \"needs_context\"` with `context_requests: [\"path/to/file\"]`, `repo_searches: [...]`, or `repo_maps: [\"path/to/module\"]`, and empty `items: []`. Never infer contracts from RepoMap contours alone.\n");
     out.push_str("4. Check for any blockers, circular dependencies, or contradictions. If blocked, report `status: \"blocked\"` with an exact `reason`.\n");
     out.push_str("5. For every executable leaf step, specify target files in `files`, reference contracts/types/conventions in `readonly_files`, addressed concept IDs in `concept_refs`, and prerequisite step IDs in `depends_on`. Calibrate leaf step granularity to cohesive units: group closely related adjacent edits under one step to avoid micro-fragmentation, while avoiding monolithic multi-file dumps.\n");
-    out.push_str("6. Language Directive: Detect the natural language of the plan title and description. Formulate all titles, details, explanations, and reasons strictly in that same language.\n");
+    out.push_str("6. Disjunction Prohibition Invariant: Every concept node and every step must state exactly one definite decision, so unresolved disjunctive alternatives such as 'either X or Y' or 'use library A or write your own structure B' are strictly prohibited. The architectural choice ('What') is fixed by the concept tree and the developer, and a genuine ambiguity is reported through `status: \"blocked\"` with the exact decision the developer must make, instead of being resolved by offering alternatives; a step owns 'How' only and never decides the architecture.\n");
+    out.push_str("7. Automated Verification Invariant: The harness runs full toolchain verification (compilation, linters, and tests) automatically and deterministically after every individual leaf step, so dedicated steps that only run tests, check the build status, or inspect the codebase without changing code are strictly prohibited: the executor has no shell, and tests are created and modified inside the steps that implement the corresponding functionality.\n");
+    out.push_str("8. Language Directive: Detect the natural language of the plan title and description. Formulate all titles, details, explanations, and reasons strictly in that same language.\n");
 
     out
 }
@@ -497,12 +481,15 @@ mod tests {
     use super::*;
 
     fn sample_plan() -> Plan {
-        Plan {
-            id: "jwt-auth".to_string(),
-            title: "JWT Authentication".to_string(),
-            description: Some("Implement secure tokens".to_string()),
-            ..Default::default()
-        }
+        Plan::from_parts(
+            "jwt-auth".to_string(),
+            "JWT Authentication".to_string(),
+            Some("Implement secure tokens".to_string()),
+            0,
+            0,
+            vec![],
+            vec![],
+        )
     }
 
     #[test]
@@ -518,41 +505,23 @@ mod tests {
 
     #[test]
     fn test_plan_horizon_user_prompt_mandates_contract_discovery() {
-        let user = build_plan_horizon_user_prompt(&sample_plan(), &[], None, None, None, None);
+        let user = build_plan_horizon_user_prompt(&sample_plan(), None, None);
         assert!(user.contains("Architect Discovery Protocol"));
         assert!(user.contains("needs_context"));
     }
 
     #[test]
-    fn test_plan_horizon_user_prompt_renders_one_repository_outline() {
-        let plan = sample_plan();
+    fn the_horizon_prompts_forbid_disjunctions_and_verification_only_steps() {
+        let sys = build_plan_horizon_system_prompt();
+        assert!(sys.contains("Disjunction Prohibition Invariant"));
+        assert!(sys.contains("exactly one definite decision"));
+        assert!(sys.contains("Automated Verification Invariant"));
+        assert!(sys.contains("no shell"));
 
-        // Symbol contours win whenever the eager map is available, so the
-        // directory tree never dilutes an existing outline.
-        let with_map = build_plan_horizon_user_prompt(
-            &plan,
-            &[],
-            Some("crate\n  pub fn main"),
-            Some("crate\n  src"),
-            None,
-            None,
-        );
-        assert!(with_map.contains("## Codebase Symbol Contours (<repo_map>):"));
-        assert!(with_map.contains("crate\n  pub fn main"));
-        assert!(!with_map.contains("## Repository Directories"));
-
-        // Without a map the compact tree still tells the Architect where
-        // subsystems live instead of leaving it blind.
-        let with_dirs =
-            build_plan_horizon_user_prompt(&plan, &[], None, Some("crate\n  src"), None, None);
-        assert!(with_dirs.contains("## Repository Directories (<repo_dirs>):"));
-        assert!(with_dirs.contains("crate\n  src"));
-        assert!(!with_dirs.contains("## Codebase Symbol Contours"));
-
-        // A blank outline renders no repository section at all.
-        let blank = build_plan_horizon_user_prompt(&plan, &[], Some("  "), Some(""), None, None);
-        assert!(!blank.contains("## Codebase Symbol Contours"));
-        assert!(!blank.contains("## Repository Directories"));
+        let user = build_plan_horizon_user_prompt(&sample_plan(), None, None);
+        assert!(user.contains("Disjunction Prohibition Invariant"));
+        assert!(user.contains("Automated Verification Invariant"));
+        assert!(user.contains("without changing code"));
     }
 
     #[test]
