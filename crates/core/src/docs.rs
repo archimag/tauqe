@@ -16,8 +16,7 @@ const CONTEXT_MODEL: &str = include_str!("../../../docs/src/ch02-perception/cont
 const DISCUSSION_FOCUS: &str =
     include_str!("../../../docs/src/ch02-perception/discussion-focus.md");
 const REPO_MAP: &str = include_str!("../../../docs/src/ch02-perception/repo-map.md");
-const DISCOVERY_ENGINE: &str =
-    include_str!("../../../docs/src/ch02-perception/discovery-engine.md");
+const RESEARCH_ENGINE: &str = include_str!("../../../docs/src/ch02-perception/research-engine.md");
 const PROJECT_PROTOCOL: &str =
     include_str!("../../../docs/src/ch03-project/tauqe-project-protocol.md");
 const MODIFICATION_LIFECYCLE: &str =
@@ -65,7 +64,7 @@ pub(crate) fn get_documentation(topic: DocTopic) -> String {
         // Part I: the paradigm and the roles that own "what" and "how".
         DocTopic::Overview => &[INTRO, SEMANTIC_HARNESS, MODEL_ROLES],
         // Part II: the perceived working set and how discovery widens it.
-        DocTopic::Context => &[CONTEXT_MODEL, DISCUSSION_FOCUS, REPO_MAP, DISCOVERY_ENGINE],
+        DocTopic::Context => &[CONTEXT_MODEL, DISCUSSION_FOCUS, REPO_MAP, RESEARCH_ENGINE],
         // Part I and Part III: the turn machine plus the project work it
         // delegates to the driver.
         DocTopic::Workflow => &[
@@ -90,7 +89,7 @@ pub(crate) fn get_documentation(topic: DocTopic) -> String {
             CONTEXT_MODEL,
             DISCUSSION_FOCUS,
             REPO_MAP,
-            DISCOVERY_ENGINE,
+            RESEARCH_ENGINE,
             PROJECT_PROTOCOL,
             MODIFICATION_LIFECYCLE,
             VERIFICATION_HEALING,
@@ -126,7 +125,7 @@ mod tests {
         assert!(get_documentation(DocTopic::Overview).contains("The Semantic Harness"));
         assert!(get_documentation(DocTopic::Overview).contains("Model Roles and the Coder Ladder"));
         assert!(get_documentation(DocTopic::Context).contains("The Context Model"));
-        assert!(get_documentation(DocTopic::Context).contains("Discovery Engine"));
+        assert!(get_documentation(DocTopic::Context).contains("Research Engine"));
         assert!(get_documentation(DocTopic::Workflow).contains("The TauqeProjectProtocol"));
         assert!(get_documentation(DocTopic::Workflow).contains("Turn Scratchpad"));
         assert!(get_documentation(DocTopic::Git).contains("Git Safety & Transactions"));
@@ -152,7 +151,7 @@ mod tests {
             "The Context Model",
             "Discussion Focus",
             "Repository Map and Blinkers",
-            "Discovery Engine",
+            "Research Engine",
             "The TauqeProjectProtocol",
             "Three-Phase Modification Lifecycle",
             "Structured Diagnostics and Verification Healing",

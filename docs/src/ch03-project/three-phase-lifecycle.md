@@ -87,6 +87,12 @@ input. Verifying before the generator runs checks a tree that is not final.
     before the first file moves, the trusted boundaries are asked on both sides of
     every expanded pair, and a refusal restores every path the member addressed,
     so no half-moved directory survives.
+14. **The commit message is declared, not assembled.** The commit that carries
+    the change set takes its subject from the `commit_message` field of the
+    success outcome — an English Conventional Commits header — so the harness
+    never authors a message of its own and the commit describes the payload it
+    really contains.
+
 ---
 
 ## 2. Mental Model & Ontology ("What")
@@ -165,7 +171,7 @@ declared external generator may produce ignored output without failing the turn.
 ### 2.5 Addressing a range: echoed text or anchors
 
 A change set has to say *which* lines it replaces. Two strategies exist, and the
-project declares one of them in `[develop] patch_strategy`:
+project declares one of them in `[repl] patch_strategy`:
 
 | Strategy | A range is addressed by | Cost of one range |
 | --- | --- | --- |

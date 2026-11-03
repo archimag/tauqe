@@ -11,17 +11,14 @@ pub const TAUQE_CO_AUTHOR_TRAILER: &str = "Co-authored-by: Tauqe AI <noreply@tau
 pub const CHECKPOINT_PREFIX: &str = "tauqe-checkpoint:";
 pub const STEP_PREFIX: &str = "tauqe-step:";
 
-/// Repository-relative path of the tracked external reference registry.
+/// Repository-relative directory holding the harness state.
 ///
-/// The ignore scheme below is the reason this path is declared here: the
-/// registry is the one tracked artifact inside the harness state directory, so
-/// the rules have to name it exactly to keep it reachable while every sibling
-/// stays excluded. `tauqe_core::refs` re-exports the declaration as the location
-/// it reads.
-pub const REFS_MANIFEST: &str = ".tauqe/refs/refs.md";
-
-/// Repository-relative directory holding the tracked registry material.
-pub const REFS_DIR: &str = ".tauqe/refs";
+/// The whole directory is excluded from Git. It holds the credentials file, the
+/// transaction marker, the durable plan, review, history, and cached
+/// documentation documents, and the staging siblings of an interrupted atomic
+/// write, none of which belongs to a change set. The exclusion is installed
+/// fail-closed and verified before a checkpoint commit runs.
+const STATE_DIR: &str = ".tauqe";
 
 /// On-disk marker recording an open Git transaction, relative to the repository
 /// root. It lives under the gitignored `.tauqe/` directory so it never becomes
@@ -103,6 +100,24 @@ impl<'de> Deserialize<'de> for TransactionBase {
     }
 }
 
+/// The phase of the capture a transaction marker records.
+///
+/// A dirty-tree checkpoint writes the marker twice: once before the developer's
+/// work is committed, and once after the checkpoint commit exists. The phase is
+/// what tells a reader which of the two writes it observes, so the marker
+/// describes a running transaction as faithfully as a settled one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TransactionPhase {
+    /// The capture is in progress: the marker is durable, but the developer's
+    /// work has not been committed into a checkpoint commit yet.
+    Capturing,
+    /// The capture is settled: the transaction state the marker records is
+    /// final and survives without a later rewrite.
+    #[default]
+    Established,
+}
+
 /// Checkpoint information representing saved pre-edit developer state.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CheckpointInfo {
@@ -111,6 +126,13 @@ pub struct CheckpointInfo {
     /// earlier revisions already wrote.
     #[serde(rename = "previous_head")]
     pub base: TransactionBase,
+    /// The phase the marker was written in.
+    ///
+    /// A marker written by an earlier revision carries no such key, so a
+    /// missing `phase` decodes as [`TransactionPhase::Established`] and keeps
+    /// the meaning that revision gave it.
+    #[serde(default)]
+    pub phase: TransactionPhase,
 }
 
 /// Resolves the path of the transaction marker for the given repository root.
@@ -154,17 +176,11 @@ fn commit_listing(dir: &Path, rev_range: &str) -> Vec<String> {
 /// marker, never a truncated or empty document that `read_transaction_marker`
 /// would decode as `None` and thereby hide an open transaction.
 ///
-/// One ordering window remains: the checkpoint commit becomes durable before
-/// the marker that records it is written. A crash between the two leaves the
-/// repository holding the checkpoint commit but no marker, and recovery
-/// deliberately leaves such a repository untouched because its contract
-/// requires the marker as proof; the developer's captured work remains
-/// recoverable inside the checkpoint commit with standard Git tooling. Writing
-/// the marker before the commit was rejected deliberately: with the current
-/// [`CheckpointInfo`] semantics it would open a window in which recovery
-/// hard-resets the recorded base while the developer's changes sit only in the
-/// index or in a commit the trailer proof does not recognize, destroying work
-/// the current order always preserves.
+/// Both writes of a capture go through this function: the marker that precedes
+/// the checkpoint commit and the marker that records it. The document therefore
+/// states the phase of the transaction at every instant, so no ordering of the
+/// commit and the marker can leave captured work behind a marker that does not
+/// name it.
 fn write_transaction_marker(dir: &Path, checkpoint: &CheckpointInfo) -> Result<()> {
     let path = transaction_marker_path(dir);
     if let Some(parent) = path.parent() {
@@ -359,20 +375,12 @@ fn reclaim_staging_sibling(path: &Path, dir: &Path, name: &str) -> bool {
     false
 }
 
-/// Name of the harness state directory, derived from the tracked registry
-/// location so the directory is never written out a second time.
-fn state_dir_name() -> &'static str {
-    REFS_DIR
-        .split_once('/')
-        .map_or(REFS_DIR, |(state_dir, _)| state_dir)
-}
-
 /// Reclaims staging artifacts inside the harness state directory.
 ///
 /// The worktree walk deliberately stops at the state directory, because it
-/// holds live harness state — credentials, the tracked reference registry, the
-/// transaction marker, and the regular plan, review, history, and reference
-/// documents — that no sweep may touch. The atomic replacement that persists
+/// holds live harness state — credentials, the transaction marker, and the
+/// regular plan, review, history, and cached documentation documents — that no
+/// sweep may touch. The atomic replacement that persists
 /// those documents stages its payload inside this same directory, so a crashed
 /// write leaves an orphan the worktree walk cannot reach. This bounded
 /// companion walks the state directory with the same discipline and reclaims
@@ -381,7 +389,7 @@ fn state_dir_name() -> &'static str {
 /// state directory reclaims nothing.
 fn cleanup_state_dir_staging_files(root: &Path) -> usize {
     let mut cleaned = 0;
-    let mut dirs_to_visit = vec![root.join(state_dir_name())];
+    let mut dirs_to_visit = vec![root.join(STATE_DIR)];
 
     while let Some(current_dir) = dirs_to_visit.pop() {
         let entries = match std::fs::read_dir(&current_dir) {
@@ -414,6 +422,87 @@ fn cleanup_state_dir_staging_files(root: &Path) -> usize {
 
     cleaned
 }
+/// Appends the staging-artifact count a sweep reclaimed to a recovery message.
+fn with_cleaned_artifacts(message: &str, cleaned_artifacts: usize) -> String {
+    if cleaned_artifacts == 0 {
+        return message.to_string();
+    }
+    format!("{message}, cleaned up {cleaned_artifacts} orphaned staging artifact(s)")
+}
+
+/// Recovers a transaction whose marker still records the capturing phase.
+///
+/// A capturing marker is durable before the developer's work becomes a
+/// checkpoint commit, so a crash leaves exactly one of two recoverable states:
+/// the commit never reached HEAD and the working tree still holds every change
+/// the capture was about to record, or the commit reached HEAD and only the
+/// rewrite that records it is missing. Both states are recognized against the
+/// recorded base — the commit HEAD still names, or the parent of the checkpoint
+/// commit — and every other shape is refused, mirroring the discipline of the
+/// established path.
+///
+/// An unwind failure propagates with the marker left in place: the pre-unwind
+/// state is intact, so a later startup retries the same recovery.
+fn recover_capturing_transaction(
+    dir: &Path,
+    checkpoint: &CheckpointInfo,
+    cleaned_artifacts: usize,
+) -> Result<Option<String>> {
+    let head = run_git(Some(dir), &["rev-parse", "--verify", "--quiet", "HEAD"])
+        .ok()
+        .map(|head| head.trim().to_string())
+        .filter(|head| !head.is_empty());
+    let head_subject = run_git(Some(dir), &["log", "-1", "--format=%s"])
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+    let head_is_checkpoint = head.is_some() && head_subject.starts_with(CHECKPOINT_PREFIX);
+    let checkpoint_parent = if head_is_checkpoint {
+        run_git(Some(dir), &["rev-parse", "--verify", "--quiet", "HEAD^"])
+            .ok()
+            .map(|parent| parent.trim().to_string())
+            .filter(|parent| !parent.is_empty())
+    } else {
+        None
+    };
+
+    // The capture crashed before it committed, so the working tree still holds
+    // the developer's changes and only the marker is stale.
+    let crashed_before_commit = match &checkpoint.base {
+        TransactionBase::Commit(base) => head.as_deref() == Some(base.as_str()),
+        TransactionBase::Unborn => head.is_none(),
+    };
+    if crashed_before_commit {
+        clear_transaction_marker(dir);
+        return Ok(Some(with_cleaned_artifacts(
+            "Closed an interrupted capture: no checkpoint commit was created and the working tree was left untouched",
+            cleaned_artifacts,
+        )));
+    }
+
+    // The capture committed, but crashed before the rewrite that records it.
+    // The commit's parent pins it to the recorded base, so a checkpoint commit
+    // produced against another revision is never mistaken for this one.
+    let crashed_after_commit = head_is_checkpoint
+        && match &checkpoint.base {
+            TransactionBase::Commit(base) => checkpoint_parent.as_deref() == Some(base.as_str()),
+            // The checkpoint commit of an unborn base is the repository root.
+            TransactionBase::Unborn => checkpoint_parent.is_none(),
+        };
+    if crashed_after_commit {
+        unwind_checkpoint_if_present(dir)
+            .context("Failed to unwind the checkpoint commit of an interrupted capture")?;
+        clear_transaction_marker(dir);
+        return Ok(Some(with_cleaned_artifacts(
+            "Recovered interrupted capture: unwound the checkpoint commit and returned the captured work to the working tree",
+            cleaned_artifacts,
+        )));
+    }
+
+    Ok(Some(
+        "Skipped crash recovery: the capturing transaction does not match the repository state; repository left untouched.".to_string(),
+    ))
+}
 
 /// Recovers repository state from an interrupted/crashed workflow.
 ///
@@ -423,7 +512,12 @@ fn cleanup_state_dir_staging_files(root: &Path) -> usize {
 /// a hand-written commit or a step commit from another branch after a checkout —
 /// is never mistaken for a dangling transaction.
 ///
-/// When the marker is present, every commit the transaction recorded on top
+/// A marker whose phase is still `capturing` describes a crash inside the
+/// capture itself, before the rewrite that records the checkpoint commit, so
+/// it is resolved against HEAD and the recorded base instead of a commit
+/// range.
+///
+/// When a settled marker is present, every commit the transaction recorded on top
 /// of its base must carry the Tauqe co-author trailer — for a born base, the
 /// commits between the base and HEAD, with the base still an ancestor of
 /// HEAD; for an unborn base, every commit reachable from HEAD. Otherwise
@@ -451,6 +545,17 @@ pub fn recover_interrupted_workflow(dir: &Path) -> Result<Option<String>> {
             return Ok(None);
         }
     };
+    // A capturing marker describes a crash inside the capture itself: the
+    // developer's work may or may not have reached a checkpoint commit, and no
+    // rewrite has recorded the outcome yet. The phase therefore selects the
+    // recovery, because the established proof below authorizes history
+    // rewriting only for a settled transaction.
+    match checkpoint.phase {
+        TransactionPhase::Capturing => {
+            return recover_capturing_transaction(dir, &checkpoint, cleaned_artifacts);
+        }
+        TransactionPhase::Established => {}
+    }
 
     // Collect the commits the transaction recorded on top of its base. They
     // must all be Tauqe-created; anything else means this is not a dangling
@@ -569,28 +674,18 @@ pub fn recover_interrupted_workflow(dir: &Path) -> Result<Option<String>> {
     }
 }
 
-/// Ensures that `.tauqe` and sensitive credential/runtime files are ignored by Git in the
-/// Git ignore rules that hide the harness state while keeping the tracked
-/// registry reachable.
+/// Returns the ignore rules that hide the harness state and the credentials.
 ///
-/// `.git/info/exclude` follows gitignore semantics: within one file the last
-/// matching rule wins, and Git descends into a directory only while no rule
-/// ignores it. The state directory is therefore re-included first, then the
-/// registry directory, and finally the manifest file, so every level of the
-/// tracked path stays reachable while each sibling under the state directory
-/// stays excluded.
-///
-/// The state directory is derived from the manifest location instead of being
-/// written out again, because a negation re-opens descent only when it names
-/// the exact ancestor of the path it protects.
+/// The whole state directory is excluded, so nothing the harness persists there
+/// — the credentials file, the transaction marker, the durable plan, review,
+/// history, and cached documentation documents, and the staging siblings of an
+/// interrupted atomic write — can reach a checkpoint commit. The credential
+/// files at the repository root are named explicitly, and the two staging
+/// suffixes keep a crashed write out of the index until recovery reclaims it.
 fn tauqe_ignore_rules() -> Vec<String> {
-    let state_dir = state_dir_name();
     vec![
-        format!("!{state_dir}"),
-        format!("{state_dir}/*"),
-        format!("!{REFS_DIR}/"),
-        format!("{REFS_DIR}/*"),
-        format!("!{REFS_MANIFEST}"),
+        format!("{STATE_DIR}/"),
+        format!("{STATE_DIR}/credentials.toml"),
         "credentials.toml".to_string(),
         ".credentials.toml".to_string(),
         "*.tauqe-tmp*".to_string(),
@@ -598,16 +693,13 @@ fn tauqe_ignore_rules() -> Vec<String> {
     ]
 }
 
-/// Ensures that the harness state and sensitive credential/runtime files are
-/// ignored by Git in the repository's local exclude configuration
-/// (`.git/info/exclude`), protecting them without modifying tracked project
-/// files.
+/// Ensures that the harness state and the credential files are ignored by Git in
+/// the repository's local exclude configuration (`.git/info/exclude`),
+/// protecting them without modifying tracked project files.
 ///
-/// The tracked reference registry lives inside the state directory, so the
-/// rules re-include it instead of hiding the whole tree. A rule written by an
-/// earlier revision is left in place: within one exclude file a later rule
-/// overrides an earlier one, so the negation re-opens a directory that rule had
-/// excluded and the manifest becomes trackable without rewriting the file.
+/// A rule written by an earlier revision is left in place: within one exclude
+/// file a later rule overrides an earlier one, and a repeated run recognises the
+/// rules of the scheme it wrote instead of appending them a second time.
 pub fn ensure_tauqe_ignored(dir: &Path) -> Result<()> {
     let git_dir_res = run_git(Some(dir), &["rev-parse", "--git-dir"]);
     if let Ok(git_dir_str) = git_dir_res {
@@ -708,6 +800,12 @@ fn verify_protected_paths_ignored(dir: &Path) -> Result<()> {
 
 /// Creates a safe checkpoint of uncommitted changes before applying AI modifications.
 ///
+/// A tree holding uncommitted work is captured in two phases: the marker that
+/// announces the capture is made durable first, and it is rewritten once the
+/// checkpoint commit records the work. A crash inside the capture is therefore
+/// always described by a marker, whichever of the two writes it interrupted,
+/// instead of leaving the captured work inside a commit nothing names.
+///
 /// `hooks` is the hook policy the temporary checkpoint commit follows.
 pub fn create_checkpoint(dir: &Path, hooks: GitHooks) -> Result<CheckpointInfo> {
     // The ignore rules are the only mechanism that keeps the credential file out
@@ -718,21 +816,34 @@ pub fn create_checkpoint(dir: &Path, hooks: GitHooks) -> Result<CheckpointInfo> 
     let status = run_git(Some(dir), &["status", "--porcelain"]).unwrap_or_default();
     let is_dirty = !status.trim().is_empty();
 
+    // A resolving HEAD names the commit the transaction starts from; a failing
+    // one means the branch is unborn, which the marker records as the typed
+    // unborn state rather than the moving ref `HEAD`.
+    let base = match run_git(Some(dir), &["rev-parse", "HEAD"]) {
+        Ok(head) => TransactionBase::Commit(head.trim().to_string()),
+        Err(_) => TransactionBase::Unborn,
+    };
+
     if !is_dirty {
-        // A resolving HEAD names the commit the transaction starts from; a
-        // failing one means the branch is unborn, which the marker records
-        // as the typed unborn state rather than the moving ref `HEAD`.
-        let base = match run_git(Some(dir), &["rev-parse", "HEAD"]) {
-            Ok(head) => TransactionBase::Commit(head.trim().to_string()),
-            Err(_) => TransactionBase::Unborn,
-        };
         let checkpoint = CheckpointInfo {
             created_checkpoint_commit: false,
             base,
+            phase: TransactionPhase::Established,
         };
         write_transaction_marker(dir, &checkpoint)?;
         return Ok(checkpoint);
     }
+
+    // Announce the capture before it starts. Without this write a crash between
+    // the commit below and the marker that records it would leave the captured
+    // work inside a checkpoint commit that no marker authorizes recovery to
+    // name.
+    let capturing = CheckpointInfo {
+        created_checkpoint_commit: false,
+        base,
+        phase: TransactionPhase::Capturing,
+    };
+    write_transaction_marker(dir, &capturing)?;
 
     // Stage and commit uncommitted user changes into a checkpoint commit.
     // Ignored paths (.tauqe, credentials, temporary files) in .git/info/exclude
@@ -757,6 +868,7 @@ pub fn create_checkpoint(dir: &Path, hooks: GitHooks) -> Result<CheckpointInfo> 
     let checkpoint = CheckpointInfo {
         created_checkpoint_commit: true,
         base: TransactionBase::Commit(new_head),
+        phase: TransactionPhase::Established,
     };
     write_transaction_marker(dir, &checkpoint)?;
     Ok(checkpoint)

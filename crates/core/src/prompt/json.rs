@@ -177,7 +177,7 @@ impl PromptProtocol for JsonPromptProtocol {
             ModelResult::Answer { .. } => {}
         }
 
-        // Discovery: context requests and repository searches.
+        // Research: context requests and repository searches.
         for request in structured.parse_context_requests(raw_text) {
             commands.push(LlmCommand::ContextRequest {
                 path: request.path,
@@ -227,6 +227,12 @@ impl PromptProtocol for JsonPromptProtocol {
             commands.push(LlmCommand::DocRequest { topic });
         }
 
+        // External project documents decoded from the structured
+        // `outer_doc_requests` field, falling back to control tags.
+        for id in structured.parse_outer_doc_requests(raw_text) {
+            commands.push(LlmCommand::OuterDocRequest { id });
+        }
+
         // Ephemeral working memory decoded from the structured `scratchpad` field.
         if let Some(notes) = structured.parse_scratchpad(raw_text) {
             commands.push(LlmCommand::Scratchpad { notes });
@@ -237,9 +243,9 @@ impl PromptProtocol for JsonPromptProtocol {
         // reported twice.
         if let Some(outcome) = structured.parse_terminal_outcome(raw_text) {
             match outcome {
-                TerminalOutcome::Success { summary } => {
+                TerminalOutcome::Success { commit_message } => {
                     commands.push(LlmCommand::Outcome {
-                        outcome: LlmOutcome::Success { summary },
+                        outcome: LlmOutcome::Success { commit_message },
                     });
                 }
                 TerminalOutcome::Error { message } => {
@@ -424,7 +430,7 @@ mod tests {
         for capability in [
             LlmCapability::TextMessage,
             LlmCapability::FileEdits,
-            LlmCapability::Discovery,
+            LlmCapability::Research,
             LlmCapability::DocRequest,
             LlmCapability::ToolchainVerify,
             LlmCapability::PlanCreation,
@@ -598,7 +604,7 @@ mod tests {
     }
 
     #[test]
-    fn test_decode_discovery_requests() {
+    fn test_decode_research_requests() {
         let protocol = JsonPromptProtocol::default();
         let output = r#"{
             "message":"Need more context",
@@ -621,6 +627,51 @@ mod tests {
             path: "crates/core".to_string(),
             regex: "fn execute".to_string(),
         }));
+    }
+
+    #[test]
+    fn test_decode_outer_doc_requests_from_structured_json_and_xml_fallback() {
+        let protocol = JsonPromptProtocol::default();
+
+        // A request names the mount point of one project declaration, and a
+        // blank identifier grants nothing.
+        let output = r#"{
+            "message": "Checking the upstream contract",
+            "changes": [],
+            "outer_doc_requests": ["vendor/api.md", "   ", "mylib"]
+        }"#;
+        let commands = protocol.decode(output, &[]);
+        assert!(commands.contains(&LlmCommand::OuterDocRequest {
+            id: "vendor/api.md".to_string(),
+        }));
+        assert!(commands.contains(&LlmCommand::OuterDocRequest {
+            id: "mylib".to_string(),
+        }));
+        assert_eq!(
+            commands
+                .iter()
+                .filter(|command| matches!(command, LlmCommand::OuterDocRequest { .. }))
+                .count(),
+            2
+        );
+
+        // An idle array requests no document at all.
+        let idle = r#"{"message":"x","changes":[],"outer_doc_requests":[]}"#;
+        assert!(!protocol
+            .decode(idle, &[])
+            .iter()
+            .any(|command| matches!(command, LlmCommand::OuterDocRequest { .. })));
+
+        // Control-tag fallback keeps both transports decoding one payload.
+        let fallback = concat!(
+            "{\"message\":\"Working\",\"changes\":[]}\n",
+            "<outer_doc_request id=\"mylib\" />",
+        );
+        assert!(protocol
+            .decode(fallback, &[])
+            .contains(&LlmCommand::OuterDocRequest {
+                id: "mylib".to_string(),
+            }));
     }
 
     #[test]
@@ -677,7 +728,7 @@ mod tests {
         assert!(protocol.supports(LlmCapability::TextMessage));
         assert!(protocol.supports(LlmCapability::PlanCreation));
         assert!(protocol.supports(LlmCapability::PlanUpdate));
-        assert!(protocol.supports(LlmCapability::Discovery));
+        assert!(protocol.supports(LlmCapability::Research));
         assert!(protocol.supports(LlmCapability::UserLanguage));
         // A plan discussion carries the full dialogue surface, so its transport
         // derives the edit mode and composes the composite registry schema.
@@ -769,7 +820,7 @@ mod tests {
             LlmCapability::TextMessage,
             LlmCapability::PlanCreation,
             LlmCapability::PlanUpdate,
-            LlmCapability::Discovery,
+            LlmCapability::Research,
             LlmCapability::UserLanguage,
         ]);
         let protocol = JsonPromptProtocol::with_capabilities(text_only);
@@ -791,7 +842,7 @@ mod tests {
             LlmCapability::TextMessage,
             LlmCapability::PlanCreation,
             LlmCapability::PlanUpdate,
-            LlmCapability::Discovery,
+            LlmCapability::Research,
             LlmCapability::UserLanguage,
         ]);
         let protocol = JsonPromptProtocol::with_capabilities(conversational);
@@ -897,9 +948,9 @@ mod tests {
         let output = r#"{
             "message": "Need the git chapter",
             "changes": [],
-            "doc_requests": ["git"],
+            "tauqe_doc_requests": ["git"],
             "scratchpad": "Verified: json decoder fixed.",
-            "outcome": {"status": "success", "summary": "All checks passed", "message": ""},
+            "outcome": {"status": "success", "commit_message": "All checks passed", "message": ""},
             "blocked": {"is_blocked": false, "reason": "", "details": ""}
         }"#;
         let commands = protocol.decode(output, &[]);
@@ -912,12 +963,21 @@ mod tests {
         }));
         assert!(commands.contains(&LlmCommand::Outcome {
             outcome: LlmOutcome::Success {
-                summary: Some("All checks passed".to_string()),
+                commit_message: Some("All checks passed".to_string()),
             },
         }));
         assert!(!commands
             .iter()
             .any(|command| matches!(command, LlmCommand::Blocked { .. })));
+
+        // The canonical field is what the strict schema advertises, and the alias
+        // stays a permanent spelling of the same command.
+        let aliased = output.replace("tauqe_doc_requests", "doc_requests");
+        assert!(protocol
+            .decode(&aliased, &[])
+            .contains(&LlmCommand::DocRequest {
+                topic: tauqe_protocol::DocTopic::Git,
+            }));
     }
 
     #[test]
@@ -1032,9 +1092,9 @@ mod tests {
         let output = r#"{
             "message": "Only text",
             "changes": [],
-            "doc_requests": ["git"],
+            "tauqe_doc_requests": ["git"],
             "scratchpad": "notes",
-            "outcome": {"status": "success", "summary": "done", "message": ""},
+            "outcome": {"status": "success", "commit_message": "done", "message": ""},
             "blocked": {"is_blocked": true, "reason": "blocked", "details": ""}
         }"#;
         let commands = protocol.decode(output, &[]);
@@ -1216,13 +1276,15 @@ mod tests {
         let output = r#"{
             "message": "",
             "changes": [],
-            "outcome": {"status": "success", "summary": "  ", "message": "", "reason": ""}
+            "outcome": {"status": "success", "commit_message": "  ", "message": "", "reason": ""}
         }"#;
         let commands = protocol.decode(output, &[]);
         assert_eq!(
             commands,
             vec![LlmCommand::Outcome {
-                outcome: LlmOutcome::Success { summary: None },
+                outcome: LlmOutcome::Success {
+                    commit_message: None
+                },
             }],
             "a payload-free success must decode as a success without a result"
         );
@@ -1272,11 +1334,13 @@ mod tests {
         // and both contours decode one and the same outcome for every status.
         let protocol = JsonPromptProtocol::edits();
 
-        let bare_success = LlmOutcome::Success { summary: None };
+        let bare_success = LlmOutcome::Success {
+            commit_message: None,
+        };
         let structured_success = r#"{
             "message": "",
             "changes": [],
-            "outcome": {"status": "success", "summary": "", "message": "", "reason": ""}
+            "outcome": {"status": "success", "commit_message": "", "message": "", "reason": ""}
         }"#;
         assert_eq!(
             decoded_outcomes(&protocol.decode(structured_success, &[])),
@@ -1323,10 +1387,12 @@ mod tests {
     }
     #[test]
     fn test_decode_review_update_from_structured_json() {
-        // A dialogue anchored on a review session records the decision the
-        // engineer reached as an atomic payload, so the decision travels as a
-        // typed command instead of being folded into the conversational text.
-        let protocol = JsonPromptProtocol::discussion();
+        // A review discussion records the decision the engineer reached as an
+        // atomic payload, so the decision travels as a typed command instead of
+        // being folded into the conversational text. The decision belongs to the
+        // review discussion regime alone, so the transport runs on that surface:
+        // the shared dialogue head never advertises the field.
+        let protocol = JsonPromptProtocol::with_capabilities(CapabilitySet::review_discussion());
         let output = r#"{
             "message": "Recording the decision.",
             "review_update": {

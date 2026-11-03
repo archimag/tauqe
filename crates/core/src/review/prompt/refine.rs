@@ -111,7 +111,7 @@ pub fn build_review_group_refine_system_prompt() -> String {
     out.push_str("   - Detect the primary natural language used in the group title, in its root-cause description, and in the findings.\n");
     out.push_str("   - You MUST formulate all titles, step details, explanations, and reasons strictly in that SAME natural language.\n\n");
 
-    push_architect_discovery_contract(&mut out);
+    push_architect_research_contract(&mut out);
     push_output_format_contract(&mut out);
     out
 }
@@ -131,9 +131,9 @@ fn push_step_granularity_contract(out: &mut String) {
     out.push_str("   - Order steps strictly by prerequisite dependencies (`depends_on`).\n\n");
 }
 
-/// Pushes the discovery contract every decomposition prompt states as rule 7.
-fn push_architect_discovery_contract(out: &mut String) {
-    out.push_str("7. Architect Discovery Protocol (Mandatory Contract Verification):\n");
+/// Pushes the research contract every decomposition prompt states as rule 7.
+fn push_architect_research_contract(out: &mut String) {
+    out.push_str("7. Architect Research Protocol (Mandatory Contract Verification):\n");
     out.push_str("   - You have access to symbol contours in `<repo_map>` and already loaded files in `Active Context Files`.\n");
     out.push_str("   - Eager contour generation may be disabled, so `<repo_map>` can cover only part of the codebase. A module absent from the contours is never evidence that it is empty: request its contours via `repo_maps` before designing a step that touches it.\n");
     out.push_str("   - RepoMap contours are blinkers, not contracts: they reveal only the shape of the codebase (names, kinds, and rough signatures), never exact type definitions, field layouts, trait bounds, error semantics, lifetimes, or crate boundaries.\n");
@@ -313,7 +313,7 @@ pub fn build_review_group_refine_user_prompt(
     out.push_str("2. Synthesize one decomposed, dependency-ordered implementation horizon of leaf steps with `status: \"todo\"` that resolves every finding of the group.\n");
     out.push_str("4. Design strictly within every recorded engineering decision: the question is already answered, so it is never a reason to report `status: \"blocked\"`.\n");
     out.push_str("5. If the group cannot be implemented within the recorded decisions, report `status: \"blocked\"` with `reason`.\n");
-    out.push_str("6. Follow the Architect Discovery Protocol: before designing any step that interacts with an existing interface, type, trait, module, or crate, verify its real contract by reporting `status: \"needs_context\"` with the required `context_requests`, `repo_searches`, or `repo_maps`. Never infer contracts from RepoMap contours alone.\n");
+    out.push_str("6. Follow the Architect Research Protocol: before designing any step that interacts with an existing interface, type, trait, module, or crate, verify its real contract by reporting `status: \"needs_context\"` with the required `context_requests`, `repo_searches`, or `repo_maps`. Never infer contracts from RepoMap contours alone.\n");
     out.push_str("7. Language Directive: Formulate all titles, details, explanations, and reasons strictly in the same natural language as the group and its findings.\n");
 
     out
@@ -452,7 +452,7 @@ mod tests {
         // a gap-free numbering.
         assert!(system.contains("5. Step Granularity and Compilability Invariants:"));
         assert!(system.contains("6. Strict Language Consistency Invariant:"));
-        assert!(system.contains("7. Architect Discovery Protocol"));
+        assert!(system.contains("7. Architect Research Protocol"));
         assert!(system.contains("8. Output Format:"));
     }
 

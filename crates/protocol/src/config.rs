@@ -350,6 +350,7 @@ pub struct SystemStatusResult {
     pub roles: Option<ModelRolesSummary>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub history_model: Option<ModelRef>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub available_models: Vec<ModelRef>,
     /// Diagnostic describing why configuration could not be fully loaded and
     /// built-in defaults were applied instead. Absent when loading succeeded.
@@ -680,5 +681,54 @@ mod tests {
             legacy.model,
             ModelRef::openrouter("anthropic/claude-3.7-sonnet")
         );
+    }
+
+    /// Builds a `SystemStatusResult` carrying every mandatory field, so a test
+    /// can focus on the model catalog alone.
+    fn system_status_without_models() -> SystemStatusResult {
+        SystemStatusResult {
+            has_git: true,
+            has_config: true,
+            config_path: None,
+            default_config_path: "/tmp/tauqe.toml".to_string(),
+            has_api_key: true,
+            credentials_path: None,
+            default_credentials_path: "/tmp/credentials.toml".to_string(),
+            ready: true,
+            model: ModelRef::openrouter("anthropic/claude-3.7-sonnet"),
+            selection: None,
+            roles: None,
+            history_model: None,
+            available_models: Vec::new(),
+            config_error: None,
+        }
+    }
+
+    #[test]
+    fn test_system_status_result_omits_and_backfills_empty_available_models() {
+        // The catalog keeps the same compatibility posture as `ConfigState`:
+        // an empty list contributes no key, and a payload without that key
+        // reads back as an empty catalog instead of failing to decode.
+        let json = serde_json::to_string(&system_status_without_models()).unwrap();
+        assert!(!json.contains("available_models"), "got: {json}");
+
+        let de: SystemStatusResult = serde_json::from_str(&json).unwrap();
+        assert!(de.available_models.is_empty());
+        assert!(de.ready);
+    }
+
+    #[test]
+    fn test_system_status_result_roundtrips_available_models() {
+        let mut status = system_status_without_models();
+        status.available_models = vec![
+            ModelRef::openrouter("anthropic/claude-3.7-sonnet"),
+            ModelRef::openrouter("openai/gpt-4o"),
+        ];
+
+        let json = serde_json::to_string(&status).unwrap();
+        assert!(json.contains("\"available_models\""));
+
+        let de: SystemStatusResult = serde_json::from_str(&json).unwrap();
+        assert_eq!(de.available_models, status.available_models);
     }
 }

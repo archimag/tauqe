@@ -1,7 +1,7 @@
 use crate::edits::protocol::xml::tags::{ParsedPlanItem, ParsedPlanTag};
 use std::path::Path;
 use std::time::SystemTime;
-use tauqe_protocol::{DiscussionPlanAction, DiscussionPlanUpdate, Plan, PlanItem};
+use tauqe_protocol::{DiscussionPlanAction, DiscussionPlanUpdate, Plan, PlanItem, PlanItemStatus};
 
 use super::{PlanApplicationOutcome, PlanMutationMode, PlanStorage};
 
@@ -20,6 +20,99 @@ enum SaveItemsReplacement {
     /// Preserve established items unless the incoming `save` carries a non-empty
     /// item list. Used by the implicit text-tag path.
     Guarded,
+}
+
+/// Reports whether a model mutation may create a step in `status`.
+///
+/// A step enters existence as a draft (`Discussion`) or as pending work (`Todo`).
+/// `InProgress`, `Blocked`, and `Cancelled` belong to the execution pipeline and
+/// to the developer's manual control, while `Done` is protected by the
+/// immutability guard, so none of those statuses can be asserted while a step is
+/// authored.
+fn is_creatable_status(status: PlanItemStatus) -> bool {
+    matches!(status, PlanItemStatus::Todo | PlanItemStatus::Discussion)
+}
+
+/// Status lifecycle barrier of one plan mutation.
+///
+/// The model authors plans, but it never runs them: a step is created only as
+/// `Todo` or `Discussion`, and a mutation never starts an established step. The
+/// barrier repairs a payload that asserts a status the mutation cannot assign
+/// instead of rejecting the whole payload, and records every repair once, in
+/// mutation order, so a caller can surface what was changed.
+struct StatusBarrier<'a> {
+    /// Identifier of the targeted plan, quoted in every repair report.
+    plan_id: String,
+    /// Repairs applied while the payload was normalized.
+    warnings: &'a mut Vec<String>,
+}
+
+impl<'a> StatusBarrier<'a> {
+    /// Creates the barrier of a mutation targeting `plan_id`.
+    fn new(plan_id: &str, warnings: &'a mut Vec<String>) -> Self {
+        Self {
+            plan_id: plan_id.to_string(),
+            warnings,
+        }
+    }
+
+    /// Resolves the status an established step carries after the mutation.
+    ///
+    /// `Done` immutability is enforced separately by the storage barrier, so this
+    /// method owns the one transition a model may never perform: starting a step.
+    /// An assignment that repeats the stored status is not a transition at all,
+    /// so it passes untouched.
+    fn existing(
+        &mut self,
+        item_id: &str,
+        stored: PlanItemStatus,
+        requested: PlanItemStatus,
+    ) -> PlanItemStatus {
+        if requested != PlanItemStatus::InProgress || stored == PlanItemStatus::InProgress {
+            return requested;
+        }
+        self.warnings.push(format!(
+            "Plan '{}': step '{}' cannot be moved to {} by a plan mutation; it keeps {}",
+            self.plan_id, item_id, requested, stored
+        ));
+        stored
+    }
+
+    /// Repairs the status of a step the mutation creates.
+    fn created(&mut self, item: &mut PlanItem) {
+        if is_creatable_status(item.status) {
+            return;
+        }
+        let requested = item.status;
+        item.status = PlanItemStatus::Todo;
+        self.warnings.push(format!(
+            "Plan '{}': new step '{}' requested status {}; created as {} (a new step may only be {} or {})",
+            self.plan_id,
+            item.id,
+            requested,
+            item.status,
+            PlanItemStatus::Todo,
+            PlanItemStatus::Discussion
+        ));
+    }
+
+    /// Applies the barrier to every node a `save` writes against `stored`.
+    ///
+    /// The stored plan separates the two cases: a node whose identifier it
+    /// already carries is an established step, while every other node —
+    /// including the children of a container the save introduces — is being
+    /// created.
+    fn saved(&mut self, stored: &Plan, item: &mut PlanItem) {
+        match stored.find_item(&item.id) {
+            Some(established) => {
+                item.status = self.existing(&item.id, established.status, item.status);
+            }
+            None => self.created(item),
+        }
+        for child in &mut item.children {
+            self.saved(stored, child);
+        }
+    }
 }
 
 impl PlanStorage {
@@ -87,6 +180,7 @@ impl PlanStorage {
         }
 
         let mut applied = Vec::new();
+        let mut warnings: Vec<String> = Vec::new();
         let now = SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)
             .unwrap_or_default()
@@ -96,6 +190,9 @@ impl PlanStorage {
 
         for tag in parsed {
             let action = tag.action.to_lowercase();
+            // Repairs are staged per mutation: a rejected mutation created nothing,
+            // so its notes are discarded together with it.
+            let mut tag_warnings: Vec<String> = Vec::new();
 
             match mode {
                 PlanMutationMode::IsolatedStep => {
@@ -105,10 +202,10 @@ impl PlanStorage {
                     ));
                     continue;
                 }
-                PlanMutationMode::Develop => {
+                PlanMutationMode::Repl => {
                     if action != "save" {
                         errors.push(format!(
-                            "Cannot perform plan action '{}' in Develop mode: only 'save' is permitted (plan modifications and deletions belong exclusively in Discussion mode)",
+                            "Cannot perform plan action '{}' in REPL mode: only 'save' is permitted (plan modifications and deletions belong exclusively in Discussion mode)",
                             action
                         ));
                         continue;
@@ -120,7 +217,7 @@ impl PlanStorage {
                                 .any(|p: &Plan| p.id.eq_ignore_ascii_case(&tag.id));
                     if already_exists {
                         errors.push(format!(
-                            "Cannot modify existing plan '{}' in Develop mode: modifying existing plans belongs exclusively in Discussion mode",
+                            "Cannot modify existing plan '{}' in REPL mode: modifying existing plans belongs exclusively in Discussion mode",
                             tag.id
                         ));
                         continue;
@@ -160,11 +257,17 @@ impl PlanStorage {
                     if !tag.concept.is_empty() || plan.concept.is_empty() {
                         plan.concept = tag.concept;
                     }
-                    let items: Vec<PlanItem> = tag
+                    let mut items: Vec<PlanItem> = tag
                         .items
                         .into_iter()
                         .map(ParsedPlanItem::into_plan_item)
                         .collect();
+                    // The stored plan is the reference of the barrier: it separates
+                    // an established step from one this save creates.
+                    let mut barrier = StatusBarrier::new(&plan.id, &mut tag_warnings);
+                    for item in &mut items {
+                        barrier.saved(&plan, item);
+                    }
                     match replacement {
                         // An explicit replacement always wins, even when it clears
                         // the stored steps.
@@ -186,6 +289,7 @@ impl PlanStorage {
                                 let _ = Self::save_active_id_unlocked(repo_root, Some(&plan.id));
                             }
                             applied.push(plan);
+                            warnings.append(&mut tag_warnings);
                         }
                         Err(err) => {
                             errors.push(format!("Failed to save plan '{}': {:#}", plan.id, err));
@@ -247,11 +351,15 @@ impl PlanStorage {
                             }
                         }
 
-                        fn update_single(items: &mut [PlanItem], update: &ParsedPlanItem) -> bool {
+                        fn update_single(
+                            barrier: &mut StatusBarrier<'_>,
+                            items: &mut [PlanItem],
+                            update: &ParsedPlanItem,
+                        ) -> bool {
                             for item in items.iter_mut() {
                                 if item.id.eq_ignore_ascii_case(&update.id) {
                                     if let Some(s) = update.status {
-                                        item.status = s;
+                                        item.status = barrier.existing(&item.id, item.status, s);
                                     }
                                     if update.details.is_some() {
                                         item.details = update.details.clone();
@@ -273,7 +381,7 @@ impl PlanStorage {
                                     }
                                     return true;
                                 }
-                                if update_single(&mut item.children, update) {
+                                if update_single(barrier, &mut item.children, update) {
                                     return true;
                                 }
                             }
@@ -286,8 +394,9 @@ impl PlanStorage {
                         // both patches established steps and adds new ones.
                         let errors_before = errors.len();
                         let mut added_items: Vec<PlanItem> = Vec::new();
+                        let mut barrier = StatusBarrier::new(&plan.id, &mut tag_warnings);
                         for update_item in &tag.items {
-                            if update_single(&mut plan.items, update_item) {
+                            if update_single(&mut barrier, &mut plan.items, update_item) {
                                 continue;
                             }
                             // Only executable leaves are added this way: creating or
@@ -300,7 +409,12 @@ impl PlanStorage {
                                 ));
                                 continue;
                             }
-                            added_items.push(update_item.clone().into_plan_item());
+                            // A step the stored plan does not contain is being
+                            // created by this mutation, so its status is repaired
+                            // to the only states a created step may carry.
+                            let mut added = update_item.clone().into_plan_item();
+                            barrier.created(&mut added);
+                            added_items.push(added);
                         }
                         plan.items.append(&mut added_items);
 
@@ -313,27 +427,16 @@ impl PlanStorage {
 
                         plan.normalize_leaf_files();
                         plan.refresh_parent_statuses();
-                        // The merged plan is validated as a whole before it reaches
-                        // disk: a repeated identifier, a dependency that does not
-                        // exist, or an unknown concept reference fails the mutation
-                        // instead of being written.
-                        if let Err(plan_errors) = plan.validate() {
-                            errors.push(format!(
-                                "Cannot apply update to plan '{}': {}",
-                                plan.id,
-                                plan_errors
-                                    .iter()
-                                    .map(|e| e.to_string())
-                                    .collect::<Vec<_>>()
-                                    .join("; ")
-                            ));
-                            continue;
-                        }
+                        // The structural verdict belongs to the storage barrier:
+                        // `save_plan_unlocked` validates the whole plan before a
+                        // byte reaches disk, so this branch never restates the
+                        // rules the single write path already enforces.
 
                         plan.updated_at = now;
                         match Self::save_plan_unlocked(repo_root, &plan) {
                             Ok(()) => {
                                 applied.push(plan);
+                                warnings.append(&mut tag_warnings);
                             }
                             Err(err) => {
                                 errors.push(format!(
@@ -379,7 +482,17 @@ impl PlanStorage {
             }
         }
 
-        PlanApplicationOutcome { applied, errors }
+        // Every repair is reported twice: in the outcome, so a caller can surface
+        // it, and in the journal, because a normalized status is a real event in
+        // the lifecycle of the plan rather than a silent rewrite.
+        for warning in &warnings {
+            tracing::warn!("{}", warning);
+        }
+        PlanApplicationOutcome {
+            applied,
+            errors,
+            warnings,
+        }
     }
 
     /// Applies a structured `DiscussionPlanUpdate` directly to local plan storage.
@@ -443,6 +556,7 @@ impl PlanStorage {
                         "Cannot save plan '{}': plan must contain a concept tree defining architectural intent and invariants",
                         plan_id
                     )],
+                    warnings: Vec::new(),
                 };
             }
 
@@ -571,8 +685,10 @@ Step 1 is done:
                 details: None,
                 status: PlanItemStatus::Todo,
                 blocked_reason: None,
+                commit: None,
                 files: vec!["src/t.rs".to_string()],
                 readonly_files: vec![],
+                outer_docs: vec![],
                 concept_refs: vec![],
                 depends_on: vec![],
                 children: vec![],
@@ -581,7 +697,7 @@ Step 1 is done:
         PlanStorage::save_plan(root, &valid_plan).unwrap();
 
         let update_item_missing =
-            "<plan action=\"update\" id=\"my-plan\"><item id=\"99\" status=\"done\" /></plan>";
+            "<plan action=\"update\" id=\"my-plan\"><item id=\"99\" status=\"done\" files=\"src/extra.rs\" /></plan>";
         let res_item = PlanStorage::apply_plan_tags(root, update_item_missing);
         assert_eq!(res_item.applied.len(), 1);
         assert!(res_item.errors.is_empty(), "Errors: {:?}", res_item.errors);
@@ -589,7 +705,11 @@ Step 1 is done:
         let added = reloaded
             .find_item("99")
             .expect("an unknown step must be added by update");
-        assert_eq!(added.status, PlanItemStatus::Done);
+        // The step is created by the mutation, so the execution status it asked
+        // for is repaired to the only creatable state and reported.
+        assert_eq!(added.status, PlanItemStatus::Todo);
+        assert_eq!(res_item.warnings.len(), 1, "{:?}", res_item.warnings);
+        assert!(res_item.warnings[0].contains("new step '99'"));
     }
 
     #[test]
@@ -608,6 +728,21 @@ Step 1 is done:
         let seeded = PlanStorage::apply_plan_tags(root, initial);
         assert!(seeded.errors.is_empty(), "Errors: {:?}", seeded.errors);
         assert_eq!(seeded.applied.len(), 1);
+        // A step enters existence as TODO: the pipeline, not the model, starts it.
+        assert_eq!(
+            seeded.applied[0].find_item("1").unwrap().status,
+            PlanItemStatus::Todo
+        );
+        PlanStorage::update_item(
+            root,
+            "upsert-plan",
+            "1",
+            Some(PlanItemStatus::InProgress),
+            None,
+            None,
+        )
+        .unwrap()
+        .expect("the seeded step must exist");
 
         let update = r#"
 <plan action="update" id="upsert-plan">
@@ -697,7 +832,7 @@ Step 1 is done:
   <concept>
     <concept_item id="c-1" title="Invariant" />
   </concept>
-  <item id="1" title="Step 1" status="todo" />
+  <item id="1" title="Step 1" status="todo" files="src/step1.rs" />
 </plan>
 "#;
         let seeded = PlanStorage::apply_plan_tags(root, initial);
@@ -706,26 +841,26 @@ Step 1 is done:
         // Duplicate identifiers inside the added batch.
         let duplicates = r#"
 <plan action="update" id="validation-plan">
-  <item id="2" title="First" status="todo" />
-  <item id="2" title="Second" status="todo" />
+  <item id="2" title="First" status="todo" files="src/first.rs" />
+  <item id="2" title="Second" status="todo" files="src/second.rs" />
 </plan>
 "#;
         let dup_res = PlanStorage::apply_plan_tags(root, duplicates);
         assert!(dup_res.applied.is_empty());
         assert_eq!(dup_res.errors.len(), 1);
-        assert!(dup_res.errors[0].contains("Cannot apply update to plan 'validation-plan'"));
+        assert!(dup_res.errors[0].contains("Cannot save plan 'validation-plan'"));
         assert!(dup_res.errors[0].contains("Duplicate step ID: '2'"));
 
         // A new step naming a dependency that does not exist.
         let dangling = r#"
 <plan action="update" id="validation-plan">
-  <item id="3" title="Step 3" status="todo" deps="99" />
+  <item id="3" title="Step 3" status="todo" deps="99" files="src/step3.rs" />
 </plan>
 "#;
         let dangling_res = PlanStorage::apply_plan_tags(root, dangling);
         assert!(dangling_res.applied.is_empty());
         assert_eq!(dangling_res.errors.len(), 1);
-        assert!(dangling_res.errors[0].contains("Cannot apply update to plan 'validation-plan'"));
+        assert!(dangling_res.errors[0].contains("Cannot save plan 'validation-plan'"));
         assert!(dangling_res.errors[0].contains("references non-existent dependency '99'"));
 
         // Restructuring the tree is not a delta update operation.
@@ -770,8 +905,10 @@ Step 1 is done:
                 details: Some("Schemas and filters".to_string()),
                 status: PlanItemStatus::InProgress,
                 blocked_reason: None,
+                commit: None,
                 files: vec!["src/protocol_types.rs".to_string()],
                 readonly_files: vec![],
+                outer_docs: vec![],
                 concept_refs: vec![],
                 depends_on: vec![],
                 children: vec![],
@@ -799,8 +936,10 @@ Step 1 is done:
                 details: Some("Updated details".to_string()),
                 status: PlanItemStatus::InProgress,
                 blocked_reason: None,
+                commit: None,
                 files: vec!["src/protocol_types.rs".to_string()],
                 readonly_files: vec![],
+                outer_docs: vec![],
                 concept_refs: vec![],
                 depends_on: vec![],
                 children: vec![],
@@ -830,6 +969,7 @@ Step 1 is done:
             vec![PlanItem {
                 id: "1".to_string(),
                 title: "Step 1".to_string(),
+                files: vec!["src/step1.rs".to_string()],
                 ..Default::default()
             }],
         );
@@ -885,6 +1025,7 @@ Step 1 is done:
                 id: "1".to_string(),
                 title: "Step 1".to_string(),
                 status: PlanItemStatus::Todo,
+                files: vec!["src/step-alpha.rs".to_string()],
                 ..Default::default()
             }],
         );
@@ -899,6 +1040,7 @@ Step 1 is done:
                 id: "1".to_string(),
                 title: "Step 1".to_string(),
                 status: PlanItemStatus::Todo,
+                files: vec!["src/step-beta.rs".to_string()],
                 ..Default::default()
             }],
         );
@@ -939,14 +1081,26 @@ Step 1 is done:
   <concept>
     <concept_item id="c-1" title="Concept" />
   </concept>
-  <item id="1" title="Step 1" status="in_progress" />
-  <item id="2" title="Step 2" status="todo" />
+  <item id="1" title="Step 1" status="in_progress" files="src/step1.rs" />
+  <item id="2" title="Step 2" status="todo" files="src/step2.rs" />
 </plan>
 "#;
         let seeded = PlanStorage::apply_plan_tags(root, initial);
         assert!(seeded.errors.is_empty(), "Errors: {:?}", seeded.errors);
         assert_eq!(seeded.applied.len(), 1);
         assert_eq!(seeded.applied[0].items.len(), 2);
+        // Steps are authored as TODO, so the IN_PROGRESS status this fixture needs
+        // is assigned through the pipeline before the save is refreshed.
+        PlanStorage::update_item(
+            root,
+            "guarded-save",
+            "1",
+            Some(PlanItemStatus::InProgress),
+            None,
+            None,
+        )
+        .unwrap()
+        .expect("the seeded step must exist");
 
         // A text-tag save that only refreshes the concept must not erase the steps.
         let concept_only = r#"
@@ -986,8 +1140,8 @@ Step 1 is done:
   <concept>
     <concept_item id="c-1" title="Concept" />
   </concept>
-  <item id="1" title="Step 1" status="todo" />
-  <item id="2" title="Step 2" status="todo" />
+  <item id="1" title="Step 1" status="todo" files="src/step1.rs" />
+  <item id="2" title="Step 2" status="todo" files="src/step2.rs" />
 </plan>
 "#;
         let seeded = PlanStorage::apply_plan_tags(root, initial);
@@ -1019,7 +1173,7 @@ Step 1 is done:
   <concept>
     <concept_item id="c-1" title="Core Invariant" />
   </concept>
-  <item id="1" title="Step 1" status="todo" />
+  <item id="1" title="Step 1" status="todo" files="src/step1.rs" />
 </plan>
 "#;
 
@@ -1033,33 +1187,33 @@ Step 1 is done:
         assert_eq!(res_isolated.errors.len(), 1);
         assert!(res_isolated.errors[0].contains("isolated step execution"));
 
-        // 2. Develop mode permits saving a new plan
-        let res_develop_save =
-            PlanStorage::apply_plan_tags_with_mode(root, initial_plan, PlanMutationMode::Develop);
-        assert_eq!(res_develop_save.applied.len(), 1);
-        assert!(res_develop_save.errors.is_empty());
+        // 2. REPL mode permits saving a new plan
+        let res_repl_save =
+            PlanStorage::apply_plan_tags_with_mode(root, initial_plan, PlanMutationMode::Repl);
+        assert_eq!(res_repl_save.applied.len(), 1);
+        assert!(res_repl_save.errors.is_empty());
 
-        // 3. Develop mode forbids updating an existing plan
+        // 3. REPL mode forbids updating an existing plan
         let update_text = r#"
 <plan action="update" id="plan-mode-test">
   <item id="1" status="done" />
 </plan>
 "#;
-        let res_develop_update =
-            PlanStorage::apply_plan_tags_with_mode(root, update_text, PlanMutationMode::Develop);
-        assert!(res_develop_update.applied.is_empty());
-        assert_eq!(res_develop_update.errors.len(), 1);
-        assert!(res_develop_update.errors[0].contains("in Develop mode: only 'save' is permitted"));
+        let res_repl_update =
+            PlanStorage::apply_plan_tags_with_mode(root, update_text, PlanMutationMode::Repl);
+        assert!(res_repl_update.applied.is_empty());
+        assert_eq!(res_repl_update.errors.len(), 1);
+        assert!(res_repl_update.errors[0].contains("in REPL mode: only 'save' is permitted"));
 
-        // 4. Develop mode forbids deleting a plan
+        // 4. REPL mode forbids deleting a plan
         let delete_text = r#"<plan action="delete" id="plan-mode-test" />"#;
-        let res_develop_delete =
-            PlanStorage::apply_plan_tags_with_mode(root, delete_text, PlanMutationMode::Develop);
-        assert!(res_develop_delete.applied.is_empty());
-        assert_eq!(res_develop_delete.errors.len(), 1);
-        assert!(res_develop_delete.errors[0].contains("in Develop mode: only 'save' is permitted"));
+        let res_repl_delete =
+            PlanStorage::apply_plan_tags_with_mode(root, delete_text, PlanMutationMode::Repl);
+        assert!(res_repl_delete.applied.is_empty());
+        assert_eq!(res_repl_delete.errors.len(), 1);
+        assert!(res_repl_delete.errors[0].contains("in REPL mode: only 'save' is permitted"));
 
-        // 5. Develop mode forbids modifying an existing plan even with action="save"
+        // 5. REPL mode forbids modifying an existing plan even with action="save"
         let overwrite_text = r#"
 <plan action="save" id="plan-mode-test" title="Overwritten">
   <concept>
@@ -1067,12 +1221,12 @@ Step 1 is done:
   </concept>
 </plan>
 "#;
-        let res_develop_overwrite =
-            PlanStorage::apply_plan_tags_with_mode(root, overwrite_text, PlanMutationMode::Develop);
-        assert!(res_develop_overwrite.applied.is_empty());
-        assert_eq!(res_develop_overwrite.errors.len(), 1);
-        assert!(res_develop_overwrite.errors[0]
-            .contains("Cannot modify existing plan 'plan-mode-test' in Develop mode"));
+        let res_repl_overwrite =
+            PlanStorage::apply_plan_tags_with_mode(root, overwrite_text, PlanMutationMode::Repl);
+        assert!(res_repl_overwrite.applied.is_empty());
+        assert_eq!(res_repl_overwrite.errors.len(), 1);
+        assert!(res_repl_overwrite.errors[0]
+            .contains("Cannot modify existing plan 'plan-mode-test' in REPL mode"));
 
         // 6. Discussion mode permits update
         let res_disc_update =
@@ -1159,5 +1313,114 @@ Step 1 is done:
             vec!["crates/protocol/src/lib.rs"]
         );
         assert_eq!(plan2.items[0].depends_on, vec!["2"]);
+    }
+
+    #[test]
+    fn test_new_steps_are_created_only_as_todo_or_discussion() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+
+        let saved = r#"
+<plan action="save" id="lifecycle-plan" title="Lifecycle">
+  <concept>
+    <concept_item id="c-1" title="Invariant" />
+  </concept>
+  <item id="1" title="Pending" status="todo" files="src/step1.rs" />
+  <item id="2" title="Draft" status="discussion" files="src/step2.rs" />
+  <item id="3" title="Running" status="in_progress" files="src/step3.rs" />
+  <item id="4" title="Finished" status="done" files="src/step4.rs" />
+  <item id="5" title="Stalled" status="blocked" files="src/step5.rs" />
+  <item id="6" title="Dropped" status="cancelled" files="src/step6.rs" />
+</plan>
+"#;
+        let outcome = PlanStorage::apply_plan_tags(root, saved);
+        assert!(outcome.errors.is_empty(), "Errors: {:?}", outcome.errors);
+        assert_eq!(outcome.applied.len(), 1);
+
+        // A created step keeps only the two authoring statuses; every execution
+        // status the payload asked for is repaired and reported.
+        assert_eq!(outcome.warnings.len(), 4, "{:?}", outcome.warnings);
+
+        let plan = PlanStorage::load_plan(root, "lifecycle-plan")
+            .unwrap()
+            .unwrap();
+        assert_eq!(plan.find_item("1").unwrap().status, PlanItemStatus::Todo);
+        assert_eq!(
+            plan.find_item("2").unwrap().status,
+            PlanItemStatus::Discussion
+        );
+        for id in ["3", "4", "5", "6"] {
+            assert_eq!(
+                plan.find_item(id).unwrap().status,
+                PlanItemStatus::Todo,
+                "step {id}"
+            );
+            assert!(
+                outcome
+                    .warnings
+                    .iter()
+                    .any(|warning| warning.contains(&format!("new step '{id}'"))),
+                "step {id}: {:?}",
+                outcome.warnings
+            );
+        }
+    }
+
+    #[test]
+    fn test_model_cannot_move_an_existing_step_into_progress() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+
+        let saved = r#"
+<plan action="save" id="lifecycle-repair" title="Lifecycle Repair">
+  <concept>
+    <concept_item id="c-1" title="Invariant" />
+  </concept>
+  <item id="1" title="Step 1" status="todo" files="src/step1.rs" />
+</plan>
+"#;
+        let seeded = PlanStorage::apply_plan_tags(root, saved);
+        assert!(seeded.errors.is_empty(), "Errors: {:?}", seeded.errors);
+
+        let update = r#"
+<plan action="update" id="lifecycle-repair">
+  <item id="1" title="Step 1 refined" status="in_progress" />
+</plan>
+"#;
+        let outcome = PlanStorage::apply_plan_tags(root, update);
+        assert!(outcome.errors.is_empty(), "Errors: {:?}", outcome.errors);
+        assert_eq!(outcome.applied.len(), 1);
+        assert_eq!(outcome.warnings.len(), 1, "{:?}", outcome.warnings);
+        assert!(outcome.warnings[0].contains("cannot be moved to IN_PROGRESS"));
+
+        let plan = PlanStorage::load_plan(root, "lifecycle-repair")
+            .unwrap()
+            .unwrap();
+        let step = plan.find_item("1").expect("step 1 must exist");
+        // The rest of the patch still applies: only the lifecycle assignment is
+        // refused, and the step keeps the status it carried.
+        assert_eq!(step.title, "Step 1 refined");
+        assert_eq!(step.status, PlanItemStatus::Todo);
+
+        // Starting a step belongs to the execution pipeline. A mutation that
+        // repeats the status the step already carries requests no transition, so
+        // it passes untouched.
+        PlanStorage::update_item(
+            root,
+            "lifecycle-repair",
+            "1",
+            Some(PlanItemStatus::InProgress),
+            None,
+            None,
+        )
+        .unwrap()
+        .expect("the seeded step must exist");
+        let repeated = PlanStorage::apply_plan_tags(root, update);
+        assert!(repeated.errors.is_empty(), "Errors: {:?}", repeated.errors);
+        assert!(repeated.warnings.is_empty(), "{:?}", repeated.warnings);
+        assert_eq!(
+            repeated.applied[0].find_item("1").unwrap().status,
+            PlanItemStatus::InProgress
+        );
     }
 }

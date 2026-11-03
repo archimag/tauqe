@@ -5,8 +5,8 @@ repository glob matcher that resolves it, and the categorical staging rejection 
 a turn away from the artifacts its own change set is judged with.
 
 A change set is judged by something. A `Justfile` says how the tree is verified, a
-specification says what an implementation must satisfy, and a reference manifest says which
-external documents the harness may fetch. Each of those files is the yardstick of a turn,
+specification says what an implementation must satisfy, and a configuration layer declares
+the harness policy itself. Each of those files is the yardstick of a turn,
 and a turn able to rewrite its own yardstick can make verification agree with itself.
 Protection keeps the yardstick out of the turn's hands without taking it out of its sight: a
 protected path stays tracked, stays readable, and stays impossible to modify.
@@ -26,8 +26,9 @@ The same argument reaches one step away from the gate:
 
 - a specification states what an implementation must satisfy, so an implementation able to
   rewrite the specification can weaken the requirement instead of meeting it;
-- a reference manifest declares which external documents the harness may fetch, so a turn
-  able to rewrite it could choose its own sources;
+- a modular configuration layer declares the harness policy a project runs under — budgets,
+  role ladders, external documentation — so a turn able to rewrite one could reshape the
+  rules it is judged by;
 - a generated source that a post-hook overwrites describes the contract its consumers
   compile against, so a turn able to edit it can move the goalposts of the very code it was
   asked to write.
@@ -105,14 +106,16 @@ rejections stay separate down to their typed errors.
 
 ```toml
 [project.boundaries]
-protected = ["Justfile", "docs/specs/**", ".tauqe/refs/refs.md"]
+protected = ["Justfile", "docs/specs/**", "tauqe.d/**"]
 ```
 
 The subsection carries one list and no command line, which makes it the part of the
 `[project]` declaration that runs no process. This repository declares exactly the three
-patterns above: the `Justfile` owns the verification lifecycle, the specifications state what
-an implementation must satisfy, and the reference manifest declares which external documents
-the harness may fetch. Each of them judges a change set rather than being judged by one.
+patterns above: the `Justfile` owns the verification lifecycle, the specifications under
+`docs/specs/` state what an implementation must satisfy, and the configuration layers under
+`tauqe.d/` declare the harness policy — budgets, role ladders, and the external
+documentation a project may read. Each of them judges a change set rather than being judged
+by one.
 
 ### 2.3 What a pattern covers
 
@@ -144,7 +147,7 @@ one thing in context selection and another in staging.
 | --- | --- |
 | Git tracking | tracked, reviewable, and committed by the developer like any other file |
 | Context access | requestable; the contract rule asks for it as `read_only` |
-| Discovery | admitted exactly like any tracked file, with no special case |
+| Research | admitted exactly like any tracked file, with no special case |
 | Staging admission | no mutating operation is admitted |
 
 The rows do not imply one another, and the last two are the ones most often conflated:
@@ -226,7 +229,8 @@ identically in the interactive dialogue and in a plan discussion.
 
 A turn that genuinely needs a different contract has one honest move: state it. A
 specification the task contradicts, a verification recipe that cannot express the check the
-change needs, and a manifest that must name a new source are semantic blockers, not edits. The
+change needs, and a configuration layer that must declare a new external source are semantic
+blockers, not edits. The
 harness then replans around the boundary instead of the turn rewriting it.
 
 Reading, by contrast, is unrestricted. A protected path enters the turn as read-only context

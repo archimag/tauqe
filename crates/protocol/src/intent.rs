@@ -32,8 +32,10 @@ use serde::{Deserialize, Serialize};
 /// The variants are mutually exclusive execution regimes:
 ///
 /// - [`TurnIntent::InteractiveRepl`] is a free interactive dialogue started
-///   from the REPL, including a dialogue anchored on a review session.
+///   from the REPL.
 /// - [`TurnIntent::PlanDiscussion`] is an architectural discussion of a plan.
+/// - [`TurnIntent::ReviewDiscussion`] is a dialogue anchored on a review
+///   session or on one of its groups.
 /// - [`TurnIntent::IsolatedStep`] is the isolated execution of one plan step
 ///   or one review finding.
 /// - [`TurnIntent::ArchitectSynthesis`] is an Architect projecting the
@@ -48,6 +50,12 @@ pub enum TurnIntent {
     InteractiveRepl,
     /// Architectural discussion of a plan.
     PlanDiscussion,
+    /// Dialogue anchored on a review session or on one of its groups.
+    ///
+    /// The decision recorded for a discussed finding is authorized by this
+    /// regime alone, so a surface narrowed to it carries the review decision
+    /// while every other regime stays without it.
+    ReviewDiscussion,
     /// Isolated execution of one plan step or one review finding.
     IsolatedStep,
     /// Architect horizon synthesis: the Architect projects the unfinished
@@ -71,6 +79,10 @@ impl TurnIntent {
     pub fn is_plan_discussion(self) -> bool {
         matches!(self, Self::PlanDiscussion)
     }
+    /// Reports whether this is a dialogue anchored on a review session.
+    pub fn is_review_discussion(self) -> bool {
+        matches!(self, Self::ReviewDiscussion)
+    }
 
     /// Reports whether this is an Architect horizon synthesis.
     pub fn is_architect_synthesis(self) -> bool {
@@ -91,15 +103,16 @@ impl TurnIntent {
     /// The mapping is the single source of truth for the pair of typed lists a
     /// turn composes: the core surface that renders into the byte-stable head
     /// shared by every dialogue contour, and the contour delta that renders into
-    /// the trailing user message. The review discussion inherits
-    /// [`TurnIntent::InteractiveRepl`], so it composes the shared head with an
-    /// empty delta instead of a profile of its own.
+    /// the trailing user message. A review discussion composes the same shared
+    /// head with the review decision in its delta, so switching the dialogue
+    /// focus leaves the head unchanged and extends the tail alone.
     pub fn regime_profile(self) -> CapabilityProfile {
         match self {
             Self::InteractiveRepl => CapabilityProfile::interactive_repl(),
             Self::PlanDiscussion => CapabilityProfile::discussion(),
+            Self::ReviewDiscussion => CapabilityProfile::review_discussion(),
             Self::IsolatedStep => CapabilityProfile::isolated_step(),
-            Self::ArchitectSynthesis => CapabilityProfile::architect_discovery(),
+            Self::ArchitectSynthesis => CapabilityProfile::architect_research(),
         }
     }
     /// Narrows a protocol capability set to what this turn intent permits.
@@ -115,6 +128,8 @@ impl TurnIntent {
     ///   mutation.
     /// - [`TurnIntent::PlanDiscussion`] keeps the discussion profile: the
     ///   dialogue head plus the plan mutation the regime authorizes.
+    /// - [`TurnIntent::ReviewDiscussion`] keeps the review-discussion profile:
+    ///   the shared dialogue head plus the decision the regime authorizes.
     /// - [`TurnIntent::IsolatedStep`] keeps the isolated-step profile and drops
     ///   toolchain verification, because the harness owns verification for a
     ///   step deterministically.
@@ -133,10 +148,13 @@ impl TurnIntent {
                 Self::intersect(capabilities, &CapabilitySet::interactive_repl())
             }
             Self::PlanDiscussion => Self::intersect(capabilities, &CapabilitySet::discussion()),
+            Self::ReviewDiscussion => {
+                Self::intersect(capabilities, &CapabilitySet::review_discussion())
+            }
             Self::IsolatedStep => Self::intersect(capabilities, &CapabilitySet::isolated_step())
                 .without(LlmCapability::ToolchainVerify),
             Self::ArchitectSynthesis => {
-                Self::intersect(capabilities, &CapabilitySet::architect_discovery())
+                Self::intersect(capabilities, &CapabilitySet::architect_research())
             }
         }
     }
@@ -156,9 +174,10 @@ impl TurnIntent {
 mod tests {
     use super::*;
 
-    const ALL: [TurnIntent; 4] = [
+    const ALL: [TurnIntent; 5] = [
         TurnIntent::InteractiveRepl,
         TurnIntent::PlanDiscussion,
+        TurnIntent::ReviewDiscussion,
         TurnIntent::IsolatedStep,
         TurnIntent::ArchitectSynthesis,
     ];
@@ -169,6 +188,7 @@ mod tests {
             let flags = [
                 intent.is_interactive_repl(),
                 intent.is_plan_discussion(),
+                intent.is_review_discussion(),
                 intent.is_isolated_step(),
                 intent.is_architect_synthesis(),
             ];
@@ -183,6 +203,7 @@ mod tests {
 
         assert!(TurnIntent::InteractiveRepl.is_interactive_repl());
         assert!(TurnIntent::PlanDiscussion.is_plan_discussion());
+        assert!(TurnIntent::ReviewDiscussion.is_review_discussion());
         assert!(TurnIntent::IsolatedStep.is_isolated_step());
     }
 
@@ -191,6 +212,7 @@ mod tests {
         let cases = [
             (TurnIntent::InteractiveRepl, "\"interactive_repl\""),
             (TurnIntent::PlanDiscussion, "\"plan_discussion\""),
+            (TurnIntent::ReviewDiscussion, "\"review_discussion\""),
             (TurnIntent::IsolatedStep, "\"isolated_step\""),
             (TurnIntent::ArchitectSynthesis, "\"architect_synthesis\""),
         ];
@@ -206,6 +228,7 @@ mod tests {
     fn test_suppresses_session_history_covers_the_non_dialogue_regimes() {
         assert!(!TurnIntent::InteractiveRepl.suppresses_session_history());
         assert!(!TurnIntent::PlanDiscussion.suppresses_session_history());
+        assert!(!TurnIntent::ReviewDiscussion.suppresses_session_history());
         assert!(TurnIntent::IsolatedStep.suppresses_session_history());
         assert!(TurnIntent::ArchitectSynthesis.suppresses_session_history());
     }
@@ -215,8 +238,8 @@ mod tests {
         let advertised = CapabilitySet::from_slice(LlmCapability::ALL);
         let narrowed = TurnIntent::ArchitectSynthesis.narrow_capabilities(&advertised);
 
-        assert_eq!(narrowed, CapabilitySet::architect_discovery());
-        assert!(narrowed.contains(LlmCapability::Discovery));
+        assert_eq!(narrowed, CapabilitySet::architect_research());
+        assert!(narrowed.contains(LlmCapability::Research));
         assert!(narrowed.contains(LlmCapability::PlanCreation));
         assert!(narrowed.contains(LlmCapability::PlanUpdate));
         assert!(narrowed.contains(LlmCapability::Scratchpad));
@@ -280,7 +303,7 @@ mod tests {
         let narrowed = TurnIntent::PlanDiscussion.narrow_capabilities(&advertised);
 
         assert!(narrowed.contains(LlmCapability::TextMessage));
-        assert!(narrowed.contains(LlmCapability::Discovery));
+        assert!(narrowed.contains(LlmCapability::Research));
         assert!(narrowed.contains(LlmCapability::DocRequest));
         assert!(narrowed.contains(LlmCapability::PlanCreation));
         assert!(narrowed.contains(LlmCapability::PlanUpdate));
@@ -298,12 +321,34 @@ mod tests {
     }
 
     #[test]
+    fn test_narrow_capabilities_review_discussion_grants_the_recorded_decision() {
+        // The review decision is authorized by the review-discussion regime
+        // alone: a surface that advertises the whole capability set narrows to
+        // the shared dialogue head plus the decision.
+        let advertised = CapabilitySet::from_slice(LlmCapability::ALL);
+        let narrowed = TurnIntent::ReviewDiscussion.narrow_capabilities(&advertised);
+        assert_eq!(narrowed, CapabilitySet::review_discussion());
+        assert!(narrowed.contains(LlmCapability::ReviewUpdate));
+        assert!(narrowed.contains(LlmCapability::FileEdits));
+        assert!(narrowed.contains(LlmCapability::PlanCreation));
+        assert!(!narrowed.contains(LlmCapability::PlanUpdate));
+
+        // The decision lives in the delta of its profile, never in the shared
+        // dialogue head. Narrowing a base surface that cannot carry the
+        // decision therefore never invents it.
+        let head_only =
+            TurnIntent::ReviewDiscussion.narrow_capabilities(&CapabilitySet::interactive_repl());
+        assert_eq!(head_only, CapabilitySet::interactive_repl());
+        assert!(!head_only.contains(LlmCapability::ReviewUpdate));
+    }
+
+    #[test]
     fn test_narrow_capabilities_isolated_step_drops_plan_verification_and_documentation() {
         let advertised = CapabilitySet::from_slice(LlmCapability::ALL);
         let narrowed = TurnIntent::IsolatedStep.narrow_capabilities(&advertised);
 
         assert!(narrowed.contains(LlmCapability::FileEdits));
-        assert!(narrowed.contains(LlmCapability::Discovery));
+        assert!(narrowed.contains(LlmCapability::Research));
         assert!(narrowed.contains(LlmCapability::Blocked));
         assert!(!narrowed.contains(LlmCapability::PlanCreation));
         assert!(!narrowed.contains(LlmCapability::PlanUpdate));
@@ -352,7 +397,7 @@ mod tests {
         ] {
             let narrowed = TurnIntent::IsolatedStep.narrow_capabilities(&base);
             assert!(narrowed.contains(LlmCapability::FileEdits));
-            assert!(narrowed.contains(LlmCapability::Discovery));
+            assert!(narrowed.contains(LlmCapability::Research));
         }
     }
 
@@ -398,7 +443,7 @@ mod tests {
         );
         assert_eq!(
             TurnIntent::ArchitectSynthesis.regime_profile(),
-            CapabilityProfile::architect_discovery()
+            CapabilityProfile::architect_research()
         );
     }
 
@@ -421,13 +466,14 @@ mod tests {
         assert_eq!(discussion.delta().as_slice(), &[LlmCapability::PlanUpdate]);
         assert!(!discussion.core().contains(LlmCapability::PlanUpdate));
 
-        // The delta list is the sanctioned extension point: a review-specific
-        // capability would join the review delta without touching the head, and
-        // none is built today.
+        // The delta list is the sanctioned extension point: the decision a
+        // review discussion records joins the review delta without touching the
+        // head, exactly as plan mutation joins the plan delta.
         assert_eq!(
             interactive.surface().as_slice(),
             CapabilitySet::from_slice(LlmCapability::ALL)
                 .without(LlmCapability::PlanUpdate)
+                .without(LlmCapability::ReviewUpdate)
                 .as_slice()
         );
     }

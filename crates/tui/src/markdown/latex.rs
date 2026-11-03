@@ -889,10 +889,10 @@ mod tests {
     #[test]
     fn test_text_wrapper_and_display_math() {
         let input =
-            r"$$\text{Prompt} \longrightarrow \text{Discovery Phase} \longrightarrow \dots$$";
+            r"$$\text{Prompt} \longrightarrow \text{Research Phase} \longrightarrow \dots$$";
         assert_eq!(
             convert_latex_to_unicode(input),
-            "Prompt ⟶ Discovery Phase ⟶ …"
+            "Prompt ⟶ Research Phase ⟶ …"
         );
     }
 

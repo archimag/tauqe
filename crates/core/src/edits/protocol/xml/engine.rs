@@ -102,6 +102,27 @@ const fn control_spec(
     }
 }
 
+/// Builds a declared alias of a capability control tag.
+///
+/// An alias realizes no capability of its own: every consumer resolves it
+/// through the canonical spelling of the module that still accepts it, so it
+/// decodes, streams, and is stripped exactly like the tag it stands for, while
+/// the operational surface of a turn advertises the canonical name alone.
+const fn alias_spec(
+    base_name: &'static str,
+    close_mode: TagCloseMode,
+    marker_policy: MarkerPolicy,
+) -> XmlTagSpec {
+    XmlTagSpec {
+        base_name,
+        capability: None,
+        close_mode,
+        marker_policy,
+        child_tags: &[],
+        is_control_tag: true,
+        stream_suppress_unmarked: true,
+    }
+}
 /// Builds a nested container tag spec.
 const fn container_spec(
     base_name: &'static str,
@@ -166,37 +187,52 @@ pub(crate) const XML_TAG_SPECS: &[XmlTagSpec] = &[
     // Capability control tags.
     control_spec(
         "context_request",
-        LlmCapability::Discovery,
+        LlmCapability::Research,
         TagCloseMode::Simple,
         MarkerPolicy::Strict,
     ),
     control_spec(
         "repo_search",
-        LlmCapability::Discovery,
+        LlmCapability::Research,
         TagCloseMode::Simple,
         MarkerPolicy::Strict,
     ),
     control_spec(
         "repo_dirs",
-        LlmCapability::Discovery,
+        LlmCapability::Research,
         TagCloseMode::Simple,
         MarkerPolicy::Strict,
     ),
     control_spec(
         "repo_map",
-        LlmCapability::Discovery,
+        LlmCapability::Research,
         TagCloseMode::Simple,
         MarkerPolicy::Strict,
     ),
     control_spec(
         "dir_list",
-        LlmCapability::Discovery,
+        LlmCapability::Research,
         TagCloseMode::Simple,
         MarkerPolicy::Strict,
     ),
+    // Canonical spelling of the internal documentation channel, followed by the
+    // pre-canonical spelling that stays decodable as a permanent alias. The
+    // alias realizes no capability of its own: it resolves through the canonical
+    // name, so the prompt and the operational surface advertise one spelling.
     control_spec(
-        "doc_request",
+        "tauqe_doc_request",
         LlmCapability::DocRequest,
+        TagCloseMode::Simple,
+        MarkerPolicy::Strict,
+    ),
+    alias_spec("doc_request", TagCloseMode::Simple, MarkerPolicy::Strict),
+    // External project documentation. A request names one entry the project
+    // declares in `[[outer_docs]]`, never a cache path: where the materialized
+    // copy lives is decided by the harness, so the tag carries only the
+    // identifier of that declaration and the model never guesses a location.
+    control_spec(
+        "outer_doc_request",
+        LlmCapability::OuterDocRequest,
         TagCloseMode::Simple,
         MarkerPolicy::Strict,
     ),
@@ -299,7 +335,7 @@ pub(crate) const XML_TAG_SPECS: &[XmlTagSpec] = &[
     spec("description", TagCloseMode::Control, false),
     spec("details", TagCloseMode::Control, false),
     spec("title", TagCloseMode::Control, false),
-    // Retired discovery tag kept only so marker normalization stays tolerant.
+    // Retired context-drop tag kept only so marker normalization stays tolerant.
     spec("context_drop", TagCloseMode::Control, false),
 ];
 
@@ -451,20 +487,32 @@ pub(crate) fn find_next_tag_with_fences<'a>(
 }
 
 /// Locates the next complete tag of `spec` and decomposes it.
-pub(crate) fn find_next_tag<'a>(text: &'a str, spec: &XmlTagSpec) -> Option<XmlTagMatch<'a>> {
+///
+/// Every production caller threads a code index through
+/// [`find_next_tag_with_fences`], so this single-tag helper stays available to
+/// the engine tests, which probe one tag family at a time.
+#[cfg(test)]
+pub(crate) fn find_next_tag<'a>(
+    text: &'a str,
+    spec: &'static XmlTagSpec,
+) -> Option<XmlTagMatch<'a>> {
     find_next_tag_with_fences(text, spec, 0, &CodeFences::find(text))
 }
 
-/// Iterates every match of `spec` in `text`, in order.
-pub(crate) fn iter_tags<'a>(
+/// Iterates every match of `spec` in `text`, reusing a precomputed code index.
+///
+/// The index describes the text alone, so a caller that probes several tag
+/// families over one buffer builds it once and threads it through instead of
+/// rescanning the markdown code of the same text once per family.
+pub(crate) fn iter_tags_with_fences<'a>(
     text: &'a str,
     spec: &'static XmlTagSpec,
+    fences: &CodeFences,
 ) -> std::vec::IntoIter<XmlTagMatch<'a>> {
-    let fences = CodeFences::find(text);
     let mut matches = Vec::new();
     let mut pos = 0;
     while pos < text.len() {
-        let Some(found) = find_next_tag_with_fences(text, spec, pos, &fences) else {
+        let Some(found) = find_next_tag_with_fences(text, spec, pos, fences) else {
             break;
         };
         pos = found.end.max(pos + 1);
@@ -473,11 +521,49 @@ pub(crate) fn iter_tags<'a>(
     matches.into_iter()
 }
 
-/// Removes every occurrence of the tags declared by `spec`.
-pub(crate) fn strip_tag_by_spec(text: &str, spec: &'static XmlTagSpec) -> String {
+/// Collects the trimmed value of one attribute from every occurrence of `spec`.
+///
+/// A tag that omits the attribute, or carries a blank one, contributes nothing,
+/// so a command whose whole payload is a repeated attribute — a mount point, a
+/// name — reads one rule instead of restating the trimming and the emptiness
+/// check at every call site. Iteration follows the order of the text, so
+/// identical markup always yields identical values.
+pub(crate) fn attribute_values_with_fences(
+    text: &str,
+    spec: &'static XmlTagSpec,
+    attribute: &str,
+    fences: &CodeFences,
+) -> Vec<String> {
+    iter_tags_with_fences(text, spec, fences)
+        .filter_map(|found| found.attr(attribute))
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .collect()
+}
+
+/// Iterates every match of `spec` in `text`, in order.
+///
+/// Every production caller threads the code index of its text through
+/// [`iter_tags_with_fences`], so this convenience form stays available to the
+/// engine tests, which probe one tag family at a time.
+#[cfg(test)]
+pub(crate) fn iter_tags<'a>(
+    text: &'a str,
+    spec: &'static XmlTagSpec,
+) -> std::vec::IntoIter<XmlTagMatch<'a>> {
+    iter_tags_with_fences(text, spec, &CodeFences::find(text))
+}
+
+/// Removes every occurrence of the tags declared by `spec`, reusing a
+/// precomputed code index.
+pub(crate) fn strip_tag_by_spec_with_fences(
+    text: &str,
+    spec: &'static XmlTagSpec,
+    fences: &CodeFences,
+) -> String {
     let mut out = String::new();
     let mut cursor = 0;
-    for found in iter_tags(text, spec) {
+    for found in iter_tags_with_fences(text, spec, fences) {
         out.push_str(&text[cursor..found.start]);
         cursor = found.end;
     }
@@ -485,16 +571,43 @@ pub(crate) fn strip_tag_by_spec(text: &str, spec: &'static XmlTagSpec) -> String
     out
 }
 
+/// Removes every occurrence of the tags declared by `spec`.
+pub(crate) fn strip_tag_by_spec(text: &str, spec: &'static XmlTagSpec) -> String {
+    strip_tag_by_spec_with_fences(text, spec, &CodeFences::find(text))
+}
+
 /// Removes every control tag from text, leaving edit blocks untouched.
 ///
 /// Code-modification tags belong to the edit contour and are stripped by that
 /// contour, so only capability and protocol-only control tags are removed here.
+///
+/// The markdown code index depends on the text alone, so it is built once and
+/// every control family resolves its matches against the same unmodified
+/// buffer. Collecting the ranges before anything is spliced keeps every offset
+/// consistent with that one index, and two overlapping matches collapse into a
+/// single removal instead of depending on the registry declaration order.
 pub(crate) fn strip_all_control_tags(text: &str) -> String {
-    let mut text = text.to_string();
+    let fences = CodeFences::find(text);
+    let mut ranges: Vec<(usize, usize)> = Vec::new();
     for spec in XML_TAG_SPECS.iter().filter(|spec| spec.is_control()) {
-        text = strip_tag_by_spec(&text, spec);
+        ranges.extend(
+            iter_tags_with_fences(text, spec, &fences).map(|found| (found.start, found.end)),
+        );
     }
-    text
+    if ranges.is_empty() {
+        return text.to_string();
+    }
+    ranges.sort_unstable();
+    let mut out = String::with_capacity(text.len());
+    let mut removed_until = 0;
+    for (start, end) in ranges {
+        if start >= removed_until {
+            out.push_str(&text[removed_until..start]);
+        }
+        removed_until = removed_until.max(end);
+    }
+    out.push_str(&text[removed_until..]);
+    out
 }
 
 /// Re-activates unmarked hidden control tags that marker normalization
@@ -527,7 +640,6 @@ pub(crate) fn activate_unmarked_hidden_tags(normalized: &str, marker: &str) -> S
     restored
 }
 
-/// Locates the earliest complete control tag in `text`.
 /// One classified step of the accumulated stream buffer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ScanStep {
@@ -987,7 +1099,7 @@ mod tests {
     fn registry_assigns_capabilities_policies_and_close_modes() {
         assert_eq!(
             spec_of("context_request").capability,
-            Some(LlmCapability::Discovery)
+            Some(LlmCapability::Research)
         );
         assert_eq!(
             spec_of("verify").capability,
@@ -1004,11 +1116,11 @@ mod tests {
         assert!(allows_unmarked_fallback("scratchpad"));
         assert_eq!(
             spec_of("repo_dirs").capability,
-            Some(LlmCapability::Discovery)
+            Some(LlmCapability::Research)
         );
         assert_eq!(
             spec_of("repo_map").capability,
-            Some(LlmCapability::Discovery)
+            Some(LlmCapability::Research)
         );
         assert_eq!(spec_of("repo_map").close_mode, TagCloseMode::Simple);
         assert!(spec_of("repo_map").is_control());
@@ -1020,7 +1132,7 @@ mod tests {
 
         assert_eq!(
             spec_of("dir_list").capability,
-            Some(LlmCapability::Discovery)
+            Some(LlmCapability::Research)
         );
         assert_eq!(spec_of("dir_list").close_mode, TagCloseMode::Simple);
         assert!(spec_of("dir_list").is_control());
@@ -1036,6 +1148,25 @@ mod tests {
         assert_eq!(spec_of("abort").close_mode, TagCloseMode::Control);
         assert!(spec_of("abort").is_control());
         assert!(!allows_unmarked_fallback("abort"));
+
+        // The internal documentation channel publishes one canonical spelling
+        // that realizes the capability and one declared alias that realizes no
+        // capability of its own.
+        assert_eq!(
+            spec_of("tauqe_doc_request").capability,
+            Some(LlmCapability::DocRequest)
+        );
+        assert_eq!(
+            spec_of("tauqe_doc_request").close_mode,
+            TagCloseMode::Simple
+        );
+        assert!(spec_of("tauqe_doc_request").is_control());
+        assert!(!allows_unmarked_fallback("tauqe_doc_request"));
+        assert_eq!(spec_of("doc_request").capability, None);
+        assert_eq!(spec_of("doc_request").close_mode, TagCloseMode::Simple);
+        assert!(spec_of("doc_request").is_control());
+        assert!(spec_of("doc_request").stream_suppress_unmarked);
+        assert!(!allows_unmarked_fallback("doc_request"));
     }
 
     #[test]
@@ -1142,7 +1273,10 @@ mod tests {
 
         let immediately_closed = "<doc_request topic=\"git\"></doc_request>";
         assert!(find_next_tag_bounds(immediately_closed, spec_of("doc_request")).is_some());
-
+        // The canonical spelling of the same channel delimits a tag identically,
+        // so neither spelling depends on the other.
+        let canonical_doc = "<tauqe_doc_request topic=\"git\" />";
+        assert!(find_next_tag_bounds(canonical_doc, spec_of("tauqe_doc_request")).is_some());
         let suffixed = "<context_request_AB12 path=\"a.rs\" />";
         assert!(find_next_tag_bounds(suffixed, spec_of("context_request")).is_some());
 
@@ -1318,6 +1452,29 @@ mod tests {
         assert_eq!(
             &text[matches[1].start..matches[1].end],
             "<verify target=\"all\" />"
+        );
+    }
+
+    #[test]
+    fn attribute_values_skip_missing_and_blank_attributes() {
+        // A mount point is the whole payload of the request, so an invocation
+        // that states none grants nothing.
+        let text = "<outer_doc_request id=\"mylib\" /><outer_doc_request id=\"  \" /><outer_doc_request />";
+        let fences = CodeFences::find(text);
+        assert_eq!(
+            attribute_values_with_fences(text, spec_of("outer_doc_request"), "id", &fences),
+            vec!["mylib".to_string()]
+        );
+
+        // A quoted value keeps its inner spaces while the surrounding
+        // whitespace is trimmed, and repetition stays visible: materializing a
+        // declared document once is decided by the phase that owns the round.
+        let repeated =
+            "<outer_doc_request id=\" vendor/api.md \" /><outer_doc_request id=\"mylib\" />";
+        let fences = CodeFences::find(repeated);
+        assert_eq!(
+            attribute_values_with_fences(repeated, spec_of("outer_doc_request"), "id", &fences),
+            vec!["vendor/api.md".to_string(), "mylib".to_string()]
         );
     }
 }

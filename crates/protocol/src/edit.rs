@@ -135,6 +135,24 @@ pub struct EditHunkEvent {
     pub operation_id: String,
     pub path: String,
     pub hunk_index: usize,
+    /// One-based first line of the hunk in the file before the change.
+    ///
+    /// `0` states that the position is unknown, so a client never prints a line
+    /// number the harness did not resolve.
+    #[serde(default)]
+    pub old_start: usize,
+    /// Number of source lines the hunk covers.
+    #[serde(default)]
+    pub old_lines: usize,
+    /// One-based first line of the hunk in the file after the change.
+    #[serde(default)]
+    pub new_start: usize,
+    /// Number of result lines the hunk covers.
+    #[serde(default)]
+    pub new_lines: usize,
+    /// Section the hunk belongs to, as a diff header names it after its ranges.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_hint: Option<String>,
     pub old_text: String,
     pub new_text: String,
 }
@@ -318,5 +336,44 @@ mod tests {
             serde_json::from_str(r#"{"applied":true,"changed_files":[],"commit_hash":null}"#)
                 .unwrap();
         assert!(legacy.verification.is_none());
+    }
+
+    #[test]
+    fn test_edit_hunk_event_carries_the_hunk_coordinates() {
+        let hunk = EditHunkEvent {
+            operation_id: "op-1".to_string(),
+            path: "src/lib.rs".to_string(),
+            hunk_index: 0,
+            old_start: 12,
+            old_lines: 2,
+            new_start: 12,
+            new_lines: 3,
+            context_hint: Some("fn run() {".to_string()),
+            old_text: "a\nb\n".to_string(),
+            new_text: "a\nb\nc\n".to_string(),
+        };
+        let json = serde_json::to_string(&hunk).unwrap();
+        assert!(json.contains("\"old_start\":12"), "{json}");
+        assert!(json.contains("\"new_lines\":3"), "{json}");
+        assert!(json.contains("\"context_hint\":\"fn run() {\""), "{json}");
+
+        // The coordinates describe the change on both sides, so a client prints
+        // real line numbers instead of counting the rows of its own rendering.
+        let decoded: EditHunkEvent = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded.old_start, 12);
+        assert_eq!(decoded.old_lines, 2);
+        assert_eq!(decoded.new_start, 12);
+        assert_eq!(decoded.new_lines, 3);
+        assert_eq!(decoded.context_hint.as_deref(), Some("fn run() {"));
+
+        // A payload produced before the coordinates existed stays decodable and
+        // reports unknown coordinates rather than failing to parse.
+        let legacy: EditHunkEvent = serde_json::from_str(
+            r#"{"operation_id":"op-1","path":"a.rs","hunk_index":1,"old_text":"x","new_text":"y"}"#,
+        )
+        .unwrap();
+        assert_eq!(legacy.old_start, 0);
+        assert_eq!(legacy.new_start, 0);
+        assert!(legacy.context_hint.is_none());
     }
 }

@@ -1,10 +1,12 @@
 use serde::{Deserialize, Serialize};
 
-pub const DEFAULT_MAX_DISCOVERY_ROUNDS: usize = 5;
-pub const DEFAULT_FILES_TOKEN_BUDGET: usize = 300_000;
+pub const DEFAULT_MAX_RESEARCH_ROUNDS: usize = 5;
+/// Default aggregate token budget of the context: repository files and the
+/// external documents a project mounts are priced the same way under it.
+pub const DEFAULT_TOKEN_BUDGET: usize = 300_000;
 pub const DEFAULT_INCLUDE_REPO_MAP: bool = true;
 
-/// Default number of repository search queries honored in one Discovery round.
+/// Default number of repository search queries honored in one Research round.
 pub const DEFAULT_MAX_SEARCH_REQUESTS_PER_ROUND: usize = 5;
 
 /// Default number of matching files reported for a single search query.
@@ -13,7 +15,7 @@ pub const DEFAULT_MAX_MATCHED_FILES_PER_SEARCH: usize = 50;
 /// Default number of entries rendered by a single directory listing.
 pub const DEFAULT_MAX_DIR_LIST_ENTRIES: usize = 100;
 
-/// Default number of targeted repository maps rendered in one Discovery round.
+/// Default number of targeted repository maps rendered in one Research round.
 pub const DEFAULT_MAX_REPO_MAP_REQUESTS_PER_ROUND: usize = 3;
 
 /// Default maximum characters of one project command stream reported back.
@@ -22,15 +24,12 @@ pub const DEFAULT_MAX_FEEDBACK_CHARS: usize = 4_000;
 /// Default maximum characters of a turn scratchpad block kept before truncation.
 pub const DEFAULT_MAX_SCRATCHPAD_CHARS: usize = 4_000;
 
-/// Default total token budget of the lazily loaded external reference documents.
-pub const DEFAULT_REFS_TOKEN_BUDGET: usize = 50_000;
-
-fn default_max_discovery_rounds() -> usize {
-    DEFAULT_MAX_DISCOVERY_ROUNDS
+fn default_max_research_rounds() -> usize {
+    DEFAULT_MAX_RESEARCH_ROUNDS
 }
 
-fn default_files_token_budget() -> usize {
-    DEFAULT_FILES_TOKEN_BUDGET
+fn default_token_budget() -> usize {
+    DEFAULT_TOKEN_BUDGET
 }
 
 fn default_include_repo_map() -> bool {
@@ -65,18 +64,24 @@ fn default_max_scratchpad_chars() -> usize {
     DEFAULT_MAX_SCRATCHPAD_CHARS
 }
 
-fn default_refs_token_budget() -> usize {
-    DEFAULT_REFS_TOKEN_BUDGET
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ContextConfig {
     #[serde(default, deserialize_with = "deserialize_pinned")]
     pub pinned: Vec<String>,
-    #[serde(default = "default_max_discovery_rounds")]
-    pub max_discovery_rounds: usize,
-    #[serde(default = "default_files_token_budget")]
-    pub files_token_budget: usize,
+    #[serde(
+        default = "default_max_research_rounds",
+        alias = "max_discovery_rounds"
+    )]
+    pub max_research_rounds: usize,
+    /// Aggregate token budget of the context.
+    ///
+    /// Repository files and the external documents a project mounts are priced
+    /// the same way under this single ceiling, so the key no longer names one
+    /// kind of material. The retired `files_token_budget` spelling stays a
+    /// permanent deserialization alias, so an existing `tauqe.toml` keeps
+    /// loading without a migration.
+    #[serde(default = "default_token_budget", alias = "files_token_budget")]
+    pub token_budget: usize,
     #[serde(default = "default_repomap_token_budget")]
     pub repomap_token_budget: usize,
     #[serde(default = "default_include_repo_map")]
@@ -99,17 +104,14 @@ pub struct ContextConfig {
     /// Characters of a turn scratchpad block kept before safe truncation.
     #[serde(default = "default_max_scratchpad_chars")]
     pub max_scratchpad_chars: usize,
-    /// Total token budget of the external reference documents kept in context.
-    #[serde(default = "default_refs_token_budget")]
-    pub refs_token_budget: usize,
 }
 
 impl Default for ContextConfig {
     fn default() -> Self {
         Self {
             pinned: Vec::new(),
-            max_discovery_rounds: DEFAULT_MAX_DISCOVERY_ROUNDS,
-            files_token_budget: DEFAULT_FILES_TOKEN_BUDGET,
+            max_research_rounds: DEFAULT_MAX_RESEARCH_ROUNDS,
+            token_budget: DEFAULT_TOKEN_BUDGET,
             repomap_token_budget: default_repomap_token_budget(),
             include_repo_map: DEFAULT_INCLUDE_REPO_MAP,
             max_search_requests_per_round: DEFAULT_MAX_SEARCH_REQUESTS_PER_ROUND,
@@ -118,7 +120,6 @@ impl Default for ContextConfig {
             max_repo_map_requests_per_round: DEFAULT_MAX_REPO_MAP_REQUESTS_PER_ROUND,
             max_feedback_chars: DEFAULT_MAX_FEEDBACK_CHARS,
             max_scratchpad_chars: DEFAULT_MAX_SCRATCHPAD_CHARS,
-            refs_token_budget: DEFAULT_REFS_TOKEN_BUDGET,
         }
     }
 }
@@ -192,15 +193,36 @@ mod tests {
         let config: ContextConfig = toml::from_str(
             r#"
             max_pattern_batch = 250
-            files_token_budget = 1234
+            token_budget = 1234
             "#,
         )
         .expect("a retired key must not fail decoding");
 
-        assert_eq!(config.files_token_budget, 1234);
+        assert_eq!(config.token_budget, 1234);
         assert_eq!(
             config.max_search_requests_per_round,
             DEFAULT_MAX_SEARCH_REQUESTS_PER_ROUND
+        );
+    }
+
+    /// The retired `files_token_budget` spelling stays a permanent
+    /// deserialization alias: an existing `tauqe.toml` keeps loading into the
+    /// single canonical budget, while serialization emits the canonical name.
+    #[test]
+    fn test_files_token_budget_is_a_permanent_alias() {
+        let config: ContextConfig =
+            toml::from_str("files_token_budget = 4242\n").expect("the retired spelling decodes");
+
+        assert_eq!(config.token_budget, 4242);
+
+        let serialized = toml::to_string(&config).expect("the configuration serializes");
+        assert!(
+            serialized.contains("token_budget = 4242"),
+            "got: {serialized}"
+        );
+        assert!(
+            !serialized.contains("files_token_budget"),
+            "got: {serialized}"
         );
     }
 }

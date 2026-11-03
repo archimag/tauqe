@@ -174,7 +174,7 @@ async fn preview_window_matches_the_window_the_launch_reads() {
         "src/a.rs",
         tauqe_protocol::ContextAccess::ReadOnly,
     );
-    config.context.files_token_budget = content_tokens.saturating_add(wrapper).saturating_mul(2);
+    config.context.token_budget = content_tokens.saturating_add(wrapper).saturating_mul(2);
     let provider = Arc::new(MockLlmProvider::scripted([MockResponse::text(
         r#"{"summary":"The audited slice is sound.","findings":[]}"#,
     )]));
@@ -237,7 +237,7 @@ async fn a_launch_audits_every_paid_file_beyond_the_retired_batch_cap() {
         tauqe_protocol::ContextAccess::ReadOnly,
     );
     let mut config = test_config();
-    config.context.files_token_budget = content_tokens
+    config.context.token_budget = content_tokens
         .saturating_add(wrapper)
         .saturating_mul(MATCHED);
 
@@ -266,4 +266,63 @@ async fn a_launch_audits_every_paid_file_beyond_the_retired_batch_cap() {
         "no count limits the launch: every paid file is audited"
     );
     assert_eq!(started["omitted_files"].as_u64(), Some(0));
+}
+
+/// A tracked file the window cannot decode is reported on its own counter by
+/// the projection and is never charged to the token budget by the launch: both
+/// shapes describe one window, and neither invents a truncation the budget did
+/// not cause.
+#[tokio::test]
+async fn preview_reports_unreadable_matches_the_launch_never_omits() {
+    let dir = TestDir::new();
+    init_repo_with_files(
+        &dir,
+        &[
+            ("src/a.rs", "pub fn target() {}\n"),
+            ("src/b.rs", "pub fn target() {}\n"),
+        ],
+    );
+    // A tracked non-UTF-8 blob matches the pattern and can never be audited as
+    // source, so it must be counted apart from the budget omissions.
+    std::fs::write(dir.path().join("src/blob.bin"), [0xff, 0xfe, 0x00, 0x01]).unwrap();
+    tauqe_core::git::cmd::stage_files(dir.path(), &["src/blob.bin".to_string()]).unwrap();
+    tauqe_core::git::cmd::commit_with_developer_author(dir.path(), "Add a binary fixture", false)
+        .unwrap();
+    let provider = Arc::new(MockLlmProvider::scripted([MockResponse::text(
+        r#"{"summary":"The audited slice is sound.","findings":[]}"#,
+    )]));
+    let (state, mut events) = state_with_events(&dir, test_config(), provider).await;
+
+    let params = serde_json::json!({ "path_patterns": ["src/"] });
+    let window =
+        projected_window(handle_review_preview(preview_request(params.clone()), &state).await);
+    assert_eq!(window.matched_files, 3);
+    assert_eq!(window.selected_files, 2);
+    assert_eq!(window.unreadable_files, 1);
+    assert_eq!(window.omitted_by_budget, 0);
+    assert!(
+        !window.is_truncated(),
+        "an undecodable match is not a budget truncation"
+    );
+
+    let res = handle_review_start(start_request(params), &state).await;
+    assert!(
+        res.error.is_none(),
+        "the launch must start from the previewed window: {:?}",
+        res.error
+    );
+    let started = drain_until(&mut events, events::REVIEW_STARTED)
+        .await
+        .expect("the launch announces its audit window");
+
+    assert_eq!(
+        started["files_count"].as_u64(),
+        Some((window.context_files + window.selected_files) as u64),
+        "the launch reads exactly the files the projection selected"
+    );
+    assert_eq!(
+        started["omitted_files"].as_u64(),
+        Some(0),
+        "a file nobody could read is never charged to the token budget"
+    );
 }

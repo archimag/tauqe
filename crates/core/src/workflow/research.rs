@@ -1,3 +1,11 @@
+//! Research subsystem of the bounded turn.
+//!
+//! The subsystem executes the investigation commands of one proposal round —
+//! context requests, repository searches, directory outlines and listings, and
+//! documentation — and reconciles the auto context layer those requests widen.
+//! Every capability is a registered handler, so a turn loop dispatches through
+//! the trait instead of branching on the command it decoded.
+
 pub mod journal;
 pub mod search;
 
@@ -13,7 +21,8 @@ use crate::config::ContextConfig;
 use crate::context::ContextManager;
 use crate::edits::protocol::ContextRequest;
 use crate::mockups;
-use crate::refs;
+use crate::outer_docs;
+use crate::outer_docs::MaterializeError;
 
 pub use search::{
     execute_repo_search, execute_repo_searches, format_search_feedback,
@@ -21,14 +30,14 @@ pub use search::{
     MAX_SEARCHABLE_FILE_SIZE, REGEX_DFA_SIZE_LIMIT, REGEX_SIZE_LIMIT,
 };
 
-/// Operational caps applied to one Discovery round.
+/// Operational caps applied to one Research round.
 ///
 /// Every cap that bounds how much material a round may report is resolved from
 /// the project's `[context]` section, so a project that routinely works with
 /// wider searches or larger listings raises the ceilings in `tauqe.toml`
 /// instead of recompiling the engine.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct DiscoveryLimits {
+pub struct ResearchLimits {
     /// Repository search queries honored in one round.
     pub max_search_requests_per_round: usize,
     /// Matching files reported for a single search query.
@@ -37,25 +46,22 @@ pub struct DiscoveryLimits {
     pub max_dir_list_entries: usize,
     /// Distinct targeted map requests honored in one round.
     pub max_repo_map_requests_per_round: usize,
-    /// Total token budget of the external reference documents kept in context.
-    pub refs_token_budget: usize,
 }
 
-impl Default for DiscoveryLimits {
+impl Default for ResearchLimits {
     fn default() -> Self {
         Self::from_context_config(&ContextConfig::default())
     }
 }
 
-impl DiscoveryLimits {
-    /// Reads the Discovery caps declared by the project configuration.
+impl ResearchLimits {
+    /// Reads the Research caps declared by the project configuration.
     pub fn from_context_config(config: &ContextConfig) -> Self {
         Self {
             max_search_requests_per_round: config.max_search_requests_per_round,
             max_matched_files_per_search: config.max_matched_files_per_search,
             max_dir_list_entries: config.max_dir_list_entries,
             max_repo_map_requests_per_round: config.max_repo_map_requests_per_round,
-            refs_token_budget: config.refs_token_budget,
         }
     }
 }
@@ -68,7 +74,7 @@ pub(crate) fn access_satisfies(current: Option<ContextAccess>, requested: Contex
     }
 }
 
-/// Diagnostic details when requested files exceed the configured files token budget.
+/// Diagnostic details when the requested material exceeds the configured token budget.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ContextLimitExceeded {
     pub current_tokens: usize,
@@ -77,15 +83,31 @@ pub struct ContextLimitExceeded {
     pub requested_files: Vec<String>,
 }
 
-/// One external reference document the Refs layer refused to hold.
+/// One external document the OuterDocs layer refused.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RefsRejection {
+pub struct OuterDocsRejection {
     /// Repository-relative cache path the model asked for.
     pub path: String,
-    /// Diagnostic reported by the Refs layer.
+    /// Diagnostic reported by the OuterDocs layer.
     pub reason: String,
 }
 
+/// One declared external document the developer's trust declaration refused.
+///
+/// A trust refusal and a delivery failure are recorded apart because they are
+/// addressed to different readers. A delivery failure stays with the model,
+/// which routes around the material it could not obtain; a trust refusal names
+/// a declaration the repository cannot reach, so it travels outward with the
+/// exact cause and the `[[workspace]]` block that would authorize the source.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OuterDocsTrustRefusal {
+    /// Repository-relative cache path the model asked for.
+    pub path: String,
+    /// Exact cause reported by the developer's trust declaration.
+    pub reason: String,
+    /// Ready-to-paste declaration that would authorize the source, when one exists.
+    pub remedy: Option<String>,
+}
 /// Outcome of applying context requests to ContextManager.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ContextApplicationOutcome {
@@ -93,37 +115,37 @@ pub struct ContextApplicationOutcome {
     pub missing: Vec<String>,
     pub already_satisfied: Vec<String>,
     pub limit_exceeded: Option<ContextLimitExceeded>,
-    pub refs_rejected: Vec<RefsRejection>,
+    pub outer_docs_rejected: Vec<OuterDocsRejection>,
 }
 
-/// Reconciles the auto context layer during Discovery (pure append-only growth).
+/// Reconciles the auto context layer during Research (pure append-only growth).
 ///
 /// Requested files are added to the Auto layer or have their access upgraded,
-/// while an external reference document is materialized into the Refs layer. The
-/// `files_token_budget` limit is evaluated against the total estimated tokens of
+/// while a declared external document enters the dedicated reference layer. The
+/// `token_budget` limit is evaluated against the total estimated tokens of
 /// current context files plus candidate additions.
 ///
 /// A candidate is admitted either because Git tracks it or because it already
 /// exists on disk inside one of the harness-owned sandboxes: `.tauqe/mockups/`
-/// holds the throwaway prototypes earlier turns wrote, and `.tauqe/cache/refs/`
-/// holds the external snapshots the reference registry materialized. Both trees
-/// are Git-ignored by construction, so the tracked file list never names them,
-/// and demanding a tracked entry would make a mockup unreachable for the very
-/// turn that must rewrite it and a snapshot unreachable through its relative
-/// link.
+/// holds the throwaway prototypes earlier turns wrote, and
+/// `.tauqe/cache/outer_docs/` holds the external snapshots the project declared.
+/// Both trees are Git-ignored by construction, so the tracked file list never
+/// names them, and demanding a tracked entry would make a mockup unreachable for
+/// the very turn that must rewrite it and a snapshot unreachable through its
+/// relative link.
 ///
-/// A snapshot is read-only by construction and enters the dedicated Refs layer
-/// through [`ContextManager::add_refs_file`], which applies its own LRU eviction
-/// against `refs_token_budget`; a document that alone exceeds that budget is
-/// reported back instead of widening the context, and its cached snapshot is
-/// removed so a refused document never lingers in the harness cache. Requesting
-/// an already loaded snapshot refreshes its LRU watermark only.
-pub fn reconcile_discovery_context(
+/// A snapshot is read-only by construction and enters the dedicated OuterDocs
+/// layer through [`ContextManager::add_outer_docs_file`]. It is priced exactly
+/// like a repository file — its content plus the wrapper its own `<file>`
+/// element renders — so both kinds of candidate compete for the single
+/// `[context].token_budget` ceiling. Requesting an already loaded snapshot
+/// changes nothing: the snapshot is immutable for the whole task and the layer
+/// keeps no eviction order.
+pub fn reconcile_research_context(
     context_manager: &mut ContextManager,
     requests: &[ContextRequest],
     available_files: &[String],
-    files_token_budget: usize,
-    refs_token_budget: usize,
+    token_budget: usize,
 ) -> ContextApplicationOutcome {
     let mut outcome = ContextApplicationOutcome::default();
 
@@ -142,12 +164,12 @@ pub fn reconcile_discovery_context(
         };
         // A snapshot is read-only by construction, so a request for write
         // access is coerced instead of trusted.
-        let requested_access = if refs::is_refs_cache_path(&path) {
+        let requested_access = if outer_docs::is_outer_docs_cache_path(&path) {
             ContextAccess::ReadOnly
         } else {
             request.access
         };
-        if !admits_discovery_path(context_manager, &path, available_files) {
+        if !admits_research_path(context_manager, &path, available_files) {
             if !outcome.missing.contains(&path) {
                 outcome.missing.push(path);
             }
@@ -157,11 +179,8 @@ pub fn reconcile_discovery_context(
             context_manager.effective_access_for(&path),
             requested_access,
         ) {
-            // A repeated request for a loaded snapshot refreshes the watermark
-            // that decides which document the Refs layer evicts first.
-            if refs::is_refs_cache_path(&path) {
-                context_manager.touch_refs_lru(&path);
-            }
+            // A repeated request for a loaded snapshot changes nothing: the
+            // snapshot is immutable for the whole task.
             if !outcome.already_satisfied.contains(&path) {
                 outcome.already_satisfied.push(path);
             }
@@ -184,7 +203,7 @@ pub fn reconcile_discovery_context(
         }
     }
 
-    // 2. Check files_token_budget limit
+    // 2. Check the aggregate token budget
     // Token estimates rely on cached context sizes and file metadata instead of
     // reading full file contents, avoiding heavy blocking I/O on the async worker.
     // Both sides of the comparison are priced the same way. A file already in
@@ -212,11 +231,11 @@ pub fn reconcile_discovery_context(
         }
     }
 
-    if current_tokens + new_tokens > files_token_budget {
+    if current_tokens + new_tokens > token_budget {
         outcome.limit_exceeded = Some(ContextLimitExceeded {
             current_tokens,
             requested_tokens: new_tokens,
-            token_budget: files_token_budget,
+            token_budget,
             requested_files: valid_new_files
                 .iter()
                 .map(|(path, _)| path.clone())
@@ -233,21 +252,24 @@ pub fn reconcile_discovery_context(
         if outcome.missing.contains(&path) || outcome.already_satisfied.contains(&path) {
             continue;
         }
-        if refs::is_refs_cache_path(&path) {
-            match context_manager.add_refs_file(&path, refs_token_budget) {
+        if outer_docs::is_outer_docs_cache_path(&path) {
+            match context_manager.add_outer_docs_file(&path) {
                 Ok(_) => {
                     if !outcome.added.contains(&path) {
                         outcome.added.push(path);
                     }
                 }
                 Err(err) => {
-                    // A refused document must not linger in the harness cache:
-                    // the snapshot is Git-ignored, so nothing else would ever
-                    // collect it, and a later round would find a file that can
-                    // never enter the context.
-                    discard_refused_snapshot(context_manager, &path);
-                    if !outcome.refs_rejected.iter().any(|entry| entry.path == path) {
-                        outcome.refs_rejected.push(RefsRejection {
+                    // The layer applies no budget of its own, so a refusal here
+                    // means the snapshot is no longer on disk. A refused
+                    // document is never deleted from the cache: a later round
+                    // may materialize it again and read it.
+                    if !outcome
+                        .outer_docs_rejected
+                        .iter()
+                        .any(|entry| entry.path == path)
+                    {
+                        outcome.outer_docs_rejected.push(OuterDocsRejection {
                             path,
                             reason: format!("{:#}", err),
                         });
@@ -266,34 +288,13 @@ pub fn reconcile_discovery_context(
 
     outcome
 }
-/// Removes the isolated snapshot of a reference document the Refs layer refused.
-///
-/// The cache is Git-ignored and harness-owned, so a refused snapshot has no owner
-/// left: nothing else would ever collect it, and a later round could request a
-/// document that can never enter the context. The removal is best-effort, because
-/// the refusal itself is what the model must learn.
-fn discard_refused_snapshot(context_manager: &ContextManager, path: &str) {
-    if !refs::is_refs_cache_path(path) {
-        return;
-    }
-    let target = context_manager.repo_root().join(path);
-    if let Err(error) = std::fs::remove_file(&target) {
-        if error.kind() != std::io::ErrorKind::NotFound {
-            tracing::warn!(
-                path = path,
-                error = %error,
-                "a refused reference snapshot could not be removed"
-            );
-        }
-    }
-}
 
 /// Reports whether a requested repository path may enter the context.
 ///
 /// A tracked file is always admissible. A harness-owned sandbox path is
 /// admissible when it already exists on disk, because Git never tracks it: both
 /// sandbox trees are ignored by construction.
-fn admits_discovery_path(
+fn admits_research_path(
     context_manager: &ContextManager,
     path: &str,
     available_files: &[String],
@@ -307,26 +308,23 @@ fn admits_discovery_path(
     if context_manager.contains(path).unwrap_or(false) {
         return true;
     }
-    let sandboxed = mockups::is_mockups_path(path) || refs::is_refs_cache_path(path);
+    let sandboxed = mockups::is_mockups_path(path) || outer_docs::is_outer_docs_cache_path(path);
     sandboxed && context_manager.repo_root().join(path).is_file()
 }
-/// Registers model-requested repository files in the Auto layer with detailed diagnostics.
-/// Enforces the hard `files_token_budget` limit across all context layers and
-/// routes external reference snapshots into the Refs layer under its own budget.
+/// Registers model-requested repository files and external documents in the
+/// context with detailed diagnostics.
+///
+/// Every candidate — a repository file and a materialized external document
+/// alike — is priced as its content plus the wrapper its own `<file>` element
+/// renders, and the whole addition set is admitted under the single
+/// `[context].token_budget` ceiling.
 pub fn apply_context_requests_detailed(
     context_manager: &mut ContextManager,
     requests: &[ContextRequest],
     available_files: &[String],
-    files_token_budget: usize,
-    refs_token_budget: usize,
+    token_budget: usize,
 ) -> ContextApplicationOutcome {
-    reconcile_discovery_context(
-        context_manager,
-        requests,
-        available_files,
-        files_token_budget,
-        refs_token_budget,
-    )
+    reconcile_research_context(context_manager, requests, available_files, token_budget)
 }
 
 /// Registers model-requested repository files in the Auto layer.
@@ -335,46 +333,39 @@ pub fn apply_context_requests(
     context_manager: &mut ContextManager,
     requests: &[ContextRequest],
     available_files: &[String],
-    files_token_budget: usize,
-    refs_token_budget: usize,
+    token_budget: usize,
 ) -> Vec<String> {
-    apply_context_requests_detailed(
-        context_manager,
-        requests,
-        available_files,
-        files_token_budget,
-        refs_token_budget,
-    )
-    .added
+    apply_context_requests_detailed(context_manager, requests, available_files, token_budget).added
 }
 
-/// Immutable inputs shared by every Discovery capability handler.
+/// Immutable inputs shared by every Research capability handler.
 ///
 /// The dispatcher resolves repository facts once per round and hands them to
 /// every handler, so a handler never performs its own file listing and never
 /// re-derives the same budget.
-pub struct DiscoveryRoundContext<'a> {
+pub struct ResearchRoundContext<'a> {
     /// Repository root used for path validation and file scans.
     pub repo_root: &'a Path,
     /// Repository-relative files known to exist in the working tree.
     pub available_files: &'a [String],
-    /// Hard token budget for context file additions.
-    pub files_token_budget: usize,
+    /// Single token budget of the context: repository files and external
+    /// documents are priced the same way under it.
+    pub token_budget: usize,
     /// Token budget for a targeted repository map rendered this round.
     pub repomap_token_budget: usize,
     /// Operational caps resolved from the project configuration.
-    pub limits: DiscoveryLimits,
+    pub limits: ResearchLimits,
     /// Whether a request already satisfied by the context counts as progress.
     pub allow_already_satisfied_feedback: bool,
 }
 
-/// Accumulated effect of one Discovery round.
+/// Accumulated effect of one Research round.
 ///
 /// Every handler folds its own findings into this value, so a turn loop
 /// interprets a round through one uniform structure instead of branching on
 /// individual request types.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct DiscoveryRoundOutcome {
+pub struct ResearchRoundOutcome {
     /// Set when context additions would breach the files token budget.
     pub limit_exceeded: Option<ContextLimitExceeded>,
     /// Files that widened the effective context this round.
@@ -383,8 +374,13 @@ pub struct DiscoveryRoundOutcome {
     pub missing_files: Vec<String>,
     /// Requested files whose current access already satisfied the request.
     pub already_satisfied_files: Vec<String>,
-    /// Reference documents the Refs layer refused, with the reported reason.
-    pub refs_rejected: Vec<RefsRejection>,
+    /// External documents the OuterDocs layer refused, with the reported reason.
+    pub outer_docs_rejected: Vec<OuterDocsRejection>,
+    /// External documents the developer's trust declaration refused.
+    ///
+    /// Kept apart from [`Self::outer_docs_rejected`] because a trust refusal is
+    /// answered by the developer, never by the model that requested the document.
+    pub outer_docs_trust_refused: Vec<OuterDocsTrustRefusal>,
     /// Repository searches executed this round, with their matches.
     pub searches_executed: Vec<RepoSearchResult>,
     /// Documentation topics loaded this round.
@@ -399,7 +395,7 @@ pub struct DiscoveryRoundOutcome {
     pub feedback_blocks: Vec<String>,
 }
 
-impl DiscoveryRoundOutcome {
+impl ResearchRoundOutcome {
     /// Reports whether the round changed what the model can see or taught it
     /// something it has not been told yet.
     ///
@@ -416,7 +412,62 @@ impl DiscoveryRoundOutcome {
             || self.repo_maps_loaded > 0
             || !self.doc_topics_loaded.is_empty()
             || (allow_already_satisfied && !self.already_satisfied_files.is_empty())
-            || !self.refs_rejected.is_empty()
+            || !self.outer_docs_rejected.is_empty()
+            || !self.outer_docs_trust_refused.is_empty()
+    }
+
+    /// Records one external document the OuterDocs layer could not materialize.
+    ///
+    /// The audience of the failure decides its channel. A trust refusal is a
+    /// decision of the developer's workspace declaration, so no round of the
+    /// turn can satisfy it: it is recorded as a typed entry beside the exact
+    /// cause and the declaration that would authorize the source, and the model
+    /// is told to report the missing document instead of routing around the
+    /// prohibition. A delivery failure addresses the model, which works with
+    /// the material it already holds and retries when the source is reachable.
+    pub fn record_outer_docs_failure(&mut self, path: &str, error: &MaterializeError) {
+        let Some(refusal) = error.trust() else {
+            self.record_delivery_failure(path, error.reason());
+            return;
+        };
+        if self
+            .outer_docs_trust_refused
+            .iter()
+            .any(|entry| entry.path == path)
+        {
+            return;
+        }
+        self.feedback_blocks.push(format!(
+            "<outer_docs_feedback>\nThe external document `{path}` was refused by the developer's trust declaration: {reason}\nThis decision belongs to the developer and cannot be satisfied from inside the turn. Report the missing document and the declaration it needs instead of retrying the request: do not request the same path again, and do not look for another route to the same material.\n</outer_docs_feedback>",
+            reason = refusal.reason()
+        ));
+        self.outer_docs_trust_refused.push(OuterDocsTrustRefusal {
+            path: path.to_string(),
+            reason: refusal.reason(),
+            remedy: refusal.remedy(),
+        });
+    }
+
+    /// Records one external document the harness could not deliver.
+    ///
+    /// A delivery failure is model-addressed: the source may be unreachable
+    /// now and reachable later, so the model routes around the missing material
+    /// and may attempt the same request in a later round.
+    fn record_delivery_failure(&mut self, path: &str, reason: String) {
+        if self
+            .outer_docs_rejected
+            .iter()
+            .any(|entry| entry.path == path)
+        {
+            return;
+        }
+        self.feedback_blocks.push(format!(
+            "<outer_docs_feedback>\nThe external document `{path}` could not be delivered: {reason}\nWork with the material you already hold and route around the missing document. The same request may be attempted again in a later round when the source is reachable.\n</outer_docs_feedback>"
+        ));
+        self.outer_docs_rejected.push(OuterDocsRejection {
+            path: path.to_string(),
+            reason,
+        });
     }
 
     /// Joins the round's feedback blocks into one prompt fragment.
@@ -429,7 +480,7 @@ impl DiscoveryRoundOutcome {
             .join("\n\n")
     }
 
-    /// One-line round summary for the FSM discovery banner.
+    /// One-line round summary for the FSM research banner.
     pub fn fsm_banner_summary(&self) -> String {
         let mut parts = Vec::new();
         if !self.added_files.is_empty() {
@@ -472,7 +523,7 @@ impl DiscoveryRoundOutcome {
         }
     }
 
-    /// Detailed round summary for the architect discovery banner.
+    /// Detailed round summary for the architect research banner.
     pub fn architect_banner_summary(&self) -> String {
         let mut notes = Vec::new();
         if !self.added_files.is_empty() {
@@ -522,12 +573,12 @@ impl DiscoveryRoundOutcome {
     }
 }
 
-/// One autonomous executor for a Discovery capability.
+/// One autonomous executor for a Research capability.
 ///
 /// A handler owns the validation, disk work, and feedback text of its own
-/// capability, so turn loops dispatch Discovery commands polymorphically instead
+/// capability, so turn loops dispatch Research commands polymorphically instead
 /// of branching on command types.
-pub trait DiscoveryCapabilityHandler: Send + Sync {
+pub trait ResearchCapabilityHandler: Send + Sync {
     /// Capability realized by this handler.
     fn capability(&self) -> LlmCapability;
 
@@ -537,19 +588,19 @@ pub trait DiscoveryCapabilityHandler: Send + Sync {
     /// Executes every command the handler owns, folding results into `outcome`.
     fn execute(
         &self,
-        round: &DiscoveryRoundContext<'_>,
+        round: &ResearchRoundContext<'_>,
         commands: &[LlmCommand],
         context_manager: &mut ContextManager,
-        outcome: &mut DiscoveryRoundOutcome,
+        outcome: &mut ResearchRoundOutcome,
     );
 }
 
 /// Executes context-file requests under the files token budget.
 struct ContextRequestHandler;
 
-impl DiscoveryCapabilityHandler for ContextRequestHandler {
+impl ResearchCapabilityHandler for ContextRequestHandler {
     fn capability(&self) -> LlmCapability {
-        LlmCapability::Discovery
+        LlmCapability::Research
     }
 
     fn handles(&self, command: &LlmCommand) -> bool {
@@ -558,10 +609,10 @@ impl DiscoveryCapabilityHandler for ContextRequestHandler {
 
     fn execute(
         &self,
-        round: &DiscoveryRoundContext<'_>,
+        round: &ResearchRoundContext<'_>,
         commands: &[LlmCommand],
         context_manager: &mut ContextManager,
-        outcome: &mut DiscoveryRoundOutcome,
+        outcome: &mut ResearchRoundOutcome,
     ) {
         let requests: Vec<ContextRequest> = commands
             .iter()
@@ -577,12 +628,11 @@ impl DiscoveryCapabilityHandler for ContextRequestHandler {
             return;
         }
 
-        let applied = reconcile_discovery_context(
+        let applied = reconcile_research_context(
             context_manager,
             &requests,
             round.available_files,
-            round.files_token_budget,
-            round.limits.refs_token_budget,
+            round.token_budget,
         );
         outcome.added_files.extend(applied.added);
         outcome.missing_files.extend(applied.missing);
@@ -597,20 +647,22 @@ impl DiscoveryCapabilityHandler for ContextRequestHandler {
                 outcome.missing_files.join(", ")
             ));
         }
-        if !applied.refs_rejected.is_empty() {
-            // A refused snapshot is actionable knowledge, not a dead end: the
-            // model learns that the declared document cannot widen the context.
+        if !applied.outer_docs_rejected.is_empty() {
+            // A snapshot that vanished is actionable knowledge, not a dead end:
+            // the model learns that the declared document is no longer cached.
             let rejected = applied
-                .refs_rejected
+                .outer_docs_rejected
                 .iter()
                 .map(|entry| format!("{}: {}", entry.path, entry.reason))
                 .collect::<Vec<_>>()
                 .join("; ");
             outcome.feedback_blocks.push(format!(
-                "<refs_feedback>\nThe following requested reference documents could not be loaded: [{}]\nRaise `[context].refs_token_budget` in the project configuration when the budget itself is the obstacle, and request a narrower section otherwise.\n</refs_feedback>",
+                "<outer_docs_feedback>\nThe following requested external documents could not be loaded: [{}]\nThe snapshot is no longer available in the harness cache. Report the missing document to the developer instead of retrying the same request in this turn.\n</outer_docs_feedback>",
                 rejected
             ));
-            outcome.refs_rejected.extend(applied.refs_rejected);
+            outcome
+                .outer_docs_rejected
+                .extend(applied.outer_docs_rejected);
         }
     }
 }
@@ -618,9 +670,9 @@ impl DiscoveryCapabilityHandler for ContextRequestHandler {
 /// Executes repository regex searches and formats their feedback.
 struct RepoSearchHandler;
 
-impl DiscoveryCapabilityHandler for RepoSearchHandler {
+impl ResearchCapabilityHandler for RepoSearchHandler {
     fn capability(&self) -> LlmCapability {
-        LlmCapability::Discovery
+        LlmCapability::Research
     }
 
     fn handles(&self, command: &LlmCommand) -> bool {
@@ -629,10 +681,10 @@ impl DiscoveryCapabilityHandler for RepoSearchHandler {
 
     fn execute(
         &self,
-        round: &DiscoveryRoundContext<'_>,
+        round: &ResearchRoundContext<'_>,
         commands: &[LlmCommand],
         _context_manager: &mut ContextManager,
-        outcome: &mut DiscoveryRoundOutcome,
+        outcome: &mut ResearchRoundOutcome,
     ) {
         let queries: Vec<RepoSearchRequest> = commands
             .iter()
@@ -665,9 +717,9 @@ impl DiscoveryCapabilityHandler for RepoSearchHandler {
 /// Renders the compact repository directory tree on demand.
 struct RepoDirsHandler;
 
-impl DiscoveryCapabilityHandler for RepoDirsHandler {
+impl ResearchCapabilityHandler for RepoDirsHandler {
     fn capability(&self) -> LlmCapability {
-        LlmCapability::Discovery
+        LlmCapability::Research
     }
 
     fn handles(&self, command: &LlmCommand) -> bool {
@@ -676,10 +728,10 @@ impl DiscoveryCapabilityHandler for RepoDirsHandler {
 
     fn execute(
         &self,
-        round: &DiscoveryRoundContext<'_>,
+        round: &ResearchRoundContext<'_>,
         commands: &[LlmCommand],
         context_manager: &mut ContextManager,
-        outcome: &mut DiscoveryRoundOutcome,
+        outcome: &mut ResearchRoundOutcome,
     ) {
         if !commands
             .iter()
@@ -712,9 +764,9 @@ impl DiscoveryCapabilityHandler for RepoDirsHandler {
 /// Renders the targeted symbol map of a requested subdirectory.
 struct RepoMapRequestHandler;
 
-impl DiscoveryCapabilityHandler for RepoMapRequestHandler {
+impl ResearchCapabilityHandler for RepoMapRequestHandler {
     fn capability(&self) -> LlmCapability {
-        LlmCapability::Discovery
+        LlmCapability::Research
     }
 
     fn handles(&self, command: &LlmCommand) -> bool {
@@ -723,10 +775,10 @@ impl DiscoveryCapabilityHandler for RepoMapRequestHandler {
 
     fn execute(
         &self,
-        round: &DiscoveryRoundContext<'_>,
+        round: &ResearchRoundContext<'_>,
         commands: &[LlmCommand],
         _context_manager: &mut ContextManager,
-        outcome: &mut DiscoveryRoundOutcome,
+        outcome: &mut ResearchRoundOutcome,
     ) {
         let max_requests = round.limits.max_repo_map_requests_per_round;
         let mut requested: Vec<String> = Vec::new();
@@ -793,9 +845,9 @@ impl DiscoveryCapabilityHandler for RepoMapRequestHandler {
 /// Lists the tracked files of a requested directory.
 struct DirListHandler;
 
-impl DiscoveryCapabilityHandler for DirListHandler {
+impl ResearchCapabilityHandler for DirListHandler {
     fn capability(&self) -> LlmCapability {
-        LlmCapability::Discovery
+        LlmCapability::Research
     }
 
     fn handles(&self, command: &LlmCommand) -> bool {
@@ -804,10 +856,10 @@ impl DiscoveryCapabilityHandler for DirListHandler {
 
     fn execute(
         &self,
-        round: &DiscoveryRoundContext<'_>,
+        round: &ResearchRoundContext<'_>,
         commands: &[LlmCommand],
         _context_manager: &mut ContextManager,
-        outcome: &mut DiscoveryRoundOutcome,
+        outcome: &mut ResearchRoundOutcome,
     ) {
         let max_entries = round.limits.max_dir_list_entries;
         let mut requested: Vec<DirListRequest> = Vec::new();
@@ -908,7 +960,7 @@ fn render_dir_listing(available_files: &[String], target: &str, recursive: bool)
 /// Loads authoritative documentation chapters for requested topics.
 struct DocRequestHandler;
 
-impl DiscoveryCapabilityHandler for DocRequestHandler {
+impl ResearchCapabilityHandler for DocRequestHandler {
     fn capability(&self) -> LlmCapability {
         LlmCapability::DocRequest
     }
@@ -919,10 +971,10 @@ impl DiscoveryCapabilityHandler for DocRequestHandler {
 
     fn execute(
         &self,
-        _round: &DiscoveryRoundContext<'_>,
+        _round: &ResearchRoundContext<'_>,
         commands: &[LlmCommand],
         _context_manager: &mut ContextManager,
-        outcome: &mut DiscoveryRoundOutcome,
+        outcome: &mut ResearchRoundOutcome,
     ) {
         let topics: Vec<DocTopic> = commands
             .iter()
@@ -950,8 +1002,8 @@ impl DiscoveryCapabilityHandler for DocRequestHandler {
     }
 }
 
-/// Registered Discovery handlers, in dispatch order.
-static DISCOVERY_HANDLERS: &[&dyn DiscoveryCapabilityHandler] = &[
+/// Registered Research handlers, in dispatch order.
+static RESEARCH_HANDLERS: &[&dyn ResearchCapabilityHandler] = &[
     &ContextRequestHandler,
     &RepoSearchHandler,
     &RepoDirsHandler,
@@ -960,12 +1012,12 @@ static DISCOVERY_HANDLERS: &[&dyn DiscoveryCapabilityHandler] = &[
     &DocRequestHandler,
 ];
 
-/// Returns the registered Discovery capability handlers in dispatch order.
-pub fn discovery_handlers() -> &'static [&'static dyn DiscoveryCapabilityHandler] {
-    DISCOVERY_HANDLERS
+/// Returns the registered Research capability handlers in dispatch order.
+pub fn research_handlers() -> &'static [&'static dyn ResearchCapabilityHandler] {
+    RESEARCH_HANDLERS
 }
 
-/// Executes Discovery commands synchronously against an already resolved
+/// Executes Research commands synchronously against an already resolved
 /// repository file list.
 ///
 /// This is the core the asynchronous facade and the server architect loop call
@@ -973,27 +1025,27 @@ pub fn discovery_handlers() -> &'static [&'static dyn DiscoveryCapabilityHandler
 /// blocks an async worker thread. The `limits` caps travel with the call, so a
 /// round applies exactly the bounds the project declared.
 #[allow(clippy::too_many_arguments)]
-pub fn execute_discovery_commands_sync(
+pub fn execute_research_commands_sync(
     context_manager: &mut ContextManager,
     repo_root: &Path,
     available_files: &[String],
     commands: &[LlmCommand],
-    files_token_budget: usize,
+    token_budget: usize,
     repomap_token_budget: usize,
-    limits: DiscoveryLimits,
+    limits: ResearchLimits,
     allow_already_satisfied_feedback: bool,
-) -> DiscoveryRoundOutcome {
-    let round = DiscoveryRoundContext {
+) -> ResearchRoundOutcome {
+    let round = ResearchRoundContext {
         repo_root,
         available_files,
-        files_token_budget,
+        token_budget,
         repomap_token_budget,
         limits,
         allow_already_satisfied_feedback,
     };
-    let mut outcome = DiscoveryRoundOutcome::default();
+    let mut outcome = ResearchRoundOutcome::default();
 
-    for handler in discovery_handlers() {
+    for handler in research_handlers() {
         if !commands.iter().any(|command| handler.handles(command)) {
             continue;
         }
@@ -1052,8 +1104,8 @@ pub async fn resolve_repository_files(repo_root: &Path) -> Option<Vec<String>> {
 /// every requested file would otherwise surface to the model as missing. The
 /// feedback block names the inspection failure instead, and the warn record
 /// of [`resolve_repository_files`] keeps the degradation observable.
-fn uninspectable_repository_outcome() -> DiscoveryRoundOutcome {
-    let mut outcome = DiscoveryRoundOutcome::default();
+fn uninspectable_repository_outcome() -> ResearchRoundOutcome {
+    let mut outcome = ResearchRoundOutcome::default();
     outcome.feedback_blocks.push(
         "<context_feedback>\nThe repository could not be inspected, so the tracked \
          file list and repository searches are unavailable for this round. Do not \
@@ -1063,8 +1115,12 @@ fn uninspectable_repository_outcome() -> DiscoveryRoundOutcome {
     );
     outcome
 }
+/// Reports whether the turn cancellation signal already fired.
+fn cancel_requested(cancel_rx: Option<&tokio::sync::watch::Receiver<bool>>) -> bool {
+    cancel_rx.is_some_and(|receiver| *receiver.borrow())
+}
 
-/// Executes Discovery commands asynchronously, resolving repository facts off
+/// Executes Research commands asynchronously, resolving repository facts off
 /// the async executor thread.
 ///
 /// The repository file list is read once per round, and every handler runs
@@ -1073,37 +1129,23 @@ fn uninspectable_repository_outcome() -> DiscoveryRoundOutcome {
 /// inspected ends the round with an inspection-failure feedback block instead
 /// of reporting every requested file as missing.
 ///
-/// A request that names a declared reference is materialized into the isolated
-/// cache before the blocking phase, so the round widens the context with the
-/// snapshot the registry declares instead of reporting a file that does not
-/// exist on disk. The transfer is bounded by `limits.refs_token_budget`, so a
-/// declared document that could never enter the Refs layer is abandoned while it
-/// streams instead of after it was fully buffered. The optional cancel signal is
-/// the turn's own, so an abandoned round stops waiting for a slow reference
-/// host, and the diagnostics of a refused materialization lead the round's
-/// feedback.
+/// The optional cancel signal is the turn's own: a round the developer already
+/// abandoned resolves immediately, before the repository file list is read and
+/// before a single handler runs.
 #[allow(clippy::too_many_arguments)]
-pub async fn execute_discovery_commands(
+pub async fn execute_research_commands(
     context_manager: &mut ContextManager,
     repo_root: &Path,
     commands: &[LlmCommand],
-    files_token_budget: usize,
+    token_budget: usize,
     repomap_token_budget: usize,
-    limits: DiscoveryLimits,
+    limits: ResearchLimits,
     allow_already_satisfied_feedback: bool,
     cancel_rx: Option<&tokio::sync::watch::Receiver<bool>>,
-) -> DiscoveryRoundOutcome {
-    if commands.is_empty() {
-        return DiscoveryRoundOutcome::default();
+) -> ResearchRoundOutcome {
+    if commands.is_empty() || cancel_requested(cancel_rx) {
+        return ResearchRoundOutcome::default();
     }
-
-    // A declared reference has no file on disk until it is materialized, so the
-    // registry requests are resolved into their isolated snapshots first. The
-    // pre-step may fetch a remote document, so it runs before the blocking
-    // phase that applies the round.
-    let (commands, refs_feedback) =
-        resolve_refs_requests(repo_root, commands, limits.refs_token_budget, cancel_rx).await;
-
     let needs_file_list = commands.iter().any(|command| {
         matches!(
             command,
@@ -1123,108 +1165,34 @@ pub async fn execute_discovery_commands(
             // empty repository.
             None => {
                 let outcome = uninspectable_repository_outcome();
-                return with_refs_feedback(outcome, refs_feedback);
+                return outcome;
             }
         }
     } else {
         Vec::new()
     };
 
-    let outcome = run_blocking(|| {
-        execute_discovery_commands_sync(
+    run_blocking(|| {
+        execute_research_commands_sync(
             context_manager,
             repo_root,
             &available_files,
-            &commands,
-            files_token_budget,
+            commands,
+            token_budget,
             repomap_token_budget,
             limits,
             allow_already_satisfied_feedback,
         )
-    });
-    with_refs_feedback(outcome, refs_feedback)
-}
-
-/// Resolves the declared reference requests of one round into their snapshots.
-///
-/// The pre-step answers one request per input in the order the round declared
-/// them, so the command list is rebuilt position by position and every other
-/// command keeps its place. A request the pre-step leaves alone — an existing
-/// registry file, the manifest itself, an undeclared name, or a refused
-/// materialization — therefore keeps its original path and is reported by the
-/// round exactly as before. The transfer is bounded by `refs_token_budget`, so a
-/// declared document too large for the Refs layer is abandoned while it streams.
-async fn resolve_refs_requests(
-    repo_root: &Path,
-    commands: &[LlmCommand],
-    refs_token_budget: usize,
-    cancel_rx: Option<&tokio::sync::watch::Receiver<bool>>,
-) -> (Vec<LlmCommand>, Vec<String>) {
-    let requests: Vec<ContextRequest> = commands
-        .iter()
-        .filter_map(|command| match command {
-            LlmCommand::ContextRequest { path, access } => Some(ContextRequest {
-                path: path.clone(),
-                access: *access,
-            }),
-            _ => None,
-        })
-        .collect();
-    if requests.is_empty() {
-        return (commands.to_vec(), Vec::new());
-    }
-
-    let (resolved, feedback) = crate::refs::materialize::materialize_requests(
-        repo_root,
-        &requests,
-        refs_token_budget,
-        cancel_rx,
-    )
-    .await;
-    let mut substituted = Vec::with_capacity(commands.len());
-    let mut resolved = resolved.into_iter();
-    for command in commands {
-        let LlmCommand::ContextRequest { .. } = command else {
-            substituted.push(command.clone());
-            continue;
-        };
-        let Some(request) = resolved.next() else {
-            substituted.push(command.clone());
-            continue;
-        };
-        substituted.push(LlmCommand::ContextRequest {
-            path: request.path,
-            access: request.access,
-        });
-    }
-
-    (substituted, feedback)
-}
-
-/// Prepends the reference diagnostics to a round outcome.
-///
-/// A refused materialization is what the round discovered first, so its
-/// diagnostic leads the feedback the handlers contribute afterwards.
-fn with_refs_feedback(
-    mut outcome: DiscoveryRoundOutcome,
-    refs_feedback: Vec<String>,
-) -> DiscoveryRoundOutcome {
-    if refs_feedback.is_empty() {
-        return outcome;
-    }
-    let mut blocks = refs_feedback;
-    blocks.append(&mut outcome.feedback_blocks);
-    outcome.feedback_blocks = blocks;
-    outcome
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// Discovery caps applied by tests that do not exercise a specific limit.
-    fn default_limits() -> DiscoveryLimits {
-        DiscoveryLimits::default()
+    /// Research caps applied by tests that do not exercise a specific limit.
+    fn default_limits() -> ResearchLimits {
+        ResearchLimits::default()
     }
 
     #[test]
@@ -1244,12 +1212,12 @@ mod tests {
             },
         ];
 
-        let added = apply_context_requests(&mut cm, &requests, &available, 300_000, 50_000);
+        let added = apply_context_requests(&mut cm, &requests, &available, 300_000);
         assert_eq!(added, vec!["a.rs".to_string()]);
         assert!(cm.is_editable("a.rs").unwrap());
 
         // Already satisfied: no further changes.
-        assert!(apply_context_requests(&mut cm, &requests, &available, 300_000, 50_000).is_empty());
+        assert!(apply_context_requests(&mut cm, &requests, &available, 300_000).is_empty());
 
         cm.clear_auto();
         assert!(!cm.contains("a.rs").unwrap());
@@ -1267,8 +1235,7 @@ mod tests {
         }];
 
         // Budget is only 2 tokens; file content is ~7 tokens.
-        let outcome = apply_context_requests_detailed(&mut cm, &requests, &available, 2, 50_000);
-        assert!(outcome.added.is_empty());
+        let outcome = apply_context_requests_detailed(&mut cm, &requests, &available, 2);
         let limit = outcome.limit_exceeded.expect("Expected limit_exceeded");
         assert_eq!(limit.token_budget, 2);
         assert!(limit.requested_tokens > 2);
@@ -1297,7 +1264,6 @@ mod tests {
             &requests,
             &available,
             content_tokens + wrapper - 1,
-            50_000,
         );
         let limit = outcome.limit_exceeded.expect("the wrapper must be charged");
         assert_eq!(limit.requested_tokens, content_tokens + wrapper);
@@ -1309,7 +1275,6 @@ mod tests {
             &requests,
             &available,
             content_tokens + wrapper,
-            50_000,
         );
         assert!(outcome.limit_exceeded.is_none());
         assert_eq!(outcome.added, vec!["a.rs".to_string()]);
@@ -1340,7 +1305,6 @@ mod tests {
             &requests,
             &available,
             loaded_tokens + next_tokens - 1,
-            50_000,
         );
         let limit = outcome.limit_exceeded.expect("the budget is exceeded");
         assert_eq!(limit.current_tokens, loaded_tokens);
@@ -1351,7 +1315,6 @@ mod tests {
             &requests,
             &available,
             loaded_tokens + next_tokens,
-            50_000,
         );
         assert!(outcome.limit_exceeded.is_none());
         assert_eq!(outcome.added, vec!["next.rs".to_string()]);
@@ -1370,7 +1333,7 @@ mod tests {
             path: "user.rs".to_string(),
             access: ContextAccess::Editable,
         }];
-        let added = apply_context_requests(&mut cm, &requests, &available, 300_000, 50_000);
+        let added = apply_context_requests(&mut cm, &requests, &available, 300_000);
         assert_eq!(added, vec!["user.rs".to_string()]);
         assert!(cm.is_editable("user.rs").unwrap());
     }
@@ -1394,8 +1357,7 @@ mod tests {
             },
         ];
 
-        let outcome =
-            apply_context_requests_detailed(&mut cm, &requests, &available, 300_000, 50_000);
+        let outcome = apply_context_requests_detailed(&mut cm, &requests, &available, 300_000);
         assert!(outcome.added.is_empty());
         assert_eq!(outcome.already_satisfied, vec!["a.rs".to_string()]);
         assert_eq!(outcome.missing, vec!["missing.rs".to_string()]);
@@ -1417,7 +1379,7 @@ mod tests {
 
     #[test]
     fn test_round_outcome_banner_summaries() {
-        let mut outcome = DiscoveryRoundOutcome::default();
+        let mut outcome = ResearchRoundOutcome::default();
         assert_eq!(outcome.fsm_banner_summary(), "0 file(s) added.");
         assert_eq!(outcome.architect_banner_summary(), "");
 
@@ -1438,7 +1400,7 @@ mod tests {
         );
 
         // The already-satisfied note only explains a round that did nothing else.
-        let mut satisfied = DiscoveryRoundOutcome::default();
+        let mut satisfied = ResearchRoundOutcome::default();
         satisfied.already_satisfied_files.push("a.rs".to_string());
         assert_eq!(
             satisfied.architect_banner_summary(),
@@ -1452,7 +1414,7 @@ mod tests {
     }
 
     #[test]
-    fn test_execute_discovery_commands_dispatches_every_capability() {
+    fn test_execute_research_commands_dispatches_every_capability() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("a.rs"), "pub fn alpha() {}\n").unwrap();
         std::fs::write(dir.path().join("b.rs"), "pub fn beta() {}\n").unwrap();
@@ -1477,13 +1439,13 @@ mod tests {
             },
         ];
 
-        let outcome = execute_discovery_commands_sync(
+        let outcome = execute_research_commands_sync(
             &mut cm,
             dir.path(),
             &available,
             &commands,
             300_000,
-            300_000,
+            crate::repomap::DEFAULT_REPOMAP_TOKEN_BUDGET,
             default_limits(),
             false,
         );
@@ -1503,7 +1465,7 @@ mod tests {
     }
 
     #[test]
-    fn test_execute_discovery_commands_stops_on_token_budget() {
+    fn test_execute_research_commands_stops_on_token_budget() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(
             dir.path().join("big.rs"),
@@ -1523,13 +1485,13 @@ mod tests {
             },
         ];
 
-        let outcome = execute_discovery_commands_sync(
+        let outcome = execute_research_commands_sync(
             &mut cm,
             dir.path(),
             &available,
             &commands,
             1,
-            300_000,
+            crate::repomap::DEFAULT_REPOMAP_TOKEN_BUDGET,
             default_limits(),
             false,
         );
@@ -1546,7 +1508,7 @@ mod tests {
     }
 
     #[test]
-    fn test_execute_discovery_commands_already_satisfied_feedback_is_aggregate_aware() {
+    fn test_execute_research_commands_already_satisfied_feedback_is_aggregate_aware() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("a.rs"), "pub fn alpha() {}\n").unwrap();
         let mut cm = ContextManager::new(dir.path().to_path_buf());
@@ -1557,13 +1519,13 @@ mod tests {
             access: ContextAccess::ReadOnly,
         }];
 
-        let outcome = execute_discovery_commands_sync(
+        let outcome = execute_research_commands_sync(
             &mut cm,
             dir.path(),
             &available,
             &commands,
             300_000,
-            300_000,
+            crate::repomap::DEFAULT_REPOMAP_TOKEN_BUDGET,
             default_limits(),
             false,
         );
@@ -1571,13 +1533,13 @@ mod tests {
         assert!(!outcome.has_progress(false));
         assert!(outcome.combined_feedback().is_empty());
 
-        let outcome = execute_discovery_commands_sync(
+        let outcome = execute_research_commands_sync(
             &mut cm,
             dir.path(),
             &available,
             &commands,
             300_000,
-            300_000,
+            crate::repomap::DEFAULT_REPOMAP_TOKEN_BUDGET,
             default_limits(),
             true,
         );
@@ -1588,7 +1550,7 @@ mod tests {
     }
 
     #[test]
-    fn test_execute_discovery_commands_renders_the_directory_tree() {
+    fn test_execute_research_commands_renders_the_directory_tree() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(dir.path().join("src/nested")).unwrap();
         let mut cm = ContextManager::new(dir.path().to_path_buf());
@@ -1598,13 +1560,13 @@ mod tests {
         ];
 
         let commands = vec![LlmCommand::RepoDirs];
-        let outcome = execute_discovery_commands_sync(
+        let outcome = execute_research_commands_sync(
             &mut cm,
             dir.path(),
             &available,
             &commands,
             300_000,
-            300_000,
+            crate::repomap::DEFAULT_REPOMAP_TOKEN_BUDGET,
             default_limits(),
             false,
         );
@@ -1621,7 +1583,7 @@ mod tests {
     }
 
     #[test]
-    fn test_execute_discovery_commands_lists_a_directory() {
+    fn test_execute_research_commands_lists_a_directory() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(dir.path().join("src/nested")).unwrap();
         let mut cm = ContextManager::new(dir.path().to_path_buf());
@@ -1636,13 +1598,13 @@ mod tests {
             path: "src".to_string(),
             recursive: false,
         }];
-        let outcome = execute_discovery_commands_sync(
+        let outcome = execute_research_commands_sync(
             &mut cm,
             dir.path(),
             &available,
             &commands,
             300_000,
-            300_000,
+            crate::repomap::DEFAULT_REPOMAP_TOKEN_BUDGET,
             default_limits(),
             false,
         );
@@ -1663,13 +1625,13 @@ mod tests {
             path: "src".to_string(),
             recursive: true,
         }];
-        let outcome = execute_discovery_commands_sync(
+        let outcome = execute_research_commands_sync(
             &mut cm,
             dir.path(),
             &available,
             &commands,
             300_000,
-            300_000,
+            crate::repomap::DEFAULT_REPOMAP_TOKEN_BUDGET,
             default_limits(),
             false,
         );
@@ -1680,7 +1642,7 @@ mod tests {
     }
 
     #[test]
-    fn test_execute_discovery_commands_caps_a_listing_at_the_configured_bound() {
+    fn test_execute_research_commands_caps_a_listing_at_the_configured_bound() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(dir.path().join("src")).unwrap();
         let mut cm = ContextManager::new(dir.path().to_path_buf());
@@ -1688,7 +1650,7 @@ mod tests {
 
         // The listing cap is configuration-driven, so a project raises or
         // narrows it in `tauqe.toml` instead of recompiling the engine.
-        let limits = DiscoveryLimits {
+        let limits = ResearchLimits {
             max_dir_list_entries: 2,
             ..default_limits()
         };
@@ -1696,13 +1658,13 @@ mod tests {
             path: "src".to_string(),
             recursive: true,
         }];
-        let outcome = execute_discovery_commands_sync(
+        let outcome = execute_research_commands_sync(
             &mut cm,
             dir.path(),
             &available,
             &commands,
             300_000,
-            300_000,
+            crate::repomap::DEFAULT_REPOMAP_TOKEN_BUDGET,
             limits,
             false,
         );
@@ -1716,30 +1678,30 @@ mod tests {
     }
 
     #[test]
-    fn test_execute_discovery_commands_ignores_commands_outside_discovery() {
+    fn test_execute_research_commands_ignores_commands_outside_research() {
         let dir = tempfile::tempdir().unwrap();
         let mut cm = ContextManager::new(dir.path().to_path_buf());
 
         let commands = vec![LlmCommand::Text {
-            content: "no discovery work".to_string(),
+            content: "no research work".to_string(),
         }];
-        let outcome = execute_discovery_commands_sync(
+        let outcome = execute_research_commands_sync(
             &mut cm,
             dir.path(),
             &[],
             &commands,
             300_000,
-            300_000,
+            crate::repomap::DEFAULT_REPOMAP_TOKEN_BUDGET,
             default_limits(),
             true,
         );
 
-        assert_eq!(outcome, DiscoveryRoundOutcome::default());
+        assert_eq!(outcome, ResearchRoundOutcome::default());
         assert!(!outcome.has_progress(true));
     }
 
     #[test]
-    fn test_execute_discovery_commands_renders_a_targeted_repo_map() {
+    fn test_execute_research_commands_renders_a_targeted_repo_map() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(dir.path().join("src/nested")).unwrap();
         std::fs::create_dir_all(dir.path().join("other")).unwrap();
@@ -1762,13 +1724,13 @@ mod tests {
                 path: "src".to_string(),
             },
         ];
-        let outcome = execute_discovery_commands_sync(
+        let outcome = execute_research_commands_sync(
             &mut cm,
             dir.path(),
             &available,
             &commands,
             300_000,
-            300_000,
+            crate::repomap::DEFAULT_REPOMAP_TOKEN_BUDGET,
             default_limits(),
             false,
         );
@@ -1789,7 +1751,7 @@ mod tests {
     }
 
     #[test]
-    fn test_execute_discovery_commands_reports_an_empty_targeted_map() {
+    fn test_execute_research_commands_reports_an_empty_targeted_map() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(dir.path().join("src")).unwrap();
         std::fs::write(dir.path().join("src/alpha.rs"), "pub fn alpha() {}\n").unwrap();
@@ -1799,13 +1761,13 @@ mod tests {
         let commands = vec![LlmCommand::RepoMap {
             path: "docs".to_string(),
         }];
-        let outcome = execute_discovery_commands_sync(
+        let outcome = execute_research_commands_sync(
             &mut cm,
             dir.path(),
             &available,
             &commands,
             300_000,
-            300_000,
+            crate::repomap::DEFAULT_REPOMAP_TOKEN_BUDGET,
             default_limits(),
             false,
         );
@@ -1817,7 +1779,7 @@ mod tests {
     }
 
     #[test]
-    fn test_execute_discovery_commands_caps_targeted_repo_maps_per_round() {
+    fn test_execute_research_commands_caps_targeted_repo_maps_per_round() {
         let dir = tempfile::tempdir().unwrap();
         let mut available = Vec::new();
         for index in 0..5 {
@@ -1842,17 +1804,17 @@ mod tests {
         // The per-round request cap is configuration-driven: the shared handler
         // owns it, so an untrusted list of requested contours can never turn one
         // round into a full repository re-index.
-        let limits = DiscoveryLimits {
+        let limits = ResearchLimits {
             max_repo_map_requests_per_round: 2,
             ..default_limits()
         };
-        let outcome = execute_discovery_commands_sync(
+        let outcome = execute_research_commands_sync(
             &mut cm,
             dir.path(),
             &available,
             &commands,
             300_000,
-            300_000,
+            crate::repomap::DEFAULT_REPOMAP_TOKEN_BUDGET,
             limits,
             false,
         );
@@ -1880,12 +1842,12 @@ mod tests {
         }];
 
         let (buffer, _guard) = crate::blocking::log_capture::install();
-        let outcome = execute_discovery_commands(
+        let outcome = execute_research_commands(
             &mut cm,
             &missing_root,
             &commands,
             300_000,
-            300_000,
+            crate::repomap::DEFAULT_REPOMAP_TOKEN_BUDGET,
             default_limits(),
             false,
             None,
@@ -1910,7 +1872,7 @@ mod tests {
     }
 
     /// A mockup written by an earlier turn is Git-ignored, so the tracked file
-    /// list never names it. Discovery must still admit it, otherwise the model
+    /// list never names it. Research must still admit it, otherwise the model
     /// could never rewrite the prototype it just created.
     #[test]
     fn test_a_sandbox_mockup_outside_the_tracked_list_is_admitted() {
@@ -1928,52 +1890,52 @@ mod tests {
 
         // The file is invisible to Git, so an empty tracked list proves the
         // sandbox rule is what admits it.
-        let outcome = apply_context_requests_detailed(&mut cm, &requests, &[], 300_000, 50_000);
+        let outcome = apply_context_requests_detailed(&mut cm, &requests, &[], 300_000);
 
         assert_eq!(outcome.added, vec![mockup.clone()]);
         assert!(outcome.missing.is_empty());
         assert!(cm.is_editable(&mockup).unwrap());
     }
 
-    /// A cached reference document is Git-ignored and read-only by
-    /// construction: it lands in the dedicated Refs layer even when the model
-    /// asks for write access.
+    /// A cached external document is Git-ignored and read-only by
+    /// construction: it lands in the dedicated OuterDocs layer even when the
+    /// model asks for write access.
     #[test]
-    fn test_a_cached_reference_document_enters_the_refs_layer_read_only() {
+    fn test_a_cached_external_document_enters_the_outer_docs_layer_read_only() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().to_path_buf();
-        let cache = root.join(crate::refs::REFS_CACHE_DIR);
+        let cache = root.join(crate::outer_docs::OUTER_DOCS_CACHE_DIR);
         std::fs::create_dir_all(&cache).unwrap();
         std::fs::write(cache.join("api.md"), "upstream notes\n").unwrap();
         let mut cm = ContextManager::new(root);
-        let cached = format!("{}/api.md", crate::refs::REFS_CACHE_DIR);
+        let cached = format!("{}/api.md", crate::outer_docs::OUTER_DOCS_CACHE_DIR);
         let requests = vec![ContextRequest {
             path: cached.clone(),
             access: ContextAccess::Editable,
         }];
 
-        let outcome = apply_context_requests_detailed(&mut cm, &requests, &[], 300_000, 50_000);
+        let outcome = apply_context_requests_detailed(&mut cm, &requests, &[], 300_000);
 
         assert_eq!(outcome.added, vec![cached.clone()]);
-        assert_eq!(cm.refs_files(), vec![cached.clone()]);
+        assert_eq!(cm.outer_docs_files(), vec![cached.clone()]);
         assert!(!cm.is_editable(&cached).unwrap());
-        assert!(outcome.refs_rejected.is_empty());
+        assert!(outcome.outer_docs_rejected.is_empty());
     }
 
-    /// Re-requesting a loaded snapshot refreshes its LRU watermark, so the
-    /// document the dialogue keeps asking for outranks one requested earlier.
+    /// Re-requesting a loaded snapshot is a no-op, and the layer keeps every
+    /// admitted document: no eviction order survives the rename.
     #[test]
-    fn test_a_repeated_reference_request_refreshes_the_eviction_order() {
+    fn test_a_repeated_external_document_request_is_a_no_op() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().to_path_buf();
-        let cache = root.join(crate::refs::REFS_CACHE_DIR);
+        let cache = root.join(crate::outer_docs::OUTER_DOCS_CACHE_DIR);
         std::fs::create_dir_all(&cache).unwrap();
-        for name in ["a.md", "b.md", "c.md"] {
-            std::fs::write(cache.join(name), "reference notes\n").unwrap();
+        for name in ["a.md", "b.md"] {
+            std::fs::write(cache.join(name), "external notes\n").unwrap();
         }
         let mut cm = ContextManager::new(root);
-        let cached = |name: &str| format!("{}/{name}", crate::refs::REFS_CACHE_DIR);
-        let (first, second, third) = (cached("a.md"), cached("b.md"), cached("c.md"));
+        let cached = |name: &str| format!("{}/{name}", crate::outer_docs::OUTER_DOCS_CACHE_DIR);
+        let (first, second) = (cached("a.md"), cached("b.md"));
         let request = |path: &str| {
             vec![ContextRequest {
                 path: path.to_string(),
@@ -1981,229 +1943,181 @@ mod tests {
             }]
         };
 
-        apply_context_requests_detailed(&mut cm, &request(&first), &[], 300_000, 1_000_000);
-        apply_context_requests_detailed(&mut cm, &request(&second), &[], 300_000, 1_000_000);
-        let repeat =
-            apply_context_requests_detailed(&mut cm, &request(&first), &[], 300_000, 1_000_000);
+        let outcome = apply_context_requests_detailed(&mut cm, &request(&first), &[], 300_000);
+        assert_eq!(outcome.added, vec![first.clone()]);
+
+        let repeat = apply_context_requests_detailed(&mut cm, &request(&first), &[], 300_000);
+        assert!(repeat.added.is_empty());
         assert_eq!(repeat.already_satisfied, vec![first.clone()]);
 
-        // A budget that fits exactly two equal documents drops the least
-        // recently requested one when the third arrives.
-        let per_document = cm
-            .get_state()
-            .items
-            .iter()
-            .find(|item| item.path == first)
-            .map(|item| item.estimated_tokens as usize)
-            .expect("the first snapshot is loaded");
-        let outcome = apply_context_requests_detailed(
-            &mut cm,
-            &request(&third),
-            &[],
-            300_000,
-            2 * per_document,
-        );
-
-        assert_eq!(outcome.added, vec![third.clone()]);
-        assert_eq!(cm.refs_files(), vec![first, third]);
+        // A second document joins the first: the layer holds both instead of
+        // evicting by a recency rank it no longer keeps.
+        let outcome = apply_context_requests_detailed(&mut cm, &request(&second), &[], 300_000);
+        assert_eq!(outcome.added, vec![second.clone()]);
+        assert_eq!(cm.outer_docs_files(), vec![first, second]);
     }
 
-    /// A document larger than the whole Refs budget is refused with a
-    /// diagnostic instead of evicting every other document and failing anyway.
+    /// An external document is priced exactly like a repository file, so a
+    /// document that alone exceeds the single token budget is refused by the
+    /// shared limit report instead of widening the context past the ceiling.
+    /// The refusal never deletes the snapshot: a later round with a wider budget
+    /// can read the very same file.
     #[test]
-    fn test_a_reference_document_larger_than_its_budget_is_reported() {
+    fn test_an_external_document_beyond_the_token_budget_is_reported() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().to_path_buf();
-        let cache = root.join(crate::refs::REFS_CACHE_DIR);
+        let cache = root.join(crate::outer_docs::OUTER_DOCS_CACHE_DIR);
         std::fs::create_dir_all(&cache).unwrap();
         std::fs::write(cache.join("huge.md"), "x".repeat(8192)).unwrap();
-        let mut cm = ContextManager::new(root);
-        let cached = format!("{}/huge.md", crate::refs::REFS_CACHE_DIR);
+        let mut cm = ContextManager::new(root.clone());
+        let cached = format!("{}/huge.md", crate::outer_docs::OUTER_DOCS_CACHE_DIR);
         let requests = vec![ContextRequest {
             path: cached.clone(),
             access: ContextAccess::ReadOnly,
         }];
 
-        let outcome = apply_context_requests_detailed(&mut cm, &requests, &[], 300_000, 1);
+        let outcome = apply_context_requests_detailed(&mut cm, &requests, &[], 1);
 
+        let limit = outcome
+            .limit_exceeded
+            .as_ref()
+            .expect("the aggregate budget refuses the whole request");
+        assert_eq!(limit.token_budget, 1);
+        assert_eq!(limit.requested_files, vec![cached.clone()]);
         assert!(outcome.added.is_empty());
-        assert_eq!(outcome.refs_rejected.len(), 1);
-        assert_eq!(outcome.refs_rejected[0].path, cached);
-        assert!(outcome.refs_rejected[0].reason.contains("refs budget"));
-        assert!(cm.refs_files().is_empty());
+        assert!(outcome.outer_docs_rejected.is_empty());
+        assert!(cm.outer_docs_files().is_empty());
+        assert!(
+            root.join(&cached).is_file(),
+            "a refused document must stay in the harness cache for a later round"
+        );
     }
 
-    /// A refused snapshot is reported back as round feedback instead of a dead
-    /// end, because the model must learn that the declared document cannot
-    /// widen the context.
+    /// Repository files and materialized external documents compete for the
+    /// single `token_budget` ceiling: both are priced as their content plus the
+    /// `<file>` wrapper, and one breached budget refuses the whole set while
+    /// naming every requested path.
     #[test]
-    fn test_execute_discovery_commands_reports_a_refused_reference_document() {
+    fn test_external_documents_are_priced_with_the_repository_files() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().to_path_buf();
-        let cache = root.join(crate::refs::REFS_CACHE_DIR);
+        std::fs::write(root.join("a.rs"), "pub fn alpha() {}\n").unwrap();
+        let cache = root.join(crate::outer_docs::OUTER_DOCS_CACHE_DIR);
         std::fs::create_dir_all(&cache).unwrap();
-        std::fs::write(cache.join("huge.md"), "x".repeat(8192)).unwrap();
-        let mut cm = ContextManager::new(root.clone());
-        let cached = format!("{}/huge.md", crate::refs::REFS_CACHE_DIR);
-        let commands = vec![LlmCommand::ContextRequest {
-            path: cached.clone(),
-            access: ContextAccess::ReadOnly,
-        }];
-        let limits = DiscoveryLimits {
-            refs_token_budget: 1,
-            ..default_limits()
-        };
+        std::fs::write(cache.join("api.md"), "upstream notes\n").unwrap();
+        let mut cm = ContextManager::new(root);
+        let cached = format!("{}/api.md", crate::outer_docs::OUTER_DOCS_CACHE_DIR);
+        let requests = vec![
+            ContextRequest {
+                path: "a.rs".to_string(),
+                access: ContextAccess::ReadOnly,
+            },
+            ContextRequest {
+                path: cached.clone(),
+                access: ContextAccess::ReadOnly,
+            },
+        ];
+        let available = vec!["a.rs".to_string()];
 
-        let outcome = execute_discovery_commands_sync(
-            &mut cm,
-            &root,
-            &[],
-            &commands,
-            300_000,
-            300_000,
-            limits,
-            false,
+        // One file's content fits the ceiling; the same ceiling priced for two
+        // entries of either kind does not.
+        let one_file = crate::prompt::estimate_tokens("pub fn alpha() {}\n")
+            + crate::prompt::context_element_overhead_tokens("a.rs", ContextAccess::ReadOnly);
+        let outcome = apply_context_requests_detailed(&mut cm, &requests, &available, one_file);
+
+        let limit = outcome
+            .limit_exceeded
+            .as_ref()
+            .expect("the mixed request breaches the shared ceiling");
+        assert_eq!(limit.token_budget, one_file);
+        assert_eq!(
+            limit.requested_files,
+            vec!["a.rs".to_string(), cached.clone()]
         );
+        assert!(outcome.added.is_empty());
+        assert!(cm.outer_docs_files().is_empty());
 
-        assert!(outcome.added_files.is_empty());
-        assert_eq!(outcome.refs_rejected.len(), 1);
+        // A ceiling that pays for both admits them together.
+        let both = one_file
+            + crate::prompt::estimate_tokens("upstream notes\n")
+            + crate::prompt::context_element_overhead_tokens(&cached, ContextAccess::ReadOnly);
+        let outcome = apply_context_requests_detailed(&mut cm, &requests, &available, both);
+
+        assert!(outcome.limit_exceeded.is_none());
+        assert_eq!(outcome.added, vec!["a.rs".to_string(), cached.clone()]);
+        assert_eq!(cm.outer_docs_files(), vec![cached]);
+    }
+    /// A trust decision is recorded apart from a delivery failure: the round
+    /// outcome carries the exact cause and the declaration that would authorize
+    /// the source, and the model is told to report it instead of routing around
+    /// the prohibition.
+    #[test]
+    fn test_a_trust_refusal_is_recorded_apart_from_a_delivery_failure() {
+        use crate::outer_docs::{TrustRefusal, WorkspaceDeclaration};
+
+        let mut outcome = ResearchRoundOutcome::default();
+        let path = format!("{}/api.md", crate::outer_docs::OUTER_DOCS_CACHE_DIR);
+        let refusal = MaterializeError::Trust(TrustRefusal::WorkspaceNotAuthorized {
+            workspace: WorkspaceDeclaration {
+                root: "/work/project".to_string(),
+                local_roots: Vec::new(),
+                allow_private_network: false,
+            },
+        });
+
+        outcome.record_outer_docs_failure(&path, &refusal);
+        // A repeated refusal of the same document is recorded once.
+        outcome.record_outer_docs_failure(&path, &refusal);
+
+        assert!(outcome.outer_docs_rejected.is_empty());
+        assert_eq!(outcome.outer_docs_trust_refused.len(), 1);
+        let entry = &outcome.outer_docs_trust_refused[0];
+        assert_eq!(entry.path, path);
+        assert!(entry.reason.contains("no entry"), "{entry:?}");
+        let remedy = entry
+            .remedy
+            .as_deref()
+            .expect("the refusal carries its declaration");
+        assert!(remedy.contains("[[workspace]]"), "{remedy}");
         assert!(outcome.has_progress(false));
+
         let feedback = outcome.combined_feedback();
-        assert!(feedback.contains("<refs_feedback>"));
-        assert!(feedback.contains(cached.as_str()));
-        assert!(cm.refs_files().is_empty());
+        assert!(feedback.contains("<outer_docs_feedback>"), "{feedback}");
+        assert!(feedback.contains("trust declaration"), "{feedback}");
+        assert!(feedback.contains("developer"), "{feedback}");
         assert!(
-            !root.join(&cached).exists(),
-            "a refused document must not linger in the reference cache"
+            feedback.contains("do not look for another route"),
+            "{feedback}"
         );
     }
 
-    /// A reference the registry declares becomes visible in the round that asks
-    /// for it: the pre-step materializes the snapshot, the rewritten request
-    /// widens the context, and the snapshot enters the Refs layer read-only.
-    #[tokio::test]
-    async fn test_a_declared_reference_is_materialized_by_the_round_that_requests_it() {
-        use wiremock::matchers::{method, path};
-        use wiremock::{Mock, MockServer, ResponseTemplate};
+    /// A failed transfer is model-addressed: it is recorded as a delivery
+    /// failure, and its feedback routes the model around the missing document
+    /// instead of forbidding a later attempt.
+    #[test]
+    fn test_a_delivery_failure_stays_with_the_model() {
+        let mut outcome = ResearchRoundOutcome::default();
+        let path = format!("{}/api.md", crate::outer_docs::OUTER_DOCS_CACHE_DIR);
+        let failure = MaterializeError::Delivery(
+            "the document `https://example.com/llm.txt` answered with the HTTP status 404"
+                .to_string(),
+        );
 
-        let server = MockServer::start().await;
-        Mock::given(method("GET"))
-            .and(path("/llm.txt"))
-            .respond_with(ResponseTemplate::new(200).set_body_string("upstream notes"))
-            .mount(&server)
-            .await;
+        outcome.record_outer_docs_failure(&path, &failure);
+        outcome.record_outer_docs_failure(&path, &failure);
 
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path().to_path_buf();
-        crate::git::init_repository(Some(&root), true).unwrap();
-        let manifest = root.join(crate::refs::REFS_MANIFEST);
-        std::fs::create_dir_all(manifest.parent().unwrap()).unwrap();
-        let url = format!("{}/llm.txt", server.uri());
-        let declared = format!("- [reference](vendor/api.md) = {url}\n");
-        std::fs::write(&manifest, &declared).unwrap();
-
-        let mut cm = ContextManager::new(root.clone());
-        let commands = vec![LlmCommand::ContextRequest {
-            path: ".tauqe/refs/vendor/api.md".to_string(),
-            access: ContextAccess::ReadOnly,
-        }];
-
-        let outcome = execute_discovery_commands(
-            &mut cm,
-            &root,
-            &commands,
-            300_000,
-            300_000,
-            default_limits(),
-            false,
-            None,
-        )
-        .await;
-
-        let cached = crate::refs::cache_path_for("vendor/api.md");
-        assert_eq!(outcome.added_files, vec![cached.clone()]);
-        assert!(outcome.missing_files.is_empty());
+        assert!(outcome.outer_docs_trust_refused.is_empty());
+        assert_eq!(outcome.outer_docs_rejected.len(), 1);
+        assert_eq!(outcome.outer_docs_rejected[0].path, path);
+        assert!(outcome.outer_docs_rejected[0].reason.contains("404"));
         assert!(outcome.has_progress(false));
-        assert_eq!(cm.refs_files(), vec![cached.clone()]);
-        assert!(!cm.is_editable(&cached).unwrap());
-        assert_eq!(
-            std::fs::read_to_string(root.join(&cached)).unwrap(),
-            "upstream notes"
-        );
 
-        // A second round requesting the same name reuses the snapshot, so the
-        // material the model reasoned about stays stable and no download repeats.
-        let outcome = execute_discovery_commands(
-            &mut cm,
-            &root,
-            &commands,
-            300_000,
-            300_000,
-            default_limits(),
-            false,
-            None,
-        )
-        .await;
-        assert!(outcome.added_files.is_empty());
-        assert_eq!(outcome.already_satisfied_files, vec![cached]);
-        assert_eq!(
-            server.received_requests().await.unwrap().len(),
-            1,
-            "a materialized snapshot must not be downloaded again"
-        );
-    }
-
-    /// A reference that cannot be materialized is reported first and still
-    /// surfaces as missing, so the model learns why the declared document is
-    /// unavailable instead of waiting for a file that never appears.
-    #[tokio::test]
-    async fn test_a_failed_reference_materialization_leads_the_round_feedback() {
-        use wiremock::matchers::{method, path};
-        use wiremock::{Mock, MockServer, ResponseTemplate};
-
-        let server = MockServer::start().await;
-        Mock::given(method("GET"))
-            .and(path("/missing.txt"))
-            .respond_with(ResponseTemplate::new(404))
-            .mount(&server)
-            .await;
-
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path().to_path_buf();
-        crate::git::init_repository(Some(&root), true).unwrap();
-        let manifest = root.join(crate::refs::REFS_MANIFEST);
-        std::fs::create_dir_all(manifest.parent().unwrap()).unwrap();
-        let url = format!("{}/missing.txt", server.uri());
-        let declared = format!("- [missing](vendor/missing.md) = {url}\n");
-        std::fs::write(&manifest, &declared).unwrap();
-
-        let mut cm = ContextManager::new(root.clone());
-        let requested = ".tauqe/refs/vendor/missing.md".to_string();
-        let commands = vec![LlmCommand::ContextRequest {
-            path: requested.clone(),
-            access: ContextAccess::ReadOnly,
-        }];
-
-        let outcome = execute_discovery_commands(
-            &mut cm,
-            &root,
-            &commands,
-            300_000,
-            300_000,
-            default_limits(),
-            false,
-            None,
-        )
-        .await;
-
-        assert!(outcome.added_files.is_empty());
-        assert_eq!(outcome.missing_files, vec![requested]);
         let feedback = outcome.combined_feedback();
+        assert!(feedback.contains("could not be delivered"), "{feedback}");
+        assert!(feedback.contains("may be attempted again"), "{feedback}");
         assert!(
-            feedback.starts_with("<refs_feedback>"),
-            "the refusal must lead the round feedback: {feedback:?}"
+            !feedback.contains("do not look for another route"),
+            "{feedback}"
         );
-        assert!(feedback.contains("404"));
-        assert!(cm.refs_files().is_empty());
     }
 }

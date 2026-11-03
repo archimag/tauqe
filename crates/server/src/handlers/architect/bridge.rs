@@ -23,6 +23,7 @@
 
 use std::sync::Arc;
 
+use async_trait::async_trait;
 use tauqe_core::config::{AppConfig, ModelsConfig};
 use tauqe_core::context::ContextManager;
 use tauqe_core::providers::{LlmProvider, StreamEvent};
@@ -67,29 +68,18 @@ impl ArchitectProviderResolver {
     }
 }
 
+#[async_trait]
 impl ProviderResolver for ArchitectProviderResolver {
-    fn resolve(&self, kind: ProviderKind) -> anyhow::Result<Arc<dyn LlmProvider>> {
-        let handle = tokio::runtime::Handle::try_current().map_err(|_| {
-            anyhow::anyhow!(
-                "The architect provider resolver needs a Tokio runtime to resolve {kind}"
-            )
-        })?;
-        let state = Arc::clone(&self.state);
-        let config = self.config.clone();
-        // The hook is synchronous while the shared resolution path is
-        // asynchronous, so the call hops onto the blocking region of the daemon
-        // runtime instead of parking the worker that polls the contour. The
-        // bridge therefore needs the multi-threaded runtime the daemon owns.
-        tokio::task::block_in_place(|| {
-            handle.block_on(resolve_architect_provider(&state, &config, kind))
-        })
-        .map_err(anyhow::Error::msg)
+    async fn resolve(&self, kind: ProviderKind) -> anyhow::Result<Arc<dyn LlmProvider>> {
+        resolve_architect_provider(&self.state, &self.config, kind)
+            .await
+            .map_err(anyhow::Error::msg)
     }
 }
 
 /// Telemetry the relay accumulated for the adapter that started the synthesis.
 ///
-/// The contour owns the provider round, the tier ladder, and the discovery
+/// The contour owns the provider round, the tier ladder, and the research
 /// rounds; the adapter owns the RPC response. This summary is the seam between
 /// them: the answer a client needs for `model/finished`, whether the run was
 /// cancelled, and the provider failure it reported, if any.
@@ -271,7 +261,7 @@ async fn relay_contour_events(
 /// merge.
 ///
 /// The contour works on its own clone of the context and owns the auto layer it
-/// widened, so the clone is merged back afterwards: the material discovery paid
+/// widened, so the clone is merged back afterwards: the material research paid
 /// for survives the run, while the layers the synthesis only borrowed are
 /// restored exactly as the core engine leaves them.
 #[allow(clippy::too_many_arguments)]
@@ -379,7 +369,7 @@ pub(crate) async fn run_contour_synthesis(
 
     // The synthesis owns the auto context layer it widened: the material is the
     // Architect's investigation rather than the developer's dialogue, so it is
-    // never kept. Everything the contour observed — the files discovery added
+    // never kept. Everything the contour observed — the files research added
     // and the restored layers — is merged back so a partial run keeps the work
     // that was already paid for.
     let merged = state
@@ -495,10 +485,10 @@ mod tests {
                 effort: Some(ReasoningEffort::High),
             },
             StreamEvent::TurnPhase {
-                phase: TurnPhase::Discovery,
+                phase: TurnPhase::Research,
                 round: Some(1),
                 max_rounds: Some(3),
-                detail: Some("Discovery round 1".to_string()),
+                detail: Some("Research round 1".to_string()),
             },
             StreamEvent::RepoMapTokens(512),
             StreamEvent::RetryingConnection {
@@ -570,7 +560,7 @@ mod tests {
 
         let phases = collect(&raw_events, events::TURN_PHASE);
         assert_eq!(phases.len(), 1);
-        assert_eq!(phases[0]["phase"], "discovery");
+        assert_eq!(phases[0]["phase"], "research");
         assert_eq!(phases[0]["round"], 1);
         assert_eq!(phases[0]["max_rounds"], 3);
 
@@ -640,7 +630,10 @@ mod tests {
     /// the contour to a typed synthesized outcome, accounts the run as one
     /// operation, and merges the context the contour worked on back into the
     /// shared state.
-    #[tokio::test(flavor = "multi_thread")]
+    ///
+    /// The current-thread flavor is the deliberate host: no seam of the launch
+    /// skeleton may require the daemon's multi-threaded runtime.
+    #[tokio::test]
     async fn contour_skeleton_synthesizes_and_merges_the_context() {
         let (state, _events, root) = test_state("skeleton");
         tauqe_core::git::init_repository(Some(&root), true).expect("init the fixture repository");
@@ -716,6 +709,31 @@ mod tests {
         );
 
         drop(operation);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The resolver is awaited inside the proposal round, so it must resolve on
+    /// whatever runtime polls the contour. A current-thread runtime is the exact
+    /// host that used to panic inside the bridge's blocking hop.
+    #[tokio::test]
+    async fn resolver_resolves_an_installed_client_on_a_current_thread_runtime() {
+        let (state, _events, root) = test_state("resolver");
+        let installed: Arc<dyn LlmProvider> =
+            Arc::new(MockLlmProvider::scripted([MockResponse::text("unused")]));
+        *state.provider_override.lock().await = Some(installed.clone());
+
+        let config = state.config.lock().await.config.clone();
+        let resolver = ArchitectProviderResolver::new(Arc::clone(&state), config);
+
+        let resolved = resolver
+            .resolve(ProviderKind::OpenRouter)
+            .await
+            .expect("the installed client resolves on a current-thread runtime");
+        assert!(
+            std::ptr::eq(&*resolved, &*installed),
+            "the resolver must return the client installed through the test seam"
+        );
+
         let _ = std::fs::remove_dir_all(&root);
     }
 }

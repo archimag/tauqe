@@ -13,7 +13,7 @@ use tauqe_protocol::{ArchitectTier, PlanItemStatus};
 
 use crate::markdown::MarkdownBodyCache;
 use crate::theme::engine::current_engine;
-use crate::ui::wrap_lines;
+use crate::ui::wrap::{wrap_line, wrapped_line_count};
 
 use super::VisiblePlanRow;
 
@@ -170,8 +170,82 @@ pub(crate) fn prepare_plan_markdown(raw: &str) -> String {
 ///
 /// The renderer and the viewport measurement consult this single predicate, so a
 /// measured row height can never disagree with the lines actually drawn (c-2).
-pub(crate) fn plan_row_gap(index: usize, row: &VisiblePlanRow) -> bool {
+fn plan_row_gap(index: usize, row: &VisiblePlanRow) -> bool {
     index > 0 && matches!(row, VisiblePlanRow::PlanHeader { .. })
+}
+
+/// Receives the rows of the plan tree in the order the shared row walk emits
+/// them.
+///
+/// The walk owns the row order, the blank separator between plans, and the match
+/// over every row variant, so the rendering visitor and the measuring visitor can
+/// never disagree about which rows exist or in which order they appear. A
+/// visitor only decides what to do with each piece it is handed: materialize it,
+/// or count it.
+trait PlanRowVisitor {
+    /// Emits the blank separator that opens a new plan.
+    fn separator(&mut self);
+
+    /// Records the first rendered line of the row that follows.
+    fn row_start(&mut self);
+
+    /// Emits one row-summary line, which still has to be wrapped to `width`.
+    fn summary(&mut self, line: Line<'static>, width: usize);
+
+    /// Emits a detail body the Markdown cache already wrapped to the target
+    /// width, so its lines are taken exactly as they are.
+    fn body(&mut self, lines: &[Line<'static>]);
+}
+
+/// Rendering visitor: materializes the wrapped lines and the row offsets.
+#[derive(Default)]
+struct PlanLineRenderer {
+    lines: Vec<Line<'static>>,
+    offsets: Vec<usize>,
+}
+
+impl PlanRowVisitor for PlanLineRenderer {
+    fn separator(&mut self) {
+        self.lines.push(Line::raw(""));
+    }
+
+    fn row_start(&mut self) {
+        self.offsets.push(self.lines.len());
+    }
+
+    fn summary(&mut self, line: Line<'static>, width: usize) {
+        self.lines.extend(wrap_line(line, width));
+    }
+
+    fn body(&mut self, lines: &[Line<'static>]) {
+        self.lines.extend(lines.iter().cloned());
+    }
+}
+
+/// Measuring visitor: reproduces the row offsets and the total height of the
+/// tree without materializing a single line.
+#[derive(Default)]
+struct PlanLineMeasure {
+    offsets: Vec<usize>,
+    height: usize,
+}
+
+impl PlanRowVisitor for PlanLineMeasure {
+    fn separator(&mut self) {
+        self.height += 1;
+    }
+
+    fn row_start(&mut self) {
+        self.offsets.push(self.height);
+    }
+
+    fn summary(&mut self, line: Line<'static>, width: usize) {
+        self.height += wrapped_line_count(&line, width);
+    }
+
+    fn body(&mut self, lines: &[Line<'static>]) {
+        self.height += lines.len();
+    }
 }
 
 /// Renders the flattened Plans rows into lines and their row offsets.
@@ -186,9 +260,6 @@ pub(crate) fn plan_row_gap(index: usize, row: &VisiblePlanRow) -> bool {
 /// lines already rendered for the unchanged description, while a changed
 /// description, indent, width, or palette re-renders exactly that one body
 /// (c-1, c-3).
-///
-/// A slice holding a single row renders exactly that row, which is how the view
-/// measures the height of one row without materializing the whole tree (c-2).
 pub(crate) fn compute_unified_plan_lines(
     rows: &[VisiblePlanRow],
     selected_idx: usize,
@@ -196,10 +267,50 @@ pub(crate) fn compute_unified_plan_lines(
     theme_mode: crate::config::ThemeMode,
     cache: &mut MarkdownBodyCache,
 ) -> (Vec<Line<'static>>, Vec<usize>) {
+    let mut renderer = PlanLineRenderer::default();
+    walk_plan_rows(rows, selected_idx, width, theme_mode, cache, &mut renderer);
+    (renderer.lines, renderer.offsets)
+}
+
+/// Measures the row offsets and the total height of the flattened Plans rows
+/// without materializing a single line.
+///
+/// Every break decision is shared with [`compute_unified_plan_lines`] through one
+/// row walk, and the short summary lines are counted through
+/// [`wrapped_line_count`] instead of being wrapped into owned lines. A cached
+/// detail body already arrives wrapped to the target width, so it contributes its
+/// own length. Measured offsets therefore match the rendered frame exactly while
+/// positioning the viewport costs no line allocation (c-2).
+pub(crate) fn measure_plan_rows(
+    rows: &[VisiblePlanRow],
+    selected_idx: usize,
+    width: usize,
+    theme_mode: crate::config::ThemeMode,
+    cache: &mut MarkdownBodyCache,
+) -> (Vec<usize>, usize) {
+    let mut measure = PlanLineMeasure::default();
+    walk_plan_rows(rows, selected_idx, width, theme_mode, cache, &mut measure);
+    (measure.offsets, measure.height)
+}
+
+/// Walks the visible rows in render order and hands every rendered piece to
+/// `visitor`.
+///
+/// This walk is the single source of truth for the shape of the tree: it emits
+/// the separator between plans, records where each row starts, builds every
+/// summary line, and resolves every detail body through the Markdown cache.
+/// Rendering and measuring therefore observe one identical layout, and no
+/// consumer can drift from another (c-2).
+fn walk_plan_rows<V: PlanRowVisitor>(
+    rows: &[VisiblePlanRow],
+    selected_idx: usize,
+    width: usize,
+    theme_mode: crate::config::ThemeMode,
+    cache: &mut MarkdownBodyCache,
+    visitor: &mut V,
+) {
     let engine = current_engine();
     let palette = engine.palette();
-    let mut all_lines = Vec::new();
-    let mut offsets = Vec::with_capacity(rows.len());
 
     for (idx, row) in rows.iter().enumerate() {
         let is_selected = idx == selected_idx;
@@ -208,9 +319,9 @@ pub(crate) fn compute_unified_plan_lines(
         // Otherwise the offset anchors the gap and scrolling stops one line
         // short of the header it is meant to reveal (c-offset-accuracy).
         if plan_row_gap(idx, row) {
-            all_lines.push(Line::raw(""));
+            visitor.separator();
         }
-        offsets.push(all_lines.len());
+        visitor.row_start();
 
         let row_style = if is_selected {
             engine.bg(palette.overlay)
@@ -272,7 +383,7 @@ pub(crate) fn compute_unified_plan_lines(
                 if is_selected {
                     header_line = pad_line_to_width(header_line, width, row_style);
                 }
-                all_lines.extend(wrap_lines(vec![header_line], width));
+                visitor.summary(header_line, width);
 
                 if *is_expanded {
                     if let Some(desc) = description {
@@ -292,7 +403,7 @@ pub(crate) fn compute_unified_plan_lines(
                             let key = plan_description_key(plan_id);
                             let body =
                                 cache.lines_for(&key, &prepared, &theme, Some(width), theme_mode);
-                            all_lines.extend(body.iter().cloned());
+                            visitor.body(body);
                         }
                     }
                 }
@@ -340,7 +451,7 @@ pub(crate) fn compute_unified_plan_lines(
                 if is_selected {
                     line = pad_line_to_width(line, width, row_style);
                 }
-                all_lines.extend(wrap_lines(vec![line], width));
+                visitor.summary(line, width);
             }
             VisiblePlanRow::ConceptItem {
                 plan_id,
@@ -381,7 +492,7 @@ pub(crate) fn compute_unified_plan_lines(
 
                 let mut spans = vec![
                     gutter,
-                    Span::raw(indent.clone()),
+                    Span::raw(indent),
                     Span::styled(fold_icon, fold_style),
                     Span::styled(format!("#{} {}", item_id, clean_title), title_style),
                 ];
@@ -392,7 +503,7 @@ pub(crate) fn compute_unified_plan_lines(
                 if is_selected {
                     row_line = pad_line_to_width(row_line, width, row_style);
                 }
-                let mut row_lines = wrap_lines(vec![row_line], width);
+                visitor.summary(row_line, width);
 
                 if *is_expanded {
                     if let Some(det) = details {
@@ -410,11 +521,10 @@ pub(crate) fn compute_unified_plan_lines(
                             let key = concept_body_key(plan_id, item_id);
                             let body =
                                 cache.lines_for(&key, &prepared, &theme, Some(width), theme_mode);
-                            row_lines.extend(body.iter().cloned());
+                            visitor.body(body);
                         }
                     }
                 }
-                all_lines.extend(row_lines);
             }
             VisiblePlanRow::ImplementationHeader {
                 total,
@@ -458,7 +568,7 @@ pub(crate) fn compute_unified_plan_lines(
                 if is_selected {
                     line = pad_line_to_width(line, width, row_style);
                 }
-                all_lines.extend(wrap_lines(vec![line], width));
+                visitor.summary(line, width);
             }
             VisiblePlanRow::PlanItem {
                 plan_id,
@@ -466,8 +576,10 @@ pub(crate) fn compute_unified_plan_lines(
                 title,
                 details,
                 status,
+                commit,
                 files,
                 readonly_files,
+                outer_docs,
                 concept_refs,
                 blocked_reason,
                 depth,
@@ -519,14 +631,14 @@ pub(crate) fn compute_unified_plan_lines(
 
                 let mut spans = vec![
                     gutter,
-                    Span::raw(indent.clone()),
+                    Span::raw(indent),
                     Span::styled(fold_icon, fold_style),
                     Span::styled(format!(" {} ", status), status_style(*status)),
                     Span::raw(" "),
                     Span::styled(format!("#{} {}", item_id, clean_title), title_style),
                 ];
 
-                if !*has_children && (!files.is_empty() || !readonly_files.is_empty()) {
+                if !*has_children {
                     let mut badge_parts = Vec::new();
                     if !files.is_empty() {
                         badge_parts.push(crate::i18n::active_t("plans.file_count").replacen(
@@ -542,10 +654,29 @@ pub(crate) fn compute_unified_plan_lines(
                             1,
                         ));
                     }
-                    spans.push(Span::styled(
-                        format!(" [{}]", badge_parts.join(" + ")),
-                        engine.fg(palette.text_muted),
-                    ));
+                    if !outer_docs.is_empty() {
+                        badge_parts.push(crate::i18n::active_t("plans.docs_count").replacen(
+                            "{}",
+                            &outer_docs.len().to_string(),
+                            1,
+                        ));
+                    }
+                    if !badge_parts.is_empty() {
+                        spans.push(Span::styled(
+                            format!(" [{}]", badge_parts.join(" + ")),
+                            engine.fg(palette.text_muted),
+                        ));
+                    }
+                }
+                if *status == PlanItemStatus::Done {
+                    let hash = commit.as_deref().unwrap_or("").trim();
+                    if !hash.is_empty() {
+                        let short: String = hash.chars().take(7).collect();
+                        spans.push(Span::styled(
+                            format!(" {}", short),
+                            engine.fg(palette.status_success),
+                        ));
+                    }
                 }
                 if *focused {
                     spans.push(focus_badge());
@@ -555,45 +686,66 @@ pub(crate) fn compute_unified_plan_lines(
                 if is_selected {
                     row_line = pad_line_to_width(row_line, width, row_style);
                 }
-                let mut row_lines = vec![row_line];
-                // A cached Markdown body arrives already wrapped, so it is
-                // collected apart and appended after the row summary and its
-                // metadata, which are short and wrapped every frame (c-1).
-                let mut detail_lines: Vec<Line<'static>> = Vec::new();
+                visitor.summary(row_line, width);
 
                 if *is_expanded {
                     if !*has_children && !files.is_empty() {
-                        row_lines.push(Line::from(vec![
-                            Span::styled(body_prefix.clone(), engine.fg(palette.text_muted)),
-                            Span::styled(
-                                format!("{} ", crate::i18n::active_t("plans.files_prefix")),
-                                engine.fg(palette.text_muted),
-                            ),
-                            Span::styled(files.join(", "), engine.fg(palette.status_info)),
-                        ]));
+                        visitor.summary(
+                            Line::from(vec![
+                                Span::styled(body_prefix.clone(), engine.fg(palette.text_muted)),
+                                Span::styled(
+                                    format!("{} ", crate::i18n::active_t("plans.files_prefix")),
+                                    engine.fg(palette.text_muted),
+                                ),
+                                Span::styled(files.join(", "), engine.fg(palette.status_info)),
+                            ]),
+                            width,
+                        );
                     }
                     if !*has_children && !readonly_files.is_empty() {
-                        row_lines.push(Line::from(vec![
-                            Span::styled(body_prefix.clone(), engine.fg(palette.text_muted)),
-                            Span::styled(
-                                format!("{} ", crate::i18n::active_t("plans.ref_prefix")),
-                                engine.fg(palette.text_muted),
-                            ),
-                            Span::styled(readonly_files.join(", "), engine.fg(palette.status_info)),
-                        ]));
+                        visitor.summary(
+                            Line::from(vec![
+                                Span::styled(body_prefix.clone(), engine.fg(palette.text_muted)),
+                                Span::styled(
+                                    format!("{} ", crate::i18n::active_t("plans.ref_prefix")),
+                                    engine.fg(palette.text_muted),
+                                ),
+                                Span::styled(
+                                    readonly_files.join(", "),
+                                    engine.fg(palette.status_info),
+                                ),
+                            ]),
+                            width,
+                        );
+                    }
+                    if !*has_children && !outer_docs.is_empty() {
+                        visitor.summary(
+                            Line::from(vec![
+                                Span::styled(body_prefix.clone(), engine.fg(palette.text_muted)),
+                                Span::styled(
+                                    format!("{} ", crate::i18n::active_t("plans.docs_prefix")),
+                                    engine.fg(palette.text_muted),
+                                ),
+                                Span::styled(outer_docs.join(", "), engine.fg(palette.status_info)),
+                            ]),
+                            width,
+                        );
                     }
                     if !concept_refs.is_empty() {
-                        row_lines.push(Line::from(vec![
-                            Span::styled(body_prefix.clone(), engine.fg(palette.text_muted)),
-                            Span::styled(
-                                crate::i18n::active_t("plans.concept_prefix"),
-                                engine.fg(palette.text_muted),
-                            ),
-                            Span::styled(
-                                concept_refs.join(", "),
-                                engine.fg(palette.button_active_bg),
-                            ),
-                        ]));
+                        visitor.summary(
+                            Line::from(vec![
+                                Span::styled(body_prefix.clone(), engine.fg(palette.text_muted)),
+                                Span::styled(
+                                    crate::i18n::active_t("plans.concept_prefix"),
+                                    engine.fg(palette.text_muted),
+                                ),
+                                Span::styled(
+                                    concept_refs.join(", "),
+                                    engine.fg(palette.button_active_bg),
+                                ),
+                            ]),
+                            width,
+                        );
                     }
                     if let Some(reason) = blocked_reason {
                         let prepared = prepare_plan_markdown(reason);
@@ -613,10 +765,13 @@ pub(crate) fn compute_unified_plan_lines(
                                 } else {
                                     Span::styled(body_prefix.clone(), engine.fg(palette.text_muted))
                                 };
-                                row_lines.push(Line::from(vec![
-                                    lead,
-                                    Span::styled(text.to_string(), reason_style),
-                                ]));
+                                visitor.summary(
+                                    Line::from(vec![
+                                        lead,
+                                        Span::styled(text.to_string(), reason_style),
+                                    ]),
+                                    width,
+                                );
                             }
                         }
                     }
@@ -635,19 +790,13 @@ pub(crate) fn compute_unified_plan_lines(
                             let key = step_body_key(plan_id, item_id);
                             let body =
                                 cache.lines_for(&key, &prepared, &theme, Some(width), theme_mode);
-                            detail_lines.extend(body.iter().cloned());
+                            visitor.body(body);
                         }
                     }
                 }
-
-                let mut rendered = wrap_lines(row_lines, width);
-                rendered.extend(detail_lines);
-                all_lines.extend(rendered);
             }
         }
     }
-
-    (all_lines, offsets)
 }
 
 #[cfg(test)]
@@ -672,8 +821,10 @@ mod tests {
             details: None,
             status: PlanItemStatus::Todo,
             blocked_reason: None,
+            commit: None,
             files: vec![],
             readonly_files: vec![],
+            outer_docs: vec![],
             concept_refs: vec![],
             depends_on: vec![],
             children: vec![],
@@ -903,8 +1054,10 @@ mod tests {
                 details: None,
                 status: PlanItemStatus::Todo,
                 blocked_reason: None,
+                commit: None,
                 files: vec!["parent.rs".to_string()],
                 readonly_files: vec![],
+                outer_docs: vec![],
                 concept_refs: vec![],
                 depends_on: vec![],
                 children: vec![PlanItem {
@@ -913,8 +1066,10 @@ mod tests {
                     details: None,
                     status: PlanItemStatus::Todo,
                     blocked_reason: None,
+                    commit: None,
                     files: vec!["leaf.rs".to_string()],
                     readonly_files: vec![],
+                    outer_docs: vec![],
                     concept_refs: vec![],
                     depends_on: vec![],
                     children: vec![],
@@ -958,11 +1113,13 @@ mod tests {
                 details: None,
                 status: PlanItemStatus::Todo,
                 blocked_reason: None,
+                commit: None,
                 files: vec!["src/auth.rs".to_string()],
                 readonly_files: vec![
                     "contracts/api.md".to_string(),
                     "contracts/types.rs".to_string(),
                 ],
+                outer_docs: vec![],
                 concept_refs: vec![],
                 depends_on: vec![],
                 children: vec![],
@@ -1107,8 +1264,10 @@ mod tests {
                 details: None,
                 status: PlanItemStatus::Todo,
                 blocked_reason: None,
+                commit: None,
                 files: vec![],
                 readonly_files: vec![],
+                outer_docs: vec![],
                 concept_refs: vec![],
                 depends_on: vec![],
                 children: vec![],
@@ -1404,6 +1563,127 @@ mod tests {
         assert_eq!(
             step_body, leaf,
             "a step body must sit at the level of its children"
+        );
+    }
+    /// A finished step names the commit it recorded in the compact form the Git
+    /// tooling prints, while a step that never finished names nothing.
+    #[test]
+    fn test_finished_step_renders_its_short_commit_hash() {
+        let mut done = leaf_item("1", "Done Step");
+        done.status = PlanItemStatus::Done;
+        done.commit = Some("0123456789abcdef".to_string());
+
+        let mut view = PlansViewState {
+            plans: vec![Plan::from_parts(
+                "commit-plan".to_string(),
+                "Commit Plan".to_string(),
+                None,
+                0,
+                0,
+                vec![],
+                vec![done, leaf_item("2", "Todo Step")],
+            )],
+            ..Default::default()
+        };
+        view.expand_all();
+
+        let (lines, _) = render_view(&mut view, usize::MAX, 200);
+        let text = joined_text(&lines);
+        assert!(
+            text.contains(" 0123456"),
+            "the short hash must render: {text}"
+        );
+        assert!(
+            !text.contains("0123456789abcdef"),
+            "the badge must stay short: {text}"
+        );
+        assert!(
+            !text.contains(" #2 Todo Step  0123456"),
+            "a step that recorded no commit carries no hash: {text}"
+        );
+    }
+    /// A leaf step implemented against an external specification renders the
+    /// document count in its compact badge and the identifiers themselves in
+    /// an expanded `docs:` line (c-plans-tree-docs-visibility).
+    #[test]
+    fn test_outer_docs_badge_and_details() {
+        let mut item = leaf_item("1", "Wire Chat");
+        item.files = vec!["src/chat.rs".to_string()];
+        item.readonly_files = vec!["contracts/api.md".to_string()];
+        item.outer_docs = vec![
+            "openrouter/chat-completion".to_string(),
+            "openrouter/limits".to_string(),
+        ];
+
+        let mut view = PlansViewState {
+            plans: vec![Plan::from_parts(
+                "docs-plan".to_string(),
+                "Docs Plan".to_string(),
+                None,
+                0,
+                0,
+                vec![],
+                vec![item],
+            )],
+            ..Default::default()
+        };
+        view.expand_all();
+
+        let (lines, _) = render_view(&mut view, usize::MAX, 200);
+        let text = joined_text(&lines);
+        assert!(
+            text.contains("[1 file(s) + 1 ref(s) + 2 doc(s)]"),
+            "the badge must count the external documents: {text}"
+        );
+        assert!(
+            text.contains("docs: openrouter/chat-completion, openrouter/limits"),
+            "the expanded step must list its documents: {text}"
+        );
+    }
+
+    /// External documentation alone makes a step expandable, so its identifiers
+    /// stay readable even when the step carries no description or file metadata.
+    #[test]
+    fn test_outer_docs_alone_expand_the_step() {
+        let mut item = leaf_item("1", "Read the spec");
+        item.outer_docs = vec!["openrouter/models".to_string()];
+
+        let mut view = PlansViewState {
+            plans: vec![Plan::from_parts(
+                "docs-only".to_string(),
+                "Docs Only".to_string(),
+                None,
+                0,
+                0,
+                vec![],
+                vec![item],
+            )],
+            ..Default::default()
+        };
+        view.expand_all();
+
+        let rows = view.flatten_rows();
+        assert!(
+            rows.iter().any(|row| matches!(
+                row,
+                VisiblePlanRow::PlanItem {
+                    item_id,
+                    is_expandable: true,
+                    ..
+                } if item_id == "1"
+            )),
+            "external documentation must make the step expandable"
+        );
+
+        let (lines, _) = render_view(&mut view, usize::MAX, 200);
+        let text = joined_text(&lines);
+        assert!(
+            text.contains("[1 doc(s)]"),
+            "a docs-only step carries its own badge: {text}"
+        );
+        assert!(
+            text.contains("docs: openrouter/models"),
+            "the expanded step must list its documents: {text}"
         );
     }
 }

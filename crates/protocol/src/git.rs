@@ -35,8 +35,13 @@ pub struct GitCommitCreatedEvent {
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct GitDiffParams {
+    /// Restricts a working-tree diff to one path. Ignored when `commit` is set.
     #[serde(default)]
     pub path: Option<String>,
+    /// Answers the diff the named commit introduced against its parent instead
+    /// of the working-tree diff.
+    #[serde(default)]
+    pub commit: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

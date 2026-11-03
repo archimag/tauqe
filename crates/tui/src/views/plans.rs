@@ -22,7 +22,7 @@ pub use self::render::render_plans_view;
 // entry points its renderer and the Review view consume, so those callers keep
 // importing one tree vocabulary from the plans module.
 pub(crate) use self::tree::{
-    architect_badge, compute_unified_plan_lines, plan_row_gap, status_style,
+    architect_badge, compute_unified_plan_lines, measure_plan_rows, status_style,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -72,8 +72,14 @@ pub enum VisiblePlanRow {
         title: String,
         details: Option<String>,
         status: PlanItemStatus,
+        /// Git commit recorded when the step was finalized, rendered as a short
+        /// hash so a finished step shows the change it produced.
+        commit: Option<String>,
         files: Vec<String>,
         readonly_files: Vec<String>,
+        /// Identifiers of the project-declared `[[outer_docs]]` entries the
+        /// step is implemented against, rendered beside its file metadata.
+        outer_docs: Vec<String>,
         concept_refs: Vec<String>,
         /// Diagnostic report of the semantic blocker that stopped the step.
         ///
@@ -574,6 +580,7 @@ impl PlansViewState {
             .unwrap_or(false);
         let has_meta = !item.files.is_empty()
             || !item.readonly_files.is_empty()
+            || !item.outer_docs.is_empty()
             || !item.concept_refs.is_empty();
         let has_blocked_reason = item
             .blocked_reason
@@ -588,8 +595,10 @@ impl PlansViewState {
             title: item.title.clone(),
             details: item.details.clone(),
             status: item.status,
+            commit: item.commit.clone(),
             files: item.files.clone(),
             readonly_files: item.readonly_files.clone(),
+            outer_docs: item.outer_docs.clone(),
             concept_refs: item.concept_refs.clone(),
             blocked_reason: item.blocked_reason.clone(),
             depth,
@@ -758,83 +767,38 @@ impl PlansViewState {
     }
 
     /// Rendered line bounds of the row at `index`, measured without materializing
-    /// the whole owned row projection.
+    /// a single line.
     ///
-    /// The tree is walked in document order and every row is measured on its own
-    /// through the frame's renderer, so the bounds can never disagree with the
-    /// lines actually drawn. The walk stops as soon as the bounds are known,
-    /// unless `measure_total` still needs the height of the whole tree so the
-    /// recenter cycle can clamp its last beat (c-2).
+    /// The tree is walked once in document order and handed to the measuring
+    /// walk, which reproduces the row order, the separator between plans, and the
+    /// wrapped height of every row through the borrowed counter. The bounds can
+    /// therefore never disagree with the lines actually drawn, while positioning
+    /// the viewport no longer re-wraps the whole tree. The walk stops as soon as
+    /// the bounds are known, unless `measure_total` still needs the height of the
+    /// whole tree so the recenter cycle can clamp its last beat (c-2).
     fn render_bounds(&mut self, index: usize, measure_total: bool) -> Option<RowBounds> {
-        /// Rendered height of one row, measured through the frame's renderer.
-        fn row_height(
-            row: &VisiblePlanRow,
-            is_selected: bool,
-            width: usize,
-            theme_mode: crate::config::ThemeMode,
-            cache: &mut MarkdownBodyCache,
-        ) -> usize {
-            // Selection changes the gutter glyph and the row fill, never the
-            // number of lines, so a row is measured in its own selection state.
-            let selected_idx = if is_selected { 0 } else { usize::MAX };
-            compute_unified_plan_lines(
-                std::slice::from_ref(row),
-                selected_idx,
-                width,
-                theme_mode,
-                cache,
-            )
-            .0
-            .len()
-        }
-
         let width = self.content_width.max(10);
         let theme_mode = self.theme_mode;
-        let mut cache = std::mem::take(&mut self.markdown_cache);
-        let mut height = 0usize;
-        let mut start = None;
-        let mut end = None;
-        let mut measured = false;
-        let mut bounds_closed = false;
 
+        // The rows before the measured one give its offset, the row after it
+        // closes the bounds by opening the following row, and the recenter cycle
+        // additionally needs the height of everything below.
+        let mut rows = Vec::new();
         self.walk_rows(&mut |row_index, row| {
-            if plan_row_gap(row_index, &row) {
-                height += 1;
-            }
-            if measured && !bounds_closed {
-                // The separator in front of this row closes the bounds of the row
-                // measured before it, exactly as the recorded frame offsets do.
-                end = Some(height);
-                bounds_closed = true;
-                if !measure_total {
-                    return false;
-                }
-            }
-            let row_start = height;
-            height += row_height(&row, row_index == index, width, theme_mode, &mut cache);
-            if row_index == index {
-                start = Some(row_start);
-                measured = true;
-            }
-            true
+            rows.push(row);
+            row_index <= index || measure_total
         });
 
-        if measured && end.is_none() {
-            // The selected row is the last one, so the document ends with its own
-            // lines, exactly as the recorded offsets fall back to the rendered
-            // length.
-            end = Some(height);
-        }
-        self.markdown_cache = cache;
+        let (offsets, total) =
+            measure_plan_rows(&rows, index, width, theme_mode, &mut self.markdown_cache);
 
-        match (start, end) {
-            (Some(start), Some(end)) => Some(RowBounds {
-                start,
-                end,
-                total: measure_total.then_some(height),
-            }),
-            _ => None,
-        }
+        let start = *offsets.get(index)?;
+        let end = offsets.get(index + 1).copied().unwrap_or(total);
+        Some(RowBounds {
+            start,
+            end,
+            total: measure_total.then_some(total),
+        })
     }
 
     /// Collapses every previously opened plan except `plan_id`, expands the
@@ -922,6 +886,7 @@ impl PlansViewState {
                     .unwrap_or(false);
                 let has_meta = !item.files.is_empty()
                     || !item.readonly_files.is_empty()
+                    || !item.outer_docs.is_empty()
                     || !item.concept_refs.is_empty();
                 let has_blocked_reason = item
                     .blocked_reason
@@ -1210,8 +1175,10 @@ mod tests {
             details: None,
             status: PlanItemStatus::Todo,
             blocked_reason: None,
+            commit: None,
             files: vec![],
             readonly_files: vec![],
+            outer_docs: vec![],
             concept_refs: vec![],
             depends_on: vec![],
             children: vec![],
@@ -1241,8 +1208,10 @@ mod tests {
                 details: None,
                 status: PlanItemStatus::Todo,
                 blocked_reason: None,
+                commit: None,
                 files: vec![],
                 readonly_files: vec![],
+                outer_docs: vec![],
                 concept_refs: vec![],
                 depends_on: vec![],
                 children: vec![],
@@ -1300,8 +1269,10 @@ mod tests {
                 details: None,
                 status: PlanItemStatus::Todo,
                 blocked_reason: None,
+                commit: None,
                 files: vec!["src/jwt.rs".to_string()],
                 readonly_files: vec![],
+                outer_docs: vec![],
                 concept_refs: vec!["c-1".to_string()],
                 depends_on: vec![],
                 children: vec![],
@@ -1385,8 +1356,10 @@ mod tests {
                     details: None,
                     status: PlanItemStatus::Todo,
                     blocked_reason: None,
+                    commit: None,
                     files: vec![],
                     readonly_files: vec![],
+                    outer_docs: vec![],
                     concept_refs: vec![],
                     depends_on: vec![],
                     children: vec![
@@ -1396,8 +1369,10 @@ mod tests {
                             details: None,
                             status: PlanItemStatus::Todo,
                             blocked_reason: None,
+                            commit: None,
                             files: vec![],
                             readonly_files: vec![],
+                            outer_docs: vec![],
                             concept_refs: vec![],
                             depends_on: vec![],
                             children: vec![],
@@ -1408,8 +1383,10 @@ mod tests {
                             details: None,
                             status: PlanItemStatus::Todo,
                             blocked_reason: None,
+                            commit: None,
                             files: vec![],
                             readonly_files: vec![],
+                            outer_docs: vec![],
                             concept_refs: vec![],
                             depends_on: vec![],
                             children: vec![],
@@ -1422,8 +1399,10 @@ mod tests {
                     details: None,
                     status: PlanItemStatus::Todo,
                     blocked_reason: None,
+                    commit: None,
                     files: vec![],
                     readonly_files: vec![],
+                    outer_docs: vec![],
                     concept_refs: vec![],
                     depends_on: vec![],
                     children: vec![PlanItem {
@@ -1432,8 +1411,10 @@ mod tests {
                         details: None,
                         status: PlanItemStatus::Todo,
                         blocked_reason: None,
+                        commit: None,
                         files: vec![],
                         readonly_files: vec![],
+                        outer_docs: vec![],
                         concept_refs: vec![],
                         depends_on: vec![],
                         children: vec![],

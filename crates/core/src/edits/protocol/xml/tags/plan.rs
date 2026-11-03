@@ -101,7 +101,19 @@ fn extract_and_strip_inner_tag(text: &str, base_name: &str) -> (Option<String>, 
 /// `<concept_item>` entries nested deeper than that budget are dropped and reported
 /// as diagnostics instead of being parsed recursively.
 pub fn parse_plan_tags_with_diagnostics(text: &str) -> (Vec<ParsedPlanTag>, Vec<String>) {
-    let fences = CodeFences::find(text);
+    parse_plan_tags_with_diagnostics_with_fences(text, &CodeFences::find(text))
+}
+
+/// Parses `<plan ...>...</plan>` blocks against a precomputed markdown code
+/// index and collects syntax and structural diagnostics.
+///
+/// The index describes the text alone, so a caller that decodes several tag
+/// families over one buffer scans the markdown code once instead of once per
+/// family.
+pub fn parse_plan_tags_with_diagnostics_with_fences(
+    text: &str,
+    fences: &CodeFences,
+) -> (Vec<ParsedPlanTag>, Vec<String>) {
     let mut plans = Vec::new();
     let mut errors = Vec::new();
     let mut pos = 0;
@@ -130,7 +142,7 @@ pub fn parse_plan_tags_with_diagnostics(text: &str) -> (Vec<ParsedPlanTag>, Vec<
             continue;
         }
 
-        if is_inside_markdown_code_with_fences(text, tag_start, &fences) {
+        if is_inside_markdown_code_with_fences(text, tag_start, fences) {
             pos = after_plan;
             continue;
         }

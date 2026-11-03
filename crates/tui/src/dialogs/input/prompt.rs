@@ -189,7 +189,7 @@ pub(crate) async fn submit_prompt_modal(
     });
     // Serializing the typed payload cannot touch the interface, so it runs
     // before the optimistic transition: a serialization failure leaves the
-    // modal and the Develop view exactly as the developer left them.
+    // modal and the REPL view exactly as the developer left them.
     let payload = serde_json::to_value(params)?;
 
     // The launch transition opens a new turn and rewrites the discussion

@@ -14,6 +14,7 @@ use tauqe_protocol::{
 
 use crate::edits::protocol::xml::engine::{self, XmlTagSpec};
 use crate::edits::protocol::xml::tags::{ParsedPlanItem, ParsedPlanTag};
+use crate::edits::protocol::xml::CodeFences;
 use crate::edits::protocol::{TerminalOutcome, VerifyOnSuccess, VerifyTarget, XmlEditProtocol};
 use crate::edits::strategy::StrategyProfile;
 use crate::mockups::MOCKUPS_DIR;
@@ -87,6 +88,7 @@ impl CapabilityModule for TextMessageModule {
         raw_text: &str,
         marker: Option<&str>,
         _editable_paths: &[String],
+        _fences: &CodeFences,
     ) -> Vec<LlmCommand> {
         let cleaned = XmlParser::new(marker).clean_assistant_text(raw_text);
         if cleaned.trim().is_empty() {
@@ -227,18 +229,23 @@ impl CapabilityModule for FileEditsModule {
                 .to_string(),
         )
     }
-
     fn decode_xml(
         &self,
         normalized_text: &str,
         _raw_text: &str,
         marker: Option<&str>,
         editable_paths: &[String],
+        fences: &CodeFences,
     ) -> Vec<LlmCommand> {
         let mut commands = Vec::new();
         // The anchored vehicle carries the change set as one JSON array, so it is
-        // decoded beside the search/replace grammar and independently of it.
-        match XmlEditProtocol.parse_anchor_edits(normalized_text, editable_paths) {
+        // decoded beside the search/replace grammar and independently of it. Both
+        // readers resolve their tags against the one index of this response.
+        match XmlEditProtocol.parse_anchor_edits_with_fences(
+            normalized_text,
+            editable_paths,
+            fences,
+        ) {
             Ok(operations) => commands.extend(
                 operations
                     .into_iter()
@@ -246,7 +253,7 @@ impl CapabilityModule for FileEditsModule {
             ),
             Err(message) => commands.push(LlmCommand::ProtocolError { message }),
         }
-        match XmlParser::new(marker).parse_output(normalized_text, editable_paths) {
+        match XmlParser::new(marker).parse_output(normalized_text, editable_paths, fences) {
             ModelResult::Edit { edits, outcome, .. } => {
                 if let Some(message) = outcome.error {
                     commands.push(LlmCommand::ProtocolError { message });
@@ -261,14 +268,14 @@ impl CapabilityModule for FileEditsModule {
     }
 }
 
-static DISCOVERY_SPECS: OnceLock<Vec<&'static XmlTagSpec>> = OnceLock::new();
+static RESEARCH_SPECS: OnceLock<Vec<&'static XmlTagSpec>> = OnceLock::new();
 
-/// Context and symbol discovery (context requests and repository searches).
-pub(crate) struct DiscoveryModule;
+/// Context and symbol research (context requests and repository searches).
+pub(crate) struct ResearchModule;
 
-impl CapabilityModule for DiscoveryModule {
+impl CapabilityModule for ResearchModule {
     fn capability(&self) -> LlmCapability {
-        LlmCapability::Discovery
+        LlmCapability::Research
     }
 
     fn canonical_tag(&self) -> Option<&'static str> {
@@ -277,7 +284,7 @@ impl CapabilityModule for DiscoveryModule {
 
     fn xml_tag_specs(&self) -> &'static [&'static XmlTagSpec] {
         resolve_specs(
-            &DISCOVERY_SPECS,
+            &RESEARCH_SPECS,
             &[
                 "context_request",
                 "repo_search",
@@ -288,11 +295,11 @@ impl CapabilityModule for DiscoveryModule {
         )
     }
 
-    /// Discovery populates several schema properties, so its fragment declares
+    /// Research populates several schema properties, so its fragment declares
     /// the context request together with every repository outline and listing
     /// request in one place.
     fn json_schema_fragment(&self) -> Option<serde_json::Value> {
-        Some(schema::discovery_fragment())
+        Some(schema::research_fragment())
     }
 
     fn render_contract_rule(&self, ctx: &ContractContext<'_>) -> Option<ContractRule> {
@@ -303,12 +310,12 @@ impl CapabilityModule for DiscoveryModule {
             let list = ctx.tag_name("dir_list");
             if ctx.has_eager_repo_map {
                 format!(
-                    "Explore codebase structure before loading files. The repository symbol map is already rendered in this prompt, so never request it again. Locate subsystems with <{dirs} />, list files in a directory with <{list} path=\"...\" recursive=\"true|false\" />, locate symbols with <{search} path=\"...\" regex=\"...\" />, and load full file contents with <{request} path=\"...\" access=\"read_only|editable\" /> only when editing or deep inspection is necessary. A discovery tag performs a request only when it appears verbatim at the very end of the response, outside markdown code: emitting the tag itself is the only way to run it, describing the intent in prose performs nothing, and the tag is never deferred to a later response. Batch every request of a round together."
+                    "Explore codebase structure before loading files. The repository symbol map is already rendered in this prompt, so never request it again. Locate subsystems with <{dirs} />, list files in a directory with <{list} path=\"...\" recursive=\"true|false\" />, locate symbols with <{search} path=\"...\" regex=\"...\" />, and load full file contents with <{request} path=\"...\" access=\"read_only|editable\" /> only when editing or deep inspection is necessary. A research tag performs a request only when it appears verbatim at the very end of the response, outside markdown code: emitting the tag itself is the only way to run it, describing the intent in prose performs nothing, and the tag is never deferred to a later response. Batch every request of a round together."
                 )
             } else {
                 let map = ctx.tag_name("repo_map");
                 format!(
-                    "Explore codebase structure before loading files. Locate subsystems with <{dirs} />, list files in a directory with <{list} path=\"...\" recursive=\"true|false\" />, inspect symbol contours and type contracts with Tree-sitter <{map} path=\"path/to/file.rs\" /> (extracts signatures, structs, and traits without function bodies to prevent context bloat), locate symbols with <{search} path=\"...\" regex=\"...\" />, and load full file contents with <{request} path=\"...\" access=\"read_only|editable\" /> only when editing or deep inspection is necessary. A discovery tag performs a request only when it appears verbatim at the very end of the response, outside markdown code: emitting the tag itself is the only way to run it, describing the intent in prose performs nothing, and the tag is never deferred to a later response. Batch every request of a round together."
+                    "Explore codebase structure before loading files. Locate subsystems with <{dirs} />, list files in a directory with <{list} path=\"...\" recursive=\"true|false\" />, inspect symbol contours and type contracts with Tree-sitter <{map} path=\"path/to/file.rs\" /> (extracts signatures, structs, and traits without function bodies to prevent context bloat), locate symbols with <{search} path=\"...\" regex=\"...\" />, and load full file contents with <{request} path=\"...\" access=\"read_only|editable\" /> only when editing or deep inspection is necessary. A research tag performs a request only when it appears verbatim at the very end of the response, outside markdown code: emitting the tag itself is the only way to run it, describing the intent in prose performs nothing, and the tag is never deferred to a later response. Batch every request of a round together."
                 )
             }
         } else if ctx.has_eager_repo_map {
@@ -319,7 +326,7 @@ impl CapabilityModule for DiscoveryModule {
         } else {
             "Explore codebase structure before loading files. Set `repo_dirs` to true only when the repository layout is still unknown, list tracked files of a directory with `dir_lists` (`path`, `recursive`), inspect symbol contours and type contracts with `repo_maps` (`path` per request, returning signatures, structs, and traits without function bodies so context stays small), locate symbols with `repo_searches` (`path`, `regex`), and load full file contents with `context_requests` (a repository path, or a path prefixed with `editable:`) only when editing or deep inspection is necessary. A populated field performs the request: describing the intent in prose performs nothing, and a request is never deferred to a later response. Batch every request of a round together.".to_string()
         };
-        Some(ContractRule::new("Discovery First", body))
+        Some(ContractRule::new("Research First", body))
     }
 
     fn render_xml_instruction(&self, ctx: &PromptRenderContext<'_>) -> Option<String> {
@@ -327,23 +334,23 @@ impl CapabilityModule for DiscoveryModule {
         let search = ctx.tag_name("repo_search");
         let dirs = ctx.tag_name("repo_dirs");
         let list = ctx.tag_name("dir_list");
-        let discovery = if ctx.has_eager_repo_map {
+        let research = if ctx.has_eager_repo_map {
             format!(
-                "- Discovery: the repository symbol map is already rendered in this prompt, so never request it again; locate symbols with <{search} path=\"...\" regex=\"...\" /> (use path=\"\" or \".\" for the repository root) and request full files with <{request} path=\"...\" access=\"read_only|editable\" /> only when modifying or thoroughly inspecting them"
+                "- Research: the repository symbol map is already rendered in this prompt, so never request it again; locate symbols with <{search} path=\"...\" regex=\"...\" /> (use path=\"\" or \".\" for the repository root) and request full files with <{request} path=\"...\" access=\"read_only|editable\" /> only when modifying or thoroughly inspecting them"
             )
         } else {
             let map = ctx.tag_name("repo_map");
             format!(
-                "- Discovery: inspect symbol contours and API contracts with Tree-sitter <{map} path=\"path/to/file.rs\" /> (returns function signatures, types, and traits without function bodies; prefer this over loading full files to avoid context bloat), request full files with <{request} path=\"...\" access=\"read_only|editable\" /> only when modifying or thoroughly inspecting them, and locate symbols with <{search} path=\"...\" regex=\"...\" /> (use path=\"\" or \".\" for the repository root)"
+                "- Research: inspect symbol contours and API contracts with Tree-sitter <{map} path=\"path/to/file.rs\" /> (returns function signatures, types, and traits without function bodies; prefer this over loading full files to avoid context bloat), request full files with <{request} path=\"...\" access=\"read_only|editable\" /> only when modifying or thoroughly inspecting them, and locate symbols with <{search} path=\"...\" regex=\"...\" /> (use path=\"\" or \".\" for the repository root)"
             )
         };
         Some(format!(
-            "{discovery}. Render the compact directory tree with <{dirs} /> when subsystem locations are unknown, and list tracked files of a directory with <{list} path=\"...\" recursive=\"true|false\" />. Emit discovery tags at the end of the response, outside markdown code, and batch multiple requests in one round. A tag performs a request only when it appears verbatim at the very end of the response, outside markdown code: emitting the tag itself is the only way to run it, describing the intent in prose performs nothing, and the tag is never deferred to a later response. Regex uses Rust / ripgrep syntax (\\b, \\w, \\d, (?:...), (?i); no lookarounds or backreferences). Files already present in <context> need no request. A directory listing covers Git-tracked files only (shallow by default, `recursive=\"true\"` widens to all files under the prefix, truncated at entry limit)."
+            "{research}. Render the compact directory tree with <{dirs} /> when subsystem locations are unknown, and list tracked files of a directory with <{list} path=\"...\" recursive=\"true|false\" />. Emit research tags at the end of the response, outside markdown code, and batch multiple requests in one round. A tag performs a request only when it appears verbatim at the very end of the response, outside markdown code: emitting the tag itself is the only way to run it, describing the intent in prose performs nothing, and the tag is never deferred to a later response. Regex uses Rust / ripgrep syntax (\\b, \\w, \\d, (?:...), (?i); no lookarounds or backreferences). Files already present in <context> need no request. A directory listing covers Git-tracked files only (shallow by default, `recursive=\"true\"` widens to all files under the prefix, truncated at entry limit)."
         ))
     }
 
     fn render_structured_instruction(&self, _ctx: &PromptRenderContext<'_>) -> Option<String> {
-        Some("- `context_requests`: full files to load into context (`path`, or `editable:<path>` for files to modify); request only when modifying or deep inspection is necessary, never for files already in context.\n- `repo_maps`: targeted Tree-sitter symbol map requests for specific subsystems or files (`path`), returning signatures, types, and traits without function bodies; prefer this over full file requests to inspect APIs without context bloat.\n- `repo_searches`: repository search requests (`path`, `regex`) using Rust / ripgrep regex syntax (\\b, \\w, \\d, (?:...), (?i); no lookarounds or backreferences).\n- `repo_dirs`: set true to render the compact repository directory tree when the repository layout is still unknown, and false otherwise.\n- `dir_lists`: directory listing requests (`path`, `recursive`) to inspect tracked files under a prefix. Populate these arrays to run requests: describing the intent in prose performs nothing and triggers no discovery round.".to_string())
+        Some("- `context_requests`: full files to load into context (`path`, or `editable:<path>` for files to modify); request only when modifying or deep inspection is necessary, never for files already in context.\n- `repo_maps`: targeted Tree-sitter symbol map requests for specific subsystems or files (`path`), returning signatures, types, and traits without function bodies; prefer this over full file requests to inspect APIs without context bloat.\n- `repo_searches`: repository search requests (`path`, `regex`) using Rust / ripgrep regex syntax (\\b, \\w, \\d, (?:...), (?i); no lookarounds or backreferences).\n- `repo_dirs`: set true to render the compact repository directory tree when the repository layout is still unknown, and false otherwise.\n- `dir_lists`: directory listing requests (`path`, `recursive`) to inspect tracked files under a prefix. Populate these arrays to run requests: describing the intent in prose performs nothing and triggers no research round.".to_string())
     }
 
     fn decode_xml(
@@ -352,28 +359,29 @@ impl CapabilityModule for DiscoveryModule {
         _raw_text: &str,
         marker: Option<&str>,
         _editable_paths: &[String],
+        fences: &CodeFences,
     ) -> Vec<LlmCommand> {
         let parser = XmlParser::new(marker);
         let mut commands = Vec::new();
-        for request in parser.parse_context_requests(normalized_text) {
+        for request in parser.parse_context_requests(normalized_text, fences) {
             commands.push(LlmCommand::ContextRequest {
                 path: request.path,
                 access: request.access,
             });
         }
-        for search in parser.parse_repo_searches(normalized_text) {
+        for search in parser.parse_repo_searches(normalized_text, fences) {
             commands.push(LlmCommand::RepoSearch {
                 path: search.path,
                 regex: search.regex,
             });
         }
-        if parser.parse_repo_dirs(normalized_text) {
+        if parser.parse_repo_dirs(normalized_text, fences) {
             commands.push(LlmCommand::RepoDirs);
         }
-        for path in parser.parse_repo_maps(normalized_text) {
+        for path in parser.parse_repo_maps(normalized_text, fences) {
             commands.push(LlmCommand::RepoMap { path });
         }
-        for request in parser.parse_dir_lists(normalized_text) {
+        for request in parser.parse_dir_lists(normalized_text, fences) {
             commands.push(LlmCommand::DirList {
                 path: request.path,
                 recursive: request.recursive,
@@ -394,15 +402,24 @@ impl CapabilityModule for DocRequestModule {
     }
 
     fn canonical_tag(&self) -> Option<&'static str> {
-        Some("doc_request")
+        Some("tauqe_doc_request")
+    }
+
+    /// The pre-canonical spelling of the internal documentation channel.
+    ///
+    /// Transcripts, persisted sessions, and model output produced before the
+    /// rename still carry it, so it keeps decoding, streaming, and cleaning
+    /// exactly like the canonical tag it resolves to.
+    fn tag_aliases(&self) -> &'static [&'static str] {
+        &["doc_request"]
     }
 
     fn xml_tag_specs(&self) -> &'static [&'static XmlTagSpec] {
-        resolve_specs(&DOC_REQUEST_SPECS, &["doc_request"])
+        resolve_specs(&DOC_REQUEST_SPECS, &["tauqe_doc_request", "doc_request"])
     }
 
     fn json_property_name(&self) -> Option<&'static str> {
-        Some("doc_requests")
+        Some("tauqe_doc_requests")
     }
 
     fn json_schema_fragment(&self) -> Option<serde_json::Value> {
@@ -423,7 +440,7 @@ impl CapabilityModule for DocRequestModule {
             )
         } else {
             format!(
-                "Never invent exact details. Answer conceptual questions about your identity, capabilities, and working processes, and help the developer set up a project, choose a workflow, or organize the work, from your baseline understanding of this harness, without a documentation request. Details that must be exact — parameters, defaults, budgets, keyboard shortcuts, configuration keys, and API surfaces — are not knowable from that understanding: environment behavior is declared in `tauqe.toml` at the repository root, so they are answered only from the authoritative documentation requested through the `doc_requests` field (topics: {topics}), where the `config` topic covers configuration and project preparation. When such a detail is needed, populate that field, keep the rest of the response to a short note, and answer strictly from the returned <system_documentation> blocks in the user's language."
+                "Never invent exact details. Answer conceptual questions about your identity, capabilities, and working processes, and help the developer set up a project, choose a workflow, or organize the work, from your baseline understanding of this harness, without a documentation request. Details that must be exact — parameters, defaults, budgets, keyboard shortcuts, configuration keys, and API surfaces — are not knowable from that understanding: environment behavior is declared in `tauqe.toml` at the repository root, so they are answered only from the authoritative documentation requested through the `tauqe_doc_requests` field (topics: {topics}), where the `config` topic covers configuration and project preparation. When such a detail is needed, populate that field, keep the rest of the response to a short note, and answer strictly from the returned <system_documentation> blocks in the user's language."
             )
         };
         Some(ContractRule::new("Self-Knowledge", body))
@@ -444,7 +461,7 @@ impl CapabilityModule for DocRequestModule {
             .collect::<Vec<_>>()
             .join(", ");
         Some(format!(
-            "- `doc_requests`: array of system documentation topics ({topics}) to request before answering questions about identity, capabilities, concepts, or workflows; use an empty array when no documentation is needed."
+            "- `tauqe_doc_requests`: array of system documentation topics ({topics}) to request before answering questions about identity, capabilities, concepts, or workflows; use an empty array when no documentation is needed."
         ))
     }
 
@@ -454,11 +471,79 @@ impl CapabilityModule for DocRequestModule {
         _raw_text: &str,
         marker: Option<&str>,
         _editable_paths: &[String],
+        fences: &CodeFences,
     ) -> Vec<LlmCommand> {
         XmlParser::new(marker)
-            .parse_doc_requests(normalized_text)
+            .parse_doc_requests(normalized_text, fences)
             .into_iter()
             .map(|topic| LlmCommand::DocRequest { topic })
+            .collect()
+    }
+}
+
+static OUTER_DOC_REQUEST_SPECS: OnceLock<Vec<&'static XmlTagSpec>> = OnceLock::new();
+
+/// Requests for external project documentation by its logical identifier.
+///
+/// A project declares the documents it exposes in `[[outer_docs]]`, so a
+/// request names one of them by identifier and never by a path: where the
+/// materialized copy is cached stays a harness detail, and only material the
+/// project itself declared is reachable. The identifier is the whole payload,
+/// so both contours publish the same channel — a control tag in the XML
+/// contour and the `outer_doc_requests` field in the structured one — and both
+/// decode into the same command.
+///
+/// The channel is documented once, by the shared trunk of the `Core System
+/// Contract`, so the module publishes the schema fragment and the decoder only:
+/// a second copy of the rule inside the module could drift from the invariant
+/// the trunk states.
+pub(crate) struct OuterDocRequestModule;
+
+impl CapabilityModule for OuterDocRequestModule {
+    fn capability(&self) -> LlmCapability {
+        LlmCapability::OuterDocRequest
+    }
+
+    fn canonical_tag(&self) -> Option<&'static str> {
+        Some("outer_doc_request")
+    }
+
+    fn xml_tag_specs(&self) -> &'static [&'static XmlTagSpec] {
+        resolve_specs(&OUTER_DOC_REQUEST_SPECS, &["outer_doc_request"])
+    }
+
+    fn json_property_name(&self) -> Option<&'static str> {
+        Some("outer_doc_requests")
+    }
+
+    fn json_schema_fragment(&self) -> Option<serde_json::Value> {
+        Some(schema::outer_doc_requests_fragment())
+    }
+
+    /// Decodes every `<outer_doc_request id="..." />` invocation.
+    ///
+    /// The identifier is the whole payload, so an invocation that states none
+    /// grants nothing and is dropped instead of producing a request nobody
+    /// named. Trimming and the emptiness check travel with the shared attribute
+    /// reader, so the tag form and the structured field treat a blank
+    /// identifier identically.
+    fn decode_xml(
+        &self,
+        normalized_text: &str,
+        _raw_text: &str,
+        _marker: Option<&str>,
+        _editable_paths: &[String],
+        fences: &CodeFences,
+    ) -> Vec<LlmCommand> {
+        let Some(base) = self.canonical_tag() else {
+            return Vec::new();
+        };
+        let Some(spec) = engine::tag_spec(base) else {
+            return Vec::new();
+        };
+        engine::attribute_values_with_fences(normalized_text, spec, "id", fences)
+            .into_iter()
+            .map(|id| LlmCommand::OuterDocRequest { id })
             .collect()
     }
 }
@@ -538,8 +623,9 @@ impl CapabilityModule for ToolchainVerifyModule {
         raw_text: &str,
         marker: Option<&str>,
         _editable_paths: &[String],
+        fences: &CodeFences,
     ) -> Vec<LlmCommand> {
-        match XmlParser::new(marker).parse_verify_request(normalized_text, raw_text) {
+        match XmlParser::new(marker).parse_verify_request(normalized_text, raw_text, fences) {
             Some(request) => vec![LlmCommand::Verify {
                 target: map_verify_target(request.target),
                 on_success: map_verify_on_success(request.on_success),
@@ -581,19 +667,17 @@ fn plan_tag_to_command(tag: ParsedPlanTag) -> LlmCommand {
 /// Intent-independent trunk of the structured plan rule.
 ///
 /// It states only the invariants every plan carries — the mandatory concept
-/// tree, the file attribute contract and its leaf-only restriction, the step
-/// formulation contract, the prohibition on unresolved alternatives, the
-/// prohibition on verification-only steps, the plan creation invariant, and
-/// language consistency — so it renders byte-identically whichever dialogue
-/// regime authors the plan. The actions a regime authorizes live in the delta
-/// constants below.
-const PLAN_STRUCTURED_CORE_BODY: &str = "Every plan travels as one structured `plan_update` field carrying `action`, plan `id`, `title`, `description`, `concept`, and `items`. Conceptual Foundation Invariant: Every plan MUST contain an architectural concept tree in `concept` defining the core requirements, design decisions, and system invariants ('What'). Inside `concept`, define architectural nodes carrying an `id` (`c-...`), a `title`, and their `details`. Plan creation without `concept` containing at least one concept node is strictly prohibited. Implementation steps in `items` define 'How', may be included with `concept_refs` (`c-...`), `files`, and `readonly_files`, or omitted if awaiting deep refinement. File Attributes Contract: `files` lists target files to create or modify (loaded as editable context), while `readonly_files` lists reference or contract files such as subsystem conventions, protocol types, and interfaces (loaded as read-only context and never modified). Leaf-Only Files Invariant: `files` and `readonly_files` must be specified exclusively for executable leaf steps without children; parent container items and task groups must never carry files. Step Formulation Contract: Formulate each step around an engineering objective and operational invariants rather than detailed procedural micro-instructions; define what state must be achieved and what invariants preserved. Disjunction Prohibition Invariant: Every concept node and every step must state exactly one definite decision, so unresolved disjunctive alternatives such as 'either X or Y' or 'use library A or write your own structure B' are strictly prohibited. The architectural choice ('What') is fixed by the Primary or Architect role, or clarified with the developer in dialogue before the plan is approved; the step executor owns 'How' only and never decides the architecture. Automated Verification Invariant: The harness runs full toolchain verification (compilation, linters, and tests) automatically and deterministically after every individual leaf step and rolls the turn back when it fails. Dedicated steps that only run tests, check the build status, or inspect the codebase without changing code are strictly prohibited, because the executor has no shell. Tests are created and modified inside the steps that implement the corresponding functionality. Always provide a clear `description` explaining the overall architecture, boundaries, and rationale. Plan Creation Invariant: Only create a plan when explicitly instructed or confirmed by the user. Whenever you propose a new plan, you MUST precede the payload with a concise conversational explanation of the proposed plan, and you MUST populate `plan_update` in the same response, carrying both `concept` (mandatory) and optional `items`. Language Consistency: Formulate the plan title, description, concept nodes, step titles, and step details in the same language as the user's request.";
-
-/// Regime delta of the structured plan rule for a develop turn.
+/// tree, the file attributes and the external specification contract with
+/// their leaf-only restriction, the prohibition on verification-only steps,
+/// the plan creation invariant, and language consistency — so it renders
+/// byte-identically whichever dialogue regime authors the plan. The actions a
+/// regime authorizes live in the delta constants below.
+const PLAN_STRUCTURED_CORE_BODY: &str = "Every plan travels as one structured `plan_update` field carrying `action`, plan `id`, `title`, `description`, `concept`, and `items`. Conceptual Foundation Invariant: Every plan MUST contain an architectural concept tree in `concept` defining the core requirements, design decisions, and system invariants ('What'). Inside `concept`, define architectural nodes carrying an `id` (`c-...`), a `title`, and their `details`. Plan creation without `concept` containing at least one concept node is strictly prohibited. Implementation steps in `items` define 'How', may be included with `concept_refs` (`c-...`), `files`, `readonly_files`, and `outer_docs`, or omitted if awaiting deep refinement. File Attributes Contract: `files` lists target files to create or modify (loaded as editable context), while `readonly_files` lists reference or contract files such as subsystem conventions, protocol types, and interfaces (loaded as read-only context and never modified). External Specification Contract: `outer_docs` lists the external specifications the step is implemented against, each entry naming a document the project declares in `[[outer_docs]]`: `id` addresses a declared root document and covers the whole subtree inside that root, while `id/relative.md` addresses a document below that root and never climbs above it, and the harness materializes every entry as read-only reference context before the step executes. Whenever a leaf step is implemented against an external contract the project declares, populate `outer_docs` at planning time instead of leaving the specification to a later refinement. Invariant: `outer_docs` is allowed only on executable leaf steps without children; a step that carries no external dependency states an empty `outer_docs`, and a parent container item never carries one. Leaf-Only Files Invariant: `files` and `readonly_files` must be specified exclusively for executable leaf steps without children; parent container items and task groups must never carry files. Step Formulation Contract: Formulate each step around an engineering objective and operational invariants rather than detailed procedural micro-instructions; define what state must be achieved and what invariants preserved. Disjunction Prohibition Invariant: Every concept node and every step must state exactly one definite decision, so unresolved disjunctive alternatives such as 'either X or Y' or 'use library A or write your own structure B' are strictly prohibited. The architectural choice ('What') is fixed by the Primary or Architect role, or clarified with the developer in dialogue before the plan is approved; the step executor owns 'How' only and never decides the architecture. Automated Verification Invariant: The harness runs full toolchain verification (compilation, linters, and tests) automatically and deterministically after every individual leaf step and rolls the turn back when it fails. Dedicated steps that only run tests, check the build status, or inspect the codebase without changing code are strictly prohibited, because the executor has no shell. Tests are created and modified inside the steps that implement the corresponding functionality. Always provide a clear `description` explaining the overall architecture, boundaries, and rationale. Plan Creation Invariant: Only create a plan when explicitly instructed or confirmed by the user. Whenever you propose a new plan, you MUST precede the payload with a concise conversational explanation of the proposed plan, and you MUST populate `plan_update` in the same response, carrying both `concept` (mandatory) and optional `items`. Language Consistency: Formulate the plan title, description, concept nodes, step titles, and step details in the same language as the user's request.";
+/// Regime delta of the structured plan rule for a REPL turn.
 ///
-/// It names the only plan action a develop turn may take and the reins that
+/// It names the only plan action a REPL turn may take and the reins that
 /// guard it, together with the planning objective of that regime.
-const PLAN_STRUCTURED_DEVELOP_DELTA: &str = "In Develop mode, you may ONLY propose new plans (`action: \"save\"`). Updating plan statuses, closing steps, or modifying existing plans from Develop mode is strictly prohibited (step execution and completion occur strictly in isolated step turns, while plan modifications and re-scoping belong exclusively in Discussion mode). Reins Invariant: Never populate `plan_update` with a payload without an explicit user instruction or confirmation to formulate a plan. Questions, analysis, architectural reviews, or exploratory discussion must be answered strictly in conversational text in `message`. Planning Objective: Plan synthesis focuses on conceptual comprehension of the objective ('What'), aligning on key architectural decisions and trade-offs, and defining a cohesive concept tree without premature low-level code churn or deep file inspection.";
+const PLAN_STRUCTURED_REPL_DELTA: &str = "In REPL mode, you may ONLY propose new plans (`action: \"save\"`). Updating plan statuses, closing steps, or modifying existing plans from REPL mode is strictly prohibited (step execution and completion occur strictly in isolated step turns, while plan modifications and re-scoping belong exclusively in Discussion mode). Reins Invariant: Never populate `plan_update` with a payload without an explicit user instruction or confirmation to formulate a plan. Questions, analysis, architectural reviews, or exploratory discussion must be answered strictly in conversational text in `message`. Planning Objective: Plan synthesis focuses on conceptual comprehension of the objective ('What'), aligning on key architectural decisions and trade-offs, and defining a cohesive concept tree without premature low-level code churn or deep file inspection.";
 
 /// Regime delta of the structured plan rule for a plan discussion.
 ///
@@ -601,6 +685,18 @@ const PLAN_STRUCTURED_DEVELOP_DELTA: &str = "In Develop mode, you may ONLY propo
 /// authorizes, states that direct code changes travel the ordinary transactional
 /// path, and carries the collaborative planning objective.
 const PLAN_STRUCTURED_DISCUSSION_DELTA: &str = "In plan discussion mode, populate the structured `plan_update` field with `action: \"save\"|\"update\"|\"delete\"`. Plan Action Semantics: use `action: \"save\"` to create or completely overwrite/replace the entire plan; use `action: \"update\"` strictly to modify specific individual nodes or items in place by ID without touching unmentioned items; use `action: \"delete\"` to remove the plan. Code modifications requested directly by the developer are permitted alongside the discussion, and they travel the ordinary transactional path. Reins Invariant: Never mutate the plan (leave `plan_update: null`) without an explicit user instruction to modify it. Questions, analysis, trade-off reviews, and critique must be answered strictly in conversational text in `message`. Planning Objective: Collaborative planning focuses on conceptual comprehension of the objective ('What'), aligning on key architectural decisions and trade-offs, and defining a cohesive concept tree without premature low-level code churn.";
+/// Invariant stating which statuses a plan mutation may assign to a step.
+///
+/// The status barrier of the plan storage repairs any other assignment, so the
+/// prompt, the wire schema, and the barrier describe one lifecycle instead of
+/// three. Both contours append the very same sentence, which keeps their trunks
+/// aligned on the rule the storage actually enforces.
+///
+/// Status spellings travel in single quotes, exactly as the description of the
+/// wire schema spells them. A backticked `blocked` would advertise a field of
+/// the structured schema inside the head of the XML contour, and the two
+/// contours describe one lifecycle without borrowing each other's vocabulary.
+const PLAN_STEP_STATUS_LIFECYCLE_INVARIANT: &str = "Step Status Lifecycle Invariant: A step created or amended by a plan mutation carries only 'todo' or 'discussion'; 'in_progress', 'blocked', and 'cancelled' belong to the execution pipeline and to the developer's manual control, while 'done' is reachable only through a verified step turn. An assignment of any other status to a created step is repaired to 'todo' and reported instead of being persisted.";
 
 /// Intent-independent trunk of the XML plan rule.
 ///
@@ -614,7 +710,7 @@ fn plan_xml_core(ctx: &ContractContext<'_>, plan: &str) -> String {
     let details = ctx.tag_name("details");
     let item = ctx.tag_name("item");
     format!(
-        "Every plan travels as one structured <{plan} action=\"save\" id=\"plan-id\" title=\"Plan Title\">...</{plan}> container. Conceptual Foundation Invariant: Every plan MUST contain an architectural concept tree in <{concept}>...</{concept}> defining the core requirements, design decisions, and system invariants ('What'). Inside <{concept}>, define architectural nodes using structured <{concept_item} id=\"c-...\" title=\"...\"><{details}>...</{details}></{concept_item}> tags. Plan creation without <{concept}> containing at least one <{concept_item}> is strictly prohibited. Implementation steps in <{item}> define 'How', may be included with concept_refs=\"c-...\", files=\"...\", and readonly=\"...\", or omitted if awaiting deep refinement. File Attributes Contract: the `files` attribute lists target files to create or modify (loaded as editable context), while the `readonly` attribute lists reference or contract files such as subsystem conventions, protocol types, and interfaces (loaded as read-only context and never modified). Leaf-Only Files Invariant: the `files` and `readonly` attributes must be specified exclusively for executable leaf steps without child items; parent container items and task groups must never have files. Step Formulation Contract: Formulate each step around an engineering objective and operational invariants rather than detailed procedural micro-instructions; define what state must be achieved and what invariants preserved. Disjunction Prohibition Invariant: Every <{concept_item}> node and every <{item}> step must state exactly one definite decision, so unresolved disjunctive alternatives such as 'either X or Y' or 'use library A or write your own structure B' are strictly prohibited. The architectural choice ('What') is fixed by the Primary or Architect role, or clarified with the developer in dialogue before the plan is approved; the step executor owns 'How' only and never decides the architecture. Automated Verification Invariant: The harness runs full toolchain verification (compilation, linters, and tests) automatically and deterministically after every individual leaf <{item}> and rolls the turn back when it fails. Dedicated <{item}> elements that only run tests, check the build status, or inspect the codebase without changing code are strictly prohibited, because the executor has no shell. Tests are created and modified inside the <{item}> elements that implement the corresponding functionality. Always provide a clear <{description}> explaining the overall architecture, boundaries, and rationale. Plan Creation Invariant: Only create a plan when explicitly instructed or confirmed by the user. Whenever you propose a new plan, you MUST precede the tag with a concise conversational explanation of the proposed plan, and you MUST emit the structured <{plan} action=\"save\" ...> tag in the same response containing both <{concept}> (mandatory) and optional <{item}> elements. Language Consistency: Formulate the plan title, description, concept nodes, step titles, and step details in the same language as the user's request.\nStructured Plan XML Format:\n<{plan} action=\"save\" id=\"plan-id\" title=\"Plan Title\">\n  <{description}>Overall architecture and rationale</{description}>\n  <{concept}>\n    <{concept_item} id=\"c-1\" title=\"Core Invariant\">\n      <{details}>Design rationale and invariants</{details}>\n    </{concept_item}>\n  </{concept}>\n  <{item} id=\"1\" title=\"Step Title\" concept_refs=\"c-1\" files=\"path/to/file.rs\" readonly=\"path/to/contract.rs\">\n    <{details}>Engineering objective and verification criteria</{details}>\n  </{item}>\n</{plan}>"
+        "Every plan travels as one structured <{plan} action=\"save\" id=\"plan-id\" title=\"Plan Title\">...</{plan}> container. Conceptual Foundation Invariant: Every plan MUST contain an architectural concept tree in <{concept}>...</{concept}> defining the core requirements, design decisions, and system invariants ('What'). Inside <{concept}>, define architectural nodes using structured <{concept_item} id=\"c-...\" title=\"...\"><{details}>...</{details}></{concept_item}> tags. Plan creation without <{concept}> containing at least one <{concept_item}> is strictly prohibited. Implementation steps in <{item}> define 'How', may be included with concept_refs=\"c-...\", files=\"...\", readonly=\"...\", and outer_docs=\"...\", or omitted if awaiting deep refinement. File Attributes Contract: the `files` attribute lists target files to create or modify (loaded as editable context), while the `readonly` attribute lists reference or contract files such as subsystem conventions, protocol types, and interfaces (loaded as read-only context and never modified). External Specification Contract: the `outer_docs` attribute lists the external specifications the step is implemented against, each entry naming a document the project declares in `[[outer_docs]]`: `id` addresses a declared root document and covers the whole subtree inside that root, while `id/relative.md` addresses a document below that root and never climbs above it, and the harness materializes every entry as read-only reference context before the step executes. Whenever a leaf <{item}> is implemented against an external contract the project declares, state the specification in `outer_docs` at planning time instead of leaving it to a later refinement. Invariant: the `outer_docs` attribute is allowed only on executable leaf <{item}> elements without children; a step that carries no external dependency states an empty `outer_docs`, and a parent container element never carries one. Leaf-Only Files Invariant: the `files` and `readonly` attributes must be specified exclusively for executable leaf steps without children; parent container items and task groups must never have files. Step Formulation Contract: Formulate each step around an engineering objective and operational invariants rather than detailed procedural micro-instructions; define what state must be achieved and what invariants preserved. Disjunction Prohibition Invariant: Every <{concept_item}> node and every <{item}> step must state exactly one definite decision, so unresolved disjunctive alternatives such as 'either X or Y' or 'use library A or write your own structure B' are strictly prohibited. The architectural choice ('What') is fixed by the Primary or Architect role, or clarified with the developer in dialogue before the plan is approved; the step executor owns 'How' only and never decides the architecture. Automated Verification Invariant: The harness runs full toolchain verification (compilation, linters, and tests) automatically and deterministically after every individual leaf <{item}> and rolls the turn back when it fails. Dedicated <{item}> elements that only run tests, check the build status, or inspect the codebase without changing code are strictly prohibited, because the executor has no shell. Tests are created and modified inside the <{item}> elements that implement the corresponding functionality. Always provide a clear <{description}> explaining the overall architecture, boundaries, and rationale. Plan Creation Invariant: Only create a plan when explicitly instructed or confirmed by the user. Whenever you propose a new plan, you MUST precede the tag with a concise conversational explanation of the proposed plan, and you MUST emit the structured <{plan} action=\"save\" ...> tag in the same response containing both <{concept}> (mandatory) and optional <{item}> elements. Language Consistency: Formulate the plan title, description, concept nodes, step titles, and step details in the same language as the user's request.\nStructured Plan XML Format:\n<{plan} action=\"save\" id=\"plan-id\" title=\"Plan Title\">\n  <{description}>Overall architecture and rationale</{description}>\n  <{concept}>\n    <{concept_item} id=\"c-1\" title=\"Core Invariant\">\n      <{details}>Design rationale and invariants</{details}>\n    </{concept_item}>\n  </{concept}>\n  <{item} id=\"1\" title=\"Step Title\" concept_refs=\"c-1\" files=\"path/to/file.rs\" readonly=\"path/to/contract.rs\" outer_docs=\"vendor/api.md\">\n    <{details}>Engineering objective and verification criteria</{details}>\n  </{item}>\n</{plan}>"
     )
 }
 
@@ -630,7 +726,7 @@ fn plan_xml_delta(ctx: &ContractContext<'_>, plan: &str) -> String {
         )
     } else {
         format!(
-            "In Develop mode, you may ONLY propose new plans (<{plan} action=\"save\" ...>). Updating plan statuses, closing steps, or modifying existing plans from Develop mode is strictly prohibited (step execution and completion occur strictly in isolated step turns, while plan modifications and re-scoping belong exclusively in Discussion mode). Reins Invariant: Never emit a plan tag without an explicit user instruction or confirmation to formulate a plan. Questions, analysis, architectural reviews, or exploratory discussion must be answered strictly in conversational text without plan tags. Planning Objective: Plan synthesis focuses on conceptual comprehension of the objective ('What'), aligning on key architectural decisions and trade-offs, and defining a cohesive concept tree without premature low-level code churn or deep file inspection."
+            "In REPL mode, you may ONLY propose new plans (<{plan} action=\"save\" ...>). Updating plan statuses, closing steps, or modifying existing plans from REPL mode is strictly prohibited (step execution and completion occur strictly in isolated step turns, while plan modifications and re-scoping belong exclusively in Discussion mode). Reins Invariant: Never emit a plan tag without an explicit user instruction or confirmation to formulate a plan. Questions, analysis, architectural reviews, or exploratory discussion must be answered strictly in conversational text without plan tags. Planning Objective: Plan synthesis focuses on conceptual comprehension of the objective ('What'), aligning on key architectural decisions and trade-offs, and defining a cohesive concept tree without premature low-level code churn or deep file inspection."
         )
     }
 }
@@ -674,12 +770,18 @@ impl CapabilityModule for PlanCreationModule {
     /// regime authorizes are declared by [`CapabilityModule::render_delta_rule`].
     fn render_contract_rule(&self, ctx: &ContractContext<'_>) -> Option<ContractRule> {
         let plan = ctx.tag_name(self.canonical_tag()?);
-        let body = if ctx.protocol == EditProtocolKind::Xml {
+        let trunk = if ctx.protocol == EditProtocolKind::Xml {
             plan_xml_core(ctx, &plan)
         } else {
             PLAN_STRUCTURED_CORE_BODY.to_string()
         };
-        Some(ContractRule::new("Local Engineering Plans", body))
+        // The status barrier that repairs a created step lives in the storage
+        // layer, so the rule states the lifecycle in both contours instead of
+        // letting a payload assert a state the mutation can never assign.
+        Some(ContractRule::new(
+            "Local Engineering Plans",
+            format!("{trunk}\n{PLAN_STEP_STATUS_LIFECYCLE_INVARIANT}"),
+        ))
     }
 
     /// Delta rule: which plan actions the declared regime authorizes.
@@ -690,13 +792,13 @@ impl CapabilityModule for PlanCreationModule {
         } else if ctx.intent.is_plan_discussion() {
             PLAN_STRUCTURED_DISCUSSION_DELTA.to_string()
         } else {
-            PLAN_STRUCTURED_DEVELOP_DELTA.to_string()
+            PLAN_STRUCTURED_REPL_DELTA.to_string()
         };
         Some(ContractRule::new("Local Engineering Plan Actions", body))
     }
 
     fn render_structured_instruction(&self, _ctx: &PromptRenderContext<'_>) -> Option<String> {
-        Some("- `plan_update`: structured plan creation or modification (`action`, `id`, `title`, `description`, `concept`, `items`), or null when the plan is not being changed.".to_string())
+        Some("- `plan_update`: structured plan creation or modification (`action`, `id`, `title`, `description`, `concept`, `items`), or null when the plan is not being changed. Every leaf item declares its target files in `files`, its reference contracts in `readonly_files`, and the external specifications it is implemented against in `outer_docs`, each entry a document the project declares in `[[outer_docs]]`: `id` for a declared root document, `id/relative.md` for a document below it.".to_string())
     }
 
     fn render_xml_instruction(&self, ctx: &PromptRenderContext<'_>) -> Option<String> {
@@ -707,7 +809,7 @@ impl CapabilityModule for PlanCreationModule {
         let details = ctx.tag_name("details");
         let description = ctx.tag_name("description");
         Some(format!(
-            "- Plans: propose a structured plan inside <{plan} action=\"save\" id=\"...\" title=\"...\">...</{plan}> only when explicitly instructed or confirmed by the user. A plan is a two-section document: a mandatory <{concept}> section of <{concept_item} id=\"c-...\" title=\"...\"><{details}>...</{details}></{concept_item}> nodes defining 'What', and <{item} id=\"...\" title=\"...\" concept_refs=\"c-...\" files=\"...\" readonly=\"...\"><{details}>...</{details}></{item}> steps defining 'How'. <{description}> carries the overall architecture and rationale. The `files` attribute lists target files loaded as editable context and `readonly` lists reference or contract files loaded as read-only; both are allowed only on executable leaf steps without children. In Develop mode only new plans may be proposed; plan modifications belong to discussion mode."
+            "- Plans: propose a structured plan inside <{plan} action=\"save\" id=\"...\" title=\"...\">...</{plan}> only when explicitly instructed or confirmed by the user. A plan is a two-section document: a mandatory <{concept}> section of <{concept_item} id=\"c-...\" title=\"...\"><{details}>...</{details}></{concept_item}> nodes defining 'What', and <{item} id=\"...\" title=\"...\" concept_refs=\"c-...\" files=\"...\" readonly=\"...\" outer_docs=\"...\"><{details}>...</{details}></{item}> steps defining 'How'. <{description}> carries the overall architecture and rationale. The `files` attribute lists target files loaded as editable context, `readonly` lists reference or contract files loaded as read-only, and `outer_docs` names the external specifications the step is implemented against, each entry a document the project declares in `[[outer_docs]]` (`id` for a declared root document, `id/relative.md` for a document below it); all three attributes are allowed only on executable leaf steps without children. Whenever a leaf step implements an external contract the project declares, state the specification in `outer_docs` while planning instead of leaving it to a later refinement. In REPL mode only new plans may be proposed; plan modifications belong to discussion mode."
         ))
     }
 
@@ -717,8 +819,9 @@ impl CapabilityModule for PlanCreationModule {
         _raw_text: &str,
         marker: Option<&str>,
         _editable_paths: &[String],
+        fences: &CodeFences,
     ) -> Vec<LlmCommand> {
-        let (plans, _diagnostics) = XmlParser::new(marker).parse_plan_tags(normalized_text);
+        let (plans, _diagnostics) = XmlParser::new(marker).parse_plan_tags(normalized_text, fences);
         plans
             .into_iter()
             .filter(|tag| tag.action == "save")
@@ -763,13 +866,40 @@ impl CapabilityModule for PlanUpdateModule {
         _raw_text: &str,
         marker: Option<&str>,
         _editable_paths: &[String],
+        fences: &CodeFences,
     ) -> Vec<LlmCommand> {
-        let (plans, _diagnostics) = XmlParser::new(marker).parse_plan_tags(normalized_text);
+        let (plans, _diagnostics) = XmlParser::new(marker).parse_plan_tags(normalized_text, fences);
         plans
             .into_iter()
             .filter(|tag| tag.action != "save")
             .map(plan_tag_to_command)
             .collect()
+    }
+}
+
+/// Review decision recorded for one finding of a discussed review session.
+///
+/// The module publishes the structured field of a review discussion and nothing
+/// else: the semantics of a decision live in the descriptions of the schema it
+/// forwards and in the prompt of the review dialogue, so the module renders no
+/// contract rule, no delta rule, and no protocol instruction. A decision travels
+/// exclusively through Structured Output — the contour declares no control tag —
+/// so the head every dialogue shares stays byte-identical.
+pub(crate) struct ReviewUpdateModule;
+
+impl CapabilityModule for ReviewUpdateModule {
+    fn capability(&self) -> LlmCapability {
+        LlmCapability::ReviewUpdate
+    }
+
+    fn json_property_name(&self) -> Option<&'static str> {
+        Some("review_update")
+    }
+
+    /// The decision reuses the authoritative review schema of `crates/protocol`,
+    /// so both contours describe the very same payload.
+    fn json_schema_fragment(&self) -> Option<serde_json::Value> {
+        Some(schema::review_update_fragment())
     }
 }
 
@@ -828,8 +958,9 @@ impl CapabilityModule for ScratchpadModule {
         raw_text: &str,
         marker: Option<&str>,
         _editable_paths: &[String],
+        fences: &CodeFences,
     ) -> Vec<LlmCommand> {
-        match XmlParser::new(marker).parse_scratchpad(normalized_text, raw_text) {
+        match XmlParser::new(marker).parse_scratchpad(normalized_text, raw_text, fences) {
             Some(notes) => vec![LlmCommand::Scratchpad { notes }],
             None => Vec::new(),
         }
@@ -867,10 +998,10 @@ impl CapabilityModule for OutcomeModule {
             let success = ctx.tag_name(self.canonical_tag()?);
             let error = ctx.tag_name("error");
             format!(
-                "Conclude every turn with an explicit terminal outcome that carries its own payload: <{success} summary=\"...\" /> on success or <{error} message=\"...\" /> on failure. A terminal status without its payload is a protocol defect rather than a result, so it never concludes a turn as a validated conclusion: a success states a non-empty summary of what was achieved, and a failure states the message that the turn failed."
+                "Conclude every turn with an explicit terminal outcome that carries its own payload: <{success} commit_message=\"...\" /> on success or <{error} message=\"...\" /> on failure. The commit message is the Git commit message of the change set, so it is always written in English as a Conventional Commits header (`type(scope): description`): imperative mood, lowercase, without a trailing period, at most 72 characters, and the conversational language never applies to it. A terminal status without its payload is a protocol defect rather than a result, so it never concludes a turn as a validated conclusion: a success states a non-empty commit message of what was achieved, and a failure states the message that the turn failed."
             )
         } else {
-            "Conclude every turn by populating the `outcome` field with an explicit terminal status that carries its own payload: `status` 'success' together with a non-empty `summary` when the turn succeeds, `status` 'error' together with a `message` when it fails, or `status` 'skip' together with a `reason` when the work is already satisfied and no change is required. A terminal status without its payload is a protocol defect rather than a result, so it never concludes a turn as a validated conclusion.".to_string()
+            "Conclude every turn by populating the `outcome` field with an explicit terminal status that carries its own payload: `status` 'success' together with a non-empty `commit_message` when the turn succeeds, `status` 'error' together with a `message` when it fails, or `status` 'skip' together with a `reason` when the work is already satisfied and no change is required. `commit_message` is the Git commit message of the change set, so it is always written in English as a Conventional Commits header (`type(scope): description`): imperative mood, lowercase, without a trailing period, at most 72 characters, and the conversational language never applies to it. A terminal status without its payload is a protocol defect rather than a result, so it never concludes a turn as a validated conclusion.".to_string()
         };
         Some(ContractRule::new("Terminal Outcome", body))
     }
@@ -879,12 +1010,12 @@ impl CapabilityModule for OutcomeModule {
         let success = ctx.tag_name(self.canonical_tag()?);
         let error = ctx.tag_name("error");
         Some(format!(
-            "- Terminal outcome: conclude with <{success} summary=\"...\" /> on success or <{error} message=\"...\" /> on failure, and always state the payload of the status you declare."
+            "- Terminal outcome: conclude with <{success} commit_message=\"...\" /> on success or <{error} message=\"...\" /> on failure, and always state the payload of the status you declare. The commit message is always an English Conventional Commits header (`type(scope): description`), because it becomes the Git commit message of the change set."
         ))
     }
 
     fn render_structured_instruction(&self, _ctx: &PromptRenderContext<'_>) -> Option<String> {
-        Some("- `outcome`: terminal outcome object with `status` ('none' while the turn continues, 'success' when it succeeds, 'error' when it fails, 'skip' when the work is already satisfied and no change is required), `summary` for a success summary, `message` for an error message, and `reason` for a skip reason; unrelated fields stay empty. Every terminal status carries its own payload: a non-empty `summary` for 'success', the `message` for 'error', and the `reason` for 'skip'. A terminal status without its payload is a protocol defect rather than a result.".to_string())
+        Some("- `outcome`: terminal outcome object with `status` ('none' while the turn continues, 'success' when it succeeds, 'error' when it fails, 'skip' when the work is already satisfied and no change is required), `commit_message` for the commit message of the change set, `message` for an error message, and `reason` for a skip reason; unrelated fields stay empty. `commit_message` is always an English Conventional Commits header (`type(scope): description`) with imperative mood, lowercase, no trailing period, and at most 72 characters, independent of the dialogue language. Every terminal status carries its own payload: a non-empty `commit_message` for 'success', the `message` for 'error', and the `reason` for 'skip'. A terminal status without its payload is a protocol defect rather than a result.".to_string())
     }
 
     fn decode_xml(
@@ -893,10 +1024,11 @@ impl CapabilityModule for OutcomeModule {
         _raw_text: &str,
         marker: Option<&str>,
         _editable_paths: &[String],
+        fences: &CodeFences,
     ) -> Vec<LlmCommand> {
-        match XmlParser::new(marker).parse_terminal_outcome(normalized_text) {
-            Some(TerminalOutcome::Success { summary }) => vec![LlmCommand::Outcome {
-                outcome: LlmOutcome::Success { summary },
+        match XmlParser::new(marker).parse_terminal_outcome(normalized_text, fences) {
+            Some(TerminalOutcome::Success { commit_message }) => vec![LlmCommand::Outcome {
+                outcome: LlmOutcome::Success { commit_message },
             }],
             Some(TerminalOutcome::Error { message }) => vec![LlmCommand::Outcome {
                 outcome: LlmOutcome::Error { message },
@@ -964,8 +1096,9 @@ impl CapabilityModule for BlockedModule {
         _raw_text: &str,
         marker: Option<&str>,
         _editable_paths: &[String],
+        fences: &CodeFences,
     ) -> Vec<LlmCommand> {
-        match XmlParser::new(marker).parse_terminal_outcome(normalized_text) {
+        match XmlParser::new(marker).parse_terminal_outcome(normalized_text, fences) {
             Some(TerminalOutcome::Blocked { reason, details }) => {
                 vec![LlmCommand::Blocked { reason, details }]
             }
@@ -997,10 +1130,18 @@ pub(crate) struct AbortModule;
 /// The structured decoder reuses this routine for its control-tag fallback, so
 /// an abort reaches the harness as one payload whichever vehicle carried it.
 pub(crate) fn abort_invocations(text: &str) -> Vec<(String, String)> {
+    abort_invocations_with_fences(text, &CodeFences::find(text))
+}
+
+/// Decodes every `<abort ... />` invocation against a shared fence index.
+pub(crate) fn abort_invocations_with_fences(
+    text: &str,
+    fences: &CodeFences,
+) -> Vec<(String, String)> {
     let Some(spec) = engine::tag_spec("abort") else {
         return Vec::new();
     };
-    engine::iter_tags(text, spec)
+    engine::iter_tags_with_fences(text, spec, fences)
         .filter_map(|found| {
             let reason = found.attr("reason").unwrap_or_default();
             let recommendation = found.attr_or_body(&["recommendation"]).unwrap_or_default();
@@ -1063,8 +1204,9 @@ impl CapabilityModule for AbortModule {
         _raw_text: &str,
         _marker: Option<&str>,
         _editable_paths: &[String],
+        fences: &CodeFences,
     ) -> Vec<LlmCommand> {
-        abort_invocations(normalized_text)
+        abort_invocations_with_fences(normalized_text, fences)
             .into_iter()
             .map(|(reason, recommendation)| LlmCommand::Abort {
                 reason,
@@ -1137,8 +1279,9 @@ impl CapabilityModule for UserLanguageModule {
         raw_text: &str,
         marker: Option<&str>,
         _editable_paths: &[String],
+        fences: &CodeFences,
     ) -> Vec<LlmCommand> {
-        match XmlParser::new(marker).parse_user_language(normalized_text, raw_text) {
+        match XmlParser::new(marker).parse_user_language(normalized_text, raw_text, fences) {
             Some(language) => vec![LlmCommand::UserLanguage { language }],
             None => Vec::new(),
         }
@@ -1319,8 +1462,9 @@ impl CapabilityModule for CustomToolsModule {
         _raw_text: &str,
         _marker: Option<&str>,
         _editable_paths: &[String],
+        fences: &CodeFences,
     ) -> Vec<LlmCommand> {
-        custom_tool_invocations(normalized_text)
+        custom_tool_invocations_with_fences(normalized_text, fences)
             .into_iter()
             .map(|(name, args)| LlmCommand::CustomTool { name, args })
             .collect()
@@ -1362,10 +1506,18 @@ fn invocation_arguments(header: &str) -> serde_json::Value {
 /// an invocation reaches the harness as one payload whichever vehicle carried
 /// it.
 pub(crate) fn custom_tool_invocations(text: &str) -> Vec<(String, serde_json::Value)> {
+    custom_tool_invocations_with_fences(text, &CodeFences::find(text))
+}
+
+/// Decodes every `<custom_tool ... />` invocation against a shared fence index.
+pub(crate) fn custom_tool_invocations_with_fences(
+    text: &str,
+    fences: &CodeFences,
+) -> Vec<(String, serde_json::Value)> {
     let Some(spec) = engine::tag_spec("custom_tool") else {
         return Vec::new();
     };
-    engine::iter_tags(text, spec)
+    engine::iter_tags_with_fences(text, spec, fences)
         .filter_map(|found| {
             let name = found.attr("name")?;
             Some((name, invocation_arguments(found.header)))
@@ -1426,7 +1578,13 @@ mod tests {
     use tauqe_protocol::{EditProtocolKind, PromptLayoutKind, TurnIntent};
 
     use super::*;
-
+    /// Decodes `text` through `module` with a fence index of that same text.
+    ///
+    /// The module under test resolves every tag family against this one index,
+    /// exactly as the registry hands it over in a response.
+    fn decode(module: &dyn CapabilityModule, text: &str) -> Vec<LlmCommand> {
+        module.decode_xml(text, text, None, &[], &CodeFences::find(text))
+    }
     /// Parses a `[project]` declaration from its JSON form.
     fn project(source: &str) -> ProjectConfig {
         serde_json::from_str(source).expect("the project section parses")
@@ -1496,7 +1654,7 @@ mod tests {
         let text = "<custom_tool name=\"log-tail\" n=\"10\" />";
 
         assert_eq!(
-            module.decode_xml(text, text, None, &[]),
+            decode(&module, text),
             vec![LlmCommand::CustomTool {
                 name: "log-tail".to_string(),
                 args: serde_json::json!({ "n": "10" }),
@@ -1510,7 +1668,7 @@ mod tests {
         let text = "<custom_tool name=\"check\" />";
 
         assert_eq!(
-            module.decode_xml(text, text, None, &[]),
+            decode(&module, text),
             vec![LlmCommand::CustomTool {
                 name: "check".to_string(),
                 args: serde_json::Value::Null,
@@ -1611,7 +1769,7 @@ mod tests {
         // A self-closing invocation carries both payloads as attributes.
         let self_closing = "<abort reason=\"Native build approval required\" recommendation=\"pnpm approve-builds\" />";
         assert_eq!(
-            module.decode_xml(self_closing, self_closing, None, &[]),
+            decode(&module, self_closing),
             vec![LlmCommand::Abort {
                 reason: "Native build approval required".to_string(),
                 recommendation: "pnpm approve-builds".to_string(),
@@ -1622,7 +1780,7 @@ mod tests {
         let paired =
             "<abort reason=\"Toolchain missing\">Install the SDK:\n  rustup component add clippy</abort>";
         assert_eq!(
-            module.decode_xml(paired, paired, None, &[]),
+            decode(&module, paired),
             vec![LlmCommand::Abort {
                 reason: "Toolchain missing".to_string(),
                 recommendation: "Install the SDK:\n  rustup component add clippy".to_string(),
@@ -1631,13 +1789,11 @@ mod tests {
 
         // An invocation that states nothing is dropped instead of producing an
         // empty abort that would stop a turn for no stated reason.
-        assert!(module
-            .decode_xml("<abort />", "<abort />", None, &[])
-            .is_empty());
+        assert!(decode(&module, "<abort />").is_empty());
 
         // Prose that merely names the tag decodes nothing.
         let prose = "Finish the turn with an <abort> tag.";
-        assert!(module.decode_xml(prose, prose, None, &[]).is_empty());
+        assert!(decode(&module, prose).is_empty());
     }
 
     #[test]
@@ -1837,13 +1993,13 @@ mod tests {
     fn the_plan_action_semantics_travel_in_the_delta_rule() {
         let module = PlanCreationModule;
 
-        let develop = delta_in(&module, EditProtocolKind::Xml);
-        assert_eq!(develop.title, "Local Engineering Plan Actions");
-        assert!(develop.body.contains("ONLY propose new plans"));
-        assert!(develop.body.contains("Reins Invariant"));
-        assert!(develop.body.contains("Planning Objective: Plan synthesis"));
-        assert!(!develop.body.contains("Conceptual Foundation Invariant"));
-        assert!(!develop.body.contains("Structured Plan XML Format"));
+        let repl = delta_in(&module, EditProtocolKind::Xml);
+        assert_eq!(repl.title, "Local Engineering Plan Actions");
+        assert!(repl.body.contains("ONLY propose new plans"));
+        assert!(repl.body.contains("Reins Invariant"));
+        assert!(repl.body.contains("Planning Objective: Plan synthesis"));
+        assert!(!repl.body.contains("Conceptual Foundation Invariant"));
+        assert!(!repl.body.contains("Structured Plan XML Format"));
 
         let discussion = discussion_delta_in(&module, EditProtocolKind::Xml);
         assert_eq!(discussion.title, "Local Engineering Plan Actions");
@@ -1855,10 +2011,10 @@ mod tests {
             .body
             .contains("Planning Objective: Collaborative"));
 
-        let structured_develop = delta_in(&module, EditProtocolKind::Structured);
-        assert!(structured_develop.body.contains("ONLY propose new plans"));
-        assert!(!structured_develop.body.contains("<plan"));
-        assert_no_operational_tags(&structured_develop);
+        let structured_repl = delta_in(&module, EditProtocolKind::Structured);
+        assert!(structured_repl.body.contains("ONLY propose new plans"));
+        assert!(!structured_repl.body.contains("<plan"));
+        assert_no_operational_tags(&structured_repl);
 
         let structured_discussion = discussion_delta_in(&module, EditProtocolKind::Structured);
         assert!(structured_discussion.body.contains("action: \"update\""));
@@ -1907,7 +2063,8 @@ mod tests {
         "<plan",
         "<concept",
         "<item",
-        "<description",
+        "<tauqe_doc_request",
+        "<outer_doc_request",
         "<details",
         "<scratchpad",
         "<success",
@@ -1940,11 +2097,11 @@ mod tests {
     }
 
     #[test]
-    fn the_discovery_rule_is_dualized_by_the_wire_format() {
-        let module = DiscoveryModule;
+    fn the_research_rule_is_dualized_by_the_wire_format() {
+        let module = ResearchModule;
 
         let xml = rule_in(&module, EditProtocolKind::Xml);
-        assert_eq!(xml.title, "Discovery First");
+        assert_eq!(xml.title, "Research First");
         assert!(xml.body.contains("<context_request path="));
         assert!(xml.body.contains("<repo_search path="));
         assert!(xml.body.contains("<repo_dirs />"));
@@ -1956,7 +2113,7 @@ mod tests {
             .contains("verbatim at the very end of the response"));
 
         let structured = rule_in(&module, EditProtocolKind::Structured);
-        assert_eq!(structured.title, "Discovery First");
+        assert_eq!(structured.title, "Research First");
         for field in [
             "`repo_dirs`",
             "`dir_lists`",
@@ -1976,14 +2133,14 @@ mod tests {
     }
 
     #[test]
-    fn the_discovery_rule_follows_the_eager_symbol_map_in_both_contours() {
-        let module = DiscoveryModule;
+    fn the_research_rule_follows_the_eager_symbol_map_in_both_contours() {
+        let module = ResearchModule;
         for protocol in [EditProtocolKind::Xml, EditProtocolKind::Structured] {
             let render = PromptRenderContext::new(&[], None).with_eager_repo_map(true);
             let ctx = ContractContext::new(TurnIntent::InteractiveRepl, protocol, render);
             let rule = module
                 .render_contract_rule(&ctx)
-                .expect("the discovery rule is always rendered");
+                .expect("the research rule is always rendered");
             assert!(
                 !rule.body.contains("repo_map"),
                 "the eager outline suppresses the on-demand map request in {protocol}: {}",
@@ -1999,13 +2156,14 @@ mod tests {
 
         let xml = rule_in(&module, EditProtocolKind::Xml);
         assert_eq!(xml.title, "Self-Knowledge");
-        assert!(xml.body.contains("<doc_request"));
+        assert!(xml.body.contains("<tauqe_doc_request"));
+        assert!(!xml.body.contains("<doc_request"));
         assert!(xml.body.contains("topic=\""));
         assert!(xml.body.contains("<system_documentation>"));
 
         let structured = rule_in(&module, EditProtocolKind::Structured);
         assert_eq!(structured.title, "Self-Knowledge");
-        assert!(structured.body.contains("`doc_requests` field"));
+        assert!(structured.body.contains("`tauqe_doc_requests` field"));
         assert!(structured.body.contains("`config`"));
         // The feedback block is prompt-side, so it stays in both contours.
         assert!(structured.body.contains("<system_documentation>"));
@@ -2101,6 +2259,87 @@ mod tests {
     }
 
     #[test]
+    fn the_plan_contract_states_the_step_status_lifecycle() {
+        let module = PlanCreationModule;
+
+        // The status barrier repairs a created step in the storage layer, so the
+        // rule states the same lifecycle in both contours, whichever vehicle
+        // carried the payload.
+        for protocol in [EditProtocolKind::Xml, EditProtocolKind::Structured] {
+            let rule = rule_in(&module, protocol);
+            assert!(
+                rule.body.contains("Step Status Lifecycle Invariant"),
+                "{protocol}"
+            );
+            assert!(rule.body.contains("'todo' or 'discussion'"), "{protocol}");
+            assert!(rule.body.contains("execution pipeline"), "{protocol}");
+            assert!(rule.body.contains("repaired to 'todo'"), "{protocol}");
+            // The lifecycle names statuses the way the wire schema describes
+            // them: a backticked `blocked` would advertise a field of the
+            // structured schema inside the head of the XML contour.
+            assert!(!rule.body.contains("`blocked`"), "{protocol}");
+        }
+
+        // The invariant is spelled with the payload vocabulary, so the structured
+        // trunk never advertises a control tag.
+        let structured = rule_in(&module, EditProtocolKind::Structured);
+        assert_no_operational_tags(&structured);
+    }
+
+    #[test]
+    fn the_plan_contracts_require_outer_docs_for_external_specifications() {
+        let module = PlanCreationModule;
+
+        // Both contours carry the external specification contract beside the
+        // file attributes, so a plan declares the specifications its leaf
+        // steps are implemented against instead of leaving them to a later
+        // refinement.
+        for protocol in [EditProtocolKind::Xml, EditProtocolKind::Structured] {
+            let rule = rule_in(&module, protocol);
+            assert!(
+                rule.body.contains("External Specification Contract"),
+                "{protocol}"
+            );
+            assert!(rule.body.contains("outer_docs"), "{protocol}");
+            assert!(rule.body.contains("id/relative.md"), "{protocol}");
+            assert!(rule.body.contains("never climbs above it"), "{protocol}");
+            assert!(
+                rule.body.contains("read-only reference context"),
+                "{protocol}"
+            );
+            assert!(rule.body.contains("executable leaf"), "{protocol}");
+            assert!(rule.body.contains("without children"), "{protocol}");
+            assert!(rule.body.contains("parent container"), "{protocol}");
+        }
+
+        // The XML trunk advertises the attribute in the shape example a
+        // reader copies, while the structured trunk spells the same contract
+        // with the field of its own schema and no foreign vocabulary.
+        let xml = rule_in(&module, EditProtocolKind::Xml);
+        assert!(xml.body.contains("outer_docs=\"vendor/api.md\""));
+
+        let structured = rule_in(&module, EditProtocolKind::Structured);
+        assert!(structured.body.contains("`outer_docs`"));
+        assert!(!structured.body.contains("outer_docs=\""));
+        assert_no_operational_tags(&structured);
+
+        // The protocol reference shows the attribute in the step shape, so the
+        // decoder never receives a field the prompt failed to advertise.
+        let render = PromptRenderContext::new(&[], None);
+        let xml_instruction = module
+            .render_xml_instruction(&render)
+            .expect("the plan module renders the xml reference");
+        assert!(xml_instruction.contains("outer_docs=\"...\""));
+        assert!(xml_instruction.contains("[[outer_docs]]"));
+
+        let structured_instruction = module
+            .render_structured_instruction(&render)
+            .expect("the plan module renders the structured reference");
+        assert!(structured_instruction.contains("`outer_docs`"));
+        assert_no_operational_tag_in(&structured_instruction, "the plan instruction");
+    }
+
+    #[test]
     fn the_discussion_plan_rule_follows_the_declared_contour() {
         let module = PlanCreationModule;
 
@@ -2150,14 +2389,14 @@ mod tests {
 
         let xml = rule_in(&module, EditProtocolKind::Xml);
         assert_eq!(xml.title, "Terminal Outcome");
-        assert!(xml.body.contains("<success summary="));
+        assert!(xml.body.contains("<success commit_message="));
         assert!(xml.body.contains("<error message="));
 
         let structured = rule_in(&module, EditProtocolKind::Structured);
         assert_eq!(structured.title, "Terminal Outcome");
         assert!(structured.body.contains("`outcome` field"));
         assert!(structured.body.contains("'success'"));
-        assert!(structured.body.contains("`summary`"));
+        assert!(structured.body.contains("`commit_message`"));
         assert!(structured.body.contains("'error'"));
         assert!(structured.body.contains("`message`"));
         assert_no_operational_tags(&structured);
@@ -2172,12 +2411,12 @@ mod tests {
         let xml = rule_in(&module, EditProtocolKind::Xml);
         assert!(xml.body.contains("carries its own payload"));
         assert!(xml.body.contains("protocol defect"));
-        assert!(xml.body.contains("non-empty summary"));
+        assert!(xml.body.contains("non-empty commit message"));
 
         let structured = rule_in(&module, EditProtocolKind::Structured);
         assert!(structured.body.contains("carries its own payload"));
         assert!(structured.body.contains("protocol defect"));
-        assert!(structured.body.contains("non-empty `summary`"));
+        assert!(structured.body.contains("non-empty `commit_message`"));
         assert_no_operational_tags(&structured);
 
         // The protocol reference formulates the same obligation, so the rule and
@@ -2196,10 +2435,14 @@ mod tests {
                 &tauqe_protocol::CapabilitySet::interactive_repl(),
                 PatchStrategy::SearchReplace,
             );
-        let description = schema["properties"]["outcome"]["properties"]["summary"]["description"]
+        let description = schema["properties"]["outcome"]["properties"]["commit_message"]
+            ["description"]
             .as_str()
-            .expect("the composed schema describes the summary");
-        assert!(description.contains("Non-empty"), "{description}");
+            .expect("the composed schema describes the commit message");
+        assert!(
+            description.contains("Conventional Commits"),
+            "{description}"
+        );
     }
 
     #[test]
@@ -2366,15 +2609,18 @@ mod tests {
         assert_no_operational_tag_in(&contract, "the structured core contract");
         assert_no_operational_tag_in(&delta, "the structured delta contract");
         assert!(!contract.contains("Operational Protocol Tags"));
-        assert_no_operational_tag_in(&contract, "the structured core contract");
-        assert!(!contract.contains("Operational Protocol Tags"));
 
         // The protocol instruction block describes the same surface and names a
         // schema field for every capability it advertises.
         let render = PromptRenderContext::new(&editable, None);
         let instructions = registry.compose_structured_protocol_instructions(&set, &render);
         assert_no_operational_tag_in(&instructions, "the structured protocol instructions");
-        for field in ["`message`", "`changes`", "`doc_requests`", "`outcome`"] {
+        for field in [
+            "`message`",
+            "`changes`",
+            "`tauqe_doc_requests`",
+            "`outcome`",
+        ] {
             assert!(instructions.contains(field), "missing {field}");
         }
     }
@@ -2484,5 +2730,62 @@ mod tests {
             assert!(rule.body.contains(MOCKUPS_DIR));
             assert_no_operational_tags(&rule);
         }
+    }
+
+    #[test]
+    fn the_outer_document_module_delegates_the_channel_to_the_shared_trunk() {
+        let module = OuterDocRequestModule;
+        assert_eq!(module.canonical_tag(), Some("outer_doc_request"));
+        assert_eq!(module.json_property_name(), Some("outer_doc_requests"));
+
+        // The channel is documented once, by the shared trunk of the Core System
+        // Contract, so the module contributes no rule and no instruction of its
+        // own: a second copy could drift from the invariant the trunk states.
+        let render = PromptRenderContext::new(&[], None);
+        let ctx = ContractContext::new(TurnIntent::InteractiveRepl, EditProtocolKind::Xml, render);
+        assert!(module.render_contract_rule(&ctx).is_none());
+        assert!(module.render_delta_rule(&ctx).is_none());
+        assert!(module.render_xml_instruction(&ctx.render).is_none());
+        assert!(module.render_structured_instruction(&ctx.render).is_none());
+
+        // The wire schema fragment stays with the module that decodes the
+        // command, so the composed schema still advertises the field.
+        let fragment = module
+            .json_schema_fragment()
+            .expect("the external channel owns a schema field");
+        assert!(fragment.get("outer_doc_requests").is_some());
+    }
+
+    #[test]
+    fn the_outer_document_module_decodes_the_declared_identifier() {
+        let module = OuterDocRequestModule;
+
+        // A request names the mount point of one project declaration.
+        assert_eq!(
+            decode(
+                &module,
+                "Checking the upstream contract.\n<outer_doc_request id=\"mylib\" />"
+            ),
+            vec![LlmCommand::OuterDocRequest {
+                id: "mylib".to_string(),
+            }]
+        );
+
+        // A marker-bound invocation decodes exactly like an unbound one, so the
+        // request participates in the turn-marker protection.
+        let marked = "<outer_doc_request_AB12 id=\"vendor/api.md\" />";
+        let fences = CodeFences::find(marked);
+        assert_eq!(
+            module.decode_xml(marked, marked, Some("AB12"), &[], &fences),
+            vec![LlmCommand::OuterDocRequest {
+                id: "vendor/api.md".to_string(),
+            }]
+        );
+
+        // An invocation that names nothing grants nothing, and prose that
+        // merely mentions the tag never issues a request.
+        assert!(decode(&module, "<outer_doc_request />").is_empty());
+        assert!(decode(&module, "<outer_doc_request id=\"  \" />").is_empty());
+        assert!(decode(&module, "Finish with an <outer_doc_request> tag.").is_empty());
     }
 }

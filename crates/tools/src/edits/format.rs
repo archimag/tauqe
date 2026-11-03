@@ -13,7 +13,10 @@
 //! exactly the bytes the validation gate inspected.
 //!
 //! The filter itself is declared by the project configuration of the repository
-//! and runs in [`crate::toolchain`]; this module owns only the hand-off.
+//! and runs in [`crate::toolchain`]; this module owns only the hand-off. The
+//! declaration is resolved once for the whole attempt, so a change set validates
+//! its filter a single time and streams every staged file through the same
+//! resolved command line and timeout.
 //!
 //! Staging reads every file it edits, so the state machine performs blocking
 //! file I/O while the entry point that drives it is async. The machine is
@@ -30,6 +33,7 @@ use super::change_set::{
     stage_and_validate_edits_inner, StageEditsResult, StagedConfigValidator, StagedEditsState,
 };
 use crate::blocking::{log_join_error, run_blocking, run_blocking_async};
+use crate::toolchain::{resolve_formatter, FormatterResolution};
 
 /// Stages edits in memory under an already resolved project configuration and
 /// streams every staged file through the project filter.
@@ -170,8 +174,15 @@ async fn stage_off_the_executor(
 /// Formatting has exactly one contour: the staged text of a file enters
 /// `[project.format]` on standard input and the rewritten text returns on
 /// standard output, so the change set is formatted while it still lives in
-/// memory. A repository that declares no filter keeps every authored content,
-/// and a cancelled invocation leaves the rest of the change set untouched.
+/// memory. The declaration is resolved once for the whole attempt, so a change
+/// set that stages many files validates its filter a single time and streams
+/// every one of them through the same resolved command line and timeout. A
+/// repository that declares no filter keeps every authored content, a
+/// declaration the configuration rejects is reported once, and a cancelled
+/// invocation leaves the rest of the change set untouched. Every file is
+/// streamed with its own repository-relative path, so the filter receives the
+/// same path the change set holds and a polyglot repository dispatches on the
+/// file type instead of guessing it from the content.
 ///
 /// `config_validator` is the gate the change set passed on admission, and every
 /// rewritten document passes it again before it joins the staged state: the
@@ -189,19 +200,21 @@ async fn format_staged_files(
     result: &mut StageEditsResult,
     cancel_rx: Option<&watch::Receiver<bool>>,
 ) {
+    let formatter = match resolve_formatter(project) {
+        FormatterResolution::Ready(formatter) => formatter,
+        // A project that declares no filter, or one whose declaration the
+        // configuration rejects, keeps every authored content; the rejection is
+        // already recorded where the declaration was resolved.
+        FormatterResolution::Absent | FormatterResolution::Rejected(_) => return,
+    };
+
     let mut formatted: Vec<(String, String)> = Vec::new();
     for path in &result.successful_paths {
         let Some(content) = result.staged_state.staged_files.get(path).cloned() else {
             // A staged deletion carries no content to rewrite.
             continue;
         };
-        let Some(outcome) =
-            crate::toolchain::format_with_project_config(repo_root, project, &content, cancel_rx)
-                .await
-        else {
-            // No in-memory formatter is declared, so nothing is rewritten.
-            return;
-        };
+        let outcome = formatter.format(repo_root, path, &content, cancel_rx).await;
         if outcome.is_cancelled {
             return;
         }
@@ -373,6 +386,107 @@ mod tests {
             Some("# AUTHORED CONFIGURATION\n")
         );
     }
+
+    /// The repository source file the multi-file attempt stages beside the
+    /// configuration.
+    const HELPER_PATH: &str = "src/lib.rs";
+    /// The content the working tree holds before the multi-file attempt.
+    const ORIGINAL_HELPER: &str = "pub fn value() -> i32 { 0 }\n";
+    /// The content the multi-file attempt authors in memory.
+    const AUTHORED_HELPER: &str = "pub fn value() -> i32 { 1 }\n";
+
+    /// One staging attempt resolves the declared filter once for the whole
+    /// change set and still keeps per-file outcomes: the file the filter
+    /// rewrites is staged formatted, while the file it refuses keeps its
+    /// authored content without failing the attempt.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_one_staging_attempt_keeps_per_file_formatter_outcomes() {
+        let dir = repository();
+        std::fs::write(dir.path().join(CONFIG_PATH), ORIGINAL_CONFIG).unwrap();
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        std::fs::write(dir.path().join(HELPER_PATH), ORIGINAL_HELPER).unwrap();
+        // The filter rewrites what it accepts and refuses a source file, so both
+        // outcomes come out of one resolved declaration.
+        let project = project_config(
+            r#"{"format": {"command": "sh", "args": ["-c", "content=$(cat); case \"$content\" in pub*) echo refused >&2; exit 3;; esac; echo \"$content\" | tr a-z A-Z"]}}"#,
+        );
+        let context = ContextState {
+            revision: 1,
+            items: vec![
+                ContextItem {
+                    path: CONFIG_PATH.to_string(),
+                    access: ContextAccess::Editable,
+                    size_bytes: ORIGINAL_CONFIG.len() as u64,
+                    estimated_tokens: 1,
+                    layer: ContextLayer::User,
+                    insertion_seq: 1,
+                },
+                ContextItem {
+                    path: HELPER_PATH.to_string(),
+                    access: ContextAccess::Editable,
+                    size_bytes: ORIGINAL_HELPER.len() as u64,
+                    estimated_tokens: 1,
+                    layer: ContextLayer::User,
+                    insertion_seq: 2,
+                },
+            ],
+            total_estimated_tokens: 2,
+        };
+        let edits = [
+            EditOperation::Replace {
+                path: CONFIG_PATH.to_string(),
+                old_text: ORIGINAL_CONFIG.to_string(),
+                new_text: AUTHORED_CONFIG.to_string(),
+            },
+            EditOperation::Replace {
+                path: HELPER_PATH.to_string(),
+                old_text: ORIGINAL_HELPER.to_string(),
+                new_text: AUTHORED_HELPER.to_string(),
+            },
+        ];
+
+        let result = prepare_staged_edits_with_config_and_validator(
+            dir.path(),
+            &project,
+            &context,
+            &edits,
+            None,
+            None,
+            None,
+        )
+        .await;
+
+        assert!(result.is_success(), "{:?}", result.failed_files);
+        assert!(result.failed_files.is_empty());
+        assert!(result.successful_paths.contains(&CONFIG_PATH.to_string()));
+        assert!(result.successful_paths.contains(&HELPER_PATH.to_string()));
+        assert_eq!(
+            result
+                .staged_state
+                .staged_files
+                .get(CONFIG_PATH)
+                .map(String::as_str),
+            Some("# AUTHORED CONFIGURATION\n")
+        );
+        assert_eq!(
+            result
+                .staged_state
+                .staged_files
+                .get(HELPER_PATH)
+                .map(String::as_str),
+            Some(AUTHORED_HELPER)
+        );
+        // Staging is memory only: the working tree keeps both authored files.
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join(CONFIG_PATH)).unwrap(),
+            ORIGINAL_CONFIG
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join(HELPER_PATH)).unwrap(),
+            ORIGINAL_HELPER
+        );
+    }
     /// The thread the offloaded staging call ran on, recorded by the validator
     /// hook of the offload test below.
     static STAGING_THREAD: std::sync::OnceLock<std::thread::ThreadId> = std::sync::OnceLock::new();
@@ -404,6 +518,86 @@ mod tests {
         assert_ne!(
             *staging_thread, executor_thread,
             "staging ran on the executor thread"
+        );
+    }
+
+    /// One staging attempt hands every staged file to the filter together with
+    /// its own repository-relative path, so a path-aware filter rewrites each
+    /// file by the same path the change set holds.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_staging_streams_every_staged_file_with_its_own_path() {
+        let dir = repository();
+        std::fs::write(dir.path().join(CONFIG_PATH), ORIGINAL_CONFIG).unwrap();
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        std::fs::write(dir.path().join(HELPER_PATH), ORIGINAL_HELPER).unwrap();
+        // The filter prefixes the staged text with the path it was handed, so the
+        // two staged files prove which path reached the process.
+        let project = project_config(
+            r#"{"format": {"command": "sh", "args": ["-c", "printf '# %s\\n' \"$TAUQE_FILE_PATH\"; cat"]}}"#,
+        );
+        let context = ContextState {
+            revision: 1,
+            items: vec![
+                ContextItem {
+                    path: CONFIG_PATH.to_string(),
+                    access: ContextAccess::Editable,
+                    size_bytes: ORIGINAL_CONFIG.len() as u64,
+                    estimated_tokens: 1,
+                    layer: ContextLayer::User,
+                    insertion_seq: 1,
+                },
+                ContextItem {
+                    path: HELPER_PATH.to_string(),
+                    access: ContextAccess::Editable,
+                    size_bytes: ORIGINAL_HELPER.len() as u64,
+                    estimated_tokens: 1,
+                    layer: ContextLayer::User,
+                    insertion_seq: 2,
+                },
+            ],
+            total_estimated_tokens: 2,
+        };
+        let edits = [
+            EditOperation::Replace {
+                path: CONFIG_PATH.to_string(),
+                old_text: ORIGINAL_CONFIG.to_string(),
+                new_text: AUTHORED_CONFIG.to_string(),
+            },
+            EditOperation::Replace {
+                path: HELPER_PATH.to_string(),
+                old_text: ORIGINAL_HELPER.to_string(),
+                new_text: AUTHORED_HELPER.to_string(),
+            },
+        ];
+
+        let result = prepare_staged_edits_with_config_and_validator(
+            dir.path(),
+            &project,
+            &context,
+            &edits,
+            None,
+            None,
+            None,
+        )
+        .await;
+
+        assert!(result.is_success(), "{:?}", result.failed_files);
+        assert_eq!(
+            result
+                .staged_state
+                .staged_files
+                .get(CONFIG_PATH)
+                .map(String::as_str),
+            Some("# tauqe.toml\n# authored configuration\n")
+        );
+        assert_eq!(
+            result
+                .staged_state
+                .staged_files
+                .get(HELPER_PATH)
+                .map(String::as_str),
+            Some("# src/lib.rs\npub fn value() -> i32 { 1 }\n")
         );
     }
 }

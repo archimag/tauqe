@@ -2,7 +2,7 @@
 //!
 //! This module owns the bounded-turn lifecycle: session bookkeeping, the
 //! orchestration that sequences the phases, and the shared [`TurnKernel`]
-//! threaded through the phase executors. The round executor, discovery, and the
+//! threaded through the phase executors. The round executor, research, and the
 //! corrective budget of an empty answer live in [`kernel`], staging lives in
 //! [`staging`], and verification and healing live in [`healing`]. Transactional
 //! persistence is delegated to an [`ApplyPolicy`], so the FSM never touches Git
@@ -29,8 +29,8 @@ use crate::plan::storage::PlanMutationMode;
 use crate::prompt::protocol::PromptProtocol;
 use crate::providers::{LlmProvider, StreamEvent};
 use crate::workflow::common::{compact_history_if_needed_with_budget, record_workflow_response};
-use crate::workflow::discovery::journal::TurnDiscoveryJournal;
 use crate::workflow::policy::ApplyPolicy;
+use crate::workflow::research::journal::TurnResearchJournal;
 use crate::workflow::retry::format_patch_retry_reason;
 use crate::workflow::verification::run_workflow_verification_with_config;
 use crate::workflow::WorkflowOptions;
@@ -38,7 +38,7 @@ use crate::workflow::WorkflowOptions;
 use cache::TurnInputCache;
 use guard::{finalize_blocked_turn, finish_turn, rollback_or_log};
 use healing::run_apply_and_verify_phase;
-use kernel::{DiscoveryPhase, EmptyStepGuard, EmptyStepRetry, TurnKernel, MAX_EMPTY_STEP_RETRIES};
+use kernel::{EmptyStepGuard, EmptyStepRetry, ResearchPhase, TurnKernel, MAX_EMPTY_STEP_RETRIES};
 use proposal::{
     extract_error_message, log_fsm_phase, merge_text, outcome_carries_result, ProposalStep,
     TurnState,
@@ -404,7 +404,7 @@ fn isolated_step_capabilities(protocol: &dyn PromptProtocol) -> tauqe_protocol::
 /// present, the turn keeps cycling instead of mistaking an intermediate step
 /// for a final answer.
 fn has_investigation_commands(step: &ProposalStep) -> bool {
-    step.has_discovery_commands() || !step.custom_tools().is_empty()
+    step.has_research_commands() || !step.custom_tools().is_empty()
 }
 
 /// Runs the FSM turn cycle without session bookkeeping.
@@ -436,7 +436,7 @@ pub(super) async fn run_fsm_turn_body(
     } else if intent.is_plan_discussion() {
         PlanMutationMode::Discussion
     } else {
-        PlanMutationMode::Develop
+        PlanMutationMode::Repl
     };
 
     let isolated_protocol;
@@ -486,7 +486,7 @@ pub(super) async fn run_fsm_turn_body(
         context_manager,
         input_cache: &mut input_cache,
         state: TurnState::default(),
-        journal: TurnDiscoveryJournal::default(),
+        journal: TurnResearchJournal::default(),
         rounds_used: 0,
         accumulated_text: String::new(),
         empty_steps: EmptyStepGuard::default(),
@@ -522,11 +522,11 @@ pub(super) async fn run_fsm_turn_body(
 
     let mut pending = step;
     let step = loop {
-        let step = match ctx.run_discovery_phase(pending).await? {
-            DiscoveryPhase::Terminate(outcome) => return Ok(*outcome),
-            DiscoveryPhase::BudgetExceeded(limit) => {
+        let step = match ctx.run_research_phase(pending).await? {
+            ResearchPhase::Terminate(outcome) => return Ok(*outcome),
+            ResearchPhase::BudgetExceeded(limit) => {
                 let warn = format!(
-                    "Context files token budget exceeded (files_token_budget = {}). The model requested {} tokens in new file(s) [{}], but the context already contains {} tokens. Scope the task down or decompose it into a plan.",
+                    "Context token budget exceeded (token_budget = {}). The model requested {} tokens in new file(s) [{}], but the context already contains {} tokens. Scope the task down or decompose it into a plan.",
                     limit.token_budget,
                     limit.requested_tokens,
                     limit.requested_files.join(", "),
@@ -557,7 +557,7 @@ pub(super) async fn run_fsm_turn_body(
                     skip_reason: None,
                 });
             }
-            DiscoveryPhase::Continue(step) => *step,
+            ResearchPhase::Continue(step) => *step,
         };
         if let Some(outcome) = finish_on_abort_outcome(&mut ctx).await {
             return Ok(outcome);
@@ -642,7 +642,7 @@ pub(super) async fn run_fsm_turn_body(
     }
 
     // Phase boundary: staging is about to validate the change set, so a cancel
-    // observed during discovery ends the turn before staging produces work.
+    // observed during research ends the turn before staging produces work.
     if ctx.cancel_requested() {
         let _ = ctx.stream_tx.send(StreamEvent::Done).await;
         let accumulated = std::mem::take(&mut ctx.accumulated_text);
@@ -883,7 +883,7 @@ const MAX_WRITTEN_ANSWER_RETRIES: usize = 1;
 /// the material already gathered is all this turn will hold, so a model that
 /// finished its investigation answers the task instead of asking for the same
 /// context once more. The wording covers both reasons an investigation closes:
-/// a request the context already satisfied and a discovery round limit that
+/// a request the context already satisfied and a research round limit that
 /// will load nothing further.
 const MISSING_ANSWER_REMINDER: &str = "\n\nYour investigation for this turn is complete: no further repository material will be loaded into the context. Answer the task now: write the analysis or the conclusion in plain conversational text, using the material you already hold. Do not request additional context, and do not emit file edits unless the code itself must change.";
 
@@ -898,7 +898,7 @@ enum WrittenAnswer {
 /// Guarantees that a turn closing its investigation ends with readable text.
 ///
 /// A round that only repeated requests the context already satisfied, or that
-/// kept asking for repository material until the discovery round limit was
+/// kept asking for repository material until the research round limit was
 /// spent, leaves nothing to stage and no prose behind. Closing the turn there
 /// would record a blank or truncated answer, so the model is asked once more
 /// with the accumulated journal and an explicit answer directive in view.
@@ -1275,7 +1275,7 @@ mod tests {
             "  <concept>\n",
             "    <concept_item id=\"c-1\" title=\"FSM Plan Architecture\" />\n",
             "  </concept>\n",
-            "  <item id=\"1\" title=\"Initial Step\" />\n",
+            "  <item id=\"1\" title=\"Initial Step\" files=\"src/step1.rs\" />\n",
             "</plan>\n",
             "Done.",
         );
@@ -1381,7 +1381,7 @@ mod tests {
         let mut history = HistoryManager::new(root.clone());
 
         let response = format!(
-            "{}\n<success summary=\"Custom squash summary\" />",
+            "{}\n<success commit_message=\"Custom squash summary\" />",
             edit_block(
                 "pub fn compute() -> i32 { 0 }",
                 "pub fn compute() -> i32 { 42 }",
@@ -1718,7 +1718,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn develop_mode_rejects_plan_update() {
+    async fn repl_mode_rejects_plan_update() {
         let (_dir, root) = setup_repo(&[("a.rs", TARGET)]);
         let mut context = context_with_target(&root);
         let mut history = HistoryManager::new(root.clone());
@@ -1735,12 +1735,13 @@ mod tests {
                 id: "1".to_string(),
                 title: "Step 1".to_string(),
                 status: tauqe_protocol::PlanItemStatus::Todo,
+                files: vec!["src/step1.rs".to_string()],
                 ..Default::default()
             }],
         );
         crate::plan::storage::PlanStorage::save_plan(&root, &existing).unwrap();
 
-        // Model in develop mode attempts to update the plan
+        // Model in REPL mode attempts to update the plan
         let update_xml = concat!(
             "Updating plan from develop:\n",
             "<plan action=\"update\" id=\"develop-plan\">\n",
@@ -1777,18 +1778,18 @@ mod tests {
         let loaded = crate::plan::storage::PlanStorage::load_plan(&root, "develop-plan")
             .unwrap()
             .unwrap();
-        // The item must remain Todo because update is rejected in Develop mode
+        // The item must remain Todo because update is rejected in REPL mode
         assert_eq!(loaded.items[0].status, tauqe_protocol::PlanItemStatus::Todo);
     }
 
-    /// Builds the workflow options a project declares through `[develop]
+    /// Builds the workflow options a project declares through `[repl]
     /// patch_strategy`.
     ///
     /// The declaration is decoded exactly as the daemon decodes `tauqe.toml`, so
     /// the test observes the same single source of truth a project provides.
     fn line_anchor_options() -> WorkflowOptions {
         let config: crate::config::AppConfig =
-            toml::from_str("[develop]\npatch_strategy = \"line_anchor\"\n")
+            toml::from_str("[repl]\npatch_strategy = \"line_anchor\"\n")
                 .expect("parse the patch strategy declaration");
         WorkflowOptions::from_app_config(&config)
     }
@@ -1932,7 +1933,7 @@ mod tests {
 
         let response = concat!(
             "Nothing to change: the helper already returns the expected value.\n",
-            "<success summary=\"Confirmed the helper returns the expected value\" />",
+            "<success commit_message=\"Confirmed the helper returns the expected value\" />",
         );
         let provider = MockLlmProvider::scripted([MockResponse::text(response)]);
         let model = ModelRef::openrouter("mock/model");

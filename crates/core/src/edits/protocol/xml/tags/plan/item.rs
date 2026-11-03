@@ -79,8 +79,10 @@ pub struct ParsedPlanItem {
     pub title: String,
     pub details: Option<String>,
     pub status: Option<tauqe_protocol::PlanItemStatus>,
+    pub commit: Option<String>,
     pub files: Vec<String>,
     pub readonly_files: Vec<String>,
+    pub outer_docs: Vec<String>,
     pub concept_refs: Vec<String>,
     pub depends_on: Vec<String>,
     pub children: Vec<ParsedPlanItem>,
@@ -94,9 +96,11 @@ impl ParsedPlanItem {
             title: self.title,
             details: self.details,
             status: self.status.unwrap_or(tauqe_protocol::PlanItemStatus::Todo),
+            commit: self.commit,
             blocked_reason: None,
             files: self.files,
             readonly_files: self.readonly_files,
+            outer_docs: self.outer_docs,
             concept_refs: self.concept_refs,
             depends_on: self.depends_on,
             children: self
@@ -115,8 +119,10 @@ impl From<tauqe_protocol::PlanItem> for ParsedPlanItem {
             title: item.title,
             details: item.details,
             status: Some(item.status),
+            commit: item.commit,
             files: item.files,
             readonly_files: item.readonly_files,
+            outer_docs: item.outer_docs,
             concept_refs: item.concept_refs,
             depends_on: item.depends_on,
             children: item.children.into_iter().map(Into::into).collect(),
@@ -226,7 +232,24 @@ pub(super) fn parse_plan_items_with_diagnostics(
                     .collect::<Vec<_>>()
             })
             .unwrap_or_default();
-
+        let outer_docs = extract_attribute(header, "outer_docs")
+            .or_else(|| extract_attribute(header, "outer_doc"))
+            .map(|s| {
+                s.split([',', ';', '\n'])
+                    .filter_map(|p| {
+                        let trimmed = p.trim();
+                        if trimmed.is_empty() {
+                            None
+                        } else {
+                            Some(trimmed.to_string())
+                        }
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        let commit = extract_attribute(header, "commit")
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
         let concept_refs = extract_attribute(header, "concept_refs")
             .or_else(|| extract_attribute(header, "concept"))
             .map(|s| {
@@ -271,8 +294,10 @@ pub(super) fn parse_plan_items_with_diagnostics(
                     title: raw_title,
                     details: attr_details,
                     status,
+                    commit,
                     files,
                     readonly_files,
+                    outer_docs,
                     concept_refs,
                     depends_on,
                     children: Vec::new(),
@@ -388,6 +413,7 @@ pub(super) fn parse_plan_items_with_diagnostics(
                         title: if title.is_empty() { id } else { title },
                         details,
                         status,
+                        commit: if children.is_empty() { commit } else { None },
                         files: if children.is_empty() {
                             files
                         } else {
@@ -395,6 +421,11 @@ pub(super) fn parse_plan_items_with_diagnostics(
                         },
                         readonly_files: if children.is_empty() {
                             readonly_files
+                        } else {
+                            Vec::new()
+                        },
+                        outer_docs: if children.is_empty() {
+                            outer_docs
                         } else {
                             Vec::new()
                         },

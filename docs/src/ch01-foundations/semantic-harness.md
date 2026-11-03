@@ -82,7 +82,7 @@ owns the mechanics.
 
 **Bit and bridle.** The model cannot choose a command of its own. It emits typed
 tags and typed structured fields; the harness parses them deterministically and
-decides what is permitted. The complete vocabulary — discovery requests, edits,
+decides what is permitted. The complete vocabulary — research requests, edits,
 verification requests, and terminal outcomes — belongs to *The Autonomous Bounded
 Turn FSM*.
 
@@ -122,7 +122,7 @@ the *what*, so the step needs the repository far more than the reference manual.
 
 ## 1.3 Mechanics & Lifecycle ("How it behaves")
 
-A single turn moves through a fixed sequence. Discovery widens the working set
+A single turn moves through a fixed sequence. Research widens the working set
 until the model reasons about real contracts instead of contours. Proposal produces
 minimal edits. Staging validates them in memory, and a mismatch returns to the model
 as a repair request rather than as a corrupted file. Verification runs the project's
@@ -157,7 +157,7 @@ constraints:
   repository.
 - **It is not a chat application.** The interface is a structured document of state
   — plans, findings, diffs, context layers — not a transcript of pleasantries.
-- **It is not a context manager.** Discovery is autonomous; the developer curates
+- **It is not a context manager.** Research is autonomous; the developer curates
   the working set when they choose to, not as a prerequisite for every prompt.
 - **It is not a shell wrapper.** No surface of the product forwards a
   model-chosen command to the operating system.
@@ -179,5 +179,5 @@ constraints:
   owns "how".
 - [Turn Scratchpad](turn-scratchpad.md) — the turn-local working memory.
 - [The Context Model](../ch02-perception/context-model.md) — what the
-model perceives and how discovery widens it.
+model perceives and how research widens it.
 - [Git Safety & Transactions](../ch03-project/git-transactions.md) — the reins.

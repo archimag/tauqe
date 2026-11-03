@@ -27,6 +27,14 @@ fn repository() -> tempfile::TempDir {
 
 /// Writes `content` to the repository-relative `path`, creating its parents.
 fn write(repo_root: &Path, path: &str, content: &str) {
+    write_bytes(repo_root, path, content.as_bytes());
+}
+
+/// Writes raw bytes to the repository-relative `path`, creating its parents.
+///
+/// A fixture needs a tracked file the staged state cannot carry as text to make a
+/// member refuse after it already relocated a file of the same subtree.
+fn write_bytes(repo_root: &Path, path: &str, content: &[u8]) {
     let full = repo_root.join(path);
     if let Some(parent) = full.parent() {
         std::fs::create_dir_all(parent).unwrap();
@@ -209,6 +217,53 @@ fn a_rename_onto_an_undeleted_existing_path_is_refused() {
     assert!(!result.staged_state.staged_files.contains_key("b.txt"));
 }
 
+/// A refused directory move inverts every pair it already relocated, so the
+/// attempt leaves exactly the state its member found: no content stranded at a
+/// destination, no source left recorded as deleted, and a destination the same
+/// change set deleted keeps its deletion.
+#[test]
+fn a_refused_directory_move_restores_exactly_the_addressed_paths() {
+    let dir = repository();
+    let root = dir.path();
+    write(root, "src/old/a.rs", "fn a() {}\n");
+    // A tracked file the staged state cannot carry as text, so the member
+    // refuses after `src/old/a.rs` already moved to the new directory.
+    write_bytes(root, "src/old/b.rs", &[0xff, 0xfe]);
+    write(root, "src/new/a.rs", "fn stale() {}\n");
+    track_all(root);
+
+    let edits = [
+        EditOperation::Delete {
+            path: "src/new/a.rs".to_string(),
+        },
+        EditOperation::MoveDir {
+            from: "src/old".to_string(),
+            to: "src/new".to_string(),
+        },
+    ];
+    let result = stage_and_validate_edits(
+        root,
+        &ProjectConfig::default(),
+        &context_state(&["src/new/a.rs"]),
+        &edits,
+        None,
+    );
+
+    assert!(!result.is_success());
+    let failure = result.failed_files.first().expect("the move is refused");
+    assert_eq!(failure.path, "src/old/b.rs");
+    assert!(matches!(&failure.error, EditError::Io(..)));
+    assert!(
+        result.staged_state.staged_files.is_empty(),
+        "no content stays at a destination"
+    );
+    assert_eq!(
+        result.staged_state.deleted_paths,
+        HashSet::from(["src/new/a.rs".to_string()]),
+        "only the deletion of the earlier member survives"
+    );
+}
+
 /// A directory move over a large subtree stages in one pass per member and
 /// reports every path it relocated exactly once. The member's path list is
 /// resolved once for the attempt, so the accounting answers for it from that
@@ -269,6 +324,138 @@ fn a_large_directory_move_reports_every_relocated_path_once() {
             "the destination carries the moved content"
         );
         assert!(result.staged_state.deleted_paths.contains(&source));
+        assert!(
+            !result.staged_state.staged_files.contains_key(&source),
+            "the source keeps no staged content of its own"
+        );
         assert!(reported.contains(destination.as_str()));
     }
+}
+
+/// A member refused while it applied claims every path it addressed, so a later
+/// member touching one of those paths is refused for the same reason and
+/// reported instead of vanishing from the result.
+#[test]
+fn a_member_touching_a_refused_path_is_reported_with_the_earlier_reason() {
+    let dir = repository();
+    let root = dir.path();
+    write(root, "a.txt", "from a\n");
+    write(root, "b.txt", "from b\n");
+
+    let edits = [
+        // `b.txt` is taken, so the rename is refused and claims both sides.
+        EditOperation::Move {
+            from: "a.txt".to_string(),
+            to: "b.txt".to_string(),
+        },
+        // The later member addresses the refused source, so it is refused too.
+        EditOperation::Replace {
+            path: "a.txt".to_string(),
+            old_text: "from a\n".to_string(),
+            new_text: "edited\n".to_string(),
+        },
+    ];
+    let result = stage_and_validate_edits(
+        root,
+        &ProjectConfig::default(),
+        &context_state(&["a.txt", "b.txt"]),
+        &edits,
+        None,
+    );
+
+    assert!(!result.is_success());
+    assert_eq!(
+        result.failed_files.len(),
+        2,
+        "the suppressed member is reported: {:?}",
+        result.failed_files
+    );
+    let failure = result.failed_files.first().expect("the rename is refused");
+    assert_eq!(failure.path, "b.txt");
+    match &failure.error {
+        EditError::DestinationExists(path) => assert_eq!(path, "b.txt"),
+        other => panic!("expected a destination rejection, got {other:?}"),
+    }
+    let suppressed = result
+        .failed_files
+        .get(1)
+        .expect("the suppressed member is reported");
+    assert_eq!(suppressed.path, "a.txt");
+    match &suppressed.error {
+        EditError::InvalidPath(path, message) => {
+            assert_eq!(path, "a.txt");
+            assert!(message.contains("was not applied"), "{message}");
+            assert!(
+                message.contains("already exists"),
+                "the reason names the earlier rejection: {message}"
+            );
+        }
+        other => panic!("expected the suppression to be reported, got {other:?}"),
+    }
+    // The refused rename left no trace in the staged state.
+    assert!(!result.staged_state.deleted_paths.contains("a.txt"));
+    assert!(!result.staged_state.staged_files.contains_key("b.txt"));
+    assert!(result.successful_paths.is_empty());
+}
+
+/// A member refused before the attempt starts claims the same paths as one the
+/// state machine rejects, so a later member touching the side that did
+/// normalize is refused instead of applying against a half-read change set.
+#[test]
+fn a_refused_rename_claims_the_side_that_normalized() {
+    let dir = repository();
+    let root = dir.path();
+    write(root, "a.txt", "from a\n");
+
+    let edits = [
+        // The destination escapes the repository, so the rename never becomes
+        // a member, yet both of its sides are claimed.
+        EditOperation::Move {
+            from: "a.txt".to_string(),
+            to: "../outside.txt".to_string(),
+        },
+        EditOperation::Replace {
+            path: "a.txt".to_string(),
+            old_text: "from a\n".to_string(),
+            new_text: "edited\n".to_string(),
+        },
+    ];
+    let result = stage_and_validate_edits(
+        root,
+        &ProjectConfig::default(),
+        &context_state(&["a.txt"]),
+        &edits,
+        None,
+    );
+
+    assert!(!result.is_success());
+    assert_eq!(
+        result.failed_files.len(),
+        2,
+        "the suppressed member is reported: {:?}",
+        result.failed_files
+    );
+    let failure = result.failed_files.first().expect("the rename is refused");
+    assert_eq!(failure.path, "../outside.txt");
+    assert!(
+        matches!(&failure.error, EditError::InvalidPath(path, _) if path == "../outside.txt"),
+        "unexpected rejection: {:?}",
+        failure.error
+    );
+    let suppressed = result
+        .failed_files
+        .get(1)
+        .expect("the suppressed member is reported");
+    assert_eq!(suppressed.path, "a.txt");
+    assert!(
+        matches!(
+            &suppressed.error,
+            EditError::InvalidPath(path, message)
+                if path == "a.txt" && message.contains("was not applied")
+        ),
+        "unexpected rejection: {:?}",
+        suppressed.error
+    );
+    assert!(result.staged_state.staged_files.is_empty());
+    assert!(result.successful_paths.is_empty());
 }

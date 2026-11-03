@@ -40,6 +40,7 @@ fn test_item(id: &str, status: PlanItemStatus) -> tauqe_protocol::PlanItem {
         id: id.to_string(),
         title: format!("Step {}", id),
         status,
+        files: vec![format!("src/step-{id}.rs")],
         ..Default::default()
     }
 }
@@ -1233,12 +1234,12 @@ async fn test_plan_step_binds_the_plan_session() {
     );
     PlanStorage::save_plan(dir.path(), &plan).unwrap();
 
-    let response = "<tauqe_edits summary=\"Set value\">\n<edit path=\"src.rs\">\n<search>\npub fn value() -> i32 { 0 }\n</search>\n<replace>\npub fn value() -> i32 { 1 }\n</replace>\n</edit>\n<success summary=\"done\" />\n</tauqe_edits>";
+    let response = "<tauqe_edits summary=\"Set value\">\n<edit path=\"src.rs\">\n<search>\npub fn value() -> i32 { 0 }\n</search>\n<replace>\npub fn value() -> i32 { 1 }\n</replace>\n</edit>\n<success commit_message=\"done\" />\n</tauqe_edits>";
     let mock_provider = Arc::new(MockLlmProvider::scripted([MockResponse::text(response)]));
 
     let mut config = tauqe_core::config::AppConfig::default();
-    config.develop.workflow = tauqe_protocol::WorkflowKind::Naive;
-    config.develop.protocol = tauqe_protocol::EditProtocolKind::Xml;
+    config.repl.workflow = tauqe_protocol::WorkflowKind::Naive;
+    config.repl.protocol = tauqe_protocol::EditProtocolKind::Xml;
     config.models.auto_level_up = false;
     let state = test_state_with_provider(&dir, config, mock_provider.clone()).await;
 
@@ -1479,14 +1480,14 @@ async fn test_plan_step_execution_uses_turn_marker() {
 
     let marker = "TESTMARKER1";
     let response = format!(
-        "<tauqe_edits_{m} summary=\"Implement compute\">\n<edit_{m} path=\"src.rs\">\n<search_{m}>\npub fn compute() -> i32 {{ 0 }}\n</search_{m}>\n<replace_{m}>\npub fn compute() -> i32 {{ 42 }}\n</replace_{m}>\n</edit_{m}>\n<success_{m} summary=\"done\" />\n</tauqe_edits_{m}>",
+        "<tauqe_edits_{m} summary=\"Implement compute\">\n<edit_{m} path=\"src.rs\">\n<search_{m}>\npub fn compute() -> i32 {{ 0 }}\n</search_{m}>\n<replace_{m}>\npub fn compute() -> i32 {{ 42 }}\n</replace_{m}>\n</edit_{m}>\n<success_{m} commit_message=\"done\" />\n</tauqe_edits_{m}>",
         m = marker
     );
     let provider = Arc::new(MockLlmProvider::scripted([MockResponse::text(response)]));
 
     let mut config = tauqe_core::config::AppConfig::default();
-    config.develop.workflow = tauqe_protocol::WorkflowKind::Naive;
-    config.develop.protocol = tauqe_protocol::EditProtocolKind::Xml;
+    config.repl.workflow = tauqe_protocol::WorkflowKind::Naive;
+    config.repl.protocol = tauqe_protocol::EditProtocolKind::Xml;
     config.models.auto_level_up = false;
 
     let state = test_state_with_provider(&dir, config, provider.clone()).await;
@@ -1581,7 +1582,7 @@ async fn test_plan_batch_automated_replanning_on_blocked_step() {
     });
     // 3. Coder turn for step "1.1" succeeds:
     let success_response = format!(
-        "<tauqe_edits_{m} summary=\"Fix value\">\n<edit_{m} path=\"src.rs\">\n<search_{m}>\npub fn value() -> i32 {{ 0 }}\n</search_{m}>\n<replace_{m}>\npub fn value() -> i32 {{ 100 }}\n</replace_{m}>\n</edit_{m}>\n<success_{m} summary=\"done\" />\n</tauqe_edits_{m}>",
+        "<tauqe_edits_{m} summary=\"Fix value\">\n<edit_{m} path=\"src.rs\">\n<search_{m}>\npub fn value() -> i32 {{ 0 }}\n</search_{m}>\n<replace_{m}>\npub fn value() -> i32 {{ 100 }}\n</replace_{m}>\n</edit_{m}>\n<success_{m} commit_message=\"done\" />\n</tauqe_edits_{m}>",
         m = marker
     );
 
@@ -1592,9 +1593,9 @@ async fn test_plan_batch_automated_replanning_on_blocked_step() {
     ]));
 
     let mut config = tauqe_core::config::AppConfig::default();
-    config.develop.workflow = tauqe_protocol::WorkflowKind::Naive;
-    config.develop.protocol = tauqe_protocol::EditProtocolKind::Xml;
-    config.develop.max_replans = 2;
+    config.repl.workflow = tauqe_protocol::WorkflowKind::Naive;
+    config.repl.protocol = tauqe_protocol::EditProtocolKind::Xml;
+    config.repl.max_replans = 2;
     config.models.auto_level_up = false;
 
     let state = test_state_with_provider(&dir, config, provider).await;
@@ -1674,7 +1675,7 @@ async fn test_plan_batch_defers_architect_escalation_until_repeated_failure() {
         }]
     });
     let success = format!(
-        "<tauqe_edits_{m} summary=\"Fix value\">\n<edit_{m} path=\"src.rs\">\n<search_{m}>\npub fn value() -> i32 {{ 0 }}\n</search_{m}>\n<replace_{m}>\npub fn value() -> i32 {{ 7 }}\n</replace_{m}>\n</edit_{m}>\n<success_{m} summary=\"done\" />\n</tauqe_edits_{m}>",
+        "<tauqe_edits_{m} summary=\"Fix value\">\n<edit_{m} path=\"src.rs\">\n<search_{m}>\npub fn value() -> i32 {{ 0 }}\n</search_{m}>\n<replace_{m}>\npub fn value() -> i32 {{ 7 }}\n</replace_{m}>\n</edit_{m}>\n<success_{m} commit_message=\"done\" />\n</tauqe_edits_{m}>",
         m = marker
     );
 
@@ -1687,9 +1688,9 @@ async fn test_plan_batch_defers_architect_escalation_until_repeated_failure() {
     ]));
 
     let mut config = tauqe_core::config::AppConfig::default();
-    config.develop.workflow = tauqe_protocol::WorkflowKind::Naive;
-    config.develop.protocol = tauqe_protocol::EditProtocolKind::Xml;
-    config.develop.max_replans = 2;
+    config.repl.workflow = tauqe_protocol::WorkflowKind::Naive;
+    config.repl.protocol = tauqe_protocol::EditProtocolKind::Xml;
+    config.repl.max_replans = 2;
     config.models.auto_level_up = false;
     config.models.primary = vec![tauqe_protocol::ModelRef::openrouter("coder/model").into()];
     config.models.architect = Some(vec![
@@ -1787,10 +1788,10 @@ async fn test_plan_batch_automated_replanning_limit_exhausted() {
     ]));
 
     let mut config = tauqe_core::config::AppConfig::default();
-    config.develop.workflow = tauqe_protocol::WorkflowKind::Naive;
-    config.develop.protocol = tauqe_protocol::EditProtocolKind::Xml;
+    config.repl.workflow = tauqe_protocol::WorkflowKind::Naive;
+    config.repl.protocol = tauqe_protocol::EditProtocolKind::Xml;
     // Limit max_replans to 1:
-    config.develop.max_replans = 1;
+    config.repl.max_replans = 1;
     config.models.auto_level_up = false;
 
     let state = test_state_with_provider(&dir, config, provider).await;
@@ -1883,9 +1884,9 @@ async fn test_plan_batch_stops_on_abort_without_replanning() {
     )]));
 
     let mut config = tauqe_core::config::AppConfig::default();
-    config.develop.workflow = tauqe_protocol::WorkflowKind::Naive;
-    config.develop.protocol = tauqe_protocol::EditProtocolKind::Xml;
-    config.develop.max_replans = 2;
+    config.repl.workflow = tauqe_protocol::WorkflowKind::Naive;
+    config.repl.protocol = tauqe_protocol::EditProtocolKind::Xml;
+    config.repl.max_replans = 2;
     config.models.auto_level_up = false;
     config.models.primary = vec![tauqe_protocol::ModelRef::openrouter("coder/model").into()];
     config.models.architect = Some(vec![tauqe_protocol::ModelEntry::new(
@@ -2137,8 +2138,8 @@ async fn test_plan_batch_projects_conceptual_horizon_just_in_time() {
     ]));
 
     let mut config = tauqe_core::config::AppConfig::default();
-    config.develop.workflow = tauqe_protocol::WorkflowKind::Naive;
-    config.develop.protocol = tauqe_protocol::EditProtocolKind::Xml;
+    config.repl.workflow = tauqe_protocol::WorkflowKind::Naive;
+    config.repl.protocol = tauqe_protocol::EditProtocolKind::Xml;
     config.models.auto_level_up = false;
 
     let state = test_state_with_provider(&dir, config, provider).await;
@@ -2952,9 +2953,9 @@ async fn test_plan_batch_persists_the_blocked_reason_on_disk() {
     )]));
 
     let mut config = tauqe_core::config::AppConfig::default();
-    config.develop.workflow = tauqe_protocol::WorkflowKind::Naive;
-    config.develop.protocol = tauqe_protocol::EditProtocolKind::Xml;
-    config.develop.max_replans = 0;
+    config.repl.workflow = tauqe_protocol::WorkflowKind::Naive;
+    config.repl.protocol = tauqe_protocol::EditProtocolKind::Xml;
+    config.repl.max_replans = 0;
     config.models.auto_level_up = false;
 
     let state = test_state_with_provider(&dir, config, provider).await;
@@ -3054,8 +3055,8 @@ async fn test_plan_step_structured_protocol_execution() {
     let provider = Arc::new(MockLlmProvider::scripted([MockResponse::text(response)]));
 
     let mut config = tauqe_core::config::AppConfig::default();
-    config.develop.workflow = tauqe_protocol::WorkflowKind::Naive;
-    config.develop.protocol = tauqe_protocol::EditProtocolKind::Structured;
+    config.repl.workflow = tauqe_protocol::WorkflowKind::Naive;
+    config.repl.protocol = tauqe_protocol::EditProtocolKind::Structured;
     config.models.auto_level_up = false;
     let state = test_state_with_provider(&dir, config, provider.clone()).await;
 
@@ -3130,7 +3131,7 @@ async fn test_plan_batch_starts_ladder_from_the_selected_coder_tier() {
     // spent at once and the step escalates one rung above the selected tier.
     // Round 2 applies the edit and completes.
     let success = format!(
-        "<tauqe_edits_{m} summary=\"Fix value\">\n<edit_{m} path=\"src.rs\">\n<search_{m}>\npub fn value() -> i32 {{ 0 }}\n</search_{m}>\n<replace_{m}>\npub fn value() -> i32 {{ 9 }}\n</replace_{m}>\n</edit_{m}>\n<success_{m} summary=\"done\" />\n</tauqe_edits_{m}>",
+        "<tauqe_edits_{m} summary=\"Fix value\">\n<edit_{m} path=\"src.rs\">\n<search_{m}>\npub fn value() -> i32 {{ 0 }}\n</search_{m}>\n<replace_{m}>\npub fn value() -> i32 {{ 9 }}\n</replace_{m}>\n</edit_{m}>\n<success_{m} commit_message=\"done\" />\n</tauqe_edits_{m}>",
         m = marker
     );
     let provider = Arc::new(MockLlmProvider::scripted([
@@ -3139,8 +3140,8 @@ async fn test_plan_batch_starts_ladder_from_the_selected_coder_tier() {
     ]));
 
     let mut config = tauqe_core::config::AppConfig::default();
-    config.develop.workflow = tauqe_protocol::WorkflowKind::Naive;
-    config.develop.protocol = tauqe_protocol::EditProtocolKind::Xml;
+    config.repl.workflow = tauqe_protocol::WorkflowKind::Naive;
+    config.repl.protocol = tauqe_protocol::EditProtocolKind::Xml;
     config.models.auto_level_up = true;
     config.models.primary = vec![tauqe_protocol::ModelRef::openrouter("coder/one").into()];
     config.models.coder = Some(vec![
@@ -3221,15 +3222,15 @@ async fn test_plan_batch_selected_coder_rung_completes_on_the_first_attempt() {
     // A verified first attempt: the edit lands and the step carries a terminal
     // success, so the ladder never has to advance.
     let response = format!(
-        "<tauqe_edits_{m} summary=\"Set value\">\n<edit_{m} path=\"src.rs\">\n<search_{m}>\npub fn value() -> i32 {{ 0 }}\n</search_{m}>\n<replace_{m}>\npub fn value() -> i32 {{ 3 }}\n</replace_{m}>\n</edit_{m}>\n<success_{m} summary=\"done\" />\n</tauqe_edits_{m}>",
+        "<tauqe_edits_{m} summary=\"Set value\">\n<edit_{m} path=\"src.rs\">\n<search_{m}>\npub fn value() -> i32 {{ 0 }}\n</search_{m}>\n<replace_{m}>\npub fn value() -> i32 {{ 3 }}\n</replace_{m}>\n</edit_{m}>\n<success_{m} commit_message=\"done\" />\n</tauqe_edits_{m}>",
         m = marker
     );
     let provider = Arc::new(MockLlmProvider::scripted([MockResponse::text(response)]));
 
     let mut config = tauqe_core::config::AppConfig::default();
-    config.develop.workflow = tauqe_protocol::WorkflowKind::Naive;
-    config.develop.protocol = tauqe_protocol::EditProtocolKind::Xml;
-    config.develop.max_retries = 2;
+    config.repl.workflow = tauqe_protocol::WorkflowKind::Naive;
+    config.repl.protocol = tauqe_protocol::EditProtocolKind::Xml;
+    config.repl.max_retries = 2;
     config.models.auto_level_up = true;
     config.models.primary = vec![tauqe_protocol::ModelRef::openrouter("coder/one").into()];
     config.models.coder = Some(vec![
@@ -3314,8 +3315,8 @@ async fn test_plan_batch_manual_excluded_coder_ends_without_escalation() {
     ]));
 
     let mut config = tauqe_core::config::AppConfig::default();
-    config.develop.workflow = tauqe_protocol::WorkflowKind::Naive;
-    config.develop.protocol = tauqe_protocol::EditProtocolKind::Xml;
+    config.repl.workflow = tauqe_protocol::WorkflowKind::Naive;
+    config.repl.protocol = tauqe_protocol::EditProtocolKind::Xml;
     config.models.auto_level_up = true;
     config.models.primary = vec![tauqe_protocol::ModelRef::openrouter("coder/one").into()];
     let manual_model = tauqe_protocol::ModelRef::openrouter("coder/manual");
@@ -3431,7 +3432,7 @@ async fn test_plan_batch_retries_the_same_tier_within_the_attempt_budget() {
     // Round 1 answers without a change set, so the step spends one attempt and
     // retries the same tier. Round 2 applies the edit and completes.
     let success = format!(
-        "<tauqe_edits_{m} summary=\"Fix value\">\n<edit_{m} path=\"src.rs\">\n<search_{m}>\npub fn value() -> i32 {{ 0 }}\n</search_{m}>\n<replace_{m}>\npub fn value() -> i32 {{ 11 }}\n</replace_{m}>\n</edit_{m}>\n<success_{m} summary=\"done\" />\n</tauqe_edits_{m}>",
+        "<tauqe_edits_{m} summary=\"Fix value\">\n<edit_{m} path=\"src.rs\">\n<search_{m}>\npub fn value() -> i32 {{ 0 }}\n</search_{m}>\n<replace_{m}>\npub fn value() -> i32 {{ 11 }}\n</replace_{m}>\n</edit_{m}>\n<success_{m} commit_message=\"done\" />\n</tauqe_edits_{m}>",
         m = marker
     );
     let mock_provider = Arc::new(MockLlmProvider::scripted([
@@ -3440,8 +3441,8 @@ async fn test_plan_batch_retries_the_same_tier_within_the_attempt_budget() {
     ]));
 
     let mut config = tauqe_core::config::AppConfig::default();
-    config.develop.workflow = tauqe_protocol::WorkflowKind::Naive;
-    config.develop.protocol = tauqe_protocol::EditProtocolKind::Xml;
+    config.repl.workflow = tauqe_protocol::WorkflowKind::Naive;
+    config.repl.protocol = tauqe_protocol::EditProtocolKind::Xml;
     config.models.auto_level_up = true;
     config.models.primary = vec![tauqe_protocol::ModelRef::openrouter("coder/one").into()];
     config.models.coder = Some(vec![
@@ -3533,8 +3534,8 @@ async fn test_plan_batch_transport_failure_ends_without_spending_an_attempt() {
     )]));
 
     let mut config = tauqe_core::config::AppConfig::default();
-    config.develop.workflow = tauqe_protocol::WorkflowKind::Naive;
-    config.develop.protocol = tauqe_protocol::EditProtocolKind::Xml;
+    config.repl.workflow = tauqe_protocol::WorkflowKind::Naive;
+    config.repl.protocol = tauqe_protocol::EditProtocolKind::Xml;
     config.models.auto_level_up = true;
     config.models.primary = vec![tauqe_protocol::ModelRef::openrouter("coder/one").into()];
     config.models.coder = Some(vec![
@@ -3676,8 +3677,8 @@ async fn test_plan_batch_hard_cancel_never_abandons_the_step_task() {
     });
 
     let mut config = tauqe_core::config::AppConfig::default();
-    config.develop.workflow = tauqe_protocol::WorkflowKind::Naive;
-    config.develop.protocol = tauqe_protocol::EditProtocolKind::Xml;
+    config.repl.workflow = tauqe_protocol::WorkflowKind::Naive;
+    config.repl.protocol = tauqe_protocol::EditProtocolKind::Xml;
     // A hard cancel is classified in the turn-classification branch, before the
     // tier budget is consulted: the raised cancel signal ends the step as
     // cancelled instead of spending an attempt on the aborted turn.

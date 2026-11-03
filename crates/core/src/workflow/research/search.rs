@@ -7,7 +7,7 @@ use crate::blocking::run_blocking;
 use crate::context::path::verify_path_within_repo;
 use crate::escape::escape_xml_attr;
 
-use super::DiscoveryLimits;
+use super::ResearchLimits;
 
 /// Maximum file size eligible for regex scanning (2 MiB).
 pub const MAX_SEARCHABLE_FILE_SIZE: u64 = 2 * 1024 * 1024;
@@ -86,15 +86,37 @@ pub fn normalize_search_path(repo_root: &Path, raw_path: &str) -> Result<String,
 
 /// Excluded service directories are a substrate-level path predicate, so the
 /// definition lives in `tauqe-tools` and this re-export keeps
-/// `search::is_excluded_path` resolvable for the discovery layer.
+/// `search::is_excluded_path` resolvable for the research layer.
 pub use tauqe_tools::paths::is_excluded_path;
 
-/// Checks if a candidate file matches the scope defined by the normalized search path.
-fn file_matches_scope(candidate: &str, scope: &str) -> bool {
-    if scope.is_empty() {
-        return true;
+/// Normalized path scope of one repository search.
+///
+/// The empty scope denotes the repository root. A subdirectory scope keeps the
+/// `path/` prefix its files carry, so resolving the round corpus and testing one
+/// query both decide membership without re-joining strings per file.
+#[derive(Debug)]
+struct SearchScope {
+    /// Normalized scope path; empty for the repository root.
+    path: String,
+    /// `path/` prefix of a subdirectory scope; empty for the root scope.
+    prefix: String,
+}
+
+impl SearchScope {
+    /// Builds a scope from an already normalized search path.
+    fn new(path: String) -> Self {
+        let prefix = if path.is_empty() {
+            String::new()
+        } else {
+            format!("{}/", path)
+        };
+        Self { path, prefix }
     }
-    candidate == scope || candidate.starts_with(&format!("{}/", scope))
+
+    /// Reports whether a repository-relative file lies inside this scope.
+    fn admits(&self, candidate: &str) -> bool {
+        candidate.starts_with(self.prefix.as_str()) || candidate == self.path.as_str()
+    }
 }
 
 /// Compiles a regex with strict size limits and provides friendly diagnostics on failure.
@@ -121,110 +143,219 @@ fn compile_search_regex(pattern: &str) -> Result<regex::Regex, String> {
         })
 }
 
-/// Synchronous internal routine executing search across repository files on disk.
-fn execute_repo_search_sync(
-    repo_root: &Path,
-    query: &RepoSearchRequest,
-    available_files: &[String],
-    limits: DiscoveryLimits,
-) -> RepoSearchResult {
-    let normalized_path = match normalize_search_path(repo_root, &query.path) {
-        Ok(p) => p,
-        Err(err) => {
-            return RepoSearchResult {
-                query: query.clone(),
-                matches: Vec::new(),
-                total_matched_files: 0,
-                total_matches: 0,
-                omitted_files: 0,
-                error: Some(err),
-            };
-        }
-    };
+/// Searchable text of one in-scope repository file.
+struct CorpusFile<'a> {
+    /// Repository-relative path of the file, borrowed from the round's file list.
+    path: &'a str,
+    /// Decoded text every query of the round runs its compiled pattern over.
+    text: String,
+}
 
-    let compiled = match compile_search_regex(&query.regex) {
-        Ok(re) => re,
-        Err(err) => {
-            return RepoSearchResult {
-                query: query.clone(),
-                matches: Vec::new(),
-                total_matched_files: 0,
-                total_matches: 0,
-                omitted_files: 0,
-                error: Some(err),
-            };
-        }
-    };
+/// Searchable corpus of one Research round.
+///
+/// The corpus holds the scope-invariant half of a search. The path-exclusion
+/// rule, the symlink boundary check, the regular-file and size gates, the disk
+/// read, the NUL-byte scan, and the UTF-8 validation run once per candidate file
+/// for the whole round, and every query then evaluates its already compiled
+/// pattern over the same retained texts.
+struct SearchCorpus<'a> {
+    /// Files admitted by at least one prepared query, with their decoded text.
+    files: Vec<CorpusFile<'a>>,
+}
 
-    let mut matches = Vec::new();
-    for candidate in available_files {
-        if is_excluded_path(candidate) {
-            continue;
-        }
-
-        if !file_matches_scope(candidate, &normalized_path) {
-            continue;
-        }
-
-        let full_path = repo_root.join(candidate);
-
-        if let Ok(meta) = std::fs::symlink_metadata(&full_path) {
-            if meta.is_symlink() && verify_path_within_repo(repo_root, candidate).is_err() {
+impl<'a> SearchCorpus<'a> {
+    /// Resolves the corpus over the union of the round's query scopes.
+    ///
+    /// `in_scope` decides whether any prepared query searches a given file, so a
+    /// round whose queries all target one subdirectory never reads the rest of
+    /// the repository. A file rejected by any gate contributes no text and is
+    /// therefore absent: no query could ever match it.
+    fn resolve(
+        repo_root: &Path,
+        available_files: &'a [String],
+        in_scope: impl Fn(&str) -> bool,
+    ) -> Self {
+        let mut files = Vec::new();
+        for candidate in available_files {
+            if !in_scope(candidate) || is_excluded_path(candidate) {
                 continue;
             }
-        } else {
-            continue;
+            if let Some(text) = read_searchable_text(repo_root, candidate) {
+                files.push(CorpusFile {
+                    path: candidate.as_str(),
+                    text,
+                });
+            }
         }
+        Self { files }
+    }
+}
 
-        let file_meta = match std::fs::metadata(&full_path) {
-            Ok(m) => m,
-            Err(_) => continue,
-        };
+/// Reads the searchable text of one repository file.
+///
+/// Every gate that decides whether a file may be searched lives here, so the
+/// round applies it exactly once per file instead of once per query: a symlink
+/// escaping the repository, a non-regular file, a file larger than
+/// [`MAX_SEARCHABLE_FILE_SIZE`], a body carrying a NUL byte, and a body that is
+/// not valid UTF-8 are all skipped.
+fn read_searchable_text(repo_root: &Path, candidate: &str) -> Option<String> {
+    let full_path = repo_root.join(candidate);
 
-        if !file_meta.is_file() || file_meta.len() > MAX_SEARCHABLE_FILE_SIZE {
-            continue;
-        }
+    let link_meta = std::fs::symlink_metadata(&full_path).ok()?;
+    if link_meta.is_symlink() && verify_path_within_repo(repo_root, candidate).is_err() {
+        return None;
+    }
 
-        let bytes = match std::fs::read(&full_path) {
-            Ok(b) => b,
-            Err(_) => continue,
-        };
+    let file_meta = std::fs::metadata(&full_path).ok()?;
+    if !file_meta.is_file() || file_meta.len() > MAX_SEARCHABLE_FILE_SIZE {
+        return None;
+    }
 
-        if bytes.contains(&0) {
-            continue;
-        }
+    let bytes = std::fs::read(&full_path).ok()?;
+    if bytes.contains(&0) {
+        return None;
+    }
 
-        let text = match std::str::from_utf8(&bytes) {
-            Ok(t) => t,
-            Err(_) => continue,
-        };
+    String::from_utf8(bytes).ok()
+}
 
-        let count = compiled.find_iter(text).count();
-        if count > 0 {
-            matches.push(FileSearchMatch {
-                path: candidate.clone(),
-                count,
-            });
+/// One query of a search round, resolved before the corpus is read.
+///
+/// A query that names an unreachable path or an invalid pattern never reaches
+/// the corpus: it keeps its diagnostic and is reported in the position it was
+/// declared, exactly like a query the round limit rejected.
+enum RoundQuery<'a> {
+    /// Query whose scope and compiled pattern resolved successfully.
+    Prepared {
+        /// Request the reported result belongs to.
+        request: &'a RepoSearchRequest,
+        /// Scope the query searches in.
+        scope: SearchScope,
+        /// Compiled pattern of the query.
+        matcher: regex::Regex,
+    },
+    /// Query rejected before any file was read.
+    Rejected {
+        /// Request the rejected result belongs to.
+        request: &'a RepoSearchRequest,
+        /// Diagnostic reported back to the model.
+        error: String,
+    },
+}
+
+impl RoundQuery<'_> {
+    /// Reports whether the query searches in the given repository file.
+    fn admits(&self, candidate: &str) -> bool {
+        match self {
+            Self::Prepared { scope, .. } => scope.admits(candidate),
+            Self::Rejected { .. } => false,
         }
     }
 
-    // Sort deterministically: highest occurrence count first, then alphabetical by path.
+    /// Evaluates the query against the corpus resolved for the round.
+    ///
+    /// Only the file texts are shared: the scope predicate, the count-descending
+    /// ordering, the truncation against `max_matched_files_per_search`, and the
+    /// diagnostic of a rejected query stay the property of the query itself.
+    fn evaluate(self, corpus: &SearchCorpus<'_>, limits: ResearchLimits) -> RepoSearchResult {
+        match self {
+            Self::Prepared {
+                request,
+                scope,
+                matcher,
+            } => {
+                let mut matches = Vec::new();
+                for file in &corpus.files {
+                    if !scope.admits(file.path) {
+                        continue;
+                    }
+                    let count = matcher.find_iter(&file.text).count();
+                    if count > 0 {
+                        matches.push(FileSearchMatch {
+                            path: file.path.to_string(),
+                            count,
+                        });
+                    }
+                }
+                accounted_search_result(request.clone(), matches, limits)
+            }
+            Self::Rejected { request, error } => failed_search_result(request.clone(), error),
+        }
+    }
+}
+
+/// Builds the round entry of a query rejected before any file was read.
+fn rejected_query<'a>(request: &'a RepoSearchRequest, error: String) -> RoundQuery<'a> {
+    RoundQuery::Rejected { request, error }
+}
+
+/// Resolves the scope and the compiled pattern of one query.
+fn prepare_query<'a>(repo_root: &Path, query: &'a RepoSearchRequest) -> RoundQuery<'a> {
+    let path = match normalize_search_path(repo_root, &query.path) {
+        Ok(path) => path,
+        Err(error) => return rejected_query(query, error),
+    };
+    match compile_search_regex(&query.regex) {
+        Ok(matcher) => RoundQuery::Prepared {
+            request: query,
+            scope: SearchScope::new(path),
+            matcher,
+        },
+        Err(error) => rejected_query(query, error),
+    }
+}
+
+/// Sorts, truncates, and accounts the matches of one query.
+fn accounted_search_result(
+    query: RepoSearchRequest,
+    mut matches: Vec<FileSearchMatch>,
+    limits: ResearchLimits,
+) -> RepoSearchResult {
+    // Deterministic order: highest occurrence count first, then alphabetical.
     matches.sort_by(|a, b| b.count.cmp(&a.count).then_with(|| a.path.cmp(&b.path)));
 
     let total_matched_files = matches.len();
-    let total_matches: usize = matches.iter().map(|m| m.count).sum();
+    let total_matches: usize = matches.iter().map(|matched| matched.count).sum();
     let omitted_files = total_matched_files.saturating_sub(limits.max_matched_files_per_search);
-
     matches.truncate(limits.max_matched_files_per_search);
 
     RepoSearchResult {
-        query: query.clone(),
+        query,
         matches,
         total_matched_files,
         total_matches,
         omitted_files,
         error: None,
     }
+}
+
+/// Builds the result of a query that never reached the corpus.
+fn failed_search_result(query: RepoSearchRequest, error: String) -> RepoSearchResult {
+    RepoSearchResult {
+        query,
+        matches: Vec::new(),
+        total_matched_files: 0,
+        total_matches: 0,
+        omitted_files: 0,
+        error: Some(error),
+    }
+}
+
+/// Synchronous internal routine executing a single search on disk.
+///
+/// A single query is a one-member round: it resolves its scope and its compiled
+/// pattern, resolves the searchable corpus over that scope through the very same
+/// shared pass the multi-query round uses, and evaluates once.
+fn execute_repo_search_sync(
+    repo_root: &Path,
+    query: &RepoSearchRequest,
+    available_files: &[String],
+    limits: ResearchLimits,
+) -> RepoSearchResult {
+    let prepared = prepare_query(repo_root, query);
+    let in_scope = |candidate: &str| prepared.admits(candidate);
+    let corpus = SearchCorpus::resolve(repo_root, available_files, in_scope);
+    prepared.evaluate(&corpus, limits)
 }
 
 /// Executes a single repository search, offloading blocking file I/O via [`run_blocking`].
@@ -236,9 +367,47 @@ pub fn execute_repo_search(
     repo_root: &Path,
     query: &RepoSearchRequest,
     available_files: &[String],
-    limits: DiscoveryLimits,
+    limits: ResearchLimits,
 ) -> RepoSearchResult {
     run_blocking(|| execute_repo_search_sync(repo_root, query, available_files, limits))
+}
+
+/// Executes multiple repository searches over a corpus resolved once per round.
+///
+/// The round resolves every query into its scope and compiled pattern first,
+/// then reads the union of those scopes exactly once, and finally evaluates each
+/// query over the shared texts.
+fn execute_repo_searches_sync(
+    repo_root: &Path,
+    queries: &[RepoSearchRequest],
+    available_files: &[String],
+    limits: ResearchLimits,
+) -> Vec<RepoSearchResult> {
+    let prepared: Vec<RoundQuery<'_>> = queries
+        .iter()
+        .enumerate()
+        .map(|(idx, query)| {
+            if idx >= limits.max_search_requests_per_round {
+                rejected_query(
+                    query,
+                    format!(
+                        "Search query limit exceeded (maximum {} queries per round allowed)",
+                        limits.max_search_requests_per_round
+                    ),
+                )
+            } else {
+                prepare_query(repo_root, query)
+            }
+        })
+        .collect();
+
+    let in_scope = |candidate: &str| prepared.iter().any(|query| query.admits(candidate));
+    let corpus = SearchCorpus::resolve(repo_root, available_files, in_scope);
+
+    prepared
+        .into_iter()
+        .map(|query| query.evaluate(&corpus, limits))
+        .collect()
 }
 
 /// Executes multiple repository searches with round limits and offloaded blocking I/O.
@@ -246,31 +415,9 @@ pub fn execute_repo_searches(
     repo_root: &Path,
     queries: &[RepoSearchRequest],
     available_files: &[String],
-    limits: DiscoveryLimits,
+    limits: ResearchLimits,
 ) -> Vec<RepoSearchResult> {
-    run_blocking(|| {
-        queries
-            .iter()
-            .enumerate()
-            .map(|(idx, query)| {
-                if idx >= limits.max_search_requests_per_round {
-                    RepoSearchResult {
-                        query: query.clone(),
-                        matches: Vec::new(),
-                        total_matched_files: 0,
-                        total_matches: 0,
-                        omitted_files: 0,
-                        error: Some(format!(
-                            "Search query limit exceeded (maximum {} queries per round allowed)",
-                            limits.max_search_requests_per_round
-                        )),
-                    }
-                } else {
-                    execute_repo_search_sync(repo_root, query, available_files, limits)
-                }
-            })
-            .collect()
-    })
+    run_blocking(|| execute_repo_searches_sync(repo_root, queries, available_files, limits))
 }
 
 /// Formats a single [`RepoSearchResult`] into the `<search_feedback>` XML block.
@@ -386,7 +533,7 @@ mod tests {
         .unwrap();
 
         let available = vec!["root.rs".to_string(), "src/lib.rs".to_string()];
-        let limits = DiscoveryLimits::default();
+        let limits = ResearchLimits::default();
 
         // Search from root: finds both
         let query_root = RepoSearchRequest::new(".", r"pub fn \w+");
@@ -434,7 +581,7 @@ mod tests {
         ];
 
         let query = RepoSearchRequest::new("", r"\w+");
-        let res = execute_repo_search(root, &query, &available, DiscoveryLimits::default());
+        let res = execute_repo_search(root, &query, &available, ResearchLimits::default());
         assert_eq!(res.total_matched_files, 0);
         assert!(res.matches.is_empty());
     }
@@ -458,7 +605,7 @@ mod tests {
         ];
 
         let query = RepoSearchRequest::new(".", "hello|data");
-        let res = execute_repo_search(root, &query, &available, DiscoveryLimits::default());
+        let res = execute_repo_search(root, &query, &available, ResearchLimits::default());
         assert_eq!(res.total_matched_files, 1);
         assert_eq!(res.matches[0].path, "ok.txt");
     }
@@ -476,9 +623,9 @@ mod tests {
         }
 
         let query = RepoSearchRequest::new("", "needle");
-        let limits = DiscoveryLimits {
+        let limits = ResearchLimits {
             max_matched_files_per_search: 50,
-            ..DiscoveryLimits::default()
+            ..ResearchLimits::default()
         };
         let res = execute_repo_search(root, &query, &available, limits);
         assert_eq!(res.total_matched_files, 60);
@@ -491,9 +638,9 @@ mod tests {
 
         // The cap is configuration-driven, so a project narrows how much of a
         // broad match set reaches the model without recompiling.
-        let narrow = DiscoveryLimits {
+        let narrow = ResearchLimits {
             max_matched_files_per_search: 3,
-            ..DiscoveryLimits::default()
+            ..ResearchLimits::default()
         };
         let res_narrow = execute_repo_search(root, &query, &available, narrow);
         assert_eq!(res_narrow.total_matched_files, 60);
@@ -508,13 +655,13 @@ mod tests {
 
         // Unsupported lookaround assertion
         let query_lookaround = RepoSearchRequest::new("", r"(?=pattern)");
-        let res = execute_repo_search(root, &query_lookaround, &[], DiscoveryLimits::default());
+        let res = execute_repo_search(root, &query_lookaround, &[], ResearchLimits::default());
         let err = res.error.expect("Expected syntax error");
         assert!(err.contains("Lookaround assertions are not supported"));
 
         // General invalid regex
         let query_broken = RepoSearchRequest::new("", r"([a-z");
-        let res_broken = execute_repo_search(root, &query_broken, &[], DiscoveryLimits::default());
+        let res_broken = execute_repo_search(root, &query_broken, &[], ResearchLimits::default());
         let err_broken = res_broken.error.expect("Expected syntax error");
         assert!(err_broken.contains("Regex syntax error"));
     }
@@ -528,9 +675,9 @@ mod tests {
             .map(|i| RepoSearchRequest::new("", format!("query_{}", i)))
             .collect::<Vec<_>>();
 
-        let limits = DiscoveryLimits {
+        let limits = ResearchLimits {
             max_search_requests_per_round: 2,
-            ..DiscoveryLimits::default()
+            ..ResearchLimits::default()
         };
         let results = execute_repo_searches(root, &queries, &[], limits);
         assert_eq!(results.len(), 5);
@@ -542,6 +689,65 @@ mod tests {
             assert!(err.contains("Search query limit exceeded"));
             assert!(err.contains("maximum 2 queries"));
         }
+    }
+
+    #[test]
+    fn test_a_multi_query_round_resolves_each_query_against_its_own_scope() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::create_dir_all(root.join("target")).unwrap();
+        std::fs::write(root.join("root.rs"), "needle needle\n").unwrap();
+        std::fs::write(root.join("src/lib.rs"), "needle\n").unwrap();
+        std::fs::write(root.join("target/generated.rs"), "needle\n").unwrap();
+        std::fs::write(root.join("binary.dat"), b"needle\0").unwrap();
+
+        let available = vec![
+            "root.rs".to_string(),
+            "src/lib.rs".to_string(),
+            "target/generated.rs".to_string(),
+            "binary.dat".to_string(),
+        ];
+
+        // One round: a repository-root query, a subdirectory query, an invalid
+        // pattern, and a query the round limit rejects. The corpus is resolved
+        // once, yet every query keeps its own scope, ordering, and diagnostic.
+        let queries = vec![
+            RepoSearchRequest::new("", "needle"),
+            RepoSearchRequest::new("src", "needle"),
+            RepoSearchRequest::new("", "([a-z"),
+            RepoSearchRequest::new("", "needle"),
+        ];
+        let limits = ResearchLimits {
+            max_search_requests_per_round: 3,
+            ..ResearchLimits::default()
+        };
+
+        let results = execute_repo_searches(root, &queries, &available, limits);
+        assert_eq!(results.len(), 4);
+
+        // The shared corpus never carries the ignored directory or the binary
+        // body, and the higher occurrence count orders first.
+        assert!(results[0].error.is_none());
+        assert_eq!(results[0].total_matched_files, 2);
+        assert_eq!(results[0].matches[0].path, "root.rs");
+        assert_eq!(results[0].matches[0].count, 2);
+        assert_eq!(results[0].matches[1].path, "src/lib.rs");
+
+        // The subdirectory query is narrowed by its own scope predicate.
+        assert!(results[1].error.is_none());
+        assert_eq!(results[1].total_matched_files, 1);
+        assert_eq!(results[1].matches[0].path, "src/lib.rs");
+
+        // An invalid pattern is reported in the position it was declared.
+        let syntax_error = results[2].error.as_ref().expect("expected a syntax error");
+        assert!(syntax_error.contains("Regex syntax error"));
+
+        // A query beyond the round limit is rejected without reading any file.
+        let limit_error = results[3].error.as_ref().expect("expected a limit error");
+        assert!(limit_error.contains("Search query limit exceeded"));
+        assert!(limit_error.contains("maximum 3 queries"));
     }
 
     #[test]

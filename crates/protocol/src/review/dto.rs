@@ -82,8 +82,10 @@ pub struct ReviewPreviewWindow {
     /// Number of repository files the path patterns matched.
     ///
     /// A file the context already carries is counted here and is not selected
-    /// a second time, so this number reports how much the patterns found
-    /// rather than how much they added.
+    /// a second time, so this number reports how much the patterns found rather
+    /// than how much they added. Every match is counted, including the ones the
+    /// window cannot read: those are reported by [`Self::unreadable_files`]
+    /// instead of disappearing from the count.
     #[serde(default)]
     pub matched_files: usize,
     /// Number of matched files the window accepted.
@@ -92,18 +94,30 @@ pub struct ReviewPreviewWindow {
     /// Estimated tokens the selected files add.
     #[serde(default)]
     pub selected_tokens: usize,
-    /// Number of matched files the file token budget dropped.
+    /// Number of matched candidates the file token budget dropped.
     ///
-    /// The file token budget is the only knife the window applies, so this
-    /// aggregate and [`Self::omitted_by_budget`] report the same files: no
-    /// other limit exists to drop a candidate, and a count of files is never a
-    /// limit of its own.
+    /// A candidate is a matched file the launch does not already hold, so this
+    /// aggregate and [`Self::omitted_by_budget`] report the same files: the file
+    /// token budget is the only knife the window applies, no other limit exists
+    /// to drop a candidate, and a count of files is never a limit of its own.
+    /// A match nobody could read is not a candidate and is reported by
+    /// [`Self::unreadable_files`] instead, so this number never grows because a
+    /// binary blob happened to match the pattern.
     #[serde(default)]
     pub omitted_files: usize,
-    /// Matched files dropped because the file token budget was exhausted.
+    /// Matched candidates dropped because the file token budget was exhausted.
     #[serde(default)]
     pub omitted_by_budget: usize,
-    /// File token budget the pattern expansion shares with discovery.
+    /// Number of matched files the window could not read as source.
+    ///
+    /// A binary blob, a symlink escaping the repository, and a file deleted
+    /// from the working tree but still tracked all match the pattern and none
+    /// of them can be audited. They are counted here rather than charged to
+    /// the file token budget, so [`Self::is_truncated`] keeps exactly one
+    /// cause: a budget that genuinely dropped a readable candidate.
+    #[serde(default)]
+    pub unreadable_files: usize,
+    /// File token budget the pattern expansion shares with research.
     #[serde(default)]
     pub files_token_budget: usize,
 }
@@ -260,6 +274,16 @@ pub struct ReviewUpdateItemResult {
 pub struct ReviewAnalyzeParams {
     /// Identifier of the stored session whose findings are classified.
     pub review_id: String,
+    /// Optional Architect selection the classification runs on.
+    ///
+    /// It carries the same untagged wire form as `PlanRefineParams::model`: a
+    /// semantic role, an explicit model reference, or an explicit role-list
+    /// rung with the reasoning depth of the configured entry the developer
+    /// picked. An absent selection runs the base rung of the architect ladder,
+    /// which is also the configuration the automatic classification after a
+    /// grouped audit runs on: that contour has no developer to pick one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<ModelSelection>,
 }
 
 /// Outcome of a completed post-analysis run.

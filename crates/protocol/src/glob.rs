@@ -50,6 +50,7 @@
 //!
 //! [`matches_glob_pattern`] is the convenience wrapper for a single match.
 //! [`GlobPattern`] is the same matcher pre-compiled for repeated use.
+use std::borrow::Cow;
 
 /// Matches a relative path against a glob pattern.
 ///
@@ -82,7 +83,12 @@ pub fn matches_glob_pattern(pattern: &str, path: &str) -> bool {
 /// Compiling normalizes the pattern, records its structural flags, and
 /// precomputes the collapsed `**` segment lists once, so matching many paths
 /// against the same pattern never re-normalizes the pattern or re-allocates its
-/// segments. Callers that match a single pattern against a large file list
+/// segments. The subject side is treated the same way: a path already in
+/// canonical form is matched in place, and only a path that still carries
+/// surrounding whitespace, a backslash separator, an empty segment, or a `.`
+/// segment is normalized into an owned string.
+///
+/// Callers that match a single pattern against a large file list
 /// (pattern-based context addition, review path selection) should build one
 /// `GlobPattern` and call [`GlobPattern::matches`] per path.
 pub struct GlobPattern {
@@ -134,7 +140,12 @@ impl GlobPattern {
 
     /// Returns `true` when `path` matches the compiled pattern.
     pub fn matches(&self, path: &str) -> bool {
-        let clean_path = normalize_path(path);
+        // The pattern half of the pair is precompiled, so the subject is probed
+        // for canonicality instead of being normalized into fresh allocations
+        // on every call: the tracked file list is already canonical, and only
+        // an unusual subject pays for normalization.
+        let subject = canonical_subject(path);
+        let clean_path: &str = &subject;
 
         if clean_path.is_empty() {
             return false;
@@ -153,11 +164,10 @@ impl GlobPattern {
             if !self.has_meta {
                 return clean_path.starts_with(&self.prefix);
             }
-            let path_parts: Vec<&str> = clean_path.split('/').collect();
-            return match_segments(&self.dir_segments, &path_parts);
+            return match_segments(&self.dir_segments, clean_path);
         }
 
-        if clean_path == self.clean {
+        if clean_path == self.clean.as_str() {
             return true;
         }
 
@@ -167,12 +177,11 @@ impl GlobPattern {
 
         // A wildcard pattern without a slash matches the basename at any depth.
         if !self.has_slash {
-            let basename = clean_path.rsplit('/').next().unwrap_or(clean_path.as_str());
+            let basename = clean_path.rsplit('/').next().unwrap_or(clean_path);
             return match_wildcard_string(&self.clean, basename);
         }
 
-        let path_parts: Vec<&str> = clean_path.split('/').collect();
-        match_segments(&self.segments, &path_parts)
+        match_segments(&self.segments, clean_path)
     }
 }
 
@@ -192,6 +201,28 @@ fn normalize_path(input: &str) -> String {
         .join("/")
 }
 
+/// Returns `input` in canonical form, borrowing it when it already is.
+///
+/// [`normalize_path`] allocates three times per call: the backslash
+/// replacement, the collected segment list, and the rejoined result. The
+/// overwhelming majority of subjects are repository-relative paths the harness
+/// already produced in canonical form, so the probe borrows those in place and
+/// leaves the owned normalization to a subject that genuinely carries
+/// surrounding whitespace, a backslash separator, an empty segment, or a `.`
+/// segment.
+fn canonical_subject(input: &str) -> Cow<'_, str> {
+    let trimmed = input.trim();
+    let needs_normalization = trimmed.len() != input.len()
+        || trimmed.contains('\\')
+        || trimmed
+            .split('/')
+            .any(|segment| segment.is_empty() || segment == ".");
+    if needs_normalization {
+        Cow::Owned(normalize_path(input))
+    } else {
+        Cow::Borrowed(trimmed)
+    }
+}
 /// Returns `true` when the pattern contains any glob metacharacter.
 ///
 /// A lone `]` is a literal: a character class always begins with `[`, so only
@@ -233,21 +264,29 @@ fn directory_segments(segments: &[String]) -> Vec<String> {
     dir_segments
 }
 
-fn match_segments(pat: &[String], path: &[&str]) -> bool {
+fn match_segments(pat: &[String], path: &str) -> bool {
     // Without `**` every pattern segment matches exactly one path segment, so
-    // the match is a straight positional comparison that needs no backtracking
-    // memo. The memo is only allocated when a `**` segment is actually present.
+    // the match is a straight positional comparison that walks the subject in
+    // place: neither a part list nor a backtracking memo is allocated.
     if !pat.iter().any(|segment| segment == "**") {
-        return pat.len() == path.len()
-            && pat
-                .iter()
-                .zip(path)
-                .all(|(segment, path_segment)| match_wildcard_string(segment, path_segment));
+        let mut segments = path.split('/');
+        for pattern_segment in pat {
+            let Some(path_segment) = segments.next() else {
+                return false;
+            };
+            if !match_wildcard_string(pattern_segment, path_segment) {
+                return false;
+            }
+        }
+        return segments.next().is_none();
     }
 
-    let cols = path.len() + 1;
+    // `**` may consume any number of segments, so the memoized matcher needs
+    // random access to the parts of the subject and collects them once.
+    let path_parts: Vec<&str> = path.split('/').collect();
+    let cols = path_parts.len() + 1;
     let mut visited = vec![false; (pat.len() + 1) * cols];
-    match_segments_at(pat, path, 0, 0, cols, &mut visited)
+    match_segments_at(pat, &path_parts, 0, 0, cols, &mut visited)
 }
 
 /// Index-based segment matcher backed by a visited-state memo.
@@ -669,5 +708,85 @@ mod tests {
     fn test_caret_negation_marker() {
         assert!(matches_glob_pattern("[^a-z]", "1"));
         assert!(!matches_glob_pattern("[^a-z]", "q"));
+    }
+
+    #[test]
+    fn test_canonical_subject_is_borrowed_without_normalization() {
+        // A subject that is already canonical is borrowed, so the hot loops
+        // that match one compiled pattern across the tracked file list pay no
+        // allocation per path.
+        assert!(matches!(canonical_subject("src/lib.rs"), Cow::Borrowed(_)));
+        assert!(matches!(canonical_subject("Justfile"), Cow::Borrowed(_)));
+        assert!(matches!(
+            canonical_subject("crates/tui/src/main.rs"),
+            Cow::Borrowed(_)
+        ));
+
+        // A subject that still needs normalization is normalized exactly as
+        // before, so the fast path can never change a match decision.
+        for subject in [
+            " src/lib.rs",
+            "src/lib.rs ",
+            "src\\lib.rs",
+            "/src/lib.rs",
+            "src//lib.rs",
+            "src/./lib.rs",
+            ".",
+            "./",
+            "/",
+            "//",
+            "",
+            "   ",
+        ] {
+            assert!(
+                matches!(canonical_subject(subject), Cow::Owned(_)),
+                "subject {subject:?} must be normalized"
+            );
+            assert_eq!(canonical_subject(subject).as_ref(), normalize_path(subject));
+        }
+    }
+
+    #[test]
+    fn test_padded_and_escaped_subjects_match_their_canonical_form() {
+        let subjects = [
+            ("src/lib.rs", "  src/lib.rs  "),
+            ("src/lib.rs", "./src/lib.rs"),
+            ("src/lib.rs", "src\\lib.rs"),
+            ("src/lib.rs", "//src//lib.rs"),
+            ("crates/foo/src/main.rs", "crates\\foo\\src\\main.rs"),
+        ];
+
+        for pattern in [
+            "src/*.rs",
+            "src/lib.rs",
+            "*.rs",
+            "src/",
+            "crates/*/",
+            "**/main.rs",
+        ] {
+            let compiled = GlobPattern::new(pattern);
+            for (canonical, padded) in subjects {
+                assert_eq!(
+                    compiled.matches(canonical),
+                    compiled.matches(padded),
+                    "pattern {pattern:?} subject {padded:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_root_denoting_subject_matches_nothing() {
+        // A subject naming the repository root normalizes to an empty path,
+        // which no pattern selects — not even the universal root matcher.
+        for pattern in [".", "src/", "*.rs", "src/lib.rs", "**"] {
+            let compiled = GlobPattern::new(pattern);
+            for subject in ["", ".", "./", "/", "\\", " . ", "//"] {
+                assert!(
+                    !compiled.matches(subject),
+                    "pattern {pattern:?} must not match root subject {subject:?}"
+                );
+            }
+        }
     }
 }

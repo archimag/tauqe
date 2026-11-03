@@ -2,25 +2,72 @@ use std::path::{Path, PathBuf};
 
 pub const DEFAULT_CONFIG_TEMPLATE: &str = include_str!("../../../../tauqe.toml");
 
-/// Repository-level configuration file names, in discovery order.
+/// Repository-level configuration file names, in resolution order.
 ///
 /// A repository declares its harness configuration through one of these names,
-/// and discovery prefers the first one that exists. Keeping the list here lets
+/// and resolution prefers the first one that exists. Keeping the list here lets
 /// the loader and the staging guard resolve the same names instead of each
 /// spelling out its own copy.
 const REPO_CONFIG_FILE_NAMES: [&str; 2] = ["tauqe.toml", ".tauqe.toml"];
 
-/// Reports whether a repository-relative path names the repository
-/// configuration file under either accepted spelling.
+/// Directory holding the modular configuration layers of a repository.
+///
+/// A project may split its configuration across `tauqe.d/*.toml` modules, which
+/// the loader merges into the base document. The directory always belongs to
+/// the repository root, never to the location an explicit `--config` names.
+pub(crate) const MODULES_DIR_NAME: &str = "tauqe.d";
+
+/// Extension a configuration module must carry to be read.
+pub(crate) const MODULE_EXTENSION: &str = "toml";
+
+/// Resolves the modular configuration directory of a repository.
+pub(crate) fn modules_dir(repo_root: &Path) -> PathBuf {
+    repo_root.join(MODULES_DIR_NAME)
+}
+
+/// Resolves the repository whose `tauqe.d` layers apply.
+///
+/// The module directory always belongs to the repository root, even when the
+/// base document arrives through `--config`: a module is a project artifact,
+/// not a command-line override. A caller without a repository falls back to the
+/// working directory, exactly as [`config_candidates`] does.
+pub(crate) fn modules_root(repo_root: Option<&Path>) -> Option<PathBuf> {
+    match repo_root {
+        Some(root) if !root.as_os_str().is_empty() => Some(root.to_path_buf()),
+        _ => std::env::current_dir().ok(),
+    }
+}
+
+/// Reports whether a repository-relative path names a configuration module.
+///
+/// Only a `*.toml` file under the module directory is a module, so a note kept
+/// beside the layers is never mistaken for one. The staging guard uses this
+/// answer to judge model-authored bytes while they are still in memory.
+pub fn is_repo_module_path(path: &str) -> bool {
+    let path = path.trim_start_matches("./");
+    let Some(name) = path
+        .strip_prefix(MODULES_DIR_NAME)
+        .and_then(|rest| rest.strip_prefix('/'))
+    else {
+        return false;
+    };
+    !name.is_empty()
+        && Path::new(name).extension().and_then(|ext| ext.to_str()) == Some(MODULE_EXTENSION)
+}
+
+/// Reports whether a repository-relative path names a project configuration
+/// document: the repository configuration file under either accepted spelling,
+/// or a module layer under the module directory.
 ///
 /// The staging guard uses this answer to decide whether model-authored bytes
-/// must be parsed and semantically validated while they are still in memory, so
-/// a repository configured through `.tauqe.toml` is guarded exactly like one
-/// configured through `tauqe.toml`. Only repository-level files match: a
-/// user-level configuration resolved through [`config_candidates`] lies outside
-/// the reach of a change set and is never validated here.
+/// must be validated while they are still in memory, so a repository configured
+/// through `.tauqe.toml` is guarded exactly like one configured through
+/// `tauqe.toml`, and an edit to a `tauqe.d` layer is guarded like an edit to
+/// the base document. Only repository-level paths match: a user-level
+/// configuration resolved through [`config_candidates`] lies outside the reach
+/// of a change set and is never validated here.
 pub fn is_repo_config_path(path: &str) -> bool {
-    REPO_CONFIG_FILE_NAMES.contains(&path)
+    REPO_CONFIG_FILE_NAMES.contains(&path) || is_repo_module_path(path)
 }
 
 /// Parses a command line option value supporting both `--flag value` and `--flag=value`.
@@ -260,14 +307,30 @@ mod tests {
     }
 
     #[test]
-    fn test_is_repo_config_path_accepts_both_accepted_spellings_only() {
-        // Both names discovery walks are guarded, and only those names.
+    fn test_is_repo_config_path_accepts_the_configuration_documents_only() {
+        // Both names the resolution walk probes are guarded, and only those names.
         for name in REPO_CONFIG_FILE_NAMES {
             assert!(is_repo_config_path(name));
         }
         assert!(!is_repo_config_path("tauqe.toml.bak"));
         assert!(!is_repo_config_path("crates/core/tauqe.toml"));
         assert!(!is_repo_config_path(""));
+    }
+
+    #[test]
+    fn test_is_repo_module_path_accepts_only_toml_layers_of_the_module_directory() {
+        assert!(is_repo_module_path("tauqe.d/10-models.toml"));
+        assert!(is_repo_config_path("tauqe.d/10-models.toml"));
+        // A note kept beside the layers is not a configuration document.
+        assert!(!is_repo_module_path("tauqe.d/README.md"));
+        assert!(!is_repo_config_path("tauqe.d/README.md"));
+        // The directory itself, and a same-named path deeper in the tree, are
+        // not module layers.
+        assert!(!is_repo_module_path("tauqe.d"));
+        assert!(!is_repo_module_path("tauqe.d/"));
+        assert!(!is_repo_module_path("crates/core/tauqe.d/10-models.toml"));
+        assert!(is_repo_config_path("tauqe.toml"));
+        assert!(!is_repo_config_path("crates/core/tauqe.toml"));
     }
 
     #[test]

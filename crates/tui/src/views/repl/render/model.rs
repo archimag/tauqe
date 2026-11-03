@@ -1,10 +1,11 @@
 use crate::theme::engine::{current_engine, ThemeEngine};
 use crate::ui::format::format_tokens;
+use crate::ui::wrap::wrapped_line_count;
 use crate::ui::wrap_line;
 use ratatui::style::{Style, Stylize};
 use ratatui::text::{Line, Span};
 
-use super::super::state::{EditOp, FileEditStatus, ReplView, ToolchainState};
+use super::super::state::{CanvasProjection, EditOp, FileEditStatus, ReplView, ToolchainState};
 use super::indicator_style;
 use super::SPINNER_FRAMES;
 
@@ -53,6 +54,34 @@ pub(crate) fn wrap_model_lines(
         wrapped.extend(line_rows);
     }
     (wrapped, visual_start, visual_end)
+}
+
+/// Measures the wrap projection of the current canvas without materializing it.
+///
+/// Every raw line is measured through the same break decisions the rendering
+/// pass takes, so a scroll target resolved through the measurement names the row
+/// the viewport draws. This is the fallback the navigation paths use when no
+/// recording describes the live state — for example before the first frame of a
+/// turn (c-1, c-4).
+pub(crate) fn measure_canvas(model: &mut ReplView) -> CanvasProjection {
+    let width = model.content_width.max(10);
+    let (raw, file_rows) = compute_model_lines_with_file_rows(model);
+    let mut visual_start = Vec::with_capacity(raw.len());
+    let mut visual_end = Vec::with_capacity(raw.len());
+    let mut total_lines = 0usize;
+    for line in &raw {
+        let rows = wrapped_line_count(line, width);
+        visual_start.push(total_lines);
+        visual_end.push(total_lines + rows.saturating_sub(1));
+        total_lines += rows;
+    }
+    CanvasProjection {
+        signature: model.canvas_signature(),
+        visual_start,
+        visual_end,
+        file_rows,
+        total_lines,
+    }
 }
 
 pub fn compute_model_lines(model: &mut ReplView) -> Vec<Line<'static>> {

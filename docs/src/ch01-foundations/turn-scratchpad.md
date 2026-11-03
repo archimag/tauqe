@@ -65,7 +65,7 @@ turn.
    their content is appended to the turn-local buffer. The same pass removes the
    scratchpad from the conversational text, so the streamed answer and the final
    answer contain neither the tag nor its body.
-2. **Accumulate.** The buffer persists across discovery rounds, staging retries, and
+2. **Accumulate.** The buffer persists across research rounds, staging retries, and
    healing rounds. A later round does not need to restate what an earlier round
    recorded.
 3. **Re-inject.** Before the next request, the buffer is rendered as the last block
@@ -94,6 +94,6 @@ inert text.
   immutability rules; the scratchpad has none of that.
 - **It is not a tool.** It requests no file, runs no command, and grants no
   permission that the active capability set does not already grant.
-- **It is not a substitute for reading.** Requesting a contract through discovery is
+- **It is not a substitute for reading.** Requesting a contract through research is
   still the only way to know its exact definition; a scratchpad note is a reminder,
   never evidence.

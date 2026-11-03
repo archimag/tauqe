@@ -99,7 +99,7 @@ mod tests {
                 .unwrap();
         assert!(prompt
             .contains("# Target Review Step Execution: [rev-7:3] Excessive clone in hot path"));
-        assert!(prompt.contains("<success_TAG summary=\"...\" />"));
+        assert!(prompt.contains("<success_TAG commit_message=\"...\" />"));
         assert!(prompt.contains("<error_TAG message=\"...\" />"));
     }
 

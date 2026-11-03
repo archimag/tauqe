@@ -57,7 +57,7 @@ use crate::handlers::host::ServerImplementationHost;
 use crate::handlers::PreflightVerdict;
 use crate::state::{AppState, OperationGuard};
 
-use super::common::{clear_auto_context, emit, offload_review};
+use super::common::{clear_auto_context, emit, offload_review, publish_review};
 
 /// Separator binding the session identifier to the group identifier of a
 /// group-member batch target.
@@ -719,7 +719,13 @@ impl BatchStepExecutor for ReviewBatchExecutor<'_> {
                 step.id
             )));
         };
-
+        // The member addresses exactly one review session, and that session is the
+        // state the client is told about once the member settles.
+        let review_id = match &scope {
+            ExecutionScope::ReviewGroup { review_id, .. }
+            | ExecutionScope::ReviewFinding { review_id, .. } => Some(review_id.clone()),
+            ExecutionScope::Plan { .. } => None,
+        };
         // Every member is a whole bounded turn of its own, so it mints its own
         // marker before the pipeline resolves the horizon it executes.
         let marker = self.state.next_turn_marker().await;
@@ -746,6 +752,15 @@ impl BatchStepExecutor for ReviewBatchExecutor<'_> {
             options,
         );
         let report = pipeline.run(&stream_tx, &cancel_rx, &soft_stop_rx).await;
+        // The pipeline settles the entity of the member before it returns, so the
+        // refreshed session is published with the verdict already on disk: a
+        // completed member reports its findings `Fixed`, and a member the engine
+        // could not implement reports them `Skipped`. A publication at member start
+        // is deliberately not performed here: it would observe a run that has not
+        // begun and report the `TODO` it still is.
+        if let Some(review_id) = review_id.as_deref() {
+            publish_review(self.state, self.repo_root, review_id).await;
+        }
         Ok(self.map_report(&step.id, &report).await)
     }
 }

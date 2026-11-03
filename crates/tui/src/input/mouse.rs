@@ -1,7 +1,7 @@
 //! Mouse event routing for the non-modal surfaces.
 //!
 //! This module owns the pointer targets that are not dialogs: the header action
-//! tabs, the Develop and History viewport scrolling, and the inline code-block
+//! tabs, the REPL and History viewport scrolling, and the inline code-block
 //! copy buttons. Modal interaction is delegated to the [`modal`] submodule, so a
 //! dialog's click and wheel behaviour lives next to the geometry that draws it
 //! instead of in one shared match.
@@ -211,12 +211,24 @@ async fn dispatch_ui_action(
         // A copy report comes from the surface that rendered the block, so the
         // dispatcher resolves the action against the owning view and reports the
         // typed outcome; it never recomputes a column or a scroll offset (c-1).
+        // The clipboard round trip is awaited after the guard is released, so a
+        // stalled display server can never freeze the event loop (c-1).
         UiAction::CopyCodeBlock { item, block } => {
-            let copied = match item {
-                Some(item_id) => st.history_view.copy_code_block(item_id, block),
-                None => st.model.copy_code_block(block),
+            let source = match item {
+                Some(item_id) => st.history_view.code_block_source(item_id, block),
+                None => st.model.code_block_source(block),
             };
-            if let Some((result, lines)) = copied {
+            if let Some(code) = source {
+                let lines = code.lines().count().max(1);
+                drop(st);
+                let result = crate::clipboard::copy_to_clipboard_async(&code).await;
+                let mut st = state.lock().await;
+                if result.is_success() {
+                    match item {
+                        Some(item_id) => st.history_view.arm_code_copy_flash(item_id, block),
+                        None => st.model.arm_code_copy_flash(block),
+                    }
+                }
                 report_code_copy(&mut st, result, lines);
             }
         }
@@ -235,7 +247,7 @@ async fn dispatch_ui_action(
 ///
 /// Both surfaces own the blocks they render and report the same typed
 /// [`crate::clipboard::CopyResult`], so the notification text is written once
-/// and Develop and History can never phrase one outcome differently (c-1).
+/// and REPL and History can never phrase one outcome differently (c-1).
 fn report_code_copy(st: &mut AppState, result: crate::clipboard::CopyResult, lines: usize) {
     match result {
         crate::clipboard::CopyResult::Native => st.notify_success(
@@ -328,8 +340,10 @@ mod tests {
                 details: None,
                 status: tauqe_protocol::PlanItemStatus::Todo,
                 blocked_reason: None,
+                commit: None,
                 files: vec![],
                 readonly_files: vec![],
+                outer_docs: vec![],
                 concept_refs: vec![],
                 depends_on: vec![],
                 children: vec![],
@@ -559,8 +573,10 @@ mod tests {
                 details: None,
                 status: tauqe_protocol::PlanItemStatus::Todo,
                 blocked_reason: None,
+                commit: None,
                 files: vec![],
                 readonly_files: vec![],
+                outer_docs: vec![],
                 concept_refs: vec![],
                 depends_on: vec![],
                 children: vec![],
@@ -930,6 +946,49 @@ mod tests {
         assert!(guard.notification.is_none());
         assert!(guard.model.copy_flash.is_none());
         assert!(conn.written().is_empty());
+    }
+
+    /// A click on a rendered code-block copy button resolves the block through
+    /// the owning view, awaits the clipboard round trip outside the state guard,
+    /// and re-locks only to report the typed outcome (c-1, c-2).
+    #[tokio::test]
+    async fn copy_code_block_click_reports_the_typed_outcome() {
+        let mut st = crate::app::test_state();
+        st.view_mode = ViewMode::Repl;
+        st.last_frame_area = Rect::new(0, 0, 100, 30);
+        st.history_view
+            .code_blocks
+            .push(crate::views::history::HistoryCodeBlock {
+                item_id: 1,
+                block_id: 0,
+                lang: "rust".to_string(),
+                code: "fn main() {}".to_string(),
+                visual_start_line: 0,
+                visual_end_line: 0,
+            });
+        st.hit_regions.register(
+            Rect::new(2, 5, 10, 1),
+            UiAction::CopyCodeBlock {
+                item: Some(1),
+                block: 0,
+            },
+        );
+
+        let state = Arc::new(Mutex::new(st));
+        let mut conn = RpcConnection::new(Vec::<u8>::new());
+        handle_mouse_event(left_click(3, 5), &state, &mut conn)
+            .await
+            .unwrap();
+
+        let guard = state.lock().await;
+        assert!(
+            guard.notification.is_some(),
+            "the copy reports its typed outcome instead of succeeding silently"
+        );
+        assert!(
+            conn.written().is_empty(),
+            "a copy is a local action and never reaches the daemon"
+        );
     }
 
     /// Builds a Repl state whose frame registry already holds the regions a

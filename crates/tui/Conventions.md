@@ -43,7 +43,7 @@ This document specifies mandatory architectural and UX invariants for the Tauqe 
    - The zero F-keys invariant (§5) holds across every map: `KeyCode::F(...)` is never bound.
 
 3. **Prohibition of Action Hint Bars in Primary Views:**
-   - Primary view modes (Develop, Context, Review, Plans, History) must **never** render persistent keyboard command toolbars, shortcut hint banners ("Actions: Tab Fold, x Check..."), or bottom action bars.
+   - Primary view modes (REPL, Context, Review, Plans, History) must **never** render persistent keyboard command toolbars, shortcut hint banners ("Actions: Tab Fold, x Check..."), or bottom action bars.
    - The standardized Help modal (`Ctrl+H` / `Alt+H`, or `?` in navigation views) is the single authoritative mechanism for discovering view commands.
    - Bottom status areas are reserved strictly for operational telemetry, entity metadata, and progress indicators.
    - Keybinding hints are permissible only inside temporary, contextual modal dialogs (confirmations, selection popups) where immediate contextual guidance is required.
@@ -83,7 +83,7 @@ This document specifies mandatory architectural and UX invariants for the Tauqe 
    - The scale is chosen before the letter. A verb never acquires a letter whose sibling already carries the opposite scale, and a batch command is never bound to a lowercase key.
 
 3. **`x` / `X` Are Reserved for Constructive Execution:**
-   - `x` executes the selected target and `X` executes the batch of every applicable target. The reservation holds in the Develop viewport, Plans, and Review alike.
+   - `x` executes the selected target and `X` executes the batch of every applicable target. The reservation holds in the REPL viewport, Plans, and Review alike.
    - Binding `x` to deletion, cancellation, dismissal, or any other destructive effect is forbidden: a keystroke pressed while disproving a step must never destroy it.
    - Removing a single entity is bound to `Delete` and always opens a confirmation dialog whose default focus is `Cancel` (§5.4).
 
@@ -123,7 +123,7 @@ This document specifies mandatory architectural and UX invariants for the Tauqe 
      - Modifier chords are never required for basic browsing, folding, or status toggling.
      - Never intercept these single keys when a text editor becomes active.
    - **Emacs-Style Commands with Zero Modal Ambiguity (Text-Input Contexts):**
-     In all views and dialogs where a text input editor is active (Develop prompt input, Squash message editor, file adding, modal text fields):
+     In all views and dialogs where a text input editor is active (REPL prompt input, Squash message editor, file adding, modal text fields):
      - **Unconditional Character Insertion:** Every printable character typed without a command modifier MUST be unconditionally inserted into the text buffer. Intercepting bare alphanumeric keys (such as `u`, `s`, `c`, `y`, `[`, `]`, or `Space`) when the prompt buffer is empty is strictly forbidden.
      - All functional commands and actions within text input contexts MUST require an explicit command modifier.
 
@@ -142,7 +142,7 @@ This document specifies mandatory architectural and UX invariants for the Tauqe 
      - `C-P`, `C-N` — move cursor line up / down in the shared text editor; inside a modal dialog the same symmetric pair is the vertical field walk between input fields and rows (§6.2), so the vertical axis never relies on `Tab`;
      - `M-P`, `M-N` — navigate prompt history backward / forward;
      - `C-T` — toggle file diff folding;
-     - `C-Space` / `Shift+Tab` — switch Develop focus between the prompt and the Viewport;
+     - `C-Space` / `Shift+Tab` — switch REPL focus between the prompt and the Viewport;
      - `C-J` — insert newline;
      - `C-1` … `C-5` / `M-1` … `M-5` — switch tabs;
      - `C-M` / `M-M` — model selection picker;
@@ -234,10 +234,10 @@ This document specifies mandatory architectural and UX invariants for the Tauqe 
 
 ---
 
-## 7. Develop Focus Model (Prompt vs Viewport)
+## 7. REPL Focus Model (Prompt vs Viewport)
 
 1. **Two Focus Targets:**
-  - The Develop tab has two focus targets: the prompt editor (default) and the Viewport (model response and file diffs).
+  - The REPL tab has two focus targets: the prompt editor (default) and the Viewport (model response and file diffs).
   - `C-Space` and `Shift+Tab` switch focus between them. `Esc` in the Viewport returns focus to the prompt.
   - Reason: arrow keys and `C-P` / `C-N` have different meanings in the editor (cursor navigation) and in the response (file selection, scrolling). Separate focus removes this conflict without adding bare-letter shortcuts.
 

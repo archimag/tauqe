@@ -26,6 +26,7 @@ use crate::app::{
     ViewMode,
 };
 use crate::command::global::{GlobalCommand, GLOBAL_COMMAND_MAP};
+use crate::command::translate_code;
 use crate::config::{InputConfig, TuiConfig};
 use crate::editor::InputEditor;
 use crate::i18n::active_t;
@@ -53,6 +54,49 @@ pub fn is_keyboard_quit(key: &KeyEvent) -> bool {
     matches!(key.code, KeyCode::Char('g'))
         && key.modifiers.contains(KeyModifiers::CONTROL)
         && !key.modifiers.contains(KeyModifiers::ALT)
+}
+
+/// Projects one incoming key event through the configured keyboard layout.
+///
+/// This is the single layout gate of the interface. `handle_key_event` calls it
+/// before the keyboard-quit chord, any modal, any global command, and any view
+/// handler reads the event, so no surface can bypass the projection
+/// (Conventions §3, §5).
+///
+/// The projection is governed by the capture boundary:
+///
+/// - the AltGr compose chord (`Ctrl+Alt`) is never projected, in either mode,
+///   so a composed character never turns into a command;
+/// - a character key carrying one command modifier (`Ctrl` or `Alt`) is always
+///   projected, including while a text editor captures the keyboard, so the
+///   `C-` and `M-` commands stay reachable while the developer types;
+/// - a character key without a command modifier is projected only when no
+///   editor captures the keyboard, which preserves the unconditional character
+///   insertion invariant: a typed letter reaches the buffer exactly as pressed.
+pub fn canonicalize_key_event(key: KeyEvent, input: &InputConfig, capturing: bool) -> KeyEvent {
+    let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+    let alt = key.modifiers.contains(KeyModifiers::ALT);
+
+    // The AltGr / compose chord belongs to neither command modifier, so it is
+    // never a command and is never projected (Conventions §5.2).
+    if ctrl && alt {
+        return key;
+    }
+
+    let code = translate_code(key.code, input);
+    if code == key.code {
+        return key;
+    }
+
+    // A character without a command modifier belongs to the text buffer while
+    // an editor captures the keyboard, so it is inserted exactly as pressed.
+    if capturing && !ctrl && !alt {
+        return key;
+    }
+
+    let mut canonical = key;
+    canonical.code = code;
+    canonical
 }
 
 /// Routes one key event into the shared text editor.
@@ -141,7 +185,7 @@ pub async fn switch_view(
 
 /// Routes pasted text to the surface that currently owns the keyboard.
 ///
-/// A modal receives the text in the field it exposes, and the Develop prompt
+/// A modal receives the text in the field it exposes, and the REPL prompt
 /// takes it when no modal is open. Every other surface ignores a paste, so a
 /// bracketed paste can never mutate a view the developer is not editing.
 pub fn handle_paste(st: &mut AppState, text: &str) {
@@ -227,28 +271,37 @@ async fn handle_key_event(
         return Ok(InputResult::Continue);
     }
 
-    // `C-g` is the universal abort chord: normalize it once, before any view or
-    // modal handler runs, so every surface reacts exactly as it reacts to `Esc`
-    // (Conventions §5.5).
+    // The layout gate runs first: the modifier configuration and the capture
+    // boundary are read in one short lock, and every later step — the
+    // keyboard-quit chord, the modal layer, the global command map, and the
+    // active view handler — reads the canonical event. No surface can bypass
+    // the projection (Conventions §3, §5).
+    let (input, capturing, modal_open, disconnected, mode) = {
+        let st = state.lock().await;
+        (
+            input_config(&st),
+            text_input_active(&st),
+            st.active_modal().is_some(),
+            st.server_disconnected.is_some(),
+            st.view_mode,
+        )
+    };
+    let key = canonicalize_key_event(key, &input, capturing);
+
+    // `C-g` is the universal abort chord: normalize it once, after the layout
+    // projection and before any view or modal handler runs, so every surface
+    // reacts exactly as it reacts to `Esc` (Conventions §5.5).
     let key = if is_keyboard_quit(&key) {
         KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)
     } else {
         key
     };
 
-    let (modal_open, disconnected, command, mode) = {
-        let st = state.lock().await;
-        let input = input_config(&st);
-        let command = GLOBAL_COMMAND_MAP
-            .resolve(key, &input, text_input_active(&st))
-            .map(|spec| spec.action);
-        (
-            st.active_modal().is_some(),
-            st.server_disconnected.is_some(),
-            command,
-            st.view_mode,
-        )
-    };
+    // The command is resolved from the snapshot read under the single lock
+    // above, so dispatch never takes the state lock a second time.
+    let command = GLOBAL_COMMAND_MAP
+        .resolve(key, &input, capturing)
+        .map(|spec| spec.action);
 
     // A disconnected daemon leaves the interface read-only: the card offers the
     // quit chords and nothing else (Conventions §6).
@@ -365,16 +418,25 @@ fn cancel_active_operation(st: &mut AppState) {
 }
 
 /// Reloads the workstation configuration from disk and repaints the interface.
+///
+/// Reading and parsing `tui.toml` is blocking filesystem work, so it runs on the
+/// blocking pool with no lock held; the state is locked only to apply the loaded
+/// configuration or to surface the failure, so rendering and RPC processing never
+/// queue behind the disk (c-1).
 async fn reload_configuration(state: &Arc<Mutex<AppState>>) {
+    let loaded = match tokio::task::spawn_blocking(TuiConfig::load_checked).await {
+        Ok(loaded) => loaded,
+        Err(err) => Err(err.to_string()),
+    };
     let mut st = state.lock().await;
-    match TuiConfig::load_checked() {
+    match loaded {
         Ok(config) => {
             st.tui_config = config;
             st.sync_theme_mode();
             st.notify_success(active_t("notify.config_reloaded"));
         }
         Err(err) => {
-            st.notify_error(active_t("notify.config_reload_error").replace("{}", &err.to_string()));
+            st.notify_error(active_t("notify.config_reload_error").replace("{}", &err));
         }
     }
 }
@@ -391,14 +453,13 @@ fn input_config(st: &AppState) -> InputConfig {
 ///
 /// The flag neutralizes bare structural chords (such as the bare `?` that opens
 /// Help) while the developer is typing, so the unconditional character
-/// insertion invariant holds (Conventions §5.1).
+/// insertion invariant holds (Conventions §5.1). The answer itself is owned by
+/// [`AppState::text_input_capturing`], the single source of truth over the
+/// surface that owns the keyboard, so the dispatcher reads one definition of the
+/// capture boundary instead of re-deriving the capture states
+/// (c-text-capture-boundary).
 fn text_input_active(st: &AppState) -> bool {
-    match st.view_mode {
-        ViewMode::Repl => true,
-        ViewMode::Onboarding => st.onboarding.input_active,
-        ViewMode::Context => st.context_view.adding_file,
-        _ => false,
-    }
+    st.text_input_capturing()
 }
 
 #[cfg(test)]
@@ -423,10 +484,10 @@ mod tests {
 
     #[test]
     fn paste_reaches_the_develop_prompt_and_no_other_view() {
-        let mut develop = crate::app::test_state();
-        develop.view_mode = ViewMode::Repl;
-        handle_paste(&mut develop, "док");
-        assert_eq!(develop.input_editor.get_text(), "док");
+        let mut repl_state = crate::app::test_state();
+        repl_state.view_mode = ViewMode::Repl;
+        handle_paste(&mut repl_state, "док");
+        assert_eq!(repl_state.input_editor.get_text(), "док");
 
         let mut plans_view = crate::app::test_state();
         plans_view.view_mode = ViewMode::Plans;
@@ -468,7 +529,7 @@ mod tests {
     /// The workstation state carries the selected layout, the dispatcher derives
     /// the `InputConfig` from it, and the shared command maps resolve the
     /// physical press: a Cyrillic key reaches the navigation and execution
-    /// commands of a structural view, while in the Develop prompt the very same
+    /// commands of a structural view, while in the REPL prompt the very same
     /// key is a literal character that never reaches a command (c-1, c-3, c-4).
     #[test]
     fn ru_jcuken_scenario_reaches_structural_actions_and_stays_literal_in_the_prompt() {
@@ -603,5 +664,157 @@ mod tests {
             .expect("quit command");
         assert_eq!(res, InputResult::Continue);
         assert!(state.lock().await.confirm_quit);
+    }
+
+    /// The layout gate projects a command chord before any surface reads the
+    /// event, so the abort chord is reachable from the JCUKEN layout: `п` sits
+    /// on the physical position of `g`, and `Ctrl+п` must end the operation
+    /// exactly like `Ctrl+g` (c-1, c-2).
+    #[test]
+    fn ctrl_cyrillic_pe_becomes_the_keyboard_quit_after_the_layout_gate() {
+        use crate::config::LayoutPreset;
+
+        let input = InputConfig {
+            layout: LayoutPreset::RuJcuken,
+            ..InputConfig::default()
+        };
+        let raw = KeyEvent::new(KeyCode::Char('п'), KeyModifiers::CONTROL);
+        assert!(
+            !is_keyboard_quit(&raw),
+            "the raw Cyrillic press is not the canonical abort chord"
+        );
+
+        let canonical = canonicalize_key_event(raw, &input, false);
+        assert_eq!(canonical.code, KeyCode::Char('g'));
+        assert_eq!(canonical.modifiers, KeyModifiers::CONTROL);
+        assert!(is_keyboard_quit(&canonical));
+
+        // The dispatcher replaces the recognized chord with `Esc`, so the
+        // normalized event aborts exactly as the Latin `C-g` does.
+        let normalized = if is_keyboard_quit(&canonical) {
+            KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)
+        } else {
+            canonical
+        };
+        assert_eq!(normalized.code, KeyCode::Esc);
+        assert_eq!(normalized.modifiers, KeyModifiers::NONE);
+    }
+
+    /// The AltGr compose chord belongs to neither command modifier, so it is
+    /// never projected and a composed character never becomes a command (c-2).
+    #[test]
+    fn layout_gate_never_projects_the_altgr_compose_chord() {
+        use crate::config::LayoutPreset;
+
+        let input = InputConfig {
+            layout: LayoutPreset::RuJcuken,
+            ..InputConfig::default()
+        };
+        let compose = KeyModifiers::CONTROL | KeyModifiers::ALT;
+        let key = KeyEvent::new(KeyCode::Char('п'), compose);
+
+        for capturing in [false, true] {
+            let canonical = canonicalize_key_event(key, &input, capturing);
+            assert_eq!(canonical.code, KeyCode::Char('п'));
+            assert_eq!(canonical.modifiers, compose);
+        }
+    }
+
+    /// A typed character stays literal while an editor captures the keyboard,
+    /// while the same physical key reaches the structural binding of a view
+    /// that captures nothing (c-2, Conventions §5.1).
+    #[test]
+    fn layout_gate_keeps_typed_characters_literal_inside_an_editor() {
+        use crate::config::LayoutPreset;
+
+        let input = InputConfig {
+            layout: LayoutPreset::RuJcuken,
+            ..InputConfig::default()
+        };
+        let typed = KeyEvent::new(KeyCode::Char('т'), KeyModifiers::NONE);
+
+        let literal = canonicalize_key_event(typed, &input, true);
+        assert_eq!(
+            literal.code,
+            KeyCode::Char('т'),
+            "the prompt receives the character the developer pressed"
+        );
+
+        let projected = canonicalize_key_event(typed, &input, false);
+        assert_eq!(projected.code, KeyCode::Char('n'));
+    }
+
+    /// A command chord is projected even while an editor captures the keyboard,
+    /// so the `C-` / `M-` commands never depend on the active layout (c-2).
+    #[test]
+    fn layout_gate_projects_command_chords_while_text_is_captured() {
+        use crate::config::LayoutPreset;
+
+        let input = InputConfig {
+            layout: LayoutPreset::RuJcuken,
+            ..InputConfig::default()
+        };
+
+        // `ч` sits on `x` and `а` on `f`.
+        let execute = canonicalize_key_event(
+            KeyEvent::new(KeyCode::Char('ч'), KeyModifiers::CONTROL),
+            &input,
+            true,
+        );
+        assert_eq!(execute.code, KeyCode::Char('x'));
+        assert_eq!(execute.modifiers, KeyModifiers::CONTROL);
+
+        let forward = canonicalize_key_event(
+            KeyEvent::new(KeyCode::Char('а'), KeyModifiers::ALT),
+            &input,
+            true,
+        );
+        assert_eq!(forward.code, KeyCode::Char('f'));
+        assert_eq!(forward.modifiers, KeyModifiers::ALT);
+    }
+    /// Under the JCUKEN layout the Develop prompt receives exactly the
+    /// Under the JCUKEN layout the REPL prompt receives exactly the
+    /// same layout still reaches its command even though the editor owns the
+    /// keyboard: the capture boundary protects typed text, not command chords
+    /// (c-text-capture-boundary).
+    #[tokio::test]
+    async fn jcuken_typing_stays_verbatim_and_command_chords_reach_the_prompt() {
+        use crate::config::LayoutPreset;
+
+        let mut st = crate::app::test_state();
+        st.tui_config.input.layout = LayoutPreset::RuJcuken;
+        st.view_mode = ViewMode::Repl;
+        let state = Arc::new(Mutex::new(st));
+        let mut conn = RpcConnection::new(Vec::<u8>::new());
+
+        for character in ['т', 'е', 'с', 'т'] {
+            let typed = KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE);
+            handle_terminal_event(Event::Key(typed), &state, &mut conn)
+                .await
+                .expect("in-memory dispatch never fails");
+        }
+        assert_eq!(state.lock().await.input_editor.get_text(), "тест");
+
+        // `C-ф` sits on the physical `a` position: the chord is normalized even
+        // while the prompt captures text, so the cursor returns to the start of
+        // the line instead of typing a Cyrillic character.
+        let chord = KeyEvent::new(KeyCode::Char('ф'), KeyModifiers::CONTROL);
+        handle_terminal_event(Event::Key(chord), &state, &mut conn)
+            .await
+            .expect("in-memory dispatch never fails");
+        let typed = KeyEvent::new(KeyCode::Char('т'), KeyModifiers::NONE);
+        handle_terminal_event(Event::Key(typed), &state, &mut conn)
+            .await
+            .expect("in-memory dispatch never fails");
+
+        assert_eq!(
+            state.lock().await.input_editor.get_text(),
+            "ттест",
+            "the chord moved the cursor and the typed character stayed literal"
+        );
+        assert!(
+            conn.written().is_empty(),
+            "typing and cursor movement never talk to the server"
+        );
     }
 }

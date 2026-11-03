@@ -65,7 +65,7 @@ pub(super) async fn run_custom_tool_phase(
         return Ok(CustomToolPhase::Absent(Box::new(step)));
     }
 
-    // Project commands and discovery share one round budget: both widen what the
+    // Project commands and research share one round budget: both widen what the
     // model knows and both cost a provider round trip, so a turn that keeps
     // asking for either without proposing a change is stopped deterministically.
     let Some(round) = ctx.spend_investigation_round() else {
@@ -78,16 +78,16 @@ pub(super) async fn run_custom_tool_phase(
         ctx.workflow_name,
         ctx.model,
         ctx.intent.is_isolated_step(),
-        TurnPhase::Discovery,
+        TurnPhase::Research,
         Some(round),
-        Some(ctx.options.max_discovery_rounds),
+        Some(ctx.options.max_research_rounds),
     );
     let _ = ctx
         .stream_tx
         .send(StreamEvent::TurnPhase {
-            phase: TurnPhase::Discovery,
+            phase: TurnPhase::Research,
             round: Some(round),
-            max_rounds: Some(ctx.options.max_discovery_rounds),
+            max_rounds: Some(ctx.options.max_research_rounds),
             detail: Some("Project command execution".to_string()),
         })
         .await;
@@ -327,7 +327,7 @@ async fn finish_budget_exhausted(ctx: &mut TurnKernel<'_>) -> FsmTurnOutcome {
         workflow = ctx.workflow_name,
         model = %ctx.model,
         isolated_step = ctx.intent.is_isolated_step(),
-        rounds = ctx.options.max_discovery_rounds,
+        rounds = ctx.options.max_research_rounds,
         "shared investigation round budget exhausted"
     );
     // Only stale paths are dropped; the findings the investigation already
@@ -344,7 +344,7 @@ async fn finish_budget_exhausted(ctx: &mut TurnKernel<'_>) -> FsmTurnOutcome {
             applied: false,
             error: Some(format!(
                 "The model exhausted the shared investigation budget ({} rounds) without proposing a change.",
-                ctx.options.max_discovery_rounds
+                ctx.options.max_research_rounds
             )),
             changed_files: Vec::new(),
             commit_hash: None,

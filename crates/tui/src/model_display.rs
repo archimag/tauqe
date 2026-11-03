@@ -64,10 +64,14 @@ impl Snapshot {
 
 /// Publishes the catalog and the role summary every renderer reads.
 ///
-/// This is the single update point of the display state. It must run before the
-/// body of a frame is drawn, so the labels of the frame always reflect the
-/// configuration reported with that frame and never the previous one (c-3).
-/// A missing summary publishes an empty snapshot instead of failing, so the
+/// This is the single update point of the display state, and the snapshot is
+/// fully determined by the summary it receives. The interface therefore
+/// republishes it only after the mirrored model choice has advanced — it gates
+/// the call on its own revision counter — while a frame that observes no
+/// mutation reuses the labels already published (c-3). A publication still runs
+/// before the body of the frame that follows a mutation, so those labels reflect
+/// the configuration reported with that frame and never the previous one. A
+/// missing summary publishes an empty snapshot instead of failing, so the
 /// interface degrades to the provider name (c-2).
 pub fn install_snapshot(summary: Option<&ModelRolesSummary>) {
     publish(Snapshot::new(summary));

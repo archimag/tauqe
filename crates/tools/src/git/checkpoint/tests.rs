@@ -422,6 +422,7 @@ fn test_recover_skips_when_no_steps_and_no_checkpoint_commit() {
     let checkpoint = CheckpointInfo {
         created_checkpoint_commit: false,
         base: TransactionBase::Commit(head),
+        phase: TransactionPhase::Established,
     };
     write_transaction_marker(path, &checkpoint).unwrap();
 
@@ -514,6 +515,7 @@ fn test_recover_refuses_when_recorded_base_is_not_an_ancestor() {
     let checkpoint = CheckpointInfo {
         created_checkpoint_commit: false,
         base: TransactionBase::Commit(foreign_base),
+        phase: TransactionPhase::Established,
     };
     write_transaction_marker(path, &checkpoint).unwrap();
 
@@ -636,89 +638,6 @@ fn test_finalize_and_create_ai_commit_close_an_empty_transaction() {
 }
 
 #[test]
-fn test_ensure_tauqe_ignored_keeps_the_tracked_registry_reachable() {
-    let dir = tempfile::tempdir().unwrap();
-    let path = dir.path();
-    crate::git::state::init_repository(Some(path), true, GitHooks::Bypass).unwrap();
-
-    let manifest = path.join(REFS_MANIFEST);
-    fs::create_dir_all(manifest.parent().unwrap()).unwrap();
-    fs::write(&manifest, "# external references\n").unwrap();
-    fs::write(path.join(".tauqe/credentials.toml"), "key = \"secret\"").unwrap();
-
-    ensure_tauqe_ignored(path).unwrap();
-    // A repeated run must recognise every rule of the scheme it wrote.
-    ensure_tauqe_ignored(path).unwrap();
-
-    let manifest_name = REFS_MANIFEST.to_string();
-    let credentials_name = ".tauqe/credentials.toml".to_string();
-    let candidates = [manifest_name.clone(), credentials_name.clone()];
-    let ignored = crate::git::cmd::run_git_check_ignore(path, &candidates).unwrap();
-    assert!(
-        !ignored.iter().any(|entry| entry == &manifest_name),
-        "the tracked registry must stay reachable: {ignored:?}"
-    );
-    assert!(
-        ignored.iter().any(|entry| entry == &credentials_name),
-        "credentials must stay ignored: {ignored:?}"
-    );
-
-    let exclude = fs::read_to_string(path.join(".git").join("info").join("exclude")).unwrap();
-    let negation = format!("!{manifest_name}");
-    assert_eq!(
-        exclude
-            .lines()
-            .filter(|line| line.trim() == negation.as_str())
-            .count(),
-        1,
-        "the negation must be written exactly once: {exclude}"
-    );
-}
-
-#[test]
-fn test_ensure_tauqe_ignored_unblocks_the_registry_after_a_legacy_rule() {
-    let dir = tempfile::tempdir().unwrap();
-    let path = dir.path();
-    crate::git::state::init_repository(Some(path), true, GitHooks::Bypass).unwrap();
-
-    // An earlier revision ignored the whole state directory.
-    let exclude_path = path.join(".git").join("info").join("exclude");
-    fs::create_dir_all(exclude_path.parent().unwrap()).unwrap();
-    fs::write(&exclude_path, ".tauqe\n").unwrap();
-
-    let manifest = path.join(REFS_MANIFEST);
-    fs::create_dir_all(manifest.parent().unwrap()).unwrap();
-    fs::write(&manifest, "# external references\n").unwrap();
-    fs::write(path.join(".tauqe/credentials.toml"), "key = \"secret\"").unwrap();
-
-    ensure_tauqe_ignored(path).unwrap();
-
-    let exclude = fs::read_to_string(&exclude_path).unwrap();
-    let negation = format!("!{REFS_MANIFEST}");
-    assert!(
-        exclude.lines().any(|line| line.trim() == ".tauqe"),
-        "the legacy rule must survive: {exclude}"
-    );
-    assert!(
-        exclude.lines().any(|line| line.trim() == negation.as_str()),
-        "the scheme must follow the legacy rule: {exclude}"
-    );
-
-    let manifest_name = REFS_MANIFEST.to_string();
-    let credentials_name = ".tauqe/credentials.toml".to_string();
-    let candidates = [manifest_name.clone(), credentials_name.clone()];
-    let ignored = crate::git::cmd::run_git_check_ignore(path, &candidates).unwrap();
-    assert!(
-        !ignored.iter().any(|entry| entry == &manifest_name),
-        "the legacy rule must not keep the registry ignored: {ignored:?}"
-    );
-    assert!(
-        ignored.iter().any(|entry| entry == &credentials_name),
-        "the legacy rule must keep hiding credentials: {ignored:?}"
-    );
-}
-
-#[test]
 fn test_transaction_marker_rewrite_publishes_a_complete_document() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path();
@@ -732,6 +651,7 @@ fn test_transaction_marker_rewrite_publishes_a_complete_document() {
     let first = CheckpointInfo {
         created_checkpoint_commit: false,
         base: TransactionBase::Commit(head.clone()),
+        phase: TransactionPhase::Established,
     };
     write_transaction_marker(path, &first).unwrap();
     let read_back = read_transaction_marker(path).expect("the marker must be readable");
@@ -742,6 +662,7 @@ fn test_transaction_marker_rewrite_publishes_a_complete_document() {
     let second = CheckpointInfo {
         created_checkpoint_commit: true,
         base: TransactionBase::Commit("0123456789abcdef0123456789abcdef01234567".to_string()),
+        phase: TransactionPhase::Established,
     };
     write_transaction_marker(path, &second).unwrap();
     let read_back = read_transaction_marker(path).expect("the marker must be readable");
@@ -773,6 +694,7 @@ fn test_transaction_marker_rewrite_publishes_a_complete_document() {
         &CheckpointInfo {
             created_checkpoint_commit: false,
             base: TransactionBase::Commit(head),
+            phase: TransactionPhase::Established,
         },
     )
     .unwrap();
@@ -801,6 +723,7 @@ fn test_concurrent_marker_writes_never_expose_a_torn_document() {
         &CheckpointInfo {
             created_checkpoint_commit: false,
             base: TransactionBase::Commit(head.clone()),
+            phase: TransactionPhase::Established,
         },
     )
     .unwrap();
@@ -848,6 +771,7 @@ fn test_concurrent_marker_writes_never_expose_a_torn_document() {
                     let marker = CheckpointInfo {
                         created_checkpoint_commit: step % 2 == 0,
                         base: TransactionBase::Commit(head.clone()),
+                        phase: TransactionPhase::Established,
                     };
                     // Register the document before it can be observed.
                     written.lock().unwrap().insert(head);
@@ -868,6 +792,7 @@ fn test_concurrent_marker_writes_never_expose_a_torn_document() {
         &CheckpointInfo {
             created_checkpoint_commit: false,
             base: TransactionBase::Commit(head),
+            phase: TransactionPhase::Established,
         },
     )
     .unwrap();
@@ -887,7 +812,7 @@ fn test_recovery_reclaims_state_dir_staging_orphans() {
     // the interrupted writes below are attributed to an exited child.
     let pid = dead_process_id();
     let state_dir = path.join(".tauqe");
-    fs::create_dir_all(state_dir.join("refs")).unwrap();
+    fs::create_dir_all(state_dir.join("reviews")).unwrap();
     fs::create_dir_all(state_dir.join("plans")).unwrap();
     fs::create_dir_all(state_dir.join("mockups")).unwrap();
 
@@ -895,8 +820,8 @@ fn test_recovery_reclaims_state_dir_staging_orphans() {
     fs::write(&credentials, "key = \"secret\"").unwrap();
     let history = state_dir.join("history.jsonl");
     fs::write(&history, "{\"type\":\"turn\"}\n").unwrap();
-    let registry = state_dir.join("refs").join("refs.md");
-    fs::write(&registry, "# external references\n").unwrap();
+    let review = state_dir.join("reviews").join("review-a.json");
+    fs::write(&review, "{\"id\":\"review-a\"}\n").unwrap();
 
     // Two interrupted atomic replacements and one interrupted sibling
     // commit, all inside the state directory the worktree walk skips.
@@ -929,8 +854,8 @@ fn test_recovery_reclaims_state_dir_staging_orphans() {
     assert_eq!(credentials_content, "key = \"secret\"");
     let history_content = fs::read_to_string(&history).unwrap();
     assert_eq!(history_content, "{\"type\":\"turn\"}\n");
-    let registry_content = fs::read_to_string(&registry).unwrap();
-    assert_eq!(registry_content, "# external references\n");
+    let review_content = fs::read_to_string(&review).unwrap();
+    assert_eq!(review_content, "{\"id\":\"review-a\"}\n");
 }
 
 #[cfg(unix)]
@@ -1134,6 +1059,9 @@ fn test_marker_decodes_the_legacy_head_literal_as_an_unborn_base() {
     let checkpoint = read_transaction_marker(path).expect("the legacy marker must decode");
     assert!(!checkpoint.created_checkpoint_commit);
     assert_eq!(checkpoint.base, TransactionBase::Unborn);
+    // A marker written before the phase existed carries no `phase` key, and the
+    // state it records is the settled one.
+    assert_eq!(checkpoint.phase, TransactionPhase::Established);
 }
 
 #[test]
@@ -1146,24 +1074,40 @@ fn test_marker_round_trips_both_base_kinds() {
     let born = CheckpointInfo {
         created_checkpoint_commit: false,
         base: TransactionBase::Commit("0123456789abcdef0123456789abcdef01234567".to_string()),
+        phase: TransactionPhase::Established,
     };
     write_transaction_marker(path, &born).unwrap();
     assert_eq!(read_transaction_marker(path), Some(born));
     assert_eq!(
         fs::read_to_string(transaction_marker_path(path)).unwrap(),
-        r#"{"created_checkpoint_commit":false,"previous_head":"0123456789abcdef0123456789abcdef01234567"}"#
+        r#"{"created_checkpoint_commit":false,"previous_head":"0123456789abcdef0123456789abcdef01234567","phase":"established"}"#
     );
 
     // An unborn base serializes as null under the same key.
     let unborn = CheckpointInfo {
         created_checkpoint_commit: false,
         base: TransactionBase::Unborn,
+        phase: TransactionPhase::Established,
     };
     write_transaction_marker(path, &unborn).unwrap();
     assert_eq!(read_transaction_marker(path), Some(unborn));
     assert_eq!(
         fs::read_to_string(transaction_marker_path(path)).unwrap(),
-        r#"{"created_checkpoint_commit":false,"previous_head":null}"#
+        r#"{"created_checkpoint_commit":false,"previous_head":null,"phase":"established"}"#
+    );
+
+    // The capturing phase carries its own wire value, so the document alone
+    // tells an open capture apart from a settled transaction.
+    let capturing = CheckpointInfo {
+        created_checkpoint_commit: false,
+        base: TransactionBase::Unborn,
+        phase: TransactionPhase::Capturing,
+    };
+    write_transaction_marker(path, &capturing).unwrap();
+    assert_eq!(read_transaction_marker(path), Some(capturing));
+    assert_eq!(
+        fs::read_to_string(transaction_marker_path(path)).unwrap(),
+        r#"{"created_checkpoint_commit":false,"previous_head":null,"phase":"capturing"}"#
     );
 }
 
@@ -1311,5 +1255,369 @@ fn test_unborn_recovery_refuses_when_a_foreign_commit_is_reachable() {
     // attempt on the proof's terms.
     assert!(!head_is_unborn(path));
     assert!(path.join("foreign.txt").exists());
+    assert!(read_transaction_marker(path).is_some());
+}
+
+#[test]
+fn test_create_checkpoint_records_an_established_marker_on_a_clean_tree() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path();
+    crate::git::state::init_repository(Some(path), true, GitHooks::Bypass).unwrap();
+
+    let checkpoint = create_checkpoint(path, GitHooks::Bypass).unwrap();
+    assert!(!checkpoint.created_checkpoint_commit);
+    assert_eq!(checkpoint.phase, TransactionPhase::Established);
+
+    // A clean tree opens the transaction with a single write, and the document
+    // it publishes says so.
+    let marker = read_transaction_marker(path).expect("the marker must be readable");
+    assert_eq!(marker, checkpoint);
+    assert!(fs::read_to_string(transaction_marker_path(path))
+        .unwrap()
+        .contains(r#""phase":"established""#));
+}
+
+#[test]
+fn test_create_checkpoint_leaves_an_established_marker_after_capturing_a_dirty_tree() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path();
+    crate::git::state::init_repository(Some(path), true, GitHooks::Bypass).unwrap();
+
+    fs::write(path.join("user_work.txt"), "uncommitted work").unwrap();
+
+    let checkpoint = create_checkpoint(path, GitHooks::Bypass).unwrap();
+    assert!(checkpoint.created_checkpoint_commit);
+    assert_eq!(checkpoint.phase, TransactionPhase::Established);
+
+    // The capturing marker the capture opened with is rewritten once the commit
+    // exists, so the document names the commit the capture created instead of
+    // the base the capture started from.
+    let marker = read_transaction_marker(path).expect("the marker must be readable");
+    assert_eq!(marker, checkpoint);
+    let head = crate::git::cmd::run_git(Some(path), &["rev-parse", "HEAD"])
+        .unwrap()
+        .trim()
+        .to_string();
+    assert_eq!(marker.base, TransactionBase::Commit(head));
+    let subject = crate::git::cmd::run_git(Some(path), &["log", "-1", "--format=%s"]).unwrap();
+    assert!(subject.trim().starts_with(CHECKPOINT_PREFIX), "{subject}");
+}
+
+#[test]
+fn test_capturing_recovery_before_the_checkpoint_commit_keeps_the_working_tree() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path();
+    crate::git::state::init_repository(Some(path), true, GitHooks::Bypass).unwrap();
+
+    let base = crate::git::cmd::run_git(Some(path), &["rev-parse", "HEAD"])
+        .unwrap()
+        .trim()
+        .to_string();
+    let user_file = path.join("user_work.txt");
+    fs::write(&user_file, "original uncommitted work").unwrap();
+
+    // The capturing marker is durable while the work still sits uncommitted in
+    // the working tree, which is the state a crash before the commit leaves.
+    write_transaction_marker(
+        path,
+        &CheckpointInfo {
+            created_checkpoint_commit: false,
+            base: TransactionBase::Commit(base.clone()),
+            phase: TransactionPhase::Capturing,
+        },
+    )
+    .unwrap();
+
+    let recovery = recover_interrupted_workflow(path).unwrap();
+    let message = recovery.unwrap_or_default();
+    assert!(
+        message.contains("no checkpoint commit was created"),
+        "{message}"
+    );
+
+    // Every byte of the developer's work and the revision HEAD names survive.
+    assert_eq!(
+        fs::read_to_string(&user_file).unwrap(),
+        "original uncommitted work"
+    );
+    let head_after = crate::git::cmd::run_git(Some(path), &["rev-parse", "HEAD"])
+        .unwrap()
+        .trim()
+        .to_string();
+    assert_eq!(head_after, base);
+    let status = crate::git::cmd::run_git(Some(path), &["status", "--porcelain"]).unwrap();
+    assert!(status.contains("?? user_work.txt"), "{status}");
+    assert!(read_transaction_marker(path).is_none());
+}
+
+#[test]
+fn test_capturing_recovery_before_the_checkpoint_commit_on_an_unborn_branch() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path();
+    init_unborn_repository(path);
+
+    let user_file = path.join("user_work.txt");
+    fs::write(&user_file, "original uncommitted work").unwrap();
+    write_transaction_marker(
+        path,
+        &CheckpointInfo {
+            created_checkpoint_commit: false,
+            base: TransactionBase::Unborn,
+            phase: TransactionPhase::Capturing,
+        },
+    )
+    .unwrap();
+
+    let recovery = recover_interrupted_workflow(path).unwrap();
+    let message = recovery.unwrap_or_default();
+    assert!(
+        message.contains("no checkpoint commit was created"),
+        "{message}"
+    );
+
+    // The branch still holds no commit and the developer's file stays untracked.
+    assert!(head_is_unborn(path));
+    assert_eq!(
+        fs::read_to_string(&user_file).unwrap(),
+        "original uncommitted work"
+    );
+    assert!(read_transaction_marker(path).is_none());
+}
+
+#[test]
+fn test_capturing_recovery_unwinds_the_checkpoint_commit() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path();
+    crate::git::state::init_repository(Some(path), true, GitHooks::Bypass).unwrap();
+
+    // The capture starts on a tracked file the developer already modified.
+    fs::write(path.join("tracked.txt"), "committed content\n").unwrap();
+    crate::git::cmd::run_git(Some(path), &["add", "tracked.txt"]).unwrap();
+    crate::git::cmd::commit_with_developer_author(
+        path,
+        "chore: add the tracked file",
+        false,
+        GitHooks::Bypass,
+    )
+    .unwrap();
+    let base = crate::git::cmd::run_git(Some(path), &["rev-parse", "HEAD"])
+        .unwrap()
+        .trim()
+        .to_string();
+    fs::write(path.join("tracked.txt"), "developer edit\n").unwrap();
+
+    write_transaction_marker(
+        path,
+        &CheckpointInfo {
+            created_checkpoint_commit: false,
+            base: TransactionBase::Commit(base.clone()),
+            phase: TransactionPhase::Capturing,
+        },
+    )
+    .unwrap();
+
+    // The capture committed the work but crashed before the marker recorded it.
+    crate::git::cmd::run_git(Some(path), &["add", "-A"]).unwrap();
+    crate::git::cmd::commit_with_developer_author(
+        path,
+        &format!("{CHECKPOINT_PREFIX} uncommitted user changes"),
+        false,
+        GitHooks::Bypass,
+    )
+    .unwrap();
+    let subject = crate::git::cmd::run_git(Some(path), &["log", "-1", "--format=%s"]).unwrap();
+    assert!(
+        subject.trim().starts_with(CHECKPOINT_PREFIX),
+        "the fixture must reproduce the crash window: {subject}"
+    );
+
+    let recovery = recover_interrupted_workflow(path).unwrap();
+    let message = recovery.unwrap_or_default();
+    assert!(
+        message.contains("Recovered interrupted capture"),
+        "{message}"
+    );
+
+    // The checkpoint commit is unwound: HEAD returns to the recorded base and
+    // the captured modification returns to the working tree unstaged.
+    let head_after = crate::git::cmd::run_git(Some(path), &["rev-parse", "HEAD"])
+        .unwrap()
+        .trim()
+        .to_string();
+    assert_eq!(head_after, base);
+    assert_eq!(
+        fs::read_to_string(path.join("tracked.txt")).unwrap(),
+        "developer edit\n"
+    );
+    let status = crate::git::cmd::run_git(Some(path), &["status", "--porcelain"]).unwrap();
+    assert!(
+        status.lines().any(|line| line == " M tracked.txt"),
+        "the captured change must return unstaged: {status}"
+    );
+    assert!(read_transaction_marker(path).is_none());
+}
+
+#[test]
+fn test_capturing_recovery_unwinds_the_root_checkpoint_commit() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path();
+    init_unborn_repository(path);
+
+    let user_file = path.join("user_work.txt");
+    fs::write(&user_file, "original uncommitted work").unwrap();
+    write_transaction_marker(
+        path,
+        &CheckpointInfo {
+            created_checkpoint_commit: false,
+            base: TransactionBase::Unborn,
+            phase: TransactionPhase::Capturing,
+        },
+    )
+    .unwrap();
+
+    // The capture committed the work as the repository root commit and crashed
+    // before the marker recorded it.
+    crate::git::cmd::run_git(Some(path), &["add", "-A"]).unwrap();
+    crate::git::cmd::commit_with_developer_author(
+        path,
+        &format!("{CHECKPOINT_PREFIX} uncommitted user changes"),
+        false,
+        GitHooks::Bypass,
+    )
+    .unwrap();
+    assert!(
+        !head_is_unborn(path),
+        "the fixture must reproduce the crash window"
+    );
+
+    let recovery = recover_interrupted_workflow(path).unwrap();
+    let message = recovery.unwrap_or_default();
+    assert!(
+        message.contains("Recovered interrupted capture"),
+        "{message}"
+    );
+
+    // The root checkpoint commit is unwound back to the unborn branch, and the
+    // captured files return to the working tree untracked.
+    assert!(head_is_unborn(path));
+    assert_eq!(
+        fs::read_to_string(&user_file).unwrap(),
+        "original uncommitted work"
+    );
+    let status = crate::git::cmd::run_git(Some(path), &["status", "--porcelain"]).unwrap();
+    assert!(status.contains("?? user_work.txt"), "{status}");
+    assert!(read_transaction_marker(path).is_none());
+}
+
+#[test]
+fn test_capturing_recovery_refuses_when_head_is_a_foreign_commit() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path();
+    crate::git::state::init_repository(Some(path), true, GitHooks::Bypass).unwrap();
+
+    let base = crate::git::cmd::run_git(Some(path), &["rev-parse", "HEAD"])
+        .unwrap()
+        .trim()
+        .to_string();
+    fs::write(path.join("user_work.txt"), "uncommitted work").unwrap();
+    write_transaction_marker(
+        path,
+        &CheckpointInfo {
+            created_checkpoint_commit: false,
+            base: TransactionBase::Commit(base),
+            phase: TransactionPhase::Capturing,
+        },
+    )
+    .unwrap();
+
+    // A developer commit lands after the crash, so HEAD reproduces neither
+    // recoverable state of the capture.
+    fs::write(path.join("foreign.txt"), "foreign work").unwrap();
+    crate::git::cmd::run_git(Some(path), &["add", "foreign.txt"]).unwrap();
+    crate::git::cmd::commit_with_developer_author(
+        path,
+        "fix: developer commit",
+        false,
+        GitHooks::Bypass,
+    )
+    .unwrap();
+
+    let head_before = crate::git::cmd::run_git(Some(path), &["rev-parse", "HEAD"])
+        .unwrap()
+        .trim()
+        .to_string();
+    let recovery = recover_interrupted_workflow(path).unwrap();
+    let message = recovery.unwrap_or_default();
+    assert!(message.contains("Skipped crash recovery"), "{message}");
+
+    // The foreign commit is preserved, the marker survives, and the developer's
+    // uncommitted work is untouched.
+    let head_after = crate::git::cmd::run_git(Some(path), &["rev-parse", "HEAD"])
+        .unwrap()
+        .trim()
+        .to_string();
+    assert_eq!(head_before, head_after);
+    assert!(path.join("foreign.txt").exists());
+    assert!(path.join("user_work.txt").exists());
+    assert!(read_transaction_marker(path).is_some());
+}
+
+#[test]
+fn test_capturing_recovery_refuses_a_checkpoint_commit_of_another_base() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path();
+    crate::git::state::init_repository(Some(path), true, GitHooks::Bypass).unwrap();
+
+    let recorded_base = crate::git::cmd::run_git(Some(path), &["rev-parse", "HEAD"])
+        .unwrap()
+        .trim()
+        .to_string();
+    write_transaction_marker(
+        path,
+        &CheckpointInfo {
+            created_checkpoint_commit: false,
+            base: TransactionBase::Commit(recorded_base),
+            phase: TransactionPhase::Capturing,
+        },
+    )
+    .unwrap();
+
+    // History moves before the capture commits, so the checkpoint commit that
+    // reaches HEAD sits on a revision the marker never recorded.
+    fs::write(path.join("foreign.txt"), "foreign work").unwrap();
+    crate::git::cmd::run_git(Some(path), &["add", "foreign.txt"]).unwrap();
+    crate::git::cmd::commit_with_developer_author(
+        path,
+        "fix: developer commit",
+        false,
+        GitHooks::Bypass,
+    )
+    .unwrap();
+    fs::write(path.join("captured.txt"), "captured work").unwrap();
+    crate::git::cmd::run_git(Some(path), &["add", "-A"]).unwrap();
+    crate::git::cmd::commit_with_developer_author(
+        path,
+        &format!("{CHECKPOINT_PREFIX} uncommitted user changes"),
+        false,
+        GitHooks::Bypass,
+    )
+    .unwrap();
+
+    let head_before = crate::git::cmd::run_git(Some(path), &["rev-parse", "HEAD"])
+        .unwrap()
+        .trim()
+        .to_string();
+    let recovery = recover_interrupted_workflow(path).unwrap();
+    let message = recovery.unwrap_or_default();
+    assert!(message.contains("Skipped crash recovery"), "{message}");
+
+    // A checkpoint commit of another base authorizes nothing, so history stays
+    // untouched and the marker survives.
+    let head_after = crate::git::cmd::run_git(Some(path), &["rev-parse", "HEAD"])
+        .unwrap()
+        .trim()
+        .to_string();
+    assert_eq!(head_before, head_after);
+    assert!(path.join("captured.txt").exists());
     assert!(read_transaction_marker(path).is_some());
 }

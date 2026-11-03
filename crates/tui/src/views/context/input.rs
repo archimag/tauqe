@@ -628,8 +628,8 @@ pub async fn handle_context_key(
                     ContextLayer::Pinned => {
                         st.notify_warning(active_t("notify.pinned_readonly"));
                     }
-                    ContextLayer::Refs => {
-                        st.notify_warning(active_t("notify.refs_readonly"));
+                    ContextLayer::OuterDocs => {
+                        st.notify_warning(active_t("notify.outer_docs_readonly"));
                     }
                     ContextLayer::User | ContextLayer::Auto => {
                         let path = item.path.clone();
@@ -697,8 +697,8 @@ pub async fn handle_context_key(
                     st.confirm_button = crate::app::ConfirmDialogButton::Cancel;
                 }
             }
-            Some(ContextRow::Header(ContextLayer::Refs)) => {
-                st.notify_info(active_t("notify.refs_protected_section"));
+            Some(ContextRow::Header(ContextLayer::OuterDocs)) => {
+                st.notify_info(active_t("notify.outer_docs_protected_section"));
             }
             _ => {}
         },
@@ -812,7 +812,7 @@ mod tests {
         assert!(!guard.context_view.pinned_expanded);
         assert!(!guard.context_view.user_expanded);
         assert!(!guard.context_view.auto_expanded);
-        assert!(!guard.context_view.refs_expanded);
+        assert!(!guard.context_view.outer_docs_expanded);
     }
 
     #[test]
@@ -968,11 +968,13 @@ mod tests {
         );
     }
     #[tokio::test]
-    async fn test_remove_on_the_refs_header_reports_the_registry() {
+    async fn test_remove_on_the_outer_docs_header_reports_the_registry() {
         let mut st = test_state();
         st.view_mode = ViewMode::Context;
-        st.context.items.push(item("refs.md", ContextLayer::Refs));
-        // Rows: Pinned, Refs header, Refs item, User, Auto.
+        st.context
+            .items
+            .push(item("docs.md", ContextLayer::OuterDocs));
+        // Rows: Pinned, OuterDocs header, OuterDocs item, User, Auto.
         st.context_view.cursor_index = 1;
         let state = Arc::new(Mutex::new(st));
         let mut conn = RpcConnection::new(Vec::<u8>::new());
@@ -990,11 +992,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_toggle_access_on_a_refs_document_is_refused() {
+    async fn test_toggle_access_on_an_outer_docs_document_is_refused() {
         let mut st = test_state();
         st.view_mode = ViewMode::Context;
-        st.context.items.push(item("refs.md", ContextLayer::Refs));
-        // Rows: Pinned, Refs header, Refs item, User, Auto.
+        st.context
+            .items
+            .push(item("docs.md", ContextLayer::OuterDocs));
+        // Rows: Pinned, OuterDocs header, OuterDocs item, User, Auto.
         st.context_view.cursor_index = 2;
         let state = Arc::new(Mutex::new(st));
         let mut conn = RpcConnection::new(Vec::<u8>::new());

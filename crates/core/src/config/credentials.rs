@@ -39,7 +39,7 @@ pub(crate) fn default_credentials_path_internal(
         .unwrap_or_else(|| PathBuf::from(".tauqe").join("credentials.toml"))
 }
 
-/// Loads credentials from an explicit path or the standard discovery chain,
+/// Loads credentials from an explicit path or the standard resolution chain,
 /// applies the API key to the config, and falls back to the environment variable.
 pub(crate) fn apply_credentials(
     config: &mut AppConfig,

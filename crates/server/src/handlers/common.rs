@@ -12,9 +12,11 @@ use std::sync::Arc;
 use crate::state::AppState;
 use crate::transport::OutChannel;
 use tauqe_core::edits::protocol::ContextRequest;
+use tauqe_core::outer_docs::{OuterDocsRegistry, MAX_DOCUMENT_BYTES};
 use tauqe_core::workflow::common::apply_context_requests_detailed;
 use tauqe_protocol::discussion::DiscussionTarget;
 use tauqe_protocol::{events, ContextAccess, Event};
+use tokio::sync::watch;
 
 /// Emits a server event with an optional serialized parameter payload.
 pub(crate) fn emit(out: &OutChannel, method: &str, params: Option<serde_json::Value>) {
@@ -191,15 +193,9 @@ pub(crate) async fn preload_declared_files(
 
     let available_files = load_repository_files(repo_root).await;
     let preloaded = crate::handlers::with_context_mutation(state, move |ctx| {
-        // Declared preload files are never capped by an artificial quota, so both
-        // the files budget and the refs budget stay unbounded here.
-        let outcome = apply_context_requests_detailed(
-            ctx,
-            &requests,
-            &available_files,
-            usize::MAX,
-            usize::MAX,
-        );
+        // Declared preload files are never capped by an artificial quota, so the
+        // token budget stays unbounded here.
+        let outcome = apply_context_requests_detailed(ctx, &requests, &available_files, usize::MAX);
         let new_state = ctx.get_state();
         (outcome, new_state)
     })
@@ -227,6 +223,171 @@ pub(crate) async fn preload_readonly_files(
     preload_declared_files(state, repo_root, &[], files).await;
 }
 
+/// Typed refusal of one declared external document.
+///
+/// A trust decision belongs to the developer: no round of the run can widen a
+/// declaration the repository cannot reach, so the refusal travels outward with
+/// the exact cause and the `[[workspace]]` block that would authorize the source.
+pub(crate) struct OuterDocsRefusal {
+    /// Declared entry the refusal addresses.
+    pub id: String,
+    /// Exact cause reported by the developer's trust declaration.
+    pub reason: String,
+    /// Ready-to-paste `[[workspace]]` declaration that would authorize the source.
+    pub remedy: Option<String>,
+}
+
+impl OuterDocsRefusal {
+    /// Diagnostic the step reports to the developer instead of starting its turn.
+    pub(crate) fn to_message(&self) -> String {
+        let mut message = format!(
+            "The step was not started: the declared external document `{id}` is refused by the developer's trust declaration. {reason}",
+            id = self.id,
+            reason = self.reason
+        );
+        match &self.remedy {
+            Some(remedy) => {
+                message.push_str("\n\nAuthorize the source by adding this declaration to `$XDG_CONFIG_HOME/tauqe/refs-trust.toml`:\n\n");
+                message.push_str(remedy.trim_end());
+            }
+            None => message.push_str(
+                "\n\nThe declared source cannot be fetched at all, so correct the `[[outer_docs]]` entry of `tauqe.toml` instead of widening the trust declaration.",
+            ),
+        }
+        message
+    }
+}
+
+/// Materializes and mounts the external documents a step declares.
+///
+/// A declared document is materialized into the isolated documentation cache and
+/// then mounted into the read-only OuterDocs context layer under the single
+/// `[context].token_budget` ceiling, exactly as a research round admits one: both
+/// kinds of context material are priced by the same rule, so a step never widens
+/// the context past the ceiling the project declared.
+///
+/// A trust refusal is returned to the caller, because no round of the run can
+/// widen a declaration the repository cannot reach. A delivery failure stays a
+/// diagnostic: the step still runs, and the model routes around the missing
+/// document instead of waiting for material that will never arrive.
+pub(crate) async fn preload_declared_outer_docs(
+    state: &Arc<AppState>,
+    repo_root: &Path,
+    registry: &OuterDocsRegistry,
+    declared: &[String],
+    token_budget: usize,
+    cancel_rx: &watch::Receiver<bool>,
+) -> Result<Vec<String>, OuterDocsRefusal> {
+    let mut unavailable: Vec<String> = Vec::new();
+    let mut mounted: Vec<String> = Vec::new();
+    let mut requested: Vec<&str> = Vec::new();
+
+    for id in declared {
+        let id = id.trim();
+        if id.is_empty() || requested.contains(&id) {
+            continue;
+        }
+        requested.push(id);
+        match registry
+            .materialize_declared(repo_root, id, MAX_DOCUMENT_BYTES, Some(cancel_rx))
+            .await
+        {
+            Ok(cache_path) => {
+                if !mounted.contains(&cache_path) {
+                    mounted.push(cache_path);
+                }
+            }
+            Err(error) if error.trust().is_some() => {
+                return Err(OuterDocsRefusal {
+                    id: id.to_string(),
+                    reason: error.reason(),
+                    remedy: error.remedy(),
+                });
+            }
+            Err(error) => unavailable.push(format!("- `{id}`: {}", error.reason())),
+        }
+    }
+
+    if mounted.is_empty() {
+        return Ok(unavailable);
+    }
+
+    // A declared document is mounted exactly like a requested repository file:
+    // the same aggregate ceiling prices its content together with the wrapper its
+    // own `<file>` element renders.
+    let requests: Vec<ContextRequest> = mounted
+        .iter()
+        .map(|path| ContextRequest {
+            path: path.clone(),
+            access: ContextAccess::ReadOnly,
+        })
+        .collect();
+    let applied = crate::handlers::with_context_mutation(state, move |ctx| {
+        let outcome = apply_context_requests_detailed(ctx, &requests, &[], token_budget);
+        let new_state = ctx.get_state();
+        (outcome, new_state)
+    })
+    .await;
+
+    match applied {
+        Ok((outcome, new_state)) => {
+            if !outcome.added.is_empty() {
+                emit(
+                    &state.out,
+                    events::CONTEXT_CHANGED,
+                    Some(serde_json::json!({ "state": new_state })),
+                );
+            }
+            if let Some(limit) = outcome.limit_exceeded {
+                unavailable.push(format!(
+                    "- the declared external documents {} were not mounted: the context would exceed the configured token budget (current {} tokens, requested {}, budget {})",
+                    limit.requested_files.join(", "),
+                    limit.current_tokens,
+                    limit.requested_tokens,
+                    limit.token_budget
+                ));
+            }
+            for rejection in &outcome.outer_docs_rejected {
+                unavailable.push(format!("- `{}`: {}", rejection.path, rejection.reason));
+            }
+        }
+        Err(err) => {
+            tracing::warn!(
+                error = %err,
+                "the declared external documents could not be mounted"
+            );
+            unavailable.push(format!(
+                "- the declared external documents could not be mounted: {err}"
+            ));
+        }
+    }
+
+    Ok(unavailable)
+}
+
+/// Appends the diagnostics of the declared external documents to a step prompt.
+///
+/// Only the documents the harness could not mount reach the prompt: a mounted
+/// document is already in the read-only OuterDocs layer, so announcing it would
+/// restate the context block. The prompt tells the model to route around the
+/// missing material instead of spending a round waiting for it.
+pub(crate) fn append_outer_docs_diagnostics(prompt: &mut String, diagnostics: &[String]) {
+    if diagnostics.is_empty() {
+        return;
+    }
+    prompt.push_str("\n## Declared External Documentation Unavailable\n");
+    prompt.push_str(
+        "The plan declares the following external documents for this step, but the harness could not mount them:\n",
+    );
+    for diagnostic in diagnostics {
+        prompt.push_str(diagnostic);
+        prompt.push('\n');
+    }
+    prompt.push_str(
+        "Work with the repository material you already hold and route around the missing document instead of waiting for it. The same document may be reachable again in a later turn.\n",
+    );
+}
+
 /// Appends the developer directives section to an execution prompt when present.
 ///
 /// Every prompt contour that can be started with developer directives — a plan
@@ -245,7 +406,7 @@ pub(crate) fn append_developer_directives(prompt: &mut String, instructions: Opt
 ///
 /// The user turn and its response are written together under a single history
 /// mutation, only after the synthesis has produced a durable result. Recording
-/// the turn before the discovery loop would leave an orphaned user entry in the
+/// the turn before the research loop would leave an orphaned user entry in the
 /// transcript whenever the round is cancelled, fails, or is rejected before a
 /// response exists. Persistence is `fsync`-bounded, so it runs on the blocking
 /// pool through `crate::handlers::with_history_mutation` instead of stalling an
@@ -380,5 +541,55 @@ mod tests {
         // A turn that produced no result at all owns no change set.
         let no_result = completed_turn(None);
         assert!(!turn_left_unreverted_changes(&no_result));
+    }
+
+    #[test]
+    fn test_append_outer_docs_diagnostics_renders_only_the_reported_failures() {
+        let mut prompt = "Execute the step.".to_string();
+        append_outer_docs_diagnostics(&mut prompt, &[]);
+        assert_eq!(
+            prompt, "Execute the step.",
+            "a step whose documents all mounted keeps its prompt unchanged"
+        );
+
+        append_outer_docs_diagnostics(
+            &mut prompt,
+            &["- `vendor/api.md`: the document answered with the HTTP status 503".to_string()],
+        );
+
+        assert!(prompt.contains("## Declared External Documentation Unavailable"));
+        assert!(prompt.contains("`vendor/api.md`"));
+        assert!(prompt.contains("route around the missing document"));
+    }
+
+    #[test]
+    fn test_a_trust_refusal_reports_the_declaration_that_authorizes_the_source() {
+        let refusal = OuterDocsRefusal {
+            id: "vendor/api.md".to_string(),
+            reason: "the workspace has no entry in `refs-trust.toml`".to_string(),
+            remedy: Some("[[workspace]]\nroot = \"/work/project\"".to_string()),
+        };
+
+        let message = refusal.to_message();
+
+        assert!(message.contains("vendor/api.md"), "{message}");
+        assert!(message.contains("no entry"), "{message}");
+        assert!(message.contains("refs-trust.toml"), "{message}");
+        assert!(message.contains("[[workspace]]"), "{message}");
+    }
+
+    #[test]
+    fn test_a_refusal_without_a_declaration_names_the_entry_to_correct() {
+        let refusal = OuterDocsRefusal {
+            id: "vendor/api.md".to_string(),
+            reason: "the source `file:///etc/passwd` is not an address the registry can fetch"
+                .to_string(),
+            remedy: None,
+        };
+
+        let message = refusal.to_message();
+
+        assert!(message.contains("tauqe.toml"), "{message}");
+        assert!(!message.contains("[[workspace]]"), "{message}");
     }
 }

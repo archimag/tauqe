@@ -10,6 +10,9 @@
 
 use crossterm::event::{KeyCode, KeyEvent};
 
+use crate::command::translate_code;
+use crate::config::InputConfig;
+
 /// State for a keyboard-navigable, scrollable list.
 ///
 /// The component is content-agnostic: it stores only the selection cursor, the
@@ -131,8 +134,21 @@ impl ListSelector {
     /// `PgUp`/`PgDn`, `Home`/`End`). Returns `true` when the key moved the
     /// selection so the caller can redraw; returns `false` for any other key so
     /// the caller can handle activation or dismissal.
-    pub fn handle_nav_key(&mut self, key: KeyEvent, visible_height: usize) -> bool {
-        match key.code {
+    ///
+    /// `input` is the workstation's configured keyboard mapping. The letter
+    /// chords are literal here rather than command specifications, so the press
+    /// is projected through the configured layout before it is matched: `о`,
+    /// `л`, `т`, and `з` walk the list from a Cyrillic layout exactly as `j`,
+    /// `k`, `n`, and `p` do (Conventions §5.1). Dedicated navigation keys pass
+    /// through the projection unchanged.
+    pub fn handle_nav_key(
+        &mut self,
+        key: KeyEvent,
+        input: &InputConfig,
+        visible_height: usize,
+    ) -> bool {
+        let code = translate_code(key.code, input);
+        match code {
             KeyCode::Up | KeyCode::Char('k') | KeyCode::Char('p') => {
                 self.select_prev(visible_height);
                 true
@@ -208,15 +224,40 @@ mod tests {
     #[test]
     fn test_handle_nav_key_pages_and_ignores_others() {
         let mut selector = ListSelector::new(20, 0);
-        assert!(selector.handle_nav_key(key(KeyCode::Down), 5));
+        let input = InputConfig::default();
+        assert!(selector.handle_nav_key(key(KeyCode::Down), &input, 5));
         assert_eq!(selector.selected_index(), 1);
-        assert!(selector.handle_nav_key(key(KeyCode::Char('n')), 5));
+        assert!(selector.handle_nav_key(key(KeyCode::Char('n')), &input, 5));
         assert_eq!(selector.selected_index(), 2);
-        assert!(selector.handle_nav_key(key(KeyCode::PageDown), 5));
+        assert!(selector.handle_nav_key(key(KeyCode::PageDown), &input, 5));
         assert_eq!(selector.selected_index(), 7);
-        assert!(selector.handle_nav_key(key(KeyCode::Char('p')), 5));
+        assert!(selector.handle_nav_key(key(KeyCode::Char('p')), &input, 5));
         assert_eq!(selector.selected_index(), 6);
-        assert!(!selector.handle_nav_key(key(KeyCode::Enter), 5));
+        assert!(!selector.handle_nav_key(key(KeyCode::Enter), &input, 5));
+    }
+
+    /// The letter chords follow the configured layout, so every picker that
+    /// reuses this arithmetic stays navigable from the JCUKEN layout
+    /// (Conventions §5.1).
+    #[test]
+    fn test_handle_nav_key_follows_the_configured_layout() {
+        use crate::config::LayoutPreset;
+
+        let input = InputConfig {
+            layout: LayoutPreset::RuJcuken,
+            ..InputConfig::default()
+        };
+        let mut selector = ListSelector::new(20, 0);
+
+        // `т` sits on `n`, `о` on `j`, `з` on `p`, and `л` on `k`.
+        for cyrillic in ['т', 'т', 'о'] {
+            assert!(selector.handle_nav_key(key(KeyCode::Char(cyrillic)), &input, 10));
+        }
+        assert_eq!(selector.selected_index(), 3);
+        for cyrillic in ['з', 'л'] {
+            assert!(selector.handle_nav_key(key(KeyCode::Char(cyrillic)), &input, 10));
+        }
+        assert_eq!(selector.selected_index(), 1);
     }
 
     #[test]

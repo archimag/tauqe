@@ -17,9 +17,9 @@ enum SquashApplyError {
     Squash(anyhow::Error),
 }
 
-/// The rejection message shared by every endpoint that accepts a `base_ref`.
+/// The rejection message shared by every endpoint that accepts a revision.
 const INVALID_REVISION: &str =
-    "Invalid base_ref: expected a non-empty revision not starting with '-'";
+    "Invalid revision: expected a non-empty revision not starting with '-'";
 
 /// Trims and validates a client-supplied Git revision.
 ///
@@ -35,8 +35,8 @@ const INVALID_REVISION: &str =
 /// revision ranges with `format!("{base_ref}..HEAD")` and hands the value to
 /// `git reset --soft` verbatim. The boundary that accepts the untrusted string
 /// is therefore the only place the rule can live, and every handler that takes
-/// a `base_ref` off the wire routes through this single gate, so the same input
-/// is refused identically on all of them.
+/// a `base_ref` or a `commit` off the wire routes through this single gate, so
+/// the same input is refused identically on all of them.
 fn validate_revision(base_ref: &str) -> Result<String, &'static str> {
     let trimmed = base_ref.trim();
     if trimmed.is_empty() || trimmed.starts_with('-') {
@@ -146,11 +146,23 @@ pub async fn handle_git_get_diff(req: Request, state: &Arc<AppState>) -> Respons
         },
         None => GitDiffParams::default(),
     };
+    // A commit reference is gated by the shared revision gate before any Git
+    // plumbing runs, so an option-shaped value never reaches Git.
+    let commit = match params.commit {
+        Some(raw) => match validate_revision(&raw) {
+            Ok(revision) => Some(revision),
+            Err(message) => return Response::err(req.id, errors::INVALID_PARAMS, message),
+        },
+        None => None,
+    };
     let target_path = params.path;
 
     let repo_root = state.repo_root().await;
-    let diff = super::offload(move || {
-        tauqe_core::git::get_diff(repo_root.as_path(), target_path.as_deref())
+    let diff = super::offload(move || match commit {
+        // A commit-scoped diff answers exactly that commit; the path filter
+        // belongs to the working-tree diff and is not applied.
+        Some(commit) => tauqe_core::git::get_commit_diff(repo_root.as_path(), &commit),
+        None => tauqe_core::git::get_diff(repo_root.as_path(), target_path.as_deref()),
     })
     .await;
 
@@ -1077,6 +1089,51 @@ mod tests {
             result.diff,
             tauqe_core::git::get_diff(root.as_path(), None).expect("the repository diff"),
             "an absent payload must answer the repository diff"
+        );
+    }
+    /// A commit-scoped diff answers exactly the named commit, and the commit
+    /// reference passes the same revision gate as every other reference.
+    #[tokio::test]
+    async fn git_get_diff_answers_a_requested_commit() {
+        let repo = SquashTestRepo::new();
+        let root = repo.path().to_path_buf();
+        let probe = root.join("injected-output.txt");
+        let head = tauqe_core::git::run_git(Some(&root), &["rev-parse", "HEAD"])
+            .expect("the commit hash")
+            .trim()
+            .to_string();
+
+        let (out, _rx) = crate::transport::OutChannel::new();
+        let (history_sender, _history_rx) = tokio::sync::mpsc::unbounded_channel();
+        let state = AppState::new(AppConfig::default(), root, history_sender, out);
+
+        let request = |commit: &str| Request {
+            id: RequestId::Number(7),
+            method: methods::GIT_GET_DIFF.to_string(),
+            params: Some(serde_json::json!({ "commit": commit })),
+        };
+
+        let resp = handle_git_get_diff(request(&head), &state).await;
+        assert!(resp.error.is_none(), "unexpected error: {:?}", resp.error);
+        let result: GitDiffResult =
+            serde_json::from_value(resp.result.expect("git/getDiff result")).unwrap();
+        assert!(
+            result.diff.contains("+# tauqe"),
+            "the commit diff must carry the change of that commit: {}",
+            result.diff
+        );
+
+        // An option-shaped value is refused before any Git plumbing runs, so
+        // the named probe file is never created.
+        let refused =
+            handle_git_get_diff(request(&format!("--output={}", probe.display())), &state).await;
+        let error = refused
+            .error
+            .expect("an option-shaped commit must be refused");
+        assert_eq!(error.code, errors::INVALID_PARAMS);
+        assert!(
+            !probe.exists(),
+            "an option-shaped commit must never reach git"
         );
     }
 }

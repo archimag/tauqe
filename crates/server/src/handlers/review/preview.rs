@@ -56,7 +56,7 @@ pub async fn handle_review_preview(mut req: Request, state: &Arc<AppState>) -> R
     // turn keeps its operation registration and its context mutation rights.
     let config = state.config.lock().await.config.clone();
     let budgets = WindowBudgets {
-        files_tokens: config.context.files_token_budget,
+        files_tokens: config.context.token_budget,
     };
     let repo_root = state.context.read().await.repo_root().to_path_buf();
 
@@ -191,6 +191,9 @@ fn accumulate(total: &mut ReviewPreviewWindow, window: &ReviewPreviewWindow) {
     total.omitted_by_budget = total
         .omitted_by_budget
         .saturating_add(window.omitted_by_budget);
+    total.unreadable_files = total
+        .unreadable_files
+        .saturating_add(window.unreadable_files);
 }
 
 #[cfg(test)]
@@ -311,8 +314,8 @@ mod tests {
             "alpha/a.rs",
             tauqe_protocol::ContextAccess::ReadOnly,
         );
-        config.context.files_token_budget = content_tokens.saturating_add(wrapper);
-        let budget = config.context.files_token_budget;
+        config.context.token_budget = content_tokens.saturating_add(wrapper);
+        let budget = config.context.token_budget;
         let state = test_state(&root, config);
 
         let result = projection(
@@ -416,6 +419,57 @@ mod tests {
         let result = projection(response);
         assert!(!result.window.is_truncated());
         assert!(result.groups.is_empty());
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+    /// A match the window cannot decode is folded into the aggregate on its own
+    /// counter, so a preset projection never reports a budget truncation the
+    /// token budget did not cause.
+    #[tokio::test]
+    async fn a_preset_projection_reports_unreadable_matches_without_truncating() {
+        let root = scratch_root("review-preview-unreadable");
+        init_repository_with_files(&root, &["alpha/a.rs", "beta/c.rs"]);
+        // A tracked non-UTF-8 blob matches the group pattern and can never be
+        // audited as source, so it must not be charged to the token budget.
+        std::fs::write(root.join("alpha/blob.bin"), [0xff, 0xfe, 0x00, 0x01]).unwrap();
+        tauqe_core::git::cmd::stage_files(&root, &["alpha/blob.bin".to_string()]).unwrap();
+        tauqe_core::git::cmd::commit_with_developer_author(&root, "Add a binary fixture", false)
+            .unwrap();
+        let state = test_state(
+            &root,
+            preset_config(serde_json::json!({
+                "presets": [{
+                    "name": "layered",
+                    "groups": [{ "name": "Alpha", "paths": ["alpha/"] }]
+                }]
+            })),
+        );
+
+        let result = projection(
+            handle_review_preview(
+                preview_request(serde_json::json!({ "preset": "layered" })),
+                &state,
+            )
+            .await,
+        );
+
+        assert_eq!(result.groups.len(), 1);
+        let window = &result.groups[0].window;
+        assert_eq!(window.matched_files, 2);
+        assert_eq!(window.selected_files, 1);
+        assert_eq!(window.unreadable_files, 1);
+        assert_eq!(window.omitted_by_budget, 0);
+        assert_eq!(window.omitted_files, 0);
+        assert!(
+            !window.is_truncated(),
+            "an undecodable match is not a budget truncation"
+        );
+
+        assert_eq!(result.window.matched_files, 2);
+        assert_eq!(result.window.selected_files, 1);
+        assert_eq!(result.window.unreadable_files, 1);
+        assert_eq!(result.window.omitted_by_budget, 0);
+        assert!(!result.window.is_truncated());
 
         let _ = std::fs::remove_dir_all(&root);
     }

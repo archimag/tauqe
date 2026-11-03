@@ -14,7 +14,7 @@ use time::macros::format_description;
 
 use crate::markdown::MarkdownBodyCache;
 use crate::theme::engine::current_engine;
-use crate::ui::wrap_lines;
+use crate::ui::wrap::{wrap_line, wrapped_line_count};
 use crate::views::plans::architect_badge;
 use crate::views::plans::tree::prepare_plan_markdown;
 
@@ -278,6 +278,80 @@ fn push_diagnostic_block(
     }
 }
 
+/// Receives the rows of the Review tree in the order the shared row walk emits
+/// them.
+///
+/// The walk owns the row order, the blank separator between sessions, and the
+/// match over every row variant, so the rendering visitor and the measuring
+/// visitor can never disagree about which rows exist or how tall they are. A
+/// visitor only decides what to do with each piece it is handed: materialize it,
+/// or count it.
+trait ReviewRowVisitor {
+    /// Emits the blank separator that opens a session.
+    fn separator(&mut self);
+
+    /// Records the first rendered line of the row that follows.
+    fn row_start(&mut self);
+
+    /// Emits one row-summary line, which still has to be wrapped to `width`.
+    fn summary(&mut self, line: Line<'static>, width: usize);
+
+    /// Emits a detail body the Markdown cache already wrapped to the target
+    /// width, so its lines are taken exactly as they are.
+    fn body(&mut self, lines: &[Line<'static>]);
+}
+
+/// Rendering visitor: materializes the wrapped lines and the row offsets.
+#[derive(Default)]
+struct ReviewLineRenderer {
+    lines: Vec<Line<'static>>,
+    offsets: Vec<usize>,
+}
+
+impl ReviewRowVisitor for ReviewLineRenderer {
+    fn separator(&mut self) {
+        self.lines.push(Line::raw(""));
+    }
+
+    fn row_start(&mut self) {
+        self.offsets.push(self.lines.len());
+    }
+
+    fn summary(&mut self, line: Line<'static>, width: usize) {
+        self.lines.extend(wrap_line(line, width));
+    }
+
+    fn body(&mut self, lines: &[Line<'static>]) {
+        self.lines.extend(lines.iter().cloned());
+    }
+}
+
+/// Measuring visitor: reproduces the row offsets and the total height of the
+/// tree without materializing a single line.
+#[derive(Default)]
+struct ReviewLineMeasure {
+    offsets: Vec<usize>,
+    height: usize,
+}
+
+impl ReviewRowVisitor for ReviewLineMeasure {
+    fn separator(&mut self) {
+        self.height += 1;
+    }
+
+    fn row_start(&mut self) {
+        self.offsets.push(self.height);
+    }
+
+    fn summary(&mut self, line: Line<'static>, width: usize) {
+        self.height += wrapped_line_count(&line, width);
+    }
+
+    fn body(&mut self, lines: &[Line<'static>]) {
+        self.height += lines.len();
+    }
+}
+
 /// Renders the flattened Review rows into lines and their row offsets.
 ///
 /// The Markdown detail blocks of findings and of their subplan steps come from
@@ -292,10 +366,51 @@ pub(crate) fn compute_unified_review_lines(
     theme_mode: crate::config::ThemeMode,
     cache: &mut MarkdownBodyCache,
 ) -> (Vec<Line<'static>>, Vec<usize>) {
+    let mut renderer = ReviewLineRenderer::default();
+    walk_review_rows(rows, selected_idx, width, theme_mode, cache, &mut renderer);
+    (renderer.lines, renderer.offsets)
+}
+
+/// Measures the row offsets and the total height of the flattened Review rows
+/// without materializing a single line.
+///
+/// Every break decision is shared with [`compute_unified_review_lines`] through
+/// one row walk, and the summary lines are counted through
+/// [`wrapped_line_count`] instead of being wrapped into owned lines. A cached
+/// detail body already arrives wrapped to the target width, so it contributes
+/// its own length. Measured offsets therefore match the rendered frame exactly
+/// while positioning the viewport costs no line allocation (c-2).
+pub(crate) fn measure_review_rows(
+    rows: &[VisibleReviewRow],
+    selected_idx: usize,
+    width: usize,
+    theme_mode: crate::config::ThemeMode,
+    cache: &mut MarkdownBodyCache,
+) -> (Vec<usize>, usize) {
+    let mut measure = ReviewLineMeasure::default();
+    walk_review_rows(rows, selected_idx, width, theme_mode, cache, &mut measure);
+    (measure.offsets, measure.height)
+}
+
+/// Walks the visible rows in render order and hands every rendered piece to
+/// `visitor`.
+///
+/// This walk is the single source of truth for the shape of the tree: it emits
+/// the separator between sessions, records where each row starts, builds every
+/// summary line, and resolves every detail body through the Markdown cache.
+/// Rendering and measuring therefore observe one identical layout, and a
+/// navigation key reads the selected row's bounds without materializing the
+/// document (c-2).
+fn walk_review_rows<V: ReviewRowVisitor>(
+    rows: &[VisibleReviewRow],
+    selected_idx: usize,
+    width: usize,
+    theme_mode: crate::config::ThemeMode,
+    cache: &mut MarkdownBodyCache,
+    visitor: &mut V,
+) {
     let engine = current_engine();
     let palette = engine.palette();
-    let mut all_lines = Vec::new();
-    let mut offsets = Vec::with_capacity(rows.len());
 
     for (idx, row) in rows.iter().enumerate() {
         let is_selected = idx == selected_idx;
@@ -304,9 +419,9 @@ pub(crate) fn compute_unified_review_lines(
         // Otherwise the offset anchors the gap and scrolling stops one line
         // short of the header it is meant to reveal.
         if idx > 0 && matches!(row, VisibleReviewRow::SessionHeader { .. }) {
-            all_lines.push(Line::raw(""));
+            visitor.separator();
         }
-        offsets.push(all_lines.len());
+        visitor.row_start();
 
         let row_style = if is_selected {
             engine.bg(palette.overlay)
@@ -378,7 +493,7 @@ pub(crate) fn compute_unified_review_lines(
                 if is_selected {
                     header_line = pad_line_to_width(header_line, width, row_style);
                 }
-                all_lines.extend(wrap_lines(vec![header_line], width));
+                visitor.summary(header_line, width);
             }
             VisibleReviewRow::SessionSummary {
                 session_id,
@@ -400,11 +515,10 @@ pub(crate) fn compute_unified_review_lines(
                 if is_selected {
                     summary_line = pad_line_to_width(summary_line, width, row_style);
                 }
-                let row_lines = vec![summary_line];
-                // The cached body arrives already wrapped, so it is collected
-                // apart and appended after the short header line (c-1).
-                let mut detail_lines: Vec<Line<'static>> = Vec::new();
+                visitor.summary(summary_line, width);
 
+                // The cached body arrives already wrapped, so it is handed over
+                // exactly as the cache produced it (c-1).
                 if *is_expanded {
                     let trimmed = description.trim();
                     if !trimmed.is_empty() {
@@ -424,12 +538,9 @@ pub(crate) fn compute_unified_review_lines(
                             Some(width),
                             theme_mode,
                         );
-                        detail_lines.extend(body.iter().cloned());
+                        visitor.body(body);
                     }
                 }
-
-                all_lines.extend(wrap_lines(row_lines, width));
-                all_lines.extend(detail_lines);
             }
             VisibleReviewRow::ReviewItem {
                 session_id,
@@ -514,12 +625,10 @@ pub(crate) fn compute_unified_review_lines(
                 if is_selected {
                     item_line = pad_line_to_width(item_line, width, row_style);
                 }
-                let mut row_lines = vec![item_line];
-                // A cached Markdown body arrives already wrapped, so it is
-                // collected apart and appended after the metadata lines, which
-                // are short and wrapped every frame (c-1).
-                let mut detail_lines: Vec<Line<'static>> = Vec::new();
-                let mut rec_lines: Vec<Line<'static>> = Vec::new();
+                // Every metadata line and the cached body are handed over in
+                // render order, so the measuring walk sees the same sequence
+                // without wrapping a single line (c-1, c-2).
+                visitor.summary(item_line, width);
 
                 // The finding's own detail block renders at the level of its
                 // children, never deeper (Conventions §4.8).
@@ -530,36 +639,42 @@ pub(crate) fn compute_unified_review_lines(
                     if let Some(loc) = loc_str {
                         let clean_loc = loc.trim();
                         if !clean_loc.is_empty() {
-                            row_lines.push(Line::from(vec![
-                                Span::styled(
-                                    format!(
-                                        "{body_indent}{}",
-                                        crate::i18n::active_t("review.files_label")
+                            visitor.summary(
+                                Line::from(vec![
+                                    Span::styled(
+                                        format!(
+                                            "{body_indent}{}",
+                                            crate::i18n::active_t("review.files_label")
+                                        ),
+                                        engine.fg(palette.status_info).bold(),
                                     ),
-                                    engine.fg(palette.status_info).bold(),
-                                ),
-                                Span::styled(
-                                    clean_loc.to_string(),
-                                    engine.fg(palette.text_primary),
-                                ),
-                            ]));
+                                    Span::styled(
+                                        clean_loc.to_string(),
+                                        engine.fg(palette.text_primary),
+                                    ),
+                                ]),
+                                width,
+                            );
                         }
                     }
 
                     if !readonly_files.is_empty() {
-                        row_lines.push(Line::from(vec![
-                            Span::styled(
-                                format!(
-                                    "{body_indent}{}",
-                                    crate::i18n::active_t("review.readonly_label")
+                        visitor.summary(
+                            Line::from(vec![
+                                Span::styled(
+                                    format!(
+                                        "{body_indent}{}",
+                                        crate::i18n::active_t("review.readonly_label")
+                                    ),
+                                    engine.fg(palette.status_warning).bold(),
                                 ),
-                                engine.fg(palette.status_warning).bold(),
-                            ),
-                            Span::styled(
-                                readonly_files.join(", "),
-                                engine.fg(palette.text_primary),
-                            ),
-                        ]));
+                                Span::styled(
+                                    readonly_files.join(", "),
+                                    engine.fg(palette.text_primary),
+                                ),
+                            ]),
+                            width,
+                        );
                     }
 
                     if let Some(notes) = note.as_deref() {
@@ -581,38 +696,47 @@ pub(crate) fn compute_unified_review_lines(
                             );
                             let mut note_lines = clean_notes.lines();
                             if let Some(first) = note_lines.next() {
-                                row_lines.push(Line::from(vec![
-                                    note_prefix.clone(),
-                                    Span::styled(
-                                        format!("{} ", note_label),
-                                        engine.fg(palette.status_warning).bold(),
-                                    ),
-                                    Span::styled(
-                                        first.to_string(),
-                                        engine.fg(palette.text_primary),
-                                    ),
-                                ]));
-                                for line in note_lines {
-                                    row_lines.push(Line::from(vec![
+                                visitor.summary(
+                                    Line::from(vec![
                                         note_prefix.clone(),
                                         Span::styled(
-                                            line.to_string(),
+                                            format!("{} ", note_label),
+                                            engine.fg(palette.status_warning).bold(),
+                                        ),
+                                        Span::styled(
+                                            first.to_string(),
                                             engine.fg(palette.text_primary),
                                         ),
-                                    ]));
+                                    ]),
+                                    width,
+                                );
+                                for line in note_lines {
+                                    visitor.summary(
+                                        Line::from(vec![
+                                            note_prefix.clone(),
+                                            Span::styled(
+                                                line.to_string(),
+                                                engine.fg(palette.text_primary),
+                                            ),
+                                        ]),
+                                        width,
+                                    );
                                 }
                             }
                         }
                     }
 
                     if !description.trim().is_empty() {
-                        row_lines.push(Line::from(Span::styled(
-                            format!(
-                                "{body_indent}{}",
-                                crate::i18n::active_t("review.description_label")
-                            ),
-                            engine.fg(palette.status_info).bold(),
-                        )));
+                        visitor.summary(
+                            Line::from(Span::styled(
+                                format!(
+                                    "{body_indent}{}",
+                                    crate::i18n::active_t("review.description_label")
+                                ),
+                                engine.fg(palette.status_info).bold(),
+                            )),
+                            width,
+                        );
                         let mut theme = crate::markdown::MarkdownTheme::answer_themed(theme_mode);
                         theme.text_style = engine.fg(palette.text_secondary);
                         theme.hard_breaks = true;
@@ -629,33 +753,33 @@ pub(crate) fn compute_unified_review_lines(
                             Some(width),
                             theme_mode,
                         );
-                        detail_lines.extend(body.iter().cloned());
+                        visitor.body(body);
                     }
 
                     if !recommendations.is_empty() {
-                        rec_lines.push(Line::from(Span::styled(
-                            format!(
-                                "{body_indent}{}",
-                                crate::i18n::active_t("review.recommendations_label")
-                            ),
-                            engine.fg(palette.status_success).bold(),
-                        )));
-                        for rec in recommendations {
-                            rec_lines.push(Line::from(vec![
-                                Span::styled(
-                                    format!("{body_indent}│ • "),
-                                    engine.fg(palette.text_muted),
+                        visitor.summary(
+                            Line::from(Span::styled(
+                                format!(
+                                    "{body_indent}{}",
+                                    crate::i18n::active_t("review.recommendations_label")
                                 ),
-                                Span::styled(rec.clone(), engine.fg(palette.text_primary)),
-                            ]));
+                                engine.fg(palette.status_success).bold(),
+                            )),
+                            width,
+                        );
+                        for rec in recommendations {
+                            visitor.summary(
+                                Line::from(vec![
+                                    Span::styled(
+                                        format!("{body_indent}│ • "),
+                                        engine.fg(palette.text_muted),
+                                    ),
+                                    Span::styled(rec.clone(), engine.fg(palette.text_primary)),
+                                ]),
+                                width,
+                            );
                         }
                     }
-                }
-
-                all_lines.extend(wrap_lines(row_lines, width));
-                all_lines.extend(detail_lines);
-                if !rec_lines.is_empty() {
-                    all_lines.extend(wrap_lines(rec_lines, width));
                 }
             }
             VisibleReviewRow::SubplanItem {
@@ -667,6 +791,7 @@ pub(crate) fn compute_unified_review_lines(
                 status,
                 files,
                 readonly_files,
+                outer_docs,
                 depends_on,
                 depth,
                 has_children,
@@ -714,7 +839,9 @@ pub(crate) fn compute_unified_review_lines(
                     Span::raw(" "),
                     Span::styled(format!("#{} {}", step_id, clean_title), title_style),
                 ];
-                if !*has_children && (!files.is_empty() || !readonly_files.is_empty()) {
+                if !*has_children
+                    && (!files.is_empty() || !readonly_files.is_empty() || !outer_docs.is_empty())
+                {
                     let mut parts = Vec::new();
                     if !files.is_empty() {
                         parts.push(crate::i18n::active_t("plans.file_count").replacen(
@@ -730,6 +857,13 @@ pub(crate) fn compute_unified_review_lines(
                             1,
                         ));
                     }
+                    if !outer_docs.is_empty() {
+                        parts.push(crate::i18n::active_t("plans.docs_count").replacen(
+                            "{}",
+                            &outer_docs.len().to_string(),
+                            1,
+                        ));
+                    }
                     spans.push(Span::styled(
                         format!(" [{}]", parts.join(" + ")),
                         engine.fg(palette.text_muted),
@@ -740,41 +874,66 @@ pub(crate) fn compute_unified_review_lines(
                 if is_selected {
                     row_line = pad_line_to_width(row_line, width, row_style);
                 }
-                let mut row_lines = vec![row_line];
-                // Cached detail bodies arrive already wrapped, so they are
-                // appended after the short metadata lines (c-1).
-                let mut detail_lines: Vec<Line<'static>> = Vec::new();
+                visitor.summary(row_line, width);
 
                 if *is_expanded {
                     if !*has_children && !files.is_empty() {
-                        row_lines.push(Line::from(vec![
-                            Span::styled(meta_prefix.clone(), engine.fg(palette.text_muted)),
-                            Span::styled(
-                                format!("{} ", crate::i18n::active_t("plans.files_prefix")),
-                                engine.fg(palette.text_muted),
-                            ),
-                            Span::styled(files.join(", "), engine.fg(palette.status_info)),
-                        ]));
+                        visitor.summary(
+                            Line::from(vec![
+                                Span::styled(meta_prefix.clone(), engine.fg(palette.text_muted)),
+                                Span::styled(
+                                    format!("{} ", crate::i18n::active_t("plans.files_prefix")),
+                                    engine.fg(palette.text_muted),
+                                ),
+                                Span::styled(files.join(", "), engine.fg(palette.status_info)),
+                            ]),
+                            width,
+                        );
                     }
                     if !*has_children && !readonly_files.is_empty() {
-                        row_lines.push(Line::from(vec![
-                            Span::styled(meta_prefix.clone(), engine.fg(palette.text_muted)),
-                            Span::styled(
-                                format!("{} ", crate::i18n::active_t("plans.ref_prefix")),
-                                engine.fg(palette.text_muted),
-                            ),
-                            Span::styled(readonly_files.join(", "), engine.fg(palette.status_info)),
-                        ]));
+                        visitor.summary(
+                            Line::from(vec![
+                                Span::styled(meta_prefix.clone(), engine.fg(palette.text_muted)),
+                                Span::styled(
+                                    format!("{} ", crate::i18n::active_t("plans.ref_prefix")),
+                                    engine.fg(palette.text_muted),
+                                ),
+                                Span::styled(
+                                    readonly_files.join(", "),
+                                    engine.fg(palette.status_info),
+                                ),
+                            ]),
+                            width,
+                        );
+                    }
+                    if !*has_children && !outer_docs.is_empty() {
+                        visitor.summary(
+                            Line::from(vec![
+                                Span::styled(meta_prefix.clone(), engine.fg(palette.text_muted)),
+                                Span::styled(
+                                    format!("{} ", crate::i18n::active_t("plans.docs_prefix")),
+                                    engine.fg(palette.text_muted),
+                                ),
+                                Span::styled(outer_docs.join(", "), engine.fg(palette.status_info)),
+                            ]),
+                            width,
+                        );
                     }
                     if !depends_on.is_empty() {
-                        row_lines.push(Line::from(vec![
-                            Span::styled(meta_prefix.clone(), engine.fg(palette.text_muted)),
-                            Span::styled(
-                                crate::i18n::active_t("review.depends_on_label"),
-                                engine.fg(palette.text_muted),
-                            ),
-                            Span::styled(depends_on.join(", "), engine.fg(palette.status_warning)),
-                        ]));
+                        visitor.summary(
+                            Line::from(vec![
+                                Span::styled(meta_prefix.clone(), engine.fg(palette.text_muted)),
+                                Span::styled(
+                                    crate::i18n::active_t("review.depends_on_label"),
+                                    engine.fg(palette.text_muted),
+                                ),
+                                Span::styled(
+                                    depends_on.join(", "),
+                                    engine.fg(palette.status_warning),
+                                ),
+                            ]),
+                            width,
+                        );
                     }
                     if let Some(det) = details {
                         // Model-authored detail blocks inherit the leading
@@ -795,14 +954,10 @@ pub(crate) fn compute_unified_review_lines(
                             let key = step_body_key(session_id, group_id, step_id);
                             let body =
                                 cache.lines_for(&key, &prepared, &theme, Some(width), theme_mode);
-                            detail_lines.extend(body.iter().cloned());
+                            visitor.body(body);
                         }
                     }
                 }
-
-                let mut rendered = wrap_lines(row_lines, width);
-                rendered.extend(detail_lines);
-                all_lines.extend(rendered);
             }
             VisibleReviewRow::GroupHeader {
                 session_id,
@@ -886,7 +1041,6 @@ pub(crate) fn compute_unified_review_lines(
                     header_line = pad_line_to_width(header_line, width, row_style);
                 }
                 let mut row_lines = vec![header_line];
-                let mut detail_lines: Vec<Line<'static>> = Vec::new();
 
                 if *is_expanded {
                     let body_indent = review_body_indent(REVIEW_TOP_LEVEL + 1);
@@ -926,6 +1080,11 @@ pub(crate) fn compute_unified_review_lines(
                             engine.fg(palette.text_secondary),
                         );
                     }
+                    // The fork is flushed before the root-cause description that
+                    // follows it, so the diagnosis still opens the group body.
+                    for line in row_lines.drain(..) {
+                        visitor.summary(line, width);
+                    }
                     if let Some(description) = description
                         .as_deref()
                         .filter(|text| !text.trim().is_empty())
@@ -943,12 +1102,13 @@ pub(crate) fn compute_unified_review_lines(
                             Some(width),
                             theme_mode,
                         );
-                        detail_lines.extend(body.iter().cloned());
+                        visitor.body(body);
                     }
                 }
 
-                all_lines.extend(wrap_lines(row_lines, width));
-                all_lines.extend(detail_lines);
+                for line in row_lines {
+                    visitor.summary(line, width);
+                }
             }
             VisibleReviewRow::GroupPlanHeader {
                 title,
@@ -981,12 +1141,10 @@ pub(crate) fn compute_unified_review_lines(
                 if is_selected {
                     branch_line = pad_line_to_width(branch_line, width, row_style);
                 }
-                all_lines.extend(wrap_lines(vec![branch_line], width));
+                visitor.summary(branch_line, width);
             }
         }
     }
-
-    (all_lines, offsets)
 }
 
 #[cfg(test)]
@@ -1101,7 +1259,6 @@ mod tests {
             .map(|span| span.content.as_ref())
             .collect()
     }
-
     fn find_line(lines: &[Line<'static>], needle: impl AsRef<str>) -> usize {
         let needle = needle.as_ref();
         lines
@@ -1110,6 +1267,78 @@ mod tests {
             .unwrap_or_else(|| panic!("missing rendered line containing {needle}"))
     }
 
+    /// The measuring walk must reproduce the offsets and the height of the
+    /// rendered frame in every fold state, so a navigation key may position the
+    /// viewport without materializing the document or cloning a cached body
+    /// (c-2).
+    #[test]
+    fn test_measure_review_rows_matches_the_rendered_frame() {
+        let long_details = (0..40)
+            .map(|line| format!("Invariant line {line}."))
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        let mut session = make_session_with_description(
+            "rev-measure",
+            "## Overview\n\nThe summary is rendered once.",
+            &[1, 2],
+        );
+        session.groups = vec![ReviewGroup {
+            id: "arch".to_string(),
+            title: "Shared cause".to_string(),
+            description: Some("One cause behind both symptoms.".to_string()),
+            kind: ReviewGroupKind::Architectural,
+            implementation: PlanImplementation {
+                items: vec![PlanItem {
+                    details: Some(long_details),
+                    ..subplan_step("1.1", "Tall step", PlanItemStatus::Todo)
+                }],
+                ..Default::default()
+            },
+            ..Default::default()
+        }];
+        session.items[0] = ReviewItem::from(ReviewIssue {
+            group: Some("arch".to_string()),
+            files: vec!["src/auth.rs".to_string()],
+            description: "The guard trusts the request header.".to_string(),
+            recommendations: vec!["Validate before decoding.".to_string()],
+            ..make_item(1)
+        });
+        let mut view = ReviewViewState {
+            sessions: vec![session],
+            ..Default::default()
+        };
+        view.toggle_item_expanded("rev-measure", 1);
+        view.toggle_subplan_item_expanded("rev-measure", "arch", "1.1");
+
+        // A selected row, no selection at all, and both ends of the document all
+        // measure the same layout the renderer draws.
+        for selected in [usize::MAX, 0, 2, 5] {
+            let rows = view.flatten_rows();
+            let (lines, offsets) = compute_unified_review_lines(
+                &rows,
+                selected,
+                60,
+                view.theme_mode,
+                &mut view.markdown_cache,
+            );
+            let (measured, height) = measure_review_rows(
+                &rows,
+                selected,
+                60,
+                view.theme_mode,
+                &mut view.markdown_cache,
+            );
+            assert_eq!(
+                measured, offsets,
+                "measured offsets must match the rendered frame"
+            );
+            assert_eq!(
+                height,
+                lines.len(),
+                "measured height must match the rendered lines"
+            );
+        }
+    }
     /// Renders the tree the way the view does, against the view's own body
     /// cache, and returns the lines with their row offsets.
     fn render_view(
@@ -2096,6 +2325,7 @@ mod tests {
                 details: Some("Parent owns the child scope.".to_string()),
                 files: vec!["src/parent_only.rs".to_string()],
                 readonly_files: vec!["contracts/parent_only.md".to_string()],
+                outer_docs: vec!["openrouter/models".to_string()],
                 children: vec![PlanItem {
                     files: vec!["src/auth.rs".to_string()],
                     readonly_files: vec!["contracts/api.md".to_string()],
@@ -2129,6 +2359,8 @@ mod tests {
         assert!(!text.contains("contracts/parent_only.md"), "{text}");
         assert!(!text.contains("files:"), "{text}");
         assert!(!text.contains("ref:"), "{text}");
+        assert!(!text.contains("docs:"), "{text}");
+        assert!(!text.contains("openrouter/models"), "{text}");
 
         // The leaf keeps its own contracts once it is unfolded.
         view.toggle_subplan_item_expanded("rev-container", "arch", "1.1");
@@ -2137,6 +2369,101 @@ mod tests {
         assert!(text.contains("files: src/auth.rs"), "{text}");
         assert!(text.contains("ref: contracts/api.md"), "{text}");
         assert!(!text.contains("src/parent_only.rs"), "{text}");
+    }
+
+    /// A leaf step of a group plan implemented against an external
+    /// specification renders the document count in its compact badge and the
+    /// identifiers themselves in an expanded `docs:` line, exactly as the Plans
+    /// tree does (concept #c-review-subplan-docs-visibility).
+    #[test]
+    fn test_subplan_step_outer_docs_badge_and_details() {
+        let mut session = make_session("rev-docs", &[1]);
+        session.groups = vec![architectural_group(
+            "arch",
+            "Shared cause",
+            vec![PlanItem {
+                files: vec!["src/chat.rs".to_string()],
+                outer_docs: vec![
+                    "openrouter/chat-completion".to_string(),
+                    "openrouter/limits".to_string(),
+                ],
+                ..subplan_step("1.1", "Wire the chat request", PlanItemStatus::InProgress)
+            }],
+        )];
+        session.items[0].group = Some("arch".to_string());
+        let mut view = ReviewViewState {
+            sessions: vec![session],
+            ..Default::default()
+        };
+
+        // Folded: the badge counts the target file and both documents.
+        let (lines, _) = render_view(&mut view, usize::MAX, 160);
+        let folded = lines.iter().map(line_text).collect::<Vec<_>>().join("\n");
+        assert!(
+            folded.contains("[1 file(s) + 2 doc(s)]"),
+            "the badge must count the external documents: {folded}"
+        );
+        assert!(
+            !folded.contains("docs: "),
+            "a folded step must not list its documents: {folded}"
+        );
+
+        // Expanded: the identifiers of the specifications become readable.
+        view.toggle_subplan_item_expanded("rev-docs", "arch", "1.1");
+        let (lines, _) = render_view(&mut view, usize::MAX, 160);
+        let expanded = lines.iter().map(line_text).collect::<Vec<_>>().join("\n");
+        assert!(
+            expanded.contains("docs: openrouter/chat-completion, openrouter/limits"),
+            "the expanded step must list its documents: {expanded}"
+        );
+    }
+
+    /// External documentation alone makes a step of a group plan expandable, so
+    /// its identifiers stay readable even when the step carries no description
+    /// or file metadata (concept #c-review-subplan-docs-visibility).
+    #[test]
+    fn test_subplan_step_outer_docs_alone_expand_the_step() {
+        let mut session = make_session("rev-docs-only", &[1]);
+        session.groups = vec![architectural_group(
+            "arch",
+            "Shared cause",
+            vec![PlanItem {
+                outer_docs: vec!["openrouter/models".to_string()],
+                ..subplan_step("1.1", "Read the spec", PlanItemStatus::Todo)
+            }],
+        )];
+        session.items[0].group = Some("arch".to_string());
+        let mut view = ReviewViewState {
+            sessions: vec![session],
+            ..Default::default()
+        };
+
+        assert!(
+            view.flatten_rows().iter().any(|row| matches!(
+                row,
+                VisibleReviewRow::SubplanItem {
+                    step_id,
+                    is_expandable: true,
+                    ..
+                } if step_id.as_str() == "1.1"
+            )),
+            "external documentation must make the step expandable"
+        );
+
+        let (lines, _) = render_view(&mut view, usize::MAX, 160);
+        let folded = lines.iter().map(line_text).collect::<Vec<_>>().join("\n");
+        assert!(
+            folded.contains("[1 doc(s)]"),
+            "a docs-only step carries its own badge: {folded}"
+        );
+
+        view.toggle_subplan_item_expanded("rev-docs-only", "arch", "1.1");
+        let (lines, _) = render_view(&mut view, usize::MAX, 160);
+        let expanded = lines.iter().map(line_text).collect::<Vec<_>>().join("\n");
+        assert!(
+            expanded.contains("docs: openrouter/models"),
+            "the expanded step must list its documents: {expanded}"
+        );
     }
 
     /// A cursor move or a scroll re-renders every row, but the Markdown bodies of

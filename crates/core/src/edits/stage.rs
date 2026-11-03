@@ -47,6 +47,20 @@ fn validate_project_config(path: &str, content: Option<&str>) -> Result<(), Stri
     let Some(content) = content else {
         return Ok(());
     };
+    // A `tauqe.d` module is a fragment of the project configuration: it declares
+    // the keys of one section rather than a whole document, so only its syntax
+    // is judged while it is staged. The merged document it takes part in is
+    // validated when the change set is verified, where every layer is present.
+    if crate::config::is_repo_module_path(path) {
+        return toml::from_str::<toml::Table>(content)
+            .map(|_| ())
+            .map_err(|err| {
+                format!(
+                    "the file is not valid TOML: {}",
+                    single_line(&err.to_string())
+                )
+            });
+    }
 
     // Level 1 — syntactic validation of the staged bytes.
     let parsed: crate::config::AppConfig = toml::from_str(content).map_err(|err| {

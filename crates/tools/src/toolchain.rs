@@ -36,6 +36,7 @@ use tauqe_protocol::{
 use tokio::sync::watch;
 
 pub use fmt::{format_with_project_config, InMemoryFormatOutcome};
+pub(crate) use fmt::{resolve_formatter, FormatterResolution};
 pub use runner::merge_manifest;
 
 /// Wall-clock budget of a single project command, in seconds.

@@ -11,9 +11,11 @@
 //!
 //! A rename is recorded in the parent directory, not in the renamed file, so
 //! the file's own `sync_all` does not make it durable either. On Unix the
-//! parent directory is opened and synced after the rename. Filesystems that
-//! reject directory syncing keep the weaker durability they offer; a genuine
-//! sync failure is reported instead of being hidden.
+//! parent directory is opened and synced after the rename, and both steps
+//! belong to the barrier: a parent that cannot be opened never reaches the
+//! sync and is reported exactly like a genuine sync failure, while a
+//! filesystem that answers the sync itself as unsupported keeps the weaker
+//! durability it offers.
 //!
 //! The staging name carries both the process id and a process-wide monotonic
 //! sequence number. A fixed name would let two writers of one process truncate
@@ -126,19 +128,23 @@ fn parent_directory(target: &Path) -> &Path {
 /// Opens the directory that holds `target` and syncs it.
 ///
 /// A rename is recorded in the parent directory, so the file's own `sync_all`
-/// does not make it durable. A rejection is ignored so writes keep working on
-/// filesystems that do not sync directories; they simply retain their weaker
-/// durability level. A genuine I/O failure is reported, because the durability
-/// of the rename is then unknown.
+/// does not make it durable. Opening the parent is therefore part of the
+/// barrier and not a preliminary: a directory that admits the rename (write
+/// and execute) but rejects the read-only open (read) publishes the new entry
+/// with no descriptor left to sync, and that lost barrier is reported.
+///
+/// The `sync_all` outcome is where a filesystem without directory-sync support
+/// answers, so only the kinds that name an unsupported operation are absorbed
+/// and such a filesystem keeps the weaker durability it offers. Every other
+/// failure is reported, because the durability of the rename is then unknown.
 #[cfg(unix)]
 fn sync_parent_directory(target: &Path) -> std::io::Result<()> {
     let parent = parent_directory(target);
 
-    let directory = match std::fs::File::open(parent) {
-        Ok(directory) => directory,
-        Err(error) if rejects_directory_sync(&error) => return Ok(()),
-        Err(error) => return Err(error),
-    };
+    // The rename already reached the directory, so an unopenable parent cannot
+    // be recovered from later; report it instead of claiming a barrier that
+    // never ran.
+    let directory = std::fs::File::open(parent)?;
 
     match directory.sync_all() {
         Ok(()) => Ok(()),
@@ -147,14 +153,20 @@ fn sync_parent_directory(target: &Path) -> std::io::Result<()> {
     }
 }
 
-/// Whether `error` reports a filesystem that does not sync directories.
+/// Whether `error` reports a filesystem that does not implement directory
+/// syncing.
+///
+/// Only the two kinds that name an unsupported operation qualify: `EINVAL` is
+/// the answer POSIX permits for a directory `fsync` a filesystem does not
+/// implement, and `ENOTSUP`/`EOPNOTSUPP` reports the same refusal explicitly.
+/// A permission denial is deliberately absent: a sandbox or a filtering layer
+/// produces it as readily as a filesystem can, and answering "synced" for a
+/// call that never ran would hide a barrier the caller believes in.
 #[cfg(unix)]
 fn rejects_directory_sync(error: &std::io::Error) -> bool {
     matches!(
         error.kind(),
-        std::io::ErrorKind::InvalidInput
-            | std::io::ErrorKind::PermissionDenied
-            | std::io::ErrorKind::Unsupported
+        std::io::ErrorKind::InvalidInput | std::io::ErrorKind::Unsupported
     )
 }
 
@@ -604,6 +616,35 @@ mod tests {
             staging_leftovers(dir.path()).is_empty(),
             "a failed write must not leave a staging file behind"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_parent_directory_that_cannot_be_opened_reports_the_missing_barrier() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempdir().unwrap();
+        let parent = dir.path().join("write_only");
+        std::fs::create_dir(&parent).unwrap();
+        let target = parent.join("document.json");
+        std::fs::write(&target, "original").unwrap();
+
+        // Write and execute admit the staging file, the rename, and the
+        // metadata read; the missing read bit rejects the read-only open of
+        // the parent, so no descriptor exists to sync the rename through.
+        std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o300)).unwrap();
+        let replaced = write_atomic(&target, b"updated");
+        std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        assert!(
+            replaced.is_err(),
+            "a barrier that never ran must be reported instead of claimed as success"
+        );
+        // The rename is already published, so the new content is on disk; what
+        // the reported failure states is that the directory entry carrying it
+        // was never synced.
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "updated");
+        assert!(staging_leftovers(&parent).is_empty());
     }
 
     #[cfg(unix)]

@@ -184,6 +184,12 @@ pub enum StepTurnResult {
     Success {
         /// Summary of the completed work, rendered by the host.
         summary: String,
+        /// Identifier of the Git commit the successful turn produced.
+        ///
+        /// A verified change set can live entirely outside Git — the
+        /// `.tauqe/mockups/` sandbox is the documented case — so the pointer is
+        /// optional and the step records it only when its turn produced one.
+        commit: Option<String>,
     },
     /// The step cannot be implemented within the approved decision.
     Blocked(String),

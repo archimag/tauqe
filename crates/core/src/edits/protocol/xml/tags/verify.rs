@@ -27,10 +27,14 @@ pub struct VerifyRequest {
     pub on_success: VerifyOnSuccess,
 }
 
-/// Extracts verification request if specified by the model.
-pub fn extract_verify_request(text: &str) -> Option<VerifyRequest> {
+/// Extracts verification request if specified by the model, reusing a
+/// precomputed code index.
+pub(crate) fn extract_verify_request_with_fences(
+    text: &str,
+    fences: &super::CodeFences,
+) -> Option<VerifyRequest> {
     let spec = tag_spec()?;
-    let found = engine::find_next_tag(text, spec)?;
+    let found = engine::find_next_tag_with_fences(text, spec, 0, fences)?;
 
     let target = match found.attr("target").as_deref() {
         Some("check") => VerifyTarget::Check,
@@ -45,6 +49,11 @@ pub fn extract_verify_request(text: &str) -> Option<VerifyRequest> {
     };
 
     Some(VerifyRequest { target, on_success })
+}
+
+/// Extracts verification request if specified by the model.
+pub fn extract_verify_request(text: &str) -> Option<VerifyRequest> {
+    extract_verify_request_with_fences(text, &super::CodeFences::find(text))
 }
 
 /// Removes all verify tags from text.

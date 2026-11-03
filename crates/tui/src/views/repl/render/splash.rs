@@ -1,4 +1,4 @@
-//! SLIME-style startup greeting for an empty Develop viewport.
+//! SLIME-style startup greeting for an empty REPL viewport.
 //!
 //! The greeting is transient: it occupies the response area only while no model
 //! output exists and yields to the regular viewport on the first byte of output,

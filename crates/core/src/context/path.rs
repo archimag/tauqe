@@ -6,7 +6,7 @@ use super::ContextManager;
 /// and live in `tauqe-tools` (`tauqe_tools::paths`), beside every other pure path
 /// predicate. The re-exports keep `crate::context::path::{verify_path_within_repo,
 /// verify_path_within_repo_for_write}` resolvable for the context, edit, and
-/// discovery layers while the transition lasts.
+/// research layers while the transition lasts.
 pub use tauqe_tools::paths::{verify_path_within_repo, verify_path_within_repo_for_write};
 
 impl ContextManager {

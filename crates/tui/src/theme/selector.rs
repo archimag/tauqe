@@ -9,11 +9,14 @@
 //! The dialog lives with the design-system subsystem because it is the single
 //! surface where the palettes are offered to the developer.
 
+use std::sync::Arc;
+
 use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::layout::Rect;
 use ratatui::style::Stylize;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
+use tokio::sync::{Mutex, MutexGuard};
 
 use crate::app::AppState;
 use crate::components::modal::{
@@ -90,7 +93,18 @@ pub fn theme_selector_body_area(term: Rect) -> Rect {
 /// navigating with `n`/`p`. A click outside the dialog cancels the selector and
 /// restores the preset that was active when it opened, exactly like `Esc`
 /// (`#c-4`). Returns `true` when the selector consumed the click.
-pub fn handle_theme_selector_click(st: &mut AppState, col: u16, row: u16, term: Rect) -> bool {
+///
+/// The guard is consumed here for the same reason as the keyboard entry point: a
+/// click on the already-highlighted row commits the preset, so the selector
+/// releases the lock around the `tui.toml` rewrite and never parks the event
+/// loop on the disk (c-1).
+pub async fn handle_theme_selector_click(
+    state: &Arc<Mutex<AppState>>,
+    mut st: MutexGuard<'_, AppState>,
+    col: u16,
+    row: u16,
+    term: Rect,
+) -> bool {
     let Some(mut selector_state) = st.theme_selector.take() else {
         return false;
     };
@@ -120,7 +134,7 @@ pub fn handle_theme_selector_click(st: &mut AppState, col: u16, row: u16, term: 
                     // A second click on the highlighted preset commits it,
                     // giving the mouse the same save path as `Enter`.
                     let preset = selector_state.selected_preset();
-                    commit_preset(st, preset);
+                    commit_preset(state, st, preset).await;
                     return true;
                 }
                 let visible = theme_selector_visible_height(term);
@@ -222,18 +236,32 @@ pub fn render_theme_selector(frame: &mut ratatui::Frame, state: &ThemeSelectorSt
 /// Commits a preset: records it in configuration, applies it live, and persists
 /// it to `tui.toml`. Shared by the keyboard `Enter` path and the mouse click on
 /// the highlighted row (`#c-4`).
-fn commit_preset(st: &mut AppState, preset: ThemePreset) {
+///
+/// The rewrite re-reads, re-parses, and atomically replaces `tui.toml`, so it
+/// runs on the blocking pool with the state guard released: rendering, RPC
+/// message processing, and every other locker of the state never queue behind
+/// the disk (c-1).
+async fn commit_preset(
+    state: &Arc<Mutex<AppState>>,
+    mut st: MutexGuard<'_, AppState>,
+    preset: ThemePreset,
+) {
     st.tui_config.theme.name = Some(preset.as_str().to_string());
     st.apply_theme_preset(preset);
-    match crate::config::save_theme_preset(preset.as_str()) {
-        Ok(_) => {
+    drop(st);
+
+    let name = preset.as_str().to_string();
+    let saved = tokio::task::spawn_blocking(move || crate::config::save_theme_preset(&name))
+        .await
+        .map_err(|err| err.to_string())
+        .and_then(|result| result.map(|_| ()).map_err(|err| err.to_string()));
+
+    let mut st = state.lock().await;
+    match saved {
+        Ok(()) => {
             st.notify_success(active_t("notify.theme_saved").replacen("{}", preset.as_str(), 1))
         }
-        Err(err) => st.notify_error(active_t("notify.theme_save_failed").replacen(
-            "{}",
-            &err.to_string(),
-            1,
-        )),
+        Err(err) => st.notify_error(active_t("notify.theme_save_failed").replacen("{}", &err, 1)),
     }
 }
 
@@ -241,13 +269,24 @@ fn commit_preset(st: &mut AppState, preset: ThemePreset) {
 ///
 /// Navigation previews the highlighted preset immediately. `Enter` commits the
 /// choice and persists it to `tui.toml`; `Esc` restores the preset that was
-/// active when the dialog opened. Returns `true` when the event was consumed.
-pub fn handle_theme_selector_key(key: KeyEvent, st: &mut AppState, visible_height: usize) -> bool {
+/// active when the dialog opened. The guard is consumed here because the commit
+/// performs blocking filesystem work: the selector releases it, runs the save on
+/// the blocking pool, and re-acquires it only to record the outcome (c-1).
+/// Returns `true` when the event was consumed.
+pub async fn handle_theme_selector_key(
+    key: KeyEvent,
+    state: &Arc<Mutex<AppState>>,
+    mut st: MutexGuard<'_, AppState>,
+    visible_height: usize,
+) -> bool {
     let Some(mut selector_state) = st.theme_selector.take() else {
         return false;
     };
 
-    if selector_state.selector.handle_nav_key(key, visible_height) {
+    if selector_state
+        .selector
+        .handle_nav_key(key, &st.tui_config.input, visible_height)
+    {
         let preset = selector_state.selected_preset();
         st.apply_theme_preset(preset);
         st.theme_selector = Some(selector_state);
@@ -261,7 +300,7 @@ pub fn handle_theme_selector_key(key: KeyEvent, st: &mut AppState, visible_heigh
         }
         KeyCode::Enter | KeyCode::Char(' ') => {
             let preset = selector_state.selected_preset();
-            commit_preset(st, preset);
+            commit_preset(state, st, preset).await;
         }
         _ => {
             st.theme_selector = Some(selector_state);
@@ -280,6 +319,18 @@ mod tests {
         KeyEvent::new(code, KeyModifiers::NONE)
     }
 
+    /// Drives one key press through the async selector entry point.
+    async fn press(state: &Arc<Mutex<AppState>>, code: KeyCode, visible: usize) -> bool {
+        let guard = state.lock().await;
+        handle_theme_selector_key(key(code), state, guard, visible).await
+    }
+
+    /// Drives one left click through the async selector entry point.
+    async fn click(state: &Arc<Mutex<AppState>>, col: u16, row: u16, term: Rect) -> bool {
+        let guard = state.lock().await;
+        handle_theme_selector_click(state, guard, col, row, term).await
+    }
+
     #[test]
     fn selector_opens_seeded_on_the_active_preset() {
         let state = ThemeSelectorState::new(ThemePreset::Catppuccin);
@@ -287,20 +338,25 @@ mod tests {
         assert_eq!(state.selected_preset(), ThemePreset::Catppuccin);
     }
 
-    #[test]
-    fn navigation_previews_and_escape_restores_the_original() {
+    #[tokio::test]
+    async fn navigation_previews_and_escape_restores_the_original() {
         let mut st = test_state();
         st.active_theme_preset = ThemePreset::TauqeDark;
         st.open_theme_selector();
+        let state = Arc::new(Mutex::new(st));
 
-        handle_theme_selector_key(key(KeyCode::Char('n')), &mut st, 5);
-        assert_eq!(st.active_theme_preset, ThemePreset::TauqeLight);
-        assert!(
-            st.theme_selector.is_some(),
-            "the dialog stays open while previewing"
-        );
+        press(&state, KeyCode::Char('n'), 5).await;
+        {
+            let st = state.lock().await;
+            assert_eq!(st.active_theme_preset, ThemePreset::TauqeLight);
+            assert!(
+                st.theme_selector.is_some(),
+                "the dialog stays open while previewing"
+            );
+        }
 
-        handle_theme_selector_key(key(KeyCode::Esc), &mut st, 5);
+        press(&state, KeyCode::Esc, 5).await;
+        let st = state.lock().await;
         assert_eq!(st.active_theme_preset, ThemePreset::TauqeDark);
         assert!(
             st.theme_selector.is_none(),
@@ -308,21 +364,23 @@ mod tests {
         );
     }
 
-    #[test]
-    fn unhandled_key_keeps_the_dialog_open() {
+    #[tokio::test]
+    async fn unhandled_key_keeps_the_dialog_open() {
         let mut st = test_state();
         st.open_theme_selector();
         let before = st.active_theme_preset;
+        let state = Arc::new(Mutex::new(st));
 
-        handle_theme_selector_key(key(KeyCode::Char('x')), &mut st, 5);
+        press(&state, KeyCode::Char('x'), 5).await;
+        let st = state.lock().await;
         assert!(st.theme_selector.is_some());
         assert_eq!(st.active_theme_preset, before);
     }
 
-    #[test]
-    fn handler_is_inert_without_an_open_dialog() {
-        let mut st = test_state();
-        assert!(!handle_theme_selector_key(key(KeyCode::Enter), &mut st, 5));
+    #[tokio::test]
+    async fn handler_is_inert_without_an_open_dialog() {
+        let state = Arc::new(Mutex::new(test_state()));
+        assert!(!press(&state, KeyCode::Enter, 5).await);
     }
 
     /// The body band keeps one row of air below the border title and one column
@@ -357,8 +415,8 @@ mod tests {
     /// Clicking a preset row selects exactly the preset painted on that row, so
     /// the drawn list and the hit-tested list can never drift apart
     /// (`#c-4`, Conventions §6.6).
-    #[test]
-    fn clicking_a_rendered_preset_row_selects_the_preset_drawn_on_it() {
+    #[tokio::test]
+    async fn clicking_a_rendered_preset_row_selects_the_preset_drawn_on_it() {
         use ratatui::backend::TestBackend;
         use ratatui::Terminal;
 
@@ -389,17 +447,16 @@ mod tests {
             expected.as_str()
         );
 
-        assert!(handle_theme_selector_click(
-            &mut st,
-            body.x + 5,
-            target_row,
-            term
-        ));
-        let selected = st
+        let state = Arc::new(Mutex::new(st));
+        assert!(click(&state, body.x + 5, target_row, term).await);
+        let selected = state
+            .lock()
+            .await
             .theme_selector
+            .as_ref()
             .expect("selection keeps the dialog open")
             .selected_preset();
         assert_eq!(selected, expected);
-        assert_eq!(st.active_theme_preset, expected);
+        assert_eq!(state.lock().await.active_theme_preset, expected);
     }
 }

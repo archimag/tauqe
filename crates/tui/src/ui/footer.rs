@@ -71,8 +71,8 @@ fn render_footer_with_engine(
         let spin = SPINNER_FRAMES[state.model.spinner_frame % SPINNER_FRAMES.len()];
 
         let (status_name, status_color) = match state.model.turn_phase {
-            Some(tauqe_protocol::TurnPhase::Discovery) => {
-                (active_t("status.discovery"), palette.status_info)
+            Some(tauqe_protocol::TurnPhase::Research) => {
+                (active_t("status.research"), palette.status_info)
             }
             Some(tauqe_protocol::TurnPhase::Proposal) => {
                 if state.model.status == TurnStatus::Thinking {
@@ -305,7 +305,7 @@ pub fn render_turn_phase_pipeline(
 ) -> Vec<Span<'static>> {
     let palette = engine.palette();
     let phases = [
-        (tauqe_protocol::TurnPhase::Discovery, "phase.discovery"),
+        (tauqe_protocol::TurnPhase::Research, "phase.research"),
         (tauqe_protocol::TurnPhase::Proposal, "phase.proposal"),
         (tauqe_protocol::TurnPhase::Staging, "phase.staging"),
         (
@@ -641,7 +641,7 @@ mod tests {
 
         // The autonomous-turn telemetry survives the transient notification ...
         assert!(
-            content.contains("Discovery"),
+            content.contains("Research"),
             "phase pipeline must remain visible next to a notification: {content:?}"
         );
         // ... while the notification is still rendered on the same status line.

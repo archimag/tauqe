@@ -251,14 +251,19 @@ pub struct ModelStreamResetEvent {
 /// Structured output carries the terminal outcome as an explicit object field
 /// instead of a `<success>` / `<error>` control tag. `status` is kept as the raw
 /// model-declared string so the decoding layer owns tolerant normalization,
-/// while `summary`, `message`, and `reason` carry the optional success summary,
-/// error text, or skip reason.
+/// while `commit_message`, `message`, and `reason` carry the optional success
+/// commit message, error text, or skip reason.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct StructuredOutcomeProposal {
     #[serde(default)]
     pub status: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub summary: Option<String>,
+    /// Git commit message of the change set declared by a successful outcome.
+    ///
+    /// The canonical property is `commit_message`; `summary` stays accepted as
+    /// the spelling an earlier revision emitted, so a stored transcript or a
+    /// cached response keeps decoding identically.
+    #[serde(default, alias = "summary", skip_serializing_if = "Option::is_none")]
+    pub commit_message: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub message: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -332,8 +337,16 @@ pub struct ModelResultProposal {
         skip_serializing_if = "Vec::is_empty"
     )]
     pub repo_searches: Vec<RepoSearchRequest>,
+    /// Canonical wire property of the internal documentation request.
+    ///
+    /// The canonical spelling is `tauqe_doc_requests`; `doc_requests` stays the
+    /// spelling an earlier revision emitted, so a stored transcript or a cached
+    /// response keeps decoding identically. Serialization emits the canonical
+    /// name alone, so the alias can never spread to a new response.
     #[serde(
         default,
+        rename = "tauqe_doc_requests",
+        alias = "doc_requests",
         deserialize_with = "deserialize_null_as_default",
         skip_serializing_if = "Vec::is_empty"
     )]
@@ -432,7 +445,7 @@ pub struct ModelErrorEvent {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TurnPhase {
-    Discovery,
+    Research,
     Proposal,
     Staging,
     Verification,
@@ -442,7 +455,7 @@ pub enum TurnPhase {
 impl std::fmt::Display for TurnPhase {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            TurnPhase::Discovery => f.write_str("discovery"),
+            TurnPhase::Research => f.write_str("research"),
             TurnPhase::Proposal => f.write_str("proposal"),
             TurnPhase::Staging => f.write_str("staging"),
             TurnPhase::Verification => f.write_str("verification"),
@@ -680,9 +693,9 @@ mod tests {
             "changes": [],
             "context_requests": [],
             "repo_searches": [],
-            "doc_requests": ["workflow", "git"],
+            "tauqe_doc_requests": ["workflow", "git"],
             "scratchpad": "Verified: parser fixed.",
-            "outcome": {"status": "success", "summary": "All checks passed", "message": null},
+            "outcome": {"status": "success", "commit_message": "All checks passed", "message": null},
             "blocked": null,
             "context_drops": [],
             "suggested_actions": []
@@ -698,13 +711,14 @@ mod tests {
         );
         let outcome = proposal.outcome.as_ref().expect("outcome proposal");
         assert_eq!(outcome.status, "success");
-        assert_eq!(outcome.summary.as_deref(), Some("All checks passed"));
+        assert_eq!(outcome.commit_message.as_deref(), Some("All checks passed"));
         assert!(outcome.message.is_none());
         assert!(outcome.reason.is_none());
         assert!(proposal.blocked.is_none());
 
         let json = serde_json::to_string(&proposal).unwrap();
-        assert!(json.contains("\"doc_requests\":[\"workflow\",\"git\"]"));
+        assert!(json.contains("\"tauqe_doc_requests\":[\"workflow\",\"git\"]"));
+        assert!(!json.contains("\"doc_requests\""), "{json}");
         assert!(json.contains("\"scratchpad\":\"Verified: parser fixed.\""));
         assert!(json.contains("\"status\":\"success\""));
         assert!(!json.contains("\"blocked\""));
@@ -714,13 +728,32 @@ mod tests {
         );
     }
 
+    /// The canonical wire property and its permanent alias are one field: a
+    /// payload written before the rename decodes identically, while serialization
+    /// emits the canonical spelling alone.
+    #[test]
+    fn test_model_result_proposal_doc_requests_canonical_spelling_and_alias() {
+        let canonical: ModelResultProposal =
+            serde_json::from_str(r#"{"message":"x","tauqe_doc_requests":["git"]}"#).unwrap();
+        let aliased: ModelResultProposal =
+            serde_json::from_str(r#"{"message":"x","doc_requests":["git"]}"#).unwrap();
+        assert_eq!(canonical.doc_requests, vec![DocTopic::Git]);
+        assert_eq!(aliased.doc_requests, canonical.doc_requests);
+
+        let encoded = serde_json::to_string(&aliased).unwrap();
+        assert!(
+            encoded.contains("\"tauqe_doc_requests\":[\"git\"]"),
+            "{encoded}"
+        );
+        assert!(!encoded.contains("\"doc_requests\""), "{encoded}");
+    }
     #[test]
     fn test_model_result_proposal_blocked_and_null_tolerance() {
         let raw = r#"{
             "message": "Cannot proceed",
             "changes": [],
             "context_requests": null,
-            "doc_requests": null,
+            "tauqe_doc_requests": null,
             "scratchpad": null,
             "outcome": null,
             "blocked": {
@@ -782,7 +815,7 @@ mod tests {
     fn test_structured_outcome_proposal_skip_and_roundtrip() {
         let proposal = StructuredOutcomeProposal {
             status: "skip".to_string(),
-            summary: None,
+            commit_message: None,
             message: None,
             reason: Some("Task already satisfied".to_string()),
         };
@@ -793,16 +826,22 @@ mod tests {
         let json = serde_json::to_string(&proposal).unwrap();
         assert!(json.contains("\"status\":\"skip\""));
         assert!(json.contains("\"reason\":\"Task already satisfied\""));
-        assert!(!json.contains("\"summary\""));
+        assert!(!json.contains("\"commit_message\""));
         assert!(!json.contains("\"message\""));
 
         let de: StructuredOutcomeProposal = serde_json::from_str(&json).unwrap();
         assert_eq!(de, proposal);
 
+        // The pre-rename spelling still decodes through the declared alias, so a
+        // stored transcript keeps replaying identically.
+        let legacy: StructuredOutcomeProposal =
+            serde_json::from_str(r#"{"status":"success","summary":"Legacy payload"}"#).unwrap();
+        assert_eq!(legacy.commit_message.as_deref(), Some("Legacy payload"));
+
         // Also test "skipped" alias variant
         let proposal_skipped = StructuredOutcomeProposal {
             status: "skipped".to_string(),
-            summary: None,
+            commit_message: None,
             message: None,
             reason: Some("Step not needed".to_string()),
         };
@@ -811,8 +850,7 @@ mod tests {
         // Backwards compatibility: empty/minimal JSON
         let minimal: StructuredOutcomeProposal = serde_json::from_str("{}").unwrap();
         assert_eq!(minimal.status, "");
-        assert_eq!(minimal.summary, None);
-        assert_eq!(minimal.message, None);
+        assert_eq!(minimal.commit_message, None);
         assert_eq!(minimal.reason, None);
         assert!(!minimal.is_skip());
     }
@@ -1086,6 +1124,6 @@ mod tests {
         assert!(with_outcome.changes.is_empty());
         let outcome = with_outcome.outcome.expect("outcome proposal");
         assert_eq!(outcome.status, "success");
-        assert_eq!(outcome.summary.as_deref(), Some("All checks passed"));
+        assert_eq!(outcome.commit_message.as_deref(), Some("All checks passed"));
     }
 }

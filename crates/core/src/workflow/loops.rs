@@ -3,7 +3,7 @@
 //! This module declares the concrete [`Task`] implementations used by the
 //! workflow execution modes:
 //!
-//! - [`AnswerEditLoop`] runs the full discovery/edit/healing cycle while
+//! - [`AnswerEditLoop`] runs the full research/edit/healing cycle while
 //!   allowing the model to answer without proposing edits or to emit new plan
 //!   definitions.
 //! - [`EditLoop`] runs the same cycle but requires at least one valid edit,
@@ -12,7 +12,7 @@
 //! Every task delegates the low-level cycling to the shared edit pipeline, so
 //! the tasks differ only in their acceptance contract, never in control flow.
 //! Keeping the phases inside one pipeline preserves a single source of truth
-//! for discovery, staging, and healing while the tasks stay declarative.
+//! for research, staging, and healing while the tasks stay declarative.
 
 use async_trait::async_trait;
 
@@ -23,7 +23,7 @@ use super::fsm::{
 };
 use super::task::{Task, TaskEnv};
 
-/// FSM task that runs a discovery/edit/healing cycle while allowing the model
+/// FSM task that runs a research/edit/healing cycle while allowing the model
 /// to answer without edits and to define new plans.
 pub struct AnswerEditLoop {
     prompt: String,
@@ -159,7 +159,7 @@ impl Task for EditLoop {
 
 /// Runs one bounded FSM turn through the shared edit pipeline.
 ///
-/// Every task delegates its low-level cycling here so discovery, staging, and
+/// Every task delegates its low-level cycling here so research, staging, and
 /// healing stay defined in a single place and each task remains declarative.
 async fn run_task_turn(prompt: &str, env: &mut TaskEnv<'_>) -> anyhow::Result<FsmTurnOutcome> {
     run_fsm_turn(
@@ -690,7 +690,7 @@ mod tests {
     async fn test_edit_loop_retry_keeps_the_retried_plan_rejection() {
         let (_dir, repo_root) = init_repo_with_target();
         // An established plan makes the corrective round's `save` an explicit
-        // mutation of stored work, which Develop mode refuses. The turn regime
+        // mutation of stored work, which REPL mode refuses. The turn regime
         // authorizes plan creation rather than plan update, so `save` is the
         // payload a corrective round can actually emit and have rejected.
         let existing = tauqe_protocol::Plan::from_parts(
@@ -704,6 +704,7 @@ mod tests {
                 id: "1".to_string(),
                 title: "Step 1".to_string(),
                 status: tauqe_protocol::PlanItemStatus::Todo,
+                files: vec!["src/step1.rs".to_string()],
                 ..Default::default()
             }],
         );
@@ -792,14 +793,14 @@ mod tests {
         // The merged outcome carries the rejection the corrective round produced.
         assert_eq!(out.plan_errors.len(), 1, "{:?}", out.plan_errors);
         assert!(
-            out.plan_errors[0].contains("Develop mode"),
+            out.plan_errors[0].contains("REPL mode"),
             "{:?}",
             out.plan_errors
         );
         let notice = out
             .plan_rejection_notice()
             .expect("a rejected mutation must produce a notice");
-        assert!(notice.contains("Develop mode"), "{notice}");
+        assert!(notice.contains("REPL mode"), "{notice}");
 
         // The diagnostic reaches the recorded history, so the next round's
         // prompt carries the exact cause the model must repair.
@@ -818,7 +819,7 @@ mod tests {
             messages
                 .iter()
                 .any(|message| message.contains("Plan mutation rejected")
-                    && message.contains("Develop mode")),
+                    && message.contains("REPL mode")),
             "the rejection must reach the recorded history: {messages:?}"
         );
 

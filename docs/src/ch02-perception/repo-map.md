@@ -12,7 +12,7 @@ mistake a contour for a contract.
 ### 1.1 Orientation without a repository
 
 A model that cannot see what exists cannot ask for the right file. Attaching the
-whole repository is impossible; attaching nothing leaves discovery blind, because
+whole repository is impossible; attaching nothing leaves research blind, because
 the model does not know which paths are worth requesting. The map fills that gap:
 it names the files and the declarations inside them, so the next request is aimed
 instead of guessed.
@@ -57,7 +57,7 @@ declaration.
 - **Compact directory outline** — the `<repo_dirs>` folder tree rendered instead of
   the eager map when the eager map is disabled.
 - **Targeted outline** — the symbol map of one requested subtree, rendered during
-  discovery.
+  research.
 
 ### 2.2 Symbols
 
@@ -132,7 +132,7 @@ only regular files reach the extractor.
 ### 3.4 Targeted outline
 
 When the eager map is disabled, or when a subsystem is too deep to read from the
-global outline, discovery requests a targeted outline with
+global outline, research requests a targeted outline with
 `<repo_map path="crates/core" />`.
 
 - The path is a repository-relative prefix matched on whole components, so
@@ -144,7 +144,7 @@ global outline, discovery requests a targeted outline with
   the symbols of the subsystem under inspection.
 - An unknown prefix yields an empty outline with an explanatory block instead of a
   repository-wide map.
-- At most three distinct targeted outlines are honored per discovery round.
+- At most three distinct targeted outlines are honored per research round.
 
 ### 3.5 Eager map versus compact directory outline
 
@@ -169,9 +169,9 @@ reads code contours or folder layout, never both.
 ### 3.6 Stability across a turn
 
 The eager map is generated once for a turn and frozen. Regenerating it after
-discovery would drop the files discovery just added and rewrite thousands of
+research would drop the files research just added and rewrite thousands of
 cached prompt tokens, so the map is part of the stable prefix. Targeted outlines
-requested during discovery are round feedback, not a new map.
+requested during research are round feedback, not a new map.
 
 ---
 
@@ -198,7 +198,7 @@ requested during discovery are round feedback, not a new map.
 
 - [The Context Model](context-model.md) — the working set the map
   complements and the context files the map excludes.
-- [Discovery Engine](discovery-engine.md) — where targeted outlines are requested
+- [Research Engine](research-engine.md) — where targeted outlines are requested
   and bounded.
 - [The Autonomous Bounded Turn FSM](../ch01-foundations/bounded-turn-fsm.md) —
   how the outline stays byte-stable across rounds.

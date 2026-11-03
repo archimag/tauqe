@@ -16,10 +16,10 @@ pub mod git;
 pub mod history;
 pub mod locale;
 pub mod mockups;
+pub mod outer_docs;
 pub mod plan;
 pub mod prompt;
 pub mod providers;
-pub mod refs;
 // The Tree-sitter repository map is deterministic substrate and now lives in
 // `tauqe-tools`, so `crate::repomap` resolves through this re-export while the
 // transition lasts.

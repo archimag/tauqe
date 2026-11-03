@@ -452,7 +452,7 @@ pub static REPL_COMMAND_MAP: CommandMap<ReplAction> = CommandMap::new(&[
     ),
 ]);
 
-/// Viewport-exclusive chords of the Develop tab.
+/// Viewport-exclusive chords of the REPL tab.
 ///
 /// The bare letter `v` belongs to this map alone: the prompt editor must insert
 /// every printable character unconditionally, so a bare letter can never be a
@@ -752,8 +752,20 @@ pub async fn handle_repl_key(
             // replaced, exactly as the dialog launch paths restore through
             // `start_turn` (Conventions §3, c-1).
             let snapshot = TurnLaunchSnapshot::capture(&st);
-            if let Some(prompt) = st.take_prompt() {
+            if let Some((prompt, history_job)) = st.take_prompt() {
                 drop(st);
+                // The history write is blocking file I/O: creating the parent
+                // directory, appending the serialized line, and rewriting the
+                // whole file atomically when the 1000-entry cap trips. It runs
+                // on the blocking pool with the state guard released, so the
+                // event-loop thread never parks on the history file, and the
+                // main loop serializes event handling, so awaiting the job keeps
+                // the appended lines in their strict order (c-1).
+                if let Some(job) = history_job {
+                    // History persistence is best-effort: a panicking write task
+                    // never aborts the turn that is about to start.
+                    let _ = tokio::task::spawn_blocking(move || job.write()).await;
+                }
                 let params = ModelAskParams::Prompt {
                     text: prompt.clone(),
                 };
@@ -1345,7 +1357,7 @@ mod tests {
         }
     }
 
-    /// Proves the dedicated inspector chord reaches the audit from the prompt and
+    /// Proves the REPL resolver honours the configured keyboard layout for
     /// from the Viewport under either command-modifier assignment (c-1).
     ///
     /// The chord is a command rather than a buffer edit, so opening the audit
@@ -1724,6 +1736,11 @@ mod viewport_scroll_tests {
             error: None,
             hunks: vec![StreamingHunk {
                 hunk_index: 0,
+                old_start: 1,
+                old_lines: 1,
+                new_start: 1,
+                new_lines: 1,
+                context_hint: None,
                 old_text: "let a = 1;".to_string(),
                 new_text: "let a = 2;".to_string(),
             }],
@@ -1814,7 +1831,7 @@ mod viewport_scroll_tests {
         assert_eq!(model.scroll, 1);
     }
 
-    /// Proves the Develop handler carries the configured keyboard layout into
+    /// Proves the REPL handler carries the configured keyboard layout into
     /// chord resolution, so the Viewport answers to a Cyrillic press exactly as
     /// it answers to the Latin chord (c-1, c-2).
     #[tokio::test]

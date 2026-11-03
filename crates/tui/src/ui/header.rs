@@ -182,6 +182,11 @@ fn tab_label(
 }
 
 /// Top header: project name -> tabs -> model selector & tools (Help).
+///
+/// The header is chrome: navigation, the active model chip, and the Help button.
+/// The work a running turn declares (`TurnWorkContext`) is projected by the
+/// REPL work marker, which is its single renderer, so the header never
+/// duplicates the running task or its queue position.
 pub fn render_header(frame: &mut ratatui::Frame, state: &mut AppState, area: Rect) {
     let engine = current_engine();
     render_header_with_engine(frame, state, area, &engine);
@@ -204,7 +209,7 @@ fn render_header_with_engine(
 
     // 1. Determine Right-Side configuration with guaranteed priority. The Help
     // button advertises the real binding (primary-modifier chord) rather than `?`,
-    // which would be typed literally into the Develop prompt.
+    // which would be typed literally into the REPL prompt.
     let help_hint = crate::app::help_open_hint(state.tui_config.input.primary_modifier);
     let help_label = state.i18n.t("header.help").to_string();
     let (max_model_len, help_text): (usize, String) = if inner_header_width >= 100 {
@@ -575,6 +580,7 @@ mod tests {
             prompt_modal: None,
             notification: None,
             diff_inspector: None,
+            diff_audit: None,
             turn_started_at: None,
             server_disconnected: None,
             server_log_path: std::path::PathBuf::from(".tauqe/server.log"),
@@ -584,6 +590,8 @@ mod tests {
             terminal_focused: true,
             shift_tip_shown: false,
             model_choice: crate::app::ModelChoice::default(),
+            model_choice_revision: 1,
+            model_display_revision: 0,
             running_model: None,
             discussion_focus: tauqe_protocol::DiscussionFocus::None,
             active_theme_preset: crate::theme::presets::ThemePreset::TauqeDark,

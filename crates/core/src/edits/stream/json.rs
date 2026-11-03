@@ -5,8 +5,8 @@ use std::path::PathBuf;
 use tauqe_protocol::{EditFileOp, EditFileStatus, EditOperation, StructuredChangeProposal};
 
 use super::{
-    normalize_hunk, resolve_path, EditStreamFilter, OwnedAnchor, StagingSimulator,
-    TRUNCATED_EDIT_DIAGNOSTIC,
+    hunk_event, normalize_hunk, resolve_path, EditStreamFilter, HunkCoordinates, OwnedAnchor,
+    StagingSimulator, TRUNCATED_EDIT_DIAGNOSTIC,
 };
 use crate::edits::staging::AnchorEdit;
 use crate::providers::StreamEvent;
@@ -299,12 +299,15 @@ impl JsonStreamFilter {
                 self.open_file(&resolved, EditFileOp::Create, events);
                 let hunk_index = self.next_hunk_index(&resolved);
                 let content = normalize_hunk(&content);
-                events.push(StreamEvent::EditHunk {
-                    path: resolved.clone(),
+                // A created file has no old side, so the hunk names only the
+                // lines the payload introduces.
+                events.push(hunk_event(
+                    &resolved,
                     hunk_index,
-                    old_text: String::new(),
-                    new_text: content.clone(),
-                });
+                    HunkCoordinates::whole_file(None, &content),
+                    String::new(),
+                    content.clone(),
+                ));
                 self.staging.overwrite(&resolved, content);
                 self.file_hunk_counts.insert(resolved, hunk_index + 1);
             }
@@ -315,12 +318,16 @@ impl JsonStreamFilter {
                 let new_content = normalize_hunk(&content);
                 match self.staging.current_content(&resolved) {
                     Ok(old_text) => {
-                        events.push(StreamEvent::EditHunk {
-                            path: resolved.clone(),
+                        // A whole-file payload replaces the file from its first
+                        // line to its last one, so both sides are counted from
+                        // the content the preview received.
+                        events.push(hunk_event(
+                            &resolved,
                             hunk_index,
+                            HunkCoordinates::whole_file(Some(&old_text), &new_content),
                             old_text,
-                            new_text: new_content.clone(),
-                        });
+                            new_content.clone(),
+                        ));
                         self.staging.overwrite(&resolved, new_content);
                         self.file_hunk_counts.insert(resolved, hunk_index + 1);
                     }
@@ -362,14 +369,15 @@ impl JsonStreamFilter {
                 let hunk_index = self.next_hunk_index(&resolved);
                 let old_text = normalize_hunk(&old_text);
                 let new_text = normalize_hunk(&new_text);
-                events.push(StreamEvent::EditHunk {
-                    path: resolved.clone(),
-                    hunk_index,
-                    old_text: old_text.clone(),
-                    new_text: new_text.clone(),
-                });
                 match self.staging.apply_hunk(&resolved, &old_text, &new_text) {
-                    Ok(()) => {
+                    Ok(coordinates) => {
+                        events.push(hunk_event(
+                            &resolved,
+                            hunk_index,
+                            coordinates,
+                            old_text,
+                            new_text,
+                        ));
                         self.file_hunk_counts.insert(resolved, hunk_index + 1);
                     }
                     Err(message) => self.fail_open_file(resolved, message, hunk_index + 1, events),
@@ -405,18 +413,21 @@ impl JsonStreamFilter {
                     self.staging.apply_anchor_batch(&resolved, &batch)
                 };
                 match outcome {
-                    Ok(replaced) => {
+                    Ok(previews) => {
                         // The snapshot text of the addressed range is the removed
-                        // side of the diff, so the preview shows an honest
-                        // replacement instead of a bare addition.
-                        let old_text = replaced.last().cloned().unwrap_or_default();
-                        events.push(StreamEvent::EditHunk {
-                            path: resolved.clone(),
-                            hunk_index,
-                            old_text,
-                            new_text: replacement,
-                        });
-                        self.file_hunk_counts.insert(resolved, hunk_index + 1);
+                        // side of the diff, and its coordinates are the lines the
+                        // anchors decoded to, so the preview shows an honest
+                        // replacement at a real place instead of a bare addition.
+                        if let Some(preview) = previews.last() {
+                            events.push(hunk_event(
+                                &resolved,
+                                hunk_index,
+                                preview.coordinates.clone(),
+                                preview.replaced.clone(),
+                                replacement,
+                            ));
+                            self.file_hunk_counts.insert(resolved, hunk_index + 1);
+                        }
                     }
                     Err(message) => self.fail_open_file(resolved, message, hunk_index, events),
                 }
@@ -893,6 +904,7 @@ mod tests {
                     hunk_index,
                     old_text,
                     new_text,
+                    ..
                 } => edits.push(format!(
                     "hunk:{}:{}:{:?}:{:?}",
                     path, hunk_index, old_text, new_text
@@ -1328,6 +1340,19 @@ mod tests {
             vec![(0, "beta".to_string(), "BETA\n".to_string())]
         );
         assert_eq!(completions(&events), vec![(EditFileStatus::Ok, 1)]);
+        // The anchored range names the second line of the file, so the streamed
+        // event states exactly that instead of leaving the coordinates unknown.
+        assert!(events.iter().any(|event| matches!(
+            event,
+            StreamEvent::EditHunk {
+                old_start: 2,
+                old_lines: 1,
+                new_start: 2,
+                new_lines: 1,
+                context_hint: Some(hint),
+                ..
+            } if hint == "alpha"
+        )));
         assert_eq!(
             events
                 .iter()
@@ -1511,6 +1536,44 @@ mod tests {
             elapsed < std::time::Duration::from_secs(20),
             "streaming a {} byte payload took {elapsed:?}; locating `message` must follow the appended bytes",
             input.len()
+        );
+    }
+    #[test]
+    fn test_replacement_reports_the_lines_it_addresses() {
+        let path = "a.rs";
+        let mut filter = JsonStreamFilter::new(vec![path.to_string()], std::env::temp_dir())
+            .with_staged_contents(HashMap::from([(
+                path.to_string(),
+                "alpha\nbeta\ngamma\n".to_string(),
+            )]));
+        let input = serde_json::json!({
+            "message": "Rewrite",
+            "changes": [{
+                "op": "replace",
+                "path": path,
+                "old_text": "beta\n",
+                "new_text": "BETA\nBETA2\n",
+            }],
+        })
+        .to_string();
+
+        let mut events = filter.push_chunk(&input);
+        events.extend(Box::new(filter).finish());
+
+        // The replaced text sits on the second line and yields two lines, so the
+        // streamed hunk names those coordinates instead of an unknown position.
+        assert!(
+            events.iter().any(|event| matches!(
+                event,
+                StreamEvent::EditHunk {
+                    old_start: 2,
+                    old_lines: 1,
+                    new_start: 2,
+                    new_lines: 2,
+                    ..
+                }
+            )),
+            "the hunk must carry the resolved coordinates: {events:?}"
         );
     }
 }

@@ -506,4 +506,38 @@ mod tests {
 
         assert_eq!(ignored, vec!["local-only/secret.txt".to_string()]);
     }
+
+    #[test]
+    fn test_worktree_snapshot_reads_the_destination_of_a_repository_rename() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path();
+
+        std::fs::write(path.join("old.rs"), "fn main() {}\n").unwrap();
+        init_repository(Some(path), true, GitHooks::Bypass).unwrap();
+
+        // Rename detection decides whether Git reports one `R` record or a
+        // separate deletion and addition, so pin it on the repository instead
+        // of inheriting the developer's global configuration.
+        run_git(Some(path), &["config", "status.renames", "true"]).unwrap();
+
+        let before = snapshot_worktree(path);
+        assert!(
+            before.is_empty(),
+            "a clean tree reports nothing: {before:?}"
+        );
+
+        // `git mv` through the real executable is the authority on the NUL
+        // order: with `-z` Git emits the destination first and the source
+        // second, so the snapshot keys the path that exists afterwards and
+        // drops the one that does not.
+        run_git(Some(path), &["mv", "old.rs", "new.rs"]).unwrap();
+
+        let after = snapshot_worktree(path);
+        assert_eq!(after.get("new.rs").map(String::as_str), Some("R"));
+        assert!(!after.contains_key("old.rs"));
+        assert_eq!(
+            changed_worktree_paths(&before, &after),
+            vec!["new.rs".to_string()]
+        );
+    }
 }

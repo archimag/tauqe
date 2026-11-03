@@ -5,6 +5,7 @@ use std::sync::Arc;
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 
+use crate::paths::is_excluded_path;
 use classify::{classify_repo_path, RepoPathKind, SymlinkStatus, SymlinkTarget};
 
 pub mod classify;
@@ -126,7 +127,9 @@ pub fn generate_repo_map(
 
 /// Generates a semantic repository map outline formatted within `token_budget` using a custom extractor.
 ///
-/// 1. Excludes files already in active context (`context_files`).
+/// 1. Excludes files already in active context (`context_files`) and drops paths
+///    under a service directory (`.git`, `.tauqe`, `target`, `node_modules`), so
+///    the symbol map reports the same repository shape as the directory outline.
 /// 2. Queries the provided `SymbolExtractor` for supported code files.
 /// 3. Discovers all Git files missing from the symbol outline and includes them in the map.
 /// 4. Formats symbols and file paths into a coherent outline with adaptive token budgeting.
@@ -145,6 +148,11 @@ pub fn generate_repo_map_with_extractor(
 
         for path in available_files {
             if context_set.contains(path.as_str()) {
+                continue;
+            }
+            // A service directory is not part of the navigable repository shape,
+            // so the symbol map and the directory outline drop the same paths.
+            if is_excluded_path(path.as_str()) {
                 continue;
             }
             match classify_repo_path(repo_root, path.as_str()) {
@@ -841,6 +849,43 @@ mod tests {
         assert!(crate::tokens::estimate_tokens(&tight) <= 2);
     }
 
+    #[test]
+    fn test_generate_repo_map_excludes_service_directories() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::create_dir_all(root.join("target/debug")).unwrap();
+        std::fs::create_dir_all(root.join("node_modules/pkg")).unwrap();
+        std::fs::write(root.join("src/lib.rs"), "pub fn kept_fn() {}\n").unwrap();
+        std::fs::write(
+            root.join("target/debug/generated.rs"),
+            "pub fn generated_fn() {}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("node_modules/pkg/index.rs"),
+            "pub fn dependency_fn() {}\n",
+        )
+        .unwrap();
+
+        let available = vec![
+            "src/lib.rs".to_string(),
+            "target/debug/generated.rs".to_string(),
+            "node_modules/pkg/index.rs".to_string(),
+        ];
+
+        let map = generate_repo_map(root, &available, &[], 1000).unwrap();
+        assert!(map.contains("src/lib.rs"));
+        assert!(map.contains("pub fn kept_fn"));
+        assert!(!map.contains("generated.rs"));
+        assert!(!map.contains("pub fn generated_fn"));
+        assert!(!map.contains("node_modules"));
+        assert!(!map.contains("pub fn dependency_fn"));
+
+        // The directory outline draws from the same selection boundary, so both
+        // generators describe one repository shape from the same input.
+        assert_eq!(dirs::generate_repo_dirs(&available), "src\n");
+    }
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_generate_repo_map_on_multi_thread_runtime() {
         let dir = tempfile::tempdir().unwrap();

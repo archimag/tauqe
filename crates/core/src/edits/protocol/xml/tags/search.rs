@@ -25,17 +25,17 @@ fn normalized_path(raw: Option<String>) -> String {
         .to_string()
 }
 
-/// Parses all `<repo_search>` tags into typed search requests.
-///
-/// Supports aliases for attributes:
-/// - `path`: `path`, `dir` (defaults to empty string for repository root)
-/// - `regex`: `regex`, `pattern`, `query`
-pub(crate) fn parse_repo_search_tags(text: &str) -> Vec<RepoSearchRequest> {
+/// Parses all `<repo_search>` tags into typed search requests, reusing a
+/// precomputed markdown code index.
+pub(crate) fn parse_repo_search_tags_with_fences(
+    text: &str,
+    fences: &super::CodeFences,
+) -> Vec<RepoSearchRequest> {
     let Some(spec) = tag_spec() else {
         return Vec::new();
     };
     let mut requests = Vec::new();
-    for found in engine::iter_tags(text, spec) {
+    for found in engine::iter_tags_with_fences(text, spec, fences) {
         let path = normalized_path(found.attr_any(&["path", "dir"]));
         let regex = found
             .attr_any(&["regex", "pattern", "query"])
@@ -47,6 +47,15 @@ pub(crate) fn parse_repo_search_tags(text: &str) -> Vec<RepoSearchRequest> {
         }
     }
     requests
+}
+
+/// Parses all `<repo_search>` tags into typed search requests.
+///
+/// Supports aliases for attributes:
+/// - `path`: `path`, `dir` (defaults to empty string for repository root)
+/// - `regex`: `regex`, `pattern`, `query`
+pub(crate) fn parse_repo_search_tags(text: &str) -> Vec<RepoSearchRequest> {
+    parse_repo_search_tags_with_fences(text, &super::CodeFences::find(text))
 }
 
 #[cfg(test)]

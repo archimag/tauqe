@@ -13,7 +13,7 @@ use super::engine::{
 };
 use super::marker::{normalize_marked_xml, restore_xml_literals};
 use super::prompt;
-use super::tags::{self, TerminalOutcome, VerifyRequest};
+use super::tags::{self, CodeFences, TerminalOutcome, VerifyRequest};
 use super::XmlEditProtocol;
 
 /// Reports whether `marker` is a syntactically valid turn marker.
@@ -55,24 +55,29 @@ impl MarkedXmlEditProtocol {
         &self,
         base: &str,
         raw_text: &str,
-        parse: impl Fn(&str) -> T,
+        parse: impl Fn(&str, &CodeFences) -> T,
         is_empty: impl Fn(&T) -> bool,
     ) -> T {
         let normalized = normalize_marked_xml(raw_text, &self.marker, true);
-        self.tolerant_parse_normalized(base, &normalized, raw_text, parse, is_empty)
+        let fences = CodeFences::find(&normalized);
+        self.tolerant_parse_normalized(base, &normalized, raw_text, &fences, parse, is_empty)
     }
 
+    /// Runs the normalized pass of [`Self::tolerant_parse`] against `fences`.
     fn tolerant_parse_normalized<T>(
         &self,
         base: &str,
         normalized: &str,
         raw_text: &str,
-        parse: impl Fn(&str) -> T,
+        fences: &CodeFences,
+        parse: impl Fn(&str, &CodeFences) -> T,
         is_empty: impl Fn(&T) -> bool,
     ) -> T {
-        let parsed = parse(normalized);
+        let parsed = parse(normalized, fences);
         if is_empty(&parsed) && allows_unmarked_fallback(base) {
-            parse(raw_text)
+            // The raw text carries its own fence layout, so the fallback resolves
+            // an index of its own instead of reusing the normalized one.
+            parse(raw_text, &CodeFences::find(raw_text))
         } else {
             parsed
         }
@@ -83,85 +88,103 @@ impl MarkedXmlEditProtocol {
         Some(&self.marker)
     }
 
-    /// Extracts context requests from pre-normalized text.
-    pub fn parse_context_requests_normalized(&self, normalized: &str) -> Vec<ContextRequest> {
-        tags::parse_context_request_tags(normalized)
+    /// Extracts context requests from pre-normalized text and its code index.
+    pub fn parse_context_requests_normalized(
+        &self,
+        normalized: &str,
+        fences: &CodeFences,
+    ) -> Vec<ContextRequest> {
+        tags::parse_context_request_tags_with_fences(normalized, fences)
     }
 
     /// Extracts context requests strictly bound to the active turn marker.
     ///
-    /// Discovery requests mutate context and must not be triggered by unmarked
-    /// example tags in conversational text or source code.
+    /// Research requests mutate context and must not be triggered by unmarked tags in conversation or documentation.
     pub fn parse_context_requests(&self, raw_text: &str) -> Vec<ContextRequest> {
         let normalized = normalize_marked_xml(raw_text, &self.marker, true);
-        self.parse_context_requests_normalized(&normalized)
+        let fences = CodeFences::find(&normalized);
+        self.parse_context_requests_normalized(&normalized, &fences)
     }
 
     /// Extracts repository search requests from pre-normalized text.
     pub fn parse_repo_searches_normalized(
         &self,
         normalized: &str,
+        fences: &CodeFences,
     ) -> Vec<tauqe_protocol::RepoSearchRequest> {
-        tags::parse_repo_search_tags(normalized)
+        tags::parse_repo_search_tags_with_fences(normalized, fences)
     }
 
     /// Extracts repository search requests strictly bound to the active turn marker.
     pub fn parse_repo_searches(&self, raw_text: &str) -> Vec<tauqe_protocol::RepoSearchRequest> {
         let normalized = normalize_marked_xml(raw_text, &self.marker, true);
-        self.parse_repo_searches_normalized(&normalized)
+        let fences = CodeFences::find(&normalized);
+        self.parse_repo_searches_normalized(&normalized, &fences)
     }
 
     /// Reports whether the model requested the directory tree from pre-normalized text.
-    pub fn parse_repo_dirs_normalized(&self, normalized: &str) -> bool {
-        tags::parse_repo_dirs_tags(normalized)
+    pub fn parse_repo_dirs_normalized(&self, normalized: &str, fences: &CodeFences) -> bool {
+        tags::parse_repo_dirs_tags_with_fences(normalized, fences)
     }
 
     /// Reports whether the model requested the compact repository directory tree.
     ///
     /// The outline widens what the model can see, so the request must be bound to
-    /// the active turn marker like every other discovery command.
+    /// the active turn marker like every other research command.
     pub fn parse_repo_dirs(&self, raw_text: &str) -> bool {
         let normalized = normalize_marked_xml(raw_text, &self.marker, true);
-        self.parse_repo_dirs_normalized(&normalized)
+        let fences = CodeFences::find(&normalized);
+        self.parse_repo_dirs_normalized(&normalized, &fences)
     }
 
     /// Extracts targeted repository map requests from pre-normalized text.
-    pub fn parse_repo_maps_normalized(&self, normalized: &str) -> Vec<String> {
-        tags::parse_repo_map_tags(normalized)
+    pub fn parse_repo_maps_normalized(&self, normalized: &str, fences: &CodeFences) -> Vec<String> {
+        tags::parse_repo_map_tags_with_fences(normalized, fences)
     }
 
     /// Extracts targeted repository map requests strictly bound to the active turn marker.
     ///
     /// The outline widens what the model can see, so the request must be bound to
-    /// the active turn marker like every other discovery command.
+    /// the active turn marker like every other research command.
     pub fn parse_repo_maps(&self, raw_text: &str) -> Vec<String> {
         let normalized = normalize_marked_xml(raw_text, &self.marker, true);
-        self.parse_repo_maps_normalized(&normalized)
+        let fences = CodeFences::find(&normalized);
+        self.parse_repo_maps_normalized(&normalized, &fences)
     }
 
     /// Extracts directory listing requests from pre-normalized text.
-    pub fn parse_dir_lists_normalized(&self, normalized: &str) -> Vec<DirListRequest> {
-        tags::parse_dir_list_tags(normalized)
+    pub fn parse_dir_lists_normalized(
+        &self,
+        normalized: &str,
+        fences: &CodeFences,
+    ) -> Vec<DirListRequest> {
+        tags::parse_dir_list_tags_with_fences(normalized, fences)
     }
 
     /// Extracts directory listing requests strictly bound to the active turn marker.
     ///
     /// A listing widens what the model can see, so the request must be bound to
-    /// the active turn marker like every other discovery command.
+    /// the active turn marker like every other research command.
     pub fn parse_dir_lists(&self, raw_text: &str) -> Vec<DirListRequest> {
         let normalized = normalize_marked_xml(raw_text, &self.marker, true);
-        self.parse_dir_lists_normalized(&normalized)
+        let fences = CodeFences::find(&normalized);
+        self.parse_dir_lists_normalized(&normalized, &fences)
     }
 
     /// Extracts documentation topics from pre-normalized text.
-    pub fn parse_doc_requests_normalized(&self, normalized: &str) -> Vec<DocTopic> {
-        tags::parse_doc_request_tags(normalized)
+    pub fn parse_doc_requests_normalized(
+        &self,
+        normalized: &str,
+        fences: &CodeFences,
+    ) -> Vec<DocTopic> {
+        tags::parse_doc_request_tags_with_fences(normalized, fences)
     }
 
     /// Extracts documentation topics strictly bound to the active turn marker.
     pub fn parse_doc_requests(&self, raw_text: &str) -> Vec<DocTopic> {
         let normalized = normalize_marked_xml(raw_text, &self.marker, true);
-        self.parse_doc_requests_normalized(&normalized)
+        let fences = CodeFences::find(&normalized);
+        self.parse_doc_requests_normalized(&normalized, &fences)
     }
 
     /// Extracts a verification request from pre-normalized text with unmarked fallback.
@@ -169,12 +192,14 @@ impl MarkedXmlEditProtocol {
         &self,
         normalized: &str,
         raw_text: &str,
+        fences: &CodeFences,
     ) -> Option<VerifyRequest> {
         self.tolerant_parse_normalized(
             "verify",
             normalized,
             raw_text,
-            tags::extract_verify_request,
+            fences,
+            tags::extract_verify_request_with_fences,
             Option::is_none,
         )
     }
@@ -184,7 +209,7 @@ impl MarkedXmlEditProtocol {
         self.tolerant_parse(
             "verify",
             raw_text,
-            tags::extract_verify_request,
+            tags::extract_verify_request_with_fences,
             Option::is_none,
         )
     }
@@ -194,12 +219,14 @@ impl MarkedXmlEditProtocol {
         &self,
         normalized: &str,
         raw_text: &str,
+        fences: &CodeFences,
     ) -> Option<String> {
         self.tolerant_parse_normalized(
             "user_language",
             normalized,
             raw_text,
-            tags::extract_user_language,
+            fences,
+            tags::extract_user_language_with_fences,
             Option::is_none,
         )
     }
@@ -209,7 +236,7 @@ impl MarkedXmlEditProtocol {
         self.tolerant_parse(
             "user_language",
             raw_text,
-            tags::extract_user_language,
+            tags::extract_user_language_with_fences,
             Option::is_none,
         )
     }
@@ -218,8 +245,9 @@ impl MarkedXmlEditProtocol {
     pub fn parse_plan_tags_normalized(
         &self,
         normalized: &str,
+        fences: &CodeFences,
     ) -> (Vec<tags::ParsedPlanTag>, Vec<String>) {
-        tags::parse_plan_tags_with_diagnostics(normalized)
+        tags::parse_plan_tags_with_diagnostics_with_fences(normalized, fences)
     }
 
     /// Extracts plan tags strictly bound to the active turn marker.
@@ -228,12 +256,18 @@ impl MarkedXmlEditProtocol {
     /// in conversation or documentation.
     pub fn parse_plan_tags(&self, raw_text: &str) -> (Vec<tags::ParsedPlanTag>, Vec<String>) {
         let normalized = normalize_marked_xml(raw_text, &self.marker, true);
-        self.parse_plan_tags_normalized(&normalized)
+        let fences = CodeFences::find(&normalized);
+        self.parse_plan_tags_normalized(&normalized, &fences)
     }
 
     /// Extracts scratchpad notes from pre-normalized text, falling back to raw unmarked notes.
-    pub fn parse_scratchpad_normalized(&self, normalized: &str, raw_text: &str) -> Option<String> {
-        tags::extract_scratchpad(normalized)
+    pub fn parse_scratchpad_normalized(
+        &self,
+        normalized: &str,
+        raw_text: &str,
+        fences: &CodeFences,
+    ) -> Option<String> {
+        tags::extract_scratchpad_with_fences(normalized, fences)
             .map(|notes| restore_xml_literals(&notes, &self.marker))
             .or_else(|| tags::extract_scratchpad(raw_text))
     }
@@ -244,15 +278,21 @@ impl MarkedXmlEditProtocol {
     /// a reasoning model that dropped the suffix still keeps its working memory.
     pub fn parse_scratchpad(&self, raw_text: &str) -> Option<String> {
         let normalized = normalize_marked_xml(raw_text, &self.marker, true);
-        self.parse_scratchpad_normalized(&normalized, raw_text)
+        let fences = CodeFences::find(&normalized);
+        self.parse_scratchpad_normalized(&normalized, raw_text, &fences)
     }
 
     /// Extracts the terminal outcome from pre-normalized text.
-    pub fn parse_terminal_outcome_normalized(&self, normalized: &str) -> Option<TerminalOutcome> {
-        let outcome = tags::extract_terminal_outcome(normalized)?;
+    pub fn parse_terminal_outcome_normalized(
+        &self,
+        normalized: &str,
+        fences: &CodeFences,
+    ) -> Option<TerminalOutcome> {
+        let outcome = tags::extract_terminal_outcome_with_fences(normalized, fences)?;
         Some(match outcome {
-            TerminalOutcome::Success { summary } => TerminalOutcome::Success {
-                summary: summary.map(|s| restore_xml_literals(&s, &self.marker)),
+            TerminalOutcome::Success { commit_message } => TerminalOutcome::Success {
+                commit_message: commit_message
+                    .map(|text| restore_xml_literals(&text, &self.marker)),
             },
             TerminalOutcome::Error { message } => TerminalOutcome::Error {
                 message: restore_xml_literals(&message, &self.marker),
@@ -273,7 +313,8 @@ impl MarkedXmlEditProtocol {
     /// unmarked tags quoted in source code or explanations.
     pub fn parse_terminal_outcome(&self, raw_text: &str) -> Option<TerminalOutcome> {
         let normalized = normalize_marked_xml(raw_text, &self.marker, true);
-        self.parse_terminal_outcome_normalized(&normalized)
+        let fences = CodeFences::find(&normalized);
+        self.parse_terminal_outcome_normalized(&normalized, &fences)
     }
 
     /// Extracts a blocker or error message from pre-normalized text.
@@ -340,8 +381,10 @@ impl MarkedXmlEditProtocol {
         &self,
         normalized: &str,
         editable_paths: &[String],
+        fences: &CodeFences,
     ) -> ModelResult {
-        let mut result = XmlEditProtocol.parse_output(normalized, editable_paths);
+        let mut result =
+            XmlEditProtocol.parse_output_with_fences(normalized, editable_paths, fences);
         match &mut result {
             ModelResult::Answer { text } => {
                 // The answer text is derived from the same normalized payload, so
@@ -417,7 +460,8 @@ impl MarkedXmlEditProtocol {
 
     pub fn parse_output(&self, raw_text: &str, editable_paths: &[String]) -> ModelResult {
         let normalized = normalize_marked_xml(raw_text, &self.marker, true);
-        self.parse_output_normalized(&normalized, editable_paths)
+        let fences = CodeFences::find(&normalized);
+        self.parse_output_normalized(&normalized, editable_paths, &fences)
     }
 }
 
@@ -606,7 +650,7 @@ mod tests {
 
         let success_output = format!(
             "Implemented the feature.\n\
-            <success_{m} summary=\"All unit tests pass cleanly\" />\n\
+            <success_{m} commit_message=\"All unit tests pass cleanly\" />\n\
             Conversational outro.",
             m = marker
         );
@@ -614,7 +658,7 @@ mod tests {
         assert_eq!(
             outcome,
             TerminalOutcome::Success {
-                summary: Some("All unit tests pass cleanly".to_string()),
+                commit_message: Some("All unit tests pass cleanly".to_string()),
             }
         );
         let cleaned_success = proto.clean_assistant_text(&success_output);
@@ -653,7 +697,7 @@ mod tests {
 
         let output = format!(
             "Here is documentation: `<success>example</success>` and `<error message=\"x\" />`.\n\
-            <success_{m} summary=\"Real outcome\" />\n\
+            <success_{m} commit_message=\"Real outcome\" />\n\
             Done.",
             m = marker
         );
@@ -662,7 +706,7 @@ mod tests {
         assert_eq!(
             outcome,
             TerminalOutcome::Success {
-                summary: Some("Real outcome".to_string()),
+                commit_message: Some("Real outcome".to_string()),
             }
         );
 
@@ -680,7 +724,7 @@ mod tests {
         let output = concat!(
             "Discussing outcomes:\n",
             "<",
-            "success summary=\"Example success\" />\n",
+            "success commit_message=\"Example success\" />\n",
             "<",
             "error message=\"Example blocker\" />\n",
             "<",
@@ -765,7 +809,7 @@ let s = \"clean\";\n\
 
         let output = format!(
             "Searching example in discussion: `<repo_search path=\"crates/core\" regex=\"fn old\" />`.\n\
-            Real discovery search:\n\
+            Real research search:\n\
             <repo_search_{m} path=\"crates/core\" regex=\"fn execute\" />\n\
             Done.",
             m = marker

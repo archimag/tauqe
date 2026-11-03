@@ -95,14 +95,14 @@ pub async fn handle_review_start(mut req: Request, state: &Arc<AppState>) -> Res
         };
 
         // The pattern expansion is bounded by the same context budgets
-        // that govern discovery, so one wide glob cannot drag an unbounded
+        // that govern research, so one wide glob cannot drag an unbounded
         // file set into the audit window.
         (
             provider,
             model,
             reasoning_effort,
             WindowBudgets {
-                files_tokens: cfg.context.files_token_budget,
+                files_tokens: cfg.context.token_budget,
             },
         )
     };
@@ -806,7 +806,9 @@ async fn start_preset_review(
         if post_analysis_mode == PostAnalysisMode::Automatic && report.is_success() {
             let root = repo_root.as_path();
             let guard = operation.as_ref();
-            match run_review_post_analysis(&state, root, &final_session, guard, true).await {
+            // No developer is present in this contour, so the automatic
+            // classification runs the base rung of the architect ladder.
+            match run_review_post_analysis(&state, root, &final_session, None, guard, true).await {
                 Ok(analyzed) => final_session = analyzed,
                 Err(err) => {
                     // The findings stay durable and published by the

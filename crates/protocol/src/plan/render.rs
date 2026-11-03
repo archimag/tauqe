@@ -107,6 +107,10 @@ impl Plan {
                 if !readonly_files.is_empty() {
                     out.push_str(&format!("{indent}    readonly_files: {readonly_files}\n"));
                 }
+                let outer_docs = inline_list(&item.outer_docs);
+                if !outer_docs.is_empty() {
+                    out.push_str(&format!("{indent}    outer_docs: {outer_docs}\n"));
+                }
                 let depends_on = inline_list(&item.depends_on);
                 if !depends_on.is_empty() {
                     out.push_str(&format!("{indent}    depends_on: {depends_on}\n"));

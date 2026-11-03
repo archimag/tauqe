@@ -1,12 +1,12 @@
 pub mod batch;
 pub mod common;
-pub mod discovery;
 pub mod execution;
 pub mod fsm;
 pub mod git_policy;
 pub mod implementation;
 pub mod loops;
 pub mod policy;
+pub mod research;
 pub(crate) mod retry;
 pub mod task;
 pub(crate) mod verification;

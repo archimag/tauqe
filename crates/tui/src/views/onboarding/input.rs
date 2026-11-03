@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use crossterm::event::{KeyCode, KeyEvent};
 use tauqe_protocol::methods;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, MutexGuard};
 
 use crate::app::{AppState, OnboardingStep, ViewMode};
 use crate::i18n::active_t;
@@ -15,9 +15,38 @@ fn fill(template: &str, args: &[&str]) -> String {
         .fold(template.to_string(), |acc, arg| acc.replacen("{}", arg, 1))
 }
 
+/// Outcome of the blocking workstation persistence job.
+///
+/// The job owns both filesystem steps — the `tui.toml` rewrite and the re-read
+/// of the written file — so the apply phase performs no I/O and only selects
+/// the message the outcome resolves to (c-1).
+enum WorkstationSaveOutcome {
+    /// The configuration was written and the written file re-read cleanly.
+    Saved {
+        path: String,
+        config: crate::config::TuiConfig,
+    },
+    /// The write itself failed; `target` is the path it would have replaced.
+    SaveFailed { target: String, error: String },
+    /// The write succeeded but the written file could not be re-read.
+    LoadFailed { path: String, error: String },
+}
+
 /// Persists the chosen workstation settings and reloads them, advancing to the
 /// Ready step only when both the write and the re-read succeed.
-fn save_workstation_config(st: &mut AppState, modifier: crate::config::PrimaryModifier) {
+///
+/// The guard is consumed here because the persistence is blocking filesystem
+/// work: `save_tui_config_full` re-reads, re-parses, and atomically rewrites
+/// `tui.toml`, and `TuiConfig::load_checked` reads and parses the written file
+/// again. Both run as one blocking-pool job with the application state guard
+/// released, and the result is applied after the guard is re-acquired, so
+/// rendering, RPC message processing, and every other locker of the state never
+/// queue behind the disk (c-1).
+async fn save_workstation_config(
+    state: &Arc<Mutex<AppState>>,
+    st: MutexGuard<'_, AppState>,
+    modifier: crate::config::PrimaryModifier,
+) {
     // The two command chords are paired: whichever key becomes the primary
     // modifier flips the meta modifier to the other key, so `C-x` and `M-x`
     // never collide on one physical key (Conventions §5.2).
@@ -25,40 +54,63 @@ fn save_workstation_config(st: &mut AppState, modifier: crate::config::PrimaryMo
         crate::config::PrimaryModifier::Ctrl => crate::config::MetaModifier::Alt,
         crate::config::PrimaryModifier::Alt => crate::config::MetaModifier::Ctrl,
     };
-    let saved = crate::config::save_tui_config_full(
-        st.onboarding.chosen_layout,
-        st.onboarding.chosen_langmap.clone(),
-        modifier,
-        meta,
-    );
-    match saved {
-        Ok(path) => match crate::config::TuiConfig::load_checked() {
-            Ok(cfg) => {
-                st.tui_config = cfg;
-                st.onboarding.has_tui_config = true;
-                st.onboarding.set_status(fill(
-                    &active_t("notify.onboarding_saved"),
-                    &[
-                        &path.display().to_string(),
-                        modifier.emacs_prefix(),
-                        meta.emacs_prefix(),
-                    ],
-                ));
-                st.onboarding.step = st.onboarding.next_step();
-                st.onboarding.selected_index = 0;
-            }
-            Err(err) => {
-                st.onboarding.set_error(fill(
-                    &active_t("notify.onboarding_load_failed"),
-                    &[&path.display().to_string(), &err.to_string()],
-                ));
-            }
+    let layout = st.onboarding.chosen_layout;
+    let langmap = st.onboarding.chosen_langmap.clone();
+    let target = st.onboarding.default_tui_config_path.clone();
+    drop(st);
+
+    let saved = tokio::task::spawn_blocking(move || {
+        match crate::config::save_tui_config_full(layout, langmap, modifier, meta) {
+            Ok(path) => match crate::config::TuiConfig::load_checked() {
+                Ok(config) => WorkstationSaveOutcome::Saved {
+                    path: path.display().to_string(),
+                    config,
+                },
+                Err(err) => WorkstationSaveOutcome::LoadFailed {
+                    path: path.display().to_string(),
+                    error: err,
+                },
+            },
+            Err(err) => WorkstationSaveOutcome::SaveFailed {
+                target,
+                error: err.to_string(),
+            },
+        }
+    })
+    .await;
+
+    let mut st = state.lock().await;
+    let outcome = match saved {
+        Ok(outcome) => outcome,
+        // A panicking persistence task still reports a failure instead of
+        // leaving the step silently unresolved.
+        Err(err) => WorkstationSaveOutcome::SaveFailed {
+            target: st.onboarding.default_tui_config_path.clone(),
+            error: err.to_string(),
         },
-        Err(err) => {
-            let target = st.onboarding.default_tui_config_path.clone();
+    };
+
+    match outcome {
+        WorkstationSaveOutcome::Saved { path, config } => {
+            st.tui_config = config;
+            st.onboarding.has_tui_config = true;
+            st.onboarding.set_status(fill(
+                &active_t("notify.onboarding_saved"),
+                &[&path, modifier.emacs_prefix(), meta.emacs_prefix()],
+            ));
+            st.onboarding.step = st.onboarding.next_step();
+            st.onboarding.selected_index = 0;
+        }
+        WorkstationSaveOutcome::LoadFailed { path, error } => {
+            st.onboarding.set_error(fill(
+                &active_t("notify.onboarding_load_failed"),
+                &[&path, &error],
+            ));
+        }
+        WorkstationSaveOutcome::SaveFailed { target, error } => {
             st.onboarding.set_error(fill(
                 &active_t("notify.onboarding_save_failed"),
-                &[&target.to_string(), &err.to_string()],
+                &[&target, &error],
             ));
         }
     }
@@ -347,7 +399,11 @@ pub async fn handle_onboarding_key(
                         } else {
                             crate::config::PrimaryModifier::Alt
                         };
-                        save_workstation_config(&mut st, modifier);
+                        // The persistence job owns the guard until it settles,
+                        // so this arm returns instead of touching the state
+                        // again (c-1).
+                        save_workstation_config(state, st, modifier).await;
+                        return Ok(InputResult::Continue);
                     }
                     OnboardingStep::Gatekeeper => match sel {
                         0 => {

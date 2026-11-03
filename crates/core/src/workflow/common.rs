@@ -6,7 +6,7 @@ use tauqe_protocol::ModelRef;
 use crate::history::{HistoryManager, DEFAULT_HISTORY_BUDGET_TOKENS, DEFAULT_TAIL_TURNS_COUNT};
 use crate::providers::{ChatMessage, LlmProvider, StreamEvent};
 
-pub use super::discovery::*;
+pub use super::research::*;
 
 /// Compacts session history if estimated tokens exceed the configured threshold using default budgets.
 pub async fn compact_history_if_needed(
@@ -373,10 +373,10 @@ mod tests {
     }
 
     #[test]
-    fn test_record_workflow_response_discovery_concatenation_no_raw_json() {
+    fn test_record_workflow_response_research_concatenation_no_raw_json() {
         let dir = tempfile::tempdir().unwrap();
         let mut hm = HistoryManager::new(dir.path().to_path_buf());
-        let raw_discovery = "{\"message\":\"Need file a.rs\",\"changes\":[],\"context_requests\":[\"editable:a.rs\"],\"suggested_actions\":[]}\n\n{\"message\":\"Updated file a.rs\",\"changes\":[{\"op\":\"replace\",\"path\":\"a.rs\",\"old_text\":\"old\",\"new_text\":\"new\",\"content\":\"\"}],\"context_requests\":[],\"suggested_actions\":[]}";
+        let raw_research = "{\"message\":\"Need file a.rs\",\"changes\":[],\"context_requests\":[\"editable:a.rs\"],\"suggested_actions\":[]}\n\n{\"message\":\"Updated file a.rs\",\"changes\":[{\"op\":\"replace\",\"path\":\"a.rs\",\"old_text\":\"old\",\"new_text\":\"new\",\"content\":\"\"}],\"context_requests\":[],\"suggested_actions\":[]}";
 
         let edit_res = ModelResult::Edit {
             summary: "Update file a.rs".to_string(),
@@ -395,7 +395,7 @@ mod tests {
             },
         };
 
-        record_workflow_response(&mut hm, &edit_res, raw_discovery, vec![]);
+        record_workflow_response(&mut hm, &edit_res, raw_research, vec![]);
 
         let entries = hm.get_entries().unwrap();
         assert_eq!(entries.len(), 1);
@@ -472,7 +472,7 @@ mod tests {
         let mut hm = HistoryManager::new(dir.path().to_path_buf());
         let proto = crate::edits::XmlEditProtocol;
 
-        // Round 1: Model emits discovery request and scratchpad note
+        // Round 1: Model emits research request and scratchpad note
         let round1_output = "Need to inspect config.\n<context_request path=\"src/config.rs\" access=\"read_only\" />\n<scratchpad>\n- Hypothesis: missing timeout field\n- Goal: inspect config struct\n</scratchpad>";
         let pad1 = proto.parse_scratchpad(round1_output);
         assert_eq!(

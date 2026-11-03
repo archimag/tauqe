@@ -381,4 +381,84 @@ mod tests {
             .expect("the failed write explains itself");
         assert_eq!(notification.level, NotificationLevel::Error);
     }
+    /// Presses one physical key through the interface gateway, so a regression
+    /// test exercises the layout normalization the real event loop applies
+    /// before any modal handler runs (c-single-choke-point).
+    async fn press(
+        state: &Arc<Mutex<crate::app::AppState>>,
+        conn: &mut RpcConnection,
+        code: KeyCode,
+        modifiers: KeyModifiers,
+    ) {
+        crate::input::handle_terminal_event(
+            crossterm::event::Event::Key(KeyEvent::new(code, modifiers)),
+            state,
+            conn,
+        )
+        .await
+        .expect("in-memory dispatch never fails");
+    }
+
+    /// Modifiers of a plain character press.
+    const PLAIN: KeyModifiers = KeyModifiers::NONE;
+
+    /// Under the JCUKEN layout the picker keeps the row vocabulary it declares:
+    /// the arrows step the highlight unchanged by the language, the digits keep
+    /// their positional meaning, and `й` (the physical `q`) dismisses the dialog
+    /// instead of leaving it open on the raw Cyrillic code point
+    /// (c-modal-dispatch-parity).
+    ///
+    /// The rows answer to the arrows rather than to the bare `n` / `p` letters in
+    /// either layout, so the projection is proven where this dialog actually
+    /// reads a letter: its dismissal.
+    #[tokio::test]
+    async fn selection_dialog_navigates_and_dismisses_from_the_jcuken_layout() {
+        let mut st = test_state();
+        st.tui_config.input.layout = crate::config::LayoutPreset::RuJcuken;
+        st.last_frame_area = ratatui::layout::Rect::new(0, 0, 120, 40);
+        st.selection_dialog = Some(SelectionDialogState::new(same_model_rungs(), 0));
+
+        let state = Arc::new(Mutex::new(st));
+        let mut conn = RpcConnection::new(Vec::<u8>::new());
+
+        for (code, expected) in [(KeyCode::Down, 1usize), (KeyCode::Up, 0)] {
+            press(&state, &mut conn, code, PLAIN).await;
+            let guard = state.lock().await;
+            let dialog = guard
+                .selection_dialog
+                .as_ref()
+                .expect("the picker stays open while it navigates");
+            assert_eq!(
+                dialog.selector.selected_index(),
+                expected,
+                "{code:?} must move the highlight"
+            );
+        }
+
+        // The digits keep their positional meaning: `3` and `1` name the third
+        // and the first rung of the same model at distinct reasoning depths.
+        for (character, expected) in [('3', 2usize), ('1', 0)] {
+            press(&state, &mut conn, KeyCode::Char(character), PLAIN).await;
+            let guard = state.lock().await;
+            let dialog = guard
+                .selection_dialog
+                .as_ref()
+                .expect("the picker stays open while a digit steers it");
+            assert_eq!(
+                dialog.selector.selected_index(),
+                expected,
+                "{character:?} must select the row it numbers"
+            );
+        }
+
+        press(&state, &mut conn, KeyCode::Char('й'), PLAIN).await;
+        assert!(
+            state.lock().await.selection_dialog.is_none(),
+            "`й` sits on the physical `q` position and must dismiss the picker"
+        );
+        assert!(
+            conn.written().is_empty(),
+            "browsing the picker never talks to the server"
+        );
+    }
 }

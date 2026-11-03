@@ -371,7 +371,7 @@ pub struct PromptAssembly {
     /// semantic layout renders the `<history>` block from them byte for byte,
     /// and the chronological layout interleaves them with the context files by
     /// their insertion watermarks.
-    pub history: Option<HistorySnapshot>,
+    pub history: Option<std::sync::Arc<HistorySnapshot>>,
     pub repo_map: Option<String>,
     /// Compact directory-tree outline of the repository.
     ///
@@ -402,6 +402,12 @@ pub struct PromptAssembly {
     /// serves it.
     pub prompt_layout: PromptLayoutKind,
     pub project: Option<tauqe_protocol::ProjectConfig>,
+    /// External documentation the project declares in `[[outer_docs]]`.
+    ///
+    /// The declarations render as a compact catalog in the byte-stable head, so
+    /// the model learns which documents it may request without learning where
+    /// the harness keeps them.
+    pub outer_docs: Vec<crate::config::OuterDocEntry>,
 }
 
 impl PromptAssembly {
@@ -411,7 +417,7 @@ impl PromptAssembly {
         context_files: Vec<ContextFileContent>,
         workflow: impl Into<String>,
         edit_protocol: EditProtocolKind,
-        history: Option<HistorySnapshot>,
+        history: Option<std::sync::Arc<HistorySnapshot>>,
         repo_map: Option<String>,
     ) -> Self {
         Self {
@@ -434,12 +440,22 @@ impl PromptAssembly {
             // semantic block order, which every intent renders correctly.
             prompt_layout: PromptLayoutKind::Semantic,
             project: None,
+            outer_docs: Vec::new(),
         }
     }
 
     /// Attaches the project command configuration available to this turn.
     pub fn with_project(mut self, project: Option<tauqe_protocol::ProjectConfig>) -> Self {
         self.project = project;
+        self
+    }
+
+    /// Attaches the external documentation declarations of the project.
+    ///
+    /// The catalog rendered from them publishes which documents exist; where a
+    /// document comes from stays a harness detail.
+    pub fn with_outer_docs(mut self, outer_docs: Vec<crate::config::OuterDocEntry>) -> Self {
+        self.outer_docs = outer_docs;
         self
     }
 
@@ -518,6 +534,17 @@ impl PromptAssembly {
         prompt.push_str(&format!("- Workflow: {}\n", self.workflow));
         prompt.push_str(&format!("- Edit Protocol: {}\n\n", self.edit_protocol));
 
+        // The catalog of the declared external documentation travels in the
+        // byte-stable head beside the project metadata it belongs to: the
+        // declaration changes between turns, never between the rounds of one
+        // turn. It is gated by the capability that can act on it, so a narrowed
+        // surface never lists a document it cannot request.
+        if capabilities.contains(tauqe_protocol::LlmCapability::OuterDocRequest) {
+            if let Some(catalog) = self.format_outer_docs_catalog_block() {
+                prompt.push_str(&catalog);
+            }
+        }
+
         prompt
     }
 
@@ -582,7 +609,6 @@ impl PromptAssembly {
         self.intent.narrow_capabilities(&protocol.capability_set())
     }
     /// Resolves the access a layout renders for `file`.
-    /// Resolves the access a layout renders for `file`.
     ///
     /// Every dialogue renders the access layer the file resolves to, and both
     /// layouts read this single predicate, so an element can never disagree with
@@ -591,14 +617,9 @@ impl PromptAssembly {
     /// because the developer may request a concrete change there. A file the plan
     /// loaded as editable therefore stays editable instead of being flattened into
     /// a read-only view.
-    /// layouts read this single predicate, so an element can never disagree with
-    /// the layer behind it. A plan discussion is a dialogue like any other: the
-    /// developer may request a concrete change there, so a file the plan loaded
-    /// as editable stays editable instead of being relabelled read-only.
     pub(crate) fn context_file_access(&self, file: &ContextFileContent) -> ContextAccess {
         file.access
     }
-    /// Renders the authoritative context block of a turn.
     /// Renders the authoritative context block of a turn.
     ///
     /// The block opens with the constant `<context>` tag and lists every file in
@@ -648,7 +669,7 @@ impl PromptAssembly {
     /// absent.
     pub fn history_snapshot(&self) -> Option<&HistorySnapshot> {
         self.history
-            .as_ref()
+            .as_deref()
             .filter(|snapshot| !snapshot.is_empty())
     }
 
@@ -755,6 +776,33 @@ impl PromptAssembly {
         }
         out.push_str("</context_manifest>\n\n");
         Some(out)
+    }
+
+    /// Renders the compact catalog of the external documentation a project declares.
+    ///
+    /// The catalog publishes what a request may name — the mount point, the title,
+    /// and the optional description of one entry — and nothing about where the
+    /// material comes from: an address, a host path, and a cache path stay harness
+    /// details. Entries keep their declaration order, and one that cannot be
+    /// resolved contributes no line, so an unusable declaration is reported by
+    /// configuration validation instead of a line nobody can request. A declaration
+    /// that resolves to nothing renders no block at all.
+    pub(crate) fn format_outer_docs_catalog_block(&self) -> Option<String> {
+        let mut catalog = String::new();
+        for entry in &self.outer_docs {
+            let Ok(doc) = crate::outer_docs::OuterDoc::from_entry(entry) else {
+                continue;
+            };
+            catalog.push_str(&format!("- {} — {}", doc.id, doc.title));
+            if let Some(description) = doc.description.as_deref() {
+                catalog.push_str(&format!(": {description}"));
+            }
+            catalog.push('\n');
+        }
+        if catalog.is_empty() {
+            return None;
+        }
+        Some(format!("## External Documentation Catalog\n{catalog}\n"))
     }
 
     pub fn format_scratchpad_block(&self) -> Option<String> {
@@ -878,10 +926,12 @@ mod tests {
             access: ContextAccess::Editable,
             content: "fn main() {}\n".to_string(),
         }];
-        let history = Some(HistorySnapshot::new(vec![HistoryEntry::Summary {
-            id: None,
-            text: "Initial".to_string(),
-        }]));
+        let history = Some(std::sync::Arc::new(HistorySnapshot::new(vec![
+            HistoryEntry::Summary {
+                id: None,
+                text: "Initial".to_string(),
+            },
+        ])));
         let repo_map = Some("crates/core/src/git.rs\n  pub fn get_repository_state()".to_string());
         let assembly = PromptAssembly::new(
             None,
@@ -1293,10 +1343,12 @@ mod tests {
             files,
             "git",
             EditProtocolKind::Xml,
-            Some(HistorySnapshot::new(vec![HistoryEntry::Summary {
-                id: Some(1),
-                text: "Earlier work".to_string(),
-            }])),
+            Some(std::sync::Arc::new(HistorySnapshot::new(vec![
+                HistoryEntry::Summary {
+                    id: Some(1),
+                    text: "Earlier work".to_string(),
+                },
+            ]))),
             Some("crate\n  fn main".to_string()),
         );
         assembly.turn_scratchpad = Some("- verified: prefix is stable".to_string());
@@ -1486,9 +1538,11 @@ mod tests {
         // environment ontology reaches it. A coder executing an approved design
         // never reads about a harness it cannot consult.
         assert!(!sys_prompt.contains("Self-Knowledge"));
+        assert!(!sys_prompt.contains("<tauqe_doc_request"));
         assert!(!sys_prompt.contains("<doc_request"));
         assert!(!sys_prompt.contains("Environment Ontology"));
-        assert!(!delta.contains("Self-Knowledge"));
+        assert!(!delta.contains("<tauqe_doc_request"));
+        assert!(!delta.contains("<doc_request"));
         assert!(!delta.contains("Environment Ontology"));
         assert!(!delta.contains("<doc_request"));
 
@@ -1508,7 +1562,8 @@ mod tests {
         // byte-stable head.
         let sys_prompt = assembly.build_system_prompt(&proto);
         assert!(sys_prompt.contains("Self-Knowledge"));
-        assert!(sys_prompt.contains("<doc_request"));
+        assert!(sys_prompt.contains("<tauqe_doc_request"));
+        assert!(!sys_prompt.contains("<doc_request"));
         assert!(sys_prompt.contains("<system_documentation>"));
         assert!(!sys_prompt.contains("Environment Ontology"));
         assert!(!sys_prompt.contains("literal harness rather than an agent"));
@@ -1531,7 +1586,12 @@ mod tests {
             &CapabilitySet::interactive_repl(),
             PatchStrategy::SearchReplace,
         );
-        assert!(interactive["properties"].get("doc_requests").is_some());
+        assert!(interactive["properties"]
+            .get("tauqe_doc_requests")
+            .is_some());
+        // The strict schema advertises one spelling per command: the
+        // pre-canonical alias stays decodable but is never published.
+        assert!(interactive["properties"].get("doc_requests").is_none());
 
         // The composed schema is a projection of the capability set, so a turn
         // that cannot consult the documentation never advertises a field its
@@ -1540,6 +1600,7 @@ mod tests {
             &CapabilitySet::isolated_step(),
             PatchStrategy::SearchReplace,
         );
+        assert!(step["properties"].get("tauqe_doc_requests").is_none());
         assert!(step["properties"].get("doc_requests").is_none());
         assert!(step["properties"].get("changes").is_some());
     }
@@ -1588,7 +1649,7 @@ mod tests {
     }
 
     #[test]
-    fn test_prompt_assembly_discovery_instructions() {
+    fn test_prompt_assembly_research_instructions() {
         let proto = XmlPromptProtocol;
 
         let assembly =
@@ -1627,6 +1688,7 @@ mod tests {
         let narrowed = assembly.build_system_prompt(&*text_only);
         assert!(narrowed.contains("tauqe.toml"));
         assert!(!narrowed.contains("Self-Knowledge"));
+        assert!(!narrowed.contains("<tauqe_doc_request"));
         assert!(!narrowed.contains("<doc_request"));
 
         // Discussion mode renders the same authoritative anchor.
@@ -1692,6 +1754,7 @@ mod tests {
         assert!(!prompt.contains("<scratchpad"));
         assert!(!prompt.contains("<success"));
         assert!(!prompt.contains("Self-Knowledge"));
+        assert!(!prompt.contains("<tauqe_doc_request"));
         assert!(!prompt.contains("<doc_request"));
         assert!(!prompt.contains("Turn Scratchpad"));
 
@@ -1773,7 +1836,7 @@ mod tests {
     fn test_prompt_assembly_requires_an_explicit_request_for_code_changes() {
         let proto = XmlPromptProtocol;
 
-        // Interactive develop turn: changes require an explicit user request or clear unambiguous task.
+        // Interactive REPL turn: changes require an explicit user request or clear unambiguous task.
         let assembly =
             PromptAssembly::new(None, 1, vec![], "git", EditProtocolKind::Xml, None, None);
         let prompt = assembly.build_system_prompt(&proto);
@@ -1951,5 +2014,97 @@ mod tests {
             let structured = assembly.effective_capabilities(&JsonPromptProtocol::edits());
             assert_eq!(xml, structured, "surface diverged for {intent:?}");
         }
+    }
+    /// Builds one declared external document for the catalog tests.
+    fn outer_doc(id: &str, title: &str, description: Option<&str>) -> crate::config::OuterDocEntry {
+        crate::config::OuterDocEntry {
+            id: id.to_string(),
+            title: title.to_string(),
+            description: description.map(str::to_string),
+            source: format!("https://example.com/{id}"),
+        }
+    }
+
+    #[test]
+    fn test_outer_docs_catalog_lists_the_declared_documents() {
+        let declared = vec![
+            outer_doc(
+                "vendor/api.md",
+                "Upstream API notes",
+                Some("Endpoint contracts."),
+            ),
+            outer_doc("mylib", "MyLib Book", None),
+        ];
+        let built = PromptAssembly::new(None, 1, vec![], "git", EditProtocolKind::Xml, None, None)
+            .with_outer_docs(declared);
+
+        let catalog = built
+            .format_outer_docs_catalog_block()
+            .expect("the declarations render a catalog");
+        assert!(catalog.starts_with("## External Documentation Catalog\n"));
+        assert!(catalog.contains("- vendor/api.md — Upstream API notes: Endpoint contracts.\n"));
+        assert!(catalog.contains("- mylib — MyLib Book\n"));
+        // Entries keep their declaration order.
+        let api = catalog.find("vendor/api.md").expect("the first entry");
+        let book = catalog.find("mylib").expect("the second entry");
+        assert!(api < book);
+        // The catalog publishes what a request may name and nothing about where
+        // the material comes from.
+        assert!(!catalog.contains("https"));
+        assert!(!catalog.contains(".tauqe"));
+    }
+
+    #[test]
+    fn test_outer_docs_catalog_renders_nothing_without_a_resolvable_entry() {
+        let empty = PromptAssembly::new(None, 1, vec![], "git", EditProtocolKind::Xml, None, None);
+        assert!(empty.format_outer_docs_catalog_block().is_none());
+
+        // An entry configuration validation rejects contributes no line, so a
+        // declaration nothing can mount renders no block at all.
+        let broken = crate::config::OuterDocEntry {
+            id: "vendor/broken.md".to_string(),
+            title: "Broken".to_string(),
+            description: None,
+            source: String::new(),
+        };
+        let built = empty.with_outer_docs(vec![broken]);
+        assert!(built.format_outer_docs_catalog_block().is_none());
+    }
+
+    #[test]
+    fn test_outer_docs_catalog_follows_the_capability_surface() {
+        use tauqe_protocol::LlmCapability;
+
+        let declared = vec![outer_doc("vendor/api.md", "Upstream API notes", None)];
+        let built = PromptAssembly::new(None, 1, vec![], "git", EditProtocolKind::Xml, None, None)
+            .with_outer_docs(declared);
+
+        // A turn that can request an external document publishes the catalog in
+        // the byte-stable head, right after the project metadata it belongs to.
+        let messages = built.assemble_chat_messages("Go", &XmlPromptProtocol);
+        let system = &messages[0].content;
+        let metadata = system.find("## Project Metadata").expect("metadata block");
+        let catalog = system
+            .find("## External Documentation Catalog")
+            .expect("catalog block");
+        assert!(metadata < catalog);
+        assert!(system.contains("- vendor/api.md — Upstream API notes\n"));
+        // The catalog is a head block: the task message never repeats it.
+        assert!(!messages[1]
+            .content
+            .contains("External Documentation Catalog"));
+        // Assembling the same state twice renders the very same bytes.
+        assert_eq!(
+            built.format_outer_docs_catalog_block(),
+            built.format_outer_docs_catalog_block()
+        );
+
+        // A narrowed surface that cannot request a document advertises none.
+        let narrowed = XmlPromptProtocol::with_capabilities(CapabilitySet::from_slice(&[
+            LlmCapability::TextMessage,
+            LlmCapability::FileEdits,
+        ]));
+        let prompt = built.build_system_prompt(&*narrowed);
+        assert!(!prompt.contains("## External Documentation Catalog"));
     }
 }

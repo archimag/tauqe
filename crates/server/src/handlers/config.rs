@@ -2,8 +2,9 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use tauqe_core::config::{
-    default_config_path, default_credentials_path, find_config_file, find_credentials_file,
-    load_config_with_options, AppConfig, ConfigLoadOptions,
+    default_config_path, default_credentials_path, ensure_no_module_conflict, find_config_file,
+    find_credentials_file, load_config_with_options, module_owners, AppConfig, ConfigLoadOptions,
+    DEFAULT_CONFIG_TEMPLATE,
 };
 use tauqe_core::edits::EditProtocolFactory;
 use tauqe_core::workflow::WorkflowFactory;
@@ -88,8 +89,8 @@ pub fn config_state(cfg: &AppConfig, selection: Option<&ModelSelection>) -> Conf
     let effective = cfg.resolve_model(&sel);
     let roles = effective_roles_summary(cfg);
     ConfigState {
-        workflow: cfg.develop.workflow,
-        edit_protocol: cfg.develop.protocol,
+        workflow: cfg.repl.workflow,
+        edit_protocol: cfg.repl.protocol,
         model: effective,
         selection: Some(sel),
         roles: Some(roles),
@@ -195,7 +196,7 @@ async fn repo_has_git(repo_opt: Option<&Path>) -> bool {
 
 /// Filesystem-derived locations reported by [`SystemStatusResult`].
 ///
-/// Discovery walks candidate directories and checks whether each candidate
+/// The lookup walks candidate directories and checks whether each candidate
 /// exists, so the values are resolved once on the blocking pool and then
 /// carried as plain in-memory data. A handler that has just written a file
 /// replaces the discovered location with the written one, so the report never
@@ -214,7 +215,7 @@ struct StatusPaths {
 impl StatusPaths {
     /// Runs every location probe against the filesystem and the environment.
     ///
-    /// Discovery compares the metadata of every candidate location, and the
+    /// The lookup compares the metadata of every candidate location, and the
     /// default-path resolution reads the process environment, so this belongs
     /// on the blocking pool and never on an async worker thread.
     fn resolve(
@@ -308,6 +309,25 @@ fn build_system_status(
         config_error: cfg.config_error.clone(),
     }
 }
+/// Configuration keys a `config/set` request writes.
+///
+/// The model selection is runtime state rather than configuration, so it names
+/// no key here: only the fields that reach `tauqe.toml` can collide with a
+/// `tauqe.d` module.
+fn written_config_keys(params: &ConfigSetParams) -> Vec<&'static str> {
+    let mut keys = Vec::new();
+    if params.history_model.is_some() {
+        keys.push("models.scribe");
+    }
+    if params.workflow.is_some() {
+        keys.push("repl.workflow");
+    }
+    if params.edit_protocol.is_some() {
+        keys.push("repl.protocol");
+    }
+    keys
+}
+
 pub async fn handle_config_get(req: Request, state: &Arc<AppState>) -> Response {
     let guard = state.config.lock().await;
     let result = config_state(&guard.config, Some(&guard.selection));
@@ -337,6 +357,35 @@ pub async fn handle_config_set(req: Request, state: &Arc<AppState>) -> Response 
             );
         }
     };
+
+    // A key declared by a `tauqe.d` module belongs to that module: the module
+    // is re-read on the next configuration load, so an in-memory change would
+    // be overwritten instead of taking effect. The request is refused with the
+    // module named, so the developer edits the layer that owns the key.
+    let written = written_config_keys(&params);
+    if !written.is_empty() {
+        if let Some(root) = resolved_repo_root(state).await {
+            let owners = match super::offload(move || module_owners(&root)).await {
+                Ok(Ok(owners)) => owners,
+                Ok(Err(err)) => return Response::err(req.id, errors::MODULE_CONFLICT, err),
+                Err(err) => return Response::err(req.id, errors::MODULE_CONFLICT, err),
+            };
+            if let Some((key, module)) = written
+                .iter()
+                .find_map(|key| owners.get(*key).map(|module| (*key, module)))
+            {
+                return Response::err(
+                    req.id,
+                    errors::MODULE_CONFLICT,
+                    format!(
+                        "The key `{}` is declared by the module {}; edit that file instead",
+                        key,
+                        module.display()
+                    ),
+                );
+            }
+        }
+    }
 
     let (updated_state, previous_model) = {
         let mut guard = state.config.lock().await;
@@ -409,12 +458,12 @@ pub async fn handle_config_set(req: Request, state: &Arc<AppState>) -> Response 
             new_scribe = Some(hist_model.clone());
         }
 
-        let mut new_workflow = guard.config.develop.workflow;
+        let mut new_workflow = guard.config.repl.workflow;
         if let Some(wf) = params.workflow {
             new_workflow = wf;
         }
 
-        let mut new_protocol = guard.config.develop.protocol;
+        let mut new_protocol = guard.config.repl.protocol;
         if let Some(proto) = params.edit_protocol {
             new_protocol = proto;
         }
@@ -422,8 +471,8 @@ pub async fn handle_config_set(req: Request, state: &Arc<AppState>) -> Response 
         // Every requested field is valid: commit the whole change atomically.
         guard.selection = new_selection;
         guard.config.models.scribe = new_scribe;
-        guard.config.develop.workflow = new_workflow;
-        guard.config.develop.protocol = new_protocol;
+        guard.config.repl.workflow = new_workflow;
+        guard.config.repl.protocol = new_protocol;
 
         (
             config_state(&guard.config, Some(&guard.selection)),
@@ -516,6 +565,28 @@ pub async fn handle_config_create(req: Request, state: &Arc<AppState>) -> Respon
 
     let (explicit_config, explicit_credentials) = explicit_cli_paths(state).await;
     let target_path = tauqe_core::config::default_config_path(repo_opt, explicit_config.as_deref());
+
+    // The created document is the template and the repository modules stay in
+    // place: a template key a module already declares would collide on the next
+    // load, so the collision is reported before a byte reaches disk.
+    let guard_target = target_path.clone();
+    let guard_root = repo_root.clone();
+    let conflict = match super::offload(move || {
+        ensure_no_module_conflict(
+            DEFAULT_CONFIG_TEMPLATE,
+            &guard_target,
+            guard_root.as_deref(),
+        )
+    })
+    .await
+    {
+        Ok(conflict) => conflict,
+        Err(err) => return Response::err(req.id, errors::CONFIG_CREATE_FAILED, err),
+    };
+    if let Err(message) = conflict {
+        return Response::err(req.id, errors::MODULE_CONFLICT, message);
+    }
+
     let write_path = target_path.clone();
     let write_outcome =
         match super::offload(move || tauqe_core::config::write_default_config(&write_path)).await {
@@ -894,12 +965,12 @@ mod tests {
     }
     /// The status locations are resolved off the async worker, so the
     /// repository root and the explicit CLI overrides must reach both the
-    /// discovery probe and the default-path computation.
+    /// location probe and the default-path computation.
     #[tokio::test]
     async fn test_resolve_status_paths_reports_discovered_and_default_locations() {
         let root = unique_repo_dir("status-paths");
         let repo_config = root.join("tauqe.toml");
-        // Discovery only checks that a candidate is a file, so the fixture
+        // The lookup only checks that a candidate is a file, so the fixture
         // carries no configuration.
         std::fs::write(&repo_config, "").unwrap();
 
@@ -1167,6 +1238,49 @@ mod tests {
             state.session_uuid().await,
             "an unchanged effective model must keep the session"
         );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+    /// A key a `tauqe.d` module declares belongs to that module: the in-memory
+    /// change would be overwritten on the next load, so the request is refused
+    /// with the typed conflict instead of mutating a value nobody can persist.
+    #[tokio::test]
+    async fn test_config_set_is_refused_for_a_key_a_module_declares() {
+        let root = unique_repo_dir("module-conflict");
+        std::fs::write(
+            root.join("tauqe.toml"),
+            "[models]\nprimary = [\"openrouter:alpha/model\"]\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(root.join("tauqe.d")).unwrap();
+        std::fs::write(
+            root.join("tauqe.d/10-models.toml"),
+            "[models]\nscribe = \"openrouter:scribe/model\"\n",
+        )
+        .unwrap();
+
+        let (out, _rx) = crate::transport::OutChannel::new();
+        let (history_sender, _hrx) = tokio::sync::mpsc::unbounded_channel();
+        let state = AppState::new(AppConfig::default(), root.clone(), history_sender, out);
+
+        let req = Request {
+            id: tauqe_protocol::RequestId::Number(4),
+            method: "config/set".to_string(),
+            params: Some(
+                serde_json::to_value(ConfigSetParams {
+                    workflow: None,
+                    edit_protocol: None,
+                    model: None,
+                    selection: None,
+                    history_model: Some(ModelRef::openrouter("scribe/model")),
+                })
+                .unwrap(),
+            ),
+        };
+
+        let resp = handle_config_set(req, &state).await;
+        let err = resp.error.expect("the module-owned key must be refused");
+        assert_eq!(err.code, errors::MODULE_CONFLICT);
 
         let _ = std::fs::remove_dir_all(&root);
     }

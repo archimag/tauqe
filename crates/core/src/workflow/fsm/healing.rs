@@ -22,7 +22,7 @@ use crate::edits::protocol::{
 };
 use crate::providers::StreamEvent;
 use crate::toolchain::VerificationStatus;
-use crate::workflow::discovery::execute_discovery_commands;
+use crate::workflow::research::execute_research_commands;
 use crate::workflow::verification::{
     build_verification_missing_edits_prompt, build_verification_retry_prompt, extract_error_paths,
     run_workflow_verification_with_config, VerificationOutcome,
@@ -30,7 +30,7 @@ use crate::workflow::verification::{
 
 use super::guard::{finish_turn, TransactionRollbackGuard};
 use super::kernel::{propose_round, TurnKernel};
-use super::proposal::{extract_success_summary, log_fsm_phase, merge_text};
+use super::proposal::{extract_commit_message, log_fsm_phase, merge_text};
 use super::FsmTurnOutcome;
 
 /// Finalizes a cancelled step of the code contour.
@@ -61,17 +61,16 @@ async fn finish_cancelled_step(
 /// verification lifecycle alike are finalized into a transaction with the
 /// verdict preserved; a failed or cancelled verification rolls the working tree
 /// back. The returned outcome is always terminal for the turn.
-/// outcome is always terminal for the turn.
 pub(super) async fn run_apply_and_verify_phase(
     ctx: &mut TurnKernel<'_>,
     cumulative_edits: Vec<EditOperation>,
     verify_request: Option<EditVerifyRequest>,
 ) -> anyhow::Result<FsmTurnOutcome> {
-    let mut summary = extract_success_summary(ctx.state.terminal_outcome.as_ref())
+    let mut commit_message = extract_commit_message(ctx.state.terminal_outcome.as_ref())
         .unwrap_or_else(|| "Apply FSM turn edits".to_string());
 
     let proposal = EditProposal {
-        summary: summary.clone(),
+        summary: commit_message.clone(),
         edits: cumulative_edits.clone(),
     };
 
@@ -110,7 +109,7 @@ pub(super) async fn run_apply_and_verify_phase(
                 .await;
             let _ = ctx.stream_tx.send(StreamEvent::Done).await;
             let result = ModelResult::Edit {
-                summary,
+                summary: commit_message,
                 edits: cumulative_edits,
                 proposal: None,
                 outcome: EditOutcome {
@@ -268,8 +267,8 @@ pub(super) async fn run_apply_and_verify_phase(
                 )
             };
             // The healing round replays the knowledge Discovery already paid
+            // The healing round replays the knowledge Research already paid
             // for: the task first, the accumulated journal next, and the
-            // compiler diagnostics last.
             let retry_prompt = ctx
                 .journal
                 .compose_user_prompt(ctx.prompt, Some(&retry_diagnostics));
@@ -402,18 +401,18 @@ pub(super) async fn run_apply_and_verify_phase(
                 return Ok(outcome);
             }
 
-            // Discovery commands emitted during healing run through the same
-            // dispatcher as the Discovery phase, so every capability (context
+            // Research commands emitted during healing run through the same
+            // dispatcher as the Research phase, so every capability (context
             // files, repository searches, documentation) behaves identically and
             // owns its own blocking offload and budget checks.
-            if step_out.has_discovery_commands() {
-                let discovery_outcome = execute_discovery_commands(
+            if step_out.has_research_commands() {
+                let research_outcome = execute_research_commands(
                     guard.context_manager,
                     ctx.repo_root,
                     step_out.commands(),
-                    ctx.options.files_token_budget,
+                    ctx.options.token_budget,
                     ctx.options.repomap_token_budget,
-                    ctx.options.discovery_limits,
+                    ctx.options.research_limits,
                     false,
                     // The healing round races the turn's own cancel signal, so
                     // an abandoned repair stops waiting for a slow reference host.
@@ -423,8 +422,8 @@ pub(super) async fn run_apply_and_verify_phase(
                 // Healing findings join the turn journal, so a later healing
                 // round still sees the documentation or outline this one asked
                 // for.
-                ctx.journal.record_outcome(&discovery_outcome);
-                if !discovery_outcome.added_files.is_empty() {
+                ctx.journal.record_outcome(&research_outcome);
+                if !research_outcome.added_files.is_empty() {
                     let ctx_state = guard.context_manager.get_state();
                     let _ = ctx
                         .stream_tx
@@ -442,7 +441,7 @@ pub(super) async fn run_apply_and_verify_phase(
             missing_edits = false;
 
             let retry_proposal = EditProposal {
-                summary: summary.clone(),
+                summary: commit_message.clone(),
                 edits: retry_edits,
             };
             // The working copy is snapshotted immediately before the attempt, so
@@ -519,8 +518,8 @@ pub(super) async fn run_apply_and_verify_phase(
                 let accumulated = std::mem::take(&mut ctx.accumulated_text);
                 return Ok(finish_cancelled_step(&mut guard, ctx.stream_tx, accumulated).await);
             }
-            if let Some(text) = extract_success_summary(ctx.state.terminal_outcome.as_ref()) {
-                summary = text;
+            if let Some(text) = extract_commit_message(ctx.state.terminal_outcome.as_ref()) {
+                commit_message = text;
             }
             // The working copy now holds more than the model proposed: the
             // toolchain may have refreshed a lock file or regenerated a
@@ -528,7 +527,8 @@ pub(super) async fn run_apply_and_verify_phase(
             // working copy once, so its differential keeps the atomic commit
             // complete instead of leaving verified artifacts outside it.
             merge_changed_files(&mut total_changed_files, guard.worktree_changes());
-            let (commit_hash, commit_error) = guard.finalize(&total_changed_files, &summary).await;
+            let (commit_hash, commit_error) =
+                guard.finalize(&total_changed_files, &commit_message).await;
             tracing::info!(
                 workflow = ctx.workflow_name,
                 model = %ctx.model,
@@ -545,7 +545,7 @@ pub(super) async fn run_apply_and_verify_phase(
                 .await;
             let _ = ctx.stream_tx.send(StreamEvent::Done).await;
             let result = ModelResult::Edit {
-                summary,
+                summary: commit_message,
                 edits: cumulative_edits,
                 proposal: None,
                 outcome: EditOutcome {
@@ -584,7 +584,7 @@ pub(super) async fn run_apply_and_verify_phase(
         );
         let _ = ctx.stream_tx.send(StreamEvent::Done).await;
         let result = ModelResult::Edit {
-            summary,
+            summary: commit_message,
             edits: cumulative_edits,
             proposal: None,
             outcome: EditOutcome {
@@ -644,7 +644,7 @@ async fn auto_register_error_files(
 ) {
     // The failure arms are recorded inside `resolve_repository_files`
     // before `None` is returned, so the downgrade here stays observable.
-    let available_files = crate::workflow::discovery::resolve_repository_files(repo_root)
+    let available_files = crate::workflow::research::resolve_repository_files(repo_root)
         .await
         .unwrap_or_default();
     let error_paths = extract_error_paths(report, &available_files);

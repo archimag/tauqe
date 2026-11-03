@@ -709,13 +709,13 @@ impl AppState {
         self.clear_context(|ctx| ctx.clear_auto()).await
     }
 
-    /// Clears the external reference layer and starts a fresh dialogue session
-    /// when documents were actually removed.
+    /// Clears the external documentation layer and starts a fresh dialogue
+    /// session when documents were actually removed.
     ///
-    /// Reference snapshots are part of the stable prompt prefix, so dropping
-    /// them shrinks it exactly like clearing the Auto layer does.
-    pub async fn clear_refs_context(self: &Arc<Self>) -> Result<ContextState, String> {
-        self.clear_context(|ctx| ctx.clear_refs()).await
+    /// External documentation snapshots are part of the stable prompt prefix, so
+    /// dropping them shrinks it exactly like clearing the Auto layer does.
+    pub async fn clear_outer_docs_context(self: &Arc<Self>) -> Result<ContextState, String> {
+        self.clear_context(|ctx| ctx.clear_outer_docs()).await
     }
 
     /// Clears every mutable context layer and starts a fresh dialogue session
@@ -760,7 +760,7 @@ impl AppState {
     /// deterministic tests may pin it through the `marker_override` seam or
     /// disable it by injecting a scripted provider.
     pub async fn next_turn_marker(&self) -> Option<String> {
-        let protocol = self.config.lock().await.config.develop.protocol;
+        let protocol = self.config.lock().await.config.repl.protocol;
         if protocol == EditProtocolKind::Structured {
             return None;
         }
@@ -1137,7 +1137,7 @@ mod tests {
         let state = AppState::new(AppConfig::default(), root.clone(), history_sender, out);
 
         assert_eq!(
-            state.config.lock().await.config.develop.protocol,
+            state.config.lock().await.config.repl.protocol,
             EditProtocolKind::Structured,
             "the default configuration must use the structured protocol"
         );
@@ -1157,7 +1157,7 @@ mod tests {
         let _ = std::fs::create_dir_all(&root);
 
         let mut config = AppConfig::default();
-        config.develop.protocol = EditProtocolKind::Xml;
+        config.repl.protocol = EditProtocolKind::Xml;
         let (out, _rx) = OutChannel::new();
         let (history_sender, _history_rx) = tokio::sync::mpsc::unbounded_channel();
         let state = AppState::new(config, root.clone(), history_sender, out);

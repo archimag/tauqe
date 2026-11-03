@@ -415,7 +415,7 @@ pub fn build_verification_retry_prompt(report: &str, target_language: Option<&st
     let mut prompt = String::new();
     prompt.push_str("Code verification failed with the following errors:\n\n```\n");
     prompt.push_str(report.trim());
-    prompt.push_str("\n```\n\nPlease fix the errors by proposing corrected edits that follow the edit protocol defined in your system instructions. If you need additional files to understand or fix the issue, request them through the discovery protocol defined in your system instructions.");
+    prompt.push_str("\n```\n\nPlease fix the errors by proposing corrected edits that follow the edit protocol defined in your system instructions. If you need additional files to understand or fix the issue, request them through the research protocol defined in your system instructions.");
     if let Some(lang) = target_language {
         prompt.push_str(&format!(
             "\n\nNote: Formulate your explanations in {} (the language of the user's request), while conducting all reasoning strictly in English.",
@@ -433,7 +433,7 @@ pub fn build_verification_missing_edits_prompt(
     let mut prompt = String::new();
     prompt.push_str("Your previous response contained explanations but did not include any code edits that follow the edit protocol defined in your system instructions.\n\nCode verification is still failing with the following errors:\n\n```\n");
     prompt.push_str(report.trim());
-    prompt.push_str("\n```\n\nYou MUST propose concrete code edits to resolve the compilation or verification errors, following the edit protocol defined in your system instructions. If you need additional files, request them through the discovery protocol defined in your system instructions.");
+    prompt.push_str("\n```\n\nYou MUST propose concrete code edits to resolve the compilation or verification errors, following the edit protocol defined in your system instructions. If you need additional files, request them through the research protocol defined in your system instructions.");
     if let Some(lang) = target_language {
         prompt.push_str(&format!(
             "\n\nNote: Formulate your explanations in {} (the language of the user's request), while conducting all reasoning strictly in English.",
@@ -461,7 +461,7 @@ mod tests {
         let prompt = build_verification_retry_prompt("error[E0308]: mismatched types", None);
         assert!(prompt.contains("error[E0308]: mismatched types"));
         assert!(prompt.contains("edit protocol defined in your system instructions"));
-        assert!(prompt.contains("discovery protocol defined in your system instructions"));
+        assert!(prompt.contains("research protocol defined in your system instructions"));
         assert!(!prompt.contains("<tauqe_edits"));
         assert!(!prompt.contains("<context_request"));
     }

@@ -103,7 +103,77 @@ fn set_private_permissions(file: &std::fs::File) -> std::io::Result<()> {
 fn set_private_permissions(_file: &std::fs::File) -> std::io::Result<()> {
     Ok(())
 }
+/// A prompt-history persistence job produced by [`TextEditor::record_history`].
+///
+/// The job owns everything the write needs: the resolved history path and the
+/// exact bytes to persist. Recording a prompt therefore performs no disk I/O,
+/// and the caller runs the job on a blocking pool after releasing the
+/// application state guard. Creating the parent directory, appending the line,
+/// and rewriting the whole file atomically when the 1000-entry cap trips all
+/// happen inside [`PromptHistoryJob::write`], never on the event-loop thread
+/// while the state is locked.
+pub struct PromptHistoryJob {
+    path: PathBuf,
+    payload: PromptHistoryPayload,
+}
 
+impl PromptHistoryJob {
+    /// Runs the job on the calling thread, ignoring I/O failures exactly as the
+    /// previous in-place recording path did.
+    ///
+    /// Callers run it on a blocking pool after releasing the application state
+    /// guard, so the event-loop thread never waits for the disk.
+    pub fn write(self) {
+        match self.payload {
+            PromptHistoryPayload::Append(line) => append_history_line(&self.path, &line),
+            PromptHistoryPayload::Rewrite(contents) => {
+                let _ = write_private_file(&self.path, &contents);
+            }
+        }
+    }
+}
+
+/// Bytes a [`PromptHistoryJob`] persists.
+enum PromptHistoryPayload {
+    /// One serialized JSON line appended to the history file.
+    Append(String),
+    /// The complete serialized history, written atomically over the file.
+    Rewrite(Vec<u8>),
+}
+
+/// Appends one serialized history line to `path`, creating the parent directory
+/// and the file with owner-only permissions. I/O failures are ignored, exactly
+/// as the in-place recording path ignored them: a prompt recall list is a
+/// convenience, never a reason to fail a turn.
+fn append_history_line(path: &Path, serialized: &str) {
+    use std::io::Write;
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+        let mut options = std::fs::OpenOptions::new();
+        options.create(true).append(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        if let Ok(mut file) = options.open(path) {
+            let _ = set_private_permissions(&file);
+            let _ = writeln!(file, "{}", serialized);
+        }
+    }
+}
+
+/// Serializes the whole history into JSON-lines contents.
+fn serialize_history(history: &[String]) -> Vec<u8> {
+    let mut contents = String::new();
+    for item in history {
+        if let Ok(serialized) = serde_json::to_string(item) {
+            contents.push_str(&serialized);
+            contents.push('\n');
+        }
+    }
+    contents.into_bytes()
+}
 /// Returns whether the key event's modifiers correspond to normal character typing:
 /// either no modifiers, Shift only, or AltGr (Ctrl+Alt / Ctrl+Alt+Shift) on Windows/X11.
 pub fn is_char_typing(modifiers: KeyModifiers) -> bool {
@@ -151,7 +221,7 @@ fn resolve_command(key: KeyEvent, is_cmd: bool, input: &InputConfig) -> Option<E
 
 /// Unified single/multiline text editor component.
 ///
-/// Every text input surface (Develop prompt, modal discussion comments, squash
+/// Every text input surface (the REPL prompt, modal discussion comments, squash
 /// message, file search, onboarding fields) is backed by this component. It owns
 /// the UTF-8 buffer, cursor navigation, the kill ring, prompt history with disk
 /// persistence, keyboard handling and the visual line wrapping used to place the
@@ -212,17 +282,6 @@ impl TextEditor {
         }
     }
 
-    pub fn save_history_to_file(&self, path: &Path) {
-        let mut contents = String::new();
-        for item in &self.history {
-            if let Ok(serialized) = serde_json::to_string(item) {
-                contents.push_str(&serialized);
-                contents.push('\n');
-            }
-        }
-        let _ = write_private_file(path, contents.as_bytes());
-    }
-
     pub fn clear(&mut self) {
         self.text.clear();
         self.cursor = 0;
@@ -254,36 +313,51 @@ impl TextEditor {
         }
     }
 
-    pub fn record_history(&mut self, prompt: &str) {
+    /// Records `prompt` in the in-memory history and returns the persistence job
+    /// the caller must run outside the application state guard.
+    ///
+    /// The recording pass keeps the memory semantics: surrounding whitespace is
+    /// trimmed, a prompt equal to the last recorded entry is not recorded twice,
+    /// the list is capped at 1000 entries, and the recall cursor returns to the
+    /// live draft. Nothing touches the disk here: the returned job owns the exact
+    /// bytes to persist, the serialized append line, or the whole serialized
+    /// history when the cap trips a rewrite. A `None` job means nothing has to be
+    /// written, because no history path is configured, the prompt is blank, or it
+    /// duplicates the last recorded entry.
+    pub fn record_history(&mut self, prompt: &str) -> Option<PromptHistoryJob> {
         let trimmed = prompt.trim();
-        if !trimmed.is_empty() && self.history.last().map(|s| s.as_str()) != Some(trimmed) {
+        let duplicate = self
+            .history
+            .last()
+            .is_some_and(|entry| entry.as_str() == trimmed);
+        let job = if trimmed.is_empty() || duplicate {
+            None
+        } else {
             self.history.push(trimmed.to_string());
-            if let Some(ref path) = self.history_path {
-                use std::io::Write;
-                if self.history.len() > 1000 {
-                    let start = self.history.len() - 1000;
-                    self.history = self.history.split_off(start);
-                    self.save_history_to_file(path);
-                } else if let Some(parent) = path.parent() {
-                    let _ = std::fs::create_dir_all(parent);
-                    let mut options = std::fs::OpenOptions::new();
-                    options.create(true).append(true);
-                    #[cfg(unix)]
-                    {
-                        use std::os::unix::fs::OpenOptionsExt;
-                        options.mode(0o600);
-                    }
-                    if let Ok(mut file) = options.open(path) {
-                        let _ = set_private_permissions(&file);
-                        if let Ok(serialized) = serde_json::to_string(trimmed) {
-                            let _ = writeln!(file, "{}", serialized);
-                        }
-                    }
-                }
-            }
-        }
+            self.history_persistence_job(trimmed)
+        };
         self.history_index = None;
         self.draft.clear();
+        job
+    }
+
+    /// Builds the persistence job for the entry [`Self::record_history`] just
+    /// recorded, or `None` when no history path is configured.
+    fn history_persistence_job(&mut self, trimmed: &str) -> Option<PromptHistoryJob> {
+        let path = self.history_path.clone()?;
+        if self.history.len() > 1000 {
+            let start = self.history.len() - 1000;
+            self.history = self.history.split_off(start);
+            return Some(PromptHistoryJob {
+                path,
+                payload: PromptHistoryPayload::Rewrite(serialize_history(&self.history)),
+            });
+        }
+        let line = serde_json::to_string(trimmed).ok()?;
+        Some(PromptHistoryJob {
+            path,
+            payload: PromptHistoryPayload::Append(line),
+        })
     }
 
     pub fn history_prev(&mut self) -> bool {
@@ -1040,8 +1114,9 @@ mod tests {
     #[test]
     fn prompt_history_navigation_and_draft_restoration() {
         let mut editor = TextEditor::default();
-        editor.record_history("first prompt");
-        editor.record_history("second prompt");
+        // No history path is configured, so the recording pass persists nothing.
+        assert!(editor.record_history("first prompt").is_none());
+        assert!(editor.record_history("second prompt").is_none());
 
         editor.insert_str("unfinished draft");
         assert!(editor.history_prev());
@@ -1082,9 +1157,18 @@ mod tests {
         let mut editor = TextEditor::default();
         editor.set_history_path(history_file.clone());
 
-        editor.record_history("first simple prompt");
-        editor.record_history("multiline\nprompt with \"quotes\" and <tags>");
-        editor.record_history("third prompt");
+        editor
+            .record_history("first simple prompt")
+            .expect("a configured history path yields a persistence job")
+            .write();
+        editor
+            .record_history("multiline\nprompt with \"quotes\" and <tags>")
+            .expect("a configured history path yields a persistence job")
+            .write();
+        editor
+            .record_history("third prompt")
+            .expect("a configured history path yields a persistence job")
+            .write();
 
         let mut reloaded = TextEditor::default();
         reloaded.set_history_path(history_file.clone());
@@ -1181,26 +1265,43 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn save_history_to_file_writes_private_atomic_file() {
+    /// The 1000-entry cap turns a recorded prompt into a whole-file rewrite, and
+    /// the job persists it atomically with owner-only permissions. The write runs
+    /// outside the editor, so the same bytes reach the disk without any I/O on
+    /// the recording path.
+    fn cap_rewrite_job_writes_a_private_atomic_file() {
         use std::os::unix::fs::PermissionsExt;
         let temp_dir = std::env::temp_dir().join(format!("tauqe_atomic_{}", std::process::id()));
         let _ = std::fs::create_dir_all(&temp_dir);
         let history_file = temp_dir.join("prompts.history");
 
-        let editor = TextEditor {
-            history: vec!["secret prompt".to_string()],
+        let mut editor = TextEditor {
+            history: (0..1000).map(|index| format!("prompt {index}")).collect(),
             ..Default::default()
         };
-        editor.save_history_to_file(&history_file);
+        editor.set_history_path(history_file.clone());
+
+        editor
+            .record_history("secret prompt")
+            .expect("the cap trips a whole-file rewrite job")
+            .write();
 
         let mode = std::fs::metadata(&history_file)
             .expect("history file exists")
             .permissions()
             .mode();
         assert_eq!(mode & 0o777, 0o600);
-        assert!(std::fs::read_to_string(&history_file)
-            .expect("history readable")
-            .contains("secret prompt"));
+
+        let contents = std::fs::read_to_string(&history_file).expect("history readable");
+        let lines: Vec<&str> = contents.lines().collect();
+        assert_eq!(lines.len(), 1000, "the cap keeps the newest entries only");
+        assert_eq!(lines.first().copied(), Some("\"prompt 1\""));
+        assert_eq!(lines.last().copied(), Some("\"secret prompt\""));
+        assert_eq!(editor.history.len(), 1000);
+        assert_eq!(
+            editor.history.last().map(String::as_str),
+            Some("secret prompt")
+        );
 
         let _ = std::fs::remove_dir_all(temp_dir);
     }
@@ -1215,7 +1316,10 @@ mod tests {
 
         let mut editor = TextEditor::default();
         editor.set_history_path(history_file.clone());
-        editor.record_history("first prompt");
+        editor
+            .record_history("first prompt")
+            .expect("a configured history path yields a persistence job")
+            .write();
 
         let mode = std::fs::metadata(&history_file)
             .expect("history file exists")

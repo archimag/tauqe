@@ -1,0 +1,44 @@
+[[outer_docs]]
+id = "openrouter/chat-completion"
+title = "OpenRouter Chat Completion API"
+source = "https://openrouter.ai/docs/api/api-reference/chat/create-a-chat-completion.md"
+
+[[outer_docs]]
+id = "openrouter/structured-outputs"
+title = "OpenRouter Structured Outputs Guide"
+source = "https://openrouter.ai/docs/guides/features/structured-outputs.md"
+
+[[outer_docs]]
+id = "openrouter/stt"
+title = "OpenRouter Speech-to-Text Guide"
+source = "https://openrouter.ai/docs/guides/overview/multimodal/stt.md"
+
+[[outer_docs]]
+id = "openrouter/tts"
+title = "OpenRouter Text-to-Speech Guide"
+source = "https://openrouter.ai/docs/guides/overview/multimodal/tts.md"
+
+[[outer_docs]]
+id = "openrouter/errors-and-debugging"
+title = "OpenRouter Errors and Debugging"
+source = "https://openrouter.ai/docs/api_reference/errors-and-debugging.md"
+
+[[outer_docs]]
+id = "openrouter/limits"
+title = "OpenRouter Rate Limits"
+source = "https://openrouter.ai/docs/api_reference/limits.md"
+
+[[outer_docs]]
+id = "openrouter/authentication"
+title = "OpenRouter Authentication"
+source = "https://openrouter.ai/docs/api_reference/authentication.md"
+
+[[outer_docs]]
+id = "openrouter/generation"
+title = "OpenRouter Generation API"
+source = "https://openrouter.ai/docs/api/api-reference/generations/get-request-&-usage-metadata-for-a-generation.md"
+
+[[outer_docs]]
+id = "openrouter/models"
+title = "OpenRouter Models API"
+source = "https://openrouter.ai/docs/api/api-reference/models/list-all-models-and-their-properties.md"

@@ -72,15 +72,29 @@ pub enum LlmCommand {
     /// the listing from the direct children to every tracked file underneath,
     /// keeping the default request shallow.
     DirList { path: String, recursive: bool },
-    /// A request for system documentation by topic.
+    /// A request for harness system documentation by topic.
     ///
-    /// The topic may be omitted: a `doc_request` payload without one decodes
-    /// to [`DocTopic::All`], so the documented missing-topic fallback holds on
+    /// The command is canonically spelled `tauqe_doc_request`, and the
+    /// pre-canonical `doc_request` stays a declared alias, so a payload written
+    /// before the rename keeps decoding identically.
+    ///
+    /// The topic may be omitted: a payload without one decodes to
+    /// [`DocTopic::All`], so the documented missing-topic fallback holds on
     /// this boundary as well.
+    #[serde(rename = "tauqe_doc_request", alias = "doc_request")]
     DocRequest {
         #[serde(default)]
         topic: DocTopic,
     },
+    /// A request for one external document declared by the project.
+    ///
+    /// The identifier names an entry of `[[outer_docs]]`, never a path: where
+    /// the materialized copy is cached stays an implementation detail of the
+    /// harness, so a request addresses only material the project itself
+    /// declared. A document that publishes a structured index answers with the
+    /// chapters it exposes, and the material it delivers enters the context as
+    /// read-only reference.
+    OuterDocRequest { id: String },
     /// A request to run deterministic toolchain verification.
     Verify {
         target: VerifyTarget,
@@ -90,10 +104,10 @@ pub enum LlmCommand {
     Plan { update: DiscussionPlanUpdate },
     /// A decision recorded for one finding of a review session.
     ///
-    /// A review decision is authorized by the dialogue anchor rather than by a
-    /// capability module: only a dialogue anchored on a review session may
-    /// record one, so the harness applies it against the session the turn names
-    /// and never against whichever session happens to be active.
+    /// The decision is authorized by the declared regime of the turn: only a
+    /// review discussion carries the capability, so the harness applies it
+    /// against the session the turn names and never against whichever session
+    /// happens to be active.
     ReviewUpdate {
         update: crate::review::ReviewUpdateProposal,
     },
@@ -131,8 +145,7 @@ pub enum LlmCommand {
 
 impl LlmCommand {
     /// Capability that this command realizes, or `None` when the command is a
-    /// protocol diagnostic, or a review decision the dialogue anchor
-    /// authorizes rather than a capability module.
+    /// protocol diagnostic rather than a realized capability.
     pub fn capability(&self) -> Option<LlmCapability> {
         match self {
             Self::Text { .. } => Some(LlmCapability::TextMessage),
@@ -141,8 +154,9 @@ impl LlmCommand {
             | Self::RepoSearch { .. }
             | Self::RepoDirs
             | Self::RepoMap { .. }
-            | Self::DirList { .. } => Some(LlmCapability::Discovery),
+            | Self::DirList { .. } => Some(LlmCapability::Research),
             Self::DocRequest { .. } => Some(LlmCapability::DocRequest),
+            Self::OuterDocRequest { .. } => Some(LlmCapability::OuterDocRequest),
             Self::Verify { .. } => Some(LlmCapability::ToolchainVerify),
             Self::Plan { update } => Some(match update.action {
                 DiscussionPlanAction::Save => LlmCapability::PlanCreation,
@@ -156,7 +170,7 @@ impl LlmCommand {
             Self::Abort { .. } => Some(LlmCapability::Abort),
             Self::UserLanguage { .. } => Some(LlmCapability::UserLanguage),
             Self::CustomTool { .. } => Some(LlmCapability::CustomTools),
-            Self::ReviewUpdate { .. } => None,
+            Self::ReviewUpdate { .. } => Some(LlmCapability::ReviewUpdate),
             Self::ProtocolError { .. } => None,
         }
     }
@@ -212,8 +226,8 @@ pub enum VerifyOnSuccess {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "status", rename_all = "snake_case")]
 pub enum LlmOutcome {
-    /// The task completed successfully, with an optional summary.
-    Success { summary: Option<String> },
+    /// The task completed successfully, carrying the Git commit message of the change set.
+    Success { commit_message: Option<String> },
     /// The task is blocked, with an explanatory message.
     Error { message: String },
     /// The task is skipped, with an explanatory reason.
@@ -271,8 +285,25 @@ mod tests {
             topic: DocTopic::Workflow,
         };
         let json = serde_json::to_string(&doc).unwrap();
-        assert!(json.contains("\"type\":\"doc_request\""));
+        assert!(json.contains("\"type\":\"tauqe_doc_request\""));
         assert_eq!(serde_json::from_str::<LlmCommand>(&json).unwrap(), doc);
+        // The pre-canonical spelling stays a declared alias, so a payload
+        // written before the rename keeps decoding identically.
+        let legacy: LlmCommand =
+            serde_json::from_str(r#"{"type":"doc_request","topic":"workflow"}"#)
+                .expect("the legacy spelling must decode");
+        assert_eq!(legacy, doc);
+
+        let outer_doc = LlmCommand::OuterDocRequest {
+            id: "mylib".to_string(),
+        };
+        let json = serde_json::to_string(&outer_doc).unwrap();
+        assert!(json.contains("\"type\":\"outer_doc_request\""));
+        assert!(json.contains("\"id\":\"mylib\""));
+        assert_eq!(
+            serde_json::from_str::<LlmCommand>(&json).unwrap(),
+            outer_doc
+        );
 
         let dirs = LlmCommand::RepoDirs;
         let json = serde_json::to_string(&dirs).unwrap();
@@ -350,15 +381,19 @@ mod tests {
 
     #[test]
     fn test_doc_request_without_topic_decodes_to_all() {
-        // The documented missing-topic fallback holds at the command boundary.
-        let command: LlmCommand = serde_json::from_str(r#"{"type":"doc_request"}"#)
-            .expect("a doc_request without a topic must decode");
-        assert_eq!(
-            command,
-            LlmCommand::DocRequest {
-                topic: DocTopic::All
-            }
-        );
+        // The documented missing-topic fallback holds at the command boundary,
+        // under the canonical spelling and its declared alias alike.
+        for spelling in ["tauqe_doc_request", "doc_request"] {
+            let raw = format!(r#"{{"type":"{spelling}"}}"#);
+            let command: LlmCommand =
+                serde_json::from_str(&raw).expect("a doc request without a topic must decode");
+            assert_eq!(
+                command,
+                LlmCommand::DocRequest {
+                    topic: DocTopic::All
+                }
+            );
+        }
     }
 
     #[test]
@@ -425,12 +460,13 @@ mod tests {
     fn test_llm_command_outcome_serde_roundtrip() {
         let success = LlmCommand::Outcome {
             outcome: LlmOutcome::Success {
-                summary: Some("All checks passed".to_string()),
+                commit_message: Some("All checks passed".to_string()),
             },
         };
         let json = serde_json::to_string(&success).unwrap();
         assert!(json.contains("\"type\":\"outcome\""));
         assert!(json.contains("\"status\":\"success\""));
+        assert!(json.contains("\"commit_message\":\"All checks passed\""));
         assert_eq!(serde_json::from_str::<LlmCommand>(&json).unwrap(), success);
 
         let error = LlmCommand::Outcome {
@@ -515,37 +551,43 @@ mod tests {
             path: "src/a.rs".to_string(),
             access: ContextAccess::ReadOnly,
         };
-        assert_eq!(context.capability(), Some(LlmCapability::Discovery));
-        assert_eq!(context.phase(), Some(CapabilityPhase::Discovery));
+        assert_eq!(context.capability(), Some(LlmCapability::Research));
+        assert_eq!(context.phase(), Some(CapabilityPhase::Research));
 
         let search = LlmCommand::RepoSearch {
             path: "src".to_string(),
             regex: "fn main".to_string(),
         };
-        assert_eq!(search.capability(), Some(LlmCapability::Discovery));
+        assert_eq!(search.capability(), Some(LlmCapability::Research));
 
         let dirs = LlmCommand::RepoDirs;
-        assert_eq!(dirs.capability(), Some(LlmCapability::Discovery));
-        assert_eq!(dirs.phase(), Some(CapabilityPhase::Discovery));
+        assert_eq!(dirs.capability(), Some(LlmCapability::Research));
+        assert_eq!(dirs.phase(), Some(CapabilityPhase::Research));
 
         let map = LlmCommand::RepoMap {
             path: "crates/core".to_string(),
         };
-        assert_eq!(map.capability(), Some(LlmCapability::Discovery));
-        assert_eq!(map.phase(), Some(CapabilityPhase::Discovery));
+        assert_eq!(map.capability(), Some(LlmCapability::Research));
+        assert_eq!(map.phase(), Some(CapabilityPhase::Research));
 
         let dir_list = LlmCommand::DirList {
             path: "crates/core".to_string(),
             recursive: false,
         };
-        assert_eq!(dir_list.capability(), Some(LlmCapability::Discovery));
-        assert_eq!(dir_list.phase(), Some(CapabilityPhase::Discovery));
+        assert_eq!(dir_list.capability(), Some(LlmCapability::Research));
+        assert_eq!(dir_list.phase(), Some(CapabilityPhase::Research));
 
         let doc = LlmCommand::DocRequest {
             topic: DocTopic::Workflow,
         };
         assert_eq!(doc.capability(), Some(LlmCapability::DocRequest));
-        assert_eq!(doc.phase(), Some(CapabilityPhase::Discovery));
+        assert_eq!(doc.phase(), Some(CapabilityPhase::Research));
+
+        let outer_doc = LlmCommand::OuterDocRequest {
+            id: "mylib".to_string(),
+        };
+        assert_eq!(outer_doc.capability(), Some(LlmCapability::OuterDocRequest));
+        assert_eq!(outer_doc.phase(), Some(CapabilityPhase::Research));
 
         let verify = LlmCommand::Verify {
             target: VerifyTarget::All,
@@ -560,7 +602,9 @@ mod tests {
         assert_eq!(scratchpad.capability(), Some(LlmCapability::Scratchpad));
 
         let outcome = LlmCommand::Outcome {
-            outcome: LlmOutcome::Success { summary: None },
+            outcome: LlmOutcome::Success {
+                commit_message: None,
+            },
         };
         assert_eq!(outcome.capability(), Some(LlmCapability::Outcome));
         assert_eq!(outcome.phase(), Some(CapabilityPhase::Outcome));
@@ -658,7 +702,9 @@ mod tests {
 
         // The dialogue anchor authorizes a decision, not a capability module,
         // so the command carries neither a capability nor a phase of its own.
-        assert_eq!(command.capability(), None);
-        assert_eq!(command.phase(), None);
+        // A decision is a capability of the review discussion regime, so the
+        // command carries that capability and its execution phase.
+        assert_eq!(command.capability(), Some(LlmCapability::ReviewUpdate));
+        assert_eq!(command.phase(), Some(CapabilityPhase::Execution));
     }
 }

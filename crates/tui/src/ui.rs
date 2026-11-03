@@ -41,7 +41,7 @@ pub use wrap::{wrap_line, wrap_lines};
 
 const MIN_TERM_WIDTH: u16 = 60;
 const MIN_TERM_HEIGHT: u16 = 12;
-/// On terminals shorter than this the footer and the non-Develop info strip
+/// On terminals shorter than this the footer and the non-REPL info strip
 /// are dropped so the main area keeps enough rows to stay usable.
 const COMPACT_TERM_HEIGHT: u16 = 20;
 
@@ -169,11 +169,12 @@ pub fn render_ui(frame: &mut ratatui::Frame, state: &mut AppState) {
     // resized surface can never survive into the next frame (c-3).
     state.hit_regions.clear();
     // Publish the provider catalog and the resolved role entries the single
-    // model-name printer reads. This is the only update point of the display
-    // state, and it runs before the body of the frame is drawn, so every label
-    // of this frame reflects the configuration reported with it instead of the
-    // previous one (c-1, c-3).
-    crate::model_display::install_snapshot(state.model_choice.roles.as_ref());
+    // model-name printer reads. The snapshot is fully determined by the
+    // mirrored model choice, so the frame republishes it only once that choice
+    // has advanced: a streaming redraw between two mutations reuses the
+    // published labels instead of re-walking the catalog and taking the
+    // projection write lock on every frame (c-1, c-3).
+    state.publish_model_display();
     if area.width < MIN_TERM_WIDTH || area.height < MIN_TERM_HEIGHT {
         render_terminal_too_small(frame);
         return;
@@ -349,24 +350,22 @@ pub fn render_ui(frame: &mut ratatui::Frame, state: &mut AppState) {
         }
         // The inspector is a live projection of the change set: every
         // edit-stream event refreshes it, and it paints the rows through the same
-        // diff cache the Develop viewport already filled, so the audit and the
+        // diff cache the REPL viewport already filled, so the audit and the
         // REPL can never disagree about a diff body (c-1, c-3).
         Some(ActiveModal::DiffInspector) => {
             // The animation frame is read before the inspector borrows the shared
             // state, so the file the stream currently writes carries the same
             // spinner here as it does in the Viewport (c-3).
             let spinner_frame = state.model.spinner_frame;
+            // A plan step audits the finished change set of its commit, while the
+            // Develop viewport audits the live staged set it owns. The two
+            // borrows are disjoint fields of the shared state (c-3).
+            let (audited, cache) = match state.diff_audit.as_mut() {
+                Some(audit) => (audit.files.as_slice(), &mut audit.cache),
+                None => (state.model.files.as_slice(), &mut state.model.diff_cache),
+            };
             if let Some(inspector) = state.diff_inspector.as_mut() {
-                // The audited set is the staged set the Viewport renders: the
-                // audit reads that single owned slice in place, and the three
-                // borrows are disjoint fields of the shared state (c-3).
-                render_diff_inspector(
-                    frame,
-                    inspector,
-                    &state.model.files,
-                    &mut state.model.diff_cache,
-                    spinner_frame,
-                );
+                render_diff_inspector(frame, inspector, audited, cache, spinner_frame);
             }
         }
         Some(ActiveModal::ThemeSelector) => {

@@ -14,6 +14,10 @@ use tokio::sync::watch;
 use super::report::log_toolchain_check_result;
 use super::ToolchainCheckResult;
 
+/// Environment variable that carries the repository-relative path of the file
+/// whose staged content is streamed through a project filter.
+pub(super) const FILE_PATH_ENV: &str = "TAUQE_FILE_PATH";
+
 /// A program together with its literal argument list.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct CommandLine {
@@ -366,9 +370,16 @@ pub(super) struct StreamingOutcome {
 /// [`run_command`], the child leads its own process group, so a timeout or a
 /// cancellation tears down the descendants the command spawned instead of
 /// leaving them behind.
+///
+/// `path` is the repository-relative path of the file whose staged content is
+/// streamed, and it reaches the child through [`FILE_PATH_ENV`], so a filter can
+/// dispatch on the file type without parsing a single byte of the content. An
+/// empty path describes a caller that knows no repository path, so the variable
+/// stays unset and the child sees no file context at all.
 pub(super) async fn run_streaming_command(
     repo_root: &Path,
     command: &CommandLine,
+    path: &str,
     input: &str,
     timeout_secs: u64,
     cancel_rx: Option<&watch::Receiver<bool>>,
@@ -397,6 +408,12 @@ pub(super) async fn run_streaming_command(
     let mut cmd = tokio::process::Command::new(command.program());
     cmd.args(command.args());
     cmd.current_dir(repo_root);
+    // The filter learns which file it is rewriting from the environment, so the
+    // pure stream contract is unchanged: the staged text still arrives on
+    // standard input and nothing reaches the file system.
+    if !path.is_empty() {
+        cmd.env(FILE_PATH_ENV, path);
+    }
     cmd.stdin(std::process::Stdio::piped());
     cmd.stdout(std::process::Stdio::piped());
     cmd.stderr(std::process::Stdio::piped());
@@ -431,16 +448,10 @@ pub(super) async fn run_streaming_command(
         input.as_bytes().to_vec(),
         command.display(),
     );
-    let stdout_task = spawn_pipe_reader(child.stdout.take());
-    let stderr_task = spawn_pipe_reader(child.stderr.take());
+    let mut stdout_task = spawn_pipe_reader(child.stdout.take());
+    let mut stderr_task = spawn_pipe_reader(child.stderr.take());
 
-    let cancel_fut = async {
-        if let Some(rx) = cancel_rx {
-            wait_for_cancel(rx.clone()).await;
-        } else {
-            std::future::pending::<()>().await;
-        }
-    };
+    let cancel_fut = wait_for_cancellation(cancel_rx);
 
     enum RaceOutcome {
         Exited(std::io::Result<std::process::ExitStatus>),
@@ -460,8 +471,27 @@ pub(super) async fn run_streaming_command(
             // pipe. Aborting the writer also releases the turn when a lingering
             // descendant inherited the pipe.
             stdin_task.abort();
-            let stdout_bytes = stdout_task.await.unwrap_or_default();
-            let stderr_bytes = stderr_task.await.unwrap_or_default();
+            // A descendant that inherited the pipes can hold them open long
+            // after the direct child exited, so the drain races the
+            // cancellation signal as well. The child is already reaped here, so
+            // its process group can no longer be signalled safely; abandoning
+            // the readers is what releases a cancelled turn instead of waiting
+            // for a descendant that may never exit.
+            let drain = async {
+                let stdout_bytes = (&mut stdout_task).await.unwrap_or_default();
+                let stderr_bytes = (&mut stderr_task).await.unwrap_or_default();
+                (stdout_bytes, stderr_bytes)
+            };
+            let drained = tokio::select! {
+                biased;
+                pipes = drain => Some(pipes),
+                _ = wait_for_cancellation(cancel_rx) => None,
+            };
+            let Some((stdout_bytes, stderr_bytes)) = drained else {
+                stdout_task.abort();
+                stderr_task.abort();
+                return cancelled_streaming_result();
+            };
             let stdout = String::from_utf8_lossy(&stdout_bytes).to_string();
             let stderr = String::from_utf8_lossy(&stderr_bytes).to_string();
             match status_res {
@@ -913,7 +943,8 @@ mod tests {
         let command = CommandLine::tokenized("cat");
         let input = "staged line one\nstaged line two\n";
 
-        let outcome = run_streaming_command(dir.path(), &command, input, 10, None).await;
+        let outcome =
+            run_streaming_command(dir.path(), &command, "src/lib.rs", input, 10, None).await;
 
         assert!(outcome.success, "command failed: {}", outcome.stderr);
         assert!(!outcome.is_cancelled);
@@ -930,7 +961,8 @@ mod tests {
         let dir = tempdir().unwrap();
         let command = CommandLine::tokenized("sleep 10");
 
-        let outcome = run_streaming_command(dir.path(), &command, "staged", 1, None).await;
+        let outcome =
+            run_streaming_command(dir.path(), &command, "src/lib.rs", "staged", 1, None).await;
 
         assert!(!outcome.success);
         assert!(outcome.timed_out);
@@ -951,8 +983,15 @@ mod tests {
         let (cancel_tx, cancel_rx) = watch::channel(true);
         drop(cancel_tx);
 
-        let outcome =
-            run_streaming_command(dir.path(), &command, "staged", 10, Some(&cancel_rx)).await;
+        let outcome = run_streaming_command(
+            dir.path(),
+            &command,
+            "src/lib.rs",
+            "staged",
+            10,
+            Some(&cancel_rx),
+        )
+        .await;
 
         assert!(!outcome.success);
         assert!(outcome.is_cancelled);
@@ -981,6 +1020,7 @@ mod tests {
             run_streaming_command(
                 &root,
                 &CommandLine::tokenized(command),
+                "src/lib.rs",
                 "staged input\n",
                 30,
                 Some(&cancel_rx),
@@ -1020,6 +1060,50 @@ mod tests {
         assert_eq!(
             size_at_kill, size_later,
             "the grandchild kept writing after the cancellation"
+        );
+    }
+
+    /// A cancelled stream filter stops waiting for a pipe a lingering
+    /// descendant holds.
+    ///
+    /// The direct child can exit long before its descendants do, and a
+    /// descendant that inherited the standard output keeps the pipe from
+    /// reaching EOF. The drain therefore races the cancellation signal: the
+    /// turn ends when it is cancelled, not when the last descendant exits.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_run_streaming_command_cancellation_releases_a_lingering_drain() {
+        let dir = tempdir().unwrap();
+        // The direct child exits at once; the grandchild keeps the inherited
+        // pipe open for several seconds.
+        let command = "sh -c 'sh -c \"sleep 3\" & exit 0'";
+        let (cancel_tx, cancel_rx) = watch::channel(false);
+        let root = dir.path().to_path_buf();
+        let task = tokio::spawn(async move {
+            run_streaming_command(
+                &root,
+                &CommandLine::tokenized(command),
+                "src/lib.rs",
+                "staged input\n",
+                30,
+                Some(&cancel_rx),
+            )
+            .await
+        });
+
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        let started = std::time::Instant::now();
+        let _ = cancel_tx.send(true);
+
+        let outcome = task.await.unwrap();
+        assert!(outcome.is_cancelled, "the drain outlived the cancellation");
+        assert!(!outcome.timed_out);
+        assert!(outcome.stdout.is_empty());
+        assert!(outcome.stderr.contains("cancelled"));
+        assert!(
+            started.elapsed() < std::time::Duration::from_millis(1200),
+            "the cancelled turn waited for the lingering descendant: {:?}",
+            started.elapsed()
         );
     }
 }

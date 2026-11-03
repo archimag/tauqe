@@ -349,8 +349,26 @@ pub fn render_review_dialog(
         } else {
             engine.fg(palette.border)
         };
+        // A section that draws fewer rows than the list carries names the
+        // highlighted row in its title instead of hiding the rest of the rows,
+        // the same way the reviewer list counters its entries
+        // (c-preset-visibility-indicator). The counter is measured against the
+        // rows the block actually draws, so it appears exactly when a row stays
+        // out of sight; a project whose rows all fit keeps the plain title.
+        let rows_hidden =
+            dialog.preset_selector.item_count() > geometry.preset_rows.height as usize;
+        let preset_title = if rows_hidden {
+            let position = (dialog.preset_selector.selected_index() + 1).to_string();
+            let total = dialog.preset_selector.item_count().to_string();
+            let counter = active_t("dialog.review_launch.presets_counter")
+                .replacen("{}", &position, 1)
+                .replacen("{}", &total, 1);
+            format!(" {counter} ")
+        } else {
+            active_t("dialog.review_launch.presets_title")
+        };
         let preset_block = Block::default()
-            .title(active_t("dialog.review_launch.presets_title"))
+            .title(preset_title)
             .borders(Borders::ALL)
             .border_style(preset_border)
             .style(Style::default().bg(engine.color(palette.surface)));
@@ -968,5 +986,46 @@ mod tests {
             .position(|row| row.contains("crates/core/"))
             .expect("the menu lists the deeper prefix");
         assert!(deeper > highlighted, "the menu grows downward");
+    }
+    /// A project that declares more presets than the section draws at once
+    /// states the position of the highlighted row in the block title instead of
+    /// hiding the rest of the rows, while a project whose rows all fit keeps the
+    /// plain title (c-preset-visibility-indicator).
+    #[test]
+    fn test_review_dialog_preset_section_names_the_hidden_rows() {
+        let presets: Vec<tauqe_protocol::ReviewPresetSummary> = (0..5)
+            .map(|index| tauqe_protocol::ReviewPresetSummary {
+                name: format!("preset-{index}"),
+                title: None,
+            })
+            .collect();
+
+        let dialog = review_dialog_fixture(1, &["a/lib.rs"], &presets);
+        let counter = active_t("dialog.review_launch.presets_counter")
+            .replacen("{}", "1", 1)
+            .replacen("{}", &dialog.preset_selector.item_count().to_string(), 1);
+        let rows = rendered_rows(&dialog);
+        assert!(
+            rows.iter().any(|row| row.contains(&counter)),
+            "the section title names the highlighted row: {counter}"
+        );
+
+        let fitting = review_dialog_fixture(1, &["a/lib.rs"], &presets[..1]);
+        let fitting_rows = rendered_rows(&fitting);
+        let fitting_counter = active_t("dialog.review_launch.presets_counter")
+            .replacen("{}", "1", 1)
+            .replacen("{}", &fitting.preset_selector.item_count().to_string(), 1);
+        assert!(
+            !fitting_rows
+                .iter()
+                .any(|row| row.contains(&fitting_counter)),
+            "a section that draws every row keeps the plain title"
+        );
+        assert!(
+            fitting_rows
+                .iter()
+                .any(|row| row.contains(active_t("dialog.review_launch.presets_title").trim())),
+            "the plain title still names the section"
+        );
     }
 }

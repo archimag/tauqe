@@ -183,7 +183,7 @@ All commits must follow the **Conventional Commits** specification:
    - New or optional parameters should be provided in commented-out form (`# key = value`) with their default values explicitly shown, along with a concise descriptive comment.
 4. **No Hardcoded Budgets:**
    - All token budgets and operational limits (history tokens, tail turns count, repomap tokens, discovery rounds, retry counts) must be configurable through `AppConfig` and carry sensible, modern defaults.
-
+   - All token budgets and operational limits (history tokens, tail turns count, repomap tokens, research rounds, retry counts) must be configurable through `AppConfig` and carry sensible, modern defaults.
 ---
 
 ## 8. Living Documentation and Conceptual Ontology (`docs/`)

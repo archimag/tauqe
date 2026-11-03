@@ -7,22 +7,23 @@ use tauqe_protocol::{
 
 mod context;
 mod credentials;
-mod develop;
 mod git;
 mod history;
 mod models;
-mod paths;
+mod modules;
+mod outer_docs;
+pub(crate) mod paths;
 mod providers;
+mod repl;
 mod review;
 
 pub use context::{
-    ContextConfig, DEFAULT_FILES_TOKEN_BUDGET, DEFAULT_INCLUDE_REPO_MAP,
-    DEFAULT_MAX_DIR_LIST_ENTRIES, DEFAULT_MAX_DISCOVERY_ROUNDS, DEFAULT_MAX_FEEDBACK_CHARS,
-    DEFAULT_MAX_MATCHED_FILES_PER_SEARCH, DEFAULT_MAX_REPO_MAP_REQUESTS_PER_ROUND,
-    DEFAULT_MAX_SCRATCHPAD_CHARS, DEFAULT_MAX_SEARCH_REQUESTS_PER_ROUND, DEFAULT_REFS_TOKEN_BUDGET,
+    ContextConfig, DEFAULT_INCLUDE_REPO_MAP, DEFAULT_MAX_DIR_LIST_ENTRIES,
+    DEFAULT_MAX_FEEDBACK_CHARS, DEFAULT_MAX_MATCHED_FILES_PER_SEARCH,
+    DEFAULT_MAX_REPO_MAP_REQUESTS_PER_ROUND, DEFAULT_MAX_RESEARCH_ROUNDS,
+    DEFAULT_MAX_SCRATCHPAD_CHARS, DEFAULT_MAX_SEARCH_REQUESTS_PER_ROUND, DEFAULT_TOKEN_BUDGET,
 };
 pub use credentials::default_credentials_path;
-pub use develop::{DevelopConfig, EditConfig};
 pub use git::GitConfig;
 pub use history::HistoryConfig;
 pub use models::{
@@ -30,11 +31,15 @@ pub use models::{
     BUILTIN_DEFAULT_CODER_MODEL, BUILTIN_DEFAULT_MODEL, BUILTIN_DEFAULT_PRIMARY_MODEL,
     BUILTIN_DEFAULT_REVIEWER_MODEL, BUILTIN_DEFAULT_SCRIBE_MODEL,
 };
+pub use modules::{ensure_no_module_conflict, module_owners, ModuleOwners};
+pub use outer_docs::{OuterDocEntry, OuterDocSource};
+pub use repl::{EditConfig, ReplConfig};
 
 use models::ModelsConfigRaw;
 pub use paths::{
     cli_arg_value_from, config_candidates, default_config_path, find_config_file,
-    is_repo_config_path, write_default_config, write_default_conventions, DEFAULT_CONFIG_TEMPLATE,
+    is_repo_config_path, is_repo_module_path, write_default_config, write_default_conventions,
+    DEFAULT_CONFIG_TEMPLATE,
 };
 pub use providers::{
     credentials_candidates, find_credentials_file, has_openrouter_key, load_credentials,
@@ -48,7 +53,16 @@ pub use review::{ReviewConfig, ReviewGroupConfig, ReviewPreset};
 pub struct AppConfig {
     pub providers: ProvidersConfig,
     pub models: ModelsConfig,
-    pub develop: DevelopConfig,
+    /// The `[repl]` section: the profile every bounded turn of this project runs
+    /// under.
+    ///
+    /// The section declares the workflow engine, the edit protocol, the patch
+    /// strategy, the prompt layout override, and the retry and replanning
+    /// budgets, so an isolated step and a discussion read exactly what an
+    /// interactive REPL turn reads. The legacy `[develop]` and `[edit]`
+    /// spellings stay permanent deserialization aliases of the section, while
+    /// serialization emits only the canonical `[repl]` name.
+    pub repl: ReplConfig,
     /// The `[project]` section: the commands this repository declares.
     ///
     /// It is the single surface that tells the harness how to verify, format,
@@ -59,6 +73,19 @@ pub struct AppConfig {
     /// runnable command line.
     pub project: ProjectConfig,
     pub context: ContextConfig,
+    /// The `[[outer_docs]]` declarations: external documentation the project
+    /// mounts for the model.
+    ///
+    /// Each entry names one mount point (`id`), one `title`, an optional
+    /// `description`, and exactly one source key — `url`, `path`, or `mdbook`.
+    /// A `mdbook` source mounts a composite document whose index — `SUMMARY.md`,
+    /// `index.md`, or `llms.txt`, tried in that order — names its parts, so one
+    /// declaration covers a whole published corpus.
+    /// A declared document is materialized lazily into the isolated cache on its
+    /// first access, so an entry costs nothing until a turn asks for it. An
+    /// absent section declares no external documentation.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub outer_docs: Vec<OuterDocEntry>,
     pub git: GitConfig,
     pub history: HistoryConfig,
     /// The `[review]` section: named presets for a multi-level review run.
@@ -106,12 +133,14 @@ struct AppConfigRaw {
     providers: ProvidersConfig,
     #[serde(default)]
     models: ModelsConfigRaw,
-    #[serde(default, alias = "edit")]
-    develop: DevelopConfig,
+    #[serde(default, alias = "develop", alias = "edit")]
+    repl: ReplConfig,
     #[serde(default)]
     project: ProjectConfig,
     #[serde(default)]
     context: ContextConfig,
+    #[serde(default)]
+    outer_docs: Vec<OuterDocEntry>,
     #[serde(default)]
     git: GitConfig,
     #[serde(default)]
@@ -127,9 +156,10 @@ impl TryFrom<AppConfigRaw> for AppConfig {
         let AppConfigRaw {
             providers,
             models,
-            develop,
+            repl,
             project,
             context,
+            outer_docs,
             git,
             history,
             review,
@@ -138,9 +168,10 @@ impl TryFrom<AppConfigRaw> for AppConfig {
         Ok(AppConfig {
             models: ModelsConfig::resolve(models, providers.catalog())?,
             providers,
-            develop,
+            repl,
             project,
             context,
+            outer_docs,
             git,
             history,
             review,
@@ -266,6 +297,7 @@ impl AppConfig {
         self.project
             .validate()
             .map_err(|err| format!("[project] {}", err))?;
+        outer_docs::validate(&self.outer_docs).map_err(|err| format!("[outer_docs] {}", err))?;
         self.review
             .validate()
             .map_err(|err| format!("[review] {}", err))?;
@@ -277,22 +309,22 @@ impl AppConfig {
     /// This is the single typed point that decides the layout: an explicitly
     /// configured [`PromptLayoutKind`] wins, otherwise the turn intent decides.
     ///
-    /// - An interactive REPL turn and a plan discussion keep a growing history
-    ///   and share one byte-stable head, so both build the chronological
-    ///   transcript: its append-only growth keeps the provider prefix cache warm
-    ///   across dialogue focus switches.
+    /// - An interactive REPL turn, a plan discussion, and a review discussion
+    ///   keep a growing history and share one byte-stable head, so all three
+    ///   build the chronological transcript: its append-only growth keeps the
+    ///   provider prefix cache warm across dialogue focus switches.
     /// - An isolated step and an Architect synthesis carry no growing dialogue
     ///   history to interleave — both suppress it — so they keep the semantic
     ///   block order.
     pub fn resolve_prompt_layout(&self, intent: TurnIntent) -> PromptLayoutKind {
-        if let Some(explicit) = self.develop.prompt_layout {
+        if let Some(explicit) = self.repl.prompt_layout {
             return explicit;
         }
 
         match intent {
-            TurnIntent::InteractiveRepl | TurnIntent::PlanDiscussion => {
-                PromptLayoutKind::Chronological
-            }
+            TurnIntent::InteractiveRepl
+            | TurnIntent::PlanDiscussion
+            | TurnIntent::ReviewDiscussion => PromptLayoutKind::Chronological,
             TurnIntent::IsolatedStep | TurnIntent::ArchitectSynthesis => PromptLayoutKind::Semantic,
         }
     }
@@ -315,33 +347,31 @@ pub fn load_config_with_options(opts: ConfigLoadOptions) -> AppConfig {
             .explicit_config
             .map(PathBuf::from)
             .or_else(|| find_config_file(opts.repo_root, opts.explicit_config));
+        let base = config_path.as_deref().filter(|p| !p.as_os_str().is_empty());
+        let label = modules::document_label(base, opts.repo_root);
 
         let mut config = AppConfig::default();
-        if let Some(p) = config_path.as_deref().filter(|p| !p.as_os_str().is_empty()) {
-            match std::fs::read_to_string(p) {
-                Ok(content) => match toml::from_str::<AppConfig>(&content) {
-                    Ok(parsed) => {
-                        config = parsed;
-                        if let Err(err) = config.validate() {
-                            tracing::warn!(
-                                "Configuration validation failed for {}: {}",
-                                p.display(),
-                                err
-                            );
-                            config.config_error =
-                                Some(format!("Invalid configuration in {}: {}", p.display(), err));
-                        }
-                    }
-                    Err(err) => {
-                        tracing::warn!("Failed to parse config file {}: {}", p.display(), err);
+        match modules::read_document(base, opts.repo_root) {
+            Ok(Some(document)) => match AppConfig::deserialize(toml::Value::Table(document)) {
+                Ok(parsed) => {
+                    config = parsed;
+                    if let Err(err) = config.validate() {
+                        tracing::warn!("Configuration validation failed for {}: {}", label, err);
                         config.config_error =
-                            Some(format!("Failed to parse {}: {}", p.display(), err));
+                            Some(format!("Invalid configuration in {}: {}", label, err));
                     }
-                },
-                Err(err) => {
-                    tracing::warn!("Failed to read config file {}: {}", p.display(), err);
-                    config.config_error = Some(format!("Failed to read {}: {}", p.display(), err));
                 }
+                Err(err) => {
+                    tracing::warn!("Failed to parse config file {}: {}", label, err);
+                    config.config_error = Some(format!("Failed to parse {}: {}", label, err));
+                }
+            },
+            // A repository that declares no configuration at all is governed by
+            // the built-in defaults, which is not a diagnostic.
+            Ok(None) => {}
+            Err(message) => {
+                tracing::warn!("{}", message);
+                config.config_error = Some(message);
             }
         }
 
@@ -372,35 +402,41 @@ pub fn load_config(repo_root: Option<&Path>) -> AppConfig {
     })
 }
 
-/// Loads a specific configuration section from `tauqe.toml` without parsing the
-/// whole configuration file or loading credentials.
+/// Loads a specific configuration section without parsing the whole layered
+/// document or loading credentials.
 ///
-/// Returns the default value if the file does not exist, cannot be read, or the
-/// section cannot be parsed.
+/// The section is read from the same merged document [`load_config_with_options`]
+/// consumes, so a section declared by a `tauqe.d` module reaches this reader
+/// exactly as it reaches the whole-configuration one.
+///
+/// Returns the default value if the repository declares no configuration, the
+/// document cannot be read or merged, or the section cannot be parsed.
 pub fn load_section<T: for<'de> Deserialize<'de> + Default>(
     repo_root: &Path,
     section_key: &str,
 ) -> T {
-    // Locating and reading the configuration file is blocking filesystem work,
-    // so it runs off the async executor thread.
+    // Locating and reading the configuration files is blocking filesystem
+    // work, so it runs off the async executor thread.
     crate::blocking::run_blocking(|| {
-        let Some(path) = find_config_file(Some(repo_root), None) else {
-            return T::default();
+        let base = find_config_file(Some(repo_root), None);
+        let document = match modules::read_document(base.as_deref(), Some(repo_root)) {
+            Ok(Some(document)) => document,
+            Ok(None) => return T::default(),
+            Err(message) => {
+                // A section reader has no diagnostics channel of its own, so a
+                // broken layered document degrades to the section defaults and
+                // is reported once in the journal.
+                tracing::warn!("{}", message);
+                return T::default();
+            }
         };
-        let Ok(content) = std::fs::read_to_string(&path) else {
-            return T::default();
-        };
-        let Ok(table) = toml::from_str::<toml::Table>(&content) else {
-            return T::default();
-        };
-        table
+        document
             .get(section_key)
             .cloned()
-            .and_then(|val| val.try_into::<T>().ok())
+            .and_then(|value| T::deserialize(value).ok())
             .unwrap_or_default()
     })
 }
-
 /// Resolves repository-local `[git]` integration settings for a repository root.
 ///
 /// Only the `[git]` table is parsed without paying for credential resolution or
@@ -416,32 +452,38 @@ pub fn load_context_config(repo_root: &Path) -> ContextConfig {
     load_section(repo_root, "context")
 }
 
-/// Validates the project configuration file that governs `repo_root`.
+/// Validates the project configuration document that governs `repo_root`.
 ///
 /// The check is delegated to the engine rather than to a project tool, because
 /// `tauqe.toml` defines the environment the turn runs in: the model roles, the
 /// budgets, and the command lines the harness may execute. Two layers are
-/// checked — the TOML syntax of the file and the semantic invariants enforced by
-/// [`AppConfig::validate`] (resolvable model roles and a sound `[project]`
-/// command chain). A file that declares no verification command passes this
-/// check: verification is optional, and the harness never invents a toolchain a
-/// project did not declare.
+/// checked — the TOML syntax of every configuration layer and the semantic
+/// invariants enforced by [`AppConfig::validate`] (resolvable model roles and a
+/// sound `[project]` command chain). A file that declares no verification
+/// command passes this check: verification is optional, and the harness never
+/// invents a toolchain a project did not declare.
+///
+/// The layers are validated as the merged document a turn would load, so a
+/// `tauqe.d` module is judged in the context it takes part in: a module that
+/// collides with the base document fails here even though its own bytes parse.
 ///
 /// A repository without a configuration file is valid: built-in defaults govern
-/// it, exactly as they do for [`load_config`]. Reading and parsing the file is
-/// blocking filesystem work, so it runs off the async executor thread.
+/// it, exactly as they do for [`load_config_with_options`]. Reading and parsing
+/// the files is blocking filesystem work, so it runs off the async executor
+/// thread.
 pub fn validate_project_config_on_disk(repo_root: &Path) -> Result<(), String> {
     crate::blocking::run_blocking(|| -> Result<(), String> {
-        let Some(path) = find_config_file(Some(repo_root), None) else {
+        let base = find_config_file(Some(repo_root), None);
+        let label = modules::document_label(base.as_deref(), Some(repo_root));
+        let document = modules::read_document(base.as_deref(), Some(repo_root))?;
+        let Some(document) = document else {
             return Ok(());
         };
-        let content = std::fs::read_to_string(&path)
-            .map_err(|err| format!("Failed to read {}: {}", path.display(), err))?;
-        let config: AppConfig = toml::from_str(&content)
-            .map_err(|err| format!("Failed to parse {}: {}", path.display(), err))?;
+        let config: AppConfig = AppConfig::deserialize(toml::Value::Table(document))
+            .map_err(|err| format!("Failed to parse {}: {}", label, err))?;
         config
             .validate()
-            .map_err(|err| format!("Invalid configuration in {}: {}", path.display(), err))
+            .map_err(|err| format!("Invalid configuration in {}: {}", label, err))
     })
 }
 
@@ -736,23 +778,23 @@ repomap_token_budget = 6000
     }
 
     #[test]
-    fn test_context_discovery_config() {
+    fn test_context_research_config() {
         let toml_str = r#"
 [context]
-max_discovery_rounds = 8
-files_token_budget = 150000
+max_research_rounds = 8
+token_budget = 150000
 "#;
         let config: AppConfig = toml::from_str(toml_str).expect("Failed to parse config");
-        assert_eq!(config.context.max_discovery_rounds, 8);
-        assert_eq!(config.context.files_token_budget, 150000);
+        assert_eq!(config.context.max_research_rounds, 8);
+        assert_eq!(config.context.token_budget, 150000);
 
         let default_cfg = ContextConfig::default();
-        assert_eq!(default_cfg.max_discovery_rounds, 5);
-        assert_eq!(default_cfg.files_token_budget, 300_000);
+        assert_eq!(default_cfg.max_research_rounds, 5);
+        assert_eq!(default_cfg.token_budget, 300_000);
     }
 
     #[test]
-    fn test_discovery_and_feedback_limits_defaults_and_overrides() {
+    fn test_research_and_feedback_limits_defaults_and_overrides() {
         // Every operational cap that shapes model context carries a documented
         // default, so an omitted key never silently disables the bound.
         let defaults = ContextConfig::default();
@@ -771,14 +813,14 @@ files_token_budget = 150000
         );
         assert_eq!(defaults.max_feedback_chars, DEFAULT_MAX_FEEDBACK_CHARS);
         assert_eq!(defaults.max_scratchpad_chars, DEFAULT_MAX_SCRATCHPAD_CHARS);
-        assert_eq!(defaults.refs_token_budget, DEFAULT_REFS_TOKEN_BUDGET);
+        assert_eq!(defaults.token_budget, DEFAULT_TOKEN_BUDGET);
         assert_eq!(defaults.max_search_requests_per_round, 5);
         assert_eq!(defaults.max_matched_files_per_search, 50);
         assert_eq!(defaults.max_dir_list_entries, 100);
         assert_eq!(defaults.max_repo_map_requests_per_round, 3);
         assert_eq!(defaults.max_feedback_chars, 4_000);
         assert_eq!(defaults.max_scratchpad_chars, 4_000);
-        assert_eq!(defaults.refs_token_budget, 50_000);
+        assert_eq!(defaults.token_budget, 300_000);
 
         // A project that routinely needs wider searches, larger listings, or
         // roomier tool-output reporting raises the ceilings in `tauqe.toml`.
@@ -791,7 +833,6 @@ max_dir_list_entries = 40
 max_repo_map_requests_per_round = 1
 max_feedback_chars = 800
 max_scratchpad_chars = 1500
-refs_token_budget = 70000
 "#,
         )
         .expect("parse config");
@@ -801,7 +842,6 @@ refs_token_budget = 70000
         assert_eq!(overridden.context.max_repo_map_requests_per_round, 1);
         assert_eq!(overridden.context.max_feedback_chars, 800);
         assert_eq!(overridden.context.max_scratchpad_chars, 1500);
-        assert_eq!(overridden.context.refs_token_budget, 70_000);
 
         // A partially declared section keeps the defaults of omitted keys.
         let partial: AppConfig =
@@ -811,7 +851,7 @@ refs_token_budget = 70000
             partial.context.max_search_requests_per_round,
             DEFAULT_MAX_SEARCH_REQUESTS_PER_ROUND
         );
-        assert_eq!(partial.context.refs_token_budget, DEFAULT_REFS_TOKEN_BUDGET);
+        assert_eq!(partial.context.token_budget, DEFAULT_TOKEN_BUDGET);
     }
 
     #[test]
@@ -905,9 +945,9 @@ primary = ["anthropc:claude"]
             config.active_model(),
             ModelRef::openrouter(BUILTIN_DEFAULT_PRIMARY_MODEL)
         );
-        assert_eq!(config.develop.workflow, WorkflowKind::Git);
-        assert_eq!(config.develop.protocol, EditProtocolKind::Structured);
-        assert_eq!(config.develop.max_retries, 3);
+        assert_eq!(config.repl.workflow, WorkflowKind::Git);
+        assert_eq!(config.repl.protocol, EditProtocolKind::Structured);
+        assert_eq!(config.repl.max_retries, 3);
         assert!(config.providers.openrouter.is_none());
     }
 
@@ -1017,7 +1057,7 @@ primary = ["anthropc:claude"]
         let temp_dir = tempfile::tempdir().unwrap();
         std::fs::write(
             temp_dir.path().join("tauqe.toml"),
-            "[context]\npinned = [\"Conventions.md\", \"README.md\"]\nmax_discovery_rounds = 9\n",
+            "[context]\npinned = [\"Conventions.md\", \"README.md\"]\nmax_research_rounds = 9\n",
         )
         .unwrap();
 
@@ -1026,7 +1066,7 @@ primary = ["anthropc:claude"]
             cfg.pinned,
             vec!["Conventions.md".to_string(), "README.md".to_string()]
         );
-        assert_eq!(cfg.max_discovery_rounds, 9);
+        assert_eq!(cfg.max_research_rounds, 9);
     }
 
     #[test]
@@ -1213,6 +1253,12 @@ args = ["check", "--all-targets"]
             default_cfg.resolve_prompt_layout(TurnIntent::PlanDiscussion),
             PromptLayoutKind::Chronological
         );
+        // A review discussion is a dialogue contour as well: it keeps the
+        // growing session history and the chronological transcript.
+        assert_eq!(
+            default_cfg.resolve_prompt_layout(TurnIntent::ReviewDiscussion),
+            PromptLayoutKind::Chronological
+        );
         assert_eq!(
             default_cfg.resolve_prompt_layout(TurnIntent::IsolatedStep),
             PromptLayoutKind::Semantic
@@ -1227,12 +1273,13 @@ args = ["check", "--all-targets"]
             ("semantic", PromptLayoutKind::Semantic),
             ("chronological", PromptLayoutKind::Chronological),
         ] {
-            let toml_str = format!("[develop]\nprompt_layout = \"{declared}\"\n");
+            let toml_str = format!("[repl]\nprompt_layout = \"{declared}\"\n");
             let config: AppConfig = toml::from_str(&toml_str).expect("parse config");
             for intent in [
                 TurnIntent::InteractiveRepl,
                 TurnIntent::PlanDiscussion,
                 TurnIntent::IsolatedStep,
+                TurnIntent::ReviewDiscussion,
                 TurnIntent::ArchitectSynthesis,
             ] {
                 assert_eq!(
@@ -1497,6 +1544,272 @@ paths = ["crates/core/src"]
         assert!(
             unknown.is_err(),
             "an unknown post-analysis mode must be rejected"
+        );
+    }
+
+    /// The canonical section is `[repl]`; the legacy `[develop]` and `[edit]`
+    /// spellings stay permanent deserialization aliases, so a configuration
+    /// written before the rename keeps loading unchanged while the serialized
+    /// form always carries the canonical name.
+    #[test]
+    fn test_legacy_turn_profile_sections_decode_into_the_repl_profile() {
+        let canonical: AppConfig = toml::from_str("[repl]\nworkflow = \"naive\"\n").expect("parse");
+        assert_eq!(canonical.repl.workflow, WorkflowKind::Naive);
+
+        for legacy in ["develop", "edit"] {
+            let declaration = format!("[{legacy}]\nworkflow = \"naive\"\n");
+            let config: AppConfig = toml::from_str(&declaration).expect("parse config");
+            assert_eq!(
+                config.repl.workflow,
+                WorkflowKind::Naive,
+                "the legacy [{legacy}] spelling of the profile section must keep decoding"
+            );
+        }
+
+        #[derive(Serialize)]
+        struct Profile<'a> {
+            repl: &'a ReplConfig,
+        }
+
+        let serialized = toml::to_string(&Profile {
+            repl: &canonical.repl,
+        })
+        .expect("serialize");
+        assert!(serialized.starts_with("[repl]"), "got: {serialized}");
+        for legacy in ["develop", "edit"] {
+            assert!(
+                !serialized.contains(legacy),
+                "the serialized profile must carry the canonical section only: {serialized}"
+            );
+        }
+    }
+    /// Creates a repository with the given base configuration and module layers.
+    fn layered_repo(base: &str, modules: &[(&str, &str)]) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("tauqe.toml"), base).unwrap();
+        if !modules.is_empty() {
+            let modules_dir = dir.path().join("tauqe.d");
+            std::fs::create_dir_all(&modules_dir).unwrap();
+            for (name, content) in modules {
+                std::fs::write(modules_dir.join(name), content).unwrap();
+            }
+        }
+        dir
+    }
+
+    #[test]
+    fn test_module_layers_merge_sections_with_the_base_document() {
+        let dir = layered_repo(
+            "[models]\nprimary = [\"openrouter:a/b\"]\n\n[context]\nrepomap_token_budget = 6000\n",
+            &[("10-research.toml", "[context]\nmax_research_rounds = 9\n")],
+        );
+
+        let config = load_config(Some(dir.path()));
+
+        assert!(
+            config.config_error.is_none(),
+            "got: {:?}",
+            config.config_error
+        );
+        // The base document keeps its own key ...
+        assert_eq!(config.context.repomap_token_budget, 6000);
+        // ... and the module contributes the key it owns.
+        assert_eq!(config.context.max_research_rounds, 9);
+    }
+
+    #[test]
+    fn test_module_layers_concatenate_arrays_of_tables_in_lexical_order() {
+        let dir = layered_repo(
+            "[models]\nprimary = [\"openrouter:a/b\"]\n\n\
+             [[review.presets]]\nname = \"base\"\n\n\
+             [[review.presets.groups]]\nname = \"core\"\npaths = [\"crates/core/src\"]\n",
+            &[
+                (
+                    "10-first.toml",
+                    "[[review.presets]]\nname = \"first\"\n\n\
+                     [[review.presets.groups]]\nname = \"one\"\npaths = [\"a\"]\n",
+                ),
+                (
+                    "20-second.toml",
+                    "[[review.presets]]\nname = \"second\"\n\n\
+                     [[review.presets.groups]]\nname = \"two\"\npaths = [\"b\"]\n",
+                ),
+            ],
+        );
+
+        let config = load_config(Some(dir.path()));
+        assert!(
+            config.config_error.is_none(),
+            "got: {:?}",
+            config.config_error
+        );
+
+        let names: Vec<&str> = config
+            .review
+            .presets
+            .iter()
+            .map(|preset| preset.name.as_str())
+            .collect();
+        assert_eq!(names, vec!["base", "first", "second"]);
+    }
+
+    #[test]
+    fn test_module_layer_scalar_collision_names_both_files_and_the_key() {
+        let dir = layered_repo(
+            "[models]\nprimary = [\"openrouter:a/b\"]\n",
+            &[(
+                "10-models.toml",
+                "[models]\nprimary = [\"openrouter:c/d\"]\n",
+            )],
+        );
+
+        let config = load_config(Some(dir.path()));
+
+        let err = config
+            .config_error
+            .expect("a scalar collision must be reported");
+        assert!(
+            err.contains("tauqe.toml"),
+            "the base file must be named: {err}"
+        );
+        assert!(
+            err.contains("10-models.toml"),
+            "the module must be named: {err}"
+        );
+        assert!(
+            err.contains("models.primary"),
+            "the colliding key must be named: {err}"
+        );
+    }
+
+    #[test]
+    fn test_module_layer_syntax_error_names_the_file_and_the_line() {
+        let dir = layered_repo(
+            "[models]\nprimary = [\"openrouter:a/b\"]\n",
+            &[("20-broken.toml", "[context]\nrepomap_token_budget = = 1\n")],
+        );
+
+        let config = load_config(Some(dir.path()));
+
+        let err = config
+            .config_error
+            .expect("a module syntax error must be reported");
+        assert!(
+            err.contains("20-broken.toml"),
+            "the module must be named: {err}"
+        );
+        assert!(err.contains("line 2"), "the line must be named: {err}");
+    }
+
+    #[test]
+    fn test_load_section_observes_the_merged_module_layers() {
+        let dir = layered_repo(
+            "[context]\nrepomap_token_budget = 6000\n",
+            &[("10-research.toml", "[context]\nmax_research_rounds = 9\n")],
+        );
+
+        let cfg = load_context_config(dir.path());
+
+        assert_eq!(cfg.repomap_token_budget, 6000);
+        assert_eq!(cfg.max_research_rounds, 9);
+    }
+
+    #[test]
+    fn test_modules_resolve_from_the_repository_root_not_the_explicit_config() {
+        let dir = layered_repo(
+            "[models]\nprimary = [\"openrouter:a/b\"]\n",
+            &[("10-context.toml", "[context]\nmax_research_rounds = 11\n")],
+        );
+        let external = dir.path().join("external.toml");
+        std::fs::write(&external, "[models]\nprimary = [\"openrouter:c/d\"]\n").unwrap();
+
+        let config = load_config_with_options(ConfigLoadOptions {
+            repo_root: Some(dir.path()),
+            explicit_config: Some(&external),
+            explicit_credentials: None,
+        });
+
+        assert!(
+            config.config_error.is_none(),
+            "got: {:?}",
+            config.config_error
+        );
+        // The explicit document anchors the configuration ...
+        assert_eq!(config.active_model(), ModelRef::openrouter("c/d"));
+        // ... while the module directory stays the one of the repository.
+        assert_eq!(config.context.max_research_rounds, 11);
+    }
+
+    #[test]
+    fn test_validate_project_config_on_disk_rejects_a_module_collision() {
+        let dir = layered_repo(
+            "[models]\nprimary = [\"openrouter:a/b\"]\n",
+            &[(
+                "10-models.toml",
+                "[models]\nprimary = [\"openrouter:c/d\"]\n",
+            )],
+        );
+
+        let err = validate_project_config_on_disk(dir.path())
+            .expect_err("a module collision must fail the on-disk check");
+        assert!(err.contains("models.primary"), "got: {err}");
+    }
+
+    #[test]
+    fn test_module_owners_names_the_layer_declaring_each_key() {
+        let dir = layered_repo(
+            "[models]\nprimary = [\"openrouter:a/b\"]\n",
+            &[
+                (
+                    "10-models.toml",
+                    "[models]\nscribe = \"openrouter:s/scribe\"\n",
+                ),
+                ("20-repl.toml", "[repl]\nworkflow = \"naive\"\n"),
+            ],
+        );
+
+        let owners = module_owners(dir.path()).expect("the modules are readable");
+
+        let owner = |key: &str| {
+            owners
+                .get(key)
+                .and_then(|path| path.file_name())
+                .and_then(|name| name.to_str())
+                .map(str::to_string)
+        };
+        assert_eq!(owner("models.scribe").as_deref(), Some("10-models.toml"));
+        assert_eq!(owner("repl.workflow").as_deref(), Some("20-repl.toml"));
+        assert!(
+            !owners.contains_key("models.primary"),
+            "the base document owns its own keys"
+        );
+    }
+
+    #[test]
+    fn test_ensure_no_module_conflict_reports_a_key_a_module_already_declares() {
+        let dir = layered_repo(
+            "[models]\nprimary = [\"openrouter:a/b\"]\n",
+            &[(
+                "10-models.toml",
+                "[models]\nprimary = [\"openrouter:c/d\"]\n",
+            )],
+        );
+        let target = dir.path().join("tauqe.toml");
+
+        let err = ensure_no_module_conflict(DEFAULT_CONFIG_TEMPLATE, &target, Some(dir.path()))
+            .expect_err("the template declares the same key");
+        assert!(err.contains("models.primary"), "got: {err}");
+
+        // A module that owns an independent key does not block the create.
+        let free = layered_repo(
+            "[models]\nprimary = [\"openrouter:a/b\"]\n",
+            &[("10-history.toml", "[history]\ntail_turns = 5\n")],
+        );
+        let free_target = free.path().join("tauqe.toml");
+        assert!(
+            ensure_no_module_conflict(DEFAULT_CONFIG_TEMPLATE, &free_target, Some(free.path()))
+                .is_ok(),
+            "an independent module key must not block the create"
         );
     }
 }

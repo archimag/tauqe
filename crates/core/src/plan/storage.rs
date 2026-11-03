@@ -17,8 +17,8 @@ pub use horizon::merge_subplan;
 pub enum PlanMutationMode {
     /// Isolated step execution: any plan creation, modification, or deletion is forbidden.
     IsolatedStep,
-    /// Develop mode: only proposing new plans (`save`) is permitted. Modification (`update`) and deletion (`delete`) are forbidden.
-    Develop,
+    /// REPL mode: only proposing new plans (`save`) is permitted. Modification (`update`) and deletion (`delete`) are forbidden.
+    Repl,
     /// Discussion mode: full plan creation, modification, and deletion are permitted.
     Discussion,
 }
@@ -234,8 +234,10 @@ impl PlanStorage {
     /// The persisted plan enforces the leaf-only file invariant: any item with
     /// children is a conceptual container and is stored without `files`.
     /// Also enforces the `Done is Immutable` invariant against any existing on-disk
-    /// plan, and refuses to overwrite a file already holding a different plan whose
-    /// sanitized storage name collides with this one.
+    /// plan, refuses to overwrite a file already holding a different plan whose
+    /// sanitized storage name collides with this one, and validates the whole plan
+    /// structurally before a single byte reaches disk, so no mutation source can
+    /// persist a plan that a later mutation would have to reject.
     fn save_plan_unlocked(repo_root: &Path, plan: &Plan) -> Result<()> {
         let dir = Self::plans_dir(repo_root);
         std::fs::create_dir_all(&dir).with_context(|| {
@@ -288,6 +290,21 @@ impl PlanStorage {
                 );
             }
             Self::validate_done_immutability(&existing_plan, &normalized)?;
+        }
+
+        // The single structural barrier of plan persistence: every mutation
+        // source (an explicit `save`, a delta `update`, a discussion payload,
+        // and the programmatic horizon primitives) reaches disk through this
+        // function, so a structurally invalid plan is rejected identically for
+        // all of them. The normalized copy is validated because it is exactly
+        // what would be written.
+        if let Err(errors) = normalized.validate() {
+            let reasons: Vec<String> = errors.iter().map(|error| error.to_string()).collect();
+            anyhow::bail!(
+                "Cannot save plan '{}': {}",
+                normalized.id,
+                reasons.join("; ")
+            );
         }
 
         let json = serde_json::to_string_pretty(&normalized)
@@ -470,16 +487,22 @@ impl PlanStorage {
     /// stopped the step. It is persisted only when the step enters
     /// [`PlanItemStatus::Blocked`]; every other transition drops the stale report,
     /// so a resumed step never keeps describing a blocker that no longer holds.
+    ///
+    /// `commit` is the identifier of the Git commit that completed the step. It is
+    /// written by the very transition that records the status, so a `Done` step
+    /// keeps a durable pointer to the change set it produced instead of a
+    /// completion nobody can attribute. Every other transition passes `None`.
     pub fn update_item(
         repo_root: &Path,
         plan_id: &str,
         item_id: &str,
         status: Option<PlanItemStatus>,
         blocked_reason: Option<&str>,
+        commit: Option<&str>,
     ) -> Result<Option<Plan>> {
         crate::blocking::run_blocking(|| {
             let _guard = Self::lock();
-            Self::update_item_unlocked(repo_root, plan_id, item_id, status, blocked_reason)
+            Self::update_item_unlocked(repo_root, plan_id, item_id, status, blocked_reason, commit)
         })
     }
 
@@ -490,6 +513,7 @@ impl PlanStorage {
         item_id: &str,
         status: Option<PlanItemStatus>,
         blocked_reason: Option<&str>,
+        commit: Option<&str>,
     ) -> Result<Option<Plan>> {
         let mut plan = match Self::load_plan_unlocked(repo_root, plan_id)? {
             Some(p) => p,
@@ -501,11 +525,20 @@ impl PlanStorage {
             target_id: &str,
             status: Option<PlanItemStatus>,
             blocked_reason: Option<&str>,
+            commit: Option<&str>,
         ) -> bool {
             for item in items {
                 if item.id.eq_ignore_ascii_case(target_id) {
                     if let Some(s) = status {
                         item.status = s;
+                        // The identifier of the change set that completed the
+                        // step belongs to the completed record: it is stored
+                        // once, together with the transition that finishes the
+                        // step, and is never restated by a later one.
+                        if let Some(commit) = commit.map(str::trim).filter(|hash| !hash.is_empty())
+                        {
+                            item.commit = Some(commit.to_string());
+                        }
                         // The diagnostic report belongs to the Blocked state
                         // alone: entering it stores the supplied reason, leaving
                         // it drops the stale report so a stored plan never keeps
@@ -521,14 +554,20 @@ impl PlanStorage {
                     }
                     return true;
                 }
-                if visit_mut(&mut item.children, target_id, status, blocked_reason) {
+                if visit_mut(
+                    &mut item.children,
+                    target_id,
+                    status,
+                    blocked_reason,
+                    commit,
+                ) {
                     return true;
                 }
             }
             false
         }
 
-        let updated = visit_mut(&mut plan.items, item_id, status, blocked_reason);
+        let updated = visit_mut(&mut plan.items, item_id, status, blocked_reason, commit);
         if updated {
             plan.refresh_parent_statuses();
             plan.updated_at = SystemTime::now()
@@ -547,12 +586,21 @@ impl PlanStorage {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct PlanApplicationOutcome {
     pub applied: Vec<Plan>,
+    /// Mutations the storage barrier rejected; a rejected mutation leaves the
+    /// stored plan untouched.
     pub errors: Vec<String>,
+    /// Repairs the lifecycle barrier applied to an otherwise valid mutation.
+    ///
+    /// A repaired mutation is applied, so its reports never share the rejection
+    /// channel: a caller that treats `errors` as failures stays accurate while
+    /// the repair remains visible.
+    pub warnings: Vec<String>,
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tauqe_protocol::{DiscussionPlanAction, DiscussionPlanUpdate};
     use tempfile::tempdir;
 
     #[test]
@@ -574,8 +622,10 @@ mod tests {
                     details: None,
                     status: PlanItemStatus::Todo,
                     blocked_reason: None,
+                    commit: None,
                     files: vec![],
                     readonly_files: vec![],
+                    outer_docs: vec![],
                     concept_refs: vec![],
                     depends_on: vec![],
                     children: vec![PlanItem {
@@ -584,8 +634,10 @@ mod tests {
                         details: None,
                         status: PlanItemStatus::Todo,
                         blocked_reason: None,
-                        files: vec![],
+                        commit: None,
+                        files: vec!["src/token.rs".to_string()],
                         readonly_files: vec![],
+                        outer_docs: vec![],
                         concept_refs: vec![],
                         depends_on: vec![],
                         children: vec![],
@@ -597,8 +649,10 @@ mod tests {
                     details: None,
                     status: PlanItemStatus::Todo,
                     blocked_reason: None,
-                    files: vec![],
+                    commit: None,
+                    files: vec!["src/endpoint.rs".to_string()],
                     readonly_files: vec![],
+                    outer_docs: vec![],
                     concept_refs: vec![],
                     depends_on: vec![],
                     children: vec![],
@@ -622,10 +676,16 @@ mod tests {
         assert_eq!(loaded.title, "Authentication Flow");
 
         // 4. Update child item
-        let updated =
-            PlanStorage::update_item(root, "auth-flow", "1.1", Some(PlanItemStatus::Done), None)
-                .unwrap()
-                .unwrap();
+        let updated = PlanStorage::update_item(
+            root,
+            "auth-flow",
+            "1.1",
+            Some(PlanItemStatus::Done),
+            None,
+            None,
+        )
+        .unwrap()
+        .unwrap();
 
         assert_eq!(updated.items[0].children[0].status, PlanItemStatus::Done);
 
@@ -726,7 +786,7 @@ mod tests {
   <concept>
     <concept_item id="c-1" title="Invariant 1" />
   </concept>
-  <item id="1" title="Step 1" status="done" />
+  <item id="1" title="Step 1" status="done" files="src/step.rs" />
 </plan>
 "#;
         let outcome1 = PlanStorage::apply_plan_tags(root, plan1_text);
@@ -739,7 +799,7 @@ mod tests {
   <concept>
     <concept_item id="c-2" title="Invariant 2" />
   </concept>
-  <item id="1" title="Step 1 in plan 2" status="todo" />
+  <item id="1" title="Step 1 in plan 2" status="todo" files="src/step.rs" />
 </plan>
 "#;
         let outcome2 = PlanStorage::apply_plan_tags(root, plan2_text);
@@ -866,6 +926,7 @@ mod tests {
                 id: format!("item-{i}"),
                 title: format!("Item {i}"),
                 status: PlanItemStatus::Todo,
+                files: vec![format!("src/item-{i}.rs")],
                 ..Default::default()
             })
             .collect();
@@ -890,6 +951,7 @@ mod tests {
                         "concurrent-plan",
                         &format!("item-{i}"),
                         Some(PlanItemStatus::Done),
+                        None,
                         None,
                     );
                 })
@@ -1068,6 +1130,7 @@ mod tests {
                 id: "1".to_string(),
                 title: "Step".to_string(),
                 status: PlanItemStatus::Todo,
+                files: vec!["src/step.rs".to_string()],
                 ..Default::default()
             }],
         );
@@ -1091,10 +1154,16 @@ mod tests {
         assert_eq!(loaded.items.len(), 1);
         assert_eq!(loaded.items[0].status, PlanItemStatus::Todo);
 
-        let updated =
-            PlanStorage::update_item(&root, "runtime-plan", "1", Some(PlanItemStatus::Done), None)
-                .unwrap()
-                .unwrap();
+        let updated = PlanStorage::update_item(
+            &root,
+            "runtime-plan",
+            "1",
+            Some(PlanItemStatus::Done),
+            None,
+            None,
+        )
+        .unwrap()
+        .unwrap();
         assert_eq!(updated.items[0].status, PlanItemStatus::Done);
 
         let refined = PlanStorage::update_concept_item(
@@ -1131,6 +1200,7 @@ mod tests {
                 id: "1".to_string(),
                 title: "Step".to_string(),
                 status: PlanItemStatus::Todo,
+                files: vec!["src/step.rs".to_string()],
                 ..Default::default()
             }],
         );
@@ -1144,6 +1214,7 @@ mod tests {
             "1",
             Some(PlanItemStatus::Blocked),
             Some("  missing git  "),
+            None,
         )
         .unwrap()
         .unwrap();
@@ -1165,11 +1236,195 @@ mod tests {
             "1",
             Some(PlanItemStatus::InProgress),
             None,
+            None,
         )
         .unwrap()
         .unwrap();
         let resumed_item = resumed.find_item("1").unwrap();
         assert_eq!(resumed_item.status, PlanItemStatus::InProgress);
         assert!(resumed_item.blocked_reason.is_none());
+    }
+
+    /// Builds one executable leaf of a stored plan that declares its target file.
+    fn plan_leaf(id: &str, file: &str) -> PlanItem {
+        PlanItem {
+            id: id.to_string(),
+            title: format!("Step {id}"),
+            status: PlanItemStatus::Todo,
+            files: vec![file.to_string()],
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn test_save_plan_rejects_duplicate_step_ids() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+
+        let first = plan_leaf("1", "src/first.rs");
+        let second = plan_leaf("1", "src/second.rs");
+        let plan = Plan::from_parts(
+            "duplicate-steps".to_string(),
+            "Duplicate Steps".to_string(),
+            None,
+            0,
+            0,
+            vec![],
+            vec![first, second],
+        );
+
+        let err = PlanStorage::save_plan(root, &plan).unwrap_err();
+        let message = err.to_string();
+        assert!(
+            message.contains("Cannot save plan 'duplicate-steps'"),
+            "{message}"
+        );
+        assert!(message.contains("Duplicate step ID: '1'"), "{message}");
+        assert!(PlanStorage::load_plan(root, "duplicate-steps")
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn test_save_plan_rejects_dependency_cycle() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+
+        let mut first = plan_leaf("a", "src/a.rs");
+        first.depends_on = vec!["b".to_string()];
+        let mut second = plan_leaf("b", "src/b.rs");
+        second.depends_on = vec!["a".to_string()];
+        let plan = Plan::from_parts(
+            "cyclic-plan".to_string(),
+            "Cyclic Plan".to_string(),
+            None,
+            0,
+            0,
+            vec![],
+            vec![first, second],
+        );
+
+        let err = PlanStorage::save_plan(root, &plan).unwrap_err();
+        let message = err.to_string();
+        assert!(
+            message.contains("Cannot save plan 'cyclic-plan'"),
+            "{message}"
+        );
+        assert!(message.contains("Cyclic dependency detected"), "{message}");
+        assert!(PlanStorage::load_plan(root, "cyclic-plan")
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn test_save_plan_rejects_a_pending_leaf_without_target_files() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+
+        let step = PlanItem {
+            id: "1".to_string(),
+            title: "Step 1".to_string(),
+            status: PlanItemStatus::Todo,
+            ..Default::default()
+        };
+        let plan = Plan::from_parts(
+            "fileless-step".to_string(),
+            "Fileless Step".to_string(),
+            None,
+            0,
+            0,
+            vec![],
+            vec![step],
+        );
+
+        let err = PlanStorage::save_plan(root, &plan).unwrap_err();
+        let message = err.to_string();
+        assert!(
+            message.contains("Cannot save plan 'fileless-step'"),
+            "{message}"
+        );
+        assert!(message.contains("must declare a target file"), "{message}");
+        assert!(PlanStorage::load_plan(root, "fileless-step")
+            .unwrap()
+            .is_none());
+    }
+
+    /// The write barrier is the single structural gate of plan persistence: the
+    /// programmatic API, the text-tag contour, and the structured discussion
+    /// contour all converge on it, so one defect is rejected identically through
+    /// each of them and nothing reaches disk.
+    #[test]
+    fn test_every_plan_mutation_source_shares_the_structural_barrier() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+
+        let invalid_items = vec![
+            plan_leaf("1", "src/first.rs"),
+            plan_leaf("1", "src/second.rs"),
+        ];
+
+        // 1. The programmatic API.
+        let direct = Plan::from_parts(
+            "barrier-direct".to_string(),
+            "Barrier Direct".to_string(),
+            None,
+            0,
+            0,
+            vec![],
+            invalid_items.clone(),
+        );
+        let direct_err = PlanStorage::save_plan(root, &direct).unwrap_err();
+        assert!(
+            direct_err.to_string().contains("Duplicate step ID: '1'"),
+            "{direct_err}"
+        );
+
+        // 2. The text-tag contour a model emits during a discussion.
+        let tags = concat!(
+            "<plan action=\"save\" id=\"barrier-tags\" title=\"Barrier Tags\">\n",
+            "  <concept>\n",
+            "    <concept_item id=\"c-1\" title=\"Invariant\" />\n",
+            "  </concept>\n",
+            "  <item id=\"1\" title=\"First\" status=\"todo\" files=\"src/first.rs\" />\n",
+            "  <item id=\"1\" title=\"Second\" status=\"todo\" files=\"src/second.rs\" />\n",
+            "</plan>\n",
+        );
+        let tag_outcome = PlanStorage::apply_plan_tags(root, tags);
+        let tag_errors = tag_outcome.errors.join("\n");
+        assert!(tag_outcome.applied.is_empty());
+        assert!(
+            tag_errors.contains("Cannot save plan 'barrier-tags'"),
+            "{tag_errors}"
+        );
+
+        // 3. The structured discussion contour.
+        let update = DiscussionPlanUpdate {
+            action: DiscussionPlanAction::Save,
+            id: Some("barrier-structured".to_string()),
+            title: Some("Barrier Structured".to_string()),
+            description: None,
+            concept: vec![tauqe_protocol::ConceptItem {
+                id: "c-1".to_string(),
+                title: "Invariant".to_string(),
+                details: None,
+                children: vec![],
+            }],
+            items: invalid_items,
+        };
+        let structured_outcome = PlanStorage::apply_discussion_plan_update(root, &update);
+        let structured_errors = structured_outcome.errors.join("\n");
+        assert!(structured_outcome.applied.is_empty());
+        assert!(
+            structured_errors.contains("Cannot save plan 'barrier-structured'"),
+            "{structured_errors}"
+        );
+
+        // No path persisted anything.
+        for id in ["barrier-direct", "barrier-tags", "barrier-structured"] {
+            assert!(
+                PlanStorage::load_plan(root, id).unwrap().is_none(),
+                "the rejected plan '{id}' must never reach disk"
+            );
+        }
     }
 }

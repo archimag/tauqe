@@ -411,8 +411,8 @@ async fn handle_client_initialize(req: Request, state: &Arc<AppState>) -> Respon
         let guard = state.config.lock().await;
         (
             guard.config.resolve_model(&guard.selection),
-            guard.config.develop.workflow,
-            guard.config.develop.protocol,
+            guard.config.repl.workflow,
+            guard.config.repl.protocol,
             guard.config.available_models(),
         )
     };

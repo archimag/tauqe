@@ -55,7 +55,7 @@ and auditable.
 
 | Role | Mandate | Produces |
 | --- | --- | --- |
-| `primary` | interactive engineering dialogue | answers, develop turns |
+| `primary` | interactive engineering dialogue | answers, REPL turns |
 | `scribe` | history compaction, squash commit messages, summarization | dense summaries and commit text |
 | `coder` | plan steps, review fixes, verification healing | code changes |
 | `architect` | plan refinement, horizon synthesis, replanning, finding decomposition | plans and subplans |

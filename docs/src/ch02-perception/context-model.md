@@ -31,7 +31,7 @@ separates four questions into four layers:
 | Question | Layer |
 | --- | --- |
 | What does the project declare authoritative? | **Pinned** |
-| What does the task quote from outside the repository? | **Refs** |
+| What does the task quote from outside the repository? | **OuterDocs** |
 | What did the developer deliberately select? | **User** |
 | What did this turn discover? | **Auto** |
 
@@ -43,17 +43,17 @@ the end of the turn.
 1. **A file outside the context is not editable.** The working set is the write
    boundary; a path the model never loaded cannot be patched blindly.
 2. **`Editable` wins over `ReadOnly` across all layers.** Effective access is
-   merged, never decided by whichever layer mentions the path last. The Refs
-   layer never contributes `Editable`: a reference snapshot is read-only by
-   construction.
+   merged, never decided by whichever layer mentions the path last. The
+   OuterDocs layer never contributes `Editable`: an external snapshot is
+   read-only by construction.
 3. **Pinned entries are configuration-owned.** The interface cannot remove them
    or change their access; only `[context].pinned` decides them.
-4. **The Auto layer is turn-scoped; the User layer is deliberate.** Discovery
+4. **The Auto layer is turn-scoped; the User layer is deliberate.** Research
    accumulates, curation persists.
-5. **The Refs layer is registry-managed and task-scoped.** A document enters it
-   only through the materialization a declared external reference produced, it
-   stays read-only for the whole task, and nothing but the layer's own token
-   budget evicts it automatically.
+5. **The OuterDocs layer is registry-managed and task-scoped.** A document
+   enters it only through the materialization a declared external reference
+   produced, it stays read-only for the whole task, and only clearing the whole
+   context drops it.
 6. **Budgets are measured, not guessed.** File cost is its estimated content plus
    the estimated wrapper its `<file>` element renders, and the aggregate is checked
    against a configured ceiling before anything is added.
@@ -81,7 +81,7 @@ the end of the turn.
 | Layer | Owner | Lifetime | Baseline access | Mutation paths |
 | --- | --- | --- | --- | --- |
 | **Pinned** | `[context].pinned` | whole session | `read_only` | configuration, hierarchical resolution |
-| **Refs** | external reference registry | whole task | `read_only` | materialization, LRU eviction, explicit removal |
+| **OuterDocs** | external reference registry | whole task | `read_only` | materialization, explicit removal |
 | **User** | developer | across turns | as chosen | add, remove, access change, promote from Auto |
 | **Auto** | model discovery | one turn | as requested | context requests, promote, drop, end-of-turn sweep |
 
@@ -94,13 +94,13 @@ the end of the turn.
 | absent | unseen: cannot be edited at all until it enters the context |
 
 Effective access merges every layer holding the path: `Editable` if any layer
-marks the path editable, otherwise `ReadOnly`, otherwise `None`. A reference
+marks the path editable, otherwise `ReadOnly`, otherwise `None`. An external
 document is read-only by construction, so it contributes `ReadOnly` like any
 other read-only entry and is never promoted to `editable`.
 
 A read-only entry is a knowledge hint, not a wall. When a task genuinely requires
 changing such a file, the patch is staged and the file is promoted to `editable`
-on apply, which keeps the declared permission honest without wasting a discovery
+on apply, which keeps the declared permission honest without wasting a research
 round. A file absent from every layer is a hard boundary: it must be requested
 before it can be touched.
 
@@ -113,13 +113,10 @@ before it can be touched.
   and resolved at the repository root and at each ancestor directory of every
   User and Auto file.
 - **Pattern batch** — one glob or directory prefix matched against the tracked
-  file list; the file token budget is the only measure of how much one batch may
+  file list; the token budget is the only measure of how much one batch may
   admit.
-- **Reference document** — a snapshot the harness materialized from a declared
-  external source and admitted read-only into the Refs layer.
-- **LRU watermark** — the monotonic counter value recorded on the most recent
-  request for a reference document; eviction compares those watermarks rather
-  than arrival order, so a document requested again stays resident.
+- **External document** — a snapshot the harness materialized from a declared
+  external source and admitted read-only into the OuterDocs layer.
 - **Revision** — a counter advanced only when layer contents actually change, so a
   no-op mutation never disturbs clients.
 - **Estimated tokens** — `size_bytes / 4`, the single estimate every budget uses.
@@ -133,7 +130,7 @@ before it can be touched.
 
 ### 3.1 Resolution and rendering order
 
-State is emitted in pinned → refs → user → auto order. Each path appears exactly
+State is emitted in pinned → outer_docs → user → auto order. Each path appears exactly
 once: the first owning layer wins, and the merged effective access is applied to
 that single row. The aggregate estimated token count is summed over the emitted
 rows, and the revision advances only when something actually changed.
@@ -175,7 +172,7 @@ The consequence is practical. Loading `crates/core/src/workflow/fsm.rs` brings
 conventions live at an ancestor level. Subsystem rules arrive exactly when the
 subsystem code does.
 
-The second pass covers the User and Auto layers only. A reference document lives
+The second pass covers the User and Auto layers only. An external document lives
 in the harness-owned cache directory rather than in a project subsystem, so
 requesting one resolves no hierarchical pattern.
 
@@ -192,13 +189,13 @@ curated path is never listed twice and never disappears with the end-of-turn
 sweep. A file the model creates on disk during a turn joins the User layer for the
 same reason: new work must survive the sweep and stay editable in later turns.
 
-The Auto layer accumulates monotonically during a turn. Discovery never removes a
+The Auto layer accumulates monotonically during a turn. Research never removes a
 previously discovered file, because later rounds may still depend on it. The
 developer can promote an entry to the User layer, drop a single entry, or clear the
 whole layer. When the turn ends, the transient layer is swept and its surviving
 contents merge into the live context.
 
-Access only moves upward in the Auto layer: a discovery request can upgrade a
+Access only moves upward in the Auto layer: a research request can upgrade a
 read-only entry to editable, never the reverse. A read-only request against an
 already editable file is a no-op.
 
@@ -218,12 +215,13 @@ identifier (`maybe_rotate_session_on_model_change`), because physical KV caches
 are model-specific; modifying only reasoning effort or reselecting the identical
 model keeps the session intact.
 
-### 3.4 The Refs layer lifecycle
+### 3.4 The OuterDocs layer lifecycle
 
-The Refs layer holds material the project does not own: a document an external
-reference declared and the harness materialized into the isolated cache. Its
-manifest, its cache, and its navigation rules belong to *The External Reference
-Registry*; here it is the fourth layer of the working set and nothing more.
+The OuterDocs layer holds material the project does not own: a document an
+external reference declared and the harness materialized into the isolated cache.
+Its declaration, its cache, and the trust rule that governs materialization belong to
+*External Project Documentation*; here it is the fourth layer of the working set and nothing
+more.
 
 **Admission.** A document enters through the registry and only through it. A
 round that requests a path under the tracked registry directory is resolved to a
@@ -231,13 +229,13 @@ declared entry, the entry is materialized, the request is rewritten to its cache
 path, and the resulting file joins the layer read-only whatever access the request
 named. A manual addition is refused, because the layer is registry-managed.
 
-**Cost and eviction.** A document is estimated from its size, like every other
-entry. One document that alone exceeds `context.refs_token_budget` is refused with
-a diagnostic naming the budget, instead of evicting every other document and
-failing anyway. A new admission keeps the layer inside that budget by evicting the
-least recently requested document until it fits. A repeated request refreshes only
-the LRU watermark of that document: the snapshot is immutable for the whole task,
-so no rendered byte changes and the revision stays put.
+**Cost.** A document is priced exactly like a repository file: its estimated
+content plus the wrapper its own `<file>` element renders, spent against the single
+`context.token_budget` ceiling. The layer applies no ceiling of its own, so it never
+evicts a document and never refuses one: a request that would breach the aggregate
+budget is refused whole by the research round that made it, and the snapshot stays in
+the cache for a later round. A repeated request is a no-op: the snapshot is immutable
+for the whole task, so no rendered byte changes and the revision stays put.
 
 **Persistence.** The layer is context rather than transcript, and that single fact
 explains its whole lifecycle:
@@ -247,7 +245,7 @@ explains its whole lifecycle:
 - sweeping the Auto layer at the end of a turn leaves the layer untouched, so a
   document outlives the round that requested it;
 - a turn merge folds the documents the turn materialized into the live layer, and
-  a path held on both sides keeps the more recent LRU watermark;
+  a path held on both sides keeps the snapshot already held;
 - pruning drops a document whose cached file disappeared;
 - clearing the whole context drops every document with it.
 
@@ -262,8 +260,8 @@ Per-file cost is the estimated content plus the estimated wrapper its own `<file
 element renders — the opening header carrying its path and access attribute and the
 closing footer — priced by the same builder that renders the `<context>` block, so the
 estimate and the rendered element cannot disagree. The assembled context reports an
-aggregate `total_estimated_tokens`, and `context.files_token_budget` (300,000 by
-default) bounds that aggregate. The check runs inside discovery: current tokens plus
+aggregate `total_estimated_tokens`, and `context.token_budget` (300,000 by
+default) bounds that aggregate. The check runs inside research: current tokens plus
 the estimated cost of the candidate additions are compared with the budget
 before a single file is added. A breach rejects the whole addition set, halts the
 round with a diagnostic naming the current, requested, and allowed amounts, and
@@ -273,16 +271,16 @@ anonymously.
 A whole family of files can be loaded by glob pattern or directory prefix in one
 batch. The intake matches the tracked file list, skips paths already curated in
 the User layer, sorts matches for determinism, and admits them until
-`context.files_token_budget` is exhausted. The number of files is never a limit of
-its own: a thousand small headers can cost less than one generated bundle, so only
+`context.token_budget` is exhausted. The token budget is the only measure of
+volume: a thousand small headers can cost less than one generated bundle, so only
 the priced total decides. When the budget drops a match, the outcome reports
 truncation, so the omission is never silent.
 
-Three further budgets belong to neighbouring mechanics:
-`context.max_discovery_rounds` bounds widening rounds (see *Discovery Engine*),
+Two further budgets belong to neighbouring mechanics:
+`context.max_research_rounds` bounds widening rounds (see *Research Engine*), and
 `context.repomap_token_budget` bounds the repository outline (see *Repository Map
-and Blinkers*), and `context.refs_token_budget` (50,000 by default) bounds the
-aggregate cost of the Refs layer (see *The External Reference Registry*).
+and Blinkers*). External documents are not a separate working set: they are priced
+by the same `token_budget` as every repository file.
 
 ### 3.6 Turn merge and reconciliation
 
@@ -291,8 +289,8 @@ merges back into the live state:
 
 - the Auto layer is replaced by the turn's Auto layer, excluding paths already
   owned by the User layer;
-- the reference documents the turn materialized are folded into the Refs layer,
-  and a path present on both sides keeps the more recent LRU watermark;
+- the external documents the turn materialized are folded into the OuterDocs layer,
+  and a path present on both sides keeps the snapshot already held;
 - paths that no longer exist on disk are pruned from every layer;
 - access upgrades and files created by the turn are mirrored into the live User
   layer;
@@ -307,7 +305,7 @@ snapshot can never overwrite or resurrect the developer's live changes.
 
 The interface exposes a small, typed surface: add one file (optionally into a
 specific layer), add a pattern batch, remove one file, change access, clear the
-Auto layer, clear the Refs layer, clear the User layer, and clear everything.
+Auto layer, clear the OuterDocs layer, clear the User layer, and clear everything.
 
 Every mutation follows the same discipline. A no-op does not advance the revision.
 Removing a pinned-only path reports no change instead of success. Setting the
@@ -324,10 +322,10 @@ This keeps clients honest: a revision bump always means the visible state moved.
   deterministic promotion path. The hard boundary is absence from the context,
   not the access attribute.
 - **It is not durable memory.** The Auto layer is swept at the end of the turn and
-  the Refs layer belongs to the task. Turn-local working memory lives in the
+  the OuterDocs layer belongs to the task. Turn-local working memory lives in the
   scratchpad; session memory lives in history.
-- **It is not a place for a turn to choose its own sources.** The Refs layer holds
-  only what the manifest declares; widening it is a declaration, never a context
+- **It is not a place for a turn to choose its own sources.** The OuterDocs layer holds
+  only what `[[outer_docs]]` declares; widening it is a declaration, never a context
   operation.
 - **It is not one session forever.** The provider session rotates whenever the
   context block shrinks or the effective model changes, because neither a
@@ -342,18 +340,18 @@ This keeps clients honest: a revision bump always means the visible state moved.
 - **It is not bounded by a file count.** The file token budget is the only measure
   of volume; the number of files one request may admit has no separate ceiling.
 - **It is not a substitute for curation.** The model can discover files
-  autonomously, but loading the task-relevant files up front removes discovery
+  autonomously, but loading the task-relevant files up front removes research
   rounds and spends fewer tokens.
 
 ---
 
 ## 5. Related Chapters
 
-- [The External Reference Registry](reference-registry.md) — the manifest, the
+- [External Project Documentation](reference-registry.md) — the declaration, the
   cache, and the layer whose place in the ontology this chapter states.
 - [Repository Map and Blinkers](repo-map.md) — the deterministic outline of the
   repository the model reads instead of the whole tree.
-- [Discovery Engine](discovery-engine.md) — the bounded rounds that widen the
+- [Research Engine](research-engine.md) — the bounded rounds that widen the
   context and the journal that records their findings.
 - [The Autonomous Bounded Turn FSM](../ch01-foundations/bounded-turn-fsm.md) —
   where the context block is rendered and why the prefix stays stable.

@@ -1,10 +1,15 @@
 use serde::{Deserialize, Serialize};
 use tauqe_protocol::{EditProtocolKind, PatchStrategy, PromptLayoutKind, WorkflowKind};
 
-/// Development profile: workflow engine, edit protocol, patch strategy, and the
-/// retry and replanning budgets of a turn.
+/// Turn profile of a project: workflow engine, edit protocol, patch strategy,
+/// and the retry and replanning budgets of a turn.
+///
+/// The profile is declared under the canonical `[repl]` section and governs
+/// every bounded turn of the project: an isolated step and a discussion run
+/// under the same workflow, transport, patch strategy, and budgets as an
+/// interactive REPL turn.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct DevelopConfig {
+pub struct ReplConfig {
     #[serde(default)]
     pub workflow: WorkflowKind,
     #[serde(default)]
@@ -37,7 +42,7 @@ pub struct DevelopConfig {
 }
 
 /// Backwards-compatible alias for the legacy `[edit]` configuration section.
-pub type EditConfig = DevelopConfig;
+pub type EditConfig = ReplConfig;
 
 fn default_max_retries() -> usize {
     3
@@ -46,7 +51,8 @@ fn default_max_retries() -> usize {
 fn default_max_replans() -> usize {
     2
 }
-impl Default for DevelopConfig {
+
+impl Default for ReplConfig {
     fn default() -> Self {
         Self {
             workflow: WorkflowKind::default(),
@@ -67,14 +73,14 @@ mod tests {
     #[test]
     fn test_structured_protocol_config() {
         let toml_str = r#"
-[develop]
+[repl]
 workflow = "git"
 protocol = "structured"
 "#;
         let config: AppConfig = toml::from_str(toml_str).expect("Failed to parse config");
-        assert_eq!(config.develop.workflow, WorkflowKind::Git);
-        assert_eq!(config.develop.protocol, EditProtocolKind::Structured);
-        assert_eq!(config.develop.max_retries, 3);
+        assert_eq!(config.repl.workflow, WorkflowKind::Git);
+        assert_eq!(config.repl.protocol, EditProtocolKind::Structured);
+        assert_eq!(config.repl.max_retries, 3);
     }
 
     #[test]
@@ -86,58 +92,55 @@ protocol = "xml"
 max_retries = 1
 "#;
         let config: AppConfig = toml::from_str(toml_str).expect("Failed to parse config");
-        assert_eq!(config.develop.workflow, WorkflowKind::Naive);
-        assert_eq!(config.develop.protocol, EditProtocolKind::Xml);
-        assert_eq!(config.develop.max_retries, 1);
+        assert_eq!(config.repl.workflow, WorkflowKind::Naive);
+        assert_eq!(config.repl.protocol, EditProtocolKind::Xml);
+        assert_eq!(config.repl.max_retries, 1);
     }
 
     #[test]
-    fn test_edit_max_retries_override() {
-        let config: AppConfig = toml::from_str("[develop]\nmax_retries = 0\n").unwrap();
-        assert_eq!(config.develop.max_retries, 0);
+    fn test_repl_max_retries_override() {
+        let config: AppConfig = toml::from_str("[repl]\nmax_retries = 0\n").unwrap();
+        assert_eq!(config.repl.max_retries, 0);
     }
 
     #[test]
-    fn test_develop_max_replans_override() {
-        let config: AppConfig = toml::from_str("[develop]\nmax_replans = 4\n").unwrap();
-        assert_eq!(config.develop.max_replans, 4);
+    fn test_repl_max_replans_override() {
+        let config: AppConfig = toml::from_str("[repl]\nmax_replans = 4\n").unwrap();
+        assert_eq!(config.repl.max_replans, 4);
     }
 
     #[test]
-    fn test_develop_patch_strategy_defaults_and_overrides() {
-        let config: AppConfig = toml::from_str("[develop]\n").unwrap();
-        assert_eq!(config.develop.patch_strategy, PatchStrategy::LineAnchor);
+    fn test_repl_patch_strategy_defaults_and_overrides() {
+        let config: AppConfig = toml::from_str("[repl]\n").unwrap();
+        assert_eq!(config.repl.patch_strategy, PatchStrategy::LineAnchor);
 
         let config: AppConfig =
-            toml::from_str("[develop]\npatch_strategy = \"search_replace\"\n").unwrap();
-        assert_eq!(config.develop.patch_strategy, PatchStrategy::SearchReplace);
+            toml::from_str("[repl]\npatch_strategy = \"search_replace\"\n").unwrap();
+        assert_eq!(config.repl.patch_strategy, PatchStrategy::SearchReplace);
 
         let config: AppConfig =
-            toml::from_str("[develop]\npatch_strategy = \"line_anchor\"\n").unwrap();
-        assert_eq!(config.develop.patch_strategy, PatchStrategy::LineAnchor);
+            toml::from_str("[repl]\npatch_strategy = \"line_anchor\"\n").unwrap();
+        assert_eq!(config.repl.patch_strategy, PatchStrategy::LineAnchor);
 
-        assert!(toml::from_str::<AppConfig>("[develop]\npatch_strategy = \"anchors\"\n").is_err());
+        assert!(toml::from_str::<AppConfig>("[repl]\npatch_strategy = \"anchors\"\n").is_err());
     }
 
     #[test]
-    fn test_develop_prompt_layout_key_override() {
-        let config: AppConfig = toml::from_str("[develop]\n").expect("parse config");
-        assert_eq!(config.develop.prompt_layout, None);
+    fn test_repl_prompt_layout_key_override() {
+        let config: AppConfig = toml::from_str("[repl]\n").expect("parse config");
+        assert_eq!(config.repl.prompt_layout, None);
 
         let config: AppConfig =
-            toml::from_str("[develop]\nprompt_layout = \"semantic\"\n").expect("parse config");
+            toml::from_str("[repl]\nprompt_layout = \"semantic\"\n").expect("parse config");
+        assert_eq!(config.repl.prompt_layout, Some(PromptLayoutKind::Semantic));
+
+        let config: AppConfig =
+            toml::from_str("[repl]\nprompt_layout = \"chronological\"\n").expect("parse config");
         assert_eq!(
-            config.develop.prompt_layout,
-            Some(PromptLayoutKind::Semantic)
-        );
-
-        let config: AppConfig =
-            toml::from_str("[develop]\nprompt_layout = \"chronological\"\n").expect("parse config");
-        assert_eq!(
-            config.develop.prompt_layout,
+            config.repl.prompt_layout,
             Some(PromptLayoutKind::Chronological)
         );
 
-        assert!(toml::from_str::<AppConfig>("[develop]\nprompt_layout = \"auto\"\n").is_err());
+        assert!(toml::from_str::<AppConfig>("[repl]\nprompt_layout = \"auto\"\n").is_err());
     }
 }

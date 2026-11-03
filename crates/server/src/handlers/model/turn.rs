@@ -14,13 +14,14 @@ use tauqe_core::prompt::xml::XmlPromptProtocol;
 use tauqe_core::providers::{
     create_provider, format_session_id, LlmProvider, StreamEvent, SESSION_PREFIX_REPL,
 };
+use tauqe_core::review::ReviewStorage;
 use tauqe_core::workflow::{ExecutionMode, SingleExecution};
 use tauqe_protocol::model::{TurnWorkContext, UsageTotals, UsageTotalsSnapshot};
 use tauqe_protocol::{
     events, EditFileDoneEvent, EditFileRetryingEvent, EditFileStartedEvent, EditFinishedEvent,
     EditHunkEvent, EditOutcome, EditStartedEvent, Event, GitCommitCreatedEvent, LlmCapability,
     ModelEscalatedEvent, ModelResultEvent, ModelRole, ModelStartedEvent, ReasoningEffort,
-    ResponseError, TurnIntent,
+    ResponseError, ReviewItem, ReviewSession, ReviewUpdatedEvent, TurnIntent,
 };
 
 use crate::handlers::common::withdraw_streamed_attempt;
@@ -305,7 +306,7 @@ async fn prepare_turn(
 
 /// Resolves the prompt protocol for a turn from its declared intent.
 ///
-/// The configured `develop.protocol` chooses the encoding for every dialogue
+/// The configured `repl.protocol` chooses the encoding for every dialogue
 /// contour: an interactive turn, a focused review dialogue, and a plan
 /// discussion all serialize their commands through the transport the project
 /// declares. The transport never narrows or widens the capability surface — the
@@ -324,6 +325,13 @@ async fn prepare_turn(
 /// `with_capability_set`, so both encodings advertise and decode the very same
 /// mutation, and the harness keeps validating the mutation itself after
 /// decoding.
+///
+/// The review decision follows the same discipline: a review-anchored dialogue
+/// travels as `TurnIntent::ReviewDiscussion`, its regime authorizes the
+/// decision, and the grant runs through the same idempotent
+/// `with_capability_set`. The decision owns no control tag, so the grant widens
+/// a structured schema with the `review_update` field while the XML contour
+/// decodes nothing from it.
 ///
 /// Under Structured Output the operating mode follows the surface: a surface
 /// that permits file edits composes the registry edit schema, where
@@ -344,14 +352,25 @@ pub(super) fn resolve_turn_protocol(
             Box::new(XmlPromptProtocol)
         }
     };
-    // A plan discussion owns the mutation by its regime, and the grant is
-    // idempotent: a protocol that already advertises the capability keeps it
-    // exactly once.
-    let plan_mutation_authorized = intent.is_plan_discussion();
-    let base_protocol = if plan_mutation_authorized {
+    // A plan discussion owns the mutation by its regime, and a review
+    // discussion owns the decision it records. Both grants are idempotent: a
+    // protocol that already advertises the capability keeps it exactly once.
+    let base_protocol = if intent.is_plan_discussion() {
         let capabilities = base_protocol
             .capability_set()
             .with(LlmCapability::PlanUpdate);
+        base_protocol.with_capability_set(capabilities)
+    } else {
+        base_protocol
+    };
+    // The decision is authorized by the review-discussion regime alone. The
+    // grant is orthogonal to the transport: the structured contour declares the
+    // field its schema carries, while the XML contour keeps a surface that owns
+    // no control tag for it.
+    let base_protocol = if intent.is_review_discussion() {
+        let capabilities = base_protocol
+            .capability_set()
+            .with(LlmCapability::ReviewUpdate);
         base_protocol.with_capability_set(capabilities)
     } else {
         base_protocol
@@ -403,7 +422,7 @@ async fn run_prepared_turn(
     let cancel_rx = operation.cancel_receiver();
 
     let (tx, mut rx) = tokio::sync::mpsc::channel::<StreamEvent>(100);
-    let protocol = resolve_turn_protocol(intent, app_config.develop.protocol, marker.as_deref());
+    let protocol = resolve_turn_protocol(intent, app_config.repl.protocol, marker.as_deref());
 
     let mut workflow_opts = tauqe_core::workflow::WorkflowOptions::from_app_config(&app_config);
     // The prepared effort already carries the role-resolved reasoning depth, so
@@ -414,13 +433,11 @@ async fn run_prepared_turn(
     // its findings, so the anchored session identity travels with the turn
     // options: the engine persists a decoded decision against that explicit
     // session and never against whichever session the interface happens to
-    // render as active.
-    // A dialogue anchored on a review session may record a decision for one of
-    // its findings. The identity travels with the turn so a decoded decision is
-    // persisted against the session the dialogue discusses, never against an
-    // ambient one. A group dialogue is anchored on the session that declares the
-    // group, because a group identifier is unique only inside its session.
-    let review_session_id = if intent.is_interactive_repl() {
+    // render as active. Both review regimes qualify, because a decision is
+    // decoded identically whether the anchor addresses one finding or a group.
+    // A group dialogue is anchored on the session that declares the group,
+    // because a group identifier is unique only inside its session.
+    let review_session_id = if intent.is_interactive_repl() || intent.is_review_discussion() {
         match state.discussion_focus().await.target() {
             Some(tauqe_protocol::DiscussionTarget::Review { id }) => Some(id.clone()),
             Some(tauqe_protocol::DiscussionTarget::ReviewGroup { session_id, .. }) => {
@@ -430,6 +447,14 @@ async fn run_prepared_turn(
         }
     } else {
         None
+    };
+    // The session as it stood before the turn is the reference the terminal
+    // publication compares against: only the findings the dialogue actually
+    // moved are republished, so a turn that records no decision publishes
+    // nothing and the client never rewrites state it already holds.
+    let review_baseline = match review_session_id.as_deref() {
+        Some(review_id) => load_review_session(state, review_id).await,
+        None => None,
     };
     workflow_opts.review_session_id = review_session_id.clone();
     workflow_opts.session_id = session_id;
@@ -548,6 +573,11 @@ async fn run_prepared_turn(
             StreamEvent::EditHunk {
                 path,
                 hunk_index,
+                old_start,
+                old_lines,
+                new_start,
+                new_lines,
+                context_hint,
                 old_text,
                 new_text,
             } => {
@@ -557,6 +587,11 @@ async fn run_prepared_turn(
                         operation_id: op_id.clone(),
                         path,
                         hunk_index,
+                        old_start,
+                        old_lines,
+                        new_start,
+                        new_lines,
+                        context_hint,
                         old_text,
                         new_text,
                     })
@@ -944,13 +979,13 @@ async fn run_prepared_turn(
                 params: Some(serde_json::json!({ "state": ctx_state })),
             });
 
-            // A dialogue anchored on a review session may have recorded a
-            // decision for one of its findings. The decision is already durable,
-            // so the refreshed session is published beside the turn's other
-            // state publications instead of being re-derived from the stream.
+            // A dialogue anchored on a review session may have recorded
+            // decisions for its findings. The decisions are already durable, so
+            // the findings the turn actually moved are published beside the
+            // turn's other state publications instead of being re-derived from
+            // the stream.
             if let Some(review_id) = review_session_id.as_deref() {
-                let review_root = state.repo_root().await;
-                crate::handlers::review::publish_review(state, &review_root, review_id).await;
+                publish_review_decisions(state, review_id, review_baseline.as_ref()).await;
             }
 
             let repo_root = state.repo_root().await;
@@ -1146,6 +1181,114 @@ async fn resync_history(state: &Arc<AppState>) {
     }
 }
 
+/// Reads the review session a dialogue is anchored on.
+///
+/// The read is advisory in both directions it is used: it captures what the
+/// session looked like before the turn and it fetches the refreshed session the
+/// terminal publication carries. A storage failure therefore degrades to an
+/// absent snapshot with a record, never to a failed turn whose decisions were
+/// already persisted.
+async fn load_review_session(state: &Arc<AppState>, review_id: &str) -> Option<ReviewSession> {
+    let root = state.repo_root().await;
+    let id = review_id.to_string();
+    match offload(move || ReviewStorage::load_review(&root, &id)).await {
+        Ok(Ok(session)) => session,
+        Ok(Err(err)) => {
+            tracing::warn!(
+                review_id = %review_id,
+                error = %err,
+                "review session could not be read",
+            );
+            None
+        }
+        Err(err) => {
+            tracing::warn!(
+                review_id = %review_id,
+                error = %err,
+                "review session read failed",
+            );
+            None
+        }
+    }
+}
+
+/// Reports whether a decision moved the stored state of one finding.
+///
+/// A decision rewrites the lifecycle status, the resolution note, and the agreed
+/// remediation of the finding, so exactly those fields decide whether the turn
+/// affected it. Presentation-only data and the finding's prose are never part of
+/// a decision and never make a finding affected.
+fn finding_moved(before: &ReviewItem, after: &ReviewItem) -> bool {
+    before.status != after.status
+        || before.resolution_notes != after.resolution_notes
+        || before.recommendations != after.recommendations
+}
+
+/// Publishes the review findings a dialogue turn moved.
+///
+/// A decision the engineer reaches in a discussion is durable state, so the
+/// client learns about it as soon as the turn completes instead of waiting for
+/// the next explicit review fetch. The publication is scoped to the findings the
+/// turn actually changed: the pre-turn snapshot is the reference, so a turn that
+/// recorded no decision publishes nothing and the client never rewrites state the
+/// developer is already looking at.
+///
+/// Every affected finding is published on its own `review/updated` event. The
+/// event carries the refreshed session, which is the shape the wire contract
+/// declares, so a client that tracks a finding by identity observes each change
+/// the turn made.
+async fn publish_review_decisions(
+    state: &Arc<AppState>,
+    review_id: &str,
+    baseline: Option<&ReviewSession>,
+) {
+    let Some(baseline) = baseline else {
+        // Without the pre-turn state the publication cannot tell which findings
+        // moved, and republishing the whole session would rewrite state the
+        // client already holds.
+        tracing::warn!(
+            review_id = %review_id,
+            "review decisions were not published: the pre-turn session state is unavailable",
+        );
+        return;
+    };
+    let Some(session) = load_review_session(state, review_id).await else {
+        return;
+    };
+    let affected = session
+        .items
+        .iter()
+        .filter(|item| match baseline.find_item(item.id) {
+            Some(before) => finding_moved(before, item),
+            // A finding the pre-turn session did not hold cannot have been moved
+            // by a decision: only an existing finding can be decided.
+            None => false,
+        })
+        .map(|item| item.id)
+        .collect::<Vec<u32>>();
+    if affected.is_empty() {
+        return;
+    }
+    tracing::info!(
+        review_id = %review_id,
+        findings = affected.len(),
+        item_ids = ?affected,
+        "review decisions recorded in the dialogue were published",
+    );
+    // The event payload is the refreshed session, so one publication per affected
+    // finding lets a client that tracks a finding identity observe every change
+    // of the turn; a repeated snapshot is idempotent.
+    for _ in &affected {
+        state.out.send_event(&Event {
+            method: events::REVIEW_UPDATED.to_string(),
+            params: serde_json::to_value(ReviewUpdatedEvent {
+                session: session.clone(),
+            })
+            .ok(),
+        });
+    }
+}
+
 /// Initiates an asynchronous model turn in the background and immediately returns its operation ID.
 ///
 /// Designed as a lightweight non-blocking wrapper for interactive single-prompt RPC requests.
@@ -1175,7 +1318,7 @@ pub async fn start_model_turn(
     .await?;
     let op_id = prepared.op_id.clone();
     let state_clone = Arc::clone(state);
-    let workflow = prepared.app_config.develop.workflow;
+    let workflow = prepared.app_config.repl.workflow;
     tokio::spawn(async move {
         let policy = build_apply_policy(&state_clone, workflow);
         let _ = run_prepared_turn(&state_clone, prompt, prepared, policy).await;

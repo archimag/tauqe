@@ -8,7 +8,7 @@
 //! module that describes and decodes it.
 //!
 //! A fragment is an object keyed by the property names the capability owns, so
-//! a capability that reports several properties — discovery carries the context
+//! a capability that reports several properties — research carries the context
 //! request together with the repository outline and listing requests — declares
 //! them in one place. The registry folds the fragments in module order, so the
 //! composed schema stays a deterministic projection of the enabled surface.
@@ -139,8 +139,8 @@ fn destination_property() -> Value {
     })
 }
 
-/// Schema fragment of the discovery properties a single capability owns.
-pub(crate) fn discovery_fragment() -> Value {
+/// Schema fragment of the research properties a single capability owns.
+pub(crate) fn research_fragment() -> Value {
     json!({
         "context_requests": {
             "type": "array",
@@ -201,16 +201,41 @@ pub(crate) fn discovery_fragment() -> Value {
     })
 }
 
-/// Schema fragment of the documentation request property.
+/// Schema fragment of the canonical documentation request property.
+///
+/// The strict schema advertises one spelling per command, so the harness
+/// publishes `tauqe_doc_requests` alone. The pre-canonical `doc_requests`
+/// spelling stays a permanent alias in the decoder, which keeps a cached
+/// response and a stored transcript decodable without widening the wire
+/// contract the model is constrained by.
 pub(crate) fn doc_requests_fragment() -> Value {
     let topics: Vec<&str> = DocTopic::ALL.iter().map(DocTopic::as_str).collect();
     json!({
-        "doc_requests": {
+        "tauqe_doc_requests": {
             "type": "array",
             "description": "System documentation topics to request before answering questions about identity, capabilities, concepts, or workflows",
             "items": {
                 "type": "string",
                 "enum": topics
+            }
+        }
+    })
+}
+
+/// Schema fragment of the external project documentation request property.
+///
+/// A request names one entry the project declares in `[[outer_docs]]`, never a
+/// cache path: where the materialized copy lives is decided by the harness, so
+/// only material the project itself declared is reachable. An empty array is the
+/// idle representation of the property, exactly as it is for every other
+/// request array.
+pub(crate) fn outer_doc_requests_fragment() -> Value {
+    json!({
+        "outer_doc_requests": {
+            "type": "array",
+            "description": "External project documents to materialize before answering, each named by the identifier of an entry declared in the project `[[outer_docs]]` configuration; a materialized document enters the context as read-only reference",
+            "items": {
+                "type": "string"
             }
         }
     })
@@ -254,7 +279,8 @@ pub(crate) fn scratchpad_fragment() -> Value {
 ///
 /// A terminal status is a claim that something happened, so the fragment states
 /// the payload contract in its descriptions: `success` carries a non-empty
-/// `summary`, `error` carries its `message`, and `skip` carries its `reason`.
+/// `commit_message`, `error` carries its `message`, and `skip` carries its
+/// `reason`.
 /// JSON Schema cannot express non-emptiness — `required` already demands every
 /// field and an empty string stays valid — so the descriptions formulate the
 /// contract while the harness enforces it after decoding.
@@ -269,9 +295,9 @@ pub(crate) fn outcome_fragment() -> Value {
                     "enum": ["none", "success", "error", "skip"],
                     "description": "'none' while the turn continues, 'success' when it succeeds, 'error' when it fails, 'skip' when the work is already satisfied and no change is required"
                 },
-                "summary": {
+                "commit_message": {
                     "type": "string",
-                    "description": "Non-empty success summary carried by status 'success'; a success without a summary is a protocol defect rather than a result (empty string otherwise)"
+                    "description": "Git commit message of the change set declared by status 'success': an English Conventional Commits header (`type(scope): description`) in imperative mood, lowercase, without a trailing period, at most 72 characters. It becomes the literal commit message of the turn, so the conversational language never applies to it and it stays English whatever the dialogue language is. A success without it is a protocol defect rather than a result (empty string otherwise)"
                 },
                 "message": {
                     "type": "string",
@@ -282,7 +308,7 @@ pub(crate) fn outcome_fragment() -> Value {
                     "description": "Skip reason carried by status 'skip' (empty string otherwise)"
                 }
             },
-            "required": ["status", "summary", "message", "reason"],
+            "required": ["status", "commit_message", "message", "reason"],
             "additionalProperties": false
         }
     })
@@ -333,6 +359,7 @@ pub(crate) fn user_language_fragment() -> Value {
 /// code-modification and the discussion contours at once, and no silent fallback
 /// can degrade the property into an empty object. The payload admits `null`
 /// because a turn that leaves the plan untouched carries none at all, which is
+/// the idle representation of the property the strict schema requires.
 /// The builder serves its cached schema by reference, so the fragment takes the
 /// single owned copy the composed edit schema needs. That copy is unavoidable:
 /// the registry composes a fresh schema on every composition, and the fragment
@@ -349,10 +376,28 @@ pub(crate) fn plan_update_fragment() -> Value {
 /// kind, so their schemas cannot be inlined into the fragment without the
 /// fragment containing itself. The definitions come from the authoritative
 /// builder of `crates/protocol` and are lifted to the root of the composed
-/// The builder serves its cached definitions by reference, so lifting them into
-/// the composed schema takes the one owned copy that composition needs.
+/// schema. The builder serves its cached definitions by reference, so lifting
+/// them into the composed schema takes the one owned copy composition needs.
 pub(crate) fn plan_update_definitions() -> Value {
     tauqe_protocol::discussion::schema::plan_schema_definitions().clone()
+}
+
+/// Schema fragment of the structured review decision property.
+///
+/// The decision shape is generated by `crates/protocol`, the single source of
+/// truth of the review contract, and the fragment forwards that builder verbatim
+/// instead of restating it. The engine therefore holds no decision shape of its
+/// own: one change to the review contract reaches the discussion contract and
+/// the code-modification schema at once.
+///
+/// The payload admits `null` because a turn that records no decision carries
+/// none at all, which is the idle representation of the property the strict
+/// schema requires. The builder serves its cached schema by reference, so the
+/// fragment takes the single owned copy the composed edit schema needs.
+pub(crate) fn review_update_fragment() -> Value {
+    json!({
+        "review_update": tauqe_protocol::discussion::schema::review_update_schema().clone()
+    })
 }
 
 /// Schema fragment of the structured abort property.
@@ -423,8 +468,9 @@ mod tests {
         for fragment in [
             message_fragment(),
             changes_fragment(PatchStrategy::SearchReplace),
-            discovery_fragment(),
+            research_fragment(),
             doc_requests_fragment(),
+            outer_doc_requests_fragment(),
             verify_fragment(),
             scratchpad_fragment(),
             outcome_fragment(),
@@ -485,7 +531,7 @@ mod tests {
     #[test]
     fn the_documentation_fragment_publishes_every_topic() {
         let fragment = doc_requests_fragment();
-        let topics = fragment["doc_requests"]["items"]["enum"]
+        let topics = fragment["tauqe_doc_requests"]["items"]["enum"]
             .as_array()
             .expect("the topic enum is an array");
         assert_eq!(topics.len(), DocTopic::ALL.len());
@@ -613,13 +659,22 @@ mod tests {
             .expect("the outcome declares its fields");
 
         // A terminal status is a claim that something happened, so the schema
-        // states which payload each status carries.
-        let summary = properties["summary"]["description"]
+        // states which payload each status carries, and it names the consumer of
+        // the success payload: the Git commit of the change set.
+        let commit_message = properties["commit_message"]["description"]
             .as_str()
-            .expect("the summary declares its purpose");
-        assert!(summary.contains("Non-empty"), "{summary}");
-        assert!(summary.contains("'success'"), "{summary}");
-        assert!(summary.contains("protocol defect"), "{summary}");
+            .expect("the commit message declares its purpose");
+        assert!(
+            commit_message.contains("Conventional Commits"),
+            "{commit_message}"
+        );
+        assert!(commit_message.contains("'success'"), "{commit_message}");
+        assert!(
+            commit_message.contains("protocol defect"),
+            "{commit_message}"
+        );
+        assert!(commit_message.contains("72"), "{commit_message}");
+        assert!(!properties.contains_key("summary"));
         assert!(properties["message"]["description"]
             .as_str()
             .expect("the message declares its purpose")
@@ -684,5 +739,63 @@ mod tests {
             .expect("the operation selector states its values");
         assert!(description.contains("'overwrite'"), "{description}");
         assert!(description.contains("'move_dir'"), "{description}");
+    }
+    /// Asserts that the fragment forwards the authoritative protocol builder.
+    #[test]
+    fn the_review_fragment_forwards_the_authoritative_protocol_schema() {
+        use tauqe_protocol::review::ReviewDecisionStatus;
+
+        let fragment = review_update_fragment();
+        let review_update = &fragment["review_update"];
+
+        // The engine holds no decision shape of its own: the fragment is the
+        // very builder of `crates/protocol`, so the discussion contract and the
+        // code-modification contour describe one identical payload.
+        assert_eq!(
+            review_update,
+            tauqe_protocol::discussion::schema::review_update_schema()
+        );
+
+        let variants = review_update["anyOf"]
+            .as_array()
+            .expect("the review payload is a nullable union");
+        assert_eq!(variants.len(), 2);
+        // `null` is the idle representation of the property, exactly as in the
+        // discussion contract the builder feeds.
+        assert_eq!(variants[1]["type"], "null");
+
+        let object = &variants[0];
+        let mut properties: Vec<&str> = object["properties"]
+            .as_object()
+            .expect("the review payload declares its fields")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        properties.sort();
+        assert_eq!(
+            properties,
+            ["group_id", "item_id", "note", "recommendations", "status"]
+        );
+
+        // The vocabulary comes from the typed model, so every decision a
+        // discussion may record is expressible and no status owned by execution
+        // is.
+        let decisions: Vec<&str> = object["properties"]["status"]["enum"]
+            .as_array()
+            .expect("the status enum is an array")
+            .iter()
+            .filter_map(|status| status.as_str())
+            .collect();
+        for decision in [
+            ReviewDecisionStatus::Todo,
+            ReviewDecisionStatus::Skipped,
+            ReviewDecisionStatus::Rejected,
+        ] {
+            assert!(
+                decisions.contains(&decision.as_str()),
+                "the status enum is missing {decision:?}"
+            );
+        }
+        assert_eq!(decisions.len(), 3);
     }
 }

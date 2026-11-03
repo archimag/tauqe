@@ -76,17 +76,19 @@ pub(super) async fn build_model_ask_prompt(
 
 /// Maps a discussion target onto the turn intent it establishes.
 ///
-/// A plan discussion is strictly read-only: the model reasons about the plan
-/// and never touches files. A review finding dialogue stays interactive,
-/// because the developer may ask the model to apply the fix directly.
+/// A plan anchor establishes the plan-discussion regime. A review anchor — a
+/// finding dialogue and a group dialogue alike — establishes the
+/// review-discussion regime: it carries the whole dialogue surface, so the
+/// developer may still ask for the fix directly, and it authorizes the decision
+/// the dialogue records for the anchored session.
 pub(super) fn intent_for_target(target: &DiscussionTarget) -> TurnIntent {
     match target {
         DiscussionTarget::Plan { .. } => TurnIntent::PlanDiscussion,
-        // A review finding dialogue and a group dialogue both stay interactive:
-        // the developer may ask the model to apply the fix directly, and the
-        // decision recorded for a group travels with the dialogue payload.
+        // A review finding dialogue and a group dialogue share one regime: the
+        // decision recorded in either travels with the dialogue payload, and a
+        // group identifier is unique only inside the session that declares it.
         DiscussionTarget::Review { .. } | DiscussionTarget::ReviewGroup { .. } => {
-            TurnIntent::InteractiveRepl
+            TurnIntent::ReviewDiscussion
         }
     }
 }

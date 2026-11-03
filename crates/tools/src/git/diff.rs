@@ -253,6 +253,25 @@ pub fn get_diff(dir: &Path, target_path: Option<&str>) -> Result<String> {
     }
 }
 
+/// Retrieves the diff a single commit introduced against its parent.
+///
+/// The caller names the revision, so the answer is scoped to exactly one
+/// commit: a step commit reports what that step delivered instead of the whole
+/// session ahead of a base. The plumbing is `diff-tree --root`, which also
+/// renders a commit that has no parent — the first commit of a repository — as
+/// the addition of its whole tree, where a diff against a missing parent would
+/// fail instead.
+pub fn get_commit_diff(dir: &Path, commit: &str) -> Result<String> {
+    let commit = commit.trim();
+    if commit.is_empty() {
+        bail!("Commit cannot be empty");
+    }
+    run_git(
+        Some(dir),
+        &["diff-tree", "--root", "--no-commit-id", "--patch", commit],
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -301,5 +320,50 @@ mod tests {
                 file.diff
             );
         }
+    }
+    #[test]
+    fn test_commit_diff_is_scoped_to_the_named_commit() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        run_git(Some(root), &["init", "-b", "master"]).unwrap();
+        run_git(Some(root), &["config", "user.name", "Test"]).unwrap();
+        run_git(Some(root), &["config", "user.email", "test@test.com"]).unwrap();
+        std::fs::write(root.join("step.rs"), "fn step() {}\n").unwrap();
+        run_git(Some(root), &["add", "-A"]).unwrap();
+        commit_with_developer_author(root, "feat: add the step", false, GitHooks::Bypass).unwrap();
+        let first = run_git(Some(root), &["rev-parse", "HEAD"])
+            .unwrap()
+            .trim()
+            .to_string();
+
+        // The first commit has no parent, so its whole tree is reported as
+        // added instead of collapsing into an empty diff.
+        let first_diff = get_commit_diff(root, &first).unwrap();
+        assert!(first_diff.contains("+fn step() {}"), "{first_diff}");
+
+        std::fs::write(root.join("step.rs"), "fn step() -> u8 { 1 }\n").unwrap();
+        std::fs::write(root.join("other.rs"), "fn other() {}\n").unwrap();
+        run_git(Some(root), &["add", "-A"]).unwrap();
+        commit_with_developer_author(root, "feat: change the step", false, GitHooks::Bypass)
+            .unwrap();
+        let second = run_git(Some(root), &["rev-parse", "HEAD"])
+            .unwrap()
+            .trim()
+            .to_string();
+
+        // The later commit is answered against its own parent only, so the
+        // earlier commit keeps its own unchanged answer.
+        let second_diff = get_commit_diff(root, &second).unwrap();
+        assert!(
+            second_diff.contains("-fn step() {}") && second_diff.contains("+fn step() -> u8 { 1 }"),
+            "{second_diff}"
+        );
+        assert!(second_diff.contains("+fn other() {}"), "{second_diff}");
+        assert_eq!(get_commit_diff(root, &first).unwrap(), first_diff);
+
+        // An empty or unknown revision is refused instead of answering a diff
+        // of something the caller never named.
+        assert!(get_commit_diff(root, "   ").is_err());
+        assert!(get_commit_diff(root, "refs/does-not-exist").is_err());
     }
 }

@@ -1,32 +1,32 @@
 //! Cumulative epistemic journal of a bounded turn.
 //!
-//! Discovery rounds widen what the model knows: they return symbol outlines,
+//! Research rounds widen what the model knows: they return symbol outlines,
 //! search matches, directory listings, and documentation. Those findings are
 //! not repository files, so they must never be mixed into the authoritative
 //! `<context>` section, where they would pollute search/replace patching and
 //! break the byte-stable prompt prefix.
 //!
 //! This journal keeps them as an ordered, append-only tail of the user message.
-//! It survives the whole turn, so the outlines requested during Discovery stay
+//! It survives the whole turn, so the outlines requested during Research stay
 //! available while the model repairs patches in Staging and compiler errors in
 //! Verification Healing. New knowledge is only ever appended, and an identical
 //! repeated block is not appended twice, so re-requesting the same outline never
 //! inflates the tail.
 
-use super::DiscoveryRoundOutcome;
+use super::ResearchRoundOutcome;
 
 /// Opening marker of the epistemic tail.
-const JOURNAL_OPEN: &str = "<discovery_journal>";
+const JOURNAL_OPEN: &str = "<research_journal>";
 /// Closing marker of the epistemic tail.
-const JOURNAL_CLOSE: &str = "</discovery_journal>";
+const JOURNAL_CLOSE: &str = "</research_journal>";
 
 /// Ordered, append-only collection of epistemic feedback blocks of one turn.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct TurnDiscoveryJournal {
+pub struct TurnResearchJournal {
     entries: Vec<String>,
 }
 
-impl TurnDiscoveryJournal {
+impl TurnResearchJournal {
     /// Appends one feedback block.
     ///
     /// Blank blocks carry no knowledge and are dropped. A block identical to one
@@ -44,11 +44,11 @@ impl TurnDiscoveryJournal {
         self.entries.push(block.to_string());
     }
 
-    /// Appends every feedback block produced by one discovery round.
+    /// Appends every feedback block produced by one research round.
     ///
     /// The round outcome is read-only here: the journal observes what the round
     /// learned and never rewrites the context the round already applied.
-    pub fn record_outcome(&mut self, outcome: &DiscoveryRoundOutcome) {
+    pub fn record_outcome(&mut self, outcome: &ResearchRoundOutcome) {
         for block in &outcome.feedback_blocks {
             self.push_block(block.as_str());
         }
@@ -115,8 +115,8 @@ impl TurnDiscoveryJournal {
 mod tests {
     use super::*;
 
-    fn outcome_with(blocks: &[&str]) -> DiscoveryRoundOutcome {
-        let mut outcome = DiscoveryRoundOutcome::default();
+    fn outcome_with(blocks: &[&str]) -> ResearchRoundOutcome {
+        let mut outcome = ResearchRoundOutcome::default();
         for block in blocks {
             outcome.feedback_blocks.push((*block).to_string());
         }
@@ -125,7 +125,7 @@ mod tests {
 
     #[test]
     fn test_journal_appends_blocks_in_order() {
-        let mut journal = TurnDiscoveryJournal::default();
+        let mut journal = TurnResearchJournal::default();
         assert!(journal.is_empty());
 
         journal.push_block("<repomap_feedback path=\"src\">\npub fn alpha\n</repomap_feedback>");
@@ -141,7 +141,7 @@ mod tests {
 
     #[test]
     fn test_journal_ignores_blank_blocks() {
-        let mut journal = TurnDiscoveryJournal::default();
+        let mut journal = TurnResearchJournal::default();
         journal.push_block("   \n\t ");
         journal.push_block("");
         assert!(journal.is_empty());
@@ -150,7 +150,7 @@ mod tests {
 
     #[test]
     fn test_journal_deduplicates_repeated_blocks() {
-        let mut journal = TurnDiscoveryJournal::default();
+        let mut journal = TurnResearchJournal::default();
         journal.push_block("<repo_dirs_feedback>\nsrc\n</repo_dirs_feedback>");
         journal.push_block("  <repo_dirs_feedback>\nsrc\n</repo_dirs_feedback>  ");
         journal.push_block("<repo_dirs_feedback>\nsrc\n  nested\n</repo_dirs_feedback>");
@@ -160,7 +160,7 @@ mod tests {
 
     #[test]
     fn test_journal_records_round_outcome_without_duplicates() {
-        let mut journal = TurnDiscoveryJournal::default();
+        let mut journal = TurnResearchJournal::default();
         journal.record_outcome(&outcome_with(&[
             "<system_documentation>\nA\n</system_documentation>",
         ]));
@@ -176,7 +176,7 @@ mod tests {
 
     #[test]
     fn test_journal_renders_a_delimited_tail() {
-        let mut journal = TurnDiscoveryJournal::default();
+        let mut journal = TurnResearchJournal::default();
         journal.push_block("<context_feedback>\nalready loaded\n</context_feedback>");
 
         let rendered = journal.rendered().expect("journal must render");
@@ -187,7 +187,7 @@ mod tests {
 
     #[test]
     fn test_compose_user_prompt_orders_task_tail_and_diagnostics() {
-        let mut journal = TurnDiscoveryJournal::default();
+        let mut journal = TurnResearchJournal::default();
         journal.push_block("<repomap_feedback path=\"src\">\npub fn alpha\n</repomap_feedback>");
 
         let composed = journal.compose_user_prompt(
@@ -207,7 +207,7 @@ mod tests {
 
     #[test]
     fn test_compose_user_prompt_without_journal_or_diagnostics() {
-        let journal = TurnDiscoveryJournal::default();
+        let journal = TurnResearchJournal::default();
         assert_eq!(
             journal.compose_user_prompt("Base task.", None),
             "Base task."
@@ -220,7 +220,7 @@ mod tests {
 
     #[test]
     fn test_compose_user_prompt_with_journal_only() {
-        let mut journal = TurnDiscoveryJournal::default();
+        let mut journal = TurnResearchJournal::default();
         journal.push_block("<system_documentation>\ncontext\n</system_documentation>");
 
         let composed = journal.compose_user_prompt("Base task.", None);

@@ -42,7 +42,8 @@ pub(crate) use confirm::{
     render_confirm_execute_pipeline_popup, render_confirm_execute_review_popup,
     render_confirm_execute_scope_popup, render_confirm_quit_popup,
     render_confirm_remove_context_file_popup, render_confirm_review_analyze_popup,
-    render_confirm_review_truncation_popup, review_analyze_params, review_truncation_params,
+    render_confirm_review_truncation_popup, review_analyze_dialog_geometry,
+    review_truncation_params,
 };
 pub(crate) use diff_inspector::render_diff_inspector;
 pub(crate) use disconnected::{disconnected_button_geometry, render_disconnected_popup};

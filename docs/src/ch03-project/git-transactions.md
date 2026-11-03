@@ -37,10 +37,14 @@ mid-turn leaves synthetic commits at the tip of the branch.
 4. **A failed or cancelled turn restores the exact pre-turn state.**
 5. **A finalized commit is ordinary history.** The developer inspects, amends, or
    reverts it with standard Git tooling.
-6. **Recovery requires proof.** It runs only with an open transaction marker and
-   a commit range created entirely by the harness: for a born base, every
-   commit between the recorded base and HEAD, with the base still an ancestor
-   of HEAD; for an unborn base, every commit reachable from HEAD.
+6. **Recovery requires proof.** It runs only with an open transaction marker, and
+   the phase that marker records selects the proof: a settled transaction must
+   show a commit range created entirely by the harness — for a born base, every
+   commit between the recorded base and HEAD, with the base still an ancestor of
+   HEAD; for an unborn base, every commit reachable from HEAD — while a marker
+   still recording a capture in progress is resolved against HEAD and the
+   recorded base alone, because the capture it describes has not produced a
+   range yet.
 
 ---
 
@@ -67,6 +71,12 @@ mid-turn leaves synthetic commits at the tip of the branch.
   first change set reached disk; the differential against it is what detects the
   paths the turn produced outside the proposal.
 - **Squash** — collapsing a contiguous run of commits into one.
+- **Commit message** — the `commit_message` the turn's success outcome declares.
+  The isolated commit takes it verbatim as its subject, and `Conventions.md` §6
+  fixes its shape: an English Conventional Commits header, imperative mood,
+  lower case, no trailing period, at most 72 characters. The developer-facing
+  answer travels in `message` and never becomes a commit message.
+
 The transaction machinery — checkpoints, step commits, the squash, crash recovery,
 and the proof that the protected paths stay excluded — is deterministic substrate
 and lives in `crates/tools/src/git/`. The engine owns its one harness-specific
@@ -78,7 +88,7 @@ every committing entry point receives.
 | --- | --- | --- |
 | Checkpoint | `tauqe-checkpoint: uncommitted user changes` | temporary |
 | Step | `tauqe-step: <phase>` | temporary |
-| Final | the turn summary | permanent |
+| Final | the `commit_message` of the success outcome | permanent |
 
 Every harness commit carries the trailer
 `Co-authored-by: Tauqe AI <noreply@tauqe.dev>`, so the harness can recognize its
@@ -92,7 +102,9 @@ The marker lives at `.tauqe/active-transaction.json`, inside the gitignored
 - `previous_head` — the base the transaction started from: the hash of the
   commit the branch already held, or `null` when the branch was unborn;
 - `created_checkpoint_commit` — whether uncommitted work was captured in a
-  checkpoint commit.
+  checkpoint commit;
+- `phase` — where the capture stands: `capturing` while the capture is still in
+  progress, `established` once its outcome is recorded.
 
 A clean tree still opens a transaction: the marker is written with
 `created_checkpoint_commit = false`. The marker is cleared when the turn is
@@ -102,7 +114,16 @@ An unborn base always implies `created_checkpoint_commit = false`: the tree
 was clean, and a dirty tree would have produced the root checkpoint commit
 whose hash the marker records instead. Markers written by earlier revisions
 recorded the moving ref `HEAD` for an unborn branch; they migrate to the
-unborn base on read, so a marker never hides an open transaction.
+   unborn base on read, so a marker never hides an open transaction.
+
+A dirty tree writes the marker twice, and the `phase` field is what tells a
+reader which of the two writes it observes. The field records a phase of the
+transaction, never an outcome of it: `capturing` is written before the work is
+staged, and `established` is written once the checkpoint commit exists and the
+marker can name it. The base still travels under the `previous_head` key earlier
+revisions wrote, now as a typed value — a commit hash or the unborn state — and a
+marker that carries no `phase` key decodes as `established`, keeping the settled
+meaning that revision gave it.
 
 The marker is persisted through the substrate's atomic-write policy: the
 document is staged in a sibling file, flushed and `fsync`ed, renamed atomically
@@ -111,12 +132,15 @@ concurrently running recovery pass therefore observes either the previous
 complete marker or the new complete marker, never a truncated document that
 would decode as an absent transaction while one is open.
 
-One ordering window remains, and it is deliberate. The checkpoint commit becomes
-durable before the marker that records it is written, so a crash between the two
-leaves the repository holding the checkpoint commit but no marker. Recovery
-requires the marker as its proof and therefore leaves such a repository
-untouched, while the developer's captured work stays recoverable inside the
-checkpoint commit with standard Git tooling.
+Neither crash window loses captured work, because the `capturing` marker is
+durable before the capture starts and recovery resolves it against HEAD. A crash
+before the checkpoint commit leaves a marker whose recorded base is still HEAD
+while the developer's changes are still in the working tree: recovery clears the
+marker and leaves the tree untouched. A crash after the commit but before the
+rewrite leaves a `capturing` marker plus a checkpoint commit whose parent is the
+recorded base: recovery unwinds that commit and returns the captured work to the
+working tree. Any other shape is refused, exactly as an unproven settled
+transaction is.
 
 ---
 
@@ -128,9 +152,11 @@ Before any edit touches the working tree, the harness inspects the repository:
 
 - **Clean tree** — no checkpoint commit is needed; the marker records the
   current HEAD — or an unborn base when the branch holds no commit yet —
-  and `created_checkpoint_commit = false`.
-- **Dirty tree** — uncommitted changes are staged and captured in one checkpoint
-  commit, and the marker records the new HEAD and
+  `created_checkpoint_commit = false`, and the settled `established` phase.
+- **Dirty tree** — the marker is persisted in the `capturing` phase first, so
+  the capture is announced before it starts; the uncommitted changes are then
+  staged and captured in one checkpoint commit, and the marker is rewritten in
+  the `established` phase recording the new HEAD and
   `created_checkpoint_commit = true`.
 
 The checkpoint step also ensures that `.tauqe`, `credentials.toml`,
@@ -169,7 +195,8 @@ On success the harness:
    the working tree;
 3. clears the transaction marker;
 4. stages exactly the turn's change set;
-5. commits them with the turn summary and the co-author trailer.
+5. commits them with the `commit_message` the success outcome declared and the
+   co-author trailer.
 
 The change set is resolved before the reset, from three sources read off the real
 tree: the paths the patch wrote, the artifacts the declared post-hook produced, and
@@ -182,6 +209,14 @@ differential never advances past an artifact the turn already produced.
 
 Repository history therefore exposes one isolated commit, not the healing noise of
 a recovered turn.
+
+The message of that commit is not composed by the harness. It is the
+`commit_message` the turn's success outcome declared, taken verbatim, which is
+why the field is named for this consumer rather than for the answer that
+accompanies it. `Conventions.md` §6 already fixes the shape for every commit in
+the repository — a Conventional Commits header, imperative mood, lower case, no
+trailing period, at most 72 characters — and the model-facing rule repeats that
+contract, so the header stays English whatever language the turn answered in.
 
 ### 3.4 Rollback
 
@@ -224,15 +259,23 @@ Recovery runs at startup and is deliberately conservative:
 2. without a transaction marker, the repository is left untouched — a
    hand-written commit that merely shares the step-commit subject prefix is never
    mistaken for a dangling transaction;
-3. with a marker, the recorded base decides the proof range: for a born base,
-   every commit between the base and HEAD, and the base must still be an
-   ancestor of HEAD or recovery refuses and reports the reason; for an
+3. a marker still recording the `capturing` phase describes a crash inside the
+   capture itself and is resolved against HEAD and the recorded base instead of
+   a commit range: a HEAD that still equals the base means no checkpoint commit
+   was created, so the marker is cleared and the working tree is left untouched;
+   a checkpoint commit whose parent equals the base — for an unborn base, a
+   checkpoint commit that is the repository root — means the capture committed
+   but crashed before the rewrite that records it, so that commit is unwound,
+   returning the captured work to the working tree; any other shape is refused;
+4. otherwise the settled marker's recorded base decides the proof range: for a
+   born base, every commit between the base and HEAD, and the base must still be
+   an ancestor of HEAD or recovery refuses and reports the reason; for an
    unborn base, every commit reachable from HEAD;
-4. every commit in that range must carry the co-author trailer; a foreign
+5. every commit in that range must carry the co-author trailer; a foreign
    commit makes recovery refuse instead of rewriting history;
-5. if there are no step commits and no checkpoint commit, the marker is
+6. if there are no step commits and no checkpoint commit, the marker is
    cleared;
-6. otherwise the tree is returned to the base — a hard reset to the recorded
+7. otherwise the tree is returned to the base — a hard reset to the recorded
    commit for a born base, a return to the unborn state that removes exactly
    the tracked paths for an unborn one — the marker is cleared, and the
    checkpoint commit is unwound.
@@ -323,6 +366,9 @@ developer.
 - **It is not a commit of the proposal alone.** A file the toolchain rewrote while it
   verified the tree is committed when the turn succeeds and disappears with the tree
   when it does not.
+- **It is not a commit message the harness writes.** The subject of the isolated
+  commit is the `commit_message` the success outcome declared, never a summary
+  the harness derives from the paths it staged.
 
 ---
 

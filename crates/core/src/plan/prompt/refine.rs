@@ -123,6 +123,14 @@ fn plan_item_schema(depth: usize, max_depth: usize) -> serde_json::Value {
         }),
     );
     properties.insert(
+        "outer_docs".to_string(),
+        serde_json::json!({
+            "type": "array",
+            "description": "Identifiers of the project-declared `[[outer_docs]]` entries materialized as read-only reference context when this step executes: `id` names a declared root document and `id/relative.md` names a document below that root. Invariant: outer_docs must only be specified for executable leaf steps without children; parent container items must have an empty outer_docs list.",
+            "items": { "type": "string" }
+        }),
+    );
+    properties.insert(
         "concept_refs".to_string(),
         serde_json::json!({
             "type": "array",
@@ -138,14 +146,26 @@ fn plan_item_schema(depth: usize, max_depth: usize) -> serde_json::Value {
             "items": { "type": "string" }
         }),
     );
+    properties.insert(
+        "commit".to_string(),
+        serde_json::json!({
+            "anyOf": [
+                { "type": "string" },
+                { "type": "null" }
+            ],
+            "description": "Identifier of the Git commit that already completed this step, or null for a step that has not run yet. The harness records a commit for a finished step and reproduces it verbatim, so a horizon never invents one."
+        }),
+    );
 
     let mut required = vec![
         serde_json::Value::String("id".to_string()),
         serde_json::Value::String("title".to_string()),
         serde_json::Value::String("details".to_string()),
         serde_json::Value::String("status".to_string()),
+        serde_json::Value::String("commit".to_string()),
         serde_json::Value::String("files".to_string()),
         serde_json::Value::String("readonly_files".to_string()),
+        serde_json::Value::String("outer_docs".to_string()),
         serde_json::Value::String("concept_refs".to_string()),
         serde_json::Value::String("depends_on".to_string()),
     ];
@@ -290,6 +310,7 @@ pub fn build_plan_horizon_system_prompt() -> String {
     out.push_str("   - Automated Verification Invariant: The harness runs full toolchain verification (compilation, linters, and tests) automatically and deterministically after every individual leaf step. Dedicated steps that only run tests, check the build status, or inspect the codebase without changing code are strictly prohibited, because the executor has no shell. Tests are created and modified inside the steps that implement the corresponding functionality.\n");
     out.push_str("   - Target File Precision (Leaf-Only Files Invariant): For every executable leaf step, you MUST populate `files: [\"path/to/file\"]` with exact repository-relative file paths. Parent items and task groups are conceptual containers and MUST have empty `files: []`. Only leaf steps (`children: []`) pre-load files into context upon execution.\n");
     out.push_str("   - Reference Files Contract (Read-Only Context): For every executable leaf step, identify and populate `readonly_files: [\"path/to/reference\"]` with existing interfaces, protocol types, or subsystem conventions needed as context during implementation. These files are pre-loaded as read-only context during step execution. Invariant: parent items must have empty `readonly_files: []`.\n");
+    out.push_str("   - External Specification Contract (Outer Docs): For every executable leaf step that must be implemented against an external contract, declare the specification the project publishes in `[[outer_docs]]` through `outer_docs: [\"id\"]`, so the harness materializes it as read-only context before the step starts. One declaration names one root document and covers the whole subtree inside that root, so address a document below the root as `id/relative.md` and never climb above it. A step that carries no external dependency must use `outer_docs: []`, and a parent container item must have an empty `outer_docs: []`.\n");
     out.push_str("   - Concept Traceability: For each step, link it to the relevant architectural concept IDs via `concept_refs: [\"concept_id\"]`.\n");
     out.push_str("   - DAG Dependency Contract: For every executable leaf step, declare prerequisite step IDs in `depends_on: [\"step_id\"]`. A step runs only after every dependency reaches DONE status. Reference only steps within this horizon; steps without prerequisites must use `depends_on: []`.\n");
     out.push_str("   - Avoid Micro-Fragmentation: Strictly avoid splitting adjacent, closely related edits into separate microscopic steps. Group cohesive changes across 1-4 related files under a single leaf step if they form a logical unit of work and carry no risk of patch conflicts.\n");
@@ -311,7 +332,7 @@ pub fn build_plan_horizon_system_prompt() -> String {
     out.push_str(
         "   - Do NOT switch languages unless the plan itself is written in that language.\n\n",
     );
-    out.push_str("6. Architect Discovery Protocol (Mandatory Contract Verification):\n");
+    out.push_str("6. Architect Research Protocol (Mandatory Contract Verification):\n");
     out.push_str("   - You have access to symbol contours in `<repo_map>` and already loaded files in `Active Context Files`.\n");
     out.push_str("   - Eager contour generation may be disabled, so `<repo_map>` can cover only part of the codebase. A module absent from the contours is never evidence that it is empty: request its contours via `repo_maps` before designing a step that touches it.\n");
     out.push_str("   - RepoMap contours are blinkers, not contracts: they reveal only the shape of the codebase (names, kinds, and rough signatures), never exact type definitions, field layouts, trait bounds, error semantics, lifetimes, or crate boundaries.\n");
@@ -466,9 +487,9 @@ pub fn build_plan_horizon_user_prompt(
     out.push_str("## Architect Instructions:\n");
     out.push_str("1. Conduct deep technical dependency analysis using the repository outline and the loaded context files.\n");
     out.push_str("2. Synthesize the COMPLETE unfinished horizon as dependency-ordered leaf steps with `status: \"todo\"`. Do NOT include any DONE step; the harness preserves the completed foundation verbatim and prepends it.\n");
-    out.push_str("3. Follow the Architect Discovery Protocol: before designing any step that touches an existing interface, type, trait, module, or crate, verify its real contract by requesting the relevant source files or searching for symbols via `status: \"needs_context\"` with `context_requests: [\"path/to/file\"]`, `repo_searches: [...]`, or `repo_maps: [\"path/to/module\"]`, and empty `items: []`. Never infer contracts from RepoMap contours alone.\n");
+    out.push_str("3. Follow the Architect Research Protocol: before designing any step that touches an existing interface, type, trait, module, or crate, verify its real contract by requesting the relevant source files or searching for symbols via `status: \"needs_context\"` with `context_requests: [\"path/to/file\"]`, `repo_searches: [...]`, or `repo_maps: [\"path/to/module\"]`, and empty `items: []`. Never infer contracts from RepoMap contours alone.\n");
     out.push_str("4. Check for any blockers, circular dependencies, or contradictions. If blocked, report `status: \"blocked\"` with an exact `reason`.\n");
-    out.push_str("5. For every executable leaf step, specify target files in `files`, reference contracts/types/conventions in `readonly_files`, addressed concept IDs in `concept_refs`, and prerequisite step IDs in `depends_on`. Calibrate leaf step granularity to cohesive units: group closely related adjacent edits under one step to avoid micro-fragmentation, while avoiding monolithic multi-file dumps.\n");
+    out.push_str("5. For every executable leaf step, specify target files in `files`, reference contracts/types/conventions in `readonly_files`, external specifications the project publishes in `outer_docs` (`id` for a declared root, `id/relative.md` for a document below it), addressed concept IDs in `concept_refs`, and prerequisite step IDs in `depends_on`. Declare `outer_docs` whenever the step must be implemented against an external contract, so the harness pre-loads the specification and the executor spends no discovery round on it. Calibrate leaf step granularity to cohesive units: group closely related adjacent edits under one step to avoid micro-fragmentation, while avoiding monolithic multi-file dumps.\n");
     out.push_str("6. Disjunction Prohibition Invariant: Every concept node and every step must state exactly one definite decision, so unresolved disjunctive alternatives such as 'either X or Y' or 'use library A or write your own structure B' are strictly prohibited. The architectural choice ('What') is fixed by the concept tree and the developer, and a genuine ambiguity is reported through `status: \"blocked\"` with the exact decision the developer must make, instead of being resolved by offering alternatives; a step owns 'How' only and never decides the architecture.\n");
     out.push_str("7. Automated Verification Invariant: The harness runs full toolchain verification (compilation, linters, and tests) automatically and deterministically after every individual leaf step, so dedicated steps that only run tests, check the build status, or inspect the codebase without changing code are strictly prohibited: the executor has no shell, and tests are created and modified inside the steps that implement the corresponding functionality.\n");
     out.push_str("8. Language Directive: Detect the natural language of the plan title and description. Formulate all titles, details, explanations, and reasons strictly in that same language.\n");
@@ -493,20 +514,18 @@ mod tests {
     }
 
     #[test]
-    fn test_plan_horizon_system_prompt_mandates_contract_discovery() {
+    fn test_plan_horizon_system_prompt_mandates_contract_research() {
         let sys = build_plan_horizon_system_prompt();
-        assert!(sys.contains("Architect Discovery Protocol"));
-        assert!(sys.contains("needs_context"));
+        assert!(sys.contains("Architect Research Protocol"));
         assert!(sys.contains("<repo_map>"));
         assert!(sys.contains("repo_maps"));
         assert!(sys.contains("hard contract violation"));
-        assert!(!sys.contains("Codebase Exploration & Discovery Contract"));
     }
 
     #[test]
-    fn test_plan_horizon_user_prompt_mandates_contract_discovery() {
+    fn test_plan_horizon_user_prompt_mandates_contract_research() {
         let user = build_plan_horizon_user_prompt(&sample_plan(), None, None);
-        assert!(user.contains("Architect Discovery Protocol"));
+        assert!(user.contains("Architect Research Protocol"));
         assert!(user.contains("needs_context"));
     }
 
@@ -638,5 +657,29 @@ mod tests {
         let sys = build_plan_horizon_system_prompt();
         assert!(sys.contains("Final Content Invariant"));
         assert!(sys.contains("reasoning process itself is never plan content"));
+    }
+
+    #[test]
+    fn test_plan_refine_schema_describes_the_outer_docs_prefix() {
+        let schema = plan_refine_response_schema();
+        let outer_docs = &schema["properties"]["items"]["items"]["properties"]["outer_docs"];
+        let description = outer_docs["description"]
+            .as_str()
+            .expect("outer_docs description must exist");
+        assert!(description.contains("id/relative.md"));
+        assert!(description.contains("parent container items must have an empty outer_docs list"));
+    }
+
+    #[test]
+    fn the_horizon_prompts_mandate_outer_docs_for_external_contracts() {
+        let sys = build_plan_horizon_system_prompt();
+        assert!(sys.contains("External Specification Contract (Outer Docs)"));
+        assert!(sys.contains("outer_docs: [\"id\"]"));
+        assert!(sys.contains("id/relative.md"));
+        assert!(sys.contains("never climb above it"));
+
+        let user = build_plan_horizon_user_prompt(&sample_plan(), None, None);
+        assert!(user.contains("external specifications the project publishes in `outer_docs`"));
+        assert!(user.contains("id/relative.md"));
     }
 }

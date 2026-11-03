@@ -4,20 +4,21 @@
 //! round is assembled from the active [`PromptProtocol`] and the turn-scoped
 //! [`PromptAssembly`] material, streamed through the protocol's
 //! [`EditStreamFilter`], and decoded into normalized commands that fold into the
-//! turn state and the [`TurnDiscoveryJournal`].
+//! turn state and the [`TurnResearchJournal`].
 //!
 //! The kernel owns the deterministic inputs frozen for the whole turn through
-//! [`TurnInputCache`], the shared investigation budget of discovery and project
+//! [`TurnInputCache`], the shared investigation budget of research and project
 //! commands, and the corrective budget of an empty answer, so no phase executor
-//! re-derives them. Discovery commands run through the polymorphic dispatcher of
-//! [`crate::workflow::discovery`]; a round that would breach the files token
+//! re-derives them. Research commands run through the polymorphic dispatcher of
+//! [`crate::workflow::research`]; a round that would breach the files token
 //! budget is reported to the caller as a typed signal instead of terminating the
 //! turn with hardcoded text.
 
 use std::path::Path;
 
 use tauqe_protocol::{
-    ContextAccess, LlmCapability, ModelRef, ModelResult, ProjectConfig, TurnIntent, TurnPhase,
+    ContextAccess, LlmCapability, LlmCommand, ModelRef, ModelResult, ProjectConfig, TurnIntent,
+    TurnPhase,
 };
 use tokio::sync::{mpsc, watch};
 
@@ -29,9 +30,9 @@ use crate::plan::storage::PlanMutationMode;
 use crate::prompt::protocol::PromptProtocol;
 use crate::prompt::PromptAssembly;
 use crate::providers::{LlmProvider, StreamEvent};
-use crate::workflow::discovery::journal::TurnDiscoveryJournal;
-use crate::workflow::discovery::ContextLimitExceeded;
 use crate::workflow::policy::ApplyPolicy;
+use crate::workflow::research::journal::TurnResearchJournal;
+use crate::workflow::research::ContextLimitExceeded;
 use crate::workflow::WorkflowOptions;
 
 use super::cache::TurnInputCache;
@@ -82,13 +83,29 @@ pub(super) struct TurnKernel<'a> {
     /// State accumulated across the proposal rounds.
     pub(super) state: TurnState,
     /// Cumulative epistemic tail of the turn.
-    pub(super) journal: TurnDiscoveryJournal,
+    pub(super) journal: TurnResearchJournal,
     /// Investigation rounds consumed by the turn so far.
     pub(super) rounds_used: usize,
     /// Conversational text accumulated across every round.
     pub(super) accumulated_text: String,
     /// Corrective budget of an empty answer, owned by the kernel.
     pub(super) empty_steps: EmptyStepGuard,
+}
+
+/// Declared external documents one research round resolved.
+///
+/// A resolved document answers with the cache path the round may now read as
+/// an ordinary context request, so the material the model asked for enters
+/// the context through the same admission rule as a repository file. Every
+/// refusal keeps the classification of its audience, so a trust decision
+/// addressed to the developer never merges with a delivery failure addressed
+/// to the model.
+#[derive(Default)]
+struct OuterDocsResolution {
+    /// Cache paths that now hold a snapshot the round asked for.
+    paths: Vec<String>,
+    /// Refusals, each carrying the document that could not be materialized.
+    failures: Vec<(String, crate::outer_docs::MaterializeError)>,
 }
 
 impl TurnKernel<'_> {
@@ -116,19 +133,105 @@ impl TurnKernel<'_> {
 
     /// Spends one shared investigation round and reports its ordinal.
     ///
-    /// Discovery rounds and project-command rounds draw from one budget: both
+    /// Research rounds and project-command rounds draw from one budget: both
     /// widen what the model knows through a provider round trip, so the model may
     /// freely alternate file requests, searches, documentation, and diagnostic
     /// command runs without one kind of investigation starving the other. `None`
     /// reports that the budget is spent.
     pub(super) fn spend_investigation_round(&mut self) -> Option<usize> {
-        if self.rounds_used >= self.options.max_discovery_rounds {
+        if self.rounds_used >= self.options.max_research_rounds {
             return None;
         }
         self.rounds_used += 1;
         Some(self.rounds_used)
     }
 
+    /// Materializes the declared external documents a round requested.
+    ///
+    /// A declared document has no file on disk until the harness materializes
+    /// it, so the round resolves both request spellings before the research
+    /// dispatcher looks for any file: a context request that addresses the
+    /// outer documentation cache names a cache path directly, while an
+    /// outer-document request names the declaration and the relative document it
+    /// wants and keeps the cache layout an implementation detail of the harness.
+    /// Every refusal keeps its classification: a trust refusal reaches the round
+    /// outcome as a developer-addressed verdict, a delivery failure as a
+    /// model-addressed one.
+    async fn materialize_requested_outer_docs(
+        &self,
+        requests: &[crate::edits::protocol::ContextRequest],
+        declared: &[String],
+    ) -> OuterDocsResolution {
+        let mut resolved = OuterDocsResolution::default();
+        let Some(config) = self.options.app_config.as_ref() else {
+            return resolved;
+        };
+        if config.outer_docs.is_empty() {
+            return resolved;
+        }
+        let registry = crate::outer_docs::OuterDocsRegistry::new(&config.outer_docs);
+        for request in requests {
+            if !crate::outer_docs::is_outer_docs_cache_path(&request.path) {
+                continue;
+            }
+            let materialized = registry
+                .materialize_request(
+                    self.repo_root,
+                    &request.path,
+                    crate::outer_docs::MAX_DOCUMENT_BYTES,
+                    Some(self.cancel_rx),
+                )
+                .await;
+            match materialized {
+                Ok(Some(cache_path)) => {
+                    tracing::info!(
+                        path = cache_path.as_str(),
+                        "outer documentation materialized for the research round"
+                    );
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    tracing::warn!(
+                        path = request.path.as_str(),
+                        trust_refusal = error.trust().is_some(),
+                        reason = %error.reason(),
+                        "outer documentation request was refused"
+                    );
+                    resolved.failures.push((request.path.clone(), error));
+                }
+            }
+        }
+        for id in declared {
+            let materialized = registry
+                .materialize_declared(
+                    self.repo_root,
+                    id,
+                    crate::outer_docs::MAX_DOCUMENT_BYTES,
+                    Some(self.cancel_rx),
+                )
+                .await;
+            match materialized {
+                Ok(cache_path) => {
+                    tracing::info!(
+                        document = id.as_str(),
+                        path = cache_path.as_str(),
+                        "outer documentation materialized for the research round"
+                    );
+                    resolved.paths.push(cache_path);
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        document = id.as_str(),
+                        trust_refusal = error.trust().is_some(),
+                        reason = %error.reason(),
+                        "outer documentation request was refused"
+                    );
+                    resolved.failures.push((id.clone(), error));
+                }
+            }
+        }
+        resolved
+    }
     /// Executes one proposal round with the accumulated turn state.
     ///
     /// The phase executors call this instead of [`propose_round`] directly, so
@@ -158,7 +261,7 @@ impl TurnKernel<'_> {
         .await
     }
 
-    /// Runs the discovery phase: resolves context and documentation requests.
+    /// Runs the research phase: resolves context and documentation requests.
     ///
     /// Each round folds the model's requested files into the auto context layer
     /// and injects requested documentation before re-asking the provider for a
@@ -168,55 +271,78 @@ impl TurnKernel<'_> {
     /// owes. The phase returns the last proposal round so the caller can stage its
     /// edits. A breached file token budget becomes a typed signal the caller
     /// renders; a cancellation or a semantic block terminates the turn instead.
-    pub(super) async fn run_discovery_phase(
+    pub(super) async fn run_research_phase(
         &mut self,
         initial: ProposalStep,
-    ) -> anyhow::Result<DiscoveryPhase> {
+    ) -> anyhow::Result<ResearchPhase> {
         let mut step = initial;
         let mut satisfied_rounds = 0usize;
         // Prose the model itself authored, tracked apart from the accumulated turn
         // text: that text also carries the harness banners of every round, so it
         // proves that the turn ran but never that the model wrote anything. The
         // phase enters with the text of the round that produced `initial`, so that
-        // text seeds the flag before the first discovery round runs.
+        // text seeds the flag before the first research round runs.
         let mut has_model_prose = !step.text().trim().is_empty();
-        while self.rounds_used < self.options.max_discovery_rounds
+        while self.rounds_used < self.options.max_research_rounds
             && step.edits().is_empty()
             && step.protocol_errors().is_empty()
         {
-            let has_discovery = !step.context_requests().is_empty()
-                || !step.doc_requests().is_empty()
-                || !step.repo_searches().is_empty()
-                || !step.repo_maps().is_empty()
-                || !step.dir_list_requests().is_empty()
-                || step.repo_dirs();
-            if !has_discovery {
+            // The round's own buckets decide whether there is research to run:
+            // one predicate serves the phase loop, the healing phase, and the
+            // empty-round guard, so a capability can never be advertised,
+            // decoded, and then silently ignored here.
+            let has_research = step.has_research_commands();
+            if !has_research {
                 break;
             }
 
-            let outcome = crate::workflow::discovery::execute_discovery_commands(
+            // A declared external document has no file on disk until the
+            // harness materializes it, so the requests addressing the outer
+            // documentation cache are resolved before the dispatcher looks for
+            // their files. A refusal keeps its audience: a trust decision
+            // reaches the outcome as a developer-addressed verdict, a delivery
+            // failure as a model-addressed one.
+            let declared = step.outer_doc_requests().to_vec();
+            let outer_docs = self
+                .materialize_requested_outer_docs(step.context_requests(), &declared)
+                .await;
+            // A document the round asked for by its mount point carries no
+            // context request of its own, so the cache path the harness derived
+            // for it joins the round as one. The dispatcher then prices it like
+            // every other candidate and admits it as read-only reference.
+            let mut commands = step.commands().to_vec();
+            for path in &outer_docs.paths {
+                commands.push(LlmCommand::ContextRequest {
+                    path: path.clone(),
+                    access: ContextAccess::ReadOnly,
+                });
+            }
+            let mut outcome = crate::workflow::research::execute_research_commands(
                 &mut *self.context_manager,
                 self.repo_root,
-                step.commands(),
-                self.options.files_token_budget,
+                &commands,
+                self.options.token_budget,
                 self.options.repomap_token_budget,
-                self.options.discovery_limits,
+                self.options.research_limits,
                 // A repeated request that the context already satisfies still
                 // teaches the model something: the aggregate note explains that
                 // the files are visible, so such a round can be answered instead
                 // of being mistaken for a dead end.
                 true,
                 // The round races the turn's own cancel signal, so an abandoned
-                // discovery request stops waiting for a slow reference host.
+                // research request stops waiting for a slow reference host.
                 Some(self.cancel_rx),
             )
             .await;
+            for (path, error) in outer_docs.failures {
+                outcome.record_outer_docs_failure(&path, &error);
+            }
 
             // A round that would breach the files token budget is reported to the
             // caller as a typed signal: the kernel never closes the turn with
             // hardcoded text of its own.
             if let Some(limit) = &outcome.limit_exceeded {
-                return Ok(DiscoveryPhase::BudgetExceeded(limit.clone()));
+                return Ok(ResearchPhase::BudgetExceeded(limit.clone()));
             }
 
             let widened = outcome.has_progress(false);
@@ -240,49 +366,49 @@ impl TurnKernel<'_> {
                 // One explanation is enough to deliver the hint, so a later
                 // repetition of the same requests closes the phase and leaves the
                 // written answer to the turn itself.
-                if satisfied_rounds >= MAX_SATISFIED_DISCOVERY_ROUNDS {
+                if satisfied_rounds >= MAX_SATISFIED_RESEARCH_ROUNDS {
                     break;
                 }
                 satisfied_rounds += 1;
             }
 
-            // A discovery round draws from the same investigation budget as a
+            // A research round draws from the same investigation budget as a
             // project command round, so the shared spender is the single place
             // that accounts for it. The loop head guarantees an available round;
             // should it ever be spent, the phase keeps the proposal it already
             // decoded instead of widening nothing.
-            let Some(discovery_round) = self.spend_investigation_round() else {
+            let Some(research_round) = self.spend_investigation_round() else {
                 break;
             };
             log_fsm_phase(
                 self.workflow_name,
                 self.model,
                 self.intent.is_isolated_step(),
-                TurnPhase::Discovery,
-                Some(discovery_round),
-                Some(self.options.max_discovery_rounds),
+                TurnPhase::Research,
+                Some(research_round),
+                Some(self.options.max_research_rounds),
             );
             tracing::info!(
                 workflow = self.workflow_name,
                 model = %self.model,
-                round = discovery_round,
+                round = research_round,
                 added = outcome.added_files.len(),
                 missing = outcome.missing_files.len(),
                 searches = outcome.searches_executed.len(),
                 doc_topics = outcome.doc_topics_loaded.len(),
-                "context discovery round completed"
+                "context research round completed"
             );
             let _ = self
                 .stream_tx
                 .send(StreamEvent::TurnPhase {
-                    phase: TurnPhase::Discovery,
-                    round: Some(discovery_round),
-                    max_rounds: Some(self.options.max_discovery_rounds),
+                    phase: TurnPhase::Research,
+                    round: Some(research_round),
+                    max_rounds: Some(self.options.max_research_rounds),
                     detail: None,
                 })
                 .await;
 
-            // Discovery findings are not repository files, so they accumulate in
+            // Research findings are not repository files, so they accumulate in
             // the turn-scoped journal, an append-only epistemic tail of the user
             // message, instead of being folded into the context that the patching
             // phase reads.
@@ -304,7 +430,7 @@ impl TurnKernel<'_> {
 
             let banner = format!(
                 "\n\n---\n**[Round {}]** {}\n\n",
-                discovery_round + 1,
+                research_round + 1,
                 banner_text
             );
             let _ = self
@@ -316,14 +442,14 @@ impl TurnKernel<'_> {
                 self.model,
                 self.intent.is_isolated_step(),
                 TurnPhase::Proposal,
-                Some(discovery_round + 1),
+                Some(research_round + 1),
                 None,
             );
             let _ = self
                 .stream_tx
                 .send(StreamEvent::TurnPhase {
                     phase: TurnPhase::Proposal,
-                    round: Some(discovery_round + 1),
+                    round: Some(research_round + 1),
                     max_rounds: None,
                     detail: None,
                 })
@@ -334,7 +460,7 @@ impl TurnKernel<'_> {
 
             if step.is_cancelled {
                 let _ = self.stream_tx.send(StreamEvent::Done).await;
-                return Ok(DiscoveryPhase::Terminate(Box::new(FsmTurnOutcome {
+                return Ok(ResearchPhase::Terminate(Box::new(FsmTurnOutcome {
                     assistant_text: std::mem::take(&mut self.accumulated_text),
                     result: ModelResult::Answer {
                         text: String::new(),
@@ -373,21 +499,21 @@ impl TurnKernel<'_> {
                     self.plan_mode,
                 )
                 .await;
-                return Ok(DiscoveryPhase::Terminate(Box::new(outcome)));
+                return Ok(ResearchPhase::Terminate(Box::new(outcome)));
             }
         }
 
-        if self.discovery_limit_reached(&step) {
+        if self.research_limit_reached(&step) {
             let warn = format!(
-                "Discovery round limit reached (max_discovery_rounds = {}). The model asked for more repository material, but no further files, searches, listings, or documentation will be loaded in this turn.",
-                self.options.max_discovery_rounds
+                "Research round limit reached (max_research_rounds = {}). The model asked for more repository material, but no further files, searches, listings, or documentation will be loaded in this turn.",
+                self.options.max_research_rounds
             );
             tracing::warn!(
                 workflow = self.workflow_name,
                 model = %self.model,
                 rounds_used = self.rounds_used,
-                max_discovery_rounds = self.options.max_discovery_rounds,
-                "discovery round limit reached; no further material will be loaded"
+                max_research_rounds = self.options.max_research_rounds,
+                "research round limit reached; no further material will be loaded"
             );
             let banner = format!("\n\n---\n⚠️ {}\n\n", warn);
             let _ = self
@@ -398,23 +524,23 @@ impl TurnKernel<'_> {
                 merge_text(std::mem::take(&mut self.accumulated_text), &banner, "");
             // The directive is what the following rounds read: it closes the phase
             // with an answer contract instead of leaving the request unanswered.
-            self.journal.push_block(DISCOVERY_LIMIT_DIRECTIVE);
+            self.journal.push_block(RESEARCH_LIMIT_DIRECTIVE);
         }
 
-        Ok(DiscoveryPhase::Continue(Box::new(step)))
+        Ok(ResearchPhase::Continue(Box::new(step)))
     }
 
-    /// Reports whether discovery stopped only because the round limit was spent.
+    /// Reports whether research stopped only because the round limit was spent.
     ///
     /// The loop leaves for several reasons; only an exhausted limit deserves a
     /// warning, and only when the model still asked for repository material that
     /// will never arrive. A round that carries edits or protocol errors is a
     /// proposal the harness can act upon, not a truncated investigation.
-    fn discovery_limit_reached(&self, step: &ProposalStep) -> bool {
-        self.rounds_used >= self.options.max_discovery_rounds
+    fn research_limit_reached(&self, step: &ProposalStep) -> bool {
+        self.rounds_used >= self.options.max_research_rounds
             && step.edits().is_empty()
             && step.protocol_errors().is_empty()
-            && step.has_discovery_commands()
+            && step.has_research_commands()
     }
 
     /// Re-asks the model after it produced a round with nothing actionable.
@@ -520,9 +646,9 @@ impl TurnKernel<'_> {
     }
 }
 
-/// Outcome of the discovery phase of a bounded turn.
-pub(super) enum DiscoveryPhase {
-    /// Discovery finished; carries the final proposal round to stage.
+/// Outcome of the research phase of a bounded turn.
+pub(super) enum ResearchPhase {
+    /// Research finished; carries the final proposal round to stage.
     ///
     /// The proposal is boxed so this variant stays small relative to
     /// `Terminate`, keeping the enum compact.
@@ -592,13 +718,13 @@ impl EmptyStepGuard {
     }
 }
 
-/// Number of Discovery rounds granted to a proposal that only repeated
+/// Number of Research rounds granted to a proposal that only repeated
 /// requests the context already satisfied.
 ///
 /// Such a round widens nothing, but the model still deserves the explanation
 /// that the files are visible. One round is enough to deliver it: repeating the
 /// hint would spend provider round trips without teaching the model anything.
-const MAX_SATISFIED_DISCOVERY_ROUNDS: usize = 1;
+const MAX_SATISFIED_RESEARCH_ROUNDS: usize = 1;
 
 /// Directive appended to the journal when a round only repeated requests the
 /// context already satisfied.
@@ -607,13 +733,13 @@ const MAX_SATISFIED_DISCOVERY_ROUNDS: usize = 1;
 /// proposal round concludes with prose instead of asking for the same files.
 const ALREADY_SATISFIED_DIRECTIVE: &str = "<response_directive>\nEvery file you requested is already loaded in <context>. Do not request those paths again: answer the task from the material you already hold. Write the analysis or the conclusion in plain conversational text, and emit file edits only when the code itself must change.\n</response_directive>";
 
-/// Directive appended to the journal when the discovery round limit is
+/// Directive appended to the journal when the research round limit is
 /// exhausted while the model still asked for more repository material.
 ///
 /// It turns the stop condition into an explicit answer contract: the next
 /// proposal round must conclude from the material already gathered instead of
 /// requesting paths the harness will no longer load.
-const DISCOVERY_LIMIT_DIRECTIVE: &str = "<response_directive>\nThe discovery round limit is exhausted: no further files, repository searches, directory listings, or documentation will be loaded in this turn. Your investigation for this turn is complete. Do not request additional paths. Answer the task from the material you already hold, stating the conclusions or emitting the file edits the gathered context supports.\n</response_directive>";
+const RESEARCH_LIMIT_DIRECTIVE: &str = "<response_directive>\nThe research round limit is exhausted: no further files, repository searches, directory listings, or documentation will be loaded in this turn. Your investigation for this turn is complete. Do not request additional paths. Answer the task from the material you already hold, stating the conclusions or emitting the file edits the gathered context supports.\n</response_directive>";
 
 /// Corrective suffix appended to the request after an empty proposal round.
 ///
@@ -624,7 +750,7 @@ const DISCOVERY_LIMIT_DIRECTIVE: &str = "<response_directive>\nThe discovery rou
 /// task instead of believing that only file edits count as a result, and it
 /// states the payload contract of a terminal outcome, because a status without
 /// its payload is as empty as a reply without content.
-const EMPTY_STEP_REMINDER: &str = "\n\nYour previous reply was empty: it carried no text, no file edits, no discovery command, and no terminal outcome with its payload, so nothing could be acted upon. Respond again with a concrete result: when the context you already hold answers the task, write the analysis or the conclusion in plain conversational text; when the code must change, emit the file edits; otherwise declare an explicit terminal outcome and state the payload of the status you declare, because a terminal status without its payload is a protocol defect rather than a result.";
+const EMPTY_STEP_REMINDER: &str = "\n\nYour previous reply was empty: it carried no text, no file edits, no research command, and no terminal outcome with its payload, so nothing could be acted upon. Respond again with a concrete result: when the context you already hold answers the task, write the analysis or the conclusion in plain conversational text; when the code must change, emit the file edits; otherwise declare an explicit terminal outcome and state the payload of the status you declare, because a terminal status without its payload is a protocol defect rather than a result.";
 /// Corrective suffix for a contour that cannot edit files.
 ///
 /// The wording follows the capability surface of the active contour
@@ -702,23 +828,10 @@ pub(super) async fn propose_round(
     .await;
 
     let ctx_state = context_manager.get_state();
-    let root = repo_root.clone();
-    let items = ctx_state.items.clone();
-    let mut context_files = crate::blocking::run_blocking_async(move || {
-        let mut results = Vec::new();
-        for item in items {
-            let full_path = root.join(&item.path);
-            if let Ok(content) = std::fs::read_to_string(&full_path) {
-                results.push(ContextFileContent {
-                    path: item.path,
-                    access: item.access,
-                    content,
-                });
-            }
-        }
-        results
-    })
-    .await?;
+    // The turn memoizes the body of every context file it already read, so a
+    // round pays only for the paths discovery just added or the change set just
+    // rewrote. The staged-content override below still wins over the memo.
+    let mut context_files = cache.context_files(&repo_root, &ctx_state.items).await?;
 
     if let Some(staged) = staged_state {
         // Staged content is merged in place: a file already present in context
@@ -788,6 +901,14 @@ pub(super) async fn propose_round(
 
     let history = cache.history_snapshot(history_manager, intent).await;
     let project = cache.project(&repo_root, Some(cancel_rx)).await;
+    // The declared external documentation is a project fact rather than a round
+    // decision, so the catalog the prompt renders comes from the same frozen
+    // configuration snapshot as the project command allowlist.
+    let outer_docs = options
+        .app_config
+        .as_ref()
+        .map(|config| config.outer_docs.clone())
+        .unwrap_or_default();
 
     // The declared patch strategy decides how the rendered context addresses the
     // lines of every file, so it travels from the project configuration into the
@@ -805,7 +926,8 @@ pub(super) async fn propose_round(
     )
     .with_repo_dirs(repo_dirs)
     .with_project(Some(project))
-    .with_patch_strategy(patch_strategy);
+    .with_patch_strategy(patch_strategy)
+    .with_outer_docs(outer_docs);
     assembly.target_language = state.language.clone();
     assembly.intent = intent;
     assembly.turn_scratchpad = state.scratchpad.clone();
@@ -1005,7 +1127,7 @@ mod tests {
 
         // A contour that cannot edit files is never asked for one: the reminder
         // names only the results its decoder would accept.
-        let without_edits = [LlmCapability::TextMessage, LlmCapability::Discovery];
+        let without_edits = [LlmCapability::TextMessage, LlmCapability::Research];
         assert_eq!(
             empty_step_reminder(&without_edits),
             super::EMPTY_STEP_REMINDER_WITHOUT_EDITS

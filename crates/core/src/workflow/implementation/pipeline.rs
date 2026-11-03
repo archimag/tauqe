@@ -30,10 +30,12 @@
 //! exactly one round and is never reprojected; the finding itself carries the
 //! verdict of that round, because it is the only durable record the run has.
 //!
-//! Findings are never tracked step by step. Their statuses stay frozen for the
-//! whole run, and the pipeline writes them exactly once, when the horizon
-//! reaches its terminal verdict: an architectural group closes the findings it
-//! still holds open once its step graph is `Done`, and a degenerate
+//! The lifecycle of a degenerate single-finding run belongs to its step
+//! executor: taking the step marks the finding `InProgress` and a reset returns
+//! it to `Todo`, so the session states which finding is executing right now.
+//! The verdict is never written there. It is stated exactly once, when the
+//! horizon reaches its terminal verdict: an architectural group closes the
+//! findings it still holds open once its step graph is `Done`, and a degenerate
 //! single-finding run states whether the run addressed the finding or skipped
 //! it.
 
@@ -312,7 +314,7 @@ impl<'a> PlanImplementationPipeline<'a> {
 
             let run_config = ImplementationRunConfig {
                 models: self.config.models.clone(),
-                protocol: self.config.develop.protocol,
+                protocol: self.config.repl.protocol,
                 marker: self.options.marker.clone(),
                 selection: self.options.selection.clone(),
                 instructions: self.options.instructions.clone(),
@@ -428,9 +430,10 @@ impl<'a> PlanImplementationPipeline<'a> {
     /// that resolves them, and the pipeline is the only place that knows the
     /// horizon reached its end.
     ///
-    /// There is no memory between the rounds and the settlement: findings are
-    /// never tracked step by step. Their statuses stay frozen for the whole run
-    /// and are written exactly once, by the terminal settlement.
+    /// The lifecycle of a running step is not part of the settlement: the step
+    /// executor already wrote `InProgress` when it took the finding and `Todo`
+    /// when it reset it. The settlement states the verdict alone, exactly once,
+    /// so no second writer touches the status of a finding.
     fn settle_completed_scope(&self, report: &PlanImplementationReport) {
         match &self.scope {
             ExecutionScope::Plan { .. } => {}
@@ -492,8 +495,8 @@ impl<'a> PlanImplementationPipeline<'a> {
     /// only durable record of the run: a completed run closes it as `Fixed` with
     /// the result of the change set, and a run whose step could not be implemented
     /// as approved closes it as `Skipped` with the diagnostic. Cancellation and a
-    /// soft stop are not verdicts on the finding, so an interrupted run leaves it
-    /// exactly as it was.
+    /// soft stop are not verdicts on the finding, so an interrupted run writes no
+    /// verdict and keeps the lifecycle its step executor recorded.
     fn settle_finding(&self, report: &PlanImplementationReport, review_id: &str, item_id: u32) {
         let (status, note) = match &report.stop {
             PlanImplementationStop::Completed => (
@@ -579,7 +582,7 @@ impl<'a> PlanImplementationPipeline<'a> {
             };
         }
 
-        let max_replans = self.config.develop.max_replans;
+        let max_replans = self.config.repl.max_replans;
         if *replans >= max_replans {
             tracing::warn!(
                 scope = ?self.scope,
@@ -905,6 +908,11 @@ mod tests {
         refinements: Vec<WaveRecord>,
         steps_run: usize,
         soft_stop: Option<(watch::Sender<bool>, usize)>,
+        /// Repository root the host re-reads the stored review from while a step
+        /// runs, when a test observes the persisted finding status mid-run.
+        store_probe: Option<std::path::PathBuf>,
+        /// Status the observed finding carried the last time a step ran.
+        observed_status: Option<IssueStatus>,
     }
 
     /// Host that replays scripted step results and Architect waves.
@@ -921,6 +929,8 @@ mod tests {
                     refinements: Vec::new(),
                     steps_run: 0,
                     soft_stop: None,
+                    store_probe: None,
+                    observed_status: None,
                 }),
             }
         }
@@ -934,6 +944,23 @@ mod tests {
             self
         }
 
+        /// Makes the host re-read the stored review session from `root` before
+        /// replaying every step, so a test can observe the persisted status of a
+        /// finding while its step runs.
+        fn with_store_probe(self, root: std::path::PathBuf) -> Self {
+            if let Ok(mut state) = self.state.lock() {
+                state.store_probe = Some(root);
+            }
+            self
+        }
+
+        /// Returns the status the observed finding carried during the last step.
+        fn observed_status(&self) -> Option<IssueStatus> {
+            self.state
+                .lock()
+                .ok()
+                .and_then(|state| state.observed_status)
+        }
         fn refinements(&self) -> Vec<WaveRecord> {
             self.state.lock().unwrap().refinements.clone()
         }
@@ -948,6 +975,13 @@ mod tests {
         async fn run_step(&self, _request: StepTurnRequest) -> StepTurnResult {
             let mut state = self.state.lock().unwrap();
             state.steps_run += 1;
+            let observed = state.store_probe.as_deref().and_then(|root| {
+                ReviewStorage::load_review(root, REVIEW_ID)
+                    .ok()
+                    .flatten()
+                    .and_then(|session| session.find_item(7).map(|item| item.status))
+            });
+            state.observed_status = observed;
             let run = state.steps_run;
             if let Some((sender, after)) = state.soft_stop.as_ref() {
                 if run >= *after {
@@ -1015,7 +1049,7 @@ mod tests {
             },
             ..AppConfig::default()
         };
-        config.develop.max_replans = max_replans;
+        config.repl.max_replans = max_replans;
         config
     }
 
@@ -1136,6 +1170,7 @@ mod tests {
         let host = ScriptedHost::new(
             vec![StepTurnResult::Success {
                 summary: "the horizon is in place".to_string(),
+                commit: None,
             }],
             vec![RefinementResult::Synthesized {
                 items: vec![leaf("1", PlanItemStatus::Todo)],
@@ -1200,6 +1235,7 @@ mod tests {
                 StepTurnResult::Blocked("the approved structure cannot express it".to_string()),
                 StepTurnResult::Success {
                     summary: "reprojected".to_string(),
+                    commit: None,
                 },
             ],
             vec![RefinementResult::Synthesized {
@@ -1277,6 +1313,7 @@ mod tests {
                 StepTurnResult::Blocked("the approved structure cannot express it".to_string()),
                 StepTurnResult::Success {
                     summary: "reprojected".to_string(),
+                    commit: None,
                 },
             ],
             vec![RefinementResult::Synthesized {
@@ -1402,6 +1439,7 @@ mod tests {
         let host = ScriptedHost::new(
             vec![StepTurnResult::Success {
                 summary: "replanned".to_string(),
+                commit: None,
             }],
             vec![RefinementResult::Synthesized {
                 items: vec![leaf("3", PlanItemStatus::Todo)],
@@ -1523,9 +1561,11 @@ mod tests {
             vec![
                 StepTurnResult::Success {
                     summary: "first step".to_string(),
+                    commit: None,
                 },
                 StepTurnResult::Success {
                     summary: "second step".to_string(),
+                    commit: None,
                 },
             ],
             Vec::new(),
@@ -1568,6 +1608,7 @@ mod tests {
         let host = ScriptedHost::new(
             vec![StepTurnResult::Success {
                 summary: "root cause removed".to_string(),
+                commit: None,
             }],
             vec![RefinementResult::Synthesized {
                 items: vec![leaf("s-1", PlanItemStatus::Todo)],
@@ -1667,6 +1708,7 @@ mod tests {
         let host = ScriptedHost::new(
             vec![StepTurnResult::Success {
                 summary: "the finding is addressed".to_string(),
+                commit: None,
             }],
             Vec::new(),
         );
@@ -1707,6 +1749,44 @@ mod tests {
         assert!(stored.find_item(8).unwrap().resolution_notes.is_none());
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_degenerate_finding_reads_in_progress_mid_run_and_fixed_after_settlement() {
+        let dir = tempdir().unwrap();
+        store_review_with_unrelated_finding(dir.path());
+
+        let host = ScriptedHost::new(
+            vec![StepTurnResult::Success {
+                summary: "the finding is addressed".to_string(),
+                commit: None,
+            }],
+            Vec::new(),
+        )
+        .with_store_probe(dir.path().to_path_buf());
+        let channels = Channels::new();
+
+        let report = run_scope(
+            dir.path(),
+            ExecutionScope::ReviewFinding {
+                review_id: REVIEW_ID.to_string(),
+                item_id: 7,
+            },
+            &host,
+            config_with_ladder(vec![tier_entry("architect/one")], 2),
+            &channels,
+        )
+        .await;
+
+        assert_eq!(report.stop, PlanImplementationStop::Completed);
+        // The step executor marks the finding as taken before the turn runs, so
+        // the session states what is executing while the model works.
+        assert_eq!(host.observed_status(), Some(IssueStatus::InProgress));
+
+        // The verdict itself is stated exactly once, by the settlement.
+        let stored = ReviewStorage::load_review(dir.path(), REVIEW_ID)
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.find_item(7).unwrap().status, IssueStatus::Fixed);
+    }
     /// Stores the review fixture with a second finding in another group, so a
     /// settlement can be observed against a finding it must never touch.
     fn store_review_with_unrelated_finding(repo_root: &Path) {

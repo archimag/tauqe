@@ -6,6 +6,7 @@
 //! `views::review::tree`. This module keeps the interactive view state and the
 //! viewport behavior (Conventions §3.5).
 
+use std::borrow::Cow;
 use std::collections::HashSet;
 
 use tauqe_protocol::{
@@ -28,7 +29,8 @@ use self::projection::{
 pub use self::render::render_review_view;
 pub(crate) use self::tree::{
     compute_unified_review_lines, format_created_at, issue_status_label, issue_status_style,
-    issue_type_badge, issue_type_style, location, model_badge, plan_status_style,
+    issue_type_badge, issue_type_style, location, measure_review_rows, model_badge,
+    plan_status_style,
 };
 
 /// Group whose isolated audit is currently streaming.
@@ -151,17 +153,33 @@ impl ReviewViewState {
             .then_some(groups.len())
     }
 
+    /// Loads a session into the mirror without touching any fold decision.
+    ///
+    /// Re-opening a stored session or refreshing the active one is a
+    /// presentation re-read, not a new audit: the Executive Summary block keeps
+    /// the fold state the developer chose, so navigating between existing
+    /// sessions never re-expands a summary that was folded
+    /// (concept #c-summary-fold-persistence).
     pub fn set_session(&mut self, session: ReviewSession) {
         self.running = false;
-        let session_id = session.id.clone();
         self.update_session(session);
-        // The freshly finished session's header (with its Executive Summary
-        // block) must be visible immediately, so unfold the summary and reset
-        // the viewport instead of leaving it where the streaming view left it.
-        self.collapsed_summaries.remove(&session_id);
         self.error = None;
         self.selected_index = 0;
         self.scroll = 0;
+    }
+
+    /// Settles a freshly finished audit onto the mirror.
+    ///
+    /// The terminal `review/finished` event is its single caller: the session it
+    /// carries has just streamed its turn, so its header and Executive Summary
+    /// block must be visible immediately and the viewport returns to the top
+    /// instead of staying where the streaming view left it. Every other path —
+    /// a live refresh, a list reload, re-opening a stored session — preserves
+    /// the folds instead (concept #c-summary-fold-persistence).
+    pub fn finish_session(&mut self, session: ReviewSession) {
+        let session_id = session.id.clone();
+        self.set_session(session);
+        self.collapsed_summaries.remove(&session_id);
     }
 
     pub fn set_sessions(&mut self, sessions: Vec<ReviewSession>, active_id: Option<String>) {
@@ -343,7 +361,7 @@ impl ReviewViewState {
             for issue in session.issues() {
                 keys.insert(format!("{}:{}", session.id, issue.id));
             }
-            for bucket in self.group_buckets(session) {
+            for bucket in self.group_buckets(session.as_ref()) {
                 collect_subplan_keys(&session.id, &bucket.id, &bucket.subplan, &mut keys);
             }
         }
@@ -351,33 +369,29 @@ impl ReviewViewState {
     }
     pub fn collapse_all(&mut self) {
         self.expanded_items.clear();
-        let effective = self.effective_sessions();
-        for session in &effective {
-            self.collapsed_sessions.insert(session.id.clone());
+        // The borrowed walk collects the owned keys first: the fold sets are
+        // mutated only after the session borrow is released (c-1, c-2).
+        let mut session_ids: Vec<String> = Vec::new();
+        let mut group_keys: Vec<String> = Vec::new();
+        let mut branch_keys: Vec<String> = Vec::new();
+        for session in self.effective_sessions() {
+            session_ids.push(session.id.clone());
+            for bucket in self.group_buckets(session.as_ref()) {
+                // The plan branch of every group carrying a plan folds together
+                // with the tree, so a collapsed overview never leaves a branch
+                // unfolded under a folded header (concept #c-1).
+                if !bucket.subplan.is_empty() {
+                    branch_keys.push(plan_branch_key(&session.id, &bucket.id));
+                }
+                group_keys.push(group_key(&session.id, &bucket.id));
+            }
         }
-        let keys: Vec<String> = effective
-            .iter()
-            .flat_map(|session| {
-                self.group_buckets(session)
-                    .into_iter()
-                    .map(|bucket| group_key(&session.id, &bucket.id))
-            })
-            .collect();
-        for key in keys {
+        for session_id in session_ids {
+            self.collapsed_sessions.insert(session_id);
+        }
+        for key in group_keys {
             self.collapsed_groups.insert(key);
         }
-        // The plan branch of every group carrying a plan folds together with the
-        // tree, so a collapsed overview never leaves a branch unfolded under a
-        // folded header (concept #c-1).
-        let branch_keys: Vec<String> = effective
-            .iter()
-            .flat_map(|session| {
-                self.group_buckets(session)
-                    .into_iter()
-                    .filter(|bucket| !bucket.subplan.is_empty())
-                    .map(|bucket| plan_branch_key(&session.id, &bucket.id))
-            })
-            .collect();
         for key in branch_keys {
             self.collapsed_plan_branches.insert(key);
         }
@@ -400,7 +414,7 @@ impl ReviewViewState {
             if !self.is_summary_expanded(&session.id) {
                 return false;
             }
-            let groups = self.group_buckets(session);
+            let groups = self.group_buckets(session.as_ref());
             let groups_open = groups.iter().all(|bucket| {
                 self.is_group_expanded(&session.id, &bucket.id)
                     && self.is_plan_branch_expanded(&session.id, &bucket.id)
@@ -432,15 +446,21 @@ impl ReviewViewState {
         self.clamp_selection();
     }
 
-    pub(crate) fn effective_sessions(&self) -> Vec<ReviewSession> {
+    /// Sessions the view renders, borrowed from the mirrored state.
+    ///
+    /// The row walk, the fold commands, and the navigation keys only read the
+    /// sessions they traverse, so the projection borrows them instead of
+    /// deep-cloning every finding, group plan, and rendered review body on each
+    /// call. A mirror holding only the active session is borrowed the same way,
+    /// and a caller that needs owned rows builds them itself (c-1, c-2).
+    pub(crate) fn effective_sessions(&self) -> Vec<Cow<'_, ReviewSession>> {
         if self.sessions.is_empty() {
-            if let Some(ref s) = self.session {
-                vec![s.clone()]
-            } else {
-                Vec::new()
+            match self.session.as_ref() {
+                Some(session) => vec![Cow::Borrowed(session)],
+                None => Vec::new(),
             }
         } else {
-            self.sessions.clone()
+            self.sessions.iter().map(Cow::Borrowed).collect()
         }
     }
 
@@ -484,7 +504,10 @@ impl ReviewViewState {
         let sel = self.selected_index.min(rows.len() - 1);
         self.selected_index = sel;
 
-        let (lines, offsets) = compute_unified_review_lines(
+        // The measuring walk shares every break decision with the renderer, so
+        // the selected row's bounds are read without materializing the document
+        // or re-cloning a single cached body (c-1, c-2).
+        let (offsets, rendered_lines) = measure_review_rows(
             &rows,
             sel,
             self.content_width.max(10),
@@ -493,7 +516,7 @@ impl ReviewViewState {
         );
         let height = self.view_height as usize;
         let start = offsets.get(sel).copied().unwrap_or(0);
-        let end = offsets.get(sel + 1).copied().unwrap_or(lines.len());
+        let end = offsets.get(sel + 1).copied().unwrap_or(rendered_lines);
         let scroll = self.scroll as usize;
 
         let new_scroll = if end.saturating_sub(start) <= height {
@@ -531,7 +554,7 @@ impl ReviewViewState {
         let sel = self.selected_index.min(rows.len().saturating_sub(1));
         self.selected_index = sel;
 
-        let (lines, offsets) = compute_unified_review_lines(
+        let (offsets, rendered_lines) = measure_review_rows(
             &rows,
             sel,
             self.content_width.max(10),
@@ -539,10 +562,10 @@ impl ReviewViewState {
             &mut self.markdown_cache,
         );
         let start = offsets.get(sel).copied().unwrap_or(0);
-        let end = offsets.get(sel + 1).copied().unwrap_or(lines.len());
-        self.scroll = self
-            .recenter_state
-            .recenter(sel, start, end, lines.len(), self.view_height);
+        let end = offsets.get(sel + 1).copied().unwrap_or(rendered_lines);
+        self.scroll =
+            self.recenter_state
+                .recenter(sel, start, end, rendered_lines, self.view_height);
     }
 
     /// Accordion-style navigation: moves to the next or previous finding,
@@ -587,65 +610,72 @@ impl ReviewViewState {
             }
         }
 
-        let effective = self.effective_sessions();
-        let mut all_nodes = Vec::new();
-        for session in &effective {
-            all_nodes.push(ReviewNodeRef {
-                session_id: session.id.clone(),
-                section_id: None,
-                item_id: None,
-                step_id: None,
-                ancestor_steps: Vec::new(),
-                plan_branch: false,
-            });
-            let groups = self
-                .group_buckets(session)
-                .into_iter()
-                .map(|bucket| (bucket.id, bucket.subplan, bucket.items))
-                .collect::<Vec<_>>();
-            for (group_id, subplan, items) in groups {
+        // The node walk borrows the mirrored sessions and releases the borrow
+        // before any fold state is touched, so an accordion key never deep-clones
+        // the session list (c-1, c-2).
+        let mut session_ids: Vec<String> = Vec::new();
+        let all_nodes = {
+            let mut all_nodes: Vec<ReviewNodeRef> = Vec::new();
+            for session in self.effective_sessions() {
+                session_ids.push(session.id.clone());
                 all_nodes.push(ReviewNodeRef {
                     session_id: session.id.clone(),
-                    section_id: Some(group_id.clone()),
+                    section_id: None,
                     item_id: None,
                     step_id: None,
                     ancestor_steps: Vec::new(),
                     plan_branch: false,
                 });
-                // The plan branch is a node of its own: the walk stops on it
-                // before descending into the steps it owns (concept #c-1).
-                if !subplan.is_empty() {
+                let groups = self
+                    .group_buckets(session.as_ref())
+                    .into_iter()
+                    .map(|bucket| (bucket.id, bucket.subplan, bucket.items))
+                    .collect::<Vec<_>>();
+                for (group_id, subplan, items) in groups {
                     all_nodes.push(ReviewNodeRef {
                         session_id: session.id.clone(),
                         section_id: Some(group_id.clone()),
                         item_id: None,
                         step_id: None,
                         ancestor_steps: Vec::new(),
-                        plan_branch: true,
-                    });
-                }
-                // The steps of the group plan are inspected one by one before
-                // its findings, exactly as the tree renders them.
-                let mut ancestors = Vec::new();
-                collect_subplan_nodes(
-                    &session.id,
-                    &group_id,
-                    &subplan,
-                    &mut ancestors,
-                    &mut all_nodes,
-                );
-                for issue in items {
-                    all_nodes.push(ReviewNodeRef {
-                        session_id: session.id.clone(),
-                        section_id: None,
-                        item_id: Some(issue.id),
-                        step_id: None,
-                        ancestor_steps: Vec::new(),
                         plan_branch: false,
                     });
+                    // The plan branch is a node of its own: the walk stops on it
+                    // before descending into the steps it owns (concept #c-1).
+                    if !subplan.is_empty() {
+                        all_nodes.push(ReviewNodeRef {
+                            session_id: session.id.clone(),
+                            section_id: Some(group_id.clone()),
+                            item_id: None,
+                            step_id: None,
+                            ancestor_steps: Vec::new(),
+                            plan_branch: true,
+                        });
+                    }
+                    // The steps of the group plan are inspected one by one before
+                    // its findings, exactly as the tree renders them.
+                    let mut ancestors = Vec::new();
+                    collect_subplan_nodes(
+                        &session.id,
+                        &group_id,
+                        &subplan,
+                        &mut ancestors,
+                        &mut all_nodes,
+                    );
+                    for issue in items {
+                        all_nodes.push(ReviewNodeRef {
+                            session_id: session.id.clone(),
+                            section_id: None,
+                            item_id: Some(issue.id),
+                            step_id: None,
+                            ancestor_steps: Vec::new(),
+                            plan_branch: false,
+                        });
+                    }
                 }
             }
-        }
+            all_nodes
+        };
 
         if all_nodes.is_empty() {
             return;
@@ -724,13 +754,15 @@ impl ReviewViewState {
 
         let target = all_nodes[target_idx].clone();
 
-        for session in &effective {
-            if session.id == target.session_id
+        // Every session folds except the one owning the target, whose path the
+        // walk reveals.
+        for session_id in session_ids {
+            if session_id == target.session_id
                 && (target.item_id.is_some() || target.section_id.is_some())
             {
                 self.collapsed_sessions.remove(&target.session_id);
             } else {
-                self.collapsed_sessions.insert(session.id.clone());
+                self.collapsed_sessions.insert(session_id);
             }
         }
 
@@ -941,6 +973,71 @@ mod tests {
         assert!(view.is_session_expanded("rev-2"));
     }
 
+    /// Re-opening or refreshing a mirrored session is a presentation re-read:
+    /// the Executive Summary keeps the fold state the developer chose, and only
+    /// a freshly finished audit unfolds it (c-summary-fold-persistence).
+    #[test]
+    fn test_summary_fold_survives_session_refresh_and_reopen() {
+        let mut view = ReviewViewState {
+            sessions: vec![make_session("rev-fold", &[1])],
+            ..Default::default()
+        };
+        view.session = view.sessions.first().cloned();
+        assert!(view.is_summary_expanded("rev-fold"));
+
+        view.toggle_summary_expanded("rev-fold");
+        assert!(!view.is_summary_expanded("rev-fold"));
+
+        // A live refresh of the same session keeps the fold.
+        view.update_session(make_session("rev-fold", &[1]));
+        assert!(!view.is_summary_expanded("rev-fold"));
+
+        // Re-opening the stored session keeps it as well.
+        view.set_session(make_session("rev-fold", &[1]));
+        assert!(!view.is_summary_expanded("rev-fold"));
+
+        // A list reload rewrites the mirror without touching the folds.
+        view.set_sessions(
+            vec![
+                make_session("rev-fold", &[1]),
+                make_session("rev-other", &[2]),
+            ],
+            Some("rev-fold".to_string()),
+        );
+        assert!(!view.is_summary_expanded("rev-fold"));
+        assert!(
+            view.is_summary_expanded("rev-other"),
+            "a session nobody folded keeps its summary expanded"
+        );
+    }
+
+    /// A freshly finished audit is the single path that unfolds the summary and
+    /// returns the viewport to the top of the session it just settled.
+    #[test]
+    fn test_finished_audit_unfolds_its_executive_summary() {
+        let mut view = ReviewViewState {
+            sessions: vec![make_session("rev-done", &[1])],
+            ..Default::default()
+        };
+        view.session = view.sessions.first().cloned();
+        view.begin();
+        view.toggle_summary_expanded("rev-done");
+        view.selected_index = 1;
+        view.scroll = 7;
+
+        view.finish_session(make_session("rev-done", &[1]));
+
+        assert!(
+            view.is_summary_expanded("rev-done"),
+            "a freshly finished audit must show its Executive Summary immediately"
+        );
+        assert_eq!(
+            view.selected_index, 0,
+            "the finished audit returns to its header"
+        );
+        assert_eq!(view.scroll, 0);
+        assert!(!view.running);
+    }
     #[test]
     fn test_scroll_to_selected_keeps_free_scroll_inside_a_tall_row() {
         let long_description = (0..120)

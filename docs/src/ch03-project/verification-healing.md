@@ -113,7 +113,7 @@ a diagnostic tail.
 The report is parsed deterministically for repository paths. Every path that is
 present in the tracked file list and not yet editable is added to the editable
 auto context layer, so the next healing round can patch it without a discovery
-round. The paths are extracted by a deterministic scan, never guessed by a model.
+auto context layer, so the next healing round can patch it without a research
 
 ### 2.6 The change set and the selected checks
 
@@ -194,7 +194,7 @@ The report contains no ANSI escapes, no tool banners, and no trailing newline.
 2. On failure, the report is rendered and the referenced error paths are
    registered as editable context.
 3. The loop asks the model for corrected edits, replaying the turn journal so the
-   knowledge discovery already paid for survives.
+   knowledge research already paid for survives.
 4. The repair edits are applied to the working tree and verification runs again.
 5. A clean check finalizes the turn. An exhausted budget rolls the working tree
    back to its pre-turn checkpoint.
@@ -216,7 +216,7 @@ Two variants keep the loop honest:
 | --- | --- |
 | mandatory verification | the declared lifecycle runs after every change set; no flag turns it off |
 | report mode | a model request chooses only whether a passing run is reported |
-| retry budget | bounds the number of healing rounds (`develop.max_retries`) |
+| retry budget | bounds the number of healing rounds (`repl.max_retries`) |
 | cancellation | read at every phase boundary; a cancelled run tears the verification process group down and returns cancellation |
 | blocked outcome | bypasses healing entirely and rolls the tree back |
 

@@ -1,7 +1,11 @@
-use tauqe_protocol::{matches_glob_pattern, ContextAccess, ContextItem, ContextLayer};
+use std::cell::Cell;
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
+
+use tauqe_protocol::glob::GlobPattern;
+use tauqe_protocol::{ContextAccess, ContextItem, ContextLayer};
 
 use crate::editor::InputEditor;
-
 pub mod input;
 pub mod render;
 
@@ -52,7 +56,7 @@ pub struct ContextViewState {
     pub pinned_expanded: bool,
     pub user_expanded: bool,
     pub auto_expanded: bool,
-    pub refs_expanded: bool,
+    pub outer_docs_expanded: bool,
     pub adding_file: bool,
     pub add_access: ContextAccess,
     pub add_input: InputEditor,
@@ -68,6 +72,13 @@ pub struct ContextViewState {
     /// accepts the card and never on the bare keystroke
     /// (Conventions §4.3, §5.4).
     pub pending_remove: Option<String>,
+    /// Memo of the last candidate scan.
+    ///
+    /// The picker derives its rows from the whole repository file list, so the
+    /// answer is served from here while the query, the in-context path set, and
+    /// the repository file list stay unchanged: cursor moves, focus changes, and
+    /// redraws then cost nothing (#32).
+    candidate_scan: CandidateScanMemo,
 }
 
 impl Default for ContextViewState {
@@ -79,7 +90,7 @@ impl Default for ContextViewState {
             pinned_expanded: true,
             user_expanded: true,
             auto_expanded: true,
-            refs_expanded: true,
+            outer_docs_expanded: true,
             adding_file: false,
             add_access: ContextAccess::ReadOnly,
             add_input: InputEditor::default(),
@@ -89,6 +100,7 @@ impl Default for ContextViewState {
             confirm_clear_auto: false,
             confirm_clear_user: false,
             pending_remove: None,
+            candidate_scan: CandidateScanMemo::default(),
         }
     }
 }
@@ -117,10 +129,10 @@ impl ContextViewState {
                     .map(|it| ContextRow::Item(it.clone())),
             );
         }
-        rows.push(ContextRow::Header(ContextLayer::Refs));
-        if self.refs_expanded {
+        rows.push(ContextRow::Header(ContextLayer::OuterDocs));
+        if self.outer_docs_expanded {
             rows.extend(
-                sorted_layer_items(items, ContextLayer::Refs)
+                sorted_layer_items(items, ContextLayer::OuterDocs)
                     .into_iter()
                     .map(|it| ContextRow::Item(it.clone())),
             );
@@ -151,27 +163,27 @@ impl ContextViewState {
         match layer {
             ContextLayer::Pinned => self.pinned_expanded = !self.pinned_expanded,
             ContextLayer::User => self.user_expanded = !self.user_expanded,
-            ContextLayer::Refs => self.refs_expanded = !self.refs_expanded,
+            ContextLayer::OuterDocs => self.outer_docs_expanded = !self.outer_docs_expanded,
             ContextLayer::Auto => self.auto_expanded = !self.auto_expanded,
         }
     }
 
     pub fn is_all_expanded(&self) -> bool {
-        self.pinned_expanded && self.refs_expanded && self.user_expanded && self.auto_expanded
+        self.pinned_expanded && self.outer_docs_expanded && self.user_expanded && self.auto_expanded
     }
 
     pub fn expand_all(&mut self) {
         self.pinned_expanded = true;
         self.user_expanded = true;
         self.auto_expanded = true;
-        self.refs_expanded = true;
+        self.outer_docs_expanded = true;
     }
 
     pub fn collapse_all(&mut self) {
         self.pinned_expanded = false;
         self.user_expanded = false;
         self.auto_expanded = false;
-        self.refs_expanded = false;
+        self.outer_docs_expanded = false;
     }
 
     pub fn toggle_fold_all(&mut self) {
@@ -182,63 +194,103 @@ impl ContextViewState {
         }
     }
 
+    /// Refreshes the picker rows for the typed query.
+    ///
+    /// Every call is answered from a memoized scan while the typed query, the
+    /// in-context path set, and the repository file list stay unchanged, so
+    /// cursor moves, focus changes, and redraws re-serve the rows the last real
+    /// query edit produced instead of re-walking the whole repository file list.
+    /// Only a genuine input change recomputes, exactly as `PatternMatchMemo`
+    /// serves the review launch dialog (#32).
     pub fn update_filtered_candidates(&mut self, items: &[ContextItem], all_repo_files: &[String]) {
-        let query = self.add_input.get_text().trim();
+        let query = self.add_input.get_text().trim().to_string();
+        let signature = candidate_scan_signature(&query, items, all_repo_files);
+
+        if !self.candidate_scan.serves(signature) {
+            self.scan_candidates(&query, items, all_repo_files);
+            self.candidate_scan.record(signature);
+        }
+
+        self.settle_candidate_selection();
+    }
+
+    /// Collects the bulk-row count and the candidate rows in one traversal.
+    ///
+    /// Both answers the picker needs — how many files the query selects and
+    /// which rows to list — come from a single pass over the repository file
+    /// list; a second pass would repeat the exclusion test and the glob match of
+    /// every file for the same query.
+    fn scan_candidates(&mut self, query: &str, items: &[ContextItem], all_repo_files: &[String]) {
         let existing: std::collections::HashSet<&str> =
             items.iter().map(|it| it.path.as_str()).collect();
 
         let mut candidates = Vec::new();
+        let mut total_matching = 0usize;
 
-        if !query.is_empty() {
+        if query.is_empty() {
+            for file in all_repo_files {
+                if existing.contains(file.as_str()) {
+                    continue;
+                }
+                total_matching += 1;
+                if candidates.len() < CANDIDATE_ROW_LIMIT {
+                    candidates.push(ContextCandidate::File(file.clone()));
+                }
+            }
+        } else {
+            // The query is compiled once for the whole traversal: `GlobPattern`
+            // exists for exactly this loop, and matching through it reuses the
+            // precomputed pattern side instead of re-deriving it per file.
+            let pattern = GlobPattern::new(query);
+            let query_lower = query.to_lowercase();
+            let mut matching_pattern_count = 0usize;
+
+            for file in all_repo_files {
+                if existing.contains(file.as_str()) {
+                    continue;
+                }
+                let glob_matched = pattern.matches(file);
+                if glob_matched {
+                    matching_pattern_count += 1;
+                }
+                // A row is listed when the query selects it either as a glob or
+                // as a case-insensitive substring, so the count behind the bulk
+                // row and the rows themselves come from the same decision.
+                if !glob_matched && !file.to_lowercase().contains(&query_lower) {
+                    continue;
+                }
+                total_matching += 1;
+                if candidates.len() < CANDIDATE_ROW_LIMIT {
+                    candidates.push(ContextCandidate::File(file.clone()));
+                }
+            }
+
             let is_pattern_query = query.contains('*')
                 || query.contains('?')
                 || query.ends_with('/')
                 || !query.contains('.');
-
-            let matching_pattern_count = all_repo_files
-                .iter()
-                .filter(|f| !existing.contains(f.as_str()) && matches_glob_pattern(query, f))
-                .count();
-
             if matching_pattern_count > 0 && is_pattern_query {
-                candidates.push(ContextCandidate::BulkPattern {
-                    pattern: query.to_string(),
-                    count: matching_pattern_count,
-                });
+                candidates.insert(
+                    0,
+                    ContextCandidate::BulkPattern {
+                        pattern: query.to_string(),
+                        count: matching_pattern_count,
+                    },
+                );
             }
-
-            let query_lower = query.to_lowercase();
-            let all_matches: Vec<String> = all_repo_files
-                .iter()
-                .filter(|f| !existing.contains(f.as_str()))
-                .filter(|f| {
-                    f.to_lowercase().contains(&query_lower) || matches_glob_pattern(query, f)
-                })
-                .cloned()
-                .collect();
-
-            self.total_matching = all_matches.len();
-            candidates.extend(all_matches.into_iter().take(50).map(ContextCandidate::File));
-        } else {
-            let available: Vec<String> = all_repo_files
-                .iter()
-                .filter(|f| !existing.contains(f.as_str()))
-                .cloned()
-                .collect();
-            self.total_matching = available.len();
-            candidates = available
-                .into_iter()
-                .take(50)
-                .map(ContextCandidate::File)
-                .collect();
         }
 
+        self.total_matching = total_matching;
         self.filtered_candidates = candidates;
+    }
 
-        // The typed bulk row is convenient but risky: a single Enter mass-adds
-        // every match and can bloat the context without warning. Default the
-        // selection to the first concrete file so Enter is safe, while keeping
-        // the bulk row reachable by navigating up.
+    /// Applies the safe default selection over the served rows.
+    ///
+    /// The typed bulk row is convenient but risky: a single Enter mass-adds
+    /// every match and can bloat the context without warning. The selection
+    /// therefore defaults to the first concrete file so Enter is safe, while the
+    /// bulk row stays reachable by navigating up.
+    fn settle_candidate_selection(&mut self) {
         let bulk_row_first = matches!(
             self.filtered_candidates.first(),
             Some(ContextCandidate::BulkPattern { .. })
@@ -255,6 +307,76 @@ impl ContextViewState {
             self.selected_candidate_index = self.filtered_candidates.len() - 1;
         }
     }
+}
+
+/// Maximum number of concrete file rows the picker lists for one query.
+///
+/// The cap keeps the popup compact: a wider match is narrowed by typing one more
+/// character instead of scrolling an arbitrarily long menu. The reported total
+/// is never capped, so the picker still states the full size of the selection.
+const CANDIDATE_ROW_LIMIT: usize = 50;
+
+/// Memo of the last candidate scan performed by [`ContextViewState`].
+///
+/// Mirroring `PatternMatchMemo` in `crate::dialogs::pattern`, the picker answers
+/// the same question on every typed character — which repository files the query
+/// selects and which rows to list first — and the answer is fully determined by
+/// the query, the in-context path set, and the repository file list. It is
+/// therefore kept against a fingerprint of exactly those inputs (#32).
+#[derive(Debug, Clone, Default)]
+struct CandidateScanMemo {
+    /// Fingerprint of the scan whose rows the picker currently holds.
+    signature: Cell<Option<u64>>,
+    /// Number of real scans served, so a regression test can pin that a cursor
+    /// move, a focus change, or a redraw never walks the repository again.
+    computations: Cell<u64>,
+}
+
+impl CandidateScanMemo {
+    /// Whether the rows already on screen answer `signature`.
+    fn serves(&self, signature: u64) -> bool {
+        self.signature.get() == Some(signature)
+    }
+
+    /// Records that a real scan answered `signature`.
+    fn record(&self, signature: u64) {
+        self.signature.set(Some(signature));
+        let computations = self.computations.get();
+        self.computations.set(computations.saturating_add(1));
+    }
+
+    /// Number of real scans served since the picker was built.
+    ///
+    /// Only the regression test reads this, exactly like `PatternMatchMemo` in
+    /// `crate::dialogs::pattern`, so the allowance keeps the zero-warning gate
+    /// green instead of widening the module surface for a counter.
+    #[allow(dead_code)]
+    fn computations(&self) -> u64 {
+        self.computations.get()
+    }
+}
+
+/// Fingerprint of the inputs behind a memoized candidate scan.
+///
+/// Mirroring `patterns_signature` in `crate::dialogs::pattern`, the typed query,
+/// the context paths, and the repository file list are folded into one hash. The
+/// repository list is folded by content rather than by its address: the daemon
+/// replaces the list wholesale on a refresh, and re-listing a repository of the
+/// same size routinely hands the new vector the block the previous one released,
+/// so an address check would serve a stale candidate list after a rename. Folding
+/// the paths stays far cheaper than the glob traversal the fingerprint guards.
+fn candidate_scan_signature(query: &str, items: &[ContextItem], all_repo_files: &[String]) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    query.hash(&mut hasher);
+    items.len().hash(&mut hasher);
+    for item in items {
+        item.path.hash(&mut hasher);
+    }
+    all_repo_files.len().hash(&mut hasher);
+    for file in all_repo_files {
+        file.hash(&mut hasher);
+    }
+    hasher.finish()
 }
 
 #[cfg(test)]
@@ -339,14 +461,14 @@ mod tests {
         let items = vec![
             item("pinned.rs", ContextLayer::Pinned),
             item("user.rs", ContextLayer::User),
-            item("refs.md", ContextLayer::Refs),
+            item("docs.md", ContextLayer::OuterDocs),
             item("auto.rs", ContextLayer::Auto),
         ];
 
         let rows = view.compute_rows(&items);
         assert_eq!(
             rendered_paths(&rows),
-            vec!["pinned.rs", "refs.md", "user.rs", "auto.rs"]
+            vec!["pinned.rs", "docs.md", "user.rs", "auto.rs"]
         );
 
         view.collapse_all();
@@ -355,26 +477,26 @@ mod tests {
     }
 
     #[test]
-    fn test_the_refs_section_is_folded_independently() {
+    fn test_the_outer_docs_section_is_folded_independently() {
         let mut view = ContextViewState::default();
         let items = vec![
             item("pinned.rs", ContextLayer::Pinned),
-            item("refs.md", ContextLayer::Refs),
+            item("docs.md", ContextLayer::OuterDocs),
             item("user.rs", ContextLayer::User),
         ];
 
         assert!(view.is_all_expanded());
-        view.toggle_section(ContextLayer::Refs);
-        assert!(!view.refs_expanded);
+        view.toggle_section(ContextLayer::OuterDocs);
+        assert!(!view.outer_docs_expanded);
         assert_eq!(
             rendered_paths(&view.compute_rows(&items)),
             vec!["pinned.rs", "user.rs"]
         );
 
-        view.toggle_section(ContextLayer::Refs);
+        view.toggle_section(ContextLayer::OuterDocs);
         assert_eq!(
             rendered_paths(&view.compute_rows(&items)),
-            vec!["pinned.rs", "refs.md", "user.rs"]
+            vec!["pinned.rs", "docs.md", "user.rs"]
         );
     }
 
@@ -438,6 +560,57 @@ mod tests {
         assert_eq!(
             ContextCandidate::File("x.rs".to_string()).display_label(),
             "x.rs"
+        );
+    }
+    /// The picker scan runs once per (query, context, repository) state: cursor
+    /// moves, focus changes, and redraws re-serve the stored rows, and only a
+    /// real input change recomputes (#32).
+    #[test]
+    fn update_filtered_candidates_is_memoized_on_the_scan_signature() {
+        let mut view = ContextViewState::default();
+        let repo = vec!["src/lib.rs".to_string(), "README.md".to_string()];
+        view.add_input.insert_str("*.rs");
+
+        view.update_filtered_candidates(&[], &repo);
+        assert_eq!(view.candidate_scan.computations(), 1);
+        assert_eq!(view.total_matching, 1);
+        assert_eq!(view.selected_candidate_index, 1);
+
+        // Moving up to the bulk row and redrawing never re-walks the repository:
+        // the stored rows still answer the unchanged query, and the safe default
+        // selection is re-applied exactly as a fresh scan would apply it.
+        view.selected_candidate_index = 0;
+        view.update_filtered_candidates(&[], &repo);
+        assert_eq!(view.candidate_scan.computations(), 1);
+        assert_eq!(view.selected_candidate_index, 1);
+
+        // A real query edit recomputes.
+        view.add_input.clear();
+        view.add_input.insert_str("*.md");
+        view.update_filtered_candidates(&[], &repo);
+        assert_eq!(view.candidate_scan.computations(), 2);
+        assert_eq!(view.total_matching, 1);
+
+        // A context change recomputes: the added path leaves the candidate set,
+        // so the same query now selects nothing at all.
+        view.add_input.clear();
+        view.add_input.insert_str("*.rs");
+        let items = vec![item("src/lib.rs", ContextLayer::User)];
+        view.update_filtered_candidates(&items, &repo);
+        assert_eq!(view.candidate_scan.computations(), 3);
+        assert_eq!(view.total_matching, 0);
+        assert!(view.filtered_candidates.is_empty());
+        assert_eq!(view.selected_candidate_index, 0);
+
+        // A refreshed repository file list recomputes even when the replaced one
+        // had the same length, which a pointer-identity check would miss.
+        let refreshed = vec!["src/main.rs".to_string(), "README.md".to_string()];
+        view.update_filtered_candidates(&items, &refreshed);
+        assert_eq!(view.candidate_scan.computations(), 4);
+        assert_eq!(view.total_matching, 1);
+        assert_eq!(
+            view.filtered_candidates.last(),
+            Some(&ContextCandidate::File("src/main.rs".to_string()))
         );
     }
 }

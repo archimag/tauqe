@@ -6,7 +6,7 @@
 //! the typed wire surface of that contour, so a caller asks the protocol for its
 //! response schema and its instructions instead of assembling either by hand.
 //!
-//! The advertised surface is [`CapabilitySet::architect_discovery`]: the
+//! The advertised surface is [`CapabilitySet::architect_research`]: the
 //! Architect reads context, searches the repository, requests symbol contours,
 //! consults the documentation, records working notes, and reports a terminal
 //! status. It never edits a file and never runs the toolchain, so neither
@@ -52,10 +52,10 @@ impl Default for PlanRefinePromptProtocol {
 }
 
 impl PlanRefinePromptProtocol {
-    /// Creates the protocol bound to the architect discovery surface.
+    /// Creates the protocol bound to the architect research surface.
     pub fn new() -> Self {
         Self {
-            capabilities: CapabilitySet::architect_discovery(),
+            capabilities: CapabilitySet::architect_research(),
         }
     }
 
@@ -226,13 +226,13 @@ impl PromptProtocol for PlanRefinePromptProtocol {
                 commands.push(LlmCommand::Blocked { reason, details });
             }
             "success" => {
-                let summary = if explanation.is_empty() {
+                let commit_message = if explanation.is_empty() {
                     None
                 } else {
                     Some(explanation.clone())
                 };
                 commands.push(LlmCommand::Outcome {
-                    outcome: LlmOutcome::Success { summary },
+                    outcome: LlmOutcome::Success { commit_message },
                 });
             }
             other => commands.push(LlmCommand::ProtocolError {
@@ -288,15 +288,15 @@ mod tests {
     }"#;
 
     #[test]
-    fn test_surface_is_the_architect_discovery_profile() {
+    fn test_surface_is_the_architect_research_profile() {
         let protocol = PlanRefinePromptProtocol::default();
         assert_eq!(protocol.name(), "plan_refinement");
         assert_eq!(protocol.kind(), EditProtocolKind::Structured);
         assert_eq!(
             protocol.capability_set(),
-            CapabilitySet::architect_discovery()
+            CapabilitySet::architect_research()
         );
-        assert!(protocol.supports(LlmCapability::Discovery));
+        assert!(protocol.supports(LlmCapability::Research));
         assert!(protocol.supports(LlmCapability::PlanUpdate));
         assert!(!protocol.supports(LlmCapability::FileEdits));
         assert!(!protocol.supports(LlmCapability::ToolchainVerify));
@@ -368,7 +368,7 @@ mod tests {
     }
 
     #[test]
-    fn test_decode_needs_context_yields_discovery_commands() {
+    fn test_decode_needs_context_yields_research_commands() {
         let protocol = PlanRefinePromptProtocol::default();
         let commands = protocol.decode(NEEDS_CONTEXT, &[]);
 
@@ -435,7 +435,7 @@ mod tests {
                 },
                 LlmCommand::Outcome {
                     outcome: LlmOutcome::Success {
-                        summary: Some("Decomposed into three verified steps".to_string()),
+                        commit_message: Some("Decomposed into three verified steps".to_string()),
                     },
                 },
             ]

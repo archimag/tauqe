@@ -54,16 +54,16 @@ The book is organized into five orthogonal parts. Each significant concept lives
 ### Part I — Foundations & Cognitive Architecture
 
 - **[Philosophy: The Semantic Harness](ch01-foundations/semantic-harness.md)** — Core mission, the literal harness metaphor, and the architectural comparison against agentic loops and manual context logisticians.
-- **[The Autonomous Bounded Turn FSM](ch01-foundations/bounded-turn-fsm.md)** — The deterministic finite-state turn: Discovery, in-memory staging, patch retry resilience, verification healing, and rollback.
+- **[The Autonomous Bounded Turn FSM](ch01-foundations/bounded-turn-fsm.md)** — The deterministic finite-state turn: Research, in-memory staging, patch retry resilience, verification healing, and rollback.
 - **[Model Roles and the Coder Ladder](ch01-foundations/model-roles.md)** — The mandatory primary role, specialized role lists, the coder and architect ladders, and decision immutability.
 - **[Turn Scratchpad](ch01-foundations/turn-scratchpad.md)** — Turn-local working memory and its isolation from persisted history.
 
 ### Part II — Context Perception & Discovery
 
-- **[The Context Model](ch02-perception/context-model.md)** — Architectural rationale of the Pinned, Refs, User, and Auto context layers, token hygiene, and multi-round Discovery.
+- **[The Context Model](ch02-perception/context-model.md)** — Architectural rationale of the Pinned, OuterDocs, User, and Auto context layers, token hygiene, and multi-round Research.
 - **[Discussion Focus](ch02-perception/discussion-focus.md)** — Anchored architectural dialogue and its typed target.
 - **[Repository Map and Blinkers](ch02-perception/repo-map.md)** — The deterministic Tree-sitter outline and its budgets.
-- **[Discovery Engine](ch02-perception/discovery-engine.md)** — Handler dispatch, round guards, and the cumulative discovery journal.
+- **[Research Engine](ch02-perception/research-engine.md)** — Handler dispatch, round guards, and the cumulative research journal.
 
 ### Part III — Project Integration & Execution
 

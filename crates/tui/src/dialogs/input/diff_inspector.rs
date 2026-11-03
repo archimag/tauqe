@@ -145,9 +145,9 @@ pub(super) static INSPECTOR_COMMAND_MAP: CommandMap<InspectorCommand> = CommandM
 
 /// Applies one key press to the open inspector.
 ///
-/// The reading position of the Develop viewport is never touched, so closing the
+/// The reading position of the REPL viewport is never touched, so closing the
 /// dialog returns the developer to the exact spot the audit was opened from
-/// (c-3). The audited set has exactly one owner — the Develop view's staged files
+/// (c-3). The audited set has exactly one owner — the REPL view's staged files
 /// — so the file walk clamps against that live length instead of a copy, and
 /// moving the highlight resets the isolated diff scroll so a shorter patch never
 /// inherits a stale offset.
@@ -169,6 +169,9 @@ pub(super) fn handle_diff_inspector_key(key: KeyEvent, st: &mut AppState) {
     };
 
     if command == InspectorCommand::Close {
+        // The imported change set of a plan commit belongs to this audit, so the
+        // next open starts from the live staged set unless it imports its own.
+        st.diff_audit = None;
         st.diff_inspector = None;
         return;
     }
@@ -286,7 +289,7 @@ mod tests {
         assert_eq!(inspector.diff_scroll, 0, "the last file caps the walk");
     }
 
-    /// The walk reads the live staged set the Develop view owns: shrinking it
+    /// The walk reads the live staged set the REPL view owns: shrinking it
     /// clamps the highlight on the next file chord, with no refresh event and no
     /// captured copy to go stale (c-3).
     #[test]

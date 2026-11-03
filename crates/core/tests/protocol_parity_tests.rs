@@ -25,14 +25,15 @@ use tauqe_core::prompt::protocol::PromptProtocol;
 use tauqe_core::prompt::xml::XmlPromptProtocol;
 use tauqe_core::prompt::PromptAssembly;
 use tauqe_protocol::{
-    CapabilitySet, EditProtocolKind, LlmCapability, LlmCommand, PatchStrategy, TurnIntent,
+    CapabilitySet, DocTopic, EditProtocolKind, LlmCapability, LlmCommand, PatchStrategy, TurnIntent,
 };
 
 /// Every intent the harness can start a bounded turn with.
-const ALL_INTENTS: [TurnIntent; 3] = [
+const ALL_INTENTS: [TurnIntent; 4] = [
     TurnIntent::InteractiveRepl,
     TurnIntent::PlanDiscussion,
     TurnIntent::IsolatedStep,
+    TurnIntent::ReviewDiscussion,
 ];
 
 /// Operational protocol tags a structured prompt must never advertise.
@@ -63,7 +64,9 @@ const OPERATIONAL_TAGS: &[&str] = &[
     "<repo_dirs",
     "<repo_map",
     "<dir_list",
+    "<tauqe_doc_request",
     "<doc_request",
+    "<outer_doc_request",
     "<custom_tool",
     "<search",
     "<replace",
@@ -318,8 +321,10 @@ fn plan_definitions_declare_exactly_the_fields_of_the_rust_nodes() {
         details: Some("details".to_string()),
         status: tauqe_protocol::PlanItemStatus::Todo,
         blocked_reason: None,
+        commit: Some("9f2c1b4".to_string()),
         files: vec!["src/a.rs".to_string()],
         readonly_files: vec!["src/b.rs".to_string()],
+        outer_docs: vec!["docs/entry".to_string()],
         concept_refs: vec!["c-1".to_string()],
         depends_on: vec!["0".to_string()],
         children: vec![tauqe_protocol::PlanItem::default()],
@@ -478,6 +483,14 @@ fn purity_matrix() -> Vec<Combination> {
             intent: TurnIntent::PlanDiscussion,
             protocol: Box::new(JsonPromptProtocol::edits()),
         },
+        Combination {
+            intent: TurnIntent::ReviewDiscussion,
+            protocol: Box::new(XmlPromptProtocol),
+        },
+        Combination {
+            intent: TurnIntent::ReviewDiscussion,
+            protocol: Box::new(JsonPromptProtocol::edits()),
+        },
     ]
 }
 
@@ -516,13 +529,14 @@ fn structured_prompts_never_advertise_an_operational_tag() {
         // The check is scoped to protocol tags: the prompt-side blocks stay.
         assert!(prompt.contains("<context>"));
     }
-    assert_eq!(checked, 3, "the matrix lost a structured combination");
+    assert_eq!(checked, 4, "the matrix lost a structured combination");
 }
 
 #[test]
 fn xml_prompts_never_name_a_structured_schema_field() {
     let fields = structured_property_names();
     assert!(fields.contains(&"plan_update".to_string()));
+    assert!(fields.contains(&"tauqe_doc_requests".to_string()));
 
     let mut checked = 0;
     for combination in &purity_matrix() {
@@ -542,7 +556,7 @@ fn xml_prompts_never_name_a_structured_schema_field() {
             );
         }
     }
-    assert_eq!(checked, 3, "the matrix lost an xml combination");
+    assert_eq!(checked, 4, "the matrix lost an xml combination");
 }
 
 // ---------------------------------------------------------------------------
@@ -678,7 +692,7 @@ fn the_plan_abort_and_custom_tool_fields_follow_the_surface() {
         &narrowed_surface(&structured, TurnIntent::InteractiveRepl),
         PatchStrategy::SearchReplace,
     );
-    for field in ["plan_update", "abort", "custom_tools"] {
+    for field in ["plan_update", "abort", "custom_tools", "outer_doc_requests"] {
         assert!(
             repl["properties"].get(field).is_some(),
             "repl lacks {field}"
@@ -691,6 +705,7 @@ fn the_plan_abort_and_custom_tool_fields_follow_the_surface() {
     );
     assert!(step["properties"].get("plan_update").is_none());
     assert!(step["properties"].get("abort").is_some());
+    assert!(step["properties"].get("outer_doc_requests").is_some());
 
     // A plan discussion carries the whole dialogue surface, so its composed
     // schema declares the change set, the plan payload, and every escape.
@@ -698,10 +713,65 @@ fn the_plan_abort_and_custom_tool_fields_follow_the_surface() {
         &narrowed_surface(&structured, TurnIntent::PlanDiscussion),
         PatchStrategy::SearchReplace,
     );
-    for field in ["plan_update", "changes", "abort", "blocked", "custom_tools"] {
+    for field in [
+        "plan_update",
+        "changes",
+        "abort",
+        "blocked",
+        "custom_tools",
+        "outer_doc_requests",
+    ] {
         assert!(
             discussion["properties"].get(field).is_some(),
             "discussion lacks {field}"
+        );
+    }
+}
+
+#[test]
+fn the_review_decision_field_follows_the_review_discussion_surface() {
+    let registry = CapabilityRegistry::global();
+    let structured = JsonPromptProtocol::edits();
+
+    // The decision is authorized by the review-discussion regime alone. The
+    // server grants it on top of the advertised base surface, exactly as it
+    // grants the plan mutation of a plan discussion, and the narrowing keeps it
+    // only where that regime authorizes it.
+    let advertised = structured
+        .capability_set()
+        .with(LlmCapability::ReviewUpdate);
+    let review = registry.compose_structured_schema(
+        &TurnIntent::ReviewDiscussion.narrow_capabilities(&advertised),
+        PatchStrategy::SearchReplace,
+    );
+    assert!(review["properties"].get("review_update").is_some());
+    let mut declared = property_names(&review);
+    declared.sort();
+    assert!(
+        declared
+            .iter()
+            .any(|field| field.as_str() == "review_update"),
+        "the review surface must declare the decision field"
+    );
+    let mut required = required_names(&review);
+    required.sort();
+    assert_eq!(required, declared, "the review schema must stay strict");
+
+    // Every other regime keeps the field out even when the decision was
+    // advertised, so the narrowing alone removes it: an ordinary dialogue can
+    // never report a decision it is not authorized to record.
+    for intent in [
+        TurnIntent::InteractiveRepl,
+        TurnIntent::PlanDiscussion,
+        TurnIntent::IsolatedStep,
+    ] {
+        let schema = registry.compose_structured_schema(
+            &intent.narrow_capabilities(&advertised),
+            PatchStrategy::SearchReplace,
+        );
+        assert!(
+            schema["properties"].get("review_update").is_none(),
+            "{intent:?} declares the review decision"
         );
     }
 }
@@ -736,14 +806,15 @@ fn equivalent_payloads() -> Vec<PayloadPair> {
 
 <context_request path="src/a.rs" access="editable" />
 <repo_search path="crates/core" regex="fn main" />
-<doc_request topic="git" />
+<tauqe_doc_request topic="git" />
+<outer_doc_request id="vendor/api.md" />
 <verify target="check" on_success="silent" />
 <plan action="save" id="p1" title="Plan"><concept><concept_item id="c-1" title="Concept" /></concept><item id="1" title="Step" status="todo" /></plan>
 <scratchpad>Verified: parser works.</scratchpad>
 <custom_tool name="check" />
 <abort reason="Toolchain missing" recommendation="rustup component add clippy" />
 <user_language>Russian</user_language>
-<success summary="All checks pass" />
+<success commit_message="All checks pass" />
 "#
             .to_string(),
             structured: r#"{
@@ -753,7 +824,8 @@ fn equivalent_payloads() -> Vec<PayloadPair> {
   ],
   "context_requests": ["editable:src/a.rs"],
   "repo_searches": [{"path": "crates/core", "regex": "fn main"}],
-  "doc_requests": ["git"],
+  "tauqe_doc_requests": ["git"],
+  "outer_doc_requests": ["vendor/api.md"],
   "verify": {"target": "check", "on_success": "silent"},
   "plan_update": {
     "action": "save",
@@ -763,7 +835,7 @@ fn equivalent_payloads() -> Vec<PayloadPair> {
     "items": [{"id": "1", "title": "Step", "status": "todo"}]
   },
   "scratchpad": "Verified: parser works.",
-  "outcome": {"status": "success", "summary": "All checks pass"},
+  "outcome": {"status": "success", "commit_message": "All checks pass"},
   "abort": {
     "is_aborted": true,
     "reason": "Toolchain missing",
@@ -846,7 +918,43 @@ fn equivalent_payloads_decode_to_the_same_commands() {
         }
     }
 }
+/// The internal documentation channel publishes one canonical spelling and keeps
+/// its pre-canonical spelling as a permanent alias.
+///
+/// The prompt advertises the canonical name alone, and both spellings decode into
+/// the same command, so a cached response or a transcript written before the
+/// rename stays a first-class payload on either transport.
+#[test]
+fn the_documentation_channel_decodes_both_spellings_identically() {
+    let xml = XmlPromptProtocol;
+    let structured = JsonPromptProtocol::edits();
+    let expected = vec![LlmCommand::DocRequest {
+        topic: DocTopic::Git,
+    }];
 
+    for payload in [
+        "<tauqe_doc_request topic=\"git\" />",
+        "<doc_request topic=\"git\" />",
+    ] {
+        assert_eq!(xml.decode(payload, &[]), expected, "{payload}");
+    }
+
+    // The composed schema advertises the canonical field alone, so the alias is
+    // asserted on the decoder rather than on the schema.
+    let schema = CapabilityRegistry::global().compose_structured_schema(
+        &CapabilitySet::interactive_repl(),
+        PatchStrategy::SearchReplace,
+    );
+    assert!(schema["properties"].get("tauqe_doc_requests").is_some());
+    assert!(schema["properties"].get("doc_requests").is_none());
+
+    for payload in [
+        r#"{"message":"","tauqe_doc_requests":["git"]}"#,
+        r#"{"message":"","doc_requests":["git"]}"#,
+    ] {
+        assert_eq!(structured.decode(payload, &[]), expected, "{payload}");
+    }
+}
 #[test]
 fn intent_narrowing_filters_the_same_commands_on_both_transports() {
     let xml = XmlPromptProtocol;
@@ -878,11 +986,12 @@ fn intent_narrowing_filters_the_same_commands_on_both_transports() {
             "abort",
             "blocked",
             "custom_tools",
-            "discovery",
             "doc_request",
             "file_edits",
             "outcome",
+            "outer_doc_request",
             "plan_creation",
+            "research",
             "scratchpad",
             "text_message",
             "toolchain_verify",
@@ -909,9 +1018,10 @@ fn intent_narrowing_filters_the_same_commands_on_both_transports() {
             "abort",
             "blocked",
             "custom_tools",
-            "discovery",
             "file_edits",
             "outcome",
+            "outer_doc_request",
+            "research",
             "scratchpad",
             "text_message",
             "user_language",
@@ -927,11 +1037,12 @@ fn intent_narrowing_filters_the_same_commands_on_both_transports() {
             "abort",
             "blocked",
             "custom_tools",
-            "discovery",
             "doc_request",
             "file_edits",
             "outcome",
+            "outer_doc_request",
             "plan_creation",
+            "research",
             "scratchpad",
             "text_message",
             "toolchain_verify",
@@ -1066,12 +1177,12 @@ fn the_dialogue_trunk_is_byte_identical_for_the_repl_and_the_plan_discussion() {
 
 /// One transport with the three dialogue contours a session switches between.
 ///
-/// The review discussion runs through the interactive intent — the server maps a
-/// review anchor onto [`TurnIntent::InteractiveRepl`] — so its contour is the
-/// REPL contour and its regime delta is the interactive delta. A plan discussion
-/// reaches the discussion surface the server grants from the dialogue anchor,
-/// because the plan mutation that regime authorizes travels in the delta list of
-/// its profile and never in the byte-stable head.
+/// Each contour declares its own regime. A plan discussion reaches the
+/// discussion surface — the shared dialogue head plus the plan mutation that
+/// regime authorizes — and a review discussion reaches the review surface: the
+/// same head plus the decision it records. Both extensions travel in the delta
+/// list of their profile and never in the byte-stable head, so switching the
+/// dialogue focus renders the head unchanged.
 struct DialogueContours {
     /// Transport that serializes every contour of the matrix.
     kind: EditProtocolKind,
@@ -1104,8 +1215,8 @@ fn dialogue_matrices() -> [DialogueContours; 2] {
                 protocol: XmlPromptProtocol::with_capabilities(CapabilitySet::discussion()),
             },
             review: Combination {
-                intent: TurnIntent::InteractiveRepl,
-                protocol: Box::new(XmlPromptProtocol),
+                intent: TurnIntent::ReviewDiscussion,
+                protocol: XmlPromptProtocol::with_capabilities(CapabilitySet::review_discussion()),
             },
         },
         DialogueContours {
@@ -1119,8 +1230,8 @@ fn dialogue_matrices() -> [DialogueContours; 2] {
                 protocol: JsonPromptProtocol::with_capabilities(CapabilitySet::discussion()),
             },
             review: Combination {
-                intent: TurnIntent::InteractiveRepl,
-                protocol: Box::new(JsonPromptProtocol::edits()),
+                intent: TurnIntent::ReviewDiscussion,
+                protocol: JsonPromptProtocol::with_capabilities(CapabilitySet::review_discussion()),
             },
         },
     ]
@@ -1162,14 +1273,20 @@ fn the_dialogue_head_is_byte_identical_across_every_dialogue_contour() {
             );
         }
 
-        // The review discussion is the interactive contour by construction: the
-        // server maps a review anchor onto the interactive intent, so the two
-        // contours carry one head and one capability surface.
-        assert_eq!(contours.review.intent, TurnIntent::InteractiveRepl);
-        assert_eq!(
-            contours.review.protocol.capability_set(),
-            contours.repl.protocol.capability_set()
-        );
+        // The review discussion runs as its own regime, so it declares the
+        // decision it records on top of the very same head. The surface is the
+        // only difference, and it renders no head byte of its own.
+        assert_eq!(contours.review.intent, TurnIntent::ReviewDiscussion);
+        assert!(contours
+            .review
+            .protocol
+            .capability_set()
+            .contains(LlmCapability::ReviewUpdate));
+        assert!(!contours
+            .review
+            .protocol
+            .capability_set()
+            .contains(LlmCapability::PlanUpdate));
     }
 }
 
@@ -1209,6 +1326,10 @@ fn the_review_delta_mirrors_the_repl_delta_and_the_plan_delta_extends_it() {
     assert_eq!(profile.delta().as_slice(), &[LlmCapability::PlanUpdate]);
     assert!(!profile.core().contains(LlmCapability::PlanUpdate));
     assert!(CapabilitySet::discussion().contains(LlmCapability::PlanUpdate));
+    let review = TurnIntent::ReviewDiscussion.regime_profile();
+    assert_eq!(review.delta().as_slice(), &[LlmCapability::ReviewUpdate]);
+    assert!(!review.core().contains(LlmCapability::ReviewUpdate));
+    assert!(CapabilitySet::review_discussion().contains(LlmCapability::ReviewUpdate));
 
     for contours in dialogue_matrices() {
         let repl = contours.repl.delta();
@@ -1263,6 +1384,11 @@ fn the_review_delta_mirrors_the_repl_delta_and_the_plan_delta_extends_it() {
             .protocol
             .capability_set()
             .contains(LlmCapability::PlanUpdate));
+        assert!(contours
+            .review
+            .protocol
+            .capability_set()
+            .contains(LlmCapability::ReviewUpdate));
 
         if matches!(contours.kind, EditProtocolKind::Xml) {
             let payload =

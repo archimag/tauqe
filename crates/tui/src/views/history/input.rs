@@ -288,7 +288,7 @@ pub async fn handle_history_key(
     // and arms the existing confirmation dialog, so it can never fire from a
     // bare key or a background view (c-history-clear-isolation). `C-g` is the
     // canonical keyboard-quit chord: normalized to Esc globally, it simply
-    // leaves History for Develop exactly like the `Esc` action below.
+    // leaves History for the REPL exactly like the `Esc` action below.
     let action = match HISTORY_COMMAND_MAP.resolve(key, &st.tui_config.input, false) {
         Some(spec) => spec.action,
         None => return Ok(InputResult::Continue),

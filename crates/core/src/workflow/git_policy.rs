@@ -129,18 +129,18 @@ impl ApplyPolicy for GitTransactionPolicy {
         &mut self,
         repo_root: &Path,
         changed_files: &[String],
-        summary: &str,
+        commit_message: &str,
     ) -> anyhow::Result<Option<String>> {
         let root = repo_root.to_path_buf();
         let files = changed_files.to_vec();
-        let summary_owned = summary.to_string();
+        let commit_message_owned = commit_message.to_string();
         let checkpoint = self.checkpoint.take();
 
         let res = crate::blocking::run_blocking_async(move || {
             if let Some(checkpoint) = checkpoint {
-                finalize_ai_commit(&root, &checkpoint, &files, &summary_owned).map(Some)
+                finalize_ai_commit(&root, &checkpoint, &files, &commit_message_owned).map(Some)
             } else {
-                create_ai_commit(&root, &files, &summary_owned).map(Some)
+                create_ai_commit(&root, &files, &commit_message_owned).map(Some)
             }
         })
         .await;

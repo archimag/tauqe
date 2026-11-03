@@ -120,11 +120,18 @@ impl KeyChord {
 /// physically occupies, while a character outside the configured mapping stays
 /// as typed. Dedicated navigation keys pass through unchanged.
 ///
-/// The projection runs strictly inside chord resolution. It never touches the
-/// text a buffer receives, so the unconditional character insertion invariant
-/// is preserved (Conventions §5.1): a layout only widens which key reaches a
-/// command, never which character is typed.
-fn translate_code(code: KeyCode, input: &InputConfig) -> KeyCode {
+/// [`KeyChord::matches`] applies the projection itself, so a chord declared
+/// with a Latin key already resolves from every configured layout. A surface
+/// that matches literal [`KeyCode`]s instead of chord specifications — the
+/// three-way batch-cancellation card, the Help tabs, and the shared list
+/// selector — calls this function explicitly, so the modal layer resolves the
+/// same projection the view command maps resolve.
+///
+/// The projection never touches the text a buffer receives, so the
+/// unconditional character insertion invariant is preserved (Conventions
+/// §5.1): a layout only widens which key reaches a command, never which
+/// character is typed.
+pub(crate) fn translate_code(code: KeyCode, input: &InputConfig) -> KeyCode {
     match code {
         KeyCode::Char(c) => {
             KeyCode::Char(translate_char(c, input.layout, input.langmap.as_deref()))

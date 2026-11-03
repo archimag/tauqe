@@ -11,7 +11,10 @@
 //! consume this expansion, so the window a developer previews is the window the
 //! launch reads (#c-1, #c-4). The counters follow the preview contract declared
 //! in `crates/protocol`: matches are counted before the context filter, while
-//! the omissions are counted against the candidate set the limits apply to.
+//! the omissions are counted against the candidate set the limits apply to. A
+//! matched path the window cannot read is not a candidate at all, so it is
+//! counted as unreadable and can neither be selected nor fabricate a
+//! truncation the budget did not cause.
 
 use std::collections::HashSet;
 use std::path::Path;
@@ -23,7 +26,7 @@ use tauqe_protocol::{ContextAccess, GlobPattern};
 /// Configured limits one audit window obeys, read once per run.
 ///
 /// The file token budget is the only measure of how much a window may load, and
-/// it is the budget discovery and the primary audit already enforce, so a single
+/// it is the budget research and the primary audit already enforce, so a single
 /// expansion can never step outside what the project declares.
 #[derive(Debug, Clone, Copy)]
 pub(super) struct WindowBudgets {
@@ -109,79 +112,104 @@ pub(super) async fn expand_window(
 
     let root = repo_root.to_path_buf();
     let existing: HashSet<String> = context.files.iter().map(|file| file.path.clone()).collect();
-    let (reads, matched_files, candidates) = crate::handlers::offload(move || {
-        // A repository Git cannot inspect selects nothing; the launch then
-        // reports that it found no file to audit instead of failing the run.
-        let available = tauqe_core::git::list_repository_files(Some(&root)).unwrap_or_default();
-        let compiled: Vec<GlobPattern> = patterns
-            .iter()
-            .map(|pattern| GlobPattern::new(pattern))
-            .collect();
-        let mut matched: Vec<String> = available
-            .into_iter()
-            .filter(|path| compiled.iter().any(|pattern| pattern.matches(path)))
-            .collect();
-        matched.sort();
-        matched.dedup();
-        // Matches are counted before the context filter: a file the launch
-        // already holds is found by the patterns and is not read twice, so the
-        // count reports how much the patterns found.
-        let matched_files = matched.len();
-        matched.retain(|path| !existing.contains(path));
-        let candidates = matched.len();
-        let mut reads = Vec::new();
-        for path in matched {
-            if tauqe_core::context::verify_path_within_repo(&root, &path).is_err() {
-                continue;
-            }
-            if let Ok(content) = std::fs::read_to_string(root.join(&path)) {
-                reads.push((path, content));
-            }
-        }
-        (reads, matched_files, candidates)
-    })
-    .await
-    .map_err(|err| format!("Failed to list the repository for the audit window: {err}"))?;
+    let context_files = context.files.len();
+    let context_tokens = context.tokens;
+    let (files, estimated_tokens, matched_files, unreadable_files, omitted_by_budget) =
+        crate::handlers::offload(move || {
+            // A repository Git cannot inspect selects nothing; the launch then
+            // reports that it found no file to audit instead of failing the run.
+            let available = tauqe_core::git::list_repository_files(Some(&root)).unwrap_or_default();
+            let compiled: Vec<GlobPattern> = patterns
+                .iter()
+                .map(|pattern| GlobPattern::new(pattern))
+                .collect();
+            let mut matched: Vec<String> = available
+                .into_iter()
+                .filter(|path| compiled.iter().any(|pattern| pattern.matches(path)))
+                .collect();
+            matched.sort();
+            matched.dedup();
+            // Matches are counted before the context filter: a file the launch
+            // already holds is found by the patterns and is not read twice, so
+            // the count reports how much the patterns found.
+            let held = matched
+                .iter()
+                .filter(|path| existing.contains(*path))
+                .count();
+            matched.retain(|path| !existing.contains(path));
+            let matched_files = held.saturating_add(matched.len());
 
-    let mut files = Vec::new();
-    let mut total_tokens = context.tokens;
-    for (path, content) in reads {
-        // A file costs its content plus the wrapper its own `<file>` element
-        // renders, so the window is priced by the same builder that renders the
-        // `<context>` block and never measures less than the audit reads.
-        let wrapper =
-            tauqe_core::prompt::context_element_overhead_tokens(&path, ContextAccess::ReadOnly);
-        let content_tokens = tauqe_core::prompt::estimate_tokens_from_bytes(content.len() as u64);
-        let tokens = content_tokens as usize + wrapper;
-        // The expansion shares the discovery files token budget, so it stops at
-        // the first file that would push the window past the configured limit.
-        if total_tokens.saturating_add(tokens) > budgets.files_tokens {
-            break;
-        }
-        total_tokens += tokens;
-        files.push(ContextFileContent {
-            path,
-            access: ContextAccess::ReadOnly,
-            content,
-        });
-    }
+            // The window prices every candidate as it reads it and stops at the
+            // first file the budget cannot pay for, so a wide pattern never
+            // materializes the whole matched tree and then discards most of it.
+            let mut files = Vec::new();
+            let mut total_tokens = context_tokens;
+            let mut unreadable = 0usize;
+            let mut omitted = 0usize;
+            let mut candidates = matched.into_iter();
+            while let Some(path) = candidates.next() {
+                // A fresh match the window cannot read is not a review
+                // candidate: a binary blob, a symlink escaping the repository,
+                // and a file deleted from the working tree but still tracked
+                // all fail here. Charging such a path to the token budget would
+                // report a truncation no limit caused.
+                if tauqe_core::context::verify_path_within_repo(&root, &path).is_err() {
+                    unreadable += 1;
+                    continue;
+                }
+                let Ok(content) = std::fs::read_to_string(root.join(&path)) else {
+                    unreadable += 1;
+                    continue;
+                };
+                // A file costs its content plus the wrapper its own `<file>`
+                // element renders, so the window is priced by the same builder
+                // that renders the `<context>` block and never measures less
+                // than the audit reads.
+                let wrapper = tauqe_core::prompt::context_element_overhead_tokens(
+                    &path,
+                    ContextAccess::ReadOnly,
+                );
+                let content_tokens =
+                    tauqe_core::prompt::estimate_tokens_from_bytes(content.len() as u64);
+                let tokens = content_tokens as usize + wrapper;
+                // The expansion shares the files token budget, so it
+                // stops at the first file that would push the window past the
+                // configured limit; that file and every match behind it are
+                // candidates the budget did not pay for and are never read.
+                if total_tokens.saturating_add(tokens) > budgets.files_tokens {
+                    omitted = omitted.saturating_add(1).saturating_add(candidates.count());
+                    break;
+                }
+                total_tokens = total_tokens.saturating_add(tokens);
+                files.push(ContextFileContent {
+                    path,
+                    access: ContextAccess::ReadOnly,
+                    content,
+                });
+            }
+
+            (files, total_tokens, matched_files, unreadable, omitted)
+        })
+        .await
+        .map_err(|err| format!("Failed to list the repository for the audit window: {err}"))?;
 
     let selected_files = files.len();
-    let selected_tokens = total_tokens.saturating_sub(context.tokens);
+    let selected_tokens = estimated_tokens.saturating_sub(context_tokens);
     // The file token budget is the only knife: a matched candidate is either
-    // selected or dropped because the budget could not pay for it.
-    let omitted_by_budget = candidates.saturating_sub(selected_files);
+    // selected or dropped because the budget could not pay for it, while a
+    // match nobody could read is counted on its own counter.
     Ok(ExpandedWindow {
         files,
-        estimated_tokens: total_tokens,
+        estimated_tokens,
         window: ReviewPreviewWindow {
-            context_files: context.files.len(),
-            context_tokens: context.tokens,
+            context_files,
+            context_tokens,
             matched_files,
             selected_files,
             selected_tokens,
             omitted_files: omitted_by_budget,
             omitted_by_budget,
+            unreadable_files,
             files_token_budget: budgets.files_tokens,
         },
     })

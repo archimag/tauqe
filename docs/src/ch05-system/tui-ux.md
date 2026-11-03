@@ -62,7 +62,7 @@ Five primary views form the workspace, and History is always the last tab:
 
 | Chord | View | Role |
 | --- | --- | --- |
-| `Ctrl+1` | REPL (Develop) | the execution canvas: turns, streaming answer, diffs, plan stepper |
+| `Ctrl+1` | REPL | the execution canvas: turns, streaming answer, diffs, plan stepper |
 | `Ctrl+2` | Plans | concept tree and implementation steps |
 | `Ctrl+3` | Review | audit sessions and findings |
 | `Ctrl+4` | Context | pinned, user, and auto layers with token metrics |
@@ -76,14 +76,14 @@ Ancillary surfaces are reached without leaving a view: model selection on `C-M` 
 `M-M`, the theme selector on `M-T`, the interface-language dialog on `M-L`, the
 usage breakdown on `M-U`, and the diff inspector on `C-V` / `M-V`.
 
-**Model selection is one component, not five.** The picker on `C-M` / `M-M` and the
-four dialogs that choose a model for a role — the review launcher, the plan refinement
-form, the finding decomposition form, and the point-execution form — all draw their rows
-through the same selector. One list state, one cyclic navigation, one positional
-quick-select, one scroll window, and one click-to-index translation serve every surface,
-so a picker row and a dialog row can never disagree about which rung `Enter` dispatches
-or which model a click selects. The picker differs only in the role it presents
-(`primary`) and in its card chrome.
+**Model selection is one component, not six.** The picker on `C-M` / `M-M` and the
+five dialogs that choose a model for a role — the review launcher, the plan refinement
+form, the finding decomposition form, the point-execution form, and the post-analysis
+confirmation — all draw their rows through the same selector. One list state, one cyclic
+navigation, one positional quick-select, one scroll window, and one click-to-index
+translation serve every surface, so a picker row and a dialog row can never disagree
+about which rung `Enter` dispatches or which model a click selects. The picker differs
+only in the role it presents (`primary`) and in its card chrome.
 
 **The picker presents the configured ladder exclusively.** It lists exactly the tiers
 declared under `[models.primary]`, each shown as `model [effort]`, and it offers no path
@@ -103,7 +103,7 @@ While a turn runs, the REPL renders it as a live document rather than a growing
 paragraph:
 
 - **Lifecycle badges** report the turn status (awaiting, thinking, responding, editing,
-  verifying, discovery, staging, healing, done, cancelled, error) and the current phase,
+  verifying, research, staging, healing, done, cancelled, error) and the current phase,
   with a round counter where the phase repeats.
 - **The reasoning transcript** streams as a bounded sliding tail: the most recent lines
   with a running line count, rendered with lightweight per-line styling. The full
@@ -124,7 +124,7 @@ paragraph:
 
 ### 2.3 Focus: editor versus viewport
 
-The Develop view has exactly two focus targets, because arrows and `Ctrl+P` / `Ctrl+N`
+The REPL view has exactly two focus targets, because arrows and `Ctrl+P` / `Ctrl+N`
 mean different things in a text buffer and in a diff list.
 
 - **Editor focus (default).** Every printable character is inserted; Emacs and Readline
@@ -350,6 +350,14 @@ description.
   resolution form, and the decision it records — the status, the reasoning, and the agreed
   remediation — is applied by the structured payload of that round, so the persisted
   session and the dialogue can never diverge.
+- A confirmation that carries a role ladder keeps the shared dialog vocabulary. The
+  post-analysis card lists the Architect rungs above its action bar and carries no
+  directives editor, so the ladder claims the band a form dialog would give its text
+  field. The arrows, bare digits, and paging browse the ladder only while it holds
+  focus, so a digit pressed over the action bar never selects a rung; `C-M` / `M-M`
+  switch the highlighted rung from any section, and `Tab` / `Shift+Tab` walk the
+  ladder and the actions. The classification starts only from the focused run button,
+  or on `C-Enter` from any section, so the safe `Cancel` default never spends a token.
 
 ### 3.4 The three-way batch stop
 
@@ -421,7 +429,7 @@ events, and the cached rendering of a row is invalidated when its status changes
 badge and its restore hint appear without a reload.
 
 **In the prompt.** When a turn is rolled back, the REPL raises one warning notification
-and leaves a persistent hint row in the Develop view until the next turn starts. The
+and leaves a persistent hint row in the REPL view until the next turn starts. The
 notification states the operative fact — the prompt was not saved to the model history
 — and names the recall chord, projected through the configured meta modifier so it
 advertises the key the developer actually has. Recall stays reachable by two routes:

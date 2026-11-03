@@ -138,6 +138,13 @@ pub fn format_plan_step_execution_prompt(
             escape_list(&step.readonly_files)
         ));
     }
+
+    if !step.outer_docs.is_empty() {
+        out.push_str(&format!(
+            "- **Preloaded External Specifications (read-only reference)**: {}\n",
+            escape_list(&step.outer_docs)
+        ));
+    }
     if !step.depends_on.is_empty() {
         out.push_str(&format!(
             "- **Prerequisite Steps (must be DONE)**: {}\n",
@@ -162,20 +169,20 @@ pub fn format_plan_step_execution_prompt(
     match protocol {
         EditProtocolKind::Structured => {
             out.push_str("4. Keep changes minimal and coherent. Toolchain verification is handled automatically and deterministically by the harness; do NOT fill the `verify` field.\n");
-            out.push_str("5. When implementation and verification are complete, set the `outcome` field to status \"success\" and fill in `summary` describing the completed work.\n");
-            out.push_str("6. Discovery Phase: If you need to inspect or edit files listed in <repo_map> that are not yet loaded in <context>, request them immediately by listing them in the `context_requests` array before writing code or explanations: a repository-relative path is read-only, and an `editable:` prefix (such as `editable:src/lib.rs`) marks it editable. Request all necessary files together in a single response to avoid exhausting discovery rounds. Do NOT halt with conversational text if the necessary files can simply be requested.\n");
+            out.push_str("5. When implementation and verification are complete, set the `outcome` field to status \"success\" and fill in `commit_message` with the English Conventional Commits commit message of the change set.\n");
+            out.push_str("6. Research Phase: If you need to inspect or edit files listed in <repo_map> that are not yet loaded in <context>, request them immediately by listing them in the `context_requests` array before writing code or explanations: a repository-relative path is read-only, and an `editable:` prefix (such as `editable:src/lib.rs`) marks it editable. Request all necessary files together in a single response to avoid exhausting research rounds. Do NOT halt with conversational text if the necessary files can simply be requested. An external specification declared for this step is already materialized in <context> as read-only reference: request a document below its root through the `outer_doc_requests` field as `root/relative.md`, follow the relative links the root text carries, and never name a path that climbs above the declared root.\n");
             out.push_str("7. If the step cannot be implemented within the approved architectural decision, because the implementation would require a different data structure, a changed interface, a substituted component, or a relaxed concept invariant, do NOT improvise an alternative design. Stop and set the `blocked` field with `is_blocked` true, a `reason`, and `details` describing the exact architectural conflict, so the harness starts a controlled replanning cycle.\n");
             out.push_str("8. If you encounter an insurmountable technical blocker that is unrelated to the architectural decision, set the `outcome` field to status \"error\" and fill in `message` with the exact blocker.\n");
         }
         EditProtocolKind::Xml | EditProtocolKind::Mixed => {
             out.push_str("4. Keep changes minimal and coherent. Toolchain verification is handled automatically and deterministically by the harness; do NOT emit <verify> tags.\n");
             out.push_str(&format!(
-                "5. When implementation and verification are complete, emit the completion tag: <success{0} summary=\"...\" />.\n",
+                "5. When implementation and verification are complete, emit the completion tag: <success{0} commit_message=\"...\" />.\n",
                 marker_suffix
             ));
 
             out.push_str(&format!(
-                "6. Discovery Phase: If you need to inspect or edit files listed in <repo_map> that are not yet loaded in <context>, request them immediately using <context_request{0} path=\"...\" access=\"read_only|editable\" /> before writing code or explanations. Request all necessary files together in a single turn to avoid exhausting discovery rounds. Do NOT halt with conversational text if the necessary files can simply be requested.\n",
+                "6. Research Phase: If you need to inspect or edit files listed in <repo_map> that are not yet loaded in <context>, request them immediately using <context_request{0} path=\"...\" access=\"read_only|editable\" /> before writing code or explanations. Request all necessary files together in a single turn to avoid exhausting research rounds. Do NOT halt with conversational text if the necessary files can simply be requested. An external specification declared for this step is already materialized in <context> as read-only reference: request a document below its root as <outer_doc_request{0} id=\"root/relative.md\" />, follow the relative links the root text carries, and never name a path that climbs above the declared root.\n",
                 marker_suffix
             ));
 
@@ -287,8 +294,10 @@ mod tests {
                 details: Some("Reuse the existing scanner.".to_string()),
                 status: PlanItemStatus::Todo,
                 blocked_reason: None,
+                commit: None,
                 files: vec!["crates/core/src/scan.rs".to_string()],
                 readonly_files: vec!["crates/core/src/api.rs".to_string()],
+                outer_docs: Vec::new(),
                 concept_refs: vec!["c-1".to_string()],
                 depends_on: Vec::new(),
                 children: Vec::new(),
@@ -332,7 +341,7 @@ mod tests {
                 .expect("prompt");
 
         for tag in [
-            "<success_M7 summary=",
+            "<success_M7 commit_message=",
             "<blocked_M7 reason=",
             "<error_M7 message=",
             "<context_request_M7 path=",
@@ -432,7 +441,7 @@ mod tests {
         .expect("prompt");
 
         // Mixed encodes code edits through the tagged contour.
-        assert!(prompt.contains("<success_M7 summary="));
+        assert!(prompt.contains("<success_M7 commit_message="));
     }
 
     #[test]
@@ -448,5 +457,43 @@ mod tests {
         assert!(!prompt.contains("M7"));
         assert!(prompt.contains("`changes`"));
         assert!(prompt.contains("`outcome`"));
+    }
+
+    #[test]
+    fn execution_prompt_renders_preloaded_external_specifications() {
+        let mut plan = leaf_plan();
+        let step = plan.items.first_mut().expect("the single step");
+        step.outer_docs = vec![
+            "vendor/api.md".to_string(),
+            "mylib/architecture.md".to_string(),
+        ];
+
+        let prompt =
+            format_plan_step_execution_prompt(&plan, "1", EditProtocolKind::Xml, Some("M7"))
+                .expect("prompt");
+
+        // The pre-loaded specifications are published as reference context ...
+        assert!(prompt.contains(
+            "**Preloaded External Specifications (read-only reference)**: vendor/api.md, mylib/architecture.md"
+        ));
+        // ... and the directive names the prefix an additional request travels
+        // with, bound to the active turn marker.
+        assert!(prompt.contains("<outer_doc_request_M7 id=\"root/relative.md\" />"));
+        assert!(prompt.contains("never name a path that climbs above the declared root"));
+    }
+
+    #[test]
+    fn structured_execution_prompt_names_the_outer_doc_field() {
+        let mut plan = leaf_plan();
+        let step = plan.items.first_mut().expect("the single step");
+        step.outer_docs = vec!["vendor/api.md".to_string()];
+
+        let prompt =
+            format_plan_step_execution_prompt(&plan, "1", EditProtocolKind::Structured, None)
+                .expect("prompt");
+
+        assert!(prompt.contains("vendor/api.md"));
+        assert!(prompt.contains("`outer_doc_requests`"));
+        assert!(!prompt.contains("<outer_doc_request"));
     }
 }

@@ -97,6 +97,18 @@ pub enum StreamEvent {
     EditHunk {
         path: String,
         hunk_index: usize,
+        /// One-based first line of the hunk in the file before the change.
+        ///
+        /// `0` states that the position is unknown.
+        old_start: usize,
+        /// Number of source lines the hunk covers.
+        old_lines: usize,
+        /// One-based first line of the hunk in the file after the change.
+        new_start: usize,
+        /// Number of result lines the hunk covers.
+        new_lines: usize,
+        /// Section the hunk belongs to, as a diff header names it after its ranges.
+        context_hint: Option<String>,
         old_text: String,
         new_text: String,
     },

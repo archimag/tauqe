@@ -728,8 +728,10 @@ pub(crate) fn execute_all_reviews_action(st: &mut AppState) {
         return;
     }
 
-    let sessions = st.review.effective_sessions();
-    if sessions.is_empty() {
+    // The mirrored sessions are borrowed for the queue walk, so the action pays
+    // no deep clone of every session it inspects (c-1, c-2).
+    let session_count = st.review.effective_sessions().len();
+    if session_count == 0 {
         st.notify_info(active_t("notify.review_no_sessions"));
         return;
     }
@@ -740,7 +742,7 @@ pub(crate) fn execute_all_reviews_action(st: &mut AppState) {
     let mut discussion_count = 0;
     let mut fixed_count = 0;
 
-    for session in &sessions {
+    for session in st.review.effective_sessions() {
         let mut session_items: Vec<ReviewIssue> = Vec::new();
         for item in &session.items {
             total_items += 1;
@@ -757,7 +759,7 @@ pub(crate) fn execute_all_reviews_action(st: &mut AppState) {
                 _ => {}
             }
         }
-        group_plans += architectural_plan_count(session, &session_items);
+        group_plans += architectural_plan_count(session.as_ref(), &session_items);
         todo_items.extend(session_items);
     }
 
@@ -1522,10 +1524,11 @@ pub async fn handle_review_key(
                             .map(str::to_string)
                             .unwrap_or_else(|| review_id.clone());
                         st.confirm_button = crate::app::ConfirmDialogButton::Cancel;
-                        st.confirm_review_analyze = Some(ConfirmReviewAnalyzeState {
+                        st.confirm_review_analyze = Some(ConfirmReviewAnalyzeState::new(
                             review_id,
                             review_title,
-                        });
+                            crate::views::plans::architect_entries(&st),
+                        ));
                     }
                     None => {
                         st.notify_info(active_t("notify.review_no_sessions"));
@@ -2081,6 +2084,13 @@ mod tests {
             .expect("the confirmation must be armed");
         assert_eq!(target.review_id, "rev-1");
         assert_eq!(target.review_title, "Session rev-1");
+        // The dialog carries exactly the Architect ladder the shared builder
+        // supplies, so the post-analysis and the refinement dialogs can never
+        // disagree about the configured architects (c-dialog-parity).
+        let expected = crate::views::plans::architect_entries(&st);
+        assert_eq!(target.selector.len(), expected.len());
+        assert_eq!(target.selected_entry(), expected.first());
+        assert_eq!(target.focus, crate::app::ReviewAnalyzeFocus::ModelList);
         assert_eq!(st.confirm_button, crate::app::ConfirmDialogButton::Cancel);
         assert!(
             !st.review.analyzing,

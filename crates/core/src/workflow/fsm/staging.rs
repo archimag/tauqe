@@ -4,7 +4,7 @@
 //! patch-retry loop that repairs pattern-matching discrepancies, tracking the
 //! residual failures for the caller to interpret. The phase operates on the
 //! shared [`TurnKernel`] and never touches Git or the working tree directly;
-//! discovery and the corrective budget of an empty answer belong to the kernel.
+//! research and the corrective budget of an empty answer belong to the kernel.
 
 use std::collections::{HashMap, HashSet};
 
@@ -550,7 +550,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn scratchpad_from_discovery_reaches_patch_retry() {
+    async fn scratchpad_from_research_reaches_patch_retry() {
         let (_dir, root) = setup_repo(&[
             ("a.rs", TARGET),
             ("helper.rs", "pub const ANSWER: i32 = 42;\n"),
@@ -866,7 +866,7 @@ mod tests {
         let protocol = XmlPromptProtocol;
         let mut policy = DirectApplyPolicy::new();
         let options = WorkflowOptions {
-            max_discovery_rounds: 4,
+            max_research_rounds: 4,
             ..Default::default()
         };
         let (stream_tx, rx) = mpsc::channel(256);
@@ -1265,7 +1265,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn discovery_findings_accumulate_in_an_append_only_journal_tail() {
+    async fn research_findings_accumulate_in_an_append_only_journal_tail() {
         let (_dir, root) = setup_repo(&[("a.rs", TARGET)]);
         let mut context = context_with_target(&root);
         let mut history = HistoryManager::new(root.clone());
@@ -1308,11 +1308,11 @@ mod tests {
         let task_at = user.content.find("Explain the git workflow").expect("task");
         let tail_at = user
             .content
-            .find("<discovery_journal>")
+            .find("<research_journal>")
             .expect("journal tail");
         assert!(task_at < tail_at);
         assert!(user.content.contains("<system_documentation>"));
-        assert!(user.content.trim_end().ends_with("</discovery_journal>"));
+        assert!(user.content.trim_end().ends_with("</research_journal>"));
     }
 
     #[tokio::test]
@@ -1598,7 +1598,7 @@ args = ["-c", "printf 'formatter failed' >&2; exit 3"]
         );
     }
 
-    /// A model that keeps requesting repository material until the discovery
+    /// A model that keeps requesting repository material until the research
     /// round limit is exhausted must be warned, handed the limit directive, and
     /// asked for a concluding answer built from the material already gathered.
     ///
@@ -1608,7 +1608,7 @@ args = ["-c", "printf 'formatter failed' >&2; exit 3"]
     /// arrive, and the turn still closes as a written `ModelResult::Answer`
     /// with the accumulated auto context intact.
     #[tokio::test]
-    async fn discovery_limit_warns_and_requests_a_concluding_answer() {
+    async fn research_limit_warns_and_requests_a_concluding_answer() {
         let (_dir, root) = setup_repo(&[
             ("a.rs", TARGET),
             ("helper1.rs", "pub const ONE: i32 = 1;\n"),
@@ -1630,7 +1630,7 @@ args = ["-c", "printf 'formatter failed' >&2; exit 3"]
         let protocol = XmlPromptProtocol;
         let mut policy = DirectApplyPolicy::new();
         let options = WorkflowOptions {
-            max_discovery_rounds: 2,
+            max_research_rounds: 2,
             ..WorkflowOptions::default()
         };
         // The receiver stays open for the whole turn, so the warning banner is
@@ -1667,9 +1667,9 @@ args = ["-c", "printf 'formatter failed' >&2; exit 3"]
         }
         assert!(outcome
             .assistant_text
-            .contains("Discovery round limit reached"));
+            .contains("Research round limit reached"));
 
-        // Two discovery rounds and one concluding answer request.
+        // Two research rounds and one concluding answer request.
         assert_eq!(provider.requests().len(), 4);
 
         // The developer-facing stream explains why the investigation stopped.
@@ -1680,16 +1680,16 @@ args = ["-c", "printf 'formatter failed' >&2; exit 3"]
             }
         }
         assert!(
-            streamed.contains("Discovery round limit reached"),
+            streamed.contains("Research round limit reached"),
             "the stream must explain the exhausted round budget: {streamed:?}"
         );
-        assert!(streamed.contains("max_discovery_rounds = 2"));
+        assert!(streamed.contains("max_research_rounds = 2"));
 
         // The concluding request carries the limit directive and the answer
         // reminder, and the gathered material is still visible in the context.
         let concluding = &provider.requests()[3].messages[1].content;
         assert!(concluding.contains("<response_directive>"));
-        assert!(concluding.contains("The discovery round limit is exhausted"));
+        assert!(concluding.contains("The research round limit is exhausted"));
         assert!(concluding.contains("Your investigation for this turn is complete"));
         assert!(provider.requests()[3].messages[0]
             .content
@@ -1936,7 +1936,7 @@ args = ["-c", "printf 'formatter failed' >&2; exit 3"]
             "verification must read the change set without the sandbox: {captured:?}"
         );
     }
-    /// A later discovery round that only repeats requests the context already
+    /// A later research round that only repeats requests the context already
     /// satisfies still delivers the aggregate hint.
     ///
     /// The guard that decides whether such a round deserves another provider
@@ -1944,7 +1944,7 @@ args = ["-c", "printf 'formatter failed' >&2; exit 3"]
     /// accumulated turn text instead answers "yes" from the second round
     /// onward, because that text also carries the harness round banners, so the
     /// directive would be unreachable for every turn that performs more than
-    /// one discovery round.
+    /// one research round.
     #[tokio::test]
     async fn a_repeated_satisfied_request_delivers_the_directive_in_a_later_round() {
         let (_dir, root) = setup_repo(&[
@@ -1966,7 +1966,7 @@ args = ["-c", "printf 'formatter failed' >&2; exit 3"]
         let protocol = XmlPromptProtocol;
         let mut policy = DirectApplyPolicy::new();
         let options = WorkflowOptions {
-            max_discovery_rounds: 4,
+            max_research_rounds: 4,
             ..Default::default()
         };
         let (stream_tx, rx) = mpsc::channel(256);
@@ -2053,7 +2053,7 @@ args = ["-c", "printf 'formatter failed' >&2; exit 3"]
         let protocol = XmlPromptProtocol;
         let mut policy = DirectApplyPolicy::new();
         let options = WorkflowOptions {
-            max_discovery_rounds: 4,
+            max_research_rounds: 4,
             ..Default::default()
         };
         let (stream_tx, rx) = mpsc::channel(256);

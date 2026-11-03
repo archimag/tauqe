@@ -213,7 +213,7 @@ mod tests {
         for capability in [
             LlmCapability::TextMessage,
             LlmCapability::FileEdits,
-            LlmCapability::Discovery,
+            LlmCapability::Research,
             LlmCapability::DocRequest,
             LlmCapability::ToolchainVerify,
             LlmCapability::PlanCreation,
@@ -366,11 +366,11 @@ mod tests {
             "Working on it.\n",
             "<context_request path=\"src/a.rs\" access=\"editable\" />\n",
             "<repo_search path=\"src\" regex=\"fn main\" />\n",
-            "<doc_request topic=\"workflow\" />\n",
+            "<tauqe_doc_request topic=\"workflow\" />\n",
             "<verify target=\"clippy\" on_success=\"silent\" />\n",
             "<scratchpad>Verified: parser works.</scratchpad>\n",
             "<user_language>Russian</user_language>\n",
-            "<success summary=\"All checks pass\" />\n",
+            "<success commit_message=\"All checks pass\" />\n",
         );
         let commands = protocol.decode(output, &[]);
 
@@ -400,7 +400,7 @@ mod tests {
         }));
         assert!(commands.contains(&LlmCommand::Outcome {
             outcome: LlmOutcome::Success {
-                summary: Some("All checks pass".to_string()),
+                commit_message: Some("All checks pass".to_string()),
             },
         }));
     }

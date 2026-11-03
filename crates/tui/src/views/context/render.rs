@@ -38,11 +38,11 @@ pub fn render_context_view(
         .iter()
         .filter(|i| i.layer == ContextLayer::Auto)
         .count();
-    let refs_count = state
+    let outer_docs_count = state
         .context
         .items
         .iter()
-        .filter(|i| i.layer == ContextLayer::Refs)
+        .filter(|i| i.layer == ContextLayer::OuterDocs)
         .count();
 
     context_lines.push(Line::from(vec![
@@ -52,10 +52,10 @@ pub fn render_context_view(
             engine.fg(palette.status_info).bold(),
         ),
         Span::raw(format!(
-            " | Files: {} (Pinned: {}, Refs: {}, User: {}, Auto: {})",
+            " | Files: {} (Pinned: {}, OuterDocs: {}, User: {}, Auto: {})",
             state.context.items.len(),
             pinned_count,
-            refs_count,
+            outer_docs_count,
             user_count,
             auto_count
         )),
@@ -93,8 +93,8 @@ pub fn render_context_view(
                             active_t("context.section.pinned_hint"),
                         )
                     }
-                    ContextLayer::Refs => {
-                        let arrow = if state.context_view.refs_expanded {
+                    ContextLayer::OuterDocs => {
+                        let arrow = if state.context_view.outer_docs_expanded {
                             "▼"
                         } else {
                             "▶"
@@ -103,16 +103,16 @@ pub fn render_context_view(
                             .context
                             .items
                             .iter()
-                            .filter(|i| i.layer == ContextLayer::Refs)
+                            .filter(|i| i.layer == ContextLayer::OuterDocs)
                             .map(|i| i.estimated_tokens)
                             .sum();
                         (
                             arrow,
-                            active_t("context.section.refs"),
-                            refs_count,
+                            active_t("context.section.outer_docs"),
+                            outer_docs_count,
                             tokens,
                             palette.status_success,
-                            active_t("context.section.refs_hint"),
+                            active_t("context.section.outer_docs_hint"),
                         )
                     }
                     ContextLayer::User => {
@@ -248,8 +248,8 @@ pub fn render_context_view(
             active_t("context.info.pinned"),
             engine.fg(palette.status_info),
         )),
-        Some(ContextRow::Header(ContextLayer::Refs)) => Line::from(Span::styled(
-            active_t("context.info.refs"),
+        Some(ContextRow::Header(ContextLayer::OuterDocs)) => Line::from(Span::styled(
+            active_t("context.info.outer_docs"),
             engine.fg(palette.status_success),
         )),
         Some(ContextRow::Header(ContextLayer::User)) => Line::from(Span::styled(
@@ -267,8 +267,8 @@ pub fn render_context_view(
                     .replacen("{}", &it.estimated_tokens.to_string(), 1),
                 engine.fg(palette.status_info),
             )),
-            ContextLayer::Refs => Line::from(Span::styled(
-                active_t("context.info.refs_item")
+            ContextLayer::OuterDocs => Line::from(Span::styled(
+                active_t("context.info.outer_docs_item")
                     .replacen("{}", it.path.as_str(), 1)
                     .replacen("{}", &it.estimated_tokens.to_string(), 1),
                 engine.fg(palette.status_success),

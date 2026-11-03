@@ -125,7 +125,7 @@ where
 }
 
 /// Extracts the human-readable text from a panic payload.
-fn panic_payload_message(payload: &(dyn std::any::Any + Send)) -> String {
+pub(crate) fn panic_payload_message(payload: &(dyn std::any::Any + Send)) -> String {
     if let Some(text) = payload.downcast_ref::<&str>() {
         (*text).to_string()
     } else if let Some(text) = payload.downcast_ref::<String>() {

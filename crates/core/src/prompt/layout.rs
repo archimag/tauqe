@@ -74,7 +74,7 @@ pub trait PromptLayout: Send + Sync {
 /// outline, context files in insertion order, active plan, language directive,
 /// and session history — and the genuinely round-varying scratchpad closes the
 /// sequence. The `<context>` block lists every file of the turn in insertion
-/// order, so a file that discovery appends extends the block at its tail.
+/// order, so a file that research appends extends the block at its tail.
 pub struct SemanticLayout;
 
 /// The semantic block-order policy shared by every turn that selects it.
@@ -378,7 +378,7 @@ mod tests {
             files,
             "git",
             EditProtocolKind::Xml,
-            Some(HistorySnapshot::new(records)),
+            Some(std::sync::Arc::new(HistorySnapshot::new(records))),
             None,
         )
     }

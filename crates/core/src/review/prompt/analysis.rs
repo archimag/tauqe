@@ -34,12 +34,13 @@ pub fn build_post_analysis_system_prompt() -> String {
     out.push_str("   - `architectural_groups`: clusters of findings that manifest one shared architectural root cause. Each cluster states that root cause in `title`, explains in `description` why exactly these findings belong together, and lists the findings that manifest it in `issue_ids`.\n");
     out.push_str("   - Cluster by a root cause that one coherent fix would resolve together, never by superficial similarity: findings that merely mention the same module, type, or symptom do not share a root cause.\n\n");
 
-    out.push_str("3. Initial Triage Contract:\n");
+    out.push_str("3. Initial Triage Contract (Action-First Bias):\n");
     out.push_str("   - `triage` carries one entry per finding, with the identity of the finding and the status its resolution starts from.\n");
+    out.push_str("   - Default to `todo` for all defects, bugs, performance bottlenecks, and code hygiene issues where the code or finding recommendations already outline an actionable remediation path.\n");
     out.push_str("   - Route a finding to `todo` when the code already decides its resolution: one unambiguous defect with one correct behavior, an unhandled error, a leak, a missing validation, a typo, an outdated reference, or a violation of a convention the project already states. No decision is open, so the finding can be executed immediately.\n");
-    out.push_str("   - Route a finding to `discussion` when its resolution depends on a decision only the engineer can make: a choice between architectural alternatives, a change of a public API or of an external contract, a compatibility or data-migration trade-off, or a product policy.\n");
-    out.push_str("   - For a `discussion` finding, state the open question in `discussion_topic` exactly as the engineer must answer it, and leave `discussion_topic` empty when the finding is routed to `todo`.\n");
-    out.push_str("   - Never route a finding to `discussion` merely because its fix is large or touches several files, and never route to `todo` a finding whose correct behavior is genuinely undecided.\n\n");
+    out.push_str("   - Route a finding to `discussion` strictly when its resolution depends on a decision only the engineer can make: a choice between mutually exclusive architectural alternatives, a change of a public API or of an external contract, a compatibility or data-migration trade-off, or a product policy.\n");
+    out.push_str("   - For a `discussion` finding, state the open question in `discussion_topic` as a concrete decision fork (e.g. Option A vs Option B) exactly as the engineer must answer it, and leave `discussion_topic` empty when the finding is routed to `todo`. Never formulate a vague or rhetorical question.\n");
+    out.push_str("   - Never route a finding to `discussion` merely because its fix is large or touches several files, when the finding already suggests an actionable recommendation, or for internal refactorings without external contract breaks; and never route to `todo` a finding whose correct behavior is genuinely undecided.\n\n");
 
     out.push_str("4. Identity Reference Invariant:\n");
     out.push_str("   - Findings are referenced exclusively by the `uuid` rendered for each of them, in the routing and in the classification alike: a 36-character UUIDv7 in canonical `8-4-4-4-12` hyphenated form, copied exactly as given.\n");
@@ -139,7 +140,7 @@ pub fn build_post_analysis_user_prompt(session: &ReviewSession) -> String {
 
     out.push_str("## Post-Analysis Instructions:\n");
     out.push_str("1. Read every finding above together: the groups audited different slices, so compare findings across groups before deciding what is local and what is systemic.\n");
-    out.push_str("2. Route every finding exactly once: send it to `todo` when the code already decides its resolution, and to `discussion` when it needs a decision only the engineer can make, stating that decision in `discussion_topic`.\n");
+    out.push_str("2. Route every finding exactly once: default to `todo` when an actionable fix or recommendation exists, and reserve `discussion` strictly for genuine decision forks, stating that decision in `discussion_topic`.\n");
     out.push_str("3. Classify each finding that carries a `uuid` exactly once: list it in `independent_issues` when it stands on its own, or in `issue_ids` of the `architectural_groups` cluster whose root cause it manifests.\n");
     out.push_str("4. Reference findings by their `uuid` only: copy the 36 characters rendered after `UUID` exactly as they appear, without backticks, quotes, a `uuid:` label, or any shortened or re-cased variant.\n");
     out.push_str("5. Never substitute a display label for an identity: the `#id` numbers and the finding titles identify nothing, and an identifier this prompt does not show does not exist.\n");

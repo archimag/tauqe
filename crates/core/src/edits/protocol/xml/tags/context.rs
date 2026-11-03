@@ -18,13 +18,17 @@ pub fn strip_context_request_tags(text: &str) -> String {
     }
 }
 
-/// Parses all `<context_request>` tags into typed access requests.
-pub(crate) fn parse_context_request_tags(text: &str) -> Vec<ContextRequest> {
+/// Parses all `<context_request>` tags into typed access requests, reusing a
+/// precomputed markdown code index.
+pub(crate) fn parse_context_request_tags_with_fences(
+    text: &str,
+    fences: &super::CodeFences,
+) -> Vec<ContextRequest> {
     let Some(spec) = tag_spec() else {
         return Vec::new();
     };
     let mut requests = Vec::new();
-    for found in engine::iter_tags(text, spec) {
+    for found in engine::iter_tags_with_fences(text, spec, fences) {
         let Some(raw_path) = found.attr("path") else {
             continue;
         };
@@ -49,6 +53,11 @@ pub(crate) fn parse_context_request_tags(text: &str) -> Vec<ContextRequest> {
         });
     }
     requests
+}
+
+/// Parses all `<context_request>` tags into typed access requests.
+pub(crate) fn parse_context_request_tags(text: &str) -> Vec<ContextRequest> {
+    parse_context_request_tags_with_fences(text, &super::CodeFences::find(text))
 }
 
 #[cfg(test)]

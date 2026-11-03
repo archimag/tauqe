@@ -11,7 +11,7 @@ use tauqe_protocol::{CapabilitySet, PatchStrategy};
 use crate::capabilities::{CapabilityRegistry, PromptRenderContext};
 use crate::edits::protocol::xml::engine::tag_bases;
 
-/// Renders the XML edit protocol reference for the interactive develop set.
+/// Renders the XML edit protocol reference for the interactive REPL set.
 pub(super) fn base_system_instructions(
     editable_paths: &[String],
     patch_strategy: PatchStrategy,
@@ -120,7 +120,10 @@ mod tests {
         assert!(instr.contains("<edit path"));
         assert!(instr.contains("<context_request"));
         assert!(instr.contains("<repo_search"));
-        assert!(instr.contains("<doc_request"));
+        // The documentation channel publishes one canonical spelling, so the
+        // reference advertises it alone while the alias stays decodable.
+        assert!(instr.contains("<tauqe_doc_request"));
+        assert!(!instr.contains("<doc_request"));
         assert!(instr.contains("<verify"));
         assert!(instr.contains("<plan action"));
         assert!(instr.contains("<concept_item"));
@@ -155,7 +158,7 @@ mod tests {
         );
         assert!(marked.contains(&format!("<scratchpad_{m}>", m = marker)));
         assert!(marked.contains(&format!("</scratchpad_{m}>", m = marker)));
-        assert!(marked.contains(&format!("<success_{m} summary", m = marker)));
+        assert!(marked.contains(&format!("<success_{m} commit_message", m = marker)));
         assert!(marked.contains(&format!("<error_{m} message", m = marker)));
         assert!(marked.contains(&format!("<blocked_{m} reason", m = marker)));
         assert!(marked.contains(&format!("<edits_{m} summary", m = marker)));

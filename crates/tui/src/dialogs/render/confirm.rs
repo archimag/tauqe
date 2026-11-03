@@ -9,10 +9,13 @@
 //! through the runtime locale (`crate::i18n::active_t`), so a hot-swapped locale
 //! reaches the whole dialog without touching the renderers (Conventions §9, c-1).
 
-use ratatui::style::Stylize;
+use ratatui::layout::{Alignment, Rect};
+use ratatui::style::{Style, Stylize};
 use ratatui::text::{Line, Span};
+use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 
-use crate::app::AppState;
+use crate::app::{AppState, ConfirmDialogButton};
+use crate::components::modal::verb_hint;
 use crate::i18n::active_t;
 use crate::theme::engine::current_engine;
 use crate::ui::header::truncate_to_width;
@@ -726,57 +729,250 @@ pub fn render_confirm_delete_review_popup(
 ) {
     render_modal_confirm(frame, delete_review_params(state, session_id));
 }
-/// Presentation parameters for the Architect post-analysis confirmation.
+/// Width of the post-analysis confirmation, as a percentage of the terminal.
+const REVIEW_ANALYZE_DIALOG_WIDTH: u16 = 68;
+/// Height of the post-analysis confirmation, as a percentage of the terminal.
+///
+/// The dialog carries the Architect ladder instead of a directives editor, so it
+/// needs noticeably less vertical room than a picker that stacks a model list
+/// above a text field (c-dialog-parity).
+const REVIEW_ANALYZE_DIALOG_HEIGHT: u16 = 52;
+/// Header rows: the heading, the audited session, and the classification note.
+const REVIEW_ANALYZE_HEADER_HEIGHT: u16 = 4;
+
+/// Full drawn confirm-button label of the post-analysis dialog, resolved from
+/// the runtime locale (c-1).
+fn review_analyze_confirm_label() -> String {
+    format!(" [ {} ] ", active_t("dialog.button.run_analysis"))
+}
+
+/// Full drawn cancel-button label of the post-analysis dialog, resolved from the
+/// runtime locale (c-1).
+fn review_analyze_cancel_label() -> String {
+    format!(" [ {} ] ", active_t("modal.cancel"))
+}
+
+/// Rectangles of the post-analysis confirmation, shared by the renderer and the
+/// mouse hit-tester so the surface that is drawn is the surface that is clicked
+/// (Conventions §6, §7).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ReviewAnalyzeDialogGeometry {
+    /// Whole dialog frame.
+    pub(crate) area: Rect,
+    /// Inner rows of the Architect model list (one row per entry).
+    pub(crate) model_rows: Rect,
+    /// Confirm button.
+    pub(crate) confirm_button: Rect,
+    /// Cancel button.
+    pub(crate) cancel_button: Rect,
+}
+
+/// Rows of the Architect ladder, merged with the band the shared picker layout
+/// reserves for an instructions editor.
+///
+/// The post-analysis confirms a round rather than describing one, so it carries
+/// no directives editor: the band below the ladder belongs to the list instead
+/// of leaving an empty zone under the last rung, exactly as the plan execution
+/// dialog behaves (c-dialog-parity, Conventions §6.7).
+fn review_analyze_list_area(chunks: &super::PickerDialogChunks) -> Rect {
+    let bottom = chunks.editor.y.saturating_add(chunks.editor.height);
+    Rect::new(
+        chunks.list.x,
+        chunks.list.y,
+        chunks.list.width,
+        bottom.saturating_sub(chunks.list.y),
+    )
+}
+
+/// Computes the dialog frame, the Architect-row area, and the action buttons
+/// from the shared picker layout the renderer uses, so the drawn buttons are
+/// always the clickable ones (Conventions §6, §7).
+pub(crate) fn review_analyze_dialog_geometry(
+    term: Rect,
+    entry_count: usize,
+) -> ReviewAnalyzeDialogGeometry {
+    let area = crate::ui::centered_rect(
+        REVIEW_ANALYZE_DIALOG_WIDTH,
+        REVIEW_ANALYZE_DIALOG_HEIGHT,
+        term,
+    );
+    let chunks = super::picker_dialog_chunks(area, entry_count, REVIEW_ANALYZE_HEADER_HEIGHT, 0);
+
+    // The button geometry is measured from the same localized labels the
+    // renderer draws, so hit-testing never desynchronizes from the drawing.
+    let (confirm_button, cancel_button) = super::picker_button_rects(
+        chunks.buttons,
+        &review_analyze_confirm_label(),
+        &review_analyze_cancel_label(),
+    );
+
+    ReviewAnalyzeDialogGeometry {
+        area,
+        model_rows: super::inset(review_analyze_list_area(&chunks)),
+        confirm_button,
+        cancel_button,
+    }
+}
+
+/// Renders the Architect post-analysis confirmation.
 ///
 /// The classification is a costly LLM layer over immutable findings, so the
-/// dialog names the audited session and leaves the safe `Cancel` button in
-/// focus before any tokens are spent (c-4).
-pub fn review_analyze_params(state: &AppState) -> Option<ConfirmModalParams<'_>> {
-    let target = state.confirm_review_analyze.as_ref()?;
+/// dialog names the audited session and the Architect rung the round runs on
+/// before any token is spent. It stays a confirmation: the ladder changes the
+/// configuration of the round, never its contract, and the safe `Cancel` button
+/// holds the default focus (c-dialog-parity, Conventions §5.4, §6).
+pub fn render_confirm_review_analyze_popup(frame: &mut ratatui::Frame, state: &AppState) {
+    let Some(target) = state.confirm_review_analyze.as_ref() else {
+        return;
+    };
+
     let engine = current_engine();
     let palette = engine.palette();
+    let dim = engine.fg(palette.text_muted);
+    let entry_count = target.selector.len();
+    let area = crate::ui::centered_rect(
+        REVIEW_ANALYZE_DIALOG_WIDTH,
+        REVIEW_ANALYZE_DIALOG_HEIGHT,
+        frame.area(),
+    );
+    frame.render_widget(Clear, area);
 
-    let body_lines = vec![
-        Line::raw(""),
+    let outer_block = Block::default()
+        .title(format!(" {} ", active_t("dialog.review_analyze.title")))
+        .borders(Borders::ALL)
+        .border_style(engine.fg(palette.button_active_bg))
+        .style(Style::default().bg(engine.color(palette.surface)));
+    frame.render_widget(outer_block, area);
+
+    let chunks = super::picker_dialog_chunks(area, entry_count, REVIEW_ANALYZE_HEADER_HEIGHT, 0);
+    let header_area = chunks.header;
+    // The picker layout reserves an instructions-editor band below the ladder.
+    // The post-analysis carries no editor, so the list claims that band and the
+    // card keeps no empty zone under the last rung (c-dialog-parity).
+    let list_area = review_analyze_list_area(&chunks);
+    let buttons_area = chunks.buttons;
+    let footer_area = chunks.footer;
+
+    // Header: which session the classification rewrites and what the layer means.
+    let header_lines = vec![
         Line::from(Span::styled(
-            active_t("dialog.review_analyze.heading"),
+            truncate_to_width(&active_t("dialog.review_analyze.heading"), 62),
             engine.fg(palette.status_info).bold(),
         )),
         Line::raw(""),
         Line::from(vec![
+            Span::styled(active_t("dialog.review_analyze.review_label"), dim),
             Span::styled(
-                active_t("dialog.review_analyze.review_label"),
-                engine.fg(palette.text_muted),
+                target.review_title.clone(),
+                engine.fg(palette.text_primary).bold(),
             ),
-            Span::styled(&target.review_title, engine.fg(palette.text_primary).bold()),
-            Span::styled(
-                format!(" [{}]", target.review_id),
-                engine.fg(palette.text_muted),
-            ),
+            Span::styled(format!(" [{}]", target.review_id), dim),
         ]),
-        Line::raw(""),
         Line::from(Span::styled(
-            active_t("dialog.review_analyze.note"),
-            engine.fg(palette.text_muted),
+            truncate_to_width(&active_t("dialog.review_analyze.note"), 62),
+            dim,
         )),
     ];
+    frame.render_widget(Paragraph::new(header_lines), header_area);
 
-    Some(ConfirmModalParams {
-        title: active_t("dialog.review_analyze.title"),
-        tone: ModalTone::Info,
-        body_lines,
-        confirm_label: active_t("dialog.button.run_analysis"),
-        cancel_label: active_t("modal.cancel"),
-        confirm_button: state.confirm_button,
-        destructive: false,
-        width: 64,
-    })
-}
-
-pub fn render_confirm_review_analyze_popup(frame: &mut ratatui::Frame, state: &AppState) {
-    if let Some(params) = review_analyze_params(state) {
-        render_modal_confirm(frame, params);
+    // Architect ladder. The shared `ModelSelector` owns the rows, numbering,
+    // scrolling, and empty-list safety; the block adds framing and the focus
+    // color.
+    let list_title = if entry_count > 1 {
+        active_t("dialog.review_analyze.model_list_counter")
+            .replacen("{}", &(target.selector.selected_index() + 1).to_string(), 1)
+            .replacen("{}", &entry_count.to_string(), 1)
+    } else {
+        active_t("dialog.review_analyze.model_list_title")
+    };
+    let list_border = if target.focus.is_model_list() {
+        engine.fg(palette.status_info).bold()
+    } else {
+        engine.fg(palette.border)
+    };
+    let list_block = Block::default()
+        .title(list_title)
+        .borders(Borders::ALL)
+        .border_style(list_border)
+        .style(Style::default().bg(engine.color(palette.surface)));
+    let list_inner = list_block.inner(list_area);
+    frame.render_widget(list_block, list_area);
+    if entry_count == 0 {
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                active_t("dialog.review_analyze.no_models"),
+                dim,
+            ))),
+            list_inner,
+        );
+    } else {
+        let rows = target
+            .selector
+            .render_list_lines(list_inner.height as usize);
+        frame.render_widget(Paragraph::new(rows), list_inner);
     }
+
+    // Action bar with focus-aware styling.
+    let in_actions = target.focus.is_actions();
+    let confirm_selected = target.confirm_button == ConfirmDialogButton::Confirm;
+    let (confirm_style, cancel_style) = if in_actions {
+        if confirm_selected {
+            (
+                engine
+                    .bg(palette.status_success)
+                    .fg(engine.color(palette.text_inverse))
+                    .bold(),
+                engine
+                    .bg(palette.button_bg)
+                    .fg(engine.color(palette.button_fg)),
+            )
+        } else {
+            (
+                engine
+                    .bg(palette.button_bg)
+                    .fg(engine.color(palette.button_fg)),
+                engine
+                    .bg(palette.button_active_bg)
+                    .fg(engine.color(palette.text_inverse))
+                    .bold(),
+            )
+        }
+    } else {
+        (
+            engine
+                .bg(palette.button_bg)
+                .fg(engine.color(palette.button_fg)),
+            engine
+                .bg(palette.button_bg)
+                .fg(engine.color(palette.button_fg)),
+        )
+    };
+    let actions = Line::from(vec![
+        Span::styled(review_analyze_confirm_label(), confirm_style),
+        Span::raw("    "),
+        Span::styled(review_analyze_cancel_label(), cancel_style),
+    ]);
+    frame.render_widget(
+        Paragraph::new(actions).alignment(Alignment::Center),
+        buttons_area,
+    );
+
+    // The hint is docked to the card's bottom edge as its own strip filled with
+    // `palette.overlay`, so it reads as persistent chrome instead of a second
+    // row of buttons (Conventions §6.4).
+    let primary = state.tui_config.input.primary_modifier;
+    let nav_hint = if in_actions {
+        active_t("dialog.review_analyze.hint_actions")
+    } else {
+        active_t("dialog.review_analyze.hint_fields")
+            .replacen("{}", primary.prefix_str(), 1)
+            .replacen(
+                "{}",
+                &crate::components::model_selector::model_select_hint(primary),
+                1,
+            )
+    };
+    crate::components::modal::render_dialog_footer(frame, footer_area, &verb_hint(nav_hint));
 }
 /// Presentation parameters for the "clear Auto context" confirmation.
 pub fn clear_auto_params(state: &AppState) -> ConfirmModalParams<'_> {
@@ -1540,35 +1736,95 @@ mod tests {
             );
         }
     }
-    /// The post-analysis confirmation names the audited session and keeps the
-    /// safe `Cancel` default, so a costly classification is never launched by a
-    /// stray keystroke (c-4).
+    /// The post-analysis dialog names the audited session, lists every configured
+    /// Architect entry, and keeps the safe `Cancel` default focus, so a costly
+    /// classification is never launched by a stray keystroke (c-dialog-parity).
     #[test]
-    fn test_review_analyze_params_are_safe_and_named() {
+    fn test_review_analyze_dialog_lists_the_architect_ladder() {
         let mut st = crate::app::test_state();
-        assert!(review_analyze_params(&st).is_none());
-
-        st.confirm_review_analyze = Some(crate::app::ConfirmReviewAnalyzeState {
-            review_id: "rev-9".to_string(),
-            review_title: "Backend audit".to_string(),
-        });
-
-        let params = review_analyze_params(&st).expect("params should be generated");
-        assert_eq!(params.title, "Run Post-Analysis");
-        assert_eq!(params.tone, ModalTone::Info);
-        assert_eq!(params.confirm_label, "Run Analysis");
-        assert_eq!(params.cancel_label, "Cancel");
+        st.confirm_review_analyze = Some(crate::app::ConfirmReviewAnalyzeState::new(
+            "rev-9".to_string(),
+            "Backend audit".to_string(),
+            vec![
+                tauqe_protocol::ModelEntry::new(
+                    tauqe_protocol::ModelRef::openrouter("architect-a"),
+                    None,
+                ),
+                tauqe_protocol::ModelEntry::new(
+                    tauqe_protocol::ModelRef::openrouter("architect-b"),
+                    Some(tauqe_protocol::ReasoningEffort::High),
+                ),
+            ],
+        ));
+        let target = st.confirm_review_analyze.as_ref().expect("dialog open");
+        assert_eq!(target.selector.len(), 2);
         assert_eq!(
-            params.confirm_button,
+            target.confirm_button,
             crate::app::ConfirmDialogButton::Cancel
         );
-        assert!(!params.destructive);
-        let texts: Vec<String> = params.body_lines.iter().map(|l| l.to_string()).collect();
+
+        let mut terminal = Terminal::new(TestBackend::new(120, 40)).unwrap();
+        terminal
+            .draw(|f| render_confirm_review_analyze_popup(f, &st))
+            .unwrap();
+
+        let buffer = terminal.backend().buffer();
+        let mut screen = String::new();
+        for row in 0..40u16 {
+            for column in 0..120u16 {
+                screen.push_str(buffer[(column, row)].symbol());
+            }
+            screen.push('\n');
+        }
+        assert!(screen.contains("Backend audit"), "{screen}");
+        assert!(screen.contains("rev-9"), "{screen}");
+        assert!(screen.contains("architect-a"), "{screen}");
+        assert!(screen.contains("architect-b [high]"), "{screen}");
+    }
+
+    /// The geometry used for mouse hit-testing must land exactly on the drawn
+    /// action buttons, whatever the localized labels are (Conventions §6, §7).
+    #[test]
+    fn rendered_review_analyze_buttons_match_hit_geometry() {
+        let term = Rect::new(0, 0, 100, 40);
+        let mut st = crate::app::test_state();
+        st.confirm_review_analyze = Some(crate::app::ConfirmReviewAnalyzeState::new(
+            "rev-1".to_string(),
+            "Session rev-1".to_string(),
+            vec![tauqe_protocol::ModelEntry::new(
+                tauqe_protocol::ModelRef::openrouter("architect-a"),
+                None,
+            )],
+        ));
+        let entry_count = st
+            .confirm_review_analyze
+            .as_ref()
+            .expect("dialog open")
+            .selector
+            .len();
+
+        let geom = review_analyze_dialog_geometry(term, entry_count);
+        let mut terminal = Terminal::new(TestBackend::new(term.width, term.height)).unwrap();
+        terminal
+            .draw(|f| render_confirm_review_analyze_popup(f, &st))
+            .unwrap();
+
+        let buffer = terminal.backend().buffer();
+        let read = |rect: Rect| -> String {
+            (rect.x..rect.x + rect.width)
+                .map(|x| buffer[(x, rect.y)].symbol())
+                .collect()
+        };
         assert!(
-            texts.iter().any(|t| t.contains("Backend audit")),
-            "{texts:?}"
+            read(geom.confirm_button).contains("Run Analysis"),
+            "confirm row: {:?}",
+            read(geom.confirm_button)
         );
-        assert!(texts.iter().any(|t| t.contains("rev-9")), "{texts:?}");
+        assert!(
+            read(geom.cancel_button).contains("Cancel"),
+            "cancel row: {:?}",
+            read(geom.cancel_button)
+        );
     }
     /// The single-file removal confirmation names the pending path, warns with
     /// the shared tone, and keeps the safe `Cancel` default (c-4).
@@ -1620,6 +1876,9 @@ mod tests {
                 // breakdown that actually defines truncation (c-3).
                 omitted_files: 7,
                 omitted_by_budget: 5,
+                // An unreadable match is never charged to the budget, so the
+                // card scenario counts none of them (c-3).
+                unreadable_files: 0,
                 files_token_budget: 60_000,
             },
         });

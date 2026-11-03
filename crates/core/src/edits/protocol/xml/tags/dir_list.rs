@@ -14,6 +14,24 @@ pub(crate) fn tag_spec() -> Option<&'static XmlTagSpec> {
     engine::tag_spec("dir_list")
 }
 
+/// Parses all `<dir_list>` tags into typed directory listing requests, reusing
+/// a precomputed markdown code index.
+pub(crate) fn parse_dir_list_tags_with_fences(
+    text: &str,
+    fences: &super::CodeFences,
+) -> Vec<DirListRequest> {
+    let Some(spec) = tag_spec() else {
+        return Vec::new();
+    };
+    engine::iter_tags_with_fences(text, spec, fences)
+        .filter_map(|found| {
+            let path = found.attr_any(&["path", "dir"]).unwrap_or_default();
+            let recursive = found.attr("recursive").as_deref().is_some_and(is_truthy);
+            DirListRequest::new(path, recursive).normalized()
+        })
+        .collect()
+}
+
 /// Parses all `<dir_list>` tags into typed directory listing requests.
 ///
 /// `path` (or its `dir` alias) defaults to the repository root. `recursive`
@@ -23,16 +41,7 @@ pub(crate) fn tag_spec() -> Option<&'static XmlTagSpec> {
 /// [`DirListRequest::normalized`]: `.` and `./` collapse to the repository
 /// root, and a path that escapes the repository is dropped instead of resolved.
 pub(crate) fn parse_dir_list_tags(text: &str) -> Vec<DirListRequest> {
-    let Some(spec) = tag_spec() else {
-        return Vec::new();
-    };
-    engine::iter_tags(text, spec)
-        .filter_map(|found| {
-            let path = found.attr_any(&["path", "dir"]).unwrap_or_default();
-            let recursive = found.attr("recursive").as_deref().is_some_and(is_truthy);
-            DirListRequest::new(path, recursive).normalized()
-        })
-        .collect()
+    parse_dir_list_tags_with_fences(text, &super::CodeFences::find(text))
 }
 
 /// Reports whether an attribute value asks for a recursive listing.

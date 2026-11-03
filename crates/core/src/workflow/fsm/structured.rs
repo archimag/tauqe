@@ -2,7 +2,7 @@
 //!
 //! Horizon synthesis and review-group decomposition are one Architect operation,
 //! so both drive this contour: the universal turn kernel carries the rounds, the
-//! prompt assembly, the discovery journal, and the corrective budget of an empty
+//! prompt assembly, the research journal, and the corrective budget of an empty
 //! answer, while the contour owns the policy that is specific to a structured
 //! Architect payload.
 //!
@@ -35,6 +35,7 @@
 use std::path::Path;
 use std::sync::Arc;
 
+use async_trait::async_trait;
 use tauqe_protocol::{ArchitectTier, ModelRole, ProviderKind, TurnIntent, TurnPhase};
 use tokio::sync::{mpsc, watch};
 
@@ -45,11 +46,11 @@ use crate::plan::prompt::{parse_plan_refinement_output, PlanRefinementOutput};
 use crate::plan::storage::PlanMutationMode;
 use crate::prompt::refine::PlanRefinePromptProtocol;
 use crate::providers::{format_session_id, LlmProvider, StreamEvent};
-use crate::workflow::discovery::journal::TurnDiscoveryJournal;
-use crate::workflow::discovery::{
-    execute_discovery_commands, ContextLimitExceeded, DiscoveryRoundOutcome,
-};
 use crate::workflow::policy::DirectApplyPolicy;
+use crate::workflow::research::journal::TurnResearchJournal;
+use crate::workflow::research::{
+    execute_research_commands, ContextLimitExceeded, ResearchRoundOutcome,
+};
 use crate::workflow::WorkflowOptions;
 
 use super::cache::TurnInputCache;
@@ -60,15 +61,15 @@ use super::FsmTurnOutcome;
 /// Operation label recorded for every round of a synthesis run.
 const WORKFLOW_NAME: &str = "architect";
 
-/// Directive appended to the turn journal when a discovery round produced nothing.
+/// Directive appended to the turn journal when a research round produced nothing.
 ///
 /// A barren round is neither progress nor a dead end: the harness answered every
 /// request with nothing, so the round is still charged and the model receives an
 /// explicit answer contract instead of an exhausted-budget verdict.
 const BARREN_ROUND_DIRECTIVE: &str = "<response_directive>\nThe previous discovery round produced no new information: no requested file was added to context, nothing is missing, and no search or targeted contour returned a result. Finalize the horizon now with status 'success', report status 'blocked' with the exact reason, or request concrete paths that exist in <repo_map>.\n</response_directive>";
 
-/// Directive appended to the turn journal once the discovery budget is spent.
-const DISCOVERY_LIMIT_DIRECTIVE: &str = "<response_directive>\nThe discovery round limit is exhausted: no further files, repository searches, symbol contours, or documentation will be loaded in this turn. Your investigation is complete. Do not request additional paths. Finalize the horizon with status 'success', or report status 'blocked' with the exact reason when the material you already hold is insufficient.\n</response_directive>";
+/// Directive appended to the turn journal once the research budget is spent.
+const RESEARCH_LIMIT_DIRECTIVE: &str = "<response_directive>\nThe research round limit is exhausted: no further files, repository searches, symbol contours, or documentation will be loaded in this turn. Your investigation is complete. Do not request additional paths. Finalize the horizon with status 'success', or report status 'blocked' with the exact reason when the material you already hold is insufficient.\n</response_directive>";
 
 /// Typed resolver of the provider client that serves another provider.
 ///
@@ -77,14 +78,16 @@ const DISCOVERY_LIMIT_DIRECTIVE: &str = "<response_directive>\nThe discovery rou
 /// injection keeps the engine free of provider construction policy: the adapter
 /// that owns credentials and transport configuration is the only place that
 /// knows how a client is built.
+#[async_trait]
 pub trait ProviderResolver: Send + Sync {
     /// Resolves the client of `kind`.
     ///
-    /// The hook is synchronous because it is consulted from inside a proposal
-    /// round; an adapter whose resolution path is asynchronous bridges the call
-    /// itself. The `Send + Sync` bound lets a contour carry the resolver into
-    /// the task that drives the synthesis, exactly like the client it returns.
-    fn resolve(&self, kind: ProviderKind) -> anyhow::Result<Arc<dyn LlmProvider>>;
+    /// The hook is asynchronous because it is consulted from inside a proposal
+    /// round: the adapter's resolution future is awaited there, so the seam
+    /// imposes no runtime-flavor requirement on the host that polls the contour.
+    /// The `Send + Sync` bound lets a contour carry the resolver into the task
+    /// that drives the synthesis, exactly like the client it returns.
+    async fn resolve(&self, kind: ProviderKind) -> anyhow::Result<Arc<dyn LlmProvider>>;
 }
 
 /// Static configuration of one structured synthesis run.
@@ -188,7 +191,7 @@ pub async fn run_structured_refine(
     let mut policy = DirectApplyPolicy::new();
     let mut input_cache = TurnInputCache::default();
     let mut state = TurnState::default();
-    let mut journal = TurnDiscoveryJournal::default();
+    let mut journal = TurnResearchJournal::default();
     let mut accumulated_text = String::new();
     let mut rounds_used = 0usize;
     let mut empty_steps = EmptyStepGuard::default();
@@ -211,9 +214,9 @@ pub async fn run_structured_refine(
     }
 
     let (output, status) = loop {
-        // A cancel raised during discovery, while a reference document streamed,
+        // A cancel raised during research, while a reference document streamed,
         // or between two provider requests ends the synthesis before another
-        // round is spent.
+        // round of it is spent.
         if *cancel_rx.borrow() {
             break (None, StructuredRefineStatus::Cancelled);
         }
@@ -221,8 +224,8 @@ pub async fn run_structured_refine(
         // The closing directive is what a model that still needs material reads:
         // it turns an exhausted budget into an explicit answer contract instead of
         // leaving the request unanswered.
-        if rounds_used >= options.max_discovery_rounds {
-            journal.push_block(DISCOVERY_LIMIT_DIRECTIVE);
+        if rounds_used >= options.max_research_rounds {
+            journal.push_block(RESEARCH_LIMIT_DIRECTIVE);
         }
 
         let round_prompt = journal.compose_user_prompt(task, phase_diagnostics.as_deref());
@@ -401,7 +404,7 @@ pub async fn run_structured_refine(
                 // another provider needs a freshly resolved client instead of the
                 // current one.
                 if next.model.provider != tier.model.provider {
-                    provider = config.providers.resolve(next.model.provider)?;
+                    provider = config.providers.resolve(next.model.provider).await?;
                 }
                 // A promoted model addresses a backend node whose prefix cache was
                 // warmed by that very model, so the session identifier rotates with
@@ -433,25 +436,25 @@ pub async fn run_structured_refine(
                 break (Some(output), StructuredRefineStatus::Blocked { reason });
             }
             RoundStatus::NeedsContext => {
-                if rounds_used >= options.max_discovery_rounds {
+                if rounds_used >= options.max_research_rounds {
                     // The budget is spent while the Architect still needs the
                     // material it names: a typed block, never a payload that
                     // silently claims to be a horizon.
                     break (
                         Some(output),
                         StructuredRefineStatus::Blocked {
-                            reason: discovery_limit_reason(options.max_discovery_rounds),
+                            reason: research_limit_reason(options.max_research_rounds),
                         },
                     );
                 }
 
-                let outcome = execute_discovery_commands(
+                let outcome = execute_research_commands(
                     context_manager,
                     repo_root,
                     step.commands(),
-                    options.files_token_budget,
+                    options.token_budget,
                     options.repomap_token_budget,
-                    options.discovery_limits,
+                    options.research_limits,
                     true,
                     // The round races the turn's own cancel signal, so an
                     // abandoned request stops waiting for a slow reference host.
@@ -483,10 +486,10 @@ pub async fn run_structured_refine(
                 rounds_used += 1;
                 let _ = stream_tx
                     .send(StreamEvent::TurnPhase {
-                        phase: TurnPhase::Discovery,
+                        phase: TurnPhase::Research,
                         round: Some(rounds_used),
-                        max_rounds: Some(options.max_discovery_rounds),
-                        detail: Some("Discovery round completed".to_string()),
+                        max_rounds: Some(options.max_research_rounds),
+                        detail: Some("Research round completed".to_string()),
                     })
                     .await;
                 if !outcome.has_progress(true) {
@@ -594,17 +597,17 @@ fn blocked_reason(output: &PlanRefinementOutput) -> String {
         .unwrap_or_else(|| "The Architect reported a blocker without stating a reason.".to_string())
 }
 
-/// Renders the typed reason of a synthesis that ran out of discovery rounds.
-fn discovery_limit_reason(limit: usize) -> String {
+/// Renders the typed reason of a synthesis that ran out of research rounds.
+fn research_limit_reason(limit: usize) -> String {
     format!(
-        "The Architect still required repository material after {limit} discovery round(s), and no further files, searches, contours, or documentation can be loaded in this turn."
+        "The Architect still required repository material after {limit} research round(s), and no further files, searches, contours, or documentation can be loaded in this turn."
     )
 }
 
 /// Renders the typed report of a breached context budget.
 fn budget_diagnostic(limit: &ContextLimitExceeded, hint: &str) -> String {
     let mut diagnostic = format!(
-        "Context files token budget exceeded (files_token_budget = {}). The Architect requested {} token(s) in {} new file(s) [{}], but the context already holds {} token(s).",
+        "Context token budget exceeded (token_budget = {}). The Architect requested {} token(s) in {} new file(s) [{}], but the context already holds {} token(s).",
         limit.token_budget,
         limit.requested_tokens,
         limit.requested_files.len(),
@@ -623,7 +626,7 @@ fn budget_diagnostic(limit: &ContextLimitExceeded, hint: &str) -> String {
 async fn stream_round_banner(
     stream_tx: &mpsc::Sender<StreamEvent>,
     round: usize,
-    outcome: &DiscoveryRoundOutcome,
+    outcome: &ResearchRoundOutcome,
 ) {
     let summary = outcome.architect_banner_summary();
     let summary = summary.trim();
@@ -656,8 +659,9 @@ mod tests {
     /// Resolver a single-provider synthesis must never consult.
     struct NoResolver;
 
+    #[async_trait]
     impl ProviderResolver for NoResolver {
-        fn resolve(&self, kind: ProviderKind) -> anyhow::Result<Arc<dyn LlmProvider>> {
+        async fn resolve(&self, kind: ProviderKind) -> anyhow::Result<Arc<dyn LlmProvider>> {
             anyhow::bail!("a single-provider synthesis must not resolve {kind}")
         }
     }

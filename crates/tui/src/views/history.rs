@@ -6,7 +6,6 @@ use tauqe_protocol::{
     edit::EditFileOp, HistoryEntryStatus, HistoryFileChange, UiHistoryItem, UiHistoryKind,
 };
 
-use crate::clipboard::CopyResult;
 use crate::i18n::active_t;
 use crate::markdown::MarkdownBodyCache;
 use crate::ui::wrap_lines;
@@ -291,28 +290,24 @@ impl HistoryViewState {
         self.selected_item_index = selected.min(self.items.len().saturating_sub(1));
     }
 
-    /// Copies the rendered code block `(item_id, block_id)` and flashes it.
+    /// Resolves the rendered code block `(item_id, block_id)` to its source.
     ///
-    /// The view owns the blocks it drew, so it resolves the action to the exact
-    /// source it rendered and arms the flash badge; the pointer dispatcher
-    /// receives only the typed action and the reported outcome (c-1, c-2).
+    /// The view owns the blocks it drew, so the pointer dispatcher asks it what
+    /// to copy instead of re-deriving a block from the action (c-1, c-2).
     /// `None` means the block no longer exists and nothing happens.
-    pub fn copy_code_block(
-        &mut self,
-        item_id: u64,
-        block_id: usize,
-    ) -> Option<(CopyResult, usize)> {
-        let code = self
-            .code_blocks
+    pub fn code_block_source(&self, item_id: u64, block_id: usize) -> Option<String> {
+        self.code_blocks
             .iter()
             .find(|block| block.item_id == item_id && block.block_id == block_id)
-            .map(|block| block.code.clone())?;
-        let lines = code.lines().count().max(1);
-        let result = crate::clipboard::copy_to_clipboard(&code);
-        if result.is_success() {
-            self.copy_flash = Some(((item_id, block_id), std::time::Instant::now()));
-        }
-        Some((result, lines))
+            .map(|block| block.code.clone())
+    }
+
+    /// Arms the flash badge of a block whose copy has already succeeded.
+    ///
+    /// The clipboard round trip is awaited outside the state guard, so the view
+    /// only records the outcome here and never performs the write itself (c-1).
+    pub fn arm_code_copy_flash(&mut self, item_id: u64, block_id: usize) {
+        self.copy_flash = Some(((item_id, block_id), std::time::Instant::now()));
     }
 }
 

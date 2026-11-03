@@ -20,8 +20,8 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CapabilityPhase {
-    /// Gathering context and documentation before a proposal is produced.
-    Discovery,
+    /// Researching context and documentation before a proposal is produced.
+    Research,
     /// Producing the answer or the concrete code changes.
     Execution,
     /// Running deterministic toolchain verification.
@@ -34,7 +34,7 @@ impl CapabilityPhase {
     /// Canonical lower-case identifier used on the wire.
     pub const fn as_str(self) -> &'static str {
         match self {
-            Self::Discovery => "discovery",
+            Self::Research => "research",
             Self::Execution => "execution",
             Self::Verification => "verification",
             Self::Outcome => "outcome",
@@ -106,15 +106,34 @@ pub enum LlmCapability {
     /// File creation, replacement, overwrite, deletion, and move operations.
     FileEdits,
     /// Requests to add or drop files from the working context.
-    Discovery,
-    /// Requests for system documentation by topic.
+    Research,
+    /// Requests for system documentation of this harness by topic.
     DocRequest,
+    /// Requests for external project documentation by its logical identifier.
+    ///
+    /// The identifier names a document the project declared in
+    /// `[[outer_docs]]`, never a cache path, so only declared material is
+    /// reachable and the harness alone decides where a snapshot lives. The
+    /// request belongs to the research phase of every contour that investigates
+    /// the project domain, an isolated step included, because a step reads the
+    /// contracts it was pointed at; the internal documentation of the harness
+    /// itself stays closed to a step.
+    OuterDocRequest,
     /// Requests to run deterministic toolchain verification.
     ToolchainVerify,
     /// Creation of a new project plan.
     PlanCreation,
     /// Modification of an existing project plan.
     PlanUpdate,
+    /// A decision recorded for one finding of a discussed review session.
+    ///
+    /// The decision belongs to the review discussion regime: it states the
+    /// status the engineer settled on for one finding together with the
+    /// reasoning behind it, and it travels exclusively through the structured
+    /// response schema, because the capability owns no control tag. The harness
+    /// applies it against the session the turn names and never against whichever
+    /// session happens to be active.
+    ReviewUpdate,
     /// Ephemeral working-memory notes for multi-round reasoning.
     Scratchpad,
     /// Explicit terminal outcome (`success` or `error`) of a turn.
@@ -142,11 +161,13 @@ impl LlmCapability {
     pub const ALL: &'static [LlmCapability] = &[
         Self::TextMessage,
         Self::FileEdits,
-        Self::Discovery,
+        Self::Research,
         Self::DocRequest,
+        Self::OuterDocRequest,
         Self::ToolchainVerify,
         Self::PlanCreation,
         Self::PlanUpdate,
+        Self::ReviewUpdate,
         Self::Scratchpad,
         Self::Outcome,
         Self::Blocked,
@@ -160,11 +181,13 @@ impl LlmCapability {
         match self {
             Self::TextMessage => "text_message",
             Self::FileEdits => "file_edits",
-            Self::Discovery => "discovery",
+            Self::Research => "research",
             Self::DocRequest => "doc_request",
+            Self::OuterDocRequest => "outer_doc_request",
             Self::ToolchainVerify => "toolchain_verify",
             Self::PlanCreation => "plan_creation",
             Self::PlanUpdate => "plan_update",
+            Self::ReviewUpdate => "review_update",
             Self::Scratchpad => "scratchpad",
             Self::Outcome => "outcome",
             Self::Blocked => "blocked",
@@ -177,11 +200,12 @@ impl LlmCapability {
     /// Phase of the bounded turn this capability belongs to.
     pub const fn phase(self) -> CapabilityPhase {
         match self {
-            Self::Discovery | Self::DocRequest => CapabilityPhase::Discovery,
+            Self::Research | Self::DocRequest | Self::OuterDocRequest => CapabilityPhase::Research,
             Self::TextMessage
             | Self::FileEdits
             | Self::PlanCreation
             | Self::PlanUpdate
+            | Self::ReviewUpdate
             | Self::Scratchpad
             | Self::UserLanguage
             | Self::CustomTools => CapabilityPhase::Execution,
@@ -275,8 +299,26 @@ impl CapabilityProfile {
         )
     }
 
-    /// One isolated step: the dialogue head minus plan authoring and
-    /// documentation, no delta.
+    /// Review finding dialogue: the shared head plus the decision in the delta.
+    ///
+    /// A decision belongs to the delta for the same reason plan mutation does:
+    /// authorizing it depends on a review anchor, which is a property of the
+    /// regime rather than of the head every dialogue contour renders
+    /// identically. The module that publishes the field renders no rule, so a
+    /// decision reaches the prompt through the schema of this regime alone.
+    pub fn review_discussion() -> Self {
+        Self::new(
+            Self::dialogue_head(),
+            CapabilitySet::from_slice(&[LlmCapability::ReviewUpdate]),
+        )
+    }
+
+    /// One isolated step: the dialogue head minus plan authoring and the
+    /// internal documentation of the harness, no delta.
+    ///
+    /// External project documentation stays available, because a step reads the
+    /// contracts it was pointed at; only knowledge about the harness itself is
+    /// noise the step cannot act on.
     pub fn isolated_step() -> Self {
         Self::new(
             Self::dialogue_head()
@@ -285,14 +327,14 @@ impl CapabilityProfile {
             CapabilitySet::new(),
         )
     }
-
-    /// Architect discovery: plan mutation moves to the delta, surface unchanged.
-    pub fn architect_discovery() -> Self {
+    /// Architect research: plan mutation moves to the delta, surface unchanged.
+    pub fn architect_research() -> Self {
         Self::new(
             CapabilitySet::from_slice(&[
                 LlmCapability::TextMessage,
-                LlmCapability::Discovery,
+                LlmCapability::Research,
                 LlmCapability::DocRequest,
+                LlmCapability::OuterDocRequest,
                 LlmCapability::PlanCreation,
                 LlmCapability::Scratchpad,
                 LlmCapability::Outcome,
@@ -305,7 +347,12 @@ impl CapabilityProfile {
 
     /// Head shared by every dialogue contour: the REPL surface.
     fn dialogue_head() -> CapabilitySet {
-        CapabilitySet::from_slice(LlmCapability::ALL).without(LlmCapability::PlanUpdate)
+        // Plan mutation and a review decision are authorized by the regime of
+        // a dialogue anchor, so both travel in the contour delta instead of the
+        // head every dialogue contour renders identically.
+        CapabilitySet::from_slice(LlmCapability::ALL)
+            .without(LlmCapability::PlanUpdate)
+            .without(LlmCapability::ReviewUpdate)
     }
 }
 
@@ -417,15 +464,28 @@ impl CapabilitySet {
         CapabilityProfile::discussion().surface()
     }
 
+    /// Review finding discussion capability set.
+    ///
+    /// The set is the declared surface of [`CapabilityProfile::review_discussion`]:
+    /// the shared dialogue head plus the decision the review regime authorizes.
+    /// A review that only edits code therefore keeps the whole dialogue surface,
+    /// while the decision field appears exclusively where a decision can be
+    /// recorded.
+    pub fn review_discussion() -> Self {
+        CapabilityProfile::review_discussion().surface()
+    }
+
     /// Capability set of one isolated step.
     ///
     /// Plan creation and modification are excluded: while an isolated step
     /// runs the plan is immutable and progress is recorded deterministically
     /// by the harness, never by the model.
     ///
-    /// Documentation requests are excluded as well: an isolated step executes
-    /// an approved design inside the codebase, so knowledge about the harness
-    /// itself is noise the step cannot act on.
+    /// Documentation requests of the harness are excluded as well: an isolated
+    /// step executes an approved design inside the codebase, so knowledge about
+    /// the harness itself is noise the step cannot act on. External project
+    /// documentation stays reachable, because a step implements the contracts it
+    /// was pointed at.
     ///
     /// Toolchain verification stays declared in the profile and is stripped by
     /// the turn-intent narrowing, so the decision that the harness owns
@@ -440,8 +500,8 @@ impl CapabilitySet {
     /// The architect gathers context and refines plans but never edits files
     /// or runs toolchain verification, so the file-edit and verification
     /// capabilities are excluded.
-    pub fn architect_discovery() -> Self {
-        CapabilityProfile::architect_discovery().surface()
+    pub fn architect_research() -> Self {
+        CapabilityProfile::architect_research().surface()
     }
 }
 
@@ -470,11 +530,13 @@ mod tests {
         let cases = [
             (LlmCapability::TextMessage, "\"text_message\""),
             (LlmCapability::FileEdits, "\"file_edits\""),
-            (LlmCapability::Discovery, "\"discovery\""),
+            (LlmCapability::Research, "\"research\""),
             (LlmCapability::DocRequest, "\"doc_request\""),
+            (LlmCapability::OuterDocRequest, "\"outer_doc_request\""),
             (LlmCapability::ToolchainVerify, "\"toolchain_verify\""),
             (LlmCapability::PlanCreation, "\"plan_creation\""),
             (LlmCapability::PlanUpdate, "\"plan_update\""),
+            (LlmCapability::ReviewUpdate, "\"review_update\""),
             (LlmCapability::Scratchpad, "\"scratchpad\""),
             (LlmCapability::Outcome, "\"outcome\""),
             (LlmCapability::Blocked, "\"blocked\""),
@@ -493,7 +555,7 @@ mod tests {
     #[test]
     fn test_capability_phase_serde_and_display() {
         let cases = [
-            (CapabilityPhase::Discovery, "\"discovery\""),
+            (CapabilityPhase::Research, "\"research\""),
             (CapabilityPhase::Execution, "\"execution\""),
             (CapabilityPhase::Verification, "\"verification\""),
             (CapabilityPhase::Outcome, "\"outcome\""),
@@ -509,7 +571,7 @@ mod tests {
 
     #[test]
     fn test_llm_capability_as_str_and_phase() {
-        assert_eq!(LlmCapability::ALL.len(), 13);
+        assert_eq!(LlmCapability::ALL.len(), 15);
         for capability in LlmCapability::ALL {
             let encoded = format!("\"{}\"", capability.as_str());
             assert_eq!(serde_json::to_string(capability).unwrap(), encoded);
@@ -520,12 +582,14 @@ mod tests {
         assert!(LlmCapability::ALL.contains(&LlmCapability::CustomTools));
 
         let expectations = [
-            (LlmCapability::Discovery, CapabilityPhase::Discovery),
-            (LlmCapability::DocRequest, CapabilityPhase::Discovery),
+            (LlmCapability::Research, CapabilityPhase::Research),
+            (LlmCapability::DocRequest, CapabilityPhase::Research),
+            (LlmCapability::OuterDocRequest, CapabilityPhase::Research),
             (LlmCapability::TextMessage, CapabilityPhase::Execution),
             (LlmCapability::FileEdits, CapabilityPhase::Execution),
             (LlmCapability::PlanCreation, CapabilityPhase::Execution),
             (LlmCapability::PlanUpdate, CapabilityPhase::Execution),
+            (LlmCapability::ReviewUpdate, CapabilityPhase::Execution),
             (LlmCapability::Scratchpad, CapabilityPhase::Execution),
             (LlmCapability::UserLanguage, CapabilityPhase::Execution),
             (LlmCapability::CustomTools, CapabilityPhase::Execution),
@@ -581,7 +645,7 @@ mod tests {
 
         // Discovery, verification, and outcome capabilities are never streamed.
         for phase in [
-            CapabilityPhase::Discovery,
+            CapabilityPhase::Research,
             CapabilityPhase::Verification,
             CapabilityPhase::Outcome,
         ] {
@@ -610,10 +674,10 @@ mod tests {
         assert_eq!(set.iter().count(), 2);
 
         // `with` adds a new capability and is idempotent.
-        let extended = set.with(LlmCapability::Discovery);
-        assert!(extended.contains(LlmCapability::Discovery));
+        let extended = set.with(LlmCapability::Research);
+        assert!(extended.contains(LlmCapability::Research));
         assert_eq!(extended.iter().count(), 3);
-        assert_eq!(extended.with(LlmCapability::Discovery), extended);
+        assert_eq!(extended.with(LlmCapability::Research), extended);
 
         // `without` removes a capability and tolerates a missing one.
         let reduced = set.without(LlmCapability::FileEdits);
@@ -621,8 +685,8 @@ mod tests {
         assert_eq!(reduced.without(LlmCapability::Outcome), reduced);
 
         // `by_phase` keeps only the requested phase, preserving order.
-        let discovery = extended.by_phase(CapabilityPhase::Discovery);
-        assert_eq!(discovery.as_slice(), &[LlmCapability::Discovery]);
+        let research = extended.by_phase(CapabilityPhase::Research);
+        assert_eq!(research.as_slice(), &[LlmCapability::Research]);
         assert!(extended.by_phase(CapabilityPhase::Outcome).is_empty());
     }
 
@@ -633,7 +697,7 @@ mod tests {
         // factories no longer exist.
         let discussion = CapabilitySet::discussion();
         assert!(discussion.contains(LlmCapability::TextMessage));
-        assert!(discussion.contains(LlmCapability::Discovery));
+        assert!(discussion.contains(LlmCapability::Research));
         assert!(discussion.contains(LlmCapability::PlanCreation));
         assert!(discussion.contains(LlmCapability::PlanUpdate));
         // A plan discussion carries the full dialogue surface: the developer may
@@ -645,10 +709,23 @@ mod tests {
         assert!(discussion.contains(LlmCapability::CustomTools));
         // The set is the surface of the regime profile, never a second list.
         assert_eq!(discussion, CapabilityProfile::discussion().surface());
-        assert_eq!(discussion, CapabilitySet::from_slice(LlmCapability::ALL));
+        // The discussion surface is the shared head plus plan mutation, so the
+        // review decision a review discussion authorizes never joins it.
+        assert_eq!(
+            discussion,
+            CapabilitySet::from_slice(LlmCapability::ALL).without(LlmCapability::ReviewUpdate)
+        );
 
-        let architect = CapabilitySet::architect_discovery();
+        // A review discussion composes the very same head, and the decision it
+        // records is the only difference.
+        let review = CapabilitySet::review_discussion();
+        assert_eq!(review, CapabilityProfile::review_discussion().surface());
+        assert!(review.contains(LlmCapability::ReviewUpdate));
+        assert!(!discussion.contains(LlmCapability::ReviewUpdate));
+
+        let architect = CapabilitySet::architect_research();
         assert!(architect.contains(LlmCapability::DocRequest));
+        assert!(architect.contains(LlmCapability::OuterDocRequest));
         assert!(architect.contains(LlmCapability::PlanCreation));
         assert!(architect.contains(LlmCapability::Scratchpad));
         assert!(!architect.contains(LlmCapability::FileEdits));
@@ -682,8 +759,9 @@ mod tests {
         for capability in [
             LlmCapability::TextMessage,
             LlmCapability::FileEdits,
-            LlmCapability::Discovery,
+            LlmCapability::Research,
             LlmCapability::DocRequest,
+            LlmCapability::OuterDocRequest,
             LlmCapability::ToolchainVerify,
             LlmCapability::PlanCreation,
             LlmCapability::Scratchpad,
@@ -701,8 +779,9 @@ mod tests {
 
         // The profile is the advertised surface minus plan mutation, so the two
         // definitions cannot drift apart when a capability is added.
-        let expected =
-            CapabilitySet::from_slice(LlmCapability::ALL).without(LlmCapability::PlanUpdate);
+        let expected = CapabilitySet::from_slice(LlmCapability::ALL)
+            .without(LlmCapability::PlanUpdate)
+            .without(LlmCapability::ReviewUpdate);
         assert_eq!(repl.as_slice(), expected.as_slice());
 
         // A step keeps the operational surface of a dialogue except plan
@@ -720,6 +799,11 @@ mod tests {
         assert!(step.contains(LlmCapability::ToolchainVerify));
         assert!(step.contains(LlmCapability::Blocked));
         assert!(step.contains(LlmCapability::Abort));
+        // External project documentation stays researchable inside a step: a
+        // step reads the contracts it was pointed at, while the internal
+        // documentation of the harness itself remains closed.
+        assert!(step.contains(LlmCapability::OuterDocRequest));
+        assert!(!step.contains(LlmCapability::DocRequest));
     }
 
     #[test]
@@ -745,7 +829,9 @@ mod tests {
         // provider prefix cache warm across focus switching. The review
         // discussion runs through the REPL profile, so its head is shared by
         // construction rather than by coincidence.
-        let head = CapabilitySet::from_slice(LlmCapability::ALL).without(LlmCapability::PlanUpdate);
+        let head = CapabilitySet::from_slice(LlmCapability::ALL)
+            .without(LlmCapability::PlanUpdate)
+            .without(LlmCapability::ReviewUpdate);
 
         for profile in [
             CapabilityProfile::interactive_repl(),
@@ -779,15 +865,16 @@ mod tests {
 
     #[test]
     fn test_capability_profile_architect_moves_plan_update_to_delta() {
-        let architect = CapabilityProfile::architect_discovery();
+        let architect = CapabilityProfile::architect_research();
         assert_eq!(architect.delta().as_slice(), &[LlmCapability::PlanUpdate]);
         assert!(!architect.core().contains(LlmCapability::PlanUpdate));
 
         // Only the placement changes: the declared surface stays identical.
         let expected = CapabilitySet::from_slice(&[
             LlmCapability::TextMessage,
-            LlmCapability::Discovery,
+            LlmCapability::Research,
             LlmCapability::DocRequest,
+            LlmCapability::OuterDocRequest,
             LlmCapability::PlanCreation,
             LlmCapability::PlanUpdate,
             LlmCapability::Scratchpad,
@@ -796,7 +883,7 @@ mod tests {
             LlmCapability::UserLanguage,
         ]);
         assert_eq!(architect.surface(), expected);
-        assert_eq!(CapabilitySet::architect_discovery(), expected);
+        assert_eq!(CapabilitySet::architect_research(), expected);
     }
 
     #[test]
@@ -812,8 +899,8 @@ mod tests {
                 CapabilitySet::isolated_step(),
             ),
             (
-                CapabilityProfile::architect_discovery(),
-                CapabilitySet::architect_discovery(),
+                CapabilityProfile::architect_research(),
+                CapabilitySet::architect_research(),
             ),
         ];
 

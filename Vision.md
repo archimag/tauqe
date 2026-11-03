@@ -91,7 +91,7 @@ The model is granted an interactive shell or open tool dispatch and an open-ende
 
 ### 2.3. The Semantic Harness (The TAUQE Paradigm)
 The developer states the engineering task in natural language without spending time manually assembling files. The system executes an **autonomous bounded turn**:
-- Autonomously discovers and requests missing files via multi-round `Discovery`;
+- Autonomously discovers and requests missing files via multi-round `Research`;
 - Applies and validates patches in memory (`Staging`);
 - Automatically repairs pattern-matching discrepancies (`Patch Retry`);
 - Runs deterministic project compilers and linters (`cargo check`, `tsc`, `pytest`);
@@ -109,7 +109,7 @@ Instead of an unbounded `while true` loop, TAUQE implements a deterministic fini
 ```text
                User Prompt
                     ↓
-        ┌─► [Discovery Phase] ──── (requests missing files via <context_request>,
+        ┌─► [Research Phase] ──── (requests missing files via <context_request>,
         │           ↓               searches codebase via <repo_search>,
         │           │               or system docs via <doc_request>)
         │   [Proposal Generation] ─ (generates minimal coherent patches)
@@ -127,7 +127,7 @@ Instead of an unbounded `while true` loop, TAUQE implements a deterministic fini
 ```
 
 Every phase in the turn is deterministic:
-1. **Discovery:** The model inspects the Tree-sitter Repo Map, searches symbol usages or dependencies via `<repo_search>`, and requests required definitions or system documentation via protocol tags (`<context_request>`, `<doc_request>`). The server adds files to the `auto` context layer, returns search match summaries, or injects documentation blocks and iterates. No manual `/add` required.
+1. **Research:** The model inspects the Tree-sitter Repo Map, searches symbol usages or dependencies via `<repo_search>`, and requests required definitions or system documentation via protocol tags (`<context_request>`, `<doc_request>`). The server adds files to the `auto` context layer, returns search match summaries, or injects documentation blocks and iterates. No manual `/add` required.
 2. **Staging:** No byte touches disk until the entire set of edits converges cleanly in virtual staging.
 3. **Healing:** If the compiler detects an error, the model receives clean toolchain output and fixes only the offending lines without touching unrelated code.
 4. **Git Transaction:** The turn is transactional. It is finalized as a single isolated commit only after the full change set converges and verifies cleanly; if the turn fails or is cancelled before that point, the working tree is restored to its exact pre-turn state. Managing the resulting permanent history is left entirely to standard Git tooling.
@@ -147,7 +147,7 @@ Its purpose is to let the model hold state across multi-round discovery and veri
 
 The model communicates its intent exclusively through typed protocol tags. Each tag is a deterministic command rather than free-form prose:
 
-- Discovery tags (`<context_request>`, `<repo_search>`, `<doc_request>`) request missing files, search codebase symbols across repository files, or request authoritative reference material.
+- Research tags (`<context_request>`, `<repo_search>`, `<doc_request>`) request missing files, search codebase symbols across repository files, or request authoritative reference material.
 - The scratchpad tag (`<scratchpad>`) records isolated, turn-local working memory.
 - The verification tag (`<verify>`) requests deterministic toolchain execution.
 - Terminal outcome tags (`<success>`, `<error>`, `<blocked>`) declare how the turn ends; the `<blocked>` outcome triggers semantic recovery instead of a blind retry.
@@ -205,7 +205,7 @@ The integration rests on four invariants:
 Git                   → Reality and transactional safety
 Project Environment   → Sovereign CLI contracts & task runners
 Tree-sitter Repo Map  → Deterministic symbol awareness
-Bounded Turn          → Autonomous turn lifecycle (Discovery + Staging + Healing)
+Bounded Turn          → Autonomous turn lifecycle (Research + Staging + Healing)
 Strict Harness        → Enforcing boundaries without shell access
 Declarative Contracts → Invariant specifications over imperative steering
 Model Roles           → Primary + Architect (What) + Coder (How) + Reviewer + Scribe

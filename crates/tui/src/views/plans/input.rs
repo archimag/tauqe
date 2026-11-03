@@ -30,6 +30,8 @@ pub enum PlansAction {
     Activate,
     Execute,
     ExecuteAll,
+    /// Inspect the diff of the commit recorded in the selected step.
+    InspectDiff,
     Discuss,
     SetFocus,
     FoldAll,
@@ -66,6 +68,12 @@ pub static PLANS_COMMAND_MAP: CommandMap<PlansAction> = CommandMap::new(&[
         PlansAction::ExecuteAll,
         Essential,
         "cmd.plans.execute_all",
+    ),
+    CommandSpec::new(
+        KeyChord::Bare(KeyCode::Char('v')),
+        PlansAction::InspectDiff,
+        Helpers,
+        "cmd.plans.inspect_diff",
     ),
     CommandSpec::new(
         KeyChord::Bare(KeyCode::Char('r')),
@@ -473,6 +481,22 @@ fn open_refine_dialog(st: &mut AppState, plan: tauqe_protocol::Plan, seed: Optio
     st.plans_view.refine_dialog = Some(dialog);
 }
 
+/// Commit recorded in a finished step row, when the row carries one.
+///
+/// The hash is recorded when the step is finalized, so an unfinished step has
+/// nothing to audit and the inspect chord reports that instead of asking the
+/// daemon for a missing commit (c-4).
+fn step_commit(row: &VisiblePlanRow) -> Option<String> {
+    match row {
+        VisiblePlanRow::PlanItem {
+            status: tauqe_protocol::PlanItemStatus::Done,
+            commit: Some(commit),
+            ..
+        } if !commit.is_empty() => Some(commit.clone()),
+        _ => None,
+    }
+}
+
 pub async fn handle_plans_key(
     key: KeyEvent,
     state: &Arc<Mutex<AppState>>,
@@ -714,6 +738,21 @@ pub async fn handle_plans_key(
                 steps,
                 pending_synthesis,
             });
+        }
+        PlansAction::InspectDiff => {
+            let sel_row = st.plans_view.selected_row();
+            let commit = sel_row.as_ref().and_then(step_commit);
+            let Some(commit) = commit else {
+                st.notify_info(active_t("notify.plan_step_no_commit"));
+                return Ok(InputResult::Continue);
+            };
+            drop(st);
+            send_request(
+                server_writer,
+                methods::GIT_GET_DIFF,
+                serde_json::json!({ "commit": commit }),
+            )
+            .await?;
         }
         PlansAction::Discuss => {
             let sel_row = st.plans_view.selected_row();
@@ -1646,5 +1685,76 @@ mod tests {
             assert_eq!(guard.plans_view.selected_index, last - 8);
             assert_plans_cursor_visible(&mut guard.plans_view);
         }
+    }
+    /// A plan holding one finished step that recorded a commit and one step
+    /// that never finished, so both inspect paths are reachable from the tree.
+    fn step_commit_state() -> crate::app::AppState {
+        let mut st = crate::app::test_state();
+        st.view_mode = ViewMode::Plans;
+        st.plans_view.plans = vec![tauqe_protocol::Plan::from_parts(
+            "plan-commit".to_string(),
+            "Commit Plan".to_string(),
+            None,
+            0,
+            0,
+            vec![],
+            vec![
+                tauqe_protocol::PlanItem {
+                    id: "1".to_string(),
+                    title: "Finished step".to_string(),
+                    status: tauqe_protocol::PlanItemStatus::Done,
+                    commit: Some("0123456789abcdef".to_string()),
+                    ..Default::default()
+                },
+                tauqe_protocol::PlanItem {
+                    id: "2".to_string(),
+                    title: "Todo step".to_string(),
+                    status: tauqe_protocol::PlanItemStatus::Todo,
+                    ..Default::default()
+                },
+            ],
+        )];
+        st.plans_view.expand_all();
+        st
+    }
+
+    #[tokio::test]
+    async fn test_v_requests_the_diff_of_the_finished_step_commit() {
+        let mut st = step_commit_state();
+        st.plans_view.selected_index = 1;
+        let state = Arc::new(Mutex::new(st));
+        let mut conn = RpcConnection::new(Vec::<u8>::new());
+
+        handle_plans_key(
+            KeyEvent::new(KeyCode::Char('v'), crossterm::event::KeyModifiers::NONE),
+            &state,
+            &mut conn,
+        )
+        .await
+        .unwrap();
+
+        let payload = String::from_utf8(conn.written().to_vec()).expect("utf-8 payload");
+        assert!(payload.contains("git/getDiff"), "{payload}");
+        assert!(payload.contains("0123456789abcdef"), "{payload}");
+        assert!(state.lock().await.diff_inspector.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_v_without_a_commit_notifies_and_sends_nothing() {
+        let mut st = step_commit_state();
+        st.plans_view.selected_index = 2;
+        let state = Arc::new(Mutex::new(st));
+        let mut conn = RpcConnection::new(Vec::<u8>::new());
+
+        handle_plans_key(
+            KeyEvent::new(KeyCode::Char('v'), crossterm::event::KeyModifiers::NONE),
+            &state,
+            &mut conn,
+        )
+        .await
+        .unwrap();
+
+        assert!(conn.written().is_empty());
+        assert!(state.lock().await.active_notification().is_some());
     }
 }

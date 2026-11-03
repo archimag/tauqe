@@ -28,8 +28,8 @@ use crate::workflow::implementation::{
 use async_trait::async_trait;
 use tauqe_protocol::model::TurnWorkQueue;
 use tauqe_protocol::{
-    EditProtocolKind, ModelRole, ModelSelection, PlanItem, PlanItemStatus, PlanScopeEvaluation,
-    ReasoningEffort, TurnWorkItem,
+    EditProtocolKind, IssueStatus, ModelRole, ModelSelection, PlanItem, PlanItemStatus,
+    PlanScopeEvaluation, ReasoningEffort, TurnWorkItem,
 };
 use tokio::sync::{mpsc, watch};
 
@@ -167,7 +167,7 @@ impl PlanImplementationStepExecutor<'_> {
         }
 
         if let Err(failure) =
-            self.set_status(&mut frame, &leaf.id, PlanItemStatus::InProgress, None)
+            self.set_status(&mut frame, &leaf.id, PlanItemStatus::InProgress, None, None)
         {
             return BatchStepOutcome::failed(failure.into_reason());
         }
@@ -240,10 +240,18 @@ impl PlanImplementationStepExecutor<'_> {
 
             let host = self.host;
             match host.run_step(request).await {
-                StepTurnResult::Success { summary } => {
-                    if let Err(failure) =
-                        self.set_status(&mut frame, &leaf.id, PlanItemStatus::Done, None)
-                    {
+                StepTurnResult::Success { summary, commit } => {
+                    // The commit is the durable pointer of the completed step, so
+                    // it is written by the very transition that marks the step
+                    // `Done`: a finished step never exists without the change set
+                    // that produced it.
+                    if let Err(failure) = self.set_status(
+                        &mut frame,
+                        &leaf.id,
+                        PlanItemStatus::Done,
+                        None,
+                        commit.as_deref(),
+                    ) {
                         return BatchStepOutcome::failed(failure.into_reason());
                     }
                     tracing::info!(
@@ -264,6 +272,7 @@ impl PlanImplementationStepExecutor<'_> {
                         &leaf.id,
                         PlanItemStatus::Blocked,
                         Some(reason.as_str()),
+                        None,
                     ) {
                         return BatchStepOutcome::failed(failure.into_reason());
                     }
@@ -435,17 +444,27 @@ impl PlanImplementationStepExecutor<'_> {
     /// transition never lives in the executor alone: a plan step is written by
     /// [`PlanStorage::update_item`], a review group step is written as the whole
     /// horizon of that group by [`ReviewStorage::update_group_subplan`], and a
-    /// degenerate single-finding run writes nothing, because the statuses of the
-    /// findings it belongs to stay frozen while it executes.
+    /// degenerate single-finding run is written onto the finding itself by
+    /// [`ReviewStorage::update_session_item_status`].
+    ///
+    /// Only the lifecycle the run owns reaches the finding: taking the step
+    /// marks it `InProgress`, and a reset returns it to `Todo`. The verdict is
+    /// not written here: the finding is closed as `Fixed` or `Skipped` exactly
+    /// once by the pipeline settlement, which is the single writer of a verdict.
     ///
     /// Every storage entry point offloads its own file I/O through the blocking
     /// pool, so the executor awaits the step loop without blocking a worker.
+    ///
+    /// `commit` is the identifier of the Git commit that carried the step, and it
+    /// is written by the same transition that finishes the step: a completed step
+    /// never exists without the pointer to the change set it produced.
     fn set_status(
         &self,
         frame: &mut ImplementationFrame,
         step_id: &str,
         status: PlanItemStatus,
         blocked_reason: Option<&str>,
+        commit: Option<&str>,
     ) -> Result<(), StepFailure> {
         match frame.scope.clone() {
             ExecutionScope::Plan { plan_id } => {
@@ -455,6 +474,7 @@ impl PlanImplementationStepExecutor<'_> {
                     step_id,
                     Some(status),
                     blocked_reason,
+                    commit,
                 )
                 .map_err(|err| {
                     StepFailure::infrastructure(format!(
@@ -476,7 +496,7 @@ impl PlanImplementationStepExecutor<'_> {
                 group_id,
             } => {
                 let mut items = frame.plan.implementation.items.clone();
-                if !set_leaf_state(&mut items, step_id, status, blocked_reason) {
+                if !set_leaf_state(&mut items, step_id, status, blocked_reason, commit) {
                     return Err(StepFailure::infrastructure(format!(
                         "Review group '{}' of session '{}' does not store step '{}'",
                         group_id, review_id, step_id
@@ -503,16 +523,48 @@ impl PlanImplementationStepExecutor<'_> {
                 frame.plan.implementation = group.implementation;
                 Ok(())
             }
-            // A single finding executes as a degenerate in-memory horizon: its
-            // finding statuses stay frozen for the whole run, and the run closes
-            // the finding through the group completion transition instead.
-            ExecutionScope::ReviewFinding { .. } => Ok(()),
+            // A single finding executes as a degenerate in-memory horizon, so it
+            // owns no persisted step graph: the lifecycle of the run is written
+            // onto the finding itself. The verdict is never written here, because
+            // the pipeline settlement states it exactly once. A finding carries
+            // no commit pointer of its own, so the commit its step produced is
+            // recorded nowhere here.
+            ExecutionScope::ReviewFinding { review_id, item_id } => {
+                let issue_status = match status {
+                    PlanItemStatus::InProgress => IssueStatus::InProgress,
+                    PlanItemStatus::Todo => IssueStatus::Todo,
+                    // Closing the finding belongs to the pipeline settlement.
+                    PlanItemStatus::Done
+                    | PlanItemStatus::Blocked
+                    | PlanItemStatus::Discussion
+                    | PlanItemStatus::Cancelled => return Ok(()),
+                };
+                let updated = ReviewStorage::update_session_item_status(
+                    self.repo_root,
+                    &review_id,
+                    item_id,
+                    issue_status,
+                )
+                .map_err(|err| {
+                    StepFailure::infrastructure(format!(
+                        "Failed to persist the status of review finding #{}: {}",
+                        item_id, err
+                    ))
+                })?;
+                if updated.is_none() {
+                    return Err(StepFailure::infrastructure(format!(
+                        "Review session '{}' does not store finding #{}",
+                        review_id, item_id
+                    )));
+                }
+                Ok(())
+            }
         }
     }
 
     /// Returns a step to TODO after a turn that produced no durable progress.
     fn reset(&self, frame: &mut ImplementationFrame, step_id: &str) {
-        if let Err(failure) = self.set_status(frame, step_id, PlanItemStatus::Todo, None) {
+        if let Err(failure) = self.set_status(frame, step_id, PlanItemStatus::Todo, None, None) {
             tracing::warn!(
                 step_id = step_id,
                 error = failure.reason(),
@@ -522,7 +574,7 @@ impl PlanImplementationStepExecutor<'_> {
     }
 }
 
-/// Sets the status and the blocker report of one leaf inside a horizon tree.
+/// Sets the status, the commit, and the blocker report of one leaf inside a horizon tree.
 ///
 /// The traversal follows the protocol identity rule: identifiers compare
 /// case-insensitively after trimming, so a step is reached by the same spelling
@@ -533,6 +585,7 @@ fn set_leaf_state(
     step_id: &str,
     status: PlanItemStatus,
     blocked_reason: Option<&str>,
+    commit: Option<&str>,
 ) -> bool {
     for item in items {
         if item.id.trim().eq_ignore_ascii_case(step_id.trim()) {
@@ -540,6 +593,12 @@ fn set_leaf_state(
                 return false;
             }
             item.status = status;
+            // The commit identifier belongs to the completed record of the step:
+            // it is stored once, together with the transition that finishes the
+            // step, and is never restated by a later one.
+            if let Some(commit) = commit.map(str::trim).filter(|hash| !hash.is_empty()) {
+                item.commit = Some(commit.to_string());
+            }
             // The report belongs to the BLOCKED state alone: leaving it drops the
             // stale diagnostic, so a resumed step never keeps describing a
             // blocker that no longer holds.
@@ -553,7 +612,7 @@ fn set_leaf_state(
             };
             return true;
         }
-        if set_leaf_state(&mut item.children, step_id, status, blocked_reason) {
+        if set_leaf_state(&mut item.children, step_id, status, blocked_reason, commit) {
             return true;
         }
     }
@@ -767,6 +826,7 @@ mod tests {
         PlanStorage::save_plan(dir.path(), &horizon_plan()).unwrap();
         let host = ScriptedHost::new(vec![StepTurnResult::Success {
             summary: "the seam is in place".to_string(),
+            commit: Some("abc1234".to_string()),
         }]);
         let scope = ExecutionScope::Plan {
             plan_id: "step-horizon".to_string(),
@@ -784,7 +844,13 @@ mod tests {
         let stored = PlanStorage::load_plan(dir.path(), "step-horizon")
             .unwrap()
             .unwrap();
-        assert_eq!(stored.find_item("1").unwrap().status, PlanItemStatus::Done);
+        let completed = stored.find_item("1").expect("the step is stored");
+        assert_eq!(completed.status, PlanItemStatus::Done);
+        assert_eq!(
+            completed.commit.as_deref(),
+            Some("abc1234"),
+            "a completed step keeps the commit that produced it"
+        );
 
         let requests = host.requests();
         assert_eq!(requests.len(), 1);
@@ -848,6 +914,7 @@ mod tests {
             StepTurnResult::Failed(StepFailure::domain("the patch did not apply")),
             StepTurnResult::Success {
                 summary: "the seam is in place".to_string(),
+                commit: None,
             },
         ]);
         let scope = ExecutionScope::Plan {
@@ -913,6 +980,7 @@ mod tests {
         stored_review(dir.path());
         let host = ScriptedHost::new(vec![StepTurnResult::Success {
             summary: "the horizon advanced".to_string(),
+            commit: Some("def5678".to_string()),
         }]);
         let scope = ExecutionScope::ReviewGroup {
             review_id: "review-horizon".to_string(),
@@ -937,16 +1005,22 @@ mod tests {
             .find(|group| group.id == "arch-1")
             .expect("the group is stored");
         assert_eq!(group.implementation.items[0].status, PlanItemStatus::Done);
+        assert_eq!(
+            group.implementation.items[0].commit.as_deref(),
+            Some("def5678"),
+            "a completed sub-step keeps the commit that produced it"
+        );
         // The finding statuses stay frozen while the horizon runs.
         assert_eq!(stored.items[0].status, IssueStatus::Todo);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn a_single_finding_run_never_writes_the_session() {
+    async fn a_single_finding_step_marks_the_finding_in_progress() {
         let dir = tempdir().unwrap();
         stored_review(dir.path());
         let host = ScriptedHost::new(vec![StepTurnResult::Success {
             summary: "the finding is addressed".to_string(),
+            commit: None,
         }]);
         let scope = ExecutionScope::ReviewFinding {
             review_id: "review-horizon".to_string(),
@@ -962,13 +1036,74 @@ mod tests {
             .unwrap();
 
         assert!(outcome.is_success());
+        // The run owns the lifecycle of the finding, so the step it completed
+        // leaves the finding InProgress; the verdict is settled by the pipeline.
+        let stored = ReviewStorage::load_review(dir.path(), "review-horizon")
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.items[0].status, IssueStatus::InProgress);
+        let requests = host.requests();
+        assert_eq!(requests.len(), 1);
+        assert!(requests[0].prompt.contains("Target Plan Step Execution"));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_reset_single_finding_step_returns_the_finding_to_todo() {
+        let dir = tempdir().unwrap();
+        stored_review(dir.path());
+        let host = ScriptedHost::new(vec![StepTurnResult::Failed(StepFailure::domain(
+            "the patch did not apply",
+        ))]);
+        let scope = ExecutionScope::ReviewFinding {
+            review_id: "review-horizon".to_string(),
+            item_id: 7,
+        };
+        let mut config = run_config("7");
+        // One rung with a single attempt: one content failure exhausts the ladder.
+        config.models.coder = Some(vec![ModelEntry {
+            model: ModelRef::openrouter("base/model"),
+            effort: None,
+            attempts: Some(1),
+            level_up: None,
+        }]);
+        let mut executor = PlanImplementationStepExecutor::new(dir.path(), scope, &host, config);
+        let (stream_tx, cancel_rx) = channels();
+
+        let outcome = executor
+            .execute_step(&BatchStep::new("7", "finding"), stream_tx, cancel_rx)
+            .await
+            .unwrap();
+
+        assert_eq!(outcome.status, BatchStepStatus::Failed);
         let stored = ReviewStorage::load_review(dir.path(), "review-horizon")
             .unwrap()
             .unwrap();
         assert_eq!(stored.items[0].status, IssueStatus::Todo);
-        let requests = host.requests();
-        assert_eq!(requests.len(), 1);
-        assert!(requests[0].prompt.contains("Target Plan Step Execution"));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_cancelled_single_finding_step_returns_the_finding_to_todo() {
+        let dir = tempdir().unwrap();
+        stored_review(dir.path());
+        let host = ScriptedHost::new(vec![StepTurnResult::Cancelled]);
+        let scope = ExecutionScope::ReviewFinding {
+            review_id: "review-horizon".to_string(),
+            item_id: 7,
+        };
+        let mut executor =
+            PlanImplementationStepExecutor::new(dir.path(), scope, &host, run_config("7"));
+        let (stream_tx, cancel_rx) = channels();
+
+        let outcome = executor
+            .execute_step(&BatchStep::new("7", "finding"), stream_tx, cancel_rx)
+            .await
+            .unwrap();
+
+        assert_eq!(outcome.status, BatchStepStatus::Cancelled);
+        let stored = ReviewStorage::load_review(dir.path(), "review-horizon")
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.items[0].status, IssueStatus::Todo);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

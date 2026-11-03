@@ -9,13 +9,13 @@
 - [Model Roles and the Coder Ladder](ch01-foundations/model-roles.md)
 - [Turn Scratchpad](ch01-foundations/turn-scratchpad.md)
 
-# Part II — Context Perception & Discovery
+# Part II — Context Perception & Research
 
 - [The Context Model](ch02-perception/context-model.md)
-- [The External Reference Registry](ch02-perception/reference-registry.md)
+- [External Project Documentation](ch02-perception/reference-registry.md)
 - [Discussion Focus](ch02-perception/discussion-focus.md)
 - [Repository Map and Blinkers](ch02-perception/repo-map.md)
-- [Discovery Engine](ch02-perception/discovery-engine.md)
+- [Research Engine](ch02-perception/research-engine.md)
 
 # Part III — Project Integration & Execution
 

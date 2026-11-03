@@ -11,7 +11,7 @@ grounded without re-selecting the entity or switching screens.
 
 ### 1.1 Analysis and mutation are different regimes
 
-A Develop turn carries the full editing toolchain: the model may request files,
+A REPL turn carries the full editing toolchain: the model may request files,
 stage patches, run verification, and rewrite the working tree. A discussion must
 not do that by accident. When analysis and mutation share one untyped channel, two
 failures follow: the model answers a design question by editing files the developer
@@ -20,7 +20,7 @@ only wanted to inspect, and requirements drift silently.
 ### 1.2 Two failure modes
 
 - **Unintended mutation.** The answer mutates the tree because the turn was a
-  normal Develop turn with editing enabled.
+  normal REPL turn with editing enabled.
 - **Accidental mode entry.** If the mode were inferred from prompt text, a message
   that merely resembles a discussion heading could enter discussion mode, and
   identifiers read out of prose could address the wrong entity.
@@ -121,7 +121,7 @@ actionable: apply requested code changes directly, treat protected contracts as
 immutable, and explain status changes instead of applying them.
 
 A discussion turn uses the transport the project configures for ordinary turns
-(`develop.protocol`). Whatever the contour, the prompt asks for the response
+(`repl.protocol`). Whatever the contour, the prompt asks for the response
 schema of the active capability profile, so the conversational message and the
 plan payload travel together and a plan change keeps one shape in every
 transport. The response declares the message first, which lets the interface
@@ -138,7 +138,7 @@ capability of its own today, so its delta is empty and its surface is exactly th
 main one.
 
 Because the main surface carries file edits, a focused dialogue reaches exactly
-the Develop transaction: edits are staged, verified, and committed as one atomic
+the REPL transaction: edits are staged, verified, and committed as one atomic
 turn, and a failure rolls the tree back to the pre-turn checkpoint.
 
 ### 3.4 Continuing, replacing, and dropping the anchor
@@ -212,7 +212,7 @@ state moves only on an explicit developer decision or a verified execution.
 - **It is not a screen switch.** Quick focus binds an entity without leaving Plans
   or Review.
 - **`Esc` is not detach.** The pause-and-clear meaning of `Esc` is preserved.
-- **A focused dialogue is not a second editing path.** It reuses the Develop
+- **A focused dialogue is not a second editing path.** It reuses the REPL
   transaction — staging, verification, and the Git rollback — and never opens a
   dialogue-specific write path.
 

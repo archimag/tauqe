@@ -153,6 +153,9 @@ pub enum VisibleReviewRow {
         status: PlanItemStatus,
         files: Vec<String>,
         readonly_files: Vec<String>,
+        /// Identifiers of the project-declared `[[outer_docs]]` entries the step
+        /// is implemented against (concept #c-review-subplan-docs-visibility).
+        outer_docs: Vec<String>,
         depends_on: Vec<String>,
         depth: usize,
         /// Whether the step owns nested child steps.
@@ -324,9 +327,9 @@ impl ReviewViewState {
 
     pub fn flatten_rows(&self) -> Vec<VisibleReviewRow> {
         let mut rows = Vec::new();
-        for session in &self.effective_sessions() {
+        for session in self.effective_sessions() {
             let is_expanded = self.is_session_expanded(&session.id);
-            rows.push(self.session_header_row(session, is_expanded));
+            rows.push(self.session_header_row(session.as_ref(), is_expanded));
             if !is_expanded {
                 continue;
             }
@@ -340,7 +343,7 @@ impl ReviewViewState {
                     });
                 }
             }
-            for bucket in self.group_buckets(session) {
+            for bucket in self.group_buckets(session.as_ref()) {
                 let group_expanded = self.is_group_expanded(&session.id, &bucket.id);
                 let has_plan = !bucket.subplan.is_empty();
                 rows.push(VisibleReviewRow::GroupHeader {
@@ -578,6 +581,7 @@ impl ReviewViewState {
                 .unwrap_or(false);
             let has_meta = !step.files.is_empty()
                 || !step.readonly_files.is_empty()
+                || !step.outer_docs.is_empty()
                 || !step.depends_on.is_empty();
             let is_expanded = self.is_subplan_item_expanded(session_id, group_id, &step.id);
 
@@ -590,6 +594,7 @@ impl ReviewViewState {
                 status: step.status,
                 files: step.files.clone(),
                 readonly_files: step.readonly_files.clone(),
+                outer_docs: step.outer_docs.clone(),
                 depends_on: step.depends_on.clone(),
                 depth,
                 has_children,

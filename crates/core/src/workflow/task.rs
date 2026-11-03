@@ -2,10 +2,10 @@
 //!
 //! A [`Task`] is the minimal unit of model interaction inside a bounded turn:
 //! it runs the shared turn pipeline against a borrowed [`TaskEnv`]. The
-//! individual FSM phases (discovery, staging, verification, healing) are
+//! individual FSM phases (research, staging, verification, healing) are
 //! orchestrated by that pipeline, so a task declares only its identity and its
 //! acceptance contract. Keeping the phases inside one pipeline preserves a
-//! single source of truth for discovery, staging, and healing while the tasks
+//! single source of truth for research, staging, and healing while the tasks
 //! stay declarative.
 
 use async_trait::async_trait;

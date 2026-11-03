@@ -672,29 +672,45 @@ pub async fn handle_modal_click(
             }
         }
         Some(ActiveModal::ReviewAnalyze) => {
-            if let Some(target) = st.confirm_review_analyze.clone() {
-                let geom = match crate::dialogs::render::review_analyze_params(&st) {
-                    Some(params) => geometry_of(term_rect, &params),
-                    None => return Ok(InputResult::Continue),
-                };
-                match check_confirm_hit(&geom, mouse.column, mouse.row) {
-                    ModalHit::Confirm => {
-                        st.confirm_review_analyze = None;
-                        crate::dialogs::input::confirm_review_analyze(
-                            state,
-                            st,
-                            target,
-                            server_writer,
-                        )
+            // The post-analysis dialog repeats the execution-dialog shape: the
+            // Architect ladder above the action bar, whose rows and buttons come
+            // from one geometry source shared with the renderer (Conventions §6,
+            // §7, c-dialog-parity).
+            if let Some(mut target) = st.confirm_review_analyze.take() {
+                let geo = crate::dialogs::render::review_analyze_dialog_geometry(
+                    term_rect,
+                    target.selector.len(),
+                );
+
+                if rect_contains(geo.confirm_button, mouse.column, mouse.row) {
+                    st.confirm_button = crate::app::ConfirmDialogButton::Cancel;
+                    crate::dialogs::input::confirm_review_analyze(state, st, target, server_writer)
                         .await?;
-                    }
-                    ModalHit::Cancel | ModalHit::Outside => {
-                        st.confirm_review_analyze = None;
-                        st.confirm_button = crate::app::ConfirmDialogButton::Cancel;
-                    }
-                    ModalHit::InsideBody => {}
+                    return Ok(InputResult::Continue);
                 }
+
+                if rect_contains(geo.cancel_button, mouse.column, mouse.row)
+                    || !rect_contains(geo.area, mouse.column, mouse.row)
+                {
+                    // Safe cancellation: dismiss without spending tokens.
+                    st.confirm_button = crate::app::ConfirmDialogButton::Cancel;
+                    return Ok(InputResult::Continue);
+                }
+
+                if rect_contains(geo.model_rows, mouse.column, mouse.row) {
+                    let visible = geo.model_rows.height as usize;
+                    let start = target.selector.visible_start(visible);
+                    let clicked_row = (mouse.row - geo.model_rows.y) as usize;
+                    let index = start + clicked_row;
+                    if index < target.selector.len() {
+                        target.selector.select_index(index);
+                    }
+                    target.focus = crate::app::ReviewAnalyzeFocus::ModelList;
+                }
+
+                st.confirm_review_analyze = Some(target);
             }
+            return Ok(InputResult::Continue);
         }
         Some(ActiveModal::ReviewTruncation) => {
             // The consent card reuses the exact confirmation parameters the
@@ -966,13 +982,17 @@ pub async fn handle_modal_click(
         }
         Some(ActiveModal::ThemeSelector) => {
             // Clicking a preset previews it; clicking outside cancels, restoring
-            // the preset that was active on open.
+            // the preset that was active on open. The selector releases the guard
+            // around the `tui.toml` rewrite, so a click never parks the event loop
+            // on the disk (c-1).
             crate::theme::selector::handle_theme_selector_click(
-                &mut st,
+                state,
+                st,
                 mouse.column,
                 mouse.row,
                 term_rect,
-            );
+            )
+            .await;
         }
         Some(ActiveModal::ClearHistory) => {
             if st.confirm_clear_history {
@@ -1114,7 +1134,8 @@ pub async fn handle_modal_click(
             };
 
             if let Some(button) = button {
-                crate::dialogs::input::click_locale_button(st, button, server_writer).await?;
+                crate::dialogs::input::click_locale_button(state, st, button, server_writer)
+                    .await?;
                 return Ok(InputResult::Continue);
             }
             if !rect_contains(geom.area, mouse.column, mouse.row) {
@@ -1334,13 +1355,28 @@ mod tests {
         let mut st = crate::app::test_state();
         st.view_mode = ViewMode::Review;
         st.last_frame_area = term;
-        st.confirm_review_analyze = Some(crate::app::ConfirmReviewAnalyzeState {
-            review_id: "rev-1".to_string(),
-            review_title: "Session rev-1".to_string(),
-        });
-
-        let params = crate::dialogs::render::review_analyze_params(&st).expect("params");
-        let geom = geometry_of(term, &params);
+        st.confirm_review_analyze = Some(crate::app::ConfirmReviewAnalyzeState::new(
+            "rev-1".to_string(),
+            "Session rev-1".to_string(),
+            vec![
+                tauqe_protocol::ModelEntry::new(
+                    tauqe_protocol::ModelRef::openrouter("architect-a"),
+                    None,
+                ),
+                tauqe_protocol::ModelEntry::new(
+                    tauqe_protocol::ModelRef::openrouter("architect-b"),
+                    None,
+                ),
+            ],
+        ));
+        {
+            let target = st
+                .confirm_review_analyze
+                .as_mut()
+                .expect("the dialog is open");
+            target.selector.select_index(1);
+        }
+        let geom = crate::dialogs::render::review_analyze_dialog_geometry(term, 2);
         let mouse = left_click(geom.confirm_button.x + 1, geom.confirm_button.y);
 
         let state = Arc::new(Mutex::new(st));
@@ -1353,6 +1389,10 @@ mod tests {
 
         let payload = String::from_utf8(conn.written().to_vec()).expect("utf-8 payload");
         assert!(payload.contains("review/analyze"), "{payload}");
+        assert!(
+            payload.contains("architect-b"),
+            "the selected architect must travel on the wire: {payload}"
+        );
 
         let guard = state.lock().await;
         assert!(guard.confirm_review_analyze.is_none());

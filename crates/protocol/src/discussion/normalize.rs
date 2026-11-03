@@ -23,7 +23,7 @@ where
 
 /// Normalizes a single repository-path request of the model-output boundary.
 ///
-/// One rule serves every discovery list alike: the targeted repository map
+/// One rule serves every research list alike: the targeted repository map
 /// requests, the directory listings, and the repository searches. An empty
 /// path, `.`, or `./` names the whole repository and normalizes to an empty
 /// string. Any other path is validated through [`normalize_repo_path`], so a

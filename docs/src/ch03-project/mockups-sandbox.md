@@ -88,7 +88,7 @@ exactly while Git ignores it.
 ### 2.2 One declaration, one answer
 
 The module owns two items: the directory constant and the predicate. Staging consults
-the predicate to decide admission and to filter the reported change set, discovery
+the predicate to decide admission and to filter the reported change set, research
 consults it to admit a file the tracked list will never name, and the prompt-side
 contract names the sandbox through the same constant. A second spelling of
 `.tauqe/mockups` anywhere in the engine would create a path the predicate does not
@@ -167,9 +167,9 @@ The sweep at the end of the turn then drops the entry with the rest of the Auto 
 The file stays on disk; only the working set shrinks.
 
 ### 3.4 Discovery admits a mockup by its existence
-
+### 3.4 Research admits a mockup by its existence
 A tracked file is admissible because the repository tracks it. A sandbox path can never
-satisfy that test, so discovery applies the one property the sandbox actually has: the
+satisfy that test, so research applies the one property the sandbox actually has: the
 file exists on disk inside the declared sandbox directory. An existing draft is
 therefore requestable in a later turn, and a requested path that does not exist is
 reported as missing like any other, because the sandbox grants no fabricated file — it
@@ -236,9 +236,9 @@ to consider a file it never tracked.
   them, and nothing protects them from the next turn or from the developer. State that
   must survive belongs in the project, in Git, or in the harness's own storage, never in
   a sketch.
-- **It is not the Refs cache.** The sibling `.tauqe/cache/refs/` shares the "exists on
-  disk" discovery admission but is read-only by construction, because a snapshot the
-  model could rewrite would stop being evidence. One directory holds drafts; the other
+- **It is not the OuterDocs cache.** The sibling `.tauqe/cache/outer_docs/` shares the
+  "exists on disk" research admission but is read-only by construction, because a snapshot
+  the model could rewrite would stop being evidence. One directory holds drafts; the other
   holds material quoted from outside the repository.
 - **It is not a place to hide a change.** A draft that must take effect is created at a
   tracked path; hiding it in the sandbox produces a file no compile, no test, and no
@@ -256,7 +256,7 @@ to consider a file it never tracked.
   change set the sandbox is filtered out of.
 - [The TauqeProjectProtocol](tauqe-project-protocol.md) — the post-hook capture whose
   differential ignores the sandbox.
-- [Discovery Engine](../ch02-perception/discovery-engine.md) — how an existing draft
+- [Research Engine](../ch02-perception/research-engine.md) — how an existing draft
   enters the context of a later turn.
 - [The Context Model](../ch02-perception/context-model.md) — the Auto layer
   the entry is swept with.

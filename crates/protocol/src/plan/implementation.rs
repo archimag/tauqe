@@ -357,7 +357,7 @@ impl PlanImplementation {
     ///
     /// Parent items act as conceptual milestones, phases, and task groups.
     /// They are never executed autonomously, so any `files`, `readonly_files`,
-    /// or `depends_on` list attached to a non-leaf item is cleared. Only leaf
+    /// `outer_docs`, or `depends_on` list attached to a non-leaf item is cleared.
     /// items (`is_leaf()`) define target context files and DAG dependencies.
     pub fn normalize_leaf_files(&mut self) {
         fn walk(items: &mut [PlanItem]) {
@@ -373,6 +373,7 @@ impl PlanImplementation {
                 }
                 item.files.clear();
                 item.readonly_files.clear();
+                item.outer_docs.clear();
                 item.depends_on.clear();
                 walk(&mut item.children);
             }
@@ -630,7 +631,7 @@ impl PlanImplementation {
                 }
                 // An executable leaf must name the context it targets: the
                 // preload and the context collection read these lists, so a
-                // leaf without them starts its step from a cold discovery
+                // leaf without them starts its step from a cold research
                 // round. A draft leaf settles its files in the dialogue, a
                 // finished leaf already recorded its work, and a cancelled
                 // leaf is never executed, so all three are exempt. A container

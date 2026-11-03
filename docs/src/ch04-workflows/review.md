@@ -34,7 +34,7 @@ Review is split into two independent phases:
    bounded turns: an independent defect on its own, and a cluster of symptoms of one
    root cause through the single plan of its architectural group.
 
-The audit never reuses the Develop conversation, and the fix phase never escalates
+The audit never reuses the REPL conversation, and the fix phase never escalates
 into the Architect role.
 
 ### 1.3 A symptom is not a defect to fix on its own
@@ -346,24 +346,39 @@ applies, so a preview can never predict a selection the server resolves differen
 blank pattern narrows nothing and the launch runs unrestricted; a pattern that matches
 nothing is an honest zero, and the launch is refused before a request is sent.
 
-`review/preview` projects the same window server-side: the context contribution, the
-matched files, the accepted files and their estimated tokens, and the budget
-breakdown, per group for a preset launch. `ReviewPreviewWindow::is_truncated` is the
-single predicate a client branches on, so a window that drops nothing needs no consent
-step and a truncated one asks before launching.
+`review/preview` projects the same window server-side: the context
+contribution, the matched files, the accepted files and their estimated
+tokens, the matches nobody could read, and the budget breakdown, per group for
+a preset launch. `ReviewPreviewWindow::is_truncated` is the single predicate a
+client branches on, so a window that drops nothing needs no consent step and a
+truncated one asks before launching.
 
-Pattern expansion is bounded by the same budget that governs discovery: the expansion
-stops at the first file that would push the loaded window past
-`context.files_token_budget`, and each matched file is priced as its content plus the
-wrapper its own `<file>` element renders, so the estimate covers what the audit
-actually reads. The number of matched files is never a limit: it is reported, not
-enforced, and a selection wider than any fixed ceiling is audited in full when the
-budget pays for it. Matches the budget cannot pay for are not inspected. The
-`review/started` event reports how many matched files were omitted, the daemon records
-a warning, and the interface raises one, so a silently narrow audit is impossible. A
-pattern that matches no tracked file is refused outright: launching anyway would audit
-a different file set than the one the developer believes the pattern chose. A partial
-selection stays a lawful run, reported through the omitted count.
+Pattern expansion is bounded by the same budget that governs research: the
+expansion reads files in selection order and stops at the first file that would
+push the loaded window past `context.token_budget`, so a wide pattern
+never loads the whole matched tree and then discards most of it. Each file is
+priced as its content plus the wrapper its own `<file>` element renders, so the
+estimate covers what the audit actually reads. The number of matched files is
+never a limit: it is reported, not enforced, and a selection wider than any
+fixed ceiling is audited in full when the budget pays for it. Matches the
+budget cannot pay for are not inspected, and the `review/started` event reports
+how many of them were omitted, the daemon records a warning, and the interface
+raises one, so a silently narrow audit is impossible.
+
+A match the window cannot decode is never a budget omission. A binary blob, a
+symlink escaping the repository, and a file deleted from the working tree but
+still tracked can all match a pattern and none of them can be audited, so they
+are counted on a counter of their own. `review/preview` reports it as
+`unreadable_files`, so those matches are never charged to the token budget.
+Truncation therefore keeps exactly one cause:
+`ReviewPreviewWindow::is_truncated` is true only when the budget dropped a
+readable candidate, and `review/started` never publishes an omission count
+inflated by files nobody could read.
+
+A pattern that matches no tracked file is refused outright: launching anyway
+would audit a different file set than the one the developer believes the
+pattern chose. A partial selection stays a lawful run, reported through the
+omitted count.
 
 While the run is in flight, the Review view mirrors its progress in the info strip. A
 grouped session audits its slices one at a time, and the strip names the group that is
@@ -378,7 +393,7 @@ grouped run stays subordinate to the run's own terminal event.
 
 ### 3.2 Why the audit is isolated
 
-The reviewer receives the pure content of the selected files — no Develop history and
+The reviewer receives the pure content of the selected files — no REPL history and
 no repository map. Three reasons make that deliberate:
 
 - **No confirmation bias.** Sharing the development narrative imports its
@@ -456,10 +471,27 @@ bare turn (§3.7).
 | `manual` | classify only when the developer asks after the groups finish |
 | `none` | never classify; the findings stay a flat list |
 
-`Shift+A` runs the classification manually over the session the cursor rests on, so a
-stored audit can be classified later or re-analyzed after new findings. The request is
-refused while a turn, an audit, or another classification is in flight, and the layer
-it produces replaces the previous one wholesale.
+`Shift+A` runs the classification manually over the session the cursor rests on, on
+the Architect rung its launch card lists, so a stored audit can be classified later
+or re-analyzed after new findings. The request is refused while a turn, an audit, or
+another classification is in flight, and the layer it produces replaces the previous
+one wholesale.
+
+**The classification declares its Architect configuration.** The request carries an
+optional Architect selection in the same wire form plan refinement uses: a semantic
+role, an explicit model reference, or an explicit rung of the Architect ladder
+together with the reasoning depth that rung was configured with, so the model and its
+depth travel as one coordinate. Resolution stays core-owned domain policy — the
+daemon renders the configuration that policy returned and never re-derives the
+ladder — so a classification and a refined horizon answer to one escalation rule.
+
+An absent selection runs the base rung of the ladder, which is exactly how the
+automatic classification after a grouped audit runs: that contour has no developer to
+pick one. The base rung is always resolvable, because the Architect ladder inherits
+the whole `primary` list when a project declares no architect entries. A selection
+the Architect role does not carry is a typed refusal naming the requested entry
+(`INVALID_MODEL`), raised before any provider call, because a silent fallback to the
+base rung would classify the findings with a configuration nobody asked for.
 
 ### 3.6 Discussion
 
@@ -482,6 +514,16 @@ it under its own lock at the round that decoded it, the session is published
 immediately, and the transition is durable even when the rest of the turn fails. A
 recommendation the finding already carries is never duplicated, and a finding the named
 session does not hold is reported as absent rather than invented.
+
+The field is authorized by the dialogue regime, never by the anchor alone. A dialogue
+anchored on a review session or on one of its groups is its own turn regime, and the
+server grants the decision to that regime exactly as it grants plan mutation to a plan
+discussion. The narrowed capability surface therefore stays the single source of truth:
+an ordinary REPL turn, a plan discussion, and an isolated step compose the shared
+dialogue head without the field, and their decoders drop it instead of accepting a
+payload they never advertise. The decision exists only in the structured contour — it
+owns no XML control tag — so it never travels as markup, and a dialogue encoded as XML
+neither advertises nor decodes it.
 
 The vocabulary is deliberately narrower than the lifecycle. A discussion may queue a
 finding for execution (`todo`), dismiss it as not reproducible (`skipped`), or reject it
@@ -538,9 +580,9 @@ Before any token is spent, a request is refused when:
 
 The isolated prompt speaks the vocabulary of the active protocol. The XML contour
 carries its marker-suffixed completion, skip, block, and discovery tags, while the
-structured contour names its response fields instead — `outcome` for completion or a
+carries its marker-suffixed completion, skip, block, and research tags, while the
 declared skip, `blocked` for a conflict with the fixed decision, and
-`context_requests` for discovery — and never advertises a tag it would not emit.
+`context_requests` for research — and never advertises a tag it would not emit.
 
 The prompt fixes the decision on two levels. The `IsolatedStep` system contract
 states that the resolving turn owns the implementation only, and the execution prompt
@@ -591,7 +633,7 @@ scheduler, because finding decomposition and plan refinement are the same
 operation — both ask the Architect for a horizon — so it runs through the same
 structured Architect contour with the same invariants: target files are
 preloaded read-only before the first round, contracts must be requested instead
-of guessed from contours, the resilient discovery loop tolerates re-requested
+of guessed from contours, the resilient research loop tolerates re-requested
 files, an unparsable payload is healed within the rung's budget, and a
 contradiction yields a blocker. A synthesized horizon that would be dead on
 arrival — a dependency naming a step that does not exist, or a step set whose
@@ -673,7 +715,7 @@ status of its findings follows that unit:
    therefore stays inspectable after the plan itself scrolls out of view.
 4. **When a step fails or blocks** the completed steps keep their `Done` status and
    their verified changes, the remaining horizon is replanned by the Architect, and
-   the walk continues around the failure. `develop.max_replans` bounds the waves.
+the walk continues around the failure. `repl.max_replans` bounds the waves.
 
 Planning material is exactly the set of open findings. The Architect synthesizes the
 horizon from the group description and its `Todo` findings, and a replan uses the same
@@ -771,7 +813,7 @@ invented.
 
 Members deliberately leave the shared turn open: a member's own error event records
 its diagnostic without tearing down the queue, and the supervisor's terminal event is
-the single point that settles the turn. The Develop canvas then stops its spinner,
+the single point that settles the turn. The REPL canvas then stops its spinner,
 projects the status onto the turn — `completed` onto `Done`, `failed` and `blocked`
 onto `Error`, `cancelled` and `stopped` onto `Cancelled` — and writes the first
 usable line of `error` into the response pane, exactly as a single failed turn does.
@@ -839,18 +881,18 @@ replace it:
    harmonizing with plan step files. Legacy single-path findings are migrated on read.
 2. **Batch context preloading.** Every declared path is loaded as editable auto
    context before the fixing turn begins, so the model receives the whole surface on
-   round zero instead of spending discovery latency on it.
+round zero instead of spending research latency on it.
 
 ### 3.12 Model assignment and escalation
 
 A finding may carry a role or an explicit model, rendered as a badge beside the
 status, so a simple defect runs on a cheap model while a hard one uses a stronger one.
 A finding without an assignment resolves to the Coder role, never to whatever model
-happens to be selected in Develop.
+happens to be selected in the REPL.
 
 Resolution is intra-role escalation only. With `models.auto_level_up` enabled, a turn
 that fails verification is first rolled back to its pre-step checkpoint and re-asked
-on the same coder rung, up to `develop.max_tier_attempts` attempts, with discovered
+on the same coder rung, up to `repl.max_tier_attempts` attempts, with discovered
 files kept in context. Only an exhausted tier advances one rung, and the new rung
 starts with a fresh budget of its own. When the ladder itself saturates, the
 domain-failure policy applies: the tree stays rolled back, the unit becomes `Skipped`
@@ -931,7 +973,7 @@ missing icon.
 - **It is not a chat about a diff.** The audit produces typed findings with a
   lifecycle, not an opinion.
 - **It is not a second opinion from the same context.** Isolation is what makes the
-  verdict independent; sharing the Develop history destroys its value.
+verdict independent; sharing the REPL history destroys its value.
 - **It is not a writer.** The reviewer reports; resolution is a separate coder turn.
 - **It is not a line-based tool.** Findings name files, never coordinates, so they
   survive consecutive edits in a batch.
@@ -979,6 +1021,9 @@ missing icon.
 - **It is not a status mutator on its own initiative.** A discussion records the
   decision the engineer states in the dialogue; it never invents a status the engineer
   did not choose, and it never declares a fix.
+- **It is not a field the XML contour carries.** The decision owns no control tag, so
+  it travels exclusively through Structured Output; a dialogue encoded as XML neither
+  advertises the field nor decodes it.
 - **It is not a way to weaken verification.** Pre-flight and per-turn gates come from
   project configuration, not from the model.
 - **It is not a batch that hides failure.** A reverted failure becomes a recorded local
@@ -986,7 +1031,7 @@ missing icon.
   working tree aborts the run, and that stop is reported through the typed summary, the
   settled turn, and the durable diagnostic on the finding.
 - **It is not an infinite retry of one rung.** A member spends its configured
-  `develop.max_tier_attempts` attempts on the current coder rung before the ladder
+  `repl.max_tier_attempts` attempts on the current coder rung before the ladder
   moves, and a saturated ladder ends in the domain-failure policy rather than another
   attempt.
 - **It is not a burned rung per broken connection.** A transport failure consumes no

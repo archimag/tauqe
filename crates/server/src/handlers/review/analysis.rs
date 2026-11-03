@@ -23,8 +23,9 @@
 //!   group of independent findings: the layer mints a single-element
 //!   architectural group for it, so the requirement holds regardless of how the
 //!   classification described the finding.
-//!   holds. A hallucinated identifier is a typed refusal instead of a group that
-//!   would render a finding nothing can name.
+//! * Every reference must name a finding the session holds. A hallucinated
+//!   identifier is a typed refusal instead of a group that would render a
+//!   finding nothing can name.
 //!
 //! The decoded payload, its strict schema, and the identity validation live in
 //! the core engine (`tauqe_core::review::analysis`), so this module owns only the
@@ -34,7 +35,9 @@ use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::Arc;
 
+use tauqe_core::config::AppConfig;
 use tauqe_core::edits::stream::json::JsonFieldStreamFilter;
+use tauqe_core::plan::prompt::resolve_architect_tier;
 use tauqe_core::providers::{format_session_id, ChatMessage, StreamEvent, SESSION_PREFIX_REVIEW};
 use tauqe_core::review::analysis::{
     parse_post_analysis, post_analysis_response_format, validate_post_analysis, PostAnalysisOutput,
@@ -44,7 +47,9 @@ use tauqe_core::review::prompt::analysis::{
 };
 use tauqe_core::review::storage::FindingAssignment;
 use tauqe_core::review::{uuid::generate_uuid_v7, ReviewStorage};
-use tauqe_protocol::model::{ReviewWorkPhase, TurnWorkContext, TurnWorkQueue};
+use tauqe_protocol::model::{
+    ArchitectTier, ModelSelection, ReviewWorkPhase, TurnWorkContext, TurnWorkQueue,
+};
 use tauqe_protocol::review::{
     ReviewGroup, ReviewGroupKind, LOCAL_REVIEW_GROUP_ID, LOCAL_REVIEW_GROUP_TITLE,
 };
@@ -73,7 +78,9 @@ use super::common::{emit, offload_review, publish_review};
 ///
 /// A session with nothing to classify is refused by the shared procedure before
 /// any provider call, exactly as a session that cannot be resolved is refused
-/// here.
+/// here. An optional Architect selection travels to that procedure, so the
+/// round runs the configuration the caller named; an absent one keeps the
+/// base rung of the architect ladder.
 pub async fn handle_review_analyze(req: Request, state: &Arc<AppState>) -> Response {
     let params: ReviewAnalyzeParams = match req.params {
         Some(params) => match serde_json::from_value(params) {
@@ -136,7 +143,16 @@ pub async fn handle_review_analyze(req: Request, state: &Arc<AppState>) -> Respo
         }
     };
 
-    match run_review_post_analysis(state, &repo_root, &session, &operation, false).await {
+    let analyzed = run_review_post_analysis(
+        state,
+        &repo_root,
+        &session,
+        params.model.as_ref(),
+        &operation,
+        false,
+    )
+    .await;
+    match analyzed {
         Ok(session) => Response::ok_typed(req.id, &ReviewAnalyzeResult { session }),
         Err(err) => Response {
             id: req.id,
@@ -166,10 +182,20 @@ pub async fn handle_review_analyze(req: Request, state: &Arc<AppState>) -> Respo
 /// shared turn and lets the batch supervisor emit the single terminal signal.
 /// Deriving it from the caller would conflate the storage contract with the
 /// execution context.
+///
+/// `selection` names the Architect configuration the round runs on: an absent
+/// value keeps the base rung of the architect ladder, while an explicit value
+/// is resolved by the same core policy plan refinement uses, so the daemon
+/// renders the configuration that policy returned instead of deriving the
+/// ladder a second time. A selection the architect role does not carry is
+/// refused by name before the provider call, because silently falling back to
+/// the base rung would classify the findings with a configuration nobody asked
+/// for.
 pub(super) async fn run_review_post_analysis(
     state: &Arc<AppState>,
     repo_root: &Path,
     session: &ReviewSession,
+    selection: Option<&ModelSelection>,
     operation: &OperationGuard,
     is_batch: bool,
 ) -> Result<ReviewSession, ResponseError> {
@@ -219,8 +245,13 @@ pub(super) async fn run_review_post_analysis(
         // Tier resolution is core-owned domain policy: the architect ladder
         // inherits the whole `primary` list when a project declares no architect
         // entries, so the base rung is always resolvable and its reasoning depth
-        // travels with it instead of being re-derived here.
-        let architect_tier = config.models.architect_tier(0);
+        // travels with it instead of being re-derived here. An absent
+        // selection runs that base rung, which is exactly what the automatic
+        // classification after a grouped audit runs on.
+        let architect_tier = match resolve_post_analysis_architect(&config, selection) {
+            Ok(tier) => tier,
+            Err(message) => return Err(post_analysis_error(errors::INVALID_MODEL, message)),
+        };
         let provider =
             match resolve_architect_provider(state, &config, architect_tier.model.provider).await {
                 Ok(provider) => provider,
@@ -548,6 +579,43 @@ pub(super) async fn run_review_post_analysis(
     Ok(stored)
 }
 
+/// Resolves the Architect configuration of one post-analysis round.
+///
+/// Tier resolution is the same core-owned policy plan refinement runs on, so
+/// the daemon renders the configuration the policy returned and never derives
+/// the architect ladder a second time. An absent selection keeps the base rung,
+/// while an explicit one carries the model together with the reasoning depth
+/// of the configured entry the developer picked.
+///
+/// A selection naming a model the architect role does not carry is refused by
+/// name. Silently falling back to the base rung would classify the findings
+/// with a configuration nobody asked for, which is exactly what an explicit
+/// selection exists to prevent. A role selection resolves through the domain
+/// role chain, so it never needs the membership check.
+fn resolve_post_analysis_architect(
+    cfg: &AppConfig,
+    selection: Option<&ModelSelection>,
+) -> Result<ArchitectTier, String> {
+    let Some(selection) = selection else {
+        return Ok(resolve_architect_tier(cfg, None, None, None, None).0);
+    };
+    if !matches!(selection, ModelSelection::Role(_)) {
+        let requested = cfg.resolve_model(selection);
+        let configured = cfg
+            .models
+            .role_entries(ModelRole::Architect)
+            .iter()
+            .any(|entry| entry.model == requested);
+        if !configured {
+            return Err(format!(
+                "Architect selection '{}' is not a configured architect entry",
+                selection
+            ));
+        }
+    }
+    Ok(resolve_architect_tier(cfg, None, Some(selection), None, None).0)
+}
+
 /// Collects the finding identities the session holds, in stored order.
 ///
 /// Identity is what the classification references. Healing runs before this
@@ -824,10 +892,12 @@ fn post_analysis_error(code: &'static str, message: String) -> ResponseError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tauqe_core::config::AppConfig;
+    use tauqe_core::config::{AppConfig, ModelsConfig};
     use tauqe_core::providers::mock::MockResponse;
-    use tauqe_core::providers::MockLlmProvider;
-    use tauqe_protocol::{IssueStatus, IssueType, ModelRef, ReviewItem, ReviewSeverity};
+    use tauqe_core::providers::{LlmProvider, MockLlmProvider};
+    use tauqe_protocol::{
+        IssueStatus, IssueType, ModelEntry, ModelRef, ReasoningEffort, ReviewItem, ReviewSeverity,
+    };
 
     /// Identity of the finding the core engine group produced.
     const CORE_UUID: &str = "018f9c1e-6b3a-7c1e-8b3a-000000000001";
@@ -859,6 +929,35 @@ mod tests {
         let (history_sender, _history_rx) = tokio::sync::mpsc::unbounded_channel();
         let state = AppState::new(AppConfig::default(), root.clone(), history_sender, out);
         AnalysisFixture { root, state }
+    }
+
+    /// Runs one post-analysis round of the fixture session through the shared
+    /// procedure, so a test names only the Architect selection it exercises.
+    async fn analyze(
+        fixture: &AnalysisFixture,
+        session: &ReviewSession,
+        selection: Option<&ModelSelection>,
+    ) -> Result<ReviewSession, ResponseError> {
+        let operation = fixture.state.try_begin_operation().unwrap();
+        run_review_post_analysis(
+            &fixture.state,
+            &fixture.root,
+            session,
+            selection,
+            &operation,
+            false,
+        )
+        .await
+    }
+
+    /// Installs an architect ladder of `entries` over the fixture project.
+    async fn configure_architect(fixture: &AnalysisFixture, entries: Vec<ModelEntry>) {
+        let mut config = fixture.state.config.lock().await;
+        config.config.models = ModelsConfig {
+            primary: vec![ModelEntry::from(ModelRef::openrouter("test/primary"))],
+            architect: Some(entries),
+            ..Default::default()
+        };
     }
 
     fn finding(id: u32, uuid: &str, group: &str, status: IssueStatus) -> ReviewItem {
@@ -936,11 +1035,9 @@ mod tests {
         ]));
         *fixture.state.provider_override.lock().await = Some(provider);
 
-        let operation = fixture.state.try_begin_operation().unwrap();
-        let first =
-            run_review_post_analysis(&fixture.state, &fixture.root, &session, &operation, false)
-                .await
-                .expect("the classification is persisted");
+        let first = analyze(&fixture, &session, None)
+            .await
+            .expect("the classification is persisted");
         // The classification is the session itself: the verdict becomes the
         // session description, the payload clusters become the session groups,
         // and every finding moves to the group that now owns it. An architecture
@@ -976,10 +1073,9 @@ mod tests {
         assert_eq!(first.items[0].status, IssueStatus::Todo);
         assert_eq!(first.items[1].status, IssueStatus::Discussion);
 
-        let second =
-            run_review_post_analysis(&fixture.state, &fixture.root, &session, &operation, false)
-                .await
-                .expect("the second classification is persisted");
+        let second = analyze(&fixture, &session, None)
+            .await
+            .expect("the second classification is persisted");
         // The second classification substitutes the grouping wholesale: no part
         // of the previous one survives, while every finding keeps its identity,
         // its content, and its lifecycle status.
@@ -1040,11 +1136,9 @@ mod tests {
         )]));
         *fixture.state.provider_override.lock().await = Some(provider);
 
-        let operation = fixture.state.try_begin_operation().unwrap();
-        let stored =
-            run_review_post_analysis(&fixture.state, &fixture.root, &session, &operation, false)
-                .await
-                .expect("the classification is persisted");
+        let stored = analyze(&fixture, &session, None)
+            .await
+            .expect("the classification is persisted");
 
         // The architecture finding is planned before it is executed, so it owns a
         // single-element architectural group titled after the finding itself,
@@ -1082,11 +1176,9 @@ mod tests {
         )]));
         *fixture.state.provider_override.lock().await = Some(provider);
 
-        let operation = fixture.state.try_begin_operation().unwrap();
-        let err =
-            run_review_post_analysis(&fixture.state, &fixture.root, &session, &operation, false)
-                .await
-                .expect_err("a foreign identifier must be refused");
+        let err = analyze(&fixture, &session, None)
+            .await
+            .expect_err("a foreign identifier must be refused");
         assert_eq!(err.code, errors::SCHEMA_ERROR);
         assert!(
             err.message.contains(foreign),
@@ -1117,11 +1209,9 @@ mod tests {
         };
         ReviewStorage::save_session(&fixture.root, &session).unwrap();
 
-        let operation = fixture.state.try_begin_operation().unwrap();
-        let err =
-            run_review_post_analysis(&fixture.state, &fixture.root, &session, &operation, false)
-                .await
-                .expect_err("an empty session has nothing to classify");
+        let err = analyze(&fixture, &session, None)
+            .await
+            .expect_err("an empty session has nothing to classify");
         assert_eq!(err.code, errors::EMPTY_ITEMS);
 
         let stored = ReviewStorage::load_review(&fixture.root, "rev-empty")
@@ -1148,11 +1238,9 @@ mod tests {
         )]));
         *fixture.state.provider_override.lock().await = Some(provider);
 
-        let operation = fixture.state.try_begin_operation().unwrap();
-        let stored =
-            run_review_post_analysis(&fixture.state, &fixture.root, &session, &operation, false)
-                .await
-                .expect("a re-spelled identity resolves");
+        let stored = analyze(&fixture, &session, None)
+            .await
+            .expect("a re-spelled identity resolves");
         assert_eq!(stored.description.as_deref(), Some("One shared boundary."));
         assert_eq!(stored.groups.len(), 3);
         assert_eq!(stored.groups[0].id, "arch-1");
@@ -1217,11 +1305,9 @@ mod tests {
         let provider = Arc::new(MockLlmProvider::scripted([MockResponse::text(payload)]));
         *fixture.state.provider_override.lock().await = Some(provider);
 
-        let operation = fixture.state.try_begin_operation().unwrap();
-        let stored =
-            run_review_post_analysis(&fixture.state, &fixture.root, &session, &operation, false)
-                .await
-                .expect("the classification is persisted");
+        let stored = analyze(&fixture, &session, None)
+            .await
+            .expect("the classification is persisted");
 
         assert_eq!(stored.items[0].status, IssueStatus::Todo);
         assert_eq!(stored.items[1].status, IssueStatus::Discussion);
@@ -1255,14 +1341,131 @@ mod tests {
         let provider = Arc::new(MockLlmProvider::scripted([MockResponse::text(payload)]));
         *fixture.state.provider_override.lock().await = Some(provider);
 
-        let operation = fixture.state.try_begin_operation().unwrap();
-        let stored =
-            run_review_post_analysis(&fixture.state, &fixture.root, &session, &operation, false)
-                .await
-                .expect("the classification is persisted");
+        let stored = analyze(&fixture, &session, None)
+            .await
+            .expect("the classification is persisted");
 
         assert_eq!(stored.items[0].status, IssueStatus::Fixed);
         assert_eq!(stored.items[0].group.as_deref(), Some("arch-1"));
         assert_eq!(stored.items[1].status, IssueStatus::Discussion);
+    }
+
+    /// The selected architect rung is the configuration the round runs on: the
+    /// model and the reasoning depth of the picked entry reach the provider.
+    #[tokio::test]
+    async fn post_analysis_runs_on_the_selected_architect_entry() {
+        let fixture = fixture("selection");
+        let session = session();
+        ReviewStorage::save_session(&fixture.root, &session).unwrap();
+        configure_architect(
+            &fixture,
+            vec![
+                ModelEntry::from(ModelRef::openrouter("test/architect")),
+                ModelEntry::new(
+                    ModelRef::openrouter("test/architect-strong"),
+                    Some(ReasoningEffort::High),
+                ),
+            ],
+        )
+        .await;
+
+        let payload = classification("One shared boundary.", &[CORE_UUID], &[]);
+        let provider = Arc::new(MockLlmProvider::scripted([MockResponse::text(payload)]));
+        let injected: Arc<dyn LlmProvider> = provider.clone();
+        *fixture.state.provider_override.lock().await = Some(injected);
+        let selection = ModelSelection::Tier {
+            model: ModelRef::openrouter("test/architect-strong"),
+            effort: Some(ReasoningEffort::High),
+        };
+
+        let stored = analyze(&fixture, &session, Some(&selection))
+            .await
+            .expect("the selected rung classifies the session");
+
+        let request = provider.last_request().expect("the provider was called");
+        assert_eq!(request.model, "test/architect-strong");
+        assert_eq!(request.reasoning_effort, Some(ReasoningEffort::High));
+        assert_eq!(stored.description.as_deref(), Some("One shared boundary."));
+    }
+
+    /// An absent selection keeps the base rung: the round runs the first
+    /// architect entry, exactly as the automatic classification after a
+    /// grouped audit does.
+    #[tokio::test]
+    async fn post_analysis_without_a_selection_runs_the_base_architect_rung() {
+        let fixture = fixture("base-rung");
+        let session = session();
+        ReviewStorage::save_session(&fixture.root, &session).unwrap();
+        configure_architect(
+            &fixture,
+            vec![
+                ModelEntry::from(ModelRef::openrouter("test/architect")),
+                ModelEntry::new(
+                    ModelRef::openrouter("test/architect-strong"),
+                    Some(ReasoningEffort::High),
+                ),
+            ],
+        )
+        .await;
+
+        let payload = classification("One shared boundary.", &[CORE_UUID], &[]);
+        let provider = Arc::new(MockLlmProvider::scripted([MockResponse::text(payload)]));
+        let injected: Arc<dyn LlmProvider> = provider.clone();
+        *fixture.state.provider_override.lock().await = Some(injected);
+
+        let stored = analyze(&fixture, &session, None)
+            .await
+            .expect("the base rung classifies the session");
+        assert_eq!(stored.description.as_deref(), Some("One shared boundary."));
+
+        let request = provider.last_request().expect("the provider was called");
+        assert_eq!(request.model, "test/architect");
+        assert!(
+            request.reasoning_effort.is_none(),
+            "the base entry declares no reasoning depth"
+        );
+    }
+
+    /// A selection the architect role does not carry is refused by name before
+    /// any provider call: the round never falls back to the base rung behind an
+    /// explicit choice.
+    #[tokio::test]
+    async fn post_analysis_refuses_an_unconfigured_architect_selection() {
+        let fixture = fixture("selection-foreign");
+        let session = session();
+        ReviewStorage::save_session(&fixture.root, &session).unwrap();
+        configure_architect(
+            &fixture,
+            vec![ModelEntry::from(ModelRef::openrouter("test/architect"))],
+        )
+        .await;
+
+        let payload = classification("Unused payload.", &[], &[]);
+        let provider = Arc::new(MockLlmProvider::scripted([MockResponse::text(payload)]));
+        let injected: Arc<dyn LlmProvider> = provider.clone();
+        *fixture.state.provider_override.lock().await = Some(injected);
+        let selection = ModelSelection::Specific(ModelRef::openrouter("test/stranger"));
+
+        let err = analyze(&fixture, &session, Some(&selection))
+            .await
+            .expect_err("an unconfigured selection must be refused");
+        assert_eq!(err.code, errors::INVALID_MODEL);
+        assert!(
+            err.message.contains("test/stranger"),
+            "the diagnostic must name the requested entry: {}",
+            err.message
+        );
+        assert!(
+            provider.requests().is_empty(),
+            "a refused selection never reaches the provider"
+        );
+
+        let stored = ReviewStorage::load_review(&fixture.root, "rev-analyze")
+            .unwrap()
+            .expect("the session is stored");
+        assert!(
+            stored.post_analysis.is_none(),
+            "a refused selection rewrites nothing"
+        );
     }
 }

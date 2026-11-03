@@ -178,7 +178,16 @@ hides an open transaction.
    unresolvable declaration, a filter that emits nothing while the staged text was
    not empty, or a rewritten document the staged-configuration gate rejects keeps
    the authored content and reports a compact reason.
-4. **Rationale (Why):** formatting improves the shape of a change; it never proves its
+4. **The File Context Travels Beside the Stream:** the filter learns which file
+   it rewrites from the resolved declaration, never from the content it reads. The
+   repository-relative path reaches the child through the `TAUQE_FILE_PATH`
+   environment variable, and a declaration that names the parameter `path` or
+   `file` receives the same path as one literal argument, which is how a polyglot
+   dispatcher selects its filter by file type. A declaration that names neither
+   keeps its argument list exactly as written, so a plain filter such as `rustfmt`
+   still reads the staged text and nothing else, and an invocation without a known
+   path supplies neither the variable nor the argument.
+5. **Rationale (Why):** formatting improves the shape of a change; it never proves its
    correctness, so it cannot sit on the verification gate.
 
 ---

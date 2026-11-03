@@ -4,8 +4,8 @@ use std::path::PathBuf;
 use tauqe_protocol::{EditFileOp, EditFileStatus, EditOperation};
 
 use super::{
-    normalize_hunk, resolve_path, EditStreamFilter, OwnedAnchor, StagingSimulator,
-    TRUNCATED_EDIT_DIAGNOSTIC,
+    hunk_event, normalize_hunk, resolve_path, EditStreamFilter, HunkCoordinates, OwnedAnchor,
+    StagingSimulator, TRUNCATED_EDIT_DIAGNOSTIC,
 };
 use crate::edits::protocol::xml::engine::{OpenTag, ScanStep, TextScan};
 use crate::edits::protocol::xml::{is_valid_turn_marker, FileBlockTag, XmlEditProtocol};
@@ -289,12 +289,21 @@ impl XmlStreamFilter {
                             String::new()
                         };
 
-                        events.push(StreamEvent::EditHunk {
-                            path: curr_path.clone(),
-                            hunk_index: 0,
+                        // A whole-file payload replaces the file from its first
+                        // line to its last one, while a created file has no old
+                        // side at all, so both sides are counted from the payload.
+                        let overwrites = curr_block.op == EditFileOp::Overwrite;
+                        let coordinates = HunkCoordinates::whole_file(
+                            overwrites.then_some(old_text.as_str()),
+                            &norm_content,
+                        );
+                        events.push(hunk_event(
+                            &curr_path,
+                            0,
+                            coordinates,
                             old_text,
-                            new_text: norm_content.clone(),
-                        });
+                            norm_content.clone(),
+                        ));
 
                         self.staging.overwrite(&curr_path, norm_content);
 
@@ -319,24 +328,28 @@ impl XmlStreamFilter {
 
                         let val_res = self.staging.apply_hunk(&curr_path, &old_text, &new_text);
 
-                        events.push(StreamEvent::EditHunk {
-                            path: curr_path.clone(),
-                            hunk_index: hunk_idx,
-                            old_text,
-                            new_text,
-                        });
-
                         self.consume(hunk_end);
 
-                        if let Err(err_msg) = val_res {
-                            events.push(StreamEvent::EditFileDone {
-                                path: curr_path,
-                                status: EditFileStatus::Error,
-                                error: Some(err_msg),
-                                hunks_count: self.file_hunks_count,
-                            });
-                            self.current_file = None;
-                            continue;
+                        match val_res {
+                            Ok(coordinates) => {
+                                events.push(hunk_event(
+                                    &curr_path,
+                                    hunk_idx,
+                                    coordinates,
+                                    old_text,
+                                    new_text,
+                                ));
+                            }
+                            Err(err_msg) => {
+                                events.push(StreamEvent::EditFileDone {
+                                    path: curr_path,
+                                    status: EditFileStatus::Error,
+                                    error: Some(err_msg),
+                                    hunks_count: self.file_hunks_count,
+                                });
+                                self.current_file = None;
+                                continue;
+                            }
                         }
                         continue;
                     }
@@ -487,12 +500,15 @@ impl ChangeSetPreview {
                 self.open(&path, &path, EditFileOp::Create, events);
                 let hunk_index = self.next_hunk_index(&path);
                 let content = normalize_hunk(&content);
-                events.push(StreamEvent::EditHunk {
-                    path: path.clone(),
+                // A created file has no old side, so the hunk names only the
+                // lines the payload introduces.
+                events.push(hunk_event(
+                    &path,
                     hunk_index,
-                    old_text: String::new(),
-                    new_text: content.clone(),
-                });
+                    HunkCoordinates::whole_file(None, &content),
+                    String::new(),
+                    content.clone(),
+                ));
                 staging.overwrite(&path, content);
                 self.hunk_counts.insert(path, hunk_index + 1);
             }
@@ -502,12 +518,16 @@ impl ChangeSetPreview {
                 let new_content = normalize_hunk(&content);
                 match staging.current_content(&path) {
                     Ok(old_text) => {
-                        events.push(StreamEvent::EditHunk {
-                            path: path.clone(),
+                        // A whole-file payload replaces the file from its first
+                        // line to its last one, so both sides are counted from
+                        // the content the preview received.
+                        events.push(hunk_event(
+                            &path,
                             hunk_index,
+                            HunkCoordinates::whole_file(Some(&old_text), &new_content),
                             old_text,
-                            new_text: new_content.clone(),
-                        });
+                            new_content.clone(),
+                        ));
                         staging.overwrite(&path, new_content);
                         self.hunk_counts.insert(path, hunk_index + 1);
                     }
@@ -543,14 +563,15 @@ impl ChangeSetPreview {
                 let hunk_index = self.next_hunk_index(&path);
                 let old_text = normalize_hunk(&old_text);
                 let new_text = normalize_hunk(&new_text);
-                events.push(StreamEvent::EditHunk {
-                    path: path.clone(),
-                    hunk_index,
-                    old_text: old_text.clone(),
-                    new_text: new_text.clone(),
-                });
                 match staging.apply_hunk(&path, &old_text, &new_text) {
-                    Ok(()) => {
+                    Ok(coordinates) => {
+                        events.push(hunk_event(
+                            &path,
+                            hunk_index,
+                            coordinates,
+                            old_text,
+                            new_text,
+                        ));
                         self.hunk_counts.insert(path, hunk_index + 1);
                     }
                     Err(message) => self.fail(path, message, hunk_index + 1, events),
@@ -580,18 +601,21 @@ impl ChangeSetPreview {
                     staging.apply_anchor_batch(&path, &batch)
                 };
                 match outcome {
-                    Ok(replaced) => {
+                    Ok(previews) => {
                         // The snapshot text of the addressed range is the removed
-                        // side of the diff, so the preview shows an honest
-                        // replacement instead of a bare addition.
-                        let old_text = replaced.last().cloned().unwrap_or_default();
-                        events.push(StreamEvent::EditHunk {
-                            path: path.clone(),
-                            hunk_index,
-                            old_text,
-                            new_text: replacement,
-                        });
-                        self.hunk_counts.insert(path, hunk_index + 1);
+                        // side of the diff, and its coordinates are the lines the
+                        // anchors decoded to, so the preview shows an honest
+                        // replacement at a real place instead of a bare addition.
+                        if let Some(preview) = previews.last() {
+                            events.push(hunk_event(
+                                &path,
+                                hunk_index,
+                                preview.coordinates.clone(),
+                                preview.replaced.clone(),
+                                replacement,
+                            ));
+                            self.hunk_counts.insert(path, hunk_index + 1);
+                        }
                     }
                     Err(message) => self.fail(path, message, hunk_index, events),
                 }
@@ -719,7 +743,7 @@ mod tests {
 
     #[test]
     fn test_plan_step_done_tags_hidden_from_stream_text() {
-        let input = "Step done.\n<success summary=\"All checks pass\" />\nReady";
+        let input = "Step done.\n<success commit_message=\"All checks pass\" />\nReady";
         let mut filter = XmlStreamFilter::new(vec![], std::env::temp_dir());
         let mut events = Vec::new();
         for ch in input.chars() {
@@ -1145,6 +1169,19 @@ mod tests {
             vec![(0, "beta".to_string(), "BETA\n".to_string())]
         );
         assert_eq!(completions(&events), vec![(EditFileStatus::Ok, 1)]);
+        // The anchored range names the second line of the file, so the streamed
+        // event states exactly that instead of leaving the coordinates unknown.
+        assert!(events.iter().any(|event| matches!(
+            event,
+            StreamEvent::EditHunk {
+                old_start: 2,
+                old_lines: 1,
+                new_start: 2,
+                new_lines: 1,
+                context_hint: Some(hint),
+                ..
+            } if hint == "alpha"
+        )));
         assert_eq!(
             events
                 .iter()

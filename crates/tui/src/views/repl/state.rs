@@ -1,3 +1,5 @@
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
 use std::time::{Duration, Instant};
 
 use ratatui::text::Line;
@@ -6,7 +8,7 @@ use tauqe_protocol::{ModelRef, ModelResult};
 
 use super::diff_cache::DiffRenderCache;
 use super::reasoning::ReasoningState;
-use super::render::{compute_model_lines, compute_model_lines_with_file_rows, wrap_model_lines};
+use super::render::measure_canvas;
 use crate::app::{DiffInspectorFocus, DiffInspectorState};
 use crate::i18n::active_t;
 use crate::views::recenter::RecenterState;
@@ -46,7 +48,7 @@ fn elapsed_fraction(elapsed: Duration, budget: Duration) -> f32 {
     (elapsed.as_secs_f32() / budget).clamp(0.0, 1.0)
 }
 
-/// Lifecycle status of a model turn as tracked by the Develop view.
+/// Lifecycle status of a model turn as tracked by the REPL view.
 ///
 /// Replacing free-form status strings with an enum lets the compiler enforce
 /// exhaustiveness: a typo or a newly introduced phase can no longer silently
@@ -61,7 +63,7 @@ pub enum TurnStatus {
     Responding,
     Editing,
     Verifying,
-    Discovery,
+    Research,
     Staging,
     Healing,
     Done,
@@ -79,7 +81,7 @@ impl TurnStatus {
                 | Self::Responding
                 | Self::Editing
                 | Self::Verifying
-                | Self::Discovery
+                | Self::Research
                 | Self::Staging
                 | Self::Healing
         )
@@ -94,7 +96,7 @@ impl TurnStatus {
             Self::Responding => active_t("status.responding"),
             Self::Editing => active_t("status.editing"),
             Self::Verifying => active_t("status.verifying"),
-            Self::Discovery => active_t("status.discovery"),
+            Self::Research => active_t("status.research"),
             Self::Staging => active_t("status.staging"),
             Self::Healing => active_t("status.healing"),
             Self::Done => active_t("status.done"),
@@ -105,7 +107,7 @@ impl TurnStatus {
 }
 
 /// Lifecycle status of a single streamed file edit.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum FileEditStatus {
     Running,
     Retrying,
@@ -141,9 +143,31 @@ pub struct ModelCodeBlock {
     pub visual_end_line: usize,
 }
 
+/// One hunk of a file patch, anchored to the lines it changes.
+///
+/// The coordinates are the ones a unified diff hunk header states
+/// (`@@ -old_start,old_lines +new_start,new_lines @@ hint`): they name the real
+/// lines of the file before the patch and after it, so a diff surface reports
+/// where a change lands instead of counting the rows of the patch
+/// (c-hunk-coordinates-model).
+///
+/// A hunk whose coordinates are unknown keeps zeros, so `0` means "unknown"
+/// rather than a real line, and a surface that renders coordinates must treat
+/// it as such.
 #[derive(Debug, Clone)]
 pub struct StreamingHunk {
     pub hunk_index: usize,
+    /// One-based first line of the hunk in the file before the patch.
+    pub old_start: usize,
+    /// Number of source lines the hunk covers.
+    pub old_lines: usize,
+    /// One-based first line of the hunk in the file after the patch.
+    pub new_start: usize,
+    /// Number of result lines the hunk covers.
+    pub new_lines: usize,
+    /// Section the header names after its ranges, usually the enclosing
+    /// function signature, as git prints it.
+    pub context_hint: Option<String>,
     pub old_text: String,
     pub new_text: String,
 }
@@ -213,6 +237,27 @@ pub enum ReplFocus {
     #[default]
     Editor,
     Viewport,
+}
+
+/// Row offsets of the canvas the viewport drew last.
+///
+/// The renderer already wraps every raw line to draw it, so it records the span
+/// each raw line occupies together with the raw index of every staged-file
+/// summary row. File navigation, recentering, and the scroll bound then resolve
+/// against the drawn layout instead of rebuilding and re-wrapping the whole
+/// canvas per keystroke (c-1, c-4).
+#[derive(Default)]
+pub(crate) struct CanvasProjection {
+    /// Fingerprint of the state the projection was measured from.
+    pub(crate) signature: u64,
+    /// First visual row of every raw canvas line.
+    pub(crate) visual_start: Vec<usize>,
+    /// Last visual row of every raw canvas line.
+    pub(crate) visual_end: Vec<usize>,
+    /// Raw canvas index of every staged-file summary row.
+    pub(crate) file_rows: Vec<usize>,
+    /// Visual rows the whole canvas occupies.
+    pub(crate) total_lines: usize,
 }
 
 pub struct ReplView {
@@ -298,6 +343,11 @@ pub struct ReplView {
     pub(crate) markdown_dirty: bool,
     pub(crate) last_markdown_render: Option<Instant>,
     pub diff_cache: DiffRenderCache,
+    /// Wrap projection of the canvas the viewport drew last (c-1, c-4).
+    ///
+    /// Navigation reads it instead of rebuilding the canvas per keystroke, and
+    /// its recorded signature decides whether it still describes the live state.
+    pub(crate) canvas: CanvasProjection,
 }
 
 impl Default for ReplView {
@@ -347,6 +397,7 @@ impl Default for ReplView {
             markdown_dirty: false,
             last_markdown_render: None,
             diff_cache: DiffRenderCache::default(),
+            canvas: CanvasProjection::default(),
         }
     }
 }
@@ -391,6 +442,9 @@ impl ReplView {
         self.turn_phase_detail = None;
         self.repomap_tokens = None;
         self.copy_flash = None;
+        // The projection describes the canvas of the finished turn; the next
+        // turn records its own before anything reads it (c-1).
+        self.canvas = CanvasProjection::default();
     }
 
     /// Re-renders the answer markdown; while streaming, repeated calls within the
@@ -540,14 +594,16 @@ impl ReplView {
     /// Maximum scroll offset of the viewport for a given visible height.
     ///
     /// The row count the last frame reported wins, because it is the canvas the
-    /// developer is looking at. Before the first frame of a turn the canvas is
-    /// wrapped on demand, so the fallback measures the rows that will be drawn
-    /// instead of the unwrapped raw lines (c-1, c-4).
+    /// developer is looking at. Before the first frame of a turn the recorded
+    /// projection answers instead, and only a stale recording falls back to the
+    /// borrowed measuring pass, so the bound never drifts from the drawn rows
+    /// (c-1, c-4).
     pub fn max_scroll(&mut self, view_height: u16) -> u16 {
         let count = if self.rendered_lines_count > 0 {
             self.rendered_lines_count
         } else {
-            self.wrapped_canvas().0.len()
+            self.refresh_canvas_projection();
+            self.canvas.total_lines
         };
         u16::try_from(count)
             .unwrap_or(u16::MAX)
@@ -561,35 +617,127 @@ impl ReplView {
         }
     }
 
-    /// Wraps the canvas at the width the renderer derived.
+    /// Fingerprint of every input the wrapped canvas is built from.
     ///
-    /// The pane stores the content width it laid out, so a scroll target is
-    /// resolved against the same wrapped canvas the viewport draws even before
-    /// the first frame of a turn reported its rendered row count (c-1, c-4).
-    fn wrapped_canvas(&mut self) -> (Vec<Line<'static>>, Vec<usize>, Vec<usize>) {
-        let width = self.content_width.max(10);
-        wrap_model_lines(compute_model_lines(self), width)
+    /// The projection the renderer records is reused only while this fingerprint
+    /// still describes the live state, so a stale recording can never misposition
+    /// the viewport. The folded inputs are exactly the ones the canvas renders:
+    /// the wrap width, the rendered answer Markdown or the raw text behind it,
+    /// the reasoning transcript with its fold and stream lifecycle, the
+    /// diagnostic and toolchain prefixes, the whole staged change set, the commit
+    /// trail, the usage counters, and the copy flash (c-1, c-4).
+    ///
+    /// The animated spinner is deliberately absent: every glyph of the frame set
+    /// occupies exactly one column, so a tick can change the content of a badge
+    /// but never the number of rows it wraps into. The fingerprint hashes a few
+    /// dozen bytes and never clones a line, a message, or a staged body.
+    pub(crate) fn canvas_signature(&self) -> u64 {
+        let mut hasher = DefaultHasher::new();
+        self.content_width.max(10).hash(&mut hasher);
+        self.markdown_lines.len().hash(&mut hasher);
+        self.text.len().hash(&mut hasher);
+        self.reasoning.lines.len().hash(&mut hasher);
+        self.reasoning.text.len().hash(&mut hasher);
+        self.reasoning.show.hash(&mut hasher);
+        self.reasoning.is_streaming().hash(&mut hasher);
+        self.error.hash(&mut hasher);
+        match self.toolchain.as_ref() {
+            Some(ToolchainState::Running { command }) => {
+                0u8.hash(&mut hasher);
+                command.hash(&mut hasher);
+            }
+            Some(ToolchainState::Passed { command }) => {
+                1u8.hash(&mut hasher);
+                command.hash(&mut hasher);
+            }
+            Some(ToolchainState::Failed { command, message }) => {
+                2u8.hash(&mut hasher);
+                command.hash(&mut hasher);
+                message.hash(&mut hasher);
+            }
+            None => 3u8.hash(&mut hasher),
+        }
+        self.edits_active.hash(&mut hasher);
+        self.edit_final_applied.hash(&mut hasher);
+        self.selected_file_index.hash(&mut hasher);
+        self.last_commit_hash.hash(&mut hasher);
+        self.last_commit_summary.hash(&mut hasher);
+        for file in &self.files {
+            file.path.hash(&mut hasher);
+            file.op_type.as_str().hash(&mut hasher);
+            file.status.hash(&mut hasher);
+            file.hunks.len().hash(&mut hasher);
+            file.error.hash(&mut hasher);
+            file.retry_info.hash(&mut hasher);
+        }
+        let totals = self.usage_totals.operation_totals();
+        totals.prompt_tokens.hash(&mut hasher);
+        totals.completion_tokens.hash(&mut hasher);
+        totals.total_tokens.hash(&mut hasher);
+        totals.reasoning_tokens.hash(&mut hasher);
+        totals.cached_tokens.hash(&mut hasher);
+        self.copy_flash
+            .as_ref()
+            .map(|(block, _)| *block)
+            .hash(&mut hasher);
+        hasher.finish()
+    }
+
+    /// Records the wrap projection of the canvas the renderer just laid out.
+    pub(crate) fn record_canvas_projection(
+        &mut self,
+        visual_start: Vec<usize>,
+        visual_end: Vec<usize>,
+        file_rows: Vec<usize>,
+        total_lines: usize,
+    ) {
+        self.canvas = CanvasProjection {
+            signature: self.canvas_signature(),
+            visual_start,
+            visual_end,
+            file_rows,
+            total_lines,
+        };
+    }
+
+    /// Refreshes the recorded projection when the live canvas no longer matches it.
+    fn refresh_canvas_projection(&mut self) {
+        if self.canvas.signature != self.canvas_signature() {
+            self.canvas = measure_canvas(self);
+        }
     }
 
     /// Visual span of every staged file summary row, with the canvas height.
     ///
-    /// The raw summary indices come from the canvas builder and are projected
-    /// through the shared wrapping pass, so the spans name the rows the renderer
-    /// draws. A summary wider than the canvas wraps, so one file can occupy
+    /// The spans are read from the projection the renderer recorded, and measured
+    /// by the borrowed wrapping pass (see [`measure_canvas`]) only when that
+    /// recording no longer describes the live state. Either way they name the rows
+    /// the viewport draws, so a summary wider than the canvas still occupies
     /// several visual rows (c-1, c-4).
     fn file_summary_layout(&mut self) -> (Vec<(usize, usize)>, usize) {
-        let width = self.content_width.max(10);
-        let (raw, file_rows) = compute_model_lines_with_file_rows(self);
-        let (wrapped, visual_start, visual_end) = wrap_model_lines(raw, width);
-        let spans = file_rows
-            .into_iter()
+        self.refresh_canvas_projection();
+        let projection = &self.canvas;
+        let spans = projection
+            .file_rows
+            .iter()
             .filter_map(|row| {
-                let start = visual_start.get(row).copied()?;
-                let end = visual_end.get(row).copied().unwrap_or(start);
+                let start = projection.visual_start.get(*row).copied()?;
+                let end = projection.visual_end.get(*row).copied().unwrap_or(start);
                 Some((start, end))
             })
             .collect();
-        (spans, wrapped.len())
+        (spans, projection.total_lines)
+    }
+
+    /// Materializes the wrapped canvas the viewport would draw (test-only).
+    ///
+    /// Production paths read the recorded projection; the regression tests pin
+    /// that derivation to the rows the renderer draws, so they keep materializing
+    /// the canvas the shared wrapping pass produces.
+    #[cfg(test)]
+    fn wrapped_canvas(&mut self) -> (Vec<Line<'static>>, Vec<usize>, Vec<usize>) {
+        let width = self.content_width.max(10);
+        super::render::wrap_model_lines(super::render::compute_model_lines(self), width)
     }
 
     /// Visual span of every staged file summary row, in `files` order.
@@ -946,7 +1094,7 @@ mod splash_tests {
             TurnStatus::Responding,
             TurnStatus::Editing,
             TurnStatus::Verifying,
-            TurnStatus::Discovery,
+            TurnStatus::Research,
             TurnStatus::Staging,
             TurnStatus::Healing,
         ];
@@ -1087,8 +1235,8 @@ mod splash_tests {
 }
 
 #[cfg(test)]
-#[cfg(test)]
 mod compact_file_list_tests {
+    use super::super::render::compute_model_lines;
     use super::*;
 
     /// Wide canvas: a rendered summary never wraps, so its visual row equals the
@@ -1103,6 +1251,11 @@ mod compact_file_list_tests {
             error: None,
             hunks: vec![StreamingHunk {
                 hunk_index: 0,
+                old_start: 1,
+                old_lines: 1,
+                new_start: 1,
+                new_lines: 1,
+                context_hint: None,
                 old_text: "let a = 1;".to_string(),
                 new_text: "let a = 2;".to_string(),
             }],
@@ -1194,6 +1347,31 @@ mod compact_file_list_tests {
             vec![(3, 3), (4, 4)],
             "a wide canvas keeps one visual row per summary"
         );
+    }
+
+    /// The renderer records the projection it just wrapped, and navigation reuses
+    /// it verbatim while its fingerprint describes the live state. The sentinel
+    /// recording proves the reuse: the spans below can only come from the
+    /// recording, never from a fresh measurement. Any change to a canvas input
+    /// invalidates the fingerprint, so the next derivation measures the live
+    /// canvas instead of the stale rows (c-1, c-4).
+    #[test]
+    fn a_matching_recording_is_reused_and_a_stale_one_is_measured_again() {
+        let mut view = view();
+        view.record_canvas_projection(vec![0, 1, 2, 3, 4], vec![0, 1, 2, 3, 4], vec![0, 1], 5);
+
+        assert_eq!(view.file_summary_visual_rows(), vec![(0, 0), (1, 1)]);
+        assert_eq!(view.max_scroll(4), 1, "the bound reads the recorded height");
+
+        view.files[0].status = FileEditStatus::Error;
+        view.files[0].error = Some("hunk did not match the file".to_string());
+
+        assert_eq!(
+            view.file_summary_visual_rows(),
+            vec![(3, 3), (5, 5)],
+            "a changed change set invalidates the recording"
+        );
+        assert_eq!(view.max_scroll(2), 4);
     }
 
     #[test]

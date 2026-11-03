@@ -37,8 +37,8 @@ use super::registry::{ContractContext, ContractRule};
 /// The list never reads [`ContractContext::intent`]: two turns that share a
 /// capability surface and the render inputs produce identical rules, which is
 /// what keeps the head identical for the interactive dialogue, the plan
-/// discussion, and the review discussion. The review dialogue runs as an
-/// interactive turn, so it shares the interactive trunk by construction.
+/// discussion, and the review discussion. The review dialogue declares a
+/// regime of its own, and the trunk never reads it.
 ///
 /// A rule that names the wire representation renders the variant of the
 /// declared protocol. The two-contour mode never reaches the trunk, because
@@ -103,6 +103,40 @@ pub fn shared_trunk_rules(
         "Always conduct internal reasoning, planning, and thinking strictly in English to preserve token budget and maximize reasoning quality.",
     ));
 
+    // External project documentation is a harness channel rather than a regime
+    // decision: a dialogue, a step, and an architect turn all reason against the
+    // documents a project declares, so the rule renders into the byte-stable head
+    // for every regime that can request one and never reads the declared intent.
+    if capabilities.contains(LlmCapability::OuterDocRequest) {
+        let request = if structured {
+            "request it by that prefix through the `outer_doc_requests` field".to_string()
+        } else {
+            format!(
+                "request it by that prefix with <{request} id=\"...\" />",
+                request = ctx.tag_name("outer_doc_request"),
+            )
+        };
+        // The contrast clause renders only when the surface also carries the
+        // internal channel: a turn that cannot consult the harness documentation
+        // never reads about a command its decoder would reject.
+        let contrast = if !capabilities.contains(LlmCapability::DocRequest) {
+            String::new()
+        } else if structured {
+            " The `tauqe_doc_requests` field requests the internal documentation of the harness itself; neither channel substitutes for the other.".to_string()
+        } else {
+            format!(
+                " The <{doc} topic=\"...\" /> tag requests the internal documentation of the harness itself; neither channel substitutes for the other.",
+                doc = ctx.tag_name("tauqe_doc_request"),
+            )
+        };
+        rules.push(ContractRule::new(
+            "External Project Documentation",
+            format!(
+                "A project may declare external documentation in `[[outer_docs]]`, keyed by an identifier that names one root document, for material it reasons against but does not version: an upstream API note, a protocol summary, or a published book. When the task must be checked against such a document, {request}. The identifier is a prefix, not a file name: `id` answers the root document exactly as its original text, and `id/relative.md` answers a document below the directory that holds the root, so follow the relative links the root text carries instead of guessing the layout. The prefix is a jail: a request that climbs above the root with `..`, or that names an absolute path, is refused. The harness alone decides where the materialized copy lives, and the copy enters the context as `read_only` reference that a turn never rewrites. Request only identifiers the project declares and never invent one: a refusal names its cause and is not retried inside the same turn, while a delivery failure may be requested again in a later round.{contrast}"
+            ),
+        ));
+    }
+
     rules
 }
 
@@ -158,10 +192,12 @@ pub fn intent_delta_rules(
         ));
 
         // The proposal offers a fork between patching now and planning first. It
-        // belongs to every dialogue contour — the free REPL and the plan
-        // discussion — and never to an isolated step, which implements an
-        // approved design instead of proposing one.
-        if (ctx.intent.is_interactive_repl() || ctx.intent.is_plan_discussion())
+        // belongs to every dialogue contour — the free REPL, the plan
+        // discussion, and the review discussion — and never to an isolated
+        // step, which implements an approved design instead of proposing one.
+        if (ctx.intent.is_interactive_repl()
+            || ctx.intent.is_plan_discussion()
+            || ctx.intent.is_review_discussion())
             && capabilities.contains(LlmCapability::PlanCreation)
         {
             let proposal = if structured {
@@ -287,10 +323,14 @@ mod tests {
                 CapabilitySet::interactive_repl(),
             ),
             (TurnIntent::PlanDiscussion, CapabilitySet::discussion()),
+            (
+                TurnIntent::ReviewDiscussion,
+                CapabilitySet::review_discussion(),
+            ),
             (TurnIntent::IsolatedStep, CapabilitySet::isolated_step()),
             (
                 TurnIntent::ArchitectSynthesis,
-                CapabilitySet::architect_discovery(),
+                CapabilitySet::architect_research(),
             ),
         ]
     }
@@ -328,6 +368,7 @@ mod tests {
         "<repo_dirs",
         "<repo_map",
         "<dir_list",
+        "<tauqe_doc_request",
         "<doc_request",
         "<custom_tool",
     ];
@@ -342,7 +383,8 @@ mod tests {
         "repo_dirs",
         "repo_maps",
         "dir_lists",
-        "doc_requests",
+        "tauqe_doc_requests",
+        "outer_doc_requests",
         "verify",
         "scratchpad",
         "outcome",
@@ -404,7 +446,7 @@ mod tests {
             LlmCapability::TextMessage,
             LlmCapability::PlanCreation,
             LlmCapability::PlanUpdate,
-            LlmCapability::Discovery,
+            LlmCapability::Research,
             LlmCapability::UserLanguage,
         ]);
         let discussion = trunk(
@@ -631,13 +673,13 @@ mod tests {
 
     #[test]
     fn plan_first_proposal_is_gated_by_intent_and_capabilities() {
-        let develop = trunk(
+        let repl = trunk(
             TurnIntent::InteractiveRepl,
             &CapabilitySet::interactive_repl(),
             EditProtocolKind::Xml,
             None,
         );
-        let names = titles(&develop);
+        let names = titles(&repl);
         let authorization = names
             .iter()
             .position(|title| *title == "Action Authorization")
@@ -711,7 +753,7 @@ mod tests {
     }
 
     #[test]
-    fn develop_trunk_carries_action_authorization_and_plan_first_proposal() {
+    fn repl_trunk_carries_action_authorization_and_plan_first_proposal() {
         let rules = trunk(
             TurnIntent::InteractiveRepl,
             &CapabilitySet::interactive_repl(),
@@ -1062,7 +1104,11 @@ mod tests {
         ));
         assert!(!reference.is_empty());
 
-        for intent in [TurnIntent::PlanDiscussion, TurnIntent::IsolatedStep] {
+        for intent in [
+            TurnIntent::PlanDiscussion,
+            TurnIntent::ReviewDiscussion,
+            TurnIntent::IsolatedStep,
+        ] {
             let other = render_contract_rules(&shared(
                 intent,
                 &surface,
@@ -1108,6 +1154,29 @@ mod tests {
         assert!(names.contains(&"Action Authorization"));
         assert!(names.contains(&"Plan-First Proposal"));
         assert!(!names.contains(&"Step Execution Scope"));
+
+        let review = delta(
+            TurnIntent::ReviewDiscussion,
+            &CapabilitySet::review_discussion(),
+            EditProtocolKind::Xml,
+            None,
+        );
+        let names = titles(&review);
+        // The review discussion states the very same delta as the REPL: the
+        // decision it records lives in the surface and renders no tail rule,
+        // so switching focus to a review session moves no tail byte either.
+        assert!(names.contains(&"Read-Only Scope"));
+        assert!(names.contains(&"Editable Scope"));
+        assert!(names.contains(&"Action Authorization"));
+        assert!(names.contains(&"Plan-First Proposal"));
+        assert!(names.contains(&"Environment Ontology"));
+        assert!(!names.contains(&"Architectural Decision Immutability"));
+        assert!(!names.contains(&"Step Execution Scope"));
+        assert_eq!(
+            render_contract_rules(&review),
+            render_contract_rules(&repl),
+            "the review delta diverged from the REPL delta"
+        );
 
         let step = delta(
             TurnIntent::IsolatedStep,
@@ -1218,7 +1287,7 @@ mod tests {
     fn the_architect_synthesis_delta_states_no_edit_scope() {
         let rules = delta(
             TurnIntent::ArchitectSynthesis,
-            &CapabilitySet::architect_discovery(),
+            &CapabilitySet::architect_research(),
             EditProtocolKind::Structured,
             None,
         );
@@ -1264,5 +1333,106 @@ mod tests {
                 }
             }
         }
+    }
+    #[test]
+    fn the_external_documentation_rule_states_the_channel_in_both_contours() {
+        // A dialogue reaches both channels: the material a project declares and
+        // the internal documentation of the harness.
+        let repl = |protocol| {
+            trunk(
+                TurnIntent::InteractiveRepl,
+                &CapabilitySet::interactive_repl(),
+                protocol,
+                None,
+            )
+        };
+
+        let xml_rules = repl(EditProtocolKind::Xml);
+        let xml = body(&xml_rules, "External Project Documentation");
+        assert!(xml.contains("<outer_doc_request id=\"...\" />"));
+        assert!(xml.contains("<tauqe_doc_request topic=\"...\" />"));
+        // The rule states the prefix surface and the jail around it in the
+        // vocabulary of the XML contour.
+        assert!(xml.contains("`id/relative.md`"));
+        assert!(xml.contains("climbs above the root"));
+        assert!(xml.contains("absolute path"));
+        assert!(!xml.contains("`outer_doc_requests`"));
+        assert!(xml.contains("`[[outer_docs]]`"));
+
+        let structured_rules = repl(EditProtocolKind::Structured);
+        let structured = body(&structured_rules, "External Project Documentation");
+        assert!(structured.contains("`outer_doc_requests`"));
+        assert!(structured.contains("`tauqe_doc_requests`"));
+        assert!(structured.contains("`id/relative.md`"));
+        assert!(structured.contains("climbs above the root"));
+        assert!(structured.contains("`[[outer_docs]]`"));
+        for prefix in XML_TAG_PREFIXES {
+            assert!(
+                !structured.contains(prefix),
+                "the structured rule advertises {prefix}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_external_documentation_rule_follows_the_capability_surface() {
+        for (intent, set) in regimes() {
+            for protocol in [EditProtocolKind::Xml, EditProtocolKind::Structured] {
+                let rules = trunk(intent, &set, protocol, None);
+                assert!(
+                    titles(&rules).contains(&"External Project Documentation"),
+                    "the {intent:?} regime cannot request the documents it declares"
+                );
+            }
+        }
+
+        // An isolated step reads the contracts its plan pointed at, so the
+        // external channel travels with it …
+        let step = trunk(
+            TurnIntent::IsolatedStep,
+            &CapabilitySet::isolated_step(),
+            EditProtocolKind::Xml,
+            None,
+        );
+        let channel = body(&step, "External Project Documentation");
+        assert!(channel.contains("<outer_doc_request"));
+        // … while the internal documentation of the harness stays closed to it,
+        // in both spellings the two contours use.
+        let structured_step = trunk(
+            TurnIntent::IsolatedStep,
+            &CapabilitySet::isolated_step(),
+            EditProtocolKind::Structured,
+            None,
+        );
+        for rule in &step {
+            assert!(!rule.body.contains("<tauqe_doc_request"));
+            assert!(!rule.body.contains("<doc_request"));
+        }
+        for rule in &structured_step {
+            assert!(!rule.body.contains("`tauqe_doc_requests`"));
+        }
+
+        // A surface without the external channel states no rule at all.
+        let without = trunk(
+            TurnIntent::InteractiveRepl,
+            &CapabilitySet::interactive_repl().without(LlmCapability::OuterDocRequest),
+            EditProtocolKind::Xml,
+            None,
+        );
+        assert!(!titles(&without).contains(&"External Project Documentation"));
+    }
+
+    #[test]
+    fn the_external_documentation_rule_folds_the_turn_marker() {
+        let rules = trunk(
+            TurnIntent::InteractiveRepl,
+            &CapabilitySet::interactive_repl(),
+            EditProtocolKind::Xml,
+            Some("M12345"),
+        );
+        let rule = body(&rules, "External Project Documentation");
+        assert!(rule.contains("<outer_doc_request_M12345 id=\"...\" />"));
+        assert!(rule.contains("<tauqe_doc_request_M12345 topic=\"...\" />"));
+        assert!(!rule.contains("<outer_doc_request id"));
     }
 }

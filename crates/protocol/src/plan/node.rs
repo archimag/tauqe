@@ -27,7 +27,7 @@ pub enum PlanValidationError {
     /// An executable leaf declares no target file.
     ///
     /// A leaf that can still be executed must name the context it targets, so
-    /// its step starts from a warm context instead of a cold discovery round.
+    /// its step starts from a warm context instead of a cold research round.
     MissingLeafFiles {
         item_id: String,
     },
@@ -267,6 +267,13 @@ impl Plan {
     }
 }
 
+/// The document header dereferences to the horizon it owns.
+///
+/// The implementation is a distinct section of the wire form rather than a
+/// flattened set of keys, while call sites address the step graph and its
+/// provenance directly (`plan.items`, `plan.find_item(..)`,
+/// `plan.evaluate_scope(..)`). These two impls keep both shapes available at
+/// once instead of duplicating the graph in the header.
 impl Deref for Plan {
     type Target = PlanImplementation;
 

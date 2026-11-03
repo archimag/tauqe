@@ -7,11 +7,13 @@ pub(crate) fn tag_spec() -> Option<&'static XmlTagSpec> {
     engine::tag_spec("user_language")
 }
 
-/// Extracts user language tag content if present (e.g. `<user_language>Russian</user_language>`
-/// or `<user_language lang="ru"/>`).
-pub fn extract_user_language(text: &str) -> Option<String> {
+/// Extracts user language tag content, reusing a precomputed code index.
+pub(crate) fn extract_user_language_with_fences(
+    text: &str,
+    fences: &super::CodeFences,
+) -> Option<String> {
     let spec = tag_spec()?;
-    let found = engine::find_next_tag(text, spec)?;
+    let found = engine::find_next_tag_with_fences(text, spec, 0, fences)?;
     if let Some(value) = found.attr_any(&["value", "lang"]) {
         let trimmed = value.trim();
         if !trimmed.is_empty() && trimmed.len() < 50 && !trimmed.contains('\n') {
@@ -23,6 +25,12 @@ pub fn extract_user_language(text: &str) -> Option<String> {
         return Some(content.to_string());
     }
     None
+}
+
+/// Extracts user language tag content if present (e.g. `<user_language>Russian</user_language>`
+/// or `<user_language lang="ru"/>`).
+pub fn extract_user_language(text: &str) -> Option<String> {
+    extract_user_language_with_fences(text, &super::CodeFences::find(text))
 }
 
 /// Removes all user_language tags from text.

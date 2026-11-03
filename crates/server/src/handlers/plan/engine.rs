@@ -24,8 +24,8 @@ pub(super) use super::horizon::{collect_plan_context_files, PlanHorizonDiagnosti
 /// Unified engine for architect plan horizon synthesis.
 ///
 /// Drives the structured Architect contour (`run_contour_synthesis`) instead of a
-/// hand-written discovery loop: the contour owns the provider rounds, the schema
-/// healing of an invalid payload, the tier ladder, the discovery journal, and the
+/// hand-written research loop: the contour owns the provider rounds, the schema
+/// healing of an invalid payload, the tier ladder, the research journal, and the
 /// typed terminal outcomes, while this adapter owns the RPC response, the repository
 /// persistence, and the session-history transaction.
 ///
@@ -69,8 +69,8 @@ pub(super) async fn execute_plan_horizon_synthesis(
         let escalation_excluded = cfg
             .models
             .excluded_from_escalation(ModelRole::Architect, &architect_tier.model);
-        // Every operational budget of the synthesis — discovery rounds, file and
-        // repomap budgets, the eager-map switch, and the discovery caps — belongs
+        // Every operational budget of the synthesis — research rounds, file and
+        // repomap budgets, the eager-map switch, and the research limits — belongs
         // to the turn, so the contour reads them from one options value instead of
         // a per-request parameter set.
         let mut options = WorkflowOptions::from_app_config(&cfg);

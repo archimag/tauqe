@@ -13,13 +13,25 @@
 //! table, so a handler wired into the dispatcher without a reviewed
 //! classification costs one task spawn instead of a stalled read loop.
 //!
-//! Inline membership carries a proof obligation. A method belongs in
-//! `INLINE_METHODS` only when its handler claims no operation slot across
-//! subprocess, provider-stream, or `fsync`-competing work, and performs no
-//! multi-probe filesystem walk. The model turns, the batch supervisors, the Git
-//! history rewrites, and the repository lifecycle probes are all classified by
-//! the default for exactly that reason, and the guard tests pin the inline set so
-//! a reclassification has to be reviewed instead of drifting in unnoticed.
+//! Inline membership carries a deliberately narrow proof obligation. A method
+//! belongs in `INLINE_METHODS` only when its handler performs O(1) in-memory
+//! state access: no subprocess, no provider stream, no filesystem IO, and no
+//! lock acquisition that can park behind such work. A guard the handler takes
+//! must be one that no offloaded task holds across blocking IO, because reading
+//! a lock that a batch holds as a write guard parks the loop exactly like the IO
+//! behind it. A record behind a synchronous storage mutex and a disk probe is
+//! therefore IO by this definition even though its handler awaits on the
+//! blocking pool, and a slot-claiming mutation behind an `fsync` barrier is not
+//! in-memory work at all.
+//!
+//! The model turns, the batch supervisors, the Git history rewrites, the
+//! repository lifecycle probes, the repository and Git reads, the plan and
+//! review record reads and writes, the context curation methods, the telemetry
+//! reset, and the history truncation all fall outside the table for exactly that
+//! reason: each one awaits a subprocess, a storage lock, an `fsync`, or a
+//! context guard another task holds as a write. The guard tests pin the inline
+//! set and the reclassified methods alike, so a reclassification has to be
+//! reviewed instead of drifting in unnoticed.
 
 use tauqe_protocol::methods;
 
@@ -34,51 +46,27 @@ pub enum DispatchClass {
     Inline,
 }
 
-/// Methods whose handlers are reviewed as short enough to run inline.
+/// Methods whose handlers are reviewed as O(1) in-memory state access.
 ///
 /// Every entry satisfies the proof obligation stated in the module
-/// documentation. The table is a curated allowlist, not the classification
-/// itself: a method that is absent runs offloaded.
+/// documentation: bounded in-memory work only, with no subprocess, provider
+/// stream, filesystem IO, or lock acquisition that can park behind such work.
+/// The table is a curated allowlist, not the classification itself: a method
+/// that is absent runs offloaded.
 const INLINE_METHODS: &[&str] = &[
-    // Repository reads.
-    methods::REPOSITORY_GET_STATE,
-    methods::REPOSITORY_LIST_FILES,
-    methods::GIT_GET_DIFF,
-    // Context curation.
-    methods::CONTEXT_GET,
-    methods::CONTEXT_ADD,
-    methods::CONTEXT_ADD_PATTERN,
-    methods::CONTEXT_REMOVE,
-    methods::CONTEXT_SET_ACCESS,
-    methods::CONTEXT_CLEAR,
     // Configuration and model selection.
     methods::CONFIG_GET,
     methods::CONFIG_SET,
     methods::MODEL_CANCEL,
     methods::MODEL_SELECT,
     methods::MODEL_CURRENT,
-    methods::MODEL_USAGE_RESET,
-    methods::MODEL_CLEAR_HISTORY,
     // Discussion focus.
     methods::DISCUSSION_SET_FOCUS,
     methods::DISCUSSION_GET_FOCUS,
     methods::DISCUSSION_CLEAR_FOCUS,
-    // Plan records.
-    methods::PLAN_LIST,
-    methods::PLAN_GET,
-    methods::PLAN_SAVE,
-    methods::PLAN_UPDATE_ITEM,
-    methods::PLAN_DELETE,
-    methods::PLAN_SET_ACTIVE,
-    methods::PLAN_CLEAR_HORIZON,
-    // Review records.
+    // Cancelling a running review.
     methods::REVIEW_CANCEL,
-    methods::REVIEW_LIST,
-    methods::REVIEW_GET,
-    methods::REVIEW_UPDATE_ITEM,
-    methods::REVIEW_DELETE,
 ];
-
 /// Classifies one RPC method for the stdin read loop.
 ///
 /// Default-offload: only a method named in `INLINE_METHODS` runs inline, so an
@@ -172,6 +160,73 @@ mod tests {
         }
     }
 
+    /// The repository and Git reads await `spawn_blocking` work: the repository
+    /// probes shell out to git and `git/getDiff` renders a commit diff. Inline
+    /// they park the read loop for the whole subprocess run, so neither a
+    /// `model/cancel` aimed at a concurrent turn nor stdin EOF can reach it.
+    #[test]
+    fn io_bound_repository_reads_are_offloaded() {
+        for method in [
+            methods::REPOSITORY_GET_STATE,
+            methods::REPOSITORY_LIST_FILES,
+            methods::GIT_GET_DIFF,
+        ] {
+            assert_eq!(
+                dispatch_class(method),
+                DispatchClass::Offload,
+                "'{method}' must be offloaded"
+            );
+        }
+    }
+
+    /// The plan and review record methods resolve a synchronous, process-wide
+    /// storage mutex plus a disk probe, the context curation methods take a
+    /// guard an offloaded batch holds as a write guard across its blocking
+    /// preload, and `model/usageReset` rewrites the telemetry file behind an
+    /// `fsync`. Every one of them can park the loop behind shared IO, so none
+    /// is in-memory work the loop may own.
+    #[test]
+    fn shared_lock_reads_and_writes_are_offloaded() {
+        for method in [
+            methods::PLAN_LIST,
+            methods::PLAN_GET,
+            methods::PLAN_SAVE,
+            methods::PLAN_UPDATE_ITEM,
+            methods::PLAN_DELETE,
+            methods::PLAN_SET_ACTIVE,
+            methods::PLAN_CLEAR_HORIZON,
+            methods::REVIEW_LIST,
+            methods::REVIEW_GET,
+            methods::REVIEW_UPDATE_ITEM,
+            methods::REVIEW_DELETE,
+            methods::CONTEXT_GET,
+            methods::CONTEXT_ADD,
+            methods::CONTEXT_ADD_PATTERN,
+            methods::CONTEXT_REMOVE,
+            methods::CONTEXT_SET_ACCESS,
+            methods::CONTEXT_CLEAR,
+            methods::MODEL_USAGE_RESET,
+        ] {
+            assert_eq!(
+                dispatch_class(method),
+                DispatchClass::Offload,
+                "'{method}' must be offloaded"
+            );
+        }
+    }
+
+    /// `model/clearHistory` claims the operation slot and truncates the session
+    /// journal behind an `fsync` barrier, which the inline obligation rules out
+    /// verbatim. The read loop must never await it, so a concurrent turn's
+    /// cancel and a shutdown stay observable while the truncation runs.
+    #[test]
+    fn slot_claiming_history_truncation_is_offloaded() {
+        assert_eq!(
+            dispatch_class(methods::MODEL_CLEAR_HISTORY),
+            DispatchClass::Offload
+        );
+    }
+
     /// An unreviewed method is offloaded, so the dangerous direction of drift —
     /// a handler wired into the dispatcher that nobody classified — costs one
     /// task spawn instead of a stalled read loop.
@@ -212,37 +267,15 @@ mod tests {
         actual.sort_unstable();
 
         let mut expected = vec![
-            methods::REPOSITORY_GET_STATE,
-            methods::REPOSITORY_LIST_FILES,
-            methods::GIT_GET_DIFF,
-            methods::CONTEXT_GET,
-            methods::CONTEXT_ADD,
-            methods::CONTEXT_ADD_PATTERN,
-            methods::CONTEXT_REMOVE,
-            methods::CONTEXT_SET_ACCESS,
-            methods::CONTEXT_CLEAR,
             methods::CONFIG_GET,
             methods::CONFIG_SET,
             methods::MODEL_CANCEL,
             methods::MODEL_SELECT,
             methods::MODEL_CURRENT,
-            methods::MODEL_USAGE_RESET,
-            methods::MODEL_CLEAR_HISTORY,
             methods::DISCUSSION_SET_FOCUS,
             methods::DISCUSSION_GET_FOCUS,
             methods::DISCUSSION_CLEAR_FOCUS,
-            methods::PLAN_LIST,
-            methods::PLAN_GET,
-            methods::PLAN_SAVE,
-            methods::PLAN_UPDATE_ITEM,
-            methods::PLAN_DELETE,
-            methods::PLAN_SET_ACTIVE,
-            methods::PLAN_CLEAR_HORIZON,
             methods::REVIEW_CANCEL,
-            methods::REVIEW_LIST,
-            methods::REVIEW_GET,
-            methods::REVIEW_UPDATE_ITEM,
-            methods::REVIEW_DELETE,
         ];
         expected.sort_unstable();
 

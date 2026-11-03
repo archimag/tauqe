@@ -15,14 +15,17 @@ use tauqe_protocol::{
 };
 
 use super::builtin::{
-    context_surface_rule, AbortModule, BlockedModule, CustomToolsModule, DiscoveryModule,
-    DocRequestModule, FileEditsModule, OutcomeModule, PlanCreationModule, PlanUpdateModule,
-    ScratchpadModule, TextMessageModule, ToolchainVerifyModule, UserLanguageModule,
+    context_surface_rule, AbortModule, BlockedModule, CustomToolsModule, DocRequestModule,
+    FileEditsModule, OutcomeModule, OuterDocRequestModule, PlanCreationModule, PlanUpdateModule,
+    ResearchModule, ReviewUpdateModule, ScratchpadModule, TextMessageModule, ToolchainVerifyModule,
+    UserLanguageModule,
 };
 use super::regime;
 use crate::edits::protocol::xml::engine::{self, XmlTagSpec};
 use crate::edits::protocol::xml::normalize_marked_xml;
+use crate::edits::protocol::xml::tags;
 use crate::edits::protocol::xml::tags::ParsedPlanTag;
+use crate::edits::protocol::xml::CodeFences;
 use crate::edits::protocol::{
     ContextRequest, MarkedXmlEditProtocol, TerminalOutcome, VerifyRequest, XmlEditProtocol,
 };
@@ -226,7 +229,7 @@ mod delta_tests {
         );
 
         // The plan-action rule is regime-specific in its body, so it renders
-        // into the delta of every dialogue that may author plans: a develop
+        // into the delta of every dialogue that may author plans: an interactive
         // turn may only propose a new plan, while a plan discussion may also
         // modify or delete an existing one. Both contours therefore carry the
         // rule and each states only the actions its own regime authorizes.
@@ -653,12 +656,18 @@ pub trait CapabilityModule: Send + Sync {
     }
 
     /// Decodes the module's capability from model output into normalized commands.
+    ///
+    /// `fences` is the markdown code index of `normalized_text`, built once per
+    /// response by the registry. A module resolves every tag family against that
+    /// shared index instead of rescanning the same buffer, so decoding a response
+    /// costs one full-buffer fence scan rather than one per tag family.
     fn decode_xml(
         &self,
         _normalized_text: &str,
         _raw_text: &str,
         _marker: Option<&str>,
         _editable_paths: &[String],
+        _fences: &CodeFences,
     ) -> Vec<LlmCommand> {
         Vec::new()
     }
@@ -698,59 +707,92 @@ impl XmlParser {
         }
     }
 
-    pub(crate) fn parse_output(&self, normalized: &str, editable_paths: &[String]) -> ModelResult {
+    pub(crate) fn parse_output(
+        &self,
+        normalized: &str,
+        editable_paths: &[String],
+        fences: &CodeFences,
+    ) -> ModelResult {
         match self {
-            Self::Unmarked(protocol) => protocol.parse_output(normalized, editable_paths),
-            Self::Marked(protocol) => protocol.parse_output_normalized(normalized, editable_paths),
+            Self::Unmarked(protocol) => {
+                protocol.parse_output_with_fences(normalized, editable_paths, fences)
+            }
+            Self::Marked(protocol) => {
+                protocol.parse_output_normalized(normalized, editable_paths, fences)
+            }
         }
     }
 
-    pub(crate) fn parse_context_requests(&self, normalized: &str) -> Vec<ContextRequest> {
+    pub(crate) fn parse_context_requests(
+        &self,
+        normalized: &str,
+        fences: &CodeFences,
+    ) -> Vec<ContextRequest> {
         match self {
-            Self::Unmarked(protocol) => protocol.parse_context_requests(normalized),
-            Self::Marked(protocol) => protocol.parse_context_requests_normalized(normalized),
+            Self::Unmarked(_) => tags::parse_context_request_tags_with_fences(normalized, fences),
+            Self::Marked(protocol) => {
+                protocol.parse_context_requests_normalized(normalized, fences)
+            }
         }
     }
 
-    pub(crate) fn parse_repo_searches(&self, normalized: &str) -> Vec<RepoSearchRequest> {
+    pub(crate) fn parse_repo_searches(
+        &self,
+        normalized: &str,
+        fences: &CodeFences,
+    ) -> Vec<RepoSearchRequest> {
         match self {
-            Self::Unmarked(protocol) => protocol.parse_repo_searches(normalized),
-            Self::Marked(protocol) => protocol.parse_repo_searches_normalized(normalized),
+            Self::Unmarked(_) => tags::parse_repo_search_tags_with_fences(normalized, fences),
+            Self::Marked(protocol) => protocol.parse_repo_searches_normalized(normalized, fences),
         }
     }
 
-    pub(crate) fn parse_repo_dirs(&self, normalized: &str) -> bool {
+    pub(crate) fn parse_repo_dirs(&self, normalized: &str, fences: &CodeFences) -> bool {
         match self {
-            Self::Unmarked(protocol) => protocol.parse_repo_dirs(normalized),
-            Self::Marked(protocol) => protocol.parse_repo_dirs_normalized(normalized),
+            Self::Unmarked(_) => tags::parse_repo_dirs_tags_with_fences(normalized, fences),
+            Self::Marked(protocol) => protocol.parse_repo_dirs_normalized(normalized, fences),
         }
     }
 
-    pub(crate) fn parse_repo_maps(&self, normalized: &str) -> Vec<String> {
+    pub(crate) fn parse_repo_maps(&self, normalized: &str, fences: &CodeFences) -> Vec<String> {
         match self {
-            Self::Unmarked(protocol) => protocol.parse_repo_maps(normalized),
-            Self::Marked(protocol) => protocol.parse_repo_maps_normalized(normalized),
+            Self::Unmarked(_) => tags::parse_repo_map_tags_with_fences(normalized, fences),
+            Self::Marked(protocol) => protocol.parse_repo_maps_normalized(normalized, fences),
         }
     }
 
-    pub(crate) fn parse_dir_lists(&self, normalized: &str) -> Vec<DirListRequest> {
+    pub(crate) fn parse_dir_lists(
+        &self,
+        normalized: &str,
+        fences: &CodeFences,
+    ) -> Vec<DirListRequest> {
         match self {
-            Self::Unmarked(protocol) => protocol.parse_dir_lists(normalized),
-            Self::Marked(protocol) => protocol.parse_dir_lists_normalized(normalized),
+            Self::Unmarked(_) => tags::parse_dir_list_tags_with_fences(normalized, fences),
+            Self::Marked(protocol) => protocol.parse_dir_lists_normalized(normalized, fences),
         }
     }
 
-    pub(crate) fn parse_doc_requests(&self, normalized: &str) -> Vec<DocTopic> {
+    pub(crate) fn parse_doc_requests(
+        &self,
+        normalized: &str,
+        fences: &CodeFences,
+    ) -> Vec<DocTopic> {
         match self {
-            Self::Unmarked(protocol) => protocol.parse_doc_requests(normalized),
-            Self::Marked(protocol) => protocol.parse_doc_requests_normalized(normalized),
+            Self::Unmarked(_) => tags::parse_doc_request_tags_with_fences(normalized, fences),
+            Self::Marked(protocol) => protocol.parse_doc_requests_normalized(normalized, fences),
         }
     }
 
-    pub(crate) fn parse_plan_tags(&self, normalized: &str) -> (Vec<ParsedPlanTag>, Vec<String>) {
+    pub(crate) fn parse_plan_tags(
+        &self,
+        normalized: &str,
+        fences: &CodeFences,
+    ) -> (Vec<ParsedPlanTag>, Vec<String>) {
         match self {
-            Self::Unmarked(protocol) => protocol.parse_plan_tags(normalized),
-            Self::Marked(protocol) => protocol.parse_plan_tags_normalized(normalized),
+            Self::Unmarked(_) => {
+                tags::parse_plan_tags_with_diagnostics_with_fences(normalized, fences)
+            }
+            Self::Marked(protocol) => protocol.parse_plan_tags_normalized(normalized, fences),
         }
     }
 
@@ -758,33 +800,54 @@ impl XmlParser {
         &self,
         normalized: &str,
         raw_text: &str,
+        fences: &CodeFences,
     ) -> Option<VerifyRequest> {
         match self {
-            Self::Unmarked(protocol) => protocol.parse_verify_request(normalized),
+            Self::Unmarked(_) => tags::extract_verify_request_with_fences(normalized, fences),
             Self::Marked(protocol) => {
-                protocol.parse_verify_request_normalized(normalized, raw_text)
+                protocol.parse_verify_request_normalized(normalized, raw_text, fences)
             }
         }
     }
 
-    pub(crate) fn parse_scratchpad(&self, normalized: &str, raw_text: &str) -> Option<String> {
+    pub(crate) fn parse_scratchpad(
+        &self,
+        normalized: &str,
+        raw_text: &str,
+        fences: &CodeFences,
+    ) -> Option<String> {
         match self {
-            Self::Unmarked(protocol) => protocol.parse_scratchpad(normalized),
-            Self::Marked(protocol) => protocol.parse_scratchpad_normalized(normalized, raw_text),
+            Self::Unmarked(_) => tags::extract_scratchpad_with_fences(normalized, fences),
+            Self::Marked(protocol) => {
+                protocol.parse_scratchpad_normalized(normalized, raw_text, fences)
+            }
         }
     }
 
-    pub(crate) fn parse_terminal_outcome(&self, normalized: &str) -> Option<TerminalOutcome> {
+    pub(crate) fn parse_terminal_outcome(
+        &self,
+        normalized: &str,
+        fences: &CodeFences,
+    ) -> Option<TerminalOutcome> {
         match self {
-            Self::Unmarked(protocol) => protocol.parse_terminal_outcome(normalized),
-            Self::Marked(protocol) => protocol.parse_terminal_outcome_normalized(normalized),
+            Self::Unmarked(_) => tags::extract_terminal_outcome_with_fences(normalized, fences),
+            Self::Marked(protocol) => {
+                protocol.parse_terminal_outcome_normalized(normalized, fences)
+            }
         }
     }
 
-    pub(crate) fn parse_user_language(&self, normalized: &str, raw_text: &str) -> Option<String> {
+    pub(crate) fn parse_user_language(
+        &self,
+        normalized: &str,
+        raw_text: &str,
+        fences: &CodeFences,
+    ) -> Option<String> {
         match self {
-            Self::Unmarked(protocol) => protocol.parse_user_language(normalized),
-            Self::Marked(protocol) => protocol.parse_user_language_normalized(normalized, raw_text),
+            Self::Unmarked(_) => tags::extract_user_language_with_fences(normalized, fences),
+            Self::Marked(protocol) => {
+                protocol.parse_user_language_normalized(normalized, raw_text, fences)
+            }
         }
     }
 }
@@ -812,11 +875,17 @@ pub struct CapabilityRegistry {
 static MODULES: &[&dyn CapabilityModule] = &[
     &TextMessageModule,
     &FileEditsModule,
-    &DiscoveryModule,
+    &ResearchModule,
     &DocRequestModule,
+    // External project documentation is research, so its module sits beside the
+    // capability it extends: the operational tag list and every composed
+    // surface then keep the two request channels adjacent instead of
+    // interleaving an external document with the outcome tags.
+    &OuterDocRequestModule,
     &ToolchainVerifyModule,
     &PlanCreationModule,
     &PlanUpdateModule,
+    &ReviewUpdateModule,
     &ScratchpadModule,
     &OutcomeModule,
     &BlockedModule,
@@ -910,11 +979,20 @@ impl CapabilityRegistry {
     /// rather than patch syntax. The enumeration is a pure projection of the
     /// module declarations, so it stays independent of the patch strategy:
     /// whether a change-set vehicle is advertised to the model is decided where
-    /// the rule is rendered ([`Self::operational_tags_rule`]).
+    /// the rule is rendered ([`Self::operational_tags_rule`]). A declared alias
+    /// is omitted as well: the model is taught one spelling per command — the
+    /// canonical name of the module that owns it — while the alias keeps
+    /// decoding and streaming exactly like the tag it stands for.
     pub fn operational_xml_tags(&self, set: &CapabilitySet) -> Vec<String> {
         let mut tags: Vec<String> = Vec::new();
         for module in self.enabled(set) {
             for spec in module.xml_tag_specs() {
+                // A declared alias decodes and is stripped exactly like the tag
+                // it stands for, but the operational surface teaches one spelling
+                // per command: the canonical name of the module that owns it.
+                if self.canonical_tag(spec.base_name) != Some(spec.base_name) {
+                    continue;
+                }
                 if spec.is_control()
                     && !tags
                         .iter()
@@ -1056,6 +1134,11 @@ impl CapabilityRegistry {
     /// Each enabled module decodes its own capability; the resulting command list
     /// is then filtered so that a command whose capability is disabled (for
     /// example a plan save while only plan updates are allowed) never survives.
+    ///
+    /// The markdown code index of the normalized text is built here, once, and
+    /// handed to every enabled module. The text alone determines that index, so a
+    /// per-module rescan would rebuild the identical structure once per capability
+    /// over the very same buffer.
     pub fn decode_xml_commands(
         &self,
         set: &CapabilitySet,
@@ -1071,9 +1154,16 @@ impl CapabilityRegistry {
             }
             None => raw_text,
         };
+        let fences = CodeFences::find(normalized_text);
         let mut commands = Vec::new();
         for module in self.enabled(set) {
-            commands.extend(module.decode_xml(normalized_text, raw_text, marker, editable_paths));
+            commands.extend(module.decode_xml(
+                normalized_text,
+                raw_text,
+                marker,
+                editable_paths,
+                &fences,
+            ));
         }
         commands.retain(|command| match command.capability() {
             Some(capability) => set.contains(capability),
@@ -1197,11 +1287,11 @@ mod tests {
     #[test]
     fn operational_xml_tags_are_filtered_and_deterministic() {
         let registry = CapabilityRegistry::global();
-        let develop = registry.operational_xml_tags(&CapabilitySet::interactive_repl());
+        let repl = registry.operational_xml_tags(&CapabilitySet::interactive_repl());
         assert_eq!(
-            develop,
+            repl,
             vec![
-                // The edit module precedes discovery in the registry, and the
+                // The edit module precedes research in the registry, and the
                 // anchored change-set vehicle is the only control tag it owns.
                 "file_edits".to_string(),
                 "context_request".to_string(),
@@ -1209,7 +1299,8 @@ mod tests {
                 "repo_dirs".to_string(),
                 "repo_map".to_string(),
                 "dir_list".to_string(),
-                "doc_request".to_string(),
+                "tauqe_doc_request".to_string(),
+                "outer_doc_request".to_string(),
                 "verify".to_string(),
                 "plan".to_string(),
                 "scratchpad".to_string(),
@@ -1223,7 +1314,7 @@ mod tests {
         );
         assert_eq!(
             registry.operational_xml_tags(&CapabilitySet::interactive_repl()),
-            develop
+            repl
         );
 
         let isolated = registry.operational_xml_tags(&CapabilitySet::isolated_step());
@@ -1236,25 +1327,24 @@ mod tests {
         let registry = CapabilityRegistry::global();
         let ctx = plain_context();
 
-        let develop =
-            registry.compose_core_contract_rules(&CapabilitySet::interactive_repl(), &ctx);
-        assert!(develop.contains("context_request"));
-        assert!(develop.contains("Minimal Coherent Change"));
-        assert!(develop.contains("1. Authoritative Source: "));
-        assert!(develop.contains("Operational Protocol Tags: "));
+        let repl = registry.compose_core_contract_rules(&CapabilitySet::interactive_repl(), &ctx);
+        assert!(repl.contains("context_request"));
+        assert!(repl.contains("Minimal Coherent Change"));
+        assert!(repl.contains("1. Authoritative Source: "));
+        assert!(repl.contains("Operational Protocol Tags: "));
         // The plan actions a regime authorizes are regime-specific, so they
         // travel in the delta instead of conditioning the shared head.
-        assert!(!develop.contains("Local Engineering Plan Actions"));
+        assert!(!repl.contains("Local Engineering Plan Actions"));
 
-        let develop_delta =
+        let repl_delta =
             registry.compose_delta_contract_rules(&CapabilitySet::interactive_repl(), &ctx);
-        assert!(develop_delta.contains("Local Engineering Plan Actions"));
-        assert!(!develop_delta.contains("Minimal Coherent Change"));
+        assert!(repl_delta.contains("Local Engineering Plan Actions"));
+        assert!(!repl_delta.contains("Minimal Coherent Change"));
 
         // A plan discussion carries the very same head: the plan mutation it
         // authorizes is the only difference, and it travels in the delta.
         let discussion = registry.compose_core_contract_rules(&CapabilitySet::discussion(), &ctx);
-        assert_eq!(discussion, develop);
+        assert_eq!(discussion, repl);
         assert!(discussion.contains("Minimal Coherent Change"));
         assert!(discussion.contains("Local Engineering Plans"));
     }
@@ -1345,7 +1435,7 @@ mod tests {
     }
 
     #[test]
-    fn develop_contract_has_no_lettered_rule_numbers() {
+    fn repl_contract_has_no_lettered_rule_numbers() {
         let registry = CapabilityRegistry::global();
         let set = CapabilitySet::interactive_repl();
         let core = registry.compose_core_contract_rules(&set, &plain_context());
@@ -1508,7 +1598,7 @@ mod tests {
             .compose_structured_protocol_instructions(&CapabilitySet::interactive_repl(), &ctx);
         assert!(json.contains("changes"));
         assert!(json.contains("message"));
-        assert!(json.contains("`doc_requests`"));
+        assert!(json.contains("`tauqe_doc_requests`"));
         assert!(json.contains("`scratchpad`"));
         assert!(json.contains("`outcome`"));
         assert!(json.contains("`blocked`"));
@@ -1520,7 +1610,7 @@ mod tests {
         // instructions name every field that surface permits.
         for field in [
             "`changes`",
-            "`doc_requests`",
+            "`tauqe_doc_requests`",
             "`scratchpad`",
             "`outcome`",
             "`blocked`",
@@ -1534,7 +1624,7 @@ mod tests {
             &ctx,
         );
         assert!(narrowed.contains("`changes`"));
-        assert!(!narrowed.contains("`doc_requests`"));
+        assert!(!narrowed.contains("`tauqe_doc_requests`"));
         assert!(!narrowed.contains("`scratchpad`"));
         assert!(!narrowed.contains("`outcome`"));
         assert!(!narrowed.contains("`blocked`"));
@@ -1581,9 +1671,10 @@ mod tests {
             "context_requests",
             "custom_tools",
             "dir_lists",
-            "doc_requests",
+            "tauqe_doc_requests",
             "message",
             "outcome",
+            "outer_doc_requests",
             "plan_update",
             "repo_dirs",
             "repo_maps",
@@ -1707,20 +1798,20 @@ mod tests {
             "</plan_AB>\n",
         );
 
-        let develop =
+        let repl =
             registry.decode_xml_commands(&CapabilitySet::interactive_repl(), raw, Some("AB"), &[]);
-        assert!(develop
+        assert!(repl
             .iter()
             .any(|command| matches!(command, LlmCommand::Plan { .. })));
-        assert!(develop
+        assert!(repl
             .iter()
             .any(|command| matches!(command, LlmCommand::ContextRequest { .. })));
-        assert!(develop.iter().any(|command| matches!(
+        assert!(repl.iter().any(|command| matches!(
             command,
             LlmCommand::DirList { path, recursive }
                 if path == "crates/core" && *recursive
         )));
-        assert!(develop
+        assert!(repl
             .iter()
             .any(|command| matches!(command, LlmCommand::Text { .. })));
 
@@ -1753,7 +1844,7 @@ mod tests {
     fn clean_text_falls_back_to_capability_scoped_stripping() {
         let registry = CapabilityRegistry::global();
         let raw = "Keep <success /> but strip <context_request path=\"a.rs\" />.";
-        let set = CapabilitySet::from_slice(&[LlmCapability::Discovery]);
+        let set = CapabilitySet::from_slice(&[LlmCapability::Research]);
         let cleaned = registry.clean_text(&set, raw, None);
         assert!(!cleaned.contains("context_request"));
         assert!(cleaned.contains("success"));
@@ -1781,9 +1872,11 @@ mod tests {
         let expectations = [
             (LlmCapability::TextMessage, "message"),
             (LlmCapability::FileEdits, "changes"),
-            (LlmCapability::DocRequest, "doc_requests"),
+            (LlmCapability::DocRequest, "tauqe_doc_requests"),
+            (LlmCapability::OuterDocRequest, "outer_doc_requests"),
             (LlmCapability::PlanCreation, "plan_update"),
             (LlmCapability::PlanUpdate, "plan_update"),
+            (LlmCapability::ReviewUpdate, "review_update"),
             (LlmCapability::ToolchainVerify, "verify"),
             (LlmCapability::Scratchpad, "scratchpad"),
             (LlmCapability::Outcome, "outcome"),
@@ -2032,7 +2125,18 @@ mod tests {
             Some("context_request")
         );
         assert_eq!(registry.canonical_tag("success"), Some("success"));
-        // A secondary tag of a multi-tag capability resolves to its own name
+        assert_eq!(registry.canonical_tag("success"), Some("success"));
+        // The internal documentation channel publishes one canonical spelling and
+        // keeps its pre-canonical spelling as a permanent alias, so an older
+        // transcript resolves through the canonical name instead of a second tag.
+        assert_eq!(
+            registry.canonical_tag("tauqe_doc_request"),
+            Some("tauqe_doc_request")
+        );
+        assert_eq!(
+            registry.canonical_tag("doc_request"),
+            Some("tauqe_doc_request")
+        );
         // instead of collapsing into the primary spelling.
         assert_eq!(registry.canonical_tag("repo_search"), Some("repo_search"));
         assert_eq!(registry.canonical_tag("edit"), Some("edit"));
@@ -2069,11 +2173,11 @@ mod tests {
 
         assert_eq!(
             registry.capability_for_tag("context_request"),
-            Some(LlmCapability::Discovery)
+            Some(LlmCapability::Research)
         );
         assert_eq!(
             registry.capability_for_tag("repo_dirs"),
-            Some(LlmCapability::Discovery)
+            Some(LlmCapability::Research)
         );
         assert_eq!(
             registry.capability_for_tag("edits"),

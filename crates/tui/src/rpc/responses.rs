@@ -24,15 +24,16 @@ use crate::app::{
     AppState, ConfirmDialogButton, ConfirmReviewTruncationState, ModelChoice, PendingReviewLaunch,
     SquashFileItem,
 };
-use crate::i18n::active_t;
+use crate::i18n::{active_t, CustomLocale};
 use crate::views::repl::TurnStatus;
-
 /// A request the client dispatches once the applied response is fully handled.
 enum FollowUp {
     /// Fire-and-forget request carrying the given parameters.
     Request(&'static str, serde_json::Value),
     /// The audit of a review launch whose projected window was not truncated.
     ReviewLaunch(Box<PendingReviewLaunch>),
+    /// A synthesized locale awaiting persistence outside the state lock.
+    PersistLocale(CustomLocale),
 }
 
 /// Applies one daemon response to the shared application state.
@@ -84,6 +85,11 @@ fn apply_response(
     follow_ups: &mut Vec<FollowUp>,
 ) {
     match method {
+        Some(methods::GIT_GET_DIFF) => {
+            if let Ok(diff) = serde_json::from_value::<tauqe_protocol::GitDiffResult>(value) {
+                apply_commit_audit(st, &diff.diff);
+            }
+        }
         Some(methods::CONFIG_GET) => {
             if let Ok(config) = serde_json::from_value::<ConfigState>(value) {
                 apply_config(st, config);
@@ -286,7 +292,7 @@ fn apply_response(
                 }
             }
         }
-        Some(methods::LOCALE_GENERATE) => handle_locale_response(st, value),
+        Some(methods::LOCALE_GENERATE) => handle_locale_response(st, value, follow_ups),
         _ => {}
     }
 }
@@ -429,6 +435,7 @@ pub(crate) fn apply_optimistic_rollback(st: &mut AppState, rollback: OptimisticR
         } => {
             st.active_model = prev_model;
             st.model_choice.selection = prev_selection;
+            st.mark_model_choice_changed();
         }
         OptimisticRollback::PlanItemStatus {
             plan_id,
@@ -485,9 +492,11 @@ fn apply_config(st: &mut AppState, config: ConfigState) {
     }
     if let Some(selection) = config.selection {
         st.model_choice.selection = selection;
+        st.mark_model_choice_changed();
     }
     if let Some(roles) = config.roles {
         st.model_choice.roles = Some(roles);
+        st.mark_model_choice_changed();
     }
     st.review_presets = config.review_presets.unwrap_or_default();
 }
@@ -498,9 +507,11 @@ fn apply_system_status(st: &mut AppState, status: SystemStatusResult, reloaded: 
     st.active_model = status.model;
     if let Some(selection) = status.selection {
         st.model_choice.selection = selection;
+        st.mark_model_choice_changed();
     }
     if let Some(roles) = status.roles {
         st.model_choice.roles = Some(roles);
+        st.mark_model_choice_changed();
     }
     if reloaded {
         if status.has_api_key {
@@ -523,7 +534,7 @@ fn apply_model(
     roles: Option<ModelRolesSummary>,
 ) {
     st.active_model = effective_model;
-    st.model_choice = ModelChoice { selection, roles };
+    st.set_model_choice(ModelChoice { selection, roles });
 }
 
 /// Applies the authoritative context state and keeps the cursor in range.
@@ -602,8 +613,15 @@ fn apply_squash_preview(st: &mut AppState, value: serde_json::Value) {
     dialog.status_message = None;
 }
 
-/// Applies a synthesized locale and persists it for the next session.
-fn handle_locale_response(st: &mut AppState, value: serde_json::Value) {
+/// Applies a synthesized locale in memory and defers its persistence.
+///
+/// The write itself is blocking filesystem work, so it is handed to the
+/// follow-up queue and performed with the state lock released (c-1).
+fn handle_locale_response(
+    st: &mut AppState,
+    value: serde_json::Value,
+    follow_ups: &mut Vec<FollowUp>,
+) {
     if let Some(dialog) = st.locale_dialog.as_mut() {
         dialog.generating = false;
     }
@@ -611,20 +629,10 @@ fn handle_locale_response(st: &mut AppState, value: serde_json::Value) {
     else {
         return;
     };
-    let language = result.language;
-    let locale = crate::i18n::CustomLocale::new(language.clone(), result.translations);
-    let saved = crate::i18n::storage::save_custom_locale(&locale);
-    st.apply_custom_locale(locale);
+    let locale = CustomLocale::new(result.language, result.translations);
+    st.apply_custom_locale(locale.clone());
     st.locale_dialog = None;
-    match saved {
-        Ok(_) => st.notify_success(active_t("notify.locale_generated").replace("{}", &language)),
-        Err(error) => {
-            let message = active_t("notify.locale_switched_unsaved")
-                .replacen("{}", &language, 1)
-                .replacen("{}", &error.to_string(), 1);
-            st.notify_warning(message);
-        }
-    }
+    follow_ups.push(FollowUp::PersistLocale(locale));
 }
 
 /// Dispatches the requests the applied response deferred.
@@ -655,8 +663,235 @@ async fn run_follow_ups(
                     st.notify_error(active_t("notify.rpc_error").replace("{}", &error.to_string()));
                 }
             }
+            FollowUp::PersistLocale(locale) => {
+                let language = locale.language.clone();
+                // The write is blocking filesystem work: it runs on the blocking
+                // pool with no lock held, and the state is locked again only to
+                // report the outcome (c-1).
+                let saved = match tokio::task::spawn_blocking(move || {
+                    crate::i18n::storage::save_custom_locale(&locale)
+                })
+                .await
+                {
+                    Ok(result) => result.map_err(|error| error.to_string()),
+                    Err(error) => Err(error.to_string()),
+                };
+                let mut st = state.lock().await;
+                match saved {
+                    Ok(_) => st.notify_success(
+                        active_t("notify.locale_generated").replace("{}", &language),
+                    ),
+                    Err(error) => {
+                        let message = active_t("notify.locale_switched_unsaved")
+                            .replacen("{}", &language, 1)
+                            .replacen("{}", &error, 1);
+                        st.notify_warning(message);
+                    }
+                }
+            }
         }
     }
+}
+
+/// Header that opens the block of one file inside a unified diff.
+const DIFF_FILE_HEADER: &str = "diff --git ";
+
+/// Opens the fullscreen audit over the change set of one commit.
+///
+/// The inspector renders the staged change set of the Develop viewport, so the
+/// finished change set of a plan step is imported into exactly that
+/// representation: one entry per file, carrying the hunks the renderer already
+/// draws. The staged set of the running turn is never touched (c-3).
+fn apply_commit_audit(st: &mut AppState, diff: &str) {
+    let files = parse_commit_diff(diff);
+    if files.is_empty() {
+        st.notify_info(active_t("notify.plan_commit_diff_empty"));
+        return;
+    }
+    st.diff_audit = Some(crate::app::CommitAudit {
+        files,
+        cache: crate::views::repl::DiffRenderCache::default(),
+    });
+    st.diff_inspector = Some(crate::app::DiffInspectorState {
+        selected_file: 0,
+        diff_scroll: 0,
+        focus: crate::app::DiffInspectorFocus::Files,
+    });
+}
+
+/// Builds the audited files of one commit from its unified diff.
+fn parse_commit_diff(diff: &str) -> Vec<crate::views::repl::StreamingFileEdit> {
+    let mut files = Vec::new();
+    let mut current: Option<CommitFile> = None;
+    for line in diff.lines() {
+        if let Some(header) = line.strip_prefix(DIFF_FILE_HEADER) {
+            if let Some(file) = current.take() {
+                files.extend(file.finish());
+            }
+            current = Some(CommitFile::new(header));
+            continue;
+        }
+        if let Some(file) = current.as_mut() {
+            file.push(line);
+        }
+    }
+    if let Some(file) = current.take() {
+        files.extend(file.finish());
+    }
+    files
+}
+
+/// The coordinates a unified diff hunk header states.
+///
+/// Git prints `@@ -old_start,old_lines +new_start,new_lines @@ hint`, omitting a
+/// count that equals one and appending the section the hunk sits in — usually
+/// the enclosing function signature — after the closing `@@`. Reading those
+/// numbers lets the audit name the real lines of the file instead of counting
+/// the rows of the patch (c-unified-diff-header-parsing).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct HunkHeader {
+    old_start: usize,
+    old_lines: usize,
+    new_start: usize,
+    new_lines: usize,
+    context_hint: Option<String>,
+}
+
+/// Parses a canonical unified diff hunk header.
+///
+/// A combined header of a merge diff (`@@@ -a,b -c,d +e,f @@@`) carries one
+/// range per parent, so it names no single pair of ranges and is refused
+/// instead of being read as an ordinary hunk.
+fn parse_hunk_header(line: &str) -> Option<HunkHeader> {
+    let (ranges, tail) = line.strip_prefix("@@ ")?.split_once(" @@")?;
+    let mut parts = ranges.split_whitespace();
+    let old = parts.next()?;
+    let new = parts.next()?;
+    if parts.next().is_some() {
+        return None;
+    }
+    let (old_start, old_lines) = parse_hunk_range(old, '-')?;
+    let (new_start, new_lines) = parse_hunk_range(new, '+')?;
+    let hint = tail.trim();
+    let context_hint = if hint.is_empty() {
+        None
+    } else {
+        Some(hint.to_string())
+    };
+    Some(HunkHeader {
+        old_start,
+        old_lines,
+        new_start,
+        new_lines,
+        context_hint,
+    })
+}
+
+/// Parses one `-start[,lines]` (or `+start[,lines]`) range of a hunk header.
+///
+/// Git omits the count when a range covers exactly one line.
+fn parse_hunk_range(spec: &str, marker: char) -> Option<(usize, usize)> {
+    let body = spec.strip_prefix(marker)?;
+    match body.split_once(',') {
+        Some((start, lines)) => Some((start.parse().ok()?, lines.parse().ok()?)),
+        None => Some((body.parse().ok()?, 1)),
+    }
+}
+
+/// One file block of a unified diff being converted into a staged file edit.
+struct CommitFile {
+    path: String,
+    op: tauqe_protocol::EditFileOp,
+    hunks: Vec<crate::views::repl::StreamingHunk>,
+}
+
+impl CommitFile {
+    /// Starts a file block from the path pair of its `diff --git` header.
+    fn new(header: &str) -> Self {
+        let path = header
+            .rsplit_once(" b/")
+            .map(|(_, path)| path.to_string())
+            .unwrap_or_else(|| header.trim().to_string());
+        Self {
+            path,
+            op: tauqe_protocol::EditFileOp::Replace,
+            hunks: Vec::new(),
+        }
+    }
+
+    /// Appends one diff line of the block this file is built from.
+    fn push(&mut self, line: &str) {
+        if line.starts_with("new file mode") {
+            self.op = tauqe_protocol::EditFileOp::Create;
+            return;
+        }
+        if line.starts_with("deleted file mode") {
+            self.op = tauqe_protocol::EditFileOp::Delete;
+            return;
+        }
+        if let Some(renamed) = line.strip_prefix("rename to ") {
+            self.path = renamed.trim().to_string();
+            self.op = tauqe_protocol::EditFileOp::Move;
+            return;
+        }
+        if line.starts_with("@@") {
+            // The header states the ranges and the section of the hunk, so the
+            // audit can name the real lines of the file. A header that names no
+            // single pair of ranges keeps its body with unknown coordinates
+            // (`0`), never an invented range (c-unified-diff-header-parsing).
+            let header = parse_hunk_header(line).unwrap_or_default();
+            self.hunks.push(crate::views::repl::StreamingHunk {
+                hunk_index: self.hunks.len(),
+                old_start: header.old_start,
+                old_lines: header.old_lines,
+                new_start: header.new_start,
+                new_lines: header.new_lines,
+                context_hint: header.context_hint,
+                old_text: String::new(),
+                new_text: String::new(),
+            });
+            return;
+        }
+        if line.starts_with("\\ No newline") {
+            return;
+        }
+        let Some(hunk) = self.hunks.last_mut() else {
+            return;
+        };
+        let mut chars = line.chars();
+        let marker = chars.next();
+        let rest = chars.as_str();
+        match marker {
+            Some(' ') => {
+                push_diff_line(&mut hunk.old_text, rest);
+                push_diff_line(&mut hunk.new_text, rest);
+            }
+            Some('-') => push_diff_line(&mut hunk.old_text, rest),
+            Some('+') => push_diff_line(&mut hunk.new_text, rest),
+            _ => {}
+        }
+    }
+
+    /// Resolves the block into the staged file the inspector audits.
+    fn finish(self) -> Option<crate::views::repl::StreamingFileEdit> {
+        if self.hunks.is_empty() {
+            return None;
+        }
+        Some(crate::views::repl::StreamingFileEdit {
+            path: self.path,
+            op_type: self.op,
+            status: crate::views::repl::FileEditStatus::Ok,
+            error: None,
+            hunks: self.hunks,
+            retry_info: None,
+        })
+    }
+}
+
+/// Appends one diff body line, keeping its trailing newline.
+fn push_diff_line(target: &mut String, text: &str) {
+    target.push_str(text);
+    target.push('\n');
 }
 
 #[cfg(test)]
@@ -818,5 +1053,105 @@ mod tests {
             guard.active_notification().map(|n| n.level),
             Some(NotificationLevel::Error)
         );
+    }
+    /// The unified diff of a commit is split into the files the inspector lists
+    /// and the hunks it renders, so the audit presents the commit exactly as the
+    /// renderer knows how to draw it (c-3).
+    #[test]
+    fn a_commit_diff_is_imported_into_the_audited_change_set() {
+        let diff = concat!(
+            "diff --git a/src/a.rs b/src/a.rs\n",
+            "index 111..222 100644\n",
+            "--- a/src/a.rs\n",
+            "+++ b/src/a.rs\n",
+            "@@ -1,2 +1,2 @@ fn main() {\n",
+            "-let a = 1;\n",
+            "+let a = 2;\n",
+            " fn main() {}\n",
+            "diff --git a/src/b.rs b/src/b.rs\n",
+            "new file mode 100644\n",
+            "index 000..333\n",
+            "--- /dev/null\n",
+            "+++ b/src/b.rs\n",
+            "@@ -0,0 +1 @@\n",
+            "+fn added() {}\n",
+        );
+
+        let files = parse_commit_diff(diff);
+
+        assert_eq!(files.len(), 2);
+        assert_eq!(files[0].path, "src/a.rs");
+        assert_eq!(files[0].op_type, tauqe_protocol::EditFileOp::Replace);
+        assert_eq!(files[0].hunks.len(), 1);
+        assert_eq!(files[0].hunks[0].old_text, "let a = 1;\nfn main() {}\n");
+        assert_eq!(files[0].hunks[0].new_text, "let a = 2;\nfn main() {}\n");
+        // The header names the ranges of both versions and the section of the
+        // change, and every number reaches the staged hunk unchanged.
+        let hunk = &files[0].hunks[0];
+        assert_eq!(
+            (
+                hunk.old_start,
+                hunk.old_lines,
+                hunk.new_start,
+                hunk.new_lines
+            ),
+            (1, 2, 1, 2)
+        );
+        assert_eq!(hunk.context_hint.as_deref(), Some("fn main() {"));
+        assert_eq!(files[1].path, "src/b.rs");
+        assert_eq!(files[1].op_type, tauqe_protocol::EditFileOp::Create);
+        assert_eq!(files[1].hunks[0].new_text, "fn added() {}\n");
+        // A created file has no source range: git states `-0,0`, and the hunk
+        // keeps that fact instead of inventing a source line.
+        assert_eq!(
+            (
+                files[1].hunks[0].old_start,
+                files[1].hunks[0].old_lines,
+                files[1].hunks[0].new_start,
+                files[1].hunks[0].new_lines,
+            ),
+            (0, 0, 1, 1)
+        );
+        assert!(files[1].hunks[0].context_hint.is_none());
+    }
+    /// The header states both ranges of the hunk and the section it sits in, so
+    /// the audit can name the real lines of both versions of the file
+    /// (c-unified-diff-header-parsing).
+    #[test]
+    fn a_hunk_header_yields_its_ranges_and_its_section() {
+        assert_eq!(
+            parse_hunk_header("@@ -12,7 +14,8 @@ fn main() {"),
+            Some(HunkHeader {
+                old_start: 12,
+                old_lines: 7,
+                new_start: 14,
+                new_lines: 8,
+                context_hint: Some("fn main() {".to_string()),
+            })
+        );
+        // Git omits a count of one, and a header may carry no section at all.
+        assert_eq!(
+            parse_hunk_header("@@ -3 +5 @@"),
+            Some(HunkHeader {
+                old_start: 3,
+                old_lines: 1,
+                new_start: 5,
+                new_lines: 1,
+                context_hint: None,
+            })
+        );
+    }
+
+    /// A combined header belongs to a merge diff and names one range per parent,
+    /// so it is refused instead of being read as a single pair of ranges.
+    #[test]
+    fn a_combined_merge_header_is_refused() {
+        assert_eq!(
+            parse_hunk_header("@@@ -1,4 -1,4 +1,5 @@@ fn main() {"),
+            None
+        );
+        assert_eq!(parse_hunk_header("@@ -1,2 @@"), None);
+        assert_eq!(parse_hunk_header("@@ -x,2 +1,2 @@"), None);
+        assert_eq!(parse_hunk_header("not a header"), None);
     }
 }

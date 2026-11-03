@@ -841,11 +841,27 @@ fn test_review_start_params_preset_backward_compatible() {
 fn test_review_analyze_params_and_result_serde() {
     let params = ReviewAnalyzeParams {
         review_id: "rev-1".to_string(),
+        model: None,
     };
     let json = serde_json::to_string(&params).unwrap();
     assert_eq!(json, "{\"review_id\":\"rev-1\"}");
     let de: ReviewAnalyzeParams = serde_json::from_str(&json).unwrap();
     assert_eq!(de, params);
+
+    // The Architect selection travels whole — the model together with the
+    // reasoning depth of the configured entry — so a round runs on the
+    // configuration the developer picked instead of the base rung. An absent
+    // selection stays off the wire, as the assertion above shows.
+    let tier = ReviewAnalyzeParams {
+        review_id: "rev-1".to_string(),
+        model: Some(ModelSelection::Tier {
+            model: ModelRef::openrouter("anthropic/claude-3.7-sonnet"),
+            effort: Some(ReasoningEffort::High),
+        }),
+    };
+    let json = serde_json::to_string(&tier).unwrap();
+    let de_tier: ReviewAnalyzeParams = serde_json::from_str(&json).unwrap();
+    assert_eq!(de_tier, tier);
 
     // The session identifier is mandatory: post-analysis classifies exactly one
     // stored session and never guesses which one the caller meant.

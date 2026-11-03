@@ -307,8 +307,29 @@ did its job is never mistaken for a crash.
 
 The declared in-memory formatter is a pure stream: it receives the staged text of
 one file on standard input and returns the rewritten text on standard output, so no
-byte reaches disk and the filter cannot touch the working tree. Three outcomes are
-distinguished:
+byte reaches disk and the filter cannot touch the working tree.
+
+The stream carries the content; the file context arrives beside it. While a change
+set lives in staging, every invocation names the file it rewrites through the
+`TAUQE_FILE_PATH` environment variable. That is what lets one filter serve a
+polyglot repository: a dispatcher reads the variable and routes a TypeScript source
+to `prettier`, a Rust file to `rustfmt`, and a Python module to `black`, while the
+staged text still enters the child on standard input and the rewritten text comes
+back on standard output.
+
+A declaration that names the parameter `path` or `file` receives the same
+repository-relative path as one literal argument, so a task-runner recipe such as
+`format file:` is addressed exactly as it is on a terminal. The name is the whole
+contract: a declaration that names neither keeps its argument list exactly as
+written, which is what a plain filter such as `rustfmt` expects, because it reads
+the staged content and knows nothing about repository paths.
+
+The path is a context of the invocation, never a second input: the filter still
+reads exactly one stream, and it receives a repository-relative path rather than an
+absolute one, so a diagnostic it prints names the file the change set and the
+verification report name.
+
+Three outcomes are distinguished:
 
 - **rewritten** — the filter processed the content; its output is kept;
 - **absent** — the repository declares no filter; the authored content is kept;

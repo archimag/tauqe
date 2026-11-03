@@ -130,11 +130,11 @@ it runs a declared command line and reads its exit status.
 | --- | --- |
 | `[providers.openrouter]` | the native model catalog the picker may offer |
 | `[models]` | semantic roles, their entries, and `auto_level_up` |
-| `[develop]` | edit retries, verification healing budget, replan budget, per-tier coder and architect attempt budgets, workflow mode, edit protocol, patch strategy, prompt layout |
+| `[repl]` | edit retries, verification healing budget, replan budget, per-tier coder and architect attempt budgets, workflow mode, edit protocol, patch strategy, prompt layout |
 | `[history]` | token budget and uncompressed tail length |
-| `[context]` | discovery rounds, file, outline, and external-reference budgets, report caps, pinned patterns |
+| `[context]` | research rounds, the aggregate token budget, the outline budget, report caps, pinned patterns |
 
-The `[develop]` section also selects the wire format of the model exchange through
+The `[repl]` section also selects the wire format of the model exchange through
 its `protocol` key. The value is `structured` (the default), `xml`, or `mixed`; the
 legacy alias `auto` still parses and resolves to `mixed`. The format never changes
 the capabilities a turn exposes — its intent and the active discussion focus decide
@@ -209,9 +209,9 @@ The boundary subsection is the one part of the declaration that runs no process.
 lists repository glob patterns, resolved by the shared matcher, and every staged operation
 that would create, rewrite, move, or delete a matching path is refused before the toolchain
 starts. The shipped `tauqe.toml` is the living example: it protects `Justfile`, the
-specifications under `docs/specs/`, and `.tauqe/refs/refs.md`, because each of them judges a
-change set rather than being judged by one. The rejection itself belongs to *Protected Paths
-and Trust Boundaries*.
+specifications under `docs/specs/`, and the configuration layers under `tauqe.d/`, because
+each of them judges a change set rather than being judged by one. The rejection itself
+belongs to *Protected Paths and Trust Boundaries*.
 
 ### 2.4 Resolution hierarchy
 
@@ -243,18 +243,23 @@ The workstation file is resolved separately, in `$XDG_CONFIG_HOME/tauqe/tui.toml
 
 | Key | Documented default | Bounds |
 | --- | --- | --- |
-| `context.max_discovery_rounds` | 5 | widening rounds per turn |
-| `context.files_token_budget` | 300,000 | aggregate cost of context files |
+| `context.max_research_rounds` | 5 | widening rounds per turn |
+| `context.token_budget` | 300,000 | aggregate cost of the context: repository files and external documents alike |
 | `context.repomap_token_budget` | 4,000 | the repository outline |
-| `context.refs_token_budget` | 50,000 | the lazily loaded external reference documents |
 | `history.budget_tokens` | 20,000 | session history before compaction |
 | `history.tail_turns` | 10 | turns kept uncompressed |
-| `develop.max_retries` | 5 | staging retries and verification healing rounds within one turn |
-| `develop.max_replans` | 2 | automated replans after a blocked step |
-| `develop.max_tier_attempts` | 3 | content attempts one coder tier receives before the ladder escalates |
-| `develop.max_architect_attempts` | 2 | generation attempts one architect tier receives before the architect ladder escalates |
+| `repl.max_retries` | 5 | staging retries and verification healing rounds within one turn |
+| `repl.max_replans` | 2 | automated replans after a blocked step |
+| `repl.max_tier_attempts` | 3 | content attempts one coder tier receives before the ladder escalates |
+| `repl.max_architect_attempts` | 2 | generation attempts one architect tier receives before the architect ladder escalates |
 | project entry `timeout_secs` | 600 | one verification, format, post-hook, or named-command invocation |
-
+Keys renamed by a later revision keep their former spelling as a permanent
+deserialization alias, so an existing `tauqe.toml` keeps loading unchanged:
+`context.max_discovery_rounds` remains accepted as an alias of
+`context.max_research_rounds`, `context.files_token_budget` remains accepted as an
+alias of `context.token_budget`, and the former `[develop]` and `[edit]` section
+names remain accepted as aliases of `[repl]`. Those retired names appear nowhere
+else in this book.
 A project entry's own `timeout_secs` overrides the harness budget for that entry
 alone. A repository may override any documented default, and this repository does
 (section 3.6). The point is not the numbers but their addressability: a small library
@@ -414,24 +419,25 @@ worth distinguishing from a stale search block.
 
 ### 3.6 Context budgets and hierarchical pinned resolution
 
-`[context]` sets the discovery round cap, the aggregate file budget, the outline
+`[context]` sets the research round cap, the aggregate token budget, the outline
 budget, and whether the eager symbol map is rendered (`include_repo_map`). When the
 eager map is disabled, the prompt carries the compact directory tree instead; the two
 outlines are mutually exclusive by design. This repository widens the documented
-defaults (8 rounds, 500,000 file tokens, 40,000 outline tokens), which is exactly why
+defaults (12 rounds, 1,000,000 tokens, 40,000 outline tokens), which is exactly why
 they are configuration rather than constants.
 
-The file budget is the single measure of volume. No key bounds how many files one
-request may admit, and every file is priced as its content plus the wrapper its own
-`<file>` element renders, so the budget is spent on what the prompt actually carries.
+The token budget is the single measure of volume, and it prices both kinds of
+context entry the same way. No key bounds how many files one request may admit, and
+so a later round can request it again.
 
-`refs_token_budget` (50,000 by default) bounds one more working set: the external
-documents the registry materialized during the task. It is the only ceiling that can drop
-a document from that layer — it evicts the least recently requested one until the layer
-fits, and it refuses a document that alone exceeds it instead of evicting every other
-document for nothing. The aggregate `files_token_budget` counts a loaded snapshot like
-every other context entry, yet it never removes one. *The External Reference Registry*
-owns the layer, the manifest, and those eviction rules.
+The same ceiling bounds the external documents a project declares in `[[outer_docs]]`. That
+declaration is a top-level array of tables, so a modular layer extends it exactly like any
+other; each entry names one document through the single `source` key — an `http(s)` address
+or a local path — together with the `id` a request addresses and a `title` the catalog
+renders. A plan step declares the entries it obeys through the `outer_docs` field of its
+leaf, and the harness mounts them before the step turn starts, priced by the rule above and
+bounded by the same budget. *External Project Documentation* owns the layer, the
+declaration, and the trust boundary that decides what may be read.
 
 `pinned` names files that travel with every prompt, and resolution is hierarchical
 rather than a flat root lookup. Each pattern is resolved at the repository root, and
@@ -577,8 +583,8 @@ Localization* owns the interface language.
   what a failing phase produces.
 - [The Context Model](../ch02-perception/context-model.md) — the layers these
   budgets bound.
-- [The External Reference Registry](../ch02-perception/reference-registry.md) — the
-  external-reference context layer and the `refs_token_budget` that bounds it.
+- [External Project Documentation](../ch02-perception/reference-registry.md) — the
+  external-document context layer and the `token_budget` that bounds it.
 - [Model Roles and the Coder Ladder](../ch01-foundations/model-roles.md) — the role
   boundaries both ladders obey.
 - [The Autonomous Bounded Turn FSM](../ch01-foundations/bounded-turn-fsm.md) — where the

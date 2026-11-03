@@ -200,7 +200,8 @@ mod wire_contract_tracking {
     /// - `ReviewUpdateItemParams`: `resolution_notes`
     /// - `ReviewIssue`: `resolution_notes`
     /// - `ReviewItem`: `resolution_notes`    /// - `PlanReplanParams`: `id`, `item_id`
-    /// - `PlanRefineParams`: `id`
+    /// - `ReviewItem`: `resolution_notes`
+    /// - `PlanReplanParams`: `id`, `item_id`
     #[test]
     fn legacy_aliases_must_be_removed_by_0_2_0() {
         let mut parts = env!("CARGO_PKG_VERSION").split('.');

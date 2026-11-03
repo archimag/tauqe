@@ -78,11 +78,19 @@ impl ConfirmDialog {
     /// `Tab`/`Shift+Tab` cycle the focused button; `Enter`/`Space` activates it;
     /// `y`/`Y` confirms immediately and `n`/`N`/`Esc`/`q` dismisses safely,
     /// regardless of which button holds focus.
-    pub fn handle_key(&mut self, key: KeyEvent) -> ConfirmOutcome {
+    ///
+    /// `input` is the workstation's configured keyboard mapping, exactly as the
+    /// view command maps receive it: the shared chord matcher projects every
+    /// character through the configured layout before it compares, so a card
+    /// stays reachable from an alternative layout such as `ru_jcuken` or a
+    /// custom `langmap` (Conventions §5.1). Resolving with a default
+    /// configuration would silently drop those presses.
+    pub fn handle_key(&mut self, key: KeyEvent, input: &InputConfig) -> ConfirmOutcome {
         // Every dialog chord is physical (`Bare`, `Shift`, or `Ctrl`), so no
-        // abstract modifier is consulted during resolution.
+        // abstract modifier is consulted during resolution; the layout
+        // projection is applied by the shared chord matcher.
         let Some(command) = DIALOG_COMMAND_MAP
-            .resolve(key, &InputConfig::default(), false)
+            .resolve(key, input, false)
             .map(|spec| spec.action)
         else {
             return ConfirmOutcome::Toggled;
@@ -290,11 +298,19 @@ pub fn render_modal_confirm(frame: &mut ratatui::Frame, params: ConfirmModalPara
 #[cfg(test)]
 mod tests {
     use super::{confirm_modal_geometry, ConfirmDialog, ConfirmOutcome};
+    use crate::config::{InputConfig, LayoutPreset};
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use ratatui::layout::Rect;
     use ratatui::text::Line;
+
     fn key(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    /// Canonical workstation input: `Ctrl` primary, `Alt` meta, no layout, so a
+    /// physical-key assertion never depends on a developer's configuration.
+    fn canonical() -> InputConfig {
+        InputConfig::default()
     }
 
     #[test]
@@ -308,7 +324,7 @@ mod tests {
     fn enter_on_cancel_dismisses_without_confirming() {
         let mut dialog = ConfirmDialog::new();
         assert_eq!(
-            dialog.handle_key(key(KeyCode::Enter)),
+            dialog.handle_key(key(KeyCode::Enter), &canonical()),
             ConfirmOutcome::Dismissed
         );
         assert!(dialog.is_cancel());
@@ -318,12 +334,12 @@ mod tests {
     fn tab_toggles_then_enter_confirms() {
         let mut dialog = ConfirmDialog::new();
         assert_eq!(
-            dialog.handle_key(key(KeyCode::Tab)),
+            dialog.handle_key(key(KeyCode::Tab), &canonical()),
             ConfirmOutcome::Toggled
         );
         assert!(dialog.is_confirm());
         assert_eq!(
-            dialog.handle_key(key(KeyCode::Enter)),
+            dialog.handle_key(key(KeyCode::Enter), &canonical()),
             ConfirmOutcome::Accepted
         );
         assert!(dialog.is_cancel());
@@ -333,20 +349,59 @@ mod tests {
     fn accelerators_confirm_and_dismiss() {
         let mut dialog = ConfirmDialog::new();
         assert_eq!(
-            dialog.handle_key(key(KeyCode::Char('y'))),
+            dialog.handle_key(key(KeyCode::Char('y')), &canonical()),
             ConfirmOutcome::Accepted
         );
 
         let mut dialog = ConfirmDialog::new();
         assert_eq!(
-            dialog.handle_key(key(KeyCode::Char('n'))),
+            dialog.handle_key(key(KeyCode::Char('n')), &canonical()),
             ConfirmOutcome::Dismissed
         );
 
         let mut dialog = ConfirmDialog::new();
         assert_eq!(
-            dialog.handle_key(key(KeyCode::Esc)),
+            dialog.handle_key(key(KeyCode::Esc), &canonical()),
             ConfirmOutcome::Dismissed
+        );
+    }
+
+    /// A confirmation card resolves the same layout projection as every view
+    /// command map: `н` sits on `y` and `т` on `n`, so both fast accelerators
+    /// stay reachable from the JCUKEN layout (Conventions §5.1).
+    #[test]
+    fn ru_jcuken_layout_reaches_the_dialog_vocabulary() {
+        let input = InputConfig {
+            layout: LayoutPreset::RuJcuken,
+            ..canonical()
+        };
+
+        let mut dialog = ConfirmDialog::new();
+        assert_eq!(
+            dialog.handle_key(key(KeyCode::Char('н')), &input),
+            ConfirmOutcome::Accepted
+        );
+
+        let mut dialog = ConfirmDialog::new();
+        assert_eq!(
+            dialog.handle_key(key(KeyCode::Char('т')), &input),
+            ConfirmOutcome::Dismissed
+        );
+    }
+
+    /// A custom `langmap` widens the vocabulary through the very projection the
+    /// command maps use, so the card never carries a second translation table.
+    #[test]
+    fn custom_langmap_reaches_the_dialog_vocabulary() {
+        let input = InputConfig {
+            langmap: Some("ф:y".to_string()),
+            ..canonical()
+        };
+
+        let mut dialog = ConfirmDialog::new();
+        assert_eq!(
+            dialog.handle_key(key(KeyCode::Char('ф')), &input),
+            ConfirmOutcome::Accepted
         );
     }
 
@@ -401,7 +456,10 @@ mod tests {
     fn ctrl_g_dismisses_safely() {
         let mut dialog = ConfirmDialog::new();
         let ctrl_g = KeyEvent::new(KeyCode::Char('g'), KeyModifiers::CONTROL);
-        assert_eq!(dialog.handle_key(ctrl_g), ConfirmOutcome::Dismissed);
+        assert_eq!(
+            dialog.handle_key(ctrl_g, &canonical()),
+            ConfirmOutcome::Dismissed
+        );
         assert!(dialog.is_cancel());
     }
 }

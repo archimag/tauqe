@@ -531,6 +531,7 @@ mod tests {
                     id: "2".to_string(),
                     title: "Superseded work".to_string(),
                     status: PlanItemStatus::Blocked,
+                    files: vec!["src/step2.rs".to_string()],
                     ..Default::default()
                 },
             ],
@@ -706,6 +707,7 @@ mod tests {
                         id: "1.2".to_string(),
                         title: "Todo leaf".to_string(),
                         status: PlanItemStatus::Todo,
+                        files: vec!["src/todo-leaf.rs".to_string()],
                         ..Default::default()
                     },
                 ],
@@ -942,6 +944,7 @@ mod tests {
                 id: "1".to_string(),
                 title: "Pending step".to_string(),
                 status: PlanItemStatus::Todo,
+                files: vec!["src/pending.rs".to_string()],
                 ..Default::default()
             }],
         );

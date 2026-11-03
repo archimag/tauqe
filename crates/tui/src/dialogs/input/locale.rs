@@ -74,7 +74,7 @@ pub(super) async fn handle_locale_dialog(
                 return Ok(Some(InputResult::Continue));
             }
             KeyCode::Enter | KeyCode::Char(' ') => {
-                return activate(st, dialog, server_writer).await;
+                return activate(state, st, dialog, server_writer).await;
             }
             _ => {
                 st.locale_dialog = Some(dialog);
@@ -123,14 +123,18 @@ pub(super) async fn handle_locale_dialog(
 }
 
 /// Executes the action button that currently holds focus.
+///
+/// The state handle travels with the guard because the reset arm removes its
+/// file off the lock and re-acquires the guard to report the outcome.
 async fn activate(
+    state: &Arc<Mutex<AppState>>,
     st: MutexGuard<'_, AppState>,
     dialog: LocaleDialogState,
     server_writer: &mut RpcConnection,
 ) -> anyhow::Result<Option<InputResult>> {
     match dialog.button {
         LocaleDialogButton::Synthesize => synthesize(st, dialog, server_writer).await,
-        LocaleDialogButton::ResetEnglish => reset_to_english(st),
+        LocaleDialogButton::ResetEnglish => reset_to_english(state, st).await,
         LocaleDialogButton::Cancel => Ok(Some(InputResult::Continue)),
     }
 }
@@ -206,6 +210,7 @@ async fn cancel_synthesis(
 /// (Conventions §6.6). While synthesis is in flight only `Cancel` acts,
 /// mirroring the keyboard gate on input.
 pub async fn click_locale_button(
+    state: &Arc<Mutex<AppState>>,
     mut st: MutexGuard<'_, AppState>,
     button: LocaleDialogButton,
     server_writer: &mut RpcConnection,
@@ -226,18 +231,33 @@ pub async fn click_locale_button(
         None => return Ok(()),
     };
     dialog.button = button;
-    let _ = activate(st, dialog, server_writer).await?;
+    let _ = activate(state, st, dialog, server_writer).await?;
     Ok(())
 }
 
 /// Deletes the single custom-locale file and reverts the engine to English (c-4, c-5).
-fn reset_to_english(mut st: MutexGuard<'_, AppState>) -> anyhow::Result<Option<InputResult>> {
+///
+/// The in-memory revert happens under the guard, the file removal runs on the
+/// blocking pool with the guard released, and the outcome is reported after the
+/// guard is re-acquired, so the state is never held across the disk access.
+async fn reset_to_english(
+    state: &Arc<Mutex<AppState>>,
+    mut st: MutexGuard<'_, AppState>,
+) -> anyhow::Result<Option<InputResult>> {
     st.reset_locale_to_english();
-    match delete_custom_locale() {
+    drop(st);
+
+    let removed = match tokio::task::spawn_blocking(delete_custom_locale).await {
+        Ok(result) => result.map_err(|err| err.to_string()),
+        Err(err) => Err(err.to_string()),
+    };
+
+    let mut st = state.lock().await;
+    match removed {
         Ok(()) => st.notify_success(active_t("notify.locale_reset_english")),
-        Err(err) => st.notify_warning(
-            active_t("notify.locale_reset_unsaved").replace("{}", &err.to_string()),
-        ),
+        Err(error) => {
+            st.notify_warning(active_t("notify.locale_reset_unsaved").replace("{}", &error));
+        }
     }
     Ok(Some(InputResult::Continue))
 }

@@ -10,6 +10,7 @@ use crate::app::{
     ViewMode,
 };
 use crate::command::dialog::{DialogCommand, DIALOG_COMMAND_MAP};
+use crate::command::translate_code;
 use crate::input::{squash, InputResult};
 use crate::rpc::{send_request, RpcConnection};
 use crate::views::history::HistoryViewState;
@@ -590,8 +591,20 @@ pub(crate) async fn confirm_review_analyze(
     target: crate::app::ConfirmReviewAnalyzeState,
     server_writer: &mut RpcConnection,
 ) -> anyhow::Result<()> {
+    // The selected Architect rung travels whole — the model together with the
+    // reasoning depth it was configured with — so the architect the developer
+    // picked is the architect that classifies, and the daemon never re-derives
+    // the depth from the configured ladder entries. An empty ladder sends no
+    // selection, which runs the base rung of the architect ladder (c-1, c-2).
+    let model = target
+        .selected_entry()
+        .map(|entry| tauqe_protocol::ModelSelection::Tier {
+            model: entry.model.clone(),
+            effort: entry.effort,
+        });
     let params = tauqe_protocol::ReviewAnalyzeParams {
         review_id: target.review_id,
+        model,
     };
     let params = serde_json::to_value(params)?;
     // The classification runs under the daemon's operation slot: the launch
@@ -602,6 +615,144 @@ pub(crate) async fn confirm_review_analyze(
     st.review.analyzing = true;
     st.notify_info(crate::i18n::active_t("notify.review_analyze_started"));
     Ok(())
+}
+
+/// Routes key events for the Architect post-analysis confirmation.
+///
+/// The dialog carries the Architect ladder above its action bar, so its keyboard
+/// contract repeats the execution dialogs: the embedded list owns bare digits,
+/// the arrows, and paging while it holds focus, `Tab` / `Shift+Tab` cycle the
+/// ladder and the actions, and `Enter` runs the classification only from the
+/// focused `Run Analysis` button, so the safe `Cancel` default never spends
+/// tokens on a stray keystroke (c-dialog-parity, Conventions §6, §7).
+async fn handle_review_analyze_dialog(
+    key: KeyEvent,
+    state: &Arc<Mutex<AppState>>,
+    mut st: MutexGuard<'_, AppState>,
+    server_writer: &mut RpcConnection,
+) -> anyhow::Result<Option<InputResult>> {
+    let mut target = match st.confirm_review_analyze.take() {
+        Some(target) => target,
+        None => return Ok(None),
+    };
+
+    let primary = st.tui_config.input.primary_modifier;
+    let meta = st.tui_config.input.meta_modifier;
+    let visible_rows = crate::dialogs::render::review_analyze_dialog_geometry(
+        st.last_frame_area,
+        target.selector.len(),
+    )
+    .model_rows
+    .height as usize;
+
+    // The C-M / M-M chord always switches the Architect; the arrows browse the
+    // ladder only while the ladder owns focus.
+    if target
+        .selector
+        .handle_key(key, primary, meta, !target.focus.is_model_list())
+    {
+        st.confirm_review_analyze = Some(target);
+        return Ok(Some(InputResult::Continue));
+    }
+
+    // Bare digits, arrows, and paging act on the ladder only while it owns
+    // focus, so the action bar never forwards a bare digit to the picker.
+    if target.focus.is_model_list() && target.selector.handle_list_key(key, visible_rows) {
+        st.confirm_review_analyze = Some(target);
+        return Ok(Some(InputResult::Continue));
+    }
+
+    let is_ctrl_alt =
+        key.modifiers.contains(KeyModifiers::CONTROL) && key.modifiers.contains(KeyModifiers::ALT);
+    let is_cmd = !is_ctrl_alt
+        && (primary.matches(key.modifiers) || key.modifiers.contains(KeyModifiers::CONTROL));
+    let has_shift = key.modifiers.contains(KeyModifiers::SHIFT);
+    let has_alt = key.modifiers.contains(KeyModifiers::ALT);
+
+    // C-Enter accelerator unconditionally runs the classification from any
+    // section, exactly as the execution dialogs confirm from any section.
+    if matches!(key.code, KeyCode::Enter) && is_cmd {
+        st.confirm_review_analyze = None;
+        confirm_review_analyze(state, st, target, server_writer).await?;
+        return Ok(Some(InputResult::Continue));
+    }
+
+    match key.code {
+        KeyCode::Esc => {
+            st.confirm_button = crate::app::ConfirmDialogButton::Cancel;
+            Ok(Some(InputResult::Continue))
+        }
+        KeyCode::Char('q') if target.focus.is_actions() => {
+            st.confirm_button = crate::app::ConfirmDialogButton::Cancel;
+            Ok(Some(InputResult::Continue))
+        }
+        // Fast accelerators mirror the shared dialog vocabulary. They are
+        // limited to the action bar, so a bare letter pressed over the ladder
+        // never runs or cancels the classification (Conventions §5).
+        KeyCode::Char('y') | KeyCode::Char('Y') if target.focus.is_actions() => {
+            st.confirm_review_analyze = None;
+            confirm_review_analyze(state, st, target, server_writer).await?;
+            Ok(Some(InputResult::Continue))
+        }
+        KeyCode::Char('n') | KeyCode::Char('N') if target.focus.is_actions() => {
+            st.confirm_button = crate::app::ConfirmDialogButton::Cancel;
+            Ok(Some(InputResult::Continue))
+        }
+        KeyCode::Tab => {
+            if target.focus.is_actions()
+                && target.confirm_button == crate::app::ConfirmDialogButton::Cancel
+            {
+                target.confirm_button = crate::app::ConfirmDialogButton::Confirm;
+            } else {
+                if target.focus.is_actions() {
+                    target.confirm_button = crate::app::ConfirmDialogButton::Cancel;
+                }
+                target.focus.cycle_next(target.selector.len());
+            }
+            st.confirm_review_analyze = Some(target);
+            Ok(Some(InputResult::Continue))
+        }
+        KeyCode::BackTab => {
+            if target.focus.is_actions()
+                && target.confirm_button == crate::app::ConfirmDialogButton::Confirm
+            {
+                target.confirm_button = crate::app::ConfirmDialogButton::Cancel;
+            } else {
+                target.focus.cycle_prev(target.selector.len());
+                if target.focus.is_actions() {
+                    target.confirm_button = crate::app::ConfirmDialogButton::Confirm;
+                }
+            }
+            st.confirm_review_analyze = Some(target);
+            Ok(Some(InputResult::Continue))
+        }
+        // Horizontal stepping moves between the action buttons.
+        KeyCode::Left | KeyCode::Right if target.focus.is_actions() => {
+            target.confirm_button = match target.confirm_button {
+                crate::app::ConfirmDialogButton::Cancel => crate::app::ConfirmDialogButton::Confirm,
+                crate::app::ConfirmDialogButton::Confirm => crate::app::ConfirmDialogButton::Cancel,
+            };
+            st.confirm_review_analyze = Some(target);
+            Ok(Some(InputResult::Continue))
+        }
+        // The classification spends tokens, so it starts only from the focused
+        // `Run Analysis` button; the safe `Cancel` default dismisses the dialog.
+        KeyCode::Enter | KeyCode::Char(' ')
+            if !has_shift && !has_alt && target.focus.is_actions() =>
+        {
+            if target.confirm_button == crate::app::ConfirmDialogButton::Confirm {
+                st.confirm_review_analyze = None;
+                confirm_review_analyze(state, st, target, server_writer).await?;
+            } else {
+                st.confirm_button = crate::app::ConfirmDialogButton::Cancel;
+            }
+            Ok(Some(InputResult::Continue))
+        }
+        _ => {
+            st.confirm_review_analyze = Some(target);
+            Ok(Some(InputResult::Continue))
+        }
+    }
 }
 /// Applies the action chosen in the batch-cancellation dialog.
 ///
@@ -734,6 +885,11 @@ pub(crate) async fn handle_dialog_event(
                 // the reviewer never changes behind the developer's cursor
                 // (c-3, c-4, c-5, Conventions §5, §7).
                 if dialog.selector.handle_key(key, primary, meta, true) {
+                    // The chord only moves the highlighted rung: the dialog must
+                    // return to the state, or switching the reviewer would close
+                    // the launcher it was switching inside
+                    // (c-modal-dispatch-parity).
+                    st.review_dialog = Some(dialog);
                     return Ok(Some(InputResult::Continue));
                 }
 
@@ -756,10 +912,11 @@ pub(crate) async fn handle_dialog_event(
                         crate::dialogs::render::review_dialog_geometry(st.last_frame_area, &dialog)
                             .preset_rows
                             .height as usize;
-                    if dialog
-                        .preset_selector
-                        .handle_nav_key(key, visible_preset_rows)
-                    {
+                    if dialog.preset_selector.handle_nav_key(
+                        key,
+                        &st.tui_config.input,
+                        visible_preset_rows,
+                    ) {
                         st.review_dialog = Some(dialog);
                         return Ok(Some(InputResult::Continue));
                     }
@@ -1275,19 +1432,7 @@ pub(crate) async fn handle_dialog_event(
             return Ok(Some(InputResult::Continue));
         }
         Some(ActiveModal::ReviewAnalyze) => {
-            if let Some(target) = st.confirm_review_analyze.clone() {
-                match resolve_confirm(&mut st, key) {
-                    ConfirmOutcome::Toggled => {}
-                    ConfirmOutcome::Dismissed => {
-                        st.confirm_review_analyze = None;
-                    }
-                    ConfirmOutcome::Accepted => {
-                        st.confirm_review_analyze = None;
-                        confirm_review_analyze(state, st, target, server_writer).await?;
-                    }
-                }
-            }
-            return Ok(Some(InputResult::Continue));
+            return handle_review_analyze_dialog(key, state, st, server_writer).await;
         }
         Some(ActiveModal::ExecuteReview) => {
             // Point execution is a form dialog (Coder selector, directives,
@@ -1359,7 +1504,10 @@ pub(crate) async fn handle_dialog_event(
                 .height
                 .max(1) as usize;
 
-                if dialog.selector.handle_nav_key(key, visible) {
+                if dialog
+                    .selector
+                    .handle_nav_key(key, &st.tui_config.input, visible)
+                {
                     st.status_dialog = Some(dialog);
                     return Ok(Some(InputResult::Continue));
                 }
@@ -1389,14 +1537,21 @@ pub(crate) async fn handle_dialog_event(
             return selection::handle_selection_dialog_key(key, state, st, server_writer).await;
         }
         Some(ActiveModal::ThemeSelector) => {
+            // The visible row window is read before the guard travels into the
+            // selector, which releases it around the `tui.toml` rewrite (c-1).
             let visible = crate::theme::selector::theme_selector_visible_height(st.last_frame_area);
-            crate::theme::selector::handle_theme_selector_key(key, &mut st, visible);
+            crate::theme::selector::handle_theme_selector_key(key, state, st, visible).await;
             return Ok(Some(InputResult::Continue));
         }
         Some(ActiveModal::Help) => {
             let command_modifier = key.modifiers.contains(KeyModifiers::CONTROL)
                 || key.modifiers.contains(KeyModifiers::ALT);
-            match key.code {
+            // The scrolling letters are literal, so the press is projected
+            // through the configured layout: `о`, `л`, `т`, and `з` scroll the
+            // tab from a Cyrillic layout exactly as `j`, `k`, `n`, and `p` do
+            // (Conventions §5.1).
+            let code = translate_code(key.code, &st.tui_config.input);
+            match code {
                 KeyCode::Char('?') | KeyCode::Esc | KeyCode::Char('q') => {
                     st.show_help = false;
                     st.help_scroll = 0;
@@ -2921,11 +3076,29 @@ mod tests {
     async fn review_analyze_confirm_dispatches_the_typed_request() {
         let mut st = crate::app::test_state();
         st.view_mode = ViewMode::Review;
-        st.confirm_review_analyze = Some(crate::app::ConfirmReviewAnalyzeState {
-            review_id: "rev-1".to_string(),
-            review_title: "Session rev-1".to_string(),
-        });
-        st.confirm_button = ConfirmDialogButton::Confirm;
+        st.confirm_review_analyze = Some(crate::app::ConfirmReviewAnalyzeState::new(
+            "rev-1".to_string(),
+            "Session rev-1".to_string(),
+            vec![
+                tauqe_protocol::ModelEntry::new(
+                    tauqe_protocol::ModelRef::openrouter("architect-a"),
+                    None,
+                ),
+                tauqe_protocol::ModelEntry::new(
+                    tauqe_protocol::ModelRef::openrouter("architect-b"),
+                    Some(tauqe_protocol::ReasoningEffort::High),
+                ),
+            ],
+        ));
+        {
+            let target = st
+                .confirm_review_analyze
+                .as_mut()
+                .expect("the dialog is open");
+            target.selector.select_index(1);
+            target.focus = crate::app::ReviewAnalyzeFocus::Actions;
+            target.confirm_button = ConfirmDialogButton::Confirm;
+        }
 
         let state = Arc::new(Mutex::new(st));
         let mut conn = RpcConnection::new(Vec::<u8>::new());
@@ -2956,10 +3129,11 @@ mod tests {
     async fn review_analyze_dismiss_sends_no_request() {
         let mut st = crate::app::test_state();
         st.view_mode = ViewMode::Review;
-        st.confirm_review_analyze = Some(crate::app::ConfirmReviewAnalyzeState {
-            review_id: "rev-1".to_string(),
-            review_title: "Session rev-1".to_string(),
-        });
+        st.confirm_review_analyze = Some(crate::app::ConfirmReviewAnalyzeState::new(
+            "rev-1".to_string(),
+            "Session rev-1".to_string(),
+            Vec::new(),
+        ));
         st.confirm_button = ConfirmDialogButton::Confirm;
 
         let state = Arc::new(Mutex::new(st));
@@ -2977,6 +3151,91 @@ mod tests {
         assert!(guard.confirm_review_analyze.is_none());
         assert!(!guard.review.analyzing);
         assert_eq!(guard.confirm_button, ConfirmDialogButton::Cancel);
+    }
+
+    /// The post-analysis dialog repeats the execution-dialog focus cycle: `Tab`
+    /// walks from the Architect ladder to the action bar, onto the confirm
+    /// button, and back, while the safe `Cancel` holds the default. A bare digit
+    /// selects a rung only from the ladder (c-dialog-parity, Conventions §6).
+    #[tokio::test]
+    async fn review_analyze_dialog_cycles_focus_and_selects_by_digit() {
+        let mut st = crate::app::test_state();
+        st.view_mode = ViewMode::Review;
+        st.confirm_review_analyze = Some(crate::app::ConfirmReviewAnalyzeState::new(
+            "rev-1".to_string(),
+            "Session rev-1".to_string(),
+            vec![
+                tauqe_protocol::ModelEntry::new(
+                    tauqe_protocol::ModelRef::openrouter("architect-a"),
+                    None,
+                ),
+                tauqe_protocol::ModelEntry::new(
+                    tauqe_protocol::ModelRef::openrouter("architect-b"),
+                    None,
+                ),
+            ],
+        ));
+
+        let state = Arc::new(Mutex::new(st));
+        let mut conn = RpcConnection::new(Vec::<u8>::new());
+
+        // The ladder opens focused, so a bare digit selects the rung.
+        handle_dialog_event(
+            KeyEvent::new(KeyCode::Char('2'), KeyModifiers::NONE),
+            &state,
+            &mut conn,
+        )
+        .await
+        .expect("in-memory dispatch never fails");
+        {
+            let guard = state.lock().await;
+            let target = guard.confirm_review_analyze.as_ref().expect("dialog open");
+            assert_eq!(target.selector.selected_index(), 1);
+            assert_eq!(target.focus, crate::app::ReviewAnalyzeFocus::ModelList);
+        }
+
+        handle_dialog_event(
+            KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE),
+            &state,
+            &mut conn,
+        )
+        .await
+        .expect("in-memory dispatch never fails");
+        {
+            let guard = state.lock().await;
+            let target = guard.confirm_review_analyze.as_ref().expect("dialog open");
+            assert_eq!(target.focus, crate::app::ReviewAnalyzeFocus::Actions);
+            assert_eq!(target.confirm_button, ConfirmDialogButton::Cancel);
+        }
+
+        handle_dialog_event(
+            KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE),
+            &state,
+            &mut conn,
+        )
+        .await
+        .expect("in-memory dispatch never fails");
+        {
+            let guard = state.lock().await;
+            let target = guard.confirm_review_analyze.as_ref().expect("dialog open");
+            assert_eq!(target.focus, crate::app::ReviewAnalyzeFocus::Actions);
+            assert_eq!(target.confirm_button, ConfirmDialogButton::Confirm);
+        }
+
+        handle_dialog_event(
+            KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE),
+            &state,
+            &mut conn,
+        )
+        .await
+        .expect("in-memory dispatch never fails");
+        {
+            let guard = state.lock().await;
+            let target = guard.confirm_review_analyze.as_ref().expect("dialog open");
+            assert_eq!(target.focus, crate::app::ReviewAnalyzeFocus::ModelList);
+            assert_eq!(target.confirm_button, ConfirmDialogButton::Cancel);
+        }
+        assert!(conn.written().is_empty(), "focus cycling launches nothing");
     }
 
     /// `C-j` opens the next path row only when the active one carries a usable
@@ -3507,5 +3766,264 @@ mod tests {
             guard.review.running,
             "the confirmed window starts the audit"
         );
+    }
+
+    /// Presses one physical key through the interface gateway, so a regression
+    /// test exercises the layout normalization the real event loop applies
+    /// before any modal handler runs (c-single-choke-point).
+    async fn press(
+        state: &Arc<Mutex<AppState>>,
+        conn: &mut RpcConnection,
+        code: KeyCode,
+        modifiers: KeyModifiers,
+    ) {
+        crate::input::handle_terminal_event(
+            crossterm::event::Event::Key(KeyEvent::new(code, modifiers)),
+            state,
+            conn,
+        )
+        .await
+        .expect("in-memory dispatch never fails");
+    }
+
+    /// Modifiers of a plain character press.
+    const PLAIN: KeyModifiers = KeyModifiers::NONE;
+
+    /// Modifiers of a command chord.
+    const CTRL: KeyModifiers = KeyModifiers::CONTROL;
+
+    /// Builds the status picker over one pending plan step.
+    fn status_picker() -> crate::app::StatusDialogState {
+        crate::app::StatusDialogState::new(
+            crate::app::StatusDialogTarget::PlanItem {
+                plan_id: "plan-1".to_string(),
+                item_id: "1".to_string(),
+                item_title: "Step 1".to_string(),
+                current_status: tauqe_protocol::PlanItemStatus::Todo,
+            },
+            0,
+        )
+    }
+
+    /// Under the JCUKEN layout the status picker answers to the same physical
+    /// keys as under QWERTY: `т`/`о` step the list down, `з`/`л` step it up,
+    /// and `й` (the physical `q`) closes the dialog instead of leaving it open
+    /// on the raw Cyrillic code point — the original defect
+    /// (c-modal-dispatch-parity).
+    #[tokio::test]
+    async fn status_dialog_navigates_and_dismisses_from_the_jcuken_layout() {
+        let mut st = crate::app::test_state();
+        st.tui_config.input.layout = crate::config::LayoutPreset::RuJcuken;
+        st.view_mode = ViewMode::Plans;
+        st.last_frame_area = ratatui::layout::Rect::new(0, 0, 120, 50);
+        st.status_dialog = Some(status_picker());
+
+        let state = Arc::new(Mutex::new(st));
+        let mut conn = RpcConnection::new(Vec::<u8>::new());
+
+        for (character, expected) in [('т', 1usize), ('т', 2), ('о', 3), ('з', 2), ('л', 1)] {
+            press(&state, &mut conn, KeyCode::Char(character), PLAIN).await;
+            let guard = state.lock().await;
+            let dialog = guard
+                .status_dialog
+                .as_ref()
+                .expect("the picker stays open while it navigates");
+            assert_eq!(
+                dialog.selector.selected_index(),
+                expected,
+                "{character:?} must move the status cursor"
+            );
+        }
+        assert!(
+            conn.written().is_empty(),
+            "navigating the picker never talks to the server"
+        );
+
+        press(&state, &mut conn, KeyCode::Char('й'), PLAIN).await;
+        assert!(
+            state.lock().await.status_dialog.is_none(),
+            "`й` sits on the physical `q` position and must dismiss the picker"
+        );
+        assert!(conn.written().is_empty());
+    }
+
+    /// The digit quick-select keeps its positional meaning under the Russian
+    /// layout: the row a digit numbers is the status the plan step receives,
+    /// and the request names exactly that transition (c-modal-dispatch-parity).
+    #[tokio::test]
+    async fn status_dialog_applies_the_numbered_row_from_the_jcuken_layout() {
+        let mut st = crate::app::test_state();
+        st.tui_config.input.layout = crate::config::LayoutPreset::RuJcuken;
+        st.view_mode = ViewMode::Plans;
+        st.last_frame_area = ratatui::layout::Rect::new(0, 0, 120, 50);
+        st.plans_view.plans = vec![tauqe_protocol::Plan::from_parts(
+            "plan-1".to_string(),
+            "Plan 1".to_string(),
+            None,
+            0,
+            0,
+            vec![],
+            vec![plan_item("1", tauqe_protocol::PlanItemStatus::Todo)],
+        )];
+        st.status_dialog = Some(status_picker());
+
+        let state = Arc::new(Mutex::new(st));
+        let mut conn = RpcConnection::new(Vec::<u8>::new());
+
+        // Option index 3 is DONE in the six-status lifecycle.
+        press(&state, &mut conn, KeyCode::Char('4'), PLAIN).await;
+
+        let expected = crate::dialogs::render::status::PLAN_STATUS_ORDER[3];
+        let payload = String::from_utf8(conn.written().to_vec()).expect("utf-8 payload");
+        assert!(payload.contains(methods::PLAN_UPDATE_ITEM), "{payload}");
+
+        let guard = state.lock().await;
+        assert!(guard.status_dialog.is_none(), "the picker is consumed");
+        assert_eq!(guard.plans_view.plans[0].items[0].status, expected);
+    }
+
+    /// The usage breakdown answers to the Russian layout in both navigation
+    /// spellings and dismisses on `й`: the branch reads the raw code point, so
+    /// a Cyrillic press used to be swallowed (c-modal-dispatch-parity).
+    #[tokio::test]
+    async fn usage_summary_scrolls_and_dismisses_from_the_jcuken_layout() {
+        let mut st = crate::app::test_state();
+        st.tui_config.input.layout = crate::config::LayoutPreset::RuJcuken;
+        st.open_usage_summary();
+        let state = Arc::new(Mutex::new(st));
+        let mut conn = RpcConnection::new(Vec::<u8>::new());
+
+        for (character, expected) in [('о', 1u16), ('т', 2), ('л', 1), ('з', 0)] {
+            press(&state, &mut conn, KeyCode::Char(character), PLAIN).await;
+            let guard = state.lock().await;
+            assert_eq!(
+                guard
+                    .usage_summary
+                    .as_ref()
+                    .expect("the breakdown stays open")
+                    .scroll,
+                expected,
+                "{character:?} must scroll the breakdown"
+            );
+        }
+
+        press(&state, &mut conn, KeyCode::Char('й'), PLAIN).await;
+        assert!(state.lock().await.usage_summary.is_none());
+        assert!(
+            conn.written().is_empty(),
+            "the read-only dialog never talks to the server"
+        );
+    }
+
+    /// The Help modal keeps its scrolling chords and its dismissal under the
+    /// Russian layout, matching the translation it already performed
+    /// internally (c-modal-dispatch-parity).
+    #[tokio::test]
+    async fn help_modal_scrolls_and_dismisses_from_the_jcuken_layout() {
+        let mut st = crate::app::test_state();
+        st.tui_config.input.layout = crate::config::LayoutPreset::RuJcuken;
+        st.show_help = true;
+        st.help_tab = HelpTab::TextEditor;
+        let state = Arc::new(Mutex::new(st));
+        let mut conn = RpcConnection::new(Vec::<u8>::new());
+
+        for (character, expected) in [('т', 1u16), ('о', 2), ('з', 1), ('л', 0)] {
+            press(&state, &mut conn, KeyCode::Char(character), PLAIN).await;
+            let guard = state.lock().await;
+            assert_eq!(
+                guard.help_scroll, expected,
+                "{character:?} must scroll the active tab"
+            );
+            assert!(guard.show_help, "scrolling keeps the modal open");
+            assert_eq!(guard.help_tab, HelpTab::TextEditor);
+        }
+
+        press(&state, &mut conn, KeyCode::Char('й'), PLAIN).await;
+        let guard = state.lock().await;
+        assert!(!guard.show_help, "`й` sits on `q` and must dismiss Help");
+        assert_eq!(guard.help_scroll, 0);
+        assert!(conn.written().is_empty());
+    }
+
+    /// Typing inside the review text fields reaches the buffers exactly as
+    /// pressed: the capture boundary keeps the gateway from translating a
+    /// plain Cyrillic character into a command chord
+    /// (c-text-capture-boundary).
+    #[tokio::test]
+    async fn review_dialog_text_fields_keep_cyrillic_typing_verbatim() {
+        let mut st = crate::app::test_state();
+        st.tui_config.input.layout = crate::config::LayoutPreset::RuJcuken;
+        st.view_mode = ViewMode::Review;
+        st.last_frame_area = ratatui::layout::Rect::new(0, 0, 120, 50);
+        let mut dialog = ReviewDialogState::new(1, 10, Vec::new(), Vec::new());
+        dialog.focus = crate::app::ReviewDialogFocus::PromptEditor;
+        st.review_dialog = Some(dialog);
+
+        let state = Arc::new(Mutex::new(st));
+        let mut conn = RpcConnection::new(Vec::<u8>::new());
+
+        for character in ['т', 'е', 'с', 'т'] {
+            press(&state, &mut conn, KeyCode::Char(character), PLAIN).await;
+        }
+        {
+            let guard = state.lock().await;
+            let dialog = guard.review_dialog.as_ref().expect("the dialog stays open");
+            assert_eq!(dialog.prompt_editor.get_text(), "тест");
+        }
+
+        // The target-path row is the dialog's second text field and follows the
+        // same capture boundary.
+        {
+            let mut guard = state.lock().await;
+            let dialog = guard.review_dialog.as_mut().expect("the dialog stays open");
+            dialog.focus = crate::app::ReviewDialogFocus::PathEditor;
+        }
+        press(&state, &mut conn, KeyCode::Char('т'), PLAIN).await;
+        {
+            let guard = state.lock().await;
+            let dialog = guard.review_dialog.as_ref().expect("the dialog stays open");
+            assert_eq!(dialog.path_inputs[0].get_text(), "т");
+            assert_eq!(dialog.prompt_editor.get_text(), "тест");
+        }
+        assert!(conn.written().is_empty());
+    }
+
+    /// A command chord is normalized even while the prompt editor owns the
+    /// keyboard: `C-ь` occupies the physical `m` position and switches the
+    /// reviewer, while the typed text stays untouched
+    /// (c-text-capture-boundary, c-modal-dispatch-parity).
+    #[tokio::test]
+    async fn review_model_chord_switches_the_reviewer_from_the_prompt_editor() {
+        let mut st = crate::app::test_state();
+        st.tui_config.input.layout = crate::config::LayoutPreset::RuJcuken;
+        st.view_mode = ViewMode::Review;
+        st.last_frame_area = ratatui::layout::Rect::new(0, 0, 120, 50);
+        let mut dialog = review_dialog_with_reviewers(
+            vec!["src/lib.rs".to_string()],
+            0,
+            crate::app::ReviewDialogFocus::PromptEditor,
+        );
+        dialog.prompt_editor.insert_str("проверить");
+        st.review_dialog = Some(dialog);
+
+        let state = Arc::new(Mutex::new(st));
+        let mut conn = RpcConnection::new(Vec::<u8>::new());
+
+        press(&state, &mut conn, KeyCode::Char('ь'), CTRL).await;
+
+        let guard = state.lock().await;
+        let dialog = guard.review_dialog.as_ref().expect("the dialog stays open");
+        assert_eq!(
+            dialog.selector.selected_index(),
+            1,
+            "`C-ь` sits on the physical `m` position and switches the reviewer"
+        );
+        assert_eq!(
+            dialog.prompt_editor.get_text(),
+            "проверить",
+            "the chord edits no text"
+        );
+        assert_eq!(dialog.focus, crate::app::ReviewDialogFocus::PromptEditor);
+        assert!(conn.written().is_empty());
     }
 }

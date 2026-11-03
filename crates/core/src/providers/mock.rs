@@ -3,7 +3,7 @@
 //! The mock replays a fixed sequence of [`MockResponse`] scripts, one per
 //! provider call, and records every request it receives. This lets the whole
 //! turn pipeline run inside `cargo test` without network access, reproducing
-//! multi-round scenarios (context discovery, edit proposals, verification
+//! multi-round scenarios (context research, edit proposals, verification
 //! healing, cancellation) deterministically.
 
 use std::collections::VecDeque;

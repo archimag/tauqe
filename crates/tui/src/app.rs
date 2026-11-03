@@ -4,6 +4,7 @@ use tauqe_protocol::{
     ReasoningEffort, RepositoryState, ReviewStartParams, SystemStatusResult,
 };
 
+use crate::components::editor::PromptHistoryJob;
 use crate::components::model_selector::ModelSelector;
 use crate::components::ListSelector;
 use crate::config::TuiConfig;
@@ -16,7 +17,7 @@ use crate::ui::HitRegistry;
 use crate::views::context::ContextViewState;
 use crate::views::history::HistoryViewState;
 use crate::views::plans::{PlansViewState, RefineDialogFocus};
-use crate::views::repl::{ReplView, TurnStatus};
+use crate::views::repl::{DiffRenderCache, ReplView, StreamingFileEdit, TurnStatus};
 use crate::views::review::ReviewViewState;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -116,7 +117,7 @@ pub enum ActiveModal {
     ClearHistory,
     Status,
     Selection,
-    /// Fullscreen two-pane audit of the change set staged in the Develop
+    /// Fullscreen two-pane audit of the change set staged in the REPL
     /// viewport: a read-only reading surface that outranks the informational
     /// overlays below it (c-3).
     DiffInspector,
@@ -464,7 +465,17 @@ pub struct ConfirmExecutePipelineState {
 }
 
 /// Pending confirmation of the Architect post-analysis over one review session.
+/// Focus sections of the Architect post-analysis confirmation.
 ///
+/// The dialog carries the Architect ladder above its action bar, so it repeats
+/// the exact two-section focus contract of the execution dialogs: `Tab` walks
+/// from the ladder to the actions and back, and a single configured entry keeps
+/// the action bar focused. Reusing the contract instead of re-implementing the
+/// cycle keeps every list-plus-actions dialog navigating identically
+/// (c-dialog-parity, Conventions §6).
+pub type ReviewAnalyzeFocus = ExecuteScopeFocus;
+
+/// Pending confirmation of the Architect post-analysis over one review session.
 /// The classification is a costly LLM operation that replaces the whole
 /// post-analysis layer of the session, so launching it requires an explicit
 /// confirmation whose safe default keeps the existing layer untouched (c-4).
@@ -474,6 +485,42 @@ pub struct ConfirmReviewAnalyzeState {
     pub review_id: String,
     /// Display title of that session, captured when the dialog opens.
     pub review_title: String,
+    /// Architect-role model selector: configured entries, cyclic navigation, and
+    /// the shared embedded-list rendering (c-dialog-parity).
+    pub selector: ModelSelector,
+    /// Section of the dialog that currently owns the keyboard.
+    pub focus: ReviewAnalyzeFocus,
+    /// Focused action button; the safe `Cancel` holds the default.
+    pub confirm_button: ConfirmDialogButton,
+}
+
+impl ConfirmReviewAnalyzeState {
+    /// Builds a post-analysis confirmation over the configured Architect entries.
+    ///
+    /// The ladder travels whole — every configured entry with its reasoning
+    /// depth and its escalation marker — so the architect the developer picks is
+    /// the architect that classifies. The caller supplies the entries through
+    /// the single ladder builder (`crate::views::plans::architect_entries`) the
+    /// refinement dialog already uses, so no dialog derives the ladder on its
+    /// own (c-dialog-parity).
+    pub fn new(
+        review_id: String,
+        review_title: String,
+        architect_entries: Vec<tauqe_protocol::ModelEntry>,
+    ) -> Self {
+        Self {
+            review_id,
+            review_title,
+            selector: ModelSelector::new(ModelRole::Architect, architect_entries, 0),
+            focus: ReviewAnalyzeFocus::default(),
+            confirm_button: ConfirmDialogButton::Cancel,
+        }
+    }
+
+    /// Currently selected Architect entry, if any.
+    pub fn selected_entry(&self) -> Option<&tauqe_protocol::ModelEntry> {
+        self.selector.selected_entry()
+    }
 }
 
 /// A review launch whose audited window is being projected.
@@ -859,6 +906,19 @@ impl DiffInspectorState {
             self.selected_file = file_count.saturating_sub(1);
         }
     }
+}
+
+/// Change set of one commit that the fullscreen inspector audits.
+///
+/// The Develop viewport audits the live staged set it owns, while a plan step
+/// audits the finished change set of the commit recorded in that step. A commit
+/// is a closed snapshot, so it carries its own files and its own render cache,
+/// and opening the audit never touches the staged set of the running turn (c-3).
+pub struct CommitAudit {
+    /// Files the commit changed, in the order its diff lists them.
+    pub files: Vec<StreamingFileEdit>,
+    /// Rendered diff bodies of those files.
+    pub cache: DiffRenderCache,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1886,8 +1946,11 @@ pub struct AppState {
     pub squash_dialog: Option<SquashDialogState>,
     pub review_dialog: Option<ReviewDialogState>,
     pub prompt_modal: Option<PromptModalState>,
-    /// Fullscreen two-pane audit of the change set the Develop viewport stages.
+    /// Fullscreen two-pane audit of the change set the REPL viewport stages.
     pub diff_inspector: Option<DiffInspectorState>,
+    /// Finished change set a plan step commit audits, when the inspector was
+    /// opened from the Plans tree instead of the Develop viewport (c-3).
+    pub diff_audit: Option<CommitAudit>,
     pub notification: Option<AppNotification>,
     pub turn_started_at: Option<std::time::Instant>,
     pub server_disconnected: Option<String>,
@@ -1904,6 +1967,21 @@ pub struct AppState {
     pub terminal_focused: bool,
     pub shift_tip_shown: bool,
     pub model_choice: ModelChoice,
+    /// Monotonic revision of the mirrored model choice.
+    ///
+    /// Every assignment or in-place mutation of [`Self::model_choice`] advances
+    /// the counter, so a consumer can tell a stale projection of the choice from
+    /// a current one without comparing the payloads. It starts at `1` while the
+    /// installed-snapshot revision starts at `0`, so the first rendered frame
+    /// publishes the initial configuration exactly once (c-3).
+    pub model_choice_revision: u64,
+    /// Revision of the model-display snapshot the last frame published.
+    ///
+    /// Equal to [`Self::model_choice_revision`] while the published provider
+    /// catalog and role entries match the mirrored model choice, so a frame that
+    /// observes no mutation reuses the published labels instead of rebuilding
+    /// them (c-3).
+    pub model_display_revision: u64,
     /// Structured identity of the model currently executing a turn, if any.
     pub running_model: Option<RunningModel>,
     /// Active discussion focus anchor mirrored from the server.
@@ -1981,6 +2059,7 @@ impl AppState {
             review_dialog: None,
             prompt_modal: None,
             diff_inspector: None,
+            diff_audit: None,
             notification: None,
             turn_started_at: None,
             server_disconnected: None,
@@ -1991,6 +2070,8 @@ impl AppState {
             terminal_focused: true,
             shift_tip_shown: false,
             model_choice: ModelChoice::default(),
+            model_choice_revision: 1,
+            model_display_revision: 0,
             running_model: None,
             discussion_focus: DiscussionFocus::None,
             active_theme_preset,
@@ -2135,7 +2216,41 @@ impl AppState {
                 )]
             })
     }
+    /// Replaces the mirrored model choice and advances its revision.
+    ///
+    /// Every wholesale replacement goes through this single method, so the
+    /// published display snapshot of the next frame can never describe a choice
+    /// the interface no longer holds. A caller that mutates one field in place
+    /// calls [`Self::mark_model_choice_changed`] right after it (c-3).
+    pub fn set_model_choice(&mut self, choice: ModelChoice) {
+        self.model_choice = choice;
+        self.mark_model_choice_changed();
+    }
 
+    /// Records that the mirrored model choice was mutated in place.
+    ///
+    /// The provider catalog and the resolved role entries every label is
+    /// resolved from are derived from the model choice alone, so this revision
+    /// is the single statement that the published snapshot is stale (c-3).
+    pub fn mark_model_choice_changed(&mut self) {
+        self.model_choice_revision = self.model_choice_revision.wrapping_add(1);
+    }
+
+    /// Publishes the model-display snapshot when the mirrored model choice has
+    /// advanced since the previous publication.
+    ///
+    /// The snapshot is fully determined by [`Self::model_choice`], so a frame
+    /// that observes no mutation must not rebuild it: on the streaming redraw
+    /// cadence the guard skips the provider-catalog walk and the projection
+    /// write lock, and the labels already published stay authoritative until the
+    /// choice changes again (c-3).
+    pub fn publish_model_display(&mut self) {
+        if self.model_display_revision == self.model_choice_revision {
+            return;
+        }
+        crate::model_display::install_snapshot(self.model_choice.roles.as_ref());
+        self.model_display_revision = self.model_choice_revision;
+    }
     /// Returns the highest-priority active modal surface, or `None` when no modal
     /// is open. This is the canonical ordering consulted by keyboard dispatch,
     /// rendering, mouse hit-testing, and paste routing.
@@ -2254,7 +2369,108 @@ impl AppState {
         // in the modal stack, yet it still blocks background interaction.
         self.active_modal().is_some() || self.context_view.adding_file
     }
+    /// Whether a text buffer currently captures printable characters.
+    ///
+    /// The answer describes the surface that owns the keyboard. While a modal is
+    /// open, only the editor it focuses captures text, because that modal receives
+    /// every keystroke and the view behind it receives none; without a modal, the
+    /// active view decides. A surface that merely lists rows, toggles buttons, or
+    /// confirms an action captures nothing, so a printable key pressed there stays
+    /// a command (Conventions §5.1).
+    ///
+    /// The capturing editors are read from the focus fields of the modal
+    /// subsystems themselves instead of a hand-written inventory: the discussion
+    /// prompt, the review target-path rows and prompt, the locale language field,
+    /// the squash commit message and its custom base-ref input, the plan-refine
+    /// instructions, the review-execution directives, the REPL prompt, the
+    /// inline Context path input, and the onboarding fields.
+    ///
+    /// This is the single source of truth the keyboard dispatcher consults before
+    /// it treats a key as a command at all, so the capture boundary cannot drift
+    /// between dispatch paths (c-text-capture-boundary).
+    pub fn text_input_capturing(&self) -> bool {
+        match self.active_modal() {
+            Some(modal) => self.modal_captures_text(modal),
+            None => self.view_captures_text(),
+        }
+    }
 
+    /// Whether the focused surface of `modal` is an editor capturing text.
+    ///
+    /// The match over the modal stack is exhaustive on purpose: a new modal
+    /// surface must state whether it captures text, so a dialog holding a text
+    /// field can never be silently treated as a command surface
+    /// (c-text-capture-boundary).
+    fn modal_captures_text(&self, modal: ActiveModal) -> bool {
+        match modal {
+            ActiveModal::Squash => self.squash_dialog.as_ref().is_some_and(|dialog| {
+                dialog.custom_input_active || dialog.focus == SquashDialogFocus::MessageEditor
+            }),
+            ActiveModal::Review => self.review_dialog.as_ref().is_some_and(|dialog| {
+                dialog.focus.is_path_editor() || dialog.focus.is_prompt_editor()
+            }),
+            ActiveModal::Prompt => self
+                .prompt_modal
+                .as_ref()
+                .is_some_and(|state| state.focus.is_editor()),
+            ActiveModal::Locale => self
+                .locale_dialog
+                .as_ref()
+                .is_some_and(|dialog| dialog.focus.is_editor()),
+            ActiveModal::RefineDialog => self
+                .plans_view
+                .refine_dialog
+                .as_ref()
+                .is_some_and(|dialog| dialog.focus.is_instructions_editor()),
+            // Only the point-execution form exposes the directives editor; a batch
+            // queue confirms as a binary card whose focus never reaches a text
+            // field.
+            ActiveModal::ExecuteReview => {
+                self.confirm_execute_review.as_ref().is_some_and(|target| {
+                    target.is_single_target() && target.focus.is_instructions_editor()
+                })
+            }
+            ActiveModal::ServerDisconnected
+            | ActiveModal::ReviewTruncation
+            | ActiveModal::ConfirmCancel
+            | ActiveModal::ConfirmQuit
+            | ActiveModal::BatchCancel
+            | ActiveModal::ClearAuto
+            | ActiveModal::ClearUser
+            | ActiveModal::RemoveContextFile
+            | ActiveModal::ConfirmDetachFocus
+            | ActiveModal::ClearHorizon
+            | ActiveModal::ClearHorizonFinal
+            | ActiveModal::DeletePlan
+            | ActiveModal::DeletePlanFinal
+            | ActiveModal::DeleteReview
+            | ActiveModal::ReviewAnalyze
+            | ActiveModal::ExecutePipeline
+            | ActiveModal::ExecuteScope
+            | ActiveModal::RefineBlocked
+            | ActiveModal::ClearHistory
+            | ActiveModal::Status
+            | ActiveModal::Selection
+            | ActiveModal::DiffInspector
+            | ActiveModal::ThemeSelector
+            | ActiveModal::UsageSummary
+            | ActiveModal::Help => false,
+        }
+    }
+
+    /// Whether the active view exposes a text buffer that captures characters.
+    ///
+    /// The REPL prompt is always present, the inline Context path input exists
+    /// only while a file path is typed, and the onboarding fields capture only on
+    /// the steps that ask for input; every structural view is a command surface.
+    fn view_captures_text(&self) -> bool {
+        match self.view_mode {
+            ViewMode::Repl => true,
+            ViewMode::Context => self.context_view.adding_file,
+            ViewMode::Onboarding => self.onboarding.input_active,
+            ViewMode::Plans | ViewMode::Review | ViewMode::History => false,
+        }
+    }
     /// Reports whether the application has active background work or unsubmitted
     /// input that would be lost on exit.
     ///
@@ -2282,7 +2498,15 @@ impl AppState {
         None
     }
 
-    pub fn take_prompt(&mut self) -> Option<String> {
+    /// Takes the submitted prompt out of the editor, returning it together with
+    /// the prompt-history persistence job the recording pass produced.
+    ///
+    /// Nothing touches the disk here: the job owns the bytes to append, or the
+    /// whole history to rewrite when the 1000-entry cap trips, and the caller
+    /// runs it on a blocking pool after releasing the application state guard.
+    /// Sending a prompt therefore never performs blocking file I/O while the
+    /// state is locked.
+    pub fn take_prompt(&mut self) -> Option<(String, Option<PromptHistoryJob>)> {
         if self.input_editor.is_empty() {
             return None;
         }
@@ -2291,7 +2515,7 @@ impl AppState {
             return None;
         }
         let prompt = self.input_editor.get_text().trim().to_string();
-        self.input_editor.record_history(&prompt);
+        let history_job = self.input_editor.record_history(&prompt);
         self.input_editor.clear();
         self.confirm_clear_history = false;
         self.confirm_cancel = false;
@@ -2322,7 +2546,7 @@ impl AppState {
         self.model.esc_clear_armed = None;
         self.turn_started_at = Some(std::time::Instant::now());
 
-        Some(prompt)
+        Some((prompt, history_job))
     }
 
     /// Raises the rollback warning and arms the persistent recall hint for a
@@ -2616,15 +2840,21 @@ mod tests {
         assert!(state.model.is_busy());
 
         let result = state.take_prompt();
-        assert_eq!(result, None);
+        assert!(result.is_none());
         assert_eq!(state.input_editor.get_text(), "next planned prompt");
         assert!(state.active_notification().is_some());
 
         state.model.status = TurnStatus::Done;
         assert!(!state.model.is_busy());
 
-        let result = state.take_prompt();
-        assert_eq!(result, Some("next planned prompt".to_string()));
+        let (prompt, history_job) = state
+            .take_prompt()
+            .expect("an idle state takes the queued prompt");
+        assert_eq!(prompt, "next planned prompt");
+        assert!(
+            history_job.is_none(),
+            "the test editor configures no history path, so nothing is persisted"
+        );
         assert!(state.input_editor.is_empty());
     }
 
@@ -3373,6 +3603,9 @@ mod tests {
         st.confirm_review_analyze = Some(ConfirmReviewAnalyzeState {
             review_id: "rev-1".to_string(),
             review_title: "Session rev-1".to_string(),
+            selector: ModelSelector::new(ModelRole::Architect, Vec::new(), 0),
+            focus: ReviewAnalyzeFocus::default(),
+            confirm_button: ConfirmDialogButton::Cancel,
         });
         assert_eq!(st.active_modal(), Some(ActiveModal::ReviewAnalyze));
         assert!(st.has_active_modal());
@@ -3705,5 +3938,400 @@ mod tests {
 
         st.review.running = true;
         assert!(st.has_lossy_work());
+    }
+
+    /// The published model-display snapshot is fully determined by the mirrored
+    /// model choice, so it is rebuilt only after that choice advances: a frame
+    /// that observes no mutation reuses the labels of the previous publication,
+    /// and every mutation path marks the published snapshot stale (c-3).
+    #[test]
+    fn test_model_display_is_published_only_after_a_model_choice_mutation() {
+        fn summary(alias: &str) -> ModelRolesSummary {
+            ModelRolesSummary {
+                scribe: ModelRef::openrouter("model-a"),
+                coder: ModelRef::openrouter("model-a"),
+                architect: ModelRef::openrouter("model-a"),
+                primary: ModelRef::openrouter("model-a"),
+                reviewer: ModelRef::openrouter("model-a"),
+                efforts: None,
+                entries: Some(tauqe_protocol::ModelRolesEntries {
+                    catalog: Some(vec![tauqe_protocol::ModelCatalogEntry {
+                        model: ModelRef::openrouter("model-a"),
+                        alias: Some(alias.to_string()),
+                    }]),
+                    ..Default::default()
+                }),
+            }
+        }
+
+        fn label() -> String {
+            crate::model_display::model_label(&ModelRef::openrouter("model-a"), None)
+        }
+
+        let mut st = test_state();
+        // The initial revision has never been published, so the first frame
+        // installs the snapshot and records exactly what it published.
+        assert_eq!(st.model_choice_revision, 1);
+        assert_eq!(st.model_display_revision, 0);
+        st.publish_model_display();
+        assert_eq!(st.model_display_revision, st.model_choice_revision);
+        assert_eq!(
+            label(),
+            "model-a",
+            "without a catalog alias the provider name wins"
+        );
+
+        // A frame that observes no mutation republishes nothing: the snapshot
+        // the previous frame installed stays authoritative (c-3).
+        st.publish_model_display();
+        assert_eq!(st.model_display_revision, st.model_choice_revision);
+
+        // A wholesale replacement marks the snapshot stale, and the next frame
+        // publishes the new catalog exactly once.
+        st.set_model_choice(ModelChoice {
+            selection: ModelSelection::Role(ModelRole::Primary),
+            roles: Some(summary("Alias A")),
+        });
+        assert_ne!(st.model_display_revision, st.model_choice_revision);
+        assert_eq!(
+            label(),
+            "model-a",
+            "a mutation states the staleness but never rebuilds the snapshot"
+        );
+        st.publish_model_display();
+        assert_eq!(st.model_display_revision, st.model_choice_revision);
+        assert_eq!(label(), "Alias A");
+        st.publish_model_display();
+        assert_eq!(label(), "Alias A");
+
+        // An in-place mutation advances the revision through the same marker.
+        st.model_choice.roles = Some(summary("Alias B"));
+        st.mark_model_choice_changed();
+        assert_ne!(st.model_display_revision, st.model_choice_revision);
+        st.publish_model_display();
+        assert_eq!(label(), "Alias B");
+        assert_eq!(st.model_display_revision, st.model_choice_revision);
+    }
+
+    /// The predicate is the single source of truth over the focused view buffer:
+    /// the REPL prompt always captures, the inline Context input and the
+    /// onboarding fields capture only while they are open, and the structural
+    /// views are pure command surfaces (c-text-capture-boundary).
+    #[test]
+    fn test_text_input_capturing_follows_the_focused_view_buffer() {
+        let mut st = test_state();
+        assert!(
+            st.text_input_capturing(),
+            "the REPL prompt is the always-present text buffer"
+        );
+
+        for mode in [ViewMode::Plans, ViewMode::Review, ViewMode::History] {
+            st.view_mode = mode;
+            assert!(!st.text_input_capturing(), "{mode:?} captures no text");
+        }
+
+        st.view_mode = ViewMode::Context;
+        assert!(
+            !st.text_input_capturing(),
+            "the Context list is a command surface"
+        );
+        st.context_view.adding_file = true;
+        assert!(
+            st.text_input_capturing(),
+            "the inline Context path input captures text"
+        );
+
+        st.context_view.adding_file = false;
+        st.view_mode = ViewMode::Onboarding;
+        assert!(
+            !st.text_input_capturing(),
+            "a passive onboarding step captures no text"
+        );
+        st.onboarding.input_active = true;
+        assert!(
+            st.text_input_capturing(),
+            "an active onboarding field captures text"
+        );
+    }
+
+    /// Every modal that focuses a text editor reports text capture, and the same
+    /// modal stops reporting it as soon as its focus moves to a list or an action
+    /// bar (c-text-capture-boundary).
+    #[test]
+    fn test_text_input_capturing_covers_the_prompt_and_locale_editors() {
+        let mut st = test_state();
+        st.view_mode = ViewMode::Plans;
+
+        let prompt = PromptModalState::new(PromptModalTarget::Plan {
+            plan_id: "plan-1".to_string(),
+            plan_title: "Plan 1".to_string(),
+            focused_items: Vec::new(),
+        });
+        assert_eq!(prompt.focus, ModalFocus::Editor);
+        st.prompt_modal = Some(prompt);
+        assert!(
+            st.text_input_capturing(),
+            "the discussion comment editor captures text"
+        );
+        if let Some(modal) = st.prompt_modal.as_mut() {
+            modal.focus = ModalFocus::Actions;
+        }
+        assert!(
+            !st.text_input_capturing(),
+            "the discussion action bar captures no text"
+        );
+        st.prompt_modal = None;
+
+        st.locale_dialog = Some(LocaleDialogState::default());
+        assert_eq!(
+            st.locale_dialog.as_ref().map(|dialog| dialog.focus),
+            Some(LocaleDialogFocus::Editor)
+        );
+        assert!(
+            st.text_input_capturing(),
+            "the locale language field captures text"
+        );
+        if let Some(dialog) = st.locale_dialog.as_mut() {
+            dialog.focus = LocaleDialogFocus::Actions;
+        }
+        assert!(
+            !st.text_input_capturing(),
+            "the locale action bar captures no text"
+        );
+    }
+
+    /// The review launcher captures text on its two editors only, and the squash
+    /// dialog captures it on the commit message and on the custom base-ref input
+    /// that stays live regardless of the list focus (c-text-capture-boundary).
+    #[test]
+    fn test_text_input_capturing_covers_the_review_and_squash_editors() {
+        let mut st = test_state();
+        st.view_mode = ViewMode::Review;
+
+        let mut dialog = review_dialog_with(&["src/lib.rs"], 2);
+        for (focus, expected) in [
+            (ReviewDialogFocus::ModelList, false),
+            (ReviewDialogFocus::PresetList, false),
+            (ReviewDialogFocus::PathEditor, true),
+            (ReviewDialogFocus::PromptEditor, true),
+            (ReviewDialogFocus::Actions, false),
+        ] {
+            dialog.focus = focus;
+            st.review_dialog = Some(dialog.clone());
+            assert_eq!(
+                st.text_input_capturing(),
+                expected,
+                "the review launcher {focus:?} section"
+            );
+        }
+        st.review_dialog = None;
+
+        let squash = SquashDialogState {
+            focus: SquashDialogFocus::MessageEditor,
+            ..Default::default()
+        };
+        st.squash_dialog = Some(squash);
+        assert!(
+            st.text_input_capturing(),
+            "the squash commit message captures text"
+        );
+        if let Some(dialog) = st.squash_dialog.as_mut() {
+            dialog.focus = SquashDialogFocus::FileList;
+        }
+        assert!(
+            !st.text_input_capturing(),
+            "browsing the squash file list captures no text"
+        );
+        if let Some(dialog) = st.squash_dialog.as_mut() {
+            dialog.custom_input_active = true;
+        }
+        assert!(
+            st.text_input_capturing(),
+            "the custom base-ref input captures text whatever the list focus"
+        );
+    }
+
+    /// The plan-refine dialog captures text on its instructions editor, and the
+    /// review-execution form captures it on the directives editor of a single
+    /// target; the batch queue is a binary confirmation (c-text-capture-boundary).
+    #[test]
+    fn test_text_input_capturing_covers_the_refine_and_execution_editors() {
+        let mut st = test_state();
+        st.view_mode = ViewMode::Plans;
+
+        let mut dialog = crate::views::plans::PlanRefineDialogState::new(
+            "plan-1".to_string(),
+            "Plan 1".to_string(),
+            vec![tauqe_protocol::ModelEntry::new(
+                ModelRef::openrouter("architect-a"),
+                None,
+            )],
+        );
+        for (focus, expected) in [
+            (RefineDialogFocus::ModelList, false),
+            (RefineDialogFocus::InstructionsEditor, true),
+            (RefineDialogFocus::Actions, false),
+        ] {
+            dialog.focus = focus;
+            st.plans_view.refine_dialog = Some(dialog.clone());
+            assert_eq!(
+                st.text_input_capturing(),
+                expected,
+                "the plan refine dialog {focus:?} section"
+            );
+        }
+        st.plans_view.refine_dialog = None;
+
+        let mut point = ConfirmExecuteReviewState::new(
+            Some("rev-1".to_string()),
+            "Session rev-1".to_string(),
+            "Unified auth guard".to_string(),
+            None,
+            Some("1.1".to_string()),
+            Vec::new(),
+            Vec::new(),
+        );
+        point.focus = RefineDialogFocus::InstructionsEditor;
+        st.confirm_execute_review = Some(point.clone());
+        assert!(
+            st.text_input_capturing(),
+            "the review-execution directives editor captures text"
+        );
+        point.focus = RefineDialogFocus::Actions;
+        st.confirm_execute_review = Some(point);
+        assert!(
+            !st.text_input_capturing(),
+            "the review-execution action bar captures no text"
+        );
+
+        st.confirm_execute_review = Some(ConfirmExecuteReviewState::new(
+            Some("rev-1".to_string()),
+            "Session rev-1".to_string(),
+            "All remaining findings".to_string(),
+            None,
+            None,
+            Vec::new(),
+            Vec::new(),
+        ));
+        assert!(
+            !st.text_input_capturing(),
+            "a batch queue confirms as a binary card and captures no text"
+        );
+    }
+
+    /// A modal that owns only rows, buttons, or a confirmation removes the text
+    /// capture of the view behind it: the surface underneath never receives the
+    /// keystroke, so it must not be treated as a text buffer
+    /// (c-text-capture-boundary, #c-modal-dispatch-parity).
+    #[test]
+    fn test_text_input_capturing_is_false_for_command_only_surfaces() {
+        let mut st = test_state();
+        assert!(
+            st.text_input_capturing(),
+            "the REPL prompt captures text while no modal is open"
+        );
+
+        st.open_usage_summary();
+        assert!(
+            !st.text_input_capturing(),
+            "the usage breakdown captures no text"
+        );
+        st.usage_summary = None;
+
+        st.show_help = true;
+        assert!(
+            !st.text_input_capturing(),
+            "the Help modal captures no text"
+        );
+        st.show_help = false;
+
+        st.open_theme_selector();
+        assert!(
+            !st.text_input_capturing(),
+            "the theme selector captures no text"
+        );
+        st.theme_selector = None;
+
+        st.status_dialog = Some(StatusDialogState::new(
+            StatusDialogTarget::PlanItem {
+                plan_id: "plan-1".to_string(),
+                item_id: "1".to_string(),
+                item_title: "Step 1".to_string(),
+                current_status: tauqe_protocol::PlanItemStatus::Todo,
+            },
+            0,
+        ));
+        assert!(
+            !st.text_input_capturing(),
+            "the status picker captures no text"
+        );
+        st.status_dialog = None;
+
+        st.selection_dialog = Some(SelectionDialogState::new(
+            vec![tauqe_protocol::ModelEntry::new(
+                ModelRef::openrouter("primary-a"),
+                None,
+            )],
+            0,
+        ));
+        assert!(
+            !st.text_input_capturing(),
+            "the model picker captures no text"
+        );
+        st.selection_dialog = None;
+
+        st.diff_inspector = Some(DiffInspectorState {
+            selected_file: 0,
+            diff_scroll: 0,
+            focus: DiffInspectorFocus::Files,
+        });
+        assert!(
+            !st.text_input_capturing(),
+            "the diff inspector captures no text"
+        );
+        st.diff_inspector = None;
+
+        st.confirm_execute_scope = Some(ConfirmExecuteScopeState::new(
+            "plan-1".to_string(),
+            "Plan 1".to_string(),
+            "Step 1".to_string(),
+            Some("1".to_string()),
+            Vec::new(),
+            Vec::new(),
+        ));
+        assert!(
+            !st.text_input_capturing(),
+            "the plan execution form exposes no text editor"
+        );
+        st.confirm_execute_scope = None;
+
+        st.confirm_execute_pipeline = Some(ConfirmExecutePipelineState {
+            plan_ids: vec!["plan-1".to_string()],
+            plan_titles: vec!["Plan 1".to_string()],
+            steps: Vec::new(),
+            pending_synthesis: Vec::new(),
+        });
+        assert!(
+            !st.text_input_capturing(),
+            "the pipeline confirmation captures no text"
+        );
+        st.confirm_execute_pipeline = None;
+
+        st.plans_view.refine_blocked = Some(crate::views::plans::PlanRefineBlockedState {
+            plan_id: "plan-1".to_string(),
+            plan_title: "Plan 1".to_string(),
+            reason: "blocking contradiction".to_string(),
+        });
+        assert!(
+            !st.text_input_capturing(),
+            "the blocked-refinement confirmation captures no text"
+        );
+        st.plans_view.refine_blocked = None;
+
+        st.confirm_quit = true;
+        assert!(
+            !st.text_input_capturing(),
+            "a confirmation over the REPL prompt captures no text"
+        );
     }
 }

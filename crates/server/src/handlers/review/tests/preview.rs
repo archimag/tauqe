@@ -124,8 +124,8 @@ async fn preview_selects_every_matched_file_the_budget_pays_for() {
         ],
     );
     let mut config = test_config();
-    config.context.files_token_budget = per_file_cost().saturating_mul(3);
-    let budget = config.context.files_token_budget;
+    config.context.token_budget = per_file_cost().saturating_mul(3);
+    let budget = config.context.token_budget;
     let state = state_for(&dir, config);
 
     let result = projection(
@@ -160,7 +160,7 @@ async fn preview_reports_the_token_budget_omission() {
     );
     let per_file = per_file_cost();
     let mut config = test_config();
-    config.context.files_token_budget = per_file.saturating_mul(2);
+    config.context.token_budget = per_file.saturating_mul(2);
     let state = state_for(&dir, config);
 
     let result = projection(
@@ -180,7 +180,51 @@ async fn preview_reports_the_token_budget_omission() {
     assert_eq!(window.selected_tokens, per_file.saturating_mul(2));
     assert!(window.is_truncated());
 }
+/// A matched path the window cannot read is counted on its own counter: it is
+/// never selected and never charged to the file token budget, so it cannot
+/// fabricate a truncation the budget did not cause (#c-1, #c-3).
+#[tokio::test]
+async fn preview_counts_an_unreadable_match_on_its_own_counter() {
+    let dir = TestDir::new();
+    init_repo_with_files(
+        &dir,
+        &[("src/a.rs", TARGET_FILE), ("src/b.rs", TARGET_FILE)],
+    );
+    // A binary blob under the same pattern is matched by the window and cannot
+    // be decoded as source text, so it is counted as unreadable instead of
+    // being charged to the token budget.
+    std::fs::write(dir.path().join("src/blob.bin"), [0xFFu8, 0xFE, 0x00])
+        .expect("the fixture is writable");
+    tauqe_core::git::cmd::stage_files(dir.path(), &["src/blob.bin".to_string()])
+        .expect("the blob is staged");
+    tauqe_core::git::cmd::commit_with_developer_author(dir.path(), "Add binary", false)
+        .expect("the blob is committed");
+    let mut config = test_config();
+    config.context.token_budget = per_file_cost().saturating_mul(3);
+    let state = state_for(&dir, config);
 
+    let result = projection(
+        handle_review_preview(
+            preview_request(serde_json::json!({ "path_patterns": ["src/"] })),
+            &state,
+        )
+        .await,
+    );
+
+    let window = &result.window;
+    assert_eq!(
+        window.matched_files, 3,
+        "a pattern match is counted whether or not it can be read"
+    );
+    assert_eq!(window.selected_files, 2);
+    assert_eq!(
+        window.unreadable_files, 1,
+        "the undecodable match is counted apart from the budget omissions"
+    );
+    assert_eq!(window.omitted_by_budget, 0);
+    assert_eq!(window.omitted_files, 0);
+    assert!(!window.is_truncated());
+}
 /// The projection reads the repository and the context without writing either:
 /// a preview leaves the context and the persisted working tree byte-identical
 /// and the operation slot free (#c-2).
@@ -199,7 +243,7 @@ async fn preview_leaves_the_context_and_the_working_tree_untouched() {
     // The audit window shares the file token budget: the file the context
     // already holds plus one matched file fit, so exactly one further match is
     // dropped by the budget and the number of files is never a limit.
-    config.context.files_token_budget = per_file_tokens().saturating_add(per_file_cost());
+    config.context.token_budget = per_file_tokens().saturating_add(per_file_cost());
     let state = state_for(&dir, config);
     state
         .context
@@ -267,6 +311,7 @@ async fn a_preset_preview_aggregates_the_token_budget_omissions_of_its_groups() 
             ContextAccess::ReadOnly,
         );
     let mut config = test_config();
+    config.context.token_budget = per_file;
     config.review = serde_json::from_value(serde_json::json!({
         "presets": [{
             "name": "layered",
@@ -277,7 +322,6 @@ async fn a_preset_preview_aggregates_the_token_budget_omissions_of_its_groups() 
         }],
     }))
     .expect("the preset fixture decodes");
-    config.context.files_token_budget = per_file;
     let state = state_for(&dir, config);
 
     let result = projection(
@@ -324,7 +368,7 @@ async fn preview_prices_the_wrapper_of_each_path_into_the_budget() {
     );
 
     let mut config = test_config();
-    config.context.files_token_budget = short_cost;
+    config.context.token_budget = short_cost;
 
     let short_dir = TestDir::new();
     init_repo_with_files(&short_dir, &[("src/a.rs", TARGET_FILE)]);
@@ -379,7 +423,7 @@ async fn preview_admits_more_files_than_the_retired_batch_cap() {
     let per_file = per_file_tokens()
         + tauqe_core::prompt::context_element_overhead_tokens(sample, ContextAccess::ReadOnly);
     let mut config = test_config();
-    config.context.files_token_budget = per_file.saturating_mul(MATCHED);
+    config.context.token_budget = per_file.saturating_mul(MATCHED);
     let state = state_for(&dir, config);
 
     let result = projection(

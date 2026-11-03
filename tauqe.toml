@@ -1,3 +1,13 @@
+# Project configuration.
+#
+# This document is the base layer of the project configuration. Every
+# `tauqe.d/*.toml` file of the repository is merged into it in lexical
+# file-name order: tables merge recursively, arrays of tables (`[[outer_docs]]`,
+# `[[review.presets]]`) concatenate, and a key two files both declare as a value
+# is a configuration error naming both of them. The module directory always
+# belongs to the repository root, even when `--config` names another base
+# document, so a split configuration travels with the project.
+#
 # The provider catalog is the single source of truth for the models this project
 # exposes and for the names they are displayed under. An entry is either a bare
 # model string or a `{ model = "...", alias = "..." }` table; the alias describes
@@ -73,7 +83,12 @@ reviewer = [
 # <blocked> report short-circuits escalation entirely.
 auto_level_up = true
 
-[develop]
+# The `[repl]` section is the profile every bounded turn of this project runs
+# under, not only an interactive REPL turn: the workflow engine, the edit
+# protocol, the patch strategy, the prompt layout, and the retry and replanning
+# budgets apply to an isolated step and to a discussion exactly as they apply to
+# the REPL itself.
+[repl]
 # Retry budget for failed edit staging and for the verification healing loop. It bounds
 # the repairs of a single turn; how many content attempts a model tier receives is
 # declared per model entry with `attempts` in the `[models]` section.
@@ -160,11 +175,11 @@ runner = "just"
 # reference, yet never lets a turn create, rewrite, move, or delete. `Justfile`
 # owns the project verification lifecycle, so a change set able to rewrite it
 # could also make verification agree with itself. `docs/specs/**` holds the
-# specifications an implementation step is checked against, and
-# `.tauqe/refs/refs.md` declares which external documents the harness may fetch,
-# so a turn able to rewrite it could choose its own sources.
+# specifications an implementation step is checked against, and `tauqe.d/**`
+# holds the modular configuration layers, so a turn able to rewrite one could
+# redefine the harness policy those layers declare.
 [project.boundaries]
-protected = ["Justfile", "docs/specs/**", ".tauqe/refs/refs.md"]
+protected = ["Justfile", "docs/specs/**", "tauqe.d/**"]
 
 [git]
 # upstream = "origin/master"  # base upstream branch for calculating diffs (auto-detected by default)
@@ -175,17 +190,16 @@ budget_tokens = 20000  # session history token budget before compaction is trigg
 # tail_turns = 10        # number of recent turns kept uncompressed in original form (default: 10)
 
 [context]
-max_discovery_rounds = 12  # maximum rounds for autonomous context discovery
-files_token_budget = 1000000  # token budget for files in active context (default: 300000)
+max_research_rounds = 12  # maximum rounds for autonomous context research
+token_budget = 1000000  # aggregate context token budget: repository files and external documents (default: 300000)
 repomap_token_budget = 40000  # token budget for the repository map (default: 4000)
 include_repo_map = true  # include the Tree-sitter repository map in turn prompts (default: true, false for on-demand)
-# max_search_requests_per_round = 5    # repository search queries honored per Discovery round (default: 5)
+# max_search_requests_per_round = 5    # repository search queries honored per Research round (default: 5)
 # max_matched_files_per_search = 50    # matching files reported for one search query (default: 50)
 # max_dir_list_entries = 100           # entries rendered by one directory listing (default: 100)
-# max_repo_map_requests_per_round = 3  # targeted repository maps rendered per Discovery round (default: 3)
+# max_repo_map_requests_per_round = 3  # targeted repository maps rendered per Research round (default: 3)
 # max_feedback_chars = 4000            # characters of one project command stream reported back to the model (default: 4000)
 # max_scratchpad_chars = 4000          # characters of a turn scratchpad block kept before truncation (default: 4000)
-# refs_token_budget = 50000            # total token budget of lazily loaded external reference documents (default: 50000)
 pinned = [
     "Conventions.md",
     "Vision.md",
@@ -231,3 +245,37 @@ prompt = "Audit RPC daemon: concurrency control (OperationGuard), request dispat
 name = "tui"
 paths = ["crates/tui/src"]
 prompt = "Audit terminal UI: views, event translation, layout geometry, and client transport without direct disk/git operations."
+
+# External documentation: authoritative material a project keeps outside the
+# repository and declares once. Every entry carries a mandatory `id` (its mount
+# point), a mandatory `title`, an optional `description`, and a mandatory
+# `source`: one string that names either an http(s) address or a local path. The
+# scheme decides the kind while the configuration is resolved — a value carrying
+# `http://` or `https://` becomes a remote address, and every other value becomes
+# a local file-system path — so a scheme the harness does not fetch is a
+# configuration error rather than a source that fails in the middle of a turn.
+#
+# The `id` names the root document. A request for `{id}` answers that root file
+# as its original text: the harness parses no index and synthesizes no catalog,
+# so the model follows the relative links the document itself carries and asks
+# for the parts it needs by `{id}/{relative}`. That relative request resolves
+# below the directory holding the root and can never leave it: a `..` segment, an
+# absolute path, a backslash, and a foreign scheme are refused. Documents are
+# materialized lazily into the Git-ignored cache `.tauqe/cache/outer_docs/`, a
+# duplicate `id` is a configuration error, and a snapshot the cache already holds
+# is served without asking the trust declaration again. Reaching a local source
+# or a non-public host for the first time requires the developer's own trust
+# declaration in `~/.config/tauqe/refs-trust.toml`, which a repository cannot
+# grant itself; authorizing the root covers the whole subtree the prefix jail
+# keeps inside it.
+#
+# [[outer_docs]]
+# id = "vendor/api.md"
+# title = "Upstream API notes"
+# description = "Endpoint contracts the implementation step is checked against."
+# source = "https://example.com/llm.txt"
+#
+# [[outer_docs]]
+# id = "mylib"
+# title = "MyLib Book"
+# source = "/srv/docs/mylib/README.md"

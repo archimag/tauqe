@@ -3,9 +3,11 @@
     deny(clippy::unwrap_used, clippy::expect_used, clippy::panic)
 )]
 
+use std::panic::AssertUnwindSafe;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use futures_util::FutureExt;
 use tauqe_core::history::HistoryMutation;
 use tauqe_protocol::{
     errors, events, Event, HistoryCompactedEvent, HistoryEntryAddedEvent,
@@ -13,6 +15,8 @@ use tauqe_protocol::{
     SHUTDOWN_DRAIN_BUDGET,
 };
 use tokio::io::{AsyncBufReadExt, BufReader};
+#[cfg(unix)]
+use tokio::signal::unix::Signal;
 
 mod dispatch;
 mod handlers;
@@ -63,6 +67,14 @@ async fn main() -> anyhow::Result<()> {
         log_path = %log_path.display(),
         "Server daemon started",
     );
+    // The shutdown watch installs its signal handlers here, synchronously, and
+    // not at the first `select!` poll: the configuration load and the
+    // checkpoint recovery inside `AppState::new` still lie ahead, and a
+    // `SIGHUP` or `SIGTERM` delivered during that startup window must route
+    // into the same cancel-and-drain exit instead of ending the process on the
+    // spot and leaving an open transaction behind.
+    let shutdown_watch = shutdown_signal();
+
     let config =
         tauqe_core::config::load_config_with_options(tauqe_core::config::ConfigLoadOptions {
             repo_root: Some(&repo_path),
@@ -140,11 +152,10 @@ async fn main() -> anyhow::Result<()> {
     let stdin = tokio::io::stdin();
     let mut reader = BufReader::new(stdin).lines();
 
-    // The signal watch is created before the read loop starts, so a signal
-    // delivered between two requests is never lost. It races the stdin reader
-    // and resolves to the same controlled exit instead of killing the process
-    // in the middle of a transaction.
-    let shutdown_watch = shutdown_signal();
+    // The watch was installed at startup, so a signal delivered between two
+    // requests is never lost. It races the stdin reader and resolves to the
+    // same controlled exit instead of killing the process in the middle of a
+    // transaction.
     tokio::pin!(shutdown_watch);
 
     // A client that closes its read end makes every write fail. The writer
@@ -223,13 +234,15 @@ async fn main() -> anyhow::Result<()> {
             let state_for_req = Arc::clone(&state);
             offloaded.spawn(async move {
                 let started = std::time::Instant::now();
-                let response = handle_request(request, &state_for_req).await;
+                let handler = handle_request(request, &state_for_req);
+                let response = answer_request(&request_id, &method, handler).await;
                 log_request_outcome(&request_id, &method, started.elapsed(), &response);
                 state_for_req.out.send_response(&response);
             });
         } else {
             let started = std::time::Instant::now();
-            let response = handle_request(request, &state).await;
+            let handler = handle_request(request, &state);
+            let response = answer_request(&request_id, &method, handler).await;
             log_request_outcome(&request_id, &method, started.elapsed(), &response);
             state.out.send_response(&response);
         }
@@ -335,35 +348,69 @@ impl ShutdownSignal {
     }
 }
 
-/// Resolves when the operating system asks the daemon to terminate.
+/// Registered termination-signal streams of the daemon.
 ///
-/// Neither signal may end the process on the spot, because an abrupt death
-/// skips the cancellation of the active turn and the rollback of its Git
-/// transaction. Both are therefore reported to the caller, which routes them
-/// into the same cancel, drain, and exit path as stdin EOF. The future is
-/// awaited alongside the stdin reader and never completes on its own.
+/// A value of this type exists only after the runtime registered the handlers,
+/// so holding one proves the registration already happened.
 #[cfg(unix)]
-async fn shutdown_signal() -> ShutdownReason {
+struct ShutdownSignals {
+    /// `SIGHUP` stream.
+    hangup: Signal,
+    /// `SIGTERM` stream.
+    terminate: Signal,
+}
+
+/// Installs the termination-signal handlers and returns their streams.
+///
+/// Registration is a synchronous side effect, so the daemon performs it during
+/// startup instead of leaving it to the first poll of the shutdown watch. An
+/// `async fn` registers its handlers only when its future is polled, and the
+/// read loop polls this watch after the configuration load, the checkpoint
+/// recovery, and the journal load. Until that poll `SIGHUP` and `SIGTERM` keep
+/// their default disposition and end the process on the spot, skipping the
+/// cancel-and-drain exit that keeps an open transaction from being stranded.
+///
+/// A handler that cannot be installed leaves the daemon on its pre-signal
+/// behaviour: it still stops on stdin EOF.
+#[cfg(unix)]
+fn install_shutdown_signals() -> Option<ShutdownSignals> {
     use tokio::signal::unix::signal;
 
     match (
         signal(ShutdownSignal::Hangup.kind()),
         signal(ShutdownSignal::Terminate.kind()),
     ) {
-        (Ok(mut hangup), Ok(mut terminate)) => {
-            tokio::select! {
-                _ = hangup.recv() => ShutdownReason::Signal(ShutdownSignal::Hangup),
-                _ = terminate.recv() => ShutdownReason::Signal(ShutdownSignal::Terminate),
-            }
-        }
+        (Ok(hangup), Ok(terminate)) => Some(ShutdownSignals { hangup, terminate }),
         (hangup, terminate) => {
-            // A handler that cannot be installed leaves the daemon on its
-            // pre-signal behaviour: it still stops on stdin EOF.
             tracing::warn!(
                 hangup_error = ?hangup.as_ref().err(),
                 terminate_error = ?terminate.as_ref().err(),
                 "Failed to install shutdown signal handlers; relying on stdin EOF",
             );
+            None
+        }
+    }
+}
+
+/// Resolves when the operating system asks the daemon to terminate.
+///
+/// The handlers are installed by the call itself, never by the first poll, so
+/// a signal delivered while the daemon is still starting up already routes
+/// into the same cancel, drain, and exit path as stdin EOF. Neither signal may
+/// end the process on the spot, because an abrupt death skips the cancellation
+/// of the active turn and the rollback of its Git transaction. The future is
+/// awaited alongside the stdin reader and never completes on its own.
+#[cfg(unix)]
+fn shutdown_signal() -> impl std::future::Future<Output = ShutdownReason> {
+    let signals = install_shutdown_signals();
+
+    async move {
+        if let Some(mut signals) = signals {
+            tokio::select! {
+                _ = signals.hangup.recv() => ShutdownReason::Signal(ShutdownSignal::Hangup),
+                _ = signals.terminate.recv() => ShutdownReason::Signal(ShutdownSignal::Terminate),
+            }
+        } else {
             std::future::pending().await
         }
     }
@@ -372,8 +419,8 @@ async fn shutdown_signal() -> ShutdownReason {
 /// On platforms without Unix signals stdin EOF remains the only controlled
 /// shutdown channel, and this future never completes.
 #[cfg(not(unix))]
-async fn shutdown_signal() -> ShutdownReason {
-    std::future::pending().await
+fn shutdown_signal() -> impl std::future::Future<Output = ShutdownReason> {
+    std::future::pending()
 }
 
 /// Poll cadence while waiting for in-flight work to unwind during shutdown.
@@ -509,6 +556,40 @@ fn log_request_outcome(
     }
 }
 
+/// Answers one RPC handler future behind a panic boundary.
+///
+/// A panicking handler must cost the client exactly one failed request. An
+/// inline handler would otherwise unwind through the request loop's own task
+/// and end the daemon before the cancel-and-drain path runs, while an offloaded
+/// handler would die before `send_response`, leaving a request id the client
+/// waits for indefinitely.
+///
+/// The handler is polled on the task that already owns it, so the boundary adds
+/// no task of its own: shutting an offloaded handler down still aborts it
+/// instead of detaching it, and the inline branch keeps its response order.
+async fn answer_request<F>(request_id: &RequestId, method: &str, handler: F) -> Response
+where
+    F: std::future::Future<Output = Response>,
+{
+    match AssertUnwindSafe(handler).catch_unwind().await {
+        Ok(response) => response,
+        Err(payload) => {
+            let reason = logging::panic_payload_message(payload.as_ref());
+            tracing::error!(
+                target: "panic",
+                request_id = ?request_id,
+                method = %method,
+                "RPC handler panicked; answering the request with an internal error",
+            );
+            Response::err(
+                request_id.clone(),
+                errors::INTERNAL_ERROR,
+                format!("The request handler panicked: {reason}"),
+            )
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -565,7 +646,27 @@ mod tests {
             "the shutdown watch fired without a signal"
         );
     }
+    /// Registration is a side effect of the call and not of the first poll: the
+    /// daemon installs both handlers during startup, before the configuration
+    /// load and the checkpoint recovery, so a `SIGHUP` or `SIGTERM` delivered
+    /// in that window still routes into the cancel-and-drain exit.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn shutdown_handlers_are_registered_by_the_call() {
+        let mut signals = install_shutdown_signals()
+            .expect("a test process must be able to install both handlers");
 
+        // A `Signal` handle exists only after the runtime registered the
+        // handler, so holding live streams already proves the registration is
+        // a side effect of the call. Awaiting one shows the stream is live and
+        // simply has no delivered signal to report.
+        let stalled = std::time::Duration::from_millis(20);
+        let outcome = tokio::time::timeout(stalled, signals.hangup.recv()).await;
+        assert!(
+            outcome.is_err(),
+            "no signal was sent, yet the shutdown stream resolved"
+        );
+    }
     /// Monotonic suffix keeping the scratch repositories of this module apart.
     static SCRATCH_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
@@ -760,6 +861,68 @@ mod tests {
             started.elapsed() >= std::time::Duration::from_millis(150),
             "the drain must not complete while the task holds the open transaction"
         );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A handler that panics for real, so the boundary is exercised by an
+    /// actual unwind instead of a simulated error response.
+    async fn panicking_handler() -> Response {
+        panic!("handler panicked on purpose")
+    }
+
+    /// A panicking handler costs the client exactly one failed request: never
+    /// the daemon, and never a request id that goes unanswered.
+    ///
+    /// Offloaded, the panic would kill the task before `send_response`, so the
+    /// client would wait for that id indefinitely; inline, it would unwind
+    /// through the request loop itself and end the daemon before the
+    /// cancel-and-drain path ran. Both branches answer through the boundary, so
+    /// the panicking future has to become a correlated error response.
+    #[tokio::test]
+    async fn panicking_handler_is_answered_with_an_internal_error() {
+        let request_id = RequestId::String("panic-1".to_string());
+        let handler = panicking_handler();
+
+        let response = answer_request(&request_id, "test/panicking", handler).await;
+
+        assert_eq!(response.id, request_id);
+        assert!(response.result.is_none());
+        let error = response
+            .error
+            .expect("the panic must be answered with an error");
+        assert_eq!(error.code, errors::INTERNAL_ERROR);
+        assert!(
+            error.message.contains("panicked"),
+            "the answer must carry the failure: {}",
+            error.message
+        );
+    }
+
+    /// The boundary is transparent for a handler that answers normally, so a
+    /// reviewed short handler reaches the client untouched.
+    #[tokio::test]
+    async fn answering_preserves_a_normal_response() {
+        let (state, root) = test_state("handler-answered");
+        let request_id = RequestId::Number(3);
+        let request = Request {
+            id: request_id.clone(),
+            method: tauqe_protocol::methods::CONFIG_GET.to_string(),
+            params: None,
+        };
+
+        let response = answer_request(
+            &request_id,
+            tauqe_protocol::methods::CONFIG_GET,
+            handle_request(request, &state),
+        )
+        .await;
+
+        assert!(
+            response.error.is_none(),
+            "a normal answer must pass through"
+        );
+        assert!(response.result.is_some());
 
         let _ = std::fs::remove_dir_all(&root);
     }

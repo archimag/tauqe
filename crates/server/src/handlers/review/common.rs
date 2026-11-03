@@ -54,9 +54,21 @@ pub(super) fn emit_error(out: &OutChannel, operation_id: &str, message: String) 
 
 /// Publishes the updated review session and refreshed review list to the client.
 ///
-/// The publication is shared with the dialogue turn: a dialogue anchored on a
-/// review session records the decision the engineer reached, so the refreshed
-/// session reaches every client through this single path.
+/// Publication happens at exactly two deterministic points, and both of them run
+/// after the lifecycle of the addressed entity is already on disk:
+///
+/// - `ServerImplementationHost::run_step` publishes a review scope before its
+///   model turn starts, so the client observes the finding or the group the run
+///   has taken over instead of the `TODO` it held when the batch was launched.
+/// - `ReviewBatchExecutor::execute_step` publishes once the pipeline of a member
+///   has settled, so a completed member reports its findings `Fixed` and a member
+///   the engine could not implement reports them `Skipped`.
+///
+/// A batch therefore never publishes at member start, because a run that has not
+/// begun yet would be published as the `TODO` it still is. Both points are
+/// fault-tolerant: a storage failure is journaled and never interrupts the turn,
+/// and the terminal summary of the whole queue arrives through the existing
+/// `review/batch_finished` event.
 pub(crate) async fn publish_review(state: &Arc<AppState>, repo_root: &Path, review_id: &str) {
     let load_root = repo_root.to_path_buf();
     let load_id = review_id.to_string();

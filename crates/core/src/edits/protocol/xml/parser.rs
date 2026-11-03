@@ -5,12 +5,18 @@
 //! The wrapper container, the file blocks, and the hunks are named by the
 //! capability registry and resolved once per process, so no scanner here
 //! re-declares a tag spelling of its own.
+//!
+//! Every construct is located through the markdown code index of the buffer, so a
+//! tag quoted inside a fenced block or an inline code span stays documentation.
+//! The decoder, the parametric engine, and the streaming preview therefore agree
+//! on what counts as a command.
 
 use std::sync::OnceLock;
 
 use tauqe_protocol::{EditFileOp, EditOperation, LlmCapability};
 
 use super::engine::TagCloseMode;
+use super::tags::{is_inside_markdown_code_with_fences, CodeFences};
 use crate::capabilities::CapabilityRegistry;
 use crate::edits::protocol::utils::{normalize_content, resolve_target_path_for_op};
 
@@ -131,27 +137,34 @@ pub(crate) fn file_edit_tags() -> &'static FileEditTags {
     })
 }
 
-/// Reports whether the text contains any XML edit tag.
+/// Reports whether the text contains any fence-free XML edit tag.
+///
+/// A tag quoted inside markdown code is documentation, so a text whose only edit
+/// markup sits in a fenced example carries no edit construct at all.
 pub fn has_xml_edit_tags(text: &str) -> bool {
+    let fences = CodeFences::find(text);
     file_edit_tags()
         .opening_names()
-        .any(|name| text.contains(&format!("<{}", name)))
+        .any(|name| find_unfenced_tag_start(text, name, &fences, 0).is_some())
 }
 
 /// Parses XML edit blocks into ordered edit operations.
+///
+/// `fences` indexes the markdown code of `text`, so a construct quoted in a fenced
+/// example or an inline span is documentation: it is never resolved against the
+/// editable set and never reaches the working tree.
 pub(super) fn parse_xml_edits(
     text: &str,
     editable_paths: &[String],
+    fences: &CodeFences,
 ) -> Result<Vec<EditOperation>, String> {
     let mut edits = Vec::new();
     let mut pos = 0;
 
     while pos < text.len() {
-        let remaining = &text[pos..];
-        let Some((block, offset)) = find_next_edit_tag(remaining) else {
+        let Some((block, tag_start)) = find_next_edit_tag(text, fences, pos) else {
             break;
         };
-        let tag_start = pos + offset;
         let tag_slice = &text[tag_start..];
         let open_tag_end = tag_slice
             .find('>')
@@ -175,6 +188,7 @@ pub(super) fn parse_xml_edits(
                     )
                 })?;
 
+                let body_start = tag_start + open_tag_end + 1;
                 let body = &tag_slice[open_tag_end + 1..];
                 let mut inner_pos = 0;
                 let mut found_any = false;
@@ -186,8 +200,10 @@ pub(super) fn parse_xml_edits(
                         }
                     }
 
-                    if let Some((_, next_edit_start)) = find_next_edit_tag(&body[inner_pos..]) {
-                        if next_edit_start < search_start {
+                    let scan_from = body_start + inner_pos;
+                    let next_block = find_next_edit_tag(text, fences, scan_from);
+                    if let Some((_, next_edit_start)) = next_block {
+                        if next_edit_start < scan_from + search_start {
                             break;
                         }
                     }
@@ -233,8 +249,10 @@ pub(super) fn parse_xml_edits(
                     )
                 })?;
 
-                if let Some((_, next_edit_start)) = find_next_edit_tag(&body[inner_pos..]) {
-                    if next_edit_start < close_offset {
+                let scan_from = body_start + inner_pos;
+                let next_block = find_next_edit_tag(text, fences, scan_from);
+                if let Some((_, next_edit_start)) = next_block {
+                    if next_edit_start < scan_from + close_offset {
                         return Err(format!(
                             "Missing closing tag '{}' for file '{}'",
                             closing_tag, target_path
@@ -338,11 +356,19 @@ pub(super) fn parse_xml_edits(
     Ok(edits)
 }
 
-/// Locates the earliest file block that opens an edit construct.
-fn find_next_edit_tag(text: &str) -> Option<(FileBlockTag, usize)> {
+/// Locates the earliest fence-free file block that opens an edit construct.
+///
+/// The search resumes at `from`, an absolute offset into the buffer the fence
+/// index was built from, so a caller that already decoded a block never
+/// re-examines the constructs it consumed.
+fn find_next_edit_tag(
+    text: &str,
+    fences: &CodeFences,
+    from: usize,
+) -> Option<(FileBlockTag, usize)> {
     let mut earliest: Option<(FileBlockTag, usize)> = None;
     for block in &file_edit_tags().file_blocks {
-        let Some(idx) = find_tag_start(text, block.name) else {
+        let Some((idx, _)) = find_unfenced_tag_start(text, block.name, fences, from) else {
             continue;
         };
         if block.requires_target && !header_names_target(text, idx) {
@@ -353,6 +379,29 @@ fn find_next_edit_tag(text: &str) -> Option<(FileBlockTag, usize)> {
         }
     }
     earliest
+}
+
+/// Locates an opening tag by base name, ignoring occurrences inside markdown code.
+///
+/// An occurrence the fence index marks as code is skipped rather than abandoned,
+/// so a real construct that follows a fenced example is still decoded. Skipping
+/// here is what makes the decoder agree with the parametric engine and with the
+/// streaming preview: all three treat markdown code as documentation.
+fn find_unfenced_tag_start(
+    text: &str,
+    tag_base: &str,
+    fences: &CodeFences,
+    from: usize,
+) -> Option<(usize, String)> {
+    let mut search_from = from;
+    while let Some((offset, name)) = find_base_tag_start(&text[search_from..], tag_base) {
+        let start = search_from + offset;
+        if !is_inside_markdown_code_with_fences(text, start, fences) {
+            return Some((start, name));
+        }
+        search_from = start + 1;
+    }
+    None
 }
 
 /// Reports whether the tag header opening at `tag_start` names a target path.
@@ -393,6 +442,11 @@ pub(crate) fn find_base_tag_start(text: &str, tag_base: &str) -> Option<(usize, 
     None
 }
 
+/// Locates a hunk block inside an already accepted file block.
+///
+/// The fence index is deliberately not consulted here: a hunk payload may quote
+/// markdown code when the edited file contains it, and the enclosing block has
+/// already proved itself to be a command rather than a fenced example.
 fn find_tag_start(text: &str, tag_name: &str) -> Option<usize> {
     find_base_tag_start(text, tag_name).map(|(idx, _)| idx)
 }
@@ -472,10 +526,11 @@ pub(crate) fn extract_attribute(tag_header: &str, attr: &str) -> Option<String> 
     None
 }
 
-pub(crate) fn extract_summary_from_xml(text: &str) -> Option<String> {
+/// Reads the summary that the first fence-free edit container declares.
+pub(crate) fn extract_summary_from_xml(text: &str, fences: &CodeFences) -> Option<String> {
     // 1. Try finding the summary attribute of an edit container.
     for container in &file_edit_tags().containers {
-        let Some((idx, _)) = find_base_tag_start(text, container) else {
+        let Some((idx, _)) = find_unfenced_tag_start(text, container, fences, 0) else {
             continue;
         };
         let Some(end) = text[idx..].find('>') else {

@@ -47,7 +47,7 @@ mod tests {
     fn a_sibling_sharing_the_prefix_is_not_the_sandbox() {
         assert!(!is_mockups_path(".tauqe/mockups-archive/old.rs"));
         assert!(!is_mockups_path(".tauqe/mockups.rs"));
-        assert!(!is_mockups_path(".tauqe/refs/refs.md"));
+        assert!(!is_mockups_path(".tauqe/cache/outer_docs/api.md"));
         assert!(!is_mockups_path("crates/core/src/mockups.rs"));
         assert!(!is_mockups_path(""));
     }

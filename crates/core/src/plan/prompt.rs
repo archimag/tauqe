@@ -51,9 +51,11 @@ mod tests {
                     details: Some("Claims struct".to_string()),
                     status: PlanItemStatus::Done,
                     blocked_reason: None,
+                    commit: None,
                     concept_refs: vec!["c-1".to_string()],
                     files: vec!["crates/core/src/models.rs".to_string()],
                     readonly_files: vec![],
+                    outer_docs: vec![],
                     depends_on: vec![],
                     children: vec![],
                 },
@@ -63,9 +65,11 @@ mod tests {
                     details: Some("Write handler".to_string()),
                     status: PlanItemStatus::InProgress,
                     blocked_reason: None,
+                    commit: None,
                     concept_refs: vec!["c-1".to_string()],
                     files: vec!["crates/core/src/handler.rs".to_string()],
                     readonly_files: vec!["crates/core/src/contract.rs".to_string()],
+                    outer_docs: vec![],
                     depends_on: vec!["1".to_string()],
                     children: vec![],
                 },
@@ -104,7 +108,7 @@ mod tests {
 
         assert!(prompt.contains("- [x] #1 Models"));
         assert!(prompt.contains("- **ID**: `2`"));
-        assert!(prompt.contains("<success_XYZ summary=\"...\" />"));
+        assert!(prompt.contains("<success_XYZ commit_message=\"...\" />"));
         assert!(prompt.contains("<error_XYZ message=\"...\" />"));
     }
 

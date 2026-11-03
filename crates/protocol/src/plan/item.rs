@@ -80,10 +80,30 @@ pub struct PlanItem {
     /// and in the interface instead of being lost with the transient session.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub blocked_reason: Option<String>,
+    /// Identifier of the Git commit that completed this step.
+    ///
+    /// The harness records it once the step's turn converges and is committed,
+    /// so a finished step keeps a durable pointer to the change set that
+    /// produced it. Present only alongside `Done`: a step that never ran carries
+    /// no commit, and the value is part of the immutable record of a completed
+    /// step.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub commit: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub files: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub readonly_files: Vec<String>,
+    /// Identifiers of the project-declared `[[outer_docs]]` entries preloaded
+    /// as read-only reference context when this step executes.
+    ///
+    /// A leaf names external project documentation the same way it names
+    /// `readonly_files`: the harness materializes every declared entry and adds
+    /// it to the read-only context of the step turn. The field carries entry
+    /// identifiers only, never cache paths, so a step reaches nothing the
+    /// project did not declare itself. A container is never executed and keeps
+    /// the list empty.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub outer_docs: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub concept_refs: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]

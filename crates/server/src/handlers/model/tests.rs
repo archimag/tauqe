@@ -21,7 +21,7 @@ use tauqe_protocol::{
 use tokio::sync::{mpsc, watch};
 
 use super::prompt::{build_model_ask_prompt, intent_for_target};
-use super::turn::{resolve_session_id, resolve_turn_protocol};
+use super::turn::{execute_model_turn, resolve_session_id, resolve_turn_protocol, StepTurnOptions};
 use super::{
     handle_model_cancel, handle_model_clear_history, handle_model_select, start_model_turn,
 };
@@ -39,15 +39,97 @@ fn plan_discussion_is_readonly() {
     assert!(!intent.is_interactive_repl());
 }
 
-/// A review finding dialogue stays interactive, because the developer may ask
-/// the model to apply the fix directly.
+/// A review finding dialogue establishes its own regime, because the decision
+/// the dialogue records is authorized by that regime alone. The developer still
+/// holds the full finding context and may ask for the fix directly.
 #[test]
-fn review_discussion_stays_interactive() {
-    let intent = intent_for_target(&DiscussionTarget::Review {
+fn review_discussion_is_authorized_by_its_regime() {
+    let finding = intent_for_target(&DiscussionTarget::Review {
         id: "review-1".to_string(),
     });
-    assert!(intent.is_interactive_repl());
-    assert!(!intent.is_plan_discussion());
+    assert!(finding.is_review_discussion());
+    assert!(!finding.is_interactive_repl());
+    assert!(!finding.is_plan_discussion());
+
+    // A group dialogue shares the regime: the plan of the group is the unit of
+    // remediation, and the decision it records belongs to the same anchored
+    // session.
+    let group = intent_for_target(&DiscussionTarget::ReviewGroup {
+        session_id: "review-1".to_string(),
+        group_id: "arch-1".to_string(),
+    });
+    assert!(group.is_review_discussion());
+}
+
+/// A decision recorded for one finding through the Structured Output transport.
+const REVIEW_DECISION_JSON: &str = r#"{"message":"Recording the decision.","review_update":{"item_id":7,"status":"rejected","note":"The race cannot happen"}}"#;
+
+/// Decodes `raw` and returns the review decisions that survived decoding.
+///
+/// The helper keeps every assertion focused on the regime authorization instead
+/// of on the surrounding command vocabulary, which differs between the two
+/// transports.
+fn decoded_review_updates(
+    protocol: &dyn PromptProtocol,
+    raw: &str,
+) -> Vec<tauqe_protocol::review::ReviewUpdateProposal> {
+    protocol
+        .decode(raw, &[])
+        .into_iter()
+        .filter_map(|command| match command {
+            LlmCommand::ReviewUpdate { update } => Some(update),
+            _ => None,
+        })
+        .collect()
+}
+
+/// The declared intent authorizes the decision: the structured contour
+/// advertises the field and decodes it into the typed command the engine
+/// persists against the anchored session.
+#[test]
+fn review_discussion_decodes_the_recorded_decision() {
+    let structured = resolve_turn_protocol(
+        TurnIntent::ReviewDiscussion,
+        EditProtocolKind::Structured,
+        None,
+    );
+    let surface = structured.capability_set();
+    assert!(surface.contains(LlmCapability::ReviewUpdate));
+
+    let decisions = decoded_review_updates(structured.as_ref(), REVIEW_DECISION_JSON);
+    assert_eq!(decisions.len(), 1);
+    assert_eq!(decisions[0].item_id, 7);
+    assert_eq!(
+        decisions[0].status,
+        tauqe_protocol::review::ReviewDecisionStatus::Rejected
+    );
+    assert_eq!(decisions[0].note, "The race cannot happen");
+}
+
+/// The decision never leaves the regime that authorizes it, and the XML contour
+/// never carries it: the field owns no control tag, so it travels exclusively
+/// through Structured Output.
+#[test]
+fn the_recorded_decision_never_leaves_the_review_regime() {
+    for intent in [
+        TurnIntent::InteractiveRepl,
+        TurnIntent::PlanDiscussion,
+        TurnIntent::IsolatedStep,
+    ] {
+        let protocol = resolve_turn_protocol(intent, EditProtocolKind::Structured, None);
+        let surface = protocol.capability_set();
+        assert!(!surface.contains(LlmCapability::ReviewUpdate));
+        let decisions = decoded_review_updates(protocol.as_ref(), REVIEW_DECISION_JSON);
+        assert!(decisions.is_empty());
+    }
+
+    // The grant is orthogonal to the transport, but the decision owns no control
+    // tag: an XML dialogue advertises the capability and decodes nothing from it.
+    let xml = resolve_turn_protocol(TurnIntent::ReviewDiscussion, EditProtocolKind::Xml, None);
+    let xml_surface = xml.capability_set();
+    assert!(xml_surface.contains(LlmCapability::ReviewUpdate));
+    let decisions = decoded_review_updates(xml.as_ref(), REVIEW_DECISION_JSON);
+    assert!(decisions.is_empty());
 }
 
 /// An isolated step never inherits the interactive session, so it cannot reuse
@@ -220,8 +302,8 @@ fn interactive_turn_never_carries_plan_mutation() {
 /// The turn-intent narrowing runs after protocol resolution, exactly as the
 /// bounded-turn FSM narrows the decoder, so the assertion covers the
 /// end-to-end surface of the step.
-fn assert_step_has_no_plan_permission(develop: EditProtocolKind) {
-    let protocol = resolve_turn_protocol(TurnIntent::IsolatedStep, develop, None);
+fn assert_step_has_no_plan_permission(transport: EditProtocolKind) {
+    let protocol = resolve_turn_protocol(TurnIntent::IsolatedStep, transport, None);
     assert!(!protocol
         .capability_set()
         .contains(LlmCapability::PlanUpdate));
@@ -837,6 +919,132 @@ async fn model_clear_history_is_refused_and_never_resurrects_a_cleared_journal()
         session,
         state.session_uuid().await,
         "a completed clear rotates the dialogue session"
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// A decision recorded in a review dialogue is durable review state, so the turn
+/// publishes it as it completes instead of leaving the client to refetch the
+/// session. The publication is scoped to the findings the turn actually moved.
+#[tokio::test]
+async fn a_recorded_review_decision_is_published_as_review_updated() {
+    use tauqe_core::providers::mock::{MockLlmProvider, MockResponse};
+    use tauqe_core::workflow::DirectApplyPolicy;
+    use tauqe_protocol::review::{
+        IssueStatus, IssueType, ReviewItem, ReviewSession, ReviewSeverity,
+    };
+
+    let root = scratch_root("review-decision-sync");
+    tauqe_core::git::init_repository(Some(&root), true).expect("initialise the scratch repository");
+    std::fs::write(root.join("README.md"), "# scratch\n").expect("write the repository fixture");
+    tauqe_core::git::cmd::stage_files(&root, &["README.md".to_string()])
+        .expect("stage the fixture");
+    tauqe_core::git::cmd::commit_with_developer_author(&root, "Add fixture", false)
+        .expect("commit the fixture");
+
+    let session = ReviewSession {
+        id: "review-sync".to_string(),
+        title: "Decision Audit".to_string(),
+        created_at: 1,
+        items: vec![ReviewItem {
+            id: 7,
+            title: "Held guard".to_string(),
+            uuid: None,
+            group: None,
+            model: None,
+            issue_type: IssueType::Bug,
+            severity: ReviewSeverity::Critical,
+            status: IssueStatus::Discussion,
+            recommendations: Vec::new(),
+            files: Vec::new(),
+            readonly_files: Vec::new(),
+            resolution_notes: None,
+            body: "The guard is released after the await".to_string(),
+        }],
+        ..ReviewSession::default()
+    };
+    tauqe_core::review::ReviewStorage::save_session(&root, &session)
+        .expect("save the review session");
+
+    let mut cfg = AppConfig::default();
+    cfg.repl.protocol = EditProtocolKind::Structured;
+    let (out, mut rx) = crate::transport::OutChannel::new();
+    let (history_sender, _history_rx) = tokio::sync::mpsc::unbounded_channel();
+    let state = AppState::new(cfg, root.clone(), history_sender, out.clone());
+    let script = [MockResponse::text(REVIEW_DECISION_JSON)];
+    let provider = Arc::new(MockLlmProvider::scripted(script));
+    let injected: Arc<dyn LlmProvider> = provider.clone();
+    *state.provider_override.lock().await = Some(injected);
+    state
+        .set_discussion_focus(DiscussionFocus::review("review-sync", Vec::new()))
+        .await;
+
+    let result = execute_model_turn(
+        &state,
+        "Record the decision we reached".to_string(),
+        Box::new(DirectApplyPolicy::new()),
+        StepTurnOptions {
+            intent: TurnIntent::ReviewDiscussion,
+            custom_selection: None,
+            plan_context: None,
+            work_context: None,
+            reasoning_effort: None,
+            marker: None,
+            session_id: None,
+            shared_operation: None,
+            phase_out: None,
+        },
+    )
+    .await
+    .expect("the review dialogue runs");
+    assert!(
+        result.error.is_none(),
+        "the dialogue failed: {:?}",
+        result.error
+    );
+    assert_eq!(
+        provider.remaining(),
+        0,
+        "the turn decodes a single provider round"
+    );
+
+    let stored = tauqe_core::review::ReviewStorage::load_review(&root, "review-sync")
+        .expect("load the session")
+        .expect("the session is stored");
+    assert_eq!(
+        stored.find_item(7).expect("the finding is stored").status,
+        IssueStatus::Rejected
+    );
+
+    let mut published = Vec::new();
+    while let Ok(line) = rx.try_recv() {
+        let event: serde_json::Value =
+            serde_json::from_str(&line).expect("the transport writes JSON lines");
+        if event.get("method").and_then(|method| method.as_str())
+            == Some(tauqe_protocol::events::REVIEW_UPDATED)
+        {
+            published.push(event);
+        }
+    }
+    let event = published
+        .first()
+        .expect("the recorded decision is published to the client");
+    assert_eq!(
+        published.len(),
+        1,
+        "one publication is emitted per affected finding"
+    );
+    let session: ReviewSession = serde_json::from_value(event["params"]["session"].clone())
+        .expect("the publication carries the refreshed session");
+    assert_eq!(session.id, "review-sync");
+    let finding = session
+        .find_item(7)
+        .expect("the decided finding is published");
+    assert_eq!(finding.status, IssueStatus::Rejected);
+    assert_eq!(
+        finding.resolution_notes.as_deref(),
+        Some("The race cannot happen")
     );
 
     let _ = std::fs::remove_dir_all(&root);

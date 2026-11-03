@@ -11,8 +11,13 @@ pub enum ContextAccess {
 #[serde(rename_all = "snake_case")]
 pub enum ContextLayer {
     Pinned,
-    /// External reference documents materialized into the isolated cache.
-    Refs,
+    /// External documentation materialized into the isolated cache.
+    ///
+    /// The layer serializes as `outer_docs`; the `refs` spelling emitted by an
+    /// earlier revision stays a decoding alias, so a transcript or a stored
+    /// context state written before the rename keeps loading.
+    #[serde(alias = "refs")]
+    OuterDocs,
     #[default]
     User,
     Auto,
@@ -138,16 +143,21 @@ mod tests {
         );
     }
     #[test]
-    fn test_context_layer_refs_serde() {
-        // The fourth layer travels under the stable name `refs`, so a client
-        // written before the layer existed never meets an unknown token.
+    fn test_context_layer_outer_docs_serde() {
+        // The fourth layer travels under the stable name `outer_docs`, and the
+        // `refs` spelling written before the rename still decodes into it, so a
+        // stored context state or transcript never meets an unknown token.
         assert_eq!(
-            serde_json::to_string(&ContextLayer::Refs).unwrap(),
-            "\"refs\""
+            serde_json::to_string(&ContextLayer::OuterDocs).unwrap(),
+            "\"outer_docs\""
+        );
+        assert_eq!(
+            serde_json::from_str::<ContextLayer>("\"outer_docs\"").unwrap(),
+            ContextLayer::OuterDocs
         );
         assert_eq!(
             serde_json::from_str::<ContextLayer>("\"refs\"").unwrap(),
-            ContextLayer::Refs
+            ContextLayer::OuterDocs
         );
         assert_eq!(ContextLayer::default(), ContextLayer::User);
     }

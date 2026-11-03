@@ -68,13 +68,13 @@ pub mod checkpoint {
         dir: &Path,
         checkpoint: &CheckpointInfo,
         changed_files: &[String],
-        summary: &str,
+        commit_message: &str,
     ) -> anyhow::Result<String> {
         tauqe_tools::git::checkpoint::finalize_ai_commit(
             dir,
             checkpoint,
             changed_files,
-            summary,
+            commit_message,
             super::hooks_for(dir),
         )
     }
@@ -83,12 +83,12 @@ pub mod checkpoint {
     pub fn create_ai_commit(
         dir: &Path,
         changed_files: &[String],
-        summary: &str,
+        commit_message: &str,
     ) -> anyhow::Result<String> {
         tauqe_tools::git::checkpoint::create_ai_commit(
             dir,
             changed_files,
-            summary,
+            commit_message,
             super::hooks_for(dir),
         )
     }
@@ -124,8 +124,8 @@ pub mod diff {
     use std::path::Path;
 
     pub use tauqe_tools::git::diff::{
-        find_last_non_ai_commit, get_commits_ahead, get_cumulative_diff, get_cumulative_file_diffs,
-        get_diff, get_diff_stat, CommitSummary,
+        find_last_non_ai_commit, get_commit_diff, get_commits_ahead, get_cumulative_diff,
+        get_cumulative_file_diffs, get_diff, get_diff_stat, CommitSummary,
     };
 
     /// Squashes every commit ahead of `base_ref` into one developer-authored commit.
@@ -174,8 +174,8 @@ pub use checkpoint::{
 };
 pub use cmd::run_git;
 pub use diff::{
-    find_last_non_ai_commit, get_commits_ahead, get_cumulative_diff, get_cumulative_file_diffs,
-    get_diff, get_diff_stat, squash_to_single_commit, CommitSummary,
+    find_last_non_ai_commit, get_commit_diff, get_commits_ahead, get_cumulative_diff,
+    get_cumulative_file_diffs, get_diff, get_diff_stat, squash_to_single_commit, CommitSummary,
 };
 pub use state::{
     detect_upstream_branch, get_repository_state, init_repository, is_git_repository,

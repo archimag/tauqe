@@ -35,7 +35,7 @@ pub fn fail_safe_reject_edits(model: &mut ReplView, reason: &str) {
     model.edit_final_error = Some(reason.to_string());
 }
 
-/// Re-anchors the Develop viewport to the bottom of the streamed turn.
+/// Re-anchors the REPL viewport to the bottom of the streamed turn.
 ///
 /// Streamed file edits and their hunks arrive below the answer block, so a
 /// turn that has already filled the viewport would leave the freshly applied
@@ -71,6 +71,21 @@ fn mark_files_awaiting_healing(model: &mut ReplView) {
         file.error = None;
     }
 }
+
+/// Renders the localized retry detail of a staging patch attempt.
+///
+/// The daemon states the attempt coordinates and the rejection reason; the
+/// sentence around them is interface text, so it resolves through the catalog
+/// like every other visible phrase. A retry that is already streaming then
+/// follows a hot-swapped locale instead of freezing the wording it started
+/// with (Conventions §9).
+fn retry_detail(data: &EditFileRetryingEvent) -> String {
+    active_t("repl.edits_retry_streaming")
+        .replacen("{}", &data.attempt.to_string(), 1)
+        .replacen("{}", &data.max_retries.to_string(), 1)
+        .replacen("{}", &data.reason, 1)
+}
+
 pub async fn handle_event(ev: Event, state: &Arc<Mutex<AppState>>, is_reasoning: &mut bool) {
     let mut st = state.lock().await;
     match ev.method.as_str() {
@@ -119,13 +134,22 @@ pub async fn handle_event(ev: Event, state: &Arc<Mutex<AppState>>, is_reasoning:
         events::HISTORY_ENTRY_ADDED => {
             if let Some(params) = ev.params {
                 if let Ok(data) = serde_json::from_value::<HistoryEntryAddedEvent>(params) {
-                    let item_tokens = data
-                        .estimated_tokens
-                        .unwrap_or_else(|| data.item.text.chars().count().div_ceil(4) as u64);
-                    if data.estimated_tokens.is_some() {
-                        st.history_view.estimated_tokens = item_tokens;
-                    } else {
-                        st.history_view.estimated_tokens += item_tokens;
+                    // `HistoryEntryAddedEvent::estimated_tokens` is the session
+                    // total the daemon maintains while it mutates the journal —
+                    // the same quantity `HISTORY_GET` reports — so a present
+                    // value replaces the mirrored estimate (c-1, c-2). A payload
+                    // that omits it carries no total at all: the mirrored value
+                    // then grows by the record's own estimate, and it is never
+                    // reset to the size of the single appended record.
+                    match data.estimated_tokens {
+                        Some(session_total) => {
+                            st.history_view.estimated_tokens = session_total;
+                        }
+                        None => {
+                            let added = data.item.text.chars().count().div_ceil(4) as u64;
+                            st.history_view.estimated_tokens =
+                                st.history_view.estimated_tokens.saturating_add(added);
+                        }
                     }
                     st.history_view.items.push(data.item);
                     st.history_view.total_count += 1;
@@ -204,10 +228,13 @@ pub async fn handle_event(ev: Event, state: &Arc<Mutex<AppState>>, is_reasoning:
                     serde_json::from_value::<tauqe_protocol::ModelChangedEvent>(params)
                 {
                     st.active_model = data.effective_model;
-                    st.model_choice = crate::app::ModelChoice {
+                    // A wholesale replacement advances the revision, so the
+                    // next frame republishes the provider catalog the labels
+                    // are resolved from (c-1, c-3).
+                    st.set_model_choice(crate::app::ModelChoice {
                         selection: data.selection,
                         roles: data.roles,
-                    };
+                    });
                 }
             }
         }
@@ -297,7 +324,7 @@ pub async fn handle_event(ev: Event, state: &Arc<Mutex<AppState>>, is_reasoning:
                     st.model.turn_max_rounds = data.max_rounds;
                     st.model.turn_phase_detail = data.detail;
                     st.model.status = match data.phase {
-                        tauqe_protocol::TurnPhase::Discovery => TurnStatus::Discovery,
+                        tauqe_protocol::TurnPhase::Research => TurnStatus::Research,
                         tauqe_protocol::TurnPhase::Proposal => {
                             if *is_reasoning {
                                 TurnStatus::Thinking
@@ -498,6 +525,15 @@ pub async fn handle_event(ev: Event, state: &Arc<Mutex<AppState>>, is_reasoning:
                         f.retry_info = None;
                         f.hunks.push(StreamingHunk {
                             hunk_index: data.hunk_index,
+                            // The daemon resolves the coordinates while it stages
+                            // the change set, so the view reports the lines the
+                            // hunk really addresses instead of inventing them
+                            // (c-hunk-coordinates-model).
+                            old_start: data.old_start,
+                            old_lines: data.old_lines,
+                            new_start: data.new_start,
+                            new_lines: data.new_lines,
+                            context_hint: data.context_hint,
                             old_text: data.old_text,
                             new_text: data.new_text,
                         });
@@ -525,10 +561,7 @@ pub async fn handle_event(ev: Event, state: &Arc<Mutex<AppState>>, is_reasoning:
             if let Some(params) = ev.params {
                 if let Ok(data) = serde_json::from_value::<EditFileRetryingEvent>(params) {
                     st.model.status = TurnStatus::Editing;
-                    let retry_msg = format!(
-                        "{}/{} retrying: {}",
-                        data.attempt, data.max_retries, data.reason
-                    );
+                    let retry_msg = retry_detail(&data);
                     if let Some(f) = st.model.files.iter_mut().find(|f| f.path == data.path) {
                         f.status = FileEditStatus::Retrying;
                         f.retry_info = Some(retry_msg);
@@ -831,7 +864,7 @@ pub async fn handle_event(ev: Event, state: &Arc<Mutex<AppState>>, is_reasoning:
             if let Some(params) = ev.params {
                 if let Ok(data) = serde_json::from_value::<ReviewFinishedEvent>(params) {
                     findings_count = data.session.items.len();
-                    st.review.set_session(data.session);
+                    st.review.finish_session(data.session);
                 }
             }
             finish_review_turn(&mut st.model);
@@ -1034,7 +1067,7 @@ pub async fn handle_event(ev: Event, state: &Arc<Mutex<AppState>>, is_reasoning:
 
 /// Resets the REPL buffer so it mirrors a freshly started Reviewer stream.
 ///
-/// The review summary is streamed into the main develop canvas, so the buffer
+/// The review summary is streamed into the main REPL canvas, so the buffer
 /// must shed any state left by a prior turn before the reviewer's reasoning and
 /// summary begin to arrive.
 fn begin_review_turn(model: &mut ReplView, data: &ReviewStartedEvent) {
@@ -2250,6 +2283,11 @@ mod tests {
             error: Some("hunk did not match the file".to_string()),
             hunks: vec![StreamingHunk {
                 hunk_index: 0,
+                old_start: 1,
+                old_lines: 1,
+                new_start: 1,
+                new_lines: 1,
+                context_hint: None,
                 old_text: "let a = 1;".to_string(),
                 new_text: "let a = 2;".to_string(),
             }],
@@ -2491,6 +2529,11 @@ mod tests {
                     operation_id: "op-stream".to_string(),
                     path: path.to_string(),
                     hunk_index: 0,
+                    old_start: 1,
+                    old_lines: 1,
+                    new_start: 1,
+                    new_lines: 1,
+                    context_hint: None,
                     old_text: old_text.to_string(),
                     new_text: new_text.to_string(),
                 })
@@ -3124,7 +3167,7 @@ mod tests {
         );
         assert!(guard.active_notification().is_none());
     }
-    /// The inspector owns no payload: it reads the live staged set the Develop
+    /// The inspector owns no payload: it reads the live staged set the REPL
     /// view renders, so a streamed start, its hunks, and a settlement need no
     /// refresh event, and shrinking the set clamps the highlight through the same
     /// method the renderer applies (c-3).
@@ -3195,5 +3238,160 @@ mod tests {
             .expect("the audit stays open across the whole stream");
         inspector.clamp_selection(file_count);
         assert_eq!(inspector.selected_file, 0);
+    }
+
+    fn entry_added_event(item: UiHistoryItem, estimated_tokens: Option<u64>) -> Event {
+        Event {
+            method: events::HISTORY_ENTRY_ADDED.to_string(),
+            params: Some(
+                serde_json::to_value(HistoryEntryAddedEvent {
+                    item,
+                    estimated_tokens,
+                })
+                .unwrap(),
+            ),
+        }
+    }
+
+    /// The daemon publishes the session total with every append, so a present
+    /// value replaces the mirrored estimate instead of being confused with the
+    /// size of the single added record (c-1, c-2).
+    #[tokio::test]
+    async fn test_history_entry_added_applies_the_reported_session_total() {
+        let mut st = crate::app::test_state();
+        st.history_view.estimated_tokens = 900;
+
+        let state = Arc::new(Mutex::new(st));
+        let mut is_reasoning = false;
+        handle_event(
+            entry_added_event(ui_history_item(6, UiHistoryKind::User, "Task"), Some(1024)),
+            &state,
+            &mut is_reasoning,
+        )
+        .await;
+
+        let guard = state.lock().await;
+        assert_eq!(
+            guard.history_view.estimated_tokens, 1024,
+            "the reported session total replaces the mirrored estimate"
+        );
+        assert_eq!(guard.history_view.items.len(), 1);
+    }
+
+    /// A payload without the session total grows the mirrored estimate by the
+    /// record's own size, so the fallback never discards the accumulation of
+    /// the records already mirrored (c-1, c-2).
+    #[tokio::test]
+    async fn test_history_entry_added_without_total_accumulates_the_record_estimate() {
+        let mut st = crate::app::test_state();
+        st.history_view.estimated_tokens = 20;
+
+        let state = Arc::new(Mutex::new(st));
+        let mut is_reasoning = false;
+        handle_event(
+            entry_added_event(ui_history_item(6, UiHistoryKind::User, "Question"), None),
+            &state,
+            &mut is_reasoning,
+        )
+        .await;
+
+        let guard = state.lock().await;
+        assert_eq!(
+            guard.history_view.estimated_tokens, 22,
+            "an unreported total grows the mirrored estimate by the record size"
+        );
+    }
+
+    /// The retry detail of a staging patch attempt is interface text: the
+    /// daemon reports the attempt coordinates and the rejection reason, while
+    /// the sentence around them resolves through the catalog, so a hot-swapped
+    /// locale reaches a retry that is already streaming (Conventions §9).
+    #[tokio::test]
+    async fn test_edit_file_retrying_localizes_the_attempt_detail() {
+        let state = Arc::new(Mutex::new(crate::app::test_state()));
+        let mut is_reasoning = false;
+        handle_event(
+            Event {
+                method: events::EDIT_FILE_RETRYING.to_string(),
+                params: Some(
+                    serde_json::to_value(EditFileRetryingEvent {
+                        operation_id: "op-stream".to_string(),
+                        path: STREAMED_PATH.to_string(),
+                        attempt: 2,
+                        max_retries: 3,
+                        reason: "hunk did not match the file".to_string(),
+                    })
+                    .unwrap(),
+                ),
+            },
+            &state,
+            &mut is_reasoning,
+        )
+        .await;
+
+        let expected = active_t("repl.edits_retry_streaming")
+            .replacen("{}", "2", 1)
+            .replacen("{}", "3", 1)
+            .replacen("{}", "hunk did not match the file", 1);
+
+        let guard = state.lock().await;
+        let file = guard
+            .model
+            .files
+            .iter()
+            .find(|file| file.path == STREAMED_PATH)
+            .expect("the retrying file must be mirrored into the staged set");
+        assert_eq!(file.status, FileEditStatus::Retrying);
+        assert_eq!(
+            file.retry_info.as_deref(),
+            Some(expected.as_str()),
+            "the attempt detail must be composed from the catalog template"
+        );
+        assert!(file.error.is_none());
+        assert!(file.error.is_none());
+    }
+
+    /// The daemon resolves the coordinates of a hunk while it stages the change
+    /// set, so the mirrored `StreamingHunk` reports the real lines of both sides
+    /// instead of the synthetic zeros the view used to invent.
+    #[tokio::test]
+    async fn test_edit_hunk_mirrors_the_resolved_coordinates() {
+        let mut st = crate::app::test_state();
+        st.model.files.push(accepted_file(STREAMED_PATH));
+        let state = Arc::new(Mutex::new(st));
+        let mut is_reasoning = false;
+
+        handle_event(
+            Event {
+                method: events::EDIT_HUNK.to_string(),
+                params: Some(
+                    serde_json::to_value(EditHunkEvent {
+                        operation_id: "op-stream".to_string(),
+                        path: STREAMED_PATH.to_string(),
+                        hunk_index: 2,
+                        old_start: 12,
+                        old_lines: 2,
+                        new_start: 12,
+                        new_lines: 3,
+                        context_hint: Some("fn run() {".to_string()),
+                        old_text: "a\nb".to_string(),
+                        new_text: "a\nb\nc".to_string(),
+                    })
+                    .unwrap(),
+                ),
+            },
+            &state,
+            &mut is_reasoning,
+        )
+        .await;
+
+        let guard = state.lock().await;
+        let hunk = &guard.model.files[0].hunks[0];
+        assert_eq!(hunk.hunk_index, 2);
+        assert_eq!(hunk.old_start, 12);
+        assert_eq!(hunk.old_lines, 2);
+        assert_eq!(hunk.new_start, 12);
+        assert_eq!(hunk.new_lines, 3);
+        assert_eq!(hunk.context_hint.as_deref(), Some("fn run() {"));
     }
 }

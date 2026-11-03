@@ -64,6 +64,79 @@ impl StageEditsResult {
     }
 }
 
+/// The refusal bookkeeping of one staging attempt.
+///
+/// A member is refused in one of two places: a path that cannot even be
+/// normalized refuses the member before it is built, and an operation the state
+/// machine rejects refuses it while it applies. Both write here, so both leave
+/// the same trace: the refusal is reported, and every path the member addressed
+/// is claimed. A later member that touches a claimed path is therefore refused
+/// for the same reason instead of being skipped without a trace.
+#[derive(Debug, Default)]
+struct StagingFailureLog {
+    /// The refusals, in the order the members were built and applied.
+    entries: Vec<FailedFileEdit>,
+    /// The reason each claimed path is refused under.
+    reasons: HashMap<String, String>,
+}
+
+impl StagingFailureLog {
+    /// Records `rejection` and claims every path the member addressed.
+    ///
+    /// `addressed` names the paths of the member and the path that caused the
+    /// refusal is claimed beside them, so a member that failed on one side of
+    /// a rename claims both of its sides, exactly as a member refused while it
+    /// applied does.
+    fn refuse(&mut self, rejection: StagingRejection, addressed: &[&str]) {
+        let (path, error) = rejection;
+        let reason = error.to_string();
+        self.claim(addressed, &path, &reason);
+        self.entries.push(FailedFileEdit {
+            path,
+            error: *error,
+        });
+    }
+
+    /// Refuses a member that touches a path an earlier refusal claimed.
+    ///
+    /// Returns `true` when the member was refused and recorded. The reported
+    /// rejection names the earlier reason, so an operation the change set can
+    /// no longer apply stays visible to the patch-retry loop, and the remaining
+    /// paths of the member join the earlier refusal under its own reason.
+    fn refuse_if_claimed(&mut self, addressed: &[&str]) -> bool {
+        let Some((path, reason)) = addressed
+            .iter()
+            .find_map(|path| self.reasons.get_key_value(*path))
+            .map(|(path, reason)| (path.clone(), reason.clone()))
+        else {
+            return false;
+        };
+        let message = format!(
+            "the change set refused an earlier operation that addressed this path, \
+             so this operation was not applied: {reason}"
+        );
+        self.claim(addressed, &path, &reason);
+        self.entries.push(FailedFileEdit {
+            path: path.clone(),
+            error: EditError::InvalidPath(path, message),
+        });
+        true
+    }
+
+    /// Claims every path of a refused member under `reason`.
+    ///
+    /// The earliest reason wins, so a member refused because it touches a path
+    /// an earlier member already claimed reports the one rejection that started
+    /// the chain instead of a paraphrase of a paraphrase.
+    fn claim(&mut self, addressed: &[&str], causing: &str, reason: &str) {
+        for path in addressed.iter().copied().chain(std::iter::once(causing)) {
+            self.reasons
+                .entry(path.to_string())
+                .or_insert_with(|| reason.to_string());
+        }
+    }
+}
+
 /// Validates edits without changing disk or context. Operations for each normalized
 /// path are applied in order, and a member that fails is rolled back to the state
 /// it found, so a member that applied earlier keeps its own effect. Other members
@@ -117,8 +190,11 @@ pub fn stage_and_validate_edits_with(
 /// content of a chained rename (`a -> b -> c`) forward. A rejected member
 /// restores every path it addressed to the snapshot taken immediately before
 /// that member applied, so an earlier member keeps its effect even when a later
-/// member fails on a path the two of them share, and the remaining members
-/// continue independently.
+/// member fails on a path the two of them share. Refusals are recorded in one
+/// [`StagingFailureLog`]: a member refused while it applies claims the same
+/// paths as one refused before the attempt starts, and a member refused because
+/// it touches a claimed path is reported with the reason of the refusal that
+/// claimed it instead of disappearing from the result.
 pub(crate) fn stage_and_validate_edits_inner(
     repo_root: &Path,
     project: &ProjectConfig,
@@ -136,7 +212,7 @@ pub(crate) fn stage_and_validate_edits_inner(
         .iter()
         .map(|item| item.path.as_str())
         .collect();
-    let (units, mut failed_files) = build_staging_units(repo_root, edits);
+    let (units, mut failures) = build_staging_units(repo_root, edits);
     // The ignore probe is one batched `git check-ignore` call, so the whole
     // change set is resolved against Git before the first member applies. A
     // directory move contributes one candidate per file it expands into, which
@@ -150,7 +226,6 @@ pub(crate) fn stage_and_validate_edits_inner(
     write_targets.sort();
     write_targets.dedup();
     let ignored = ignored_target_paths(repo_root, &write_targets);
-    let mut failed_paths: HashSet<String> = HashSet::new();
     // The members that applied cleanly, in change-set order. The reported change
     // set is derived from them, so an earlier member that shares a path with a
     // later refused member keeps its place in it.
@@ -163,19 +238,23 @@ pub(crate) fn stage_and_validate_edits_inner(
     let unit_paths: Vec<Vec<&str>> = units.iter().map(|unit| unit.paths()).collect();
 
     for (index, (unit, paths)) in units.iter().zip(unit_paths.iter()).enumerate() {
-        if paths.iter().any(|path| failed_paths.contains(*path)) {
+        // A member that touches a path an earlier refusal claimed is refused
+        // for the same reason and reported like any other, so no operation
+        // disappears from the result the patch-retry loop reads.
+        if failures.refuse_if_claimed(paths) {
             continue;
         }
-        // Every member snapshots its own paths immediately before it applies, so a
-        // refusal restores the state that member found. A replacement addressed to
-        // a rename destination is therefore rolled back to the renamed content,
-        // instead of the opening state of the attempt, in which the destination did
-        // not exist yet and the moved content would be lost.
-        let snapshots: Vec<(String, PathSnapshot)> = paths
-            .iter()
-            .copied()
-            .map(|path| (path.to_string(), PathSnapshot::capture(&state, path)))
-            .collect();
+        // Every member records the state of the paths it addresses immediately
+        // before it applies, so a refusal restores exactly the state that member
+        // found. A file member snapshots the body of its own path; a move member
+        // records the membership of every pair it relocates instead, because its
+        // transfer only permutes the staged keys and its inversion therefore moves
+        // the content back instead of cloning a body per addressed path. A
+        // replacement addressed to a rename destination is rolled back to the
+        // renamed content either way, instead of the opening state of the attempt,
+        // in which the destination did not exist yet and the moved content would be
+        // lost.
+        let rollback = MemberRollback::capture(unit, &state);
         let applied = apply_staging_unit(
             repo_root,
             &context_paths,
@@ -187,15 +266,9 @@ pub(crate) fn stage_and_validate_edits_inner(
         );
         match applied {
             Ok(()) => applied_units.push(index),
-            Err((path, error)) => {
-                for (rejected, snapshot) in &snapshots {
-                    snapshot.restore(&mut state, rejected);
-                    failed_paths.insert(rejected.clone());
-                }
-                failed_files.push(FailedFileEdit {
-                    path,
-                    error: *error,
-                });
+            Err(failure) => {
+                rollback.restore(&mut state);
+                failures.refuse(failure, paths);
             }
         }
     }
@@ -228,7 +301,7 @@ pub(crate) fn stage_and_validate_edits_inner(
         staged_state: state,
         successful_paths,
         successful_edits,
-        failed_files,
+        failed_files: failures.entries,
     }
 }
 
@@ -272,6 +345,116 @@ impl PathSnapshot {
     }
 }
 
+/// The membership a relocated pair held before its move member applied.
+///
+/// A move member only permutes the keys of the staged map, so inverting one of
+/// its pairs needs no copy of the relocated body: the content moves back from the
+/// destination to the source and the deletion bits return to the values they
+/// held. The destination is free when an admitted member starts — the
+/// member-level pre-pass refuses an occupied one — so a pair records the staged
+/// membership of its source and the deletion bits of both sides.
+struct MovePairSnapshot<'a> {
+    /// Source path of the pair.
+    from: &'a str,
+    /// Destination path of the pair.
+    to: &'a str,
+    /// Whether the source held staged content of its own.
+    from_staged: bool,
+    /// Whether the source was already recorded as deleted.
+    from_deleted: bool,
+    /// Whether the destination was already recorded as deleted.
+    to_deleted: bool,
+}
+
+impl<'a> MovePairSnapshot<'a> {
+    /// Records the membership `from` and `to` hold right now.
+    fn capture(state: &StagedEditsState, from: &'a str, to: &'a str) -> Self {
+        Self {
+            from,
+            to,
+            from_staged: state.staged_files.contains_key(from),
+            from_deleted: state.deleted_paths.contains(from),
+            to_deleted: state.deleted_paths.contains(to),
+        }
+    }
+
+    /// Puts the pair back into the membership it held before the member applied.
+    ///
+    /// The destination holds content only when the pair actually transferred, so
+    /// a pair the member never reached leaves both of its keys untouched. A body
+    /// the pair read from the working tree is dropped again, because its source
+    /// had no staged entry of its own; the one source that keeps such a body is
+    /// itself a destination of another pair, whose own inversion moves it on.
+    fn restore(&self, state: &mut StagedEditsState, destinations: &HashSet<&str>) {
+        if let Some(content) = state.staged_files.remove(self.to) {
+            if self.from_staged || destinations.contains(self.from) {
+                state.staged_files.insert(self.from.to_string(), content);
+            }
+        }
+        if self.from_deleted {
+            state.deleted_paths.insert(self.from.to_string());
+        } else {
+            state.deleted_paths.remove(self.from);
+        }
+        if self.to_deleted {
+            state.deleted_paths.insert(self.to.to_string());
+        } else {
+            state.deleted_paths.remove(self.to);
+        }
+    }
+}
+
+/// The state a staging member restores when it is refused.
+///
+/// A file member rewrites content in place, so it snapshots the body of the path
+/// it addresses. A move member only permutes the keys of the staged map, so it
+/// records the membership of every pair it relocates and inverts the permutation
+/// instead: a subtree move copies no file body on the success path, and its
+/// rejection moves the staged content back between the same keys.
+enum MemberRollback<'a> {
+    /// The content snapshot of the path a file member rewrites.
+    File(String, PathSnapshot),
+    /// The prior membership of the pairs a move member relocates.
+    Pairs(Vec<MovePairSnapshot<'a>>),
+}
+
+impl<'a> MemberRollback<'a> {
+    /// Records the state `unit` is about to change.
+    fn capture(unit: &'a StagingUnit<'_>, state: &StagedEditsState) -> Self {
+        match unit {
+            StagingUnit::File { path, .. } => {
+                Self::File(path.clone(), PathSnapshot::capture(state, path))
+            }
+            StagingUnit::Move { from, to, .. } => {
+                Self::Pairs(vec![MovePairSnapshot::capture(state, from, to)])
+            }
+            StagingUnit::DirMove { files, .. } => Self::Pairs(
+                files
+                    .iter()
+                    .map(|file| MovePairSnapshot::capture(state, &file.from, &file.to))
+                    .collect(),
+            ),
+        }
+    }
+
+    /// Puts every path the refused member addressed back into the captured state.
+    fn restore(&self, state: &mut StagedEditsState) {
+        match self {
+            Self::File(path, snapshot) => snapshot.restore(state, path),
+            Self::Pairs(pairs) => {
+                // A source of one pair can also be the destination of another,
+                // and the content of the earlier pair travels through it. The
+                // pairs are therefore inverted from the last one applied to the
+                // first, which hands that content back along the chain.
+                let destinations: HashSet<&str> = pairs.iter().map(|pair| pair.to).collect();
+                for pair in pairs.iter().rev() {
+                    pair.restore(state, &destinations);
+                }
+            }
+        }
+    }
+}
+
 /// One atomic member of a staging attempt.
 enum StagingUnit<'a> {
     /// A run of operations addressing a single file.
@@ -289,8 +472,8 @@ enum StagingUnit<'a> {
     ///
     /// The expansion is built once, before the first member applies, so every
     /// path the member addresses is known up front: the destination paths join
-    /// the batched ignore probe, and a refusal restores each of them from the
-    /// snapshot taken immediately before the member applied.
+    /// the batched ignore probe, and a refusal inverts each pair from the
+    /// membership recorded immediately before the member applied.
     DirMove {
         from: String,
         to: String,
@@ -394,14 +577,14 @@ fn destination_occupied(staged: &StagedEditsState, repo_root: &Path, path: &str)
 /// also the unit the anchored batching of [`stage_file_edits`] resolves against.
 /// A directory move is expanded here, before the attempt starts, so its member
 /// addresses the files of the subtree instead of the directory itself. A path
-/// that cannot be normalized is reported immediately instead of forming a member
-/// of its own.
+/// that cannot be normalized refuses its own operation and claims its paths
+/// instead of forming a member of its own.
 fn build_staging_units<'a>(
     repo_root: &Path,
     edits: &'a [EditOperation],
-) -> (Vec<StagingUnit<'a>>, Vec<FailedFileEdit>) {
+) -> (Vec<StagingUnit<'a>>, StagingFailureLog) {
     let mut units: Vec<StagingUnit<'a>> = Vec::new();
-    let mut failed_files = Vec::new();
+    let mut failures = StagingFailureLog::default();
     // The path of the last member, while it still accepts consecutive
     // operations on the same file.
     let mut open: Option<String> = None;
@@ -419,11 +602,18 @@ fn build_staging_units<'a>(
                         to,
                         operation: edit,
                     }),
-                    (Err((path, error)), _) | (_, Err((path, error))) => {
-                        failed_files.push(FailedFileEdit {
-                            path,
-                            error: *error,
-                        });
+                    // A rename addresses both of its sides, so a refusal claims
+                    // the canonical form of the side that normalized and the raw
+                    // spelling of the side that did not. A later member touching
+                    // either side is then refused by exactly the rule that
+                    // governs a member refused while it applied.
+                    (Err(failure), to) => {
+                        let to = to.unwrap_or_else(|failure| failure.0);
+                        failures.refuse(failure, &[to.as_str()]);
+                    }
+                    (from, Err(failure)) => {
+                        let from = from.unwrap_or_else(|failure| failure.0);
+                        failures.refuse(failure, &[from.as_str()]);
                     }
                 }
             }
@@ -445,26 +635,29 @@ fn build_staging_units<'a>(
                             files,
                             operation: edit,
                         }),
+                        // The expansion refused before a single file moved, so
+                        // the two directories it named are claimed instead.
                         Err(error) => {
-                            failed_files.push(FailedFileEdit { path: from, error });
+                            failures.refuse((from, Box::new(error)), &[to.as_str()]);
                         }
                     },
-                    (Err((path, error)), _) | (_, Err((path, error))) => {
-                        failed_files.push(FailedFileEdit {
-                            path,
-                            error: *error,
-                        });
+                    (Err(failure), to) => {
+                        let to = to.unwrap_or_else(|failure| failure.0);
+                        failures.refuse(failure, &[to.as_str()]);
+                    }
+                    (from, Err(failure)) => {
+                        let from = from.unwrap_or_else(|failure| failure.0);
+                        failures.refuse(failure, &[from.as_str()]);
                     }
                 }
             }
             _ => {
                 let path = match normalize_edit_path(repo_root, operation_path(edit)) {
                     Ok(path) => path,
-                    Err((path, error)) => {
-                        failed_files.push(FailedFileEdit {
-                            path,
-                            error: *error,
-                        });
+                    // A file operation addresses exactly one path, so the
+                    // refusal claims that path and no other.
+                    Err(failure) => {
+                        failures.refuse(failure, &[]);
                         continue;
                     }
                 };
@@ -483,7 +676,7 @@ fn build_staging_units<'a>(
         }
     }
 
-    (units, failed_files)
+    (units, failures)
 }
 
 /// Names the path an operation writes, regardless of its kind.
@@ -608,17 +801,18 @@ fn apply_staging_unit(
                     EditError::DestinationExists(path.to_string()),
                 ));
             }
+            // Every destination is a write target, so the batched ignore answer
+            // and the repository-root containment both apply to it exactly as
+            // they do to an explicit write. Both are resolved here, once per
+            // file, before the first file of the subtree stages; the loop below
+            // then only transfers content.
             for file in files {
-                // Every destination is a write target, so the batched ignore
-                // answer and the repository-root containment both apply to it
-                // exactly as they do to an explicit write.
                 admit_move_destination(repo_root, &file.to, ignored)
                     .map_err(|error| rejection(&file.to, error))?;
             }
-            // The subtree moves as one member: a refusal below restores every
-            // path the expansion addresses from the snapshot the caller took
-            // immediately before this member applied, so no half-moved
-            // directory survives the attempt.
+            // The subtree moves as one member: the caller recorded the membership
+            // of every pair before this member applied, so a refusal below moves
+            // the content back and no half-moved directory survives the attempt.
             for file in files {
                 // A path this attempt already deleted has no content left to
                 // relocate, so its deletion keeps its meaning at the source
@@ -626,7 +820,9 @@ fn apply_staging_unit(
                 if state.deleted_paths.contains(&file.from) {
                     continue;
                 }
-                stage_rename(repo_root, &file.from, &file.to, state)?;
+                // Every admission fact of this destination was resolved in the
+                // pre-pass above, so the transfer only moves the content.
+                transfer_rename(repo_root, &file.from, &file.to, state)?;
             }
             Ok(())
         }
@@ -637,9 +833,10 @@ fn apply_staging_unit(
 ///
 /// An explicit move addresses one file, so its source must be part of the
 /// context or of the state this attempt has already built: a rename never
-/// guesses which file the model meant. A directory move reaches
-/// [`stage_rename`] directly, because its sources are the deterministic contents
-/// of the directory it names rather than paths the model typed.
+/// guesses which file the model meant. A directory move resolves the admission
+/// of its whole subtree in one pre-pass and then reaches [`transfer_rename`]
+/// directly, because its sources are the deterministic contents of the directory
+/// it names rather than paths the model typed.
 fn stage_move(
     repo_root: &Path,
     context_paths: &HashSet<&str>,
@@ -655,14 +852,21 @@ fn stage_move(
     stage_rename(repo_root, from, to, state)
 }
 
-/// Moves the staged or on-disk content of `from` to `to`.
+/// Resolves the admission of one explicitly named rename and performs it.
 ///
-/// The source is resolved from the state this attempt has already built before
-/// the working tree is consulted, so a chained rename carries its content
-/// forward instead of looking for a file that never reached disk. The
-/// destination must still be free, because a rename never overwrites; a path
-/// the same change set deletes counts as free, since staging never touches disk
-/// and its removal reaches the file only with the commit.
+/// An explicit move addresses a single file the model typed, so both of its sides
+/// are proved here: a source or destination that escapes the repository is
+/// refused, and a destination that is already taken refuses the rename. The
+/// source is resolved from the state this attempt has already built before the
+/// working tree is consulted, so a chained rename carries its content forward
+/// instead of looking for a file that never reached disk. The destination must
+/// still be free, because a rename never overwrites; a path the same change set
+/// deletes counts as free, since staging never touches disk and its removal
+/// reaches the file only with the commit.
+///
+/// A directory move resolves the same facts for its whole subtree in one
+/// member-level pre-pass and then calls [`transfer_rename`] directly, so a
+/// relocated file is never re-verified and never re-probed.
 fn stage_rename(
     repo_root: &Path,
     from: &str,
@@ -680,8 +884,24 @@ fn stage_rename(
     if destination_occupied(state, repo_root, to) {
         return Err(rejection(to, EditError::DestinationExists(to.to_string())));
     }
-    let content = match state.staged_files.get(from) {
-        Some(content) => content.clone(),
+    transfer_rename(repo_root, from, to, state)
+}
+
+/// Moves the staged or on-disk content of `from` to `to` without re-resolving
+/// admission.
+///
+/// A staged body is moved between the map keys instead of being cloned, so a
+/// member that relocates a whole subtree copies no file content. The pair either
+/// transfers completely or leaves the state exactly as it found it, which is what
+/// lets the caller invert it by moving the content back.
+fn transfer_rename(
+    repo_root: &Path,
+    from: &str,
+    to: &str,
+    state: &mut StagedEditsState,
+) -> Result<(), StagingRejection> {
+    let content = match state.staged_files.remove(from) {
+        Some(content) => content,
         None if state.deleted_paths.contains(from) => {
             return Err(rejection(from, EditError::FileNotFound(from.to_string())));
         }
@@ -696,7 +916,6 @@ fn stage_rename(
     };
     state.staged_files.insert(to.to_string(), content);
     state.deleted_paths.remove(to);
-    state.staged_files.remove(from);
     state.deleted_paths.insert(from.to_string());
     Ok(())
 }

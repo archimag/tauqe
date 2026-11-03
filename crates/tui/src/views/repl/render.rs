@@ -21,6 +21,7 @@ mod splash;
 
 pub(crate) use self::model::compute_model_lines_with_file_rows;
 pub(crate) use self::model::file_op_badge;
+pub(crate) use self::model::measure_canvas;
 pub(crate) use self::model::wrap_model_lines;
 use self::splash::render_splash;
 
@@ -367,7 +368,7 @@ fn step_window(total: usize, active: usize, capacity: usize) -> Option<StepWindo
 ///
 /// The marker names the work the running turn declares — its kind, the owning
 /// entity, the position inside the batch queue, the active member, and the
-/// phase — from the typed work contract, so the Develop viewport never derives
+/// phase — from the typed work contract, so the REPL viewport never derives
 /// the task from the stored plans and reviews (c-1). It occupies one dense row
 /// by default (c-3) and adds the sliding window of the queued members once the
 /// developer expands it (c-4).
@@ -431,7 +432,7 @@ impl WorkMarker {
 /// Builds the universal work marker from the declared work contract.
 ///
 /// A turn that executes no declared work yields `None`, so an interactive
-/// answer keeps the whole response area and Develop pays nothing (c-1, c-3).
+/// answer keeps the whole response area and the REPL pays nothing (c-1, c-3).
 fn work_marker(state: &AppState) -> Option<WorkMarker> {
     let breadcrumb = work_breadcrumb(state)?;
     let engine = current_engine();
@@ -709,7 +710,7 @@ fn render_model_pane(frame: &mut ratatui::Frame, state: &mut AppState, area: Rec
         return;
     }
 
-    let raw_lines = compute_model_lines(&mut state.model);
+    let (raw_lines, file_rows) = compute_model_lines_with_file_rows(&mut state.model);
 
     let prefix_count =
         (state.model.error.is_some() as usize) + (state.model.toolchain.is_some() as usize);
@@ -731,6 +732,15 @@ fn render_model_pane(frame: &mut ratatui::Frame, state: &mut AppState, area: Rec
 
     let total_lines = model_lines.len();
     state.model.rendered_lines_count = total_lines;
+    // The canvas is wrapped once per frame, so the offsets are published here and
+    // reused by every navigation key of this frame instead of being rebuilt
+    // (c-1, c-4).
+    state.model.record_canvas_projection(
+        raw_to_visual_start,
+        raw_to_visual_end,
+        file_rows,
+        total_lines,
+    );
 
     // The bound saturates instead of wrapping through a truncated cast: a
     // response longer than `u16::MAX` visual lines keeps the largest
@@ -1012,5 +1022,87 @@ mod tests {
             Some((1, 1))
         );
         assert_eq!(step_window(1, 0, MAX_STEPPER_WINDOW), None);
+    }
+    /// Both review variants are projected exactly as a plan step is: the badge
+    /// names the declared work kind, the entity addresses the review, and the
+    /// running unit is named with its one-based position in the queue.
+    #[test]
+    fn review_work_contexts_render_their_badge_and_queue_position() {
+        let engine = current_engine();
+
+        let finding = TurnWorkContext::ReviewStep {
+            review_id: "rev-42".to_string(),
+            review_title: "rev-42".to_string(),
+            queue: TurnWorkQueue {
+                items: vec![
+                    TurnWorkItem {
+                        id: "7".to_string(),
+                        title: "Guard the parser".to_string(),
+                    },
+                    TurnWorkItem {
+                        id: "8".to_string(),
+                        title: "Fix the overflow".to_string(),
+                    },
+                ],
+                active_index: 1,
+            },
+        };
+        let breadcrumb = work_context_breadcrumb(&finding).expect("a review step declares work");
+        assert_eq!(breadcrumb.badge_key, "repl.work.badge_review");
+        assert_eq!(breadcrumb.entity, "rev-42");
+        let (member, position, total) = breadcrumb
+            .active()
+            .expect("the running finding is the active member");
+        assert_eq!(member.id, "8");
+        assert_eq!(member.title, "Fix the overflow");
+        assert_eq!((position, total), (2, 2));
+
+        let header = breadcrumb_header(&breadcrumb, None, &engine);
+        let text: String = header
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect();
+        assert!(
+            text.contains("[2/2]"),
+            "the queue position must be rendered: {text}"
+        );
+        assert!(text.contains("Fix the overflow"), "{text}");
+
+        let group = TurnWorkContext::ReviewGroupStep {
+            review_id: "rev-42".to_string(),
+            review_title: "rev-42".to_string(),
+            group_id: "arch-1".to_string(),
+            group_title: "Unified error handling".to_string(),
+            queue: TurnWorkQueue {
+                items: vec![TurnWorkItem {
+                    id: "s-1".to_string(),
+                    title: "Introduce the seam".to_string(),
+                }],
+                active_index: 0,
+            },
+        };
+        let breadcrumb = work_context_breadcrumb(&group).expect("a group step declares work");
+        assert_eq!(breadcrumb.badge_key, "repl.work.badge_review_group");
+        assert_eq!(breadcrumb.entity, "rev-42 \u{203a} Unified error handling");
+        assert_eq!(
+            breadcrumb
+                .active()
+                .map(|(_, position, total)| (position, total)),
+            Some((1, 1))
+        );
+
+        let header = breadcrumb_header(&breadcrumb, Some(SPINNER_FRAMES[0]), &engine);
+        let text: String = header
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect();
+        assert!(text.contains("Unified error handling"), "{text}");
+        assert!(text.contains("[1/1]"), "{text}");
+        assert!(text.contains("Introduce the seam"), "{text}");
+
+        // An interactive answer declares no work, so no marker is ever fabricated.
+        assert!(work_context_breadcrumb(&TurnWorkContext::Interactive).is_none());
     }
 }

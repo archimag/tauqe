@@ -48,7 +48,7 @@ fn visible_row(content: Rect, visual_line: usize, scroll: u16, visible_height: u
 ///
 /// `visual_line` is the header row in the body's visual coordinate space and
 /// `line_prefix_cols` is the horizontal prefix the body renderer prepends to
-/// every line (zero in Develop, the History line prefix in History). The button
+/// every line (zero in the REPL, the History line prefix in History). The button
 /// span comes from [`crate::markdown::copy_button_span`], the same source the
 /// renderer paints from, so a drawn button and its hit region cannot drift
 /// apart (c-1).

@@ -2,10 +2,13 @@
 
 use crate::edits::protocol::xml::engine;
 
-/// Extracts ephemeral scratchpad content from model output if present.
-pub fn extract_scratchpad(text: &str) -> Option<String> {
+/// Extracts ephemeral scratchpad content, reusing a precomputed code index.
+pub(crate) fn extract_scratchpad_with_fences(
+    text: &str,
+    fences: &super::CodeFences,
+) -> Option<String> {
     let spec = engine::tag_spec("scratchpad")?;
-    let notes: Vec<String> = engine::iter_tags(text, spec)
+    let notes: Vec<String> = engine::iter_tags_with_fences(text, spec, fences)
         .filter_map(|tag| tag.attr_or_body(&["note"]))
         .map(|note| note.trim().to_string())
         .filter(|note| !note.is_empty())
@@ -15,6 +18,11 @@ pub fn extract_scratchpad(text: &str) -> Option<String> {
     } else {
         Some(notes.join("\n\n"))
     }
+}
+
+/// Extracts ephemeral scratchpad content from model output if present.
+pub fn extract_scratchpad(text: &str) -> Option<String> {
+    extract_scratchpad_with_fences(text, &super::CodeFences::find(text))
 }
 
 /// Removes all scratchpad tags and enclosed content from text.

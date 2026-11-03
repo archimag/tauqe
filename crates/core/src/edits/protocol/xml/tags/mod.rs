@@ -1,5 +1,5 @@
 //! Control tags of the XML edit protocol that are not code edits: the
-//! discovery requests (`<context_request>`, `<repo_search>`, `<repo_dirs>`,
+//! research requests (`<context_request>`, `<repo_search>`, `<repo_dirs>`,
 //! `<repo_map>`, `<dir_list>`), documentation requests, verification, plan
 //! blocks, and the turn-scoped scratchpad.
 
@@ -16,11 +16,15 @@ mod verify;
 
 use super::engine;
 
-pub(crate) use context::parse_context_request_tags;
-pub(crate) use dir_list::parse_dir_list_tags;
-pub(crate) use dirs::parse_repo_dirs_tags;
-pub(crate) use docs::parse_doc_request_tags;
-pub(crate) use search::parse_repo_search_tags;
+pub(crate) use context::{parse_context_request_tags, parse_context_request_tags_with_fences};
+pub(crate) use dir_list::{parse_dir_list_tags, parse_dir_list_tags_with_fences};
+pub(crate) use dirs::{parse_repo_dirs_tags, parse_repo_dirs_tags_with_fences};
+pub(crate) use docs::{parse_doc_request_tags, parse_doc_request_tags_with_fences};
+pub(crate) use language::extract_user_language_with_fences;
+pub(crate) use outcome::extract_terminal_outcome_with_fences;
+pub(crate) use scratchpad::extract_scratchpad_with_fences;
+pub(crate) use search::{parse_repo_search_tags, parse_repo_search_tags_with_fences};
+pub(crate) use verify::extract_verify_request_with_fences;
 
 pub use context::strip_context_request_tags;
 pub use dirs::strip_repo_dirs_tags;
@@ -31,7 +35,10 @@ pub use outcome::{
     strip_blocked_tags, strip_error_tags, strip_skip_tags, strip_success_tags,
     strip_terminal_outcome_tags, TerminalOutcome,
 };
-pub use plan::{parse_plan_tags_with_diagnostics, strip_plan_tags, ParsedPlanItem, ParsedPlanTag};
+pub use plan::{
+    parse_plan_tags_with_diagnostics, parse_plan_tags_with_diagnostics_with_fences,
+    strip_plan_tags, ParsedPlanItem, ParsedPlanTag,
+};
 pub use scratchpad::{extract_scratchpad, strip_scratchpad_tags};
 pub use search::strip_repo_search_tags;
 pub use verify::{
@@ -51,18 +58,24 @@ pub fn strip_repo_map_tags(text: &str) -> String {
     }
 }
 
+/// Extracts targeted repository map requests (`<repo_map path="..." />`) in
+/// order, reusing a precomputed markdown code index.
+pub(crate) fn parse_repo_map_tags_with_fences(text: &str, fences: &CodeFences) -> Vec<String> {
+    match repo_map_spec() {
+        Some(spec) => engine::iter_tags_with_fences(text, spec, fences)
+            .map(|tag| tag.attr("path").unwrap_or_default())
+            .collect(),
+        None => Vec::new(),
+    }
+}
+
 /// Extracts targeted repository map requests (`<repo_map path="..." />`) in order.
 ///
 /// A missing `path` attribute yields an empty string, which names the whole
 /// repository. Marked occurrences inside markdown code are ignored by the tag
 /// engine, so a quoted example never widens what the model can see.
 pub(crate) fn parse_repo_map_tags(text: &str) -> Vec<String> {
-    match repo_map_spec() {
-        Some(spec) => engine::iter_tags(text, spec)
-            .map(|tag| tag.attr("path").unwrap_or_default())
-            .collect(),
-        None => Vec::new(),
-    }
+    parse_repo_map_tags_with_fences(text, &CodeFences::find(text))
 }
 
 fn strip_tags(text: &str, next: fn(&str) -> Option<(usize, usize)>) -> String {
@@ -144,8 +157,12 @@ pub(crate) fn inline_code_span(text: &str, target_pos: usize) -> InlineCode {
 /// An interval is half-open: `start <= pos < end` means `pos` belongs to a
 /// block. It starts at the first byte of the opening fence line and ends after
 /// the closing fence line, or at `text.len()` when the block is never closed.
+///
+/// One index describes one text, so a caller that decodes several capabilities
+/// from the same response builds it once and hands it to every reader. The
+/// fields stay private, so an index is only ever produced by [`Self::find`].
 #[derive(Debug)]
-pub(crate) struct CodeFences {
+pub struct CodeFences {
     intervals: Vec<(usize, usize)>,
 }
 
@@ -372,18 +389,19 @@ mod tests {
     #[test]
     fn test_extract_and_strip_success_self_closing_with_summary() {
         let text =
-            "Changes applied.\n<success summary=\"Created models and passed checks\" />\nDone.";
+            "Changes applied.\n<success commit_message=\"Created models and passed checks\" />\nDone.";
         let outcome = extract_terminal_outcome(text).unwrap();
         assert_eq!(
             outcome,
             TerminalOutcome::Success {
-                summary: Some("Created models and passed checks".to_string()),
+                commit_message: Some("Created models and passed checks".to_string()),
             }
         );
         assert_eq!(
             extract_success(text),
             Some(Some("Created models and passed checks".to_string()))
         );
+
         assert_eq!(extract_error(text), None);
 
         let stripped = strip_terminal_outcome_tags(text);
@@ -398,7 +416,9 @@ mod tests {
         assert_eq!(
             outcome,
             TerminalOutcome::Success {
-                summary: Some("Refactored database module and verified transactions.".to_string()),
+                commit_message: Some(
+                    "Refactored database module and verified transactions.".to_string()
+                ),
             }
         );
         let stripped = strip_terminal_outcome_tags(text);
@@ -410,7 +430,12 @@ mod tests {
     fn test_extract_and_strip_success_empty() {
         let text = "Completed.\n<success />";
         let outcome = extract_terminal_outcome(text).unwrap();
-        assert_eq!(outcome, TerminalOutcome::Success { summary: None });
+        assert_eq!(
+            outcome,
+            TerminalOutcome::Success {
+                commit_message: None
+            }
+        );
         assert_eq!(extract_success(text), Some(None));
     }
 
@@ -497,7 +522,7 @@ mod tests {
         let text = r#"
 Example outcome:
 ```xml
-<success summary="Mock success" />
+<success commit_message="Mock success" />
 <error message="Mock error" />
 ```
 Inline `<success />` and `<error message="inline" />`.
@@ -512,7 +537,7 @@ Real outcome:
             }
         );
         let stripped = strip_terminal_outcome_tags(text);
-        assert!(stripped.contains("<success summary=\"Mock success\" />"));
+        assert!(stripped.contains("<success commit_message=\"Mock success\" />"));
         assert!(stripped.contains("`<error message=\"inline\" />`"));
         assert!(!stripped.contains("<error message=\"Real blocker\" />"));
     }

@@ -128,6 +128,7 @@ mod tests {
                     id: "2".to_string(),
                     title: "Step 2".to_string(),
                     status: PlanItemStatus::Todo,
+                    files: vec!["src/step2.rs".to_string()],
                     ..Default::default()
                 },
             ],
@@ -146,6 +147,7 @@ mod tests {
                 id: "2".to_string(),
                 title: "Step 2".to_string(),
                 status: PlanItemStatus::Todo,
+                files: vec!["src/step2.rs".to_string()],
                 ..Default::default()
             }],
         );
@@ -164,18 +166,31 @@ mod tests {
             None,
             10,
             10,
-            vec![],
-            vec![PlanItem {
-                id: "1".to_string(),
-                title: "Original Title".to_string(),
-                details: Some("Original Details".to_string()),
-                status: PlanItemStatus::Done,
-                files: vec!["src/done.rs".to_string()],
-                readonly_files: vec!["src/contract.rs".to_string()],
-                concept_refs: vec!["c-1".to_string()],
-                depends_on: vec!["0".to_string()],
-                ..Default::default()
+            vec![tauqe_protocol::ConceptItem {
+                id: "c-1".to_string(),
+                title: "Done invariant".to_string(),
+                details: None,
+                children: vec![],
             }],
+            vec![
+                PlanItem {
+                    id: "1".to_string(),
+                    title: "Original Title".to_string(),
+                    details: Some("Original Details".to_string()),
+                    status: PlanItemStatus::Done,
+                    files: vec!["src/done.rs".to_string()],
+                    readonly_files: vec!["src/contract.rs".to_string()],
+                    concept_refs: vec!["c-1".to_string()],
+                    depends_on: vec!["0".to_string()],
+                    ..Default::default()
+                },
+                PlanItem {
+                    id: "0".to_string(),
+                    title: "Foundation".to_string(),
+                    status: PlanItemStatus::Done,
+                    ..Default::default()
+                },
+            ],
         );
         PlanStorage::save_plan(root, &plan).unwrap();
 
@@ -253,6 +268,18 @@ mod tests {
         let initial_res = PlanStorage::apply_plan_tags(root, initial_text);
         assert!(initial_res.errors.is_empty());
         assert_eq!(initial_res.applied.len(), 1);
+        // Steps are authored as TODO; completion is recorded by the execution
+        // pipeline, so the fixture reaches DONE through it.
+        PlanStorage::update_item(
+            root,
+            "guard-plan",
+            "1",
+            Some(PlanItemStatus::Done),
+            None,
+            None,
+        )
+        .unwrap()
+        .expect("the seeded step must exist");
 
         // 1. apply_plan_tags update attempting status regression
         let invalid_update = r#"

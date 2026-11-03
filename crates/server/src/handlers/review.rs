@@ -35,11 +35,10 @@ pub use storage_ops::{
     handle_review_delete, handle_review_get, handle_review_list, handle_review_update_item,
 };
 pub use synthesis::{handle_review_cancel, handle_review_start};
-
-// A dialogue anchored on a review session publishes the decision it recorded
-// through the same path every other review mutation uses.
+// The implementation host publishes a review session before it starts the model
+// turn of a review scope, so the refreshed lifecycle reaches the client before
+// the turn streams.
 pub(crate) use common::publish_review;
-
 // The integration tests import the batch supervisor and the shared context
 // helpers directly from their submodules, so no test-only re-exports are
 // needed here.

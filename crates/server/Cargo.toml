@@ -19,7 +19,7 @@ tracing-appender.workspace = true
 time.workspace = true
 anyhow.workspace = true
 async-trait.workspace = true
-
+futures-util.workspace = true
 [dev-dependencies]
 # Enables `MockLlmProvider` for handler unit tests without leaking the test
 # double into the release daemon binary.

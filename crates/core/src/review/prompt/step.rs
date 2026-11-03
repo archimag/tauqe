@@ -200,16 +200,16 @@ pub fn format_review_step_execution_prompt(
     match protocol {
         EditProtocolKind::Structured => {
             out.push_str("5. Keep changes minimal and coherent. Toolchain verification is handled automatically and deterministically by the harness; do NOT fill the `verify` field.\n");
-            out.push_str("6. When implementation and verification are complete, set the `outcome` field to status \"success\" and fill in `summary` describing the resolved finding.\n");
+            out.push_str("6. When implementation and verification are complete, set the `outcome` field to status \"success\" and fill in `commit_message` with the English Conventional Commits commit message of the resolved finding.\n");
             out.push_str("7. If the finding is already resolved by earlier changes, is a false positive, or requires no code modifications, do NOT emit unnecessary edits; instead set the `outcome` field to status \"skip\" and fill in `reason` with a detailed explanation.\n");
-            out.push_str("8. Discovery Phase: If you need to inspect or edit files listed in <repo_map> that are not yet loaded in <context>, request them immediately by listing them in the `context_requests` array before writing code or explanations: a repository-relative path is read-only, and an `editable:` prefix (such as `editable:crates/x/src/parser.rs`) marks it editable. Request all necessary files together in a single response to avoid exhausting discovery rounds. Do NOT halt with conversational text if the necessary files can simply be requested.\n");
+            out.push_str("8. Research Phase: If you need to inspect or edit files listed in <repo_map> that are not yet loaded in <context>, request them immediately by listing them in the `context_requests` array before writing code or explanations: a repository-relative path is read-only, and an `editable:` prefix (such as `editable:crates/x/src/parser.rs`) marks it editable. Request all necessary files together in a single response to avoid exhausting research rounds. Do NOT halt with conversational text if the necessary files can simply be requested.\n");
             out.push_str("9. If the finding cannot be resolved within the approved architectural decision, because the fix would require a different data structure, a changed interface, a substituted component, or a relaxed constraint, do NOT improvise an alternative design. Stop and fill the `blocked` field with `is_blocked` true, a `reason`, and `details` describing the exact architectural conflict, so the harness starts a controlled replanning cycle.\n");
             out.push_str("10. If you encounter an insurmountable technical blocker that is unrelated to the architectural decision, set the `outcome` field to status \"error\" and fill in `message` with the exact blocker.\n");
         }
         EditProtocolKind::Xml | EditProtocolKind::Mixed => {
             out.push_str("5. Keep changes minimal and coherent. Toolchain verification is handled automatically and deterministically by the harness; do NOT emit <verify> tags.\n");
             out.push_str(&format!(
-                "6. When implementation and verification are complete, emit the completion tag: <success{0} summary=\"...\" />.\n",
+                "6. When implementation and verification are complete, emit the completion tag: <success{0} commit_message=\"...\" />.\n",
                 marker_suffix
             ));
             out.push_str(&format!(
@@ -217,7 +217,7 @@ pub fn format_review_step_execution_prompt(
                 marker_suffix
             ));
             out.push_str(&format!(
-                "8. Discovery Phase: If you need to inspect or edit files listed in <repo_map> that are not yet loaded in <context>, request them immediately using <context_request{0} path=\"...\" access=\"read_only|editable\" /> before writing code or explanations. Do NOT halt with conversational text if the necessary files can simply be requested.\n",
+                "8. Research Phase: If you need to inspect or edit files listed in <repo_map> that are not yet loaded in <context>, request them immediately using <context_request{0} path=\"...\" access=\"read_only|editable\" /> before writing code or explanations. Do NOT halt with conversational text if the necessary files can simply be requested.\n",
                 marker_suffix
             ));
             out.push_str(&format!(
@@ -312,7 +312,7 @@ mod tests {
                 .expect("prompt");
 
         for tag in [
-            "<success_M7 summary=",
+            "<success_M7 commit_message=",
             "<skip_M7 reason=",
             "<blocked_M7 reason=",
             "<error_M7 message=",
@@ -384,7 +384,7 @@ mod tests {
                 .expect("prompt");
 
         // Mixed encodes code edits through the tagged contour.
-        assert!(prompt.contains("<success_M7 summary="));
+        assert!(prompt.contains("<success_M7 commit_message="));
     }
 
     #[test]

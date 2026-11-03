@@ -64,7 +64,7 @@ pub struct DiscussionPlanUpdate {
     pub items: Vec<PlanItem>,
 }
 
-/// Declarative repository search request emitted during discovery or discussion turns.
+/// Declarative repository search request emitted during a research or discussion turn.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RepoSearchRequest {
     pub path: String,
@@ -96,7 +96,7 @@ impl RepoSearchRequest {
     }
 }
 
-/// Declarative directory content listing request emitted during discovery.
+/// Declarative directory content listing request emitted during research.
 ///
 /// The request addresses a repository-relative directory prefix; an empty path
 /// names the repository root. `recursive` widens the listing from the direct
@@ -441,7 +441,10 @@ impl DiscussionResponse {
     }
 
     pub fn with_context_requests(mut self, requests: Vec<DiscussionContextRequest>) -> Self {
-        self.context_requests = requests;
+        self.context_requests = requests
+            .into_iter()
+            .filter_map(DiscussionContextRequest::normalized)
+            .collect();
         self
     }
 
@@ -793,8 +796,10 @@ mod tests {
                     details: Some("Add discussion schemas".to_string()),
                     status: PlanItemStatus::Done,
                     blocked_reason: None,
+                    commit: None,
                     files: vec!["crates/protocol/src/discussion.rs".to_string()],
                     readonly_files: vec![],
+                    outer_docs: vec![],
                     concept_refs: vec!["c-1".to_string()],
                     depends_on: vec![],
                     children: vec![],
@@ -805,5 +810,33 @@ mod tests {
         let json = serde_json::to_string_pretty(&resp).unwrap();
         let de: DiscussionResponse = serde_json::from_str(&json).unwrap();
         assert_eq!(de, resp);
+    }
+    #[test]
+    fn test_context_requests_builder_applies_repository_path_rules() {
+        // The builder shares the boundary of its sibling builders: an entry that
+        // the decode path drops never reaches the response through this
+        // construction path either, so a directly built response carries only
+        // repository-relative paths.
+        let response = DiscussionResponse::new("Hello").with_context_requests(vec![
+            DiscussionContextRequest::read_only("./crates/core/src/lib.rs"),
+            DiscussionContextRequest::editable("/etc/passwd"),
+            DiscussionContextRequest::read_only("../escape.rs"),
+            DiscussionContextRequest::editable("   "),
+            DiscussionContextRequest::editable("crates/core/src/lib.rs"),
+        ]);
+
+        // The two reachable requests keep their order, normalized path, and
+        // requested access level.
+        assert_eq!(response.context_requests.len(), 2);
+        assert_eq!(response.context_requests[0].path, "crates/core/src/lib.rs");
+        assert_eq!(response.context_requests[0].access, ContextAccess::ReadOnly);
+        assert_eq!(response.context_requests[1].path, "crates/core/src/lib.rs");
+        assert_eq!(response.context_requests[1].access, ContextAccess::Editable);
+
+        // An empty request list stays empty instead of defaulting to anything.
+        assert!(DiscussionResponse::new("Hello")
+            .with_context_requests(Vec::new())
+            .context_requests
+            .is_empty());
     }
 }

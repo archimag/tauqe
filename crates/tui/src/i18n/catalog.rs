@@ -60,7 +60,7 @@ pub fn canonical_catalog() -> Vec<LocaleCatalogItem> {
         // ------------------------------------------------------------------
         // Bounded-turn phase pipeline (footer FSM telemetry).
         // ------------------------------------------------------------------
-        item("phase.discovery", "Discovery", "Bounded-turn discovery phase label", Some(12)),
+        item("phase.research", "Research", "Bounded-turn research phase label", Some(12)),
         item("phase.proposal", "Proposal", "Bounded-turn proposal phase label", Some(12)),
         item("phase.staging", "Staging", "Bounded-turn staging phase label", Some(12)),
         item("phase.verification", "Verify", "Bounded-turn verification phase label", Some(12)),
@@ -101,7 +101,7 @@ pub fn canonical_catalog() -> Vec<LocaleCatalogItem> {
         item("status.responding", "Responding", "Model streaming response indicator", Some(16)),
         item("status.editing", "Editing", "Staging code edits indicator", Some(14)),
         item("status.verifying", "Verifying", "Running compiler verification pipeline", Some(16)),
-        item("status.discovery", "Discovery", "Discovering repository context files", Some(16)),
+        item("status.research", "Research", "Researching repository context files and documentation", Some(16)),
         item("status.staging", "Staging", "Applying and validating patches in memory", Some(16)),
         item("status.healing", "Healing", "Compiler error healing loop", Some(16)),
         item("status.done", "Done", "Turn completed successfully indicator", Some(10)),
@@ -333,6 +333,11 @@ pub fn canonical_catalog() -> Vec<LocaleCatalogItem> {
         item("dialog.review_analyze.heading", "Classify the findings of this session with the Architect?", "Heading in the post-analysis confirmation dialog", None),
         item("dialog.review_analyze.review_label", " Review: ", "Post-analysis confirmation session field label", None),
         item("dialog.review_analyze.note", "The post-analysis replaces the previous classification layer with a fresh architectural analysis of the findings.", "Post-analysis confirmation note explaining that the classification layer is rebuilt", None),
+        item("dialog.review_analyze.model_list_title", " Architect Model ", "Post-analysis confirmation architect model list title with a single entry", None),
+        item("dialog.review_analyze.model_list_counter", " Architect Model  [{} of {}] ", "Post-analysis confirmation architect model list title with a position counter", None),
+        item("dialog.review_analyze.no_models", "  (no architect models configured)", "Post-analysis confirmation empty architect model list placeholder", None),
+        item("dialog.review_analyze.hint_actions", "Enter analyze • ← / → button • Esc cancel", "Post-analysis confirmation footer hint while the action bar has focus", None),
+        item("dialog.review_analyze.hint_fields", "{}Enter analyze • Tab focus • {} model • Esc cancel", "Post-analysis confirmation footer hint while the architect ladder has focus", None),
         item("dialog.clear_auto.question", "Clear all Auto-context files?", "Clear-auto-context dialog question line", None),
         item("dialog.clear_auto.body_prefix", "Are you sure you want to remove all ", "Clear-auto-context body prefix before the count", None),
         item("dialog.clear_auto.body_count", "{} file(s)", "Clear-auto-context styled file count", None),
@@ -440,26 +445,26 @@ pub fn canonical_catalog() -> Vec<LocaleCatalogItem> {
         item("context.section.user_hint", " [Editable / Read-Only]", "Context User section header hint", None),
         item("context.section.auto_hint", " [Model Requested]", "Context Auto section header hint", None),
         item(
-            "context.section.refs",
-            "Reference Documents",
-            "Context Refs layer section header",
+            "context.section.outer_docs",
+            "External Documentation",
+            "Context OuterDocs layer section header",
             None,
         ),
         item(
-            "context.section.refs_hint",
-            " [Registry / Read-Only]",
-            "Context Refs section header hint",
+            "context.section.outer_docs_hint",
+            " [Declared / Read-Only]",
+            "Context OuterDocs section header hint",
             None,
         ),
         item("context.badge.editable", "[EDITABLE]", "Badge marking an editable context file", Some(12)),
         item("context.badge.readonly", "[READ-ONLY]", "Badge marking a read-only context file", Some(14)),
         item("context.info.pinned", "Pinned layer: Architecture & reference documents specified in tauqe.toml", "Context info line for the Pinned layer", None),
         item("context.info.user", "User layer: Persistent files curated by the developer (Editable or Read-Only)", "Context info line for the User layer", None),
-        item("context.info.auto", "Auto layer: Files autonomously requested by the model during discovery rounds", "Context info line for the Auto layer", None),
+        item("context.info.auto", "Auto layer: Files autonomously requested by the model during research rounds", "Context info line for the Auto layer", None),
         item(
-            "context.info.refs",
-            "Refs layer: External reference documents materialized from .tauqe/refs/refs.md into the isolated cache; read-only for the whole task",
-            "Context info line for the Refs layer",
+            "context.info.outer_docs",
+            "External documentation layer: documents declared under [[outer_docs]] and materialized into the isolated cache; read-only for the whole task",
+            "Context info line for the OuterDocs layer",
             None,
         ),
         item("context.info.default", "Context state: 4 layers (Pinned, Refs, User, Auto) | Press '?' for commands", "Context info line when no row is selected", None),
@@ -483,7 +488,7 @@ pub fn canonical_catalog() -> Vec<LocaleCatalogItem> {
         // Plans view headers and empty state.
         // ------------------------------------------------------------------
         item("plans.empty_title", "No local engineering plans yet.", "Plans view empty-state heading", None),
-        item("plans.empty_hint", "Ask Tauqe AI in Develop (Ctrl+1) to formulate a multi-step task plan, or press 'g' to refresh.", "Plans view empty-state hint", None),
+        item("plans.empty_hint", "Ask Tauqe AI in the REPL (Ctrl+1) to formulate a multi-step task plan, or press 'g' to refresh.", "Plans view empty-state hint", None),
         item("plans.refining", "[REFINING: AI Architect is analyzing codebase...]", "Plans view refinement-in-progress indicator", None),
         item("plans.plan_label", "Plan:", "Plans info line plan label", None),
         item("plans.concept_summary", "Concept: {} item(s) of architectural intent", "Plans info line concept section summary", None),
@@ -515,28 +520,28 @@ pub fn canonical_catalog() -> Vec<LocaleCatalogItem> {
             "Review info-strip badge while the Architect post-analysis classifies the findings",
             None,
         ),
-        item("review.running_hint", "Streaming findings and summary in Develop view (Ctrl+1).", "Review view hint while a review streams", None),
+        item("review.running_hint", "Streaming findings and summary in the REPL view (Ctrl+1).", "Review view hint while a review streams", None),
         item("review.empty_title", "No code reviews yet.", "Review view empty-state heading", None),
         item("review.empty_hint", "Add files to Context (Ctrl+4), then press 'N' to run a code review.", "Review view empty-state hint", None),
         item("review.filter_open", "Filter: Open only", "Review view open-findings filter indicator", None),
 
         // ------------------------------------------------------------------
-        // REPL (Develop) startup greeting. The greeting is a transient welcome
+        // REPL startup greeting. The greeting is a transient welcome
         // surface shown only while the response area is empty, so its motto and
         // quick-start verbs are localized like every other interface text.
         // ------------------------------------------------------------------
-        item("splash.motto", "The Answer to the Ultimate Question of Engineering", "Develop splash motto revealed by the typewriter effect", None),
-        item("splash.hint.help", "Help", "Develop splash quick-start hint verb for opening Help", None),
-        item("splash.hint.send", "Send prompt", "Develop splash quick-start hint verb for sending a prompt", None),
+        item("splash.motto", "The Answer to the Ultimate Question of Engineering", "REPL splash motto revealed by the typewriter effect", None),
+        item("splash.hint.help", "Help", "REPL splash quick-start hint verb for opening Help", None),
+        item("splash.hint.send", "Send prompt", "REPL splash quick-start hint verb for sending a prompt", None),
 
         // ------------------------------------------------------------------
-        // REPL (Develop) view badges and hints.
+        // REPL view badges and hints.
         // ------------------------------------------------------------------
-        item("repl.focus_badge_plan", "[PLAN]", "Develop discussion focus badge for a plan", Some(12)),
-        item("repl.focus_badge_review", "[REVIEW]", "Develop discussion focus badge for a review", Some(14)),
-        item("repl.detach_hint", "[Esc to detach]", "Develop hint for detaching the discussion focus", None),
-        item("repl.viewport_title", "[VIEWPORT]", "Develop viewport focus title", Some(14)),
-        // The universal work marker of the Develop viewport names every kind
+        item("repl.focus_badge_plan", "[PLAN]", "REPL discussion focus badge for a plan", Some(12)),
+        item("repl.focus_badge_review", "[REVIEW]", "REPL discussion focus badge for a review", Some(14)),
+        item("repl.detach_hint", "[Esc to detach]", "REPL hint for detaching the discussion focus", None),
+        item("repl.viewport_title", "[VIEWPORT]", "REPL viewport focus title", Some(14)),
+        // The universal work marker of the REPL viewport names every kind
         // of running work in one dense row, so the viewport never reconstructs
         // the task from the stored plans and reviews (c-1, c-3, c-4).
         item(
@@ -782,6 +787,24 @@ pub fn canonical_catalog() -> Vec<LocaleCatalogItem> {
         item("cmd.plans.clear_horizon", "Clear the implementation horizon of the selected plan (with confirmation)", "Plans command description", None),
         item("cmd.plans.refresh", "Refresh plans from the server", "Plans command description", None),
         item("cmd.plans.delete", "Delete the plan", "Plans command description", None),
+        item(
+            "cmd.plans.inspect_diff",
+            "Inspect the changes of the commit recorded in the selected step",
+            "Plans command description",
+            None,
+        ),
+        item(
+            "notify.plan_step_no_commit",
+            "The selected step has no recorded commit to inspect",
+            "Plans notification when the diff inspector is requested for a step that recorded no commit",
+            None,
+        ),
+        item(
+            "notify.plan_commit_diff_empty",
+            "The selected commit carries no changes to inspect",
+            "Plans notification when the diff of a step commit holds no file changes",
+            None,
+        ),
 
         // ------------------------------------------------------------------
         // Command descriptions for the Review view.
@@ -855,7 +878,8 @@ pub fn canonical_catalog() -> Vec<LocaleCatalogItem> {
             "Implementation Plan",
             "Review branch header owning the unified root-cause plan of a group, rendered between the group header and the plan steps it owns",
             None,
-        ),        item(
+        ),
+        item(
             "review.group_kind.architectural",
             "[ARCH]",
             "Badge marking a review group whose findings share one architectural root cause and are executed as one unified plan",
@@ -916,7 +940,7 @@ pub fn canonical_catalog() -> Vec<LocaleCatalogItem> {
         ),
 
         // ------------------------------------------------------------------
-        // Command descriptions for the REPL (Develop) view.
+        // Command descriptions for the REPL view.
         // ------------------------------------------------------------------
         item("cmd.repl.send", "Send the prompt", "REPL command description", None),
         item("cmd.repl.squash", "Open the squash AI commits dialog", "REPL command description", None),
@@ -984,15 +1008,15 @@ pub fn canonical_catalog() -> Vec<LocaleCatalogItem> {
         item("notify.pinned_protected_remove", "Pinned files are protected and cannot be removed", "Context notification rejecting a Pinned removal", None),
         item("notify.pinned_protected_section", "Pinned section is protected and cannot be removed", "Context notification rejecting a Pinned section removal", None),
         item(
-            "notify.refs_readonly",
-            "Reference documents are read-only and their access cannot be changed",
-            "Context notification rejecting an access change on a Refs document",
+            "notify.outer_docs_readonly",
+            "External documents are read-only and their access cannot be changed",
+            "Context notification rejecting an access change on an OuterDocs document",
             None,
         ),
         item(
-            "notify.refs_protected_section",
-            "Reference documents are managed by the registry manifest and cannot be removed here",
-            "Context notification explaining that the Refs layer is owned by the reference registry",
+            "notify.outer_docs_protected_section",
+            "External documentation is managed by the [[outer_docs]] registry and cannot be removed here",
+            "Context notification explaining that the OuterDocs layer is owned by the external documentation registry",
             None,
         ),
         item("notify.context_copied", "File path copied to clipboard", "Context notification after copying file path", None),
@@ -1014,7 +1038,7 @@ pub fn canonical_catalog() -> Vec<LocaleCatalogItem> {
         item("notify.plan_concept_section_not_executable", "Concept section cannot be executed; execute implementation steps below.", "Plans notification rejecting concept-section execution", None),
         item("notify.plan_concept_item_not_executable", "Concept item cannot be executed directly; execute implementation steps or press 'd' to discuss.", "Plans notification rejecting concept-item execution", None),
         item("notify.plan_concept_no_status", "Concept items define architectural requirements and do not have task statuses. Press 'd' to discuss.", "Plans notification explaining concept items have no status", None),
-        item("notify.plan_concept_discuss", "Concept items define architectural requirements. Press 'd' to discuss in Develop.", "Plans notification directing concept discussion to Develop", None),
+        item("notify.plan_concept_discuss", "Concept items define architectural requirements. Press 'd' to discuss in the REPL.", "Plans notification directing concept discussion to the REPL", None),
         item("notify.plan_focus_set", "Discussion focus set to plan '{}'", "Plans notification confirming a focus change", None),
         item("notify.plan_focus_item_set", "Discussion focus set to {} in plan '{}'", "Plans notification confirming an item focus change", None),
         item("notify.plan_copied", "Plan copied to clipboard", "Plans notification after copying a plan", None),
@@ -1085,7 +1109,7 @@ pub fn canonical_catalog() -> Vec<LocaleCatalogItem> {
         item("notify.review_copy_failed", "Failed to copy to clipboard", "Review notification when copying fails", None),
 
         // ------------------------------------------------------------------
-        // REPL (Develop) view notifications.
+        // REPL view notifications.
         // ------------------------------------------------------------------
         item("notify.prompt_cleared", "Prompt cleared (C-Y to restore)", "REPL notification after clearing the prompt", None),
         item("notify.prompt_clear_arm", "Press Esc again to clear the prompt", "REPL notification arming the prompt clear", None),
@@ -1299,6 +1323,12 @@ pub fn canonical_catalog() -> Vec<LocaleCatalogItem> {
         item("dialog.review_launch.model_list_title", " Reviewer Model ", "Review launch dialog reviewer list title with a single entry", None),
         item("dialog.review_launch.no_models", "  (no reviewer models configured)", "Review launch dialog empty reviewer list placeholder", None),
         item("dialog.review_launch.presets_title", " Presets ", "Review launch dialog review-preset section title", None),
+        item(
+            "dialog.review_launch.presets_counter",
+            "Presets ({}/{})",
+            "Review launch dialog review-preset section title carrying the position of the highlighted row and the total row count, shown when the declared presets exceed the rows the section draws at once",
+            None,
+        ),
         item("dialog.review_launch.preset_custom", "Custom (manual launch)", "Review launch dialog preset row that falls back to a one-off manual launch", None),
         item(
             "dialog.review_launch.directories_title",
@@ -1395,7 +1425,7 @@ pub fn canonical_catalog() -> Vec<LocaleCatalogItem> {
 
         // ------------------------------------------------------------------
         // Fullscreen diff inspector (c-3): the two-pane audit of the change
-        // set the Develop viewport staged. The card names the audited files,
+        // set the REPL viewport staged. The card names the audited files,
         // their operation and verification badges, the isolated diff read
         // area, and the audit progress row.
         // ------------------------------------------------------------------
@@ -1416,7 +1446,8 @@ pub fn canonical_catalog() -> Vec<LocaleCatalogItem> {
         item("cmd.diff_inspector.prev_file", "Select the previous audited file", "Diff inspector command description", None),
         item("cmd.diff_inspector.toggle_focus", "Switch the active pane between the audited file list and the diff read area", "Diff inspector command description", None),
         item("cmd.diff_inspector.move_up", "Move up in the focused pane: the previous file or the patch one line up", "Diff inspector command description", None),
-        item("cmd.diff_inspector.move_down", "Move down in the focused pane: the next file or the patch one line down", "Diff inspector command description", None),        item("cmd.diff_inspector.scroll_up", "Scroll the audited diff up one line", "Diff inspector command description", None),
+        item("cmd.diff_inspector.move_down", "Move down in the focused pane: the next file or the patch one line down", "Diff inspector command description", None),
+        item("cmd.diff_inspector.scroll_up", "Scroll the audited diff up one line", "Diff inspector command description", None),
         item("cmd.diff_inspector.scroll_down", "Scroll the audited diff down one line", "Diff inspector command description", None),
         item("cmd.diff_inspector.page_up", "Scroll the audited diff up one page", "Diff inspector command description", None),
         item("cmd.diff_inspector.page_down", "Scroll the audited diff down one page", "Diff inspector command description", None),
@@ -1529,20 +1560,20 @@ pub fn canonical_catalog() -> Vec<LocaleCatalogItem> {
         item("onboarding.input.key_hint_hide", "({}R: Show, {}V: Paste, Enter: Save, Esc: Cancel)", "Onboarding API key input hint while the key is masked", None),
 
         // ------------------------------------------------------------------
-        // View labels surfaced by the Develop, Plans, and Review render paths.
+        // View labels surfaced by the REPL, Plans, and Review render paths.
         // ------------------------------------------------------------------
-        item("repl.proposed_edits", "Proposed Edits", "Develop header label for the staged file edits list", None),
-        item("repl.validation_error", "Validation Error:", "Develop label prefixing a failed file validation message", None),
-        item("repl.usage.tokens", "Tokens", "Develop usage line label preceding the token breakdown", None),
-        item("repl.usage.prompt", "prompt", "Develop usage line unit for prompt tokens", None),
-        item("repl.usage.completion", "completion", "Develop usage line unit for completion tokens", None),
-        item("repl.usage.reasoning", "reasoning", "Develop usage line unit for reasoning tokens", None),
-        item("repl.usage.cached", "cached", "Develop usage line unit for cached tokens", None),
-        item("repl.thinking", "Thinking...", "Develop reasoning block title while reasoning is shown", None),
-        item("repl.thinking_streaming", "Thinking (streaming)...", "Develop reasoning block title while reasoning streams", None),
-        item("repl.thinking_hidden", "Thinking (hidden)", "Develop reasoning block title while reasoning is folded", None),
-        item("repl.thinking_lines", "({} lines)", "Develop reasoning block line counter appended while reasoning streams", None),
-        item("repl.thinking_truncated", "({} earlier lines dropped)", "Develop reasoning block marker stating how many earliest reasoning lines fell out of the bounded transcript window", None),
+        item("repl.proposed_edits", "Proposed Edits", "REPL header label for the staged file edits list", None),
+        item("repl.validation_error", "Validation Error:", "REPL label prefixing a failed file validation message", None),
+        item("repl.usage.tokens", "Tokens", "REPL usage line label preceding the token breakdown", None),
+        item("repl.usage.prompt", "prompt", "REPL usage line unit for prompt tokens", None),
+        item("repl.usage.completion", "completion", "REPL usage line unit for completion tokens", None),
+        item("repl.usage.reasoning", "reasoning", "REPL usage line unit for reasoning tokens", None),
+        item("repl.usage.cached", "cached", "REPL usage line unit for cached tokens", None),
+        item("repl.thinking", "Thinking...", "REPL reasoning block title while reasoning is shown", None),
+        item("repl.thinking_streaming", "Thinking (streaming)...", "REPL reasoning block title while reasoning streams", None),
+        item("repl.thinking_hidden", "Thinking (hidden)", "REPL reasoning block title while reasoning is folded", None),
+        item("repl.thinking_lines", "({} lines)", "REPL reasoning block line counter appended while reasoning streams", None),
+        item("repl.thinking_truncated", "({} earlier lines dropped)", "REPL reasoning block marker stating how many earliest reasoning lines fell out of the bounded transcript window", None),
         item("plans.concept_title", "Concept", "Plans section title for architectural concept items", None),
         item("plans.impl_title", "Implementation", "Plans section title for implementation items", None),
         item("review.skip_reason_label", "Skip reason:", "Review detail label for a skipped finding rationale", None),
@@ -1623,9 +1654,9 @@ pub fn canonical_catalog() -> Vec<LocaleCatalogItem> {
         item("context.info.user_item", "User file: {} {}, ~{} tokens", "Context info line for a selected User file", None),
         item("context.info.auto_item", "Auto-discovered file: {} {}, ~{} tokens", "Context info line for a selected Auto file", None),
         item(
-            "context.info.refs_item",
-            "Reference document: {} (read-only, ~{} tokens)",
-            "Context info line for a selected Refs document",
+            "context.info.outer_docs_item",
+            "External document: {} (read-only, ~{} tokens)",
+            "Context info line for a selected OuterDocs document",
             None,
         ),
 
@@ -1641,29 +1672,35 @@ pub fn canonical_catalog() -> Vec<LocaleCatalogItem> {
         item("review.recommendations_label", "Recommendations:", "Review detail label for a finding's remediation strategy", None),
 
         // ------------------------------------------------------------------
-        // Develop response and staged-edit surfaces (views/repl/render).
+        // REPL response and staged-edit surfaces (views/repl/render).
         // ------------------------------------------------------------------
-        item("repl.error_label", "Error: ", "Develop label prefixing a failed turn error message", None),
-        item("repl.toolchain_badge_running", " [{}] TOOLCHAIN ", "Develop badge naming the running verification command", None),
-        item("repl.toolchain_running", "Running `{}`...", "Develop status naming the running verification command", None),
-        item("repl.toolchain_badge_passed", " [TOOLCHAIN: OK] ", "Develop badge after the verification command passes", None),
-        item("repl.toolchain_passed", "`{}` passed", "Develop status naming the passed verification command", None),
-        item("repl.toolchain_badge_failed", " [TOOLCHAIN: FAILED] ", "Develop badge after the verification command fails", None),
-        item("repl.toolchain_failed", "`{}` failed", "Develop status naming the failed verification command", None),
-        item("repl.edits_badge_committed", " [COMMITTED: {}] ", "Develop badge naming the commit that recorded the edits", None),
-        item("repl.edits_badge_applied", " [APPLIED] ", "Develop badge after edits are applied without a commit", None),
-        item("repl.edits_badge_rejected", " [REJECTED] ", "Develop badge after edits fail verification", None),
-        item("repl.edits_badge_modifying", " [{}] Modifying ", "Develop badge while edits stream into staging", None),
-        item("repl.edits_files_progress", "({}/{} files)", "Develop label counting validated files of the staged edit set", None),
-        item("repl.edits_summary_label", "Summary: ", "Develop label prefixing the recorded commit summary", None),
-        item("repl.edits_retry_label", "(Retrying {})", "Develop label counting the retry attempt of a failed file", None),
-        item("repl.edits_retry_healing", "compiler rejected edits, generating fixes", "Develop retry reason shown on a staged file returned to the Retrying state while the verification healing loop regenerates its patch", None),
-        item("repl.hunk_renamed", "renamed", "Develop label describing a moved file", None),
-        item("repl.hunk_rewritten", "rewritten", "Develop label describing an overwritten file", None),
-        item("repl.hunk_deleted", "deleted", "Develop label describing a deleted file", None),
-        item("repl.hunk_line_count", "{} line(s)", "Develop label counting the lines of a created file", None),
-        item("repl.hunk_count", "{} hunk(s)", "Develop label counting the patches applied to a file", None),
-        item("repl.edit_failed_fallback", "Edit failed on the server", "Develop fallback error recorded on a staged file when the daemon omits its own failure reason", None),
+        item("repl.error_label", "Error: ", "REPL label prefixing a failed turn error message", None),
+        item("repl.toolchain_badge_running", " [{}] TOOLCHAIN ", "REPL badge naming the running verification command", None),
+        item("repl.toolchain_running", "Running `{}`...", "REPL status naming the running verification command", None),
+        item("repl.toolchain_badge_passed", " [TOOLCHAIN: OK] ", "REPL badge after the verification command passes", None),
+        item("repl.toolchain_passed", "`{}` passed", "REPL status naming the passed verification command", None),
+        item("repl.toolchain_badge_failed", " [TOOLCHAIN: FAILED] ", "REPL badge after the verification command fails", None),
+        item("repl.toolchain_failed", "`{}` failed", "REPL status naming the failed verification command", None),
+        item("repl.edits_badge_committed", " [COMMITTED: {}] ", "REPL badge naming the commit that recorded the edits", None),
+        item("repl.edits_badge_applied", " [APPLIED] ", "REPL badge after edits are applied without a commit", None),
+        item("repl.edits_badge_rejected", " [REJECTED] ", "REPL badge after edits fail verification", None),
+        item("repl.edits_badge_modifying", " [{}] Modifying ", "REPL badge while edits stream into staging", None),
+        item("repl.edits_files_progress", "({}/{} files)", "REPL label counting validated files of the staged edit set", None),
+        item("repl.edits_summary_label", "Summary: ", "REPL label prefixing the recorded commit summary", None),
+        item("repl.edits_retry_label", "(Retrying {})", "REPL label counting the retry attempt of a failed file", None),
+        item(
+            "repl.edits_retry_streaming",
+            "Retrying {}/{}: {}",
+            "REPL retry detail of a staged file while the patch retry regenerates it: the first two placeholders receive the attempt and the maximum attempts, the third the rejection reason reported by the daemon",
+            None,
+        ),
+        item("repl.edits_retry_healing", "compiler rejected edits, generating fixes", "REPL retry reason shown on a staged file returned to the Retrying state while the verification healing loop regenerates its patch", None),
+        item("repl.hunk_renamed", "renamed", "REPL label describing a moved file", None),
+        item("repl.hunk_rewritten", "rewritten", "REPL label describing an overwritten file", None),
+        item("repl.hunk_deleted", "deleted", "REPL label describing a deleted file", None),
+        item("repl.hunk_line_count", "{} line(s)", "REPL label counting the lines of a created file", None),
+        item("repl.hunk_count", "{} hunk(s)", "REPL label counting the patches applied to a file", None),
+        item("repl.edit_failed_fallback", "Edit failed on the server", "REPL fallback error recorded on a staged file when the daemon omits its own failure reason", None),
         // ------------------------------------------------------------------
         // History record badges and body labels (views/history.rs).
         // ------------------------------------------------------------------
@@ -1684,8 +1721,10 @@ pub fn canonical_catalog() -> Vec<LocaleCatalogItem> {
         item("plans.concept_item_count", "{} item(s)", "Plans concept section header counting concept items", None),
         item("plans.file_count", "{} file(s)", "Tree badge counting target files of a leaf step", None),
         item("plans.ref_count", "{} ref(s)", "Tree badge counting reference files of a leaf step", None),
+        item("plans.docs_count", "{} doc(s)", "Tree badge counting a step's external documents", None),
+        item("plans.docs_prefix", "docs:", "Plans tree label prefixing the external documents of a step", None),
+        item("plans.blocked_prefix", "blocked:", "Plans tree label prefixing the semantic blocker reason of a blocked step", None),
         item("plans.concept_prefix", "concept: ", "Plans tree label prefixing concept references of a step", None),
-        item("plans.blocked_prefix", "blocked:", "Plans tree label prefixing the reason a step was blocked", None),
 
         // ------------------------------------------------------------------
         // Review info strip and tree-renderer labels (views/review).
@@ -1775,7 +1814,7 @@ mod tests {
         assert!(keys.contains("footer.stopping"));
         assert!(keys.contains("footer.retrying"));
         assert!(keys.contains("footer.retrying_cancel"));
-        assert!(keys.contains("phase.discovery"));
+        assert!(keys.contains("phase.research"));
         assert!(keys.contains("phase.healing"));
 
         // Modal headings and buttons.
@@ -1818,7 +1857,7 @@ mod tests {
         assert!(keys.contains("cmd.diff_inspector.next_file"));
         assert!(keys.contains("cmd.diff_inspector.toggle_focus"));
 
-        // The universal work marker of the Develop viewport (c-3, c-4).
+        // The universal work marker of the REPL viewport (c-3, c-4).
         assert!(keys.contains("repl.work.badge_plan"));
         assert!(keys.contains("repl.work.badge_review"));
         assert!(keys.contains("repl.work.badge_review_group"));
@@ -1933,7 +1972,7 @@ mod tests {
         ];
 
         let forbidden: &[&str] = &[
-            // Develop toolchain, edit badges, and staged-file labels.
+            // REPL toolchain, edit badges, and staged-file labels.
             "Error: ",
             " [{}] TOOLCHAIN ",
             "[TOOLCHAIN: OK]",
@@ -2056,6 +2095,7 @@ mod tests {
             "\"Plan\"",
             "\"Review\"",
             "Edit failed on the server",
+            "{}/{} retrying: ",
             "tauqe.toml created successfully",
             "OpenRouter API key saved successfully",
             "Configuration reloaded. All checks passed",

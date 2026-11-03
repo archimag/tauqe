@@ -51,8 +51,8 @@ pub async fn handle_context_add(req: Request, state: &Arc<AppState>) -> Response
     };
 
     // Honor the requested layer instead of always defaulting to the User layer.
-    // The Pinned layer stays configuration-only and the Refs layer is owned by
-    // the external-reference registry, so both are refused here.
+    // The Pinned layer stays configuration-only and the OuterDocs layer is
+    // owned by the external documentation registry, so both are refused here.
     let layer = params.layer.unwrap_or(ContextLayer::User);
     if layer == ContextLayer::Pinned {
         return Response::err(
@@ -61,11 +61,11 @@ pub async fn handle_context_add(req: Request, state: &Arc<AppState>) -> Response
             "Pinned files are managed by project configuration and cannot be added manually",
         );
     }
-    if layer == ContextLayer::Refs {
+    if layer == ContextLayer::OuterDocs {
         return Response::err(
             req.id,
             errors::INVALID_PARAMS,
-            "The Refs layer is registry-managed and cannot be added manually",
+            "The OuterDocs layer is registry-managed and cannot be added manually",
         );
     }
 
@@ -112,11 +112,11 @@ pub async fn handle_context_add_pattern(req: Request, state: &Arc<AppState>) -> 
             }
         };
 
-    // Read the file token budget before taking the context write lock so the
+    // Read the aggregate token budget before taking the context write lock so the
     // two locks are never held at the same time.
-    let files_token_budget = {
+    let token_budget = {
         let guard = state.config.lock().await;
-        guard.config.context.files_token_budget
+        guard.config.context.token_budget
     };
 
     let repo_root = state.repo_root().await;
@@ -134,7 +134,7 @@ pub async fn handle_context_add_pattern(req: Request, state: &Arc<AppState>) -> 
             &params.pattern,
             params.access,
             &available_files,
-            files_token_budget,
+            token_budget,
         )
         .map(|outcome| {
             let state = ctx.get_state();
@@ -281,11 +281,11 @@ pub async fn handle_context_clear(req: Request, state: &Arc<AppState>) -> Respon
 
     // Clearing recomputes hierarchical pinned files, which stats the disk, so it
     // runs on the blocking pool like every other context mutation. Clearing the
-    // Auto layer, the Refs layer, or the whole context really shrinks the stable
-    // prompt prefix, so those paths go through the shared `AppState` facade,
-    // which rotates the dialogue session exactly when files were removed. A
-    // user-layer clear leaves the Auto layer intact, so it keeps the warm
-    // session and stays a plain context mutation.
+    // Auto layer, the OuterDocs layer, or the whole context really shrinks the
+    // stable prompt prefix, so those paths go through the shared `AppState`
+    // facade, which rotates the dialogue session exactly when files were
+    // removed. A user-layer clear leaves the Auto layer intact, so it keeps the
+    // warm session and stays a plain context mutation.
     let cleared = match params.layer {
         Some(ContextLayer::Auto) => state.clear_auto_context().await,
         Some(ContextLayer::User) => {
@@ -295,9 +295,9 @@ pub async fn handle_context_clear(req: Request, state: &Arc<AppState>) -> Respon
             })
             .await
         }
-        // Reference documents form a persistent layer of their own, so clearing
+        // External documents form a persistent layer of their own, so clearing
         // it drops exactly that layer and leaves the other three intact.
-        Some(ContextLayer::Refs) => state.clear_refs_context().await,
+        Some(ContextLayer::OuterDocs) => state.clear_outer_docs_context().await,
         // The Pinned layer is refused above, so nothing else remains to clear.
         _ => state.clear_all_context().await,
     };
@@ -786,10 +786,10 @@ mod tests {
         );
     }
     #[tokio::test]
-    async fn test_handle_context_add_rejects_the_refs_layer() {
+    async fn test_handle_context_add_rejects_the_outer_docs_layer() {
         let dir = TestDir::new();
         let (state, _rx) = test_state(&dir);
-        std::fs::write(dir.path().join("ref.md"), "# Reference\n").unwrap();
+        std::fs::write(dir.path().join("ref.md"), "# External\n").unwrap();
 
         let req = Request {
             id: RequestId::Number(1),
@@ -797,7 +797,7 @@ mod tests {
             params: serde_json::to_value(ContextAddParams {
                 path: "ref.md".to_string(),
                 access: ContextAccess::ReadOnly,
-                layer: Some(ContextLayer::Refs),
+                layer: Some(ContextLayer::OuterDocs),
             })
             .ok(),
         };
@@ -806,22 +806,22 @@ mod tests {
         assert_eq!(res.error.unwrap().code, errors::INVALID_PARAMS);
         assert!(
             !state.context.read().await.contains("ref.md").unwrap(),
-            "the registry owns the Refs layer"
+            "the registry owns the OuterDocs layer"
         );
     }
 
     #[tokio::test]
-    async fn test_handle_context_clear_drops_only_the_refs_layer() {
+    async fn test_handle_context_clear_drops_only_the_outer_docs_layer() {
         let dir = TestDir::new();
         let (state, mut rx) = test_state(&dir);
-        std::fs::write(dir.path().join("ref.md"), "# Reference snapshot\n").unwrap();
+        std::fs::write(dir.path().join("ref.md"), "# External snapshot\n").unwrap();
         std::fs::write(dir.path().join("user.rs"), "fn user() {}\n").unwrap();
 
         state
             .context
             .write()
             .await
-            .add_refs_file("ref.md", 10_000)
+            .add_outer_docs_file("ref.md")
             .unwrap();
         state
             .context
@@ -835,7 +835,7 @@ mod tests {
             id: RequestId::Number(1),
             method: methods::CONTEXT_CLEAR.to_string(),
             params: serde_json::to_value(ContextClearParams {
-                layer: Some(ContextLayer::Refs),
+                layer: Some(ContextLayer::OuterDocs),
             })
             .ok(),
         };
@@ -848,17 +848,17 @@ mod tests {
             cleared
                 .items
                 .iter()
-                .all(|item| item.layer != ContextLayer::Refs),
-            "the Refs layer must be empty"
+                .all(|item| item.layer != ContextLayer::OuterDocs),
+            "the OuterDocs layer must be empty"
         );
         assert!(
             cleared.items.iter().any(|item| item.path == "user.rs"),
-            "clearing references must leave the other layers intact"
+            "clearing external documents must leave the other layers intact"
         );
         assert_ne!(
             warm_session,
             state.session_uuid().await,
-            "removing reference documents must rotate the provider session"
+            "removing external documents must rotate the provider session"
         );
 
         let evt = rx.try_recv().expect("event received");

@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use crate::edits::anchor::decode_anchor;
-use crate::edits::fuzzy::scan_lines;
+use crate::edits::fuzzy::{scan_lines, LineSpan};
 use crate::edits::staging::AnchorEdit;
 use crate::providers::StreamEvent;
 
@@ -69,6 +69,184 @@ pub(crate) use crate::edits::protocol::utils::normalize_content as normalize_hun
 /// not deliver.
 pub(crate) const TRUNCATED_EDIT_DIAGNOSTIC: &str =
     "edit block truncated before its closing tag: the response ended inside the edit";
+/// Real line coordinates of one streamed hunk.
+///
+/// A unified diff names the lines a hunk covers on both sides of the change —
+/// `@@ -old_start,old_lines +new_start,new_lines @@ hint` — so a diff surface
+/// prints real line numbers instead of counting the rows of its own rendering.
+/// A start of `0` states that the position is unknown, and a count is only
+/// meaningful beside a known start.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct HunkCoordinates {
+    /// One-based first line of the hunk in the file before the change.
+    pub(crate) old_start: usize,
+    /// Number of source lines the hunk covers.
+    pub(crate) old_lines: usize,
+    /// One-based first line of the hunk in the file after the change.
+    pub(crate) new_start: usize,
+    /// Number of result lines the hunk covers.
+    pub(crate) new_lines: usize,
+    /// Section the hunk belongs to, as a diff header names it after its ranges.
+    pub(crate) context_hint: Option<String>,
+}
+
+/// Longest section hint a streamed hunk carries, in characters.
+const MAX_CONTEXT_HINT_CHARS: usize = 120;
+
+impl HunkCoordinates {
+    /// Coordinates of a payload that replaces a whole file.
+    ///
+    /// A created file has nothing to replace, so its old side stays absent. An
+    /// overwritten file is replaced from its first line to its last one.
+    pub(crate) fn whole_file(old_text: Option<&str>, new_text: &str) -> Self {
+        let (old_start, old_lines) = match old_text {
+            Some(text) if !text.is_empty() => (1, line_count(text)),
+            _ => (0, 0),
+        };
+        Self {
+            old_start,
+            old_lines,
+            new_start: 1,
+            new_lines: line_count(new_text),
+            context_hint: None,
+        }
+    }
+
+    /// Coordinates of a located search/replace attempt.
+    ///
+    /// The coordinates are resolved against the content the patch was applied
+    /// to, because that is the document the old side of the hunk describes. A
+    /// patch the fuzzy matcher accepted without an exact match is located by its
+    /// first line instead, and a patch whose position cannot be named reports
+    /// unknown coordinates rather than an invented line.
+    pub(crate) fn replacement(current: &str, old_text: &str, new_text: &str) -> Self {
+        let lines = scan_lines(current);
+        let Some(offset) = locate_replacement(current, &lines, old_text) else {
+            return Self::unknown();
+        };
+        let start = line_index_at(&lines, offset);
+        Self {
+            old_start: start,
+            old_lines: line_count(old_text),
+            new_start: start,
+            new_lines: line_count(new_text),
+            context_hint: section_hint(current, &lines, start.saturating_sub(1)),
+        }
+    }
+
+    /// Coordinates of one anchored range resolved against the file snapshot.
+    ///
+    /// The anchors name the lines the context block rendered, so the range keeps
+    /// the indices it decoded to on the old side, while the new side counts the
+    /// lines the replacement introduces from the very same line.
+    pub(crate) fn anchored(
+        original: &str,
+        lines: &[LineSpan],
+        first: usize,
+        last: usize,
+        replacement: &str,
+    ) -> Self {
+        Self {
+            old_start: first + 1,
+            old_lines: last.saturating_sub(first) + 1,
+            new_start: first + 1,
+            new_lines: line_count(replacement),
+            context_hint: section_hint(original, lines, first),
+        }
+    }
+
+    /// Coordinates a staging simulator could not resolve.
+    pub(crate) fn unknown() -> Self {
+        Self {
+            old_start: 0,
+            old_lines: 0,
+            new_start: 0,
+            new_lines: 0,
+            context_hint: None,
+        }
+    }
+}
+
+/// One anchored range resolved into the preview a streaming consumer reports.
+#[derive(Debug)]
+pub(crate) struct AnchorPreview {
+    /// Snapshot text of the addressed range.
+    pub(crate) replaced: String,
+    /// Coordinates of the range on both sides of the change.
+    pub(crate) coordinates: HunkCoordinates,
+}
+
+/// Builds the streamed hunk event of one applied change.
+///
+/// Every contour reports a hunk through this constructor, so the coordinates a
+/// diff surface reads always travel beside the texts they describe.
+pub(crate) fn hunk_event(
+    path: &str,
+    hunk_index: usize,
+    coordinates: HunkCoordinates,
+    old_text: String,
+    new_text: String,
+) -> StreamEvent {
+    StreamEvent::EditHunk {
+        path: path.to_string(),
+        hunk_index,
+        old_start: coordinates.old_start,
+        old_lines: coordinates.old_lines,
+        new_start: coordinates.new_start,
+        new_lines: coordinates.new_lines,
+        context_hint: coordinates.context_hint,
+        old_text,
+        new_text,
+    }
+}
+
+/// Number of lines a text occupies, as a diff counts the lines of a hunk.
+fn line_count(text: &str) -> usize {
+    scan_lines(text).len()
+}
+
+/// One-based index of the line that holds `offset`.
+fn line_index_at(lines: &[LineSpan], offset: usize) -> usize {
+    lines.iter().take_while(|span| span.start < offset).count() + 1
+}
+
+/// Locates the first byte a search/replace pattern addresses.
+///
+/// An exact match is the offset the pattern starts at. A patch the fuzzy matcher
+/// accepted by trailing whitespace or indentation has no exact match, so its
+/// first non-empty line names the place instead: the first line of the file whose
+/// trimmed content equals that line is where the matched block begins.
+fn locate_replacement(current: &str, lines: &[LineSpan], old_text: &str) -> Option<usize> {
+    if let Some(offset) = current.find(old_text) {
+        return Some(offset);
+    }
+    let pattern = scan_lines(old_text);
+    let first = pattern.iter().find(|span| {
+        old_text
+            .get(span.start..span.content_end)
+            .is_some_and(|line| !line.trim().is_empty())
+    })?;
+    let needle = old_text.get(first.start..first.content_end)?.trim();
+    lines.iter().find_map(|span| {
+        let line = current.get(span.start..span.content_end)?;
+        (line.trim() == needle).then_some(span.start)
+    })
+}
+
+/// Nearest non-empty line above a hunk, as a diff header renders its section.
+///
+/// The hint is read from the document itself, so it names the construct the
+/// change sits in without asking the model to describe it.
+fn section_hint(text: &str, lines: &[LineSpan], before_line: usize) -> Option<String> {
+    lines.iter().take(before_line).rev().find_map(|span| {
+        let line = text.get(span.start..span.content_end)?.trim();
+        if line.is_empty() {
+            return None;
+        }
+        Some(line.chars().take(MAX_CONTEXT_HINT_CHARS).collect())
+    })
+}
+
 /// Shared in-memory staging simulator for the streaming edit filters.
 ///
 /// Both the XML and JSON filters must report edit status exactly as the final
@@ -130,7 +308,6 @@ impl StagingSimulator {
             .insert(path.to_string(), content.clone());
         Ok(content)
     }
-
     /// Applies one batch of anchored ranges against the original snapshot.
     ///
     /// Every anchor of a file names a line the context block rendered, so the
@@ -138,9 +315,10 @@ impl StagingSimulator {
     /// authoritative staging primitive: an anchor outside the snapshot, a
     /// reversed range, and two overlapping ranges are rejected with the very
     /// error the disk application would produce, and a rejected batch leaves the
-    /// staged contents untouched. The returned texts are the snapshot content of
-    /// the addressed ranges in batch order, so the live preview can show the
-    /// replacement instead of a bare insertion.
+    /// staged contents untouched. The returned previews describe the addressed
+    /// ranges in batch order — the snapshot text the live preview shows as
+    /// removed, together with the coordinates the hunk header states — so the
+    /// stream reports a real replacement at a real place.
     ///
     /// A file's anchored ranges therefore arrive as one batch: the staged
     /// content becomes the applied result rather than an accumulation of
@@ -149,19 +327,20 @@ impl StagingSimulator {
         &mut self,
         path: &str,
         edits: &[AnchorEdit<'_>],
-    ) -> Result<Vec<String>, String> {
+    ) -> Result<Vec<AnchorPreview>, String> {
         if edits.is_empty() {
             return Ok(Vec::new());
         }
         let original = self.original_content(path)?;
         let updated = crate::edits::apply_anchor_edits(&original, edits, path)
             .map_err(|err| err.to_string())?;
-        let mut replaced = Vec::with_capacity(edits.len());
+        let lines = scan_lines(&original);
+        let mut previews = Vec::with_capacity(edits.len());
         for edit in edits {
-            replaced.push(original_range_text(&original, path, edit.start, edit.end)?);
+            previews.push(anchor_preview(&original, &lines, path, edit)?);
         }
         self.staged_contents.insert(path.to_string(), updated);
-        Ok(replaced)
+        Ok(previews)
     }
 
     /// Returns the current content from staged memory or, failing that, from disk.
@@ -178,12 +357,17 @@ impl StagingSimulator {
     /// [`crate::edits::EditError::ReplaceWithoutRange`], exactly as the staging
     /// engine refuses it, so the preview explains the defect in the vocabulary
     /// of the active patch strategy instead of reporting a search/replace miss.
+    ///
+    /// The coordinates are resolved against the content the patch was applied
+    /// to, because that is the document the old side of the hunk describes, and
+    /// they travel back to the caller so the streamed hunk names the lines it
+    /// really changes.
     pub(crate) fn apply_hunk(
         &mut self,
         path: &str,
         old_text: &str,
         new_text: &str,
-    ) -> Result<(), String> {
+    ) -> Result<HunkCoordinates, String> {
         if old_text.trim().is_empty() {
             let rejection = crate::edits::EditError::ReplaceWithoutRange {
                 path: path.to_string(),
@@ -193,8 +377,9 @@ impl StagingSimulator {
         let current_content = self.current_content(path)?;
         let updated = crate::edits::apply_replace(&current_content, old_text, new_text, path)
             .map_err(|err| err.to_string())?;
+        let coordinates = HunkCoordinates::replacement(&current_content, old_text, new_text);
         self.staged_contents.insert(path.to_string(), updated);
-        Ok(())
+        Ok(coordinates)
     }
 
     /// Registers a move by relocating staged or on-disk content to the new path.
@@ -244,33 +429,63 @@ impl OwnedAnchor {
     }
 }
 
-/// Slices the text one anchored range held in the original snapshot.
+/// Resolves one anchored range into the preview a streaming consumer reports.
 ///
 /// The batch reaches this helper only after the authoritative staging primitive
 /// accepted every range, so the anchors decode and the addressed lines exist.
 /// The helper therefore describes the replacement instead of validating it: it
-/// names the snapshot text the preview shows as replaced.
-fn original_range_text(
+/// names the snapshot text the preview shows as removed together with the
+/// coordinates the hunk header states, so the stream places the change at the
+/// lines the context block rendered.
+fn anchor_preview(
     original: &str,
+    lines: &[LineSpan],
     path: &str,
-    start: &str,
-    end: &str,
+    edit: &AnchorEdit<'_>,
+) -> Result<AnchorPreview, String> {
+    let first = decode_anchor(path, edit.start.trim()).map_err(|err| err.to_string())?;
+    let last = decode_anchor(path, edit.end.trim()).map_err(|err| err.to_string())?;
+    let replaced = addressed_text(original, lines, path, edit, first, last)?;
+    let coordinates = HunkCoordinates::anchored(original, lines, first, last, edit.content);
+    Ok(AnchorPreview {
+        replaced,
+        coordinates,
+    })
+}
+
+/// Slices the text one anchored range held in the decoded snapshot lines.
+fn addressed_text(
+    original: &str,
+    lines: &[LineSpan],
+    path: &str,
+    edit: &AnchorEdit<'_>,
+    first: usize,
+    last: usize,
 ) -> Result<String, String> {
-    let lines = scan_lines(original);
-    let first = decode_anchor(path, start.trim()).map_err(|err| err.to_string())?;
-    let last = decode_anchor(path, end.trim()).map_err(|err| err.to_string())?;
-    let first_start = lines
-        .get(first)
-        .map(|span| span.start)
-        .ok_or_else(|| format!("In file '{path}': anchor '{start}' names no line of the file"))?;
+    let first_start = lines.get(first).map(|span| span.start).ok_or_else(|| {
+        format!(
+            "In file '{path}': anchor '{}' names no line of the file",
+            edit.start
+        )
+    })?;
     let last_end = lines
         .get(last)
         .map(|span| span.content_end)
-        .ok_or_else(|| format!("In file '{path}': anchor '{end}' names no line of the file"))?;
+        .ok_or_else(|| {
+            format!(
+                "In file '{path}': anchor '{}' names no line of the file",
+                edit.end
+            )
+        })?;
     original
         .get(first_start..last_end)
         .map(str::to_string)
-        .ok_or_else(|| format!("In file '{path}': the range '{start}'..'{end}' addresses no text"))
+        .ok_or_else(|| {
+            format!(
+                "In file '{path}': the range '{}'..'{}' addresses no text",
+                edit.start, edit.end
+            )
+        })
 }
 
 #[cfg(test)]
@@ -307,11 +522,11 @@ mod tests {
             simulator.current_content("source.txt").unwrap(),
             "hello world"
         );
+        simulator
+            .apply_hunk("source.txt", "hello", "goodbye")
+            .expect("the replacement applies");
         assert_eq!(
-            simulator
-                .apply_hunk("source.txt", "hello", "goodbye")
-                .map(|()| simulator.current_content("source.txt").unwrap())
-                .unwrap(),
+            simulator.current_content("source.txt").unwrap(),
             "goodbye world"
         );
 
@@ -360,14 +575,25 @@ mod tests {
         // in.
         let upper = Anchored::new("source.txt", 0, 1, "ALPHA\nBETA\n");
         let lower = Anchored::new("source.txt", 2, 2, "GAMMA\n");
-        let replaced = simulator
+        let previews = simulator
             .apply_anchor_batch("source.txt", &[upper.as_edit(), lower.as_edit()])
             .expect("the batch applies");
 
-        assert_eq!(
-            replaced,
-            vec!["alpha\nbeta".to_string(), "gamma".to_string()]
-        );
+        let replaced: Vec<&str> = previews
+            .iter()
+            .map(|preview| preview.replaced.as_str())
+            .collect();
+        assert_eq!(replaced, vec!["alpha\nbeta", "gamma"]);
+
+        // The anchors name the rendered lines, so the preview states the real
+        // coordinates of both ranges instead of counting its own rows.
+        assert_eq!(previews[0].coordinates.old_start, 1);
+        assert_eq!(previews[0].coordinates.old_lines, 2);
+        assert_eq!(previews[0].coordinates.new_start, 1);
+        assert_eq!(previews[0].coordinates.new_lines, 2);
+        assert_eq!(previews[1].coordinates.old_start, 3);
+        assert_eq!(previews[1].coordinates.old_lines, 1);
+        assert_eq!(previews[1].coordinates.new_lines, 1);
         assert_eq!(
             simulator.current_content("source.txt").unwrap(),
             "ALPHA\nBETA\nGAMMA\n"
@@ -425,10 +651,12 @@ mod tests {
         );
 
         let second = Anchored::new("source.txt", 1, 1, "BETA\n");
-        let replaced = simulator
+        let previews = simulator
             .apply_anchor_batch("source.txt", &[second.as_edit()])
             .expect("the seeded snapshot has the addressed line");
-        assert_eq!(replaced, vec!["beta".to_string()]);
+        assert_eq!(previews.len(), 1);
+        assert_eq!(previews[0].replaced, "beta");
+        assert_eq!(previews[0].coordinates.old_start, 2);
 
         // The snapshot stays the address space of every later batch of the file.
         let third = Anchored::new("source.txt", 2, 2, "GAMMA\n");
@@ -458,6 +686,57 @@ mod tests {
             "alpha\nbeta\n",
             "a rejected hunk must not reach the staged contents"
         );
+
+        std::fs::remove_dir_all(&repo_root).ok();
+    }
+    #[test]
+    fn a_replacement_reports_the_lines_it_addresses() {
+        let repo_root = unique_test_dir();
+        std::fs::write(repo_root.join("source.txt"), "alpha\nbeta\ngamma\n")
+            .expect("write source file");
+        let mut simulator = StagingSimulator::new(HashMap::new(), repo_root.clone());
+
+        let coordinates = simulator
+            .apply_hunk("source.txt", "beta\n", "BETA\nBETA2\n")
+            .expect("the replacement applies");
+
+        // The match sits on the second line and yields two lines, so the hunk
+        // names exactly those coordinates on both sides of the change.
+        assert_eq!(coordinates.old_start, 2);
+        assert_eq!(coordinates.old_lines, 1);
+        assert_eq!(coordinates.new_start, 2);
+        assert_eq!(coordinates.new_lines, 2);
+        assert_eq!(coordinates.context_hint.as_deref(), Some("alpha"));
+
+        std::fs::remove_dir_all(&repo_root).ok();
+    }
+
+    #[test]
+    fn an_indentation_shifted_replacement_reports_the_lines_it_addresses() {
+        let repo_root = unique_test_dir();
+        std::fs::write(
+            repo_root.join("source.txt"),
+            "impl Test {\n        fn run() {\n            let a = 1;\n        }\n}\n",
+        )
+        .expect("write source file");
+        let mut simulator = StagingSimulator::new(HashMap::new(), repo_root.clone());
+
+        // The authored block carries the indentation of its own level, so the
+        // exact match misses and the indentation-shifted match locates the
+        // change by its first line instead.
+        let coordinates = simulator
+            .apply_hunk(
+                "source.txt",
+                "fn run() {\n    let a = 1;\n}\n",
+                "fn run() {\n    let a = 2;\n}\n",
+            )
+            .expect("the indentation-shifted replacement applies");
+
+        assert_eq!(coordinates.old_start, 2);
+        assert_eq!(coordinates.old_lines, 3);
+        assert_eq!(coordinates.new_start, 2);
+        assert_eq!(coordinates.new_lines, 3);
+        assert_eq!(coordinates.context_hint.as_deref(), Some("impl Test {"));
 
         std::fs::remove_dir_all(&repo_root).ok();
     }

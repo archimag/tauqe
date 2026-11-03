@@ -7,7 +7,6 @@
 //! evolve independently.
 //!
 //! [`SingleExecution`] runs exactly one bounded turn by composing the
-//! [`SingleExecution`] runs exactly one bounded turn by composing the
 //! single-turn workflow lifecycle: session bookkeeping, the FSM cycle, and the
 //! recording of the turn response.
 
@@ -23,16 +22,16 @@ use crate::providers::{LlmProvider, StreamEvent};
 use crate::workflow::policy::ApplyPolicy;
 
 use super::WorkflowExecutionResult;
-use crate::workflow::discovery::DiscoveryLimits;
 use crate::workflow::fsm::guard::rollback_or_log;
 use crate::workflow::fsm::{begin_session_turn, record_session_response, run_fsm_turn_body};
+use crate::workflow::research::ResearchLimits;
 
 /// Execution options and token budgets for edit workflows.
 #[derive(Debug, Clone)]
 pub struct WorkflowOptions {
     pub max_retries: usize,
-    pub max_discovery_rounds: usize,
-    pub files_token_budget: usize,
+    pub max_research_rounds: usize,
+    pub token_budget: usize,
     pub history_budget_tokens: u64,
     pub history_tail_turns: usize,
     pub repomap_token_budget: usize,
@@ -41,8 +40,8 @@ pub struct WorkflowOptions {
     /// When disabled, the prompt carries the compact directory outline instead,
     /// so the model still knows where subsystems live without a full map.
     pub include_repo_map: bool,
-    /// Operational caps the Discovery phase applies to one round.
-    pub discovery_limits: DiscoveryLimits,
+    /// Operational caps the Research phase applies to one round.
+    pub research_limits: ResearchLimits,
     /// Maximum characters of one project command stream reported back to the model.
     pub max_feedback_chars: usize,
     /// Maximum characters of a turn scratchpad block before safe truncation.
@@ -73,13 +72,13 @@ impl Default for WorkflowOptions {
     fn default() -> Self {
         Self {
             max_retries: 3,
-            max_discovery_rounds: crate::config::DEFAULT_MAX_DISCOVERY_ROUNDS,
-            files_token_budget: crate::config::DEFAULT_FILES_TOKEN_BUDGET,
+            max_research_rounds: crate::config::DEFAULT_MAX_RESEARCH_ROUNDS,
+            token_budget: crate::config::DEFAULT_TOKEN_BUDGET,
             history_budget_tokens: crate::history::DEFAULT_HISTORY_BUDGET_TOKENS,
             history_tail_turns: crate::history::DEFAULT_TAIL_TURNS_COUNT,
             repomap_token_budget: crate::repomap::DEFAULT_REPOMAP_TOKEN_BUDGET,
             include_repo_map: true,
-            discovery_limits: DiscoveryLimits::default(),
+            research_limits: ResearchLimits::default(),
             max_feedback_chars: crate::config::DEFAULT_MAX_FEEDBACK_CHARS,
             max_scratchpad_chars: crate::config::DEFAULT_MAX_SCRATCHPAD_CHARS,
             history_model: ModelRef::openrouter(crate::config::BUILTIN_DEFAULT_SCRIBE_MODEL),
@@ -94,16 +93,16 @@ impl Default for WorkflowOptions {
 impl WorkflowOptions {
     /// Constructs workflow options from the unified application configuration.
     pub fn from_app_config(config: &crate::config::AppConfig) -> Self {
-        let max_retries = config.develop.max_retries;
+        let max_retries = config.repl.max_retries;
         Self {
             max_retries,
-            max_discovery_rounds: config.context.max_discovery_rounds,
-            files_token_budget: config.context.files_token_budget,
+            max_research_rounds: config.context.max_research_rounds,
+            token_budget: config.context.token_budget,
             history_budget_tokens: config.history.budget_tokens,
             history_tail_turns: config.history.tail_turns,
             repomap_token_budget: config.context.repomap_token_budget,
             include_repo_map: config.context.include_repo_map,
-            discovery_limits: DiscoveryLimits::from_context_config(&config.context),
+            research_limits: ResearchLimits::from_context_config(&config.context),
             max_feedback_chars: config.context.max_feedback_chars,
             max_scratchpad_chars: config.context.max_scratchpad_chars,
             history_model: config.history_model(),
@@ -123,19 +122,13 @@ impl WorkflowOptions {
     pub fn patch_strategy(&self) -> PatchStrategy {
         self.app_config
             .as_ref()
-            .map(|config| config.develop.patch_strategy)
+            .map(|config| config.repl.patch_strategy)
             .unwrap_or_default()
     }
 
     /// Returns the prompt layout policy that composes this turn's messages.
-    /// The declared `[develop]` key of the governing project configuration
-    /// wins for every turn; without one the turn intent decides: an
-    /// interactive REPL turn and a plan discussion keep a growing session
-    /// history and share one byte-stable head, so both build the chronological
-    /// transcript, while an isolated step keeps the semantic block order.
-    /// Returns the prompt layout policy that composes this turn's messages.
     ///
-    /// The declared `[develop]` key of the governing project configuration
+    /// The declared `[repl]` key of the governing project configuration
     /// wins for every turn; without one the turn intent decides: an
     /// interactive REPL turn and a plan discussion keep a growing session
     /// history and share one byte-stable head, so both build the chronological
@@ -512,7 +505,7 @@ mod tests {
         let mut history = HistoryManager::new(repo_root.clone());
 
         let protocol = crate::prompt::xml::XmlPromptProtocol;
-        // An established plan is protected from Develop-mode mutation: only the
+        // An established plan is protected from REPL-mode mutation: only the
         // Discussion mode may modify it, so the storage engine refuses this
         // payload and its refusal must stay visible to the model and to the
         // developer.
@@ -578,7 +571,7 @@ mod tests {
             execution.plan_errors
         );
         assert!(
-            execution.plan_errors[0].contains("Develop mode"),
+            execution.plan_errors[0].contains("REPL mode"),
             "the reason must be carried on the turn result: {:?}",
             execution.plan_errors
         );
@@ -602,7 +595,7 @@ mod tests {
             messages
                 .iter()
                 .any(|message| message.contains("Plan mutation rejected")
-                    && message.contains("Develop mode")),
+                    && message.contains("REPL mode")),
             "the rejection must reach the recorded history: {messages:?}"
         );
         assert!(

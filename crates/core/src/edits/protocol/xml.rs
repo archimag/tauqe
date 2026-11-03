@@ -37,7 +37,7 @@ pub use tags::{
     strip_context_request_tags, strip_doc_request_tags, strip_error_tags, strip_plan_tags,
     strip_repo_dirs_tags, strip_repo_map_tags, strip_repo_search_tags, strip_scratchpad_tags,
     strip_skip_tags, strip_success_tags, strip_terminal_outcome_tags, strip_user_language_tags,
-    strip_verify_tags, TerminalOutcome, VerifyOnSuccess, VerifyRequest, VerifyTarget,
+    strip_verify_tags, CodeFences, TerminalOutcome, VerifyOnSuccess, VerifyRequest, VerifyTarget,
 };
 
 /// XML-based code edit protocol
@@ -90,11 +90,25 @@ impl XmlEditProtocol {
         raw_text: &str,
         editable_paths: &[String],
     ) -> Result<Vec<EditOperation>, String> {
+        self.parse_anchor_edits_with_fences(raw_text, editable_paths, &CodeFences::find(raw_text))
+    }
+
+    /// Decodes the anchored change-set vehicle against a shared fence index.
+    ///
+    /// The index describes the text alone, so a caller that decodes several tag
+    /// families over one response builds it once and threads it here instead of
+    /// rescanning the markdown code of the same text.
+    pub fn parse_anchor_edits_with_fences(
+        &self,
+        raw_text: &str,
+        editable_paths: &[String],
+        fences: &CodeFences,
+    ) -> Result<Vec<EditOperation>, String> {
         let Some(spec) = engine::tag_spec("file_edits") else {
             return Ok(Vec::new());
         };
         let mut operations = Vec::new();
-        for found in engine::iter_tags(raw_text, spec) {
+        for found in engine::iter_tags_with_fences(raw_text, spec, fences) {
             let body = found.body.unwrap_or_default();
             operations.extend(super::structured::parse_anchor_edits(body, editable_paths)?);
         }
@@ -178,16 +192,34 @@ impl XmlEditProtocol {
     }
 
     /// Parses raw model text into a `ModelResult`.
+    ///
+    /// The markdown code index of the output is built once and shared by every
+    /// reader below, so a construct quoted in a fenced example is never decoded,
+    /// never summarized, and never resolved against the editable set.
     pub fn parse_output(&self, raw_text: &str, editable_paths: &[String]) -> ModelResult {
+        self.parse_output_with_fences(raw_text, editable_paths, &CodeFences::find(raw_text))
+    }
+
+    /// Parses model text against a markdown code index the caller already built.
+    ///
+    /// A capability module that resolved the index of a response once hands it
+    /// here, so the vehicle, the summary, and the edit blocks of that response
+    /// all resolve against one fence layout instead of rescanning the buffer.
+    pub fn parse_output_with_fences(
+        &self,
+        raw_text: &str,
+        editable_paths: &[String],
+        fences: &CodeFences,
+    ) -> ModelResult {
         if !has_xml_edit_tags(raw_text) {
             return ModelResult::Answer {
                 text: strip_all_control_tags(raw_text),
             };
         }
 
-        let extracted_summary = extract_summary_from_xml(raw_text);
+        let extracted_summary = extract_summary_from_xml(raw_text, fences);
 
-        match parse_xml_edits(raw_text, editable_paths) {
+        match parse_xml_edits(raw_text, editable_paths, fences) {
             Ok(edits) => {
                 if edits.is_empty() {
                     ModelResult::Answer {
@@ -432,5 +464,83 @@ let s = "clean </edit>";
             }
             _ => panic!("Expected ModelResult::Edit, got: {:?}", res),
         }
+    }
+    #[test]
+    fn test_fenced_edit_example_is_documentation_not_a_command() {
+        let proto = XmlEditProtocol;
+        let editable = vec!["src/lib.rs".to_string()];
+
+        // The example names a path outside the context, so decoding it would fail
+        // path resolution and discard the real edit that follows.
+        let output = r#"Here is the shape of the change:
+
+```xml
+<tauqe_edits summary="Example">
+  <edit path="src/example_only.rs">
+    <search>
+old();
+    </search>
+    <replace>
+new();
+    </replace>
+  </edit>
+</tauqe_edits>
+```
+
+Applying it now:
+
+<tauqe_edits summary="Real change">
+  <edit path="src/lib.rs">
+    <search>
+pub fn old_fn() {}
+    </search>
+    <replace>
+pub fn new_fn() {}
+    </replace>
+  </edit>
+</tauqe_edits>"#;
+
+        match proto.parse_output(output, &editable) {
+            ModelResult::Edit {
+                summary,
+                edits,
+                outcome,
+                ..
+            } => {
+                assert!(outcome.error.is_none());
+                assert_eq!(summary, "Real change");
+                assert_eq!(edits.len(), 1);
+                match &edits[0] {
+                    EditOperation::Replace { path, new_text, .. } => {
+                        assert_eq!(path, "src/lib.rs");
+                        assert!(new_text.contains("pub fn new_fn() {}"));
+                    }
+                    other => panic!("expected the real replacement, got {other:?}"),
+                }
+            }
+            other => panic!("expected the real edit, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_fenced_and_inline_edit_examples_decode_nothing() {
+        let proto = XmlEditProtocol;
+        let editable = vec!["src/lib.rs".to_string()];
+
+        let fenced =
+            "Documentation:\n\n```xml\n<edits>\n<delete path=\"src/lib.rs\" />\n</edits>\n```\n";
+        assert!(!has_xml_edit_tags(fenced));
+        assert!(matches!(
+            proto.parse_output(fenced, &editable),
+            ModelResult::Answer { .. }
+        ));
+
+        // A mention inside an inline code span is documentation as well.
+        let inline = "Use `<delete path=\"src/lib.rs\" />` to retire the file.";
+        assert!(!has_xml_edit_tags(inline));
+        assert!(matches!(
+            proto.parse_output(inline, &editable),
+            ModelResult::Answer { .. }
+        ));
     }
 }

@@ -97,8 +97,8 @@ fn test_session(id: &str, items: Vec<tauqe_protocol::ReviewIssue>) -> ReviewSess
 
 fn test_config() -> tauqe_core::config::AppConfig {
     let mut config = tauqe_core::config::AppConfig::default();
-    config.develop.workflow = tauqe_protocol::WorkflowKind::Naive;
-    config.develop.protocol = tauqe_protocol::EditProtocolKind::Xml;
+    config.repl.workflow = tauqe_protocol::WorkflowKind::Naive;
+    config.repl.protocol = tauqe_protocol::EditProtocolKind::Xml;
     config.models.auto_level_up = false;
     config
 }

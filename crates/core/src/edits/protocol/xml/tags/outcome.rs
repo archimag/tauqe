@@ -6,7 +6,7 @@ use crate::edits::protocol::xml::engine::{self, XmlTagMatch, XmlTagSpec};
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TerminalOutcome {
     Success {
-        summary: Option<String>,
+        commit_message: Option<String>,
     },
     Error {
         message: String,
@@ -33,9 +33,9 @@ impl TerminalOutcome {
         matches!(self, Self::Blocked { .. })
     }
 
-    pub fn summary(&self) -> Option<&str> {
+    pub fn commit_message(&self) -> Option<&str> {
         match self {
-            Self::Success { summary } => summary.as_deref(),
+            Self::Success { commit_message } => commit_message.as_deref(),
             _ => None,
         }
     }
@@ -82,7 +82,12 @@ pub(crate) fn skip_tag_spec() -> Option<&'static XmlTagSpec> {
     engine::tag_spec("skip")
 }
 
-const SUCCESS_SUMMARY_ATTRS: &[&str] = &["summary", "note", "message"];
+/// Attributes that carry the commit message of a `<success>` tag.
+///
+/// The canonical name leads the list, while the spellings an earlier revision
+/// emitted — `summary` above all — stay accepted, so a stored transcript or a
+/// prompt cached by a client keeps decoding identically.
+const SUCCESS_COMMIT_MESSAGE_ATTRS: &[&str] = &["commit_message", "summary", "note", "message"];
 const ERROR_MESSAGE_ATTRS: &[&str] = &["message", "reason", "details", "note"];
 const BLOCKED_REASON_ATTRS: &[&str] = &["reason", "message", "violated_assumption"];
 const BLOCKED_DETAILS_ATTRS: &[&str] = &["details", "note", "suggested_action"];
@@ -138,23 +143,31 @@ fn parse_skip_match(found: &XmlTagMatch<'_>) -> String {
     }
 }
 
-/// Extracts `<success ...>` completion signal from model output if present.
-pub fn extract_success(text: &str) -> Option<Option<String>> {
+/// Extracts `<success ...>` completion signal, reusing a precomputed code index.
+pub(crate) fn extract_success_with_fences(
+    text: &str,
+    fences: &super::CodeFences,
+) -> Option<Option<String>> {
     let spec = success_tag_spec()?;
-    let mut last_summary = None;
+    let mut last_commit_message = None;
     let mut found = false;
-    for tag in engine::iter_tags(text, spec) {
-        last_summary = tag.attr_or_body(SUCCESS_SUMMARY_ATTRS);
+    for tag in engine::iter_tags_with_fences(text, spec, fences) {
+        last_commit_message = tag.attr_or_body(SUCCESS_COMMIT_MESSAGE_ATTRS);
         found = true;
     }
-    found.then_some(last_summary)
+    found.then_some(last_commit_message)
 }
 
-/// Extracts `<error ...>` blocker/failure signal from model output if present.
-pub fn extract_error(text: &str) -> Option<String> {
+/// Extracts `<success ...>` completion signal from model output if present.
+pub fn extract_success(text: &str) -> Option<Option<String>> {
+    extract_success_with_fences(text, &super::CodeFences::find(text))
+}
+
+/// Extracts `<error ...>` blocker/failure signal, reusing a precomputed code index.
+pub(crate) fn extract_error_with_fences(text: &str, fences: &super::CodeFences) -> Option<String> {
     let spec = error_tag_spec()?;
     let mut last_error = None;
-    for tag in engine::iter_tags(text, spec) {
+    for tag in engine::iter_tags_with_fences(text, spec, fences) {
         last_error = Some(
             tag.attr_or_body(ERROR_MESSAGE_ATTRS)
                 .unwrap_or_else(|| "Execution error".to_string()),
@@ -163,44 +176,66 @@ pub fn extract_error(text: &str) -> Option<String> {
     last_error
 }
 
-/// Extracts `<blocked ...>` blocker/assumption failure signal from model output if present.
-pub fn extract_blocked(text: &str) -> Option<(String, Option<String>)> {
+/// Extracts `<error ...>` blocker/failure signal from model output if present.
+pub fn extract_error(text: &str) -> Option<String> {
+    extract_error_with_fences(text, &super::CodeFences::find(text))
+}
+
+/// Extracts `<blocked ...>` blocker/assumption failure signal, reusing a
+/// precomputed code index.
+pub(crate) fn extract_blocked_with_fences(
+    text: &str,
+    fences: &super::CodeFences,
+) -> Option<(String, Option<String>)> {
     let spec = blocked_tag_spec()?;
     let mut last_blocked = None;
-    for tag in engine::iter_tags(text, spec) {
+    for tag in engine::iter_tags_with_fences(text, spec, fences) {
         last_blocked = Some(parse_blocked_match(&tag));
     }
     last_blocked
 }
 
-/// Extracts a `<skip ...>` reason from model output if present.
-pub fn extract_skip(text: &str) -> Option<String> {
+/// Extracts `<blocked ...>` blocker/assumption failure signal from model output if present.
+pub fn extract_blocked(text: &str) -> Option<(String, Option<String>)> {
+    extract_blocked_with_fences(text, &super::CodeFences::find(text))
+}
+
+/// Extracts a `<skip ...>` reason, reusing a precomputed code index.
+pub(crate) fn extract_skip_with_fences(text: &str, fences: &super::CodeFences) -> Option<String> {
     let spec = skip_tag_spec()?;
     let mut last_reason = None;
-    for tag in engine::iter_tags(text, spec) {
+    for tag in engine::iter_tags_with_fences(text, spec, fences) {
         last_reason = Some(parse_skip_match(&tag));
     }
     last_reason
 }
 
+/// Extracts a `<skip ...>` reason from model output if present.
+pub fn extract_skip(text: &str) -> Option<String> {
+    extract_skip_with_fences(text, &super::CodeFences::find(text))
+}
+
 /// Extracts the final terminal outcome (`<success>`, `<error>`, `<blocked>`, or
-/// `<skip>`) from model output.
-pub fn extract_terminal_outcome(text: &str) -> Option<TerminalOutcome> {
+/// `<skip>`) from model output, reusing a precomputed code index.
+pub(crate) fn extract_terminal_outcome_with_fences(
+    text: &str,
+    fences: &super::CodeFences,
+) -> Option<TerminalOutcome> {
     let mut outcomes: Vec<(usize, TerminalOutcome)> = Vec::new();
 
     if let Some(spec) = success_tag_spec() {
-        for tag in engine::iter_tags(text, spec) {
+        for tag in engine::iter_tags_with_fences(text, spec, fences) {
             outcomes.push((
                 tag.start,
                 TerminalOutcome::Success {
-                    summary: tag.attr_or_body(SUCCESS_SUMMARY_ATTRS),
+                    commit_message: tag.attr_or_body(SUCCESS_COMMIT_MESSAGE_ATTRS),
                 },
             ));
         }
     }
 
     if let Some(spec) = error_tag_spec() {
-        for tag in engine::iter_tags(text, spec) {
+        for tag in engine::iter_tags_with_fences(text, spec, fences) {
             outcomes.push((
                 tag.start,
                 TerminalOutcome::Error {
@@ -213,14 +248,14 @@ pub fn extract_terminal_outcome(text: &str) -> Option<TerminalOutcome> {
     }
 
     if let Some(spec) = blocked_tag_spec() {
-        for tag in engine::iter_tags(text, spec) {
+        for tag in engine::iter_tags_with_fences(text, spec, fences) {
             let (reason, details) = parse_blocked_match(&tag);
             outcomes.push((tag.start, TerminalOutcome::Blocked { reason, details }));
         }
     }
 
     if let Some(spec) = skip_tag_spec() {
-        for tag in engine::iter_tags(text, spec) {
+        for tag in engine::iter_tags_with_fences(text, spec, fences) {
             outcomes.push((
                 tag.start,
                 TerminalOutcome::Skip {
@@ -232,6 +267,12 @@ pub fn extract_terminal_outcome(text: &str) -> Option<TerminalOutcome> {
 
     outcomes.sort_by_key(|(start, _)| *start);
     outcomes.pop().map(|(_, outcome)| outcome)
+}
+
+/// Extracts the final terminal outcome (`<success>`, `<error>`, `<blocked>`, or
+/// `<skip>`) from model output.
+pub fn extract_terminal_outcome(text: &str) -> Option<TerminalOutcome> {
+    extract_terminal_outcome_with_fences(text, &super::CodeFences::find(text))
 }
 
 fn strip_outcome_tags(text: &str, spec: Option<&'static XmlTagSpec>) -> String {

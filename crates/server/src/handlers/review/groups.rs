@@ -47,7 +47,7 @@ use tauqe_core::workflow::batch::{
 };
 use tauqe_protocol::{
     events, ModelRole, ModelSelection, ModelUsageEvent, ModelUsageInfo, ReviewGroup,
-    ReviewGroupFinishedEvent, ReviewGroupStartedEvent, ReviewSession,
+    ReviewGroupFinishedEvent, ReviewGroupStartedEvent, ReviewReasoningDeltaEvent, ReviewSession,
 };
 use tokio::sync::{mpsc, watch};
 
@@ -198,6 +198,19 @@ impl GroupAuditExecutor<'_> {
                     // discarded while the filter keeps accumulating the payload.
                     let _ = filter.push_chunk(&chunk);
                 }
+                // The reviewer reasons before it writes, and a grouped audit runs
+                // the same reviewer model as a plain launch: forwarding the
+                // deltas makes each group show the live thinking the single
+                // audit already shows (#c-review-reasoning-stream).
+                StreamEvent::ReasoningDelta(delta) => emit(
+                    &self.state.out,
+                    events::REVIEW_REASONING_DELTA,
+                    serde_json::to_value(ReviewReasoningDeltaEvent {
+                        operation_id: self.operation_id.clone(),
+                        delta,
+                    })
+                    .ok(),
+                ),
                 StreamEvent::Usage(reported) => usage = Some(reported),
                 StreamEvent::Done => break,
                 StreamEvent::Cancelled => {
@@ -448,7 +461,7 @@ pub(crate) async fn run_group_audits(
     let (provider, budgets) = {
         let config = state.config.lock().await.config.clone();
         let budgets = WindowBudgets {
-            files_tokens: config.context.files_token_budget,
+            files_tokens: config.context.token_budget,
         };
         // Deterministic unit tests inject a scripted provider through the state's
         // test seam; production builds construct a real network provider from
@@ -839,5 +852,40 @@ mod tests {
                 "every appended finding carries its own identity"
             );
         }
+    }
+
+    /// The reviewer reasons before it writes, so a grouped audit forwards the
+    /// reasoning deltas of the group it audits exactly as a plain launch does:
+    /// the client renders live thinking instead of a silent wait
+    /// (#c-review-reasoning-stream).
+    #[tokio::test]
+    async fn group_audit_forwards_reasoning_deltas() {
+        let mut fixture = fixture("reasoning");
+        let session = session(vec![group("grp-alpha", "Alpha", &["alpha/"])]);
+        ReviewStorage::save_session(&fixture.root, &session).unwrap();
+
+        let response = MockResponse::text(findings_payload("Alpha cloning"))
+            .with_reasoning("Inspecting the audited slice");
+        let provider = Arc::new(MockLlmProvider::scripted([response]));
+        *fixture.state.provider_override.lock().await = Some(provider);
+
+        let operation = Arc::new(fixture.state.try_begin_operation().unwrap());
+        let report = run_group_audits(&fixture.state, &fixture.root, &session, operation)
+            .await
+            .expect("the group batch runs");
+        assert!(report.is_success());
+
+        let published = drain_events(&mut fixture.events);
+        let reasoning = events_of(&published, events::REVIEW_REASONING_DELTA);
+        assert_eq!(reasoning.len(), 1, "the group forwards its reasoning");
+        assert_eq!(
+            reasoning[0]["delta"],
+            serde_json::json!("Inspecting the audited slice")
+        );
+        let operation_id = reasoning[0]["operation_id"].as_str().unwrap_or_default();
+        assert!(
+            operation_id.starts_with("op-"),
+            "the group delta names the operation it belongs to: {operation_id}"
+        );
     }
 }

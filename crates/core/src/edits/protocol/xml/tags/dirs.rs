@@ -19,12 +19,18 @@ pub fn strip_repo_dirs_tags(text: &str) -> String {
     }
 }
 
-/// Reports whether the model requested the compact repository directory tree.
-pub(crate) fn parse_repo_dirs_tags(text: &str) -> bool {
+/// Reports whether the model requested the compact repository directory tree,
+/// reusing a precomputed markdown code index.
+pub(crate) fn parse_repo_dirs_tags_with_fences(text: &str, fences: &super::CodeFences) -> bool {
     match tag_spec() {
-        Some(spec) => engine::find_next_tag(text, spec).is_some(),
+        Some(spec) => engine::find_next_tag_with_fences(text, spec, 0, fences).is_some(),
         None => false,
     }
+}
+
+/// Reports whether the model requested the compact repository directory tree.
+pub(crate) fn parse_repo_dirs_tags(text: &str) -> bool {
+    parse_repo_dirs_tags_with_fences(text, &super::CodeFences::find(text))
 }
 
 #[cfg(test)]

@@ -5,7 +5,7 @@
 //! decomposition share: both are the same Architect operation, so they run on
 //! exactly one implementation here instead of a copy per subsystem.
 //!
-//! The contour itself — the proposal rounds, the discovery journal, the schema
+//! The contour itself — the proposal rounds, the research journal, the schema
 //! healing, the empty-answer budget, and the tier ladder — lives in `crates/core`,
 //! so the daemon carries no domain logic of a synthesis. This module keeps only the
 //! adapter-side seams: the provider client a promoted rung is resolved through, the

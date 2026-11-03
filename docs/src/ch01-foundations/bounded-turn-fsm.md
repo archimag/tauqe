@@ -1,7 +1,7 @@
 # 3. The Autonomous Bounded Turn FSM
 
 A turn is not a conversation with a model. It is a finite-state machine that
-carries one stated objective through discovery, proposal, staging, verification, and
+carries one stated objective through research, proposal, staging, verification, and
 healing, and then either commits the result or restores the repository.
 
 ---
@@ -27,7 +27,7 @@ known recovery path.
 3. **A turn is transactional.** It ends as one commit that carries the explicit
    verdict of its verification run, or the working tree returns to its pre-turn
    state.
-4. **Every phase is bounded.** Discovery rounds, patch retries, healing rounds, and
+4. **Every phase is bounded.** Research rounds, patch retries, healing rounds, and
    replanning cycles all have finite budgets.
 5. **The process is deterministic; the content is generative.** The model chooses
    what to write, never which stage runs next.
@@ -66,14 +66,14 @@ regime the server assigns to a dialogue anchored on a plan. Plan creation is not
 mutation: it stays in the dialogue head, so a developer may request a plan at
 any moment of a dialogue. The transport is declared separately from the
 intent: a specialised plan discussion pins the structured discussion transport,
-while a develop or step turn keeps the transport configured in `tauqe.toml` —
+while a REPL or step turn keeps the transport configured in `tauqe.toml` —
 `structured` by default, `xml`, or `mixed`. The transport changes the encoding
 only, never the capability surface: an XML turn and a structured turn advertise
 and decode the very same operational commands. No default value exists, so a
 forgotten argument cannot silently substitute a mode.
 
 An Architect synthesis declares `ArchitectSynthesis`. Its surface is the
-architect discovery profile — discovery, plan creation, plan update, and the
+architect research profile — research, plan creation, plan update, and the
 scratchpad — with no file-edit capability and no toolchain verification,
 because a synthesis produces a horizon rather than a patch; like an isolated
 step it suppresses session history, so recording a synthesis belongs to the
@@ -89,21 +89,22 @@ The five phases are surfaced to the interface as turn-phase events:
 
 | Phase | Repeats | Meaning |
 | --- | --- | --- |
-| `Discovery` | yes, bounded | widen the working set until contracts are known |
+| `Research` | yes, bounded | widen the working set until contracts are known |
 | `Proposal` | once per model interaction | produce minimal coherent edits |
 | `Staging` | yes, bounded | validate edits against a virtual tree |
 | `Verification` | once per applied proposal | run the project toolchain |
 | `Healing` | yes, bounded | repair what verification rejected |
 
-Discovery, Staging, and Healing carry a round counter and a maximum, because they
+Research, Staging, and Healing carry a round counter and a maximum, because they
 repeat; Proposal is emitted for every model interaction and Verification runs once
 per applied proposal.
 
 ### 3.2.3 Capabilities and commands
 
 A protocol declares what it supports as a set of capabilities — text message, file
-edits, discovery, documentation requests, toolchain verification, plan creation,
-plan update, scratchpad, outcome, blocked, abort, user language, project custom
+edits, research, internal documentation requests, external project documentation
+requests, toolchain verification, plan creation, plan update, scratchpad, outcome,
+blocked, abort, user language, project custom
 tools. A capability set is the
 profile mask naming the capabilities enabled for one role or mode, and role and
 mode profiles are the only sanctioned way to narrow a protocol.
@@ -118,7 +119,7 @@ spellings of the XML contour. The structured contour expresses the very same
 commands as fields of its JSON Schema, so the capability surface never depends on
 the configured encoding.
 
-Each capability belongs to a phase (`Discovery`, `Execution`, `Verification`,
+Each capability belongs to a phase (`Research`, `Execution`, `Verification`,
 `Outcome`). Model output is decoded into a normalized command list — text, edit,
 context request, repository search, documentation request, verification, plan,
 scratchpad, outcome, blocked, user language, protocol error — so no consumer ever
@@ -134,7 +135,7 @@ disabled capability leaves no trace in either the prompt or the command stream.
 Each capability also declares how its output reaches the harness. `LiveStreaming`
 marks the contours consumed while tokens arrive — conversational text and file
 edits, which the interface renders as the model generates. `RoundDeferred` marks
-everything that only becomes meaningful once the round finishes — discovery,
+everything that only becomes meaningful once the round finishes — research,
 documentation, verification, plans, scratchpad, outcome, blockers, language, and
 project tool payloads. Streaming scanners and round-level decoders read that
 declared property instead of matching capability names, so delivery stays
@@ -152,7 +153,7 @@ functional categories that govern their lifecycle within the bounded turn:
 
 | Tool Category | Operations / Tags | Lifecycle Effect | Terminates Turn? |
 | --- | --- | --- | --- |
-| **Perception (Discovery)** | `<context_request>`, `<repo_search>`, `<doc_request>`, `<dir_list>`, `<repo_dirs>` | Widens context or provides authoritative reference | **No.** Triggers next Discovery round. |
+| **Perception (Research)** | `<context_request>`, `<repo_search>`, `<tauqe_doc_request>`, `<outer_doc_request>`, `<dir_list>`, `<repo_dirs>` | Widens context or provides authoritative reference | **No.** Triggers next Research round. |
 | **Inspection (Diagnostic Execution)** | Declared project commands (`CustomTool`, e.g. integration tests, linters, benchmarks) | Executes isolated CLI process; streams stdout/stderr back into the turn journal | **No.** Triggers next Proposal round for model reasoning. |
 | **Mutation (Terminal Outcome)** | `<edits>`, `<success>`, `<error>`, `<blocked>`, `<skip>` | Commits patches to virtual staging or signals turn conclusion | **Yes.** Closes the turn upon verification and Git commit. |
 
@@ -176,12 +177,26 @@ A blocked outcome is not a failure to retry: the transaction is rolled back, no
 patch retry or healing cycle runs, and the owning supervisor may replan instead of
 repeating.
 
-Every terminal status carries its own result: `success` states what the turn
-accomplished, `error` carries its message, `skip` carries its reason. The
-decoders substitute a deterministic payload for `error` and `skip`, because for
-those two the status already means something. `success` cannot be completed that
-way — only the model can say what the turn achieved — so a payload-free success
-is a protocol defect rather than a result, and it cannot close a turn.
+Every terminal status carries its own result: `success` carries the
+`commit_message` of its change set, `error` carries its message, `skip` carries
+its reason. The decoders substitute a deterministic payload for `error` and
+`skip`, because for those two the status already means something. `success`
+cannot be completed that way — only the model can say what the turn achieved —
+so a payload-free success is a protocol defect rather than a result, and it
+cannot close a turn.
+
+The field is named for its consumer, not for the moment it is written.
+`commit_message` is the Git commit message of the change set, so it is an
+English Conventional Commits header — `type(scope): description`, imperative
+mood, lower case, no trailing period, at most 72 characters — whatever language
+the conversation uses. Both contours spell it the same way: the attribute of the
+`<success>` tag and the property of the structured `outcome` object are both
+`commit_message`. The repository conventions already demand that shape from every
+commit (§6), so the harness aligns the wire field with the standard it feeds
+instead of inventing a second one. The language obligation therefore splits:
+`message` answers the developer in the language of the dialogue, and
+`commit_message` is an English machine contract that `user_language` never
+reaches.
 
 ### 3.2.6 Result-Bearing Elements and Auxiliary Channels
 
@@ -190,7 +205,7 @@ wrote. One classification decides it:
 
 | Channel | Elements | Advances the turn? |
 | --- | --- | --- |
-| Result-bearing | conversational text, file edits, discovery requests, plan updates, a verification request, a project command invocation, a protocol error, a terminal outcome carrying its payload, a blocked report, an abort | yes |
+| Result-bearing | conversational text, file edits, research requests, plan updates, a verification request, a project command invocation, a protocol error, a terminal outcome carrying its payload, a blocked report, an abort | yes |
 | Auxiliary | scratchpad notes, the user-language declaration | no |
 
 An auxiliary channel is memory and configuration, not work: it records what the
@@ -249,7 +264,7 @@ the status existed still deserializes as committed.
 ```text
       objective
           |
-   [Discovery] --requests--> context, search, docs, outlines
+   [Research] --requests--> context, search, docs, outlines
           |
    [Proposal]  --edits-----> virtual tree
           |
@@ -264,9 +279,9 @@ the status existed still deserializes as committed.
                         finalize commit  <--or-->  roll back to checkpoint
 ```
 
-### 3.3.1 Discovery
+### 3.3.1 Research
 
-Discovery widens the working set until the model reasons about contracts rather
+Research widens the working set until the model reasons about contracts rather
 than contours. The model inspects the repository outline and emits typed requests:
 open a file into context, search the tracked tree by regular expression, render the
 folder tree, outline one subsystem, list the tracked files of one directory, or
@@ -281,13 +296,20 @@ never widened.
 Two details make the loop cheap. Files preloaded for a step bypass the budget,
 because the caller already decided they are required. And findings that are not
 repository files — search reports, listings, outlines, documentation — never enter
-the context block: they accumulate in a turn-scoped discovery journal that extends
+the context block: they accumulate in a turn-scoped research journal that extends
 the user message and survives the whole turn, so a staging retry or a healing round
-keeps the knowledge discovery already paid for.
+keeps the knowledge research already paid for.
+
+A step arrives with more than its files. The external documents its leaf declares in
+`outer_docs` are materialized and mounted into the read-only OuterDocs layer before the
+turn starts, under the same `[context].token_budget` ceiling. A trust refusal ends the step
+before any model work, because no round can widen a declaration that lives outside the
+repository; a delivery failure travels as a diagnostic of the step prompt, and the model
+may request the same document again in a later round.
 
 A round reports whether it made progress. That single question lets the machine
 distinguish a productive round from a dead end without inspecting individual request
-types, and it is bounded by `context.max_discovery_rounds`.
+types, and it is bounded by `context.max_research_rounds`.
 
 ### 3.3.2 Proposal
 
@@ -334,10 +356,11 @@ a failed step. Three properties follow.
    text, an edit, a discovery request, a plan update, a verification request, a
    project command invocation, a blocked report, an abort, or a terminal outcome
    that carries its payload.
-2. **A status tag is a claim, not a result.** A `success` without a stated summary
-   is decoded into a command and then fails the same emptiness test as a blank
-   round, so the model cannot close a turn by asserting that it closed.
-3. **No phase observes silence.** Discovery, Staging, and Healing run only on
+2. **A status tag is a claim, not a result.** A `success` without a stated
+   `commit_message` is decoded into a command and then fails the same emptiness
+   test as a blank round, so the model cannot close a turn by asserting that it
+   closed.
+3. **No phase observes silence.** Research, Staging, and Healing run only on
    rounds that already passed the test, so a later phase never has to distinguish
    "nothing to do" from "nothing was said".
 
@@ -351,10 +374,10 @@ diagnostic investigation step rather than a terminal completion.
    allowlist. It runs in its own process group with strict timeout enforcement
    and literal arguments.
 2. **Structured Journal Feedback:** The execution outcome (`exit status`, `stdout`,
+2. **Structured Journal Feedback:** The execution outcome (`exit status`, `stdout`,
    and `stderr`, truncated to safe scalar boundaries) is recorded into the
-   turn-scoped `TurnDiscoveryJournal` inside a structured `<project_command_feedback>`
+   turn-scoped `TurnResearchJournal` inside a structured `<project_command_feedback>`
    block.
-3. **Next Proposal Round:** Instead of terminating the turn with an empty answer,
    the FSM requests an answer round from the model with the updated journal. The
    model perceives the real command output, evaluates test failures or runtime
    panics, and either proposes corrective code edits, invokes another inspection tool,
@@ -408,7 +431,7 @@ inside one attempt of the current coder tier.
 
 When it does not converge, the turn reports its outcome and stops there. Retry and
 escalation belong to the step supervisor, not to the turn: the failed transaction is
-rolled back to the step's pre-turn checkpoint, the transient discovery context is
+rolled back to the step's pre-turn checkpoint, the transient research context is
 pruned, and the step is re-asked on the same coder tier until
 `develop.max_tier_attempts` content attempts are spent. Only an exhausted tier
 advances one rung of the coder ladder — deeper reasoning on the same model first, a
@@ -420,10 +443,12 @@ ladder entirely.
 
 ### 3.3.8 Finalize or roll back
 
-A converged turn is finalized as one isolated commit authored by the developer,
-marked with a co-author trailer so the harness can recognize its own work, and
-carrying the explicit verdict of its verification run: `passed` when the declared
-gate accepted the tree, `not_configured` when the project declares no lifecycle.
+A converged turn is finalized as one isolated commit. It is authored by the
+developer, its subject is the `commit_message` the success outcome declared — the
+harness never assembles one of its own — and it is marked with a co-author
+trailer so the harness can recognize its own work. The same commit carries the
+explicit verdict of its verification run: `passed` when the declared gate
+accepted the tree, `not_configured` when the project declares no lifecycle.
 Intermediate step commits exist only so healing can converge phase by phase and
 are squashed away, so history never exposes the healing noise of a recovered turn.
 
@@ -475,7 +500,7 @@ what makes it testable without a network:
 | Provider | transport, streaming, cancellation; a retrying decorator wraps every provider |
 
 The cycle itself is one reusable kernel (`TurnKernel`). It carries the rounds,
-the prompt assembly of each round, the discovery journal, the corrective budget
+the prompt assembly of each round, the research journal, the corrective budget
 of an empty answer, and the observation of cancellation, so a contour supplies
 only the prompt protocol and the policy of its own payload. The Architect
 synthesis is exactly that: the same kernel driven by `PlanRefinePromptProtocol`
@@ -547,7 +572,7 @@ is documented rather than hidden — a map regenerated between turns excludes th
 files that entered the context, so the head itself changes and the whole tail is
 invalidated.
 
-Growth inside a turn stays append-only. Discovery appends an element at the tail of
+Growth inside a turn stays append-only. Research appends an element at the tail of
 the context block, or appends the file after the last record of the transcript, and
 a promotion rewrites a single `access` attribute in place. The chronological order
 comes from the insertion watermark every context entry carries, so a file picked up
@@ -556,7 +581,7 @@ transcript.
 
 The tail carries everything that legitimately changes: the regime delta first,
 then the active plan, the context manifest of the chronological policy — paths and
-access, never content — and the turn scratchpad, while round feedback (discovery
+access, never content — and the turn scratchpad, while round feedback (research
 findings, patch retry reports, verification diagnostics) is appended after the
 delta.
 fixed shape: task first, accumulated journal next, phase diagnostics last. A staging
@@ -629,15 +654,14 @@ holds an open Git transaction and aborts once that transaction has closed.
 
 | Guard | Setting |
 | --- | --- |
-| Discovery rounds per turn | `context.max_discovery_rounds` |
-| Context files budget | `context.files_token_budget` |
+| Research rounds per turn | `context.max_research_rounds` |
+| Context token budget | `context.token_budget` |
 | Repository outline budget | `context.repomap_token_budget` |
-| Patch retries and healing rounds | `develop.max_retries` |
-| Content attempts per coder tier | `develop.max_tier_attempts` |
+| Patch retries and healing rounds | `repl.max_retries` |
+| Content attempts per coder tier | `repl.max_tier_attempts` |
 | Generation attempts per architect rung | `attempts` on the architect entry (2 by default) |
-| Automated replans | `develop.max_replans` |
-| Outlines per discovery round | fixed request cap |
-
+| Automated replans | `repl.max_replans` |
+| Outlines per research round | fixed request cap |
 No operational limit is hardcoded, and no budget silently discards work: a breached
 budget halts with a diagnostic that asks for a narrower scope, so the developer
 learns what to decompose instead of watching a turn fail anonymously.
@@ -648,7 +672,7 @@ learns what to decompose instead of watching a turn fail anonymously.
 
 - **It is not an agent loop.** The machine never asks the model what to do next; it
   asks the model to do the current step.
-- **It is not a single-shot completion.** Discovery, retry, and healing rounds are
+- **It is not a single-shot completion.** Research, retry, and healing rounds are
   first-class states, not error handling bolted onto a request.
 - **It does not own project knowledge.** Formatters, post-hooks, and verification
   commands belong to the `[project]` declaration; the machine only decides when they
@@ -669,6 +693,9 @@ learns what to decompose instead of watching a turn fail anonymously.
   field, not a non-empty string, so the schema and the prompt state the payload
   obligation while the authoritative test runs after decoding, on the typed
   commands. A schema never decides by itself whether a turn is finished.
+- **It does not let the dialogue language reach the commit.** `commit_message` is
+  an English Conventional Commits header whatever language the turn answered in;
+  the language directive governs the answer, never the Git history.
 - **It does not keep an uncommitted prompt in the model context.** A turn that
   produced no result leaves no record behind, so the model never reads a task whose
   outcome it cannot see.

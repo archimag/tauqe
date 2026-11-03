@@ -9,7 +9,8 @@ use tauqe_protocol::{
 use crate::capabilities::{
     abort_invocations, custom_tool_invocations, CapabilityRegistry, PromptRenderContext,
 };
-use crate::edits::protocol::xml::engine::strip_all_control_tags;
+use crate::edits::protocol::xml::engine::{self, strip_all_control_tags};
+use crate::edits::protocol::xml::CodeFences;
 use crate::edits::strategy::StrategyProfile;
 use crate::edits::stream::json::decode::{balanced_object_end, strip_code_fence};
 use crate::providers::{JsonSchemaDefinition, ResponseFormat};
@@ -173,7 +174,7 @@ impl StructuredEditProtocol {
         // The reachability of a file absent from <context> depends on whether
         // the discovery capability is enabled: only a set that advertises
         // `context_requests` in the schema may be told to use it.
-        if capabilities.contains(LlmCapability::Discovery) {
+        if capabilities.contains(LlmCapability::Research) {
             prompt.push_str("A file absent from <context> is reached through `context_requests` or created with `op: 'create'`.\n\n");
         } else {
             prompt
@@ -308,15 +309,65 @@ impl StructuredEditProtocol {
         super::xml::tags::parse_dir_list_tags(raw_text)
     }
 
-    /// Extracts requested documentation topics from a structured proposal,
-    /// falling back to XML control tags when the JSON field is absent.
+    /// Extracts requested documentation topics from the canonical
+    /// `tauqe_doc_requests` field, falling back to the pre-canonical
+    /// `doc_requests` spelling and then to XML control tags.
+    ///
+    /// The canonical field is the one the strict response schema advertises, and
+    /// the pre-canonical spelling stays a permanent alias, so a cached response
+    /// written before the rename keeps decoding. Both vehicles carry the same
+    /// payload, so a response never has to choose a spelling to be understood.
     pub fn parse_doc_requests(&self, raw_text: &str) -> Vec<DocTopic> {
-        if let Some(proposal) = parse_proposal(raw_text) {
-            if !proposal.doc_requests.is_empty() {
-                return proposal.doc_requests;
+        if let Some(value) = parse_json_object(raw_text) {
+            for field in ["tauqe_doc_requests", "doc_requests"] {
+                let Some(entries) = value.get(field).and_then(|entries| entries.as_array()) else {
+                    continue;
+                };
+                let topics: Vec<DocTopic> = entries
+                    .iter()
+                    .filter_map(|entry| entry.as_str())
+                    .map(DocTopic::parse_lossy)
+                    .collect();
+                if !topics.is_empty() {
+                    return topics;
+                }
             }
         }
         super::xml::tags::parse_doc_request_tags(raw_text)
+    }
+
+    /// Extracts requested external documents from the structured
+    /// `outer_doc_requests` field, falling back to `<outer_doc_request>` control
+    /// tags when the JSON field is absent or empty.
+    ///
+    /// Each entry names one document the project declares in `[[outer_docs]]`
+    /// rather than a cache path, so where the materialized copy lives stays a
+    /// harness detail. A blank identifier grants nothing and is dropped, exactly
+    /// as the tag form drops one, and repetition is preserved because
+    /// materializing a declared document twice is decided by the phase that owns
+    /// the round.
+    pub fn parse_outer_doc_requests(&self, raw_text: &str) -> Vec<String> {
+        if let Some(value) = parse_json_object(raw_text) {
+            if let Some(entries) = value
+                .get("outer_doc_requests")
+                .and_then(|field| field.as_array())
+            {
+                let ids: Vec<String> = entries
+                    .iter()
+                    .filter_map(|entry| entry.as_str())
+                    .map(str::trim)
+                    .filter(|id| !id.is_empty())
+                    .map(str::to_string)
+                    .collect();
+                if !ids.is_empty() {
+                    return ids;
+                }
+            }
+        }
+        let Some(spec) = engine::tag_spec("outer_doc_request") else {
+            return Vec::new();
+        };
+        engine::attribute_values_with_fences(raw_text, spec, "id", &CodeFences::find(raw_text))
     }
 
     /// Extracts ephemeral scratchpad notes from a structured proposal,
@@ -345,13 +396,13 @@ impl StructuredEditProtocol {
                 let status = outcome.status.trim().to_ascii_lowercase();
                 match status.as_str() {
                     "success" => {
-                        let summary = outcome
-                            .summary
+                        let commit_message = outcome
+                            .commit_message
                             .as_deref()
                             .map(str::trim)
-                            .filter(|summary| !summary.is_empty())
+                            .filter(|commit_message| !commit_message.is_empty())
                             .map(str::to_string);
-                        return Some(TerminalOutcome::Success { summary });
+                        return Some(TerminalOutcome::Success { commit_message });
                     }
                     "error" => {
                         let message = outcome
@@ -807,6 +858,7 @@ pub fn extract_json_messages(raw: &str) -> Vec<String> {
                             || val.get("repo_dirs").is_some()
                             || val.get("repo_maps").is_some()
                             || val.get("dir_lists").is_some()
+                            || val.get("tauqe_doc_requests").is_some()
                             || val.get("doc_requests").is_some()
                             || val.get("scratchpad").is_some()
                             || val.get("outcome").is_some()
@@ -1316,7 +1368,13 @@ mod tests {
             .iter()
             .filter_map(|field| field.as_str())
             .collect();
-        for field in ["doc_requests", "scratchpad", "outcome", "blocked", "abort"] {
+        for field in [
+            "tauqe_doc_requests",
+            "scratchpad",
+            "outcome",
+            "blocked",
+            "abort",
+        ] {
             assert!(
                 required.contains(&field),
                 "field '{field}' must be required in the schema"
@@ -1338,7 +1396,7 @@ mod tests {
             "boolean"
         );
         assert_eq!(
-            schema["properties"]["doc_requests"]["items"]["type"],
+            schema["properties"]["tauqe_doc_requests"]["items"]["type"],
             "string"
         );
         // The strict control objects carry no nullable type; the plan payload
@@ -1353,7 +1411,7 @@ mod tests {
         let capabilities = CapabilitySet::from_slice(&[
             LlmCapability::TextMessage,
             LlmCapability::FileEdits,
-            LlmCapability::Discovery,
+            LlmCapability::Research,
             LlmCapability::DocRequest,
             LlmCapability::Scratchpad,
             LlmCapability::Outcome,
@@ -1364,7 +1422,7 @@ mod tests {
             &[],
             PatchStrategy::SearchReplace,
         );
-        for field in ["doc_requests", "scratchpad", "outcome", "blocked"] {
+        for field in ["tauqe_doc_requests", "scratchpad", "outcome", "blocked"] {
             assert!(
                 instructions.contains(field),
                 "instructions must mention '{field}'"
@@ -1378,7 +1436,7 @@ mod tests {
         let json = r#"{
             "message": "Need docs",
             "changes": [],
-            "doc_requests": ["workflow", "git"],
+            "tauqe_doc_requests": ["workflow", "git"],
             "scratchpad": "Verified: parser fixed."
         }"#;
         assert_eq!(
@@ -1389,10 +1447,48 @@ mod tests {
             proto.parse_scratchpad(json).as_deref(),
             Some("Verified: parser fixed.")
         );
+        // The pre-canonical spelling stays a permanent alias, so a cached
+        // response decodes into the very same topics.
+        let aliased = json.replace("tauqe_doc_requests", "doc_requests");
+        assert_eq!(
+            proto.parse_doc_requests(&aliased),
+            proto.parse_doc_requests(json)
+        );
 
-        let empty = r#"{"message":"Nothing","changes":[],"doc_requests":[],"scratchpad":""}"#;
+        let empty = r#"{"message":"Nothing","changes":[],"tauqe_doc_requests":[],"scratchpad":""}"#;
         assert!(proto.parse_doc_requests(empty).is_empty());
         assert_eq!(proto.parse_scratchpad(empty), None);
+    }
+
+    #[test]
+    fn test_structured_protocol_parse_outer_doc_requests() {
+        let proto = StructuredEditProtocol;
+
+        // Each entry names the mount point of one project declaration, and a
+        // blank identifier grants nothing.
+        let json = r#"{
+            "message": "Checking the upstream contract",
+            "changes": [],
+            "outer_doc_requests": [" vendor/api.md ", "   ", "mylib"]
+        }"#;
+        assert_eq!(
+            proto.parse_outer_doc_requests(json),
+            vec!["vendor/api.md".to_string(), "mylib".to_string()]
+        );
+
+        // An idle array requests no document at all.
+        let idle = r#"{"message":"x","changes":[],"outer_doc_requests":[]}"#;
+        assert!(proto.parse_outer_doc_requests(idle).is_empty());
+
+        // Control-tag fallback keeps both transports decoding one payload.
+        let fallback = concat!(
+            "{\"message\":\"Working\",\"changes\":[]}\n",
+            "<outer_doc_request id=\"mylib\" />",
+        );
+        assert_eq!(
+            proto.parse_outer_doc_requests(fallback),
+            vec!["mylib".to_string()]
+        );
     }
 
     #[test]
@@ -1402,12 +1498,12 @@ mod tests {
         let success = r#"{
             "message": "Done",
             "changes": [],
-            "outcome": {"status": "success", "summary": "All checks passed", "message": ""}
+            "outcome": {"status": "success", "commit_message": "All checks passed", "message": ""}
         }"#;
         assert_eq!(
             proto.parse_terminal_outcome(success),
             Some(TerminalOutcome::Success {
-                summary: Some("All checks passed".to_string())
+                commit_message: Some("All checks passed".to_string())
             })
         );
 
@@ -1557,7 +1653,7 @@ mod tests {
             "changes": [],
             "outcome": {
                 "status": "skip",
-                "summary": "",
+                "commit_message": "",
                 "message": "",
                 "reason": "Step already implemented"
             }
@@ -1574,7 +1670,7 @@ mod tests {
         let skipped_alias = r#"{
             "message": "Already satisfied",
             "changes": [],
-            "outcome": {"status": "skipped", "summary": "", "message": "", "reason": "  "}
+            "outcome": {"status": "skipped", "commit_message": "", "message": "", "reason": "  "}
         }"#;
         assert_eq!(
             proto.parse_terminal_outcome(skipped_alias),
@@ -1622,6 +1718,10 @@ mod tests {
 <blocked reason=\"Missing table\" details=\"users table absent\" />";
 
         assert_eq!(proto.parse_doc_requests(raw), vec![DocTopic::Git]);
+        // The canonical spelling of the same channel decodes into the very same
+        // request, so a transcript written before the rename keeps working.
+        let canonical = raw.replace("doc_request", "tauqe_doc_request");
+        assert_eq!(proto.parse_doc_requests(&canonical), vec![DocTopic::Git]);
         assert_eq!(
             proto.parse_scratchpad(raw).as_deref(),
             Some("Inspect parser")
@@ -1776,7 +1876,7 @@ mod tests {
             "repo_dirs",
             "repo_maps",
             "dir_lists",
-            "doc_requests",
+            "tauqe_doc_requests",
             "scratchpad",
             "outcome",
             "blocked",
@@ -1814,7 +1914,7 @@ mod tests {
             "repo_dirs",
             "repo_maps",
             "dir_lists",
-            "doc_requests",
+            "tauqe_doc_requests",
             "scratchpad",
             "outcome",
             "blocked",
@@ -1897,5 +1997,37 @@ mod tests {
         let malformed =
             proto.parse_review_update(r#"{"message":"x","review_update":{"item_id":"seven"}}"#);
         assert!(malformed.is_err(), "{malformed:?}");
+    }
+    #[test]
+    fn test_review_update_field_follows_the_review_discussion_surface() {
+        let review = StructuredEditProtocol::schema_for(
+            &CapabilitySet::review_discussion(),
+            PatchStrategy::SearchReplace,
+        );
+        assert!(
+            review["properties"].get("review_update").is_some(),
+            "a review discussion declares the decision field"
+        );
+        let required: Vec<&str> = review["required"]
+            .as_array()
+            .expect("required array")
+            .iter()
+            .filter_map(|field| field.as_str())
+            .collect();
+        assert!(required.contains(&"review_update"));
+
+        // Every other dialogue contour leaves the field out, so a decision can
+        // never be recorded outside the regime that authorizes it.
+        for surface in [
+            CapabilitySet::interactive_repl(),
+            CapabilitySet::discussion(),
+            CapabilitySet::isolated_step(),
+        ] {
+            let schema = StructuredEditProtocol::schema_for(&surface, PatchStrategy::SearchReplace);
+            assert!(
+                schema["properties"].get("review_update").is_none(),
+                "the decision field leaked into a surface that does not authorize it"
+            );
+        }
     }
 }

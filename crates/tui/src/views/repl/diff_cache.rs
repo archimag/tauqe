@@ -3,9 +3,9 @@ use std::collections::HashMap;
 use ratatui::style::Stylize;
 use ratatui::text::{Line, Span};
 
-use crate::theme::engine::current_engine;
+use crate::theme::engine::{current_engine, ThemeEngine};
 
-use super::state::{EditOp, StreamingFileEdit};
+use super::state::{EditOp, StreamingFileEdit, StreamingHunk};
 
 /// Cache of rendered diff bodies for the staged file edits.
 ///
@@ -23,15 +23,34 @@ struct DiffCacheEntry {
     rendered: RenderedDiff,
 }
 
-/// A rendered diff body together with the row offsets of its hunk headers.
+/// A rendered diff body together with the row offsets of its hunk headers and
+/// the line coordinates of every row.
 ///
 /// The offsets are relative to `lines`, so the Viewport projects them through
 /// its own visual coordinates and names the hunk under the top edge without
-/// re-deriving the patch layout (c-1).
+/// re-deriving the patch layout (c-1). `row_numbers` runs parallel to `lines`
+/// and names the lines every row occupies on both sides of the patch, so a
+/// two-column gutter reads the coordinates of the patch instead of counting the
+/// rows of the patch itself (c-two-column-gutter).
 #[derive(Debug, Default)]
 pub(crate) struct RenderedDiff {
     pub lines: Vec<Line<'static>>,
     pub hunk_rows: Vec<usize>,
+    pub row_numbers: Vec<RowNumbers>,
+}
+
+/// Source and result line number of one rendered diff row.
+///
+/// A context row carries both sides, a removed row only the line it occupied in
+/// the file before the patch, and an added row only the line it occupies in the
+/// file after it. A hunk header carries neither. `None` therefore means the row
+/// has no line on that side, or the hunk did not state its coordinates, and the
+/// gutter leaves that column blank instead of inventing a number
+/// (c-two-column-gutter).
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct RowNumbers {
+    pub old: Option<usize>,
+    pub new: Option<usize>,
 }
 
 impl DiffRenderCache {
@@ -76,6 +95,10 @@ impl DiffRenderCache {
 
 /// Cheap content fingerprint of a file's hunks, used to invalidate the diff
 /// render cache without recomputing the diff itself.
+///
+/// The coordinates and the context hint belong to the fingerprint because a
+/// header and a gutter are rendered from them: a hunk that keeps its texts but
+/// lands on another line must re-render (c-diff-cache-git-headers).
 fn diff_fingerprint(file: &StreamingFileEdit) -> u64 {
     use std::collections::hash_map::DefaultHasher;
     use std::hash::{Hash, Hasher};
@@ -85,6 +108,11 @@ fn diff_fingerprint(file: &StreamingFileEdit) -> u64 {
     (file.op_type as u8).hash(&mut hasher);
     for hunk in &file.hunks {
         hunk.hunk_index.hash(&mut hasher);
+        hunk.old_start.hash(&mut hasher);
+        hunk.old_lines.hash(&mut hasher);
+        hunk.new_start.hash(&mut hasher);
+        hunk.new_lines.hash(&mut hasher);
+        hunk.context_hint.hash(&mut hasher);
         hunk.old_text.hash(&mut hasher);
         hunk.new_text.hash(&mut hasher);
     }
@@ -97,73 +125,150 @@ fn diff_fingerprint(file: &StreamingFileEdit) -> u64 {
 /// length reused for scroll accounting without recomputing the diff.
 fn render_expanded_diff(file: &StreamingFileEdit) -> RenderedDiff {
     let engine = current_engine();
-    let palette = engine.palette();
-    let mut lines: Vec<Line<'static>> = Vec::new();
-    let mut hunk_rows: Vec<usize> = Vec::new();
+    let mut rendered = RenderedDiff::default();
     for hunk in &file.hunks {
-        hunk_rows.push(lines.len());
-        if file.op_type == EditOp::Create {
-            lines.push(Line::from(vec![Span::styled(
-                "  @@ new file @@",
-                engine.fg(palette.diff_added).bold(),
-            )]));
-            for line in hunk.new_text.lines() {
-                lines.push(Line::from(vec![
-                    Span::styled("  + ", engine.fg(palette.diff_added).bold()),
-                    Span::styled(line.to_string(), engine.fg(palette.diff_added)),
-                ]));
-            }
-        } else if file.op_type == EditOp::Delete {
-            lines.push(Line::from(vec![Span::styled(
-                "  @@ deleted file @@",
-                engine.fg(palette.diff_removed).bold(),
-            )]));
-            for line in hunk.old_text.lines() {
-                lines.push(Line::from(vec![
-                    Span::styled("  - ", engine.fg(palette.diff_removed).bold()),
-                    Span::styled(line.to_string(), engine.fg(palette.diff_removed)),
-                ]));
-            }
-        } else {
-            let diff = similar::TextDiff::from_lines(&hunk.old_text, &hunk.new_text);
-            let header_text = if file.hunks.len() > 1 {
-                format!("  @@ hunk {} @@", hunk.hunk_index + 1)
-            } else {
-                "  @@ diff @@".to_string()
-            };
-            lines.push(Line::from(vec![Span::styled(
-                header_text,
-                engine.fg(palette.status_info).bold(),
-            )]));
-
-            for op in diff.ops() {
-                for change in diff.iter_changes(op) {
-                    let line_str = change.value().trim_end_matches(['\r', '\n']);
-                    match change.tag() {
-                        similar::ChangeTag::Delete => {
-                            lines.push(Line::from(vec![
-                                Span::styled("  - ", engine.fg(palette.diff_removed).bold()),
-                                Span::styled(line_str.to_string(), engine.fg(palette.diff_removed)),
-                            ]));
-                        }
-                        similar::ChangeTag::Insert => {
-                            lines.push(Line::from(vec![
-                                Span::styled("  + ", engine.fg(palette.diff_added).bold()),
-                                Span::styled(line_str.to_string(), engine.fg(palette.diff_added)),
-                            ]));
-                        }
-                        similar::ChangeTag::Equal => {
-                            lines.push(Line::from(vec![
-                                Span::styled("    ", engine.fg(palette.diff_context)),
-                                Span::styled(line_str.to_string(), engine.fg(palette.diff_context)),
-                            ]));
-                        }
-                    }
-                }
-            }
+        rendered.hunk_rows.push(rendered.lines.len());
+        rendered
+            .lines
+            .push(hunk_header(file.op_type, hunk, &engine));
+        rendered.row_numbers.push(RowNumbers::default());
+        match file.op_type {
+            EditOp::Create => push_created_rows(&mut rendered, hunk, &engine),
+            EditOp::Delete => push_deleted_rows(&mut rendered, hunk, &engine),
+            _ => push_replaced_rows(&mut rendered, hunk, &engine),
         }
     }
-    RenderedDiff { lines, hunk_rows }
+    rendered
+}
+
+/// Renders the canonical unified diff header of one hunk.
+///
+/// Every hunk states the exact lines it spans on both sides in the standard
+/// `@@ -old_start,old_lines +new_start,new_lines @@` form, so a header names its
+/// coordinates instead of its position inside the patch. The section hint the
+/// patch carries follows the ranges. A whole-file creation or deletion keeps its
+/// operation marker in that hint slot, because `new file` and `deleted file`
+/// say more about the row than a context line would
+/// (c-diff-cache-git-headers).
+fn hunk_header(op: EditOp, hunk: &StreamingHunk, engine: &ThemeEngine) -> Line<'static> {
+    let palette = engine.palette();
+    let ranges = format!(
+        "@@ -{},{} +{},{} @@",
+        hunk.old_start, hunk.old_lines, hunk.new_start, hunk.new_lines
+    );
+    let hint = match op {
+        EditOp::Create => Some("new file"),
+        EditOp::Delete => Some("deleted file"),
+        _ => hunk.context_hint.as_deref(),
+    };
+    let mut spans = vec![Span::styled(
+        format!("  {ranges}"),
+        engine.fg(palette.status_info).bold(),
+    )];
+    if let Some(hint) = hint {
+        spans.push(Span::styled(
+            format!(" {hint}"),
+            engine.fg(palette.text_secondary),
+        ));
+    }
+    Line::from(spans)
+}
+
+/// Appends the rows of a whole-file creation: every line is an addition, so the
+/// source column stays empty and the result column names the new lines
+/// (c-two-column-gutter).
+fn push_created_rows(rendered: &mut RenderedDiff, hunk: &StreamingHunk, engine: &ThemeEngine) {
+    let color = engine.fg(engine.palette().diff_added);
+    let mut new_number = line_number(hunk.new_start);
+    for text in hunk.new_text.lines() {
+        rendered.lines.push(Line::from(vec![
+            Span::styled("  + ", color.bold()),
+            Span::styled(text.to_string(), color),
+        ]));
+        rendered.row_numbers.push(RowNumbers {
+            old: None,
+            new: new_number,
+        });
+        new_number = new_number.map(|number| number + 1);
+    }
+}
+
+/// Appends the rows of a whole-file deletion: every line is a removal, so the
+/// result column stays empty and the source column names the removed lines
+/// (c-two-column-gutter).
+fn push_deleted_rows(rendered: &mut RenderedDiff, hunk: &StreamingHunk, engine: &ThemeEngine) {
+    let color = engine.fg(engine.palette().diff_removed);
+    let mut old_number = line_number(hunk.old_start);
+    for text in hunk.old_text.lines() {
+        rendered.lines.push(Line::from(vec![
+            Span::styled("  - ", color.bold()),
+            Span::styled(text.to_string(), color),
+        ]));
+        rendered.row_numbers.push(RowNumbers {
+            old: old_number,
+            new: None,
+        });
+        old_number = old_number.map(|number| number + 1);
+    }
+}
+
+/// Appends the rows of a hunk that rewrites the file in place.
+///
+/// The rows follow the operation tags of the diff: a context row keeps both
+/// counters, a removal advances the source counter, and an addition advances the
+/// result counter, so every row is numbered exactly as the patch positions it
+/// (c-two-column-gutter).
+fn push_replaced_rows(rendered: &mut RenderedDiff, hunk: &StreamingHunk, engine: &ThemeEngine) {
+    let palette = engine.palette();
+    let diff = similar::TextDiff::from_lines(&hunk.old_text, &hunk.new_text);
+    let mut old_number = line_number(hunk.old_start);
+    let mut new_number = line_number(hunk.new_start);
+    for op in diff.ops() {
+        for change in diff.iter_changes(op) {
+            let text = change.value().trim_end_matches(['\r', '\n']);
+            let (prefix, color, numbers) = match change.tag() {
+                similar::ChangeTag::Delete => {
+                    let numbers = RowNumbers {
+                        old: old_number,
+                        new: None,
+                    };
+                    old_number = old_number.map(|number| number + 1);
+                    ("  - ", engine.fg(palette.diff_removed), numbers)
+                }
+                similar::ChangeTag::Insert => {
+                    let numbers = RowNumbers {
+                        old: None,
+                        new: new_number,
+                    };
+                    new_number = new_number.map(|number| number + 1);
+                    ("  + ", engine.fg(palette.diff_added), numbers)
+                }
+                similar::ChangeTag::Equal => {
+                    let numbers = RowNumbers {
+                        old: old_number,
+                        new: new_number,
+                    };
+                    old_number = old_number.map(|number| number + 1);
+                    new_number = new_number.map(|number| number + 1);
+                    ("    ", engine.fg(palette.diff_context), numbers)
+                }
+            };
+            rendered.lines.push(Line::from(vec![
+                Span::styled(prefix, color.bold()),
+                Span::styled(text.to_string(), color),
+            ]));
+            rendered.row_numbers.push(numbers);
+        }
+    }
+}
+
+/// First line number of one side of a hunk.
+///
+/// A hunk whose coordinates are unknown keeps zeros, so `0` means "unknown"
+/// rather than a real line and that side is never numbered from zero
+/// (c-two-column-gutter).
+fn line_number(start: usize) -> Option<usize> {
+    (start > 0).then_some(start)
 }
 
 #[cfg(test)]
@@ -180,6 +285,11 @@ mod cache_tests {
             error: None,
             hunks: vec![StreamingHunk {
                 hunk_index: 0,
+                old_start: 1,
+                old_lines: 1,
+                new_start: 1,
+                new_lines: 1,
+                context_hint: None,
                 old_text: "let a = 1;".to_string(),
                 new_text: "let a = 2;".to_string(),
             }],
@@ -266,6 +376,123 @@ mod cache_tests {
             "the refreshed entry must record the new fingerprint"
         );
         assert_eq!(cache.entries.len(), 1);
+    }
+
+    /// A header states the lines the hunk spans on both sides, so a patch row
+    /// names its coordinates instead of the position of the hunk inside the
+    /// patch, and the section hint the patch carries follows them
+    /// (c-diff-cache-git-headers).
+    #[test]
+    fn the_header_states_the_ranges_and_the_context_hint() {
+        let mut file = file_with_hunk("crates/tui/src/main.rs");
+        file.hunks[0].old_start = 12;
+        file.hunks[0].old_lines = 3;
+        file.hunks[0].new_start = 12;
+        file.hunks[0].new_lines = 4;
+        file.hunks[0].old_text = "let a = 1;\nlet b = 2;\nlet c = 3;".to_string();
+        file.hunks[0].new_text = "let a = 1;\nlet b = 2;\nlet c = 4;\nlet d = 5;".to_string();
+        file.hunks[0].context_hint = Some("fn main".to_string());
+
+        let mut cache = DiffRenderCache::default();
+        let text = rendered_text(cache.render(&file));
+
+        assert!(text.contains("@@ -12,3 +12,4 @@ fn main"), "{text}");
+    }
+
+    /// A creation keeps the marker that names the operation beside the ranges it
+    /// spans, so the card never hides what kind of change it audits
+    /// (c-diff-cache-git-headers).
+    #[test]
+    fn a_created_file_keeps_its_marker_beside_the_ranges() {
+        let mut file = file_with_hunk("crates/tui/src/new.rs");
+        file.op_type = EditOp::Create;
+        file.hunks[0].old_start = 0;
+        file.hunks[0].old_lines = 0;
+        file.hunks[0].new_start = 1;
+        file.hunks[0].new_lines = 1;
+        file.hunks[0].old_text = String::new();
+        file.hunks[0].new_text = "fn added() {}".to_string();
+
+        let mut cache = DiffRenderCache::default();
+        let text = rendered_text(cache.render(&file));
+
+        assert!(text.contains("@@ -0,0 +1,1 @@ new file"), "{text}");
+    }
+
+    /// A deletion mirrors the creation: it names the removed lines and keeps the
+    /// marker of the operation (c-diff-cache-git-headers).
+    #[test]
+    fn a_deleted_file_keeps_its_marker_beside_the_ranges() {
+        let mut file = file_with_hunk("crates/tui/src/old.rs");
+        file.op_type = EditOp::Delete;
+        file.hunks[0].old_start = 1;
+        file.hunks[0].old_lines = 1;
+        file.hunks[0].new_start = 0;
+        file.hunks[0].new_lines = 0;
+        file.hunks[0].old_text = "fn removed() {}".to_string();
+        file.hunks[0].new_text = String::new();
+
+        let mut cache = DiffRenderCache::default();
+        let text = rendered_text(cache.render(&file));
+
+        assert!(text.contains("@@ -1,1 +0,0 @@ deleted file"), "{text}");
+    }
+
+    /// Every rendered row records the lines it occupies on both sides, which is
+    /// the only source a two-column gutter may read (c-two-column-gutter).
+    #[test]
+    fn the_recorded_row_numbers_follow_the_patch_tags() {
+        let mut file = file_with_hunk("crates/tui/src/app.rs");
+        file.hunks[0].old_start = 10;
+        file.hunks[0].old_lines = 2;
+        file.hunks[0].new_start = 10;
+        file.hunks[0].new_lines = 2;
+        file.hunks[0].old_text = "let a = 1;\nlet b = 2;".to_string();
+        file.hunks[0].new_text = "let a = 1;\nlet b = 3;".to_string();
+
+        let mut cache = DiffRenderCache::default();
+        let rendered = cache.render(&file);
+
+        let coordinates: Vec<(Option<usize>, Option<usize>)> = rendered
+            .row_numbers
+            .iter()
+            .map(|numbers| (numbers.old, numbers.new))
+            .collect();
+
+        assert_eq!(rendered.row_numbers.len(), rendered.lines.len());
+        assert_eq!(
+            coordinates,
+            vec![
+                (None, None),
+                (Some(10), Some(10)),
+                (Some(11), None),
+                (None, Some(11)),
+            ],
+            "a header carries no number, context keeps both sides, a removal \
+             keeps the source line, an addition keeps the result line"
+        );
+    }
+
+    /// A hunk that did not state its coordinates leaves the gutter without
+    /// numbers instead of numbering from zero (c-two-column-gutter).
+    #[test]
+    fn an_unstated_coordinate_carries_no_number() {
+        let mut file = file_with_hunk("crates/tui/src/app.rs");
+        file.hunks[0].old_start = 0;
+        file.hunks[0].old_lines = 0;
+        file.hunks[0].new_start = 0;
+        file.hunks[0].new_lines = 0;
+
+        let mut cache = DiffRenderCache::default();
+        let rendered = cache.render(&file);
+
+        assert!(
+            rendered
+                .row_numbers
+                .iter()
+                .all(|numbers| numbers.old.is_none() && numbers.new.is_none()),
+            "an unknown coordinate must never turn into a number"
+        );
     }
 
     /// Concatenated text of every rendered diff row.

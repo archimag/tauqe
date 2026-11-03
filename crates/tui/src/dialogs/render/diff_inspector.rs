@@ -4,14 +4,16 @@
 //! formula, so it breathes exactly like every other dialog (Conventions §6.7,
 //! §6.8). The left pane walks the audited files with their operation badge and
 //! verification status; the right pane reads the diff of the highlighted file in
-//! isolation, with a line-number gutter and its own scroll offset, so a long
-//! patch is never interrupted by the file list (c-3).
+//! isolation, with a two-column line-number gutter (the source line beside the
+//! result line, the way Git and Magit present a patch) and its own scroll
+//! offset, so a long patch is never interrupted by the file list
+//! (c-3, c-two-column-gutter).
 //!
-//! The audited set is the live staged list the Develop viewport owns, observed in
+//! The audited set is the live staged list the REPL viewport owns, observed in
 //! place rather than copied: an edit-stream event needs no refresh call, a file
 //! that is still streaming reads the same here as in the Viewport, and the file
 //! the stream currently writes carries an animated spinner beside its running
-//! badge (c-3). The diff body comes from the `DiffRenderCache` the Develop
+//! badge (c-3). The diff body comes from the `DiffRenderCache` the REPL
 //! viewport already fills, so the audit paints exactly the rows the REPL laid out
 //! and a repeated frame never recomputes a `similar::TextDiff` nor copies the
 //! stored body (c-1, c-3). Every visible phrase is resolved through the runtime
@@ -33,7 +35,7 @@ use crate::i18n::active_t;
 use crate::theme::engine::{current_engine, ThemeEngine};
 use crate::ui::header::truncate_to_width;
 use crate::views::repl::render::{file_op_badge, SPINNER_FRAMES};
-use crate::views::repl::{DiffRenderCache, FileEditStatus, StreamingFileEdit};
+use crate::views::repl::{DiffRenderCache, FileEditStatus, RenderedDiff, StreamingFileEdit};
 
 /// Renders the inspector card over the Develop viewport.
 ///
@@ -219,7 +221,7 @@ fn file_rows(
 }
 
 /// Counts the patches the audited set applied to one file through the catalog
-/// label the Develop viewport already uses, so both surfaces describe a file
+/// label the REPL viewport already uses, so both surfaces describe a file
 /// identically (c-4).
 fn patch_count(file: &StreamingFileEdit) -> String {
     active_t("repl.hunk_count").replacen("{}", &file.hunks.len().to_string(), 1)
@@ -283,7 +285,7 @@ fn render_diff_pane(
             ));
         } else {
             hunk_rows = rendered.hunk_rows.as_slice();
-            lines = numbered_diff_lines(&rendered.lines, engine);
+            lines = numbered_diff_lines(rendered, engine);
         }
     } else {
         lines.push(placeholder_line(
@@ -321,22 +323,32 @@ fn render_diff_pane(
     )
 }
 
-/// Prepends the line-number gutter to a cached diff body.
+/// Prepends the two-column line-number gutter to a cached diff body.
 ///
-/// The rows themselves are reused unchanged, so the audit reads exactly the
-/// patch the cache rendered and the gutter never re-derives a diff (c-3).
+/// The coordinates were recorded by the cache while it rendered the patch, so
+/// the audit reads exactly the patch the cache rendered and never re-derives a
+/// diff (c-1, c-3). The left column names the line in the file before the patch
+/// and the right one the line after it: a context row carries both, a removed
+/// row keeps the source number and leaves the result column blank, and an added
+/// row does the reverse, exactly as Git and Magit present a patch
+/// (c-two-column-gutter).
 ///
 /// The returned rows borrow the cached body: only the gutter string is copied,
 /// so a frame over a large patch costs one small allocation per row instead of
 /// a deep copy of every span (c-1).
-fn numbered_diff_lines<'a>(lines: &'a [Line<'static>], engine: &ThemeEngine) -> Vec<Line<'a>> {
+fn numbered_diff_lines<'a>(rendered: &'a RenderedDiff, engine: &ThemeEngine) -> Vec<Line<'a>> {
     let number_style = engine.fg(engine.palette().text_muted);
-    lines
+    rendered
+        .lines
         .iter()
         .enumerate()
         .map(|(index, line)| {
+            let numbers = rendered.row_numbers.get(index).copied().unwrap_or_default();
             let mut spans = Vec::with_capacity(line.spans.len() + 1);
-            spans.push(Span::styled(format!("{:>4} ", index + 1), number_style));
+            spans.push(Span::styled(
+                format!("{:>4} {:>4} ", column(numbers.old), column(numbers.new)),
+                number_style,
+            ));
             spans.extend(line.spans.iter().map(|span| {
                 let content: &'a str = match &span.content {
                     Cow::Borrowed(text) => text,
@@ -349,6 +361,12 @@ fn numbered_diff_lines<'a>(lines: &'a [Line<'static>], engine: &ThemeEngine) -> 
             numbered
         })
         .collect()
+}
+
+/// Formats one gutter cell: the line number, or blank cells of the same width so
+/// both columns stay aligned on every row of the patch (c-two-column-gutter).
+fn column(number: Option<usize>) -> String {
+    number.map_or_else(String::new, |number| number.to_string())
 }
 
 /// One-based number of the hunk whose header is the last one at or above the
@@ -440,6 +458,14 @@ mod tests {
             error: None,
             hunks: vec![StreamingHunk {
                 hunk_index: 0,
+                // The ranges follow the fixture bodies, so a created file
+                // reports no source range instead of an invented one
+                // (c-hunk-coordinates-model).
+                old_start: usize::from(!patch.0.is_empty()),
+                old_lines: patch.0.lines().count(),
+                new_start: usize::from(!patch.1.is_empty()),
+                new_lines: patch.1.lines().count(),
+                context_hint: None,
                 old_text: patch.0.to_string(),
                 new_text: patch.1.to_string(),
             }],
@@ -477,6 +503,19 @@ mod tests {
         text
     }
 
+    /// Trimmed gutter cell of every row of a cached body, so a test can assert
+    /// the two columns without counting the padding by hand.
+    fn gutters(rendered: &RenderedDiff, engine: &ThemeEngine) -> Vec<String> {
+        numbered_diff_lines(rendered, engine)
+            .iter()
+            .map(|line| {
+                line.spans
+                    .first()
+                    .map_or_else(String::new, |span| span.content.trim_end().to_string())
+            })
+            .collect()
+    }
+
     #[test]
     fn file_list_shows_operation_and_verification_badges() {
         let files = vec![
@@ -507,7 +546,7 @@ mod tests {
     }
 
     #[test]
-    fn read_area_numbers_every_rendered_diff_row() {
+    fn the_read_area_states_the_canonical_hunk_header() {
         let files = vec![file(
             "crates/tui/src/app.rs",
             EditOp::Replace,
@@ -519,9 +558,52 @@ mod tests {
 
         let text = rendered(&files, &mut inspector, &mut cache);
 
-        assert!(text.contains("   1   @@ diff @@"), "{text}");
-        assert!(text.contains("   2   - let a = 1;"), "{text}");
-        assert!(text.contains("   3   + let a = 2;"), "{text}");
+        assert!(text.contains("@@ -1,1 +1,1 @@"), "{text}");
+        assert!(text.contains("- let a = 1;"), "{text}");
+        assert!(text.contains("+ let a = 2;"), "{text}");
+    }
+
+    /// A whole-file creation keeps the marker that names the operation beside the
+    /// ranges it spans, so the card never hides what kind of change it audits
+    /// (c-diff-cache-git-headers).
+    #[test]
+    fn a_created_file_names_the_creation_beside_its_ranges() {
+        let files = vec![file(
+            "crates/tui/src/new.rs",
+            EditOp::Create,
+            FileEditStatus::Ok,
+            ("", "fn added() {}"),
+        )];
+        let mut inspector = reading_position();
+        let mut cache = DiffRenderCache::default();
+
+        let text = rendered(&files, &mut inspector, &mut cache);
+
+        assert!(text.contains("@@ -0,0 +1,1 @@ new file"), "{text}");
+    }
+
+    /// Both gutter columns name real file lines: the left one the line in the
+    /// file before the patch, the right one the line after it
+    /// (c-two-column-gutter).
+    #[test]
+    fn the_gutter_numbers_the_source_and_the_result_sides() {
+        let files = [file(
+            "crates/tui/src/app.rs",
+            EditOp::Replace,
+            FileEditStatus::Ok,
+            ("let a = 1;\nlet b = 2;", "let a = 1;\nlet b = 3;"),
+        )];
+        let mut cache = DiffRenderCache::default();
+        let engine = current_engine();
+
+        let rows = gutters(cache.render(&files[0]), &engine);
+
+        assert_eq!(
+            rows,
+            vec!["", "   1    1", "   2", "        2"],
+            "a header carries no number, context keeps both sides, a removal \
+             keeps the source line, an addition keeps the result line"
+        );
     }
 
     #[test]

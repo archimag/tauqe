@@ -125,7 +125,7 @@ fn lock_state(state_lock: &Mutex<ExtractorState>) -> MutexGuard<'_, ExtractorSta
 /// entries, each new file evicts the least recently used one.
 ///
 /// Production callers resolve the process-wide shared instance through
-/// [`shared_extractor`], so parsed symbols stay warm across turns, discovery
+/// [`shared_extractor`], so parsed symbols stay warm across turns, research
 /// rounds, and targeted map requests instead of being discarded with a
 /// per-call extractor.
 #[derive(Clone)]

@@ -4,7 +4,7 @@
 //! a full Tree-sitter pass over every tracked file outside the active context.
 //! It is generated once, on the first proposal round of a bounded turn, and
 //! frozen for the rest of that turn. Patch retries, verification healing, and
-//! discovery rounds that widened the context all receive the identical map
+//! research rounds that widened the context all receive the identical map
 //! string, so the repository map block of the prompt stays byte-identical and a
 //! provider's prefix cache keeps matching its tokens across rounds.
 
@@ -28,7 +28,16 @@ pub(super) struct TurnInputCache {
     /// frozen as well instead of re-reading history.jsonl on each round. The
     /// snapshot keeps the records rather than the rendered block, so every
     /// layout reads the same structural material.
-    history: Option<HistorySnapshot>,
+    history: Option<std::sync::Arc<HistorySnapshot>>,
+    /// Body of every context file this turn has already read.
+    ///
+    /// A round renders the context it was handed, and within one turn that body
+    /// only changes when the change set reaches the working tree. The memo
+    /// therefore reads each path once and re-reads it only when the identity it
+    /// recorded moved, so a file discovery just added costs one read while every
+    /// later proposal, patch-retry, and healing round reuses the bytes already
+    /// held.
+    context_contents: std::collections::HashMap<String, MemoizedContextFile>,
     /// Directory outline captured on the first proposal round of the turn.
     ///
     /// `Some` marks the outline as rendered, so an empty tree is frozen as well
@@ -54,13 +63,69 @@ struct FrozenRepoMap {
 struct FrozenRepoDirs {
     tree: Option<String>,
 }
+/// On-disk identity of a context file as the memo recorded it.
+///
+/// The pair tells an unchanged file from a rewritten one without reading the
+/// body: a file keeps its identity until something writes it. A filesystem
+/// that reports no modification time always answers `false`, so the file is
+/// read again instead of serving bytes the memo cannot prove current.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ContextFileIdentity {
+    size_bytes: u64,
+    modified: Option<std::time::SystemTime>,
+}
+
+impl ContextFileIdentity {
+    /// Returns the identity of a file whose metadata was just read.
+    fn of(metadata: &std::fs::Metadata) -> Self {
+        Self {
+            size_bytes: metadata.len(),
+            modified: metadata.modified().ok(),
+        }
+    }
+
+    /// Reports whether the file at `full_path` still carries this identity.
+    fn is_current(&self, full_path: &Path) -> bool {
+        let Ok(metadata) = std::fs::metadata(full_path) else {
+            return false;
+        };
+        match (self.modified, metadata.modified().ok()) {
+            (Some(memoized), Some(current)) => {
+                self.size_bytes == metadata.len() && memoized == current
+            }
+            _ => false,
+        }
+    }
+}
+
+/// Content of one context file memoized for the rest of the turn.
+#[derive(Debug)]
+struct MemoizedContextFile {
+    identity: ContextFileIdentity,
+    content: String,
+}
+
+impl MemoizedContextFile {
+    /// Reads `path` and records the identity the read started from.
+    ///
+    /// The metadata is taken before the body on purpose: a write that lands
+    /// while the file is being read moves the identity, so the next round reads
+    /// the file again instead of trusting content that may already be stale.
+    fn read(root: &Path, path: &str) -> Option<Self> {
+        let full_path = root.join(path);
+        let metadata = std::fs::metadata(&full_path).ok()?;
+        let identity = ContextFileIdentity::of(&metadata);
+        let content = std::fs::read_to_string(&full_path).ok()?;
+        Some(Self { identity, content })
+    }
+}
 
 impl TurnInputCache {
     /// Returns the repository map frozen at the start of the turn.
     ///
     /// The first call generates the map from the tracked files, the paths
     /// already present in context, and the token budget, then freezes the
-    /// result. Every later call returns that exact string, even when a discovery
+    /// result. Every later call returns that exact string, even when a research
     /// round added files to the context and thereby narrowed the set of paths the
     /// map describes: dropping those nodes mid-turn would shorten the map block
     /// and invalidate the prompt prefix the provider has already cached.
@@ -132,9 +197,10 @@ impl TurnInputCache {
         &mut self,
         history_manager: &HistoryManager,
         intent: TurnIntent,
-    ) -> Option<HistorySnapshot> {
+    ) -> Option<std::sync::Arc<HistorySnapshot>> {
         if self.history.is_none() {
-            self.history = Some(Self::resolve_history(history_manager, intent).await);
+            let snapshot = Self::resolve_history(history_manager, intent).await;
+            self.history = Some(std::sync::Arc::new(snapshot));
         }
         self.history
             .as_ref()
@@ -251,6 +317,102 @@ impl TurnInputCache {
     /// rounds that widened the context render only the files they added. An
     /// unchanged file therefore keeps the exact bytes — and the exact line
     /// anchors — the previous round already sent to the provider.
+    /// Returns the context files of a round, reading only the paths this turn
+    /// has not read yet.
+    ///
+    /// The list follows the context state's item order, so the memo never
+    /// reorders a file an earlier round already rendered. A path that entered
+    /// the context through research is read once, on first appearance, and
+    /// every later proposal, patch-retry, and healing round reuses the bytes
+    /// already held. A path whose recorded identity moved — the change set a
+    /// turn applied to the working tree — is read again, so a healing round
+    /// reasons about the bytes it is about to patch rather than the bytes the
+    /// turn opened with.
+    ///
+    /// A path that cannot be read leaves the memo and is omitted from the round,
+    /// which is how an unreadable context file has always been rendered. A
+    /// failed offload is reported to the caller instead of silently shrinking
+    /// the context.
+    pub(super) async fn context_files(
+        &mut self,
+        repo_root: &Path,
+        items: &[tauqe_protocol::ContextItem],
+    ) -> anyhow::Result<Vec<crate::context::ContextFileContent>> {
+        let mut memoized: Vec<String> = Vec::new();
+        let mut to_read: Vec<String> = Vec::new();
+        for item in items {
+            if self.context_contents.contains_key(&item.path) {
+                memoized.push(item.path.clone());
+            } else {
+                to_read.push(item.path.clone());
+            }
+        }
+
+        // Serving a memoized file costs one metadata query, never a content
+        // read: the identity it recorded decides whether the bytes the memo
+        // holds are still the bytes on disk.
+        if !memoized.is_empty() {
+            let identities: Vec<(String, ContextFileIdentity)> = memoized
+                .iter()
+                .filter_map(|path| {
+                    self.context_contents
+                        .get(path)
+                        .map(|entry| (path.clone(), entry.identity))
+                })
+                .collect();
+            if !identities.is_empty() {
+                let root = repo_root.to_path_buf();
+                let moved = crate::blocking::run_blocking_async(move || {
+                    identities
+                        .into_iter()
+                        .filter(|(path, identity)| !identity.is_current(&root.join(path.as_str())))
+                        .map(|(path, _)| path)
+                        .collect::<Vec<String>>()
+                })
+                .await?;
+                to_read.extend(moved);
+            }
+        }
+
+        if !to_read.is_empty() {
+            let root = repo_root.to_path_buf();
+            let read = crate::blocking::run_blocking_async(move || {
+                to_read
+                    .into_iter()
+                    .map(|path| {
+                        let entry = MemoizedContextFile::read(&root, &path);
+                        (path, entry)
+                    })
+                    .collect::<Vec<(String, Option<MemoizedContextFile>)>>()
+            })
+            .await?;
+            for (path, entry) in read {
+                match entry {
+                    Some(entry) => {
+                        self.context_contents.insert(path, entry);
+                    }
+                    None => {
+                        self.context_contents.remove(&path);
+                    }
+                }
+            }
+        }
+
+        let files: Vec<crate::context::ContextFileContent> = items
+            .iter()
+            .filter_map(|item| {
+                self.context_contents.get(&item.path).map(|entry| {
+                    crate::context::ContextFileContent {
+                        path: item.path.clone(),
+                        access: item.access,
+                        content: entry.content.clone(),
+                    }
+                })
+            })
+            .collect();
+        Ok(files)
+    }
+
     pub(super) fn context_cache(&mut self) -> &mut ContextBlockCache {
         &mut self.context_block
     }
@@ -259,6 +421,58 @@ impl TurnInputCache {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The context memo reads a file once per turn and re-reads it only when the
+    /// bytes on disk moved: a discovery addition costs one read, and a change set
+    /// the turn applied to the working tree is rendered from the bytes now on
+    /// disk.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn context_files_are_read_once_and_refreshed_when_the_bytes_move() {
+        use crate::context::ContextManager;
+        use tauqe_protocol::ContextAccess;
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        std::fs::write(root.join("a.rs"), "alpha\n").unwrap();
+        std::fs::write(root.join("b.rs"), "beta\n").unwrap();
+
+        let mut context = ContextManager::new(root.clone());
+        context.add_file("a.rs", ContextAccess::Editable).unwrap();
+        let mut cache = TurnInputCache::default();
+
+        let opening = context.get_state();
+        let files = cache
+            .context_files(&root, &opening.items)
+            .await
+            .expect("the opening round reads the context");
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].content, "alpha\n");
+
+        // A research addition is read on first appearance, while the file the
+        // opening round already read keeps the bytes it was rendered with.
+        context
+            .add_auto_file("b.rs", ContextAccess::ReadOnly)
+            .unwrap();
+        let widened = context.get_state();
+        let files = cache
+            .context_files(&root, &widened.items)
+            .await
+            .expect("the widened round reads only the new path");
+        assert_eq!(files.len(), 2);
+        assert_eq!(files[0].content, "alpha\n");
+        assert_eq!(files[1].content, "beta\n");
+
+        // The turn applied a change set, so the memoized bytes are stale and the
+        // round serves what is on disk now.
+        std::fs::write(root.join("a.rs"), "alpha, revised\n").unwrap();
+        let healed = context.get_state();
+        let files = cache
+            .context_files(&root, &healed.items)
+            .await
+            .expect("the healing round reads the rewritten file again");
+        assert_eq!(files[0].content, "alpha, revised\n");
+        assert_eq!(files[1].content, "beta\n");
+    }
 
     /// The context memo is scoped to the turn: it reproduces an unchanged file
     /// byte for byte and extends the block only at its tail when a discovery
@@ -295,7 +509,7 @@ mod tests {
             .expect("the memo reproduces the block");
         assert_eq!(second, first);
 
-        // A discovery round appends a file: the previous element keeps its exact
+        // A research round appends a file: the previous element keeps its exact
         // bytes and the new one lands at the tail.
         assembly.context_files.push(file("b.rs", "beta\n"));
         let third = assembly
@@ -320,7 +534,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn repo_map_stays_identical_when_discovery_widens_the_context() {
+    async fn repo_map_stays_identical_when_research_widens_the_context() {
         let (_dir, root) = repo_with_two_files();
         let mut cache = TurnInputCache::default();
 
@@ -332,7 +546,7 @@ mod tests {
         assert!(first.contains("b.rs"));
         assert!(first.contains("pub fn beta"));
 
-        // A discovery round pulls `b.rs` into the context, which would exclude
+        // A research round pulls `b.rs` into the context, which would exclude
         // it from a regenerated map. The frozen map keeps the node and stays
         // byte-identical, so the prompt prefix of the previous round survives.
         let later_round = vec!["b.rs".to_string()];

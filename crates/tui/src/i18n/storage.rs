@@ -157,7 +157,7 @@ mod tests {
 
     fn sample_locale() -> CustomLocale {
         let mut map = BTreeMap::new();
-        map.insert("tab.develop".to_string(), "Разработка".to_string());
+        map.insert("tab.repl".to_string(), "Репл".to_string());
         map.insert("modal.confirm".to_string(), "Принять".to_string());
         CustomLocale::new("Russian", map)
     }

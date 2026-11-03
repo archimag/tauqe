@@ -40,6 +40,9 @@ static PLAN_UPDATE_SCHEMA: OnceLock<serde_json::Value> = OnceLock::new();
 /// Process-wide cache of the shared definitions the plan payload references.
 static PLAN_SCHEMA_DEFINITIONS: OnceLock<serde_json::Value> = OnceLock::new();
 
+/// Process-wide cache of the structured review decision property.
+static REVIEW_UPDATE_SCHEMA: OnceLock<serde_json::Value> = OnceLock::new();
+
 /// Process-wide cache of the assembled structured-output wrapper.
 static DISCUSSION_RESPONSE_SCHEMA_DEFINITION: OnceLock<serde_json::Value> = OnceLock::new();
 
@@ -194,7 +197,14 @@ pub fn plan_schema_definitions() -> &'static serde_json::Value {
                         "status": {
                             "type": "string",
                             "enum": plan_item_status_enum(),
-                            "description": "Status of the plan step"
+                            "description": "Status of the plan step. A step that a plan mutation creates or amends may carry only 'todo' or 'discussion': 'in_progress', 'blocked', and 'cancelled' belong to the execution pipeline and to the developer's manual control, while 'done' is reachable only through a verified step turn. An assignment of any other status to a created step is repaired to 'todo' and reported instead of being persisted."
+                        },
+                        "commit": {
+                            "anyOf": [
+                                { "type": "string" },
+                                { "type": "null" }
+                            ],
+                            "description": "Identifier of the Git commit that completed this step. The harness records it when the step reaches 'done', and a mutation that reproduces a finished step reproduces its commit verbatim."
                         },
                         "files": {
                             "type": "array",
@@ -206,6 +216,13 @@ pub fn plan_schema_definitions() -> &'static serde_json::Value {
                         "readonly_files": {
                             "type": "array",
                             "description": "Repository-relative file paths for read-only reference context (subsystem conventions, interface contracts, protocol types)",
+                            "items": {
+                                "type": "string"
+                            }
+                        },
+                        "outer_docs": {
+                            "type": "array",
+                            "description": "Identifiers of the project-declared `[[outer_docs]]` entries preloaded as read-only reference context when this step executes",
                             "items": {
                                 "type": "string"
                             }
@@ -232,11 +249,73 @@ pub fn plan_schema_definitions() -> &'static serde_json::Value {
                             }
                         }
                     },
-                    "required": ["id", "title", "details", "status", "files", "readonly_files", "concept_refs", "depends_on", "children"],
+                    "required": ["id", "title", "details", "status", "commit", "files", "readonly_files", "outer_docs", "concept_refs", "depends_on", "children"],
                     "additionalProperties": false
                 }
             })
         })
+}
+
+/// Generates the structured review decision property of the review contract.
+///
+/// The decision shape is declared here once, beside the Rust review model it
+/// mirrors, so both contours describe one identical payload: the discussion
+/// contract embeds it as its `review_update` property and the
+/// code-modification schema forwards the very same builder through its own
+/// capability module.
+///
+/// The property admits `null` because a turn that records no decision carries no
+/// payload at all, which is the idle representation of a property the strict
+/// schema requires.
+///
+/// The payload is assembled once and served by a shared reference, so a caller
+/// that composes or serializes it pays no per-call deep copy of the tree.
+pub fn review_update_schema() -> &'static serde_json::Value {
+    REVIEW_UPDATE_SCHEMA.get_or_init(|| {
+        serde_json::json!({
+            "anyOf": [
+                {
+                    "type": "object",
+                    "description": "Decision recorded for one finding of the discussed review session. Null unless the discussion is anchored on a review session and the engineer has reached a final decision.",
+                    "properties": {
+                        "item_id": {
+                            "type": "integer",
+                            "description": "Identifier of the finding inside the discussed review session"
+                        },
+                        "group_id": {
+                            "anyOf": [
+                                { "type": "string" },
+                                { "type": "null" }
+                            ],
+                            "description": "Identifier of the review group the decision is recorded for; null when the decision addresses the finding alone"
+                        },
+                        "status": {
+                            "type": "string",
+                            "enum": review_decision_status_enum(),
+                            "description": "Status the finding moves to: 'todo' queues it for execution, 'skipped' records that the finding is not reproducible, and 'rejected' records a false positive or an accepted trade-off"
+                        },
+                        "note": {
+                            "type": "string",
+                            "description": "The decision itself, in the engineer's words: the recorded resolution of the finding"
+                        },
+                        "recommendations": {
+                            "type": "array",
+                            "description": "Additional remediation recommendations agreed in the discussion; empty when the decision adds none",
+                            "items": {
+                                "type": "string"
+                            }
+                        }
+                    },
+                    "required": ["item_id", "group_id", "status", "note", "recommendations"],
+                    "additionalProperties": false
+                },
+                {
+                    "type": "null"
+                }
+            ],
+            "description": "Optional decision recorded for one review finding at the end of the turn"
+        })
+    })
 }
 
 /// Builds the `status` enum of the plan item definition from [`PlanItemStatus`].
@@ -313,49 +392,7 @@ pub fn discussion_response_schema() -> &'static serde_json::Value {
                         "description": "Conversational response, reasoning, and answers formatted in Markdown. This field is streamed immediately to the user interface."
                     },
                     "plan_update": plan_update_schema().clone(),
-                    "review_update": {
-                        "anyOf": [
-                            {
-                                "type": "object",
-                                "description": "Decision recorded for one finding of the discussed review session. Null unless the discussion is anchored on a review session and the engineer has reached a final decision.",
-                                "properties": {
-                                    "item_id": {
-                                        "type": "integer",
-                                        "description": "Identifier of the finding inside the discussed review session"
-                                    },
-                                    "group_id": {
-                                        "anyOf": [
-                                            { "type": "string" },
-                                            { "type": "null" }
-                                        ],
-                                        "description": "Identifier of the review group the decision is recorded for; null when the decision addresses the finding alone"
-                                    },
-                                    "status": {
-                                        "type": "string",
-                                        "enum": review_decision_status_enum(),
-                                        "description": "Status the finding moves to: 'todo' queues it for execution, 'skipped' records that the finding is not reproducible, and 'rejected' records a false positive or an accepted trade-off"
-                                    },
-                                    "note": {
-                                        "type": "string",
-                                        "description": "The decision itself, in the engineer's words: the recorded resolution of the finding"
-                                    },
-                                    "recommendations": {
-                                        "type": "array",
-                                        "description": "Additional remediation recommendations agreed in the discussion; empty when the decision adds none",
-                                        "items": {
-                                            "type": "string"
-                                        }
-                                    }
-                                },
-                                "required": ["item_id", "group_id", "status", "note", "recommendations"],
-                                "additionalProperties": false
-                            },
-                            {
-                                "type": "null"
-                            }
-                        ],
-                        "description": "Optional decision recorded for one review finding at the end of the turn"
-                    },
+                    "review_update": review_update_schema().clone(),
                     "context_requests": {
                         "type": "array",
                         "description": "Files to request into context for inspection or editable access",
@@ -686,6 +723,26 @@ mod tests {
         }
     }
 
+    /// The status property states the lifecycle barrier the storage enforces.
+    ///
+    /// The enum admits every state a step can reach, while a mutation may
+    /// introduce a step only as `todo` or `discussion`. The description carries
+    /// that narrowing to the model, so a payload never asserts a status the
+    /// status barrier would repair.
+    #[test]
+    fn test_plan_item_status_description_states_the_creation_barrier() {
+        let definitions = plan_schema_definitions();
+        let description = definitions["PlanItem"]["properties"]["status"]["description"]
+            .as_str()
+            .expect("the status property describes the lifecycle of a step");
+        assert!(
+            description.contains("'todo' or 'discussion'"),
+            "{description}"
+        );
+        assert!(description.contains("'done'"), "{description}");
+        assert!(description.contains("repaired"), "{description}");
+    }
+
     #[test]
     fn test_schema_definition_wrapper() {
         let def = discussion_response_schema_definition();
@@ -823,8 +880,10 @@ mod tests {
             details: Some("details".to_string()),
             status: PlanItemStatus::Todo,
             blocked_reason: None,
+            commit: Some("9f2c1b4".to_string()),
             files: vec!["src/a.rs".to_string()],
             readonly_files: vec!["src/b.rs".to_string()],
+            outer_docs: vec!["docs/entry".to_string()],
             concept_refs: vec!["c-1".to_string()],
             depends_on: vec!["0".to_string()],
             children: vec![PlanItem::default()],
@@ -935,5 +994,51 @@ mod tests {
                 "context_requests.access enum is missing variant {wire}"
             );
         }
+    }
+    /// The decision payload is authored by two contours, so it is declared once.
+    ///
+    /// The discussion contract embeds the authoritative builder verbatim, and
+    /// the code-modification schema forwards the same builder, which is what
+    /// makes one definition of the decision serve both.
+    #[test]
+    fn test_review_payload_is_generated_once() {
+        let schema = discussion_response_schema();
+        assert_eq!(
+            &schema["properties"]["review_update"],
+            super::review_update_schema()
+        );
+
+        let payload = super::review_update_schema();
+        let variants = payload["anyOf"]
+            .as_array()
+            .expect("the review payload is a nullable union");
+        assert_eq!(variants.len(), 2);
+        assert_eq!(variants[1]["type"], "null");
+
+        let object = &variants[0];
+        assert_eq!(object["type"], "object");
+        assert_eq!(object["additionalProperties"], serde_json::json!(false));
+        assert_eq!(
+            declared_fields(object),
+            required_fields(object),
+            "the payload requires exactly the fields it declares"
+        );
+
+        // A decision addresses one finding, so remediation recommendations stay
+        // plain strings instead of nested objects.
+        assert_eq!(
+            object["properties"]["recommendations"]["items"]["type"],
+            "string"
+        );
+
+        // The vocabulary is generated from the typed model, so a status owned by
+        // verification or by execution can never appear here.
+        let decisions: Vec<&str> = object["properties"]["status"]["enum"]
+            .as_array()
+            .expect("the status enum is an array")
+            .iter()
+            .filter_map(|status| status.as_str())
+            .collect();
+        assert_eq!(decisions, vec!["todo", "skipped", "rejected"]);
     }
 }

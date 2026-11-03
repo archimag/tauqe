@@ -156,7 +156,7 @@ pub(super) async fn handle_refine_dialog(
 /// Validates and submits the plan refinement request. Shared by the keyboard
 /// handler and the mouse `Start Refinement` button so the ordering stays
 /// consistent: resolve the optional instructions and the selected architect,
-/// flag the plan as refining, then hand the turn to the Develop view. If the
+/// flag the plan as refining, then hand the turn to the REPL view. If the
 /// model is already busy the dialog simply stays open.
 ///
 /// The optimistic transition is applied through `start_turn`, so a failed
@@ -250,7 +250,7 @@ pub(super) async fn handle_refine_blocked(
 /// Shared by the keyboard and mouse confirmation paths so a click starts the
 /// exact same replanning turn as `Enter`: the blocker reason is folded into the
 /// refine instructions, the plan is flagged as refining, and the turn hands off
-/// to the Develop view. When the model is already busy the dialog is restored so
+/// to the REPL view. When the model is already busy the dialog is restored so
 /// the developer can retry.
 ///
 /// The optimistic transition is applied through `start_turn`, so a failed

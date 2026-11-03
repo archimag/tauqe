@@ -42,6 +42,9 @@ pub(super) struct ProposalStep {
     pub(super) repo_dirs: bool,
     pub(super) repo_map_requests: Vec<String>,
     pub(super) dir_list_requests: Vec<DirListRequest>,
+    /// Declared external documents requested by their mount point, in the order
+    /// they were stated and without repetition.
+    pub(super) outer_doc_requests: Vec<String>,
     pub(super) verify_request: Option<EditVerifyRequest>,
     pub(super) terminal_outcome: Option<LlmOutcome>,
     pub(super) blocked: Option<String>,
@@ -85,6 +88,16 @@ impl ProposalStep {
                     });
                 }
                 LlmCommand::DocRequest { topic } => step.doc_requests.push(*topic),
+                // A request for external project documentation travels the
+                // research phase, which owns the catalogue and the cache of the
+                // documents the project declares. The bucket keeps the mount
+                // points, so the phase materializes each of them once.
+                LlmCommand::OuterDocRequest { id } => {
+                    let id = id.trim().to_string();
+                    if !id.is_empty() && !step.outer_doc_requests.contains(&id) {
+                        step.outer_doc_requests.push(id);
+                    }
+                }
                 LlmCommand::RepoSearch { path, regex } => {
                     step.repo_searches
                         .push(RepoSearchRequest::new(path.clone(), regex.clone()));
@@ -93,7 +106,7 @@ impl ProposalStep {
                 LlmCommand::RepoMap { path } => step.repo_map_requests.push(path.clone()),
                 // The request is normalized during decoding, so a listing that
                 // names a location outside the repository is dropped here
-                // instead of reaching the discovery dispatcher.
+                // instead of reaching the research dispatcher.
                 LlmCommand::DirList { path, recursive } => {
                     if let Some(request) =
                         DirListRequest::new(path.clone(), *recursive).normalized()
@@ -190,34 +203,17 @@ impl ProposalStep {
         &self.context_requests
     }
 
-    /// Documentation topics requested by the model.
-    pub(super) fn doc_requests(&self) -> &[DocTopic] {
-        &self.doc_requests
-    }
-
-    /// Repository search requests carried by the proposal, if any.
-    pub(super) fn repo_searches(&self) -> &[RepoSearchRequest] {
-        &self.repo_searches
-    }
-
-    /// Whether the proposal requested the compact repository directory tree.
-    pub(super) fn repo_dirs(&self) -> bool {
-        self.repo_dirs
-    }
-
     /// Targeted repository map requests carried by the proposal.
     pub(super) fn repo_maps(&self) -> &[String] {
         &self.repo_map_requests
     }
 
-    /// Directory listing requests carried by the proposal.
+    /// Declared external documents requested by their mount point.
     ///
-    /// Entries are normalized while decoding, so a listing that named a
-    /// location outside the repository never reaches this accessor. The
-    /// discovery loop reads it to recognize a round that only listed a
-    /// directory as progress instead of a dead end.
-    pub(super) fn dir_list_requests(&self) -> &[DirListRequest] {
-        &self.dir_list_requests
+    /// Each entry names an `[[outer_docs]]` id rather than a cache path, so the
+    /// research phase resolves the location the harness derived for it.
+    pub(super) fn outer_doc_requests(&self) -> &[String] {
+        &self.outer_doc_requests
     }
 
     /// Toolchain verification request carried by the proposal, if any.
@@ -270,24 +266,25 @@ impl ProposalStep {
         &self.protocol_errors
     }
 
-    /// Reports whether the proposal carries any discovery capability command.
+    /// Reports whether the proposal carries any research capability command.
     ///
     /// Reads the pre-partitioned buckets, so the healing phase can decide
-    /// whether to run the discovery dispatcher without rescanning the raw
+    /// whether to run the research dispatcher without rescanning the raw
     /// command list.
-    pub(super) fn has_discovery_commands(&self) -> bool {
+    pub(super) fn has_research_commands(&self) -> bool {
         !self.context_requests.is_empty()
             || !self.doc_requests.is_empty()
             || !self.repo_searches.is_empty()
             || !self.repo_maps().is_empty()
             || !self.dir_list_requests.is_empty()
+            || !self.outer_doc_requests.is_empty()
             || self.repo_dirs
     }
 
     /// Reports whether the round carried nothing the harness can act upon.
     ///
     /// An empty round produced no conversational text, no file edits, no
-    /// protocol error, no discovery command, no plan mutation, no verification
+    /// protocol error, no research command, no plan mutation, no verification
     /// request, no project command invocation, and no terminal outcome that
     /// carries its own result. Such a round is a transport-level non-answer
     /// rather than a validated reply, so the FSM re-asks the model instead of
@@ -306,7 +303,7 @@ impl ProposalStep {
             && self.blocked.is_none()
             && self.abort.is_none()
             && self.custom_tools.is_empty()
-            && !self.has_discovery_commands()
+            && !self.has_research_commands()
     }
 }
 
@@ -347,12 +344,12 @@ impl TurnState {
     }
 }
 
-/// Reports whether a success summary states what the turn accomplished.
+/// Reports whether a success commit message states what the turn accomplished.
 ///
-/// A summary is the only payload a `success` status carries, so an absent or
-/// blank summary declares an outcome without stating a result.
-fn summary_states_result(summary: Option<&str>) -> bool {
-    match summary {
+/// The commit message is the only payload a `success` status carries, so an
+/// absent or blank one declares an outcome without stating a result.
+fn commit_message_states_result(commit_message: Option<&str>) -> bool {
+    match commit_message {
         Some(text) => !text.trim().is_empty(),
         None => false,
     }
@@ -367,7 +364,9 @@ fn summary_states_result(summary: Option<&str>) -> bool {
 /// therefore a protocol defect rather than a result.
 pub(super) fn outcome_carries_result(outcome: Option<&LlmOutcome>) -> bool {
     match outcome {
-        Some(LlmOutcome::Success { summary }) => summary_states_result(summary.as_deref()),
+        Some(LlmOutcome::Success { commit_message }) => {
+            commit_message_states_result(commit_message.as_deref())
+        }
         Some(LlmOutcome::Error { .. } | LlmOutcome::Skip { .. }) => true,
         None => false,
     }
@@ -388,10 +387,10 @@ fn to_edit_verify_request(target: VerifyTarget, on_success: VerifyOnSuccess) -> 
     EditVerifyRequest { target, on_success }
 }
 
-/// Extracts a non-empty success summary from a terminal outcome.
-pub(super) fn extract_success_summary(outcome: Option<&LlmOutcome>) -> Option<String> {
+/// Extracts a non-empty success commit message from a terminal outcome.
+pub(super) fn extract_commit_message(outcome: Option<&LlmOutcome>) -> Option<String> {
     match outcome {
-        Some(LlmOutcome::Success { summary }) => summary
+        Some(LlmOutcome::Success { commit_message }) => commit_message
             .as_ref()
             .map(|text| text.trim())
             .filter(|text| !text.is_empty())
@@ -620,55 +619,84 @@ mod tests {
     }
 
     #[test]
-    fn has_discovery_commands_detects_each_discovery_capability() {
+    fn has_research_commands_detects_each_research_capability() {
         use tauqe_protocol::ContextAccess;
 
         let text_only = ProposalStep::from_commands(vec![LlmCommand::Text {
             content: "hello".to_string(),
         }]);
-        assert!(!text_only.has_discovery_commands());
+        assert!(!text_only.has_research_commands());
 
         let context = ProposalStep::from_commands(vec![LlmCommand::ContextRequest {
             path: "src/a.rs".to_string(),
             access: ContextAccess::ReadOnly,
         }]);
-        assert!(context.has_discovery_commands());
+        assert!(context.has_research_commands());
 
         let search = ProposalStep::from_commands(vec![LlmCommand::RepoSearch {
             path: "src".to_string(),
             regex: "fn main".to_string(),
         }]);
-        assert!(search.has_discovery_commands());
+        assert!(search.has_research_commands());
 
         let doc = ProposalStep::from_commands(vec![LlmCommand::DocRequest {
             topic: DocTopic::Git,
         }]);
-        assert!(doc.has_discovery_commands());
+        assert!(doc.has_research_commands());
 
         let dirs = ProposalStep::from_commands(vec![LlmCommand::RepoDirs]);
-        assert!(dirs.repo_dirs());
-        assert!(dirs.has_discovery_commands());
+        assert!(dirs.has_research_commands());
 
         let maps = ProposalStep::from_commands(vec![LlmCommand::RepoMap {
             path: "crates/core".to_string(),
         }]);
         assert_eq!(maps.repo_maps().len(), 1);
         assert_eq!(maps.repo_maps()[0], "crates/core");
-        assert!(maps.has_discovery_commands());
+        assert!(maps.has_research_commands());
 
         let dir_list = ProposalStep::from_commands(vec![LlmCommand::DirList {
             path: "crates/core".to_string(),
             recursive: false,
         }]);
-        assert!(dir_list.has_discovery_commands());
+        assert!(dir_list.has_research_commands());
 
         // A listing that would escape the repository is dropped during
-        // decoding, so it never counts as discovery progress.
+        // decoding, so it never counts as research progress.
         let escaping = ProposalStep::from_commands(vec![LlmCommand::DirList {
             path: "../escape".to_string(),
             recursive: true,
         }]);
-        assert!(!escaping.has_discovery_commands());
+        assert!(!escaping.has_research_commands());
+    }
+
+    /// An outer-document request names a mount point of the project
+    /// declaration, so it is research: a round that only asks for external
+    /// documentation carries an actionable command instead of being an empty
+    /// reply the corrective machine must re-ask.
+    #[test]
+    fn an_outer_document_request_is_research_that_names_its_mount_point() {
+        use tauqe_protocol::LlmCommand;
+
+        let step = ProposalStep::from_commands(vec![LlmCommand::OuterDocRequest {
+            id: "mylib".to_string(),
+        }]);
+        assert_eq!(step.outer_doc_requests().len(), 1);
+        assert_eq!(step.outer_doc_requests()[0], "mylib");
+        assert!(step.has_research_commands());
+        assert!(!step.is_empty_step());
+
+        // A repeated mount point is materialized once, and a blank id grants
+        // nothing: the round keeps the declared documents it actually named.
+        let repeated = ProposalStep::from_commands(vec![
+            LlmCommand::OuterDocRequest {
+                id: " mylib ".to_string(),
+            },
+            LlmCommand::OuterDocRequest {
+                id: "   ".to_string(),
+            },
+        ]);
+        assert_eq!(repeated.outer_doc_requests().len(), 1);
+        assert_eq!(repeated.outer_doc_requests()[0], "mylib");
     }
 
     #[test]
@@ -700,11 +728,11 @@ mod tests {
         }]);
         assert!(!answer.is_empty_step());
 
-        let discovery = ProposalStep::from_commands(vec![LlmCommand::ContextRequest {
+        let research = ProposalStep::from_commands(vec![LlmCommand::ContextRequest {
             path: "src/a.rs".to_string(),
             access: ContextAccess::ReadOnly,
         }]);
-        assert!(!discovery.is_empty_step());
+        assert!(!research.is_empty_step());
 
         let malformed = ProposalStep::from_commands(vec![LlmCommand::ProtocolError {
             message: "unclosed <edit>".to_string(),
@@ -714,13 +742,15 @@ mod tests {
         // A status without its payload is a protocol defect, not a result, so
         // the round stays empty and the corrective machine re-asks the model.
         let bare_success = ProposalStep::from_commands(vec![LlmCommand::Outcome {
-            outcome: LlmOutcome::Success { summary: None },
+            outcome: LlmOutcome::Success {
+                commit_message: None,
+            },
         }]);
         assert!(bare_success.is_empty_step());
 
         let summarized = ProposalStep::from_commands(vec![LlmCommand::Outcome {
             outcome: LlmOutcome::Success {
-                summary: Some("Confirmed the change".to_string()),
+                commit_message: Some("Confirmed the change".to_string()),
             },
         }]);
         assert!(!summarized.is_empty_step());
@@ -735,7 +765,9 @@ mod tests {
                 content: "The helper already returns 42.".to_string(),
             },
             LlmCommand::Outcome {
-                outcome: LlmOutcome::Success { summary: None },
+                outcome: LlmOutcome::Success {
+                    commit_message: None,
+                },
             },
         ]);
         assert!(!explained.is_empty_step());
@@ -749,7 +781,9 @@ mod tests {
                 },
             },
             LlmCommand::Outcome {
-                outcome: LlmOutcome::Success { summary: None },
+                outcome: LlmOutcome::Success {
+                    commit_message: None,
+                },
             },
         ]);
         assert!(!edited.is_empty_step());
@@ -757,7 +791,7 @@ mod tests {
         // A blank summary states no result either.
         let blank = ProposalStep::from_commands(vec![LlmCommand::Outcome {
             outcome: LlmOutcome::Success {
-                summary: Some("  \n\t ".to_string()),
+                commit_message: Some("  \n\t ".to_string()),
             },
         }]);
         assert!(blank.is_empty_step());

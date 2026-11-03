@@ -1,7 +1,7 @@
 //! Deterministic end-to-end integration tests for the core FSM task cycles.
 //!
 //! Every test drives the real turn pipeline against a scripted
-//! [`MockLlmProvider`], exercising discovery, edit staging, patch-retry
+//! [`MockLlmProvider`], exercising research, edit staging, patch-retry
 //! healing, and toolchain verification healing without any network access or
 //! manual context assembly.
 
@@ -299,10 +299,10 @@ async fn answer_edit_loop_discovers_context_via_repo_search() {
         .expect("add target to context");
     let mut history = HistoryManager::new(repo_root.clone());
 
-    let search_discovery = format!(
+    let search_round = format!(
         "Searching for answer constant.\n<repo_search_{MARKER} path=\"src\" regex=\"pub const ANSWER\" />"
     );
-    let file_discovery = format!(
+    let file_round = format!(
         "Found definition, requesting file.\n<context_request_{MARKER} path=\"src/helper.rs\" access=\"read_only\" />"
     );
     let edit = edit_block(
@@ -312,8 +312,8 @@ async fn answer_edit_loop_discovers_context_via_repo_search() {
         "pub fn compute() -> i32 { 42 }",
     );
     let provider = MockLlmProvider::scripted([
-        MockResponse::text(search_discovery),
-        MockResponse::text(file_discovery),
+        MockResponse::text(search_round),
+        MockResponse::text(file_round),
         MockResponse::text(edit),
     ]);
     let model = ModelRef::openrouter("mock/model");
@@ -376,7 +376,7 @@ async fn answer_edit_loop_discovers_requested_context() {
         .expect("add target to context");
     let mut history = HistoryManager::new(repo_root.clone());
 
-    let discovery = format!(
+    let research = format!(
         "I need the constant definitions.\n<context_request_{MARKER} path=\"helper.rs\" access=\"read_only\" />"
     );
     let edit = edit_block(
@@ -386,7 +386,7 @@ async fn answer_edit_loop_discovers_requested_context() {
         "pub fn compute() -> i32 { 42 }",
     );
     let provider =
-        MockLlmProvider::scripted([MockResponse::text(discovery), MockResponse::text(edit)]);
+        MockLlmProvider::scripted([MockResponse::text(research), MockResponse::text(edit)]);
     let model = ModelRef::openrouter("mock/model");
     let protocol = tauqe_core::prompt::xml::XmlPromptProtocol;
     let protocol = protocol.with_turn_marker(MARKER).unwrap();
@@ -444,7 +444,7 @@ async fn answer_edit_loop_discovers_the_directory_outline() {
         .expect("add target to context");
     let mut history = HistoryManager::new(repo_root.clone());
 
-    let discovery = format!("I need the repository layout.\n<repo_dirs_{MARKER} />");
+    let research = format!("I need the repository layout.\n<repo_dirs_{MARKER} />");
     let edit = edit_block(
         "Use the helper constant",
         "target.rs",
@@ -452,7 +452,7 @@ async fn answer_edit_loop_discovers_the_directory_outline() {
         "pub fn compute() -> i32 { 42 }",
     );
     let provider =
-        MockLlmProvider::scripted([MockResponse::text(discovery), MockResponse::text(edit)]);
+        MockLlmProvider::scripted([MockResponse::text(research), MockResponse::text(edit)]);
     let model = ModelRef::openrouter("mock/model");
     let protocol = tauqe_core::prompt::xml::XmlPromptProtocol;
     let protocol = protocol.with_turn_marker(MARKER).unwrap();
@@ -506,7 +506,7 @@ async fn answer_edit_loop_discovers_a_targeted_repo_map() {
         .expect("add target to context");
     let mut history = HistoryManager::new(repo_root.clone());
 
-    let discovery = format!("Outlining the subsystem.\n<repo_map_{MARKER} path=\"src\" />");
+    let research = format!("Outlining the subsystem.\n<repo_map_{MARKER} path=\"src\" />");
     let edit = edit_block(
         "Use the helper constant",
         "target.rs",
@@ -514,7 +514,7 @@ async fn answer_edit_loop_discovers_a_targeted_repo_map() {
         "pub fn compute() -> i32 { 42 }",
     );
     let provider =
-        MockLlmProvider::scripted([MockResponse::text(discovery), MockResponse::text(edit)]);
+        MockLlmProvider::scripted([MockResponse::text(research), MockResponse::text(edit)]);
     let model = ModelRef::openrouter("mock/model");
     let protocol = tauqe_core::prompt::xml::XmlPromptProtocol;
     let protocol = protocol.with_turn_marker(MARKER).unwrap();
@@ -568,7 +568,7 @@ async fn structured_turn_discovers_a_targeted_repo_map() {
         .expect("add target to context");
     let mut history = HistoryManager::new(repo_root.clone());
 
-    let discovery = serde_json::json!({
+    let research = serde_json::json!({
         "message": "Outlining the subsystem.",
         "changes": [],
         "context_requests": [],
@@ -586,12 +586,12 @@ async fn structured_turn_discovers_a_targeted_repo_map() {
             "content": ""
         }],
         "context_requests": [],
-        "outcome": { "status": "success", "summary": "Constant applied", "message": "" },
+        "outcome": { "status": "success", "commit_message": "Constant applied", "message": "" },
     })
     .to_string();
 
     let provider =
-        MockLlmProvider::scripted([MockResponse::text(discovery), MockResponse::text(edit)]);
+        MockLlmProvider::scripted([MockResponse::text(research), MockResponse::text(edit)]);
     let model = ModelRef::openrouter("mock/model");
     let protocol = tauqe_core::prompt::json::JsonPromptProtocol::edits();
     let mut policy = tauqe_core::workflow::policy::DirectApplyPolicy::new();
@@ -1065,7 +1065,7 @@ async fn git_workflow_heals_when_verification_response_has_text_only() {
 }
 
 #[tokio::test]
-async fn scratchpad_from_discovery_reaches_verification_healing() {
+async fn scratchpad_from_research_reaches_verification_healing() {
     let (_dir, repo_root) = init_repo();
     std::fs::write(repo_root.join("Cargo.toml"), HEAL_MANIFEST).expect("write manifest");
     std::fs::create_dir_all(repo_root.join("src")).expect("create src directory");
@@ -1084,7 +1084,7 @@ async fn scratchpad_from_discovery_reaches_verification_healing() {
         .expect("add library to context");
     let mut history = HistoryManager::new(repo_root.clone());
 
-    let discovery = format!(
+    let research = format!(
         "Recording hypothesis.\n<scratchpad_{MARKER}>\n- Hypothesis: repair both return types\n</scratchpad_{MARKER}>\n<context_request_{MARKER} path=\"helper.rs\" access=\"read_only\" />"
     );
     let fix_alpha = format!(
@@ -1106,7 +1106,7 @@ async fn scratchpad_from_discovery_reaches_verification_healing() {
         ),
     );
     let provider = MockLlmProvider::scripted([
-        MockResponse::text(discovery),
+        MockResponse::text(research),
         MockResponse::text(fix_alpha),
         MockResponse::text(fix_beta),
     ]);
@@ -1234,7 +1234,7 @@ async fn fsm_turn_saves_and_activates_plan() {
           <concept_{MARKER}>\n\
             <concept_item_{MARKER} id=\"c-1\" title=\"Plan Invariant\" />\n\
           </concept_{MARKER}>\n\
-          <item_{MARKER} id=\"1\" title=\"First step\" status=\"todo\" />\n\
+          <item_{MARKER} id=\"1\" title=\"First step\" status=\"todo\" files=\"src/first.rs\" />\n\
         </plan_{MARKER}>"
     );
     let provider = MockLlmProvider::scripted([MockResponse::text(plan_output)]);
@@ -1296,7 +1296,7 @@ async fn scratchpad_persists_between_proposal_rounds() {
         .expect("add target to context");
     let mut history = HistoryManager::new(repo_root.clone());
 
-    let discovery = format!(
+    let research = format!(
         "Recording working notes.\n\
         <scratchpad_{MARKER}>\n- Finding: helper.rs holds ANSWER\n</scratchpad_{MARKER}>\n\
         <context_request_{MARKER} path=\"helper.rs\" access=\"read_only\" />"
@@ -1308,7 +1308,7 @@ async fn scratchpad_persists_between_proposal_rounds() {
         "pub fn compute() -> i32 { 42 }",
     );
     let provider =
-        MockLlmProvider::scripted([MockResponse::text(discovery), MockResponse::text(edit)]);
+        MockLlmProvider::scripted([MockResponse::text(research), MockResponse::text(edit)]);
     let model = ModelRef::openrouter("mock/model");
     let protocol = tauqe_core::prompt::xml::XmlPromptProtocol
         .with_turn_marker(MARKER)
@@ -1754,7 +1754,7 @@ async fn discussion_turn_streams_clean_markdown_without_json_leakage() {
     commit_fixture(&repo_root, &["target.rs"]);
 
     let mut context = ContextManager::new(repo_root.clone());
-    // Pre-satisfy the discussion's context request so discovery never re-runs
+    // Pre-satisfy the discussion's context request so research never re-runs
     // the proposal and the single scripted response is consumed exactly once.
     context
         .add_file("target.rs", ContextAccess::ReadOnly)
@@ -1862,7 +1862,7 @@ async fn plan_discussion_renders_the_real_context_access_layers() {
         .expect("add reference to context");
     let mut history = HistoryManager::new(repo_root.clone());
 
-    let discovery = serde_json::json!({
+    let research = serde_json::json!({
         "message": "Запрашиваю константу.",
         "plan_update": null,
         "context_requests": [
@@ -1880,7 +1880,7 @@ async fn plan_discussion_renders_the_real_context_access_layers() {
     .to_string();
 
     let provider =
-        MockLlmProvider::scripted([MockResponse::text(discovery), MockResponse::text(answer)]);
+        MockLlmProvider::scripted([MockResponse::text(research), MockResponse::text(answer)]);
     let model = ModelRef::openrouter("mock/model");
     let protocol = tauqe_core::prompt::json::JsonPromptProtocol::discussion();
     let mut policy = tauqe_core::workflow::policy::DirectApplyPolicy::new();
@@ -1964,7 +1964,7 @@ async fn discussion_turn_persists_plan_update_and_active_marker() {
                     "title": "First step",
                     "details": "Concrete work",
                     "status": "todo",
-                    "files": [],
+                     "files": ["src/first_step.rs"],
                     "readonly_files": [],
                     "concept_refs": ["c-1"],
                     "depends_on": [],
@@ -2082,7 +2082,7 @@ async fn structured_turn_persists_scratchpad_between_proposal_rounds() {
         .expect("add target to context");
     let mut history = HistoryManager::new(repo_root.clone());
 
-    let discovery = serde_json::json!({
+    let research = serde_json::json!({
         "message": "Recording working notes.",
         "changes": [],
         "context_requests": ["helper.rs"],
@@ -2100,12 +2100,12 @@ async fn structured_turn_persists_scratchpad_between_proposal_rounds() {
             "content": ""
         }],
         "context_requests": [],
-        "outcome": { "status": "success", "summary": "Constant applied", "message": "" },
+        "outcome": { "status": "success", "commit_message": "Constant applied", "message": "" },
     })
     .to_string();
 
     let provider =
-        MockLlmProvider::scripted([MockResponse::text(discovery), MockResponse::text(edit)]);
+        MockLlmProvider::scripted([MockResponse::text(research), MockResponse::text(edit)]);
     let model = ModelRef::openrouter("mock/model");
     let protocol = tauqe_core::prompt::json::JsonPromptProtocol::edits();
     let mut policy = tauqe_core::workflow::policy::DirectApplyPolicy::new();
@@ -2151,7 +2151,7 @@ async fn structured_turn_terminates_on_terminal_error_outcome() {
         "message": "I cannot proceed.",
         "changes": [],
         "context_requests": [],
-        "outcome": { "status": "error", "summary": "", "message": "Missing dependency" },
+        "outcome": { "status": "error", "commit_message": "", "message": "Missing dependency" },
     })
     .to_string();
 
@@ -2335,7 +2335,7 @@ async fn xml_and_structured_protocols_are_interchangeable_peers() {
             "content": ""
         }],
         "context_requests": [],
-        "outcome": { "status": "success", "summary": "Change compute to 42", "message": "" }
+        "outcome": { "status": "success", "commit_message": "Change compute to 42", "message": "" }
     })
     .to_string();
     let (structured_result, structured_requests, structured_content) =
@@ -2358,15 +2358,15 @@ async fn xml_and_structured_protocols_are_interchangeable_peers() {
     assert_eq!(structured_content, xml_content);
 }
 
-/// A discovery round must extend the cached prompt prefix instead of
+/// A research round must extend the cached prompt prefix instead of
 /// reshaping it.
 ///
 /// The head of the system message (the core contract and the frozen repository
 /// map) is rendered byte-identically, the requested file extends
-/// the context block in insertion order, and the discovery feedback appends to
+/// the context block in insertion order, and the research feedback appends to
 /// the user message rather than being woven into the head.
 #[tokio::test]
-async fn discovery_round_extends_the_stable_prompt_prefix() {
+async fn research_round_extends_the_stable_prompt_prefix() {
     let (_dir, repo_root) = init_repo();
     std::fs::write(
         repo_root.join("target.rs"),
@@ -2383,7 +2383,7 @@ async fn discovery_round_extends_the_stable_prompt_prefix() {
         .expect("add target to context");
     let mut history = HistoryManager::new(repo_root.clone());
 
-    let discovery = format!(
+    let research = format!(
         "I need the constant definitions.\n<context_request_{MARKER} path=\"helper.rs\" access=\"read_only\" />"
     );
     let edit = edit_block(
@@ -2393,7 +2393,7 @@ async fn discovery_round_extends_the_stable_prompt_prefix() {
         "pub fn compute() -> i32 { 42 }",
     );
     let provider =
-        MockLlmProvider::scripted([MockResponse::text(discovery), MockResponse::text(edit)]);
+        MockLlmProvider::scripted([MockResponse::text(research), MockResponse::text(edit)]);
     let model = ModelRef::openrouter("mock/model");
     let protocol = tauqe_core::prompt::xml::XmlPromptProtocol
         .with_turn_marker(MARKER)
@@ -2452,21 +2452,20 @@ async fn discovery_round_extends_the_stable_prompt_prefix() {
     let second_context = rendered_context_body(second_system);
     assert!(
         second_context.starts_with(first_context),
-        "discovery must append to the context block instead of reshaping it"
+        "research must append to the context block instead of reshaping it"
     );
     assert!(second_context.contains("path=\"helper.rs\" access=\"read_only\""));
 
-    // Discovery feedback appends to the user message, never to the head.
+    // Research feedback appends to the user message, never to the head.
     assert!(provider.requests()[1].messages[1]
         .content
         .starts_with(&provider.requests()[0].messages[1].content));
 }
-
-/// Multiple consecutive discovery rounds must preserve the static head and
+/// Multiple consecutive research rounds must preserve the static head and
 /// monotonically grow the reusable prompt cache prefix as new files enter
 /// context under `line_anchor` strategy.
 #[tokio::test]
-async fn multi_round_discovery_preserves_and_monotonically_grows_cached_prefix() {
+async fn multi_round_research_preserves_and_monotonically_grows_cached_prefix() {
     let (_dir, repo_root) = init_repo();
     std::fs::write(
         repo_root.join("target.rs"),
@@ -2510,7 +2509,7 @@ async fn multi_round_discovery_preserves_and_monotonically_grows_cached_prefix()
     let mut policy = tauqe_core::workflow::policy::DirectApplyPolicy::new();
     let mut options = strategy_options("line_anchor");
     options.session_id = Some("test-session-cache-invariants".to_string());
-    options.max_discovery_rounds = 5;
+    options.max_research_rounds = 5;
     let (stream_tx, cancel_rx) = event_channel();
 
     let output = {
@@ -2540,7 +2539,7 @@ async fn multi_round_discovery_preserves_and_monotonically_grows_cached_prefix()
     assert_eq!(
         requests.len(),
         4,
-        "must execute exactly 3 discovery rounds followed by 1 proposal round"
+        "must execute exactly 3 research rounds followed by 1 proposal round"
     );
 
     // 1. Session ID is preserved across all rounds to maintain provider KV-cache routing
@@ -2569,7 +2568,7 @@ async fn multi_round_discovery_preserves_and_monotonically_grows_cached_prefix()
         );
     }
 
-    // 3. Rendered context body extends strictly at the tail on each discovery round
+    // 3. Rendered context body extends strictly at the tail on each research round
     for i in 0..requests.len() - 1 {
         let ctx_cur = rendered_context_body(&requests[i].messages[0].content);
         let ctx_next = rendered_context_body(&requests[i + 1].messages[0].content);
@@ -2591,7 +2590,7 @@ async fn multi_round_discovery_preserves_and_monotonically_grows_cached_prefix()
     //    that follows the context block: the session history renders after the
     //    context so the divergence point of two consecutive turns falls as
     //    late as possible, and within the turn the whole warmed context stays
-    //    inside the shared prefix, which grows with every discovery round.
+    //    inside the shared prefix, which grows with every research round.
     let mut prev_prefix_len = 0;
     for i in 1..requests.len() {
         let prev_sys = &requests[i - 1].messages[0].content;
@@ -2643,7 +2642,7 @@ async fn scratchpad_renders_in_the_volatile_tail() {
         .expect("add target to context");
     let mut history = HistoryManager::new(repo_root.clone());
 
-    let discovery = format!(
+    let research = format!(
         "Recording working notes.\n\
         <scratchpad_{MARKER}>\n- Finding: helper.rs holds ANSWER\n</scratchpad_{MARKER}>\n\
         <context_request_{MARKER} path=\"helper.rs\" access=\"read_only\" />"
@@ -2655,7 +2654,7 @@ async fn scratchpad_renders_in_the_volatile_tail() {
         "pub fn compute() -> i32 { 42 }",
     );
     let provider =
-        MockLlmProvider::scripted([MockResponse::text(discovery), MockResponse::text(edit)]);
+        MockLlmProvider::scripted([MockResponse::text(research), MockResponse::text(edit)]);
     let model = ModelRef::openrouter("mock/model");
     let protocol = tauqe_core::prompt::xml::XmlPromptProtocol
         .with_turn_marker(MARKER)
@@ -2974,11 +2973,11 @@ args = ["-c", "cat; echo '// formatted'"]
     );
 }
 
-/// Discovery navigation is Git-only and exclusion-aware: a search and a listing
+/// Research navigation is Git-only and exclusion-aware: a search and a listing
 /// that address a service directory report nothing, so vendored or generated
 /// files never reach the prompt.
 #[tokio::test]
-async fn discovery_ignores_excluded_paths() {
+async fn research_ignores_excluded_paths() {
     let (_dir, repo_root) = init_repo();
     std::fs::create_dir_all(repo_root.join("node_modules/pkg")).expect("create node_modules dir");
     std::fs::write(
@@ -2999,7 +2998,7 @@ async fn discovery_ignores_excluded_paths() {
         .expect("add target to context");
     let mut history = HistoryManager::new(repo_root.clone());
 
-    let discovery = format!(
+    let research = format!(
         "Inspecting the vendored tree.\n\
         <repo_search_{MARKER} path=\"node_modules\" regex=\"module\\.exports\" />\n\
         <dir_list_{MARKER} path=\"node_modules\" recursive=\"true\" />"
@@ -3011,7 +3010,7 @@ async fn discovery_ignores_excluded_paths() {
         "pub fn compute() -> i32 { 42 }",
     );
     let provider =
-        MockLlmProvider::scripted([MockResponse::text(discovery), MockResponse::text(edit)]);
+        MockLlmProvider::scripted([MockResponse::text(research), MockResponse::text(edit)]);
     let model = ModelRef::openrouter("mock/model");
     let protocol = tauqe_core::prompt::xml::XmlPromptProtocol
         .with_turn_marker(MARKER)
@@ -3176,7 +3175,7 @@ async fn dir_list_truncates_at_the_entry_cap() {
         .expect("add target to context");
     let mut history = HistoryManager::new(repo_root.clone());
 
-    let discovery =
+    let research =
         format!("Listing the wide folder.\n<dir_list_{MARKER} path=\"many\" recursive=\"true\" />");
     let edit = edit_block(
         "Change compute to 42",
@@ -3185,7 +3184,7 @@ async fn dir_list_truncates_at_the_entry_cap() {
         "pub fn compute() -> i32 { 42 }",
     );
     let provider =
-        MockLlmProvider::scripted([MockResponse::text(discovery), MockResponse::text(edit)]);
+        MockLlmProvider::scripted([MockResponse::text(research), MockResponse::text(edit)]);
     let model = ModelRef::openrouter("mock/model");
     let protocol = tauqe_core::prompt::xml::XmlPromptProtocol
         .with_turn_marker(MARKER)
@@ -3275,7 +3274,7 @@ async fn repo_dirs_lists_root_files_and_marks_pinned_conventions() {
         .expect("add target to context");
     let mut history = HistoryManager::new(repo_root.clone());
 
-    let discovery = format!("Outlining the repository.\n<repo_dirs_{MARKER} />");
+    let research = format!("Outlining the repository.\n<repo_dirs_{MARKER} />");
     let edit = edit_block(
         "Change compute to 42",
         "target.rs",
@@ -3283,7 +3282,7 @@ async fn repo_dirs_lists_root_files_and_marks_pinned_conventions() {
         "pub fn compute() -> i32 { 42 }",
     );
     let provider =
-        MockLlmProvider::scripted([MockResponse::text(discovery), MockResponse::text(edit)]);
+        MockLlmProvider::scripted([MockResponse::text(research), MockResponse::text(edit)]);
     let model = ModelRef::openrouter("mock/model");
     let protocol = tauqe_core::prompt::xml::XmlPromptProtocol
         .with_turn_marker(MARKER)
@@ -3359,7 +3358,7 @@ async fn doc_request_config_returns_authoritative_configuration_documentation() 
         .expect("add target to context");
     let mut history = HistoryManager::new(repo_root.clone());
 
-    let discovery = format!(
+    let research = format!(
         "Checking the authoritative configuration reference.\n\
         <doc_request_{MARKER} topic=\"config\" />"
     );
@@ -3370,7 +3369,7 @@ async fn doc_request_config_returns_authoritative_configuration_documentation() 
         "pub fn compute() -> i32 { 42 }",
     );
     let provider =
-        MockLlmProvider::scripted([MockResponse::text(discovery), MockResponse::text(edit)]);
+        MockLlmProvider::scripted([MockResponse::text(research), MockResponse::text(edit)]);
     let model = ModelRef::openrouter("mock/model");
     let protocol = tauqe_core::prompt::xml::XmlPromptProtocol
         .with_turn_marker(MARKER)
@@ -3450,7 +3449,7 @@ async fn tauqe_toml_anchor_renders_in_the_stable_prefix_before_the_context_block
         .expect("add target to context");
     let mut history = HistoryManager::new(repo_root.clone());
 
-    let discovery = format!(
+    let research = format!(
         "I need the constant definitions.\n<context_request_{MARKER} path=\"helper.rs\" access=\"read_only\" />"
     );
     let edit = edit_block(
@@ -3460,7 +3459,7 @@ async fn tauqe_toml_anchor_renders_in_the_stable_prefix_before_the_context_block
         "pub fn compute() -> i32 { 42 }",
     );
     let provider =
-        MockLlmProvider::scripted([MockResponse::text(discovery), MockResponse::text(edit)]);
+        MockLlmProvider::scripted([MockResponse::text(research), MockResponse::text(edit)]);
     let model = ModelRef::openrouter("mock/model");
     let protocol = tauqe_core::prompt::xml::XmlPromptProtocol
         .with_turn_marker(MARKER)
@@ -3526,11 +3525,11 @@ async fn tauqe_toml_anchor_renders_in_the_stable_prefix_before_the_context_block
     );
 }
 
-/// A discovery finding is not a repository file, so it lands in the turn
+/// A research finding is not a repository file, so it lands in the turn
 /// journal instead of the context block and survives into the patch-retry
 /// round: the model never re-learns what the turn already paid for.
 #[tokio::test]
-async fn discovery_findings_reach_the_patch_retry_round() {
+async fn research_findings_reach_the_patch_retry_round() {
     let (_dir, repo_root) = init_repo();
     std::fs::write(
         repo_root.join("target.rs"),
@@ -3545,7 +3544,7 @@ async fn discovery_findings_reach_the_patch_retry_round() {
         .expect("add target to context");
     let mut history = HistoryManager::new(repo_root.clone());
 
-    let discovery =
+    let research =
         format!("Checking the authoritative git chapter.\n<doc_request_{MARKER} topic=\"git\" />");
     let broken = edit_block(
         "Broken attempt",
@@ -3560,7 +3559,7 @@ async fn discovery_findings_reach_the_patch_retry_round() {
         "pub fn compute() -> i32 { 42 }",
     );
     let provider = MockLlmProvider::scripted([
-        MockResponse::text(discovery),
+        MockResponse::text(research),
         MockResponse::text(broken),
         MockResponse::text(corrected),
     ]);
@@ -3597,12 +3596,12 @@ async fn discovery_findings_reach_the_patch_retry_round() {
     assert_eq!(provider.requests().len(), 3);
 
     let retry = &provider.requests()[2].messages[1].content;
-    assert!(retry.contains("<discovery_journal>"));
+    assert!(retry.contains("<research_journal>"));
     assert!(retry.contains("<system_documentation>"));
 
     // The message keeps one fixed order: task, journal, phase diagnostics.
     let task_at = retry.find("Change compute to return 42").expect("task");
-    let journal_at = retry.find("<discovery_journal>").expect("journal");
+    let journal_at = retry.find("<research_journal>").expect("journal");
     let diagnostics_at = retry
         .find("Failed files and errors:")
         .expect("repair diagnostics");
@@ -3611,10 +3610,10 @@ async fn discovery_findings_reach_the_patch_retry_round() {
 }
 
 /// Verification healing replays the whole turn journal, so a documentation
-/// chapter requested during Discovery is still available when the compiler
+/// chapter requested during Research is still available when the compiler
 /// rejects the first attempt.
 #[tokio::test]
-async fn discovery_findings_reach_verification_healing() {
+async fn research_findings_reach_verification_healing() {
     let (_dir, repo_root) = init_repo();
     std::fs::write(repo_root.join("Cargo.toml"), HEAL_MANIFEST).expect("write manifest");
     std::fs::create_dir_all(repo_root.join("src")).expect("create src directory");
@@ -3628,7 +3627,7 @@ async fn discovery_findings_reach_verification_healing() {
         .expect("add library to context");
     let mut history = HistoryManager::new(repo_root.clone());
 
-    let discovery =
+    let research =
         format!("Consulting the workflow chapter.\n<doc_request_{MARKER} topic=\"workflow\" />");
     let fix_alpha = format!(
         "{edits}\n<verify_{MARKER} target=\"check\" on_success=\"silent\" />",
@@ -3649,7 +3648,7 @@ async fn discovery_findings_reach_verification_healing() {
         ),
     );
     let provider = MockLlmProvider::scripted([
-        MockResponse::text(discovery),
+        MockResponse::text(research),
         MockResponse::text(fix_alpha),
         MockResponse::text(fix_beta),
     ]);
@@ -3684,14 +3683,14 @@ async fn discovery_findings_reach_verification_healing() {
     assert_eq!(provider.requests().len(), 3);
 
     let healing = &provider.requests()[2].messages[1].content;
-    assert!(healing.contains("<discovery_journal>"));
+    assert!(healing.contains("<research_journal>"));
     assert_eq!(
         healing.matches("<system_documentation>").count(),
         1,
         "the journal must not duplicate an identical finding"
     );
 
-    let journal_at = healing.find("<discovery_journal>").expect("journal");
+    let journal_at = healing.find("<research_journal>").expect("journal");
     let diagnostics_at = healing
         .find("Please fix the errors")
         .expect("healing diagnostics");
@@ -3704,7 +3703,7 @@ async fn discovery_findings_reach_verification_healing() {
 /// The journal is append-only and de-duplicated: re-requesting the same
 /// documentation chapter never inflates the turn message.
 #[tokio::test]
-async fn repeated_discovery_findings_are_not_duplicated() {
+async fn repeated_research_findings_are_not_duplicated() {
     let (_dir, repo_root) = init_repo();
     std::fs::write(
         repo_root.join("target.rs"),
@@ -4334,7 +4333,7 @@ async fn diagnostic_command_feedback_reaches_the_next_rounds_and_is_committed() 
 
     let probe =
         format!("Inspecting the project diagnostics.\n<custom_tool_{MARKER} name=\"probe\" />");
-    let discovery = format!(
+    let research = format!(
         "Requesting the constant definition.\n<context_request_{MARKER} path=\"helper.rs\" access=\"read_only\" />"
     );
     let edit = edit_block(
@@ -4345,7 +4344,7 @@ async fn diagnostic_command_feedback_reaches_the_next_rounds_and_is_committed() 
     );
     let provider = MockLlmProvider::scripted([
         MockResponse::text(probe),
-        MockResponse::text(discovery),
+        MockResponse::text(research),
         MockResponse::text(edit),
     ]);
     let model = ModelRef::openrouter("mock/model");
@@ -4357,7 +4356,7 @@ async fn diagnostic_command_feedback_reaches_the_next_rounds_and_is_committed() 
     let baseline = commit_count(&repo_root);
     let mut policy = GitTransactionPolicy::new();
     let options = WorkflowOptions {
-        max_discovery_rounds: 4,
+        max_research_rounds: 4,
         ..WorkflowOptions::default()
     };
     let exec = SingleExecution::new(options);
@@ -4404,7 +4403,7 @@ async fn diagnostic_command_feedback_reaches_the_next_rounds_and_is_committed() 
         .find("Use the helper constant")
         .expect("task statement");
     let journal_at = after_probe
-        .find("<discovery_journal>")
+        .find("<research_journal>")
         .expect("journal tail");
     assert!(task_at < journal_at);
     assert!(after_probe.contains("<project_command_feedback name=\"probe\" success=\"true\">"));
@@ -4464,7 +4463,7 @@ async fn diagnostic_rounds_consume_the_shared_investigation_budget() {
 
     let mut policy = GitTransactionPolicy::new();
     let options = WorkflowOptions {
-        max_discovery_rounds: 1,
+        max_research_rounds: 1,
         ..WorkflowOptions::default()
     };
     let exec = SingleExecution::new(options);
@@ -4544,7 +4543,7 @@ async fn empty_reply_after_a_diagnostic_round_keeps_the_command_feedback() {
         .expect("marker-bound protocol");
     let mut policy = tauqe_core::workflow::policy::DirectApplyPolicy::new();
     let options = WorkflowOptions {
-        max_discovery_rounds: 4,
+        max_research_rounds: 4,
         ..WorkflowOptions::default()
     };
     let (stream_tx, cancel_rx) = event_channel();
@@ -4610,8 +4609,8 @@ fn user_layer_paths(context: &ContextManager) -> Vec<String> {
 }
 
 /// A conversational turn ends without touching the accumulated research: the
-/// file discovery gathered keeps the transient auto layer, and the
-/// developer-owned file keeps the user layer.
+/// discovered file keeps the transient auto layer, and the developer-owned
+/// file keeps the user layer.
 #[tokio::test]
 async fn auto_context_survives_a_text_answer_turn() {
     let (_dir, repo_root) = init_repo();
@@ -4630,12 +4629,12 @@ async fn auto_context_survives_a_text_answer_turn() {
         .expect("add target to context");
     let mut history = HistoryManager::new(repo_root.clone());
 
-    let discovery = format!(
+    let research = format!(
         "I need the constant definitions.\n<context_request_{MARKER} path=\"helper.rs\" access=\"read_only\" />"
     );
     let answer = "The helper module declares ANSWER as 42, so the task needs no code change.";
     let provider =
-        MockLlmProvider::scripted([MockResponse::text(discovery), MockResponse::text(answer)]);
+        MockLlmProvider::scripted([MockResponse::text(research), MockResponse::text(answer)]);
     let model = ModelRef::openrouter("mock/model");
     let protocol = tauqe_core::prompt::xml::XmlPromptProtocol
         .with_turn_marker(MARKER)
@@ -4701,7 +4700,7 @@ async fn auto_context_survives_an_unapplied_patch_failure() {
         .expect("add target to context");
     let mut history = HistoryManager::new(repo_root.clone());
 
-    let discovery = format!(
+    let research = format!(
         "I need the constant definitions.\n<context_request_{MARKER} path=\"helper.rs\" access=\"read_only\" />"
     );
     let broken = edit_block(
@@ -4717,7 +4716,7 @@ async fn auto_context_survives_an_unapplied_patch_failure() {
         "irrelevant replacement",
     );
     let provider = MockLlmProvider::scripted([
-        MockResponse::text(discovery),
+        MockResponse::text(research),
         MockResponse::text(broken),
         MockResponse::text(broken_retry),
     ]);
@@ -4775,7 +4774,7 @@ async fn auto_context_survives_an_unapplied_patch_failure() {
 }
 
 /// A verification failure rolls the working tree back but keeps the context:
-/// the files discovery gathered stay available for the next attempt.
+/// the files discovered during the turn stay available for the next attempt.
 #[cfg(unix)]
 #[tokio::test]
 async fn auto_context_survives_a_failed_verification() {
@@ -4800,7 +4799,7 @@ async fn auto_context_survives_a_failed_verification() {
         .expect("add target to context");
     let mut history = HistoryManager::new(repo_root.clone());
 
-    let discovery = format!(
+    let research = format!(
         "I need the constant definitions.\n<context_request_{MARKER} path=\"helper.rs\" access=\"read_only\" />"
     );
     let edit = format!(
@@ -4813,7 +4812,7 @@ async fn auto_context_survives_a_failed_verification() {
         ),
     );
     let provider =
-        MockLlmProvider::scripted([MockResponse::text(discovery), MockResponse::text(edit)]);
+        MockLlmProvider::scripted([MockResponse::text(research), MockResponse::text(edit)]);
     let model = ModelRef::openrouter("mock/model");
     let protocol = tauqe_core::prompt::xml::XmlPromptProtocol
         .with_turn_marker(MARKER)
@@ -4888,7 +4887,7 @@ async fn successful_commit_clears_the_auto_layer() {
         .expect("add target to context");
     let mut history = HistoryManager::new(repo_root.clone());
 
-    let discovery = format!(
+    let research = format!(
         "I need the constant definitions.\n<context_request_{MARKER} path=\"helper.rs\" access=\"read_only\" />"
     );
     let edit = edit_block(
@@ -4898,7 +4897,7 @@ async fn successful_commit_clears_the_auto_layer() {
         "pub fn compute() -> i32 { 42 }",
     );
     let provider =
-        MockLlmProvider::scripted([MockResponse::text(discovery), MockResponse::text(edit)]);
+        MockLlmProvider::scripted([MockResponse::text(research), MockResponse::text(edit)]);
     let model = ModelRef::openrouter("mock/model");
     let protocol = tauqe_core::prompt::xml::XmlPromptProtocol
         .with_turn_marker(MARKER)
@@ -4960,7 +4959,7 @@ async fn a_turn_never_widens_the_user_layer() {
         .expect("add target to context");
     let mut history = HistoryManager::new(repo_root.clone());
 
-    let discovery = format!(
+    let research = format!(
         "I need to change the constant.\n<context_request_{MARKER} path=\"helper.rs\" access=\"editable\" />"
     );
     let edit = edit_block(
@@ -4970,7 +4969,7 @@ async fn a_turn_never_widens_the_user_layer() {
         "pub const ANSWER: i32 = 43;",
     );
     let provider =
-        MockLlmProvider::scripted([MockResponse::text(discovery), MockResponse::text(edit)]);
+        MockLlmProvider::scripted([MockResponse::text(research), MockResponse::text(edit)]);
     let model = ModelRef::openrouter("mock/model");
     let protocol = tauqe_core::prompt::xml::XmlPromptProtocol
         .with_turn_marker(MARKER)
@@ -5237,7 +5236,7 @@ args = ['-c', 'printf "# self-preserved\n" >> tauqe.toml']
     );
 }
 
-/// Builds the workflow options a project declares through `[develop]
+/// Builds the workflow options a project declares through `[repl]`
 /// patch_strategy`, pinning the semantic prompt layout.
 ///
 /// The options are decoded from a declaration exactly as the daemon decodes
@@ -5249,7 +5248,7 @@ args = ['-c', 'printf "# self-preserved\n" >> tauqe.toml']
 /// inheriting the intent-selected default of an interactive turn.
 fn strategy_options(strategy: &str) -> WorkflowOptions {
     let declaration =
-        format!("[develop]\npatch_strategy = \"{strategy}\"\nprompt_layout = \"semantic\"\n");
+        format!("[repl]\npatch_strategy = \"{strategy}\"\nprompt_layout = \"semantic\"\n");
     let config: tauqe_core::config::AppConfig =
         toml::from_str(&declaration).expect("parse the patch strategy declaration");
     WorkflowOptions::from_app_config(&config)
@@ -5724,15 +5723,14 @@ async fn line_anchor_turn_advertises_a_schema_without_the_overwrite_operation() 
         "the echoed schema keeps the full-rewrite operation: {echoed}"
     );
 }
-/// Builds the workflow options a project declares through `[develop]
-/// prompt_layout`.
-///
+/// Builds the workflow options a project declares through the `[repl]`
+/// `prompt_layout` key.
 /// The options are decoded from a declaration exactly as the daemon decodes
 /// `tauqe.toml`, so a test observes the same single source of truth the project
 /// configuration provides: one key decides the block order of every prompt the
 /// turn assembles.
 fn layout_options(layout: &str) -> WorkflowOptions {
-    let declaration = format!("[develop]\nprompt_layout = \"{layout}\"\n");
+    let declaration = format!("[repl]\nprompt_layout = \"{layout}\"\n");
     let config: tauqe_core::config::AppConfig =
         toml::from_str(&declaration).expect("parse the prompt layout declaration");
     WorkflowOptions::from_app_config(&config)
@@ -6033,7 +6031,7 @@ async fn dialogue_tail_leads_with_the_regime_delta_across_rounds() {
         .expect("add target to context");
     let mut history = HistoryManager::new(repo_root.clone());
 
-    let discovery = format!(
+    let research = format!(
         "Recording working notes.\n\
         <scratchpad_{MARKER}>\n- Finding: helper.rs holds ANSWER\n</scratchpad_{MARKER}>\n\
         <context_request_{MARKER} path=\"helper.rs\" access=\"read_only\" />"
@@ -6051,7 +6049,7 @@ async fn dialogue_tail_leads_with_the_regime_delta_across_rounds() {
         "pub fn compute() -> i32 { 42 }",
     );
     let provider = MockLlmProvider::scripted([
-        MockResponse::text(discovery),
+        MockResponse::text(research),
         MockResponse::text(broken),
         MockResponse::text(corrected),
     ]);
@@ -6060,9 +6058,10 @@ async fn dialogue_tail_leads_with_the_regime_delta_across_rounds() {
         .with_turn_marker(MARKER)
         .expect("marker-bound protocol");
     let mut policy = tauqe_core::workflow::policy::DirectApplyPolicy::new();
-    // Единая голова диалога требует транскрипта: при semantic-layout дельта
-    // режима сливается с сообщением задачи и хвостового сообщения не существует.
-    // Тест заявляет макет, который анализирует, вместо неявного дефолта.
+    // One shared dialogue head requires the transcript: under the semantic
+    // layout the regime delta merges into the task message and no tail message
+    // exists. The test states the layout it analyzes instead of inheriting an
+    // implicit default.
     let options = layout_options("chronological");
     let (stream_tx, cancel_rx) = event_channel();
 
@@ -6217,8 +6216,9 @@ async fn verification_healing_reproduces_the_regime_delta_byte_for_byte() {
     let (stream_tx, cancel_rx) = event_channel();
 
     let mut policy = GitTransactionPolicy::new();
-    // Healing повторяет тот же оборот: макет обязан быть тем же транскриптом,
-    // иначе байт-стабильность дельты проверялась бы на другом порядке блоков.
+    // Healing repeats the same turn: the layout has to be the same transcript,
+    // otherwise the byte stability of the delta would be verified against a
+    // different block order.
     let exec = SingleExecution::new(layout_options("chronological"));
     let execution = exec
         .execute(

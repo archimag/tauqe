@@ -46,24 +46,31 @@ Roles and the Coder Ladder* owns that boundary. A plan is where it becomes visib
    `Done`; cycles are rejected before a plan reaches disk.
 5. **`Done` is immutable.** A finished step cannot be deleted, renamed, have its
    files changed, or be regressed to an earlier status.
-6. **Completed work is preserved, uncompleted work is replaceable.** Synthesis
+6. **A step enters existence as work, never as execution.** A plan mutation
+   may create a step only as `Todo` or `Discussion`. `InProgress`, `Blocked`,
+   and `Cancelled` belong to the execution pipeline and to the developer's
+   manual control, while `Done` is reachable only through a verified step turn.
+7. **Completed work is preserved, uncompleted work is replaceable.** Synthesis
    splices a new horizon onto the verified foundation instead of editing it.
-7. **The daemon owns the queue.** Step statuses and advancement belong to the
+8. **The daemon owns the queue.** Step statuses and advancement belong to the
    server-side pipeline, not to a client that can disconnect.
-8. **A plan refuses to guess.** An unsatisfiable precondition is reported as a
+9. **A plan refuses to guess.** An unsatisfiable precondition is reported as a
    blocker, never repaired by silently weakening the requirement.
-9. **A step never renegotiates its decision.** The Architect fixed *what* the step
-   must achieve; the executing Coder owns only *how*. Replacing the chosen
-   structure, the selected library, the designed interface, or a concept invariant
-   is not a step's decision to make, and a step that cannot proceed inside the
-   approved design reports the conflict.
-10. **Verification is not model-configurable.** A scope is gated before its first
+10. **A step never renegotiates its decision.** The Architect fixed *what* the step
+    must achieve; the executing Coder owns only *how*. Replacing the chosen
+    structure, the selected library, the designed interface, or a concept invariant
+    is not a step's decision to make, and a step that cannot proceed inside the
+    approved design reports the conflict.
+11. **Verification is not model-configurable.** A scope is gated before its first
     turn, and each turn is verified by the project toolchain, not by a model's
     opinion.
-11. **The step graph is one shared structure.** A plan, an architectural review
+12. **The step graph is one shared structure.** A plan, an architectural review
     group, and a single review finding execute the same `PlanImplementation`, so
     readiness, aggregation, leaf normalization, and dependency validation are
-    defined once and cannot drift between workflows.
+  defined once and cannot drift between workflows.
+13. **A step declares the external specifications it obeys.** A leaf names the declared
+    `[[outer_docs]]` entries its implementation is checked against, and the harness mounts
+    them before its turn starts, so the specification arrives without a research round.
 
 ---
 
@@ -119,11 +126,15 @@ Code Review* §2.1).
   but it is never scheduled, never verified, and never binds files.
 - **Plan item** — a node of the implementation tree. It carries a status, its
   prerequisites (`depends_on`), the concept nodes it satisfies (`concept_refs`),
-  and — on leaves only — target files (`files`) and read-only reference files
-  (`readonly_files`).
+  and — on leaves only — target files (`files`), read-only reference files
+  (`readonly_files`), and the external documents the step obeys (`outer_docs`).
 - **Leaf** — an item with no children. It is the atomic unit of a bounded turn and
   the only node allowed to bind files; any container has its file lists cleared on
   parse, on deserialize, and on save, so a container and a leaf can never disagree.
+- **External specification binding** — the `outer_docs` field of a leaf, naming declared
+  `[[outer_docs]]` entries rather than paths. The harness materializes and mounts every
+  named document read-only before the step turn starts, so a specification the step must
+  satisfy arrives without a research round (*External Project Documentation*).
 - **Done foundation** — the prefix of `Done` leaves that every synthesis preserves
   verbatim.
 - **Horizon** — the uncompleted remainder of the implementation tree. It is
@@ -137,6 +148,15 @@ Code Review* §2.1).
 ### 2.3 Status vocabulary
 
 `Discussion`, `Todo`, `InProgress`, `Done`, `Blocked`, `Cancelled`.
+
+A step enters existence only as `Todo` or `Discussion`. The model authors
+plans but never runs them, so the remaining statuses belong to other
+owners: `InProgress`, `Blocked`, and `Cancelled` are assigned by the
+execution pipeline and by the developer's manual control, while `Done` is
+reachable only through a verified step turn. A payload that asserts any
+other status on a step it creates has the assignment repaired to `Todo`
+and the repair reported, so the mutation still applies and the deviation
+stays visible instead of silently rewriting the plan.
 
 Status is assigned deliberately through the status dialog, never by an accidental
 keypress. `PlanItemStatus::next` defines only the cycle order of that picker and is
@@ -166,7 +186,7 @@ Planning and execution are different regimes and use different wire contours:
 
 | Regime | Protocol | Shape |
 | --- | --- | --- |
-| Discussion and creation | the transport configured for ordinary turns (`develop.protocol`) | the conversational message first, then an optional plan change with `action: save \| update \| delete` |
+| Discussion and creation | the transport configured for ordinary turns (`repl.protocol`) | the conversational message first, then an optional plan change with `action: save \| update \| delete` |
 | Step execution | streaming edits | search/replace hunks plus a terminal outcome tag |
 
 Declaring the message first lets the interface stream the rationale while the
@@ -270,7 +290,11 @@ conversational history and honours five rules:
   synthesized step must interact with an existing item, the Architect requests the
   concrete source files and returns no steps for that round. A contract guessed from
   a contour line is a violation.
-- **Resilient discovery loop.** Target files of the item being refined are preloaded
+- **Declared external contracts.** A step whose implementation must satisfy a document the
+  project does not own names that document in `outer_docs`, so the executing turn receives
+  the specification instead of searching for it. The name must be a declared `[[outer_docs]]`
+  entry, because the harness mounts the entry rather than a path the step supplies.
+- **Resilient research loop.** Target files of the item being refined are preloaded
   as read-only context before the first round, and those preloads bypass the files
   token budget. The loop terminates only when a round adds nothing new, reports
   nothing missing, and leaves no requested file already satisfied, so re-listing a
@@ -281,7 +305,7 @@ conversational history and honours five rules:
 
 The pass is not a loop of its own. It runs on the shared turn kernel, which owns
 the rounds, the byte-stable prompt head, the rendered repository outline, the
-discovery journal, and the corrective budget of an empty answer, while the
+research journal, and the corrective budget of an empty answer, while the
 structured Architect contour owns what is specific to a horizon. The domain
 framing of a synthesis — the plan identity, the immutable concept, the `Done`
 foundation, a blocked step, and the developer directives — travels in the task
@@ -379,8 +403,9 @@ For each scheduled leaf the pipeline persists the step as `InProgress` in the st
 that owns the horizon and hands one turn request to the seam. The daemon executes it:
 
 1. it clears the transient context layer a previous step left behind, then preloads
-   `files` as editable context and `readonly_files` as read-only reference context,
-   which removes discovery latency for the files the plan already names;
+   `files` as editable context and `readonly_files` as read-only reference context, and
+   materializes the documents `outer_docs` names, which removes research latency for the
+   material the plan already declared;
 2. it runs one streaming bounded turn under `TurnIntent::IsolatedStep`, as described in
    *The Autonomous Bounded Turn FSM*, with the whole concept tree and the completed
    milestones injected and the conversational history suppressed, so the turn reasons
@@ -390,6 +415,16 @@ that owns the horizon and hands one turn request to the seam. The daemon execute
    unconditional abort stops the queue without spending a wave, a change set that was
    never rolled back is an unreverted failure, and a turn that produced no model result
    is an infrastructure failure rather than a content verdict.
+
+Before the turn starts, the harness resolves the leaf's `outer_docs` and mounts every named
+document read-only, priced like any other context entry under `[context].token_budget`. A
+trust refusal is not the step's failure: only the developer can widen a declaration the
+repository cannot reach, so the step is never started and the run stops with the exact
+cause and the `[[workspace]]` block that would authorize the source. A delivery failure — a
+name the declaration does not carry, an unreachable host, an HTTP status, a timeout, a
+cancelled transfer — is a diagnostic of the step prompt instead: the turn starts, and the
+model routes around the missing document, which may become reachable again in a later turn.
+A budget breach is reported the same way.
 
 The pipeline then closes the lifecycle: the step becomes `Done` only if the turn
 succeeded — edits applied and the toolchain clean — or if the model declared completion
@@ -441,12 +476,12 @@ reports the failure instead of generating against a working tree that still carr
 the previous attempt, because the next round would reason about code it did not
 write.
 
-The reprompt budget is the per-tier budget, `develop.max_tier_attempts` (3 by
+The reprompt budget is the per-tier budget, `repl.max_tier_attempts` (3 by
 default), and not an independent counter. The step is re-asked on the same coder rung
 while that budget lasts, and only an exhausted tier lets `models.auto_level_up`
 advance the ladder, where the next rung receives a fresh budget of its own. A
 saturated ladder returns the step to `Todo` and stops the batch. The staging retries
-and healing rounds inside one attempt stay bounded by `develop.max_retries`, which is
+and healing rounds inside one attempt stay bounded by `repl.max_retries`, which is
 a different limit and escalates nothing.
 
 The terminal tag carries a dynamic per-turn marker. A marked tag is preferred, and
@@ -496,7 +531,7 @@ a blocker. A synthesized result then reaches storage as one operation:
    after that successful persistence, so a failed attempt leaves no phantom record;
 7. the batch supervisor resumes from the first executable leaf of the new horizon.
 
-Automated recovery is bounded by `develop.max_replans`. Once consecutive waves
+Automated recovery is bounded by `repl.max_replans`. Once consecutive waves
 exceed that budget the batch halts with the step still `Blocked` and asks for the
 developer.
 
@@ -711,4 +746,4 @@ keeps naming a plan that no longer exists (*Discussion Focus* §3.4).
 - [Structured Code Review](review.md) — the second workflow that produces plans, and
   executes them through the same pipeline.
 - [Configuration and Project Preparation](../ch05-system/configuration.md) —
-  `develop.max_retries`, `develop.max_replans`, and model roles.
+  `repl.max_retries`, `repl.max_replans`, and model roles.
