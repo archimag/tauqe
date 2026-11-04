@@ -33,6 +33,12 @@ pub(crate) use builtin::{
     abort_invocations, custom_tool_invocations, map_verify_on_success, map_verify_target,
 };
 
+// The structured schema fragments are a single source of truth shared with every
+// contour that publishes the same field. Re-exporting the abort fragment keeps
+// the horizon-synthesis contract of `crate::plan::prompt` on the very shape the
+// edit contour uses, so a second copy of the escape hatch cannot drift from it.
+pub(crate) use schema::abort_fragment;
+
 // The tag schema is a single source of truth shared with the parametric XML
 // engine. Re-exporting it here keeps the capability-module contract nameable
 // without leaking the engine's internal module layout.

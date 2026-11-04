@@ -294,8 +294,8 @@ pub fn format_repo_map_with_budget<S: AsRef<RepoFileSymbols>>(
     ];
 
     for &level in &levels {
-        let outline = format_all_files(symbols, level);
-        let combined = combine_outline_and_other_files(&outline, all_git_files);
+        let rendered = format_all_files(symbols, level);
+        let combined = combine_outline_and_other_files(&rendered, all_git_files);
         if !combined.is_empty() && crate::tokens::estimate_tokens(&combined) <= token_budget {
             return combined;
         }
@@ -303,11 +303,13 @@ pub fn format_repo_map_with_budget<S: AsRef<RepoFileSymbols>>(
 
     // If even TopLevelOnly + other files exceeds budget, greedily include symbol blocks then other files
     let mut accumulated: Vec<String> = Vec::new();
+    let mut rendered_paths: HashSet<String> = HashSet::new();
     let mut current_tokens = 0;
     let separator_tokens = crate::tokens::estimate_tokens("\n\n");
 
     for file in symbols {
-        let block = format_file_symbols(file.as_ref(), DetailLevel::TopLevelOnly);
+        let file = file.as_ref();
+        let block = format_file_symbols(file, DetailLevel::TopLevelOnly);
         if block.is_empty() {
             continue;
         }
@@ -323,37 +325,42 @@ pub fn format_repo_map_with_budget<S: AsRef<RepoFileSymbols>>(
         }
 
         current_tokens += needed_tokens;
+        rendered_paths.insert(file.path.clone());
         accumulated.push(block);
     }
 
     let outline = accumulated.join("\n\n");
-    let present_in_outline: HashSet<&str> = outline
-        .lines()
-        .filter(|l| !l.starts_with(' ') && !l.starts_with('\t') && !l.is_empty())
-        .map(|l| l.split(" (").next().unwrap_or(l).trim())
-        .collect();
 
     let other_files: Vec<&str> = all_git_files
         .iter()
         .map(|s| s.as_str())
-        .filter(|f| !present_in_outline.contains(f))
+        .filter(|f| !rendered_paths.contains(*f))
         .collect();
 
+    // The candidate is priced from its byte length instead of being rebuilt and
+    // re-estimated on every iteration: the token heuristic is a pure function of
+    // the byte count, so a running length answers the same question at one
+    // addition per appended file. This fallback runs exactly when a tight budget
+    // meets a large repository, where the file list is longest.
+    let outline_prefix_bytes = if outline.is_empty() {
+        0
+    } else {
+        // The outline and the file block are joined by a blank line.
+        outline.len() + 2
+    };
     let mut other_accumulated: Vec<&str> = Vec::new();
+    let mut other_bytes = 0usize;
     for file in other_files {
-        let candidate_other = if other_accumulated.is_empty() {
-            file.to_string()
-        } else {
-            format!("{}\n{}", other_accumulated.join("\n"), file)
-        };
-        let candidate_full = if outline.is_empty() {
-            candidate_other.clone()
-        } else {
-            format!("{}\n\n{}", outline, candidate_other)
-        };
-        if crate::tokens::estimate_tokens(&candidate_full) > token_budget {
+        // Listed files are joined by single newlines, so only a file that already
+        // has a predecessor adds a separator byte.
+        let separator_bytes = usize::from(!other_accumulated.is_empty());
+        let entry_bytes = separator_bytes + file.len();
+        let byte_len = (outline_prefix_bytes + other_bytes + entry_bytes) as u64;
+        let candidate_tokens = crate::tokens::estimate_tokens_from_bytes(byte_len);
+        if candidate_tokens > token_budget as u64 {
             break;
         }
+        other_bytes += entry_bytes;
         other_accumulated.push(file);
     }
 
@@ -369,40 +376,54 @@ pub fn format_repo_map_with_budget<S: AsRef<RepoFileSymbols>>(
     }
 }
 
-fn combine_outline_and_other_files(outline: &str, all_git_files: &[String]) -> String {
-    let present_in_outline: HashSet<&str> = outline
-        .lines()
-        .filter(|l| !l.starts_with(' ') && !l.starts_with('\t') && !l.is_empty())
-        .map(|l| l.split(" (").next().unwrap_or(l).trim())
-        .collect();
-
-    let other_files: Vec<&str> = all_git_files
-        .iter()
-        .map(|s| s.as_str())
-        .filter(|f| !present_in_outline.contains(f))
-        .collect();
-
-    if other_files.is_empty() {
-        return outline.to_string();
-    }
-
-    let other_block = other_files.join("\n");
-    if outline.is_empty() {
-        other_block
-    } else {
-        format!("{}\n\n{}", outline, other_block)
-    }
+/// A rendered symbol outline together with the exact paths it names.
+///
+/// A rendered header carries a ` (N lines)` suffix and a repository path may
+/// itself contain ` (`, so an outline line cannot be parsed back into a path:
+/// splitting on the first separator truncates such a path and leaves the file
+/// to be listed a second time among the plain entries. The set is collected
+/// while the blocks are produced, where every path is still the structured
+/// `RepoFileSymbols::path` field.
+struct RenderedOutline {
+    outline: String,
+    paths: HashSet<String>,
 }
 
-fn format_all_files<S: AsRef<RepoFileSymbols>>(files: &[S], level: DetailLevel) -> String {
-    let mut blocks = Vec::new();
+/// Renders every symbol block at `level` and records the paths it names.
+fn format_all_files<S: AsRef<RepoFileSymbols>>(files: &[S], level: DetailLevel) -> RenderedOutline {
+    let mut blocks: Vec<String> = Vec::new();
+    let mut paths: HashSet<String> = HashSet::new();
     for file in files {
-        let block = format_file_symbols(file.as_ref(), level);
+        let file = file.as_ref();
+        let block = format_file_symbols(file, level);
         if !block.is_empty() {
+            paths.insert(file.path.clone());
             blocks.push(block);
         }
     }
-    blocks.join("\n\n")
+    RenderedOutline {
+        outline: blocks.join("\n\n"),
+        paths,
+    }
+}
+
+fn combine_outline_and_other_files(rendered: &RenderedOutline, all_git_files: &[String]) -> String {
+    let other_files: Vec<&str> = all_git_files
+        .iter()
+        .map(|s| s.as_str())
+        .filter(|f| !rendered.paths.contains(*f))
+        .collect();
+
+    if other_files.is_empty() {
+        return rendered.outline.clone();
+    }
+
+    let other_block = other_files.join("\n");
+    if rendered.outline.is_empty() {
+        other_block
+    } else {
+        format!("{}\n\n{}", rendered.outline, other_block)
+    }
 }
 
 fn format_file_symbols(file: &RepoFileSymbols, level: DetailLevel) -> String {
@@ -1070,5 +1091,79 @@ mod tests {
         assert!(truncated.contains("pub fn a"));
         assert!(!truncated.contains("alias.rs -> lib.rs"));
         assert!(crate::tokens::estimate_tokens(&truncated) <= budget);
+    }
+    #[test]
+    fn test_format_repo_map_greedy_other_files_follow_the_exact_byte_budget() {
+        // Without symbols the outline stays empty, so the greedy fallback lists
+        // plain file names and the budget alone decides how many it admits.
+        let symbols: Vec<RepoFileSymbols> = Vec::new();
+        let all_files: Vec<String> = (0..10).map(|index| format!("f{index}.rs")).collect();
+
+        // Every name is five bytes, and neighbors are joined by one newline, so
+        // each additional name grows the block by six bytes.
+        let two = "f0.rs\nf1.rs";
+        let three = "f0.rs\nf1.rs\nf2.rs";
+
+        let budget_two = crate::tokens::estimate_tokens(two);
+        let budget_three = crate::tokens::estimate_tokens(three);
+
+        assert_eq!(
+            format_repo_map_with_budget(&symbols, &all_files, budget_two),
+            two
+        );
+        assert_eq!(
+            format_repo_map_with_budget(&symbols, &all_files, budget_three),
+            three
+        );
+    }
+
+    #[test]
+    fn test_format_repo_map_deduplicates_paths_containing_parens() {
+        let paren = RepoFileSymbols {
+            path: "src/report (draft).rs".to_string(),
+            symbols: vec![Symbol::new(
+                "draft",
+                SymbolKind::Function,
+                Some("pub fn draft()".into()),
+                true,
+                1,
+            )],
+            line_count: 3,
+        };
+        let mut big_symbols = Vec::new();
+        for index in 0..10 {
+            big_symbols.push(Symbol::new(
+                format!("big{index}"),
+                SymbolKind::Function,
+                Some(format!("pub fn big{index}()")),
+                true,
+                index + 1,
+            ));
+        }
+        let big = RepoFileSymbols {
+            path: "src/big.rs".to_string(),
+            symbols: big_symbols,
+            line_count: 40,
+        };
+        let symbols = vec![paren.clone(), big.clone()];
+        let all_files = vec![paren.path.clone(), big.path.clone()];
+
+        // A generous budget renders both symbol blocks, so the entry list
+        // stays empty and the path appears exactly once.
+        let full = format_repo_map_with_budget(&symbols, &all_files, 1000);
+        assert_eq!(full.matches("src/report (draft).rs").count(), 1);
+        assert!(full.contains("src/big.rs (40 lines)"));
+
+        // A budget that admits one symbol block forces the greedy fallback,
+        // which lists the truncated file as a plain entry. The rendered path
+        // must not be listed again beside its own block.
+        let paren_block = format_file_symbols(&symbols[0], DetailLevel::TopLevelOnly);
+        let greedy_bytes = format!("{}\n\n{}\n{}", paren_block, paren.path, big.path);
+        let budget = crate::tokens::estimate_tokens(&greedy_bytes);
+        let truncated = format_repo_map_with_budget(&symbols, &all_files, budget);
+        assert!(truncated.contains("pub fn draft"));
+        assert!(!truncated.contains("pub fn big0"));
+        assert_eq!(truncated.matches("src/report (draft).rs").count(), 1);
+        assert!(truncated.contains("src/big.rs"));
     }
 }

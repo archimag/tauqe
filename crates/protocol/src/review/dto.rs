@@ -248,13 +248,8 @@ pub struct ReviewUpdateItemParams {
     pub status: Option<IssueStatus>,
     /// Resolution note recorded on the finding.
     ///
-    /// Serialized as `note`; the legacy `resolution_notes` key is still
-    /// accepted on read so older clients keep updating findings unchanged.
-    #[serde(
-        default,
-        alias = "resolution_notes",
-        skip_serializing_if = "Option::is_none"
-    )]
+    /// Serialized as `note`, the single canonical wire name of the datum.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub note: Option<String>,
 }
 

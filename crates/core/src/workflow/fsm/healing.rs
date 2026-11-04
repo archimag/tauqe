@@ -30,6 +30,7 @@ use crate::workflow::verification::{
 
 use super::guard::{finish_turn, TransactionRollbackGuard};
 use super::kernel::{propose_round, TurnKernel};
+use super::plans::{settle_plans, TurnQualification};
 use super::proposal::{extract_commit_message, log_fsm_phase, merge_text};
 use super::FsmTurnOutcome;
 
@@ -108,6 +109,15 @@ pub(super) async fn run_apply_and_verify_phase(
                 .send(StreamEvent::ContextChanged(ctx_state))
                 .await;
             let _ = ctx.stream_tx.send(StreamEvent::Done).await;
+            // The change set never reached the disk, so the payload leaves the
+            // turn as one diagnostic instead of disappearing.
+            let settlement = settle_plans(
+                ctx.repo_root,
+                &ctx.state.plans,
+                ctx.plan_mode,
+                TurnQualification::disqualified("the change set could not be applied"),
+            )
+            .await;
             let result = ModelResult::Edit {
                 summary: commit_message,
                 edits: cumulative_edits,
@@ -123,11 +133,8 @@ pub(super) async fn run_apply_and_verify_phase(
             return Ok(finish_turn(
                 std::mem::take(&mut ctx.accumulated_text),
                 result,
-                ctx.repo_root,
-                &ctx.state.plans,
-                ctx.plan_mode,
-            )
-            .await);
+                settlement,
+            ));
         }
     };
 
@@ -266,7 +273,6 @@ pub(super) async fn run_apply_and_verify_phase(
                     ctx.state.language.as_deref(),
                 )
             };
-            // The healing round replays the knowledge Discovery already paid
             // The healing round replays the knowledge Research already paid
             // for: the task first, the accumulated journal next, and the
             let retry_prompt = ctx
@@ -345,6 +351,15 @@ pub(super) async fn run_apply_and_verify_phase(
                     .send(StreamEvent::ContextChanged(ctx_state))
                     .await;
                 let _ = ctx.stream_tx.send(StreamEvent::Done).await;
+                let settlement = settle_plans(
+                    ctx.repo_root,
+                    &ctx.state.plans,
+                    ctx.plan_mode,
+                    TurnQualification::disqualified(
+                        "the turn was aborted during verification healing",
+                    ),
+                )
+                .await;
                 let result = ModelResult::Edit {
                     summary: "Execution aborted".to_string(),
                     edits: Vec::new(),
@@ -360,11 +375,8 @@ pub(super) async fn run_apply_and_verify_phase(
                 let mut outcome = finish_turn(
                     std::mem::take(&mut ctx.accumulated_text),
                     result,
-                    ctx.repo_root,
-                    &ctx.state.plans,
-                    ctx.plan_mode,
-                )
-                .await;
+                    settlement,
+                );
                 outcome.abort = Some(abort);
                 return Ok(outcome);
             }
@@ -377,6 +389,15 @@ pub(super) async fn run_apply_and_verify_phase(
                     .send(StreamEvent::ContextChanged(ctx_state))
                     .await;
                 let _ = ctx.stream_tx.send(StreamEvent::Done).await;
+                let settlement = settle_plans(
+                    ctx.repo_root,
+                    &ctx.state.plans,
+                    ctx.plan_mode,
+                    TurnQualification::disqualified(
+                        "the turn was blocked during verification healing",
+                    ),
+                )
+                .await;
                 let result = ModelResult::Edit {
                     summary: "Execution blocked".to_string(),
                     edits: Vec::new(),
@@ -392,11 +413,8 @@ pub(super) async fn run_apply_and_verify_phase(
                 let mut outcome = finish_turn(
                     std::mem::take(&mut ctx.accumulated_text),
                     result,
-                    ctx.repo_root,
-                    &ctx.state.plans,
-                    ctx.plan_mode,
-                )
-                .await;
+                    settlement,
+                );
                 outcome.blocked = Some(reason);
                 return Ok(outcome);
             }
@@ -544,6 +562,13 @@ pub(super) async fn run_apply_and_verify_phase(
                 .send(StreamEvent::ContextChanged(ctx_state))
                 .await;
             let _ = ctx.stream_tx.send(StreamEvent::Done).await;
+            let settlement = settle_plans(
+                ctx.repo_root,
+                &ctx.state.plans,
+                ctx.plan_mode,
+                TurnQualification::Qualified,
+            )
+            .await;
             let result = ModelResult::Edit {
                 summary: commit_message,
                 edits: cumulative_edits,
@@ -559,11 +584,8 @@ pub(super) async fn run_apply_and_verify_phase(
             return Ok(finish_turn(
                 std::mem::take(&mut ctx.accumulated_text),
                 result,
-                ctx.repo_root,
-                &ctx.state.plans,
-                ctx.plan_mode,
-            )
-            .await);
+                settlement,
+            ));
         }
 
         let changed_files = if guard.rollback().await {
@@ -583,6 +605,13 @@ pub(super) async fn run_apply_and_verify_phase(
             "verification failed after healing attempts"
         );
         let _ = ctx.stream_tx.send(StreamEvent::Done).await;
+        let settlement = settle_plans(
+            ctx.repo_root,
+            &ctx.state.plans,
+            ctx.plan_mode,
+            TurnQualification::disqualified("verification failed"),
+        )
+        .await;
         let result = ModelResult::Edit {
             summary: commit_message,
             edits: cumulative_edits,
@@ -601,11 +630,8 @@ pub(super) async fn run_apply_and_verify_phase(
         Ok(finish_turn(
             std::mem::take(&mut ctx.accumulated_text),
             result,
-            ctx.repo_root,
-            &ctx.state.plans,
-            ctx.plan_mode,
-        )
-        .await)
+            settlement,
+        ))
     }
 }
 

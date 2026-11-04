@@ -73,11 +73,17 @@ and decode the very same operational commands. No default value exists, so a
 forgotten argument cannot silently substitute a mode.
 
 An Architect synthesis declares `ArchitectSynthesis`. Its surface is the
-architect research profile — research, plan creation, plan update, and the
-scratchpad — with no file-edit capability and no toolchain verification,
-because a synthesis produces a horizon rather than a patch; like an isolated
-step it suppresses session history, so recording a synthesis belongs to the
-caller that started it. The regime is what puts the synthesis on the same
+architect research profile — research, plan creation, plan update, the
+scratchpad, and the abort escape hatch — with no file-edit capability and no
+toolchain verification, because a synthesis produces a horizon rather than a
+patch. The escape hatch travels with the profile because a synthesis runs
+unattended exactly as an isolated step does: a condition that only the
+improvised or downgraded into a blocked answer. It renders no session history,
+exactly as an isolated step does: neither regime continues the developer's
+dialogue, so neither prompt carries the `<history>` block. Rendering is not
+recording: a step journals the two-sided card of its own event (§3.2.8), and a
+synthesis is recorded by the caller that started it, because only that caller
+knows the projection it produced. The regime is what puts the synthesis on the
 machine as every other turn: the structured Architect contour is a policy layer
 over the shared turn kernel (§3.3.9), so it inherits the rounds, the prompt
 head, the discovery journal, the corrective budget of an empty answer, and the
@@ -244,6 +250,19 @@ stand-in for another:
 The journal answers what the harness and the model exchanged; the editor file
 answers what the developer typed. Because they are different files, a failed turn
 cannot lose a prompt from the editor and cannot leak it into the model's context.
+
+A dialogue turn and an isolated step journal different cards of the same
+event. A dialogue turn records what the developer asked and what the model
+answered, which is the material the next dialogue reads. An isolated step
+records a **two-sided step card**: the structured execution prompt that opened
+it — the plan, the step identifier, its title, and its target files — and a
+compact result that closed it, which carries the status of the step, the commit
+it produced, the files it changed, and the first line of the reason or summary
+it reported. The full reply of the model is never recorded for a step: the
+chronicle needs the outcome of the step, not a transcript of it. Because a batch
+may execute many steps, a step turn passes through the same budgeted compaction
+as a dialogue (`history.budget_tokens`), so the journal is bounded by the
+configured budget rather than by the length of the batch.
 
 Every journal record also carries a typed lifecycle status, and the status is
 never inferred from the text of a message:
@@ -459,10 +478,27 @@ transaction marker written when the checkpoint was opened and rewinds only when
 every commit in the recorded range carries the harness trailer; a foreign commit in
 that range makes recovery refuse and report instead of rewriting history.
 
+**The plan payload of the turn settles at the same boundary.** Finishing a turn no
+longer applies plan mutations as a side effect: every terminal path runs the accumulated
+payload through one settlement phase before the outcome is packed. A qualifying result —
+a validated answer or an applied change set — applies the mutations and collects the
+warnings the status barrier produced, while a non-qualifying result — a semantic block,
+an abort, a terminal error, a patch failure, an edit proposal that applied nothing, an
+empty round, or an exceeded context budget — abandons the payload with a single
+`Abandoned` rejection that names the reason. A cancelled turn is the one intentional
+silence. A payload the planning contract itself refuses buys exactly one corrective
+exchange, and only the payload of that exchange is settled; a refusal the turn regime
+forbids, or a payload that already left the turn, buys none, because repeating the turn
+cannot change the verdict. The contract is documented in *Local Plans* §3.13.
+
 **The session journal is transactional in the same way.** The prompt is appended
 to `.tauqe/history.jsonl` and published as `Active` the moment the turn starts, so
 the running task is visible before any result exists. A turn that produces a
-result appends it and publishes both records as `Committed`.
+result appends it and publishes both records as `Committed`. The rule holds for
+every turn the kernel journals: a dialogue turn and an isolated step alike open
+their card before the first token and keep both cards only when the turn
+produced a result, so a batch of steps is a sequence of two-sided cards rather
+than an unrecorded stretch of work.
 
 **A rolled-back record is deleted, not annotated.** When the turn ends any other
 way — a provider failure, a cancellation, an exhausted ladder, a blocked report —

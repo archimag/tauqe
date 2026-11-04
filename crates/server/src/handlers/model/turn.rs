@@ -912,13 +912,34 @@ async fn run_prepared_turn(
             // stream and the session history, and the daemon records them once
             // per turn so the refusal stays reconstructible from the journal.
             if !wf_result.plan_errors.is_empty() {
+                // Each rejection carries the wording its birthplace reported, so
+                // the journal renders those messages verbatim while the typed
+                // category stays available to every later surface.
+                let kinds = wf_result
+                    .plan_errors
+                    .iter()
+                    .map(|rejection| rejection.kind)
+                    .collect::<Vec<_>>();
+                let reasons = wf_result
+                    .plan_errors
+                    .iter()
+                    .map(|rejection| rejection.message.as_str())
+                    .collect::<Vec<_>>()
+                    .join(" | ");
                 tracing::warn!(
                     operation_id = %op_id,
                     rejected = wf_result.plan_errors.len(),
-                    reasons = %wf_result.plan_errors.join(" | "),
+                    kinds = ?kinds,
+                    reasons = %reasons,
                     "plan mutations were rejected during the turn",
                 );
             }
+
+            // Both plan-mutation lists are projections of the classified turn
+            // outcome: every refusal keeps the category its birthplace decided
+            // and every normalization note stays verbatim, so the terminal event
+            // never reclassifies a refusal or rephrases a note.
+            let (plan_rejections, plan_warnings) = plan_mutation_fields(&wf_result);
 
             if let tauqe_protocol::ModelResult::Edit {
                 ref summary,
@@ -1039,6 +1060,8 @@ async fn run_prepared_turn(
                     usage: Some(operation_totals.to_usage_info()),
                     session_total_cost: Some(snapshot.session.cost),
                     current_cost: Some(operation_totals.cost),
+                    plan_rejections,
+                    plan_warnings,
                 })),
             });
 
@@ -1554,4 +1577,78 @@ fn send_edit_aborted(out: &OutChannel, op_id: &str, error: String) {
         })
         .ok(),
     });
+}
+
+/// Projects a completed turn onto the typed plan-mutation fields of the
+/// terminal `model/result` event.
+///
+/// The projection is a pass-through of what the engine already classified: the
+/// category of every refusal was decided where the refusal was born, and every
+/// normalization note was recorded by the barrier that produced it. The daemon
+/// therefore never reclassifies a refusal or rephrases a note, so the client
+/// renders exactly the outcome the storage engine reported.
+fn plan_mutation_fields(
+    result: &tauqe_core::workflow::WorkflowExecutionResult,
+) -> (Vec<tauqe_protocol::PlanRejection>, Vec<String>) {
+    (result.plan_errors.clone(), result.plan_warnings.clone())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tauqe_core::workflow::WorkflowExecutionResult;
+    use tauqe_protocol::{ModelResult, PlanRejection, PlanRejectionKind};
+
+    fn turn_result(
+        plan_errors: Vec<PlanRejection>,
+        plan_warnings: Vec<String>,
+    ) -> WorkflowExecutionResult {
+        WorkflowExecutionResult {
+            result: ModelResult::Answer {
+                text: String::new(),
+            },
+            assistant_text: String::new(),
+            blocked: None,
+            skip_reason: None,
+            abort: None,
+            plan_saved: false,
+            plan_errors,
+            plan_warnings,
+        }
+    }
+
+    #[test]
+    fn test_plan_mutation_fields_keep_the_typed_outcome() {
+        let result = turn_result(
+            vec![
+                PlanRejection::payload_defect("the payload breaks the planning contract"),
+                PlanRejection::mode_forbidden("the turn regime forbids the mutation"),
+            ],
+            vec!["requested status corrected to in progress".to_string()],
+        );
+
+        let (rejections, warnings) = plan_mutation_fields(&result);
+
+        assert_eq!(rejections, result.plan_errors);
+        assert_eq!(warnings, result.plan_warnings);
+        let kinds: Vec<PlanRejectionKind> = rejections.iter().map(|item| item.kind).collect();
+        assert_eq!(
+            kinds,
+            [
+                PlanRejectionKind::PayloadDefect,
+                PlanRejectionKind::ModeForbidden
+            ],
+            "the projection keeps the category every refusal declared",
+        );
+    }
+
+    #[test]
+    fn test_plan_mutation_fields_of_an_untouched_plan_stay_empty() {
+        let result = turn_result(Vec::new(), Vec::new());
+
+        let (rejections, warnings) = plan_mutation_fields(&result);
+
+        assert!(rejections.is_empty());
+        assert!(warnings.is_empty());
+    }
 }

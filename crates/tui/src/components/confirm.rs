@@ -121,6 +121,12 @@ impl ConfirmDialog {
                 self.reset_to_cancel();
                 ConfirmOutcome::Dismissed
             }
+            // The model-list submit accelerator is declared only by
+            // `MODEL_LIST_DIALOG_COMMAND_MAP`, so a binary confirmation never
+            // resolves it. Keeping the dialog open and its focus untouched
+            // matches the neutral outcome an unrecognized press already
+            // produces (Conventions §4).
+            DialogCommand::SubmitAccelerator => ConfirmOutcome::Toggled,
         }
     }
 }
@@ -133,8 +139,7 @@ pub struct ConfirmModalGeometry {
     pub cancel_button: Rect,
 }
 
-/// Computes the geometry and button bounds for a confirmation modal so that
-/// Nominal card width the percentage split implies before it rounds.
+/// Nominal card width that the percentage split implies before it rounds.
 ///
 /// `width_percent` is a percentage of the terminal, exactly as [`centered_rect`]
 /// reads it, so the first budgeting pass needs the column count it stands for.

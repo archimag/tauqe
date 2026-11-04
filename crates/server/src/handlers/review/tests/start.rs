@@ -162,6 +162,59 @@ async fn test_handle_review_cancel_soft_keeps_operation_active() {
     assert!(state.is_operation_active());
 }
 
+/// A present-but-malformed cancellation payload is refused instead of silently
+/// degrading to the default hard stop: a mistyped soft stop must not
+/// hard-cancel the running review and arm its abort watchdog.
+#[tokio::test]
+async fn test_handle_review_cancel_refuses_a_malformed_payload_without_cancelling() {
+    let dir = TestDir::new();
+    let (out, _rx) = OutChannel::new();
+    let (hist_tx, _hist_rx) = tokio::sync::mpsc::unbounded_channel();
+    let state = AppState::new(
+        tauqe_core::config::AppConfig::default(),
+        dir.path().to_path_buf(),
+        hist_tx,
+        out,
+    );
+
+    let operation = state.try_begin_operation().expect("register operation");
+    let cancel_rx = operation.cancel_receiver();
+    let soft_rx = operation.soft_stop_receiver();
+
+    // An unknown mode string and a wrongly typed field are both malformed
+    // payloads, so both are answered with the parameter error.
+    for params in [
+        serde_json::json!({ "mode": "sometimes" }),
+        serde_json::json!({ "mode": 7 }),
+    ] {
+        let req = Request {
+            id: tauqe_protocol::RequestId::Number(1),
+            method: tauqe_protocol::methods::REVIEW_CANCEL.to_string(),
+            params: Some(params),
+        };
+        let res = handle_review_cancel(req, &state).await;
+        assert_eq!(
+            res.error
+                .expect("the malformed payload must be refused")
+                .code,
+            tauqe_protocol::errors::INVALID_PARAMS
+        );
+        assert!(
+            !*cancel_rx.borrow(),
+            "a refused payload must not hard-cancel the review"
+        );
+        assert!(
+            !*soft_rx.borrow(),
+            "a refused payload must not request a soft stop"
+        );
+    }
+    assert!(
+        state.is_operation_active(),
+        "the running review must keep owning the slot"
+    );
+
+    drop(operation);
+}
 /// A provider that reports cancellation exclusively through an explicit
 /// `StreamEvent::Cancelled`, without the turn's cancel signal ever being
 /// raised. This reproduces the race the review handler must tolerate:

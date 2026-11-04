@@ -1,6 +1,16 @@
+//! Keyboard routing for the plan refinement form and its blocked modal.
+//!
+//! The refinement dialog belongs to the model-list family, so its keyboard
+//! contract lives in the shared core at [`super::model_list`]: the embedded
+//! Architect ladder, the instructions editor, the action bar, the `Shift+Tab`
+//! spelling, and the bare-press guard of the letter accelerators are resolved
+//! once for every dialog of the family. This adapter keeps only what belongs to
+//! the refinement target itself — the take guard, the dialog geometry, the
+//! hoisted clipboard read, and the launch it dispatches.
+
 use std::sync::Arc;
 
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::KeyEvent;
 use tauqe_protocol::methods;
 use tokio::sync::{Mutex, MutexGuard};
 
@@ -8,11 +18,13 @@ use crate::app::{AppState, ConfirmDialogButton};
 use crate::input::InputResult;
 use crate::rpc::RpcConnection;
 
+use super::model_list::{handle_dialog_key, hoisted_editor_yank, ModelListKeyOutcome};
+
 /// Routes key events for the plan refine dialog: the embedded Architect model
 /// list, the instructions editor, and the confirm/cancel button pair. Focus
-/// cycles through the three sections in visual order with `Tab`; the model list
-/// owns bare digits and arrows, while the editor keeps text entry and the
-/// `Alt+1..9` / `C-M` selection chords (c-embedded-model-list,
+/// cycles through the three sections in visual order with `Tab` / `Shift+Tab`;
+/// the model list owns bare digits and arrows, while the editor keeps text entry
+/// and the `Alt+1..9` / `C-M` selection chords (c-embedded-model-list,
 /// c-magit-key-navigation, c-unified-dialog-integration).
 pub(super) async fn handle_refine_dialog(
     key: KeyEvent,
@@ -25,132 +37,38 @@ pub(super) async fn handle_refine_dialog(
         None => return Ok(None),
     };
 
-    let primary = st.tui_config.input.primary_modifier;
-    let meta = st.tui_config.input.meta_modifier;
     let visible_rows =
         crate::dialogs::render::refine_dialog_geometry(st.last_frame_area, dialog.selector.len())
             .model_rows
             .height as usize;
 
-    // The C-M / M-M chord always switches the architect; the arrows browse the
-    // list only while the list owns focus, so list navigation and text editing
-    // never fight over the same keys (c-magit-key-navigation).
-    if dialog
-        .selector
-        .handle_key(key, primary, meta, !dialog.focus.is_model_list())
-    {
-        st.plans_view.refine_dialog = Some(dialog);
-        return Ok(Some(InputResult::Continue));
-    }
-
-    // Bare digits, arrows, and paging act on the model list only while it owns
-    // focus; elsewhere the editor keeps those keys.
-    if dialog.focus.is_model_list() && dialog.selector.handle_list_key(key, visible_rows) {
-        st.plans_view.refine_dialog = Some(dialog);
-        return Ok(Some(InputResult::Continue));
-    }
-
-    let is_ctrl_alt =
-        key.modifiers.contains(KeyModifiers::CONTROL) && key.modifiers.contains(KeyModifiers::ALT);
-
-    // Alt+digit picks an architect by position without moving the cursor out of
-    // the instructions editor (c-magit-key-navigation).
-    if dialog.focus.is_instructions_editor()
-        && !is_ctrl_alt
-        && !key.modifiers.contains(KeyModifiers::CONTROL)
-        && key.modifiers.contains(KeyModifiers::ALT)
-    {
-        if let KeyCode::Char(c @ '1'..='9') = key.code {
-            let index = c as usize - '1' as usize;
-            if index < dialog.selector.len() {
-                dialog.selector.select_index(index);
-                st.plans_view.refine_dialog = Some(dialog);
-                return Ok(Some(InputResult::Continue));
-            }
+    match handle_dialog_key(&mut dialog, key, &st.tui_config.input, visible_rows) {
+        ModelListKeyOutcome::Submit => {
+            return submit_refine_dialog(state, st, dialog, server_writer).await;
         }
-    }
-
-    let is_cmd = !is_ctrl_alt
-        && (primary.matches(key.modifiers) || key.modifiers.contains(KeyModifiers::CONTROL));
-    let has_shift = key.modifiers.contains(KeyModifiers::SHIFT);
-    let has_alt = key.modifiers.contains(KeyModifiers::ALT);
-
-    // C-Enter accelerator unconditionally submits from any section.
-    if matches!(key.code, KeyCode::Enter) && is_cmd {
-        return submit_refine_dialog(state, st, dialog, server_writer).await;
-    }
-
-    match key.code {
-        KeyCode::Esc => Ok(Some(InputResult::Continue)),
-        KeyCode::Char('q') if dialog.focus.is_actions() => Ok(Some(InputResult::Continue)),
-        KeyCode::Tab => {
-            if dialog.focus.is_actions() && dialog.confirm_button == ConfirmDialogButton::Cancel {
-                dialog.confirm_button = ConfirmDialogButton::Confirm;
-            } else {
-                if dialog.focus.is_actions() {
-                    dialog.confirm_button = ConfirmDialogButton::Cancel;
-                }
-                dialog.focus.cycle_next(dialog.selector.len());
-            }
+        // The paste buffer is a native round trip bounded at
+        // NATIVE_CLIPBOARD_TIMEOUT, so the shared helper releases the state
+        // guard around it and applies the answer after the re-lock (c-1).
+        ModelListKeyOutcome::Yank => {
+            hoisted_editor_yank(
+                state,
+                st,
+                dialog,
+                |st, dialog| st.plans_view.refine_dialog = Some(dialog),
+                |st| st.plans_view.refine_dialog.take(),
+            )
+            .await;
+        }
+        // Safe cancellation returns the shared button to its default and drops
+        // the dialog without a request.
+        ModelListKeyOutcome::Dismiss => {
+            st.confirm_button = ConfirmDialogButton::Cancel;
+        }
+        ModelListKeyOutcome::Consumed => {
             st.plans_view.refine_dialog = Some(dialog);
-            Ok(Some(InputResult::Continue))
-        }
-        KeyCode::BackTab => {
-            if dialog.focus.is_actions() && dialog.confirm_button == ConfirmDialogButton::Confirm {
-                dialog.confirm_button = ConfirmDialogButton::Cancel;
-            } else {
-                dialog.focus.cycle_prev(dialog.selector.len());
-                if dialog.focus.is_actions() {
-                    dialog.confirm_button = ConfirmDialogButton::Confirm;
-                }
-            }
-            st.plans_view.refine_dialog = Some(dialog);
-            Ok(Some(InputResult::Continue))
-        }
-        // Horizontal stepping moves between the action buttons.
-        KeyCode::Left | KeyCode::Right if dialog.focus.is_actions() => {
-            dialog.confirm_button = match dialog.confirm_button {
-                ConfirmDialogButton::Cancel => ConfirmDialogButton::Confirm,
-                ConfirmDialogButton::Confirm => ConfirmDialogButton::Cancel,
-            };
-            st.plans_view.refine_dialog = Some(dialog);
-            Ok(Some(InputResult::Continue))
-        }
-        // Starting a refinement begins from `Confirm`. Safe `Cancel` dismisses the dialog.
-        KeyCode::Enter | KeyCode::Char(' ')
-            if !has_shift && !has_alt && dialog.focus.is_actions() =>
-        {
-            if dialog.confirm_button == ConfirmDialogButton::Confirm {
-                submit_refine_dialog(state, st, dialog, server_writer).await
-            } else {
-                // Safe cancel dismisses without re-attaching the dialog.
-                Ok(Some(InputResult::Continue))
-            }
-        }
-        _ => {
-            if dialog.focus.is_instructions_editor()
-                && dialog.instructions_editor.takes_yank_chord(key, is_cmd)
-            {
-                // The paste buffer is a native round trip bounded at
-                // NATIVE_CLIPBOARD_TIMEOUT, so it is read with the state guard
-                // released and the answer is applied after the re-lock (c-1).
-                st.plans_view.refine_dialog = Some(dialog);
-                drop(st);
-                let clipboard = crate::clipboard::get_from_clipboard_async().await;
-                let mut st = state.lock().await;
-                if let Some(mut dialog) = st.plans_view.refine_dialog.take() {
-                    dialog.instructions_editor.yank_with(clipboard);
-                    st.plans_view.refine_dialog = Some(dialog);
-                }
-                return Ok(Some(InputResult::Continue));
-            }
-            if dialog.focus.is_instructions_editor() {
-                crate::input::handle_editor_key(&mut dialog.instructions_editor, key, is_cmd, true);
-            }
-            st.plans_view.refine_dialog = Some(dialog);
-            Ok(Some(InputResult::Continue))
         }
     }
+    Ok(Some(InputResult::Continue))
 }
 
 /// Validates and submits the plan refinement request. Shared by the keyboard
@@ -298,11 +216,12 @@ mod tests {
     use std::sync::Arc;
 
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use tauqe_protocol::{ModelEntry, ModelRef};
     use tokio::sync::Mutex;
 
     use crate::app::{test_state, AppState, ConfirmDialogButton, ViewMode};
     use crate::rpc::RpcConnection;
-    use crate::views::plans::PlanRefineBlockedState;
+    use crate::views::plans::{PlanRefineBlockedState, PlanRefineDialogState, RefineDialogFocus};
 
     fn blocked_state() -> AppState {
         let mut st = test_state();
@@ -412,5 +331,320 @@ mod tests {
             guard.active_notification().map(|n| n.text.as_str()),
             Some("Model is currently busy; wait for operation to finish")
         );
+    }
+    fn architect(name: &str) -> ModelEntry {
+        ModelEntry::new(ModelRef::openrouter(name), None)
+    }
+
+    /// A refinement form over two configured Architect entries, so the focus
+    /// walk and the model-switch chord are both live (c-3, c-4).
+    fn refine_state() -> AppState {
+        let mut st = test_state();
+        st.view_mode = ViewMode::Plans;
+        st.plans_view.refine_dialog = Some(PlanRefineDialogState::new(
+            "plan-1".to_string(),
+            "Plan One".to_string(),
+            vec![architect("architect-a"), architect("architect-b")],
+        ));
+        st
+    }
+
+    async fn press_dialog(state: &Arc<Mutex<AppState>>, conn: &mut RpcConnection, key: KeyEvent) {
+        let guard = state.lock().await;
+        super::handle_refine_dialog(key, state, guard, conn)
+            .await
+            .expect("in-memory dispatch never fails");
+    }
+
+    async fn open_dialog(state: &Arc<Mutex<AppState>>) -> PlanRefineDialogState {
+        state
+            .lock()
+            .await
+            .plans_view
+            .refine_dialog
+            .clone()
+            .expect("dialog stays open")
+    }
+
+    async fn set_focus(state: &Arc<Mutex<AppState>>, focus: RefineDialogFocus) {
+        let mut guard = state.lock().await;
+        if let Some(dialog) = guard.plans_view.refine_dialog.as_mut() {
+            dialog.focus = focus;
+        }
+    }
+
+    async fn set_confirm_button(state: &Arc<Mutex<AppState>>, button: ConfirmDialogButton) {
+        let mut guard = state.lock().await;
+        if let Some(dialog) = guard.plans_view.refine_dialog.as_mut() {
+            dialog.confirm_button = button;
+        }
+    }
+
+    /// `C-Enter` submits the refinement from the editor that owns the keyboard,
+    /// so the developer never has to walk the focus to the action bar.
+    #[tokio::test]
+    async fn ctrl_enter_submits_the_refinement_from_the_editor() {
+        let state = Arc::new(Mutex::new(refine_state()));
+        let mut conn = RpcConnection::new(Vec::<u8>::new());
+        {
+            let mut guard = state.lock().await;
+            let dialog = guard
+                .plans_view
+                .refine_dialog
+                .as_mut()
+                .expect("dialog must be open");
+            assert_eq!(dialog.focus, RefineDialogFocus::InstructionsEditor);
+            dialog
+                .instructions_editor
+                .insert_str("split the first step");
+        }
+
+        press_dialog(
+            &state,
+            &mut conn,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::CONTROL),
+        )
+        .await;
+
+        let payload = String::from_utf8(conn.written().to_vec()).expect("utf-8 payload");
+        assert!(payload.contains("plan/refine"), "{payload}");
+        assert!(payload.contains("plan-1"), "{payload}");
+        assert!(payload.contains("split the first step"), "{payload}");
+
+        let guard = state.lock().await;
+        assert!(guard.plans_view.refine_dialog.is_none());
+        assert!(guard.plans_view.refining);
+        assert_eq!(guard.plans_view.refining_plan_id.as_deref(), Some("plan-1"));
+        assert_eq!(guard.view_mode, ViewMode::Repl);
+    }
+
+    /// The shared action-bar vocabulary reaches the refinement form: `y`
+    /// confirms and `n` cancels without a request.
+    #[tokio::test]
+    async fn y_confirms_from_the_actions_and_n_cancels() {
+        let confirm = Arc::new(Mutex::new(refine_state()));
+        let mut confirm_conn = RpcConnection::new(Vec::<u8>::new());
+        set_focus(&confirm, RefineDialogFocus::Actions).await;
+        press_dialog(
+            &confirm,
+            &mut confirm_conn,
+            KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE),
+        )
+        .await;
+        let payload = String::from_utf8(confirm_conn.written().to_vec()).expect("utf-8 payload");
+        assert!(payload.contains("plan/refine"), "{payload}");
+        let guard = confirm.lock().await;
+        assert!(guard.plans_view.refine_dialog.is_none());
+        assert!(guard.plans_view.refining);
+        drop(guard);
+
+        let cancel = Arc::new(Mutex::new(refine_state()));
+        let mut cancel_conn = RpcConnection::new(Vec::<u8>::new());
+        set_focus(&cancel, RefineDialogFocus::Actions).await;
+        press_dialog(
+            &cancel,
+            &mut cancel_conn,
+            KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE),
+        )
+        .await;
+        let guard = cancel.lock().await;
+        assert!(guard.plans_view.refine_dialog.is_none());
+        assert!(!guard.plans_view.refining);
+        assert_eq!(guard.view_mode, ViewMode::Plans);
+        drop(guard);
+        assert!(cancel_conn.written().is_empty());
+    }
+
+    /// Dismissal returns the shared confirm button to its safe default, so the
+    /// next dialog opens on `Cancel` instead of inheriting `Refine`.
+    #[tokio::test]
+    async fn esc_dismisses_and_resets_the_shared_confirm_button() {
+        let state = Arc::new(Mutex::new(refine_state()));
+        let mut conn = RpcConnection::new(Vec::<u8>::new());
+        set_focus(&state, RefineDialogFocus::Actions).await;
+        set_confirm_button(&state, ConfirmDialogButton::Confirm).await;
+
+        press_dialog(
+            &state,
+            &mut conn,
+            KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+        )
+        .await;
+
+        let guard = state.lock().await;
+        assert!(guard.plans_view.refine_dialog.is_none());
+        assert_eq!(guard.confirm_button, ConfirmDialogButton::Cancel);
+        assert!(!guard.plans_view.refining);
+        drop(guard);
+        assert!(conn.written().is_empty());
+    }
+
+    /// The letter accelerators are bare presses: `Ctrl+Y` is the editor's yank
+    /// chord, so it must neither start a token-spending refinement nor dismiss
+    /// the dialog that still holds the developer's instructions
+    /// (Conventions §5.2).
+    #[tokio::test]
+    async fn ctrl_y_from_the_actions_writes_no_request_and_keeps_the_dialog() {
+        let state = Arc::new(Mutex::new(refine_state()));
+        let mut conn = RpcConnection::new(Vec::<u8>::new());
+        set_focus(&state, RefineDialogFocus::Actions).await;
+
+        press_dialog(
+            &state,
+            &mut conn,
+            KeyEvent::new(KeyCode::Char('y'), KeyModifiers::CONTROL),
+        )
+        .await;
+
+        assert!(
+            conn.written().is_empty(),
+            "a command chord must never start a refinement"
+        );
+        let open = open_dialog(&state).await;
+        assert_eq!(open.focus, RefineDialogFocus::Actions);
+        let guard = state.lock().await;
+        assert!(!guard.plans_view.refining);
+        assert_eq!(guard.view_mode, ViewMode::Plans);
+    }
+
+    /// `Ctrl+Q` and `Ctrl+N` are command chords, not the dialog's dismissal or
+    /// cancellation accelerators, so neither may discard typed instructions.
+    #[tokio::test]
+    async fn ctrl_q_and_ctrl_n_do_not_dismiss_the_dialog() {
+        for character in ['q', 'n'] {
+            let state = Arc::new(Mutex::new(refine_state()));
+            let mut conn = RpcConnection::new(Vec::<u8>::new());
+            set_focus(&state, RefineDialogFocus::Actions).await;
+
+            press_dialog(
+                &state,
+                &mut conn,
+                KeyEvent::new(KeyCode::Char(character), KeyModifiers::CONTROL),
+            )
+            .await;
+
+            assert!(
+                state.lock().await.plans_view.refine_dialog.is_some(),
+                "Ctrl+{character} must not dismiss the dialog"
+            );
+            assert!(conn.written().is_empty());
+        }
+    }
+
+    /// The `Shift+Tab` spelling a terminal reports as `Tab` carrying `SHIFT`
+    /// walks the focus backward, exactly as the dedicated `BackTab` code does
+    /// (Conventions §6.2).
+    #[tokio::test]
+    async fn tab_with_shift_cycles_focus_backward() {
+        let state = Arc::new(Mutex::new(refine_state()));
+        let mut conn = RpcConnection::new(Vec::<u8>::new());
+        set_focus(&state, RefineDialogFocus::InstructionsEditor).await;
+
+        press_dialog(
+            &state,
+            &mut conn,
+            KeyEvent::new(KeyCode::Tab, KeyModifiers::SHIFT),
+        )
+        .await;
+
+        let open = open_dialog(&state).await;
+        assert_eq!(open.focus, RefineDialogFocus::ModelList);
+        assert!(conn.written().is_empty());
+    }
+
+    /// A bare letter typed into the editor stays literal text, so the
+    /// accelerators never swallow the developer's instructions (Conventions §5).
+    #[tokio::test]
+    async fn q_n_and_y_typed_in_the_editor_stay_literal_text() {
+        let state = Arc::new(Mutex::new(refine_state()));
+        let mut conn = RpcConnection::new(Vec::<u8>::new());
+
+        for character in ['q', 'n', 'y'] {
+            press_dialog(
+                &state,
+                &mut conn,
+                KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE),
+            )
+            .await;
+        }
+
+        let open = open_dialog(&state).await;
+        assert_eq!(open.instructions_editor.get_text(), "qny");
+        assert_eq!(open.focus, RefineDialogFocus::InstructionsEditor);
+        assert!(conn.written().is_empty());
+    }
+
+    /// A bare digit selects an Architect rung only from the ladder; in the
+    /// editor it is literal text (c-4, Conventions §5).
+    #[tokio::test]
+    async fn digits_select_in_the_list_but_type_in_the_editor() {
+        let state = Arc::new(Mutex::new(refine_state()));
+        let mut conn = RpcConnection::new(Vec::<u8>::new());
+
+        set_focus(&state, RefineDialogFocus::ModelList).await;
+        press_dialog(
+            &state,
+            &mut conn,
+            KeyEvent::new(KeyCode::Char('2'), KeyModifiers::NONE),
+        )
+        .await;
+        let selected = open_dialog(&state).await;
+        assert_eq!(selected.selector.selected_index(), 1);
+        assert!(selected.instructions_editor.is_empty());
+
+        set_focus(&state, RefineDialogFocus::InstructionsEditor).await;
+        press_dialog(
+            &state,
+            &mut conn,
+            KeyEvent::new(KeyCode::Char('2'), KeyModifiers::NONE),
+        )
+        .await;
+        let typed = open_dialog(&state).await;
+        assert_eq!(typed.instructions_editor.get_text(), "2");
+        assert_eq!(
+            typed.selector.selected_index(),
+            1,
+            "typing a digit must not switch the architect"
+        );
+    }
+
+    /// The AltGr compose chord (`Ctrl+Alt`) belongs to neither command modifier,
+    /// so a composed character reaches no accelerator: it neither selects an
+    /// Architect in the ladder nor confirms, cancels, or submits from the action
+    /// bar (Conventions §5.2).
+    #[tokio::test]
+    async fn compose_chord_reaches_neither_the_accelerators_nor_the_ladder() {
+        let state = Arc::new(Mutex::new(refine_state()));
+        let mut conn = RpcConnection::new(Vec::<u8>::new());
+        let compose = KeyModifiers::CONTROL | KeyModifiers::ALT;
+
+        set_focus(&state, RefineDialogFocus::ModelList).await;
+        press_dialog(
+            &state,
+            &mut conn,
+            KeyEvent::new(KeyCode::Char('2'), compose),
+        )
+        .await;
+        assert_eq!(
+            open_dialog(&state).await.selector.selected_index(),
+            0,
+            "a composed digit must not select an Architect"
+        );
+
+        set_focus(&state, RefineDialogFocus::Actions).await;
+        for code in [
+            KeyCode::Char('y'),
+            KeyCode::Char('n'),
+            KeyCode::Char('q'),
+            KeyCode::Enter,
+        ] {
+            press_dialog(&state, &mut conn, KeyEvent::new(code, compose)).await;
+        }
+
+        let open = open_dialog(&state).await;
+        assert_eq!(open.focus, RefineDialogFocus::Actions);
+        assert_eq!(open.confirm_button, ConfirmDialogButton::Cancel);
+        assert!(!state.lock().await.plans_view.refining);
+        assert!(conn.written().is_empty());
     }
 }

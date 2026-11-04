@@ -19,7 +19,7 @@ pub struct ReviewSession {
     pub user_prompt: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub target_files: Vec<String>,
-    #[serde(default, alias = "issues", skip_serializing_if = "Vec::is_empty")]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub items: Vec<ReviewItem>,
     #[serde(default)]
     pub raw_markdown: String,

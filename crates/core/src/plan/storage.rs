@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 
 use std::sync::{Mutex, MutexGuard};
 use std::time::SystemTime;
-use tauqe_protocol::{Plan, PlanItem, PlanItemStatus, PlanSummary};
+use tauqe_protocol::{Plan, PlanItem, PlanItemStatus, PlanRejection, PlanSummary};
 use tauqe_tools::atomic_write::write_atomic;
 
 mod apply;
@@ -588,7 +588,10 @@ pub struct PlanApplicationOutcome {
     pub applied: Vec<Plan>,
     /// Mutations the storage barrier rejected; a rejected mutation leaves the
     /// stored plan untouched.
-    pub errors: Vec<String>,
+    ///
+    /// Every entry is classified where the refusal was produced, so a caller
+    /// reads the category from the typed field and never from the wording.
+    pub errors: Vec<PlanRejection>,
     /// Repairs the lifecycle barrier applied to an otherwise valid mutation.
     ///
     /// A repaired mutation is applied, so its reports never share the rejection
@@ -600,8 +603,18 @@ pub struct PlanApplicationOutcome {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tauqe_protocol::{DiscussionPlanAction, DiscussionPlanUpdate};
+    use tauqe_protocol::{DiscussionPlanAction, DiscussionPlanUpdate, PlanRejectionKind};
     use tempfile::tempdir;
+
+    /// Renders the reported wording of a batch of typed rejections, so an
+    /// assertion reads the surface text without the entry categories.
+    fn rejection_messages(rejections: &[PlanRejection]) -> String {
+        rejections
+            .iter()
+            .map(|rejection| rejection.message.as_str())
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
 
     #[test]
     fn test_plan_storage_crud_and_active() {
@@ -1390,7 +1403,15 @@ mod tests {
             "</plan>\n",
         );
         let tag_outcome = PlanStorage::apply_plan_tags(root, tags);
-        let tag_errors = tag_outcome.errors.join("\n");
+        let tag_errors = rejection_messages(&tag_outcome.errors);
+        assert!(
+            tag_outcome
+                .errors
+                .iter()
+                .all(|rejection| rejection.kind == PlanRejectionKind::PayloadDefect),
+            "a structural defect is a payload defect: {:?}",
+            tag_outcome.errors
+        );
         assert!(tag_outcome.applied.is_empty());
         assert!(
             tag_errors.contains("Cannot save plan 'barrier-tags'"),
@@ -1412,7 +1433,15 @@ mod tests {
             items: invalid_items,
         };
         let structured_outcome = PlanStorage::apply_discussion_plan_update(root, &update);
-        let structured_errors = structured_outcome.errors.join("\n");
+        let structured_errors = rejection_messages(&structured_outcome.errors);
+        assert!(
+            structured_outcome
+                .errors
+                .iter()
+                .all(|rejection| rejection.kind == PlanRejectionKind::PayloadDefect),
+            "a structural defect is a payload defect: {:?}",
+            structured_outcome.errors
+        );
         assert!(structured_outcome.applied.is_empty());
         assert!(
             structured_errors.contains("Cannot save plan 'barrier-structured'"),

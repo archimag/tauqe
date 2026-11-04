@@ -9,10 +9,10 @@ use tauqe_protocol::{events, Plan, PlanItem, PlanListChangedEvent, PlanUpdatedEv
 
 use crate::state::AppState;
 
-/// Event emission and auto-context clearing are shared with every other handler
-/// subsystem, so they are re-exported here instead of being duplicated per
-/// subsystem.
-pub(super) use crate::handlers::common::{clear_auto_context, emit};
+/// Event emission and transient-context cleanup are shared with every other
+/// handler subsystem, so they are re-exported here instead of being duplicated
+/// per subsystem.
+pub(super) use crate::handlers::common::{cleanup_transient_context, emit};
 
 /// Runs a blocking plan-storage operation on the Tokio blocking pool.
 ///

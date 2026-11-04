@@ -26,6 +26,7 @@ use ratatui::style::Stylize;
 use ratatui::text::{Line, Span};
 use tauqe_protocol::{ModelEntry, ModelRole};
 
+use crate::command::is_bare_press;
 use crate::config::{MetaModifier, PrimaryModifier};
 use crate::model_display::{numbered_selection_label, selection_label};
 use crate::theme::engine::current_engine;
@@ -153,7 +154,9 @@ impl ModelSelector {
     /// position, arrows step cyclically, and `PgUp`/`PgDn`/`Home`/`End` jump
     /// within the list. It is only invoked when the list, not the instruction
     /// editor, holds focus, so intercepting bare keys never violates the
-    /// unconditional character insertion rule (Conventions.md §5). Returns
+    /// unconditional character insertion rule (Conventions.md §5). Every digit
+    /// is a bare press, so the `C-1`…`C-5` view-switch chords and the AltGr
+    /// compose chord never quick-select a model (Conventions §3, §5.1). Returns
     /// `true` when the key was consumed.
     pub fn handle_list_key(&mut self, key: KeyEvent, visible_height: usize) -> bool {
         if self.entries.is_empty() {
@@ -161,7 +164,7 @@ impl ModelSelector {
         }
 
         match key.code {
-            KeyCode::Char(c @ '1'..='9') => {
+            KeyCode::Char(c @ '1'..='9') if is_bare_press(key.modifiers) => {
                 let index = c as usize - '1' as usize;
                 if index < self.entries.len() {
                     self.select_index(index);
@@ -535,5 +538,30 @@ mod tests {
 
         assert!(!selector.handle_list_key(key(KeyCode::Char('9'), KeyModifiers::NONE), 5));
         assert_eq!(selector.selected_index(), 2);
+    }
+
+    /// The digit quick-select of the embedded list is a bare press: the global
+    /// `C-1`…`C-5` view-switch chords and the AltGr compose chord never select
+    /// a model, while the list's dedicated navigation keys stay unconditional
+    /// (Conventions §3, §5.1).
+    #[test]
+    fn command_modified_digits_are_refused_by_the_list_quick_select() {
+        for modifiers in [
+            KeyModifiers::CONTROL,
+            KeyModifiers::ALT,
+            KeyModifiers::CONTROL | KeyModifiers::ALT,
+        ] {
+            let mut selector = ModelSelector::new(ModelRole::Reviewer, three_entries(), 0);
+            for digit in ['1', '2', '3'] {
+                assert!(
+                    !selector.handle_list_key(key(KeyCode::Char(digit), modifiers), 5),
+                    "{digit:?} with {modifiers:?} must reach no quick-select"
+                );
+            }
+            assert_eq!(selector.selected_index(), 0);
+
+            assert!(selector.handle_list_key(key(KeyCode::Down, modifiers), 5));
+            assert_eq!(selector.selected_index(), 1);
+        }
     }
 }

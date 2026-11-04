@@ -17,6 +17,16 @@
 //! filesystem that answers the sync itself as unsupported keeps the weaker
 //! durability it offers.
 //!
+//! The barrier covers the whole lifecycle of a durable document, not only the
+//! moment its state is published. [`remove_atomic`] removes a file and syncs
+//! the directory that held it, because an unlink is recorded there exactly as
+//! a rename is, so a crash cannot resurrect a removed entry. Symmetrically,
+//! [`create_dir_all_durable`] creates the directories a later write needs and
+//! syncs the parent of every directory it created, because the entry of a new
+//! directory lives in its parent, so a crash cannot lose the chain of
+//! directories that is about to hold a marker. A durable document therefore
+//! travels through this module from the first directory it requires until the
+//! moment it is gone.
 //! The staging name carries both the process id and a process-wide monotonic
 //! sequence number. A fixed name would let two writers of one process truncate
 //! each other's staging file and publish a corrupted result; that hazard is
@@ -86,7 +96,75 @@ pub fn write_atomic(target: &Path, contents: &[u8]) -> Result<()> {
         replaced
     })
 }
+/// Durably removes `target`.
+///
+/// An unlink is recorded in the directory that held the file, not in the file
+/// itself, so removing the entry alone would let a crash resurrect it. The
+/// removal therefore syncs that directory, exactly as the rename performed by
+/// [`write_atomic`] does. A target that is already absent is success and syncs
+/// nothing, because no entry exists that a crash could bring back; every other
+/// failure is reported with the path it addressed.
+pub fn remove_atomic(target: &Path) -> Result<()> {
+    // The unlink and its directory barrier both run off the async executor
+    // thread, so a slow disk never stalls the bounded turn, provider
+    // streaming, or RPC handling.
+    crate::blocking::run_blocking(move || {
+        match std::fs::remove_file(target) {
+            Ok(()) => sync_holding_directory(target),
+            // A target that is already absent is the state a completed
+            // removal leaves behind: no entry survives that a crash could
+            // resurrect, so there is nothing left to sync.
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => {
+                Err(error).with_context(|| format!("Failed to remove {}", target.display()))
+            }
+        }
+    })
+}
 
+/// Creates `dir` and every missing ancestor of it, durably.
+///
+/// `std::fs::create_dir_all` records each new directory in its parent, so the
+/// entries it added can be lost by a crash unless those parents are synced.
+/// The directories that do not exist yet are collected before the call, and
+/// the parent of every directory the call created is synced afterwards,
+/// shallowest first, so a crash cannot detach the new chain from the directory
+/// that roots it. A directory that already exists is success and syncs
+/// nothing; creation and sync failures are reported with the path they
+/// addressed.
+pub fn create_dir_all_durable(dir: &Path) -> Result<()> {
+    // Building the chain and running its sync barriers both happen off the
+    // async executor thread, so a slow disk never stalls the bounded turn.
+    crate::blocking::run_blocking(move || {
+        let created = missing_directories(dir);
+        std::fs::create_dir_all(dir)
+            .with_context(|| format!("Failed to create the directory {}", dir.display()))?;
+        for directory in &created {
+            sync_holding_directory(directory)?;
+        }
+        Ok(())
+    })
+}
+
+/// The directories of `dir` that do not exist yet, shallowest first.
+///
+/// `std::fs::create_dir_all` reports nothing about which entries it added, so
+/// the barrier derives them from the filesystem before the call: an entry
+/// that does not exist yet is exactly the entry the call is about to add. The
+/// walk stops at the first ancestor that exists, because every ancestor above
+/// it exists as well; an empty ancestor, which is how a bare relative path
+/// terminates, ends the walk too.
+fn missing_directories(dir: &Path) -> Vec<PathBuf> {
+    let mut missing = Vec::new();
+    for ancestor in dir.ancestors() {
+        if ancestor.as_os_str().is_empty() || ancestor.exists() {
+            break;
+        }
+        missing.push(ancestor.to_path_buf());
+    }
+    missing.reverse();
+    missing
+}
 /// Stages `contents` into `staging`, syncs it, carries the permissions of an
 /// existing `target` onto the staged copy, renames it over `target`, and syncs
 /// the directory that holds the result.
@@ -105,12 +183,7 @@ fn stage_and_rename(staging: &Path, target: &Path, contents: &[u8]) -> Result<()
     // The file's own `sync_all` covers its data and inode, not the directory
     // entry that now points at it. Syncing the parent directory makes the
     // rename itself durable, so a power loss cannot roll it back.
-    sync_parent_directory(target).with_context(|| {
-        format!(
-            "Failed to sync the directory that holds {}",
-            target.display()
-        )
-    })
+    sync_holding_directory(target)
 }
 
 /// The directory that holds `target`.
@@ -175,7 +248,15 @@ fn rejects_directory_sync(error: &std::io::Error) -> bool {
 fn sync_parent_directory(_target: &Path) -> std::io::Result<()> {
     Ok(())
 }
-
+/// Syncs the directory that records the change performed on `entry`.
+///
+/// An unlink, a rename, and a new directory are all recorded in the parent
+/// directory of the entry they address, so every barrier of this module
+/// reaches durability through this one step.
+fn sync_holding_directory(entry: &Path) -> Result<()> {
+    sync_parent_directory(entry)
+        .with_context(|| format!("Failed to sync the directory of {}", entry.display()))
+}
 /// Builds a staging path for `target` that is unique within this process.
 ///
 /// The sibling carries [`STAGING_TEMP_MARKER`], the marker of the crate's
@@ -516,8 +597,9 @@ impl SiblingCommit {
 #[cfg(test)]
 mod tests {
     use super::{
-        is_process_alive, staging_backup_original_name, staging_backup_sibling, staging_path,
-        staging_temp_original_name, staging_temp_sibling, write_atomic, SiblingCommit,
+        create_dir_all_durable, is_process_alive, remove_atomic, staging_backup_original_name,
+        staging_backup_sibling, staging_path, staging_temp_original_name, staging_temp_sibling,
+        write_atomic, SiblingCommit,
     };
     use std::path::Path;
     use tempfile::tempdir;
@@ -839,5 +921,88 @@ mod tests {
             "a rewrite must never widen the mode of the file it replaces"
         );
         assert!(staging_leftovers(dir.path()).is_empty());
+    }
+    #[test]
+    fn a_durable_removal_deletes_the_target_and_leaves_no_staging_file() {
+        let dir = tempdir().unwrap();
+        let target = dir.path().join("active-transaction.json");
+        std::fs::write(&target, "{}").unwrap();
+
+        remove_atomic(&target).unwrap();
+
+        assert!(!target.exists());
+        assert!(staging_leftovers(dir.path()).is_empty());
+    }
+
+    #[test]
+    fn a_durable_removal_of_an_absent_target_is_success() {
+        let dir = tempdir().unwrap();
+        let target = dir.path().join("active-transaction.json");
+
+        // An absent target is the state a completed removal leaves behind, so
+        // the barrier reports success instead of an error.
+        remove_atomic(&target).unwrap();
+
+        assert!(!target.exists());
+        assert!(staging_leftovers(dir.path()).is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_removal_the_parent_directory_rejects_is_reported() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempdir().unwrap();
+        let parent = dir.path().join("read_only");
+        std::fs::create_dir(&parent).unwrap();
+        let target = parent.join("active-transaction.json");
+        std::fs::write(&target, "{}").unwrap();
+
+        // Without the write bit the parent records no unlink at all, so the
+        // removal fails before any directory sync could run.
+        std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o555)).unwrap();
+        let removed = remove_atomic(&target);
+        std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        assert!(removed.is_err(), "a refused removal is reported");
+        assert!(target.is_file(), "a refused removal keeps the target");
+    }
+
+    #[test]
+    fn a_durable_creation_builds_the_missing_directory_chain() {
+        let dir = tempdir().unwrap();
+        let chain = dir.path().join("state").join("nested").join("deep");
+
+        create_dir_all_durable(&chain).unwrap();
+
+        assert!(chain.is_dir());
+        assert!(dir.path().join("state").join("nested").is_dir());
+    }
+
+    #[test]
+    fn a_durable_creation_of_an_existing_directory_is_success() {
+        let dir = tempdir().unwrap();
+        let existing = dir.path().join("state");
+        std::fs::create_dir(&existing).unwrap();
+
+        // The directory already exists, so the call creates nothing and has
+        // nothing to sync.
+        create_dir_all_durable(&existing).unwrap();
+
+        assert!(existing.is_dir());
+    }
+
+    #[test]
+    fn a_directory_chain_blocked_by_a_file_reports_the_creation_error() {
+        let dir = tempdir().unwrap();
+        let blocker = dir.path().join("state");
+        std::fs::write(&blocker, "a file, not a directory").unwrap();
+        let chain = blocker.join("nested");
+
+        let created = create_dir_all_durable(&chain);
+
+        assert!(created.is_err(), "a blocked chain is reported");
+        assert!(blocker.is_file());
+        assert!(!chain.exists());
     }
 }

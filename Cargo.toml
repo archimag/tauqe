@@ -68,6 +68,11 @@ pulldown-cmark = { version = "0.12", default-features = false }
 syntect = { version = "5.3", default-features = false, features = ["default-syntaxes", "default-themes", "parsing", "regex-fancy"] }
 similar = "2.7"
 arboard = "3.7"
+# Opening an URL in the platform browser comes from the ecosystem crate
+# (Conventions §1.6): the per-platform launch is never re-derived in-repo,
+# and the detached variant leaves no child for the caller to reap. The entry
+# lives here because `crates/tui` is its single consumer (Conventions §12.3).
+open = "5"
 toml_edit = "0.22"
 
 # Test-only dependencies shared by workspace crates.

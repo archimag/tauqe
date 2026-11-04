@@ -25,9 +25,10 @@
 //! in-memory work at all.
 //!
 //! The model turns, the batch supervisors, the Git history rewrites, the
-//! repository lifecycle probes, the repository and Git reads, the plan and
-//! review record reads and writes, the context curation methods, the telemetry
-//! reset, and the history truncation all fall outside the table for exactly that
+//! repository lifecycle and configuration probes, the repository and Git
+//! reads, the plan and review record reads and writes, the context curation
+//! methods, the telemetry reset, and the history truncation all fall outside
+//! the table for exactly that
 //! reason: each one awaits a subprocess, a storage lock, an `fsync`, or a
 //! context guard another task holds as a write. The guard tests pin the inline
 //! set and the reclassified methods alike, so a reclassification has to be
@@ -56,7 +57,6 @@ pub enum DispatchClass {
 const INLINE_METHODS: &[&str] = &[
     // Configuration and model selection.
     methods::CONFIG_GET,
-    methods::CONFIG_SET,
     methods::MODEL_CANCEL,
     methods::MODEL_SELECT,
     methods::MODEL_CURRENT,
@@ -160,6 +160,17 @@ mod tests {
         }
     }
 
+    /// `config/set` rewrites a configuration document and, whenever the request
+    /// names the `history_model`, `workflow`, or `edit_protocol` keys, awaits a
+    /// `module_owners` walk and parse of the repository's `tauqe.d` files
+    /// before it answers. That is a disk probe on the blocking pool, which the
+    /// inline obligation rules out: awaiting it on the read loop parks stdin
+    /// for its duration, so neither `model/cancel` nor a closing pipe is
+    /// observable.
+    #[test]
+    fn configuration_write_probe_is_offloaded() {
+        assert_eq!(dispatch_class(methods::CONFIG_SET), DispatchClass::Offload);
+    }
     /// The repository and Git reads await `spawn_blocking` work: the repository
     /// probes shell out to git and `git/getDiff` renders a commit diff. Inline
     /// they park the read loop for the whole subprocess run, so neither a
@@ -268,7 +279,6 @@ mod tests {
 
         let mut expected = vec![
             methods::CONFIG_GET,
-            methods::CONFIG_SET,
             methods::MODEL_CANCEL,
             methods::MODEL_SELECT,
             methods::MODEL_CURRENT,

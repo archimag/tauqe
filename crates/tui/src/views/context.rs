@@ -197,14 +197,22 @@ impl ContextViewState {
     /// Refreshes the picker rows for the typed query.
     ///
     /// Every call is answered from a memoized scan while the typed query, the
-    /// in-context path set, and the repository file list stay unchanged, so
-    /// cursor moves, focus changes, and redraws re-serve the rows the last real
+    /// in-context path set, and the repository file list revision stay unchanged,
+    /// so cursor moves, focus changes, and redraws re-serve the rows the last real
     /// query edit produced instead of re-walking the whole repository file list.
-    /// Only a genuine input change recomputes, exactly as `PatternMatchMemo`
-    /// serves the review launch dialog (#32).
-    pub fn update_filtered_candidates(&mut self, items: &[ContextItem], all_repo_files: &[String]) {
+    /// The revision is the authoritative repository signal: the list itself is
+    /// replaced only through `AppState::set_repo_files`, which advances it in the
+    /// same step, so the memo never hashes a path list that can hold a whole
+    /// monorepo. Only a genuine input change recomputes, exactly as
+    /// `PatternMatchMemo` serves the review launch dialog (#32).
+    pub fn update_filtered_candidates(
+        &mut self,
+        items: &[ContextItem],
+        all_repo_files: &[String],
+        repo_revision: u64,
+    ) {
         let query = self.add_input.get_text().trim().to_string();
-        let signature = candidate_scan_signature(&query, items, all_repo_files);
+        let signature = candidate_scan_signature(&query, items, repo_revision);
 
         if !self.candidate_scan.serves(signature) {
             self.scan_candidates(&query, items, all_repo_files);
@@ -321,8 +329,9 @@ const CANDIDATE_ROW_LIMIT: usize = 50;
 /// Mirroring `PatternMatchMemo` in `crate::dialogs::pattern`, the picker answers
 /// the same question on every typed character — which repository files the query
 /// selects and which rows to list first — and the answer is fully determined by
-/// the query, the in-context path set, and the repository file list. It is
-/// therefore kept against a fingerprint of exactly those inputs (#32).
+/// the query, the in-context path set, and the revision of the repository file
+/// list. It is therefore kept against a fingerprint of exactly those inputs
+/// (#32).
 #[derive(Debug, Clone, Default)]
 struct CandidateScanMemo {
     /// Fingerprint of the scan whose rows the picker currently holds.
@@ -359,23 +368,21 @@ impl CandidateScanMemo {
 /// Fingerprint of the inputs behind a memoized candidate scan.
 ///
 /// Mirroring `patterns_signature` in `crate::dialogs::pattern`, the typed query,
-/// the context paths, and the repository file list are folded into one hash. The
-/// repository list is folded by content rather than by its address: the daemon
-/// replaces the list wholesale on a refresh, and re-listing a repository of the
-/// same size routinely hands the new vector the block the previous one released,
-/// so an address check would serve a stale candidate list after a rename. Folding
-/// the paths stays far cheaper than the glob traversal the fingerprint guards.
-fn candidate_scan_signature(query: &str, items: &[ContextItem], all_repo_files: &[String]) -> u64 {
+/// the context paths, and the repository file list revision are folded into one
+/// hash. The path list itself is never folded: it can hold a whole monorepo, and
+/// hashing it on every keystroke and every context event costs exactly the pass
+/// the memo exists to avoid. The revision is authoritative because the list has
+/// a single writer — `AppState::set_repo_files` replaces the list and advances
+/// the counter in the same step — so a refreshed list is always a distinct
+/// fingerprint and a re-served answer always describes the list in hand (#32).
+fn candidate_scan_signature(query: &str, items: &[ContextItem], repo_revision: u64) -> u64 {
     let mut hasher = DefaultHasher::new();
     query.hash(&mut hasher);
     items.len().hash(&mut hasher);
     for item in items {
         item.path.hash(&mut hasher);
     }
-    all_repo_files.len().hash(&mut hasher);
-    for file in all_repo_files {
-        file.hash(&mut hasher);
-    }
+    repo_revision.hash(&mut hasher);
     hasher.finish()
 }
 
@@ -425,7 +432,7 @@ mod tests {
         let suspicious = "[+] Add all matching '*.rs' (3 files)";
         let all_repo_files = vec![suspicious.to_string(), "src/lib.rs".to_string()];
 
-        view.update_filtered_candidates(&[], &all_repo_files);
+        view.update_filtered_candidates(&[], &all_repo_files, 1);
 
         assert_eq!(
             view.filtered_candidates.first(),
@@ -439,7 +446,7 @@ mod tests {
         let all_repo_files = vec!["src/lib.rs".to_string(), "src/main.rs".to_string()];
         view.add_input.insert_str("*.rs");
 
-        view.update_filtered_candidates(&[], &all_repo_files);
+        view.update_filtered_candidates(&[], &all_repo_files, 1);
 
         assert_eq!(
             view.filtered_candidates.first(),
@@ -506,7 +513,7 @@ mod tests {
         view.add_input.insert_str("*.rs");
         let all_repo_files = vec!["a.rs".to_string(), "b.rs".to_string()];
 
-        view.update_filtered_candidates(&[], &all_repo_files);
+        view.update_filtered_candidates(&[], &all_repo_files, 1);
 
         assert_eq!(
             view.filtered_candidates,
@@ -534,7 +541,7 @@ mod tests {
         view.add_input.insert_str("demo.rs");
         let all_repo_files = vec![sentinel_path.clone()];
 
-        view.update_filtered_candidates(&[], &all_repo_files);
+        view.update_filtered_candidates(&[], &all_repo_files, 1);
 
         assert_eq!(
             view.filtered_candidates,
@@ -562,16 +569,17 @@ mod tests {
             "x.rs"
         );
     }
-    /// The picker scan runs once per (query, context, repository) state: cursor
-    /// moves, focus changes, and redraws re-serve the stored rows, and only a
-    /// real input change recomputes (#32).
+    /// The picker scan runs once per (query, context, repository revision)
+    /// state: cursor moves, focus changes, and redraws re-serve the stored rows,
+    /// and only a real input change or a replaced repository list recomputes
+    /// (#32).
     #[test]
     fn update_filtered_candidates_is_memoized_on_the_scan_signature() {
         let mut view = ContextViewState::default();
         let repo = vec!["src/lib.rs".to_string(), "README.md".to_string()];
         view.add_input.insert_str("*.rs");
 
-        view.update_filtered_candidates(&[], &repo);
+        view.update_filtered_candidates(&[], &repo, 1);
         assert_eq!(view.candidate_scan.computations(), 1);
         assert_eq!(view.total_matching, 1);
         assert_eq!(view.selected_candidate_index, 1);
@@ -580,14 +588,14 @@ mod tests {
         // the stored rows still answer the unchanged query, and the safe default
         // selection is re-applied exactly as a fresh scan would apply it.
         view.selected_candidate_index = 0;
-        view.update_filtered_candidates(&[], &repo);
+        view.update_filtered_candidates(&[], &repo, 1);
         assert_eq!(view.candidate_scan.computations(), 1);
         assert_eq!(view.selected_candidate_index, 1);
 
         // A real query edit recomputes.
         view.add_input.clear();
         view.add_input.insert_str("*.md");
-        view.update_filtered_candidates(&[], &repo);
+        view.update_filtered_candidates(&[], &repo, 1);
         assert_eq!(view.candidate_scan.computations(), 2);
         assert_eq!(view.total_matching, 1);
 
@@ -596,16 +604,17 @@ mod tests {
         view.add_input.clear();
         view.add_input.insert_str("*.rs");
         let items = vec![item("src/lib.rs", ContextLayer::User)];
-        view.update_filtered_candidates(&items, &repo);
+        view.update_filtered_candidates(&items, &repo, 1);
         assert_eq!(view.candidate_scan.computations(), 3);
         assert_eq!(view.total_matching, 0);
         assert!(view.filtered_candidates.is_empty());
         assert_eq!(view.selected_candidate_index, 0);
 
-        // A refreshed repository file list recomputes even when the replaced one
-        // had the same length, which a pointer-identity check would miss.
+        // A refreshed repository file list advances the revision that keys the
+        // memo, so the rows are rebuilt even when the replaced list kept its
+        // length and every path of it.
         let refreshed = vec!["src/main.rs".to_string(), "README.md".to_string()];
-        view.update_filtered_candidates(&items, &refreshed);
+        view.update_filtered_candidates(&items, &refreshed, 2);
         assert_eq!(view.candidate_scan.computations(), 4);
         assert_eq!(view.total_matching, 1);
         assert_eq!(

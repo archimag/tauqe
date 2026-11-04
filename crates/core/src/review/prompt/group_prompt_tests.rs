@@ -27,6 +27,7 @@ fn finding() -> ReviewItem {
         id: 7,
         title: "Parser error type".to_string(),
         uuid: None,
+        commit: None,
         group: Some("arch-1".to_string()),
         model: None,
         issue_type: IssueType::Bug,

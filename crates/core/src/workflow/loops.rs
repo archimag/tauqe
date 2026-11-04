@@ -19,7 +19,8 @@ use async_trait::async_trait;
 use crate::providers::StreamEvent;
 
 use super::fsm::{
-    begin_session_turn, record_session_response, run_fsm_turn, run_fsm_turn_body, FsmTurnOutcome,
+    announce_plan_diagnostics, begin_session_turn, record_session_response, run_fsm_turn,
+    run_fsm_turn_body, FsmTurnOutcome,
 };
 use super::task::{Task, TaskEnv};
 
@@ -74,7 +75,6 @@ impl Task for EditLoop {
         // never duplicate the user prompt in history or re-run compaction.
         let turn_id = begin_session_turn(
             &self.prompt,
-            env.intent,
             env.context,
             env.history,
             env.provider,
@@ -125,23 +125,14 @@ impl Task for EditLoop {
                             .rollback_entry(id, "Turn cancelled by the developer");
                     }
                 } else {
-                    record_session_response(env.history, &output);
-                    // A plan mutation the storage engine refused never fails the
+                    record_session_response(env.history, &output, env.intent);
+                    // A refused or repaired plan mutation never fails the
                     // turn, but it is a protocol-level diagnostic the developer
                     // must see. The corrective round applies its own plan
                     // payload, so the merged outcome carries every attempt's
-                    // rejection and the banner reports them once the turn
-                    // settles.
-                    if let Some(notice) = output.plan_rejection_notice() {
-                        tracing::warn!("{}", notice);
-                        let _ = env
-                            .stream_tx
-                            .send(StreamEvent::TextDelta(format!(
-                                "\n\n---\n\u{26a0}\u{fe0f} {}\n\n",
-                                notice
-                            )))
-                            .await;
-                    }
+                    // rejection and repair, and both are announced once the
+                    // turn settles.
+                    announce_plan_diagnostics(&output, &env.stream_tx).await;
                 }
                 Ok(output)
             }
@@ -259,6 +250,7 @@ fn merge_output(target: &mut FsmTurnOutcome, next: FsmTurnOutcome, banner: &str)
         has_terminal_success,
         plan_saved,
         plan_errors,
+        plan_warnings,
         skip_reason,
         abort,
     } = next;
@@ -279,6 +271,7 @@ fn merge_output(target: &mut FsmTurnOutcome, next: FsmTurnOutcome, banner: &str)
     // corrective round reported is appended rather than replacing the
     // first-attempt list.
     target.plan_errors.extend(plan_errors);
+    target.plan_warnings.extend(plan_warnings);
     target.abort = abort;
 }
 
@@ -288,7 +281,9 @@ mod tests {
     use std::sync::Mutex;
 
     use async_trait::async_trait;
-    use tauqe_protocol::{ContextAccess, ModelRef, ModelResult, ProviderKind};
+    use tauqe_protocol::{
+        ContextAccess, ModelRef, ModelResult, PlanRejection, PlanRejectionKind, ProviderKind,
+    };
     use tokio::sync::{mpsc, watch};
 
     use crate::context::ContextManager;
@@ -792,8 +787,14 @@ mod tests {
 
         // The merged outcome carries the rejection the corrective round produced.
         assert_eq!(out.plan_errors.len(), 1, "{:?}", out.plan_errors);
+        assert_eq!(
+            out.plan_errors[0].kind,
+            PlanRejectionKind::ModeForbidden,
+            "the regime branch declares the category: {:?}",
+            out.plan_errors
+        );
         assert!(
-            out.plan_errors[0].contains("REPL mode"),
+            out.plan_errors[0].message.contains("REPL mode"),
             "{:?}",
             out.plan_errors
         );
@@ -848,7 +849,8 @@ mod tests {
             blocked: None,
             has_terminal_success: false,
             plan_saved: false,
-            plan_errors: vec!["first attempt rejection".to_string()],
+            plan_errors: vec![PlanRejection::payload_defect("first attempt rejection")],
+            plan_warnings: vec!["first attempt repair".to_string()],
             skip_reason: None,
             abort: None,
         };
@@ -861,7 +863,8 @@ mod tests {
             blocked: Some("blocked on the retried attempt".to_string()),
             has_terminal_success: true,
             plan_saved: true,
-            plan_errors: vec!["retried attempt rejection".to_string()],
+            plan_errors: vec![PlanRejection::mode_forbidden("retried attempt rejection")],
+            plan_warnings: vec!["retried attempt repair".to_string()],
             skip_reason: Some("skipped on the retried attempt".to_string()),
             abort: Some(AbortReport {
                 reason: "host capability missing".to_string(),
@@ -889,10 +892,18 @@ mod tests {
         assert_eq!(
             target.plan_errors,
             vec![
-                "first attempt rejection".to_string(),
-                "retried attempt rejection".to_string()
+                PlanRejection::payload_defect("first attempt rejection"),
+                PlanRejection::mode_forbidden("retried attempt rejection")
             ],
             "each attempt's rejections are independent and both must survive"
+        );
+        assert_eq!(
+            target.plan_warnings,
+            vec![
+                "first attempt repair".to_string(),
+                "retried attempt repair".to_string()
+            ],
+            "each attempt's repairs are independent and both must survive"
         );
         assert_eq!(
             target.skip_reason.as_deref(),

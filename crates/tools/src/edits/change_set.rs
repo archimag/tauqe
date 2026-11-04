@@ -36,10 +36,36 @@ pub type StagedConfigValidator = fn(&str, Option<&str>) -> Result<(), String>;
 
 /// Cumulative in-memory state. Paths are normalized relative to the repository.
 /// A path must occur in at most one of these collections.
+///
+/// Staged content is bytes: a rename carries the payload of a file verbatim, so
+/// an image, a font, or a serialized asset relocates exactly as a source file
+/// does. The text pipeline reads a staged entry through a strict UTF-8 decode,
+/// and the only text view of the whole state is
+/// [`StagedEditsState::staged_text_files`].
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct StagedEditsState {
-    pub staged_files: HashMap<String, String>,
+    pub staged_files: HashMap<String, Vec<u8>>,
     pub deleted_paths: HashSet<String>,
+}
+
+impl StagedEditsState {
+    /// Returns the staged files that decode losslessly as UTF-8, as owned text.
+    ///
+    /// Staged content is bytes, so this is the only text view of the state: an
+    /// entry whose bytes are not valid UTF-8 is absent rather than lossily
+    /// rendered, so a prompt or a streaming preview never shows a payload the
+    /// turn cannot address as text. A path recorded as deleted holds no content
+    /// and therefore never appears.
+    pub fn staged_text_files(&self) -> HashMap<String, String> {
+        self.staged_files
+            .iter()
+            .filter_map(|(path, bytes)| {
+                std::str::from_utf8(bytes)
+                    .ok()
+                    .map(|text| (path.clone(), text.to_string()))
+            })
+            .collect()
+    }
 }
 
 #[derive(Debug)]
@@ -311,7 +337,7 @@ pub(crate) fn stage_and_validate_edits_inner(
 /// in an earlier member keeps its effect: a replacement that follows a rename is
 /// rolled back to the renamed content, not to the opening state of the attempt.
 struct PathSnapshot {
-    content: Option<String>,
+    content: Option<Vec<u8>>,
     deleted: bool,
 }
 
@@ -746,7 +772,9 @@ fn apply_staging_unit(
             }
             match staged {
                 Some(content) => {
-                    state.staged_files.insert(path.clone(), content);
+                    state
+                        .staged_files
+                        .insert(path.clone(), content.into_bytes());
                     state.deleted_paths.remove(path);
                 }
                 None => {
@@ -891,9 +919,12 @@ fn stage_rename(
 /// admission.
 ///
 /// A staged body is moved between the map keys instead of being cloned, so a
-/// member that relocates a whole subtree copies no file content. The pair either
-/// transfers completely or leaves the state exactly as it found it, which is what
-/// lets the caller invert it by moving the content back.
+/// member that relocates a whole subtree copies no file content. The bytes
+/// travel exactly as they were staged, and a source this attempt has not staged
+/// is read as bytes too, so a payload that is not text — an image, a font, or a
+/// serialized asset — relocates verbatim instead of being refused. The pair
+/// either transfers completely or leaves the state exactly as it found it, which
+/// is what lets the caller invert it by moving the content back.
 fn transfer_rename(
     repo_root: &Path,
     from: &str,
@@ -910,7 +941,7 @@ fn transfer_rename(
             if !source.is_file() {
                 return Err(rejection(from, EditError::FileNotFound(from.to_string())));
             }
-            std::fs::read_to_string(&source)
+            std::fs::read(&source)
                 .map_err(|err| rejection(from, EditError::Io(from.to_string(), err)))?
         }
     };
@@ -920,8 +951,34 @@ fn transfer_rename(
     Ok(())
 }
 
+/// Decodes the staged bytes of a text edit.
+///
+/// The text pipeline addresses bytes as text, so a staged entry that is not
+/// valid UTF-8 cannot serve as the base of a replacement, an overwrite, or a
+/// staged read. The refusal is the classification a disk read of those bytes
+/// produces, and never a silent reload from the working tree, which would
+/// discard what the change set has already staged.
+fn decode_staged_text(path: &str, bytes: &[u8]) -> Result<String, EditError> {
+    std::str::from_utf8(bytes).map(str::to_string).map_err(|_| {
+        EditError::Io(
+            path.to_string(),
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "stream did not contain valid UTF-8",
+            ),
+        )
+    })
+}
+
+/// Stages the run of operations one change set addresses to `path`.
+///
 /// None represents a staged deletion. Disk reads are deferred until a replace
 /// needs the original content, so create/delete also work for non-text files.
+///
+/// The text pipeline reads a staged entry through a strict UTF-8 decode: a
+/// payload that does not decode refuses the member with the `InvalidData`
+/// classification the same bytes produce when they are read from disk, instead
+/// of reloading the working tree and discarding what the change set staged.
 fn stage_file_edits(
     repo_root: &Path,
     context_paths: &HashSet<&str>,
@@ -940,7 +997,10 @@ fn stage_file_edits(
     let mut content = if deleted {
         None
     } else {
-        initial_staged.staged_files.get(path).cloned()
+        match initial_staged.staged_files.get(path) {
+            Some(bytes) => Some(decode_staged_text(path, bytes)?),
+            None => None,
+        }
     };
     let mut loaded = deleted || content.is_some();
     // Files created in memory need not be added to context until disk commit.

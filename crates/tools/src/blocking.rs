@@ -23,6 +23,14 @@
 //! route it through [`run_blocking_async`], which suspends the task and runs
 //! the closure on a dedicated blocking thread, leaving the executor free to
 //! poll the rest of the runtime (streaming, cancellations, RPC handling).
+//!
+//! An offload can also fail instead of returning its result, and its two
+//! failures mean opposite things. A cancelled blocking task never ran the work
+//! — the runtime shut down first — so the work is still outstanding and a
+//! synchronous fallback completes it. A panicked blocking task ran the work and
+//! crashed, so the failure is deterministic: retrying it would crash the
+//! calling thread too and spend the work a second time.
+//! [`resolve_offload_failure`] draws that distinction for every caller.
 
 use std::cell::Cell;
 
@@ -97,6 +105,7 @@ where
 /// indistinguishable from a legitimately empty result. Every call site that
 /// downgrades a failed offload to a fallback must route the `JoinError`
 /// through here first, so the failure point leaves an observable trace.
+/// [`resolve_offload_failure`] pairs that record with the degradation itself.
 pub fn log_join_error(error: &JoinError, operation: &str) {
     tracing::warn!(
         operation = operation,
@@ -104,6 +113,31 @@ pub fn log_join_error(error: &JoinError, operation: &str) {
         panicked = error.is_panic(),
         "offloaded blocking task failed"
     );
+}
+
+/// Completes the work a failed offload left undone, or resumes the panic that
+/// ended it.
+///
+/// The two offload failures are not interchangeable. A cancelled blocking task
+/// was never run — the runtime shut down first — so the work is still
+/// outstanding and `inline` performs it on the calling thread, which is exactly
+/// the synchronous path the caller would have taken without the offload. A
+/// panicked blocking task, in contrast, ran the work and crashed: the panic is
+/// deterministic, so retrying it inline would crash the calling thread too,
+/// spend the work a second time, and replace the original payload with a fresh
+/// one raised where nothing remembers the real failure. The panic is therefore
+/// recorded and its payload resumed here, so the failure surfaces once, carrying
+/// the context it was raised with.
+pub fn resolve_offload_failure<T>(
+    error: JoinError,
+    operation: &str,
+    inline: impl FnOnce() -> T,
+) -> T {
+    log_join_error(&error, operation);
+    if error.is_panic() {
+        std::panic::resume_unwind(error.into_panic());
+    }
+    inline()
 }
 
 /// Clears the thread-local blocking flag when the guarded scope ends, including
@@ -118,7 +152,7 @@ impl Drop for ResetBlockingFlag {
 
 #[cfg(test)]
 mod tests {
-    use super::{run_blocking, run_blocking_async};
+    use super::{resolve_offload_failure, run_blocking, run_blocking_async};
 
     #[test]
     fn runs_outside_a_runtime() {
@@ -179,5 +213,43 @@ mod tests {
         .await;
         assert!(result.is_err());
         assert!(result.unwrap_err().is_panic());
+    }
+
+    #[tokio::test]
+    async fn cancelled_offload_runs_the_inline_fallback() {
+        let handle = tokio::spawn(std::future::pending::<()>());
+        handle.abort();
+        let error = handle
+            .await
+            .expect_err("an aborted task reports a cancelled offload");
+        assert!(error.is_cancelled());
+        let mut inline_ran = false;
+        let value = resolve_offload_failure(error, "test", || {
+            inline_ran = true;
+            29
+        });
+        assert_eq!(value, 29);
+        assert!(inline_ran, "a cancelled offload is completed inline");
+    }
+
+    #[tokio::test]
+    async fn panicked_offload_resumes_the_payload_without_running_inline() {
+        let error = tokio::task::spawn_blocking(|| panic!("offloaded work crashed"))
+            .await
+            .expect_err("a panicking task reports a panicked offload");
+        assert!(error.is_panic());
+        let mut inline_ran = false;
+        let resumed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            resolve_offload_failure(error, "test", || {
+                inline_ran = true;
+                31
+            })
+        }));
+        let payload = resumed.expect_err("a panicked offload resumes its payload");
+        assert_eq!(
+            payload.downcast_ref::<&str>().copied(),
+            Some("offloaded work crashed")
+        );
+        assert!(!inline_ran, "a panicked offload is never retried inline");
     }
 }

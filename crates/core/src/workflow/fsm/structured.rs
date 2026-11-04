@@ -11,7 +11,7 @@
 //! [`PlanRefinePromptProtocol`], so the rendered instructions, the response
 //! schema, and the decoder observe one capability surface.
 //!
-//! Three terminal policies live here:
+//! Four terminal policies live here:
 //!
 //! - *Silence* is a transport-level non-answer, so the kernel's own budget
 //!   resolves it and the running architect rung is never charged for it.
@@ -26,11 +26,16 @@
 //!   be served* are typed terminal outcomes ([`StructuredRefineStatus`]), so a
 //!   caller renders them deterministically instead of reconstructing a verdict
 //!   from prose.
+//! - *A host-environment abort* is the escape hatch of an unattended regime: the
+//!   payload asserts that no plan can complete the work in the current
+//!   environment, so the contour streams the exact command the developer must
+//!   run and ends in [`StructuredRefineStatus::Aborted`] without spending a
+//!   generation attempt of the running rung.
 //!
 //! The contour never records session history: recording a synthesis belongs to the
-//! caller. It does clear the auto context layer it widened, because the material
-//! gathered for a synthesis is the Architect's investigation rather than the
-//! developer's dialogue.
+//! caller. It does release the transient context it widened, both the files its
+//! rounds discovered and the external documents they materialized, because that
+//! material is the Architect's investigation rather than the developer's dialogue.
 
 use std::path::Path;
 use std::sync::Arc;
@@ -56,7 +61,7 @@ use crate::workflow::WorkflowOptions;
 use super::cache::TurnInputCache;
 use super::kernel::{EmptyStepGuard, EmptyStepRetry, TurnKernel};
 use super::proposal::{log_fsm_phase, ProposalStep, TurnState};
-use super::FsmTurnOutcome;
+use super::{AbortReport, FsmTurnOutcome};
 
 /// Operation label recorded for every round of a synthesis run.
 const WORKFLOW_NAME: &str = "architect";
@@ -123,6 +128,13 @@ pub enum StructuredRefineStatus {
         /// Deterministic reason the caller reports.
         reason: String,
     },
+    /// The synthesis needs an action only the developer can perform on the host.
+    ///
+    /// An abort is not a blocker: it states that no plan can complete the work
+    /// in the current environment, so the report carries the exact command the
+    /// developer must run. The variant wraps the very [`AbortReport`] the edit
+    /// contour publishes, so both contours name the same two fields.
+    Aborted(AbortReport),
     /// The turn was cancelled before the Architect finalized.
     Cancelled,
 }
@@ -152,6 +164,8 @@ enum RoundStatus {
     Success,
     /// The Architect refused to plan and stated its reason.
     Blocked,
+    /// The Architect aborted: only the developer can unblock the host.
+    Aborted,
     /// The Architect named the evidence it still needs.
     NeedsContext,
 }
@@ -435,6 +449,27 @@ pub async fn run_structured_refine(
                 let reason = blocked_reason(&output);
                 break (Some(output), StructuredRefineStatus::Blocked { reason });
             }
+            RoundStatus::Aborted => {
+                // An abort supersedes every other reading of the payload, so it
+                // is resolved before the horizon is inspected: the report names
+                // the host action the developer must perform, the developer sees
+                // that exact command while the run settles, and the turn ends on
+                // the typed verdict without spending an attempt of the rung.
+                let report = abort_report(&output);
+                tracing::error!(
+                    workflow = WORKFLOW_NAME,
+                    model = %tier.model,
+                    round = rounds_used + 1,
+                    reason = %report.reason,
+                    "architect synthesis terminated by an abort outcome"
+                );
+                let notice = format!(
+                    "\n\n---\n⛔ **[Execution Aborted]**\n\n{}\n\n",
+                    report.to_message()
+                );
+                let _ = stream_tx.send(StreamEvent::TextDelta(notice)).await;
+                break (Some(output), StructuredRefineStatus::Aborted(report));
+            }
             RoundStatus::NeedsContext => {
                 if rounds_used >= options.max_research_rounds {
                     // The budget is spent while the Architect still needs the
@@ -504,12 +539,16 @@ pub async fn run_structured_refine(
         }
     };
 
-    // The synthesis owns the auto context layer it widened: the material is the
-    // Architect's investigation, not the developer's dialogue, so it never
-    // survives the run. Clearing the layer recomputes pinned files through disk
-    // checks, so the sweep runs off the async executor thread.
+    // The synthesis owns the transient context it widened: the files its
+    // research rounds discovered and the external documents they materialized
+    // are the Architect's investigation, not the developer's dialogue, so the
+    // one primitive that owns that lifetime releases both layers together
+    // (crates/core/Conventions.md §12). A release drops the context entries and
+    // never deletes a materialized snapshot, which stays admissible from the
+    // cache without another transfer. Recomputing pinned files reads the disk,
+    // so the sweep runs off the async executor thread.
     crate::blocking::run_blocking(|| {
-        context_manager.clear_auto();
+        context_manager.clear_transient();
     });
     let _ = stream_tx.send(StreamEvent::Done).await;
 
@@ -558,6 +597,12 @@ async fn run_round(
 /// violation and receives the same healing treatment.
 fn parse_round(step: &ProposalStep) -> Result<(PlanRefinementOutput, RoundStatus), String> {
     let output = parse_plan_refinement_output(step.raw_text()).map_err(|err| err.to_string())?;
+    // An active abort supersedes the declared status: the payload asserts that no
+    // plan can complete the work, so a `success` carrying items is void and an
+    // unrecognized status is a verdict rather than a schema violation to heal.
+    if declares_abort(&output) {
+        return Ok((output, RoundStatus::Aborted));
+    }
     let status = match output.status.trim().to_ascii_lowercase().as_str() {
         "success" => RoundStatus::Success,
         "blocked" => RoundStatus::Blocked,
@@ -565,6 +610,32 @@ fn parse_round(step: &ProposalStep) -> Result<(PlanRefinementOutput, RoundStatus
         other => return Err(format!("Unsupported plan refinement status '{other}'")),
     };
     Ok((output, status))
+}
+
+/// Reports whether the payload declares an active host-environment abort.
+fn declares_abort(output: &PlanRefinementOutput) -> bool {
+    output.abort.as_ref().is_some_and(|abort| abort.is_aborted)
+}
+
+/// Reads the abort report of a payload, with the edit contour's defaults.
+///
+/// The two contours publish one escape hatch, so a blank reason or
+/// recommendation resolves to the very default the structured edit contour
+/// substitutes instead of ending the synthesis on an empty payload.
+fn abort_report(output: &PlanRefinementOutput) -> AbortReport {
+    let abort = output.abort.as_ref();
+    let reason = abort
+        .map(|abort| abort.reason.trim())
+        .filter(|reason| !reason.is_empty())
+        .unwrap_or("Execution aborted");
+    let recommendation = abort
+        .map(|abort| abort.recommendation.trim())
+        .filter(|recommendation| !recommendation.is_empty())
+        .unwrap_or("No recommendation was stated.");
+    AbortReport {
+        reason: reason.to_string(),
+        recommendation: recommendation.to_string(),
+    }
 }
 
 /// Renders the model-facing diagnostic of a schema violation.
@@ -643,7 +714,7 @@ async fn stream_round_banner(
 mod tests {
     use super::*;
     use crate::providers::mock::{MockLlmProvider, MockResponse};
-    use tauqe_protocol::{ModelRef, ReasoningEffort};
+    use tauqe_protocol::{ContextAccess, ContextLayer, ModelRef, ReasoningEffort};
 
     /// Creates a repository the synthesis can inspect.
     fn repo() -> (tempfile::TempDir, std::path::PathBuf) {
@@ -839,5 +910,256 @@ mod tests {
             )),
             "the promotion must travel as a semantic event"
         );
+    }
+
+    /// Builds one architect payload that declares a host-environment abort.
+    fn abort_payload(status: &str, items: serde_json::Value) -> String {
+        serde_json::json!({
+            "status": status,
+            "explanation": "The host environment must be repaired before the horizon exists",
+            "reason": null,
+            "abort": {
+                "is_aborted": true,
+                "reason": "  native build approval required  ",
+                "recommendation": "  pnpm approve-builds  "
+            },
+            "context_requests": [],
+            "repo_searches": [],
+            "repo_maps": [],
+            "items": items
+        })
+        .to_string()
+    }
+
+    /// An abort declared beside a `blocked` verdict ends the synthesis on the
+    /// typed status: the rung keeps its generation budget, the ladder is never
+    /// consulted, and the exact host action reaches the developer live.
+    #[tokio::test]
+    async fn an_abort_declared_beside_a_blocked_verdict_ends_the_synthesis() {
+        let (_dir, root) = repo();
+        let models = models(
+            "{ model = \"openrouter:mock/base\", attempts = 1 }, \
+             { model = \"openrouter:mock/strong\", attempts = 1 }",
+        );
+        let provider = Arc::new(MockLlmProvider::scripted([MockResponse::text(
+            abort_payload("blocked", serde_json::json!([])),
+        )]));
+        let client: Arc<dyn LlmProvider> = provider.clone();
+        let mut context = ContextManager::new(root.clone());
+        let options = WorkflowOptions::default();
+        let (stream_tx, mut stream_rx) = mpsc::channel(256);
+        let collector = tokio::spawn(async move {
+            let mut events = Vec::new();
+            while let Some(event) = stream_rx.recv().await {
+                events.push(event);
+            }
+            events
+        });
+        let (_cancel_tx, cancel_rx) = watch::channel(false);
+
+        let outcome = run_structured_refine(
+            &mut context,
+            client,
+            "Synthesize the unfinished horizon",
+            StructuredRefineConfig {
+                repo_root: &root,
+                options: &options,
+                models: &models,
+                tier: models.architect_tier(0),
+                providers: &NoResolver,
+                intro_header: "",
+                budget_hint: "",
+            },
+            stream_tx,
+            cancel_rx,
+        )
+        .await
+        .expect("the synthesis runs to completion");
+
+        assert_eq!(
+            outcome.status,
+            StructuredRefineStatus::Aborted(AbortReport {
+                reason: "native build approval required".to_string(),
+                recommendation: "pnpm approve-builds".to_string(),
+            })
+        );
+        // The abort consumes no generation attempt of the running rung, so the
+        // stronger rung of the ladder is never entered.
+        assert_eq!(provider.requests().len(), 1);
+        assert_eq!(outcome.tier.model, ModelRef::openrouter("mock/base"));
+
+        drop(_cancel_tx);
+        let events = collector.await.expect("the collector joins");
+        assert!(
+            events.iter().any(|event| matches!(
+                event,
+                StreamEvent::TextDelta(delta)
+                    if delta.contains("[Execution Aborted]")
+                        && delta.contains("pnpm approve-builds")
+            )),
+            "the abort banner must reach the developer with the exact host action"
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, StreamEvent::TierEscalated { .. })),
+            "an abort must never escalate the ladder"
+        );
+        assert!(events
+            .iter()
+            .any(|event| matches!(event, StreamEvent::Done)));
+    }
+
+    /// An abort supersedes a declared `success`: the horizon that arrived with
+    /// the verdict is never treated as a result of the synthesis.
+    #[tokio::test]
+    async fn an_abort_supersedes_a_declared_success_horizon() {
+        let (_dir, root) = repo();
+        let models = models(
+            "{ model = \"openrouter:mock/base\", attempts = 1 }, \
+             { model = \"openrouter:mock/strong\", attempts = 1 }",
+        );
+        let provider = Arc::new(MockLlmProvider::scripted([MockResponse::text(
+            abort_payload(
+                "success",
+                serde_json::json!([{
+                    "id": "1",
+                    "title": "Step 1",
+                    "status": "todo",
+                    "files": ["src/step-1.rs"],
+                    "readonly_files": [],
+                    "concept_refs": [],
+                    "depends_on": [],
+                    "children": []
+                }]),
+            ),
+        )]));
+        let client: Arc<dyn LlmProvider> = provider.clone();
+        let mut context = ContextManager::new(root.clone());
+        let options = WorkflowOptions::default();
+        let (stream_tx, mut stream_rx) = mpsc::channel(256);
+        let collector = tokio::spawn(async move { while stream_rx.recv().await.is_some() {} });
+        let (_cancel_tx, cancel_rx) = watch::channel(false);
+
+        let outcome = run_structured_refine(
+            &mut context,
+            client,
+            "Synthesize the unfinished horizon",
+            StructuredRefineConfig {
+                repo_root: &root,
+                options: &options,
+                models: &models,
+                tier: models.architect_tier(0),
+                providers: &NoResolver,
+                intro_header: "",
+                budget_hint: "",
+            },
+            stream_tx,
+            cancel_rx,
+        )
+        .await
+        .expect("the synthesis runs to completion");
+
+        match &outcome.status {
+            StructuredRefineStatus::Aborted(report) => {
+                assert_eq!(report.reason, "native build approval required");
+                assert_eq!(report.recommendation, "pnpm approve-builds");
+            }
+            other => panic!("expected a typed abort, got {other:?}"),
+        }
+        let output = outcome
+            .output
+            .expect("the payload travels with the verdict");
+        assert_eq!(
+            output.items.len(),
+            1,
+            "the abort supersedes the horizon the payload carried"
+        );
+        assert_eq!(provider.requests().len(), 1);
+
+        drop(_cancel_tx);
+        collector.await.expect("the collector joins");
+    }
+
+    /// A finished synthesis releases the whole transient context: the files its
+    /// research rounds discovered and the external documents it materialized
+    /// share one lifetime, so no material of either layer survives the run,
+    /// while the cached snapshot outlives the release and a later round admits
+    /// it again without a transfer.
+    #[tokio::test]
+    async fn a_finished_synthesis_releases_the_whole_transient_context() {
+        let (_dir, root) = repo();
+        let models = models("");
+        let provider = Arc::new(MockLlmProvider::scripted([MockResponse::text(payload(
+            "success",
+            "Horizon synthesized from the held material",
+        ))]));
+        let client: Arc<dyn LlmProvider> = provider.clone();
+        let mut context = ContextManager::new(root.clone());
+
+        // A research round widened both transient layers: a discovered
+        // repository file and an external document materialized into the
+        // isolated cache the registry owns.
+        context
+            .add_auto_file("a.rs", ContextAccess::ReadOnly)
+            .expect("the discovered file enters the auto layer");
+        let snapshot = format!("{}/index.md", crate::outer_docs::document_dir("mylib"));
+        let snapshot_path = root.join(&snapshot);
+        std::fs::create_dir_all(snapshot_path.parent().expect("the snapshot has a parent"))
+            .expect("the cache directory is created");
+        std::fs::write(&snapshot_path, "# MyLib\n").expect("the snapshot is written");
+        context
+            .add_outer_docs_file(&snapshot)
+            .expect("the materialized snapshot enters the outer docs layer");
+
+        let options = WorkflowOptions::default();
+        let (stream_tx, mut stream_rx) = mpsc::channel(256);
+        let collector = tokio::spawn(async move { while stream_rx.recv().await.is_some() {} });
+        let (_cancel_tx, cancel_rx) = watch::channel(false);
+
+        let outcome = run_structured_refine(
+            &mut context,
+            client,
+            "Synthesize the unfinished horizon",
+            StructuredRefineConfig {
+                repo_root: &root,
+                options: &options,
+                models: &models,
+                tier: models.architect_tier(0),
+                providers: &NoResolver,
+                intro_header: "",
+                budget_hint: "",
+            },
+            stream_tx,
+            cancel_rx,
+        )
+        .await
+        .expect("the synthesis runs to completion");
+
+        assert_eq!(outcome.status, StructuredRefineStatus::Synthesized);
+        assert!(
+            context.auto_files().is_empty(),
+            "the files discovered for the synthesis never survive it"
+        );
+        assert!(
+            context.outer_docs_files().is_empty(),
+            "the documents materialized for the synthesis never survive it"
+        );
+        assert!(
+            snapshot_path.is_file(),
+            "the release drops the context entry, never the cached snapshot"
+        );
+
+        // The snapshot stays admissible: a later round reads the very bytes the
+        // cache holds instead of paying for another transfer.
+        let readmitted = context
+            .add_outer_docs_file(&snapshot)
+            .expect("the cached snapshot is admitted again");
+        assert_eq!(readmitted.layer, ContextLayer::OuterDocs);
+        assert_eq!(readmitted.access, ContextAccess::ReadOnly);
+        assert_eq!(context.outer_docs_files(), vec![snapshot]);
+
+        drop(_cancel_tx);
+        collector.await.expect("the collector joins");
     }
 }

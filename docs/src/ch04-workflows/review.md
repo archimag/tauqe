@@ -391,6 +391,36 @@ badge; a standalone classification request is a turn of its own and settles the
 interface when its terminal event arrives, while the automatic classification inside a
 grouped run stays subordinate to the run's own terminal event.
 
+### 3.1.1 Declaring review presets in `tauqe.toml`
+
+Auditing an entire repository in a single unconstrained run risks token budget truncation
+and conflates unrelated architectural concerns. Review presets decompose the repository
+into isolated, sequential groups declared in `tauqe.toml` as an array of tables `[[review.presets]]`.
+
+A preset carries an identifier `name`, an optional UI `title`, a `post_analysis` mode
+(`"automatic"`, `"manual"`, or `"none"`), and one or more group slices `[[review.presets.groups]]`:
+
+```toml
+[[review.presets]]
+name = "workspace"
+title = "Full Workspace Audit"
+post_analysis = "automatic"
+
+[[review.presets.groups]]
+name = "protocol"
+paths = ["crates/protocol/src"]
+prompt = "Audit wire contracts, serialization invariants, and pure DTOs without I/O."
+
+[[review.presets.groups]]
+name = "core"
+paths = ["crates/core/src"]
+prompt = "Audit bounded-turn FSM, capability registry, and prompt layout invariants."
+```
+
+When a preset is launched, the supervisor audits each group sequentially with its own
+isolated context and local prompt. The results merge into a single review session under
+their respective group headers, and `post_analysis` triggers the Architect classification
+wave across all groups when specified.
 ### 3.2 Why the audit is isolated
 
 The reviewer receives the pure content of the selected files — no REPL history and
@@ -644,7 +674,11 @@ diagnostic instead of a generic save failure. A synthesis that ends in a blocker
 budget, or a payload that never satisfies the schema — is never fatal to the
 run: the diagnosis is stored on the group itself, the findings the group did not
 finish return to `Todo` with the diagnostic in `note`, and the member is counted
-as a local failure, so the queue advances to its next member (§3.8).
+as a local failure, so the queue advances to its next member (§3.8). A
+host-environment abort is a diagnosis of the same weight: the Architect states
+that the work cannot be completed in the current environment, and the exact
+command only the developer can run travels with that verdict instead of a
+contradiction the model would have to invent.
 
 **A targeted step.** `x` on a step of the group plan sends `group_id` together with
 `step_id` and runs exactly that leaf step. The target is validated before the walk
@@ -735,10 +769,13 @@ findings all carry a decision is settled, and a decomposition that reports `bloc
 such a group is refused with a typed `UNEXPECTED_STATUS` error before the verdict
 reaches storage, so a replanning wave can never reopen a decision the engineer already
 took.
-A synthesis that ends in a blocker or in an exhausted budget is a diagnosis of
-the group, so it is recorded on the group itself in `blocked_reason`, and the
-findings the group did not finish return to `Todo` with the diagnostic report in
-`note`. A cancellation returns them the same way with the cancellation recorded.
+A synthesis that ends in a blocker, in a host-environment abort, or in an
+exhausted budget is a diagnosis of the group, so it is recorded on the group
+itself in `blocked_reason`, and the findings the group did not finish return to
+`Todo` with the diagnostic report in `note`; the abort keeps the required
+developer action in that diagnosis instead of a contradiction the Architect
+could name. A cancellation returns them the same way with the cancellation
+recorded.
 A failed synthesis never stops the queue on its own: the member is counted as a
 local failure and the walk advances to the next member, so one group whose cause
 the Architect could not decompose never costs the run its other groups.

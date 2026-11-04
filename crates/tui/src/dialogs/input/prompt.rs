@@ -7,7 +7,8 @@ use tauqe_protocol::{
 use tokio::sync::{Mutex, MutexGuard};
 
 use crate::app::{AppState, ModalFocus, PromptModalState, PromptModalTarget};
-use crate::input::{is_char_typing, InputResult};
+use crate::command::is_bare_press;
+use crate::input::InputResult;
 use crate::rpc::{send_request, RpcConnection};
 
 /// Routes key events for the unified discussion prompt modal. The modal targets
@@ -33,7 +34,12 @@ pub(super) async fn handle_prompt_modal(
 
     if modal.focus.is_actions() {
         match key.code {
-            KeyCode::Esc | KeyCode::Char('q') => {
+            KeyCode::Esc => {
+                return Ok(Some(InputResult::Continue));
+            }
+            // The dismissal letter is a bare press, so the global quit chord
+            // never discards a typed comment (Conventions §3, §5.1).
+            KeyCode::Char('q') if is_bare_press(key.modifiers) => {
                 return Ok(Some(InputResult::Continue));
             }
             KeyCode::Tab | KeyCode::BackTab => {
@@ -46,10 +52,12 @@ pub(super) async fn handle_prompt_modal(
                 st.prompt_modal = Some(modal);
                 return Ok(Some(InputResult::Continue));
             }
-            KeyCode::Char('y') | KeyCode::Char('Y') if is_char_typing(key.modifiers) => {
+            // Both fast accelerators are bare presses, so a command chord or the
+            // AltGr compose chord never confirms or cancels the card.
+            KeyCode::Char('y') | KeyCode::Char('Y') if is_bare_press(key.modifiers) => {
                 return submit_prompt_modal(state, st, modal, server_writer).await;
             }
-            KeyCode::Char('n') | KeyCode::Char('N') if is_char_typing(key.modifiers) => {
+            KeyCode::Char('n') | KeyCode::Char('N') if is_bare_press(key.modifiers) => {
                 return Ok(Some(InputResult::Continue));
             }
             KeyCode::Enter | KeyCode::Char(' ') => {
@@ -214,4 +222,117 @@ pub(crate) async fn submit_prompt_modal(
     }
 
     Ok(Some(InputResult::Continue))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn key(code: KeyCode, modifiers: KeyModifiers) -> KeyEvent {
+        KeyEvent::new(code, modifiers)
+    }
+
+    /// Discussion modal anchored on a plan: a typed comment and the action bar
+    /// focused, which is the section that owns the fast accelerators.
+    fn actions_modal() -> PromptModalState {
+        let mut modal = PromptModalState::new(PromptModalTarget::Plan {
+            plan_id: "plan-1".to_string(),
+            plan_title: "Plan 1".to_string(),
+            focused_items: Vec::new(),
+        });
+        modal.prompt_editor.insert_str("keep this comment");
+        modal.focus = ModalFocus::Actions;
+        modal
+    }
+
+    /// Presses one key against the modal and returns the verdict.
+    ///
+    /// The state guard is created here and consumed by the handler, so the
+    /// caller can lock the state again to inspect the outcome.
+    async fn press(
+        state: &Arc<Mutex<AppState>>,
+        event: KeyEvent,
+        writer: &mut RpcConnection,
+    ) -> Option<InputResult> {
+        let guard = state.lock().await;
+        handle_prompt_modal(event, state, guard, writer)
+            .await
+            .expect("an in-memory transport never fails")
+    }
+
+    /// A command-modified or AltGr-composed letter reaches neither fast
+    /// accelerator nor the dismissal letter: the typed comment survives and no
+    /// request leaves the client (Conventions §3, §5.1).
+    #[tokio::test]
+    async fn command_modified_letters_are_refused_by_every_guarded_arm() {
+        for (code, modifiers) in [
+            (KeyCode::Char('y'), KeyModifiers::CONTROL),
+            (KeyCode::Char('y'), KeyModifiers::ALT),
+            (
+                KeyCode::Char('y'),
+                KeyModifiers::CONTROL | KeyModifiers::ALT,
+            ),
+            (KeyCode::Char('n'), KeyModifiers::CONTROL),
+            (
+                KeyCode::Char('n'),
+                KeyModifiers::CONTROL | KeyModifiers::ALT,
+            ),
+            (KeyCode::Char('q'), KeyModifiers::CONTROL),
+            (
+                KeyCode::Char('q'),
+                KeyModifiers::CONTROL | KeyModifiers::ALT,
+            ),
+        ] {
+            let state = Arc::new(Mutex::new(crate::app::test_state()));
+            {
+                let mut st = state.lock().await;
+                st.prompt_modal = Some(actions_modal());
+            }
+            let mut writer = RpcConnection::new(Vec::<u8>::new());
+
+            let result = press(&state, key(code, modifiers), &mut writer).await;
+            assert!(matches!(result, Some(InputResult::Continue)));
+
+            let st = state.lock().await;
+            let modal = st.prompt_modal.as_ref().expect("the modal must stay open");
+            assert_eq!(modal.prompt_editor.get_text(), "keep this comment");
+            assert!(
+                writer.written().is_empty(),
+                "{code:?} with {modifiers:?} must not launch a turn"
+            );
+        }
+    }
+
+    /// The guard never over-blocks: a bare `n` still cancels the card and `Esc`
+    /// stays unconditional (Conventions §3).
+    #[tokio::test]
+    async fn bare_letters_and_escape_keep_their_actions() {
+        let state = Arc::new(Mutex::new(crate::app::test_state()));
+        {
+            let mut st = state.lock().await;
+            st.prompt_modal = Some(actions_modal());
+        }
+        let mut writer = RpcConnection::new(Vec::<u8>::new());
+        let cancel = key(KeyCode::Char('n'), KeyModifiers::NONE);
+        let result = press(&state, cancel, &mut writer).await;
+        assert!(matches!(result, Some(InputResult::Continue)));
+        assert!(
+            state.lock().await.prompt_modal.is_none(),
+            "a bare n must still cancel the card"
+        );
+
+        let state = Arc::new(Mutex::new(crate::app::test_state()));
+        {
+            let mut st = state.lock().await;
+            st.prompt_modal = Some(actions_modal());
+        }
+        let escape = key(KeyCode::Esc, KeyModifiers::CONTROL);
+        let result = press(&state, escape, &mut writer).await;
+        assert!(matches!(result, Some(InputResult::Continue)));
+        assert!(
+            state.lock().await.prompt_modal.is_none(),
+            "Esc stays unconditional while a command modifier is held"
+        );
+        assert!(writer.written().is_empty());
+    }
 }

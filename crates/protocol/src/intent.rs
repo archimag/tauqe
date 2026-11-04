@@ -89,11 +89,14 @@ impl TurnIntent {
         matches!(self, Self::ArchitectSynthesis)
     }
 
-    /// Reports whether turns of this regime suppress session history.
+    /// Reports whether turns of this regime render the session history.
     ///
     /// An isolated step executes an approved design and an Architect synthesis
     /// projects a horizon from repository evidence; neither continues the
-    /// developer's dialogue, so neither renders nor records its history.
+    /// developer's dialogue, so neither renders the `<history>` block into its
+    /// prompt. Recording is a separate channel: a step still journals the
+    /// two-sided card of its own event, and the prompt of the step that wrote it
+    /// never carries that record back.
     pub fn suppresses_session_history(self) -> bool {
         matches!(self, Self::IsolatedStep | Self::ArchitectSynthesis)
     }
@@ -243,6 +246,10 @@ mod tests {
         assert!(narrowed.contains(LlmCapability::PlanCreation));
         assert!(narrowed.contains(LlmCapability::PlanUpdate));
         assert!(narrowed.contains(LlmCapability::Scratchpad));
+        // A synthesis runs unattended exactly as an isolated step does, so the
+        // narrowing keeps the escape hatch that demands a host action instead of
+        // improvising a surrogate change or misreporting a blocker.
+        assert!(narrowed.contains(LlmCapability::Abort));
         assert!(!narrowed.contains(LlmCapability::FileEdits));
         assert!(!narrowed.contains(LlmCapability::ToolchainVerify));
     }

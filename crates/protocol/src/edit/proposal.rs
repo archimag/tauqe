@@ -6,23 +6,38 @@ use serde::{Deserialize, Serialize};
 
 use crate::edit::EditFileOp;
 
+/// A single typed change operation.
+///
+/// A decoded operation can never address a location outside the repository: the
+/// serde boundary normalizes and validates every path it carries — the `path`
+/// of a file operation and both directories of a move — through
+/// [`normalize_repo_path`]. An operation is a typed enum variant rather than a
+/// list entry, so a rejected path surfaces as a decode failure naming it
+/// instead of being dropped silently. This is a first line of defence only:
+/// `core` still canonicalizes and confines every path against the repository
+/// root.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum EditOperation {
     Replace {
+        #[serde(deserialize_with = "deserialize_repo_path")]
         path: String,
         old_text: String,
         new_text: String,
     },
     Create {
+        #[serde(deserialize_with = "deserialize_repo_path")]
         path: String,
         content: String,
     },
     Delete {
+        #[serde(deserialize_with = "deserialize_repo_path")]
         path: String,
     },
     Move {
+        #[serde(deserialize_with = "deserialize_repo_path")]
         from: String,
+        #[serde(deserialize_with = "deserialize_repo_path")]
         to: String,
     },
     /// Moves a directory subtree, naming the source and the destination.
@@ -31,10 +46,13 @@ pub enum EditOperation {
     /// staging engine expands it into the per-file moves of the subtree under
     /// `from`. No replaced lines, range bounds, or payload belong to it.
     MoveDir {
+        #[serde(deserialize_with = "deserialize_repo_path")]
         from: String,
+        #[serde(deserialize_with = "deserialize_repo_path")]
         to: String,
     },
     Overwrite {
+        #[serde(deserialize_with = "deserialize_repo_path")]
         path: String,
         content: String,
     },
@@ -45,6 +63,7 @@ pub enum EditOperation {
     /// complete replacement of the addressed range, so the replaced text never
     /// has to be echoed back.
     LineAnchor {
+        #[serde(deserialize_with = "deserialize_repo_path")]
         path: String,
         start: String,
         end: String,
@@ -324,6 +343,23 @@ pub fn normalize_repo_path(raw: &str) -> Result<String, String> {
         return Err("Change path must not be empty".to_string());
     }
     Ok(segments.join("/"))
+}
+
+/// Deserializes one repository-relative path at the wire boundary.
+///
+/// The decoded path is normalized and validated through
+/// [`normalize_repo_path`], so a field deserialized with this adapter can never
+/// address a location outside the repository. A malformed path is reported as a
+/// decode failure naming it, because a typed field has no representation for
+/// "absent" and must not be dropped silently. This is a first line of defence
+/// only: `core` still canonicalizes and confines every path against the
+/// repository root.
+pub(crate) fn deserialize_repo_path<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let raw = String::deserialize(deserializer)?;
+    normalize_repo_path(&raw).map_err(serde::de::Error::custom)
 }
 
 #[cfg(test)]
@@ -766,5 +802,38 @@ mod tests {
 
         let decoded: EditOperation = serde_json::from_str(&json).unwrap();
         assert_eq!(decoded, op);
+    }
+    #[test]
+    fn test_edit_operation_paths_are_confined_at_the_wire_boundary() {
+        // A benign spelling is normalized on decode, so the engine never has to
+        // re-clean a path the boundary could have cleaned.
+        let decoded: EditOperation =
+            serde_json::from_str(r#"{"type":"move","from":"./src/a.rs","to":" ./src/b.rs "}"#)
+                .expect("a benign move must decode");
+        assert_eq!(
+            decoded,
+            EditOperation::Move {
+                from: "src/a.rs".to_string(),
+                to: "src/b.rs".to_string(),
+            }
+        );
+
+        // An escaping path is a decode failure naming it, because a typed enum
+        // variant cannot silently drop itself.
+        for payload in [
+            r#"{"type":"delete","path":"../escape.rs"}"#,
+            r#"{"type":"create","path":"/etc/passwd","content":""}"#,
+            r#"{"type":"replace","path":"a/../b.rs","old_text":"a","new_text":"b"}"#,
+            r#"{"type":"overwrite","path":"C:\\Windows","content":""}"#,
+            r#"{"type":"line_anchor","path":"../escape.rs","start":"K1","end":"K2","content":"x"}"#,
+            r#"{"type":"move_dir","from":"../escape","to":"src/new"}"#,
+        ] {
+            let error = serde_json::from_str::<EditOperation>(payload)
+                .expect_err("an escaping edit path must be rejected");
+            assert!(
+                error.to_string().contains("path"),
+                "diagnostic for {payload} must name the rejected path: {error}"
+            );
+        }
     }
 }

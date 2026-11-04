@@ -16,6 +16,7 @@ use crate::git::state::{changed_worktree_paths, snapshot_worktree, WorktreeSnaps
 use crate::providers::StreamEvent;
 use crate::workflow::policy::ApplyPolicy;
 
+use super::plans::{settle_plans, PlanSettlement, TurnQualification};
 use super::FsmTurnOutcome;
 
 /// Number of rollback attempts before a transient failure is treated as fatal.
@@ -169,9 +170,12 @@ impl<'a> TransactionRollbackGuard<'a> {
         summary: &str,
     ) -> (Option<String>, Option<String>) {
         self.armed = false;
-        // Clearing auto context recomputes hierarchical pinned files through
-        // disk checks, so the sweep runs off the async executor thread.
-        crate::blocking::run_blocking(|| self.context_manager.clear_auto());
+        // A committed change set releases the whole transient context: the
+        // files discovery gathered and the external documents the registry
+        // materialized share one lifecycle, so neither of them outlives the
+        // edits it served. Clearing it recomputes hierarchical pinned files
+        // through disk checks, so the sweep runs off the async executor thread.
+        crate::blocking::run_blocking(|| self.context_manager.clear_transient());
         finalize_applied(self.policy, self.repo_root, changed_files, summary).await
     }
 
@@ -191,7 +195,7 @@ impl<'a> TransactionRollbackGuard<'a> {
             .apply_temporary(self.repo_root, self.project, self.context_manager, proposal)
             .await?;
 
-        for artifact in self.run_post_hook().await? {
+        for artifact in self.run_post_hook(&changed_files).await? {
             if !changed_files.contains(&artifact) {
                 changed_files.push(artifact);
             }
@@ -233,16 +237,19 @@ impl<'a> TransactionRollbackGuard<'a> {
     /// The working copy is snapshotted immediately before the hook starts and
     /// again once it exited successfully, so the difference is exactly the set of
     /// files the project step created, rewrote, or removed, with `.gitignore`
-    /// respected through Git itself. A hook that fails or is interrupted aborts
-    /// the change set: committing a tree whose generator failed would record
-    /// artifacts nobody can reproduce.
-    async fn run_post_hook(&self) -> anyhow::Result<Vec<String>> {
+    /// respected through Git itself. The change set that already reached disk
+    /// arrives on the hook's standard input, one path per line, so a generator
+    /// rebuilds only what the turn touched. A hook that fails or is interrupted
+    /// aborts the change set: committing a tree whose generator failed would
+    /// record artifacts nobody can reproduce.
+    async fn run_post_hook(&self, changed_files: &[String]) -> anyhow::Result<Vec<String>> {
         let repo_root = self.repo_root;
         let before = crate::blocking::run_blocking(|| snapshot_worktree(repo_root));
 
         let response = crate::toolchain::run_post_hooks_with_config(
             repo_root,
             self.project,
+            changed_files,
             Some(&self.cancel_rx),
         )
         .await
@@ -310,39 +317,21 @@ async fn finalize_applied(
         }
     }
 }
-
-/// Applies the turn's plan updates and packages the outcome.
+/// Packs a settled turn outcome.
 ///
 /// History recording is deliberately excluded here: it runs once per bounded
 /// turn in [`super::run_fsm_turn`], so repeated proposal rounds never duplicate
 /// history entries.
 ///
-/// Invariant: Plan mutations are applied strictly when the turn succeeds without
-/// rollback or error (`applied == true` for edits, or `ModelResult::Answer`).
-pub(super) async fn finish_turn(
+/// Invariant: the caller runs the turn's plan payload through
+/// [`super::plans::settle_plans`] exactly once and hands the settlement over, so
+/// this packer never touches plan storage and the qualification of the payload
+/// is decided by the phase that closed the turn.
+pub(super) fn finish_turn(
     assistant_text: String,
     result: ModelResult,
-    repo_root: &Path,
-    plans: &[tauqe_protocol::DiscussionPlanUpdate],
-    mode: crate::plan::storage::PlanMutationMode,
+    settlement: PlanSettlement,
 ) -> FsmTurnOutcome {
-    let should_apply_plans = match &result {
-        ModelResult::Answer { .. } => true,
-        ModelResult::Edit { outcome, .. } => outcome.applied,
-    };
-    // A turn "saved" a plan when it carried an explicit `save` action and the
-    // plan mutations were actually applied. Surfacing the flag alongside the
-    // turn result lets the server mark the emitted `plan/updated` event as a
-    // creation instead of re-deriving it from storage.
-    let plan_saved = should_apply_plans
-        && plans
-            .iter()
-            .any(|plan| plan.action == tauqe_protocol::DiscussionPlanAction::Save);
-    let plan_errors = if should_apply_plans {
-        apply_turn_plans(repo_root, plans, mode).await
-    } else {
-        Vec::new()
-    };
     FsmTurnOutcome {
         assistant_text,
         result,
@@ -350,60 +339,10 @@ pub(super) async fn finish_turn(
         blocked: None,
         abort: None,
         has_terminal_success: false,
-        plan_saved,
-        plan_errors,
+        plan_saved: settlement.plan_saved,
+        plan_errors: settlement.plan_errors,
+        plan_warnings: settlement.plan_warnings,
         skip_reason: None,
-    }
-}
-
-/// Applies the turn's plan mutations and returns every rejection the storage
-/// engine reported.
-///
-/// A rejection is a diagnostic rather than a failed turn: the change set it
-/// travelled with may be valid while the plan payload is not, so the reasons
-/// travel back to the caller instead of being aborted on here. They reach the
-/// session history and the developer, so a refused mutation is never a silent
-/// journal trace the model can never learn from.
-async fn apply_turn_plans(
-    repo_root: &Path,
-    plans: &[tauqe_protocol::DiscussionPlanUpdate],
-    mode: crate::plan::storage::PlanMutationMode,
-) -> Vec<String> {
-    if plans.is_empty() {
-        return Vec::new();
-    }
-    let root = repo_root.to_path_buf();
-    let plans_vec = plans.to_vec();
-    match crate::blocking::run_blocking_async(move || {
-        let mut errors = Vec::new();
-        for plan_update in &plans_vec {
-            let outcome = crate::plan::storage::PlanStorage::apply_discussion_plan_update_with_mode(
-                &root,
-                plan_update,
-                mode,
-            );
-            for err in &outcome.errors {
-                tracing::warn!("Plan update rejected: {}", err);
-            }
-            errors.extend(outcome.errors);
-            for plan in outcome.applied {
-                let _ = crate::plan::storage::PlanStorage::save_active_id(&root, Some(&plan.id));
-            }
-        }
-        errors
-    })
-    .await
-    {
-        Ok(errors) => errors,
-        Err(err) => {
-            // The offload itself failed, so every mutation of this turn was
-            // left unapplied: the turn reports that as one reason instead of
-            // letting the plans disappear silently.
-            tracing::error!("Failed to apply turn plans: {}", err);
-            vec![format!(
-                "The turn's plan mutations could not be applied: {err}"
-            )]
-        }
     }
 }
 
@@ -414,6 +353,9 @@ async fn apply_turn_plans(
 /// outcome so the caller can move the step to `Blocked`; no patch retry or
 /// healing cycle runs, because a block asserts that the step preconditions
 /// cannot be satisfied as stated.
+///
+/// The plan payload the step carried never qualifies, so it leaves the turn as
+/// one typed abandonment instead of disappearing.
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn finalize_blocked_turn(
     policy: &mut dyn ApplyPolicy,
@@ -436,6 +378,15 @@ pub(super) async fn finalize_blocked_turn(
     let ctx_state = context_manager.get_state();
     let _ = stream_tx.send(StreamEvent::ContextChanged(ctx_state)).await;
     let _ = stream_tx.send(StreamEvent::Done).await;
+    // The step ends blocked, so the payload it carried never qualifies: it
+    // leaves the turn as one diagnostic naming the block.
+    let settlement = settle_plans(
+        repo_root,
+        plans,
+        mode,
+        TurnQualification::disqualified("the turn reported a semantic block"),
+    )
+    .await;
     let result = ModelResult::Edit {
         summary: "Execution blocked".to_string(),
         edits: Vec::new(),
@@ -448,7 +399,7 @@ pub(super) async fn finalize_blocked_turn(
             verification: None,
         },
     };
-    let mut outcome = finish_turn(accumulated_text, result, repo_root, plans, mode).await;
+    let mut outcome = finish_turn(accumulated_text, result, settlement);
     outcome.blocked = Some(reason);
     outcome
 }
@@ -567,6 +518,30 @@ mod tests {
         assert_eq!(
             std::fs::read_to_string(root.join("generated.rs")).unwrap(),
             "generated\n"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn post_hook_receives_the_turn_change_set_on_standard_input() {
+        let (_dir, root) = setup_repo(Some(
+            "[project.post_hook]\ncommand = \"sh\"\nargs = ['-c', 'cat > received.txt']\n",
+        ));
+        let mut context = ContextManager::new(root.clone());
+        context.add_file("a.rs", ContextAccess::Editable).unwrap();
+        let mut policy = GitTransactionPolicy::new();
+        let (_cancel_tx, cancel_rx) = watch::channel(false);
+        let project = crate::toolchain::effective_project_config(&root, None).await;
+        let mut guard =
+            TransactionRollbackGuard::new(&mut policy, &mut context, &root, &project, cancel_rx);
+
+        let changed = guard.apply_temporary(&replace_edit()).await.unwrap();
+
+        assert!(changed.contains(&"a.rs".to_string()), "{changed:?}");
+        assert_eq!(
+            std::fs::read_to_string(root.join("received.txt")).unwrap(),
+            "a.rs\n",
+            "the hook receives the change set that just reached the disk"
         );
     }
 

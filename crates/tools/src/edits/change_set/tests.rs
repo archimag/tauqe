@@ -32,14 +32,29 @@ fn write(repo_root: &Path, path: &str, content: &str) {
 
 /// Writes raw bytes to the repository-relative `path`, creating its parents.
 ///
-/// A fixture needs a tracked file the staged state cannot carry as text to make a
-/// member refuse after it already relocated a file of the same subtree.
+/// A payload that does not decode as UTF-8 proves that a relocation carries
+/// bytes verbatim, because no text pipeline stage can read such a file.
 fn write_bytes(repo_root: &Path, path: &str, content: &[u8]) {
     let full = repo_root.join(path);
     if let Some(parent) = full.parent() {
         std::fs::create_dir_all(parent).unwrap();
     }
     std::fs::write(full, content).unwrap();
+}
+
+/// Creates a symbolic link whose target does not exist.
+///
+/// Git records a symbolic link as the text of its target, so the link is a
+/// tracked file of the subtree while the path it names does not exist. Such a
+/// source cannot be relocated, which makes it the deterministic refusal a
+/// directory move raises after it already transferred an earlier file.
+#[cfg(unix)]
+fn write_dangling_symlink(repo_root: &Path, path: &str, target: &str) {
+    let full = repo_root.join(path);
+    if let Some(parent) = full.parent() {
+        std::fs::create_dir_all(parent).unwrap();
+    }
+    std::os::unix::fs::symlink(target, full).unwrap();
 }
 
 /// Records every file of the working tree in the Git index.
@@ -76,6 +91,19 @@ fn context_state(paths: &[&str]) -> ContextState {
     }
 }
 
+/// Returns the exact staged bytes of `path`.
+///
+/// Staging keeps bytes, so a fixture compares the payload it expects verbatim
+/// instead of decoding the staged content as text.
+fn staged_bytes<'a>(result: &'a StageEditsResult, path: &str) -> &'a [u8] {
+    result
+        .staged_state
+        .staged_files
+        .get(path)
+        .map(Vec::as_slice)
+        .unwrap_or_else(|| panic!("'{path}' is not staged"))
+}
+
 /// A destination the same change set deletes is free, so the coherent sequence
 /// "delete `b`, then move `a` to `b`" stages instead of being refused on a file
 /// only the working tree still holds.
@@ -109,12 +137,8 @@ fn a_rename_takes_a_destination_the_same_change_set_deletes() {
         result.failed_files
     );
     assert_eq!(
-        result
-            .staged_state
-            .staged_files
-            .get("b.txt")
-            .map(String::as_str),
-        Some("from a\n"),
+        staged_bytes(&result, "b.txt"),
+        &b"from a\n"[..],
         "the destination carries the moved content"
     );
     assert!(!result.staged_state.deleted_paths.contains("b.txt"));
@@ -163,12 +187,8 @@ fn a_directory_move_takes_a_destination_the_same_change_set_deletes() {
         result.failed_files
     );
     assert_eq!(
-        result
-            .staged_state
-            .staged_files
-            .get("src/new/moved.rs")
-            .map(String::as_str),
-        Some("fn moved() {}\n"),
+        staged_bytes(&result, "src/new/moved.rs"),
+        &b"fn moved() {}\n"[..],
         "the destination carries the moved content"
     );
     assert!(!result
@@ -221,14 +241,16 @@ fn a_rename_onto_an_undeleted_existing_path_is_refused() {
 /// attempt leaves exactly the state its member found: no content stranded at a
 /// destination, no source left recorded as deleted, and a destination the same
 /// change set deleted keeps its deletion.
+#[cfg(unix)]
 #[test]
 fn a_refused_directory_move_restores_exactly_the_addressed_paths() {
     let dir = repository();
     let root = dir.path();
     write(root, "src/old/a.rs", "fn a() {}\n");
-    // A tracked file the staged state cannot carry as text, so the member
-    // refuses after `src/old/a.rs` already moved to the new directory.
-    write_bytes(root, "src/old/b.rs", &[0xff, 0xfe]);
+    // Git tracks a symbolic link as the text of its target, so this source is
+    // part of the subtree while the path it names does not exist. It refuses
+    // after `src/old/a.rs` already moved to the new directory.
+    write_dangling_symlink(root, "src/old/b.rs", "../missing.rs");
     write(root, "src/new/a.rs", "fn stale() {}\n");
     track_all(root);
 
@@ -252,7 +274,11 @@ fn a_refused_directory_move_restores_exactly_the_addressed_paths() {
     assert!(!result.is_success());
     let failure = result.failed_files.first().expect("the move is refused");
     assert_eq!(failure.path, "src/old/b.rs");
-    assert!(matches!(&failure.error, EditError::Io(..)));
+    assert!(
+        matches!(&failure.error, EditError::FileNotFound(path) if path == "src/old/b.rs"),
+        "unexpected rejection: {:?}",
+        failure.error
+    );
     assert!(
         result.staged_state.staged_files.is_empty(),
         "no content stays at a destination"
@@ -315,12 +341,8 @@ fn a_large_directory_move_reports_every_relocated_path_once() {
         let source = format!("src/old/module_{index:03}.rs");
         let destination = format!("src/new/module_{index:03}.rs");
         assert_eq!(
-            result
-                .staged_state
-                .staged_files
-                .get(&destination)
-                .map(String::as_str),
-            Some("fn moved() {}\n"),
+            staged_bytes(&result, &destination),
+            &b"fn moved() {}\n"[..],
             "the destination carries the moved content"
         );
         assert!(result.staged_state.deleted_paths.contains(&source));
@@ -458,4 +480,280 @@ fn a_refused_rename_claims_the_side_that_normalized() {
     );
     assert!(result.staged_state.staged_files.is_empty());
     assert!(result.successful_paths.is_empty());
+}
+
+/// A move carries the payload of a source this attempt has not staged, so a
+/// file that does not decode as text relocates byte for byte instead of being
+/// refused on every retry.
+#[test]
+fn a_move_carries_a_binary_source_verbatim() {
+    let dir = repository();
+    let root = dir.path();
+    let binary: &[u8] = &[0x89, b'P', b'N', b'G', 0x00, 0xff];
+    write_bytes(root, "assets/logo.png", binary);
+
+    let edits = [EditOperation::Move {
+        from: "assets/logo.png".to_string(),
+        to: "assets/brand/logo.png".to_string(),
+    }];
+    let result = stage_and_validate_edits(
+        root,
+        &ProjectConfig::default(),
+        &context_state(&["assets/logo.png"]),
+        &edits,
+        None,
+    );
+
+    assert!(
+        result.is_success(),
+        "the move stages: {:?}",
+        result.failed_files
+    );
+    assert_eq!(
+        staged_bytes(&result, "assets/brand/logo.png"),
+        binary,
+        "the destination carries the moved bytes"
+    );
+    assert!(!result
+        .staged_state
+        .staged_files
+        .contains_key("assets/logo.png"));
+    assert!(
+        result
+            .staged_state
+            .deleted_paths
+            .contains("assets/logo.png"),
+        "the source removal is recorded"
+    );
+    // Staging is memory only, so the working tree keeps what it held.
+    assert_eq!(std::fs::read(root.join("assets/logo.png")).unwrap(), binary);
+    assert!(!root.join("assets/brand/logo.png").exists());
+}
+
+/// A directory move relocates every tracked file of its subtree, the members
+/// that do not decode as text included.
+#[test]
+fn a_directory_move_relocates_a_binary_member_verbatim() {
+    let dir = repository();
+    let root = dir.path();
+    let binary: &[u8] = &[0xff, 0x00, 0xfe, b'a'];
+    write(root, "src/old/a.rs", "fn a() {}\n");
+    write_bytes(root, "src/old/logo.bin", binary);
+    track_all(root);
+
+    let edits = [EditOperation::MoveDir {
+        from: "src/old".to_string(),
+        to: "src/new".to_string(),
+    }];
+    let result = stage_and_validate_edits(
+        root,
+        &ProjectConfig::default(),
+        &context_state(&[]),
+        &edits,
+        None,
+    );
+
+    assert!(
+        result.is_success(),
+        "the move stages: {:?}",
+        result.failed_files
+    );
+    assert_eq!(staged_bytes(&result, "src/new/a.rs"), &b"fn a() {}\n"[..]);
+    assert_eq!(
+        staged_bytes(&result, "src/new/logo.bin"),
+        binary,
+        "the relocated payload keeps its bytes"
+    );
+    assert!(result.staged_state.deleted_paths.contains("src/old/a.rs"));
+    assert!(result
+        .staged_state
+        .deleted_paths
+        .contains("src/old/logo.bin"));
+    assert_eq!(result.staged_state.staged_files.len(), 2);
+    // The subtree is relocated in memory only, so the working tree keeps both
+    // sources.
+    assert!(root.join("src/old/logo.bin").exists());
+    assert!(!root.join("src/new").exists());
+}
+
+/// A relocation carries bytes while every text operation stays text: a
+/// replacement that addresses a binary moved destination is refused with the
+/// strict-decode classification, the move keeps its effect, and the refusal
+/// claims exactly the path it addressed.
+#[test]
+fn a_replacement_addressing_a_binary_move_destination_is_refused() {
+    let dir = repository();
+    let root = dir.path();
+    let binary: &[u8] = &[0xff, 0xfe, 0x00];
+    write_bytes(root, "assets/logo.bin", binary);
+    write(root, "assets/notes.txt", "notes\n");
+
+    let edits = [
+        EditOperation::Move {
+            from: "assets/logo.bin".to_string(),
+            to: "assets/brand/logo.bin".to_string(),
+        },
+        EditOperation::Replace {
+            path: "assets/brand/logo.bin".to_string(),
+            old_text: "anything".to_string(),
+            new_text: "replacement".to_string(),
+        },
+        EditOperation::Delete {
+            path: "assets/notes.txt".to_string(),
+        },
+        EditOperation::Overwrite {
+            path: "assets/brand/logo.bin".to_string(),
+            content: "text".to_string(),
+        },
+    ];
+    let result = stage_and_validate_edits(
+        root,
+        &ProjectConfig::default(),
+        &context_state(&["assets/logo.bin", "assets/notes.txt"]),
+        &edits,
+        None,
+    );
+
+    assert!(!result.is_success());
+    assert_eq!(
+        result.failed_files.len(),
+        2,
+        "the suppressed member is reported: {:?}",
+        result.failed_files
+    );
+    let failure = result
+        .failed_files
+        .first()
+        .expect("the replacement is refused");
+    assert_eq!(failure.path, "assets/brand/logo.bin");
+    match &failure.error {
+        EditError::Io(path, source) => {
+            assert_eq!(path, "assets/brand/logo.bin");
+            assert_eq!(source.kind(), std::io::ErrorKind::InvalidData);
+            assert!(
+                source.to_string().contains("valid UTF-8"),
+                "the refusal must carry the standard message: {source}"
+            );
+        }
+        other => panic!("expected the strict-decode refusal, got {other:?}"),
+    }
+    let suppressed = result
+        .failed_files
+        .get(1)
+        .expect("the suppressed member is reported");
+    assert_eq!(suppressed.path, "assets/brand/logo.bin");
+    match &suppressed.error {
+        EditError::InvalidPath(path, message) => {
+            assert_eq!(path, "assets/brand/logo.bin");
+            assert!(message.contains("was not applied"), "{message}");
+            assert!(
+                message.contains("valid UTF-8"),
+                "the reason names the earlier rejection: {message}"
+            );
+        }
+        other => panic!("expected the suppression to be reported, got {other:?}"),
+    }
+    // The move applied and keeps its effect, and the refusal claims no path it
+    // did not address: the deletion of another file still applies.
+    assert_eq!(staged_bytes(&result, "assets/brand/logo.bin"), binary);
+    assert!(result
+        .staged_state
+        .deleted_paths
+        .contains("assets/logo.bin"));
+    assert!(result
+        .staged_state
+        .deleted_paths
+        .contains("assets/notes.txt"));
+    assert_eq!(
+        result.successful_paths,
+        vec![
+            "assets/logo.bin",
+            "assets/brand/logo.bin",
+            "assets/notes.txt"
+        ]
+    );
+}
+
+/// The text view of the staged state is lossless: it answers exactly the
+/// entries that decode as UTF-8 and omits every other payload.
+#[test]
+fn the_staged_text_view_omits_entries_that_do_not_decode() {
+    let mut staged = StagedEditsState::default();
+    staged
+        .staged_files
+        .insert("src/lib.rs".to_string(), b"pub fn value() {}\n".to_vec());
+    staged
+        .staged_files
+        .insert("src/empty.rs".to_string(), Vec::new());
+    staged
+        .staged_files
+        .insert("assets/logo.bin".to_string(), vec![0xff, 0x00, 0xfe]);
+    staged.deleted_paths.insert("src/gone.rs".to_string());
+
+    let text = staged.staged_text_files();
+
+    assert_eq!(
+        text.get("src/lib.rs").map(String::as_str),
+        Some("pub fn value() {}\n")
+    );
+    assert_eq!(text.get("src/empty.rs").map(String::as_str), Some(""));
+    assert!(
+        !text.contains_key("assets/logo.bin"),
+        "a payload that is not UTF-8 is absent from the text view"
+    );
+    assert!(!text.contains_key("src/gone.rs"));
+    assert_eq!(
+        staged.staged_files.len(),
+        3,
+        "the text view never mutates the state"
+    );
+}
+
+/// A replacement addresses text, so binary staged content refuses the member
+/// with the very classification a disk read of those bytes produces.
+#[test]
+fn a_replacement_addressing_binary_staged_content_is_refused() {
+    let dir = repository();
+    let root = dir.path();
+    let binary = vec![0xff, 0xfe, 0x00];
+    write_bytes(root, "assets/logo.bin", &binary);
+    let mut staged = StagedEditsState::default();
+    staged
+        .staged_files
+        .insert("assets/logo.bin".to_string(), binary);
+
+    let edits = [EditOperation::Replace {
+        path: "assets/logo.bin".to_string(),
+        old_text: "anything".to_string(),
+        new_text: "replacement".to_string(),
+    }];
+    let result = stage_and_validate_edits(
+        root,
+        &ProjectConfig::default(),
+        &context_state(&["assets/logo.bin"]),
+        &edits,
+        Some(&staged),
+    );
+
+    assert!(!result.is_success());
+    let failure = result
+        .failed_files
+        .first()
+        .expect("the replacement is refused");
+    assert_eq!(failure.path, "assets/logo.bin");
+    match &failure.error {
+        EditError::Io(path, source) => {
+            assert_eq!(path, "assets/logo.bin");
+            assert_eq!(source.kind(), std::io::ErrorKind::InvalidData);
+            assert!(
+                source.to_string().contains("valid UTF-8"),
+                "the refusal must carry the standard message: {source}"
+            );
+        }
+        other => panic!("expected the strict-decode refusal, got {other:?}"),
+    }
+    assert_eq!(
+        result.staged_state, staged,
+        "the refused member leaves the staged state untouched"
+    );
 }

@@ -84,10 +84,6 @@ mod tests {
     #[test]
     fn test_canonical_name_resolves_aliases() {
         assert_eq!(
-            EditProtocolFactory::canonical_name("json_schema"),
-            Some(EditProtocolKind::Structured)
-        );
-        assert_eq!(
             EditProtocolFactory::canonical_name("xml"),
             Some(EditProtocolKind::Xml)
         );

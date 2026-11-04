@@ -826,6 +826,7 @@ mod tests {
             id,
             title: format!("Finding {id}"),
             uuid: None,
+            commit: None,
             group: group.map(str::to_string),
             model: None,
             issue_type: IssueType::Architecture,

@@ -115,6 +115,10 @@ mod tests {
 
     use super::ReviewStorage;
 
+    /// Commit recorded on the fixture finding, standing in for the hash the
+    /// executor records once it resolves a finding.
+    const RESOLVED_COMMIT: &str = "9a8b7c6d5e4f30211203f4e5d6c7b8a99f0e1d2c";
+
     /// Builds a session whose single finding already carries a recommendation.
     fn session_with_finding() -> ReviewSession {
         ReviewSession {
@@ -125,6 +129,7 @@ mod tests {
                 id: 1,
                 title: "Finding".to_string(),
                 uuid: None,
+                commit: Some(RESOLVED_COMMIT.to_string()),
                 group: None,
                 model: None,
                 issue_type: IssueType::Bug,
@@ -173,6 +178,11 @@ mod tests {
 
         assert_eq!(updated.status, IssueStatus::Rejected);
         assert_eq!(
+            updated.commit.as_deref(),
+            Some(RESOLVED_COMMIT),
+            "the recorded commit survives the decision"
+        );
+        assert_eq!(
             updated.note.as_deref(),
             Some("The guard is released after the await")
         );
@@ -189,6 +199,11 @@ mod tests {
             .expect("the session is stored");
         let stored = stored.find_item(1).expect("the finding is stored");
         assert_eq!(stored.status, IssueStatus::Rejected);
+        assert_eq!(
+            stored.commit.as_deref(),
+            Some(RESOLVED_COMMIT),
+            "the recorded commit is persisted with the finding"
+        );
         assert_eq!(
             stored.resolution_notes.as_deref(),
             Some("The guard is released after the await")
@@ -216,6 +231,35 @@ mod tests {
             applied.is_none(),
             "an absent finding is reported, never invented"
         );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+    /// The commit an executor records on a finding must survive a reload, so a
+    /// finished finding reports the exact commit that resolved it.
+    #[test]
+    fn a_commit_recorded_by_the_executor_is_persisted_with_the_finding() {
+        let root = scratch_root("commit");
+        ReviewStorage::save_session(&root, &session_with_finding()).expect("save the session");
+
+        let commit = "0123456789abcdef0123456789abcdef01234567";
+        let updated = ReviewStorage::update_session_item(&root, "rev-decision", 1, |issue| {
+            issue.commit = Some(commit.to_string());
+        })
+        .expect("record the commit")
+        .expect("the finding is present");
+        assert_eq!(updated.commit.as_deref(), Some(commit));
+
+        // The commit reaches the session file, so a later read reports the exact
+        // commit that resolved the finding instead of an anonymous fixed status.
+        let session_file = ReviewStorage::reviews_dir(&root).join("rev-decision.json");
+        let json = std::fs::read_to_string(&session_file).expect("read the session file");
+        assert!(json.contains(commit), "the commit is stored: {json}");
+
+        let stored = ReviewStorage::load_review(&root, "rev-decision")
+            .expect("load the session")
+            .expect("the session is stored");
+        let stored = stored.find_item(1).expect("the finding is stored");
+        assert_eq!(stored.commit.as_deref(), Some(commit));
 
         let _ = std::fs::remove_dir_all(&root);
     }

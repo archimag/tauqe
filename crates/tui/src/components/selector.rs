@@ -10,7 +10,7 @@
 
 use crossterm::event::{KeyCode, KeyEvent};
 
-use crate::command::translate_code;
+use crate::command::{is_bare_press, translate_code};
 use crate::config::InputConfig;
 
 /// State for a keyboard-navigable, scrollable list.
@@ -140,7 +140,9 @@ impl ListSelector {
     /// is projected through the configured layout before it is matched: `о`,
     /// `л`, `т`, and `з` walk the list from a Cyrillic layout exactly as `j`,
     /// `k`, `n`, and `p` do (Conventions §5.1). Dedicated navigation keys pass
-    /// through the projection unchanged.
+    /// through the projection unchanged. The letters are bare presses only, so a
+    /// command chord or the AltGr compose chord moves nothing (Conventions §3,
+    /// §5.1).
     pub fn handle_nav_key(
         &mut self,
         key: KeyEvent,
@@ -148,12 +150,24 @@ impl ListSelector {
         visible_height: usize,
     ) -> bool {
         let code = translate_code(key.code, input);
+        let bare = is_bare_press(key.modifiers);
         match code {
-            KeyCode::Up | KeyCode::Char('k') | KeyCode::Char('p') => {
+            KeyCode::Up => {
                 self.select_prev(visible_height);
                 true
             }
-            KeyCode::Down | KeyCode::Char('j') | KeyCode::Char('n') => {
+            KeyCode::Down => {
+                self.select_next(visible_height);
+                true
+            }
+            // The letter chords are bare presses, so a press carrying a command
+            // modifier or the AltGr compose chord moves nothing and falls
+            // through to the caller (Conventions §3, §5.1).
+            KeyCode::Char('k') | KeyCode::Char('p') if bare => {
+                self.select_prev(visible_height);
+                true
+            }
+            KeyCode::Char('j') | KeyCode::Char('n') if bare => {
                 self.select_next(visible_height);
                 true
             }
@@ -276,5 +290,32 @@ mod tests {
         selector.set_item_count(3);
         assert_eq!(selector.selected_index(), 2);
         assert_eq!(selector.item_count(), 3);
+    }
+
+    /// The letter chords are bare presses, so a press carrying a command
+    /// modifier or the AltGr compose chord moves nothing, while the dedicated
+    /// navigation keys stay unconditional (Conventions §3, §5.1).
+    #[test]
+    fn test_handle_nav_key_refuses_command_modified_letters() {
+        let input = InputConfig::default();
+        for modifiers in [
+            KeyModifiers::CONTROL,
+            KeyModifiers::ALT,
+            KeyModifiers::CONTROL | KeyModifiers::ALT,
+        ] {
+            let mut selector = ListSelector::new(20, 5);
+            for letter in ['j', 'k', 'n', 'p'] {
+                let press = KeyEvent::new(KeyCode::Char(letter), modifiers);
+                assert!(
+                    !selector.handle_nav_key(press, &input, 10),
+                    "{letter:?} with {modifiers:?} must move nothing"
+                );
+            }
+            assert_eq!(selector.selected_index(), 5);
+            assert_eq!(selector.scroll_offset(), 0);
+
+            assert!(selector.handle_nav_key(KeyEvent::new(KeyCode::Down, modifiers), &input, 10));
+            assert_eq!(selector.selected_index(), 6);
+        }
     }
 }

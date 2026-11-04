@@ -71,6 +71,12 @@ Roles and the Coder Ladder* owns that boundary. A plan is where it becomes visib
 13. **A step declares the external specifications it obeys.** A leaf names the declared
     `[[outer_docs]]` entries its implementation is checked against, and the harness mounts
     them before its turn starts, so the specification arrives without a research round.
+14. **A refusal is typed where it is born.** A refused plan mutation carries the category
+    its producer assigned — a defective payload, a forbidden regime, or an abandoned
+    payload — and no layer derives that category from the wording of a reason.
+15. **A payload is never lost silently.** A turn settles its mutations through one phase
+    at finalization, and a turn that closes without a qualifying result abandons its
+    payload with a typed diagnostic instead of dropping it.
 
 ---
 
@@ -144,6 +150,15 @@ Code Review* §2.1).
   that produced the current horizon, recorded as `implementation.architect` together
   with `implementation.last_replanned_step`, so a later wave reproduces or escalates
   that configuration instead of re-deriving one.
+- **Mutation rejection** — a typed refusal of one plan mutation: its category
+  (`PayloadDefect`, `ModeForbidden`, or `Abandoned`) plus the wording a surface renders
+  verbatim. The category is born with the refusal and is never inferred from its text.
+- **Settlement phase** — the single phase every terminal path of a bounded turn runs its
+  accumulated plan payload through before packing the outcome. It applies the mutations
+  or abandons them, and it reports the repairs the status barrier performed.
+- **Normalization warning** — the report of a status the barrier repaired instead of
+  refusing: the step was persisted, and the status it requested was replaced by the one a
+  step is allowed to carry when it enters existence.
 
 ### 2.3 Status vocabulary
 
@@ -230,7 +245,9 @@ distinction is deliberate:
 
 Neither action bypasses the guards: the merged document is validated as a whole, so a
 repeated identifier, a dependency that does not exist, an unknown concept reference,
-or a cycle refuses the mutation instead of persisting a partially merged plan.
+or a cycle refuses the mutation instead of persisting a partially merged plan. Both
+actions share one feedback contract: a refusal is typed at the barrier that produced it,
+and the turn reports it instead of letting the mutation disappear (§3.13).
 
 ---
 
@@ -267,12 +284,13 @@ signature update, or one focused bug fix is compact and indivisible, so it is
 executed immediately instead of being proposed for decomposition.
 
 **Applying the payload.** Whatever the action, the merged document is validated as a
-whole before it reaches disk. A refusal is a diagnostic rather than a journal trace:
-its reason is recorded in the session history and reported in the interface, so the
-next request carries the diagnostic and the payload can be corrected. The harness
-never repairs that payload on the model's behalf — an automatic corrective round
-would rewrite a developer-owned document nobody asked it to touch — while a
-successful mutation publishes `plan/updated` exactly as before.
+whole before it reaches disk, and a refusal is a typed diagnostic rather than a journal
+trace: its category and its wording are recorded in the session history and reported in
+the interface. A payload that is itself defective buys one corrective exchange, in which
+the model re-emits the document and the harness validates only what arrives (§3.13). The
+harness never rewrites the payload on the model's behalf — the corrected document is
+always authored by the dialogue — while a successful mutation publishes `plan/updated`
+exactly as before.
 
 ### 3.2 Horizon synthesis (deep refinement)
 
@@ -319,12 +337,16 @@ whose budget the rung declares itself. Only an exhausted rung climbs the
 architect ladder, and the promoted rung applies its own reasoning effort to
 every later round and rotates the provider session identifier with the
 effective model, so a cached prefix is never reused across a model change.
-
 The synthesis therefore ends in a typed status instead of in prose: a
-synthesized horizon, a blocker that names the contradiction, an exceeded
-context budget, or a cancellation. A saturated ladder ends it as a blocker,
-never as a fabricated horizon, and an empty `items` list beside a success
-status is refused as a protocol defect. The interface sees the pass while it
+synthesized horizon, a blocker that names the contradiction, an abort that
+names the host action only the developer can perform, an exceeded context
+budget, or a cancellation. An abort is not a blocker: it states that no plan
+can complete the work in the current environment, so the harness streams the
+exact command live and ends the synthesis on that verdict without spending a
+generation attempt of the running rung. A saturated ladder ends it as a
+blocker, never as a fabricated horizon, and an empty `items` list beside a
+success status is refused as a protocol defect. The interface sees the pass
+while it
 runs: the contour reports its rounds, its promotions, and its outline size as
 kernel events, and the server bridge turns them into the turn-phase,
 model-escalation, and outline telemetry a client already renders.
@@ -687,7 +709,72 @@ the plan a discussion is anchored on also releases that anchor, so no interface
 keeps naming a plan that no longer exists (*Discussion Focus* §3.4).
 
 ---
+### 3.13 Mutation feedback: typed refusals, one repair round, and report surfaces
 
+Applying a payload is a dialogue act with a verdict, not a fire-and-forget write. Three
+properties keep that verdict legible: the refusal is typed where it is produced, the
+payload settles exactly once at the end of the turn, and every outcome — applied,
+repaired, refused, or abandoned — reaches both the model and the developer.
+
+**Typed refusals.** A refusal is born typed, as `PlanRejection { kind, message }`, and the
+category belongs to the code that produced it:
+
+| Kind | Producer | Meaning |
+| --- | --- | --- |
+| `PayloadDefect` | plan storage | the payload cannot be applied: the planning contract or the structural validation of the stored plan refuses it — a parse that yielded no usable document, a missing concept tree, an `update` whose identity names no plan or several plans, an `update` that tries to introduce a container, or a `save` that fails validation |
+| `ModeForbidden` | plan storage | the turn regime forbids mutation whatever the payload carries, as an isolated step does |
+| `Abandoned` | the turn engine | the payload never reached storage, because the turn closed without a qualifying result |
+
+The message travels beside the category and is the wording a surface renders verbatim. No
+lower layer and no client derives a category from the text of a reason (root conventions
+§1, *Typed Intent over Textual Inference*), so a refusal keeps the classification of the
+barrier that made it all the way to the client that shows it.
+
+**One settlement phase at finalization.** Every terminal path of a bounded turn runs the
+accumulated payload through the same settlement phase exactly once, before the outcome is
+packed; finishing a turn no longer applies mutations as a side effect. The phase reads a
+declared qualification:
+
+- a **qualifying** result — a validated answer or an applied change set — applies every
+  mutation and collects the warnings the status barrier produced;
+- a **non-qualifying** result — a semantic block, an abort, a terminal error, a patch
+  failure, an edit proposal that applied nothing, an empty round, or an exceeded context
+  budget — abandons the payload with a single `Abandoned` refusal whose message names the
+  reason, and records a warning in the journal. The budget case is deliberate rather than
+  exceptional: a turn that exhausted its budget without widening its context is exactly
+  the turn whose payload must not reach storage unverified.
+
+An empty payload settles into nothing, so a turn that carried no mutation reports no
+diagnostic. The single intentional exception is a turn the developer cancelled: that work
+ended by explicit request, so the abandoned payload is not reported as a defect.
+
+**One repair round for payload defects.** `PayloadDefect` is the only category generation
+can correct, so it buys exactly one corrective exchange — never a loop, and never a
+configuration knob. The typed reasons compose a directive that travels through the turn's
+research journal, and one proposal round follows. That answer is absorbed partially: its
+plan payload and its text, and nothing else. The terminal semantics of the turn are not
+reopened, so a repair round cannot turn an answer into a block, cannot edit files, and
+cannot widen the turn it repairs. Only the payload of the repair round is settled
+afterwards, so mutations the first batch already applied are never re-executed, because
+replaying them would manufacture a refusal for work that already succeeded. `ModeForbidden`
+and `Abandoned` spend no generation at all: repeating a turn whose regime forbids the
+mutation, or resending a payload that already left the turn, cannot change the verdict.
+
+**Normalization is reported.** The status barrier repairs a requested status instead of
+refusing the payload: a step enters existence as `Todo` or `Discussion`, and a new step
+that asserts any other status is persisted with the assignment repaired and the repair
+reported. That repair is a lifecycle event of the plan, not an implementation detail, so it
+leaves storage as `plan_warnings` on the turn outcome. Silent normalization is forbidden:
+the model and the developer both see that the requested status was corrected.
+
+**Report surfaces.** Four surfaces carry the verdict, and none stands in for another:
+
+| Surface | Carries | Consumer |
+| --- | --- | --- |
+| Turn banner | the rejection and warning notices rendered as the turn closes | the developer watching the turn |
+| Session history | the diagnostic recorded with the turn | the durable record of the dialogue |
+| Journal | one warning per refusal, repair, and abandonment | post-mortem analysis of the daemon |
+| `ModelResultEvent` | `plan_rejections` and `plan_warnings`, filled by the server from the turn result | the client, which raises one warning notification with a localized heading and the refusal messages as its detail |
 ## 4. Boundaries & Anti-Patterns ("What it is NOT")
 
 - **It is not a repository artifact.** Plans are local, ignored, and never
@@ -724,8 +811,16 @@ keeps naming a plan that no longer exists (*Discussion Focus* §3.4).
 - **It is not verified by the model.** Pre-flight and per-step verification come from
   the project toolchain, not from a model's claim of success.
 - **It is not silently refused.** A mutation that fails validation names its reason in
-  the session history and in the interface, and the dialogue — not a hidden retry —
-  produces the corrected payload.
+  the session history and in the interface, and one corrective exchange — not a hidden
+  retry loop — lets the dialogue produce the corrected payload.
+- **It is not classified by wording.** The category of a refusal is born with the refusal,
+  so no layer guesses a cause from the text of a reason.
+- **It is not a payload that outlives its verdict.** A turn that closes without a
+  qualifying result abandons its mutations with a typed diagnostic instead of applying
+  them silently, and a cancelled turn is the only silence the contract allows.
+- **It is not normalized in silence.** A status the barrier repairs is reported through
+  the same surfaces as a refusal, because a repaired plan and a rejected payload are both
+  decisions the developer must see.
 
 ---
 

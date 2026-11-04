@@ -62,7 +62,9 @@ impl KeyChord {
 
         match *self {
             KeyChord::Bare(expected) => {
-                !text_input_active && !ctrl && !alt && bare_code(expected, code, key.modifiers)
+                !text_input_active
+                    && is_bare_press(key.modifiers)
+                    && bare_code(expected, code, key.modifiers)
             }
             KeyChord::Primary(expected) => {
                 input.is_primary(key.modifiers) && lenient_code(expected, code)
@@ -138,6 +140,23 @@ pub(crate) fn translate_code(code: KeyCode, input: &InputConfig) -> KeyCode {
         }
         other => other,
     }
+}
+/// Reports whether the press carries neither command modifier, so it may reach
+/// a bare-key command.
+///
+/// This is the command-surface counterpart of
+/// [`crate::components::editor::is_char_typing`]. Text insertion deliberately
+/// admits the AltGr compose chord (`CONTROL | ALT`, optionally with `SHIFT`),
+/// because a composed character has to land in the buffer; a command surface
+/// must refuse that same chord, so a composed character never confirms a
+/// dialog, applies a status, or launches a turn. Only a press without
+/// `CONTROL` and without `ALT` is bare: both command chords, the AltGr compose
+/// chord, and a raw `Ctrl` press are refused.
+///
+/// `SHIFT` passes through, because the letter case of a bare binding is
+/// discriminated at the key code (see `bare_code`), never at the modifier.
+pub(crate) fn is_bare_press(modifiers: KeyModifiers) -> bool {
+    !modifiers.contains(KeyModifiers::CONTROL) && !modifiers.contains(KeyModifiers::ALT)
 }
 
 /// Matches a bare structural-navigation key.
@@ -341,7 +360,7 @@ impl<A: 'static> CommandMap<A> {
 
 #[cfg(test)]
 mod tests {
-    use super::dialog::DIALOG_COMMAND_MAP;
+    use super::dialog::{DIALOG_COMMAND_MAP, MODEL_LIST_DIALOG_COMMAND_MAP};
     use super::editor::EDITOR_COMMAND_MAP;
     use super::global::GLOBAL_COMMAND_MAP;
     use super::*;
@@ -412,6 +431,34 @@ mod tests {
 
         assert!(chord.matches(key(KeyCode::Char('s'), KeyModifiers::NONE), &input, false));
         assert!(!chord.matches(key(KeyCode::Char('s'), KeyModifiers::NONE), &input, true));
+    }
+
+    #[test]
+    fn bare_press_admits_plain_and_shifted_keys_only() {
+        // A plain or shifted press reaches a bare-key command; the letter case
+        // is discriminated at the key code, never at the modifier.
+        assert!(is_bare_press(KeyModifiers::NONE));
+        assert!(is_bare_press(KeyModifiers::SHIFT));
+
+        // Both command modifiers and the AltGr compose chord are refused.
+        assert!(!is_bare_press(KeyModifiers::CONTROL));
+        assert!(!is_bare_press(KeyModifiers::ALT));
+        assert!(!is_bare_press(KeyModifiers::CONTROL | KeyModifiers::ALT));
+        assert!(!is_bare_press(
+            KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SHIFT
+        ));
+    }
+
+    /// The two predicates deliberately disagree on the AltGr compose chord:
+    /// text insertion admits it so a composed character reaches the buffer,
+    /// while a command surface refuses it so the same chord never fires a
+    /// bare-key command.
+    #[test]
+    fn compose_chord_is_character_typing_but_never_a_bare_press() {
+        let compose = KeyModifiers::CONTROL | KeyModifiers::ALT;
+
+        assert!(crate::components::editor::is_char_typing(compose));
+        assert!(!is_bare_press(compose));
     }
 
     #[test]
@@ -888,6 +935,10 @@ mod tests {
         assert_unique_chords(&GLOBAL_COMMAND_MAP, "GLOBAL_COMMAND_MAP");
         assert_unique_chords(&EDITOR_COMMAND_MAP, "EDITOR_COMMAND_MAP");
         assert_unique_chords(&DIALOG_COMMAND_MAP, "DIALOG_COMMAND_MAP");
+        assert_unique_chords(
+            &MODEL_LIST_DIALOG_COMMAND_MAP,
+            "MODEL_LIST_DIALOG_COMMAND_MAP",
+        );
         assert_unique_chords(&CONTEXT_COMMAND_MAP, "CONTEXT_COMMAND_MAP");
         assert_unique_chords(&HISTORY_COMMAND_MAP, "HISTORY_COMMAND_MAP");
         assert_unique_chords(&PLANS_COMMAND_MAP, "PLANS_COMMAND_MAP");
@@ -900,6 +951,10 @@ mod tests {
         assert_every_command_is_described(&GLOBAL_COMMAND_MAP, "GLOBAL_COMMAND_MAP");
         assert_every_command_is_described(&EDITOR_COMMAND_MAP, "EDITOR_COMMAND_MAP");
         assert_every_command_is_described(&DIALOG_COMMAND_MAP, "DIALOG_COMMAND_MAP");
+        assert_every_command_is_described(
+            &MODEL_LIST_DIALOG_COMMAND_MAP,
+            "MODEL_LIST_DIALOG_COMMAND_MAP",
+        );
         assert_every_command_is_described(&CONTEXT_COMMAND_MAP, "CONTEXT_COMMAND_MAP");
         assert_every_command_is_described(&HISTORY_COMMAND_MAP, "HISTORY_COMMAND_MAP");
         assert_every_command_is_described(&PLANS_COMMAND_MAP, "PLANS_COMMAND_MAP");
@@ -938,6 +993,11 @@ mod tests {
         assert_keys(&GLOBAL_COMMAND_MAP, &catalog, "GLOBAL_COMMAND_MAP");
         assert_keys(&EDITOR_COMMAND_MAP, &catalog, "EDITOR_COMMAND_MAP");
         assert_keys(&DIALOG_COMMAND_MAP, &catalog, "DIALOG_COMMAND_MAP");
+        assert_keys(
+            &MODEL_LIST_DIALOG_COMMAND_MAP,
+            &catalog,
+            "MODEL_LIST_DIALOG_COMMAND_MAP",
+        );
         assert_keys(&CONTEXT_COMMAND_MAP, &catalog, "CONTEXT_COMMAND_MAP");
         assert_keys(&HISTORY_COMMAND_MAP, &catalog, "HISTORY_COMMAND_MAP");
         assert_keys(&PLANS_COMMAND_MAP, &catalog, "PLANS_COMMAND_MAP");
@@ -949,6 +1009,10 @@ mod tests {
     fn abstract_modifiers_follow_the_configured_primary_and_meta() {
         assert_map_follows_both_configurations(&GLOBAL_COMMAND_MAP, "GLOBAL_COMMAND_MAP");
         assert_map_follows_both_configurations(&EDITOR_COMMAND_MAP, "EDITOR_COMMAND_MAP");
+        assert_map_follows_both_configurations(
+            &MODEL_LIST_DIALOG_COMMAND_MAP,
+            "MODEL_LIST_DIALOG_COMMAND_MAP",
+        );
         assert_map_follows_both_configurations(&CONTEXT_COMMAND_MAP, "CONTEXT_COMMAND_MAP");
         assert_map_follows_both_configurations(&HISTORY_COMMAND_MAP, "HISTORY_COMMAND_MAP");
         assert_map_follows_both_configurations(&PLANS_COMMAND_MAP, "PLANS_COMMAND_MAP");
@@ -1271,6 +1335,11 @@ mod tests {
         assert_no_key_event_collisions(&GLOBAL_COMMAND_MAP, &input, "GLOBAL_COMMAND_MAP");
         assert_no_key_event_collisions(&EDITOR_COMMAND_MAP, &input, "EDITOR_COMMAND_MAP");
         assert_no_key_event_collisions(&DIALOG_COMMAND_MAP, &input, "DIALOG_COMMAND_MAP");
+        assert_no_key_event_collisions(
+            &MODEL_LIST_DIALOG_COMMAND_MAP,
+            &input,
+            "MODEL_LIST_DIALOG_COMMAND_MAP",
+        );
         assert_no_key_event_collisions(&CONTEXT_COMMAND_MAP, &input, "CONTEXT_COMMAND_MAP");
         assert_no_key_event_collisions(&HISTORY_COMMAND_MAP, &input, "HISTORY_COMMAND_MAP");
         assert_no_key_event_collisions(&PLANS_COMMAND_MAP, &input, "PLANS_COMMAND_MAP");
@@ -1389,6 +1458,10 @@ mod tests {
         assert_jcuken_equivalents(&GLOBAL_COMMAND_MAP, "GLOBAL_COMMAND_MAP");
         assert_jcuken_equivalents(&EDITOR_COMMAND_MAP, "EDITOR_COMMAND_MAP");
         assert_jcuken_equivalents(&DIALOG_COMMAND_MAP, "DIALOG_COMMAND_MAP");
+        assert_jcuken_equivalents(
+            &MODEL_LIST_DIALOG_COMMAND_MAP,
+            "MODEL_LIST_DIALOG_COMMAND_MAP",
+        );
         assert_jcuken_equivalents(&CONTEXT_COMMAND_MAP, "CONTEXT_COMMAND_MAP");
         assert_jcuken_equivalents(&HISTORY_COMMAND_MAP, "HISTORY_COMMAND_MAP");
         assert_jcuken_equivalents(&PLANS_COMMAND_MAP, "PLANS_COMMAND_MAP");

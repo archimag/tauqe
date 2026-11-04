@@ -709,6 +709,19 @@ impl AppState {
         self.clear_context(|ctx| ctx.clear_auto()).await
     }
 
+    /// Clears the task's transient context and starts a fresh dialogue session
+    /// when the transient layers actually held material.
+    ///
+    /// The Auto layer and the external documentation layer form one transient
+    /// context: the files a research round discovered and the documents the
+    /// registry materialized are provided so the model can decide, so they are
+    /// released together once that decision is fixed. Releasing only one of
+    /// them would leave half of the material that warmed the prompt prefix
+    /// resident, and every later round would keep paying for it.
+    pub async fn clear_transient_context(self: &Arc<Self>) -> Result<ContextState, String> {
+        self.clear_context(|ctx| ctx.clear_transient()).await
+    }
+
     /// Clears the external documentation layer and starts a fresh dialogue
     /// session when documents were actually removed.
     ///
@@ -973,6 +986,63 @@ mod tests {
             warm_session,
             state.session_uuid().await,
             "a full reset must start a fresh dialogue session"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The Auto layer and the external documentation layer are one transient
+    /// context: releasing it drops both layers and starts a fresh dialogue
+    /// session, while a repeated clear on an already empty transient context
+    /// keeps the warm session.
+    #[tokio::test]
+    async fn clear_transient_context_drops_both_transient_layers_and_rotates_the_session() {
+        let root =
+            std::env::temp_dir().join(format!("tauqe-state-transient-{}", next_operation_id()));
+        let _ = std::fs::create_dir_all(&root);
+        std::fs::write(root.join("auto.rs"), "fn auto() {}\n").unwrap();
+        std::fs::write(root.join("ref.md"), "# External snapshot\n").unwrap();
+
+        let (out, _rx) = OutChannel::new();
+        let (history_sender, _history_rx) = tokio::sync::mpsc::unbounded_channel();
+        let state = AppState::new(AppConfig::default(), root.clone(), history_sender, out);
+
+        state
+            .context
+            .write()
+            .await
+            .add_auto_file("auto.rs", ContextAccess::ReadOnly)
+            .unwrap();
+        state
+            .context
+            .write()
+            .await
+            .add_outer_docs_file("ref.md")
+            .unwrap();
+        let warm_session = state.session_uuid().await;
+
+        let transient = state.clear_transient_context().await.expect("clear runs");
+
+        assert!(
+            transient.items.is_empty(),
+            "both transient layers must be released"
+        );
+        assert_ne!(
+            warm_session,
+            state.session_uuid().await,
+            "releasing the transient context must start a fresh dialogue session"
+        );
+
+        // A repeated clear removes nothing, so the warm session is preserved.
+        let repeated_session = state.session_uuid().await;
+        state
+            .clear_transient_context()
+            .await
+            .expect("the repeated clear runs");
+        assert_eq!(
+            repeated_session,
+            state.session_uuid().await,
+            "an empty transient context must not rotate the session"
         );
 
         let _ = std::fs::remove_dir_all(&root);

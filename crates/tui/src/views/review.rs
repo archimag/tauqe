@@ -9,6 +9,7 @@
 use std::borrow::Cow;
 use std::collections::HashSet;
 
+use tauqe_protocol::review::DEFAULT_REVIEW_GROUP_ID;
 use tauqe_protocol::{
     DiscussionFocus, IssueStatus, PlanItem, ReviewIssue, ReviewItem, ReviewSession,
 };
@@ -143,14 +144,23 @@ impl ReviewViewState {
     /// group belongs to: a session left over from an earlier run names its
     /// own groups, so an unknown group id degrades the badge to an ordinal
     /// without a denominator instead of inventing a total.
+    ///
+    /// The count borrows the stored groups instead of resolving the effective
+    /// ones: the badge is redrawn at the streaming cadence, so resolving them
+    /// would deep-clone every plan of the run once per frame. A session that
+    /// stores no group is the degenerate case of the single implicit `Default`
+    /// group, which is named exactly as the effective resolution names it.
     pub fn running_group_total(&self) -> Option<usize> {
         let group = self.running_group.as_ref()?;
         let session = self.session.as_ref()?;
-        let groups = session.effective_groups();
-        groups
+        if session.groups.is_empty() {
+            return (group.id == DEFAULT_REVIEW_GROUP_ID).then_some(1);
+        }
+        session
+            .groups
             .iter()
-            .any(|g| g.id == group.id)
-            .then_some(groups.len())
+            .any(|stored| stored.id == group.id)
+            .then_some(session.groups.len())
     }
 
     /// Loads a session into the mirror without touching any fold decision.
@@ -362,7 +372,7 @@ impl ReviewViewState {
                 keys.insert(format!("{}:{}", session.id, issue.id));
             }
             for bucket in self.group_buckets(session.as_ref()) {
-                collect_subplan_keys(&session.id, &bucket.id, &bucket.subplan, &mut keys);
+                collect_subplan_keys(&session.id, &bucket.id, bucket.subplan, &mut keys);
             }
         }
         self.expanded_items.extend(keys);
@@ -422,7 +432,7 @@ impl ReviewViewState {
                         &self.expanded_items,
                         &session.id,
                         &bucket.id,
-                        &bucket.subplan,
+                        bucket.subplan,
                     )
             });
             groups_open
@@ -658,7 +668,7 @@ impl ReviewViewState {
                     collect_subplan_nodes(
                         &session.id,
                         &group_id,
-                        &subplan,
+                        subplan,
                         &mut ancestors,
                         &mut all_nodes,
                     );
@@ -851,6 +861,7 @@ mod tests {
             id,
             title: format!("Finding {}", id),
             uuid: None,
+            commit: None,
             group: None,
             model: None,
             issue_type: IssueType::Architecture,
@@ -1674,5 +1685,13 @@ mod tests {
         };
         view.session = Some(foreign);
         assert_eq!(view.running_group_total(), None);
+
+        // A session that stores no group is the degenerate case of the single
+        // implicit `Default` group, so the badge names that one total and never
+        // invents a denominator for an identifier it does not carry.
+        view.session = Some(make_session("rev-legacy", &[1]));
+        assert_eq!(view.running_group_total(), None);
+        view.begin_group(DEFAULT_REVIEW_GROUP_ID.to_string(), "Default".to_string());
+        assert_eq!(view.running_group_total(), Some(1));
     }
 }

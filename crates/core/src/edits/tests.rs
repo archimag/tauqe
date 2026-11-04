@@ -13,6 +13,19 @@ fn replace(path: &str, old_text: &str, new_text: &str) -> EditOperation {
     }
 }
 
+/// Returns the exact staged bytes of `path`.
+///
+/// Staging keeps bytes, so a fixture compares the payload it expects verbatim
+/// instead of decoding the staged content as text.
+fn staged_bytes<'a>(result: &'a StageEditsResult, path: &str) -> &'a [u8] {
+    result
+        .staged_state
+        .staged_files
+        .get(path)
+        .map(Vec::as_slice)
+        .unwrap_or_else(|| panic!("'{path}' is not staged"))
+}
+
 #[tokio::test]
 async fn a_failed_member_rolls_back_only_its_own_effect_and_keeps_disk_unchanged() {
     let dir = tempdir().unwrap();
@@ -38,8 +51,8 @@ async fn a_failed_member_rolls_back_only_its_own_effect_and_keeps_disk_unchanged
         result.successful_edits,
         vec![edits[0].clone(), edits[1].clone()]
     );
-    assert_eq!(result.staged_state.staged_files["a.rs"], "changed");
-    assert_eq!(result.staged_state.staged_files["b.rs"], "success");
+    assert_eq!(staged_bytes(&result, "a.rs"), &b"changed"[..]);
+    assert_eq!(staged_bytes(&result, "b.rs"), &b"success"[..]);
     assert_eq!(result.failed_files.len(), 1);
     assert_eq!(result.failed_files[0].path, "a.rs");
     assert!(matches!(
@@ -81,7 +94,7 @@ fn retries_use_staged_content_and_preserve_it_on_failure() {
     );
     assert!(!failed.is_success());
     assert_eq!(failed.staged_state, second.staged_state);
-    assert_eq!(first.staged_state.staged_files["a.rs"], "two");
+    assert_eq!(staged_bytes(&first, "a.rs"), &b"two"[..]);
     assert_eq!(std::fs::read_to_string(root.join("a.rs")).unwrap(), "one");
 }
 
@@ -104,7 +117,7 @@ async fn create_replace_delete_and_recreate_follow_operation_order() {
         &[replace("new.rs", "one", "two")],
         Some(&first.staged_state),
     );
-    assert_eq!(second.staged_state.staged_files["new.rs"], "two");
+    assert_eq!(staged_bytes(&second, "new.rs"), &b"two"[..]);
     let deleted = stage_and_validate_edits(
         root,
         &cm,
@@ -209,10 +222,7 @@ async fn readonly_file_in_context_can_be_edited_and_promoted_to_editable() {
     let edit = replace("ref.rs", "fn original() {}", "fn updated() {}");
     let stage_res = stage_and_validate_edits(root, &cm, std::slice::from_ref(&edit), None);
     assert!(stage_res.is_success());
-    assert_eq!(
-        stage_res.staged_state.staged_files["ref.rs"],
-        "fn updated() {}"
-    );
+    assert_eq!(staged_bytes(&stage_res, "ref.rs"), &b"fn updated() {}"[..]);
 
     let proposal = EditProposal {
         summary: "Update read-only file".into(),
@@ -241,7 +251,7 @@ async fn overwrite_replaces_existing_file_and_requires_context() {
     };
     let result = stage_and_validate_edits(root, &cm, std::slice::from_ref(&op), None);
     assert!(result.is_success());
-    assert_eq!(result.staged_state.staged_files["a.rs"], "all new");
+    assert_eq!(staged_bytes(&result, "a.rs"), &b"all new"[..]);
     assert_eq!(std::fs::read_to_string(root.join("a.rs")).unwrap(), "one");
 
     let missing = EditOperation::Overwrite {
@@ -280,7 +290,7 @@ async fn test_move_file_stages_and_applies() {
 
     let result = stage_and_validate_edits(root, &cm, std::slice::from_ref(&move_op), None);
     assert!(result.is_success());
-    assert_eq!(result.staged_state.staged_files["new.rs"], "fn hello() {}");
+    assert_eq!(staged_bytes(&result, "new.rs"), &b"fn hello() {}"[..]);
     assert!(result.staged_state.deleted_paths.contains("old.rs"));
 
     let proposal = EditProposal {
@@ -394,7 +404,7 @@ fn a_failed_replace_after_a_move_keeps_the_moved_content_at_its_destination() {
     ));
     // The rename applied cleanly and keeps its effect in both directions: the
     // destination holds the moved content and the source stays marked as moved.
-    assert_eq!(result.staged_state.staged_files["b.rs"], "fn hello() {}\n");
+    assert_eq!(staged_bytes(&result, "b.rs"), &b"fn hello() {}\n"[..]);
     assert!(result.staged_state.deleted_paths.contains("a.rs"));
     assert_eq!(result.successful_paths, vec!["a.rs", "b.rs"]);
     assert_eq!(result.successful_edits, vec![edits[0].clone()]);
@@ -412,8 +422,8 @@ fn a_failed_replace_after_a_move_keeps_the_moved_content_at_its_destination() {
     );
     assert!(retry.is_success(), "{:?}", retry.failed_files);
     assert_eq!(
-        retry.staged_state.staged_files["b.rs"],
-        "fn hello() -> i32 { 42 }\n"
+        staged_bytes(&retry, "b.rs"),
+        &b"fn hello() -> i32 { 42 }\n"[..]
     );
     assert!(retry.staged_state.deleted_paths.contains("a.rs"));
     assert_eq!(
@@ -453,8 +463,8 @@ fn a_failed_move_keeps_the_source_content_a_previous_member_created() {
     // The member that created the source applied cleanly and keeps its effect, and
     // the refused rename leaves no deletion marker behind for the source.
     assert_eq!(
-        result.staged_state.staged_files["draft.rs"],
-        "pub fn draft() {}\n"
+        staged_bytes(&result, "draft.rs"),
+        &b"pub fn draft() {}\n"[..]
     );
     assert!(!result.staged_state.deleted_paths.contains("draft.rs"));
     assert_eq!(result.successful_paths, vec!["draft.rs"]);
@@ -478,8 +488,8 @@ fn a_failed_move_keeps_the_source_content_a_previous_member_created() {
     );
     assert!(retry.is_success(), "{:?}", retry.failed_files);
     assert_eq!(
-        retry.staged_state.staged_files["renamed.rs"],
-        "pub fn draft() {}\n"
+        staged_bytes(&retry, "renamed.rs"),
+        &b"pub fn draft() {}\n"[..]
     );
     assert!(!retry.staged_state.staged_files.contains_key("draft.rs"));
     assert!(retry.staged_state.deleted_paths.contains("draft.rs"));
@@ -516,7 +526,7 @@ fn a_refused_second_hop_restores_the_state_the_first_hop_produced() {
         &result.failed_files[0].error,
         EditError::DestinationExists(path) if path == "c.rs"
     ));
-    assert_eq!(result.staged_state.staged_files["b.rs"], "fn hello() {}\n");
+    assert_eq!(staged_bytes(&result, "b.rs"), &b"fn hello() {}\n"[..]);
     assert!(result.staged_state.deleted_paths.contains("a.rs"));
     assert!(!result.staged_state.deleted_paths.contains("b.rs"));
     assert_eq!(result.successful_paths, vec!["a.rs", "b.rs"]);
@@ -539,7 +549,7 @@ fn staging_preserves_crlf_and_empty_attempt_preserves_state() {
     cm.add_file("a.rs", ContextAccess::Editable).unwrap();
     let result = stage_and_validate_edits(root, &cm, &[replace("a.rs", "one\n", "two\n")], None);
     assert!(result.is_success());
-    assert_eq!(result.staged_state.staged_files["a.rs"], "two\r\n");
+    assert_eq!(staged_bytes(&result, "a.rs"), &b"two\r\n"[..]);
     let empty = stage_and_validate_edits(root, &cm, &[], Some(&result.staged_state));
     assert!(empty.is_success());
     assert_eq!(empty.staged_state, result.staged_state);
@@ -637,8 +647,8 @@ fn ignored_paths_are_rejected_for_create_overwrite_and_move() {
     let result = stage_and_validate_edits(root, &cm, std::slice::from_ref(&allowed), None);
     assert!(result.is_success(), "{:?}", result.failed_files);
     assert_eq!(
-        result.staged_state.staged_files["src/generated.rs"],
-        "fn generated() {}"
+        staged_bytes(&result, "src/generated.rs"),
+        &b"fn generated() {}"[..]
     );
 
     // Nothing above reached disk.
@@ -670,8 +680,8 @@ fn the_sandbox_admits_creates_and_move_destinations_git_ignores() {
     let result = stage_and_validate_edits(root, &cm, std::slice::from_ref(&created), None);
     assert!(result.is_success(), "{:?}", result.failed_files);
     assert_eq!(
-        result.staged_state.staged_files[".tauqe/mockups/prototype.rs"],
-        "pub fn prototype() {}\n"
+        staged_bytes(&result, ".tauqe/mockups/prototype.rs"),
+        &b"pub fn prototype() {}\n"[..]
     );
 
     let moved = EditOperation::Move {
@@ -686,8 +696,8 @@ fn the_sandbox_admits_creates_and_move_destinations_git_ignores() {
     );
     assert!(result.is_success(), "{:?}", result.failed_files);
     assert_eq!(
-        result.staged_state.staged_files[".tauqe/mockups/copied.rs"],
-        "fn hello() {}\n"
+        staged_bytes(&result, ".tauqe/mockups/copied.rs"),
+        &b"fn hello() {}\n"[..]
     );
     assert!(result.staged_state.deleted_paths.contains("source.rs"));
 
@@ -748,8 +758,8 @@ fn an_existing_mockup_is_edited_under_the_ordinary_context_rules() {
     );
     assert!(replaced.is_success(), "{:?}", replaced.failed_files);
     assert_eq!(
-        replaced.staged_state.staged_files[".tauqe/mockups/prototype.rs"],
-        "pub fn prototype() -> i32 { 42 }\n"
+        staged_bytes(&replaced, ".tauqe/mockups/prototype.rs"),
+        &b"pub fn prototype() -> i32 { 42 }\n"[..]
     );
 
     let rewritten = stage_and_validate_edits(
@@ -763,8 +773,8 @@ fn an_existing_mockup_is_edited_under_the_ordinary_context_rules() {
     );
     assert!(rewritten.is_success(), "{:?}", rewritten.failed_files);
     assert_eq!(
-        rewritten.staged_state.staged_files[".tauqe/mockups/prototype.rs"],
-        "pub fn prototype() -> i32 { 7 }\n"
+        staged_bytes(&rewritten, ".tauqe/mockups/prototype.rs"),
+        &b"pub fn prototype() -> i32 { 7 }\n"[..]
     );
     // The sandbox lives in memory until the turn commits, like every file.
     assert_eq!(
@@ -902,8 +912,8 @@ fn staged_project_config_without_verification_is_accepted() {
     let result = stage_and_validate_edits(root, &cm, std::slice::from_ref(&dropped_verify), None);
     assert!(result.is_success(), "{:?}", result.failed_files);
     assert_eq!(
-        result.staged_state.staged_files["tauqe.toml"],
-        "[models]\nprimary = [\"openrouter:a/b\"]\n"
+        staged_bytes(&result, "tauqe.toml"),
+        &b"[models]\nprimary = [\"openrouter:a/b\"]\n"[..]
     );
     assert_eq!(
         std::fs::read_to_string(root.join("tauqe.toml")).unwrap(),
@@ -1058,8 +1068,8 @@ async fn prepare_formats_staged_content_without_touching_disk() {
 
     assert!(result.is_success(), "{:?}", result.failed_files);
     assert_eq!(
-        result.staged_state.staged_files["a.rs"],
-        "PUB FN VALUE() -> I32 { 42 }\n"
+        staged_bytes(&result, "a.rs"),
+        &b"PUB FN VALUE() -> I32 { 42 }\n"[..]
     );
     assert_eq!(
         std::fs::read_to_string(root.join("a.rs")).unwrap(),
@@ -1092,7 +1102,8 @@ async fn prepare_keeps_the_authored_content_when_the_filter_fails() {
 
     assert!(result.is_success(), "{:?}", result.failed_files);
     assert_eq!(
-        result.staged_state.staged_files["a.rs"], "pub fn value() -> i32 { 42 }\n",
+        staged_bytes(&result, "a.rs"),
+        &b"pub fn value() -> i32 { 42 }\n"[..],
         "a failed filter must fall back to the authored content"
     );
 }
@@ -1119,7 +1130,8 @@ async fn prepare_keeps_the_authored_content_without_a_declared_filter() {
 
     assert!(result.is_success(), "{:?}", result.failed_files);
     assert_eq!(
-        result.staged_state.staged_files["a.rs"], "pub fn value() -> i32 { 42 }\n",
+        staged_bytes(&result, "a.rs"),
+        &b"pub fn value() -> i32 { 42 }\n"[..],
         "a repository without a filter keeps the authored content"
     );
 }
@@ -1150,10 +1162,7 @@ fn anchored_ranges_stage_bottom_to_top_without_touching_disk() {
     ];
     let result = stage_and_validate_edits(root, &cm, &edits, None);
     assert!(result.is_success(), "{:?}", result.failed_files);
-    assert_eq!(
-        result.staged_state.staged_files["a.rs"],
-        "ALPHA\nbeta\nGAMMA\n"
-    );
+    assert_eq!(staged_bytes(&result, "a.rs"), &b"ALPHA\nbeta\nGAMMA\n"[..]);
     assert_eq!(
         std::fs::read_to_string(root.join("a.rs")).unwrap(),
         "alpha\nbeta\ngamma\n",
@@ -1173,8 +1182,8 @@ fn anchored_range_collapses_into_a_single_replacement() {
     let result = stage_and_validate_edits(root, &cm, &edits, None);
     assert!(result.is_success(), "{:?}", result.failed_files);
     assert_eq!(
-        result.staged_state.staged_files["a.rs"],
-        "alpha\nmiddle\ndelta\n"
+        staged_bytes(&result, "a.rs"),
+        &b"alpha\nmiddle\ndelta\n"[..]
     );
 }
 
@@ -1252,8 +1261,8 @@ async fn a_whole_file_anchored_range_narrows_to_the_changed_lines() {
     let result = stage_and_validate_edits(root, &cm, std::slice::from_ref(&widened), None);
     assert!(result.is_success(), "{:?}", result.failed_files);
     assert_eq!(
-        result.staged_state.staged_files["a.rs"],
-        "alpha\nBETA\ngamma\nDELTA\n"
+        staged_bytes(&result, "a.rs"),
+        &b"alpha\nBETA\ngamma\nDELTA\n"[..]
     );
     assert_eq!(
         std::fs::read_to_string(root.join("a.rs")).unwrap(),
@@ -1292,8 +1301,8 @@ fn a_padded_range_never_collides_with_a_range_it_only_resent_unchanged() {
     let result = stage_and_validate_edits(root, &cm, &[padded, tail], None);
     assert!(result.is_success(), "{:?}", result.failed_files);
     assert_eq!(
-        result.staged_state.staged_files["a.rs"],
-        "alpha\nBETA\nGAMMA\ndelta\n"
+        staged_bytes(&result, "a.rs"),
+        &b"alpha\nBETA\nGAMMA\ndelta\n"[..]
     );
     assert_eq!(
         std::fs::read_to_string(root.join("a.rs")).unwrap(),
@@ -1526,8 +1535,8 @@ fn paths_outside_the_declared_boundaries_stage_normally() {
     );
     assert!(result.is_success(), "{:?}", result.failed_files);
     assert_eq!(
-        result.staged_state.staged_files["src.rs"],
-        "pub fn value() -> i32 { 0 }\n"
+        staged_bytes(&result, "src.rs"),
+        &b"pub fn value() -> i32 { 0 }\n"[..]
     );
 }
 
@@ -1553,7 +1562,7 @@ fn a_repository_without_a_boundary_declaration_protects_nothing() {
         None,
     );
     assert!(result.is_success(), "{:?}", result.failed_files);
-    assert_eq!(result.staged_state.staged_files["Justfile"], "check: fmt\n");
+    assert_eq!(staged_bytes(&result, "Justfile"), &b"check: fmt\n"[..]);
 }
 
 #[test]
@@ -1634,12 +1643,12 @@ fn a_directory_move_expands_into_the_moves_of_its_subtree() {
         ]
     );
     assert_eq!(
-        result.staged_state.staged_files["src/new/a.rs"],
-        "pub fn a() {}\n"
+        staged_bytes(&result, "src/new/a.rs"),
+        &b"pub fn a() {}\n"[..]
     );
     assert_eq!(
-        result.staged_state.staged_files["src/new/nested/b.rs"],
-        "pub fn b() {}\n"
+        staged_bytes(&result, "src/new/nested/b.rs"),
+        &b"pub fn b() {}\n"[..]
     );
     assert!(result.staged_state.deleted_paths.contains("src/old/a.rs"));
     assert!(result
@@ -1898,5 +1907,162 @@ async fn a_directory_move_lands_on_disk_and_reconciles_the_context() {
             "src/new/a.rs".to_string(),
             "src/new/nested/b.rs".to_string(),
         ]
+    );
+}
+
+/// A relocation carries bytes, so a payload that does not decode as text
+/// reaches its destination verbatim, the emptied source directory is pruned,
+/// and the destination joins the transient auto layer as an editable file.
+#[tokio::test]
+async fn a_binary_move_reaches_disk_and_reconciles_the_context() {
+    let dir = tempdir().unwrap();
+    let root = dir.path();
+    let binary: &[u8] = &[0x89, b'P', b'N', b'G', 0x00, 0xff];
+    std::fs::create_dir_all(root.join("assets/legacy")).unwrap();
+    std::fs::write(root.join("assets/legacy/logo.png"), binary).unwrap();
+    let mut cm = ContextManager::new(root.to_path_buf());
+    cm.add_file("assets/legacy/logo.png", ContextAccess::Editable)
+        .unwrap();
+
+    let proposal = EditProposal {
+        summary: "Relocate the logo".into(),
+        edits: vec![EditOperation::Move {
+            from: "assets/legacy/logo.png".into(),
+            to: "assets/brand/logo.png".into(),
+        }],
+    };
+    let changed = apply_edit_proposal(root, &mut cm, &proposal).await.unwrap();
+
+    assert_eq!(
+        changed,
+        vec!["assets/legacy/logo.png", "assets/brand/logo.png"]
+    );
+    assert_eq!(
+        std::fs::read(root.join("assets/brand/logo.png")).unwrap(),
+        binary,
+        "the destination carries the moved bytes"
+    );
+    assert!(
+        !root.join("assets/legacy").exists(),
+        "the emptied source directory is pruned"
+    );
+    assert!(
+        root.join("assets").is_dir(),
+        "a directory that still holds a file survives the prune"
+    );
+    assert!(!cm.contains("assets/legacy/logo.png").unwrap());
+    assert!(cm.is_editable("assets/brand/logo.png").unwrap());
+    assert_eq!(cm.auto_files(), vec!["assets/brand/logo.png".to_string()]);
+}
+
+/// A directory move carries every member of its subtree, the payloads that do
+/// not decode as text included, and reconciles the context with the
+/// destinations it created.
+#[tokio::test]
+async fn a_directory_move_carries_a_binary_member_to_disk() {
+    let dir = tempdir().unwrap();
+    let root = dir.path();
+    let binary: &[u8] = &[0xff, 0x00, 0xfe, b'a'];
+    std::fs::create_dir_all(root.join("src/old")).unwrap();
+    std::fs::write(root.join("src/old/a.rs"), "pub fn a() {}\n").unwrap();
+    std::fs::write(root.join("src/old/logo.bin"), binary).unwrap();
+    // A directory move expands into the tracked files of its source, so the
+    // fixtures have to reach the index before the change set stages.
+    crate::git::run_git(Some(root), &["init"]).unwrap();
+    crate::git::run_git(Some(root), &["add", "-A"]).unwrap();
+    let mut cm = ContextManager::new(root.to_path_buf());
+    cm.add_file("src/old/a.rs", ContextAccess::Editable)
+        .unwrap();
+
+    let proposal = EditProposal {
+        summary: "Rename the module directory".into(),
+        edits: vec![EditOperation::MoveDir {
+            from: "src/old".into(),
+            to: "src/new".into(),
+        }],
+    };
+    let changed = apply_edit_proposal(root, &mut cm, &proposal).await.unwrap();
+
+    assert_eq!(
+        changed,
+        vec![
+            "src/old/a.rs",
+            "src/new/a.rs",
+            "src/old/logo.bin",
+            "src/new/logo.bin",
+        ]
+    );
+    assert_eq!(
+        std::fs::read(root.join("src/new/logo.bin")).unwrap(),
+        binary,
+        "the relocated payload keeps its bytes"
+    );
+    assert_eq!(
+        std::fs::read_to_string(root.join("src/new/a.rs")).unwrap(),
+        "pub fn a() {}\n"
+    );
+    assert!(
+        !root.join("src/old").exists(),
+        "the emptied source tree must be pruned"
+    );
+    assert!(
+        root.join("src").is_dir(),
+        "a directory that still holds a file survives the prune"
+    );
+    assert!(!cm.contains("src/old/a.rs").unwrap());
+    assert!(cm.is_editable("src/new/logo.bin").unwrap());
+    let mut auto = cm.auto_files();
+    auto.sort();
+    assert_eq!(
+        auto,
+        vec!["src/new/a.rs".to_string(), "src/new/logo.bin".to_string()]
+    );
+}
+
+/// Formatting is a text contour: the declared filter rewrites the text member
+/// of a change set while the bytes of a relocated payload stay verbatim.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_formatting_project_never_rewrites_a_moved_binary_payload() {
+    let dir = tempdir().unwrap();
+    let root = dir.path();
+    let binary: &[u8] = &[0xff, 0x00, 0xfe, b'a'];
+    std::fs::write(root.join("a.rs"), "pub fn value() -> i32 { 0 }\n").unwrap();
+    std::fs::write(root.join("logo.bin"), binary).unwrap();
+    declare_format_filter(root, "tr a-z A-Z");
+    let mut cm = ContextManager::new(root.to_path_buf());
+    cm.add_file("a.rs", ContextAccess::Editable).unwrap();
+    cm.add_file("logo.bin", ContextAccess::Editable).unwrap();
+
+    let proposal = EditProposal {
+        summary: "Relocate the payload and fix the value".into(),
+        edits: vec![
+            EditOperation::Move {
+                from: "logo.bin".into(),
+                to: "assets/logo.bin".into(),
+            },
+            replace(
+                "a.rs",
+                "pub fn value() -> i32 { 0 }",
+                "pub fn value() -> i32 { 42 }",
+            ),
+        ],
+    };
+    let changed = apply_edit_proposal(root, &mut cm, &proposal).await.unwrap();
+
+    assert_eq!(changed, vec!["logo.bin", "assets/logo.bin", "a.rs"]);
+    assert!(
+        !root.join("logo.bin").exists(),
+        "the source of the relocation is removed"
+    );
+    assert_eq!(
+        std::fs::read(root.join("assets/logo.bin")).unwrap(),
+        binary,
+        "the filter never rewrites a payload it cannot decode"
+    );
+    assert_eq!(
+        std::fs::read_to_string(root.join("a.rs")).unwrap(),
+        "PUB FN VALUE() -> I32 { 42 }\n",
+        "the text member of the same change set is formatted"
     );
 }

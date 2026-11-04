@@ -181,6 +181,14 @@ async fn main() -> anyhow::Result<()> {
         },
         reason = &mut shutdown_watch => break reason,
         () = &mut transport_lost => break ShutdownReason::TransportClosed,        };
+        // A finished handler keeps its join-set entry — the task output and
+        // its intrusive list node — until the entry is joined, so reaping
+        // only inside the shutdown drain would retain one entry per request
+        // the daemon has ever served. Collecting the finished handlers on
+        // every wake-up bounds the set to the tasks that are still running,
+        // which is also what makes the drain's `is_empty`, `len`, and
+        // remaining count describe real in-flight work.
+        reap_finished_handlers(&mut offloaded);
         let line = line.trim();
         if line.is_empty() {
             continue;
@@ -270,7 +278,6 @@ enum ShutdownReason {
     StdinEof,
     /// Reading stdin failed, which is a defect rather than a controlled end.
     StdinFailed(String),
-    /// The operating system delivered a termination signal.
     /// The operating system delivered a termination signal.
     Signal(ShutdownSignal),
     /// The client's end of the output pipe is gone, so no response and no
@@ -436,6 +443,28 @@ const SHUTDOWN_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_mi
 /// the deferral protects.
 const FORCE_ABORT_BUDGET: std::time::Duration =
     CLIENT_SHUTDOWN_WAIT.saturating_sub(SHUTDOWN_DRAIN_BUDGET);
+
+/// Collects every offloaded handler task that has already finished.
+///
+/// A `JoinSet` retains a completed task — its output and its intrusive list
+/// node — until the entry is joined, so a set that is drained only at shutdown
+/// grows for the daemon's whole lifetime: one entry per request it has served.
+/// This pass runs on every wake-up of the request loop and leaves only the
+/// handlers that are still running, so `is_empty`, `len`, and the count the
+/// drain reports describe real in-flight work instead of lifetime request
+/// history. A handler that ended abnormally is recorded here instead of being
+/// dropped silently; its own outcome already reached the client through the
+/// panic boundary of `answer_request`.
+fn reap_finished_handlers(offloaded: &mut tokio::task::JoinSet<()>) {
+    while let Some(outcome) = offloaded.try_join_next() {
+        if let Err(err) = outcome {
+            tracing::warn!(
+                error = %err,
+                "Offloaded RPC handler task ended abnormally",
+            );
+        }
+    }
+}
 
 /// Cancels the active operation and waits for in-flight work to finish so the
 /// process never exits mid-transaction.
@@ -863,6 +892,33 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A finished handler keeps its join-set entry until the entry is joined,
+    /// so steady-state reaping must remove it while leaving a running handler
+    /// in place. That difference is what bounds the set to real in-flight work
+    /// instead of the daemon's lifetime request count.
+    #[tokio::test]
+    async fn reaping_collects_finished_handlers_and_keeps_running_ones() {
+        let mut offloaded = tokio::task::JoinSet::new();
+        let (finished, done) = tokio::sync::oneshot::channel::<()>();
+        let _finished = offloaded.spawn(async move {
+            let _ = finished.send(());
+        });
+        let _running = offloaded.spawn(std::future::pending::<()>());
+
+        // The current-thread runtime records the completion of the first
+        // handler before it yields back here, so the set holds one finished
+        // entry and one running task at this point.
+        done.await.expect("the finished handler must run");
+
+        reap_finished_handlers(&mut offloaded);
+
+        assert_eq!(
+            offloaded.len(),
+            1,
+            "the finished handler must be reaped while the running one survives"
+        );
     }
 
     /// A handler that panics for real, so the boundary is exercised by an

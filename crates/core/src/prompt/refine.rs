@@ -11,7 +11,10 @@
 //! consults the documentation, records working notes, and reports a terminal
 //! status. It never edits a file and never runs the toolchain, so neither
 //! [`LlmCapability::FileEdits`] nor [`LlmCapability::ToolchainVerify`] belongs
-//! to it.
+//! to it. A synthesis runs unattended exactly as an isolated step does, so the
+//! surface keeps the abort escape hatch: a condition that only the developer
+//! can repair on the host is reported through [`LlmCapability::Abort`] instead
+//! of an improvised surrogate or a misreported blocker.
 //!
 //! The provider schema envelope is derived from the single declarative
 //! definition in `crate::plan::prompt`, so the envelope and the definition can
@@ -129,8 +132,9 @@ fn refinement_output_contract() -> String {
     out.push_str("   - `success`: `items` carries the complete new unfinished horizon, while `context_requests`, `repo_searches`, and `repo_maps` stay empty.\n");
     out.push_str("   - `needs_context`: the contract you are about to implement is not verified yet, so `items` stays empty, `explanation` names that contract, and the evidence still missing is named by `context_requests`, `repo_searches`, or `repo_maps`.\n");
     out.push_str("   - `blocked`: the horizon cannot be designed, so `reason` states the exact blocker and `items` stays empty.\n");
-    out.push_str("4. The schema carries the authoritative description of every field and every status value, and accepts no key beyond the declared ones.\n");
-    out.push_str("5. Final Content Invariant: every text field carries only the final distilled result. Deliberation, self-questioning, exploratory analysis, and intermediate reasoning are never payload content.\n");
+    out.push_str("4. `abort` reports a host-environment impossibility the harness cannot repair itself, such as a missing system utility or package, a build script awaiting approval, a stopped daemon or database, or an unauthenticated registry. Its idle form is `is_aborted: false`; an active abort (`is_aborted: true`) supersedes any declared `status`, carries the concrete missing capability in `reason` and the exact command the developer must run in `recommendation`, and is never replaced by a `blocked` answer or by an improvised surrogate step. An active abort carries no horizon: `items` stays empty.\n");
+    out.push_str("5. The schema carries the authoritative description of every field and every status value, and accepts no key beyond the declared ones.\n");
+    out.push_str("6. Final Content Invariant: every text field carries only the final distilled result. Deliberation, self-questioning, exploratory analysis, and intermediate reasoning are never payload content.\n");
     out
 }
 
@@ -147,6 +151,28 @@ fn contract_values(schema: &serde_json::Value, pointer: &str) -> Vec<String> {
                 .collect()
         })
         .unwrap_or_default()
+}
+
+/// Normalizes the payload of an active abort.
+///
+/// A report that states no reason still stops the turn, so the deterministic
+/// defaults the edit contour uses for a blank field stand in for an empty
+/// `reason` and `recommendation` instead of leaving the abort without a cause or
+/// without a next step.
+fn abort_payload(reason: &str, recommendation: &str) -> (String, String) {
+    let reason = reason.trim();
+    let reason = if reason.is_empty() {
+        "Execution aborted"
+    } else {
+        reason
+    };
+    let recommendation = recommendation.trim();
+    let recommendation = if recommendation.is_empty() {
+        "No recommendation was stated."
+    } else {
+        recommendation
+    };
+    (reason.to_string(), recommendation.to_string())
 }
 
 impl PromptProtocol for PlanRefinePromptProtocol {
@@ -186,6 +212,19 @@ impl PromptProtocol for PlanRefinePromptProtocol {
             commands.push(LlmCommand::Text {
                 content: explanation.clone(),
             });
+        }
+
+        // An active abort supersedes the declared status: the round reports work
+        // the harness cannot perform at all, so no horizon, blocker, or research
+        // request is decoded beside it. A blank payload keeps the deterministic
+        // defaults the edit contour uses, so an abort always states a cause.
+        if let Some(abort) = output.abort.as_ref().filter(|abort| abort.is_aborted) {
+            let (reason, recommendation) = abort_payload(&abort.reason, &abort.recommendation);
+            commands.push(LlmCommand::Abort {
+                reason,
+                recommendation,
+            });
+            return commands;
         }
 
         match output.status.as_str() {
@@ -299,6 +338,10 @@ mod tests {
         assert!(protocol.supports(LlmCapability::Research));
         assert!(protocol.supports(LlmCapability::PlanUpdate));
         assert!(!protocol.supports(LlmCapability::FileEdits));
+        // A synthesis runs unattended exactly as an isolated step does, so the
+        // surface keeps the escape hatch that demands a host action instead of
+        // improvising a surrogate change or misreporting a blocker.
+        assert!(protocol.supports(LlmCapability::Abort));
         assert!(!protocol.supports(LlmCapability::ToolchainVerify));
     }
 
@@ -475,5 +518,89 @@ mod tests {
             })
             .collect();
         assert_eq!(streamed, "Decomposed");
+    }
+    /// A round that reports a host-environment impossibility instead of a horizon.
+    const ABORTED: &str = r#"{
+        "status": "success",
+        "explanation": "The native build needs an approval only the developer can give",
+        "reason": null,
+        "abort": {
+            "is_aborted": true,
+            "reason": "  Native build approval required  ",
+            "recommendation": "  pnpm approve-builds  "
+        },
+        "context_requests": ["crates/core/src/toolchain.rs"],
+        "repo_searches": [],
+        "repo_maps": [],
+        "items": []
+    }"#;
+
+    #[test]
+    fn test_decode_an_active_abort_supersedes_the_declared_status() {
+        let protocol = PlanRefinePromptProtocol::default();
+        let commands = protocol.decode(ABORTED, &[]);
+
+        // The escape hatch reaches the harness as one command, with the payload
+        // trimmed exactly as the edit contour trims it.
+        assert!(commands.contains(&LlmCommand::Abort {
+            reason: "Native build approval required".to_string(),
+            recommendation: "pnpm approve-builds".to_string(),
+        }));
+
+        // The declared status is superseded: no terminal outcome, no blocker, and
+        // no research request is decoded beside the abort.
+        assert!(!commands
+            .iter()
+            .any(|command| matches!(command, LlmCommand::Outcome { .. })));
+        assert!(!commands
+            .iter()
+            .any(|command| matches!(command, LlmCommand::Blocked { .. })));
+        assert!(!commands.iter().any(|command| matches!(
+            command,
+            LlmCommand::ContextRequest { .. }
+                | LlmCommand::RepoSearch { .. }
+                | LlmCommand::RepoMap { .. }
+        )));
+
+        // The explanation still reaches the developer as conversational text.
+        assert!(commands.contains(&LlmCommand::Text {
+            content: "The native build needs an approval only the developer can give".to_string(),
+        }));
+    }
+
+    #[test]
+    fn test_decode_an_active_abort_states_a_deterministic_payload() {
+        let protocol = PlanRefinePromptProtocol::default();
+        let blank = r#"{
+            "status": "success",
+            "explanation": "",
+            "reason": null,
+            "abort": {"is_aborted": true, "reason": "   ", "recommendation": " "},
+            "context_requests": [],
+            "repo_searches": [],
+            "repo_maps": [],
+            "items": []
+        }"#;
+        assert_eq!(
+            protocol.decode(blank, &[]),
+            vec![LlmCommand::Abort {
+                reason: "Execution aborted".to_string(),
+                recommendation: "No recommendation was stated.".to_string(),
+            }]
+        );
+    }
+
+    #[test]
+    fn test_output_contract_states_the_abort_precedence() {
+        let instructions = PlanRefinePromptProtocol::default().instructions();
+
+        // The escape hatch is declared beside the status vocabulary, and the
+        // contract names its idle form, its precedence, and the prohibition on
+        // downgrading it into a plan-invariant blocker.
+        assert!(instructions.contains("`abort`"));
+        assert!(instructions.contains("`is_aborted: false`"));
+        assert!(instructions.contains("supersedes any declared `status`"));
+        assert!(instructions.contains("`items` stays empty"));
+        assert!(instructions.contains("never replaced by a `blocked` answer"));
     }
 }

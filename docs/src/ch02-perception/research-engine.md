@@ -242,9 +242,10 @@ Materialization has a fixed sequence:
   reader observes either the previous complete snapshot or the new one.
 
 A document a round requested enters the context read-only, priced exactly like a
-repository file, and stays there for the rest of the task. A plan step declares the same
-kind of document through the `outer_docs` field of its leaf, and the harness mounts it
-before the step turn starts (*Local Plans*).
+repository file, and remains resident for every later round of the same task. It is released
+together with the files a round discovered once the turn's change set is committed or the
+isolated step ends. A plan step declares the same kind of document through the `outer_docs`
+field of its leaf, and the harness mounts it before the step turn starts (*Local Plans*).
 
 ### 3.6 Requesting harness documentation
 

@@ -21,6 +21,7 @@ use crate::toolchain::ToolchainCheckResult;
 
 use super::guard::{finalize_blocked_turn, finish_turn};
 use super::kernel::TurnKernel;
+use super::plans::{settle_plans, TurnQualification};
 use super::proposal::{log_fsm_phase, merge_text, ProposalStep};
 use super::FsmTurnOutcome;
 
@@ -316,6 +317,7 @@ fn cancelled_turn(ctx: &mut TurnKernel<'_>) -> FsmTurnOutcome {
         has_terminal_success: false,
         plan_saved: false,
         plan_errors: Vec::new(),
+        plan_warnings: Vec::new(),
         skip_reason: None,
     }
 }
@@ -336,6 +338,18 @@ async fn finish_budget_exhausted(ctx: &mut TurnKernel<'_>) -> FsmTurnOutcome {
         ctx.context_manager.prune_missing_files();
     });
     let _ = ctx.stream_tx.send(StreamEvent::Done).await;
+    // An exhausted investigation budget closes the turn without a qualifying
+    // result, so the payload leaves it with a diagnostic that names the budget.
+    let settlement = settle_plans(
+        ctx.repo_root,
+        &ctx.state.plans,
+        ctx.plan_mode,
+        TurnQualification::disqualified(format!(
+            "the shared investigation budget ({} rounds) was exhausted",
+            ctx.options.max_research_rounds
+        )),
+    )
+    .await;
     let result = ModelResult::Edit {
         summary: "Investigation budget exhausted".to_string(),
         edits: Vec::new(),
@@ -354,11 +368,8 @@ async fn finish_budget_exhausted(ctx: &mut TurnKernel<'_>) -> FsmTurnOutcome {
     finish_turn(
         std::mem::take(&mut ctx.accumulated_text),
         result,
-        ctx.repo_root,
-        &ctx.state.plans,
-        ctx.plan_mode,
+        settlement,
     )
-    .await
 }
 
 #[cfg(test)]

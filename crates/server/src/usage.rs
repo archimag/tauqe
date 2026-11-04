@@ -217,17 +217,19 @@ impl Drop for UsageGuard {
 /// keeps it strictly ordered against flush: once flush has taken the window
 /// away under the same lock, the next heartbeat observes the absent window
 /// and exits, so no stale "still running" snapshot can be published after the
-/// final one.
+/// final one. The cadence arrives as `tick`, so a test can compress it without
+/// touching the production default.
 fn spawn_live_duration_ticker(
     state: &Arc<AppState>,
     operation_id: &str,
     started: Instant,
+    tick: Duration,
 ) -> tokio::task::JoinHandle<()> {
     let state = Arc::clone(state);
     let operation_id = operation_id.to_string();
     tokio::spawn(async move {
         loop {
-            tokio::time::sleep(LIVE_DURATION_TICK).await;
+            tokio::time::sleep(tick).await;
             // The lock is held across the send because the send is
             // synchronous: the heartbeat stays strictly ordered against
             // flush without ever awaiting on a locked window.
@@ -254,13 +256,23 @@ impl AppState {
     /// discarded here, so one abandoned turn never inflates the in-flight
     /// totals of the next one.
     pub async fn begin_usage(self: &Arc<Self>) -> UsageGuard {
+        self.begin_usage_with_tick(LIVE_DURATION_TICK).await
+    }
+
+    /// Opens a usage accounting window whose heartbeat runs on `tick`.
+    ///
+    /// [`AppState::begin_usage`] passes the production cadence, while a test
+    /// passes a compressed one, so no assertion has to wait a whole production
+    /// tick. The seam is private to this module and never changes the cadence
+    /// the daemon publishes with.
+    async fn begin_usage_with_tick(self: &Arc<Self>, tick: Duration) -> UsageGuard {
         let operation_id = format!("op-{}", next_operation_id());
         {
             let mut snapshot = self.usage.lock().await;
             snapshot.cur = Some(UsageTotals::default());
         }
         let started = Instant::now();
-        let ticker = spawn_live_duration_ticker(self, &operation_id, started);
+        let ticker = spawn_live_duration_ticker(self, &operation_id, started, tick);
         let guard = UsageGuard {
             state: Arc::clone(self),
             operation_id,
@@ -397,7 +409,15 @@ mod tests {
         tokio::sync::mpsc::UnboundedReceiver<String>,
         PathBuf,
     ) {
-        let root = std::env::temp_dir().join(format!("tauqe-usage-{}", next_operation_id()));
+        // The root must stay unique across processes: nextest runs each test
+        // in its own process, where the process-local operation counter
+        // restarts, so a counter-only suffix makes every test process share
+        // one directory and race on `.tauqe/usage.json`.
+        let root = std::env::temp_dir().join(format!(
+            "tauqe-usage-{}-{}",
+            std::process::id(),
+            next_operation_id()
+        ));
         let _ = std::fs::create_dir_all(&root);
         let (out, rx) = OutChannel::new();
         let (history_sender, _history_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -507,15 +527,18 @@ mod tests {
     /// per tick with the live in-flight duration; flush silences it and folds
     /// the full measured duration into the session and lifetime totals.
     ///
-    /// The heartbeat runs on the real clock: one tick is one second, so the
-    /// test polls the transport until at least one live publication arrives
-    /// instead of relying on a paused tokio clock, which would require the
-    /// `test-util` feature the workspace does not enable.
+    /// The heartbeat runs on the real clock, so the test opens the window on a
+    /// compressed tick and polls the transport until at least one live
+    /// publication arrives, instead of relying on a paused tokio clock, which
+    /// would require the `test-util` feature the workspace does not enable.
     #[tokio::test]
     async fn live_duration_heartbeat_publishes_and_is_silenced_by_flush() {
+        // The window runs on a compressed tick: the first heartbeat arrives in
+        // tens of milliseconds instead of a whole production second.
+        const TEST_TICK: Duration = Duration::from_millis(50);
         let (state, mut rx, root) = test_state();
 
-        let guard = state.begin_usage().await;
+        let guard = state.begin_usage_with_tick(TEST_TICK).await;
         guard.observe(&usage(3, 2)).await;
 
         // Poll the transport until a heartbeat publishes the live duration.
@@ -541,7 +564,7 @@ mod tests {
                 }
             }
             if max_live_ms == 0 {
-                tokio::time::sleep(Duration::from_millis(100)).await;
+                tokio::time::sleep(Duration::from_millis(10)).await;
             }
         }
         assert!(
@@ -563,12 +586,12 @@ mod tests {
         assert_eq!(snapshot.session.duration_ms, snapshot.prev.duration_ms);
         assert_eq!(snapshot.lifetime.duration_ms, snapshot.prev.duration_ms);
 
-        // Drain everything published so far, then let a whole tick pass:
+        // Drain everything published so far, then let several ticks pass:
         // the queue must stay empty because the heartbeat was silenced with
         // the window and no stale "still running" snapshot can arrive after
         // the final publish.
         while rx.try_recv().is_ok() {}
-        tokio::time::sleep(LIVE_DURATION_TICK + Duration::from_millis(200)).await;
+        tokio::time::sleep(TEST_TICK + Duration::from_millis(200)).await;
         assert!(
             rx.try_recv().is_err(),
             "no heartbeat may outlive the flushed window"

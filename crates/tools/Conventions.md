@@ -62,6 +62,14 @@ turn.
 7. **The Sandbox Is Admitted Only When Git Ignores It:** `.tauqe/mockups/` accepts
    writes because the harness keeps `.tauqe/` out of Git, so a draft never joins the
    change set, the verification input, or the commit.
+8. **Relocations Carry Bytes Verbatim:** a move carries the payload of its
+   source exactly as it lies in the working tree, so a file that does not decode
+   as text — an image, a font, or a serialized asset — travels like any other. A
+   source this attempt has not staged is read as bytes, and only the text
+   pipeline (replacement, anchors, in-memory formatting, prompt rendering, and
+   the streaming preview) restricts itself to entries that decode losslessly as
+   UTF-8. A source that is missing or is not a regular file is refused as a
+   missing file, while a genuine read failure stays an I/O rejection.
 
 ---
 
@@ -85,7 +93,14 @@ working-tree file alike — is named exclusively by `STAGING_TEMP_MARKER` or
 crash recovery derive their names from those two markers instead of inventing
 one of their own. Recovery reclaims orphaned siblings everywhere they can
 appear — the working tree and the harness state directory — and touches only
-names that parse as staging siblings whose recorded writer is provably gone.
+names that parse as staging siblings whose recorded writer is provably gone. A
+working-tree sweep descends one directory level at a time and asks Git to
+classify the next level in one batched `git check-ignore` probe, so a tree the
+ignore rules cover is never entered: no admitted change set can leave a sibling
+there, while walking it would stat every entry of a build or dependency tree at
+every recovery and every rollback. A level Git cannot classify keeps its whole
+set, so an uninspectable repository degrades to the previous reach instead of
+skipping a directory that may hold a sibling.
 A sibling a still-running writer owns is untouchable: deleting its staged
 content or moving its live backup aside corrupts the commit that writer is
 about to publish. A legacy pid-less name records no writer and keeps the
@@ -116,9 +131,12 @@ attributed sibling reports a live writer.
 
 1. **Checkpoint Before Any Write:** uncommitted developer work is captured in a
 temporary checkpoint commit before the first byte of a change set reaches disk.
-The transaction marker that records this checkpoint is itself persisted through
-the atomic disk commit policy of §3, so a crash cannot leave a torn marker that
-hides an open transaction.
+The transaction marker that records this checkpoint lives through the atomic
+disk commit policy of §3 end to end: the directories a first write needs are
+created durably, the document is rewritten atomically, and its removal is a
+durable unlink that treats an absent marker as success. A crash can therefore
+neither leave a torn marker that hides an open transaction nor resurrect a
+marker a finished transaction already cleared.
 2. **The Exclusion Is Proven, Not Assumed:** the ignore rules covering `.tauqe`,
    `credentials.toml`, and the staging suffixes are installed fail-closed and then
    verified with one batched `git check-ignore` call before `git add -A` runs.
@@ -129,6 +147,12 @@ hides an open transaction.
    a born base the range is every commit between the recorded base and HEAD,
    with the base still an ancestor of HEAD; for an unborn base it is every
    commit reachable from HEAD. A foreign commit is never rewritten.
+   Recovery additionally requires the recorded writer to be provably gone,
+   the same decision the staging reclamation applies. A marker attributed to
+   a process that still runs describes a live transaction: recovery reports
+   the skip diagnostic, keeps the marker for a later startup, and rewrites no
+   history. A marker that names no writer — one written by an earlier
+   revision — proves nothing about ownership and recovers exactly as before.
 5. **The Hook Policy Arrives as an Argument:** whether a commit bypasses the
    repository hooks is resolved by the engine and passed in as `GitHooks`.
 6. **The Child Environment Is Sanitized:** every `git` invocation is spawned
@@ -160,9 +184,11 @@ hides an open transaction.
 1. **No Blocking I/O on Async Worker Threads:** an `fsync`-bounded write, a cold
    metadata read, or a `git` subprocess runs through `run_blocking` from synchronous
    code or `run_blocking_async` from async code.
-2. **Reentrant and Panic-Free:** both helpers degrade to a direct call outside a
-   multi-threaded runtime, and a failed offload is logged instead of propagating a
-   panic.
+2. **Reentrant and Failure-Aware:** both helpers degrade to a direct call outside
+   a multi-threaded runtime, and a failed offload is always logged. Only a
+   cancelled task — one the runtime shut down before it ran — is completed inline
+   by its caller; a task that panicked already ran the work and crashed
+   deterministically, so its payload resumes instead of the work being retried.
 
 ---
 

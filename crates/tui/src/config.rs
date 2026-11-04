@@ -43,6 +43,20 @@ impl PrimaryModifier {
             PrimaryModifier::Alt => "M-",
         }
     }
+    /// The meta modifier that keeps the two command chords on separate keys.
+    ///
+    /// `C-` and `M-` are two independent chords on two physical keys, so
+    /// assigning the primary chord to a key frees that key's former role for
+    /// the meta chord: a `ctrl` primary leaves `alt` as the meta modifier, and
+    /// an `alt` primary leaves `ctrl`. The rule belongs to the modifiers
+    /// themselves, so it is stated once here and every writer of `tui.toml`
+    /// reads it instead of restating the match (Conventions §5.2).
+    pub fn paired_meta(&self) -> MetaModifier {
+        match self {
+            PrimaryModifier::Ctrl => MetaModifier::Alt,
+            PrimaryModifier::Alt => MetaModifier::Ctrl,
+        }
+    }
 }
 
 /// Abstract meta command modifier (`M-`), the Readline/Emacs counterpart of the
@@ -480,12 +494,53 @@ pub fn save_theme_preset(name: &str) -> std::io::Result<PathBuf> {
 /// truncated or partially updated.
 fn write_atomically(path: &Path, content: &str) -> std::io::Result<()> {
     let temp_path = temp_sibling_path(path);
-    fs::write(&temp_path, content)?;
+    // A staged sibling is reclaimed on every exit from this function, whether
+    // its content was published or not, so an interrupted save never grows a
+    // family of orphans beside the workstation file.
+    if let Err(err) = write_staged(&temp_path, content) {
+        let _ = fs::remove_file(&temp_path);
+        return Err(err);
+    }
     if let Err(err) = fs::rename(&temp_path, path) {
         let _ = fs::remove_file(&temp_path);
         return Err(err);
     }
+    sync_parent(path);
     Ok(())
+}
+
+/// Writes `content` into the staged sibling and flushes it to disk before the
+/// rename publishes it.
+///
+/// The flush is what makes the replacement durable: without it a crash right
+/// after the rename can publish an empty or truncated file, because the
+/// directory entry reached the disk while the data did not. The deterministic
+/// substrate states the same rule for its own atomic replacement of a state
+/// document (`crates/tools/Conventions.md` §3.3).
+fn write_staged(temp_path: &Path, content: &str) -> std::io::Result<()> {
+    use std::io::Write;
+    let mut file = fs::File::create(temp_path)?;
+    file.write_all(content.as_bytes())?;
+    file.sync_all()
+}
+
+/// Flushes the directory entry of `path` to disk, best effort.
+///
+/// Flushing a directory is not portable — some platforms refuse to open one for
+/// writing — so a failure here degrades to the previous behavior instead of
+/// failing a write whose content is already published.
+fn sync_parent(path: &Path) {
+    let Some(parent) = path.parent() else {
+        return;
+    };
+    let dir = if parent.as_os_str().is_empty() {
+        Path::new(".")
+    } else {
+        parent
+    };
+    if let Ok(handle) = fs::File::open(dir) {
+        let _ = handle.sync_all();
+    }
 }
 
 /// Builds a unique temporary sibling path next to `target`.
@@ -828,5 +883,50 @@ mode = "light"
         let merged = merge_theme_name("", "tauqe-light");
         assert!(merged.contains("[theme]"));
         assert!(merged.contains("name = \"tauqe-light\""));
+    }
+    /// The chord pairing is a property of the modifiers themselves, so a saved
+    /// workstation file never maps both command chords onto one physical key
+    /// (Conventions §5.2).
+    #[test]
+    fn test_paired_meta_keeps_the_two_chords_on_separate_keys() {
+        assert_eq!(PrimaryModifier::Ctrl.paired_meta(), MetaModifier::Alt);
+        assert_eq!(PrimaryModifier::Alt.paired_meta(), MetaModifier::Ctrl);
+
+        let saved = merge_workstation_settings(
+            "",
+            LayoutPreset::None,
+            None,
+            PrimaryModifier::Alt,
+            PrimaryModifier::Alt.paired_meta(),
+        );
+        assert!(saved.contains("primary_modifier = \"alt\""));
+        assert!(saved.contains("meta_modifier = \"ctrl\""));
+    }
+
+    /// A save that never reaches its rename publishes nothing and reclaims the
+    /// staged sibling, so a failed workstation write cannot leave an orphan
+    /// file beside `tui.toml`.
+    #[test]
+    fn test_write_atomically_reclaims_the_sibling_when_the_rename_fails() {
+        let dir = std::env::temp_dir().join(format!(
+            "tauqe_cfg_atomic_rename_fail_{}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&dir).expect("create temp dir");
+        let path = dir.join("tui.toml");
+        // An existing directory cannot be replaced by a file, so the rename
+        // fails after the content was already staged.
+        fs::create_dir(&path).expect("occupy the target path with a directory");
+
+        assert!(write_atomically(&path, "[input]\n").is_err());
+
+        let leftovers = fs::read_dir(&dir)
+            .expect("read dir")
+            .filter_map(|entry| entry.ok())
+            .filter(|entry| entry.file_name() != std::ffi::OsStr::new("tui.toml"))
+            .count();
+        assert_eq!(leftovers, 0, "the staged sibling survived a failed save");
+
+        let _ = fs::remove_dir_all(&dir);
     }
 }

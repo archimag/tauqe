@@ -874,10 +874,24 @@ async fn start_preset_review(
     Response::ok(req.id, serde_json::json!({ "operation_id": op_id }))
 }
 pub async fn handle_review_cancel(req: Request, state: &Arc<AppState>) -> Response {
-    let params: ReviewCancelParams = req
-        .params
-        .and_then(|p| serde_json::from_value(p).ok())
-        .unwrap_or_default();
+    // A present-but-malformed payload is refused instead of defaulted: silently
+    // degrading to the default would answer a mistyped soft stop with the most
+    // destructive cancellation, hard-cancelling a review the client asked to
+    // drain. Only an absent payload keeps the default immediate abort that a
+    // client predating two-mode cancellation sends.
+    let params: ReviewCancelParams = match req.params {
+        Some(params) => match serde_json::from_value(params) {
+            Ok(params) => params,
+            Err(err) => {
+                return Response::err(
+                    req.id,
+                    errors::INVALID_PARAMS,
+                    format!("Invalid cancel parameters: {}", err),
+                );
+            }
+        },
+        None => ReviewCancelParams::default(),
+    };
 
     if params.mode == Some(tauqe_protocol::model::CancelMode::Soft) {
         state.soft_stop_active_operation();
@@ -928,6 +942,7 @@ mod tests {
             id,
             title: title.to_string(),
             uuid: None,
+            commit: None,
             group: None,
             model: None,
             issue_type: IssueType::Quality,

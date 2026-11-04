@@ -537,6 +537,7 @@ mod tests {
                 dirty: false,
             }),
             all_repo_files: Vec::new(),
+            all_repo_files_revision: 1,
             workflow: tauqe_protocol::WorkflowKind::Git,
             edit_protocol: tauqe_protocol::EditProtocolKind::Xml,
             active_model: ModelRef::openrouter("anthropic/claude-3-7-sonnet"),
@@ -766,7 +767,7 @@ mod tests {
             );
             assert_eq!(
                 state.hit_regions.action_at(region.rect.x, HEADER_ROW),
-                Some(region.action),
+                Some(region.action.clone()),
                 "a drawn control must resolve to its own action"
             );
         }
@@ -876,13 +877,13 @@ mod tests {
 
             draw_header(&mut terminal, &mut state, &current_engine());
 
-            for (action, label) in expected {
-                let rect = header_region(&state, action)
+            for (action, label) in &expected {
+                let rect = header_region(&state, action.clone())
                     .unwrap_or_else(|| panic!("{label} must be drawn and registered at width {w}"));
                 assert!(rect.right() < w, "{label} exceeds width {w} ({rect:?})");
                 assert_eq!(
                     state.hit_regions.action_at(rect.x, HEADER_ROW),
-                    Some(action),
+                    Some(action.clone()),
                     "{label} must resolve at width {w}"
                 );
             }

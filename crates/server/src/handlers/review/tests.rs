@@ -62,6 +62,7 @@ fn test_item(id: u32, status: IssueStatus, file: &str) -> tauqe_protocol::Review
         id,
         title: format!("Finding {}", id),
         uuid: None,
+        commit: None,
         group: None,
         model: None,
         issue_type: tauqe_protocol::IssueType::Quality,

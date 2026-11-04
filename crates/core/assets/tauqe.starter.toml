@@ -1,0 +1,339 @@
+# =============================================================================
+# TAUQE starter configuration
+# =============================================================================
+#
+# This file is the canonical configuration archetype of TAUQE: a complete,
+# self-documenting manifest that a project copies to `tauqe.toml` (or to
+# `.tauqe.toml`) and edits. It ships inside the binary instead of being read
+# from another repository, so the documentation a new project receives always
+# matches the engine that runs it.
+#
+# The file is organized by progressive disclosure. Only the essentials are
+# uncommented and already valid; every other declaration is written out
+# commented, next to the explanation of what it does. Uncomment a line, keep it,
+# and the project opts into that behavior.
+#
+# Two rules keep the manifest honest:
+#
+#   - Every uncommented declaration is valid for the engine that ships the file:
+#     it parses, it validates, and a test in the engine enforces exactly that
+#     invariant, so the archetype cannot rot as the configuration evolves.
+#   - Every commented declaration documents one option — its accepted values and
+#     the engine default where the option has one — so this file is both the
+#     manual and the manifest, and no setting is left to a wiki.
+#
+# A project may split the document across `tauqe.d/*.toml` modules. The layers
+# merge into the base document in lexical file-name order: tables merge
+# recursively, arrays of tables concatenate, and a key two files both declare as
+# a value is a configuration error naming both of them. The module directory
+# always belongs to the repository root, so a split configuration travels with
+# the project.
+#
+# The provider API key never belongs here, because `tauqe.toml` is versioned. It
+# is read from `.tauqe/credentials.toml`, from
+# `~/.config/tauqe/credentials.toml`, or from the `OPENROUTER_API_KEY`
+# environment variable.
+
+
+# =============================================================================
+# 1. Model roles
+# =============================================================================
+#
+# A functional role is backed by an ordered list of model entries rather than by
+# a single model name, and each role keeps one mandate: `primary` owns the
+# interactive engineering dialogue, `coder` owns concrete code changes,
+# `architect` owns decomposition and plans, `reviewer` audits without editing a
+# byte, and `scribe` compacts history and writes commit messages.
+#
+# An entry names a model by its provider specification (`openrouter:vendor/model`)
+# or by an alias registered in the provider catalog, and adds only the runtime
+# parameters of that slot: an optional `effort` ("low", "medium", "high",
+# "xhigh", "max"), an optional `attempts` budget, and an optional `level_up`
+# marker. A display alias is not a role field: it describes the model itself and
+# is declared once in the catalog, so the same model is never labelled twice.
+
+[models]
+# `primary` is mandatory and must list at least one entry. Its first entry is the
+# idle active model and the deterministic default for every specialized role
+# that omits its own list, so a role never silently loses access to the
+# configured models. Replace the entry below with a model your account can
+# reach.
+primary = ["openrouter:~google/gemini-flash-latest"]
+
+# The single utility model for history compaction, commit message synthesis, and
+# diff summarization. It defaults to the first `primary` entry.
+# scribe = "openrouter:~anthropic/claude-haiku-latest"
+
+# The coder list is the escalation ladder. When verification healing stalls or
+# the retry budget is exhausted, the turn advances one rung at a time and
+# saturates on the last one. Escalation stays strictly inside the Coder role and
+# never switches to Architect, so the *What* and *How* mandates stay separate.
+# coder = [
+#   { model = "openrouter:~deepseek/deepseek-flash-latest", effort = "max" },
+#   { model = "openrouter:~z-ai/glm-latest", effort = "max" },
+#   { model = "openrouter:~google/gemini-flash-latest" },
+# ]
+
+# The architect list is the re-planning ladder: a blocked step escalates one rung
+# at a time through the Architect role, which owns intent rather than source
+# lines.
+# architect = ["openrouter:~z-ai/glm-latest"]
+
+# The reviewer list backs an automated code review of the active context files.
+# reviewer = ["openrouter:~anthropic/claude-sonnet-latest"]
+
+# Whether the harness may climb a ladder automatically. The marker on an entry
+# works the other way around: `level_up = false` keeps that rung manually
+# selectable while excluding it from the automatic climb.
+# auto_level_up = false
+
+
+# =============================================================================
+# 2. Project commands
+# =============================================================================
+#
+# The `[project]` section is the single surface that declares what the harness
+# may run for this repository. Every entry is a plain command line executed as a
+# process with literal arguments — never through a shell — so a declared command
+# cannot widen into arbitrary command execution. An entry may reuse a declared
+# command by writing `@<name>` as its executable; a reference names the command
+# that runs and carries no arguments, description, or parameters of its own.
+#
+# Verification is declarative: a project that declares no `verify` command stays
+# valid and simply runs no verification step. Declare one before the first
+# autonomous turn, because a change set the harness cannot verify is a change set
+# nobody has checked.
+
+[project]
+# Nothing is declared yet. The keys and sub-tables below are the complete surface
+# of the section: uncomment what this project actually runs.
+
+# A declared task runner delegates the project lifecycle to the recipes a
+# manifest exports. With `just`, recipes tagged `[group('tauqe')]` fill the
+# verification gate (`verify`), the in-memory format filter (`format`), and the
+# disk-side hook (`post-hook`), while every other exported recipe becomes a typed
+# custom tool. A declaration written here always wins over the runner, so one
+# stage can be pinned without touching the manifest.
+# runner = "just"
+
+# Verification gate. The command exits 0 on success and reports structured
+# diagnostics on failure, so a failing change set is repaired instead of blindly
+# retried.
+# [project.verify]
+# command = "cargo"
+# args = ["test", "--workspace"]
+# timeout_secs = 900
+
+# In-memory formatter. Staged content arrives on standard input and the rewritten
+# content leaves on standard output, so the change set is formatted while it
+# still lives in virtual staging and no unformatted byte ever reaches disk.
+# [project.format]
+# command = "rustfmt"
+# args = ["--emit", "stdout"]
+# timeout_secs = 120
+
+# Disk-side post-hook. It runs strictly after the change set is written and
+# before verification, so generated sources and refreshed manifests exist when
+# the gate runs. Artifacts it creates are captured through Git and join the same
+# atomic commit.
+# [project.post_hook]
+# command = "cargo"
+# args = ["generate-lockfile"]
+
+# Trust boundaries: repository glob patterns the harness tracks through Git and
+# keeps readable as reference, yet never lets a turn create, rewrite, move, or
+# delete. Protect the manifest that owns verification, the specifications a step
+# is checked against, and the configuration layers that define harness policy. A
+# pattern is never silently empty: a blank entry is rejected, while a
+# root-denoting entry such as `.` protects every path.
+# [project.boundaries]
+# protected = ["Justfile", "docs/specs/**", "tauqe.d/**"]
+
+# Named project commands are published to the model as typed custom tools. A
+# command carries its own description and the named parameters a caller may
+# supply, so the model reads the signature a command actually accepts instead of
+# guessing it. A parameter left out keeps its declared default, and a supplied
+# value is one literal argument that is never split, expanded, or interpreted.
+# [project.commands.lint]
+# command = "cargo"
+# args = ["clippy", "--workspace", "--all-targets", "--", "-D", "warnings"]
+# description = "Lint every workspace target, denying warnings."
+# timeout_secs = 600
+# parameters = [{ name = "package", doc = "Limit the lint to one package." }]
+
+
+# =============================================================================
+# 3. Provider catalog
+# =============================================================================
+#
+# The catalog is the single source of truth for the models this project exposes
+# and for the names they are displayed under. An entry is either a bare model
+# string or a `{ model, alias }` table; `alias` is metadata of the model itself,
+# so the picker, the headers, and the role summaries all resolve a display name
+# from this one declaration, and a project renames a model everywhere by editing
+# a single line.
+#
+# A role may then name a model by its alias instead of restating the provider
+# identifier, because resolution runs only after the whole document has been
+# decoded.
+
+# [providers.openrouter]
+# models = [
+#   { model = "~google/gemini-flash-latest", alias = "Gemini Flash" },
+#   { model = "~anthropic/claude-sonnet-latest", alias = "Claude Sonnet" },
+#   { model = "~z-ai/glm-latest", alias = "GLM" },
+# ]
+
+
+# =============================================================================
+# 4. Turn profile
+# =============================================================================
+#
+# The `[repl]` section is the profile every bounded turn of the project runs
+# under — the interactive dialogue, an isolated plan step, and a discussion
+# alike. It selects the workflow engine, the transport of an edit, the strategy
+# that addresses the replaced lines, and the budgets of a turn.
+
+# [repl]
+# # `git` runs every turn inside a checkpointed transaction that rolls the working
+# # tree back on failure; `naive` writes bytes directly and keeps no checkpoint.
+# workflow = "git"
+# # The format changes only the transport, the token cost, and the prefix caching:
+# # `structured` drives strict JSON-Schema structured output, `xml` drives
+# # marker-protected XML tags, and `mixed` pairs both contours — XML for code
+# # edits, structured output for every discussion and synthesis.
+# protocol = "structured"
+# # `line_anchor` names an inclusive line range through the compact opaque anchors
+# # rendered beside every context line, so the model copies a short token instead
+# # of reproducing the text it replaces; `search_replace` echoes the replaced text
+# # and matches it exactly. The strategy is orthogonal to `protocol`.
+# patch_strategy = "line_anchor"
+# # Prompt layout policy. Absent by default, because the layout then follows the
+# # turn intent: a dialogue contour builds the append-only chronological
+# # transcript, while an isolated step and an architect synthesis keep the
+# # semantic block order. A declared value pins one policy for every turn.
+# # prompt_layout = "chronological"
+# # Retry budget of one turn: failed edit staging and verification healing. It
+# # bounds how often a single attempt may repair its own change set; how many
+# # generation attempts a model tier receives is declared per model entry with
+# # `attempts`.
+# max_retries = 3
+# # Automated replanning cycles a blocked coder step may trigger before the
+# # harness asks the developer to intervene.
+# max_replans = 2
+
+
+# =============================================================================
+# 5. Context and research budgets
+# =============================================================================
+#
+# A bounded turn perceives the repository through a Tree-sitter map, a layered
+# context, and a research engine that widens both on demand. The keys below bound
+# how much the model may pull into the window. Every one of them carries a
+# documented default and none of them is hardcoded in the engine, so a project
+# that routinely needs wider searches or roomier tool output raises a ceiling
+# instead of living with a bound that does not fit.
+
+# [context]
+# max_research_rounds = 5          # autonomous discovery rounds per turn
+# token_budget = 300000            # aggregate budget: repository files and outer docs
+# repomap_token_budget = 4000      # budget of the repository map
+# include_repo_map = true          # render the map eagerly; false keeps it on demand
+# max_search_requests_per_round = 5
+# max_matched_files_per_search = 50
+# max_dir_list_entries = 100
+# max_repo_map_requests_per_round = 3
+# max_feedback_chars = 4000        # characters of one command stream reported back
+# max_scratchpad_chars = 4000      # characters of a scratchpad block kept before truncation
+# # Pinned files enter every turn and are never dropped from the context. They are
+# # the project's own conceptual index and conventions.
+# pinned = ["Conventions.md", "docs/src/SUMMARY.md"]
+
+
+# =============================================================================
+# 6. Git integration
+# =============================================================================
+#
+# Git defines reality: a checkpoint is captured before the first byte touches
+# disk, the change set converges into one isolated commit only after it verifies
+# cleanly, and a failed or cancelled turn restores the working tree to its exact
+# pre-turn state.
+
+# [git]
+# upstream = "origin/master"     # base branch for diffs; auto-detected by default
+# bypass_hooks = true            # pass --no-verify so Tauqe commits skip project hooks
+
+
+# =============================================================================
+# 7. Session history
+# =============================================================================
+#
+# A long dialogue is compacted by the Scribe role instead of being truncated, so
+# the turn keeps its density without an unbounded window.
+
+# [history]
+# budget_tokens = 20000          # compaction threshold of the session history
+# tail_turns = 10                # recent turns kept verbatim after compaction
+
+
+# =============================================================================
+# 8. Review presets
+# =============================================================================
+#
+# A preset decomposes one audit into isolated groups, each carrying its own
+# repository paths and an optional local prompt, and declares when the
+# post-analysis layer is produced: `automatic` classifies the findings once every
+# group has finished, `manual` waits for an explicit analyze request, and `none`
+# keeps them a flat list. A preset name must be unique across the section and
+# every group must name at least one path. An absent section declares no preset,
+# so a single-audit session stays available.
+
+# [[review.presets]]
+# name = "workspace"
+# title = "Workspace audit"
+# post_analysis = "manual"
+#
+# [[review.presets.groups]]
+# name = "engine"
+# paths = ["src"]
+# prompt = "Audit domain invariants, state transitions, and error handling."
+#
+# [[review.presets.groups]]
+# name = "interface"
+# paths = ["tests"]
+# prompt = "Audit the public contract and its behavioural coverage."
+
+
+# =============================================================================
+# 9. External documentation
+# =============================================================================
+#
+# Authoritative material a project reasons against but does not version — an
+# upstream API note, a protocol summary, a published book — is declared once
+# here. Every entry carries a mandatory `id` (its mount point), a mandatory
+# `title`, an optional `description`, and one mandatory `source`: an http(s)
+# address or a local path. The scheme decides the kind while the configuration is
+# resolved, so an unfetchable scheme is a configuration error rather than a
+# source that fails in the middle of a turn.
+#
+# The `id` names the root document. A request for the id answers that root as its
+# original text: the harness parses no index and synthesizes no catalog, so the
+# model follows the relative links the document carries and asks for the parts it
+# needs as `id/relative`. That relative request resolves below the directory
+# holding the root and can never leave it.
+#
+# Documents are materialized lazily into the Git-ignored cache
+# `.tauqe/cache/outer_docs/`. Reaching a remote host or a local source for the
+# first time requires the developer's own trust declaration in
+# `~/.config/tauqe/refs-trust.toml`, which a repository cannot grant itself.
+
+# [[outer_docs]]
+# id = "vendor/api.md"
+# title = "Upstream API notes"
+# description = "Endpoint contracts the implementation step is checked against."
+# source = "https://example.com/llm.txt"
+#
+# [[outer_docs]]
+# id = "handbook"
+# title = "Engineering handbook"
+# source = "/srv/docs/handbook/README.md"

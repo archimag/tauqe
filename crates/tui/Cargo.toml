@@ -24,6 +24,10 @@ pulldown-cmark.workspace = true
 syntect.workspace = true
 similar.workspace = true
 arboard.workspace = true
+# Opening a Markdown link in the browser is delegated to the ecosystem crate
+# (Conventions §1.6); the version and feature set live in the workspace entry
+# so the build graph keeps exactly one resolution (Conventions §12.3).
+open.workspace = true
 unicode-width.workspace = true
 toml.workspace = true
 toml_edit.workspace = true

@@ -713,6 +713,12 @@ pub fn canonical_catalog() -> Vec<LocaleCatalogItem> {
         item("cmd.dialog.activate", "Activate the focused control", "Dialog command description", None),
         item("cmd.dialog.confirm_fast", "Confirm immediately", "Dialog command description", None),
         item("cmd.dialog.cancel_fast", "Cancel immediately", "Dialog command description", None),
+        item(
+            "cmd.dialog.submit_accelerator",
+            "Submit the dialog with the primary modifier and Enter",
+            "Dialog command description for the model-list submit accelerator",
+            None,
+        ),
 
         // ------------------------------------------------------------------
         // Command descriptions for the Context view.
@@ -1162,6 +1168,29 @@ pub fn canonical_catalog() -> Vec<LocaleCatalogItem> {
         item("notify.turn_completed_summary", "Turn completed: {}", "Notification for a completed turn with a summary", None),
         item("notify.turn_completed_hash_summary", "Turn completed ({}): {}", "Notification for a completed turn with a hash and summary", None),
         item("notify.edit_desync", "Edit state desynchronized: server finished without sending edit/finished", "Notification when the edit state desynchronizes", None),
+        // A plan mutation the harness refused or a plan status it had to repair
+        // is a real event of the plan lifecycle: the daemon reports both typed
+        // beside the turn result, so the interface raises one warning whose text
+        // carries the refusal messages and the normalization notes verbatim
+        // (c-4, c-5).
+        item(
+            "notify.plan_mutations_title",
+            "Plan mutations need attention",
+            "Base line of the in-app warning raised when the harness refused a plan mutation or repaired a plan status during the turn",
+            None,
+        ),
+        item(
+            "notify.plan_rejections_detail",
+            " · Refused: {}",
+            "Suffix of the plan-mutation warning listing the refused plan mutations; the placeholder receives the refusal messages reported by the harness",
+            None,
+        ),
+        item(
+            "notify.plan_warnings_detail",
+            " · Normalized: {}",
+            "Suffix of the plan-mutation warning listing the plan status repairs the harness performed; the placeholder receives the recorded normalization notes",
+            None,
+        ),
         item("notify.turn_failed_no_payload", "Turn failed without a diagnostic message from the server", "Turn error recorded when a model/error event arrives without a usable payload", None),
         item("notify.cancelled_before_edits", "Operation cancelled before edits were applied", "Notification when a turn is cancelled before applying edits", None),
         item("notify.failed_before_edits", "Operation failed before edits were applied", "Notification when a turn fails before applying edits", None),
@@ -1452,6 +1481,18 @@ pub fn canonical_catalog() -> Vec<LocaleCatalogItem> {
         item("cmd.diff_inspector.page_up", "Scroll the audited diff up one page", "Diff inspector command description", None),
         item("cmd.diff_inspector.page_down", "Scroll the audited diff down one page", "Diff inspector command description", None),
         item("notify.diff_inspector_empty", "No staged changes to inspect", "Notification when the diff inspector is requested with an empty change set", None),
+
+        // ------------------------------------------------------------------
+        // Markdown hyperlink launcher (c-2, c-4, c-5): a click on a link
+        // resolves through the frame registry to the address the renderer
+        // painted, and the dispatcher reports every outcome of the open-or-copy
+        // decision through these entries, so a switched locale reaches them.
+        // ------------------------------------------------------------------
+        item("notify.link_opened", "Opened {} in the browser", "Notification naming the address a Markdown hyperlink click handed to the developer's browser; {} receives the address", None),
+        item("notify.link_copied_ssh", "Copied {} to the clipboard: this session runs over SSH, so a browser would open on the remote host", "Notification naming the address a hyperlink click copied instead of opening because the session runs over SSH; {} receives the address", None),
+        item("notify.link_copied_no_browser", "Copied {} to the clipboard: no browser could be launched", "Notification naming the address a hyperlink click copied instead of opening because no browser could be launched on this host; {} receives the address", None),
+        item("notify.link_open_failed", "Failed to open {}: no browser could be launched and the clipboard is unreachable", "Notification naming the address a hyperlink click could neither open in a browser nor copy to the clipboard; {} receives the address", None),
+        item("notify.unsafe_link_rejected", "Only http and https links can be opened: {}", "Notification naming a refused hyperlink whose scheme is not a web scheme, so it never reaches an external process; {} receives the address", None),
         // ------------------------------------------------------------------
         // RPC response and system notifications: configuration diagnostics,
         // pre-flight verification, context mutations, locale switching,
@@ -2120,6 +2161,57 @@ mod tests {
         }
     }
 
+    /// A Markdown hyperlink reports every outcome through the catalog: the
+    /// pointer dispatcher owns no user-facing literal, and this audit fails if
+    /// one comes back (c-5, Conventions §9).
+    #[test]
+    fn test_link_notifications_resolve_through_the_catalog() {
+        let catalog = canonical_catalog();
+        for key in [
+            "notify.link_opened",
+            "notify.link_copied_ssh",
+            "notify.link_copied_no_browser",
+            "notify.link_open_failed",
+            "notify.unsafe_link_rejected",
+        ] {
+            assert!(
+                catalog.iter().any(|entry| entry.key == key),
+                "the catalog must declare the link outcome {key}"
+            );
+        }
+
+        // The plan settled the two names below, so a stale key would leave the
+        // dispatcher reporting a message no locale can translate.
+        for removed in ["notify.link_copy_failed", "notify.link_scheme_blocked"] {
+            assert!(
+                !catalog.iter().any(|entry| entry.key == removed),
+                "the superseded link key must not survive: {removed}"
+            );
+        }
+
+        let production = include_str!("../input/mouse.rs")
+            .split("#[cfg(test)]")
+            .next()
+            .unwrap_or_default();
+        for fragment in [
+            "Opened {} in the browser",
+            "this session runs over SSH, so a browser would open",
+            "Copied {} to the clipboard",
+            "the clipboard is unreachable",
+            "Only http and https links can be opened",
+        ] {
+            assert!(
+                !production.contains(fragment),
+                "the pointer dispatcher hardcodes the catalog phrase {fragment:?}"
+            );
+        }
+        for key in ["notify.unsafe_link_rejected", "notify.link_open_failed"] {
+            assert!(
+                production.contains(key),
+                "the pointer dispatcher must resolve {key} through the catalog"
+            );
+        }
+    }
     /// The compact Viewport delegates patch reading to the inspector, so the
     /// catalog must not resurrect the keys of the removed inline fold surface
     /// or of the sticky reading-position overlay (c-4).
@@ -2134,6 +2226,23 @@ mod tests {
             assert!(
                 !catalog.iter().any(|item| item.key == removed),
                 "the removed surface must not come back: {removed}"
+            );
+        }
+    }
+    /// The plan-mutation warning is a catalog surface of its own: a key that
+    /// only existed inside the renderer would leave a switched locale unable to
+    /// render the refusal it reports (Conventions §9).
+    #[test]
+    fn test_plan_mutation_warning_surfaces_are_declared() {
+        let catalog = canonical_catalog();
+        for key in [
+            "notify.plan_mutations_title",
+            "notify.plan_rejections_detail",
+            "notify.plan_warnings_detail",
+        ] {
+            assert!(
+                catalog.iter().any(|entry| entry.key == key),
+                "the plan-mutation warning must be declared: {key}"
             );
         }
     }

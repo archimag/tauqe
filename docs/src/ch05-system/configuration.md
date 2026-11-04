@@ -15,12 +15,14 @@ Two further files complete the picture without belonging to either audience: the
 personal workstation file (`tui.toml`) and the credentials file. Neither is ever read
 from the repository, so a theme or an API key can never reach a commit.
 
-Two rules govern the whole chapter. Project behavior is declared in `tauqe.toml`, and
-the shipped file is the living reference: every section is documented inline with its
-default, so the file itself answers "what can I configure here?". And configuration is
-never guessed: when a question concerns a parameter, a budget, or a project
-convention, the answer comes from this chapter rather than from a recollection of
-source code.
+Two rules govern the whole chapter. Project behavior is declared in `tauqe.toml`,
+while the canonical catalogue of what may be declared is the archetype shipped
+inside the binary (`crates/core/assets/tauqe.starter.toml`): every section is
+documented there inline with its default, so that manifest answers "what can I
+configure here?" while a repository's own `tauqe.toml` answers "what does this
+repository actually declare?". And configuration is never guessed: when a
+question concerns a parameter, a budget, or a project convention, the answer
+comes from this chapter rather than from a recollection of source code.
 
 ---
 
@@ -82,12 +84,15 @@ it runs a declared command line and reads its exit status.
    before any byte is written.
 7. **No operational limit is hardcoded.** Rounds, retries, replans, bytes, tokens, and
    command timeouts are configuration with modern defaults.
-8. **Every new parameter is documented in the shipped template**, in commented form
-   with its default, in the same change that introduces it.
+8. **Every new parameter is documented in the shipped archetype**, in commented
+   form with its default, in the same change that introduces it.
 9. **Configuration is read, never inferred.** A guessed default is indistinguishable
    from a fabricated one.
 10. **A project file the harness could not load is never committed.** Any rewrite of
     `tauqe.toml` is validated in memory before it reaches the working tree.
+11. **The shipped archetype is proven by a test.** Its uncommented declarations parse
+    and validate as a configuration in the suite, so the manifest a new project
+    copies cannot rot as the engine evolves.
 
 ---
 
@@ -98,8 +103,12 @@ it runs a declared command line and reads its exit status.
 - **Tier** — one audience of configuration: harness policy or project commands.
 - **Candidate list** — the ordered paths a file is looked up in.
 - **Template** — the `tauqe.toml` shipped with the binary and written by the
-  onboarding create action; it is also the living reference.
-- **Role** — a semantic responsibility (`primary`, `scribe`, `coder`, `architect`,
+- **Archetype (the shipped template)** — `crates/core/assets/tauqe.starter.toml`,
+  the canonical manifest shipped inside the binary and written as `tauqe.toml` by
+  the onboarding create action; it is also the living reference.
+- **Operational configuration** — the root `tauqe.toml` of a repository: the
+  declarations that repository actually runs, as opposed to every option the
+  engine accepts.
   `reviewer`) resolved to a concrete model by the server.
 - **Entry** — one model reference with an optional reasoning `effort` and an optional `level_up` marker; a role slot
   never carries a display alias.
@@ -133,7 +142,7 @@ it runs a declared command line and reads its exit status.
 | `[repl]` | edit retries, verification healing budget, replan budget, per-tier coder and architect attempt budgets, workflow mode, edit protocol, patch strategy, prompt layout |
 | `[history]` | token budget and uncompressed tail length |
 | `[context]` | research rounds, the aggregate token budget, the outline budget, report caps, pinned patterns |
-
+| `[[review.presets]]` | named review presets, audited path slices, and post-analysis timing |
 The `[repl]` section also selects the wire format of the model exchange through
 its `protocol` key. The value is `structured` (the default), `xml`, or `mixed`; the
 legacy alias `auto` still parses and resolves to `mixed`. The format never changes
@@ -188,6 +197,41 @@ a committed secret (section 3.8, *Why credentials are never a project setting*).
 key is supplied by the credentials file, by the environment variable, or by
 onboarding.
 
+Review presets decompose one audit into isolated, sequential groups and declare when
+the post-analysis classification wave runs. A preset is declared as an array of tables
+`[[review.presets]]`:
+
+| Key | Type | Description | Default |
+| --- | --- | --- | --- |
+| `name` | string | Unique identifier of the preset (required) | — |
+| `title` | string | Human-readable title rendered in dialogs | `name` |
+| `post_analysis` | enum | When the Architect produces classification: `"automatic"`, `"manual"`, `"none"` | `"none"` |
+| `groups` | array of tables | Ordered list of audit slices (`[[review.presets.groups]]`) | (at least one required) |
+
+Each group inside `[[review.presets.groups]]` defines one isolated inspection slice:
+
+| Group Key | Type | Description | Default |
+| --- | --- | --- | --- |
+| `name` | string | Name of the group, rendered as the group title in the review tree | — |
+| `paths` | array of strings | Repository-relative paths audited by this group (at least one required) | — |
+| `prompt` | string | Focused instructions applied exclusively to this group | optional |
+
+```toml
+[[review.presets]]
+name = "backend"
+title = "Backend Services Audit"
+post_analysis = "manual"
+
+[[review.presets.groups]]
+name = "api"
+paths = ["src/api", "src/routes"]
+prompt = "Audit HTTP endpoint handlers, request validation, and status code consistency."
+
+[[review.presets.groups]]
+name = "storage"
+paths = ["src/db", "migrations"]
+prompt = "Audit connection pooling, query efficiency, transaction boundaries, and schema migrations."
+```
 ### 2.3 The `[project]` declaration
 
 | Section | Declares | Required | Moment |
@@ -269,6 +313,35 @@ work. Volume is measured in tokens only: no parameter bounds how many files a
 request may admit, and each file is priced as its content plus the wrapper its
 `<file>` element renders, so the budget compares what the prompt actually carries.
 
+### 2.6 The archetype and the operational configuration
+
+Two configuration documents exist, and confusing them is the failure this section
+prevents.
+
+The **archetype** is `crates/core/assets/tauqe.starter.toml`. It ships inside
+the binary through `include_str!` and is installed as `tauqe.toml` by
+`write_default_config`, so the manifest a new project receives always matches
+the engine that writes it. It is written by progressive disclosure: the
+essentials a project must edit are uncommented and already valid, while every
+other section and parameter appears commented with its default and a concise
+explanation. The archetype is therefore the catalogue — the file that answers
+"what can I configure here?".
+
+The **operational configuration** is the root `tauqe.toml` of a repository. It
+declares how that repository actually runs: its model roles, project commands,
+budgets, and pinned context. This repository's own file is exactly that — the
+working configuration of the development process — so it is not required to
+enumerate, in commented form, every option the engine accepts. A repository that
+declares only what it uses stays readable; one that mirrors the whole catalogue
+duplicates it and drifts from it.
+
+The archetype cannot rot silently. Every uncommented declaration it carries is
+parsed and validated as a configuration by an automated test in `crates/core`, so
+a parameter that changes shape breaks that test instead of breaking the first
+project that copies the file. An option that exists in the engine and is absent
+from the archetype is undocumented, and an undocumented option is
+indistinguishable from one that does not exist.
+
 ---
 
 ## 3. Mechanics & Lifecycle ("How it behaves")
@@ -284,9 +357,10 @@ A discovered or explicit file that exists but cannot be read, parsed, or validat
 recorded as a diagnostic instead of aborting, so the interface can warn that the
 project declaration was ignored rather than silently switching models and budgets.
 
-First-run onboarding writes the living template and advances through a fixed order —
-Git, configuration, credentials, workstation, command modifier, ready — derived solely
-from completion flags. An optional phase the developer deliberately skips is recorded,
+First-run onboarding installs the shipped archetype (section 2.6) as `tauqe.toml`
+and advances through a fixed order — Git, configuration, credentials, workstation,
+command modifier, ready — derived solely from completion flags. An optional phase
+the developer deliberately skips is recorded,
 so the flow never loops back and no step is silently dropped. While onboarding is
 open, view switching and header navigation are locked, so setup cannot be bypassed by
 accident.
@@ -547,6 +621,10 @@ Localization* owns the interface language.
 - **It is not two project files.** A separate engineering manifest would reintroduce
   two owners, two review cadences, and a second place to look for the command a turn
   just ran.
+- **It is not the catalogue of every option.** The root `tauqe.toml` is the
+  operational manifest of this repository; the complete catalogue, documented
+  option by option, is the shipped archetype in
+  `crates/core/assets/tauqe.starter.toml`.
 - **It is not an environment-variable soup.** One secret has an environment override
   for convenience; budgets, roles, and project commands are declared.
 - **It is not a secret store.** A provider key in the project file is ignored, and the

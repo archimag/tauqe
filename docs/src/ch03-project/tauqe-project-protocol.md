@@ -74,8 +74,9 @@ follow:
    an undeclared target, or a reference cycle invalidates the declaration before a
    process is spawned.
 9. **The change set is harness-owned.** The turn's authoritative changed paths reach
-   the verification command on its standard input, one path per line. The command
-   never derives that list from Git itself.
+   the post-hook and the verification command on their standard input, one path per
+   line, under one delivery rule: an empty list sends no input at all. Neither
+   command derives that list from Git itself.
 10. **Selection narrows work, never the gate.** A dispatcher may route the change set
     to fewer checks, but an empty list, a terminal on standard input, or a path no
     rule recognizes selects the complete suite.
@@ -103,8 +104,8 @@ follow:
 - **Change set** — the turn's authoritative changed paths: the model's edits, the
   post-hook artifacts, the files a repair round touched, and the working-copy
   differential of the transaction.
-- **Change-set delivery** — the change set written to the verification command's
-  standard input, one repository-relative path per line.
+- **Change-set delivery** — the change set written to the post-hook's and the
+  verification command's standard input, one repository-relative path per line.
 - **Named command** — an entry of the allowlist the model may address as a typed
   tool.
 - **Task runner** — an external tool that exports the project's commands from its
@@ -154,7 +155,7 @@ it; *Protected Paths and Trust Boundaries* specifies that rejection.
 | Phase | Invocation shape | Moment | Failure contract |
 | --- | --- | --- | --- |
 | **Format** | staged text on stdin, rewritten text on stdout | before any byte reaches disk | the authored content is kept |
-| **Post-hook** | a plain process on the working copy | after the write, before verification | the change set is aborted |
+| **Post-hook** | a plain process with the change set on stdin | after the write, before verification | the change set is aborted |
 | **Verify** | a plain process with a declared timeout, the change set on stdin | after every phase above | typed diagnostics feed the healing loop |
 
 The order is not negotiable: a formatter that ran after the write would create
@@ -271,6 +272,10 @@ empty list, a terminal on standard input, or an unrecognized path falls back to 
 complete suite. A child process that never reads its standard input is harmless:
 the broken pipe is reported as a diagnostic, never as a failed turn.
 
+The declared post-hook receives the same delivery under the same rule. Its list is
+the change set that just reached disk, so a generator rebuilds only the paths the
+write produced, and the artifacts it creates join the change set afterwards.
+
 The wall-clock budget comes from the entry's `timeout_secs` and falls back to the
 harness default of 600 seconds. A real test suite routinely exceeds a minute,
 which is why the default is generous.
@@ -343,8 +348,10 @@ to rewrite, because keeping the authored text is safer than erasing code.
 
 The declared post-hook runs on the working copy strictly after the change set is
 written and before verification. It receives no file list — the standard-input
-delivery belongs to verification alone — so the declaration names its own literal
-arguments and the harness captures whatever the hook produced through Git.
+written and before verification. The hook receives the change set that just
+reached disk on its standard input, one repository-relative path per line, under
+the same delivery rule as verification, so the declaration still names its own
+literal
 
 The working copy is snapshotted immediately before the hook starts and once more
 after it exits successfully, so the difference is exactly the set of files the hook
@@ -363,8 +370,8 @@ compose, chain, extend, or redirect a command line, and it adds no arguments of 
 own, because the declaration already names them.
 
 A named command receives no change set either: standard input carries a file list
-only for the verification lifecycle, so one delivery channel exists instead of a
-second one the model could address.
+only for the verification lifecycle and the declared post-hook, so one delivery
+channel exists instead of a second one the model could address.
 
 The invocation is answered with the real result: its exit status and the head of its
 output join the turn journal, so the next round reasons about what the command

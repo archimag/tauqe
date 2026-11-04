@@ -86,6 +86,18 @@ The interaction protocol between Tauqe and large language models is strictly div
    - The status of an entire plan or review session is strictly a computed property derived deterministically from the statuses of its constituent items (`compute_items_status`), never stored as an independent mutable field on disk. This prevents state desynchronization and ensures strict adherence to the underlying task hierarchy.
    - Progress counting obeys the same single-source rule. A `resolved / total` metric counts only actionable items: terminal, non-actionable outcomes are excluded from the denominator so an entity whose remaining work is finished reports `resolved == total` rather than a fraction that can never reach one. `Plan::count_stats` drops `Cancelled` leaves; `ReviewSession::stats` drops `Skipped` and `Rejected` findings.
 
+5. **Plan Steps Journal Two-Sided, Budget-Bounded Cards:**
+   - An isolated plan step records a card on both sides of its turn: the structured execution
+     prompt that opened it, and a compact result that closed it — the status of the step, the
+     commit it produced, the files it changed, and the first reported line of the reason or
+     summary. The full reply of the model is never recorded for a step.
+   - Because a batch executes many steps, a step turn passes through the same budgeted
+     compaction as a dialogue (`compact_history_if_needed_with_budget`), so the journal is
+     bounded by the configured token budget instead of the length of the batch.
+   - `TurnIntent::suppresses_session_history` governs rendering only: it keeps the `<history>`
+     block out of the prompt a step assembles, and it never suppresses the record the step
+     writes to the journal.
+
 ---
 
 ## 4. Determinism & Toolchain Guardrails
@@ -236,9 +248,9 @@ The interaction protocol between Tauqe and large language models is strictly div
      files by insertion order or by insertion watermark, symbols and directories
      in their generated order), so identical state produces identical bytes.
 6. **Append-Only Growth:**
-   - Discovery widens the context by appending newly discovered files. Under
    - Research widens the context by appending newly discovered files. Under
-     tail; under `ChronologicalLayout` it is appended after the records already in
+     `SemanticLayout` it is appended at the tail; under `ChronologicalLayout` it
+     is appended after the records already in
      the transcript. Previously rendered elements keep their exact bytes.
    - Promoting a file from read-only to editable rewrites only that file's own
      `access` attribute in place; it never relocates the element or reflows its
@@ -281,13 +293,14 @@ The interaction protocol between Tauqe and large language models is strictly div
      cache warmed by its predecessor.
    - Session invalidation and rotation occur at exactly two deterministic
      boundaries:
-     1. When shrinking or clearing the context block (clearing the Auto layer
-        via `AppState::clear_auto_context` or resetting context via
-        `AppState::clear_all_context`). A fresh session opens a prefix no earlier
-        request warmed; keeping the old identifier would address a node whose
-        cached prefix the dialogue no longer sends. The rotation follows the
-        boolean reported by `ContextManager::clear_auto` or `clear`, so a
-        no-op clear preserves the warm session.
+     1. When shrinking or clearing the context block: the post-turn release of
+        the transient context (`AppState::clear_transient_context`, backed by
+        `ContextManager::clear_transient`), an explicit clear of the Auto or the
+        OuterDocs layer, or a full reset through `AppState::clear_all_context`.
+        A fresh session opens a prefix no earlier request warmed; keeping the
+        old identifier would address a node whose cached prefix the dialogue no
+        longer sends. The rotation follows the boolean the underlying clear
+        reports, so a no-op clear preserves the warm session.
      2. When the effective model changes (`maybe_rotate_session_on_model_change`).
         Provider KV caches and routing affinities are physically model-specific.
         Reusing a session identifier across different models produces guaranteed
@@ -364,3 +377,67 @@ The interaction protocol between Tauqe and large language models is strictly div
      declared once in `crates/tools/Conventions.md`.
    - A core rule describes only the engine-side consequence of a substrate
      decision, so the two documents can never disagree about the same invariant.
+
+---
+
+## 12. Transient Context Lifecycle
+
+1. **One transient context, two layers:**
+   - The Auto layer and the OuterDocs layer form one transient context. The files
+     a research round discovered and the documents the external documentation
+     registry materialized are provided for the same reason — so the model can
+     decide — and they are released for the same reason once that decision is
+     durable.
+   - No rule of this document treats one of them as persistent while the other
+     is transient. A claim that a snapshot survives the task, or that only a
+     full context reset drops it, contradicts this section.
+2. **One release primitive:**
+   - `ContextManager::clear_transient` drops both layers, recomputes the
+     hierarchical pinned entries, advances the context revision, and reports
+     whether anything was removed. It is the only primitive an automatic
+     boundary calls.
+   - `clear_auto` and `clear_outer_docs` remain available to an explicit
+     per-layer developer action and to tests, and neither of them releases the
+     transient context on a turn boundary: releasing one layer while keeping the
+     other would leave resident material the turn already paid for.
+3. **Released on commit, kept until then:**
+   - `TransactionRollbackGuard::finalize` releases the transient context on the
+     commit path, after the change set is applied and verified, so the material
+     that served one decision never inflates the next one.
+   - A rolled-back, blocked, or cancelled turn only prunes context paths that no
+     longer exist on disk, so the research a retry still needs survives the
+     failed attempt.
+   - Inside the REPL the transient context grows across the rounds and replies of
+     one task until the model edits code: the boundary is the committed change
+     set, never the round.
+4. **Isolated boundaries:**
+   - A plan step, a review finding run, and an Architect wave start from a clean
+     transient context through
+     `crate::handlers::common::cleanup_transient_context` and release it when the
+     step ends, so no discovered file or external document of a previous step
+     leaks into the next one.
+   - The declared target files and the declared `outer_docs` entries of a step
+     reach the context after that sweep, so the isolation holds without
+     weakening the preload contract.
+5. **Session affinity follows the release:**
+   - A release that actually removed material shrinks the stable prompt prefix,
+     so the dialogue session identifier rotates with it: the `AppState` clearing
+     facade reports the boolean that rotation reads. A release that removed
+     nothing leaves both the prefix and the session warm.
+6. **The cache outlives the entry:**
+   - Releasing the context never deletes a materialized snapshot. The cache under
+     `.tauqe/cache/outer_docs/` stays immutable, and a later request re-admits the
+     same bytes without a transfer, so the durable cache and the transient entry
+     never merge into one lifetime.
+7. **Rationale (Why):**
+   - Discovery material is bought for one decision. Leaving it resident after that
+     decision is durable pays for it on every later request of a prompt prefix
+     that no longer needs it, and it lets a finished step's documents silently
+     shape the next step's reasoning.
+   - Releasing only the repository half of that material would make the two layers
+     disagree about one lifetime, which is why the release is defined once, over
+     the transient context as a whole.
+
+The concept chapter `docs/src/ch02-perception/reference-registry.md` owns the declaration,
+the cache, and the trust boundary; this section states only the engine-side consequence of
+the lifecycle those mechanisms share.

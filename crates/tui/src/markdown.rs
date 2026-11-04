@@ -229,6 +229,17 @@ impl MarkdownTheme {
     pub fn reasoning() -> Self {
         Self::reasoning_themed(crate::config::ThemeMode::Auto)
     }
+    /// Constrains the table column budget of a rendered body to `width`.
+    ///
+    /// A body renders with its `line_prefix` already in place, so a table laid
+    /// out against the full viewport width overflows by the prefix width, and
+    /// the wrap pass that follows splits its box-drawing borders mid-row.
+    /// Subtracting the prefix here keeps every table row inside the viewport
+    /// (crates/tui/Conventions.md §4.8).
+    pub fn constrain_table_width(&mut self, width: usize) {
+        let prefix_width = self.line_prefix.as_ref().map_or(0, |prefix| prefix.width());
+        self.max_width = Some(width.saturating_sub(prefix_width));
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -271,6 +282,39 @@ pub struct ExtractedCodeBlock {
     pub content: String,
     pub start_line: usize,
     pub end_line: usize,
+}
+
+/// A hyperlink the renderer located in the finished body.
+///
+/// One entry describes one painted line of the link: `start_col..end_col` is a
+/// half-open column range measured in display columns from the start of the
+/// line the renderer built, so a label that wraps over a break yields one entry
+/// per line it covers. The range also covers the destination the renderer
+/// appends after the label, so a click on the shown address resolves to the
+/// same target as a click on the label.
+///
+/// A list bullet, a quote bar, and the list indent are already part of the
+/// reported column. The leading prefix a tree body prepends through the theme's
+/// `line_prefix` is not: an entry names the position inside the body text, and
+/// a surface that shifts the body adds that shift itself.
+///
+/// The regions feed the interactive link registry, which turns them into
+/// clickable rectangles.
+// The regions are exercised by the extraction tests below; the allowance keeps
+// the crate's zero-warning gate green until the link registry reads them.
+#[allow(dead_code)]
+#[derive(Debug, Clone)]
+pub struct ExtractedLink {
+    /// Position of the region inside the body, counting from zero.
+    pub id: usize,
+    /// Destination the region resolves to, exactly as the source wrote it.
+    pub url: String,
+    /// Rendered line that carries the region.
+    pub line_idx: usize,
+    /// First display column of the region on its line.
+    pub start_col: usize,
+    /// Display column just past the region on its line.
+    pub end_col: usize,
 }
 
 struct TableCellData {
@@ -360,6 +404,56 @@ fn ensure_line_prefix(
     }
 }
 
+/// Display width of the spans painted so far on the current line.
+fn painted_width(current_spans: &[Span<'static>]) -> usize {
+    current_spans.iter().map(|span| span.width()).sum()
+}
+
+/// Opens the region of the link being painted, unless it is already open.
+///
+/// The column is read after the quote bar or the list bullet was placed, so it
+/// names the position the label is painted at rather than a position the body
+/// would occupy without them (c-1). A break inside the label closes the current
+/// region, and the next painted span opens a fresh one on the following line.
+fn open_link_region(
+    region: &mut Option<(usize, usize)>,
+    current_spans: &[Span<'static>],
+    out_lines: &[Line<'static>],
+) {
+    if region.is_none() {
+        *region = Some((out_lines.len(), painted_width(current_spans)));
+    }
+}
+
+/// Closes the open link region at the current painting position.
+///
+/// A region that reaches no painted column is dropped, so an empty label the
+/// renderer never drew cannot become a zero-width click target.
+fn close_link_region(
+    region: &mut Option<(usize, usize)>,
+    url: Option<&str>,
+    current_spans: &[Span<'static>],
+    extracted: &mut Vec<ExtractedLink>,
+) {
+    let Some((line_idx, start_col)) = region.take() else {
+        return;
+    };
+    let Some(url) = url else {
+        return;
+    };
+    let end_col = painted_width(current_spans);
+    if end_col <= start_col {
+        return;
+    }
+    extracted.push(ExtractedLink {
+        id: extracted.len(),
+        url: url.to_string(),
+        line_idx,
+        start_col,
+        end_col,
+    });
+}
+
 pub fn render_markdown(text: &str, theme: &MarkdownTheme) -> Vec<Line<'static>> {
     render_markdown_with_blocks(text, theme, None).0
 }
@@ -368,9 +462,13 @@ pub fn render_markdown_with_blocks(
     text: &str,
     theme: &MarkdownTheme,
     flashing_block_id: Option<usize>,
-) -> (Vec<Line<'static>>, Vec<ExtractedCodeBlock>) {
+) -> (
+    Vec<Line<'static>>,
+    Vec<ExtractedCodeBlock>,
+    Vec<ExtractedLink>,
+) {
     if text.is_empty() {
-        return (Vec::new(), Vec::new());
+        return (Vec::new(), Vec::new(), Vec::new());
     }
 
     let mut options = Options::empty();
@@ -383,6 +481,7 @@ pub fn render_markdown_with_blocks(
 
     let mut out_lines: Vec<Line<'static>> = Vec::new();
     let mut extracted_blocks = Vec::new();
+    let mut extracted_links: Vec<ExtractedLink> = Vec::new();
     let mut block_counter = 0;
     let mut style_mod = StyleModifier::default();
     let mut link_url: Option<String> = None;
@@ -393,6 +492,8 @@ pub fn render_markdown_with_blocks(
     let mut code_block: Option<CodeBlockState> = None;
     let mut table_state: Option<TableState> = None;
     let mut current_spans: Vec<Span<'static>> = Vec::new();
+    // Region of the link being painted, opened by the first span of its label.
+    let mut link_region: Option<(usize, usize)> = None;
 
     for event in parser {
         match event {
@@ -413,9 +514,24 @@ pub fn render_markdown_with_blocks(
                     HeadingLevel::H5 => ("##### ", theme.h5),
                     HeadingLevel::H6 => ("###### ", theme.h6),
                 };
-                let mut heading_spans = vec![Span::styled(prefix, h_style)];
+                let prefix_width = prefix.width();
+                let mut heading_spans = Vec::with_capacity(current_spans.len() + 1);
+                heading_spans.push(Span::styled(prefix, h_style));
                 for span in current_spans.drain(..) {
                     heading_spans.push(Span::styled(span.content, h_style));
+                }
+                // A region opened while the heading body accumulated was measured
+                // before the marker the finished line carries existed, so its
+                // columns sit `prefix_width` before the link the reader points at.
+                // Shifting the regions of this line keeps the clickable row on the
+                // painted text (c-1, c-3).
+                let heading_line = out_lines.len();
+                for link in extracted_links
+                    .iter_mut()
+                    .filter(|link| link.line_idx == heading_line)
+                {
+                    link.start_col += prefix_width;
+                    link.end_col += prefix_width;
                 }
                 push_styled_line(theme, &mut out_lines, heading_spans);
                 if !theme.compact {
@@ -573,6 +689,7 @@ pub fn render_markdown_with_blocks(
             }
             Event::Start(Tag::Link { ref dest_url, .. }) => {
                 link_url = Some(dest_url.to_string());
+                link_region = None;
             }
             Event::End(TagEnd::Link) => {
                 if let Some(url) = link_url.take() {
@@ -581,7 +698,21 @@ pub fn render_markdown_with_blocks(
                         ts.current_cell_len += span.width();
                         ts.current_cell_spans.push(span);
                     } else {
+                        ensure_line_prefix(
+                            theme,
+                            &mut current_spans,
+                            quote_depth,
+                            &mut list_stack,
+                            &mut item_started,
+                        );
+                        open_link_region(&mut link_region, &current_spans, &out_lines);
                         current_spans.push(span);
+                        close_link_region(
+                            &mut link_region,
+                            Some(url.as_str()),
+                            &current_spans,
+                            &mut extracted_links,
+                        );
                     }
                 }
             }
@@ -598,6 +729,9 @@ pub fn render_markdown_with_blocks(
                         &mut list_stack,
                         &mut item_started,
                     );
+                    if link_url.is_some() {
+                        open_link_region(&mut link_region, &current_spans, &out_lines);
+                    }
                     current_spans.push(code_span);
                 }
             }
@@ -627,6 +761,9 @@ pub fn render_markdown_with_blocks(
                             &mut list_stack,
                             &mut item_started,
                         );
+                        if link_url.is_some() {
+                            open_link_region(&mut link_region, &current_spans, &out_lines);
+                        }
                         current_spans.extend(spans);
                     }
                 }
@@ -661,6 +798,12 @@ pub fn render_markdown_with_blocks(
             Event::SoftBreak => {
                 if code_block.is_none() && table_state.is_none() {
                     if theme.hard_breaks {
+                        close_link_region(
+                            &mut link_region,
+                            link_url.as_deref(),
+                            &current_spans,
+                            &mut extracted_links,
+                        );
                         flush_line(theme, &mut current_spans, &mut out_lines);
                     } else {
                         current_spans.push(Span::raw(" "));
@@ -669,6 +812,12 @@ pub fn render_markdown_with_blocks(
             }
             Event::HardBreak => {
                 if code_block.is_none() && table_state.is_none() {
+                    close_link_region(
+                        &mut link_region,
+                        link_url.as_deref(),
+                        &current_spans,
+                        &mut extracted_links,
+                    );
                     flush_line(theme, &mut current_spans, &mut out_lines);
                 }
             }
@@ -704,6 +853,12 @@ pub fn render_markdown_with_blocks(
     if let Some(ts) = table_state {
         render_table(theme, ts, &mut out_lines, true);
     }
+    close_link_region(
+        &mut link_region,
+        link_url.as_deref(),
+        &current_spans,
+        &mut extracted_links,
+    );
     flush_line(theme, &mut current_spans, &mut out_lines);
 
     while let Some(last) = out_lines.last() {
@@ -722,7 +877,7 @@ pub fn render_markdown_with_blocks(
         }
     }
 
-    (out_lines, extracted_blocks)
+    (out_lines, extracted_blocks, extracted_links)
 }
 
 #[cfg(test)]
@@ -802,5 +957,140 @@ mod tests {
         // its scalar count, so hit-testing follows what is actually painted.
         let (start, _) = copy_button_span("日本語");
         assert_eq!(start, 2 + 6 + 1);
+    }
+
+    #[test]
+    fn a_link_reports_its_line_columns_and_target() {
+        let theme = MarkdownTheme::answer();
+        let (_, _, links) =
+            render_markdown_with_blocks("See [docs](https://example.com) now.", &theme, None);
+
+        assert_eq!(links.len(), 1, "the paragraph carries exactly one link");
+        let link = &links[0];
+        assert_eq!(link.id, 0);
+        assert_eq!(link.url, "https://example.com");
+        assert_eq!(link.line_idx, 0);
+        assert_eq!(link.start_col, "See ".len());
+        assert_eq!(
+            link.end_col,
+            "See docs (https://example.com)".len(),
+            "the shown target belongs to the clickable region"
+        );
+    }
+
+    #[test]
+    fn a_label_that_wraps_over_a_break_opens_a_region_on_each_line() {
+        let mut theme = MarkdownTheme::answer();
+        theme.hard_breaks = true;
+        let (_, _, links) =
+            render_markdown_with_blocks("[first\nsecond](https://example.com)", &theme, None);
+
+        assert_eq!(links.len(), 2, "one region per painted line");
+        assert_eq!(links[0].line_idx, 0);
+        assert_eq!(links[0].start_col, 0);
+        assert_eq!(links[0].end_col, "first".len());
+        assert_eq!(links[1].line_idx, 1);
+        assert_eq!(links[1].start_col, 0);
+        assert_eq!(links[1].end_col, "second (https://example.com)".len());
+        assert_eq!(links[0].url, links[1].url);
+        assert_eq!(links[1].id, 1);
+    }
+
+    #[test]
+    fn a_list_bullet_is_part_of_the_reported_column() {
+        let theme = MarkdownTheme::answer();
+        let (_, _, links) =
+            render_markdown_with_blocks("- [docs](https://example.com)", &theme, None);
+
+        assert_eq!(links.len(), 1);
+        assert_eq!(
+            links[0].start_col, 2,
+            "the bullet and its trailing space occupy two columns"
+        );
+    }
+
+    /// A quote bar is painted before the label, so the reported columns address
+    /// the link the reader points at rather than the raw body text (c-1).
+    #[test]
+    fn a_quote_bar_is_part_of_the_reported_column() {
+        let theme = MarkdownTheme::answer();
+        let (_, _, links) =
+            render_markdown_with_blocks("> [docs](https://example.com)", &theme, None);
+
+        assert_eq!(links.len(), 1);
+        assert_eq!(links[0].start_col, 2, "the quote bar occupies two columns");
+        assert_eq!(
+            links[0].end_col,
+            2 + "docs (https://example.com)".len(),
+            "the shown target follows the label inside the same region"
+        );
+    }
+
+    /// The heading marker is painted ahead of the collected body, so a region
+    /// measured without it would sit a couple of columns left of the link the
+    /// reader sees (c-1, c-3).
+    #[test]
+    fn a_heading_marker_shifts_the_reported_columns() {
+        let theme = MarkdownTheme::answer();
+        let (lines, _, links) =
+            render_markdown_with_blocks("## [docs](https://example.com)", &theme, None);
+
+        assert_eq!(links.len(), 1);
+        let painted: String = lines
+            .iter()
+            .flat_map(|line| line.spans.iter())
+            .map(|span| span.content.as_ref())
+            .collect();
+        assert_eq!(painted, "## docs (https://example.com)");
+        assert_eq!(links[0].start_col, "## ".len());
+        assert_eq!(links[0].end_col, painted.len());
+    }
+
+    /// Extraction reports every destination verbatim: whether an address may be
+    /// opened is the dispatcher's scheme gate, not the renderer's decision
+    /// (c-1, c-2).
+    #[test]
+    fn extraction_keeps_a_destination_the_scheme_gate_refuses() {
+        let theme = MarkdownTheme::answer();
+        let (_, _, links) = render_markdown_with_blocks("[run](file:///etc/passwd)", &theme, None);
+
+        assert_eq!(links.len(), 1);
+        assert_eq!(links[0].url, "file:///etc/passwd");
+    }
+    #[test]
+    fn a_link_inside_a_table_cell_keeps_the_table_geometry() {
+        let theme = MarkdownTheme::answer();
+        let (lines, _, links) = render_markdown_with_blocks(
+            "| target |\n| --- |\n| [docs](https://example.com) |",
+            &theme,
+            None,
+        );
+
+        assert!(!lines.is_empty(), "the table renders its own rows");
+        assert!(
+            links.is_empty(),
+            "a table cell owns its columns, so no body region is reported"
+        );
+    }
+
+    #[test]
+    fn regions_are_identified_in_painting_order() {
+        let theme = MarkdownTheme::answer();
+        let (_, _, links) = render_markdown_with_blocks(
+            "[one](https://a.example) and [two](https://b.example)",
+            &theme,
+            None,
+        );
+
+        assert_eq!(links.len(), 2);
+        assert_eq!(links[0].id, 0);
+        assert_eq!(links[0].url, "https://a.example");
+        assert_eq!(links[1].id, 1);
+        assert_eq!(links[1].url, "https://b.example");
+        assert_eq!(links[0].line_idx, links[1].line_idx);
+        assert!(
+            links[0].end_col <= links[1].start_col,
+            "the second region starts after the first one ends"
+        );
     }
 }

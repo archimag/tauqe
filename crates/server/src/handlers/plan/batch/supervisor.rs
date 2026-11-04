@@ -29,7 +29,7 @@ use tokio::sync::mpsc;
 use crate::handlers::host::ServerImplementationHost;
 use crate::state::{AppState, OperationGuard};
 
-use super::super::common::{clear_auto_context, emit, offload_plan, publish_plan};
+use super::super::common::{cleanup_transient_context, emit, offload_plan, publish_plan};
 
 /// Outcome of a server-driven batch of plan steps.
 ///
@@ -153,7 +153,9 @@ pub(super) async fn run_plan_batch_with(
         })
         .await;
     }
-    clear_auto_context(state).await;
+    // A batch starts from a released transient context: nothing a previous turn
+    // discovered or mounted survives into the horizon it is about to run.
+    cleanup_transient_context(state).await;
 
     let operation_id = format!("op-{}", operation.id());
     tracing::info!(
@@ -195,7 +197,9 @@ pub(super) async fn run_plan_batch_with(
     )
     .await;
 
-    clear_auto_context(state).await;
+    // The transient context is released again once the horizon settles, so the
+    // next run starts from the same clean basis.
+    cleanup_transient_context(state).await;
     publish_plan_state(state, &repo_root, plan_id).await;
     finish_batch(state, &operation_id, plan_id, started_at, &report)
 }

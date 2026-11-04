@@ -63,30 +63,6 @@ fn test_plan_refine_types_serde_and_helpers() {
     assert_eq!(de_blocked, blocked_res);
 }
 
-/// The legacy `id` spelling of `plan/refine` lives on the DTO, so the wire
-/// contract stays the single parser for every accepted field name, and a
-/// malformed field fails the typed parse instead of being dropped by a
-/// call-site fallback.
-#[test]
-fn test_plan_refine_params_accepts_legacy_id_alias() {
-    let params: PlanRefineParams = serde_json::from_value(serde_json::json!({
-        "id": "legacy-plan",
-        "model": "architect",
-        "instructions": "Decompose"
-    }))
-    .unwrap();
-    assert_eq!(params.plan_id, "legacy-plan");
-    assert_eq!(
-        params.model,
-        Some(ModelSelection::Role(ModelRole::Architect))
-    );
-    assert_eq!(params.instructions.as_deref(), Some("Decompose"));
-
-    assert!(
-        serde_json::from_value::<PlanRefineParams>(serde_json::json!({ "plan_id": 123 })).is_err()
-    );
-}
-
 /// The client requests the active plan with an empty object, so the DTO —
 /// not a server-side fallback — defines the empty payload as "no target id",
 /// while a malformed id still fails the typed parse.
@@ -2250,5 +2226,48 @@ fn test_plan_implementation_validate_structure_matrix() {
                 item_id: "1".to_string(),
             },
         ]
+    );
+}
+
+/// A plan rejection carries its category as typed wire data and renders its
+/// reported wording verbatim, so a surface that printed the historical reason
+/// string keeps its exact bytes and no consumer classifies the refusal from text.
+#[test]
+fn test_plan_rejection_carries_its_kind_and_renders_its_message() {
+    let cases = [
+        (PlanRejectionKind::PayloadDefect, "\"payload_defect\""),
+        (PlanRejectionKind::ModeForbidden, "\"mode_forbidden\""),
+        (PlanRejectionKind::Abandoned, "\"abandoned\""),
+    ];
+    for (kind, wire_kind) in cases {
+        let rejection = PlanRejection::new(kind, "Cannot save plan 'x': duplicate step ID: '1'");
+        let json = serde_json::to_string(&rejection).unwrap();
+        assert!(json.contains(wire_kind), "{json}");
+        assert!(json.contains("\"message\""), "{json}");
+
+        let decoded: PlanRejection = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded, rejection);
+        assert_eq!(decoded.kind, kind);
+    }
+
+    // The named constructors are the single way a producer states its category,
+    // so a refusal never carries a kind its birthplace did not decide.
+    assert_eq!(
+        PlanRejection::payload_defect("defect").kind,
+        PlanRejectionKind::PayloadDefect
+    );
+    assert_eq!(
+        PlanRejection::mode_forbidden("regime").kind,
+        PlanRejectionKind::ModeForbidden
+    );
+    assert_eq!(
+        PlanRejection::abandoned("abandoned").kind,
+        PlanRejectionKind::Abandoned
+    );
+
+    // An unknown category fails the typed parse instead of degrading into a
+    // guessed one.
+    assert!(
+        serde_json::from_str::<PlanRejection>(r#"{"kind":"mystery","message":"refused"}"#).is_err()
     );
 }

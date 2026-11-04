@@ -1301,6 +1301,56 @@ mod tests {
         assert!(!names.contains(&"Plan-First Proposal"));
         assert!(names.contains(&"Environment Ontology"));
     }
+    #[test]
+    fn architect_synthesis_trunk_keeps_the_abort_escape_hatch() {
+        // A synthesis runs unattended exactly as an isolated step does, so its
+        // trunk states the same host-failure rule: a condition that only the
+        // developer can repair on the host is reported through the escape hatch
+        // instead of an improvised surrogate or a misreported blocker.
+        let rules = shared(
+            TurnIntent::ArchitectSynthesis,
+            &CapabilitySet::architect_research(),
+            EditProtocolKind::Structured,
+            None,
+        );
+        assert!(titles(&rules).contains(&"Host Environment Failures"));
+        let host = body(&rules, "Host Environment Failures");
+        assert!(host.contains("`abort`"));
+        assert!(host.contains("`is_aborted`"));
+        assert!(host.contains("`recommendation`"));
+        assert!(!host.contains("<abort"));
+
+        // The rule belongs to the shared trunk and never to the regime delta, so
+        // the synthesis states it in the byte-stable head beside the invariants
+        // every turn shares.
+        let regime = delta(
+            TurnIntent::ArchitectSynthesis,
+            &CapabilitySet::architect_research(),
+            EditProtocolKind::Structured,
+            None,
+        );
+        assert!(!titles(&regime).contains(&"Host Environment Failures"));
+
+        // The rule is rendered from the declared capability, so a surface
+        // without the escape hatch never advertises a command it cannot decode.
+        let without = shared(
+            TurnIntent::ArchitectSynthesis,
+            &CapabilitySet::architect_research().without(LlmCapability::Abort),
+            EditProtocolKind::Structured,
+            None,
+        );
+        assert!(!titles(&without).contains(&"Host Environment Failures"));
+
+        // The XML contour of the same regime spells the command as a control
+        // tag through the active turn marker.
+        let xml = shared(
+            TurnIntent::ArchitectSynthesis,
+            &CapabilitySet::architect_research(),
+            EditProtocolKind::Xml,
+            Some("M12345"),
+        );
+        assert!(body(&xml, "Host Environment Failures").contains("<abort_M12345"));
+    }
 
     #[test]
     fn every_regime_states_a_non_empty_delta_beside_the_shared_trunk() {

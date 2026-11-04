@@ -51,10 +51,8 @@ impl std::fmt::Display for IssueType {
 pub enum IssueStatus {
     #[default]
     Discussion,
-    #[serde(alias = "refine")]
     Todo,
     InProgress,
-    #[serde(alias = "done")]
     Fixed,
     Skipped,
     Rejected,
@@ -181,7 +179,7 @@ pub struct ReviewIssue {
     pub issue_type: IssueType,
     #[serde(default)]
     pub status: IssueStatus,
-    #[serde(default, alias = "body")]
+    #[serde(default)]
     pub description: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub recommendations: Vec<String>,
@@ -189,11 +187,14 @@ pub struct ReviewIssue {
     pub files: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub readonly_files: Vec<String>,
-    #[serde(
-        default,
-        alias = "resolution_notes",
-        skip_serializing_if = "Option::is_none"
-    )]
+    /// Hash of the Git commit that resolved the finding, when one did.
+    ///
+    /// The finding records the commit of the change set that resolved it, so
+    /// the review interface can show and inspect the exact commit that fixed
+    /// it. A finding no committed change set has resolved yet carries none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub commit: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub note: Option<String>,
 }
 
@@ -238,26 +239,24 @@ pub struct ReviewItem {
     pub files: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub readonly_files: Vec<String>,
+    /// Hash of the Git commit that resolved the finding, when one did.
+    ///
+    /// The finding records the commit of the change set that resolved it, so
+    /// the review interface can show and inspect the exact commit that fixed
+    /// it. A finding no committed change set has resolved yet carries none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub commit: Option<String>,
     /// Resolution note recorded on the finding.
     ///
     /// Serialized as `note`, the single canonical wire name of the datum,
-    /// shared with [`ReviewIssue`]. The retired `resolution_notes` spelling is
-    /// still accepted on read, so a session stored by an older daemon keeps
-    /// decoding, and it is never written back under that spelling.
-    #[serde(
-        default,
-        rename = "note",
-        alias = "resolution_notes",
-        skip_serializing_if = "Option::is_none"
-    )]
+    /// shared with [`ReviewIssue`].
+    #[serde(default, rename = "note", skip_serializing_if = "Option::is_none")]
     pub resolution_notes: Option<String>,
     /// The finding's prose, serialized under the canonical `description` key.
     ///
     /// Serialized as `description`, the single canonical wire name of the
-    /// datum, shared with [`ReviewIssue`]. The retired `body` spelling is
-    /// still accepted on read, so a session stored by an older daemon keeps
-    /// decoding, and it is never written back under that spelling.
-    #[serde(default, rename = "description", alias = "body")]
+    /// datum, shared with [`ReviewIssue`].
+    #[serde(default, rename = "description")]
     pub body: String,
 }
 
@@ -267,10 +266,7 @@ pub struct ReviewItem {
 /// a coarse `severity` spelling. The shadow accepts every historical key for the
 /// category (`type`, `severity`, `issue_type`) and lets the item recompute its
 /// presentation severity from it, so exactly one classification is read and a
-/// session file can never desynchronize the two. Every datum that once carried
-/// a second spelling is read under both the canonical name and the retired one:
-/// the note under `note` and `resolution_notes`, the body under `description`
-/// and `body`.
+/// session file can never desynchronize the two.
 #[derive(Deserialize)]
 struct ReviewItemWire {
     id: u32,
@@ -291,11 +287,13 @@ struct ReviewItemWire {
     files: Vec<String>,
     #[serde(default)]
     readonly_files: Vec<String>,
-    #[serde(default, alias = "resolution_notes")]
+    #[serde(default)]
+    commit: Option<String>,
+    #[serde(default)]
     note: Option<String>,
     /// The finding's prose. Both spellings read into one datum: the canonical
-    /// `description` and the retired `body`. The item writes the datum back
-    /// under `description`, never under the retired spelling.
+    /// `description` and the struct's own `body` field name. The item writes the
+    /// datum back under `description`.
     #[serde(default, alias = "description")]
     body: String,
 }
@@ -314,6 +312,7 @@ impl From<ReviewItemWire> for ReviewItem {
             recommendations: wire.recommendations,
             files: wire.files,
             readonly_files: wire.readonly_files,
+            commit: wire.commit,
             resolution_notes: wire.note,
             body: wire.body,
         }
@@ -343,6 +342,7 @@ impl From<ReviewIssue> for ReviewItem {
             recommendations: issue.recommendations,
             files: issue.files,
             readonly_files: issue.readonly_files,
+            commit: issue.commit,
             resolution_notes: issue.note,
             body: issue.description,
         }
@@ -368,6 +368,7 @@ impl From<ReviewItem> for ReviewIssue {
             recommendations: item.recommendations,
             files: item.files,
             readonly_files: item.readonly_files,
+            commit: item.commit,
             note: item.resolution_notes,
         }
     }

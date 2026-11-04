@@ -327,7 +327,15 @@ impl CapabilityProfile {
             CapabilitySet::new(),
         )
     }
-    /// Architect research: plan mutation moves to the delta, surface unchanged.
+    /// Architect research: plan mutation moves to the delta, the discovery
+    /// surface stays.
+    ///
+    /// File edits and toolchain verification stay excluded, because a synthesis
+    /// projects a horizon instead of patching a tree. The abort escape hatch
+    /// stays included, because a synthesis runs unattended exactly as an
+    /// isolated step does: a host-environment impossibility only the developer
+    /// can repair is reported through `abort` instead of an improvised
+    /// surrogate or a misreported blocker.
     pub fn architect_research() -> Self {
         Self::new(
             CapabilitySet::from_slice(&[
@@ -339,6 +347,7 @@ impl CapabilityProfile {
                 LlmCapability::Scratchpad,
                 LlmCapability::Outcome,
                 LlmCapability::Blocked,
+                LlmCapability::Abort,
                 LlmCapability::UserLanguage,
             ]),
             CapabilitySet::from_slice(&[LlmCapability::PlanUpdate]),
@@ -500,6 +509,11 @@ impl CapabilitySet {
     /// The architect gathers context and refines plans but never edits files
     /// or runs toolchain verification, so the file-edit and verification
     /// capabilities are excluded.
+    ///
+    /// The abort escape hatch stays included: a synthesis runs unattended
+    /// exactly as an isolated step does, so a host-environment impossibility
+    /// only the developer can repair is reported through `abort` instead of an
+    /// improvised surrogate or a misreported blocker.
     pub fn architect_research() -> Self {
         CapabilityProfile::architect_research().surface()
     }
@@ -729,6 +743,10 @@ mod tests {
         assert!(architect.contains(LlmCapability::PlanCreation));
         assert!(architect.contains(LlmCapability::Scratchpad));
         assert!(!architect.contains(LlmCapability::FileEdits));
+        // A synthesis runs unattended exactly as an isolated step does, so the
+        // profile keeps the escape hatch that demands a host action instead of
+        // improvising a surrogate change or misreporting a blocker.
+        assert!(architect.contains(LlmCapability::Abort));
         assert!(!architect.contains(LlmCapability::ToolchainVerify));
         assert!(!architect.contains(LlmCapability::CustomTools));
     }
@@ -880,6 +898,7 @@ mod tests {
             LlmCapability::Scratchpad,
             LlmCapability::Outcome,
             LlmCapability::Blocked,
+            LlmCapability::Abort,
             LlmCapability::UserLanguage,
         ]);
         assert_eq!(architect.surface(), expected);

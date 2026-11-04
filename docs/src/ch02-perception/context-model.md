@@ -50,10 +50,10 @@ the end of the turn.
    or change their access; only `[context].pinned` decides them.
 4. **The Auto layer is turn-scoped; the User layer is deliberate.** Research
    accumulates, curation persists.
-5. **The OuterDocs layer is registry-managed and task-scoped.** A document
-   enters it only through the materialization a declared external reference
-   produced, it stays read-only for the whole task, and only clearing the whole
-   context drops it.
+5. **The OuterDocs layer is registry-managed and part of the transient context.** A
+   document enters it only through the materialization a declared external reference
+   produced, it stays read-only for as long as it is resident, and it leaves together
+   with the Auto layer once the change set is committed or the isolated step ends.
 6. **Budgets are measured, not guessed.** File cost is its estimated content plus
    the estimated wrapper its `<file>` element renders, and the aggregate is checked
    against a configured ceiling before anything is added.
@@ -81,9 +81,9 @@ the end of the turn.
 | Layer | Owner | Lifetime | Baseline access | Mutation paths |
 | --- | --- | --- | --- | --- |
 | **Pinned** | `[context].pinned` | whole session | `read_only` | configuration, hierarchical resolution |
-| **OuterDocs** | external reference registry | whole task | `read_only` | materialization, explicit removal |
+| **OuterDocs** | external reference registry | transient context | `read_only` | materialization, release with the transient context |
 | **User** | developer | across turns | as chosen | add, remove, access change, promote from Auto |
-| **Auto** | model discovery | one turn | as requested | context requests, promote, drop, end-of-turn sweep |
+| **Auto** | model discovery | transient context | as requested | context requests, promote, drop, release with the transient context |
 
 ### 2.2 Access
 
@@ -117,6 +117,8 @@ before it can be touched.
   admit.
 - **External document** — a snapshot the harness materialized from a declared
   external source and admitted read-only into the OuterDocs layer.
+- **Transient context** — the Auto layer and the OuterDocs layer together: the material
+  provided so the model can decide, released as one unit once that decision is committed.
 - **Revision** — a counter advanced only when layer contents actually change, so a
   no-op mutation never disturbs clients.
 - **Estimated tokens** — `size_bytes / 4`, the single estimate every budget uses.
@@ -237,17 +239,24 @@ budget is refused whole by the research round that made it, and the snapshot sta
 the cache for a later round. A repeated request is a no-op: the snapshot is immutable
 for the whole task, so no rendered byte changes and the revision stays put.
 
-**Persistence.** The layer is context rather than transcript, and that single fact
-explains its whole lifecycle:
+**Release.** The layer is transient: it is material provided so the model can decide,
+and it is released as one unit with the Auto layer rather than on its own.
 
-- history compaction rewrites history entries and never touches the layer, so a
-  snapshot cannot be summarized away;
-- sweeping the Auto layer at the end of a turn leaves the layer untouched, so a
-  document outlives the round that requested it;
 - a turn merge folds the documents the turn materialized into the live layer, and
   a path held on both sides keeps the snapshot already held;
-- pruning drops a document whose cached file disappeared;
-- clearing the whole context drops every document with it.
+- an interactive turn releases the whole transient context — external documents and
+  discovered files alike — once its change set is applied, verified, and committed, so a
+  document never outlives the decision it served;
+- an isolated plan step, a review member, and an architect wave start from a clean
+  transient context and release it when the step ends, so no document leaks into the next
+  step;
+- history compaction rewrites history entries and never touches the layer, so a snapshot
+  cannot be summarized away while the turn still reasons about it;
+- pruning drops a document whose cached file disappeared, and a full context reset drops
+  every document with it.
+
+The cached snapshot itself is durable: releasing the context entry never deletes it, and a
+later request re-admits the same bytes without a transfer.
 
 **What is refused.** Access cannot be changed, a document cannot be renamed or
 moved, and no operation promotes a snapshot to editable. An explicit removal is
@@ -321,9 +330,10 @@ This keeps clients honest: a revision bump always means the visible state moved.
 - **It is not a security sandbox.** `read_only` is a knowledge hint with a
   deterministic promotion path. The hard boundary is absence from the context,
   not the access attribute.
-- **It is not durable memory.** The Auto layer is swept at the end of the turn and
-  the OuterDocs layer belongs to the task. Turn-local working memory lives in the
-  scratchpad; session memory lives in history.
+- **It is not durable memory.** The Auto and OuterDocs layers form one transient
+  context, released together once the change set is committed or the isolated step
+  ends. Turn-local working memory lives in the scratchpad; session memory lives in
+  history.
 - **It is not a place for a turn to choose its own sources.** The OuterDocs layer holds
   only what `[[outer_docs]]` declares; widening it is a declaration, never a context
   operation.

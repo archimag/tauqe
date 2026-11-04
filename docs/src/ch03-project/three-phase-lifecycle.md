@@ -102,12 +102,14 @@ input. Verifying before the generator runs checks a tree that is not final.
 | Phase | Declared by | Channel | Moment | Failure contract |
 | --- | --- | --- | --- | --- |
 | **In-Memory Format** | `[project.format]`, or the `format` recipe the declared task runner exports | standard input and output | before any byte reaches disk | the authored content is kept |
-| **Disk Post-Hook** | `[project.post_hook]` | a plain process | after the write, before verification | the change set is aborted |
-| **Verify** | `[project.verify]` | a plain process | after every phase above | typed diagnostics feed the healing loop |
+| **Disk Post-Hook** | `[project.post_hook]` | a plain process with the change set on stdin | after the write, before verification | the change set is aborted |
+| **Verify** | `[project.verify]` | a plain process with a declared timeout, the change set on stdin | after every phase above | typed diagnostics feed the healing loop |
 
 ### 2.2 Terms
 
-- **Staged content** — the validated in-memory text a change set will write.
+- **Staged content** — the validated in-memory payload a change set will write:
+  text for a document that decodes as UTF-8, and the exact bytes for a payload
+  that does not.
 - **In-memory format** — rewriting staged text through the declared stream filter.
 - **Disk post-hook** — a side effect that needs the file to exist on disk.
 - **Verification command** — the mandatory command that decides whether the change
@@ -267,9 +269,10 @@ delete, or rename anything in the working tree.
 ### 3.2 Disk post-hook
 
 Once the change set is written, the declared post-hook runs as a plain process. It
-receives the literal arguments its declaration names and no file list: the harness
-does not guess which paths the generator needs, and the hook does not have to parse a
-request to learn them.
+receives the literal arguments its declaration names and the change set that just
+reached disk on its standard input, one repository-relative path per line, so the
+generator rebuilds only the files the turn touched. An empty change set sends no
+input at all.
 
 The working copy is snapshotted before the hook starts and after it exits
 successfully, and the difference — computed through Git, with ignores respected —
@@ -355,8 +358,15 @@ when the budget expires or the developer cancels.
 A directory move is expressed as one operation, never as a list of files. The
 entry names the source directory and the destination directory, and the staging
 engine expands it into the per-file moves of the tracked files under the source.
-The expansion lives in `crates/tools/src/edits/staging.rs`.That expansion set is deliberate: an ignored artifact inside the subtree is not
+The expansion lives in `crates/tools/src/edits/staging.rs`, and it is
+deliberately the set Git tracks: an ignored artifact inside the subtree is not
 part of the repository, so a build directory never travels with the rename.
+
+The member carries every file as bytes, so a subtree that holds an image, a
+font, or any other payload that does not decode as text relocates exactly as it
+lies on disk. Only the text pipeline — a replacement, the anchored ranges, and
+the in-memory format of §3.1 — restricts itself to entries that decode
+losslessly as UTF-8.
 
 The whole expansion is one atomic member of the change set. A source that names
 no directory, a source directory that holds no tracked file, a destination inside

@@ -122,6 +122,7 @@ mod tests {
             id: 7,
             title: "Guard the parser".to_string(),
             uuid: None,
+            commit: None,
             group: None,
             model: None,
             issue_type: tauqe_protocol::review::IssueType::Bug,

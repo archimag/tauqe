@@ -531,6 +531,7 @@ fn walk_review_rows<V: ReviewRowVisitor>(
                         theme.hard_breaks = true;
                         theme.compact = true;
                         theme.line_prefix = Some(body_prefix);
+                        theme.constrain_table_width(width);
                         let body = cache.lines_for(
                             &summary_body_key(session_id),
                             trimmed,
@@ -745,6 +746,7 @@ fn walk_review_rows<V: ReviewRowVisitor>(
                             format!("{body_indent}│ "),
                             engine.fg(palette.text_muted),
                         ));
+                        theme.constrain_table_width(width);
                         let key = item_body_key(session_id, *item_id);
                         let body = cache.lines_for(
                             &key,
@@ -951,6 +953,7 @@ fn walk_review_rows<V: ReviewRowVisitor>(
                             theme.compact = true;
                             theme.line_prefix =
                                 Some(Span::styled(meta_prefix, engine.fg(palette.text_muted)));
+                            theme.constrain_table_width(width);
                             let key = step_body_key(session_id, group_id, step_id);
                             let body =
                                 cache.lines_for(&key, &prepared, &theme, Some(width), theme_mode);
@@ -1094,6 +1097,7 @@ fn walk_review_rows<V: ReviewRowVisitor>(
                         theme.hard_breaks = true;
                         theme.compact = true;
                         theme.line_prefix = Some(body_prefix);
+                        theme.constrain_table_width(width);
                         let key = format!("{}:g:{}:d", session_id, group_id);
                         let body = cache.lines_for(
                             &key,
@@ -1161,6 +1165,7 @@ mod tests {
             id,
             title: format!("Finding {}", id),
             uuid: None,
+            commit: None,
             group: None,
             model: None,
             issue_type: IssueType::Architecture,

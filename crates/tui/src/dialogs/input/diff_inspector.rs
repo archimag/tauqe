@@ -176,9 +176,12 @@ pub(super) fn handle_diff_inspector_key(key: KeyEvent, st: &mut AppState) {
         return;
     }
 
-    // The live staged set is the only owner of the audited payload, so its length
-    // is read before the reading position is borrowed (c-3).
-    let file_count = st.model.files.len();
+    // The audited set is either the imported commit audit or the live staged set,
+    // so its length is read from the active source before the inspector is borrowed (c-3).
+    let file_count = match &st.diff_audit {
+        Some(audit) => audit.files.len(),
+        None => st.model.files.len(),
+    };
     let Some(inspector) = st.diff_inspector.as_mut() else {
         return;
     };
@@ -424,5 +427,40 @@ mod tests {
             assert_eq!(st.model.scroll, 7, "the reading position is preserved");
             assert_eq!(st.model.selected_file_index, 1);
         }
+    }
+
+    #[test]
+    fn file_walk_navigates_commit_audit_when_staged_set_is_empty() {
+        let mut st = crate::app::test_state();
+        assert!(st.model.files.is_empty());
+        st.diff_audit = Some(crate::app::CommitAudit {
+            files: vec![
+                file("crates/tui/src/a.rs"),
+                file("crates/tui/src/b.rs"),
+                file("crates/tui/src/c.rs"),
+            ],
+            cache: crate::views::repl::DiffRenderCache::default(),
+        });
+        st.diff_inspector = Some(DiffInspectorState {
+            selected_file: 0,
+            diff_scroll: 0,
+            focus: DiffInspectorFocus::Files,
+        });
+
+        press(&mut st, KeyCode::Char('n'));
+        let inspector = st.diff_inspector.as_ref().expect("the dialog stays open");
+        assert_eq!(inspector.selected_file, 1);
+
+        press(&mut st, KeyCode::Char('n'));
+        let inspector = st.diff_inspector.as_ref().expect("the dialog stays open");
+        assert_eq!(inspector.selected_file, 2);
+
+        press(&mut st, KeyCode::Char('n'));
+        let inspector = st.diff_inspector.as_ref().expect("the dialog stays open");
+        assert_eq!(inspector.selected_file, 2, "capped at last file");
+
+        press(&mut st, KeyCode::Char('p'));
+        let inspector = st.diff_inspector.as_ref().expect("the dialog stays open");
+        assert_eq!(inspector.selected_file, 1);
     }
 }

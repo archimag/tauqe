@@ -965,6 +965,7 @@ mod tests {
             id,
             title: format!("Finding {id}"),
             uuid: Some(uuid.to_string()),
+            commit: None,
             group: Some(group.to_string()),
             model: None,
             issue_type: IssueType::Architecture,

@@ -313,6 +313,7 @@ mod tests {
             id,
             title: title.to_string(),
             uuid: None,
+            commit: None,
             group: Some("arch-1".to_string()),
             model: None,
             issue_type: IssueType::Bug,

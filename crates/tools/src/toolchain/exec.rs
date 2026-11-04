@@ -75,8 +75,14 @@ impl CommandLine {
 /// `stdin_payload` is the only input a project command ever receives: when it is
 /// present the child starts with a piped standard input and the payload is
 /// written to it, one repository-relative path per line for the verification
-/// lifecycle. Without a payload the child receives no input at all, so a command
-/// can never consume the daemon's own request stream.
+/// written to it, one repository-relative path per line for the verification
+/// lifecycle and the disk-side post-hook. Without a payload the child receives
+/// no input at all, so a command can never consume the daemon's own request
+/// stream.
+/// `timeout_secs` bounds the whole invocation, not only the direct child. A
+/// descendant that inherited the output pipes keeps them open after the child
+/// exited, and the drain that waits for their EOF is bounded by the same
+/// wall-clock deadline, so no descendant can stall the turn past its budget.
 pub(super) async fn run_command(
     repo_root: &Path,
     command: &CommandLine,
@@ -95,6 +101,46 @@ pub(super) async fn run_command(
     let duration_ms = started.elapsed().as_millis() as u64;
     log_toolchain_check_result(&result, duration_ms);
     result
+}
+
+/// How the post-exit drain of the output pipes ended.
+///
+/// The direct child can exit long before its descendants do, and a descendant
+/// that inherited a pipe keeps it from reaching EOF. The drain is therefore
+/// bounded by the caller's cancellation signal and by the wall-clock deadline of
+/// the whole invocation, never by the descendants alone.
+enum DrainOutcome {
+    /// Both pipes reached EOF and yielded their complete content.
+    Drained { stdout: Vec<u8>, stderr: Vec<u8> },
+    /// The turn was cancelled while a descendant still held a pipe open.
+    Cancelled,
+    /// The wall-clock budget expired while a descendant still held a pipe open.
+    TimedOut,
+}
+
+/// Drains the output pipes of an already reaped child under the invocation budget.
+///
+/// The direct child is gone, so its process group can no longer be signalled
+/// safely; abandoning the readers is what releases the turn instead of waiting
+/// for a descendant that may never exit.
+async fn drain_output(
+    stdout_task: &mut tokio::task::JoinHandle<Vec<u8>>,
+    stderr_task: &mut tokio::task::JoinHandle<Vec<u8>>,
+    cancel_rx: Option<&watch::Receiver<bool>>,
+    deadline: tokio::time::Instant,
+) -> DrainOutcome {
+    let drain = async {
+        let stdout = (&mut *stdout_task).await.unwrap_or_default();
+        let stderr = (&mut *stderr_task).await.unwrap_or_default();
+        DrainOutcome::Drained { stdout, stderr }
+    };
+
+    tokio::select! {
+        biased;
+        drained = drain => drained,
+        _ = wait_for_cancellation(cancel_rx) => DrainOutcome::Cancelled,
+        _ = tokio::time::sleep_until(deadline) => DrainOutcome::TimedOut,
+    }
 }
 
 async fn run_command_core(
@@ -122,6 +168,10 @@ async fn run_command_core(
             return cancelled_result(&display);
         }
     }
+
+    // One budget governs the whole invocation: the direct child and the drain
+    // that waits for the output pipes to reach EOF after the child exited.
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
 
     let mut cmd = tokio::process::Command::new(command.program());
     cmd.args(command.args());
@@ -188,7 +238,7 @@ async fn run_command_core(
 
     let outcome = tokio::select! {
         status = child.wait() => RaceOutcome::Exited(status),
-        _ = tokio::time::sleep(std::time::Duration::from_secs(timeout_secs)) => RaceOutcome::TimedOut,
+        _ = tokio::time::sleep_until(deadline) => RaceOutcome::TimedOut,
         _ = cancel_fut => RaceOutcome::Cancelled,
     };
 
@@ -202,25 +252,40 @@ async fn run_command_core(
                 task.abort();
             }
             // A descendant that inherited the pipes can hold them open long
-            // after the direct child exited, so the drain races the
-            // cancellation signal as well. The child is already reaped here, so
-            // its process group can no longer be signalled safely; abandoning
-            // the readers is what releases a cancelled turn instead of waiting
-            // for a descendant that may never exit.
-            let drain = async {
-                let stdout_bytes = (&mut stdout_task).await.unwrap_or_default();
-                let stderr_bytes = (&mut stderr_task).await.unwrap_or_default();
-                (stdout_bytes, stderr_bytes)
-            };
-            let drained = tokio::select! {
-                biased;
-                pipes = drain => Some(pipes),
-                _ = wait_for_cancellation(cancel_rx) => None,
-            };
-            let Some((stdout_bytes, stderr_bytes)) = drained else {
-                stdout_task.abort();
-                stderr_task.abort();
-                return cancelled_result(&display);
+            // after the direct child exited. The drain races the caller's
+            // cancellation signal and the same wall-clock deadline that bounds
+            // the child, so neither a cancelled turn nor an idle one waits for a
+            // descendant that may never exit. The child is already reaped here,
+            // so its process group can no longer be signalled safely;
+            // abandoning the readers is what releases the turn instead.
+            let drained =
+                drain_output(&mut stdout_task, &mut stderr_task, cancel_rx, deadline).await;
+            let (stdout_bytes, stderr_bytes) = match drained {
+                DrainOutcome::Drained { stdout, stderr } => (stdout, stderr),
+                DrainOutcome::Cancelled => {
+                    stdout_task.abort();
+                    stderr_task.abort();
+                    return cancelled_result(&display);
+                }
+                DrainOutcome::TimedOut => {
+                    stdout_task.abort();
+                    stderr_task.abort();
+                    return ToolchainCheckResult {
+                        success: false,
+                        is_cancelled: false,
+                        command: display.clone(),
+                        stdout: String::new(),
+                        stderr: format!(
+                            "Execution timed out ({}s): a descendant process held the output pipes open",
+                            timeout_secs
+                        ),
+                        combined_output: format!(
+                            "Command '{}' timed out after {}s: a descendant process held the output pipes open",
+                            display, timeout_secs
+                        ),
+                        diagnostics: Vec::new(),
+                    };
+                }
             };
             match status_res {
                 Ok(status) => {
@@ -369,7 +434,9 @@ pub(super) struct StreamingOutcome {
 /// the staged content of the file and can never modify the working tree. Like
 /// [`run_command`], the child leads its own process group, so a timeout or a
 /// cancellation tears down the descendants the command spawned instead of
-/// leaving them behind.
+/// leaving them behind. The wall-clock budget covers the whole invocation, so a
+/// descendant that keeps the output pipes open after the child exited is
+/// abandoned at the deadline instead of holding the turn.
 ///
 /// `path` is the repository-relative path of the file whose staged content is
 /// streamed, and it reaches the child through [`FILE_PATH_ENV`], so a filter can
@@ -404,6 +471,10 @@ pub(super) async fn run_streaming_command(
     if cancel_rx.is_some_and(|rx| *rx.borrow()) {
         return cancelled_streaming_result();
     }
+
+    // The same budget that bounds the direct child also bounds the drain that
+    // waits for the output pipes to reach EOF after the child exited.
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
 
     let mut cmd = tokio::process::Command::new(command.program());
     cmd.args(command.args());
@@ -461,7 +532,7 @@ pub(super) async fn run_streaming_command(
 
     let outcome = tokio::select! {
         status = child.wait() => RaceOutcome::Exited(status),
-        _ = tokio::time::sleep(std::time::Duration::from_secs(timeout_secs)) => RaceOutcome::TimedOut,
+        _ = tokio::time::sleep_until(deadline) => RaceOutcome::TimedOut,
         _ = cancel_fut => RaceOutcome::Cancelled,
     };
 
@@ -472,25 +543,35 @@ pub(super) async fn run_streaming_command(
             // descendant inherited the pipe.
             stdin_task.abort();
             // A descendant that inherited the pipes can hold them open long
-            // after the direct child exited, so the drain races the
-            // cancellation signal as well. The child is already reaped here, so
-            // its process group can no longer be signalled safely; abandoning
-            // the readers is what releases a cancelled turn instead of waiting
-            // for a descendant that may never exit.
-            let drain = async {
-                let stdout_bytes = (&mut stdout_task).await.unwrap_or_default();
-                let stderr_bytes = (&mut stderr_task).await.unwrap_or_default();
-                (stdout_bytes, stderr_bytes)
-            };
-            let drained = tokio::select! {
-                biased;
-                pipes = drain => Some(pipes),
-                _ = wait_for_cancellation(cancel_rx) => None,
-            };
-            let Some((stdout_bytes, stderr_bytes)) = drained else {
-                stdout_task.abort();
-                stderr_task.abort();
-                return cancelled_streaming_result();
+            // after the direct child exited. The drain races the caller's
+            // cancellation signal and the same wall-clock deadline that bounds
+            // the child, so neither a cancelled turn nor an idle one waits for a
+            // descendant that may never exit. The child is already reaped here,
+            // so its process group can no longer be signalled safely;
+            // abandoning the readers is what releases the turn instead.
+            let drained =
+                drain_output(&mut stdout_task, &mut stderr_task, cancel_rx, deadline).await;
+            let (stdout_bytes, stderr_bytes) = match drained {
+                DrainOutcome::Drained { stdout, stderr } => (stdout, stderr),
+                DrainOutcome::Cancelled => {
+                    stdout_task.abort();
+                    stderr_task.abort();
+                    return cancelled_streaming_result();
+                }
+                DrainOutcome::TimedOut => {
+                    stdout_task.abort();
+                    stderr_task.abort();
+                    return StreamingOutcome {
+                        success: false,
+                        is_cancelled: false,
+                        timed_out: true,
+                        stdout: String::new(),
+                        stderr: format!(
+                            "Execution timed out ({}s): a descendant process held the output pipes open",
+                            timeout_secs
+                        ),
+                    };
+                }
             };
             let stdout = String::from_utf8_lossy(&stdout_bytes).to_string();
             let stderr = String::from_utf8_lossy(&stderr_bytes).to_string();
@@ -682,6 +763,17 @@ fn tokenize_command(input: &str) -> Vec<String> {
     tokens
 }
 
+/// How long a heartbeat fixture is observed after a process-group kill or a
+/// cancellation.
+///
+/// The fixtures append one tick every 100 ms, so a writer that survived the
+/// teardown adds several ticks inside this window and changes the log size.
+/// Watching the log for this window proves the teardown in far less wall-clock
+/// time than a fixed multi-second sleep.
+#[cfg(test)]
+pub(super) const PROCESS_GROUP_STABILITY_WINDOW: std::time::Duration =
+    std::time::Duration::from_millis(400);
+
 #[cfg(test)]
 mod tests {
     use super::super::run_toolchain_check_with_timeout;
@@ -813,7 +905,7 @@ mod tests {
         // timeout must tear down the whole process group, so the grandchild has
         // to stop writing as well.
         let command =
-            "sh -c 'sh -c \"while true; do echo tick >> heartbeat.log; sleep 1; done\" & wait'";
+            "sh -c 'sh -c \"while true; do echo tick >> heartbeat.log; sleep 0.1; done\" & wait'";
         let res = run_toolchain_check_with_timeout(dir.path(), command, 1, None).await;
         assert!(!res.success, "expected a timeout: {}", res.combined_output);
         assert!(
@@ -824,7 +916,7 @@ mod tests {
 
         let heartbeat = dir.path().join("heartbeat.log");
         let size_at_kill = std::fs::metadata(&heartbeat).map(|m| m.len()).unwrap_or(0);
-        tokio::time::sleep(std::time::Duration::from_millis(2200)).await;
+        tokio::time::sleep(PROCESS_GROUP_STABILITY_WINDOW).await;
         let size_later = std::fs::metadata(&heartbeat).map(|m| m.len()).unwrap_or(0);
         assert_eq!(
             size_at_kill, size_later,
@@ -845,7 +937,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let heartbeat = dir.path().join("heartbeat.log");
         let command =
-            "sh -c 'sh -c \"while true; do echo tick >> heartbeat.log; sleep 1; done\" & wait'";
+            "sh -c 'sh -c \"while true; do echo tick >> heartbeat.log; sleep 0.1; done\" & wait'";
         let (cancel_tx, cancel_rx) = watch::channel(false);
         let root = dir.path().to_path_buf();
         let task = tokio::spawn(async move {
@@ -884,7 +976,7 @@ mod tests {
         let size_at_kill = std::fs::metadata(&heartbeat)
             .map(|meta| meta.len())
             .unwrap_or(0);
-        tokio::time::sleep(std::time::Duration::from_millis(2200)).await;
+        tokio::time::sleep(PROCESS_GROUP_STABILITY_WINDOW).await;
         let size_later = std::fs::metadata(&heartbeat)
             .map(|meta| meta.len())
             .unwrap_or(0);
@@ -930,6 +1022,41 @@ mod tests {
         assert!(
             started.elapsed() < std::time::Duration::from_millis(1200),
             "the cancelled turn waited for the lingering descendant: {:?}",
+            started.elapsed()
+        );
+    }
+
+    /// Without a cancellation signal the drain of the output pipes is bounded by
+    /// the wall-clock deadline: a descendant that inherited the pipes and never
+    /// exits ends the invocation with a timeout instead of hanging the turn.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_run_command_without_cancellation_is_bounded_by_the_deadline() {
+        let dir = tempdir().unwrap();
+        // The direct child exits at once; the grandchild keeps the inherited
+        // pipes open far longer than the budget of the invocation.
+        let command = CommandLine::tokenized("sh -c 'sh -c \"sleep 5\" & exit 0'");
+
+        let started = std::time::Instant::now();
+        let result = run_command(dir.path(), &command, 1, None, None).await;
+
+        assert!(!result.success, "a held pipe must not report success");
+        assert!(!result.is_cancelled);
+        assert!(
+            result.combined_output.contains("timed out"),
+            "output: {}",
+            result.combined_output
+        );
+        assert!(
+            result
+                .combined_output
+                .contains("held the output pipes open"),
+            "output: {}",
+            result.combined_output
+        );
+        assert!(
+            started.elapsed() < std::time::Duration::from_millis(4000),
+            "the turn waited for the pipe-holding descendant: {:?}",
             started.elapsed()
         );
     }
@@ -1013,7 +1140,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let heartbeat = dir.path().join("heartbeat.log");
         let command =
-            "sh -c 'sh -c \"while true; do echo tick >> heartbeat.log; sleep 1; done\" & wait'";
+            "sh -c 'sh -c \"while true; do echo tick >> heartbeat.log; sleep 0.1; done\" & wait'";
         let (cancel_tx, cancel_rx) = watch::channel(false);
         let root = dir.path().to_path_buf();
         let task = tokio::spawn(async move {
@@ -1053,7 +1180,7 @@ mod tests {
         let size_at_kill = std::fs::metadata(&heartbeat)
             .map(|meta| meta.len())
             .unwrap_or(0);
-        tokio::time::sleep(std::time::Duration::from_millis(2200)).await;
+        tokio::time::sleep(PROCESS_GROUP_STABILITY_WINDOW).await;
         let size_later = std::fs::metadata(&heartbeat)
             .map(|meta| meta.len())
             .unwrap_or(0);
@@ -1103,6 +1230,34 @@ mod tests {
         assert!(
             started.elapsed() < std::time::Duration::from_millis(1200),
             "the cancelled turn waited for the lingering descendant: {:?}",
+            started.elapsed()
+        );
+    }
+
+    /// A stream filter whose descendant holds the output pipes is bounded by the
+    /// wall-clock deadline even when no cancellation signal releases the drain.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_run_streaming_command_without_cancellation_is_bounded_by_the_deadline() {
+        let dir = tempdir().unwrap();
+        let command = CommandLine::tokenized("sh -c 'sh -c \"sleep 5\" & exit 0'");
+
+        let started = std::time::Instant::now();
+        let outcome =
+            run_streaming_command(dir.path(), &command, "src/lib.rs", "staged", 1, None).await;
+
+        assert!(!outcome.success);
+        assert!(outcome.timed_out);
+        assert!(!outcome.is_cancelled);
+        assert!(outcome.stdout.is_empty());
+        assert!(
+            outcome.stderr.contains("held the output pipes open"),
+            "stderr: {}",
+            outcome.stderr
+        );
+        assert!(
+            started.elapsed() < std::time::Duration::from_millis(4000),
+            "the turn waited for the pipe-holding descendant: {:?}",
             started.elapsed()
         );
     }

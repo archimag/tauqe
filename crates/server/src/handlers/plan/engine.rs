@@ -14,7 +14,7 @@ use tauqe_protocol::{
 
 use crate::handlers::architect::{format_architect_escalation_note, run_contour_synthesis};
 use crate::handlers::common::{
-    clear_auto_context, emit, preload_readonly_files, record_synthesis_history,
+    cleanup_transient_context, emit, preload_readonly_files, record_synthesis_history,
 };
 use crate::state::{AppState, OperationGuard};
 
@@ -105,7 +105,10 @@ pub(super) async fn execute_plan_horizon_synthesis(
         );
     }
 
-    clear_auto_context(state).await;
+    // The synthesis starts from a released transient context: only the files it
+    // declares below reach the Architect, so a replanning wave never inherits
+    // the material that already failed.
+    cleanup_transient_context(state).await;
 
     // Guarantee baseline visibility for both deep planning and replanning:
     // collect every existing step's declared target and reference files and
@@ -224,10 +227,10 @@ pub(super) async fn execute_plan_horizon_synthesis(
     } = match contour_result {
         Ok(outcome) => outcome,
         Err(err) => {
-            // The contour owns the auto layer it widened and the launch skeleton
-            // merged everything else back, so the transient layer is released
-            // before the turn reports its failure.
-            clear_auto_context(state).await;
+            // The contour owns the transient layers it widened and the launch
+            // skeleton merged everything else back, so the transient context is
+            // released before the turn reports its failure.
+            cleanup_transient_context(state).await;
             // A cancellation observed while the contour settled still ends the
             // turn as a cancellation instead of a provider failure.
             if summary.cancelled {
@@ -258,7 +261,9 @@ pub(super) async fn execute_plan_horizon_synthesis(
 
     match status {
         StructuredRefineStatus::Cancelled => {
-            clear_auto_context(state).await;
+            // A cancelled synthesis leaves the transient context behind, so it
+            // is released exactly as an ended step does.
+            cleanup_transient_context(state).await;
             return Response::err(
                 req_id,
                 errors::CANCELLED,
@@ -284,6 +289,27 @@ pub(super) async fn execute_plan_horizon_synthesis(
             )
             .await;
             return Response::ok_typed(req_id, &PlanRefineResult::Blocked { reason });
+        }
+        StructuredRefineStatus::Aborted(report) => {
+            // An abort states that the work cannot be completed in the current
+            // environment, so the developer receives the exact host action
+            // beside the recorded verdict instead of a contradiction the
+            // Architect would have had to invent.
+            let message = report.to_message();
+            tracing::warn!(
+                plan_id = %plan.id,
+                reason = %report.reason,
+                "architect reported an abort"
+            );
+            record_synthesis_history(
+                state,
+                history_turn_prompt,
+                history_context_paths,
+                message.clone(),
+                Some(format!("{}: Aborted ({})", operation_title, plan.title)),
+            )
+            .await;
+            return Response::ok_typed(req_id, &PlanRefineResult::Blocked { reason: message });
         }
         StructuredRefineStatus::BudgetExceeded { diagnostic } => {
             record_synthesis_history(

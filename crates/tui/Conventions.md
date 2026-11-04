@@ -336,3 +336,35 @@ This document specifies mandatory architectural and UX invariants for the Tauqe 
 4. **Mandatory Regression Coverage:**
    - Registry resolution (top-most region wins, edges exclusive, empty space resolves to nothing, a cleared registry drops every region) and the dispatcher transitions are covered by unit tests in `crates/tui/src/ui.rs` and `crates/tui/src/input/mouse.rs`.
    - A change that reintroduces a widget-specific coordinate check inside the pointer handler, or lets a covered surface keep a clickable region, must break these tests rather than pass silently.
+
+---
+
+## 11. Memory Bounds of the Presentation Layer
+
+1. **The Interface Never Retains Unbounded Growth:**
+   - A long session, a deeply expanded tree, or a large audit log must never translate into a presentation structure that grows with the session. Every cache, retained list, and reading buffer the interface owns carries a declared ceiling.
+2. **Markdown Body Cache Ceiling (`MAX_CACHED_BODIES`):**
+   - Rendered Markdown bodies are held by the single cache in `crates/tui/src/markdown/cache.rs`, capped at `MAX_CACHED_BODIES = 128` bodies.
+   - Every lookup stamps the body it returns, a cache hit and a freshly rendered body alike, with the current value of a monotonic cache clock (`CachedBody::last_used`). A hit therefore refreshes the stamp, and a body read again becomes the most recently used one.
+   - When a new body would exceed the ceiling, the body with the smallest `last_used` is evicted through a linear search over the retained entries. Room is made before the new body enters, so the body the current call asks for is never the victim of its own insertion.
+   - A view that drops an item from the window it can draw releases that item's body explicitly through `MarkdownBodyCache::evict`. Releasing a key that holds no body is a neutral no-op.
+3. **Retained History Window (`HISTORY_RETAINED_ITEMS`):**
+   - The History view mirrors a journal that grows for the whole session, while the
+     presentation layer owns a bounded amount of memory. The view retains the newest
+     `HISTORY_RETAINED_ITEMS = 200` records and drops the oldest prefix when a live append
+     crosses that ceiling.
+   - The dropped block is measured through the same layout the viewport uses — the item
+     bodies honour the fold state and the records are separated by dividers — so the scroll
+     offset and the selected index are compensated by the height and the count of what left
+     above them. The fold state and the cached body of a dropped record are released with
+     it, together with the copy flash that targeted it.
+   - Dropping a record from the view never drops it from the store. The view reports that
+     older records are available (`has_more`), so the top of the list reads them back
+     through the existing paging request. Replacing the list (`apply_page`) and
+     restructuring it (`apply_compaction`) are not trimmed: an explicit older-page fetch may
+     widen the window until the next live record arrives.
+4. **Rendering Metrics Keep Their Meaning:**
+   - The ceiling and the explicit release change no measurement: `render_count` counts real renders only, so a hit, an eviction, and a no-op release leave it flat and the regression tests still prove that navigation never re-parses a body.
+5. **Rationale (Why):**
+   - An unbounded body cache turns every node a session ever expanded into permanently retained memory, and that cost stays invisible until the process is already large. A hard ceiling with an explicit release path bounds the memory by construction and keeps the release decision in the view that knows which items left its window.
+   - The history window follows the same argument one level up: a session that appends a record per prompt and per answer would otherwise keep every rendered row of the whole run in memory. Bounding the view while compensating the reading position keeps a long session both legible and cheap.

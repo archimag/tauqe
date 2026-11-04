@@ -12,6 +12,11 @@
 //! [`StagedEditsState::staged_files`] — and therefore the working tree — are
 //! exactly the bytes the validation gate inspected.
 //!
+//! The filter is a text contour, so a staged entry that does not decode as
+//! UTF-8 never enters it: the bytes of a binary payload are kept verbatim,
+//! because a formatter that cannot represent them would otherwise corrupt the
+//! very content a rename carries.
+//!
 //! The filter itself is declared by the project configuration of the repository
 //! and runs in [`crate::toolchain`]; this module owns only the hand-off. The
 //! declaration is resolved once for the whole attempt, so a change set validates
@@ -32,7 +37,7 @@ use tokio::sync::watch;
 use super::change_set::{
     stage_and_validate_edits_inner, StageEditsResult, StagedConfigValidator, StagedEditsState,
 };
-use crate::blocking::{log_join_error, run_blocking, run_blocking_async};
+use crate::blocking::{resolve_offload_failure, run_blocking_async};
 use crate::toolchain::{resolve_formatter, FormatterResolution};
 
 /// Stages edits in memory under an already resolved project configuration and
@@ -150,10 +155,14 @@ impl StagingInputs {
 /// executor free to poll cancellation, provider streaming, and RPC traffic
 /// while a large change set stages.
 ///
-/// An offload that returns no result — a panicked or cancelled blocking task —
-/// is recorded through [`log_join_error`] and the attempt degrades to the
-/// synchronous path: the change set still stages, it simply does so on the
-/// calling thread.
+/// An offload can fail instead of returning its result, and the two failures
+/// are not interchangeable. A blocking task the runtime cancelled never ran the
+/// state machine, so the attempt degrades to the synchronous path and the change
+/// set still stages — it simply does so on the calling thread. A blocking task
+/// that panicked already ran the state machine and crashed: the work is
+/// deterministic, so retrying it on the caller would crash a second time and
+/// spend the whole staging pass again. The panic therefore resumes here with the
+/// payload it was raised with.
 async fn stage_off_the_executor(
     inputs: Arc<StagingInputs>,
     config_validator: Option<StagedConfigValidator>,
@@ -163,8 +172,12 @@ async fn stage_off_the_executor(
     match staged {
         Ok(result) => result,
         Err(error) => {
-            log_join_error(&error, "stage_and_validate_edits");
-            run_blocking(|| inputs.stage(config_validator))
+            // A cancelled offload leaves the state machine unrun, so the
+            // synchronous fallback still stages the change set. A panicked one
+            // already ran it, so its payload resumes instead of being retried.
+            resolve_offload_failure(error, "stage_and_validate_edits", || {
+                inputs.stage(config_validator)
+            })
         }
     }
 }
@@ -176,13 +189,15 @@ async fn stage_off_the_executor(
 /// standard output, so the change set is formatted while it still lives in
 /// memory. The declaration is resolved once for the whole attempt, so a change
 /// set that stages many files validates its filter a single time and streams
-/// every one of them through the same resolved command line and timeout. A
-/// repository that declares no filter keeps every authored content, a
-/// declaration the configuration rejects is reported once, and a cancelled
-/// invocation leaves the rest of the change set untouched. Every file is
-/// streamed with its own repository-relative path, so the filter receives the
-/// same path the change set holds and a polyglot repository dispatches on the
-/// file type instead of guessing it from the content.
+/// every one of them through the same resolved command line and timeout. The
+/// filter is a text contour, so an entry that does not decode as UTF-8 is never
+/// streamed through it and keeps its bytes verbatim. A repository that declares
+/// no filter keeps every authored content, a declaration the configuration
+/// rejects is reported once, and a cancelled invocation leaves the rest of the
+/// change set untouched. Every file is streamed with its own
+/// repository-relative path, so the filter receives the same path the change
+/// set holds and a polyglot repository dispatches on the file type instead of
+/// guessing it from the content.
 ///
 /// `config_validator` is the gate the change set passed on admission, and every
 /// rewritten document passes it again before it joins the staged state: the
@@ -210,8 +225,15 @@ async fn format_staged_files(
 
     let mut formatted: Vec<(String, String)> = Vec::new();
     for path in &result.successful_paths {
-        let Some(content) = result.staged_state.staged_files.get(path).cloned() else {
+        let Some(bytes) = result.staged_state.staged_files.get(path).cloned() else {
             // A staged deletion carries no content to rewrite.
+            continue;
+        };
+        // A staged entry that does not decode as UTF-8 never enters the
+        // filter: a formatter is a text contour, and streaming a binary
+        // payload through it would corrupt the very bytes the change set
+        // carries.
+        let Ok(content) = String::from_utf8(bytes) else {
             continue;
         };
         let outcome = formatter.format(repo_root, path, &content, cancel_rx).await;
@@ -237,7 +259,10 @@ async fn format_staged_files(
             );
             continue;
         }
-        result.staged_state.staged_files.insert(path, content);
+        result
+            .staged_state
+            .staged_files
+            .insert(path, content.into_bytes());
     }
 }
 
@@ -288,6 +313,19 @@ mod tests {
             }],
             total_estimated_tokens: 1,
         }
+    }
+
+    /// Returns the exact staged bytes of `path`.
+    ///
+    /// Staging keeps bytes, so a fixture compares the payload it expects
+    /// verbatim instead of decoding the staged content as text.
+    fn staged_bytes<'a>(result: &'a StageEditsResult, path: &str) -> &'a [u8] {
+        result
+            .staged_state
+            .staged_files
+            .get(path)
+            .map(Vec::as_slice)
+            .unwrap_or_else(|| panic!("'{path}' is not staged"))
     }
 
     /// Rejects a rewritten document that carries the corruption marker.
@@ -345,15 +383,15 @@ mod tests {
         );
         assert!(result.failed_files.is_empty());
         assert_eq!(result.successful_paths, vec![CONFIG_PATH.to_string()]);
-        let staged = result
-            .staged_state
-            .staged_files
-            .get(CONFIG_PATH)
-            .expect("the authored content still stages");
-        assert_eq!(staged.as_str(), AUTHORED_CONFIG);
+        assert_eq!(
+            staged_bytes(&result, CONFIG_PATH),
+            AUTHORED_CONFIG.as_bytes(),
+            "the authored content survives the rejected rewrite"
+        );
+        let rendered = String::from_utf8_lossy(staged_bytes(&result, CONFIG_PATH));
         assert!(
-            !staged.contains("CORRUPT"),
-            "the corrupted formatted bytes reached the staged state: {staged:?}"
+            !rendered.contains("CORRUPT"),
+            "the corrupted formatted bytes reached the staged state: {rendered}"
         );
         // Staging is memory only, so the working tree keeps the original.
         assert_eq!(
@@ -378,12 +416,8 @@ mod tests {
         assert!(result.is_success());
         assert!(result.failed_files.is_empty());
         assert_eq!(
-            result
-                .staged_state
-                .staged_files
-                .get(CONFIG_PATH)
-                .map(String::as_str),
-            Some("# AUTHORED CONFIGURATION\n")
+            staged_bytes(&result, CONFIG_PATH),
+            &b"# AUTHORED CONFIGURATION\n"[..]
         );
     }
 
@@ -462,20 +496,12 @@ mod tests {
         assert!(result.successful_paths.contains(&CONFIG_PATH.to_string()));
         assert!(result.successful_paths.contains(&HELPER_PATH.to_string()));
         assert_eq!(
-            result
-                .staged_state
-                .staged_files
-                .get(CONFIG_PATH)
-                .map(String::as_str),
-            Some("# AUTHORED CONFIGURATION\n")
+            staged_bytes(&result, CONFIG_PATH),
+            &b"# AUTHORED CONFIGURATION\n"[..]
         );
         assert_eq!(
-            result
-                .staged_state
-                .staged_files
-                .get(HELPER_PATH)
-                .map(String::as_str),
-            Some(AUTHORED_HELPER)
+            staged_bytes(&result, HELPER_PATH),
+            AUTHORED_HELPER.as_bytes()
         );
         // Staging is memory only: the working tree keeps both authored files.
         assert_eq!(
@@ -584,20 +610,111 @@ mod tests {
 
         assert!(result.is_success(), "{:?}", result.failed_files);
         assert_eq!(
+            staged_bytes(&result, CONFIG_PATH),
+            &b"# tauqe.toml\n# authored configuration\n"[..]
+        );
+        assert_eq!(
+            staged_bytes(&result, HELPER_PATH),
+            &b"# src/lib.rs\npub fn value() -> i32 { 1 }\n"[..]
+        );
+    }
+    /// A staged payload that does not decode as UTF-8 never reaches the filter,
+    /// so its bytes stay verbatim while the text files of the same change set
+    /// are still formatted.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_the_formatter_seam_keeps_a_payload_that_does_not_decode_verbatim() {
+        let dir = repository();
+        let project =
+            project_config(r#"{"format": {"command": "sh", "args": ["-c", "tr a-z A-Z"]}}"#);
+        let binary: Vec<u8> = vec![0xff, 0xfe, 0x00, b'a'];
+        let mut result = StageEditsResult {
+            staged_state: StagedEditsState::default(),
+            successful_paths: vec!["assets/logo.bin".to_string(), "src/lib.rs".to_string()],
+            successful_edits: Vec::new(),
+            failed_files: Vec::new(),
+        };
+        result
+            .staged_state
+            .staged_files
+            .insert("assets/logo.bin".to_string(), binary.clone());
+        result
+            .staged_state
+            .staged_files
+            .insert("src/lib.rs".to_string(), b"pub fn value() {}\n".to_vec());
+
+        format_staged_files(dir.path(), &project, None, &mut result, None).await;
+
+        assert_eq!(
             result
                 .staged_state
                 .staged_files
-                .get(CONFIG_PATH)
-                .map(String::as_str),
-            Some("# tauqe.toml\n# authored configuration\n")
+                .get("assets/logo.bin")
+                .map(Vec::as_slice),
+            Some(binary.as_slice()),
+            "a payload the filter cannot represent keeps its bytes verbatim"
         );
         assert_eq!(
             result
                 .staged_state
                 .staged_files
-                .get(HELPER_PATH)
-                .map(String::as_str),
-            Some("# src/lib.rs\npub fn value() -> i32 { 1 }\n")
+                .get("src/lib.rs")
+                .map(Vec::as_slice),
+            Some(&b"PUB FN VALUE() {}\n"[..]),
+            "the text files of the same change set are still formatted"
+        );
+    }
+
+    /// The staging rounds the panic fixture observed, counted by its validator
+    /// hook.
+    static STAGING_ROUNDS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+    /// Crashes the staging state machine and counts the round it crashed in.
+    ///
+    /// The hook panics on purpose: it models a bug inside the state machine, which
+    /// no input can express, and it counts the rounds so the fixture can prove the
+    /// offloaded attempt is never retried.
+    #[allow(clippy::panic_in_result_fn)]
+    fn panic_during_staging(_path: &str, _content: Option<&str>) -> Result<(), String> {
+        STAGING_ROUNDS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        panic!("the staging state machine crashed");
+    }
+
+    /// A panicked offload already ran the state machine, so it is never retried on
+    /// the calling thread: the turn observes the original panic payload exactly
+    /// once, and the staging pass is not spent twice.
+    #[test]
+    fn test_a_panicked_staging_offload_is_not_retried_on_the_caller_thread() {
+        use std::sync::atomic::Ordering;
+
+        let dir = repository();
+        std::fs::write(dir.path().join(CONFIG_PATH), ORIGINAL_CONFIG).unwrap();
+        let project = project_config(r#"{"verify": {"command": "cargo"}}"#);
+        STAGING_ROUNDS.store(0, Ordering::SeqCst);
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+
+        let resumed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            runtime.block_on(stage_configuration_replacement(
+                dir.path(),
+                &project,
+                panic_during_staging,
+            ))
+        }));
+        let payload = resumed.expect_err("the staging panic resumes in the turn");
+
+        assert_eq!(
+            payload.downcast_ref::<&str>().copied(),
+            Some("the staging state machine crashed"),
+            "the original panic payload reaches the caller"
+        );
+        assert_eq!(
+            STAGING_ROUNDS.load(Ordering::SeqCst),
+            1,
+            "a panicked offload is never retried"
         );
     }
 }

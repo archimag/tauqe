@@ -892,7 +892,13 @@ pub async fn handle_review_key(
         None => return Ok(InputResult::Continue),
     };
 
-    let rows_len = st.review.flatten_rows().len();
+    // The count comes from the counter that mirrors the projection, never from
+    // the projection itself: a key that never reads it — `Esc`, `Return`, a
+    // cursor move — must not materialize every session title, group header,
+    // finding description, and file list of the tree. The counting walk is
+    // pinned to the flattened rows by the fold-state regression tests, so the
+    // two can never disagree (c-2).
+    let rows_len = st.review.row_count();
     let page = st.review.view_height.saturating_sub(2).max(1);
 
     match action {
@@ -1646,6 +1652,7 @@ mod tests {
                 id: 1,
                 title: "Finding".to_string(),
                 uuid: None,
+                commit: None,
                 group: None,
                 model: None,
                 issue_type: IssueType::Architecture,
@@ -1703,6 +1710,7 @@ mod tests {
                     id: 1,
                     title: "Finding 1".to_string(),
                     uuid: None,
+                    commit: None,
                     group: None,
                     model: None,
                     issue_type: IssueType::Architecture,
@@ -1718,6 +1726,7 @@ mod tests {
                     id: 2,
                     title: "Finding 2".to_string(),
                     uuid: None,
+                    commit: None,
                     group: None,
                     model: None,
                     issue_type: IssueType::Quality,
@@ -1771,6 +1780,7 @@ mod tests {
                     id: 1,
                     title: "Finding 1".to_string(),
                     uuid: None,
+                    commit: None,
                     group: None,
                     model: None,
                     issue_type: IssueType::Architecture,
@@ -1786,6 +1796,7 @@ mod tests {
                     id: 2,
                     title: "Finding 2".to_string(),
                     uuid: None,
+                    commit: None,
                     group: None,
                     model: None,
                     issue_type: IssueType::Quality,
@@ -1816,6 +1827,7 @@ mod tests {
                     id: 1,
                     title: "Finding 3".to_string(),
                     uuid: None,
+                    commit: None,
                     group: None,
                     model: None,
                     issue_type: IssueType::Bug,
@@ -1831,6 +1843,7 @@ mod tests {
                     id: 2,
                     title: "Finding 4".to_string(),
                     uuid: None,
+                    commit: None,
                     group: None,
                     model: None,
                     issue_type: IssueType::Quality,
@@ -1888,6 +1901,7 @@ mod tests {
                 id: 1,
                 title: "Finding 1".to_string(),
                 uuid: None,
+                commit: None,
                 group: None,
                 model: None,
                 issue_type: IssueType::Architecture,
@@ -1985,6 +1999,7 @@ mod tests {
                 id: 1,
                 title: "Todo Finding".to_string(),
                 uuid: None,
+                commit: None,
                 group: None,
                 model: None,
                 issue_type: IssueType::Architecture,
@@ -2031,6 +2046,7 @@ mod tests {
                 id: item_id,
                 title: "Todo Finding".to_string(),
                 uuid: None,
+                commit: None,
                 group: None,
                 model: None,
                 issue_type: IssueType::Architecture,
@@ -2183,6 +2199,7 @@ mod tests {
                         id: n,
                         title: format!("Finding {n}"),
                         uuid: None,
+                        commit: None,
                         group: None,
                         model: None,
                         issue_type: IssueType::Architecture,

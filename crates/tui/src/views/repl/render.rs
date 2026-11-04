@@ -21,6 +21,7 @@ mod splash;
 
 pub(crate) use self::model::compute_model_lines_with_file_rows;
 pub(crate) use self::model::file_op_badge;
+pub(crate) use self::model::link_rows;
 pub(crate) use self::model::measure_canvas;
 pub(crate) use self::model::wrap_model_lines;
 use self::splash::render_splash;
@@ -732,6 +733,17 @@ fn render_model_pane(frame: &mut ratatui::Frame, state: &mut AppState, area: Rec
 
     let total_lines = model_lines.len();
     state.model.rendered_lines_count = total_lines;
+    // The answer hyperlinks are resolved onto the rows the canvas draws before
+    // the projection is published: publishing hands the wrap offsets to the
+    // view, and the resolution reads them (c-1, c-3).
+    let answer_links = link_rows(
+        &state.model.links,
+        prefix_count,
+        &model_lines,
+        &raw_to_visual_start,
+        &raw_to_visual_end,
+        content_width,
+    );
     // The canvas is wrapped once per frame, so the offsets are published here and
     // reused by every navigation key of this frame instead of being rebuilt
     // (c-1, c-4).
@@ -785,6 +797,27 @@ fn render_model_pane(frame: &mut ratatui::Frame, state: &mut AppState, area: Rec
         }
     }
     for (rect, action) in block_regions {
+        state.hit_regions.register(rect, action);
+    }
+    // The answer hyperlinks declare one region per row they paint: the Markdown
+    // renderer named them by the columns of the unwrapped line, the wrap
+    // projection above turns that into the rows the viewport actually draws, and
+    // the registry receives the finished rectangles together with the address
+    // they open (c-1, c-3). A link scrolled out of view declares nothing.
+    let mut link_regions: Vec<(Rect, UiAction)> = Vec::new();
+    for link in answer_links {
+        if let Some(rect) = geometry::link_row_rect(
+            inner,
+            link.visual_line,
+            link.start_col,
+            link.end_col,
+            state.model.scroll,
+            content_height,
+        ) {
+            link_regions.push((rect, UiAction::OpenUrl(link.url)));
+        }
+    }
+    for (rect, action) in link_regions {
         state.hit_regions.register(rect, action);
     }
 

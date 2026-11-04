@@ -6,6 +6,7 @@ use crate::discussion::{
     DiscussionRequest, RepoSearchRequest,
 };
 use crate::edit::{EditOperation, EditOutcome, StructuredChangeProposal};
+use crate::plan::PlanRejection;
 
 use super::effort::ReasoningEffort;
 use super::reference::ModelRef;
@@ -258,11 +259,7 @@ pub struct StructuredOutcomeProposal {
     #[serde(default)]
     pub status: String,
     /// Git commit message of the change set declared by a successful outcome.
-    ///
-    /// The canonical property is `commit_message`; `summary` stays accepted as
-    /// the spelling an earlier revision emitted, so a stored transcript or a
-    /// cached response keeps decoding identically.
-    #[serde(default, alias = "summary", skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub commit_message: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub message: Option<String>,
@@ -332,7 +329,6 @@ pub struct ModelResultProposal {
     pub context_requests: Vec<DiscussionContextRequest>,
     #[serde(
         default,
-        alias = "search_requests",
         deserialize_with = "deserialize_repo_search_requests",
         skip_serializing_if = "Vec::is_empty"
     )]
@@ -377,28 +373,102 @@ pub struct ModelResultProposal {
 ///
 /// A JSON `null` deserializes to an empty list, so a model that emits an
 /// explicit null never aborts the proposal parse.
+///
+/// The element shape is dispatched with a visitor instead of an untagged enum,
+/// so a malformed entry reports the precise reason it was rejected — a missing
+/// `path`, an unsupported value type, or a malformed `access` level — rather
+/// than the opaque "data did not match any variant of untagged enum" message,
+/// which names neither the field nor the offending entry. An entry that
+/// decodes but names a path that cannot identify a repository file is still
+/// dropped, so one unusable path never discards the usable requests next to
+/// it.
 fn deserialize_context_request_specs<'de, D>(
     deserializer: D,
 ) -> Result<Vec<DiscussionContextRequest>, D::Error>
 where
     D: serde::Deserializer<'de>,
 {
-    #[derive(Deserialize)]
-    #[serde(untagged)]
-    enum ContextRequestSpec {
-        Path(String),
-        Detailed(DiscussionContextRequest),
-    }
-
     let specs = Option::<Vec<ContextRequestSpec>>::deserialize(deserializer)?;
     Ok(specs
         .unwrap_or_default()
         .into_iter()
-        .filter_map(|spec| match spec {
-            ContextRequestSpec::Path(path) => DiscussionContextRequest::parse_spec(&path),
-            ContextRequestSpec::Detailed(request) => request.normalized(),
-        })
+        .filter_map(ContextRequestSpec::resolve)
         .collect())
+}
+
+/// Shared polymorphic specification of one `context_requests` entry.
+///
+/// A request is either the compact access-prefixed path string the
+/// edit-protocol schema emits (`"path"`, `"read_only:path"`, or
+/// `"editable:path"`) or the structured `{ path, access }` table a
+/// round-tripped proposal carries. Both forms resolve to one
+/// [`DiscussionContextRequest`], so the requested access level is preserved
+/// instead of being dropped into an ambiguous bare string.
+///
+/// The value is dispatched on its runtime shape with a visitor rather than an
+/// untagged enum. An untagged enum reports every malformed element as the
+/// opaque "data did not match any variant", which discards the precise
+/// diagnostic produced while parsing the structured form and cannot be
+/// localized to the offending entry; the visitor forwards that diagnostic
+/// verbatim.
+enum ContextRequestSpec {
+    /// Access-prefixed path specification emitted by the edit-protocol schema.
+    Compact(String),
+    /// Structured `{ path, access }` request carried by a round-tripped proposal.
+    Detailed(DiscussionContextRequest),
+}
+
+impl ContextRequestSpec {
+    /// Resolves the specification into a typed, access-aware request.
+    ///
+    /// An entry whose path cannot identify a repository file yields `None`, so
+    /// it is dropped instead of discarding the usable requests around it. The
+    /// requested access level is preserved.
+    fn resolve(self) -> Option<DiscussionContextRequest> {
+        match self {
+            Self::Compact(path) => DiscussionContextRequest::parse_spec(&path),
+            Self::Detailed(request) => request.normalized(),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for ContextRequestSpec {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct SpecVisitor;
+
+        impl<'de> serde::de::Visitor<'de> for SpecVisitor {
+            type Value = ContextRequestSpec;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("a context request path string or a { path, access } table")
+            }
+
+            fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                Ok(ContextRequestSpec::Compact(value.to_string()))
+            }
+
+            fn visit_map<A>(self, map: A) -> Result<Self::Value, A::Error>
+            where
+                A: serde::de::MapAccess<'de>,
+            {
+                // Delegating the structured form to the request's own
+                // `Deserialize` keeps its field validation identical to the
+                // typed path while preserving the precise field diagnostic.
+                let request = DiscussionContextRequest::deserialize(
+                    serde::de::value::MapAccessDeserializer::new(map),
+                )?;
+                Ok(ContextRequestSpec::Detailed(request))
+            }
+        }
+
+        deserializer.deserialize_any(SpecVisitor)
+    }
 }
 
 #[allow(clippy::large_enum_variant)]
@@ -428,6 +498,22 @@ pub struct ModelResultEvent {
     pub session_total_cost: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub current_cost: Option<f64>,
+    /// Plan mutations the harness refused during the turn.
+    ///
+    /// Each refusal arrives typed: the category is decided by the code that
+    /// produced it and the message is the wording that code reported, so a
+    /// client renders the refusal without classifying it from text. An empty
+    /// list is omitted from the wire form, and a producer that predates the
+    /// field stays decodable, because an absent field reads as an empty list.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub plan_rejections: Vec<PlanRejection>,
+    /// Plan status repairs the harness performed during the turn.
+    ///
+    /// A normalizing status barrier is a real event of the plan lifecycle, so a
+    /// status the stored plan refused is reported instead of being applied
+    /// silently. An empty list is omitted from the wire form.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub plan_warnings: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -619,16 +705,6 @@ mod tests {
         assert_eq!(proposal.repo_searches[0].path, "crates/core");
         assert_eq!(proposal.repo_searches[0].regex, "struct PlanStorage");
 
-        // Alias `search_requests` support
-        let raw_alias = r#"{
-            "message": "Alias search",
-            "search_requests": [{"path": "crates/protocol", "regex": "enum LlmCommand"}]
-        }"#;
-        let proposal_alias: ModelResultProposal = serde_json::from_str(raw_alias).unwrap();
-        assert_eq!(proposal_alias.repo_searches.len(), 1);
-        assert_eq!(proposal_alias.repo_searches[0].path, "crates/protocol");
-        assert_eq!(proposal_alias.repo_searches[0].regex, "enum LlmCommand");
-
         // Null tolerance
         let raw_null = r#"{
             "message": "Null search",
@@ -655,6 +731,52 @@ mod tests {
         );
     }
 
+    /// A malformed `context_requests` element reports why it was rejected, so
+    /// the diagnostic can be localized to the offending entry instead of
+    /// surfacing the opaque "data did not match any variant" message an
+    /// untagged enum produces.
+    #[test]
+    fn test_model_result_proposal_context_requests_report_precise_element_errors() {
+        // A structured entry without its mandatory path surfaces the missing
+        // field instead of an opaque variant mismatch.
+        let payload = r#"{"message":"Need files","context_requests":[{"access":"editable"}]}"#;
+        let err = serde_json::from_str::<ModelResultProposal>(payload)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("missing field `path`"), "got: {err}");
+
+        // An element of an unsupported shape names the shapes the field
+        // accepts, so the diagnostic states what a valid entry looks like.
+        for raw in [
+            r#"{"message":"x","context_requests":[null]}"#,
+            r#"{"message":"x","context_requests":[7]}"#,
+            r#"{"message":"x","context_requests":[["src/a.rs"]]}"#,
+        ] {
+            let err = serde_json::from_str::<ModelResultProposal>(raw)
+                .unwrap_err()
+                .to_string();
+            assert!(
+                err.contains("a context request path string or a { path, access } table"),
+                "got: {err} for {raw}"
+            );
+        }
+
+        // No rejection falls back to the opaque untagged-enum message: each
+        // one names its own cause.
+        for raw in [
+            r#"{"message":"x","context_requests":[null]}"#,
+            r#"{"message":"x","context_requests":[{"access":"editable"}]}"#,
+            r#"{"message":"x","context_requests":[{"path":"src/a.rs","access":"sometimes"}]}"#,
+        ] {
+            let err = serde_json::from_str::<ModelResultProposal>(raw)
+                .unwrap_err()
+                .to_string();
+            assert!(
+                !err.contains("did not match any variant"),
+                "got: {err} for {raw}"
+            );
+        }
+    }
     #[test]
     fn test_cancel_mode_and_model_cancel_params_serde() {
         assert_eq!(CancelMode::default(), CancelMode::Hard);
@@ -831,12 +953,6 @@ mod tests {
 
         let de: StructuredOutcomeProposal = serde_json::from_str(&json).unwrap();
         assert_eq!(de, proposal);
-
-        // The pre-rename spelling still decodes through the declared alias, so a
-        // stored transcript keeps replaying identically.
-        let legacy: StructuredOutcomeProposal =
-            serde_json::from_str(r#"{"status":"success","summary":"Legacy payload"}"#).unwrap();
-        assert_eq!(legacy.commit_message.as_deref(), Some("Legacy payload"));
 
         // Also test "skipped" alias variant
         let proposal_skipped = StructuredOutcomeProposal {
@@ -1076,17 +1192,6 @@ mod tests {
         assert_eq!(proposal.repo_searches[0].regex, "fn run");
         assert!(proposal.repo_searches[1].path.is_empty());
         assert_eq!(proposal.repo_searches[1].regex, "pub fn");
-
-        // The alias decodes through the same normalizer instead of bypassing
-        // it.
-        let raw_alias = r#"{
-            "message": "Alias search",
-            "search_requests": [{"path": "./crates/protocol/", "regex": "enum LlmCommand"}]
-        }"#;
-        let aliased: ModelResultProposal = serde_json::from_str(raw_alias).unwrap();
-        assert_eq!(aliased.repo_searches.len(), 1);
-        assert_eq!(aliased.repo_searches[0].path, "crates/protocol");
-        assert_eq!(aliased.repo_searches[0].regex, "enum LlmCommand");
     }
 
     #[test]
@@ -1118,12 +1223,54 @@ mod tests {
             "changes": null,
             "context_drops": null,
             "suggested_actions": null,
-            "outcome": {"status": "success", "summary": "All checks passed"}
+            "outcome": {"status": "success", "commit_message": "All checks passed"}
         }"#;
         let with_outcome: ModelResultProposal = serde_json::from_str(raw_outcome).unwrap();
         assert!(with_outcome.changes.is_empty());
         let outcome = with_outcome.outcome.expect("outcome proposal");
         assert_eq!(outcome.status, "success");
         assert_eq!(outcome.commit_message.as_deref(), Some("All checks passed"));
+    }
+    /// The terminal event carries the typed plan mutations beside the turn
+    /// result: each refusal keeps the category its birthplace declared, an
+    /// absent field decodes as an empty list, and an empty list is never
+    /// serialized, so the extension stays compatible in both directions.
+    #[test]
+    fn test_model_result_event_carries_typed_plan_mutations() {
+        let event = ModelResultEvent {
+            operation_id: "op-plan".to_string(),
+            result: ModelResult::Answer {
+                text: "done".to_string(),
+            },
+            usage: None,
+            session_total_cost: None,
+            current_cost: None,
+            plan_rejections: vec![PlanRejection::payload_defect(
+                "the payload breaks the planning contract",
+            )],
+            plan_warnings: vec!["requested status corrected to in progress".to_string()],
+        };
+
+        let json = serde_json::to_string(&event).unwrap();
+        assert!(json.contains("\"plan_rejections\""));
+        assert!(json.contains("\"kind\":\"payload_defect\""));
+        assert!(json.contains("\"plan_warnings\""));
+
+        let decoded: ModelResultEvent = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded.operation_id, "op-plan");
+        assert_eq!(decoded.plan_rejections, event.plan_rejections);
+        assert_eq!(decoded.plan_warnings, event.plan_warnings);
+
+        // A producer that predates the fields keeps decoding, and its payload
+        // round-trips without inventing an empty list on the wire.
+        let legacy: ModelResultEvent = serde_json::from_str(
+            r#"{"operation_id":"op-legacy","result":{"kind":"answer","text":"ok"}}"#,
+        )
+        .unwrap();
+        assert!(legacy.plan_rejections.is_empty());
+        assert!(legacy.plan_warnings.is_empty());
+        let encoded = serde_json::to_string(&legacy).unwrap();
+        assert!(!encoded.contains("plan_rejections"));
+        assert!(!encoded.contains("plan_warnings"));
     }
 }

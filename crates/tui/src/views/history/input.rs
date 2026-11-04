@@ -38,12 +38,22 @@ pub async fn request_older_history(
             before_id: Some(before_id),
         }
     };
-    send_request(
-        server_writer,
-        methods::HISTORY_GET,
-        serde_json::to_value(params)?,
-    )
-    .await?;
+    let params = match serde_json::to_value(params) {
+        Ok(params) => params,
+        Err(error) => {
+            // The request never left the client, so the handshake it armed is
+            // released here; leaving `loading` set would silently disable every
+            // later fetch for the rest of the session (c-3).
+            state.lock().await.history_view.cancel_page_fetch();
+            return Err(error.into());
+        }
+    };
+    if let Err(error) = send_request(server_writer, methods::HISTORY_GET, params).await {
+        // A request the transport never carried has no answer to settle it, so
+        // the handshake is released here for the same reason (c-3).
+        state.lock().await.history_view.cancel_page_fetch();
+        return Err(error);
+    }
     Ok(())
 }
 

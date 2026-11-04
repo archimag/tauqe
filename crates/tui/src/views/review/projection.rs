@@ -273,11 +273,28 @@ fn normalized_diagnostic(value: Option<&str>) -> Option<String> {
         .map(str::to_string)
 }
 
+/// Findings one group renders, in render order.
+///
+/// A declared group, the implicit `Default` group of a legacy session, and the
+/// protective orphan bucket resolve their member list through this one filter,
+/// so the buckets can never disagree about which finding belongs to which
+/// header (concept #c-1, #c-3).
+fn findings_of<'a>(visible: &[&'a ReviewItem], group_id: &str) -> Vec<&'a ReviewItem> {
+    visible
+        .iter()
+        .copied()
+        .filter(|item| item.group.as_deref().unwrap_or(DEFAULT_REVIEW_GROUP_ID) == group_id)
+        .collect()
+}
+
 /// One group of a session, ready to be rendered.
 ///
-/// The bucket owns the group metadata it displays and borrows the findings it
-/// holds, so the row builder and the row counter walk one structure instead of
-/// re-deriving the grouping twice (concept #c-1, #c-3).
+/// The bucket owns the group metadata it displays and borrows both the
+/// findings it holds and the plan it renders, so the row builder and the row
+/// counter walk one structure instead of re-deriving the grouping twice
+/// (concept #c-1, #c-3). The plan is borrowed because the tree is rebuilt on
+/// every frame: copying the step graph here would deep-clone every plan of
+/// every group at the streaming redraw cadence.
 pub(super) struct GroupBucket<'a> {
     pub(super) id: String,
     /// Class of the group, which decides how it is executed.
@@ -294,7 +311,8 @@ pub(super) struct GroupBucket<'a> {
     /// moment it is built, so the branch header of the group and the header of
     /// a plan report one number for the same horizon (c-5).
     progress: (usize, usize),
-    pub(super) subplan: Vec<PlanItem>,
+    /// Unified plan of the group, borrowed from the session that stores it.
+    pub(super) subplan: &'a [PlanItem],
     subplan_architect: Option<ArchitectTier>,
     pub(super) items: Vec<&'a ReviewItem>,
 }
@@ -382,7 +400,7 @@ impl ReviewViewState {
                         self.flatten_subplan_rows(
                             &session.id,
                             &bucket.id,
-                            &bucket.subplan,
+                            bucket.subplan,
                             0,
                             &mut rows,
                         );
@@ -469,45 +487,61 @@ impl ReviewViewState {
             .iter()
             .filter(|item| !self.hide_closed || !is_closed(item.status))
             .collect();
-        let declared = session.effective_groups();
-        let implicit_default = session.groups.is_empty();
-
+        // The stored groups are walked in place. Resolving the effective groups
+        // would clone every group of the session — its whole plan tree included
+        // — on every call, while the projection runs once per rendered frame
+        // (concept #c-1, #c-3).
         let mut buckets: Vec<GroupBucket<'a>> = Vec::new();
-        for group in &declared {
-            let items: Vec<&ReviewItem> = visible
-                .iter()
-                .copied()
-                .filter(|item| {
-                    item.group.as_deref().unwrap_or(DEFAULT_REVIEW_GROUP_ID) == group.id.as_str()
-                })
-                .collect();
-            // A legacy session synthesizes one group from its target files; an
-            // empty implicit group would render a header over nothing.
-            if implicit_default && items.is_empty() {
-                continue;
+        if session.groups.is_empty() {
+            // A session written before grouping existed, or one launched as a
+            // single audit, is the degenerate case of one implicit `Default`
+            // group: it owns no stored plan, so the bucket borrows an empty step
+            // slice, and an empty implicit group renders no header at all.
+            let items = findings_of(&visible, DEFAULT_REVIEW_GROUP_ID);
+            if !items.is_empty() {
+                buckets.push(GroupBucket {
+                    id: DEFAULT_REVIEW_GROUP_ID.to_string(),
+                    kind: ReviewGroupKind::Simple,
+                    title: orphan_title(DEFAULT_REVIEW_GROUP_ID),
+                    description: None,
+                    blocked_reason: None,
+                    resolution_notes: None,
+                    progress: (0, 0),
+                    subplan: &[],
+                    subplan_architect: None,
+                    items,
+                });
             }
-            buckets.push(GroupBucket {
-                id: group.id.clone(),
-                kind: group.kind,
-                title: if group.title.trim().is_empty() {
-                    group.id.clone()
-                } else {
-                    group.title.clone()
-                },
-                description: normalized_diagnostic(group.description.as_deref()),
-                blocked_reason: normalized_diagnostic(group.blocked_reason.as_deref()),
-                resolution_notes: normalized_diagnostic(group.resolution_notes.as_deref()),
-                progress: leaf_progress(&group.implementation),
-                subplan: group.implementation.items.clone(),
-                subplan_architect: group.implementation.architect.clone(),
-                items,
-            });
+        } else {
+            for group in &session.groups {
+                buckets.push(GroupBucket {
+                    id: group.id.clone(),
+                    kind: group.kind,
+                    title: if group.title.trim().is_empty() {
+                        group.id.clone()
+                    } else {
+                        group.title.clone()
+                    },
+                    description: normalized_diagnostic(group.description.as_deref()),
+                    blocked_reason: normalized_diagnostic(group.blocked_reason.as_deref()),
+                    resolution_notes: normalized_diagnostic(group.resolution_notes.as_deref()),
+                    progress: leaf_progress(&group.implementation),
+                    subplan: &group.implementation.items,
+                    subplan_architect: group.implementation.architect.clone(),
+                    items: findings_of(&visible, &group.id),
+                });
+            }
         }
 
         let mut orphan_ids: Vec<String> = Vec::new();
         for item in &visible {
             let group_id = item.group.as_deref().unwrap_or(DEFAULT_REVIEW_GROUP_ID);
-            if declared.iter().any(|group| group.id == group_id) {
+            let declared = if session.groups.is_empty() {
+                group_id == DEFAULT_REVIEW_GROUP_ID
+            } else {
+                session.groups.iter().any(|group| group.id == group_id)
+            };
+            if declared {
                 continue;
             }
             if !orphan_ids.iter().any(|known| known == group_id) {
@@ -522,16 +556,9 @@ impl ReviewViewState {
                 blocked_reason: None,
                 resolution_notes: None,
                 progress: (0, 0),
-                subplan: Vec::new(),
+                subplan: &[],
                 subplan_architect: None,
-                items: visible
-                    .iter()
-                    .copied()
-                    .filter(|item| {
-                        item.group.as_deref().unwrap_or(DEFAULT_REVIEW_GROUP_ID)
-                            == group_id.as_str()
-                    })
-                    .collect(),
+                items: findings_of(&visible, &group_id),
                 id: group_id,
             });
         }
@@ -651,7 +678,7 @@ impl ReviewViewState {
             if !bucket.subplan.is_empty() {
                 count += 1; // The plan branch header.
                 if self.is_plan_branch_expanded(&session.id, &bucket.id) {
-                    count += self.count_subplan_rows(&session.id, &bucket.id, &bucket.subplan);
+                    count += self.count_subplan_rows(&session.id, &bucket.id, bucket.subplan);
                 }
             }
             count += bucket.items.len(); // One finding row per rendered finding.
@@ -696,6 +723,7 @@ mod tests {
             id,
             title: format!("Finding {}", id),
             uuid: None,
+            commit: None,
             group: None,
             model: None,
             issue_type: IssueType::Architecture,
@@ -1112,5 +1140,40 @@ mod tests {
             }
             other => panic!("expected a group header, got {other:?}"),
         }
+    }
+
+    /// The bucket borrows the plan the session stores instead of copying it:
+    /// the tree is rebuilt on every frame, so a deep clone of every group plan
+    /// per frame is exactly the cost this projection must not pay (c-1, c-5).
+    #[test]
+    fn test_group_bucket_borrows_the_stored_plan() {
+        let mut session = make_session("rev-borrow", &[1]);
+        session.groups = vec![ReviewGroup {
+            id: "arch".to_string(),
+            title: "Shared cause".to_string(),
+            kind: ReviewGroupKind::Architectural,
+            implementation: PlanImplementation {
+                items: vec![subplan_step("1", "Unify the guard", PlanItemStatus::Todo)],
+                ..Default::default()
+            },
+            ..Default::default()
+        }];
+        session.items[0].group = Some("arch".to_string());
+        let view = ReviewViewState {
+            sessions: vec![session],
+            ..Default::default()
+        };
+
+        let buckets = view.group_buckets(&view.sessions[0]);
+        let bucket = buckets
+            .iter()
+            .find(|bucket| bucket.id == "arch")
+            .expect("the declared group must be bucketed");
+        assert_eq!(
+            bucket.subplan.as_ptr(),
+            view.sessions[0].groups[0].implementation.items.as_ptr(),
+            "the bucket must borrow the stored plan instead of cloning it"
+        );
+        assert_eq!(bucket.subplan.len(), 1);
     }
 }

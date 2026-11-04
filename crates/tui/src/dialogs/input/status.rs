@@ -158,6 +158,7 @@ mod tests {
             id,
             title: format!("Finding {id}"),
             uuid: None,
+            commit: None,
             group: None,
             model: None,
             issue_type: IssueType::Architecture,

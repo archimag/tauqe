@@ -70,6 +70,8 @@ struct CachedBody {
     theme: MarkdownTheme,
     /// Copy flash the body was rendered with, if any.
     flash: Option<usize>,
+    /// Value of the cache clock at the most recent access to this body.
+    last_used: u64,
     /// Finished, already wrapped body lines.
     lines: Vec<Line<'static>>,
     /// Fenced code blocks of the body, in wrapped line space.
@@ -110,16 +112,30 @@ struct RenderedBody {
 
 impl RenderedBody {
     /// Seals a render result into the entry the cache retains.
-    fn into_body(self, signature: u64, theme: &MarkdownTheme, flash: Option<usize>) -> CachedBody {
+    fn into_body(
+        self,
+        signature: u64,
+        theme: &MarkdownTheme,
+        flash: Option<usize>,
+        last_used: u64,
+    ) -> CachedBody {
         CachedBody {
             signature,
             theme: theme.clone(),
             flash,
+            last_used,
             lines: self.lines,
             blocks: self.blocks,
         }
     }
 }
+
+/// Upper bound on the number of retained Markdown bodies.
+///
+/// A tree keeps one body per expanded node, and a long session can expand an
+/// unbounded number of them, so the cache holds a hard ceiling instead of
+/// growing with the session. Crossing it evicts the least recently used body.
+const MAX_CACHED_BODIES: usize = 128;
 
 /// Cache of rendered Markdown bodies, keyed by the item that owns them.
 ///
@@ -136,6 +152,8 @@ pub struct MarkdownBodyCache<K = String> {
     inputs: Option<RenderInputs>,
     /// Rendered bodies, keyed by the owning item.
     entries: HashMap<K, CachedBody>,
+    /// Monotonic access clock that stamps the bodies retained in `entries`.
+    clock: u64,
     /// How many bodies were actually rendered so far.
     render_count: u64,
 }
@@ -146,6 +164,7 @@ impl<K> MarkdownBodyCache<K> {
         Self {
             inputs: None,
             entries: HashMap::new(),
+            clock: 0,
             render_count: 0,
         }
     }
@@ -198,6 +217,39 @@ impl<K> Default for MarkdownBodyCache<K> {
 }
 
 impl<K: Clone + Eq + Hash> MarkdownBodyCache<K> {
+    /// Drops the body cached under `key`, reporting whether one was retained.
+    ///
+    /// A view calls this when an item it rendered leaves the window it can draw,
+    /// so the memory of a body nobody reads is released before the ceiling has to
+    /// make room on its own. A key without a body is a neutral no-op: the body may
+    /// already have been evicted by the ceiling or dropped with the whole cache.
+    pub fn evict(&mut self, key: &K) -> bool {
+        self.entries.remove(key).is_some()
+    }
+
+    /// Advances the access clock and returns the stamp of the current access.
+    fn next_stamp(&mut self) -> u64 {
+        self.clock = self.clock.saturating_add(1);
+        self.clock
+    }
+
+    /// Drops the least recently used body while the cache sits at its ceiling.
+    ///
+    /// A stamp is handed out once per access and the clock never moves backwards,
+    /// so no two bodies share one, which makes the victim unique.
+    fn evict_least_recently_used(&mut self) {
+        if self.entries.len() < MAX_CACHED_BODIES {
+            return;
+        }
+        let victim = self
+            .entries
+            .iter()
+            .min_by_key(|(_, body)| body.last_used)
+            .map(|(key, _)| key.clone());
+        if let Some(victim) = victim {
+            self.entries.remove(&victim);
+        }
+    }
     /// Returns the wrapped body lines of `text`, rendering them only when the
     /// cached entry no longer matches the requested inputs.
     ///
@@ -239,6 +291,10 @@ impl<K: Clone + Eq + Hash> MarkdownBodyCache<K> {
 
     /// Returns the retained body for `key`, rendering and storing it when the
     /// requested inputs differ from the ones that produced it.
+    ///
+    /// Every call is an access: the body it returns, a cache hit or a freshly
+    /// rendered body, takes the current stamp of the cache clock, which is the
+    /// value the ceiling compares when it has to choose a victim.
     fn body_for(
         &mut self,
         key: &K,
@@ -251,20 +307,30 @@ impl<K: Clone + Eq + Hash> MarkdownBodyCache<K> {
         self.prepare(width, theme_mode, crate::theme::engine::current_depth());
 
         let signature = content_signature(text);
+        let stamp = self.next_stamp();
         let mut rendered = 0u64;
-        let body = match self.entries.entry(key.clone()) {
+
+        // Room is made before a new body enters, so the body this call asks for
+        // can never be the victim of its own insertion.
+        if !self.entries.contains_key(key) {
+            self.evict_least_recently_used();
+        }
+
+        let body: &CachedBody = match self.entries.entry(key.clone()) {
             Entry::Occupied(mut occupied) => {
                 if !occupied.get().is_current(signature, theme, flash) {
-                    rendered += 1;
+                    rendered = 1;
                     let fresh = render_body(text, theme, width, flash);
-                    *occupied.get_mut() = fresh.into_body(signature, theme, flash);
+                    *occupied.get_mut() = fresh.into_body(signature, theme, flash, stamp);
                 }
-                occupied.into_mut()
+                let entry = occupied.into_mut();
+                entry.last_used = stamp;
+                entry
             }
             Entry::Vacant(vacant) => {
-                rendered += 1;
+                rendered = 1;
                 let fresh = render_body(text, theme, width, flash);
-                vacant.insert(fresh.into_body(signature, theme, flash))
+                vacant.insert(fresh.into_body(signature, theme, flash, stamp))
             }
         };
         self.render_count = self.render_count.saturating_add(rendered);
@@ -279,7 +345,9 @@ fn render_body(
     width: Option<usize>,
     flash: Option<usize>,
 ) -> RenderedBody {
-    let (raw, extracted) = render_markdown_with_blocks(text, theme, flash);
+    // A cached tree body keeps the painted rows and their fenced blocks; the
+    // extracted link regions serve the interactive surface and are not cached.
+    let (raw, extracted, _links) = render_markdown_with_blocks(text, theme, flash);
 
     let Some(width) = width else {
         return RenderedBody {
@@ -615,5 +683,111 @@ mod tests {
 
         cache.clear();
         assert!(cache.is_empty(), "an explicit clear drops every body");
+    }
+    /// Whether the cache currently retains a body for `key`.
+    fn contains<K: Eq + Hash>(cache: &MarkdownBodyCache<K>, key: &K) -> bool {
+        cache.entries.contains_key(key)
+    }
+
+    #[test]
+    fn the_ceiling_evicts_the_least_recently_used_body() {
+        let theme = body_theme("  ");
+        let newcomer = format!("node-{MAX_CACHED_BODIES}");
+        let mut cache = MarkdownBodyCache::new();
+
+        for index in 0..MAX_CACHED_BODIES {
+            cache.lines_for(
+                &format!("node-{index}"),
+                "Body.",
+                &theme,
+                None,
+                ThemeMode::Dark,
+            );
+        }
+        assert_eq!(cache.len(), MAX_CACHED_BODIES);
+
+        cache.lines_for(&newcomer, "Body.", &theme, None, ThemeMode::Dark);
+
+        assert_eq!(
+            cache.len(),
+            MAX_CACHED_BODIES,
+            "the ceiling keeps the cache at its bound"
+        );
+        assert!(
+            !contains(&cache, &"node-0".to_string()),
+            "the least recently used body is the victim"
+        );
+        assert!(
+            contains(&cache, &newcomer),
+            "the body this call asked for always survives"
+        );
+    }
+
+    #[test]
+    fn a_recent_lookup_protects_its_body_from_the_ceiling() {
+        let theme = body_theme("  ");
+        let touched = "node-0".to_string();
+        let next_oldest = "node-1".to_string();
+        let newcomer = format!("node-{MAX_CACHED_BODIES}");
+        let mut cache = MarkdownBodyCache::new();
+
+        for index in 0..MAX_CACHED_BODIES {
+            cache.lines_for(
+                &format!("node-{index}"),
+                "Body.",
+                &theme,
+                None,
+                ThemeMode::Dark,
+            );
+        }
+        cache.lines_for(&touched, "Body.", &theme, None, ThemeMode::Dark);
+        assert_eq!(
+            cache.render_count(),
+            MAX_CACHED_BODIES as u64,
+            "the touch is a hit, not a render"
+        );
+
+        cache.lines_for(&newcomer, "Body.", &theme, None, ThemeMode::Dark);
+
+        assert_eq!(cache.len(), MAX_CACHED_BODIES);
+        assert!(
+            contains(&cache, &touched),
+            "a body accessed later survives the ceiling"
+        );
+        assert!(
+            !contains(&cache, &next_oldest),
+            "the next oldest body is evicted instead"
+        );
+    }
+
+    #[test]
+    fn evict_removes_the_target_body_and_ignores_a_missing_key() {
+        let theme = body_theme("  ");
+        let target = "node-0".to_string();
+        let sibling = "node-1".to_string();
+        let mut cache = MarkdownBodyCache::new();
+
+        cache.lines_for(&target, "Body.", &theme, None, ThemeMode::Dark);
+        cache.lines_for(&sibling, "Body.", &theme, None, ThemeMode::Dark);
+        assert_eq!(cache.len(), 2);
+
+        assert!(cache.evict(&target), "a retained body is removed");
+        assert!(!contains(&cache, &target));
+        assert_eq!(cache.len(), 1, "the sibling keeps its body");
+
+        assert!(!cache.evict(&target), "a released key is a neutral no-op");
+        assert!(
+            !cache.evict(&"never cached".to_string()),
+            "an unknown key is a neutral no-op"
+        );
+        assert_eq!(cache.len(), 1, "a no-op leaves the cache untouched");
+        assert_eq!(cache.render_count(), 2, "eviction is not a render");
+
+        cache.lines_for(&target, "Body.", &theme, None, ThemeMode::Dark);
+        assert_eq!(
+            cache.render_count(),
+            3,
+            "a released body is rendered again rather than revived"
+        );
     }
 }

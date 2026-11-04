@@ -1,9 +1,8 @@
 use crossterm::event::{KeyCode, KeyEvent};
 
 use crate::app::{AppState, BatchCancelButton};
-use crate::command::translate_code;
+use crate::command::{is_bare_press, translate_code};
 use crate::components::confirm::ConfirmDialog;
-use crate::components::editor::is_char_typing;
 use crate::input::is_keyboard_quit;
 
 pub(super) use crate::components::confirm::ConfirmOutcome;
@@ -46,27 +45,43 @@ pub(super) enum BatchCancelOutcome {
 /// JCUKEN layout, and a custom `langmap` widens the vocabulary the same way
 /// (Conventions §5.1). The projection result is bound before the match so the
 /// shared borrow of the state ends before an arm mutates the focused button.
+/// Every letter is a bare press, so a command chord or the AltGr compose
+/// chord neither chooses a stop action nor dismisses the card (Conventions
+/// §3, §5.1).
 pub(super) fn resolve_batch_cancel(st: &mut AppState, key: KeyEvent) -> BatchCancelOutcome {
     let code = translate_code(key.code, &st.tui_config.input);
+    let bare = is_bare_press(key.modifiers);
     match code {
-        KeyCode::Left | KeyCode::Char('p') | KeyCode::BackTab => {
+        KeyCode::Left | KeyCode::BackTab => {
             st.batch_cancel_button.cycle_prev();
             BatchCancelOutcome::Toggled
         }
-        KeyCode::Right | KeyCode::Char('n') | KeyCode::Tab => {
+        KeyCode::Right | KeyCode::Tab => {
             st.batch_cancel_button.cycle_next();
             BatchCancelOutcome::Toggled
         }
-        KeyCode::Char('s') | KeyCode::Char('S') if is_char_typing(key.modifiers) => {
+        // The focus walk and the fast accelerators are bare presses, so a
+        // command chord or the AltGr compose chord reaches none of them
+        // (Conventions §3, §5.1).
+        KeyCode::Char('p') if bare => {
+            st.batch_cancel_button.cycle_prev();
+            BatchCancelOutcome::Toggled
+        }
+        KeyCode::Char('n') if bare => {
+            st.batch_cancel_button.cycle_next();
+            BatchCancelOutcome::Toggled
+        }
+        KeyCode::Char('s') | KeyCode::Char('S') if bare => {
             BatchCancelOutcome::Chosen(BatchCancelButton::SoftStop)
         }
-        KeyCode::Char('h') | KeyCode::Char('H') if is_char_typing(key.modifiers) => {
+        KeyCode::Char('h') | KeyCode::Char('H') if bare => {
             BatchCancelOutcome::Chosen(BatchCancelButton::HardStop)
         }
-        KeyCode::Char('c') | KeyCode::Char('C') if is_char_typing(key.modifiers) => {
+        KeyCode::Char('c') | KeyCode::Char('C') if bare => {
             BatchCancelOutcome::Chosen(BatchCancelButton::Continue)
         }
-        KeyCode::Esc | KeyCode::Char('q') => BatchCancelOutcome::Dismissed,
+        KeyCode::Esc => BatchCancelOutcome::Dismissed,
+        KeyCode::Char('q') if bare => BatchCancelOutcome::Dismissed,
         KeyCode::Char('g') if is_keyboard_quit(&key) => BatchCancelOutcome::Dismissed,
         KeyCode::Enter | KeyCode::Char(' ') => BatchCancelOutcome::Chosen(st.batch_cancel_button),
         _ => BatchCancelOutcome::Toggled,
@@ -161,5 +176,45 @@ mod tests {
             BatchCancelOutcome::Toggled
         );
         assert_eq!(st.batch_cancel_button, BatchCancelButton::Continue);
+    }
+
+    fn key_with(code: KeyCode, modifiers: KeyModifiers) -> KeyEvent {
+        KeyEvent::new(code, modifiers)
+    }
+
+    /// Command-modified and composed letters reach no accelerator and move no
+    /// focus: `Ctrl+S`/`Ctrl+H` never choose a stop action, `Ctrl+N`/`Ctrl+P`
+    /// never walk the buttons, and `Ctrl+Q` never dismisses the card, while
+    /// `Esc` stays unconditional (Conventions §3, §5.1).
+    #[test]
+    fn command_modified_letters_are_refused_by_every_guarded_arm() {
+        let letters = ['s', 'S', 'h', 'H', 'c', 'C', 'n', 'p', 'q'];
+        for modifiers in [
+            KeyModifiers::CONTROL,
+            KeyModifiers::ALT,
+            KeyModifiers::CONTROL | KeyModifiers::ALT,
+        ] {
+            for letter in letters {
+                let mut st = crate::app::test_state();
+                assert_eq!(st.batch_cancel_button, BatchCancelButton::Continue);
+                let outcome =
+                    resolve_batch_cancel(&mut st, key_with(KeyCode::Char(letter), modifiers));
+                assert_eq!(
+                    outcome,
+                    BatchCancelOutcome::Toggled,
+                    "{letter:?} with {modifiers:?} must reach no action"
+                );
+                assert_eq!(
+                    st.batch_cancel_button,
+                    BatchCancelButton::Continue,
+                    "{letter:?} with {modifiers:?} must not move the focus"
+                );
+            }
+        }
+
+        // `Esc` keeps its unconditional dismissal.
+        let mut st = crate::app::test_state();
+        let escaped = resolve_batch_cancel(&mut st, key_with(KeyCode::Esc, KeyModifiers::CONTROL));
+        assert_eq!(escaped, BatchCancelOutcome::Dismissed);
     }
 }

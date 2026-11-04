@@ -471,6 +471,7 @@ impl TurnKernel<'_> {
                     has_terminal_success: false,
                     plan_saved: false,
                     plan_errors: Vec::new(),
+                    plan_warnings: Vec::new(),
                     skip_reason: None,
                 })));
             }
@@ -615,6 +616,7 @@ impl TurnKernel<'_> {
                 has_terminal_success: false,
                 plan_saved: false,
                 plan_errors: Vec::new(),
+                plan_warnings: Vec::new(),
                 skip_reason: None,
             })));
         }
@@ -838,9 +840,13 @@ pub(super) async fn propose_round(
         // keeps its position, its neighbors keep their tokens, and the round
         // extends the previous prompt instead of reshaping it. Files created
         // during the turn are appended after the existing block in path order,
-        // which keeps the appended tail deterministic across rounds.
+        // which keeps the appended tail deterministic across rounds. The staged
+        // state keeps bytes, so only its lossless text view joins the prompt: a
+        // payload that does not decode as UTF-8 stays out of it instead of being
+        // rendered lossily.
+        let staged_text = staged.staged_text_files();
         let mut appended = Vec::new();
-        for (path, content) in &staged.staged_files {
+        for (path, content) in &staged_text {
             if let Some(file) = context_files.iter_mut().find(|file| &file.path == path) {
                 file.content = content.clone();
             } else {
@@ -968,10 +974,12 @@ pub(super) async fn propose_round(
     );
 
     let staged_for_filter = staged_state
-        .map(|staged| staged.staged_files.clone())
+        .map(StagedEditsState::staged_text_files)
         .unwrap_or_default();
     // The streaming preview receives the same context list as the decoder, so a
-    // reported edit and the staged edit always name the same file.
+    // reported edit and the staged edit always name the same file. The seed is
+    // the lossless text view of the staged state, so a payload that is not text
+    // is absent from the preview exactly as it is absent from the prompt.
     let stream_filter =
         protocol.create_stream_filter(context_paths.clone(), repo_root, staged_for_filter);
     let forward_stream_tx = stream_tx.clone();

@@ -218,11 +218,24 @@ pub async fn handle_discussion_clear_focus(req: Request, state: &Arc<AppState>) 
 
 pub async fn handle_model_cancel(req: Request, state: &Arc<AppState>) -> Response {
     // The mode is optional so clients that predate two-mode cancellation keep
-    // sending an empty object and receive the default immediate abort.
-    let params: ModelCancelParams = req
-        .params
-        .and_then(|p| serde_json::from_value(p).ok())
-        .unwrap_or_default();
+    // sending an empty object and receive the default immediate abort. A
+    // present-but-malformed payload is refused instead of defaulted: silently
+    // degrading to the default would answer a mistyped soft stop with the most
+    // destructive cancellation, hard-cancelling a turn the client asked to
+    // drain gracefully.
+    let params: ModelCancelParams = match req.params {
+        Some(params) => match serde_json::from_value(params) {
+            Ok(params) => params,
+            Err(err) => {
+                return Response::err(
+                    req.id,
+                    tauqe_protocol::errors::INVALID_PARAMS,
+                    format!("Invalid cancel parameters: {}", err),
+                );
+            }
+        },
+        None => ModelCancelParams::default(),
+    };
 
     // A soft stop is advisory: the batch supervisor finishes the current member
     // (its turn, compiler verification, and Git commit) and then stops before

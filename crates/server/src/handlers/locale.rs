@@ -144,6 +144,12 @@ pub async fn handle_locale_generate(req: Request, state: &Arc<AppState>) -> Resp
         return Response::err(req.id, errors::CANCELLED, "Locale generation was cancelled");
     }
     if let Some(message) = stream_error {
+        // The stream reported a terminal error, but its task has not necessarily
+        // returned yet: it is aborted and reaped here exactly as the
+        // cancellation branch above does, so no provider call outlives the
+        // response after the operation slot has been released.
+        stream_task.abort();
+        let _ = stream_task.await;
         close_locale_usage(state, usage_guard, &op_id).await;
         return Response::err(req.id, errors::MODEL_ERROR, message);
     }
@@ -680,6 +686,69 @@ mod tests {
         assert!(
             !state.is_operation_active(),
             "the operation slot is released after the abort"
+        );
+    }
+    /// Provider double that reports a terminal error and then parks forever
+    /// without observing the cancellation signal, modeling a call that fails
+    /// while its own task is still running.
+    struct FailingThenWedgedProvider {
+        stopped: Arc<AtomicBool>,
+    }
+
+    #[async_trait]
+    impl LlmProvider for FailingThenWedgedProvider {
+        fn kind(&self) -> tauqe_protocol::ProviderKind {
+            tauqe_protocol::ProviderKind::OpenRouter
+        }
+
+        async fn stream_chat(
+            &self,
+            _model: &str,
+            _messages: Vec<ChatMessage>,
+            _response_format: Option<ResponseFormat>,
+            tx: tokio::sync::mpsc::Sender<StreamEvent>,
+            _cancel_rx: tokio::sync::watch::Receiver<bool>,
+        ) -> anyhow::Result<()> {
+            // The marker and the sender stay alive across the park: the future
+            // only ever completes by being aborted, exactly like a provider call
+            // that fails and then hangs instead of returning.
+            let _marker = ProviderStopMarker(Arc::clone(&self.stopped));
+            let _ = tx.send(StreamEvent::Error("boom".to_string())).await;
+            std::future::pending::<()>().await;
+            Ok(())
+        }
+    }
+
+    /// A provider that reports a terminal error and then keeps running must not
+    /// leave its task behind: the error path terminates the stream task the way
+    /// the cancellation path does, so no provider call outlives the response
+    /// after the operation slot has been released.
+    #[tokio::test]
+    async fn terminates_the_stream_task_when_the_provider_reports_an_error() {
+        let stopped = Arc::new(AtomicBool::new(false));
+        let provider: Arc<dyn LlmProvider> = Arc::new(FailingThenWedgedProvider {
+            stopped: Arc::clone(&stopped),
+        });
+        let state = state_with_provider(provider).await;
+
+        let catalog = params(vec![item("tab.review", "Review", None)]);
+        let response = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            handle_locale_generate(request(&catalog), &state),
+        )
+        .await
+        .expect("the handler must answer the provider error");
+
+        let err = response.error.expect("the stream error must surface");
+        assert_eq!(err.code, errors::MODEL_ERROR);
+        assert!(err.message.contains("boom"));
+        assert!(
+            stopped.load(Ordering::SeqCst),
+            "the provider task must be terminated before the handler returns"
+        );
+        assert!(
+            !state.is_operation_active(),
+            "the operation slot is released"
         );
     }
 }

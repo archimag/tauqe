@@ -51,6 +51,11 @@ contacts a provider.
 11. **A patch is never blind.** Every staged file keeps one summary row — its
     operation, path, patch count, and verification mark — and the whole change
     set opens as one isolated two-pane card on the inspector chord.
+12. **A bare key is bare.** An accelerator, a digit quick-select, and a navigation
+    letter fire only on a press without `Ctrl` and `Alt`: a yank chord never
+    confirms a dialog, a quit chord never dismisses one, a view-switch digit never
+    applies a status, and the AltGr compose chord is never a command. Text
+    insertion mirrors it: a composed character still reaches the buffer.
 
 ---
 
@@ -167,15 +172,25 @@ mean different things in a text buffer and in a diff list.
   the configured modifiers, so no view hardcodes a physical modifier; raw `Ctrl` and
   `Alt` are reserved for the chords that must never be remapped (the cancel chord and
   `Ctrl+G`).
+- **Bare means bare** — a `Bare` chord matches only through `is_bare_press`, which
+  refuses `Ctrl`, `Alt`, and the AltGr compose chord they form together, while
+  `Shift` passes because case selects the binding. The rule is uniform across
+  every command surface: the `y` / `n` / `q` accelerators of the modal dialogs, the
+  digit quick-selects of the status and model lists, and the `j` / `k` / `n` / `p`
+  navigation letters all ignore a press carrying a command modifier, while the
+  dedicated arrows, `PgUp` / `PgDn`, and `Home` / `End` stay unconditional. Text
+  insertion is the deliberate mirror image: `is_char_typing` admits the compose
+  chord, because a composed character has to land in the buffer.
 - **`CommandCategory`** — `Essential` (costly: sends, executions, squashes),
   `Interface` (navigation and view state), and `Helpers` (copy, filter, recenter). The
   Help dialog renders them in that canonical order and omits an empty tier.
 - **Command maps** — one static map per scope: global, the shared text editor, each
-  view, the Develop Viewport, the diff inspector, and the shared dialog map. A
-  collision validator in the test suite enumerates printable characters and
-  navigation keys across the modifier sets and asserts that no single event
-  resolves to two actions inside one map, so declaration order never decides what
-  a key does.
+  view, the Develop Viewport, the diff inspector, the shared dialog map, and the
+  model-list dialog map, adding the `C-Enter` submit accelerator to the shared
+  dialog vocabulary. A collision validator in the test suite enumerates the
+  printable characters and navigation keys across the modifier sets and asserts
+  that no single event resolves to two actions inside one map, so declaration
+  order never decides what a key does.
 
 ### 2.5 The modal card
 
@@ -254,6 +269,15 @@ authoritative record, and the view replaces that one row in place. A record the 
 has never seen is inserted, so a failure that lands before the prompt was rendered
 still leaves a trace. Compaction follows the same discipline — the summarized head is
 dropped, the summary takes the first row, and the preserved tail keeps its order.
+
+**The chronicle is a sliding window, not the whole journal.** The view retains the newest
+200 records. A record that crosses that ceiling pushes the oldest one out, and the reading
+position is compensated by the height of the dropped block, so the viewport keeps showing
+the lines the developer was reading instead of jumping to the oldest retained record; the
+fold state and the cached Markdown body of a dropped record are released with it. Nothing
+is lost: the records stay in the session journal, the view reports that older ones are
+available, and reaching the top of the list loads them back through the same paging
+handshake that backs the initial load.
 
 Three stores back this view and the REPL, and they stay separate: the session journal
 (`.tauqe/history.jsonl`) is the model's dialogue memory, the History view adds the
@@ -342,7 +366,11 @@ description.
   once, before any handler runs, so the Emacs `keyboard-quit` chord behaves identically
   everywhere without a per-handler binding and without a `SIGINT` handler.
 - Confirmation dialogs accept `y` / `Y` to confirm immediately and `n` / `N`, `q`, or
-  `Esc` to cancel.
+  `Esc` to cancel. Those letters are bare presses: a press carrying `Ctrl`, `Alt`,
+  or the AltGr compose chord confirms nothing and dismisses nothing, so no yank
+  chord launches a turn and no quit chord discards typed instructions. A digit that
+  quick-selects a status or a model row is guarded the same way, while `Esc` itself
+  stays unconditional.
 - Status is assigned intentionally through a status dialog (Plans: discussion, todo, in
   progress, done, blocked, cancelled; Review: discussion, todo, in progress, fixed,
   rejected), never by an accidental cycle.
@@ -358,6 +386,18 @@ description.
   switch the highlighted rung from any section, and `Tab` / `Shift+Tab` walk the
   ladder and the actions. The classification starts only from the focused run button,
   or on `C-Enter` from any section, so the safe `Cancel` default never spends a token.
+- The dialogs that launch a turn from an embedded model ladder — the
+  review-execution confirmation, the plan refinement form, the scope confirmation,
+  and the post-analysis confirmation — do not each own a keyboard contract. One core
+  resolves a key press end to end against the model-list dialog map (the shared
+  dialog vocabulary plus the `C-Enter` submit accelerator), and it owns the
+  list-focused digits, the focus walk with the confirm-button ping-pong, the guarded
+  activation of the focused button, the clipboard read behind the editor's yank
+  chord, and the editor delegation. Both `Shift+Tab` spellings walk the focus
+  backward, the letter accelerators obey the bare-press rule, and the `q` alias
+  dismisses only from the action bar so it stays a literal character in an
+  instructions editor. One implementation now carries the whole family, so its next
+  rule change lands in a single place.
 
 ### 3.4 The three-way batch stop
 
@@ -492,6 +532,9 @@ locale reaches the compact list and the inspector without editing a renderer.
 - **It is not mouse-first.** The pointer mirrors the keyboard through one shared
   geometry, and every action stays reachable without it.
 - **It is not a modal trap.** In editor focus, printable characters always type.
+- **It is not modifier-blind.** A bare-key accelerator, a digit quick-select, and a
+  navigation letter fire only without `Ctrl` and `Alt`; the AltGr compose chord
+  belongs to character input and never to a command.
 - **It is not color-literal.** Raw ANSI names and unstyled modal backgrounds are
   defects, not style choices.
 - **It is not a per-view dialect.** Five views share one verb matrix and one navigation

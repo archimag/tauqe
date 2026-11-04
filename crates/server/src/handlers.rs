@@ -108,8 +108,10 @@ pub async fn handle_request(req: Request, state: &Arc<AppState>) -> Response {
 ///   between the check and the write. Every handler that mutates state a
 ///   running turn merges back or swaps belongs here: rebinding a manager set
 ///   (`client/initialize`, `repository/init`), rewriting commit history
-///   (`git/squashPreview`, `git/squashApply`), replacing the shared
-///   configuration and model selection (`config/set`, `config/reload`,
+///   (`git/squashPreview`, `git/squashApply`), reading the commit range a
+///   squash message is generated from (`git/squashGenerateMessage`), and
+///   replacing the shared configuration and model selection (`config/set`,
+///   `config/reload`,
 ///   `config/create`, `credentials/save`, `credentials/create_stub`,
 ///   `model/select`), discarding the interaction history
 ///   (`model/clearHistory`), and mutating the context a turn reasons over

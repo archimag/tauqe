@@ -45,9 +45,8 @@ models = [
 # escalation while leaving the model selectable by hand; the default (`true`)
 # lets the harness escalate onto the rung when verification fails.
 primary = [
-  { model = "GLM", effort = "high" },
-  { model = "GLM", effort = "max" },  
-  "Gemini Flash"
+  "Gemini Flash",
+  "GLM"
 ]
 scribe = "Claude Haiku"    # history compaction, git squash commit messages, diff summarization
 # The coder list is the natural escalation ladder (level up): on verification
@@ -71,9 +70,7 @@ architect = [
 # conceptual design, plan refinement, blocked-step replanning
 reviewer = [
   "GLM",
-  "Gemini Argon",
   "Claude Sonnet",
-  "Claude Opus"
 ]   # automated code review of active context files
 
 # Automatically escalate the Coder along its ladder when verification healing stalls,

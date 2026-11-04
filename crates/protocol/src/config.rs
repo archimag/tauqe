@@ -51,10 +51,7 @@ impl FromStr for WorkflowKind {
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s.trim().to_ascii_lowercase().as_str() {
             "git" => Ok(Self::Git),
-            // `single` and `direct` are legacy aliases for the naive (direct)
-            // workflow; scheduled for removal in 0.2.0 and tracked by the
-            // wire-contract test in `lib.rs`.
-            "naive" | "single" | "direct" => Ok(Self::Naive),
+            "naive" => Ok(Self::Naive),
             other => Err(format!(
                 "Unknown workflow '{}'. Expected 'git' or 'naive'",
                 other
@@ -118,10 +115,7 @@ impl FromStr for EditProtocolKind {
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s.trim().to_ascii_lowercase().as_str() {
             "xml" => Ok(Self::Xml),
-            // `structured_output`, `json_schema`, and `json` are legacy aliases
-            // for the structured protocol; scheduled for removal in 0.2.0 and
-            // tracked by the wire-contract test in `lib.rs`.
-            "structured" | "structured_output" | "json_schema" | "json" => Ok(Self::Structured),
+            "structured" => Ok(Self::Structured),
             // `auto` is the historical name of the two-contour mode. It stays a
             // permanent compatibility alias, so a configuration written before
             // the rename keeps resolving to the same behavior instead of fading
@@ -421,22 +415,14 @@ mod tests {
             WorkflowKind::Naive
         );
         assert_eq!(
-            serde_json::from_str::<WorkflowKind>("\"single\"").unwrap(),
-            WorkflowKind::Naive
-        );
-        assert_eq!(
-            serde_json::from_str::<WorkflowKind>("\"direct\"").unwrap(),
-            WorkflowKind::Naive
-        );
-        assert_eq!(
             serde_json::from_str::<WorkflowKind>("\" GIT \"").unwrap(),
             WorkflowKind::Git
         );
-        assert_eq!(
-            serde_json::from_str::<WorkflowKind>("\" DIRECT \"").unwrap(),
-            WorkflowKind::Naive
-        );
         assert!(serde_json::from_str::<WorkflowKind>("\"legacy\"").is_err());
+        // `single` and `direct` named the direct mode before the workflow
+        // vocabulary was fixed; neither is a workflow name any more.
+        assert!(serde_json::from_str::<WorkflowKind>("\"single\"").is_err());
+        assert!(serde_json::from_str::<WorkflowKind>("\"direct\"").is_err());
     }
 
     #[test]
@@ -445,10 +431,6 @@ mod tests {
         assert_eq!(WorkflowKind::Git.as_str(), "git");
         assert_eq!(WorkflowKind::Naive.to_string(), "naive");
         assert_eq!(" GIT ".parse::<WorkflowKind>().unwrap(), WorkflowKind::Git);
-        assert_eq!(
-            "direct".parse::<WorkflowKind>().unwrap(),
-            WorkflowKind::Naive
-        );
         assert!("".parse::<WorkflowKind>().is_err());
         assert!("bogus".parse::<WorkflowKind>().is_err());
     }
@@ -472,18 +454,16 @@ mod tests {
             serde_json::from_str::<EditProtocolKind>("\"xml\"").unwrap(),
             EditProtocolKind::Xml
         );
-        assert_eq!(
-            serde_json::from_str::<EditProtocolKind>("\"structured_output\"").unwrap(),
-            EditProtocolKind::Structured
-        );
-        assert_eq!(
-            serde_json::from_str::<EditProtocolKind>("\"json_schema\"").unwrap(),
-            EditProtocolKind::Structured
-        );
-        assert_eq!(
-            serde_json::from_str::<EditProtocolKind>("\"json\"").unwrap(),
-            EditProtocolKind::Structured
-        );
+        // A retired spelling no longer names a wire protocol: only the
+        // canonical identifiers and the `auto` compatibility alias of the
+        // two-contour mode survive.
+        for retired in ["json", "json_schema", "structured_output"] {
+            let quoted = format!("\"{retired}\"");
+            assert!(
+                serde_json::from_str::<EditProtocolKind>(&quoted).is_err(),
+                "the retired spelling {quoted} must not name a protocol"
+            );
+        }
         assert_eq!(
             serde_json::from_str::<EditProtocolKind>("\"mixed\"").unwrap(),
             EditProtocolKind::Mixed
@@ -500,10 +480,6 @@ mod tests {
             serde_json::from_str::<EditProtocolKind>("\" XML \"").unwrap(),
             EditProtocolKind::Xml
         );
-        assert_eq!(
-            serde_json::from_str::<EditProtocolKind>("\" JSON_SCHEMA \"").unwrap(),
-            EditProtocolKind::Structured
-        );
         assert!(serde_json::from_str::<EditProtocolKind>("\"yaml\"").is_err());
     }
 
@@ -515,10 +491,6 @@ mod tests {
         assert_eq!(EditProtocolKind::Mixed.to_string(), "mixed");
         assert_eq!(
             "STRUCTURED".parse::<EditProtocolKind>().unwrap(),
-            EditProtocolKind::Structured
-        );
-        assert_eq!(
-            "json".parse::<EditProtocolKind>().unwrap(),
             EditProtocolKind::Structured
         );
         assert_eq!(

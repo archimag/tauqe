@@ -1,6 +1,13 @@
 use std::path::{Path, PathBuf};
 
-pub const DEFAULT_CONFIG_TEMPLATE: &str = include_str!("../../../../tauqe.toml");
+/// The configuration archetype installed into a new project.
+///
+/// The document ships inside the binary instead of being read from another
+/// repository, so the documentation a new project receives always matches the
+/// engine that writes it. Every uncommented declaration it carries parses and
+/// validates against that same engine, which is the invariant
+/// [`write_default_config`] relies on when it installs the file.
+pub const DEFAULT_CONFIG_TEMPLATE: &str = include_str!("../../assets/tauqe.starter.toml");
 
 /// Repository-level configuration file names, in resolution order.
 ///

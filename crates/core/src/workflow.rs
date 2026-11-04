@@ -25,7 +25,7 @@ pub use loops::{AnswerEditLoop, EditLoop};
 pub use policy::{ApplyPolicy, DirectApplyPolicy};
 pub use task::{Task, TaskEnv};
 
-use tauqe_protocol::{ModelResult, WorkflowKind};
+use tauqe_protocol::{ModelResult, PlanRejection, WorkflowKind};
 
 /// Result of a completed workflow turn.
 #[derive(Debug, Clone)]
@@ -48,10 +48,18 @@ pub struct WorkflowExecutionResult {
     /// focus a freshly created plan instead of an incremental update.
     pub plan_saved: bool,
     /// Plan mutations the storage engine refused during the turn.
-    ///
     /// A rejection never fails the turn, but it is carried to the caller so the
-    /// daemon records it instead of leaving it in the engine journal only.
-    pub plan_errors: Vec<String>,
+    /// daemon records it instead of leaving it in the engine journal only. Each
+    /// entry is classified where the refusal was produced, so a surface renders
+    /// the wording and reads the category from the typed field.
+    pub plan_errors: Vec<PlanRejection>,
+    /// Status repairs the plan barrier performed on an applied payload.
+    ///
+    /// A normalization is a real event of the plan lifecycle, so it travels to
+    /// the caller instead of staying a journal trace: the daemon forwards it to
+    /// the client beside the typed rejections, and the turn stream and the
+    /// session history carry the same notice.
+    pub plan_warnings: Vec<String>,
 }
 
 /// Factory responsible for reporting and validating the supported workflow names.
@@ -84,8 +92,6 @@ mod tests {
     fn test_workflow_factory_validation() {
         assert!(WorkflowFactory::is_valid("git"));
         assert!(WorkflowFactory::is_valid("naive"));
-        assert!(WorkflowFactory::is_valid("direct"));
-        assert!(WorkflowFactory::is_valid("single"));
         assert!(!WorkflowFactory::is_valid("toolchain"));
         assert!(!WorkflowFactory::is_valid("unknown_wf"));
     }

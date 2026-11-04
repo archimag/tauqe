@@ -497,6 +497,11 @@ impl<'a> PlanImplementationPipeline<'a> {
     /// as approved closes it as `Skipped` with the diagnostic. Cancellation and a
     /// soft stop are not verdicts on the finding, so an interrupted run writes no
     /// verdict and keeps the lifecycle its step executor recorded.
+    ///
+    /// The commit is never restated by the verdict: the step executor wrote the
+    /// commit of the completed step on the finding, and the settlement states the
+    /// status and the note only, so a finished finding keeps the exact pointer to
+    /// the change set that resolved it.
     fn settle_finding(&self, report: &PlanImplementationReport, review_id: &str, item_id: u32) {
         let (status, note) = match &report.stop {
             PlanImplementationStop::Completed => (
@@ -517,6 +522,9 @@ impl<'a> PlanImplementationPipeline<'a> {
         let result =
             ReviewStorage::update_session_item(self.repo_root, review_id, item_id, |issue| {
                 issue.status = status;
+                // The commit the step executor recorded is the durable pointer of
+                // the change set, so the verdict states the status and the note
+                // and leaves it untouched.
                 // A note the developer already stated is never overwritten: the run
                 // records its verdict on a finding that carries none.
                 if !carries_note(issue.note.as_deref()) {
@@ -1113,6 +1121,7 @@ mod tests {
             id: 7,
             title: "Guard the parser".to_string(),
             uuid: None,
+            commit: None,
             group: Some(GROUP_ID.to_string()),
             model: None,
             issue_type: IssueType::Bug,
@@ -1708,7 +1717,7 @@ mod tests {
         let host = ScriptedHost::new(
             vec![StepTurnResult::Success {
                 summary: "the finding is addressed".to_string(),
-                commit: None,
+                commit: Some("abc1234".to_string()),
             }],
             Vec::new(),
         );
@@ -1741,6 +1750,11 @@ mod tests {
             .find_item(7)
             .expect("the addressed finding is stored");
         assert_eq!(target.status, IssueStatus::Fixed);
+        assert_eq!(
+            target.commit.as_deref(),
+            Some("abc1234"),
+            "the settlement keeps the commit the step executor recorded"
+        );
         assert!(target
             .resolution_notes
             .as_deref()

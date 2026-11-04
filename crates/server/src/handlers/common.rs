@@ -1,6 +1,6 @@
 //! Shared helpers for the RPC handler subsystems.
 //!
-//! Event emission, transient auto-context management, turn-outcome inspection,
+//! Event emission, transient-context cleanup, turn-outcome inspection,
 //! read-only context preloading, and Architect synthesis history recording are
 //! identical across the plan, review, and architect handlers. They are defined
 //! once here so every subsystem emits events and mutates context through a
@@ -111,16 +111,22 @@ pub(crate) async fn release_focus_anchored_on(state: &Arc<AppState>, anchor: &Di
     }
 }
 
-/// Clears the transient auto context layer so a retried attempt starts from a
-/// clean, deterministic basis, then notifies clients of the new snapshot.
+/// Releases the task's transient context so a retried attempt or the next step
+/// starts from a clean, deterministic basis, then notifies clients of the new
+/// snapshot.
 ///
-/// The clear goes through the shared [`AppState`] facade, so removing files from
-/// the transient layer also rotates the provider session identifier when the
-/// layer really held files: the stable prompt prefix those files warmed no
+/// The transient context is whatever the harness gathered so the model could
+/// decide: the files a research round discovered and the external documents the
+/// registry materialized. Both layers are released together, because they are
+/// provided for the same decision and a step decides it fully.
+///
+/// The clear goes through the shared [`AppState`] facade, so removing files
+/// from the transient layers also rotates the provider session identifier when
+/// those layers really held files: the stable prompt prefix they warmed no
 /// longer exists, and the next round must not be routed to a node holding a
 /// stale copy of it.
-pub(crate) async fn clear_auto_context(state: &Arc<AppState>) {
-    if let Ok(new_ctx_state) = state.clear_auto_context().await {
+pub(crate) async fn cleanup_transient_context(state: &Arc<AppState>) {
+    if let Ok(new_ctx_state) = state.clear_transient_context().await {
         emit(
             &state.out,
             events::CONTEXT_CHANGED,

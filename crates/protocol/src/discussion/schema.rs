@@ -528,17 +528,16 @@ pub fn custom_tool_call_schema() -> serde_json::Value {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeSet;
+
     use super::{
         discussion_response_schema, discussion_response_schema_definition, plan_item_status_wire,
         plan_schema_definitions, plan_update_schema,
     };
     use crate::context::ContextAccess;
-    use crate::discussion::{
-        DirListRequest, DiscussionContextRequest, DiscussionPlanAction, DiscussionPlanUpdate,
-        DiscussionResponse, RepoSearchRequest,
-    };
-    use crate::plan::{ConceptItem, PlanItem, PlanItemStatus};
-    use crate::review::{IssueStatus, ReviewDecisionStatus, ReviewUpdateProposal};
+    use crate::discussion::DiscussionPlanAction;
+    use crate::plan::PlanItemStatus;
+    use crate::review::{IssueStatus, ReviewDecisionStatus};
 
     #[test]
     fn test_custom_tool_call_schema_pins_the_invocation_contract() {
@@ -609,7 +608,7 @@ mod tests {
     }
 
     /// Collects the property names a schema object declares.
-    fn declared_fields(node: &serde_json::Value) -> std::collections::BTreeSet<String> {
+    fn declared_fields(node: &serde_json::Value) -> BTreeSet<String> {
         node["properties"]
             .as_object()
             .map(|properties| properties.keys().cloned().collect())
@@ -617,7 +616,7 @@ mod tests {
     }
 
     /// Collects the property names a schema object requires.
-    fn required_fields(node: &serde_json::Value) -> std::collections::BTreeSet<String> {
+    fn required_fields(node: &serde_json::Value) -> BTreeSet<String> {
         node["required"]
             .as_array()
             .map(|required| {
@@ -627,6 +626,200 @@ mod tests {
                     .collect()
             })
             .unwrap_or_default()
+    }
+
+    /// Declaring source of the plan model, embedded at compile time.
+    ///
+    /// The parity suite reads the declarations themselves instead of a
+    /// serialized projection of them, so a field hidden from a fixture by
+    /// `skip_serializing_if` stays visible to the comparison.
+    const PLAN_ITEM_SOURCE: &str = include_str!("../plan/item.rs");
+
+    /// Declaring source of the discussion wire model.
+    const DISCUSSION_SOURCE: &str = include_str!("../discussion.rs");
+
+    /// Declaring source of the review wire model.
+    const REVIEW_ITEM_SOURCE: &str = include_str!("../review/item.rs");
+
+    /// Every struct whose declared fields the discussion schema mirrors.
+    const SCHEMA_MIRRORED_STRUCTS: &[&str] = &[
+        "DiscussionResponse",
+        "DiscussionPlanUpdate",
+        "ReviewUpdateProposal",
+        "DiscussionContextRequest",
+        "RepoSearchRequest",
+        "DirListRequest",
+        "ConceptItem",
+        "PlanItem",
+    ];
+
+    /// A deliberate divergence between a declared field and the schema.
+    struct SchemaFieldExemption {
+        /// Struct whose declaration carries the field.
+        struct_name: &'static str,
+        /// Field declared on the struct and withheld from the schema.
+        field: &'static str,
+        /// Why the divergence is deliberate rather than drift.
+        reason: &'static str,
+    }
+
+    /// Every divergence the model-facing structured-output contract may carry.
+    ///
+    /// The schema declares `additionalProperties: false` under `strict: true`,
+    /// so a property it omits can never be emitted by constrained decoding. A
+    /// field is therefore withheld only when the model must not author it, and
+    /// recording that intent here is what tells a maintainer apart from drift.
+    /// `test_schema_field_exemption_table_stays_honest` checks every entry
+    /// against both the declaration and the schema.
+    const SCHEMA_FIELD_EXEMPTIONS: &[SchemaFieldExemption] = &[SchemaFieldExemption {
+        struct_name: "PlanItem",
+        field: "blocked_reason",
+        reason: "harness-authored diagnostic: the bounded turn records why the step could not proceed, so the model never authors the field",
+    }];
+
+    /// Net count of square brackets a line opens.
+    fn bracket_balance(line: &str) -> i32 {
+        line.chars().fold(0, |balance, ch| match ch {
+            '[' => balance + 1,
+            ']' => balance - 1,
+            _ => balance,
+        })
+    }
+
+    /// Extracts the body of a `pub struct <name> { ... }` declaration.
+    fn struct_body<'a>(source: &'a str, struct_name: &str) -> &'a str {
+        let header = format!("pub struct {struct_name} {{");
+        let start = source
+            .find(&header)
+            .unwrap_or_else(|| panic!("{struct_name} must be declared as `{header}`"))
+            + header.len();
+        let mut depth = 1usize;
+        let mut in_string = false;
+        let mut escaped = false;
+        for (offset, ch) in source[start..].char_indices() {
+            if in_string {
+                if escaped {
+                    escaped = false;
+                } else if ch == '\\' {
+                    escaped = true;
+                } else if ch == '"' {
+                    in_string = false;
+                }
+                continue;
+            }
+            match ch {
+                '"' => in_string = true,
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return &source[start..start + offset];
+                    }
+                }
+                _ => {}
+            }
+        }
+        panic!("the declaration of {struct_name} must carry a complete struct body");
+    }
+
+    /// Declared `pub` fields of a struct, read from its source declaration.
+    ///
+    /// Doc comments, plain comments, and serde attribute blocks — including
+    /// multi-line ones — are skipped, so the enumeration reports the fields the
+    /// struct declares rather than the keys a serialized value happens to
+    /// carry.
+    fn declared_struct_fields(source: &str, struct_name: &str) -> BTreeSet<String> {
+        let body = struct_body(source, struct_name);
+        let mut fields = BTreeSet::new();
+        let mut open_attributes = 0i32;
+        for raw in body.lines() {
+            let line = raw.trim();
+            if open_attributes > 0 {
+                open_attributes += bracket_balance(line);
+                continue;
+            }
+            if line.is_empty() || line.starts_with("//") {
+                continue;
+            }
+            if line.starts_with("#[") || line.starts_with("#![") {
+                open_attributes += bracket_balance(line);
+                continue;
+            }
+            let declaration = line.strip_prefix("pub ").unwrap_or_else(|| {
+                panic!("every field of {struct_name} is declared `pub`, found: {line}")
+            });
+            let (name, _) = declaration
+                .split_once(':')
+                .unwrap_or_else(|| panic!("a field of {struct_name} carries no name: {line}"));
+            fields.insert(name.trim().to_string());
+        }
+        fields
+    }
+
+    /// Embedded source that declares a struct the schema mirrors.
+    fn source_for_struct(struct_name: &str) -> &'static str {
+        match struct_name {
+            "DiscussionResponse"
+            | "DiscussionPlanUpdate"
+            | "DiscussionContextRequest"
+            | "RepoSearchRequest"
+            | "DirListRequest" => DISCUSSION_SOURCE,
+            "ConceptItem" | "PlanItem" => PLAN_ITEM_SOURCE,
+            "ReviewUpdateProposal" => REVIEW_ITEM_SOURCE,
+            other => panic!("no embedded source declares {other}"),
+        }
+    }
+
+    /// Schema object that mirrors one struct declaration.
+    fn schema_object_for<'a>(
+        schema: &'a serde_json::Value,
+        struct_name: &str,
+    ) -> &'a serde_json::Value {
+        match struct_name {
+            "DiscussionResponse" => schema,
+            "DiscussionPlanUpdate" => &schema["properties"]["plan_update"]["anyOf"][0],
+            "ReviewUpdateProposal" => &schema["properties"]["review_update"]["anyOf"][0],
+            "DiscussionContextRequest" => &schema["properties"]["context_requests"]["items"],
+            "RepoSearchRequest" => &schema["properties"]["repo_searches"]["items"],
+            "DirListRequest" => &schema["properties"]["dir_lists"]["items"],
+            "ConceptItem" => &schema["$defs"]["ConceptItem"],
+            "PlanItem" => &schema["$defs"]["PlanItem"],
+            other => panic!("no schema object mirrors {other}"),
+        }
+    }
+
+    /// Declared fields of a struct minus the recorded exemptions.
+    fn expected_schema_fields(source: &str, struct_name: &str) -> BTreeSet<String> {
+        let declared = declared_struct_fields(source, struct_name);
+        let exempted: BTreeSet<&str> = SCHEMA_FIELD_EXEMPTIONS
+            .iter()
+            .filter(|exemption| exemption.struct_name == struct_name)
+            .map(|exemption| exemption.field)
+            .collect();
+        for field in &exempted {
+            assert!(
+                declared.contains(*field),
+                "the exemption for {struct_name}.{field} no longer names a declared field"
+            );
+        }
+        declared
+            .into_iter()
+            .filter(|field| !exempted.contains(field.as_str()))
+            .collect()
+    }
+
+    /// Asserts a schema object declares exactly `expected` and requires all of
+    /// it, which is what a strict structured-output contract means.
+    fn assert_strict_object(label: &str, node: &serde_json::Value, expected: &BTreeSet<String>) {
+        let (properties, required) = (declared_fields(node), required_fields(node));
+        assert_eq!(
+            &properties, expected,
+            "{label} must declare exactly the fields of its Rust struct minus the recorded exemptions"
+        );
+        assert_eq!(
+            required, properties,
+            "{label} is strict, so it must require every field it declares"
+        );
     }
 
     /// A plan is authored by two contours, so its payload is generated once.
@@ -753,99 +946,31 @@ mod tests {
 
     /// Pins the strict JSON Schema to the authoritative Rust data model.
     ///
-    /// Every property of `DiscussionResponse` and its nested types must appear in the
-    /// schema (and vice versa), and every required field must be listed in `required`.
-    /// This prevents silent drift between the strict schema and the types, which would
-    /// otherwise forbid the model from expressing fields that exist in the model.
+    /// Every schema object must declare exactly the fields its Rust struct
+    /// declares, minus the divergences recorded in `SCHEMA_FIELD_EXEMPTIONS`,
+    /// and must require every field it declares. The declared fields are
+    /// enumerated from their sources instead of from a serialized fixture:
+    /// `skip_serializing_if` hides an absent `Option` from a fixture, which
+    /// would let the schema omit a declared field while the comparison stayed
+    /// green.
     #[test]
     fn test_schema_matches_data_model() {
-        use std::collections::BTreeSet;
-
-        fn keys(value: &serde_json::Value) -> BTreeSet<String> {
-            value
-                .as_object()
-                .map(|m| m.keys().cloned().collect())
-                .unwrap_or_default()
-        }
-
-        fn field_sets(node: &serde_json::Value) -> (BTreeSet<String>, BTreeSet<String>) {
-            let props = keys(&node["properties"]);
-            let required: BTreeSet<String> = node["required"]
-                .as_array()
-                .map(|a| {
-                    a.iter()
-                        .filter_map(|v| v.as_str().map(String::from))
-                        .collect()
-                })
-                .unwrap_or_default();
-            (props, required)
-        }
-
         let schema = discussion_response_schema();
 
-        // 1. Top-level DiscussionResponse fields must match the schema exactly.
-        let response = DiscussionResponse::new("hello")
-            .with_plan_update(DiscussionPlanUpdate {
-                action: DiscussionPlanAction::Save,
-                id: Some("p1".to_string()),
-                title: Some("Plan".to_string()),
-                description: Some("desc".to_string()),
-                concept: vec![ConceptItem::default()],
-                items: vec![PlanItem::default()],
-            })
-            .with_review_update(ReviewUpdateProposal {
-                item_id: 1,
-                group_id: None,
-                status: ReviewDecisionStatus::Todo,
-                note: "The lock must be held across the turn".to_string(),
-                recommendations: vec!["Extend the guard".to_string()],
-            })
-            .with_context_requests(vec![DiscussionContextRequest::read_only("a.rs")])
-            .with_repo_searches(vec![RepoSearchRequest::new("crates/core", "regex")])
-            .with_repo_dirs(true)
-            .with_repo_maps(vec!["crates/core".to_string()])
-            .with_dir_lists(vec![DirListRequest::new("crates/core", true)])
-            .with_user_language("English");
-        let (props, required) = field_sets(schema);
-        assert_eq!(props, keys(&serde_json::to_value(&response).unwrap()));
-        assert_eq!(
-            required, props,
-            "strict schema must require every DiscussionResponse field"
-        );
+        // 1. Every mirrored struct is compared against its own declaration, so
+        //    a field the schema withholds is either recorded as a deliberate
+        //    exemption or reported as drift.
+        for struct_name in SCHEMA_MIRRORED_STRUCTS {
+            let expected = expected_schema_fields(source_for_struct(struct_name), struct_name);
+            assert_strict_object(
+                struct_name,
+                schema_object_for(schema, struct_name),
+                &expected,
+            );
+        }
 
-        // 2. Nested plan_update object.
-        let (props, required) = field_sets(&schema["properties"]["plan_update"]["anyOf"][0]);
-        assert_eq!(
-            props,
-            keys(&serde_json::to_value(response.plan_update.clone().unwrap()).unwrap())
-        );
-        assert_eq!(required, props);
-
-        // 2b. Nested review_update object.
-        let (props, required) = field_sets(&schema["properties"]["review_update"]["anyOf"][0]);
-        assert_eq!(
-            props,
-            keys(&serde_json::to_value(response.review_update.clone().unwrap()).unwrap())
-        );
-        assert_eq!(required, props);
-
-        // 3. context_requests item object.
-        let (props, required) = field_sets(&schema["properties"]["context_requests"]["items"]);
-        assert_eq!(
-            props,
-            keys(&serde_json::to_value(DiscussionContextRequest::read_only("a.rs")).unwrap())
-        );
-        assert_eq!(required, props);
-
-        // 3a. repo_searches item object.
-        let (props, required) = field_sets(&schema["properties"]["repo_searches"]["items"]);
-        assert_eq!(
-            props,
-            keys(&serde_json::to_value(RepoSearchRequest::new("a", "b")).unwrap())
-        );
-        assert_eq!(required, props);
-
-        // 3b. repo_dirs is a nullable boolean and repo_maps is a path array.
+        // 2. The fields without an object shape carry their own contracts:
+        //    repo_dirs is a nullable boolean and repo_maps is a path array.
         let dir_variants = schema["properties"]["repo_dirs"]["anyOf"]
             .as_array()
             .expect("repo_dirs anyOf array");
@@ -854,45 +979,7 @@ mod tests {
         assert_eq!(schema["properties"]["repo_maps"]["type"], "array");
         assert_eq!(schema["properties"]["repo_maps"]["items"]["type"], "string");
 
-        // 3c. dir_lists item object.
-        let (props, required) = field_sets(&schema["properties"]["dir_lists"]["items"]);
-        assert_eq!(
-            props,
-            keys(&serde_json::to_value(DirListRequest::new("crates/core", true)).unwrap())
-        );
-        assert_eq!(required, props);
-
-        // 4. ConceptItem definition.
-        let concept = ConceptItem {
-            id: "c-1".to_string(),
-            title: "Concept".to_string(),
-            details: Some("details".to_string()),
-            children: vec![ConceptItem::default()],
-        };
-        let (props, required) = field_sets(&schema["$defs"]["ConceptItem"]);
-        assert_eq!(props, keys(&serde_json::to_value(&concept).unwrap()));
-        assert_eq!(required, props);
-
-        // 5. PlanItem definition (includes readonly_files, depends_on, status).
-        let item = PlanItem {
-            id: "1".to_string(),
-            title: "Step".to_string(),
-            details: Some("details".to_string()),
-            status: PlanItemStatus::Todo,
-            blocked_reason: None,
-            commit: Some("9f2c1b4".to_string()),
-            files: vec!["src/a.rs".to_string()],
-            readonly_files: vec!["src/b.rs".to_string()],
-            outer_docs: vec!["docs/entry".to_string()],
-            concept_refs: vec!["c-1".to_string()],
-            depends_on: vec!["0".to_string()],
-            children: vec![PlanItem::default()],
-        };
-        let (props, required) = field_sets(&schema["$defs"]["PlanItem"]);
-        assert_eq!(props, keys(&serde_json::to_value(&item).unwrap()));
-        assert_eq!(required, props);
-
-        // 6. Every PlanItemStatus variant must be expressible in the status enum.
+        // 3. Every PlanItemStatus variant must be expressible in the status enum.
         let status_enum: BTreeSet<String> = schema["$defs"]["PlanItem"]["properties"]["status"]
             ["enum"]
             .as_array()
@@ -918,7 +1005,7 @@ mod tests {
             );
         }
 
-        // 7. Every DiscussionPlanAction variant must be expressible in the
+        // 4. Every DiscussionPlanAction variant must be expressible in the
         //    plan_update.action enum.
         let action_enum: BTreeSet<String> = schema["properties"]["plan_update"]["anyOf"][0]
             ["properties"]["action"]["enum"]
@@ -942,9 +1029,9 @@ mod tests {
             );
         }
 
-        // 8b. Every decision a discussion may record is expressible in the
-        //     review_update.status enum, and no status owned by verification or
-        //     by execution is.
+        // 5. Every decision a discussion may record is expressible in the
+        //    review_update.status enum, and no status owned by verification or
+        //    by execution is.
         let decision_enum: BTreeSet<String> = schema["properties"]["review_update"]["anyOf"][0]
             ["properties"]["status"]["enum"]
             .as_array()
@@ -975,7 +1062,7 @@ mod tests {
             );
         }
 
-        // 8. Every ContextAccess variant must be expressible in the
+        // 6. Every ContextAccess variant must be expressible in the
         //    context_requests.access enum.
         let access_enum: BTreeSet<String> = schema["properties"]["context_requests"]["items"]
             ["properties"]["access"]["enum"]
@@ -995,6 +1082,44 @@ mod tests {
             );
         }
     }
+
+    /// A recorded divergence must still be a divergence, and still declared.
+    ///
+    /// An exemption is only meaningful while the field it names exists in the
+    /// declaration and is genuinely absent from the schema. Once the field
+    /// disappears or the schema starts publishing it, this test fails and the
+    /// entry must be retired instead of silently widening the blind spot it
+    /// was meant to record.
+    #[test]
+    fn test_schema_field_exemption_table_stays_honest() {
+        let schema = discussion_response_schema();
+        for exemption in SCHEMA_FIELD_EXEMPTIONS {
+            assert!(
+                !exemption.reason.trim().is_empty(),
+                "{}.{} is exempted without a reason, so its omission cannot be told apart from drift",
+                exemption.struct_name,
+                exemption.field
+            );
+            let declared = declared_struct_fields(
+                source_for_struct(exemption.struct_name),
+                exemption.struct_name,
+            );
+            assert!(
+                declared.contains(exemption.field),
+                "{}.{} is exempted but no longer declared",
+                exemption.struct_name,
+                exemption.field
+            );
+            let properties = declared_fields(schema_object_for(schema, exemption.struct_name));
+            assert!(
+                !properties.contains(exemption.field),
+                "{}.{} is published by the schema again, so its exemption must be retired",
+                exemption.struct_name,
+                exemption.field
+            );
+        }
+    }
+
     /// The decision payload is authored by two contours, so it is declared once.
     ///
     /// The discussion contract embeds the authoritative builder verbatim, and

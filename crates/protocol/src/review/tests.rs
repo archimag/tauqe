@@ -84,6 +84,7 @@ fn test_review_issue_serde() {
         id: 1,
         title: "Potential race condition".to_string(),
         uuid: None,
+        commit: None,
         group: None,
         model: None,
         issue_type: IssueType::Bug,
@@ -115,24 +116,6 @@ fn test_review_issue_serde() {
     assert!(update_json.contains("\"note\":\"Plan defined\""));
     let de_update: ReviewUpdateItemParams = serde_json::from_str(&update_json).unwrap();
     assert_eq!(de_update, update_params);
-
-    // The renamed `note` field still accepts the legacy `resolution_notes`
-    // key on read, so older clients keep updating findings unchanged.
-    let legacy_update: ReviewUpdateItemParams =
-        serde_json::from_str(r#"{"item_id":1,"resolution_notes":"legacy note"}"#).unwrap();
-    assert_eq!(legacy_update.note.as_deref(), Some("legacy note"));
-
-    // Legacy "severity", "body", and "done" aliases still map cleanly.
-    let legacy_json = r#"{"id":2,"title":"Legacy","severity":"critical","status":"done","body":"Defect details","model":"architect"}"#;
-    let de_legacy: ReviewIssue = serde_json::from_str(legacy_json).unwrap();
-    assert_eq!(de_legacy.issue_type, IssueType::Bug);
-    assert_eq!(de_legacy.status, IssueStatus::Fixed);
-    assert_eq!(de_legacy.description, "Defect details");
-    assert_eq!(
-        de_legacy.model,
-        Some(ModelSelection::Role(crate::model::ModelRole::Architect))
-    );
-    assert!(de_legacy.files.is_empty());
 }
 
 #[test]
@@ -380,7 +363,7 @@ fn test_issue_type_methods_and_serde() {
 }
 
 #[test]
-fn test_issue_status_lifecycle_and_legacy_refine_alias() {
+fn test_issue_status_lifecycle() {
     let status = IssueStatus::Discussion;
     assert_eq!(status.next(), IssueStatus::Todo);
     assert_eq!(status.next().next(), IssueStatus::InProgress);
@@ -403,18 +386,6 @@ fn test_issue_status_lifecycle_and_legacy_refine_alias() {
         serde_json::from_str::<IssueStatus>("\"fixed\"").unwrap(),
         IssueStatus::Fixed
     );
-
-    // A finding written before the status was retired keeps decoding: the
-    // legacy `refine` spelling migrates to `todo` on read and is never written
-    // back under its retired spelling.
-    assert_eq!(
-        serde_json::from_str::<IssueStatus>("\"refine\"").unwrap(),
-        IssueStatus::Todo
-    );
-    assert_eq!(
-        serde_json::to_string(&IssueStatus::Todo).unwrap(),
-        "\"todo\""
-    );
 }
 
 #[test]
@@ -423,6 +394,7 @@ fn test_review_issue_serde_carries_its_classification() {
         id: 42,
         title: "Memory leak in cache".to_string(),
         uuid: None,
+        commit: None,
         group: None,
         model: None,
         issue_type: IssueType::Bug,
@@ -448,12 +420,12 @@ fn test_review_issue_serde_carries_its_classification() {
 }
 
 #[test]
-fn test_review_session_issues_accessor_and_alias() {
+fn test_review_session_issues_accessor() {
     let raw = r#"{
         "id": "rev-test",
         "title": "Test Review",
         "created_at": 100,
-        "issues": [
+        "items": [
             {
                 "id": 1,
                 "title": "Bug",
@@ -478,6 +450,7 @@ fn finding(id: u32, status: IssueStatus) -> ReviewItem {
         id,
         title: format!("Finding {id}"),
         uuid: None,
+        commit: None,
         group: None,
         model: None,
         issue_type: IssueType::Bug,
@@ -551,6 +524,7 @@ fn categorized_finding(id: u32, issue_type: IssueType) -> ReviewItem {
         id,
         title: format!("Finding {}", issue_type.as_str()),
         uuid: None,
+        commit: None,
         group: None,
         model: None,
         issue_type,
@@ -606,13 +580,13 @@ fn test_review_item_accepts_legacy_category_spellings() {
         "id": "rev-legacy-categories",
         "created_at": 1,
         "items": [
-            {"id": 1, "title": "Critical", "severity": "critical", "body": "b1"},
-            {"id": 2, "title": "Warning", "severity": "warning", "body": "b2"},
-            {"id": 3, "title": "Suggestion", "severity": "suggestion", "body": "b3"},
-            {"id": 4, "title": "Info", "severity": "info", "body": "b4"},
-            {"id": 5, "title": "Typed", "type": "security", "body": "b5"},
+            {"id": 1, "title": "Critical", "severity": "critical", "description": "b1"},
+            {"id": 2, "title": "Warning", "severity": "warning", "description": "b2"},
+            {"id": 3, "title": "Suggestion", "severity": "suggestion", "description": "b3"},
+            {"id": 4, "title": "Info", "severity": "info", "description": "b4"},
+            {"id": 5, "title": "Typed", "type": "security", "description": "b5"},
             {"id": 6, "title": "Aliased", "issue_type": "performance", "description": "b6"},
-            {"id": 7, "title": "Unclassified", "body": "b7"}
+            {"id": 7, "title": "Unclassified", "description": "b7"}
         ]
     }"#;
 
@@ -632,7 +606,7 @@ fn test_review_item_accepts_legacy_category_spellings() {
         ]
     );
 
-    // The description alias still feeds the finding body.
+    // The canonical description key carries the finding body.
     assert_eq!(issues[5].description, "b6");
     assert_eq!(issues[6].description, "b7");
 
@@ -1185,6 +1159,7 @@ fn test_review_note_serializes_under_one_canonical_key() {
         id: 1,
         title: "Note key".to_string(),
         uuid: None,
+        commit: None,
         group: None,
         model: None,
         issue_type: IssueType::Quality,
@@ -1206,30 +1181,6 @@ fn test_review_note_serializes_under_one_canonical_key() {
         "got: {issue_json}"
     );
     assert!(!item_json.contains("resolution_notes"), "got: {item_json}");
-
-    // A session written by an older daemon keeps decoding through the retired
-    // spelling and is rewritten under the canonical key, so the datum cannot
-    // travel under two names depending on which type wrote it.
-    let legacy = r#"{"id":1,"title":"Legacy","resolution_notes":"Resolved upstream"}"#;
-    let legacy_item: ReviewItem = serde_json::from_str(legacy).unwrap();
-    assert_eq!(
-        legacy_item.resolution_notes.as_deref(),
-        Some("Resolved upstream")
-    );
-    let rewritten = serde_json::to_string(&legacy_item).unwrap();
-    assert!(
-        rewritten.contains("\"note\":\"Resolved upstream\""),
-        "got: {rewritten}"
-    );
-    assert!(!rewritten.contains("resolution_notes"), "got: {rewritten}");
-
-    // The analytical view accepts the retired spelling as well, so both
-    // representations read every session ever stored.
-    let legacy_issue: ReviewIssue = serde_json::from_str(
-        r#"{"id":1,"title":"Legacy","type":"quality","resolution_notes":"Resolved upstream"}"#,
-    )
-    .unwrap();
-    assert_eq!(legacy_issue.note.as_deref(), Some("Resolved upstream"));
 }
 
 /// The body datum of a finding has exactly one wire spelling: the analytical
@@ -1241,6 +1192,7 @@ fn test_review_body_serializes_under_one_canonical_key() {
         id: 1,
         title: "Body key".to_string(),
         uuid: None,
+        commit: None,
         group: None,
         model: None,
         issue_type: IssueType::Quality,
@@ -1265,26 +1217,6 @@ fn test_review_body_serializes_under_one_canonical_key() {
     );
     assert!(!issue_json.contains("\"body\":"), "got: {issue_json}");
     assert!(!item_json.contains("\"body\":"), "got: {item_json}");
-
-    // A session written by an older daemon keeps decoding through the retired
-    // spelling and is rewritten under the canonical key, so the prose cannot
-    // travel under two names depending on which type wrote it.
-    let legacy = r#"{"id":1,"title":"Legacy","body":"Old body"}"#;
-    let legacy_item: ReviewItem = serde_json::from_str(legacy).unwrap();
-    assert_eq!(legacy_item.body, "Old body");
-    let rewritten = serde_json::to_string(&legacy_item).unwrap();
-    assert!(
-        rewritten.contains("\"description\":\"Old body\""),
-        "got: {rewritten}"
-    );
-    assert!(!rewritten.contains("\"body\":"), "got: {rewritten}");
-
-    // The analytical view accepts the retired spelling as well, so both
-    // representations read every session ever stored.
-    let legacy_issue: ReviewIssue =
-        serde_json::from_str(r#"{"id":1,"title":"Legacy","type":"quality","body":"Old body"}"#)
-            .unwrap();
-    assert_eq!(legacy_issue.description, "Old body");
 }
 #[test]
 fn test_issue_status_as_str_matches_the_wire_spelling() {
@@ -1361,4 +1293,41 @@ fn test_review_update_proposal_serde() {
     assert!(
         serde_json::from_str::<ReviewUpdateProposal>(r#"{"item_id":3,"status":"todo"}"#).is_err()
     );
+}
+
+#[test]
+fn test_review_commit_round_trips_through_the_wire_and_the_issue_projection() {
+    let commit = "9a8b7c6d5e4f30211203f4e5d6c7b8a99f0e1d2c";
+    let mut item = finding(1, IssueStatus::Fixed);
+    item.commit = Some(commit.to_string());
+
+    let json = serde_json::to_string(&item).unwrap();
+    assert!(
+        json.contains("\"commit\":\"9a8b7c6d5e4f30211203f4e5d6c7b8a99f0e1d2c\""),
+        "got: {json}"
+    );
+    let restored: ReviewItem = serde_json::from_str(&json).unwrap();
+    assert_eq!(restored.commit.as_deref(), Some(commit));
+
+    // The commit survives the projection into the analytical view and back,
+    // so both layers of the review agree on the fix that resolved the finding.
+    let issue = ReviewIssue::from(restored);
+    assert_eq!(issue.commit.as_deref(), Some(commit));
+    let rebuilt = ReviewItem::from(issue);
+    assert_eq!(rebuilt.commit.as_deref(), Some(commit));
+}
+
+#[test]
+fn test_review_commit_stays_absent_from_a_finding_that_carries_none() {
+    let item = finding(1, IssueStatus::Todo);
+    let json = serde_json::to_string(&item).unwrap();
+    assert!(!json.contains("commit"), "got: {json}");
+
+    // A finding stored before the commit was recorded stays readable: the
+    // field defaults and is written back only once a commit exists.
+    let legacy = r#"{"id": 9, "title": "Legacy", "type": "bug", "status": "fixed"}"#;
+    let legacy_item: ReviewItem = serde_json::from_str(legacy).unwrap();
+    assert!(legacy_item.commit.is_none());
+    let legacy_json = serde_json::to_string(&legacy_item).unwrap();
+    assert!(!legacy_json.contains("commit"), "got: {legacy_json}");
 }

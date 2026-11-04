@@ -6,15 +6,24 @@
 //! step's instructions itself, so the dialog carries no directives editor: the
 //! list owns bare digits, arrows, and paging only while it holds focus
 //! (c-4, Conventions §6, §7).
+//!
+//! The dialog belongs to the model-list family, so its keyboard contract lives
+//! in the shared core at [`super::model_list`]: the list, the action bar, the
+//! `Shift+Tab` spelling, and the bare-press guard of the letter accelerators are
+//! resolved once for every dialog of the family. This adapter keeps only what
+//! belongs to the target itself — the take guard, the dialog geometry, and the
+//! launch it dispatches.
 
 use std::sync::Arc;
 
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::KeyEvent;
 use tokio::sync::{Mutex, MutexGuard};
 
 use crate::app::{AppState, ConfirmDialogButton};
 use crate::input::InputResult;
 use crate::rpc::RpcConnection;
+
+use super::model_list::{handle_dialog_key, ModelListKeyOutcome};
 
 /// Routes key events for the plan execution form dialog.
 ///
@@ -33,8 +42,6 @@ pub(super) async fn handle_execute_scope_dialog(
         None => return Ok(None),
     };
 
-    let primary = st.tui_config.input.primary_modifier;
-    let meta = st.tui_config.input.meta_modifier;
     let visible_rows = crate::dialogs::render::execute_scope_dialog_geometry(
         st.last_frame_area,
         target.selector.len(),
@@ -43,107 +50,23 @@ pub(super) async fn handle_execute_scope_dialog(
     .model_rows
     .height as usize;
 
-    // The C-M / M-M chord always switches the Coder; the arrows browse the list
-    // only while the list owns focus.
-    if target
-        .selector
-        .handle_key(key, primary, meta, !target.focus.is_model_list())
-    {
-        st.confirm_execute_scope = Some(target);
-        return Ok(Some(InputResult::Continue));
-    }
-
-    // Bare digits, arrows, and paging act on the model list only while it owns
-    // focus, so the action bar never forwards a bare digit to the picker.
-    if target.focus.is_model_list() && target.selector.handle_list_key(key, visible_rows) {
-        st.confirm_execute_scope = Some(target);
-        return Ok(Some(InputResult::Continue));
-    }
-
-    let is_ctrl_alt =
-        key.modifiers.contains(KeyModifiers::CONTROL) && key.modifiers.contains(KeyModifiers::ALT);
-
-    let is_cmd = !is_ctrl_alt
-        && (primary.matches(key.modifiers) || key.modifiers.contains(KeyModifiers::CONTROL));
-    let has_shift = key.modifiers.contains(KeyModifiers::SHIFT);
-    let has_alt = key.modifiers.contains(KeyModifiers::ALT);
-
-    // C-Enter accelerator unconditionally executes from any section.
-    if matches!(key.code, KeyCode::Enter) && is_cmd {
-        super::confirm_execute_scope(state, st, server_writer, target).await?;
-        return Ok(Some(InputResult::Continue));
-    }
-
-    match key.code {
-        KeyCode::Esc => {
-            st.confirm_button = ConfirmDialogButton::Cancel;
-            Ok(Some(InputResult::Continue))
-        }
-        KeyCode::Char('q') if target.focus.is_actions() => {
-            st.confirm_button = ConfirmDialogButton::Cancel;
-            Ok(Some(InputResult::Continue))
-        }
-        // Fast accelerators mirror the shared dialog vocabulary. They are
-        // limited to the action bar, so a bare letter pressed over the Coder
-        // list never confirms or cancels the launch (Conventions §5).
-        KeyCode::Char('y') | KeyCode::Char('Y') if target.focus.is_actions() => {
+    match handle_dialog_key(&mut target, key, &st.tui_config.input, visible_rows) {
+        ModelListKeyOutcome::Submit => {
             super::confirm_execute_scope(state, st, server_writer, target).await?;
-            Ok(Some(InputResult::Continue))
         }
-        KeyCode::Char('n') | KeyCode::Char('N') if target.focus.is_actions() => {
+        // Safe cancellation returns the shared button to its default and drops
+        // the dialog without a request.
+        ModelListKeyOutcome::Dismiss => {
             st.confirm_button = ConfirmDialogButton::Cancel;
-            Ok(Some(InputResult::Continue))
         }
-        KeyCode::Tab => {
-            if target.focus.is_actions() && target.confirm_button == ConfirmDialogButton::Cancel {
-                target.confirm_button = ConfirmDialogButton::Confirm;
-            } else {
-                if target.focus.is_actions() {
-                    target.confirm_button = ConfirmDialogButton::Cancel;
-                }
-                target.focus.cycle_next(target.selector.len());
-            }
+        // The dialog carries no directives editor, so the yank outcome is
+        // unreachable; keeping the dialog is the only sensible interpretation of
+        // a key it never produces (Conventions §5).
+        ModelListKeyOutcome::Consumed | ModelListKeyOutcome::Yank => {
             st.confirm_execute_scope = Some(target);
-            Ok(Some(InputResult::Continue))
-        }
-        KeyCode::BackTab => {
-            if target.focus.is_actions() && target.confirm_button == ConfirmDialogButton::Confirm {
-                target.confirm_button = ConfirmDialogButton::Cancel;
-            } else {
-                target.focus.cycle_prev(target.selector.len());
-                if target.focus.is_actions() {
-                    target.confirm_button = ConfirmDialogButton::Confirm;
-                }
-            }
-            st.confirm_execute_scope = Some(target);
-            Ok(Some(InputResult::Continue))
-        }
-        // Horizontal stepping moves between the action buttons.
-        KeyCode::Left | KeyCode::Right if target.focus.is_actions() => {
-            target.confirm_button = match target.confirm_button {
-                ConfirmDialogButton::Cancel => ConfirmDialogButton::Confirm,
-                ConfirmDialogButton::Confirm => ConfirmDialogButton::Cancel,
-            };
-            st.confirm_execute_scope = Some(target);
-            Ok(Some(InputResult::Continue))
-        }
-        // Execution spends tokens, so it starts only from the focused `Execute`
-        // button; the safe `Cancel` default dismisses the dialog.
-        KeyCode::Enter | KeyCode::Char(' ')
-            if !has_shift && !has_alt && target.focus.is_actions() =>
-        {
-            if target.confirm_button == ConfirmDialogButton::Confirm {
-                super::confirm_execute_scope(state, st, server_writer, target).await?;
-            } else {
-                st.confirm_button = ConfirmDialogButton::Cancel;
-            }
-            Ok(Some(InputResult::Continue))
-        }
-        _ => {
-            st.confirm_execute_scope = Some(target);
-            Ok(Some(InputResult::Continue))
         }
     }
+    Ok(Some(InputResult::Continue))
 }
 
 #[cfg(test)]
@@ -348,5 +271,116 @@ mod tests {
         let guard = state.lock().await;
         assert!(guard.confirm_execute_scope.is_none());
         assert_eq!(guard.view_mode, ViewMode::Repl);
+    }
+    /// The `Shift+Tab` spelling that a terminal reports as `Tab` carrying
+    /// `SHIFT` moves the focus backward, exactly as the dedicated `BackTab` code
+    /// does, so a shifted press never cycles the focus forward (Conventions §6.2).
+    #[tokio::test]
+    async fn tab_with_shift_cycles_focus_backward() {
+        let state = Arc::new(Mutex::new(state_with_target()));
+        let mut conn = RpcConnection::new(Vec::<u8>::new());
+        set_focus(&state, ExecuteScopeFocus::Actions).await;
+
+        press(
+            &state,
+            &mut conn,
+            KeyEvent::new(KeyCode::Tab, KeyModifiers::SHIFT),
+        )
+        .await;
+
+        let back = target(&state).await;
+        assert_eq!(back.focus, ExecuteScopeFocus::ModelList);
+        assert_eq!(back.confirm_button, ConfirmDialogButton::Cancel);
+        assert!(conn.written().is_empty());
+    }
+
+    /// The letter accelerators are bare presses: `Ctrl+Y` is the editor's yank
+    /// chord, so it must neither launch a token-spending turn nor dismiss the
+    /// dialog that still holds the developer's Coder choice (Conventions §5.2).
+    #[tokio::test]
+    async fn ctrl_y_from_the_actions_writes_no_request_and_keeps_the_dialog() {
+        let state = Arc::new(Mutex::new(state_with_target()));
+        let mut conn = RpcConnection::new(Vec::<u8>::new());
+        set_focus(&state, ExecuteScopeFocus::Actions).await;
+
+        press(
+            &state,
+            &mut conn,
+            KeyEvent::new(KeyCode::Char('y'), KeyModifiers::CONTROL),
+        )
+        .await;
+
+        assert!(
+            conn.written().is_empty(),
+            "a command chord must never launch a turn"
+        );
+        let guard = state.lock().await;
+        assert!(guard.confirm_execute_scope.is_some());
+        assert_eq!(guard.view_mode, ViewMode::Plans);
+    }
+
+    /// `Ctrl+Q` and `Ctrl+N` are command chords, not the dialog's dismissal or
+    /// cancellation accelerators, so neither may drop the pending launch.
+    #[tokio::test]
+    async fn ctrl_q_and_ctrl_n_do_not_dismiss_the_dialog() {
+        for character in ['q', 'n'] {
+            let state = Arc::new(Mutex::new(state_with_target()));
+            let mut conn = RpcConnection::new(Vec::<u8>::new());
+            set_focus(&state, ExecuteScopeFocus::Actions).await;
+
+            press(
+                &state,
+                &mut conn,
+                KeyEvent::new(KeyCode::Char(character), KeyModifiers::CONTROL),
+            )
+            .await;
+
+            let guard = state.lock().await;
+            assert!(
+                guard.confirm_execute_scope.is_some(),
+                "Ctrl+{character} must not dismiss the dialog"
+            );
+            drop(guard);
+            assert!(conn.written().is_empty());
+        }
+    }
+
+    /// The AltGr compose chord (`Ctrl+Alt`) belongs to neither command modifier,
+    /// so a composed character reaches no accelerator: it neither selects a
+    /// Coder in the list nor confirms, cancels, or submits from the action bar
+    /// (Conventions §5.2).
+    #[tokio::test]
+    async fn compose_chord_reaches_neither_the_accelerators_nor_the_list() {
+        let state = Arc::new(Mutex::new(state_with_target()));
+        let mut conn = RpcConnection::new(Vec::<u8>::new());
+        let compose = KeyModifiers::CONTROL | KeyModifiers::ALT;
+
+        set_focus(&state, ExecuteScopeFocus::ModelList).await;
+        press(
+            &state,
+            &mut conn,
+            KeyEvent::new(KeyCode::Char('2'), compose),
+        )
+        .await;
+        assert_eq!(
+            target(&state).await.selector.selected_index(),
+            0,
+            "a composed digit must not select a Coder"
+        );
+
+        set_focus(&state, ExecuteScopeFocus::Actions).await;
+        for code in [
+            KeyCode::Char('y'),
+            KeyCode::Char('n'),
+            KeyCode::Char('q'),
+            KeyCode::Enter,
+        ] {
+            press(&state, &mut conn, KeyEvent::new(code, compose)).await;
+        }
+
+        let open = target(&state).await;
+        assert_eq!(open.focus, ExecuteScopeFocus::Actions);
+        assert_eq!(open.confirm_button, ConfirmDialogButton::Cancel);
+        assert!(conn.written().is_empty());
     }
 }

@@ -110,7 +110,7 @@ pub(crate) fn commit_staged_edits(
                     Some(parent) => create_parent_dirs(parent, &mut created_dirs),
                     None => Ok(()),
                 };
-                parent_ready.and_then(|()| SiblingCommit::stage(&final_path, content.as_bytes()))
+                parent_ready.and_then(|()| SiblingCommit::stage(&final_path, content.as_slice()))
             }
             None => SiblingCommit::removal(&final_path),
         };
@@ -381,7 +381,7 @@ mod tests {
         let mut staged = StagedEditsState::default();
         staged
             .staged_files
-            .insert("existing_dir".to_string(), "content".to_string());
+            .insert("existing_dir".to_string(), b"content".to_vec());
 
         let result = commit_staged_edits(root, &staged, &["existing_dir".to_string()]);
 
@@ -403,7 +403,7 @@ mod tests {
         let mut staged = StagedEditsState::default();
         staged
             .staged_files
-            .insert("shared.rs".to_string(), "content".to_string());
+            .insert("shared.rs".to_string(), b"content".to_vec());
 
         let handles: Vec<_> = (0..8)
             .map(|_| {
@@ -451,10 +451,10 @@ mod tests {
         let mut staged = StagedEditsState::default();
         staged
             .staged_files
-            .insert("src/new/a.rs".to_string(), "pub fn a() {}\n".to_string());
+            .insert("src/new/a.rs".to_string(), b"pub fn a() {}\n".to_vec());
         staged.staged_files.insert(
             "src/new/nested/b.rs".to_string(),
-            "pub fn b() {}\n".to_string(),
+            b"pub fn b() {}\n".to_vec(),
         );
         staged.deleted_paths.insert("src/old/a.rs".to_string());
         staged

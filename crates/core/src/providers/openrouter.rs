@@ -27,7 +27,7 @@ const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 /// Maximum idle time between reads on an open stream. Bounds a stalled
 /// provider so a hung connection cannot block the turn indefinitely.
 const READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
-/// Budget of the best-effort generation-stats enrichment fetch.
+/// Default budget of the best-effort generation-stats enrichment fetch.
 ///
 /// The fetch only enriches the reported cost, so it must never dominate the
 /// completion of an otherwise delivered stream: a single request is attempted
@@ -37,6 +37,7 @@ pub struct OpenRouterProvider {
     api_key: String,
     base_url: String,
     http_client: reqwest::Client,
+    generation_stats_timeout: std::time::Duration,
 }
 
 impl OpenRouterProvider {
@@ -53,6 +54,7 @@ impl OpenRouterProvider {
             api_key,
             base_url: "https://openrouter.ai/api/v1".to_string(),
             http_client,
+            generation_stats_timeout: GENERATION_STATS_TIMEOUT,
         }
     }
 
@@ -61,10 +63,18 @@ impl OpenRouterProvider {
         self
     }
 
+    /// Overrides the budget of the best-effort generation-stats enrichment
+    /// fetch. Production keeps `GENERATION_STATS_TIMEOUT`; tests shrink it so
+    /// a stalled endpoint is observed without waiting out the ceiling.
+    pub fn with_generation_stats_timeout(mut self, timeout: std::time::Duration) -> Self {
+        self.generation_stats_timeout = timeout;
+        self
+    }
+
     /// Fetches the generation cost OpenRouter reports for `generation_id`.
     ///
     /// The fetch only enriches the usage report, so it makes a single attempt
-    /// under `GENERATION_STATS_TIMEOUT`: a slow, hung, or unreachable
+    /// under the configured budget: a slow, hung, or unreachable
     /// generation endpoint yields `None` instead of stalling the caller inside
     /// the shared client's much larger read budget.
     pub async fn get_generation_stats(
@@ -86,7 +96,7 @@ impl OpenRouterProvider {
             .http_client
             .get(&url)
             .headers(headers)
-            .timeout(GENERATION_STATS_TIMEOUT)
+            .timeout(self.generation_stats_timeout)
             .send()
             .await
         {
@@ -734,8 +744,9 @@ mod tests {
             .mount(&mock_server)
             .await;
 
-        let provider =
-            OpenRouterProvider::new("test-api-key".to_string()).with_base_url(mock_server.uri());
+        let provider = OpenRouterProvider::new("test-api-key".to_string())
+            .with_base_url(mock_server.uri())
+            .with_generation_stats_timeout(std::time::Duration::from_millis(25));
 
         let (tx, mut rx) = mpsc::channel(10);
         let (_cancel_tx, cancel_rx) = watch::channel(false);
@@ -756,7 +767,7 @@ mod tests {
             got_done
         };
 
-        let (result, got_done) = tokio::time::timeout(std::time::Duration::from_secs(30), async {
+        let (result, got_done) = tokio::time::timeout(std::time::Duration::from_secs(5), async {
             tokio::join!(provider_task, drain)
         })
         .await

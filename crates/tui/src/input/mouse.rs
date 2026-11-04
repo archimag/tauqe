@@ -1,10 +1,10 @@
 //! Mouse event routing for the non-modal surfaces.
 //!
 //! This module owns the pointer targets that are not dialogs: the header action
-//! tabs, the REPL and History viewport scrolling, and the inline code-block
-//! copy buttons. Modal interaction is delegated to the [`modal`] submodule, so a
-//! dialog's click and wheel behaviour lives next to the geometry that draws it
-//! instead of in one shared match.
+//! tabs, the REPL and History viewport scrolling, the inline code-block copy
+//! buttons, and the hyperlinks a Markdown surface paints. Modal interaction is
+//! delegated to the [`modal`] submodule, so a dialog's click and wheel behaviour
+//! lives next to the geometry that draws it instead of in one shared match.
 
 use std::sync::Arc;
 
@@ -91,8 +91,11 @@ pub async fn handle_mouse_event(
                 }
                 ViewMode::History => {
                     let view_height = st.last_model_height;
-                    let total = st.history_view.rendered_lines_count as u16;
-                    let max = total.saturating_sub(view_height);
+                    // The bound is computed by the view in `usize` and only
+                    // then narrowed, so a history longer than the `u16`
+                    // viewport unit saturates instead of wrapping through a
+                    // truncated cast (c-2).
+                    let max = st.history_view.max_scroll(view_height);
                     st.history_view.scroll = (st
                         .history_view
                         .scroll
@@ -124,8 +127,10 @@ pub async fn handle_mouse_event(
                         .min(max);
                 }
                 ViewMode::Plans => {
-                    let max = (st.plans_view.rendered_lines as u16)
-                        .saturating_sub(st.plans_view.view_height);
+                    // The tree measures its own bound, so a tree longer than
+                    // the `u16` viewport unit saturates instead of wrapping
+                    // through a truncated cast (c-2).
+                    let max = st.plans_view.max_scroll();
                     st.plans_view.scroll = st
                         .plans_view
                         .scroll
@@ -239,6 +244,45 @@ async fn dispatch_ui_action(
                 st.shift_tip_shown = true;
             }
         }
+        // Opening a link is a local interface side effect the dispatcher owns:
+        // nothing about it reaches the daemon, and every decision it makes is
+        // reported back to the developer (c-2, c-3, c-4).
+        UiAction::OpenUrl(url) => {
+            // The scheme gate runs before any process work, so a dangerous or
+            // relative address never reaches an external launcher (c-2).
+            if !is_openable_scheme(&url) {
+                let template = crate::i18n::active_t("notify.unsafe_link_rejected");
+                st.notify_warning(template.replacen("{}", &url, 1));
+                return Ok(());
+            }
+
+            // Over SSH a browser would open on the remote host, where the
+            // developer cannot see it, so the address goes to the clipboard
+            // instead of an unreachable window (c-4).
+            if crate::clipboard::is_ssh_session() {
+                drop(st);
+                let copied = crate::clipboard::copy_to_clipboard_async(&url).await;
+                let mut st = state.lock().await;
+                report_link_clipboard(&mut st, &url, copied, LinkFallback::SshSession);
+                return Ok(());
+            }
+
+            // The launch runs on the blocking pool, so a slow launcher can never
+            // stall the draw loop or the server drain (c-4).
+            drop(st);
+            if launch_in_browser(&url).await {
+                let mut st = state.lock().await;
+                let template = crate::i18n::active_t("notify.link_opened");
+                st.notify_success(template.replacen("{}", &url, 1));
+                return Ok(());
+            }
+
+            // A host without a graphical browser degrades to the clipboard
+            // instead of failing silently (c-4).
+            let copied = crate::clipboard::copy_to_clipboard_async(&url).await;
+            let mut st = state.lock().await;
+            report_link_clipboard(&mut st, &url, copied, LinkFallback::NoBrowser);
+        }
     }
     Ok(())
 }
@@ -261,7 +305,74 @@ fn report_code_copy(st: &mut AppState, result: crate::clipboard::CopyResult, lin
         }
     }
 }
+/// Why the launcher degraded to the clipboard.
+enum LinkFallback {
+    /// The session runs over SSH, where a browser opens on the remote host.
+    SshSession,
+    /// No browser could be launched on this host.
+    NoBrowser,
+}
 
+/// Whether the launcher may hand `url` to an external browser.
+///
+/// An absolute URL starts with the RFC 3986 scheme production
+/// `ALPHA *( ALPHA / DIGIT / "+" / "-" / "." )` followed by a colon, and that
+/// scheme decides whether the address is safe to open. Only the two web schemes
+/// pass, so `javascript:`, `data:`, `file:`, and every relative path stay inside
+/// the harness instead of reaching a process (c-2).
+fn is_openable_scheme(url: &str) -> bool {
+    let Some((scheme, _)) = url.split_once(':') else {
+        return false;
+    };
+    let mut chars = scheme.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    if !first.is_ascii_alphabetic() {
+        return false;
+    }
+    if !chars.all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '+' | '-' | '.')) {
+        return false;
+    }
+    scheme.eq_ignore_ascii_case("http") || scheme.eq_ignore_ascii_case("https")
+}
+
+/// Hands the validated address to the developer's browser, off the draw loop.
+///
+/// The launch is blocking by nature: `open` spawns a detached child process. The
+/// work therefore runs on the blocking pool while the caller awaits it, so the
+/// interface keeps drawing and keeps draining the daemon (c-4). A host that
+/// cannot spawn a browser reports `false`, which degrades to the clipboard.
+async fn launch_in_browser(url: &str) -> bool {
+    let address = url.to_string();
+    tokio::task::spawn_blocking(move || open::that_detached(address).is_ok())
+        .await
+        .unwrap_or(false)
+}
+
+/// Reports the clipboard fallback of a link the launcher could not open.
+///
+/// Both fallbacks, an SSH session and a host without a browser, copy the address
+/// and state why it was copied, so the developer knows where the address went
+/// instead of a browser window (c-4, c-5).
+fn report_link_clipboard(
+    st: &mut AppState,
+    url: &str,
+    copied: crate::clipboard::CopyResult,
+    fallback: LinkFallback,
+) {
+    if !copied.is_success() {
+        let template = crate::i18n::active_t("notify.link_open_failed");
+        st.notify_error(template.replacen("{}", url, 1));
+        return;
+    }
+    let key = match fallback {
+        LinkFallback::SshSession => "notify.link_copied_ssh",
+        LinkFallback::NoBrowser => "notify.link_copied_no_browser",
+    };
+    let template = crate::i18n::active_t(key);
+    st.notify_warning(template.replacen("{}", url, 1));
+}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -407,6 +518,7 @@ mod tests {
                 id: 1,
                 title: "Finding".to_string(),
                 uuid: None,
+                commit: None,
                 group: None,
                 model: None,
                 issue_type: tauqe_protocol::IssueType::Architecture,
@@ -998,7 +1110,7 @@ mod tests {
         st.view_mode = ViewMode::Repl;
         st.last_frame_area = Rect::new(0, 0, 100, 30);
         for (rect, action) in regions {
-            st.hit_regions.register(*rect, *action);
+            st.hit_regions.register(*rect, action.clone());
         }
         st
     }
@@ -1138,5 +1250,168 @@ mod tests {
         let guard = state.lock().await;
         assert_eq!(guard.review.scroll, 480);
         assert_eq!(guard.review.selected_index, 0);
+    }
+    /// A hyperlink region resolves through the registry to the address it
+    /// declares, and the dispatcher handles it locally: opening a link never
+    /// reaches the daemon, and a scheme the launcher refuses is reported instead
+    /// of being handed to an external process (c-2, c-3).
+    #[tokio::test]
+    async fn a_registered_link_click_dispatches_without_a_request() {
+        let st = state_with_regions(&[(
+            Rect::new(2, 5, 20, 1),
+            UiAction::OpenUrl("file:///etc/passwd".to_string()),
+        )]);
+        let state = Arc::new(Mutex::new(st));
+        let mut conn = RpcConnection::new(Vec::<u8>::new());
+
+        handle_mouse_event(left_click(3, 5), &state, &mut conn)
+            .await
+            .unwrap();
+
+        assert!(conn.written().is_empty());
+        let guard = state.lock().await;
+        assert_eq!(guard.view_mode, ViewMode::Repl);
+        assert!(
+            guard.notification.is_some(),
+            "a refused scheme is reported instead of launched"
+        );
+    }
+
+    /// The scheme gate accepts exactly the two web schemes, in either case, and
+    /// refuses every other protocol together with every relative address, so a
+    /// clicked link can never smuggle a local path or a script into an external
+    /// launcher (c-2).
+    #[test]
+    fn the_scheme_gate_accepts_only_web_addresses() {
+        for openable in [
+            "http://example.com",
+            "https://example.com/path?query=1#fragment",
+            "HTTPS://EXAMPLE.COM",
+            "Http://example.com",
+        ] {
+            assert!(is_openable_scheme(openable), "{openable} must be openable");
+        }
+
+        for refused in [
+            "file:///etc/passwd",
+            "javascript:alert(1)",
+            "JAVASCRIPT:alert(1)",
+            "data:text/html,<script>alert(1)</script>",
+            "ftp://example.com",
+            "mailto:dev@example.com",
+            "tel:+10000000000",
+            "docs/readme.md",
+            "example.com",
+            "#anchor",
+            "",
+            ":no-scheme",
+            "ht tp://example.com",
+            "C:/Windows/system.ini",
+        ] {
+            assert!(!is_openable_scheme(refused), "{refused} must be refused");
+        }
+    }
+    /// A refused scheme reaches no external process and is reported with the
+    /// catalog wording that names the address, so the developer learns why the
+    /// click did nothing (c-2, c-5).
+    #[tokio::test]
+    async fn a_refused_scheme_reports_the_localized_wording() {
+        let address = "file:///etc/passwd";
+        let st = state_with_regions(&[(
+            Rect::new(2, 5, 20, 1),
+            UiAction::OpenUrl(address.to_string()),
+        )]);
+        let state = Arc::new(Mutex::new(st));
+        let mut conn = RpcConnection::new(Vec::<u8>::new());
+
+        handle_mouse_event(left_click(3, 5), &state, &mut conn)
+            .await
+            .unwrap();
+
+        assert!(
+            conn.written().is_empty(),
+            "a refused link never reaches the daemon"
+        );
+        let guard = state.lock().await;
+        let notification = guard
+            .notification
+            .as_ref()
+            .expect("a refused scheme is reported");
+        assert_eq!(
+            notification.text,
+            crate::i18n::active_t("notify.unsafe_link_rejected").replacen("{}", address, 1)
+        );
+        assert!(matches!(
+            notification.level,
+            crate::app::NotificationLevel::Warning
+        ));
+    }
+
+    /// The SSH fallback copies the address instead of opening a browser the
+    /// developer could not see, worded by the catalog (c-4, c-5).
+    #[test]
+    fn the_ssh_fallback_reports_the_catalog_wording() {
+        let address = "https://example.com/docs";
+        let mut st = crate::app::test_state();
+        report_link_clipboard(
+            &mut st,
+            address,
+            crate::clipboard::CopyResult::Native,
+            LinkFallback::SshSession,
+        );
+
+        let notification = st.notification.as_ref().expect("the fallback is reported");
+        assert_eq!(
+            notification.text,
+            crate::i18n::active_t("notify.link_copied_ssh").replacen("{}", address, 1)
+        );
+        assert!(matches!(
+            notification.level,
+            crate::app::NotificationLevel::Warning
+        ));
+    }
+
+    /// A host without a graphical browser degrades the same way and states its
+    /// own reason through its own entry (c-4, c-5).
+    #[test]
+    fn the_no_browser_fallback_reports_the_catalog_wording() {
+        let address = "https://example.com/docs";
+        let mut st = crate::app::test_state();
+        report_link_clipboard(
+            &mut st,
+            address,
+            crate::clipboard::CopyResult::Osc52Only,
+            LinkFallback::NoBrowser,
+        );
+
+        let notification = st.notification.as_ref().expect("the fallback is reported");
+        assert_eq!(
+            notification.text,
+            crate::i18n::active_t("notify.link_copied_no_browser").replacen("{}", address, 1)
+        );
+    }
+
+    /// When neither the browser nor the clipboard is reachable the dispatcher
+    /// reports the open failure as an error that names the address (c-4, c-5).
+    #[test]
+    fn an_unreachable_clipboard_reports_the_open_failure() {
+        let address = "https://example.com/docs";
+        let mut st = crate::app::test_state();
+        report_link_clipboard(
+            &mut st,
+            address,
+            crate::clipboard::CopyResult::Failed,
+            LinkFallback::NoBrowser,
+        );
+
+        let notification = st.notification.as_ref().expect("the failure is reported");
+        assert_eq!(
+            notification.text,
+            crate::i18n::active_t("notify.link_open_failed").replacen("{}", address, 1)
+        );
+        assert!(matches!(
+            notification.level,
+            crate::app::NotificationLevel::Error
+        ));
     }
 }

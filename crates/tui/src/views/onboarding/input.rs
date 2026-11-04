@@ -48,12 +48,11 @@ async fn save_workstation_config(
     modifier: crate::config::PrimaryModifier,
 ) {
     // The two command chords are paired: whichever key becomes the primary
-    // modifier flips the meta modifier to the other key, so `C-x` and `M-x`
-    // never collide on one physical key (Conventions §5.2).
-    let meta = match modifier {
-        crate::config::PrimaryModifier::Ctrl => crate::config::MetaModifier::Alt,
-        crate::config::PrimaryModifier::Alt => crate::config::MetaModifier::Ctrl,
-    };
+    // modifier leaves the other key as the meta modifier, so `C-x` and `M-x`
+    // never collide on one physical key. The rule lives on the modifier type
+    // itself, so every writer of `tui.toml` states it identically
+    // (Conventions §5.2).
+    let meta = modifier.paired_meta();
     let layout = st.onboarding.chosen_layout;
     let langmap = st.onboarding.chosen_langmap.clone();
     let target = st.onboarding.default_tui_config_path.clone();

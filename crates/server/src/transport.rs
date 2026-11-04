@@ -15,6 +15,13 @@ use tokio::sync::{mpsc, Notify};
 /// produces, and this threshold makes exactly that condition visible.
 const BACKLOG_WARN_THRESHOLD: usize = 8192;
 
+/// Upper bound on the number of queued lines one sink write coalesces.
+///
+/// The writer publishes whatever is already queued in a single write, so the
+/// bound keeps that drain finite when a producer outpaces the writer and keeps
+/// the coalescing buffer from growing with the queue itself.
+const MAX_COALESCED_LINES: usize = 1024;
+
 /// Liveness and depth of the outbound transport, shared by every clone of
 /// [`OutChannel`] and by the writer that owns the output sink.
 struct OutboundState {
@@ -61,13 +68,13 @@ impl OutboundState {
         self.lost.notify_one();
     }
 
-    /// Accounts one line leaving the queue and re-arms the backlog report once
+    /// Accounts `lines` leaving the queue and re-arms the backlog report once
     /// the queue has drained.
-    fn release_pending(&self) {
+    fn release_pending(&self, lines: usize) {
         let remaining = self
             .pending
-            .fetch_sub(1, Ordering::Relaxed)
-            .saturating_sub(1);
+            .fetch_sub(lines, Ordering::Relaxed)
+            .saturating_sub(lines);
         if remaining < BACKLOG_WARN_THRESHOLD {
             self.backlog_reported.store(false, Ordering::Relaxed);
         }
@@ -112,14 +119,25 @@ impl OutChannel {
 
     pub fn send_response(&self, resp: &Response) {
         match serde_json::to_string(resp) {
-            Ok(line) => self.enqueue(line + "\n"),
+            Ok(mut line) => {
+                // The terminator joins the payload inside its own allocation,
+                // so a response stays one buffer end to end instead of a
+                // payload and a whole-line `line + "\n"` copy of it.
+                line.push('\n');
+                self.enqueue(line);
+            }
             Err(err) => tracing::error!("failed to serialize response {:?}: {}", resp.id, err),
         }
     }
 
     pub fn send_event(&self, event: &Event) {
         match serde_json::to_string(event) {
-            Ok(line) => self.enqueue(line + "\n"),
+            Ok(mut line) => {
+                // One buffer carries the payload and its terminator, so an
+                // event costs a single allocation on the streaming hot path.
+                line.push('\n');
+                self.enqueue(line);
+            }
             Err(err) => tracing::error!("failed to serialize event '{}': {}", event.method, err),
         }
     }
@@ -160,7 +178,7 @@ impl OutChannel {
         }
 
         if let Err(err) = self.tx.send(line) {
-            self.state.release_pending();
+            self.state.release_pending(1);
             self.state.mark_sink_lost(&err.to_string());
         }
     }
@@ -185,16 +203,35 @@ impl OutboundWriter {
     /// Implements [`OutboundWriter::run`] against an explicit sink, so a
     /// deterministic test can exercise the failure path without touching the
     /// real stdout of the process.
+    ///
+    /// Whatever is already queued when the writer wakes is coalesced into one
+    /// sink write and one flush. A turn relays its deltas at token
+    /// granularity, so a per-line write would pay a blocking-pool dispatch and
+    /// a line flush per delta, while a batch pays them once per burst.
     async fn run_with<W>(mut self, mut sink: W)
     where
         W: AsyncWrite + Unpin,
     {
+        let mut batch = String::new();
         while let Some(line) = self.rx.recv().await {
-            let written = match sink.write_all(line.as_bytes()).await {
+            batch.clear();
+            batch.push_str(&line);
+            let mut coalesced = 1;
+            while coalesced < MAX_COALESCED_LINES {
+                match self.rx.try_recv() {
+                    Ok(next) => {
+                        batch.push_str(&next);
+                        coalesced += 1;
+                    }
+                    Err(_) => break,
+                }
+            }
+
+            let written = match sink.write_all(batch.as_bytes()).await {
                 Ok(()) => sink.flush().await,
                 Err(err) => Err(err),
             };
-            self.state.release_pending();
+            self.state.release_pending(coalesced);
             if let Err(err) = written {
                 self.state.mark_sink_lost(&err.to_string());
                 return;
@@ -242,6 +279,108 @@ mod tests {
             method: name.to_string(),
             params: None,
         }
+    }
+
+    /// Waits until the writer released every queued line.
+    async fn wait_for_drain(out: &OutChannel) {
+        for _ in 0..200 {
+            if out.state.pending.load(Ordering::Relaxed) == 0 {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert_eq!(
+            out.state.pending.load(Ordering::Relaxed),
+            0,
+            "the writer must release every queued line"
+        );
+    }
+
+    /// Sink that records every write and every flush, so the coalescing
+    /// contract is observable without the real stdout of the process.
+    #[derive(Clone, Default)]
+    struct RecordingSink {
+        writes: Arc<std::sync::Mutex<Vec<Vec<u8>>>>,
+        flushes: Arc<AtomicUsize>,
+    }
+
+    impl RecordingSink {
+        /// Payloads the writer handed to the sink, in write order.
+        fn writes(&self) -> Vec<Vec<u8>> {
+            self.writes
+                .lock()
+                .map(|writes| writes.clone())
+                .unwrap_or_default()
+        }
+
+        /// Number of flushes the writer requested.
+        fn flushes(&self) -> usize {
+            self.flushes.load(Ordering::SeqCst)
+        }
+    }
+
+    impl AsyncWrite for RecordingSink {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<std::io::Result<usize>> {
+            if let Ok(mut writes) = self.writes.lock() {
+                writes.push(buf.to_vec());
+            }
+            Poll::Ready(Ok(buf.len()))
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            self.flushes.fetch_add(1, Ordering::SeqCst);
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    /// A burst of queued lines must cost one sink write and one flush, not one
+    /// of each per line: a turn relays its deltas at token granularity, so a
+    /// per-line cost would scale with tokens instead of bursts.
+    #[tokio::test]
+    async fn queued_lines_are_coalesced_into_one_write_and_one_flush() {
+        let (out, rx) = OutChannel::new();
+        let names = ["test/first", "test/second", "test/third"];
+        for name in names {
+            out.send_event(&event(name));
+        }
+
+        let sink = RecordingSink::default();
+        let writing = tokio::spawn(out.writer(rx).run_with(sink.clone()));
+        wait_for_drain(&out).await;
+
+        let writes = sink.writes();
+        assert_eq!(
+            writes.len(),
+            1,
+            "a queued burst must reach the sink in one write"
+        );
+        assert_eq!(sink.flushes(), 1, "the burst must cost exactly one flush");
+
+        let payload = &writes[0];
+        assert_eq!(
+            payload.iter().filter(|byte| **byte == b'\n').count(),
+            names.len(),
+            "every queued line must keep exactly one terminator"
+        );
+        assert!(
+            payload.ends_with(b"\n"),
+            "the batch must end on a line boundary"
+        );
+        let text = String::from_utf8_lossy(payload);
+        for name in names {
+            assert!(text.contains(name), "the batch dropped '{name}'");
+        }
+
+        writing.abort();
+        let _ = writing.await;
     }
 
     /// A write failure must be recorded and surfaced instead of swallowed, and

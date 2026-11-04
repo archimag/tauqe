@@ -1,3 +1,4 @@
+use crate::markdown::ExtractedLink;
 use crate::theme::engine::{current_engine, ThemeEngine};
 use crate::ui::format::format_tokens;
 use crate::ui::wrap::wrapped_line_count;
@@ -82,6 +83,73 @@ pub(crate) fn measure_canvas(model: &mut ReplView) -> CanvasProjection {
         file_rows,
         total_lines,
     }
+}
+
+/// One clickable row of a Markdown hyperlink, in canvas coordinates.
+///
+/// The Markdown renderer names a link by the display columns it painted on the
+/// unwrapped line, while the viewport draws a wrapped canvas. Resolving the two
+/// belongs to the surface that wrapped the canvas, so the pointer dispatcher
+/// receives finished rows instead of a line index and a column pair (c-1, c-3).
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct LinkRow {
+    /// Address the row opens.
+    pub(crate) url: String,
+    /// Visual row of the drawn canvas.
+    pub(crate) visual_line: usize,
+    /// First painted column of the link on that row.
+    pub(crate) start_col: usize,
+    /// Column just past the link on that row.
+    pub(crate) end_col: usize,
+}
+
+/// Resolves the answer hyperlinks onto the rows the canvas draws.
+///
+/// Every link arrives with the columns of the unwrapped Markdown line, so the row
+/// band of that line is read from the wrap projection and the link is clipped row
+/// by row: each visual row accounts for the width it paints, and a link that
+/// crosses a break yields one row per part it covers. A link of a line that never
+/// wrapped therefore keeps its exact columns, and a link whose line is not part of
+/// the canvas — a parse that predates the current turn — resolves to nothing
+/// instead of a mispositioned target (c-1, c-3).
+pub(crate) fn link_rows(
+    links: &[ExtractedLink],
+    prefix_count: usize,
+    rows: &[Line<'static>],
+    visual_start: &[usize],
+    visual_end: &[usize],
+    width: usize,
+) -> Vec<LinkRow> {
+    let mut resolved = Vec::new();
+    if width == 0 {
+        return resolved;
+    }
+    for link in links {
+        let raw = prefix_count + link.line_idx;
+        let (Some(&first), Some(&last)) = (visual_start.get(raw), visual_end.get(raw)) else {
+            continue;
+        };
+        // Columns of the source line the rows walked so far have consumed.
+        let mut source_col = 0usize;
+        for visual_line in first..=last {
+            let painted = rows.get(visual_line).map_or(0, |row| row.width());
+            let row_end = source_col.saturating_add(painted);
+            let start = link.start_col.clamp(source_col, row_end) - source_col;
+            let end = link.end_col.clamp(source_col, row_end) - source_col;
+            let start = start.min(width);
+            let end = end.min(width);
+            if end > start {
+                resolved.push(LinkRow {
+                    url: link.url.clone(),
+                    visual_line,
+                    start_col: start,
+                    end_col: end,
+                });
+            }
+            source_col = row_end;
+        }
+    }
+    resolved
 }
 
 pub fn compute_model_lines(model: &mut ReplView) -> Vec<Line<'static>> {
@@ -478,5 +546,90 @@ mod tests {
             .collect();
         assert!(rendered.contains("7 prompt"), "{rendered}");
         assert!(rendered.contains("3 completion"), "{rendered}");
+    }
+}
+
+#[cfg(test)]
+mod link_row_tests {
+    use super::*;
+
+    /// A link as the Markdown renderer reports it: address plus the display
+    /// columns of the unwrapped line it painted.
+    fn link(url: &str, line_idx: usize, start_col: usize, end_col: usize) -> ExtractedLink {
+        ExtractedLink {
+            id: 0,
+            url: url.to_string(),
+            line_idx,
+            start_col,
+            end_col,
+        }
+    }
+
+    fn row(text: &str) -> Line<'static> {
+        Line::raw(text.to_string())
+    }
+
+    #[test]
+    fn a_link_of_an_unwrapped_line_keeps_its_painted_columns() {
+        let rows = vec![row("See docs for details")];
+        let links = vec![link("https://example.com", 0, 4, 8)];
+
+        assert_eq!(
+            link_rows(&links, 0, &rows, &[0], &[0], 40),
+            vec![LinkRow {
+                url: "https://example.com".to_string(),
+                visual_line: 0,
+                start_col: 4,
+                end_col: 8,
+            }]
+        );
+    }
+
+    #[test]
+    fn the_prefix_rows_of_the_canvas_shift_the_resolved_line() {
+        // An error row and a toolchain row precede the answer, so the first
+        // Markdown line is drawn on the third visual row.
+        let rows = vec![row("error"), row("cargo check"), row("See docs")];
+        let links = vec![link("https://example.com", 0, 4, 8)];
+
+        let resolved = link_rows(&links, 2, &rows, &[0, 1, 2], &[0, 1, 2], 40);
+        assert_eq!(resolved.len(), 1);
+        assert_eq!(resolved[0].visual_line, 2);
+        assert_eq!((resolved[0].start_col, resolved[0].end_col), (4, 8));
+    }
+
+    #[test]
+    fn a_link_that_crosses_a_wrap_break_yields_one_row_per_part() {
+        // The line wrapped into two ten-column rows; the link starts inside the
+        // first one and runs past the break.
+        let rows = vec![row("0123456789"), row("0123456789")];
+        let links = vec![link("https://example.com", 0, 8, 14)];
+
+        assert_eq!(
+            link_rows(&links, 0, &rows, &[0], &[1], 10),
+            vec![
+                LinkRow {
+                    url: "https://example.com".to_string(),
+                    visual_line: 0,
+                    start_col: 8,
+                    end_col: 10,
+                },
+                LinkRow {
+                    url: "https://example.com".to_string(),
+                    visual_line: 1,
+                    start_col: 0,
+                    end_col: 4,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn a_link_outside_the_canvas_resolves_to_nothing() {
+        let rows = vec![row("See docs")];
+        let links = vec![link("https://example.com", 7, 0, 3)];
+
+        assert!(link_rows(&links, 0, &rows, &[0], &[0], 40).is_empty());
+        assert!(link_rows(&links, 0, &rows, &[0], &[0], 0).is_empty());
     }
 }

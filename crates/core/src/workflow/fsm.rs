@@ -4,7 +4,8 @@
 //! orchestration that sequences the phases, and the shared [`TurnKernel`]
 //! threaded through the phase executors. The round executor, research, and the
 //! corrective budget of an empty answer live in [`kernel`], staging lives in
-//! [`staging`], and verification and healing live in [`healing`]. Transactional
+//! [`staging`], the settlement policy of the turn's plan payload lives in
+//! [`plans`], and verification and healing live in [`healing`]. Transactional
 //! persistence is delegated to an [`ApplyPolicy`], so the FSM never touches Git
 //! directly and stays independent of any single wire format.
 
@@ -12,6 +13,7 @@ mod cache;
 pub(crate) mod guard;
 mod healing;
 mod kernel;
+mod plans;
 mod proposal;
 mod staging;
 pub mod structured;
@@ -19,7 +21,9 @@ mod tools;
 
 use std::collections::HashMap;
 
-use tauqe_protocol::{EditOperation, EditOutcome, ModelRef, ModelResult, TurnIntent};
+use tauqe_protocol::{
+    EditOperation, EditOutcome, HistoryFileChange, ModelRef, ModelResult, PlanRejection, TurnIntent,
+};
 use tokio::sync::{mpsc, watch};
 
 use crate::context::ContextManager;
@@ -39,6 +43,7 @@ use cache::TurnInputCache;
 use guard::{finalize_blocked_turn, finish_turn, rollback_or_log};
 use healing::run_apply_and_verify_phase;
 use kernel::{EmptyStepGuard, EmptyStepRetry, ResearchPhase, TurnKernel, MAX_EMPTY_STEP_RETRIES};
+use plans::{settle_plans, TurnQualification};
 use proposal::{
     extract_error_message, log_fsm_phase, merge_text, outcome_carries_result, ProposalStep,
     TurnState,
@@ -79,8 +84,16 @@ pub struct FsmTurnOutcome {
     /// with may be valid while the plan payload is not — but it is never silent
     /// either: the reasons are recorded in session history, so the next round's
     /// prompt carries them, and the orchestration reports them to the
-    /// developer.
-    pub plan_errors: Vec<String>,
+    /// developer. Every entry is classified where the refusal was produced, so
+    /// no consumer derives a category from the wording of a reason.
+    pub plan_errors: Vec<PlanRejection>,
+    /// Status repairs the plan barrier performed while applying this turn's
+    /// payload.
+    ///
+    /// A repaired status is a real event of the plan lifecycle, so the warnings
+    /// travel to the caller, reach the turn stream and the session history, and
+    /// are journaled. A silently normalized plan is a prohibited outcome.
+    pub plan_warnings: Vec<String>,
     /// The model's skip report when the turn ended with a semantic skip
     /// signal.
     ///
@@ -148,16 +161,17 @@ impl FsmTurnOutcome {
             has_terminal_success: false,
             plan_saved: false,
             plan_errors: Vec::new(),
+            plan_warnings: Vec::new(),
             skip_reason: None,
         }
     }
 
-    /// Renders the plan mutations the storage engine refused, if any.
+    /// Renders the plan mutations this turn refused, if any.
     ///
-    /// The notice is compact by construction: each line is the storage engine's
-    /// own reason, which already names the plan identifier and the action, so no
-    /// payload is ever echoed back. A turn whose plan payload was accepted
-    /// produces no notice at all.
+    /// The notice is compact by construction: each line is the reported wording
+    /// of one typed rejection, which already names the plan identifier and the
+    /// action, so no payload is ever echoed back. A turn whose plan payload was
+    /// accepted produces no notice at all.
     pub fn plan_rejection_notice(&self) -> Option<String> {
         if self.plan_errors.is_empty() {
             return None;
@@ -168,11 +182,63 @@ impl FsmTurnOutcome {
             "Plan mutations rejected:"
         };
         let mut notice = String::from(header);
-        for error in &self.plan_errors {
+        for rejection in &self.plan_errors {
             notice.push_str("\n- ");
-            notice.push_str(error);
+            notice.push_str(&rejection.message);
         }
         Some(notice)
+    }
+
+    /// Renders the status repairs the plan barrier performed on this turn.
+    ///
+    /// The notice is compact by construction: each line is the reported wording
+    /// of one repair, which already names the plan, the step, and the status it
+    /// kept. A payload applied without a repair produces no notice at all.
+    pub fn plan_warning_notice(&self) -> Option<String> {
+        if self.plan_warnings.is_empty() {
+            return None;
+        }
+        let header = if self.plan_warnings.len() == 1 {
+            "Plan mutation normalized:"
+        } else {
+            "Plan mutations normalized:"
+        };
+        let mut notice = String::from(header);
+        for warning in &self.plan_warnings {
+            notice.push_str("\n- ");
+            notice.push_str(warning);
+        }
+        Some(notice)
+    }
+}
+
+/// Announces the plan diagnostics a turn collected on the turn stream.
+///
+/// The notices are the developer-facing surface of the plan lifecycle: a
+/// rejection states why a mutation never reached storage, and a repair names
+/// the status the barrier kept. The announcement lives beside the outcome
+/// instead of inside an execution-mode supervisor, because the bounded turn is
+/// the one surface every contour passes through, so a reply answered without
+/// edits reports a refused or repaired mutation exactly like a supervised
+/// execution does.
+///
+/// A turn that carries neither notice announces nothing.
+pub(super) async fn announce_plan_diagnostics(
+    outcome: &FsmTurnOutcome,
+    stream_tx: &mpsc::Sender<StreamEvent>,
+) {
+    let notices = [
+        outcome.plan_rejection_notice(),
+        outcome.plan_warning_notice(),
+    ];
+    for notice in notices.into_iter().flatten() {
+        tracing::warn!("{}", notice);
+        let _ = stream_tx
+            .send(StreamEvent::TextDelta(format!(
+                "\n\n---\n\u{26a0}\u{fe0f} {}\n\n",
+                notice
+            )))
+            .await;
     }
 }
 
@@ -227,7 +293,6 @@ pub async fn run_fsm_turn(
     }
     let turn_id = begin_session_turn(
         prompt,
-        intent,
         context_manager,
         history_manager,
         provider,
@@ -235,6 +300,12 @@ pub async fn run_fsm_turn(
         options,
     )
     .await;
+    // The bounded turn announces the plan diagnostics it collected itself: the
+    // notice rides on the turn stream, so a reply answered without edits reports
+    // a refused or repaired mutation exactly like a supervised execution does.
+    // The announcement owns a clone of the stream, which leaves the original
+    // sender to the body.
+    let notice_tx = stream_tx.clone();
     let turn_res = run_fsm_turn_body(
         prompt,
         intent,
@@ -271,7 +342,8 @@ pub async fn run_fsm_turn(
             let _ = history_manager.rollback_entry(id, "Turn cancelled by the developer");
         }
     } else {
-        record_session_response(history_manager, &outcome);
+        record_session_response(history_manager, &outcome, intent);
+        announce_plan_diagnostics(&outcome, &notice_tx).await;
     }
     Ok(outcome)
 }
@@ -284,23 +356,23 @@ pub async fn run_fsm_turn(
 /// compaction pass follows, so the running turn reaches the developer's
 /// chronicle the moment it starts instead of after a summarization call that
 /// costs a whole provider round trip. Compaction keeps the newest turns in its
-/// tail, so the fresh record survives the rewrite untouched. The turn declares
-/// its mode as a typed [`TurnIntent`], so an isolated step suppresses history
-/// bookkeeping entirely without being recognized from the shape of its prompt
-/// text.
+/// tail, so the fresh record survives the rewrite untouched.
+///
+/// Every turn the kernel journals opens its card, an isolated step included:
+/// the prompt a step carries is the structured execution card of one plan step,
+/// so the developer's chronicle records which step ran, and the same budgeted
+/// compaction that governs a dialogue keeps a long batch of steps from growing
+/// the journal without bound. Rendering is a separate decision:
+/// [`TurnIntent::suppresses_session_history`] still keeps the `<history>` block
+/// out of a step prompt, so a step never reads the record it just wrote.
 pub(super) async fn begin_session_turn(
     prompt: &str,
-    intent: TurnIntent,
     context_manager: &ContextManager,
     history_manager: &mut HistoryManager,
     provider: &dyn LlmProvider,
     cancel_rx: &watch::Receiver<bool>,
     options: &WorkflowOptions,
 ) -> Option<u64> {
-    if intent.is_isolated_step() {
-        return None;
-    }
-
     // One state read yields both halves of the record — the paths the turn
     // observed and the highest insertion watermark it observed — so they can
     // never disagree. The watermark is the placement signal a chronological
@@ -336,19 +408,120 @@ pub(super) async fn begin_session_turn(
 /// Records the completed turn outcome in session history.
 ///
 /// Cancelled turns are skipped by the caller, so a partial turn never leaves a
-/// response entry behind. Plan mutations the storage engine refused are appended
-/// afterwards as one diagnostic record.
+/// response entry behind. The recorded card follows the declared
+/// [`TurnIntent`]: a dialogue turn keeps the conversation — the summary of its
+/// change set and the cleaned assistant text — while an isolated step records
+/// the compact result of the step instead of the whole reply it produced. Plan
+/// mutations the storage engine refused are appended afterwards as one
+/// diagnostic record, and the status repairs the barrier performed are recorded
+/// beside them, whichever contour produced them.
 pub(super) fn record_session_response(
     history_manager: &mut HistoryManager,
     outcome: &FsmTurnOutcome,
+    intent: TurnIntent,
 ) {
-    record_workflow_response(
-        history_manager,
-        &outcome.result,
-        &outcome.assistant_text,
-        Vec::new(),
-    );
+    if intent.is_isolated_step() {
+        record_step_response(history_manager, outcome);
+    } else {
+        record_workflow_response(
+            history_manager,
+            &outcome.result,
+            &outcome.assistant_text,
+            Vec::new(),
+        );
+    }
     record_plan_rejections(history_manager, outcome);
+    record_plan_warnings(history_manager, outcome);
+}
+
+/// Records the compact result card of an isolated step.
+///
+/// A step is not a dialogue: the developer's chronicle needs the status of the
+/// step, the commit it produced, and the reason it could not complete, never
+/// the full reply the model wrote for it. The card therefore carries the changed
+/// files of the applied change set and the first reported line of the outcome,
+/// which names the result without echoing the answer behind it.
+fn record_step_response(history_manager: &mut HistoryManager, outcome: &FsmTurnOutcome) {
+    // The applied change set is the only result that carries a commit and a
+    // file list; a step that applied nothing reports its reason alone.
+    let applied = match &outcome.result {
+        ModelResult::Edit { outcome: edit, .. } if edit.applied => Some(edit),
+        _ => None,
+    };
+    let status = step_status(outcome, applied.is_some());
+    let commit = applied.and_then(|edit| edit.commit_hash.clone());
+    let files: Vec<HistoryFileChange> = applied
+        .map(|edit| {
+            edit.changed_files
+                .iter()
+                .cloned()
+                .map(HistoryFileChange::plain)
+                .collect()
+        })
+        .unwrap_or_default();
+    let message = match step_detail(outcome) {
+        Some(detail) => format!("Step {status}: {detail}"),
+        None => format!("Step {status}."),
+    };
+    if let Err(err) = history_manager.record_response(message, commit, None, files) {
+        tracing::warn!(
+            "Failed to record the plan step result in session history: {}",
+            err
+        );
+    }
+}
+
+/// Status a step result card reports, read from the typed outcome fields.
+///
+/// A reported block outranks a skip, and both outrank the result of the turn,
+/// so the card never derives a status from the wording of a message: a step is
+/// completed only when it applied its change set or stated a terminal success.
+fn step_status(outcome: &FsmTurnOutcome, applied_change: bool) -> &'static str {
+    if outcome.blocked.is_some() {
+        "blocked"
+    } else if outcome.skip_reason.is_some() {
+        "skipped"
+    } else if applied_change || outcome.has_terminal_success {
+        "completed"
+    } else {
+        "failed"
+    }
+}
+
+/// First reported line of a step outcome, which is what its card carries.
+///
+/// The reason a step reported — a block, a skip, a failure, or the summary of
+/// the change set it produced — is taken from the typed payload of the turn and
+/// reduced to its first non-empty line, so the recorded card names the result
+/// without reproducing the reply around it.
+fn step_detail(outcome: &FsmTurnOutcome) -> Option<String> {
+    if let Some(report) = outcome
+        .blocked
+        .as_deref()
+        .or(outcome.skip_reason.as_deref())
+    {
+        return first_reported_line(report);
+    }
+    match &outcome.result {
+        ModelResult::Edit {
+            outcome: edit,
+            summary,
+            ..
+        } => edit
+            .error
+            .as_deref()
+            .and_then(first_reported_line)
+            .or_else(|| first_reported_line(summary)),
+        ModelResult::Answer { text } => first_reported_line(text),
+    }
+}
+
+/// Returns the first non-empty line of a reported text.
+fn first_reported_line(text: &str) -> Option<String> {
+    text.lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .map(str::to_string)
 }
 
 /// Records the plan mutations the storage engine refused as one diagnostic.
@@ -370,6 +543,28 @@ fn record_plan_rejections(history_manager: &mut HistoryManager, outcome: &FsmTur
     ) {
         tracing::warn!(
             "Failed to record the rejected plan mutation in session history: {}",
+            err
+        );
+    }
+}
+
+/// Records the status repairs the plan barrier performed as one diagnostic.
+///
+/// A repaired status is a real event of the plan lifecycle, so it is journaled
+/// beside the turn and preserved in session history: without that record the
+/// model would keep requesting a status the barrier silently replaced.
+fn record_plan_warnings(history_manager: &mut HistoryManager, outcome: &FsmTurnOutcome) {
+    let Some(notice) = outcome.plan_warning_notice() else {
+        return;
+    };
+    if let Err(err) = history_manager.record_response(
+        notice,
+        None,
+        Some("Plan mutation normalized".to_string()),
+        Vec::new(),
+    ) {
+        tracing::warn!(
+            "Failed to record the normalized plan mutation in session history: {}",
             err
         );
     }
@@ -544,18 +739,23 @@ pub(super) async fn run_fsm_turn_body(
                     .stream_tx
                     .send(StreamEvent::TextDelta(format!("\n\n⚠️ {}", warn)))
                     .await;
+                // A breached budget closes the turn without a qualifying
+                // result, so the payload leaves it with a diagnostic that names
+                // the budget rather than disappearing silently.
+                let settlement = settle_plans(
+                    ctx.repo_root,
+                    &ctx.state.plans,
+                    ctx.plan_mode,
+                    TurnQualification::disqualified(format!(
+                        "the context token budget was exceeded (token_budget = {})",
+                        limit.token_budget
+                    )),
+                )
+                .await;
                 let _ = ctx.stream_tx.send(StreamEvent::Done).await;
-                return Ok(FsmTurnOutcome {
-                    assistant_text: warn.clone(),
-                    result: ModelResult::Answer { text: warn },
-                    is_cancelled: false,
-                    blocked: None,
-                    abort: None,
-                    has_terminal_success: false,
-                    plan_saved: false,
-                    plan_errors: Vec::new(),
-                    skip_reason: None,
-                });
+                let assistant_text = warn.clone();
+                let result = ModelResult::Answer { text: warn };
+                return Ok(finish_turn(assistant_text, result, settlement));
             }
             ResearchPhase::Continue(step) => *step,
         };
@@ -719,16 +919,18 @@ async fn finish_on_error_outcome(ctx: &mut TurnKernel<'_>) -> Option<FsmTurnOutc
             verification: None,
         },
     };
-    Some(
-        finish_turn(
-            std::mem::take(&mut ctx.accumulated_text),
-            result,
-            ctx.repo_root,
-            &ctx.state.plans,
-            ctx.plan_mode,
-        )
-        .await,
+    let settlement = settle_plans(
+        ctx.repo_root,
+        &ctx.state.plans,
+        ctx.plan_mode,
+        TurnQualification::disqualified("the turn ended with a terminal error"),
     )
+    .await;
+    Some(finish_turn(
+        std::mem::take(&mut ctx.accumulated_text),
+        result,
+        settlement,
+    ))
 }
 
 /// Finalizes the turn when the model emitted a semantic `<abort>` signal.
@@ -783,14 +985,18 @@ async fn finish_aborted_turn(ctx: &mut TurnKernel<'_>, abort: AbortReport) -> Fs
             verification: None,
         },
     };
-    let mut outcome = finish_turn(
-        std::mem::take(&mut ctx.accumulated_text),
-        result,
+    let settlement = settle_plans(
         ctx.repo_root,
         &ctx.state.plans,
         ctx.plan_mode,
+        TurnQualification::disqualified("the turn was aborted"),
     )
     .await;
+    let mut outcome = finish_turn(
+        std::mem::take(&mut ctx.accumulated_text),
+        result,
+        settlement,
+    );
     outcome.abort = Some(abort);
     outcome
 }
@@ -860,14 +1066,14 @@ async fn finish_answer_without_edits(ctx: &mut TurnKernel<'_>) -> FsmTurnOutcome
     let result = ModelResult::Answer {
         text: answer_text.clone(),
     };
-    let mut outcome = finish_turn(
-        answer_text,
-        result,
+    let settlement = settle_plans(
         ctx.repo_root,
         &ctx.state.plans,
         ctx.plan_mode,
+        TurnQualification::Qualified,
     )
     .await;
+    let mut outcome = finish_turn(answer_text, result, settlement);
     outcome.has_terminal_success = has_terminal_success;
     outcome.skip_reason = skip_reason;
     outcome
@@ -1053,14 +1259,18 @@ async fn finish_patch_failure(
             verification: None,
         },
     };
-    finish_turn(
-        std::mem::take(&mut ctx.accumulated_text),
-        result,
+    let settlement = settle_plans(
         ctx.repo_root,
         &ctx.state.plans,
         ctx.plan_mode,
+        TurnQualification::disqualified("no change set could be staged"),
     )
-    .await
+    .await;
+    finish_turn(
+        std::mem::take(&mut ctx.accumulated_text),
+        result,
+        settlement,
+    )
 }
 
 /// Finalizes the turn when no edits were successfully staged.
@@ -1087,14 +1297,18 @@ async fn finish_no_edits(ctx: &mut TurnKernel<'_>) -> FsmTurnOutcome {
             verification: None,
         },
     };
-    finish_turn(
-        std::mem::take(&mut ctx.accumulated_text),
-        result,
+    let settlement = settle_plans(
         ctx.repo_root,
         &ctx.state.plans,
         ctx.plan_mode,
+        TurnQualification::disqualified("no edits were successfully staged"),
     )
-    .await
+    .await;
+    finish_turn(
+        std::mem::take(&mut ctx.accumulated_text),
+        result,
+        settlement,
+    )
 }
 
 /// Finalizes the turn when the model kept generating an empty response.
@@ -1131,14 +1345,18 @@ async fn finish_empty_step(ctx: &mut TurnKernel<'_>) -> FsmTurnOutcome {
             verification: None,
         },
     };
-    finish_turn(
-        std::mem::take(&mut ctx.accumulated_text),
-        result,
+    let settlement = settle_plans(
         ctx.repo_root,
         &ctx.state.plans,
         ctx.plan_mode,
+        TurnQualification::disqualified("the model produced an empty response"),
     )
-    .await
+    .await;
+    finish_turn(
+        std::mem::take(&mut ctx.accumulated_text),
+        result,
+        settlement,
+    )
 }
 
 #[cfg(test)]
@@ -1223,6 +1441,73 @@ mod tests {
         assert_eq!(
             std::fs::read_to_string(root.join("a.rs")).unwrap(),
             "pub fn compute() -> i32 { 42 }\n"
+        );
+    }
+
+    /// A committed REPL turn releases the whole transient context: the files
+    /// discovery gathered and the external documents the registry materialized
+    /// share one lifecycle, so neither of them outlives the edits it served.
+    #[tokio::test]
+    async fn a_committed_turn_clears_the_whole_transient_context() {
+        let (_dir, root) = setup_repo(&[
+            ("a.rs", TARGET),
+            ("notes.rs", "pub fn notes() -> i32 { 1 }\n"),
+            ("external/spec.md", "external specification\n"),
+        ]);
+        let mut context = context_with_target(&root);
+        context
+            .add_auto_file("notes.rs", ContextAccess::ReadOnly)
+            .unwrap();
+        context
+            .add_outer_docs_file("external/spec.md")
+            .expect("the external document is materialized");
+        assert_eq!(context.auto_files(), vec!["notes.rs".to_string()]);
+        assert_eq!(
+            context.outer_docs_files(),
+            vec!["external/spec.md".to_string()]
+        );
+
+        let mut history = HistoryManager::new(root.clone());
+        let provider = MockLlmProvider::scripted([MockResponse::text(edit_block(
+            "pub fn compute() -> i32 { 0 }",
+            "pub fn compute() -> i32 { 42 }",
+        ))]);
+        let model = ModelRef::openrouter("mock/model");
+        let protocol = XmlPromptProtocol;
+        let mut policy = DirectApplyPolicy::new();
+        let options = WorkflowOptions::default();
+        let (stream_tx, rx) = mpsc::channel(256);
+        drop(rx);
+        let (_cancel_tx, cancel_rx) = watch::channel(false);
+
+        let outcome = run_fsm_turn(
+            "Change compute to 42",
+            tauqe_protocol::TurnIntent::InteractiveRepl,
+            &provider,
+            &model,
+            &mut context,
+            &mut history,
+            &protocol,
+            &mut policy,
+            "git",
+            stream_tx,
+            cancel_rx,
+            &options,
+        )
+        .await
+        .unwrap();
+
+        assert!(matches!(
+            outcome.result,
+            ModelResult::Edit { outcome, .. } if outcome.applied
+        ));
+        assert!(
+            context.auto_files().is_empty(),
+            "a committed turn must release the repository files discovery gathered"
+        );
+        assert!(
+            context.outer_docs_files().is_empty(),
+            "a committed turn must release the materialized external documents"
         );
     }
 
@@ -1538,7 +1823,6 @@ mod tests {
 
         let turn_id = begin_session_turn(
             "Change compute to 42",
-            tauqe_protocol::TurnIntent::InteractiveRepl,
             &context,
             &mut history,
             &provider,
@@ -1964,5 +2248,161 @@ mod tests {
         assert!(matches!(outcome.result, ModelResult::Answer { .. }));
         assert!(outcome.has_terminal_success);
         assert_eq!(provider.requests().len(), 1);
+    }
+
+    /// Builds the structured execution card of one plan step.
+    ///
+    /// The card names the plan, the step identifier, its title, and its target
+    /// file, which is exactly what the opening journal record must carry.
+    fn isolated_step_prompt() -> String {
+        let plan = tauqe_protocol::Plan::from_parts(
+            "memory-bounds".to_string(),
+            "Bound the memory".to_string(),
+            None,
+            0,
+            0,
+            Vec::new(),
+            vec![tauqe_protocol::PlanItem {
+                id: "1".to_string(),
+                title: "Journal both cards".to_string(),
+                files: vec!["a.rs".to_string()],
+                ..Default::default()
+            }],
+        );
+        crate::plan::prompt::format_plan_step_execution_prompt(
+            &plan,
+            "1",
+            tauqe_protocol::EditProtocolKind::Xml,
+            None,
+        )
+        .expect("the step execution card renders")
+    }
+
+    /// An isolated step journals both sides of its event: the structured
+    /// execution card that opened it and the compact result card that closed
+    /// it, which carries the status and the commit instead of the reply the
+    /// model wrote.
+    #[tokio::test]
+    async fn isolated_step_records_both_sides_of_its_event() {
+        let (_dir, root) = setup_repo(&[("a.rs", TARGET)]);
+        let mut context = context_with_target(&root);
+        let mut history = HistoryManager::new(root.clone());
+
+        let response = format!(
+            "{}\n<success commit_message=\"Journal the step result\" />",
+            edit_block(
+                "pub fn compute() -> i32 { 0 }",
+                "pub fn compute() -> i32 { 42 }",
+            )
+        );
+        let provider = MockLlmProvider::scripted([MockResponse::text(response)]);
+        let model = ModelRef::openrouter("mock/model");
+        let protocol = XmlPromptProtocol;
+        let mut policy = crate::workflow::git_policy::GitTransactionPolicy::new();
+        let options = WorkflowOptions::default();
+        let (stream_tx, rx) = mpsc::channel(256);
+        drop(rx);
+        let (_cancel_tx, cancel_rx) = watch::channel(false);
+
+        let outcome = run_fsm_turn(
+            &isolated_step_prompt(),
+            tauqe_protocol::TurnIntent::IsolatedStep,
+            &provider,
+            &model,
+            &mut context,
+            &mut history,
+            &protocol,
+            &mut policy,
+            "git",
+            stream_tx,
+            cancel_rx,
+            &options,
+        )
+        .await
+        .expect("the isolated step executes");
+
+        assert!(
+            matches!(&outcome.result, ModelResult::Edit { outcome, .. } if outcome.applied),
+            "the step must apply its change set: {:?}",
+            outcome.result
+        );
+
+        let entries = history.get_entries().expect("the journal reads");
+        assert_eq!(
+            entries.len(),
+            2,
+            "an isolated step journals the card that opened it and the card that closed it"
+        );
+        match &entries[0] {
+            crate::history::HistoryEntry::Turn { prompt, .. } => {
+                assert!(prompt.contains("# Target Plan Step Execution: [memory-bounds:1]"));
+                assert!(prompt.contains("Journal both cards"));
+                assert!(prompt.contains("a.rs"));
+            }
+            other => panic!("expected the step opening card, got {other:?}"),
+        }
+        match &entries[1] {
+            crate::history::HistoryEntry::Response {
+                message,
+                commit,
+                files,
+                ..
+            } => {
+                assert_eq!(message, "Step completed: Journal the step result");
+                assert!(
+                    commit.is_some(),
+                    "the completed step card carries the commit that produced it"
+                );
+                assert_eq!(files, &vec![HistoryFileChange::plain("a.rs")]);
+                assert!(
+                    !message.contains("tauqe_edits"),
+                    "the card states the result, never the reply: {message}"
+                );
+            }
+            other => panic!("expected the step result card, got {other:?}"),
+        }
+    }
+
+    /// A step whose stream fails leaves the journal exactly as it found it: the
+    /// opening card is rolled back with the transaction, so the chronicle never
+    /// reports a step that produced no result.
+    #[tokio::test]
+    async fn a_failed_isolated_step_leaves_no_journal_record() {
+        let (_dir, root) = setup_repo(&[("a.rs", TARGET)]);
+        let mut context = context_with_target(&root);
+        let mut history = HistoryManager::new(root.clone());
+
+        let provider =
+            MockLlmProvider::scripted([MockResponse::error("Connection terminated prematurely")]);
+        let model = ModelRef::openrouter("mock/model");
+        let protocol = XmlPromptProtocol;
+        let mut policy = crate::workflow::git_policy::GitTransactionPolicy::new();
+        let options = WorkflowOptions::default();
+        let (stream_tx, rx) = mpsc::channel(256);
+        drop(rx);
+        let (_cancel_tx, cancel_rx) = watch::channel(false);
+
+        let result = run_fsm_turn(
+            &isolated_step_prompt(),
+            tauqe_protocol::TurnIntent::IsolatedStep,
+            &provider,
+            &model,
+            &mut context,
+            &mut history,
+            &protocol,
+            &mut policy,
+            "git",
+            stream_tx,
+            cancel_rx,
+            &options,
+        )
+        .await;
+
+        assert!(result.is_err(), "the step must fail fast on a stream error");
+        assert!(
+            history.get_entries().expect("the journal reads").is_empty(),
+            "a failed step leaves no card behind"
+        );
+        assert_eq!(std::fs::read_to_string(root.join("a.rs")).unwrap(), TARGET);
     }
 }

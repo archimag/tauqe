@@ -34,10 +34,10 @@ where
     }
 }
 
-/// Event emission and auto-context clearing are shared with every other handler
-/// subsystem, so they are re-exported here instead of being duplicated per
-/// subsystem.
-pub(super) use crate::handlers::common::{clear_auto_context, emit};
+/// Event emission and transient-context cleanup are shared with every other
+/// handler subsystem, so they are re-exported here instead of being duplicated
+/// per subsystem.
+pub(super) use crate::handlers::common::{cleanup_transient_context, emit};
 
 /// Emits a `review/error` event for a failed review operation.
 pub(super) fn emit_error(out: &OutChannel, operation_id: &str, message: String) {

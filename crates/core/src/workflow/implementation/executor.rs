@@ -448,10 +448,11 @@ impl PlanImplementationStepExecutor<'_> {
     /// [`ReviewStorage::update_session_item_status`].
     ///
     /// Only the lifecycle the run owns reaches the finding: taking the step
-    /// marks it `InProgress`, and a reset returns it to `Todo`. The verdict is
-    /// not written here: the finding is closed as `Fixed` or `Skipped` exactly
-    /// once by the pipeline settlement, which is the single writer of a verdict.
-    ///
+    /// Only the lifecycle the run owns reaches the finding: taking the step
+    /// marks it `InProgress`, a reset returns it to `Todo`, and completing it
+    /// records the commit that carried the step. The verdict is not written
+    /// here: the finding is closed as `Fixed` or `Skipped` exactly once by the
+    /// pipeline settlement, which is the single writer of a verdict.
     /// Every storage entry point offloads its own file I/O through the blocking
     /// pool, so the executor awaits the step loop without blocking a worker.
     ///
@@ -525,17 +526,20 @@ impl PlanImplementationStepExecutor<'_> {
             }
             // A single finding executes as a degenerate in-memory horizon, so it
             // owns no persisted step graph: the lifecycle of the run is written
-            // onto the finding itself. The verdict is never written here, because
-            // the pipeline settlement states it exactly once. A finding carries
-            // no commit pointer of its own, so the commit its step produced is
-            // recorded nowhere here.
+            // onto the finding itself. A completed step records the commit that
+            // carried it, because the verdict the settlement states describes the
+            // finding and never the change set that resolved it.
             ExecutionScope::ReviewFinding { review_id, item_id } => {
                 let issue_status = match status {
                     PlanItemStatus::InProgress => IssueStatus::InProgress,
                     PlanItemStatus::Todo => IssueStatus::Todo,
-                    // Closing the finding belongs to the pipeline settlement.
-                    PlanItemStatus::Done
-                    | PlanItemStatus::Blocked
+                    // The commit is recorded by the transition that completes the
+                    // step; the verdict that closes the finding belongs to the
+                    // pipeline settlement, so no status is written here.
+                    PlanItemStatus::Done => {
+                        return self.record_finding_commit(&review_id, item_id, commit);
+                    }
+                    PlanItemStatus::Blocked
                     | PlanItemStatus::Discussion
                     | PlanItemStatus::Cancelled => return Ok(()),
                 };
@@ -560,6 +564,41 @@ impl PlanImplementationStepExecutor<'_> {
                 Ok(())
             }
         }
+    }
+
+    /// Records the commit of a completed single-finding step on the finding.
+    ///
+    /// The commit is the durable pointer of the change set the step produced, so
+    /// it is written by the very transition that completes the step, exactly as a
+    /// plan step stores it. A step that produced no commit records nothing. The
+    /// verdict of the finding is never written here: the pipeline settlement
+    /// states it exactly once.
+    fn record_finding_commit(
+        &self,
+        review_id: &str,
+        item_id: u32,
+        commit: Option<&str>,
+    ) -> Result<(), StepFailure> {
+        let Some(commit) = commit.map(str::trim).filter(|hash| !hash.is_empty()) else {
+            return Ok(());
+        };
+        let updated =
+            ReviewStorage::update_session_item(self.repo_root, review_id, item_id, |issue| {
+                issue.commit = Some(commit.to_string());
+            })
+            .map_err(|err| {
+                StepFailure::infrastructure(format!(
+                    "Failed to persist the commit of review finding #{}: {}",
+                    item_id, err
+                ))
+            })?;
+        if updated.is_none() {
+            return Err(StepFailure::infrastructure(format!(
+                "Review session '{}' does not store finding #{}",
+                review_id, item_id
+            )));
+        }
+        Ok(())
     }
 
     /// Returns a step to TODO after a turn that produced no durable progress.
@@ -751,6 +790,7 @@ mod tests {
             id: 7,
             title: "Guard the executor".to_string(),
             uuid: None,
+            commit: None,
             group: Some("arch-1".to_string()),
             model: None,
             issue_type: IssueType::Bug,
@@ -1045,6 +1085,39 @@ mod tests {
         let requests = host.requests();
         assert_eq!(requests.len(), 1);
         assert!(requests[0].prompt.contains("Target Plan Step Execution"));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_completed_single_finding_step_records_the_commit_on_the_finding() {
+        let dir = tempdir().unwrap();
+        stored_review(dir.path());
+        let host = ScriptedHost::new(vec![StepTurnResult::Success {
+            summary: "the finding is addressed".to_string(),
+            commit: Some("abc1234".to_string()),
+        }]);
+        let scope = ExecutionScope::ReviewFinding {
+            review_id: "review-horizon".to_string(),
+            item_id: 7,
+        };
+        let mut executor =
+            PlanImplementationStepExecutor::new(dir.path(), scope, &host, run_config("7"));
+        let (stream_tx, cancel_rx) = channels();
+
+        let outcome = executor
+            .execute_step(&BatchStep::new("7", "finding"), stream_tx, cancel_rx)
+            .await
+            .unwrap();
+
+        assert!(outcome.is_success());
+        // The commit belongs to the completed record of the step, so the finding
+        // points at the change set that resolved it even before the settlement
+        // states the verdict.
+        let stored = ReviewStorage::load_review(dir.path(), "review-horizon")
+            .unwrap()
+            .unwrap();
+        let finding = stored.find_item(7).expect("the finding is stored");
+        assert_eq!(finding.commit.as_deref(), Some("abc1234"));
+        assert_eq!(finding.status, IssueStatus::InProgress);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

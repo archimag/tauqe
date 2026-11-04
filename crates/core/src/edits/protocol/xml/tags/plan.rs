@@ -715,7 +715,10 @@ And outside markdown:
 
     #[test]
     fn test_parse_plan_tags_bounds_item_nesting_depth() {
-        let (plans, errors) = parse_plan_tags_with_diagnostics(&nested_item_plan(10_000));
+        // Two levels past the cap is enough: the parser keeps
+        // MAX_PLAN_REFINEMENT_DEPTH levels and reports the dropped tail.
+        let (plans, errors) =
+            parse_plan_tags_with_diagnostics(&nested_item_plan(MAX_PLAN_REFINEMENT_DEPTH + 2));
         assert_eq!(plans.len(), 1, "errors: {:?}", errors);
         assert!(
             errors
@@ -736,7 +739,8 @@ And outside markdown:
 
     #[test]
     fn test_parse_plan_tags_bounds_concept_nesting_depth() {
-        let depth = 10_000;
+        // Two levels past the cap is enough to prove the depth cut.
+        let depth = MAX_PLAN_REFINEMENT_DEPTH + 2;
         let mut concept = String::new();
         for level in 0..depth {
             concept.push_str(&format!(

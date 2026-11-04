@@ -170,19 +170,24 @@ All commits must follow the **Conventional Commits** specification:
 
 ---
 
-## 7. Living Configuration Reference (`tauqe.toml` and User Config)
+## 7. Living Configuration Reference (`tauqe.starter.toml`, `tauqe.toml`, and User Config)
 
-1. **Authoritative Example for Project Configuration:**
-   - The root `tauqe.toml` file in this repository serves as the authoritative, living reference example of project-level configuration options.
-   - Project configuration (`tauqe.toml`) governs toolchains, project models, context limits, and repomap budgets, and is safe for repository version control.
-2. **Separation of Project and User Configuration:**
+1. **The Shipped Archetype Is the Authoritative Example:**
+   - `crates/core/assets/tauqe.starter.toml` is the canonical, living reference example of project configuration. It ships inside the binary through `include_str!` and is installed by `write_default_config`, so the manifest a new project receives always matches the engine that writes it.
+   - The archetype is written by progressive disclosure: the essentials a project must edit are uncommented and already valid, while every other section and parameter appears commented (`# key = value`) with its default explicitly shown and a concise descriptive comment. A question about an available option is answered by this file.
+   - The archetype is a documentation artifact of the engine, never the configuration of this repository: it carries no credential, no workstation preference, and no project-specific command.
+2. **The Root `tauqe.toml` Is the Operational Configuration:**
+   - The root `tauqe.toml` of this repository declares how this development process actually runs — its model roles, project commands, context budgets, and pinned context. It is a working manifest, so it declares what the process consumes and is never required to enumerate, in commented form, every option the engine accepts.
+   - Project configuration governs harness policy, project commands, context limits, and model roles, and is safe for repository version control.
+3. **Separation of Project and User Configuration:**
    - Personal developer preferences (terminal themes, keyboard layout mappings, primary command modifiers) must never be placed in `tauqe.toml`.
    - User-specific TUI configuration belongs in `$XDG_CONFIG_HOME/tauqe/tui.toml` (or `~/.config/tauqe/tui.toml`), keeping repository configs free of personal workstation settings.
-3. **Mandatory Documentation of Parameters:**
-   - When introducing any new configuration section or parameter in `AppConfig`, it must immediately be reflected in `tauqe.toml`.
-   - New or optional parameters should be provided in commented-out form (`# key = value`) with their default values explicitly shown, along with a concise descriptive comment.
-4. **No Hardcoded Budgets:**
-   - All token budgets and operational limits (history tokens, tail turns count, repomap tokens, discovery rounds, retry counts) must be configurable through `AppConfig` and carry sensible, modern defaults.
+4. **Mandatory Documentation of Parameters:**
+   - When introducing any new configuration section or parameter in `AppConfig`, it must immediately be reflected in the archetype `crates/core/assets/tauqe.starter.toml`, in commented form with its default explicitly shown and a concise descriptive comment.
+   - Introducing or renaming a parameter without updating the archetype is a defect: an option that is undocumented there is indistinguishable from one that does not exist.
+5. **Archetype Validity Is Enforced, Never Assumed:**
+   - Every uncommented declaration of the archetype parses and validates as an `AppConfig`. An automated test in `crates/core` enforces exactly that invariant against the compiled-in asset, so a configuration change that invalidates the manifest fails the suite instead of breaking the first project that copies it.
+6. **No Hardcoded Budgets:**
    - All token budgets and operational limits (history tokens, tail turns count, repomap tokens, research rounds, retry counts) must be configurable through `AppConfig` and carry sensible, modern defaults.
 ---
 

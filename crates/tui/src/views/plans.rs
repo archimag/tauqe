@@ -25,6 +25,12 @@ pub(crate) use self::tree::{
     architect_badge, compute_unified_plan_lines, measure_plan_rows, status_style,
 };
 
+/// Saturating conversion for scroll arithmetic; avoids wrap-around on a very
+/// tall rendered tree.
+fn clamp_u16(n: usize) -> u16 {
+    u16::try_from(n).unwrap_or(u16::MAX)
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum VisiblePlanRow {
     PlanHeader {
@@ -398,6 +404,20 @@ impl PlansViewState {
         }
     }
 
+    /// Maximum valid viewport offset for the plan tree last rendered.
+    ///
+    /// The wheel moves the window without moving the cursor, so it needs
+    /// exactly the upper bound the renderer applies. It is computed in `usize`
+    /// and only then narrowed through the saturating conversion, so a tree
+    /// longer than the `u16` viewport unit saturates instead of wrapping around
+    /// and trapping the viewport short of its end (c-2).
+    pub fn max_scroll(&self) -> u16 {
+        let max = self
+            .rendered_lines
+            .saturating_sub(usize::from(self.view_height));
+        clamp_u16(max)
+    }
+
     /// Whether the active discussion focus anchors on a whole plan.
     fn is_plan_focused(&self, plan_id: &str) -> bool {
         matches!(
@@ -742,7 +762,7 @@ impl PlansViewState {
         } else {
             scroll
         };
-        self.scroll = u16::try_from(new_scroll).unwrap_or(u16::MAX);
+        self.scroll = clamp_u16(new_scroll);
     }
 
     /// Positions the viewport around the selected plan row using the three-beat
@@ -1824,6 +1844,24 @@ mod tests {
         view.selected_index = 1;
         view.clamp_selection();
         assert_eq!(view.selected_index, 0);
+    }
+
+    #[test]
+    fn test_max_scroll_saturates_past_the_u16_viewport_unit() {
+        let mut view = PlansViewState {
+            rendered_lines: 500,
+            view_height: 20,
+            ..Default::default()
+        };
+        assert_eq!(view.max_scroll(), 480);
+
+        view.rendered_lines = 70_000;
+        view.view_height = 10;
+        assert_eq!(view.max_scroll(), u16::MAX);
+
+        // A tree shorter than the viewport has no scroll range at all.
+        view.rendered_lines = 10;
+        assert_eq!(view.max_scroll(), 0);
     }
 
     /// Expected `Center`, `Top`, and `Bottom` viewport offsets for a row that

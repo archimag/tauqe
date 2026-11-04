@@ -400,15 +400,15 @@ async fn test_handle_plan_refine_rejects_malformed_payloads() {
     .await;
     assert_eq!(res.error.unwrap().code, "INVALID_PARAMS");
 
-    // The legacy `id` spelling still parses through the DTO alias, so an
-    // unknown plan answers NOT_FOUND rather than falling back to the active
-    // plan.
+    // The retired `id` spelling no longer parses: a payload that names only
+    // the legacy key is rejected with INVALID_PARAMS instead of silently
+    // addressing the active plan, so the canonical field cannot drift.
     let res = handle_plan_refine(
         make_req(4, Some(serde_json::json!({ "id": "ghost" }))),
         &state,
     )
     .await;
-    assert_eq!(res.error.unwrap().code, "NOT_FOUND");
+    assert_eq!(res.error.unwrap().code, "INVALID_PARAMS");
 
     // A rejected request never claims the operation slot.
     assert!(!state.is_operation_active());
@@ -913,14 +913,15 @@ async fn test_handle_plan_replan_rejects_malformed_payloads() {
     .await;
     assert_eq!(res.error.unwrap().code, "INVALID_PARAMS");
 
-    // The legacy `id`/`item_id` spellings parse through the DTO aliases, so
-    // an unknown plan answers NOT_FOUND rather than silently degrading.
+    // The retired `id`/`item_id` spellings no longer parse: a payload that
+    // names only the legacy keys is rejected with INVALID_PARAMS instead of
+    // silently degrading to an unnamed plan or step.
     let res = handle_plan_replan(
         make_req(3, Some(serde_json::json!({ "id": "p", "item_id": "1" }))),
         &state,
     )
     .await;
-    assert_eq!(res.error.unwrap().code, "NOT_FOUND");
+    assert_eq!(res.error.unwrap().code, "INVALID_PARAMS");
 }
 
 #[tokio::test]
@@ -3769,4 +3770,94 @@ async fn test_plan_batch_hard_cancel_never_abandons_the_step_task() {
         .await
         .expect("the probe turn must acquire the session lock and reach the provider")
         .expect("the provider signals that its probe stream was entered");
+}
+
+/// An abort declared by the Architect is a typed diagnosis rather than a lost
+/// turn: the refine request answers the blocked channel with the exact host
+/// action, the recommendation survives verbatim, and the session history records
+/// the verdict under its own label.
+#[tokio::test]
+async fn test_handle_plan_refine_surfaces_the_architect_abort() {
+    let dir = TestDir::new();
+    let plan = Plan::from_parts(
+        "abort-refine".to_string(),
+        "Abort Refine".to_string(),
+        None,
+        1,
+        1,
+        Vec::new(),
+        vec![test_item("1", PlanItemStatus::Todo)],
+    );
+    PlanStorage::save_plan(dir.path(), &plan).unwrap();
+
+    let abort_output = serde_json::json!({
+        "status": "blocked",
+        "explanation": "The toolchain cannot run in this environment",
+        "reason": null,
+        "abort": {
+            "is_aborted": true,
+            "reason": "clippy is not installed",
+            "recommendation": "rustup component add clippy"
+        },
+        "context_requests": [],
+        "repo_searches": [],
+        "repo_maps": [],
+        "items": []
+    });
+    let provider = Arc::new(MockLlmProvider::scripted([MockResponse::text(
+        abort_output.to_string(),
+    )]));
+    let config = tauqe_core::config::AppConfig::default();
+    let state = test_state_with_provider(&dir, config, provider.clone()).await;
+
+    let req = Request {
+        id: tauqe_protocol::RequestId::Number(1),
+        method: tauqe_protocol::methods::PLAN_REFINE.to_string(),
+        params: Some(serde_json::json!({ "plan_id": "abort-refine" })),
+    };
+    let res = handle_plan_refine(req, &state).await;
+    assert!(res.error.is_none(), "refine failed: {:?}", res.error);
+
+    let value = res.result.expect("an abort is a typed outcome");
+    let result: PlanRefineResult = serde_json::from_value(value).expect("the result decodes");
+    match result {
+        PlanRefineResult::Blocked { reason } => {
+            assert!(reason.contains("Execution aborted"), "{reason}");
+            assert!(reason.contains("clippy is not installed"), "{reason}");
+            assert!(
+                reason.contains("rustup component add clippy"),
+                "the recommendation must survive verbatim: {reason}"
+            );
+        }
+        other => panic!("expected a typed block carrying the abort, got {other:?}"),
+    }
+
+    // The verdict is durable in the session history under its own label.
+    let entries = state.history.lock().await.get_entries().unwrap();
+    let recorded = entries
+        .iter()
+        .find_map(|entry| match entry {
+            tauqe_core::history::HistoryEntry::Response {
+                message, summary, ..
+            } => Some((message.clone(), summary.clone())),
+            _ => None,
+        })
+        .expect("the aborted synthesis records its verdict");
+    assert!(
+        recorded.0.contains("rustup component add clippy"),
+        "{:?}",
+        recorded.0
+    );
+    let summary = recorded.1.expect("the verdict carries an abort label");
+    assert!(summary.contains("Aborted"), "{summary}");
+    assert!(summary.contains("Abort Refine"), "{summary}");
+
+    // An abort reprojects nothing: the stored plan keeps the horizon it had.
+    let reloaded = PlanStorage::load_plan(dir.path(), "abort-refine")
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        reloaded.find_item("1").unwrap().status,
+        PlanItemStatus::Todo
+    );
 }

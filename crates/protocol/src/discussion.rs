@@ -392,7 +392,6 @@ pub struct DiscussionResponse {
     pub context_requests: Vec<DiscussionContextRequest>,
     #[serde(
         default,
-        alias = "search_requests",
         deserialize_with = "deserialize_repo_search_requests",
         skip_serializing_if = "Vec::is_empty"
     )]
@@ -749,20 +748,6 @@ mod tests {
         assert!(resp.repo_maps.is_empty());
         assert!(resp.dir_lists.is_empty());
         assert!(resp.user_language.is_none());
-    }
-
-    #[test]
-    fn test_discussion_response_search_requests_alias() {
-        let raw = r#"{
-            "message": "Let me search",
-            "search_requests": [
-                {"path": "crates/core", "regex": "fn execute"}
-            ]
-        }"#;
-        let resp: DiscussionResponse = serde_json::from_str(raw).unwrap();
-        assert_eq!(resp.repo_searches.len(), 1);
-        assert_eq!(resp.repo_searches[0].path, "crates/core");
-        assert_eq!(resp.repo_searches[0].regex, "fn execute");
     }
 
     #[test]

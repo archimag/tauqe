@@ -709,6 +709,110 @@ fn cancel_request() -> Request {
     }
 }
 
+/// Builds a `model/cancel` request carrying `params`.
+fn cancel_request_with(params: serde_json::Value) -> Request {
+    Request {
+        id: tauqe_protocol::RequestId::Number(5),
+        method: tauqe_protocol::methods::MODEL_CANCEL.to_string(),
+        params: Some(params),
+    }
+}
+
+/// A present-but-malformed cancellation payload is refused instead of silently
+/// degrading to the default hard stop: a mistyped soft stop must not
+/// hard-cancel the running operation and arm its abort watchdog.
+#[tokio::test]
+async fn model_cancel_refuses_a_malformed_payload_without_cancelling() {
+    let root = scratch_root("cancel-malformed");
+    let state = state_over_root(root.clone());
+    let operation = state
+        .try_begin_operation()
+        .expect("operation slot must be free");
+    let cancel_rx = operation.cancel_receiver();
+    let soft_rx = operation.soft_stop_receiver();
+
+    // An unknown mode string and a wrongly typed field are both malformed
+    // payloads, so both are answered with the parameter error.
+    for params in [
+        serde_json::json!({ "mode": "sometimes" }),
+        serde_json::json!({ "mode": 7 }),
+    ] {
+        let refused = handle_model_cancel(cancel_request_with(params), &state).await;
+        assert_eq!(
+            refused
+                .error
+                .expect("the malformed payload must be refused")
+                .code,
+            tauqe_protocol::errors::INVALID_PARAMS
+        );
+        assert!(
+            !*cancel_rx.borrow(),
+            "a refused payload must not hard-cancel the operation"
+        );
+        assert!(
+            !*soft_rx.borrow(),
+            "a refused payload must not request a soft stop"
+        );
+    }
+    assert!(
+        state.is_operation_active(),
+        "the running operation must keep owning the slot"
+    );
+
+    drop(operation);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// A correctly spelled soft stop drains the operation and never raises the
+/// hard-cancel signal, while an absent payload keeps the default immediate
+/// abort of a client that predates two-mode cancellation.
+#[tokio::test]
+async fn model_cancel_soft_payload_drains_and_absent_payload_hard_cancels() {
+    let root = scratch_root("cancel-modes");
+    let state = state_over_root(root.clone());
+
+    let operation = state
+        .try_begin_operation()
+        .expect("operation slot must be free");
+    let cancel_rx = operation.cancel_receiver();
+    let soft_rx = operation.soft_stop_receiver();
+    let soft = handle_model_cancel(
+        cancel_request_with(serde_json::json!({ "mode": "soft" })),
+        &state,
+    )
+    .await;
+    assert!(
+        soft.error.is_none(),
+        "a soft stop must be accepted: {:?}",
+        soft.error
+    );
+    assert!(*soft_rx.borrow(), "the soft stop must reach the supervisor");
+    assert!(!*cancel_rx.borrow(), "a soft stop must not hard-cancel");
+    assert!(
+        state.is_operation_active(),
+        "a soft stop leaves the operation registered"
+    );
+    drop(operation);
+
+    let operation = state
+        .try_begin_operation()
+        .expect("operation slot must be free");
+    let cancel_rx = operation.cancel_receiver();
+    let hard = handle_model_cancel(cancel_request(), &state).await;
+    assert!(
+        hard.error.is_none(),
+        "an absent payload must keep the immediate abort: {:?}",
+        hard.error
+    );
+    assert!(
+        *cancel_rx.borrow(),
+        "an absent payload must raise the hard-cancel signal"
+    );
+    drop(operation);
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
 /// A bounded turn must not hold the shared history guard for its duration.
 ///
 /// The daemon serves requests from one stdin loop and awaits every inline
@@ -951,6 +1055,7 @@ async fn a_recorded_review_decision_is_published_as_review_updated() {
             id: 7,
             title: "Held guard".to_string(),
             uuid: None,
+            commit: None,
             group: None,
             model: None,
             issue_type: IssueType::Bug,

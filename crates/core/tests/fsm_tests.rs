@@ -18,8 +18,8 @@ use tauqe_core::workflow::{
     WorkflowOptions,
 };
 use tauqe_protocol::{
-    ContextAccess, ModelRef, ModelResult, Plan, PlanItem, PlanItemStatus, PlanScopeEvaluation,
-    VerificationVerdict,
+    ContextAccess, ModelRef, ModelResult, Plan, PlanItem, PlanItemStatus, PlanRejectionKind,
+    PlanScopeEvaluation, VerificationVerdict,
 };
 use tokio::sync::{mpsc, watch};
 
@@ -3868,7 +3868,7 @@ async fn disk_post_hook_runs_the_declared_project_command() {
     );
     commit_fixture(&repo_root, &["src.rs", "tauqe.toml"]);
 
-    let response = tauqe_core::toolchain::run_post_hooks(&repo_root, None)
+    let response = tauqe_core::toolchain::run_post_hooks(&repo_root, &[], None)
         .await
         .expect("the declared post-hook runs");
 
@@ -7751,5 +7751,676 @@ async fn git_workflow_reports_passed_verification_for_a_declared_command() {
     assert!(
         worktree_status(&repo_root).is_empty(),
         "the turn must not leave unaccounted files behind"
+    );
+}
+
+/// A REPL turn authorizes plan creation, so a `save` that would rewrite an
+/// established plan is refused. The refusal is born typed: the storage regime
+/// branch classifies it, the stored plan keeps the state the developer left it
+/// in, and the developer-facing surface renders the reported wording.
+#[tokio::test]
+async fn repl_save_of_an_existing_plan_is_reported_as_mode_forbidden() {
+    let (_dir, repo_root) = init_repo();
+    std::fs::write(
+        repo_root.join("target.rs"),
+        "pub fn compute() -> i32 { 0 }\n",
+    )
+    .expect("write target fixture");
+    commit_fixture(&repo_root, &["target.rs"]);
+
+    let seeded = Plan::from_parts(
+        "develop-plan".to_string(),
+        "Develop Plan".to_string(),
+        None,
+        0,
+        0,
+        Vec::new(),
+        vec![PlanItem {
+            id: "1".to_string(),
+            title: "Step 1".to_string(),
+            status: PlanItemStatus::Todo,
+            files: vec!["src/step1.rs".to_string()],
+            ..Default::default()
+        }],
+    );
+    tauqe_core::plan::storage::PlanStorage::save_plan(&repo_root, &seeded)
+        .expect("seed the stored plan");
+
+    let mut context = ContextManager::new(repo_root.clone());
+    context
+        .add_file("target.rs", ContextAccess::Editable)
+        .expect("add target to context");
+    let mut history = HistoryManager::new(repo_root.clone());
+
+    let rewrite = format!(
+        "Rewriting the stored plan.\n\
+         <plan_{MARKER} action=\"save\" id=\"develop-plan\" title=\"Rewritten\">\n\
+         <concept_{MARKER}>\n\
+         <concept_item_{MARKER} id=\"c-1\" title=\"Stored invariant\" />\n\
+         </concept_{MARKER}>\n\
+         <item_{MARKER} id=\"1\" title=\"Rewritten step\" files=\"src/step1.rs\" />\n\
+         </plan_{MARKER}>"
+    );
+    let provider = MockLlmProvider::scripted([MockResponse::text(rewrite)]);
+    let model = ModelRef::openrouter("mock/model");
+    let protocol = tauqe_core::prompt::xml::XmlPromptProtocol
+        .with_turn_marker(MARKER)
+        .expect("marker-bound protocol");
+    let mut policy = tauqe_core::workflow::policy::DirectApplyPolicy::new();
+    let options = WorkflowOptions::default();
+    let (stream_tx, mut stream_rx, cancel_rx) = event_channel_with_rx();
+
+    let exec = SingleExecution::new(options);
+    let execution = exec
+        .execute(
+            &mut policy,
+            "Rewrite the stored plan",
+            tauqe_protocol::TurnIntent::InteractiveRepl,
+            &provider,
+            &model,
+            &mut context,
+            &mut history,
+            protocol.as_ref(),
+            stream_tx,
+            cancel_rx,
+        )
+        .await
+        .expect("repl turn executes");
+
+    // The refusal is classified where it was produced, so the caller reads the
+    // category instead of interpreting the wording.
+    assert_eq!(
+        execution.plan_errors.len(),
+        1,
+        "{:?}",
+        execution.plan_errors
+    );
+    assert_eq!(
+        execution.plan_errors[0].kind,
+        PlanRejectionKind::ModeForbidden
+    );
+    assert!(
+        execution.plan_errors[0].message.contains("in REPL mode"),
+        "{:?}",
+        execution.plan_errors
+    );
+
+    // The banner the developer sees renders the reported wording verbatim.
+    let mut streamed = String::new();
+    while let Ok(event) = stream_rx.try_recv() {
+        if let StreamEvent::TextDelta(delta) = event {
+            streamed.push_str(&delta);
+        }
+    }
+    assert!(streamed.contains("Plan mutation rejected"), "{streamed}");
+    assert!(streamed.contains("in REPL mode"), "{streamed}");
+
+    // The stored plan keeps its identity and its progress.
+    let stored = tauqe_core::plan::storage::PlanStorage::load_plan(&repo_root, "develop-plan")
+        .expect("load the stored plan")
+        .expect("the seeded plan survives the refused mutation");
+    assert_eq!(stored.title, "Develop Plan");
+    assert_eq!(stored.items[0].title, "Step 1");
+    assert_eq!(stored.items[0].status, PlanItemStatus::Todo);
+}
+
+/// A validated answer applies its plan payload and reports every status the
+/// barrier repaired: the repair reaches the outcome, the turn stream, and the
+/// recorded history, so a normalized plan is never silent.
+#[tokio::test]
+async fn applied_plan_payload_reports_its_normalized_status() {
+    let (_dir, repo_root) = init_repo();
+    std::fs::write(
+        repo_root.join("target.rs"),
+        "pub fn compute() -> i32 { 0 }\n",
+    )
+    .expect("write target fixture");
+    commit_fixture(&repo_root, &["target.rs"]);
+
+    let mut context = ContextManager::new(repo_root.clone());
+    context
+        .add_file("target.rs", ContextAccess::Editable)
+        .expect("add target to context");
+    let mut history = HistoryManager::new(repo_root.clone());
+
+    let response = format!(
+        "Recording the plan.\n\
+         <plan_{MARKER} action=\"save\" id=\"warning-plan\" title=\"Warning Plan\">\n\
+         <concept_{MARKER}>\n\
+         <concept_item_{MARKER} id=\"c-1\" title=\"Plan invariant\" />\n\
+         </concept_{MARKER}>\n\
+         <item_{MARKER} id=\"1\" title=\"Step\" status=\"in_progress\" files=\"src/step.rs\" />\n\
+         </plan_{MARKER}>"
+    );
+    let provider = MockLlmProvider::scripted([MockResponse::text(response)]);
+    let model = ModelRef::openrouter("mock/model");
+    let protocol = tauqe_core::prompt::xml::XmlPromptProtocol
+        .with_turn_marker(MARKER)
+        .expect("marker-bound protocol");
+    let (stream_tx, mut stream_rx, cancel_rx) = event_channel_with_rx();
+
+    let collector = tokio::spawn(async move {
+        let mut streamed = String::new();
+        while let Some(event) = stream_rx.recv().await {
+            if let StreamEvent::TextDelta(delta) = event {
+                streamed.push_str(&delta);
+            }
+        }
+        streamed
+    });
+
+    let execution = {
+        let mut policy = tauqe_core::workflow::policy::DirectApplyPolicy::new();
+        let exec = SingleExecution::new(WorkflowOptions::default());
+        exec.execute(
+            &mut policy,
+            "Draft the plan",
+            tauqe_protocol::TurnIntent::InteractiveRepl,
+            &provider,
+            &model,
+            &mut context,
+            &mut history,
+            protocol.as_ref(),
+            stream_tx,
+            cancel_rx,
+        )
+        .await
+        .expect("plan turn executes")
+    };
+
+    assert!(matches!(&execution.result, ModelResult::Answer { .. }));
+    assert!(execution.plan_saved);
+    assert!(execution.plan_errors.is_empty());
+    assert_eq!(execution.plan_warnings.len(), 1);
+    assert!(
+        execution.plan_warnings[0].contains("new step '1'"),
+        "{:?}",
+        execution.plan_warnings
+    );
+
+    let stored = tauqe_core::plan::storage::PlanStorage::load_plan(&repo_root, "warning-plan")
+        .expect("load the applied plan")
+        .expect("the qualified payload must be persisted");
+    assert_eq!(stored.find_item("1").unwrap().status, PlanItemStatus::Todo);
+
+    let streamed = collector.await.expect("the collector joins");
+    assert_eq!(
+        streamed.matches("Plan mutation normalized").count(),
+        1,
+        "the repair must be announced exactly once"
+    );
+
+    let rendered = history
+        .format_history_tag()
+        .expect("the history tag renders");
+    assert!(
+        rendered.contains("Plan mutation normalized"),
+        "the repair must reach the recorded history"
+    );
+}
+
+/// A semantically blocked turn never applies its payload: the plan mutations it
+/// carried leave the turn as one typed abandonment that names the block.
+#[tokio::test]
+async fn blocked_turn_abandons_its_plan_payload() {
+    let (_dir, repo_root) = init_repo();
+    let mut context = ContextManager::new(repo_root.clone());
+    let mut history = HistoryManager::new(repo_root.clone());
+
+    let response = format!(
+        "Cannot proceed.\n\
+         <blocked_{MARKER} reason=\"Precondition violated\" />\n\
+         <plan_{MARKER} action=\"save\" id=\"blocked-plan\" title=\"Blocked Plan\">\n\
+         <concept_{MARKER}>\n\
+         <concept_item_{MARKER} id=\"c-1\" title=\"Plan invariant\" />\n\
+         </concept_{MARKER}>\n\
+         <item_{MARKER} id=\"1\" title=\"Step\" files=\"src/step.rs\" />\n\
+         </plan_{MARKER}>"
+    );
+    let provider = MockLlmProvider::scripted([MockResponse::text(response)]);
+    let model = ModelRef::openrouter("mock/model");
+    let protocol = tauqe_core::prompt::xml::XmlPromptProtocol
+        .with_turn_marker(MARKER)
+        .expect("marker-bound protocol");
+    let mut policy = tauqe_core::workflow::policy::DirectApplyPolicy::new();
+    let options = WorkflowOptions::default();
+    let (stream_tx, cancel_rx) = event_channel();
+
+    let outcome = tauqe_core::workflow::fsm::run_fsm_turn(
+        "Draft the plan",
+        tauqe_protocol::TurnIntent::InteractiveRepl,
+        &provider,
+        &model,
+        &mut context,
+        &mut history,
+        protocol.as_ref(),
+        &mut policy,
+        "git",
+        stream_tx,
+        cancel_rx,
+        &options,
+    )
+    .await
+    .expect("blocked turn executes");
+
+    assert_eq!(outcome.blocked.as_deref(), Some("Precondition violated"));
+    assert_eq!(outcome.plan_errors.len(), 1);
+    let rejection = &outcome.plan_errors[0];
+    assert_eq!(rejection.kind, PlanRejectionKind::Abandoned);
+    assert!(
+        rejection.message.contains("semantic block"),
+        "{:?}",
+        outcome.plan_errors
+    );
+    assert!(outcome.plan_warnings.is_empty());
+    assert!(
+        tauqe_core::plan::storage::PlanStorage::load_plan(&repo_root, "blocked-plan")
+            .expect("load plan")
+            .is_none(),
+        "an abandoned payload must never reach plan storage"
+    );
+}
+
+/// A turn whose change set never matches abandons the payload it carried: the
+/// mutations are reported once and never reach plan storage.
+#[tokio::test]
+async fn patch_failure_abandons_the_plan_payload() {
+    let (_dir, repo_root) = init_repo();
+    std::fs::write(
+        repo_root.join("target.rs"),
+        "pub fn compute() -> i32 { 0 }\n",
+    )
+    .expect("write target fixture");
+    commit_fixture(&repo_root, &["target.rs"]);
+
+    let mut context = ContextManager::new(repo_root.clone());
+    context
+        .add_file("target.rs", ContextAccess::Editable)
+        .expect("add target to context");
+    let mut history = HistoryManager::new(repo_root.clone());
+
+    let broken = format!(
+        "{edits}\n\
+         <plan_{MARKER} action=\"save\" id=\"failed-plan\" title=\"Failed Plan\">\n\
+         <concept_{MARKER}>\n\
+         <concept_item_{MARKER} id=\"c-1\" title=\"Plan invariant\" />\n\
+         </concept_{MARKER}>\n\
+         <item_{MARKER} id=\"1\" title=\"Step\" files=\"src/step.rs\" />\n\
+         </plan_{MARKER}>",
+        edits = edit_block(
+            "Broken attempt",
+            "target.rs",
+            "this text does not exist in the file",
+            "irrelevant replacement",
+        ),
+    );
+    let provider = MockLlmProvider::scripted([
+        MockResponse::text(broken.clone()),
+        MockResponse::text(broken),
+    ]);
+    let model = ModelRef::openrouter("mock/model");
+    let protocol = tauqe_core::prompt::xml::XmlPromptProtocol
+        .with_turn_marker(MARKER)
+        .expect("marker-bound protocol");
+    let mut policy = tauqe_core::workflow::policy::DirectApplyPolicy::new();
+    let options = WorkflowOptions {
+        max_retries: 1,
+        ..WorkflowOptions::default()
+    };
+    let (stream_tx, cancel_rx) = event_channel();
+
+    let outcome = tauqe_core::workflow::fsm::run_fsm_turn(
+        "Change compute to return 42",
+        tauqe_protocol::TurnIntent::InteractiveRepl,
+        &provider,
+        &model,
+        &mut context,
+        &mut history,
+        protocol.as_ref(),
+        &mut policy,
+        "git",
+        stream_tx,
+        cancel_rx,
+        &options,
+    )
+    .await
+    .expect("patch failure turn executes");
+
+    assert!(matches!(
+        &outcome.result,
+        ModelResult::Edit { outcome, .. } if !outcome.applied
+    ));
+    assert_eq!(outcome.plan_errors.len(), 1);
+    let rejection = &outcome.plan_errors[0];
+    assert_eq!(rejection.kind, PlanRejectionKind::Abandoned);
+    assert!(
+        rejection.message.contains("staged"),
+        "{:?}",
+        outcome.plan_errors
+    );
+    assert!(
+        tauqe_core::plan::storage::PlanStorage::load_plan(&repo_root, "failed-plan")
+            .expect("load plan")
+            .is_none()
+    );
+    assert_eq!(
+        std::fs::read_to_string(repo_root.join("target.rs")).expect("read target fixture"),
+        "pub fn compute() -> i32 { 0 }\n"
+    );
+}
+
+/// A breached context budget closes the turn without a qualifying result, so its
+/// plan payload is abandoned with a diagnostic that names the budget.
+#[tokio::test]
+async fn budget_exceeded_turn_abandons_its_plan_payload_with_the_budget_reason() {
+    let (_dir, repo_root) = init_repo();
+    std::fs::write(
+        repo_root.join("target.rs"),
+        "pub fn compute() -> i32 { 0 }\n",
+    )
+    .expect("write target fixture");
+    std::fs::write(repo_root.join("helper.rs"), "pub const ANSWER: i32 = 42;\n")
+        .expect("write helper fixture");
+    commit_fixture(&repo_root, &["target.rs", "helper.rs"]);
+
+    let mut context = ContextManager::new(repo_root.clone());
+    context
+        .add_file("target.rs", ContextAccess::Editable)
+        .expect("add target to context");
+    let mut history = HistoryManager::new(repo_root.clone());
+
+    let response = format!(
+        "I need the helper and a plan.\n\
+         <context_request_{MARKER} path=\"helper.rs\" access=\"read_only\" />\n\
+         <plan_{MARKER} action=\"save\" id=\"budget-plan\" title=\"Budget Plan\">\n\
+         <concept_{MARKER}>\n\
+         <concept_item_{MARKER} id=\"c-1\" title=\"Plan invariant\" />\n\
+         </concept_{MARKER}>\n\
+         <item_{MARKER} id=\"1\" title=\"Step\" files=\"src/step.rs\" />\n\
+         </plan_{MARKER}>"
+    );
+    let provider = MockLlmProvider::scripted([MockResponse::text(response)]);
+    let model = ModelRef::openrouter("mock/model");
+    let protocol = tauqe_core::prompt::xml::XmlPromptProtocol
+        .with_turn_marker(MARKER)
+        .expect("marker-bound protocol");
+    let mut policy = tauqe_core::workflow::policy::DirectApplyPolicy::new();
+    let options = WorkflowOptions {
+        token_budget: 1,
+        ..WorkflowOptions::default()
+    };
+    let (stream_tx, cancel_rx) = event_channel();
+
+    let outcome = tauqe_core::workflow::fsm::run_fsm_turn(
+        "Use the helper constant",
+        tauqe_protocol::TurnIntent::InteractiveRepl,
+        &provider,
+        &model,
+        &mut context,
+        &mut history,
+        protocol.as_ref(),
+        &mut policy,
+        "git",
+        stream_tx,
+        cancel_rx,
+        &options,
+    )
+    .await
+    .expect("budget turn executes");
+
+    assert!(matches!(&outcome.result, ModelResult::Answer { .. }));
+    assert_eq!(outcome.plan_errors.len(), 1);
+    let rejection = &outcome.plan_errors[0];
+    assert_eq!(rejection.kind, PlanRejectionKind::Abandoned);
+    assert!(
+        rejection.message.contains("token_budget = 1"),
+        "the abandonment must name the budget"
+    );
+    assert!(
+        tauqe_core::plan::storage::PlanStorage::load_plan(&repo_root, "budget-plan")
+            .expect("load plan")
+            .is_none()
+    );
+}
+
+/// A cancelled turn is the one intentional exception: the payload it carried is
+/// neither applied nor reported, because the developer aborted the work.
+#[tokio::test]
+async fn cancelled_turn_leaves_no_plan_payload_diagnostic() {
+    let (_dir, repo_root) = init_repo();
+    let mut context = ContextManager::new(repo_root.clone());
+    let mut history = HistoryManager::new(repo_root.clone());
+
+    let response = format!(
+        "<plan_{MARKER} action=\"save\" id=\"cancelled-plan\" title=\"Cancelled Plan\">\n\
+         <concept_{MARKER}>\n\
+         <concept_item_{MARKER} id=\"c-1\" title=\"Plan invariant\" />\n\
+         </concept_{MARKER}>\n\
+         <item_{MARKER} id=\"1\" title=\"Step\" files=\"src/step.rs\" />\n\
+         </plan_{MARKER}>"
+    );
+    let provider = MockLlmProvider::scripted([MockResponse::text(response)]);
+    let model = ModelRef::openrouter("mock/model");
+    let protocol = tauqe_core::prompt::xml::XmlPromptProtocol
+        .with_turn_marker(MARKER)
+        .expect("marker-bound protocol");
+    let mut policy = tauqe_core::workflow::policy::DirectApplyPolicy::new();
+    let options = WorkflowOptions::default();
+    let (stream_tx, rx) = mpsc::channel(512);
+    drop(rx);
+    let (cancel_tx, cancel_rx) = watch::channel(false);
+    cancel_tx.send(true).expect("signal cancellation");
+
+    let outcome = tauqe_core::workflow::fsm::run_fsm_turn(
+        "Draft the plan",
+        tauqe_protocol::TurnIntent::InteractiveRepl,
+        &provider,
+        &model,
+        &mut context,
+        &mut history,
+        protocol.as_ref(),
+        &mut policy,
+        "git",
+        stream_tx,
+        cancel_rx,
+        &options,
+    )
+    .await
+    .expect("cancelled turn executes");
+
+    assert!(outcome.is_cancelled, "the turn must report cancellation");
+    assert!(outcome.plan_errors.is_empty());
+    assert!(outcome.plan_warnings.is_empty());
+    assert!(
+        tauqe_core::plan::storage::PlanStorage::load_plan(&repo_root, "cancelled-plan")
+            .expect("load plan")
+            .is_none()
+    );
+}
+
+/// The corrective edit loop folds the repairs of every attempt: the merged
+/// outcome carries the repair once, and the turn stream announces it once.
+#[tokio::test]
+async fn edit_loop_retry_keeps_each_plan_warning_once() {
+    let (_dir, repo_root) = init_repo();
+    std::fs::write(
+        repo_root.join("target.rs"),
+        "pub fn compute() -> i32 { 0 }\n",
+    )
+    .expect("write target fixture");
+    commit_fixture(&repo_root, &["target.rs"]);
+
+    let mut context = ContextManager::new(repo_root.clone());
+    context
+        .add_file("target.rs", ContextAccess::Editable)
+        .expect("add target to context");
+    let mut history = HistoryManager::new(repo_root.clone());
+
+    let no_edit = "The helper already looks correct; no changes are required.".to_string();
+    let with_edit_and_plan = format!(
+        "{edits}\n\
+         <plan_{MARKER} action=\"save\" id=\"retry-plan\" title=\"Retry Plan\">\n\
+         <concept_{MARKER}>\n\
+         <concept_item_{MARKER} id=\"c-1\" title=\"Plan invariant\" />\n\
+         </concept_{MARKER}>\n\
+         <item_{MARKER} id=\"1\" title=\"Step\" status=\"in_progress\" files=\"src/step.rs\" />\n\
+         </plan_{MARKER}>",
+        edits = edit_block(
+            "Change compute to 42",
+            "target.rs",
+            "pub fn compute() -> i32 { 0 }",
+            "pub fn compute() -> i32 { 42 }",
+        ),
+    );
+    let provider = MockLlmProvider::scripted([
+        MockResponse::text(no_edit),
+        MockResponse::text(with_edit_and_plan),
+    ]);
+    let model = ModelRef::openrouter("mock/model");
+    let protocol = tauqe_core::prompt::xml::XmlPromptProtocol
+        .with_turn_marker(MARKER)
+        .expect("marker-bound protocol");
+    let mut policy = tauqe_core::workflow::policy::DirectApplyPolicy::new();
+    let options = WorkflowOptions::default();
+    let (stream_tx, mut stream_rx, cancel_rx) = event_channel_with_rx();
+
+    let collector = tokio::spawn(async move {
+        let mut streamed = String::new();
+        while let Some(event) = stream_rx.recv().await {
+            if let StreamEvent::TextDelta(delta) = event {
+                streamed.push_str(&delta);
+            }
+        }
+        streamed
+    });
+
+    let output = {
+        let mut env = build_env(
+            &provider,
+            &model,
+            &mut context,
+            &mut history,
+            protocol.as_ref(),
+            &mut policy,
+            stream_tx,
+            cancel_rx,
+            &options,
+        );
+        EditLoop::new("Change compute to return 42")
+            .execute(&mut env)
+            .await
+            .expect("edit loop executes")
+    };
+
+    assert!(matches!(
+        &output.result,
+        ModelResult::Edit { edits, .. } if !edits.is_empty()
+    ));
+    assert_eq!(output.plan_warnings.len(), 1);
+    assert!(
+        output.plan_warnings[0].contains("new step '1'"),
+        "{:?}",
+        output.plan_warnings
+    );
+
+    let streamed = collector.await.expect("the collector joins");
+    assert_eq!(
+        streamed.matches("Plan mutation normalized").count(),
+        1,
+        "the repair must be announced exactly once"
+    );
+}
+
+/// A reply answered without edits announces the plan status it normalized: the
+/// bounded turn is the surface every contour passes through, so the notice
+/// reaches the stream even when no execution-mode supervisor is in play.
+#[tokio::test]
+async fn answer_turn_announces_its_normalized_plan_status() {
+    let (_dir, repo_root) = init_repo();
+    std::fs::write(
+        repo_root.join("target.rs"),
+        "pub fn compute() -> i32 { 0 }\n",
+    )
+    .expect("write target fixture");
+    commit_fixture(&repo_root, &["target.rs"]);
+
+    let mut context = ContextManager::new(repo_root.clone());
+    context
+        .add_file("target.rs", ContextAccess::Editable)
+        .expect("add target to context");
+    let mut history = HistoryManager::new(repo_root.clone());
+
+    let response = format!(
+        "Recording the plan.\n\
+         <plan_{MARKER} action=\"save\" id=\"answer-plan\" title=\"Answer Plan\">\n\
+         <concept_{MARKER}>\n\
+         <concept_item_{MARKER} id=\"c-1\" title=\"Plan invariant\" />\n\
+         </concept_{MARKER}>\n\
+         <item_{MARKER} id=\"1\" title=\"Step\" status=\"in_progress\" files=\"src/step.rs\" />\n\
+         </plan_{MARKER}>"
+    );
+    let provider = MockLlmProvider::scripted([MockResponse::text(response)]);
+    let model = ModelRef::openrouter("mock/model");
+    let protocol = tauqe_core::prompt::xml::XmlPromptProtocol
+        .with_turn_marker(MARKER)
+        .expect("marker-bound protocol");
+    let mut policy = tauqe_core::workflow::policy::DirectApplyPolicy::new();
+    let options = WorkflowOptions::default();
+    let (stream_tx, mut stream_rx, cancel_rx) = event_channel_with_rx();
+
+    let collector = tokio::spawn(async move {
+        let mut streamed = String::new();
+        while let Some(event) = stream_rx.recv().await {
+            if let StreamEvent::TextDelta(delta) = event {
+                streamed.push_str(&delta);
+            }
+        }
+        streamed
+    });
+
+    let outcome = tauqe_core::workflow::fsm::run_fsm_turn(
+        "Draft the plan",
+        tauqe_protocol::TurnIntent::InteractiveRepl,
+        &provider,
+        &model,
+        &mut context,
+        &mut history,
+        protocol.as_ref(),
+        &mut policy,
+        "git",
+        stream_tx,
+        cancel_rx,
+        &options,
+    )
+    .await
+    .expect("the bounded turn executes");
+
+    assert!(matches!(outcome.result, ModelResult::Answer { .. }));
+    assert!(outcome.plan_saved);
+    assert_eq!(
+        outcome.plan_warnings.len(),
+        1,
+        "{:?}",
+        outcome.plan_warnings
+    );
+
+    let stored = tauqe_core::plan::storage::PlanStorage::load_plan(&repo_root, "answer-plan")
+        .expect("load the applied plan")
+        .expect("the qualified payload must be persisted");
+    assert_eq!(stored.find_item("1").unwrap().status, PlanItemStatus::Todo);
+
+    let streamed = collector.await.expect("the collector joins");
+    assert_eq!(
+        streamed.matches("Plan mutation normalized").count(),
+        1,
+        "the repair must reach the turn stream exactly once: {streamed:?}"
+    );
+
+    let rendered = history
+        .format_history_tag()
+        .expect("the history tag renders");
+    assert!(
+        rendered.contains("Plan mutation normalized"),
+        "the repair must reach the recorded history"
     );
 }

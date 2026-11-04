@@ -290,7 +290,9 @@ mod tests {
         let invalid_res = PlanStorage::apply_plan_tags(root, invalid_update);
         assert!(invalid_res.applied.is_empty());
         assert!(!invalid_res.errors.is_empty());
-        assert!(invalid_res.errors[0].contains("Cannot regress status of completed step '1'"));
+        assert!(invalid_res.errors[0]
+            .message
+            .contains("Cannot regress status of completed step '1'"));
 
         // 2. apply_discussion_plan_update attempting to delete completed step
         let invalid_disc = DiscussionPlanUpdate {
@@ -314,6 +316,8 @@ mod tests {
         let disc_res = PlanStorage::apply_discussion_plan_update(root, &invalid_disc);
         assert!(disc_res.applied.is_empty());
         assert!(!disc_res.errors.is_empty());
-        assert!(disc_res.errors[0].contains("Cannot remove completed step '1'"));
+        assert!(disc_res.errors[0]
+            .message
+            .contains("Cannot remove completed step '1'"));
     }
 }

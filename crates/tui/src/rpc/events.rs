@@ -5,9 +5,9 @@ use tauqe_protocol::{
     GitCommitCreatedEvent, GitSquashApplyResult, HistoryCompactedEvent, HistoryEntryAddedEvent,
     HistoryEntryRolledBackEvent, ModelDeltaEvent, ModelErrorEvent, ModelEscalatedEvent,
     ModelResult, ModelResultEvent, ModelStartedEvent, ModelUsageTotalsEvent,
-    PlanBatchFinishedEvent, RepositoryState, ReviewAnalyzeFinishedEvent, ReviewBatchFinishedEvent,
-    ReviewContentDeltaEvent, ReviewErrorEvent, ReviewFinishedEvent, ReviewGroupStartedEvent,
-    ReviewReasoningDeltaEvent, ReviewStartedEvent,
+    PlanBatchFinishedEvent, PlanRejection, RepositoryState, ReviewAnalyzeFinishedEvent,
+    ReviewBatchFinishedEvent, ReviewContentDeltaEvent, ReviewErrorEvent, ReviewFinishedEvent,
+    ReviewGroupStartedEvent, ReviewReasoningDeltaEvent, ReviewStartedEvent,
 };
 use tokio::sync::Mutex;
 
@@ -86,6 +86,36 @@ fn retry_detail(data: &EditFileRetryingEvent) -> String {
         .replacen("{}", &data.reason, 1)
 }
 
+/// Builds the in-app warning that reports the plan mutations the harness refused
+/// or repaired during the turn.
+///
+/// Both lists arrive typed beside the turn result, so the notice is assembled
+/// from those fields and never re-derived from the streamed answer: the refusal
+/// messages are rendered verbatim and the normalization notes are appended as
+/// they were recorded. `None` reports a turn that left the stored plan
+/// untouched, which raises no interface surface at all (c-4, c-5).
+fn plan_mutation_notice(rejections: &[PlanRejection], warnings: &[String]) -> Option<String> {
+    if rejections.is_empty() && warnings.is_empty() {
+        return None;
+    }
+    let mut notice = active_t("notify.plan_mutations_title");
+    if !rejections.is_empty() {
+        let details = rejections
+            .iter()
+            .map(|rejection| rejection.message.as_str())
+            .collect::<Vec<_>>()
+            .join("; ");
+        let template = active_t("notify.plan_rejections_detail");
+        notice.push_str(&template.replacen("{}", &details, 1));
+    }
+    if !warnings.is_empty() {
+        let details = warnings.join("; ");
+        let template = active_t("notify.plan_warnings_detail");
+        notice.push_str(&template.replacen("{}", &details, 1));
+    }
+    Some(notice)
+}
+
 pub async fn handle_event(ev: Event, state: &Arc<Mutex<AppState>>, is_reasoning: &mut bool) {
     let mut st = state.lock().await;
     match ev.method.as_str() {
@@ -153,8 +183,13 @@ pub async fn handle_event(ev: Event, state: &Arc<Mutex<AppState>>, is_reasoning:
                     }
                     st.history_view.items.push(data.item);
                     st.history_view.total_count += 1;
+                    // The chronicle is a sliding window: a record that crosses
+                    // the ceiling pushes the oldest one out of the view, and a
+                    // dropped record releases its fold state and its rendered
+                    // body with it (c-history-window).
+                    let view_height = st.last_model_height;
+                    st.history_view.trim_to_retained_window(view_height);
                     if st.history_view.auto_scroll {
-                        let view_height = st.last_model_height;
                         let total_lines = crate::views::history::compute_history_items_line_count(
                             &st.history_view.items,
                             None,
@@ -198,6 +233,8 @@ pub async fn handle_event(ev: Event, state: &Arc<Mutex<AppState>>, is_reasoning:
                     } else {
                         st.history_view.items.push(item);
                         st.history_view.total_count += 1;
+                        let view_height = st.last_model_height;
+                        st.history_view.trim_to_retained_window(view_height);
                     }
                     // The turn failed or was cancelled before its prompt reached
                     // the model history, so the editor history is now the only
@@ -630,6 +667,14 @@ pub async fn handle_event(ev: Event, state: &Arc<Mutex<AppState>>, is_reasoning:
         events::MODEL_RESULT => {
             if let Some(params) = ev.params {
                 if let Ok(data) = serde_json::from_value::<ModelResultEvent>(params) {
+                    // A refused plan mutation and a repaired plan status are real
+                    // events of the plan lifecycle that the daemon reports typed
+                    // beside the turn result, so the interface raises one warning
+                    // instead of letting the payload vanish (c-4, c-5).
+                    let notice = plan_mutation_notice(&data.plan_rejections, &data.plan_warnings);
+                    if let Some(notice) = notice {
+                        st.notify_warning(notice);
+                    }
                     match &data.result {
                         ModelResult::Edit {
                             outcome, summary, ..
@@ -3393,5 +3438,123 @@ mod tests {
         assert_eq!(hunk.new_start, 12);
         assert_eq!(hunk.new_lines, 3);
         assert_eq!(hunk.context_hint.as_deref(), Some("fn run() {"));
+    }
+
+    fn model_result_event(
+        plan_rejections: Vec<PlanRejection>,
+        plan_warnings: Vec<String>,
+    ) -> Event {
+        Event {
+            method: events::MODEL_RESULT.to_string(),
+            params: Some(
+                serde_json::to_value(ModelResultEvent {
+                    operation_id: "op-plan".to_string(),
+                    result: ModelResult::Answer {
+                        text: "done".to_string(),
+                    },
+                    usage: None,
+                    session_total_cost: None,
+                    current_cost: None,
+                    plan_rejections,
+                    plan_warnings,
+                })
+                .unwrap(),
+            ),
+        }
+    }
+
+    /// A turn that refused a plan mutation and repaired a plan status reports
+    /// both typed beside its result, so the interface raises one warning that
+    /// renders the refusal messages and the normalization notes verbatim
+    /// (c-4, c-5).
+    #[tokio::test]
+    async fn test_model_result_surfaces_refused_and_normalized_plan_mutations() {
+        let state = Arc::new(Mutex::new(crate::app::test_state()));
+        let mut is_reasoning = false;
+        let ev = model_result_event(
+            vec![PlanRejection::mode_forbidden("the turn regime forbids it")],
+            vec!["requested status corrected to in progress".to_string()],
+        );
+
+        handle_event(ev, &state, &mut is_reasoning).await;
+
+        let guard = state.lock().await;
+        let notif = guard
+            .active_notification()
+            .expect("a plan-mutation warning must be raised");
+        assert_eq!(notif.level, crate::app::NotificationLevel::Warning);
+        assert!(notif
+            .text
+            .contains(&active_t("notify.plan_mutations_title")));
+        assert!(notif.text.contains("the turn regime forbids it"));
+        assert!(notif
+            .text
+            .contains("requested status corrected to in progress"));
+    }
+
+    /// A turn that left the stored plan untouched raises nothing: the warning
+    /// exists to report a real plan lifecycle event, never to narrate a turn.
+    #[tokio::test]
+    async fn test_model_result_without_plan_mutations_stays_silent() {
+        let state = Arc::new(Mutex::new(crate::app::test_state()));
+        let mut is_reasoning = false;
+        let ev = model_result_event(Vec::new(), Vec::new());
+
+        handle_event(ev, &state, &mut is_reasoning).await;
+
+        let guard = state.lock().await;
+        assert!(
+            guard.active_notification().is_none(),
+            "a turn that left the stored plan untouched raises no warning"
+        );
+    }
+
+    /// The live append path keeps the mirrored chronicle inside its sliding
+    /// window: the record that crosses the ceiling pushes the oldest one out
+    /// with its fold state and copy flash, while the journal keeps it reachable
+    /// through paging (c-history-window).
+    #[tokio::test]
+    async fn test_history_entry_added_keeps_the_sliding_window() {
+        let window = crate::views::history::HISTORY_RETAINED_ITEMS;
+        let mut st = crate::app::test_state();
+        st.history_view.content_width = 40;
+        st.history_view.auto_scroll = false;
+        st.history_view.selected_item_index = 2;
+        st.history_view.items = (1u64..=(window as u64))
+            .map(|id| ui_history_item(id, UiHistoryKind::User, "record"))
+            .collect();
+        st.history_view.total_count = window;
+        st.history_view.expanded_items.insert(1);
+        st.history_view.arm_code_copy_flash(1, 0);
+
+        let state = Arc::new(Mutex::new(st));
+        let mut is_reasoning = false;
+        handle_event(
+            entry_added_event(ui_history_item(10_000, UiHistoryKind::User, "record"), None),
+            &state,
+            &mut is_reasoning,
+        )
+        .await;
+
+        let guard = state.lock().await;
+        assert_eq!(guard.history_view.items.len(), window);
+        assert_eq!(guard.history_view.items.first().map(|it| it.id), Some(2));
+        assert_eq!(
+            guard.history_view.items.last().map(|it| it.id),
+            Some(10_000)
+        );
+        assert_eq!(guard.history_view.selected_item_index, 1);
+        assert!(
+            !guard.history_view.expanded_items.contains(&1),
+            "a dropped record releases its fold state"
+        );
+        assert!(
+            guard.history_view.copy_flash.is_none(),
+            "a dropped record releases its copy flash"
+        );
+        assert!(
+            guard.history_view.has_more,
+            "the dropped records stay reachable through paging"
+        );
     }
 }

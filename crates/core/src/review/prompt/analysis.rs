@@ -260,6 +260,7 @@ mod tests {
             id,
             title: title.to_string(),
             uuid: uuid.map(str::to_string),
+            commit: None,
             group: group.map(str::to_string),
             model: None,
             issue_type: IssueType::Architecture,

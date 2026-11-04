@@ -843,7 +843,7 @@ mod tests {
 
         let mut st = test_state();
         st.view_mode = ViewMode::Context;
-        st.all_repo_files = vec![sentinel_path.clone()];
+        st.set_repo_files(vec![sentinel_path.clone()]);
         st.context_view.adding_file = true;
         st.context_view.add_input.insert_str("demo.rs");
         st.update_filtered_candidates();
@@ -873,7 +873,7 @@ mod tests {
     async fn enter_on_the_typed_bulk_row_dispatches_add_pattern() {
         let mut st = test_state();
         st.view_mode = ViewMode::Context;
-        st.all_repo_files = vec!["a.rs".to_string(), "b.rs".to_string()];
+        st.set_repo_files(vec!["a.rs".to_string(), "b.rs".to_string()]);
         st.context_view.adding_file = true;
         st.context_view.add_input.insert_str("*.rs");
         st.update_filtered_candidates();
@@ -905,7 +905,7 @@ mod tests {
     async fn enter_on_a_glob_query_with_a_file_row_highlighted_adds_that_file() {
         let mut st = test_state();
         st.view_mode = ViewMode::Context;
-        st.all_repo_files = vec!["a.rs".to_string(), "b.rs".to_string()];
+        st.set_repo_files(vec!["a.rs".to_string(), "b.rs".to_string()]);
         st.context_view.adding_file = true;
         st.context_view.add_input.insert_str("*.rs");
         st.update_filtered_candidates();
@@ -931,7 +931,7 @@ mod tests {
     async fn tab_completes_from_file_rows_and_skips_the_bulk_row() {
         let mut st = test_state();
         st.view_mode = ViewMode::Context;
-        st.all_repo_files = vec!["a.rs".to_string(), "b.rs".to_string()];
+        st.set_repo_files(vec!["a.rs".to_string(), "b.rs".to_string()]);
         st.context_view.adding_file = true;
         st.context_view.add_input.insert_str("*.rs");
         st.update_filtered_candidates();

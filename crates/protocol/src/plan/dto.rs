@@ -101,10 +101,6 @@ pub struct PlanExecuteParams {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct PlanRefineParams {
-    // The `id` alias is a legacy wire name retained so older clients keep
-    // working; scheduled for removal in 0.2.0 and tracked by the
-    // wire-contract test in `lib.rs`.
-    #[serde(alias = "id")]
     pub plan_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<ModelSelection>,
@@ -112,14 +108,9 @@ pub struct PlanRefineParams {
     pub instructions: Option<String>,
 }
 
-// The `id` and `item_id` aliases on this RPC parameter type are legacy wire
-// names retained so older clients keep working; scheduled for removal in 0.2.0
-// and tracked by the wire-contract test in `lib.rs`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct PlanReplanParams {
-    #[serde(alias = "id")]
     pub plan_id: String,
-    #[serde(alias = "item_id")]
     pub step_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,

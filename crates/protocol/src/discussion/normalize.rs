@@ -31,11 +31,39 @@ where
 /// yields `None` and the request is dropped. This is the crate's single shared
 /// normalizer for these paths, so every wire boundary applies the same rules.
 pub fn normalize_repo_map_path(raw: &str) -> Option<String> {
+    normalize_repo_map_path_checked(raw).ok()
+}
+
+/// Normalizes a repository-path request, keeping the rejection diagnostic.
+///
+/// A boundary that cannot drop a malformed entry decodes through this sibling
+/// instead of the dropping [`normalize_repo_map_path`]: a typed command field
+/// has no representation for "absent", so a rejected path must surface as a
+/// decode failure. Both apply the very same rules and differ only in how they
+/// report a rejection.
+fn normalize_repo_map_path_checked(raw: &str) -> Result<String, String> {
     let trimmed = raw.trim().trim_matches('`').trim();
     if trimmed.is_empty() || trimmed == "." || trimmed == "./" {
-        return Some(String::new());
+        return Ok(String::new());
     }
-    normalize_repo_path(trimmed).ok()
+    normalize_repo_path(trimmed)
+}
+
+/// Deserializes one repository-map-style path at the wire boundary.
+///
+/// The decoded path is normalized and validated through
+/// [`normalize_repo_map_path_checked`], so a field deserialized with this
+/// adapter can never address a location outside the repository. An escaping
+/// path is reported as a decode failure naming it instead of reaching the
+/// engine, because a typed command field cannot silently drop itself. This is a
+/// first line of defence only: the engine still confines every path against the
+/// repository root.
+pub(crate) fn deserialize_repo_map_path<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let raw = String::deserialize(deserializer)?;
+    normalize_repo_map_path_checked(&raw).map_err(serde::de::Error::custom)
 }
 
 /// Deserializes the `repo_maps` field of

@@ -291,10 +291,10 @@ mod tests {
         let mut staged = StagedEditsState::default();
         staged
             .staged_files
-            .insert("a.rs".to_string(), "staged a".to_string());
+            .insert("a.rs".to_string(), b"staged a".to_vec());
         staged
             .staged_files
-            .insert("b.rs".to_string(), "staged b".to_string());
+            .insert("b.rs".to_string(), b"staged b".to_vec());
 
         let mut cumulative = vec![
             EditOperation::Replace {
@@ -342,7 +342,7 @@ mod tests {
         let mut staged = StagedEditsState::default();
         staged
             .staged_files
-            .insert("b.rs".to_string(), "content of a".to_string());
+            .insert("b.rs".to_string(), b"content of a".to_vec());
         staged.deleted_paths.insert("a.rs".to_string());
 
         let mut cumulative = vec![

@@ -37,14 +37,18 @@ mid-turn leaves synthetic commits at the tip of the branch.
 4. **A failed or cancelled turn restores the exact pre-turn state.**
 5. **A finalized commit is ordinary history.** The developer inspects, amends, or
    reverts it with standard Git tooling.
-6. **Recovery requires proof.** It runs only with an open transaction marker, and
-   the phase that marker records selects the proof: a settled transaction must
-   show a commit range created entirely by the harness — for a born base, every
-   commit between the recorded base and HEAD, with the base still an ancestor of
-   HEAD; for an unborn base, every commit reachable from HEAD — while a marker
-   still recording a capture in progress is resolved against HEAD and the
-   recorded base alone, because the capture it describes has not produced a
-   range yet.
+6. **Recovery requires proof.** It runs only with an open transaction marker whose
+   recorded writer is provably gone, and only against a commit range created
+   entirely by the harness. The ownership proof comes first: a marker naming a
+   process that still runs describes a live transaction, so recovery preserves it
+   and rewrites nothing until that writer has exited, while a marker that names
+   no writer keeps the earlier behavior. The phase the marker records then
+   selects the second proof: a settled transaction must show a commit range
+   created entirely by the harness — for a born base, every commit between the
+   recorded base and HEAD, with the base still an ancestor of HEAD; for an unborn
+   base, every commit reachable from HEAD — while a marker still recording a
+   capture in progress is resolved against HEAD and the recorded base alone,
+   because the capture it describes has not produced a range yet.
 
 ---
 
@@ -104,7 +108,10 @@ The marker lives at `.tauqe/active-transaction.json`, inside the gitignored
 - `created_checkpoint_commit` — whether uncommitted work was captured in a
   checkpoint commit;
 - `phase` — where the capture stands: `capturing` while the capture is still in
-  progress, `established` once its outcome is recorded.
+  progress, `established` once its outcome is recorded;
+- `writer_pid` — the process id of the writer that opened the transaction, or
+  `null` when an earlier revision wrote the marker without recording a writer
+  at all.
 
 A clean tree still opens a transaction: the marker is written with
 `created_checkpoint_commit = false`. The marker is cleared when the turn is
@@ -125,12 +132,42 @@ revisions wrote, now as a typed value — a commit hash or the unborn state — 
 marker that carries no `phase` key decodes as `established`, keeping the settled
 meaning that revision gave it.
 
-The marker is persisted through the substrate's atomic-write policy: the
-document is staged in a sibling file, flushed and `fsync`ed, renamed atomically
-over the marker, and the directory that holds it is synced. A crash or a
-concurrently running recovery pass therefore observes either the previous
-complete marker or the new complete marker, never a truncated document that
-would decode as an absent transaction while one is open.
+The writer travels the same way. `writer_pid` names the process that opened the
+transaction, and a marker that carries no such key — one written by an earlier
+revision — decodes as unattributed rather than failing to decode, because an
+undecodable marker would hide an open transaction.
+
+The recorded writer also decides who may recover the transaction. Only a writer
+that is provably gone authorizes the history-rewriting branches, exactly as only
+a gone writer authorizes reclaiming a staging sibling; both decisions read the
+same recorded process id through one shared helper, so the marker gate and the
+sibling sweep cannot drift. A marker that names a live writer is skipped with the
+marker preserved, and a marker that names none keeps the previous behavior.
+
+The marker is persisted through the substrate's atomic-write policy end to
+end. The directories a first write needs are created durably, with the parent
+of every created directory synced, so a fresh `.tauqe/` entry is durable in the
+repository root before the marker exists. The document is then staged in a
+sibling file, flushed and `fsync`ed, renamed atomically over the marker, and the
+directory that holds it is synced. A crash or a concurrently running recovery
+pass therefore observes either the previous complete marker or the new complete
+marker, never a truncated document that would decode as an absent transaction
+while one is open.
+
+Removal follows the same policy. Clearing the marker is a durable unlink that
+syncs the directory which recorded it, and an already absent marker is success,
+so a finished transaction cannot be resurrected by a crash or a power loss after
+the harness returned. That durability guards the single artifact that authorizes
+history rewriting: a marker a crash could bring back would let recovery prove a
+settled transaction against the delivered squash commit — whose trailer it
+carries — and reset the finished work away. A clear that cannot be proven
+durable therefore reaches its caller. The operational paths — finalization, the
+isolated commit, rollback, and the recovery branches that have not touched
+history yet — abort on it with the diagnostic, so nothing continues on top of a
+marker that still records an open transaction. The post-reset path of recovery
+reports the failed removal and still returns, because the tree already sits at
+the recorded base and the surviving marker makes the next startup retry an
+idempotent recovery.
 
 Neither crash window loses captured work, because the `capturing` marker is
 durable before the capture starts and recovery resolves it against HEAD. A crash
@@ -152,12 +189,14 @@ Before any edit touches the working tree, the harness inspects the repository:
 
 - **Clean tree** — no checkpoint commit is needed; the marker records the
   current HEAD — or an unborn base when the branch holds no commit yet —
-  `created_checkpoint_commit = false`, and the settled `established` phase.
+  `created_checkpoint_commit = false`, the settled `established` phase, and the
+  process id of the writer that opened it.
 - **Dirty tree** — the marker is persisted in the `capturing` phase first, so
   the capture is announced before it starts; the uncommitted changes are then
   staged and captured in one checkpoint commit, and the marker is rewritten in
   the `established` phase recording the new HEAD and
-  `created_checkpoint_commit = true`.
+  `created_checkpoint_commit = true`; both writes name the writer that opened
+  the transaction in `writer_pid`.
 
 The checkpoint step also ensures that `.tauqe`, `credentials.toml`,
 `.credentials.toml`, and the staging suffixes are ignored through
@@ -259,7 +298,13 @@ Recovery runs at startup and is deliberately conservative:
 2. without a transaction marker, the repository is left untouched — a
    hand-written commit that merely shares the step-commit subject prefix is never
    mistaken for a dangling transaction;
-3. a marker still recording the `capturing` phase describes a crash inside the
+3. a marker attributed to a writer that still runs describes a live transaction,
+   not a crashed one: recovery reports the skip diagnostic naming that process
+   id, preserves the marker, and rewrites nothing, so a later startup retries
+   once the writer has exited; a marker that names no writer — one written by an
+   earlier revision — proves nothing about ownership and keeps the previous
+   behavior;
+4. a marker still recording the `capturing` phase describes a crash inside the
    capture itself and is resolved against HEAD and the recorded base instead of
    a commit range: a HEAD that still equals the base means no checkpoint commit
    was created, so the marker is cleared and the working tree is left untouched;
@@ -267,26 +312,29 @@ Recovery runs at startup and is deliberately conservative:
    checkpoint commit that is the repository root — means the capture committed
    but crashed before the rewrite that records it, so that commit is unwound,
    returning the captured work to the working tree; any other shape is refused;
-4. otherwise the settled marker's recorded base decides the proof range: for a
+5. otherwise the settled marker's recorded base decides the proof range: for a
    born base, every commit between the base and HEAD, and the base must still be
    an ancestor of HEAD or recovery refuses and reports the reason; for an
    unborn base, every commit reachable from HEAD;
-5. every commit in that range must carry the co-author trailer; a foreign
+6. every commit in that range must carry the co-author trailer; a foreign
    commit makes recovery refuse instead of rewriting history;
-6. if there are no step commits and no checkpoint commit, the marker is
+7. if there are no step commits and no checkpoint commit, the marker is
    cleared;
-7. otherwise the tree is returned to the base — a hard reset to the recorded
+8. otherwise the tree is returned to the base — a hard reset to the recorded
    commit for a born base, a return to the unborn state that removes exactly
    the tracked paths for an unborn one — the marker is cleared, and the
    checkpoint commit is unwound.
 
 Recovery therefore restores an interrupted turn without ever discarding commits
 the harness did not create, and it is total: once the destructive reset has run,
-a failure to unwind the checkpoint commit is logged, the marker is still
-cleared, and the call completes with a diagnostic naming the partial state,
-where the developer's pre-turn work stays recoverable inside the
-`tauqe-checkpoint:` commit at HEAD. An interrupted turn can therefore never
-leave a repository that fails recovery identically on every later startup.
+a failure to unwind the checkpoint commit and a failure to clear the marker are
+both logged, and the call completes with a diagnostic naming the partial state
+instead of aborting. The developer's pre-turn work stays recoverable inside the
+`tauqe-checkpoint:` commit at HEAD when the unwind failed, and a marker that
+survived the reset makes the next startup retry the recovery, which is
+idempotent once the tree already sits at the recorded base. An interrupted turn
+can therefore never leave a repository that fails recovery identically on every
+later startup.
 
 ### 3.6 Undoing the last harness commit
 
@@ -354,6 +402,10 @@ developer.
   keep working.
 - **It is not safe by assumption on crash.** Recovery refuses when a born base
   is not an ancestor or when the proof range contains a foreign commit.
+- **It is not a recovery of a live writer's transaction.** A marker attributed to
+  a process that still runs is skipped with the marker preserved, and no branch
+  is reset; only a provably gone writer, or a marker that names none, authorizes
+  the history-rewriting branches.
 - **It is not a checkpoint without a proven exclusion.** A checkpoint whose rules
   cannot be installed, or whose protected paths Git reports as not ignored, aborts
   before `git add -A` runs.

@@ -38,7 +38,7 @@ use tokio::sync::watch;
 
 use crate::handlers::architect::run_contour_synthesis;
 use crate::handlers::common::{
-    append_developer_directives, append_outer_docs_diagnostics, clear_auto_context, emit,
+    append_developer_directives, append_outer_docs_diagnostics, cleanup_transient_context, emit,
     preload_declared_files, preload_declared_outer_docs, turn_applied_edits,
     turn_left_unreverted_changes, OuterDocsRefusal,
 };
@@ -234,9 +234,10 @@ impl ImplementationHost for ServerImplementationHost {
             cancel_rx,
         } = request;
 
-        // Every attempt starts from a clean transient layer: the files a previous
-        // step preloaded describe work that is already finished.
-        clear_auto_context(&self.state).await;
+        // Every attempt starts from a clean transient context: the files a
+        // previous step discovered and the documents it mounted describe work
+        // that is already finished.
+        cleanup_transient_context(&self.state).await;
         preload_declared_files(&self.state, &self.repo_root, &files, &readonly_files).await;
         // A step declares the external specifications it obeys, so the harness
         // mounts them before the turn starts instead of leaving the Coder to
@@ -468,6 +469,14 @@ impl ImplementationHost for ServerImplementationHost {
             },
             StructuredRefineStatus::BudgetExceeded { diagnostic } => RefinementResult::Blocked {
                 reason: diagnostic,
+                tier: synthesized_tier,
+            },
+            // An abort is a diagnosis of the same weight as a blocker: the plan
+            // or the group records why the horizon could not be reprojected, and
+            // the message carries the host action the developer must perform
+            // before the wave can run again.
+            StructuredRefineStatus::Aborted(report) => RefinementResult::Blocked {
+                reason: report.to_message(),
                 tier: synthesized_tier,
             },
             StructuredRefineStatus::Cancelled => RefinementResult::Blocked {

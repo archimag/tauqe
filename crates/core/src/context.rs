@@ -482,7 +482,24 @@ impl ContextManager {
             false
         }
     }
-
+    /// Drops every file of the transient context: the auto layer and the
+    /// external documents materialized by the registry.
+    ///
+    /// The transient context is whatever the harness gathered so the model
+    /// could decide, so both of its layers are released at exactly the same
+    /// boundaries. Returns `true` only when at least one of them actually held
+    /// files, so a cleanup that removed nothing is distinguishable from one
+    /// that shrank the stable prefix of the prompt.
+    pub fn clear_transient(&mut self) -> bool {
+        if self.auto.is_empty() && self.outer_docs.is_empty() {
+            return false;
+        }
+        self.auto.clear();
+        self.outer_docs.clear();
+        self.recompute_pinned();
+        self.revision += 1;
+        true
+    }
     /// Drops all files strictly from the user context layer.
     /// Root pinned files are never affected; hierarchical pinned files are recomputed.
     pub fn clear_user(&mut self) {
@@ -1673,7 +1690,91 @@ mod tests {
         assert!(!cm.clear_outer_docs(), "a repeated clear reports no change");
         assert!(cm.outer_docs_files().is_empty());
     }
+    #[test]
+    fn test_clear_transient_removes_auto_and_outer_docs_only() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        for name in ["pinned.rs", "user.rs", "auto.rs", "docs.md"] {
+            std::fs::write(root.join(name), "fn f() {}\n").unwrap();
+        }
 
+        let mut cm = ContextManager::new(root);
+        cm.load_pinned(&["pinned.rs".to_string()]);
+        cm.add_file("user.rs", ContextAccess::Editable).unwrap();
+        cm.add_auto_file("auto.rs", ContextAccess::ReadOnly)
+            .unwrap();
+        cm.add_outer_docs_file("docs.md").unwrap();
+        let rev_before = cm.get_state().revision;
+
+        assert!(cm.clear_transient());
+
+        assert!(cm.auto_files().is_empty());
+        assert!(cm.outer_docs_files().is_empty());
+        assert!(!cm.contains("auto.rs").unwrap());
+        assert!(!cm.contains("docs.md").unwrap());
+        // Pinned and user entries are not transient and stay in place.
+        assert!(cm.contains("pinned.rs").unwrap());
+        assert!(cm.contains("user.rs").unwrap());
+        assert!(cm.is_editable("user.rs").unwrap());
+        assert!(cm.get_state().revision > rev_before);
+    }
+
+    #[test]
+    fn test_clear_transient_reports_whether_anything_was_removed() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        std::fs::write(root.join("auto.rs"), "fn auto() {}\n").unwrap();
+        std::fs::write(root.join("docs.md"), "external notes\n").unwrap();
+
+        let mut cm = ContextManager::new(root);
+        assert!(
+            !cm.clear_transient(),
+            "clearing an empty transient context must report no change"
+        );
+
+        cm.add_auto_file("auto.rs", ContextAccess::ReadOnly)
+            .unwrap();
+        assert!(
+            cm.clear_transient(),
+            "removing an auto file must report a change"
+        );
+
+        cm.add_outer_docs_file("docs.md").unwrap();
+        assert!(
+            cm.clear_transient(),
+            "removing an external document must report a change"
+        );
+        assert!(
+            !cm.clear_transient(),
+            "a repeated clear on an empty transient context must report no change"
+        );
+    }
+
+    #[test]
+    fn test_clear_transient_recomputes_hierarchical_pinned_files() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        std::fs::write(root.join("Conventions.md"), "# Root Conventions").unwrap();
+        std::fs::create_dir_all(root.join("crates/core/src")).unwrap();
+        std::fs::write(
+            root.join("crates/core/Conventions.md"),
+            "# Core Conventions",
+        )
+        .unwrap();
+        std::fs::write(root.join("crates/core/src/lib.rs"), "pub fn core() {}").unwrap();
+
+        let mut cm = ContextManager::with_pinned(root, &["Conventions.md".to_string()]);
+        cm.add_auto_file("crates/core/src/lib.rs", ContextAccess::ReadOnly)
+            .unwrap();
+        assert!(cm.contains("crates/core/Conventions.md").unwrap());
+
+        cm.clear_transient();
+
+        // The hierarchical pinned entry arrived with the transient file, so it
+        // leaves together with it, while the root-level pinned file stays.
+        assert!(cm.contains("Conventions.md").unwrap());
+        assert!(!cm.contains("crates/core/Conventions.md").unwrap());
+    }
     fn outer_docs_tokens(cm: &ContextManager) -> u64 {
         cm.get_state()
             .items

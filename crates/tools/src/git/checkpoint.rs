@@ -1,7 +1,5 @@
 use super::cmd::{commit_with_developer_author, run_git, run_git_check_ignore, stage_files};
-use crate::atomic_write::{
-    is_process_alive, staging_backup_sibling, staging_temp_sibling, StagingSibling,
-};
+use crate::atomic_write::{is_process_alive, staging_backup_sibling, staging_temp_sibling};
 use crate::git::GitHooks;
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
@@ -133,6 +131,14 @@ pub struct CheckpointInfo {
     /// the meaning that revision gave it.
     #[serde(default)]
     pub phase: TransactionPhase,
+    /// The process id of the writer that opened the transaction.
+    ///
+    /// `Some` names the harness process that wrote this marker, so a later
+    /// reader can ask whether that writer still runs. `None` names a marker
+    /// written by an earlier revision, which recorded no writer at all and
+    /// therefore proves nothing about ownership.
+    #[serde(default)]
+    pub writer_pid: Option<u32>,
 }
 
 /// Resolves the path of the transaction marker for the given repository root.
@@ -169,9 +175,12 @@ fn commit_listing(dir: &Path, rev_range: &str) -> Vec<String> {
 /// merely shares the step-commit subject prefix.
 ///
 /// The marker is the single artifact that authorizes history-rewriting
-/// recovery, so it is persisted through the crate's atomic-write policy: the
-/// document is staged in a sibling file, synced, renamed into place, and its
-/// parent directory synced. A crash or a concurrently running recovery pass
+/// recovery, so it is persisted through the crate's atomic-write policy end to
+/// end: the directories a first write needs are created durably, with the
+/// parent of every created directory synced, so a fresh `.tauqe/` entry is
+/// durable in the repository root before the marker exists; the document is
+/// then staged in a sibling file, synced, renamed into place, and its parent
+/// directory synced. A crash or a concurrently running recovery pass
 /// therefore observes either the previous complete marker or the new complete
 /// marker, never a truncated or empty document that `read_transaction_marker`
 /// would decode as `None` and thereby hide an open transaction.
@@ -184,7 +193,7 @@ fn commit_listing(dir: &Path, rev_range: &str) -> Vec<String> {
 fn write_transaction_marker(dir: &Path, checkpoint: &CheckpointInfo) -> Result<()> {
     let path = transaction_marker_path(dir);
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).with_context(|| {
+        crate::atomic_write::create_dir_all_durable(parent).with_context(|| {
             format!(
                 "Failed to create transaction marker directory: {:?}",
                 parent
@@ -198,9 +207,22 @@ fn write_transaction_marker(dir: &Path, checkpoint: &CheckpointInfo) -> Result<(
     Ok(())
 }
 
-/// Removes the transaction marker once a transaction is committed or rolled back.
-fn clear_transaction_marker(dir: &Path) {
-    let _ = std::fs::remove_file(transaction_marker_path(dir));
+/// Durably removes the transaction marker once a transaction is committed,
+/// rolled back, or recovered.
+///
+/// The removal runs through the durable removal barrier of the crate's
+/// atomic-write policy, which syncs the directory that recorded the unlink, so
+/// a crash or a power loss after the harness returned cannot resurrect a marker
+/// it already cleared. That durability guards the single artifact that
+/// authorizes history rewriting: a resurrected marker would let recovery prove
+/// a settled transaction against the delivered squash commit, whose trailer it
+/// carries, and reset the finished work away. A marker that is already absent
+/// is success, and a removal that cannot be proven durable is reported instead
+/// of discarded.
+fn clear_transaction_marker(dir: &Path) -> Result<()> {
+    let path = transaction_marker_path(dir);
+    crate::atomic_write::remove_atomic(&path)
+        .with_context(|| format!("Failed to clear transaction marker: {:?}", path))
 }
 
 /// Reads the transaction marker left behind by an interrupted transaction.
@@ -287,42 +309,66 @@ fn return_to_unborn(dir: &Path) -> Result<()> {
 /// gone, so a sweep never disturbs a commit another process is still
 /// publishing.
 ///
+/// The walk descends one directory level at a time and asks Git to classify
+/// the next level in one batched `git check-ignore` probe, so a directory the
+/// ignore rules cover is never entered. A staging sibling only ever appears
+/// next to a path a change set was admitted to write, and admission refuses
+/// every ignored path, so a build, dependency, or generated tree holds no
+/// artifact this sweep would reclaim, while entering it would stat every entry
+/// of that tree at every recovery and every rollback.
+///
 /// The walk stops at `.git` and at the harness state directory, whose live
 /// contents only the bounded companion `cleanup_state_dir_staging_files` may
 /// inspect.
 pub fn cleanup_orphaned_staging_files(root: &Path) -> usize {
     let mut cleaned = 0;
-    let mut dirs_to_visit = vec![root.to_path_buf()];
+    let mut level = vec![root.to_path_buf()];
 
-    while let Some(current_dir) = dirs_to_visit.pop() {
-        let entries = match std::fs::read_dir(&current_dir) {
-            Ok(entries) => entries,
+    while !level.is_empty() {
+        let mut next_level = Vec::new();
+        for current_dir in &level {
+            cleaned += reclaim_in_directory(current_dir, &mut next_level);
+        }
+        level = prune_ignored_directories(root, next_level);
+    }
+
+    cleaned
+}
+
+/// Reclaims the staging siblings of one directory and collects the
+/// subdirectories the sweep descends into next.
+///
+/// A symbolic link is classified, never followed, and the repository metadata
+/// directory and the harness state directory are never entered.
+fn reclaim_in_directory(current_dir: &Path, next_level: &mut Vec<PathBuf>) -> usize {
+    let mut cleaned = 0;
+    let entries = match std::fs::read_dir(current_dir) {
+        Ok(entries) => entries,
+        Err(_) => return cleaned,
+    };
+
+    for entry in entries.filter_map(|entry| entry.ok()) {
+        let path = entry.path();
+        let file_type = match entry.file_type() {
+            Ok(file_type) => file_type,
             Err(_) => continue,
         };
 
-        for entry in entries.filter_map(|e| e.ok()) {
-            let path = entry.path();
-            let file_type = match entry.file_type() {
-                Ok(ft) => ft,
-                Err(_) => continue,
-            };
+        if file_type.is_symlink() {
+            continue;
+        }
 
-            if file_type.is_symlink() {
+        if file_type.is_dir() {
+            let file_name = entry.file_name();
+            if file_name == ".git" || file_name == ".tauqe" {
                 continue;
             }
-
-            if file_type.is_dir() {
-                let file_name = entry.file_name();
-                if file_name == ".git" || file_name == ".tauqe" {
-                    continue;
-                }
-                dirs_to_visit.push(path);
-            } else if file_type.is_file() {
-                let file_name = entry.file_name();
-                let name = file_name.to_string_lossy();
-                if reclaim_staging_sibling(&path, &current_dir, &name) {
-                    cleaned += 1;
-                }
+            next_level.push(path);
+        } else if file_type.is_file() {
+            let file_name = entry.file_name();
+            let name = file_name.to_string_lossy();
+            if reclaim_staging_sibling(&path, current_dir, &name) {
+                cleaned += 1;
             }
         }
     }
@@ -330,19 +376,90 @@ pub fn cleanup_orphaned_staging_files(root: &Path) -> usize {
     cleaned
 }
 
-/// Reports whether the writer recorded in a staging sibling is provably gone.
+/// Keeps the sweep directories Git does not ignore and drops the rest.
 ///
-/// Reclamation may touch a sibling only when the writer that created it can
-/// never publish it: deleting a live writer's staged content, or moving its
-/// live backup aside, corrupts the commit the sibling exists to protect. The
-/// liveness probe is conservative, so a writer that still runs — or cannot be
-/// proven dead — owns its siblings. A name of the earlier fixed-name policy
-/// records no writer at all and keeps the previous reclaim behavior.
-fn writer_is_gone(sibling: &StagingSibling<'_>) -> bool {
-    match sibling.owner_pid {
-        Some(pid) => !is_process_alive(pid),
-        None => true,
+/// One batched `git check-ignore` call classifies the whole level, so a build,
+/// dependency, or generated tree is pruned before it is entered instead of
+/// walking every entry inside it. A candidate is addressed with a trailing
+/// separator, so a directory-only rule such as `target/` matches it, and every
+/// verdict echoes the probe that named the candidate it covers.
+///
+/// A level Git cannot classify keeps its whole set. An absent repository, an
+/// unavailable `git`, or an unreadable index must never make the sweep skip a
+/// directory that may hold a staging sibling, so the degraded answer restores
+/// the whole-tree reach the sweep had before it asked.
+fn prune_ignored_directories(root: &Path, candidates: Vec<PathBuf>) -> Vec<PathBuf> {
+    if candidates.is_empty() {
+        return candidates;
     }
+
+    let probes: Vec<Option<String>> = candidates
+        .iter()
+        .map(|path| path.strip_prefix(root).ok().map(repository_relative_probe))
+        .collect();
+    let request: Vec<String> = probes.iter().flatten().cloned().collect();
+    let ignored = match run_git_check_ignore(root, &request) {
+        Ok(ignored) => ignored,
+        Err(error) => {
+            tracing::debug!(
+                "Git could not classify the sweep directories, walking the whole level: {}",
+                error
+            );
+            return candidates;
+        }
+    };
+    if ignored.is_empty() {
+        return candidates;
+    }
+
+    let mut kept = Vec::with_capacity(candidates.len());
+    for (path, probe) in candidates.into_iter().zip(probes) {
+        let covered = match probe {
+            Some(probe) => ignored.contains(&probe),
+            None => false,
+        };
+        if !covered {
+            kept.push(path);
+        }
+    }
+    kept
+}
+
+/// Renders a repository-relative directory as the probe `git check-ignore`
+/// expects: forward slashes and a trailing separator.
+fn repository_relative_probe(relative: &Path) -> String {
+    let mut probe = String::new();
+    for component in relative.components() {
+        if let std::path::Component::Normal(part) = component {
+            if !probe.is_empty() {
+                probe.push('/');
+            }
+            probe.push_str(&part.to_string_lossy());
+        }
+    }
+    probe.push('/');
+    probe
+}
+
+/// The writer recorded in a transaction marker or a staging sibling, when that
+/// writer provably still runs.
+///
+/// Both ownership decisions of this module ask this one question, so the marker
+/// gate and the sibling sweep cannot drift. Recovery may act on a transaction
+/// only when the writer that opened it can never publish it: another process
+/// mid-capture, mid-step, or mid-finalization must not have its marker cleared,
+/// its branch reset, or its checkpoint commit unwound. Reclamation may touch a
+/// sibling only on the same terms: deleting a live writer's staged content, or
+/// moving its live backup aside, corrupts the commit the sibling exists to
+/// protect.
+///
+/// The probe is conservative, so a writer that still runs — or cannot be proven
+/// dead — owns what it recorded, and a platform without a process probe reports
+/// every attributed writer as live. A record of the earlier revisions, which
+/// names no writer at all, proves nothing about ownership and keeps the
+/// previous behavior of both paths.
+fn live_writer(writer_pid: Option<u32>) -> Option<u32> {
+    writer_pid.filter(|&pid| is_process_alive(pid))
 }
 
 /// Reclaims one staging sibling and reports whether anything changed.
@@ -359,10 +476,10 @@ fn writer_is_gone(sibling: &StagingSibling<'_>) -> bool {
 /// target already carries content.
 fn reclaim_staging_sibling(path: &Path, dir: &Path, name: &str) -> bool {
     if let Some(sibling) = staging_temp_sibling(name) {
-        return writer_is_gone(&sibling) && std::fs::remove_file(path).is_ok();
+        return live_writer(sibling.owner_pid).is_none() && std::fs::remove_file(path).is_ok();
     }
     if let Some(sibling) = staging_backup_sibling(name) {
-        if !writer_is_gone(&sibling) {
+        if live_writer(sibling.owner_pid).is_some() {
             return false;
         }
         let target = dir.join(sibling.original);
@@ -441,8 +558,9 @@ fn with_cleaned_artifacts(message: &str, cleaned_artifacts: usize) -> String {
 /// commit — and every other shape is refused, mirroring the discipline of the
 /// established path.
 ///
-/// An unwind failure propagates with the marker left in place: the pre-unwind
-/// state is intact, so a later startup retries the same recovery.
+/// A failure to unwind the checkpoint commit or to clear the marker propagates
+/// with the marker left in place, so a later startup resolves the same state
+/// again instead of continuing on top of an open transaction.
 fn recover_capturing_transaction(
     dir: &Path,
     checkpoint: &CheckpointInfo,
@@ -473,7 +591,7 @@ fn recover_capturing_transaction(
         TransactionBase::Unborn => head.is_none(),
     };
     if crashed_before_commit {
-        clear_transaction_marker(dir);
+        clear_transaction_marker(dir)?;
         return Ok(Some(with_cleaned_artifacts(
             "Closed an interrupted capture: no checkpoint commit was created and the working tree was left untouched",
             cleaned_artifacts,
@@ -492,7 +610,7 @@ fn recover_capturing_transaction(
     if crashed_after_commit {
         unwind_checkpoint_if_present(dir)
             .context("Failed to unwind the checkpoint commit of an interrupted capture")?;
-        clear_transaction_marker(dir);
+        clear_transaction_marker(dir)?;
         return Ok(Some(with_cleaned_artifacts(
             "Recovered interrupted capture: unwound the checkpoint commit and returned the captured work to the working tree",
             cleaned_artifacts,
@@ -545,6 +663,22 @@ pub fn recover_interrupted_workflow(dir: &Path) -> Result<Option<String>> {
             return Ok(None);
         }
     };
+
+    // The marker names the process that opened the transaction, so a writer
+    // that still runs owns it: the capturing refresh, the settled trailer
+    // proof, the reset to a born base, the return to an unborn base, and the
+    // checkpoint unwind all act on a transaction another process is still
+    // driving. The gate therefore sits ahead of the phase dispatch and refuses
+    // like the other unproven branches, so the marker survives for a later
+    // startup that observes an exited writer. A marker that names no writer —
+    // one written by an earlier revision — proves nothing about ownership and
+    // recovers as before.
+    if let Some(writer_pid) = live_writer(checkpoint.writer_pid) {
+        return Ok(Some(format!(
+            "Skipped crash recovery: the transaction writer (pid {writer_pid}) is still running; repository left untouched."
+        )));
+    }
+
     // A capturing marker describes a crash inside the capture itself: the
     // developer's work may or may not have reached a checkpoint commit, and no
     // rewrite has recorded the outcome yet. The phase therefore selects the
@@ -603,7 +737,7 @@ pub fn recover_interrupted_workflow(dir: &Path) -> Result<Option<String>> {
     // no transaction state to unwind. Resetting --hard in this case would destroy
     // legitimate uncommitted working tree changes.
     if unwound_steps == 0 && !checkpoint.created_checkpoint_commit {
-        clear_transaction_marker(dir);
+        clear_transaction_marker(dir)?;
         if cleaned_artifacts > 0 {
             return Ok(Some(format!(
                 "Cleaned up {} orphaned staging artifact(s).",
@@ -644,7 +778,22 @@ pub fn recover_interrupted_workflow(dir: &Path) -> Result<Option<String>> {
             unwind_error = Some(err);
         }
     }
-    clear_transaction_marker(dir);
+    // The reset above has already returned the tree to the recorded base, so a
+    // failure to clear the marker must not abort with the recovered tree left
+    // behind a marker that still records an open transaction: the failure is
+    // reported in the diagnostic instead, and the surviving marker makes the
+    // next startup retry a recovery that is idempotent once the tree already
+    // sits at the recorded base.
+    let clear_error = match clear_transaction_marker(dir) {
+        Ok(()) => None,
+        Err(err) => {
+            tracing::error!(
+                "Failed to clear the transaction marker during recovery: {}",
+                err
+            );
+            Some(err)
+        }
+    };
 
     if unwound_steps > 0 || checkpoint.created_checkpoint_commit {
         let mut msg = format!(
@@ -661,6 +810,12 @@ pub fn recover_interrupted_workflow(dir: &Path) -> Result<Option<String>> {
             msg.push_str(&format!(
                 ", but the checkpoint commit could not be unwound ({err}); the pre-turn work \
                  stays recoverable inside the `{CHECKPOINT_PREFIX}` commit at HEAD"
+            ));
+        }
+        if let Some(err) = clear_error {
+            msg.push_str(&format!(
+                ", but the transaction marker could not be cleared ({err}); a later startup \
+                 retries the recovery"
             ));
         }
         Ok(Some(msg))
@@ -829,6 +984,7 @@ pub fn create_checkpoint(dir: &Path, hooks: GitHooks) -> Result<CheckpointInfo> 
             created_checkpoint_commit: false,
             base,
             phase: TransactionPhase::Established,
+            writer_pid: Some(std::process::id()),
         };
         write_transaction_marker(dir, &checkpoint)?;
         return Ok(checkpoint);
@@ -842,6 +998,7 @@ pub fn create_checkpoint(dir: &Path, hooks: GitHooks) -> Result<CheckpointInfo> 
         created_checkpoint_commit: false,
         base,
         phase: TransactionPhase::Capturing,
+        writer_pid: Some(std::process::id()),
     };
     write_transaction_marker(dir, &capturing)?;
 
@@ -869,6 +1026,7 @@ pub fn create_checkpoint(dir: &Path, hooks: GitHooks) -> Result<CheckpointInfo> 
         created_checkpoint_commit: true,
         base: TransactionBase::Commit(new_head),
         phase: TransactionPhase::Established,
+        writer_pid: Some(std::process::id()),
     };
     write_transaction_marker(dir, &checkpoint)?;
     Ok(checkpoint)
@@ -905,7 +1063,7 @@ pub fn restore_checkpoint(dir: &Path, checkpoint: &CheckpointInfo) -> Result<()>
     //    never leave the marker behind and strand every later recovery: the
     //    marker is cleared first, and the failure propagates as a diagnostic the
     //    rollback-retry loop of the engine can act on.
-    clear_transaction_marker(dir);
+    clear_transaction_marker(dir)?;
     if checkpoint.created_checkpoint_commit {
         unwind_checkpoint_if_present(dir).with_context(|| {
             format!(
@@ -963,7 +1121,7 @@ fn close_transaction_without_changes(
     if matches!(checkpoint, Some(checkpoint) if checkpoint.created_checkpoint_commit) {
         let _ = unwind_checkpoint_if_present(dir)?;
     }
-    clear_transaction_marker(dir);
+    clear_transaction_marker(dir)?;
     Ok(String::new())
 }
 
@@ -1012,7 +1170,7 @@ pub fn finalize_ai_commit(
     // working tree. Clear the transaction marker now so an error during staging
     // or committing does not leave a dangling marker that would reset --hard and
     // destroy working tree changes on startup.
-    clear_transaction_marker(dir);
+    clear_transaction_marker(dir)?;
 
     // 3. Stage touched files
     stage_files(dir, changed_files)?;
@@ -1043,7 +1201,7 @@ pub fn create_ai_commit(
     // If HEAD is a temporary checkpoint commit, unwind it so user dirty changes remain in working tree
     let _ = unwind_checkpoint_if_present(dir)?;
 
-    clear_transaction_marker(dir);
+    clear_transaction_marker(dir)?;
 
     stage_files(dir, changed_files)?;
 

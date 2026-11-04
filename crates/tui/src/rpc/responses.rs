@@ -132,7 +132,7 @@ fn apply_response(
         }
         Some(methods::REPOSITORY_LIST_FILES) => {
             if let Ok(files) = serde_json::from_value::<RepositoryListFilesResult>(value) {
-                st.all_repo_files = files.files;
+                st.set_repo_files(files.files);
                 if st.context_view.adding_file {
                     st.update_filtered_candidates();
                 }
@@ -197,19 +197,8 @@ fn apply_response(
         }
         Some(methods::HISTORY_GET) => {
             if let Ok(history) = serde_json::from_value::<HistoryGetResult>(value) {
-                st.history_view.items = history.items;
-                st.history_view.total_count = history.total_count;
-                st.history_view.estimated_tokens = history.estimated_tokens;
-                if st.history_view.auto_scroll {
-                    let view_height = st.last_model_height;
-                    let total_lines = crate::views::history::compute_history_items_line_count(
-                        &st.history_view.items,
-                        None,
-                    ) as u16;
-                    st.history_view.scroll = total_lines.saturating_sub(view_height);
-                    st.history_view.selected_item_index =
-                        st.history_view.items.len().saturating_sub(1);
-                }
+                let view_height = st.last_model_height;
+                st.history_view.apply_page(history, view_height);
             }
         }
         Some(methods::PLAN_LIST) => {
@@ -383,6 +372,13 @@ fn reject_response(st: &mut AppState, method: Option<&str>, message: &str) {
                 dialog.generating = false;
             }
             st.notify_error(active_t("notify.locale_generate_failed").replace("{}", message));
+        }
+        Some(methods::HISTORY_GET) => {
+            // A refused page settles the handshake it armed: no answer arrives
+            // for it, and a stuck `loading` flag would silently disable every
+            // later fetch for the rest of the session (c-3).
+            st.history_view.cancel_page_fetch();
+            st.notify_error(active_t("notify.rpc_error").replace("{}", message));
         }
         _ => st.notify_error(active_t("notify.rpc_error").replace("{}", message)),
     }

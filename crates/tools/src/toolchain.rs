@@ -15,7 +15,9 @@
 //! - `[project.format]` is the in-memory filter that rewrites staged content
 //!   through standard input and output before any byte reaches disk.
 //! - `[project.post_hook]` is the disk-side step that runs strictly after the
-//!   change set is written and before verification.
+//!   change set is written and before verification. It receives the same change
+//!   set on standard input as `[project.verify]`, so a generator rebuilds only
+//!   the files the turn touched.
 //!
 //! Nothing is detected here: a repository either declares the commands it runs
 //! or runs nothing at all.
@@ -145,15 +147,20 @@ pub async fn run_toolchain_check_with_timeout(
 ///
 /// The hook executes strictly after the change set reached disk and before
 /// verification, so generated sources and refreshed manifests are present when
-/// the verification command runs. It receives no file list: the harness captures
-/// whatever the hook produced through Git, so the command stays a plain project
-/// process. A project that declares no hook runs nothing and succeeds.
+/// the verification command runs. The turn's change set reaches the command on
+/// its standard input, one path per line, exactly as the verification lifecycle
+/// receives it, so a generator rebuilds only the files the turn touched. An
+/// empty change set sends no input at all, so the hook conservatively rebuilds
+/// everything. The harness still captures whatever the hook produced through
+/// Git, so the command stays a plain project process. A project that declares no
+/// hook runs nothing and succeeds.
 ///
 /// A bounded turn passes the configuration it froze on its first proposal round,
 /// so the hook is never preceded by a second task runner dump.
 pub async fn run_post_hooks_with_config(
     repo_root: &Path,
     project: &ProjectConfig,
+    changed_files: &[String],
     cancel_rx: Option<&watch::Receiver<bool>>,
 ) -> Result<ProjectPostHookResponse, String> {
     let Some(spec) = project.post_hook.as_ref() else {
@@ -172,7 +179,15 @@ pub async fn run_post_hooks_with_config(
         .filter(|secs| *secs > 0)
         .unwrap_or(DEFAULT_PROJECT_TIMEOUT_SECS);
     let command = exec::CommandLine::new(resolved.command, resolved.args);
-    let outcome = exec::run_command(repo_root, &command, timeout_secs, None, cancel_rx).await;
+    let change_set = change_set_payload(changed_files);
+    let outcome = exec::run_command(
+        repo_root,
+        &command,
+        timeout_secs,
+        change_set.as_deref(),
+        cancel_rx,
+    )
+    .await;
 
     if outcome.is_cancelled {
         return Err("the project post-hook was cancelled".to_string());
@@ -386,5 +401,42 @@ mod tests {
         assert!(ok);
         assert_eq!(results.len(), 1);
         assert!(results[0].success);
+    }
+
+    /// The post-hook receives the turn's change set on its standard input, so a
+    /// generator selects the files the turn touched instead of scanning the
+    /// whole repository.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_the_post_hook_receives_the_change_set_on_standard_input() {
+        let dir = tempfile::tempdir().unwrap();
+        let project: ProjectConfig = serde_json::from_str(
+            r#"{"post_hook":{"command":"sh","args":["-c","cat > received.txt"]}}"#,
+        )
+        .unwrap();
+
+        let changed = vec!["src/lib.rs".to_string(), "src/main.rs".to_string()];
+        let response = run_post_hooks_with_config(dir.path(), &project, &changed, None)
+            .await
+            .expect("the declared hook runs");
+
+        assert!(response.success, "hook failed: {:?}", response.message);
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("received.txt")).unwrap(),
+            "src/lib.rs\nsrc/main.rs\n",
+            "the hook receives one relative path per line"
+        );
+
+        // An empty change set sends no input at all, so a generator
+        // conservatively rebuilds everything.
+        run_post_hooks_with_config(dir.path(), &project, &[], None)
+            .await
+            .expect("the declared hook runs");
+        assert!(
+            std::fs::read_to_string(dir.path().join("received.txt"))
+                .unwrap()
+                .is_empty(),
+            "an empty change set sends no input"
+        );
     }
 }

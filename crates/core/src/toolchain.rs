@@ -227,15 +227,21 @@ fn classify_status(passed: bool, results: &[ToolchainCheckResult]) -> Verificati
 ///
 /// The hook executes strictly after the change set reached disk and before
 /// verification, so generated sources and refreshed manifests are present when
-/// the verification command runs. It receives no file list: the harness captures
-/// whatever the hook produced through Git, so the command stays a plain project
-/// process. A repository that declares no hook runs nothing and succeeds.
+/// the verification command runs. The turn's change set reaches the command on
+/// its standard input, one path per line, exactly as the verification lifecycle
+/// receives it. The caller supplies that change set, so the wrapper reaches the
+/// hook with exactly the paths the current round wrote; an empty slice sends no
+/// input at all, so the hook conservatively rebuilds everything. The harness
+/// still captures whatever the hook produced through Git, so the command stays a
+/// plain project process. A repository that declares no hook runs nothing and
+/// succeeds.
 pub async fn run_post_hooks(
     repo_root: &Path,
+    changed_files: &[String],
     cancel_rx: Option<&watch::Receiver<bool>>,
 ) -> Result<ProjectPostHookResponse, String> {
     let project = effective_project_config(repo_root, cancel_rx).await;
-    run_post_hooks_with_config(repo_root, &project, cancel_rx).await
+    run_post_hooks_with_config(repo_root, &project, changed_files, cancel_rx).await
 }
 
 /// Runs one project command the model may address by name.
@@ -394,7 +400,7 @@ mod tests {
     async fn test_post_hook_runs_nothing_without_a_declaration() {
         let dir = repo(None);
 
-        let response = run_post_hooks(dir.path(), None).await.unwrap();
+        let response = run_post_hooks(dir.path(), &[], None).await.unwrap();
 
         assert!(response.success);
         assert!(response.executed_hooks.is_empty());
@@ -408,7 +414,7 @@ mod tests {
             "[project.post_hook]\ncommand = \"sh\"\nargs = ['-c', 'printf \"missing input\" >&2; exit 2']\n",
         ));
 
-        let response = run_post_hooks(dir.path(), None).await.unwrap();
+        let response = run_post_hooks(dir.path(), &[], None).await.unwrap();
 
         assert!(!response.success);
         assert_eq!(response.executed_hooks.len(), 1);
@@ -423,9 +429,31 @@ mod tests {
     async fn test_post_hook_rejects_a_broken_declaration() {
         let dir = repo(Some("[project.post_hook]\ncommand = \"@missing\"\n"));
 
-        let err = run_post_hooks(dir.path(), None).await.unwrap_err();
+        let err = run_post_hooks(dir.path(), &[], None).await.unwrap_err();
 
         assert!(err.contains("missing"), "unexpected reason: {err}");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_post_hook_receives_the_change_set_on_standard_input() {
+        // The wrapper forwards the change set of the current round, one relative
+        // path per line, exactly as the verification lifecycle receives it.
+        let dir = repo(Some(
+            "[project.post_hook]\ncommand = \"sh\"\nargs = ['-c', 'cat > received.txt']\n",
+        ));
+
+        let changed = vec!["src/lib.rs".to_string(), "src/main.rs".to_string()];
+        let response = run_post_hooks(dir.path(), &changed, None)
+            .await
+            .expect("the declared hook runs");
+
+        assert!(response.success);
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("received.txt")).unwrap(),
+            "src/lib.rs\nsrc/main.rs\n",
+            "the hook receives one relative path per line"
+        );
     }
 
     #[cfg(unix)]

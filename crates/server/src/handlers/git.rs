@@ -279,6 +279,20 @@ pub async fn handle_git_squash_preview(req: Request, state: &Arc<AppState>) -> R
 }
 
 pub async fn handle_git_squash_generate_message(req: Request, state: &Arc<AppState>) -> Response {
+    // The handler reads the commit list and the cumulative diff a running turn
+    // may be rewriting, then streams the message from that pair, so the slot is
+    // claimed for the whole handler: sampling it after the reads would let a
+    // concurrent `squashApply` rewrite move HEAD between the commit listing and
+    // the diff, feeding a torn pair into the provider prompt.
+    let operation = match super::begin_exclusive_operation(
+        &req.id,
+        state,
+        "Cannot generate a squash message while a model operation is in progress",
+    ) {
+        Ok(guard) => guard,
+        Err(resp) => return *resp,
+    };
+
     let params: tauqe_protocol::GitSquashGenerateMessageParams =
         match req.params.and_then(|p| serde_json::from_value(p).ok()) {
             Some(p) => p,
@@ -286,7 +300,6 @@ pub async fn handle_git_squash_generate_message(req: Request, state: &Arc<AppSta
                 return Response::err(req.id, errors::INVALID_PARAMS, "Missing base_ref parameter");
             }
         };
-
     // The revision is gated before it reaches any Git plumbing, so an
     // option-shaped value is never forwarded to `git log` or `git diff`.
     let base_ref = match validate_revision(&params.base_ref) {
@@ -355,16 +368,7 @@ pub async fn handle_git_squash_generate_message(req: Request, state: &Arc<AppSta
     };
 
     let (message, usage_snapshot) = if let Ok(provider) = provider_res {
-        let operation = match state.try_begin_operation() {
-            Ok(guard) => guard,
-            Err(()) => {
-                return Response::err(
-                    req.id,
-                    errors::OPERATION_IN_PROGRESS,
-                    "Cannot generate a squash message while a model operation is in progress",
-                );
-            }
-        };
+        // The slot claimed at entry already owns this operation.
         // The identifier and the usage window exist before the first streamed
         // byte, so a cancellation delivered before the stream starts still
         // closes exactly one accounted operation.
@@ -472,7 +476,7 @@ pub async fn handle_git_squash_generate_message(req: Request, state: &Arc<AppSta
         let snapshot = close_squash_usage(state, usage_guard, &op_id).await;
         (msg, Some(snapshot))
     } else {
-        // Without a provider no operation ever opens, so the zero operation
+        // Without a provider no usage window opens, so the zero operation
         // neither reaches the session totals nor increments the operation count.
         (
             commits_ahead
@@ -904,6 +908,52 @@ mod tests {
 
         drop(operation);
         assert!(!state.is_operation_active());
+    }
+
+    /// The message generator reads the commit list and the cumulative diff a
+    /// running turn may be rewriting, so it owns the operation slot for the
+    /// whole handler rather than claiming it once the reads are done.
+    ///
+    /// The probe is a root that is not a repository: were the reads still
+    /// outside the slot, they would fail first and answer `COMMITS_AHEAD_FAILED`
+    /// instead of the refusal.
+    #[tokio::test]
+    async fn squash_message_generation_is_refused_before_reading_the_repository() {
+        let dir = std::env::temp_dir().join(format!(
+            "tauqe-test-squash-generate-exclusive-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        let _ = std::fs::create_dir_all(&dir);
+
+        let (out, _rx) = crate::transport::OutChannel::new();
+        let (history_sender, _history_rx) = tokio::sync::mpsc::unbounded_channel();
+        let state = AppState::new(AppConfig::default(), dir.clone(), history_sender, out);
+        let operation = state.try_begin_operation().expect("the slot is free");
+
+        let resp = handle_git_squash_generate_message(squash_message_request(), &state).await;
+        assert_eq!(
+            resp.error.expect("the generation must be refused").code,
+            errors::OPERATION_IN_PROGRESS,
+            "the slot must be claimed before the repository is read"
+        );
+        assert!(
+            state.is_operation_active(),
+            "the running operation must keep owning the slot"
+        );
+        let snapshot = state.usage.lock().await.clone();
+        assert_eq!(
+            snapshot.operations, 0,
+            "a refused generation accounts no operation"
+        );
+        assert!(snapshot.cur.is_none());
+
+        drop(operation);
+        assert!(!state.is_operation_active());
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Builds one squash request carrying the given `base_ref`.

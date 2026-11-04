@@ -3,8 +3,8 @@ default: dev
 
 # Build the server, then run the TUI for development
 dev *args="":
-    cargo build -p tauqe-server
-    cargo run -p tauqe-tui -- {{args}}
+    cargo build --release -p tauqe-server
+    cargo run --release -p tauqe-tui -- {{args}}
 
 # Install release builds of tauqe-server and tauqe into ~/.cargo/bin
 # (`cargo install` always builds binaries in --release mode)

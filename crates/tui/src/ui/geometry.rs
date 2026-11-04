@@ -100,6 +100,32 @@ pub fn code_block_body_rect(
     ))
 }
 
+/// Screen rectangle of one painted row of a Markdown hyperlink.
+///
+/// `start_col` and `end_col` are display columns inside the row — a half-open
+/// range the Markdown surface derived from the line it painted. The row is
+/// resolved through the same scroll window every other region uses, so a link
+/// scrolled out of view declares nothing and a link clipped by the pane keeps
+/// only the columns the developer can actually point at (c-1, c-3).
+pub fn link_row_rect(
+    content: Rect,
+    visual_line: usize,
+    start_col: usize,
+    end_col: usize,
+    scroll: u16,
+    visible_height: u16,
+) -> Option<Rect> {
+    let row = visible_row(content, visual_line, scroll, visible_height)?;
+    let start = u16::try_from(start_col).ok()?;
+    let end = u16::try_from(end_col).ok()?;
+    let width = end.checked_sub(start)?;
+    if width == 0 {
+        return None;
+    }
+    let rect = Rect::new(content.x.checked_add(start)?, row, width, 1);
+    (rect.right() <= content.right()).then_some(rect)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -146,5 +172,17 @@ mod tests {
 
         assert!(code_block_body_rect(CONTENT, 0, 1, 2, 20).is_none());
         assert!(code_block_body_rect(CONTENT, 0, 5, 2, 0).is_none());
+    }
+    #[test]
+    fn link_row_is_clipped_to_the_visible_pane() {
+        let rect = link_row_rect(CONTENT, 4, 6, 20, 2, 20).expect("visible");
+        assert_eq!(rect, Rect::new(CONTENT.x + 6, CONTENT.y + 2, 14, 1));
+
+        // A row above the scroll window declares nothing, and so does an empty
+        // window, a zero-width range, and a range that starts past the pane.
+        assert!(link_row_rect(CONTENT, 1, 6, 20, 2, 20).is_none());
+        assert!(link_row_rect(CONTENT, 4, 6, 20, 0, 0).is_none());
+        assert!(link_row_rect(CONTENT, 3, 9, 9, 2, 20).is_none());
+        assert!(link_row_rect(CONTENT, 3, CONTENT.width as usize, 999, 2, 20).is_none());
     }
 }

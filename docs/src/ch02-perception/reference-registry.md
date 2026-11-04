@@ -96,7 +96,9 @@ repository able to authorize itself would have no boundary at all.
 10. **Materialization happens inside the bounded turn.** The transfer races the turn's
     cancellation signal and reports a compact reason instead of panicking.
 11. **The OuterDocs layer is context, not transcript.** History compaction never touches it,
-    and only clearing the whole context drops it.
+    and it is released together with the Auto layer on the commit of a turn's change set and
+    at the boundary of an isolated step, so a snapshot outlives neither the change set it
+    served nor the step that requested it.
 12. **Pricing is shared.** A document costs its content plus the wrapper its own `<file>`
     element renders, under the single `[context].token_budget` ceiling; the layer has no
     ceiling of its own and evicts nothing.
@@ -144,7 +146,9 @@ repository able to authorize itself would have no boundary at all.
   clean relative path below it, and nothing else.
 - **Cache path** — the repository-relative path of a snapshot:
   `.tauqe/cache/outer_docs/<id>/<file name>`.
-- **OuterDocs layer** — the context layer holding snapshots read-only for the whole task.
+- **OuterDocs layer** — the part of the transient context that holds materialized snapshots
+  read-only. The transient context is the Auto layer and this layer together: the material
+  provided so the model can decide, released together once it has.
 - **Trust declaration** — the developer's `refs-trust.toml`, written outside the
   repository.
 - **Trust refusal** — a typed decision of that declaration, addressed to the developer.
@@ -232,7 +236,8 @@ snapshot.
 1. A declared document stays invisible until a round requests it. Reading the declaration
    materializes nothing.
 2. A requested document arrives at its cache path, `read_only`, and stays in the OuterDocs
-   layer for the rest of the task.
+   layer for every later round of the same task. It leaves together with the Auto layer once
+   the turn's change set is committed or the isolated step ends.
 3. A request for write access is coerced to `read_only`: the layer never promotes a
    snapshot to editable, because material quoted from outside the repository must not be
    rewritten by the turn that reasons about it.
@@ -454,18 +459,32 @@ the `outer_docs` field of its leaf, and the harness materializes and mounts them
 step turn starts (*Local Plans*). The layer is the same one a research round widens, so a
 step that names its documents spends no research round discovering them.
 
-### 3.6 Persistence for the whole task
+### 3.6 A transient layer over a durable cache
 
-The OuterDocs layer is context rather than transcript, and that single fact explains its
-whole lifecycle:
+The cache file and the context entry have different lifetimes, and separating them is what
+makes the behaviour predictable.
 
-- history compaction rewrites history entries and never touches the layer, so a snapshot
-  cannot be summarized away;
-- sweeping the Auto layer at the end of a turn leaves the layer untouched, so a document
-  outlives the round that requested it;
+The **cache file** is durable. A materialized snapshot is immutable, so releasing the
+context entry never deletes it: a later task answers the same path byte for byte without a
+transfer (3.7).
+
+The **context entry** is transient. A document is provided so the model can decide, so it
+shares the lifecycle of the Auto layer a research round widens:
+
 - a turn merge folds the documents the turn materialized into the live layer;
-- pruning drops a document whose cached file disappeared;
-- clearing the Auto layer leaves the layer untouched, while clearing all context drops it.
+- an interactive turn releases the whole transient context — discovered files and external
+  documents alike — once its change set is applied, verified, and committed, so material
+  that served one decision never inflates the next one;
+- an isolated plan step, a review member, and an architect wave start from a clean transient
+  context and release it when the step ends, so no document leaks into the next step;
+- history compaction rewrites history entries and never touches the layer, so a snapshot
+  cannot be summarized away while the turn still reasons about it;
+- pruning drops a document whose cached file disappeared, and a full context reset drops the
+  layer together with every other one.
+
+The boundary is the committed change set, not the round. A dialogue that only reads keeps
+its material in hand, so the transient context grows across the rounds and replies of one
+task until the model edits code, and only then is it released.
 
 ### 3.7 Refreshing a snapshot
 
@@ -550,9 +569,11 @@ so refreshing is an explicit act rather than a background policy.
   the harness never guesses which of two documents should answer a request.
 - **It is not a per-layer budget.** There is no separate external-document ceiling, no
   eviction order, and no recency ranking: a document costs what every other context entry
-  costs and lives until the context is cleared.
+  costs and lives exactly as long as the transient context that admitted it.
 - **It is not durable state the harness protects.** The cache is expendable. Deleting it
-  costs one materialization per document, never a lost declaration.
+  costs one materialization per document, never a lost declaration, and the context entry
+  that named it is transient anyway: a committed change set releases it exactly as it
+  releases a discovered file.
 - **It is not a substitute for the trust declaration.** A declaration a repository writes
   cannot reach the host's file system or the host's own network, and a trust refusal is
   never retried into success by a later round of the same turn.

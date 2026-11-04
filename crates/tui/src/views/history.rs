@@ -3,7 +3,8 @@ use std::collections::HashSet;
 use ratatui::style::{Style, Stylize};
 use ratatui::text::{Line, Span};
 use tauqe_protocol::{
-    edit::EditFileOp, HistoryEntryStatus, HistoryFileChange, UiHistoryItem, UiHistoryKind,
+    edit::EditFileOp, HistoryEntryStatus, HistoryFileChange, HistoryGetResult, UiHistoryItem,
+    UiHistoryKind,
 };
 
 use crate::i18n::active_t;
@@ -18,6 +19,14 @@ pub use self::input::{handle_history_key, request_older_history, HISTORY_COMMAND
 pub use self::render::render_history_view;
 
 const COLLAPSED_PREVIEW_LINES: usize = 3;
+
+/// Number of records the History view retains in its sliding window.
+///
+/// The chronicle mirrors the session journal, which grows for the whole
+/// session, while the presentation layer owns a bounded amount of memory. The
+/// window keeps the newest records; older ones stay in the daemon's journal
+/// and the paging handshake keeps them reachable.
+pub const HISTORY_RETAINED_ITEMS: usize = 200;
 
 /// Columns every rendered History body line is prefixed with.
 ///
@@ -138,6 +147,20 @@ impl HistoryViewState {
         }
     }
 
+    /// Maximum valid viewport offset for the entry document last rendered.
+    ///
+    /// The wheel moves the window without moving the cursor, so it needs
+    /// exactly this upper bound. It is computed in `usize` and only then
+    /// narrowed through the saturating conversion, so a history longer than
+    /// the `u16` viewport unit saturates instead of wrapping through a
+    /// truncated cast and trapping the viewport short of its end (c-2).
+    pub fn max_scroll(&self, view_height: u16) -> u16 {
+        let max = self
+            .rendered_lines_count
+            .saturating_sub(usize::from(view_height));
+        clamp_u16(max)
+    }
+
     /// Applies a server-side session compaction event to the in-memory view.
     ///
     /// Compaction is a structural replacement, not an append: the summarized
@@ -189,6 +212,134 @@ impl HistoryViewState {
         } else {
             self.scroll = self.scroll.min(max_scroll);
         }
+    }
+
+    /// Applies the page a `history/get` answer carries and settles the paging
+    /// handshake.
+    ///
+    /// A page requested through `request_older_history` is strictly older than
+    /// the entries already displayed, so it is prepended above them; any other
+    /// answer — the initial load, and the refresh of a view switch — replaces
+    /// the entries instead. Both outcomes adopt the authoritative `has_more` of
+    /// the answer and release the handshake, so a settled fetch stays
+    /// repeatable but never re-enters through a stale flag (c-3).
+    pub fn apply_page(&mut self, page: HistoryGetResult, view_height: u16) {
+        let armed = self.pending_before_id.take().is_some();
+        let select_previous = std::mem::take(&mut self.select_prev_after_load);
+        self.loading = false;
+        self.total_count = page.total_count;
+        self.estimated_tokens = page.estimated_tokens;
+        self.has_more = page.has_more;
+        if armed {
+            self.prepend_page(page.items, select_previous, view_height);
+        } else {
+            self.replace_page(page.items, view_height);
+        }
+    }
+
+    /// Releases an armed paging handshake that no answer will settle.
+    ///
+    /// A request whose write never reached the daemon is answered by nobody, so
+    /// the handshake is released here; leaving `loading` set would silently
+    /// disable every later fetch for the rest of the session (c-3).
+    pub fn cancel_page_fetch(&mut self) {
+        self.loading = false;
+        self.pending_before_id = None;
+        self.select_prev_after_load = false;
+    }
+
+    /// Applies the sliding window after a record entered the view.
+    ///
+    /// The chronicle mirrors a journal that grows for the whole session, while
+    /// the interface owns a bounded amount of memory, so a record that crosses
+    /// [`HISTORY_RETAINED_ITEMS`] pushes the oldest prefix out of the view.
+    ///
+    /// The dropped block is measured through the same layout the viewport uses
+    /// — the item bodies honour the fold state and the records are separated by
+    /// dividers — so the reading position keeps showing the lines the developer
+    /// was reading and the cursor keeps the record it pointed at. The fold
+    /// state and the cached Markdown body of a dropped record are released with
+    /// it, and the paging flag reports that the journal still holds the records
+    /// the window gave up.
+    pub fn trim_to_retained_window(&mut self, view_height: u16) {
+        let excess = self.items.len().saturating_sub(HISTORY_RETAINED_ITEMS);
+        if excess == 0 {
+            return;
+        }
+        let max_width = Some(self.content_width);
+        // The offset of the first retained record counts every line above it,
+        // including the divider that separated it from the dropped block.
+        let (_, offsets) = self.layout_offsets(max_width, None);
+        let dropped_lines = offsets.get(excess).copied().unwrap_or(0);
+        let dropped: Vec<u64> = self.items.drain(..excess).map(|item| item.id).collect();
+        for id in &dropped {
+            self.expanded_items.remove(id);
+            self.body_cache.evict(id);
+        }
+        let flash_dropped = self
+            .copy_flash
+            .is_some_and(|((item_id, _), _)| dropped.contains(&item_id));
+        if flash_dropped {
+            self.copy_flash = None;
+        }
+        // Everything above the retained block left the document, so the
+        // viewport moves down by exactly that height and the cursor by the
+        // number of records that went with it.
+        self.scroll = self.scroll.saturating_sub(clamp_u16(dropped_lines));
+        self.selected_item_index = self
+            .selected_item_index
+            .saturating_sub(excess)
+            .min(self.items.len().saturating_sub(1));
+        // The dropped records still exist in the session journal, so paging can
+        // read them back.
+        self.has_more = true;
+        let selected = self.selected_item_index;
+        let (total_lines, _) = self.layout_offsets(max_width, Some(selected));
+        self.rendered_lines_count = total_lines;
+        self.scroll = self.scroll.min(self.max_scroll(view_height));
+    }
+    /// Prepends an older page above the displayed entries.
+    ///
+    /// The block the page occupies is measured before it is inserted, so a
+    /// reading position that only widened the history keeps showing the same
+    /// lines instead of jumping to the oldest record.
+    fn prepend_page(&mut self, page: Vec<UiHistoryItem>, select_previous: bool, view_height: u16) {
+        if page.is_empty() {
+            return;
+        }
+        let added = page.len();
+        // The measurement includes the divider that now separates the older
+        // page from the entries that were already displayed.
+        let added_lines = compute_history_items_line_count(&page, Some(self.content_width)) + 1;
+        self.items.splice(0..0, page);
+        if select_previous {
+            // The record directly above the former first one is "the previous
+            // item" at the top of the list, so the cursor lands on it.
+            self.selected_item_index = added - 1;
+            self.scroll_to_selected_item(view_height, Some(self.content_width));
+            return;
+        }
+        self.auto_scroll = false;
+        self.selected_item_index =
+            (self.selected_item_index + added).min(self.items.len().saturating_sub(1));
+        self.scroll = clamp_u16(self.scroll as usize + added_lines);
+    }
+
+    /// Replaces the displayed entries with an authoritative page.
+    fn replace_page(&mut self, items: Vec<UiHistoryItem>, view_height: u16) {
+        self.items = items;
+        // Fold state of an entry the answer dropped is stale; the rendered
+        // bodies stay cached by id and simply stop being requested (c-3).
+        let live: HashSet<u64> = self.items.iter().map(|item| item.id).collect();
+        self.expanded_items.retain(|id| live.contains(id));
+        if self.auto_scroll {
+            self.selected_item_index = self.items.len().saturating_sub(1);
+            self.scroll_to_selected_item(view_height, Some(self.content_width));
+            return;
+        }
+        self.selected_item_index = self
+            .selected_item_index
+            .min(self.items.len().saturating_sub(1));
     }
 
     /// Returns the total visual line count and per-item start offsets, reusing cached bodies.
@@ -535,7 +686,7 @@ fn build_item_body(
             let mut history_theme = crate::markdown::MarkdownTheme::answer_themed(theme_mode);
             history_theme.line_prefix = Some(Span::raw(LINE_PREFIX));
             if let Some(w) = max_width {
-                history_theme.max_width = Some(w.saturating_sub(2));
+                history_theme.constrain_table_width(w);
             }
             // The Markdown body leads the item body, so its block positions are
             // shifted by the lines already emitted above it instead of being
@@ -1369,6 +1520,23 @@ mod tests {
     }
 
     #[test]
+    fn test_max_scroll_saturates_past_the_u16_viewport_unit() {
+        let mut st = HistoryViewState {
+            rendered_lines_count: 500,
+            ..Default::default()
+        };
+        assert_eq!(st.max_scroll(20), 480);
+        assert_eq!(st.max_scroll(0), 500);
+
+        st.rendered_lines_count = 70_000;
+        assert_eq!(st.max_scroll(10), u16::MAX);
+
+        // A document shorter than the viewport has no scroll range at all.
+        st.rendered_lines_count = 10;
+        assert_eq!(st.max_scroll(20), 0);
+    }
+
+    #[test]
     fn test_apply_compaction_removes_head_and_anchors_auto_scroll() {
         let mut st = HistoryViewState {
             content_width: 40,
@@ -1530,5 +1698,276 @@ mod tests {
         assert_eq!(st.total_count, 2);
         assert_eq!(st.estimated_tokens, 64);
         assert_eq!(st.selected_item_index, 1);
+    }
+
+    /// Builds the answer of a `history/get` request.
+    fn history_page(
+        items: Vec<UiHistoryItem>,
+        has_more: bool,
+        total_count: usize,
+    ) -> HistoryGetResult {
+        HistoryGetResult {
+            items,
+            has_more,
+            total_count,
+            estimated_tokens: 0,
+        }
+    }
+
+    /// The initial load and a view refresh replace the entries and adopt the
+    /// paging capability of the answer, which is what makes older pages
+    /// reachable at all (c-3).
+    #[test]
+    fn test_page_without_a_handshake_replaces_the_entries() {
+        let mut st = HistoryViewState {
+            content_width: 40,
+            items: vec![history_item(1, UiHistoryKind::User, "stale")],
+            ..Default::default()
+        };
+
+        st.apply_page(
+            history_page(
+                vec![
+                    history_item(7, UiHistoryKind::User, "seven"),
+                    assistant_item(8, "eight"),
+                ],
+                true,
+                25,
+            ),
+            10,
+        );
+
+        let ids: Vec<u64> = st.items.iter().map(|item| item.id).collect();
+        assert_eq!(ids, vec![7, 8]);
+        assert!(st.has_more, "the answer owns the paging capability");
+        assert_eq!(st.total_count, 25);
+        assert!(!st.loading);
+        assert!(st.pending_before_id.is_none());
+        assert!(!st.select_prev_after_load);
+    }
+
+    /// The answer of the armed fetch is older than what is displayed, so it is
+    /// prepended and the cursor lands on the record directly above the former
+    /// first one (c-3).
+    #[test]
+    fn test_armed_page_is_prepended_and_selects_the_previous_item() {
+        let mut st = HistoryViewState {
+            content_width: 40,
+            auto_scroll: false,
+            selected_item_index: 0,
+            items: vec![
+                history_item(5, UiHistoryKind::User, "five"),
+                assistant_item(6, "six"),
+            ],
+            has_more: true,
+            loading: true,
+            pending_before_id: Some(5),
+            select_prev_after_load: true,
+            ..Default::default()
+        };
+
+        st.apply_page(
+            history_page(
+                vec![
+                    history_item(3, UiHistoryKind::User, "three"),
+                    assistant_item(4, "four"),
+                ],
+                false,
+                6,
+            ),
+            10,
+        );
+
+        let ids: Vec<u64> = st.items.iter().map(|item| item.id).collect();
+        assert_eq!(ids, vec![3, 4, 5, 6], "the older page leads the entries");
+        assert_eq!(
+            st.items[st.selected_item_index].id, 4,
+            "the cursor moves to the record above the former first one"
+        );
+        assert!(!st.has_more, "the answer reports the start of the history");
+        assert_eq!(st.total_count, 6);
+        assert!(!st.loading);
+        assert!(st.pending_before_id.is_none());
+        assert!(!st.select_prev_after_load);
+    }
+
+    /// A page loaded by scrolling to the top must not move the reading
+    /// position: the viewport follows the block inserted above it while the
+    /// cursor keeps the record it pointed at.
+    #[test]
+    fn test_armed_page_without_a_cursor_move_keeps_the_reading_position() {
+        let mut st = HistoryViewState {
+            content_width: 40,
+            auto_scroll: false,
+            scroll: 4,
+            selected_item_index: 1,
+            items: vec![
+                history_item(5, UiHistoryKind::User, "five"),
+                assistant_item(6, "six"),
+            ],
+            has_more: true,
+            loading: true,
+            pending_before_id: Some(5),
+            ..Default::default()
+        };
+
+        st.apply_page(
+            history_page(vec![history_item(4, UiHistoryKind::User, "four")], true, 6),
+            10,
+        );
+
+        let ids: Vec<u64> = st.items.iter().map(|item| item.id).collect();
+        assert_eq!(ids, vec![4, 5, 6]);
+        assert_eq!(
+            st.items[st.selected_item_index].id, 6,
+            "the cursor keeps the record it pointed at"
+        );
+        assert!(
+            st.scroll > 4,
+            "the viewport moves down by the block inserted above it"
+        );
+        assert!(!st.auto_scroll);
+    }
+
+    /// An empty older page proves the start of the history without touching
+    /// what is displayed, and it still settles the handshake (c-3).
+    #[test]
+    fn test_an_empty_older_page_settles_the_handshake_and_keeps_the_entries() {
+        let mut st = HistoryViewState {
+            content_width: 40,
+            items: vec![history_item(5, UiHistoryKind::User, "five")],
+            has_more: true,
+            loading: true,
+            pending_before_id: Some(5),
+            select_prev_after_load: true,
+            ..Default::default()
+        };
+
+        st.apply_page(history_page(Vec::new(), false, 1), 10);
+
+        let ids: Vec<u64> = st.items.iter().map(|item| item.id).collect();
+        assert_eq!(ids, vec![5]);
+        assert!(!st.has_more);
+        assert_eq!(st.total_count, 1);
+        assert!(!st.loading);
+        assert!(st.pending_before_id.is_none());
+        assert!(!st.select_prev_after_load);
+    }
+
+    /// A request that never reached the daemon has no answer to settle it, so
+    /// releasing the handshake is what keeps later fetches possible (c-3).
+    #[test]
+    fn test_cancel_page_fetch_releases_the_handshake() {
+        let mut st = HistoryViewState {
+            loading: true,
+            pending_before_id: Some(3),
+            select_prev_after_load: true,
+            ..Default::default()
+        };
+
+        st.cancel_page_fetch();
+
+        assert!(!st.loading);
+        assert!(st.pending_before_id.is_none());
+        assert!(!st.select_prev_after_load);
+    }
+
+    /// A live append keeps the view bounded: the record that crosses the
+    /// ceiling pushes the oldest one out, the viewport and the cursor are
+    /// compensated by what left above them, and the dropped record releases its
+    /// fold state, its rendered body, and its copy flash (c-history-window).
+    #[test]
+    fn test_retained_window_drops_the_oldest_record_and_compensates_the_viewport() {
+        let height = 10u16;
+        let mut st = HistoryViewState {
+            content_width: 40,
+            auto_scroll: false,
+            items: (1u64..=(HISTORY_RETAINED_ITEMS as u64))
+                .map(|id| assistant_item(id, "```rust\nfn main() {}\n```"))
+                .collect(),
+            total_count: HISTORY_RETAINED_ITEMS,
+            ..Default::default()
+        };
+        st.expanded_items.insert(1);
+        st.expanded_items.insert(2);
+        st.selected_item_index = 5;
+        st.arm_code_copy_flash(1, 0);
+
+        let width = Some(st.content_width);
+        st.scroll_to_selected_item(height, width);
+        let scroll_before = st.scroll;
+        assert!(scroll_before > 0, "the fixture reads away from the head");
+        assert_eq!(st.selected_item_index, 5);
+        assert_eq!(st.body_cache.len(), 2, "both expanded answers are cached");
+
+        let (_, offsets) = st.layout_offsets(width, None);
+        let dropped_lines = offsets[1];
+
+        // At the ceiling the window retains every record and touches nothing.
+        st.trim_to_retained_window(height);
+        assert_eq!(st.items.len(), HISTORY_RETAINED_ITEMS);
+        assert_eq!(st.scroll, scroll_before);
+        assert!(
+            !st.has_more,
+            "nothing left the view, so paging stays as it was"
+        );
+
+        st.items
+            .push(assistant_item(10_000, "```rust\nfn main() {}\n```"));
+        st.total_count += 1;
+        st.trim_to_retained_window(height);
+
+        assert_eq!(st.items.len(), HISTORY_RETAINED_ITEMS);
+        assert_eq!(st.items.first().map(|item| item.id), Some(2));
+        assert_eq!(st.items.last().map(|item| item.id), Some(10_000));
+        assert_eq!(st.selected_item_index, 4);
+        assert_eq!(
+            st.scroll,
+            scroll_before.saturating_sub(u16::try_from(dropped_lines).unwrap_or(u16::MAX)),
+            "the viewport follows the block that left above it"
+        );
+        assert!(
+            !st.expanded_items.contains(&1),
+            "the fold state of the dropped record is released"
+        );
+        assert!(
+            st.expanded_items.contains(&2),
+            "a retained record keeps its fold state"
+        );
+        assert_eq!(st.body_cache.len(), 1, "the dropped body is evicted");
+        assert!(st.copy_flash.is_none(), "the dropped flash is released");
+        assert!(
+            st.has_more,
+            "the dropped record stays reachable through paging"
+        );
+    }
+
+    /// The window is a bound on growth, not a background prune: a view at or
+    /// below the ceiling is left exactly as it stands (c-history-window).
+    #[test]
+    fn test_retained_window_leaves_a_view_below_the_ceiling_untouched() {
+        let height = 10u16;
+        let mut st = HistoryViewState {
+            content_width: 40,
+            auto_scroll: false,
+            scroll: 7,
+            selected_item_index: 2,
+            items: (1u64..(HISTORY_RETAINED_ITEMS as u64))
+                .map(|id| history_item(id, UiHistoryKind::User, "record"))
+                .collect(),
+            ..Default::default()
+        };
+        st.expanded_items.insert(1);
+
+        st.trim_to_retained_window(height);
+
+        assert_eq!(st.items.len(), HISTORY_RETAINED_ITEMS - 1);
+        assert_eq!(st.scroll, 7);
+        assert_eq!(st.selected_item_index, 2);
+        assert!(st.expanded_items.contains(&1));
+        assert!(
+            !st.has_more,
+            "the window never claims paging it did not need"
+        );
     }
 }

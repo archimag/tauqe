@@ -100,10 +100,7 @@ impl FromStr for DocTopic {
             "git" => Ok(Self::Git),
             "interface" => Ok(Self::Interface),
             "review" => Ok(Self::Review),
-            // `plans` is a legacy plural alias kept only for tolerant model
-            // output parsing; scheduled for removal in 0.2.0 and tracked by the
-            // wire-contract test in `lib.rs`.
-            "plan" | "plans" => Ok(Self::Plan),
+            "plan" => Ok(Self::Plan),
             "config" => Ok(Self::Config),
             "all" => Ok(Self::All),
             other => Err(format!(
@@ -127,14 +124,6 @@ mod tests {
     #[test]
     fn test_doc_topic_serde_aliases_default_and_parsing() {
         assert_eq!(serde_json::to_string(&DocTopic::Plan).unwrap(), "\"plan\"");
-        assert_eq!(
-            serde_json::from_str::<DocTopic>("\"plans\"").unwrap(),
-            DocTopic::Plan
-        );
-        assert_eq!(
-            serde_json::from_str::<DocTopic>("\"  PLANS  \"").unwrap(),
-            DocTopic::Plan
-        );
         assert_eq!(
             serde_json::from_str::<DocTopic>("\"all\"").unwrap(),
             DocTopic::All
@@ -163,6 +152,9 @@ mod tests {
         assert_eq!(DocTopic::Config.to_string(), "config");
         assert_eq!("config".parse::<DocTopic>().unwrap(), DocTopic::Config);
         assert!("bogus".parse::<DocTopic>().is_err());
+        // `plans` named the plan topic before the vocabulary was fixed, so the
+        // closed topic set no longer carries it.
+        assert!("plans".parse::<DocTopic>().is_err());
 
         // Unknown doc topic inside an LlmCommand does not fail deserialization.
         let raw = r#"{"type":"doc_request","topic":"nonexistent_topic"}"#;

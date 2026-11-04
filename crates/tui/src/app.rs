@@ -344,7 +344,6 @@ impl StatusDialogTarget {
     }
 }
 
-/// Pending confirmation of a plan step or scope execution.
 /// Section of the plan step and scope execution dialog that owns the keyboard.
 ///
 /// Executing a step or a scope hands control to the Coder role, and the plan is
@@ -464,7 +463,6 @@ pub struct ConfirmExecutePipelineState {
     pub pending_synthesis: Vec<String>,
 }
 
-/// Pending confirmation of the Architect post-analysis over one review session.
 /// Focus sections of the Architect post-analysis confirmation.
 ///
 /// The dialog carries the Architect ladder above its action bar, so it repeats
@@ -597,7 +595,6 @@ impl ConfirmExecuteReviewState {
     ///
     /// One constructor serves both shapes: point execution (one finding or one
     /// subplan step, which exposes the Coder selector and the directives editor)
-    /// implementation step, which exposes the Coder selector and the directives editor)
     /// (concept #c-3).
     pub fn new(
         review_id: Option<String>,
@@ -1216,7 +1213,6 @@ pub struct ReviewDialogState {
     /// never re-walks the whole file list to rebuild the prefix tree (c-5).
     pub path_directories: Vec<String>,
     /// Contextual directory completion of the active path row (c-5).
-    /// Contextual directory completion of the active path row (c-5).
     pub path_completion: PathCompletion,
     /// Memoized union match count of the path rows (#47).
     ///
@@ -1767,10 +1763,20 @@ impl OnboardingState {
     }
 
     /// Applies the authoritative flags and paths reported by the server.
+    ///
+    /// The resolved defaults travel with the status because the daemon is the
+    /// side that knows where it looked: an explicit `--config` path or a
+    /// machine-wide candidate names a different file from the repository-local
+    /// one, and the onboarding card states which file a create action would
+    /// write. Adopting them here keeps the recorded path and the path the
+    /// daemon would use the same value instead of leaving the client on its own
+    /// hardcoded guess ("never guess what is deterministically known").
     pub fn apply_status(&mut self, status: &SystemStatusResult) {
         self.has_git = status.has_git;
         self.has_config = status.has_config;
         self.has_api_key = status.has_api_key;
+        self.default_config_path = status.default_config_path.clone();
+        self.default_credentials_path = status.default_credentials_path.clone();
         if status.config_path.is_some() {
             self.config_path = status.config_path.clone();
         }
@@ -1888,7 +1894,19 @@ pub struct AppState {
     pub view_mode: ViewMode,
     pub protocol_version: String,
     pub repo_state: Option<RepositoryState>,
+    /// Repository file list the handshake delivered.
+    ///
+    /// The list can hold a whole monorepo, so the Context picker memo never
+    /// hashes it: [`Self::all_repo_files_revision`] keys the memo instead. Every
+    /// replacement goes through [`Self::set_repo_files`], which advances that
+    /// revision.
     pub all_repo_files: Vec<String>,
+    /// Monotonic revision of [`Self::all_repo_files`].
+    ///
+    /// The counter advances on every replacement, so a consumer can tell a
+    /// refreshed list from the previous one without walking it. It starts at `1`,
+    /// so the list the handshake delivered is already a distinct revision.
+    pub all_repo_files_revision: u64,
     pub workflow: tauqe_protocol::WorkflowKind,
     pub edit_protocol: tauqe_protocol::EditProtocolKind,
     pub active_model: ModelRef,
@@ -2016,6 +2034,7 @@ impl AppState {
             protocol_version: init.protocol_version,
             repo_state: init.repo_state,
             all_repo_files: init.all_repo_files,
+            all_repo_files_revision: 1,
             workflow: init.workflow,
             edit_protocol: init.edit_protocol,
             active_model: init.active_model,
@@ -2574,9 +2593,24 @@ impl AppState {
         )
     }
 
+    /// Replaces the mirrored repository file list and advances its revision.
+    ///
+    /// The list feeds the Context picker scan and can hold a whole monorepo, so
+    /// the picker memo is keyed on [`Self::all_repo_files_revision`] instead of
+    /// the paths themselves. Every wholesale replacement goes through this single
+    /// method, so the memo can never serve rows computed from a list the
+    /// interface no longer holds (c-3).
+    pub fn set_repo_files(&mut self, files: Vec<String>) {
+        self.all_repo_files = files;
+        self.all_repo_files_revision = self.all_repo_files_revision.wrapping_add(1);
+    }
+
     pub fn update_filtered_candidates(&mut self) {
-        self.context_view
-            .update_filtered_candidates(&self.context.items, &self.all_repo_files);
+        self.context_view.update_filtered_candidates(
+            &self.context.items,
+            &self.all_repo_files,
+            self.all_repo_files_revision,
+        );
     }
 
     /// Propagates the configured theme to every view that renders Markdown,
@@ -2791,6 +2825,43 @@ mod tests {
 
         state.workstation_skipped = true;
         assert_eq!(state.next_step(), OnboardingStep::Ready);
+    }
+
+    /// The status carries the paths the daemon actually resolved, so the
+    /// onboarding card names the file a create action would write instead of a
+    /// client-side guess ("never guess what is deterministically known").
+    #[test]
+    fn test_apply_status_adopts_the_resolved_default_paths() {
+        let mut state = OnboardingState::default();
+        assert_eq!(state.default_config_path, "tauqe.toml");
+
+        state.apply_status(&SystemStatusResult {
+            has_git: true,
+            has_config: false,
+            config_path: None,
+            default_config_path: "/home/dev/.config/tauqe/tauqe.toml".to_string(),
+            has_api_key: true,
+            credentials_path: None,
+            default_credentials_path: "/home/dev/.config/tauqe/credentials.toml".to_string(),
+            ready: false,
+            model: ModelRef::openrouter("test-model"),
+            selection: None,
+            roles: None,
+            history_model: None,
+            available_models: Vec::new(),
+            config_error: None,
+        });
+
+        assert_eq!(
+            state.default_config_path,
+            "/home/dev/.config/tauqe/tauqe.toml"
+        );
+        assert_eq!(
+            state.default_credentials_path,
+            "/home/dev/.config/tauqe/credentials.toml"
+        );
+        assert!(!state.has_config);
+        assert!(state.config_path.is_none());
     }
 
     #[test]
@@ -3881,10 +3952,6 @@ mod tests {
             group_step.is_single_target(),
             "one step of a group plan keeps the explicit Coder form"
         );
-        assert!(
-            group_step.is_single_target(),
-            "one step of a group plan keeps the explicit Coder form"
-        );
     }
 
     /// A whole-session queue names no single unit of work, so it never renders
@@ -4332,6 +4399,36 @@ mod tests {
         assert!(
             !st.text_input_capturing(),
             "a confirmation over the REPL prompt captures no text"
+        );
+    }
+
+    /// The repository file list is replaced through one setter that advances its
+    /// revision, so the picker memo recomputes after a refresh instead of serving
+    /// rows computed from the replaced list (c-3).
+    #[test]
+    fn test_set_repo_files_advances_the_picker_memo_revision() {
+        use crate::views::context::ContextCandidate;
+
+        let mut st = test_state();
+        st.context_view.add_input.insert_str("*.rs");
+        assert_eq!(st.all_repo_files_revision, 1);
+
+        st.set_repo_files(vec!["src/lib.rs".to_string()]);
+        assert_eq!(st.all_repo_files_revision, 2);
+        st.update_filtered_candidates();
+        assert_eq!(
+            st.context_view.filtered_candidates.last(),
+            Some(&ContextCandidate::File("src/lib.rs".to_string()))
+        );
+
+        // A refreshed list of the same length still invalidates the served rows,
+        // which an identity check on the replaced vector would miss.
+        st.set_repo_files(vec!["src/main.rs".to_string()]);
+        assert_eq!(st.all_repo_files_revision, 3);
+        st.update_filtered_candidates();
+        assert_eq!(
+            st.context_view.filtered_candidates.last(),
+            Some(&ContextCandidate::File("src/main.rs".to_string()))
         );
     }
 }

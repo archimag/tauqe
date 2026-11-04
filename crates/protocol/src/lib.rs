@@ -37,12 +37,15 @@ pub mod review;
 // turn an accidental name collision between two modules into a compile error
 // instead of a silently ambiguous glob re-export. Module paths remain public,
 // so both `tauqe_protocol::Item` and `tauqe_protocol::module::Item` resolve.
-//
-// The wire contract is everything a facade re-exports: DTOs, events, request
-// and result types, enums, the error and event name constants, and the schema
-// constructors. Every wire-contract name must also resolve as
+// The wire contract is everything a facade re-exports or declares: DTOs,
+// events, request and result types, enums, the error and event name constants,
+// and the schema constructors. Every wire-contract name must also resolve as
 // `tauqe_protocol::<Name>`, so the lists below are pinned mechanically by the
-// `wire_contract_tracking` facade-parity test rather than by author discipline
+// `wire_contract_tracking` tests rather than by author discipline alone. Both
+// coverage classes are gated: one test checks the `pub use` re-export parity of
+// every facade module, and another checks the string constants a facade module
+// declares directly, so a name declared in `errors.rs` or `events.rs` without
+// its root entry fails the suite instead of drifting out of the facade.
 // alone.
 //
 // A small fixed set of pure helpers is deliberately module-scoped and stays
@@ -80,17 +83,18 @@ pub use edit::{
 pub use errors::{
     ADD_FAILED, ADD_PATTERN_FAILED, ARCHITECTURAL_GROUP_EXECUTION_REQUIRED, CANCELLED,
     COMMITS_AHEAD_FAILED, CONFIG_CREATE_FAILED, CREDENTIALS_SAVE_FAILED, CREDENTIALS_STUB_FAILED,
-    EMPTY_CONTEXT, EMPTY_ITEMS, GET_DIFF_FAILED, INIT_FAILED, INTERNAL_ERROR, INVALID_KEY,
-    INVALID_MODEL, INVALID_PARAMS, INVALID_PLAN_ID, INVALID_PLAN_TREE, INVALID_PROTOCOL,
-    INVALID_REQUEST, INVALID_WORKFLOW, ITEM_IN_DISCUSSION, ITEM_REJECTED, LIST_FILES_FAILED,
-    METHOD_NOT_FOUND, MODEL_ERROR, NEEDS_CONTEXT, NOTHING_TO_EXECUTE, NOT_A_LEAF, NOT_FOUND,
-    NO_API_KEY, OPERATION_IN_PROGRESS, PARSE_ERROR, PINNED_PROTECTED, PLAN_CLEAR_FAILED,
-    PLAN_DELETE_FAILED, PLAN_GET_FAILED, PLAN_LIST_FAILED, PLAN_LOAD_FAILED, PLAN_SAVE_FAILED,
-    PLAN_SET_ACTIVE_FAILED, PLAN_UPDATE_FAILED, PREFLIGHT_VERIFICATION_FAILED, REMOVE_FAILED,
-    REPOSITORY_STATE_FAILED, REVIEW_DELETE_FAILED, REVIEW_GET_FAILED, REVIEW_LIST_FAILED,
-    REVIEW_LOAD_FAILED, REVIEW_UPDATE_FAILED, SCHEMA_ERROR, SET_ACCESS_FAILED, SQUASH_FAILED,
+    EMPTY_CONTEXT, EMPTY_ITEMS, GET_DIFF_FAILED, GROUP_UNRESOLVED_QUESTIONS, HISTORY_GET_FAILED,
+    INIT_FAILED, INTERNAL_ERROR, INVALID_KEY, INVALID_MODEL, INVALID_PARAMS, INVALID_PLAN_ID,
+    INVALID_PLAN_TREE, INVALID_PROTOCOL, INVALID_REQUEST, INVALID_WORKFLOW, ITEM_IN_DISCUSSION,
+    ITEM_REJECTED, LIST_FILES_FAILED, METHOD_NOT_FOUND, MODEL_ERROR, MODULE_CONFLICT,
+    NEEDS_CONTEXT, NOTHING_TO_EXECUTE, NOT_A_LEAF, NOT_FOUND, NO_API_KEY, OPERATION_IN_PROGRESS,
+    PARSE_ERROR, PINNED_PROTECTED, PLAN_CLEAR_FAILED, PLAN_DELETE_FAILED, PLAN_GET_FAILED,
+    PLAN_LIST_FAILED, PLAN_LOAD_FAILED, PLAN_SAVE_FAILED, PLAN_SET_ACTIVE_FAILED,
+    PLAN_UPDATE_FAILED, PREFLIGHT_VERIFICATION_FAILED, REMOVE_FAILED, REPOSITORY_STATE_FAILED,
+    REVIEW_DELETE_FAILED, REVIEW_GET_FAILED, REVIEW_LIST_FAILED, REVIEW_LOAD_FAILED,
+    REVIEW_PREVIEW_FAILED, REVIEW_UPDATE_FAILED, SCHEMA_ERROR, SET_ACCESS_FAILED, SQUASH_FAILED,
     SQUASH_PREVIEW_FAILED, STEP_BLOCKED, STEP_BLOCKED_BY_DEPENDENCIES, STEP_CANCELLED,
-    STEP_IMMUTABLE, STEP_IN_DISCUSSION, UNEXPECTED_STATUS,
+    STEP_IMMUTABLE, STEP_IN_DISCUSSION, UNDO_FAILED, UNEXPECTED_STATUS,
 };
 
 // The event and error namespaces both declare `MODEL_ERROR`: the RPC error code
@@ -145,9 +149,9 @@ pub use plan::{
     compute_items_status, ConceptItem, Plan, PlanClearHorizonParams, PlanClearHorizonResult,
     PlanDeleteParams, PlanExecuteParams, PlanExecutePipelineParams, PlanGetParams, PlanGetResult,
     PlanImplementation, PlanItem, PlanItemStatus, PlanListChangedEvent, PlanListResult,
-    PlanRefineParams, PlanRefineResult, PlanReplanParams, PlanSaveParams, PlanScopeEvaluation,
-    PlanSetActiveParams, PlanSetActiveResult, PlanStats, PlanSummary, PlanUpdateItemParams,
-    PlanUpdateItemResult, PlanUpdatedEvent, PlanValidationError,
+    PlanRefineParams, PlanRefineResult, PlanRejection, PlanRejectionKind, PlanReplanParams,
+    PlanSaveParams, PlanScopeEvaluation, PlanSetActiveParams, PlanSetActiveResult, PlanStats,
+    PlanSummary, PlanUpdateItemParams, PlanUpdateItemResult, PlanUpdatedEvent, PlanValidationError,
 };
 pub use project::{
     format_diagnostics, Diagnostic, DiagnosticSeverity, ProjectCommandSpec, ProjectConfig,
@@ -182,40 +186,219 @@ mod wire_contract_tracking {
     fn protocol_version_tracks_crate_version() {
         assert_eq!(PROTOCOL_VERSION, env!("CARGO_PKG_VERSION"));
     }
+    /// One line of the machine-readable alias ledger.
+    ///
+    /// The record is `(file, anchor, spelling)`. `file` is the path relative to
+    /// `crates/protocol/src`, `anchor` names the type, variant, or field that
+    /// carries the attribute, and `spelling` is the alias value itself. The pair
+    /// `(file, spelling)` is the machine-checked identity, so it must match one
+    /// `alias = "..."` attribute of the scanned source exactly; `anchor` stays
+    /// documentation, because renaming a field changes prose rather than the
+    /// compatibility surface.
+    type AliasRecord = (&'static str, &'static str, &'static str);
 
-    /// Forcing function for the removal of the legacy compatibility aliases.
+    /// Every `alias = "..."` attribute the crate sources declare.
     ///
-    /// A set of backward-compatibility aliases is retained only so older
-    /// clients keep working and is annotated "scheduled for removal in 0.2.0".
-    /// A comment alone never forces that cleanup, so this gate turns the intent
-    /// into an enforceable check: it passes while the crate is on the 0.1 line
-    /// and fails the moment the version reaches 0.2.0, forcing the aliases to
-    /// be deleted together with this test.
+    /// The ledger is the authoritative record of the compatibility surface, and
+    /// `alias_registry_matches_source_attributes` checks it in both directions:
+    /// an attribute without a recorded entry fails completeness, and a
+    /// record whose attribute is gone fails honesty. An alias added in a file
+    /// outside the scan surface therefore requires extending `ALIAS_SOURCES`,
+    /// the same discipline `FACADE_SOURCES` already imposes on the facade parity
+    /// check.
+    const ALIAS_REGISTRY: &[AliasRecord] = &[
+        // review/item.rs: a category and a severity are read tolerantly, so a
+        // payload produced under either vocabulary keeps decoding.
+        ("review/item.rs", "IssueType::Bug", "critical"),
+        ("review/item.rs", "IssueType::Architecture", "warning"),
+        ("review/item.rs", "IssueType::Architecture", "warn"),
+        ("review/item.rs", "IssueType::Quality", "style"),
+        ("review/item.rs", "IssueType::Quality", "suggestion"),
+        ("review/item.rs", "IssueType::Quality", "info"),
+        ("review/item.rs", "ReviewSeverity::Critical", "bug"),
+        ("review/item.rs", "ReviewSeverity::Critical", "security"),
+        ("review/item.rs", "ReviewSeverity::Warning", "architecture"),
+        ("review/item.rs", "ReviewSeverity::Warning", "performance"),
+        ("review/item.rs", "ReviewSeverity::Suggestion", "quality"),
+        ("review/item.rs", "ReviewSeverity::Suggestion", "style"),
+        // review/item.rs: the historical wire keys of the category field.
+        ("review/item.rs", "ReviewIssue::issue_type", "severity"),
+        ("review/item.rs", "ReviewIssue::issue_type", "issue_type"),
+        ("review/item.rs", "ReviewItemWire::issue_type", "severity"),
+        ("review/item.rs", "ReviewItemWire::issue_type", "issue_type"),
+        // review/item.rs: the shadow reads the canonical key the item writes.
+        ("review/item.rs", "ReviewItemWire::body", "description"),
+        // model/turn.rs
+        (
+            "model/turn.rs",
+            "ModelResultProposal::doc_requests",
+            "doc_requests",
+        ),
+        // command.rs
+        ("command.rs", "LlmCommand::DocRequest", "doc_request"),
+        // context.rs
+        ("context.rs", "ContextLayer::OuterDocs", "refs"),
+    ];
+
+    /// Source text of the submodules the alias scan reads besides the facades.
     ///
-    /// Tracked aliases:
-    /// - `DocTopic`: `plans`
-    /// - `WorkflowKind`: `single`, `direct`
-    /// - `EditProtocolKind`: `structured_output`, `json_schema`, `json`
-    /// - `IssueStatus`: `done`
-    /// - `ReviewUpdateItemParams`: `resolution_notes`
-    /// - `ReviewIssue`: `resolution_notes`
-    /// - `ReviewItem`: `resolution_notes`    /// - `PlanReplanParams`: `id`, `item_id`
-    /// - `ReviewItem`: `resolution_notes`
-    /// - `PlanReplanParams`: `id`, `item_id`
+    /// `FACADE_SOURCES` names one file per wire-contract surface, but a serde
+    /// attribute sits in the submodule that declares the type, not in the facade
+    /// that re-exports it. These files are listed explicitly so the scan reads
+    /// exactly what it claims: an alias added in a file outside this list
+    /// requires extending it, the same discipline `FACADE_SOURCES` imposes on
+    /// the facade parity check.
+    const ALIAS_SOURCES: &[(&str, &str)] = &[
+        ("model/turn.rs", include_str!("model/turn.rs")),
+        ("plan/dto.rs", include_str!("plan/dto.rs")),
+        ("review/dto.rs", include_str!("review/dto.rs")),
+        ("review/item.rs", include_str!("review/item.rs")),
+        ("review/session.rs", include_str!("review/session.rs")),
+    ];
+
+    /// Every source file the alias scan reads, as `(path, text)` pairs.
+    ///
+    /// Facade entries are spelled `<module>.rs`, so one path vocabulary covers
+    /// both halves of the surface and a registry record names the same file the
+    /// scan read.
+    fn alias_scan_surface() -> Vec<(String, &'static str)> {
+        let mut surface = Vec::new();
+        for (module, source) in FACADE_SOURCES {
+            surface.push((format!("{module}.rs"), *source));
+        }
+        for (path, source) in ALIAS_SOURCES {
+            surface.push(((*path).to_string(), *source));
+        }
+        surface
+    }
+
+    /// Removes every line and block comment from one source text.
+    ///
+    /// The scan reads textual markers rather than a syntax tree, so it also
+    /// tracks double-quoted literals: a `//` inside a string is data, and
+    /// treating it as a comment would hide the attribute that follows it on the
+    /// same line. A comment is dropped in place while its line breaks are kept,
+    /// so two spellings on neighbouring lines never join into one.
+    fn strip_comments(source: &str) -> String {
+        let mut stripped = String::with_capacity(source.len());
+        let mut chars = source.chars().peekable();
+        let mut in_string = false;
+        let mut block_depth = 0usize;
+
+        while let Some(current) = chars.next() {
+            if block_depth > 0 {
+                if current == '\n' {
+                    stripped.push('\n');
+                }
+                if current == '/' && chars.peek() == Some(&'*') {
+                    chars.next();
+                    block_depth += 1;
+                } else if current == '*' && chars.peek() == Some(&'/') {
+                    chars.next();
+                    block_depth -= 1;
+                }
+                continue;
+            }
+
+            if in_string {
+                stripped.push(current);
+                if current == '\\' {
+                    stripped.extend(chars.next());
+                } else if current == '"' {
+                    in_string = false;
+                }
+                continue;
+            }
+
+            if current == '"' {
+                in_string = true;
+                stripped.push(current);
+            } else if current == '/' && chars.peek() == Some(&'/') {
+                while chars.peek().is_some_and(|next| *next != '\n') {
+                    chars.next();
+                }
+            } else if current == '/' && chars.peek() == Some(&'*') {
+                chars.next();
+                block_depth = 1;
+            } else {
+                stripped.push(current);
+            }
+        }
+
+        stripped
+    }
+
+    /// Every `alias = "..."` spelling one source text declares, in source order.
+    ///
+    /// Several aliases may share one attribute line, so the scan resumes after
+    /// each spelling it reads instead of consuming the rest of the line.
+    fn alias_spellings(source: &str) -> Vec<String> {
+        let text = strip_comments(source);
+        let mut spellings = Vec::new();
+        let mut rest = text.as_str();
+
+        while let Some(index) = rest.find("alias") {
+            let Some(after_alias) = rest.get(index + "alias".len()..) else {
+                break;
+            };
+            rest = after_alias;
+            let Some(attribute) = rest.trim_start().strip_prefix('=') else {
+                continue;
+            };
+            let Some(value) = attribute.trim_start().strip_prefix('"') else {
+                continue;
+            };
+            let Some((spelling, remainder)) = value.split_once('"') else {
+                continue;
+            };
+            spellings.push(spelling.to_string());
+            rest = remainder;
+        }
+
+        spellings
+    }
+
+    /// Pins the alias ledger against the source attributes it records.
+    ///
+    /// The ledger is only as authoritative as its agreement with the sources, so
+    /// the check runs in both directions: a source attribute without a record
+    /// fails completeness, and a record whose attribute is gone fails honesty.
+    /// The comparison is a multiset one, because several distinct
+    /// declarations deliberately carry the same spelling and each of them needs
+    /// a decision of its own.
     #[test]
-    fn legacy_aliases_must_be_removed_by_0_2_0() {
-        let mut parts = env!("CARGO_PKG_VERSION").split('.');
-        let major: u32 = parts.next().and_then(|s| s.parse().ok()).unwrap_or(0);
-        let minor: u32 = parts.next().and_then(|s| s.parse().ok()).unwrap_or(0);
+    fn alias_registry_matches_source_attributes() {
+        let mut declared: Vec<(String, String)> = Vec::new();
+        for (file, source) in alias_scan_surface() {
+            for spelling in alias_spellings(source) {
+                declared.push((file.clone(), spelling));
+            }
+        }
+
+        let mut recorded: Vec<(String, String)> = ALIAS_REGISTRY
+            .iter()
+            .map(|(file, _, spelling)| ((*file).to_string(), (*spelling).to_string()))
+            .collect();
+        let mut unrecorded = Vec::new();
+
+        for entry in declared {
+            match recorded.iter().position(|candidate| candidate == &entry) {
+                Some(index) => {
+                    recorded.remove(index);
+                }
+                None => unrecorded.push(entry),
+            }
+        }
+
         assert!(
-            (major, minor) < (0, 2),
-            "Crate version {}. The legacy aliases (DocTopic `plans`; WorkflowKind \
-             `single`/`direct`; EditProtocolKind `structured_output`/`json_schema`/\
-             `json`; IssueStatus `done`; ReviewUpdateItemParams `resolution_notes`; \
-             ReviewIssue and ReviewItem `resolution_notes`; PlanReplanParams \
-             `id`/`item_id`; PlanRefineParams `id`) were scheduled for removal in \
-             0.2.0. Remove them and delete this test.",
-            PROTOCOL_VERSION
+            unrecorded.is_empty(),
+            "these source `alias` attributes carry no registry record: {unrecorded:?}. \
+             Record each spelling in `ALIAS_REGISTRY`."
+        );
+        assert!(
+            recorded.is_empty(),
+            "these `ALIAS_REGISTRY` records match no source attribute: {recorded:?}. \
+             Delete each stale record, or restore the attribute it documents."
         );
     }
     /// Source text of every facade module whose `pub use` statements form the
@@ -262,6 +445,22 @@ mod wire_contract_tracking {
         ("edit", "ChangeConversionError"),
         ("edit", "normalize_repo_path"),
     ];
+
+    /// Sanctioned rename of a declared constant at the crate root.
+    ///
+    /// Each entry pairs the module that declares the constant and the declared
+    /// name with the name the root facade exports it under. A declaration
+    /// reaches the crate root under its own name unless an entry records
+    /// otherwise, so the table is the authoritative record of the exceptions
+    /// rather than a list that can silently absorb an omission.
+    type FacadeRename = (&'static str, &'static str, &'static str);
+
+    /// The single sanctioned rename of the wire contract.
+    ///
+    /// `events::MODEL_ERROR` is exported as `MODEL_ERROR_EVENT` because the RPC
+    /// error code and the event method share one identifier, and the error code
+    /// keeps the bare name every other error constant uses.
+    const FACADE_RENAMES: &[FacadeRename] = &[("events", "MODEL_ERROR", "MODEL_ERROR_EVENT")];
 
     /// Line that opens this tracking module at the tail of `lib.rs`.
     const ROOT_TEST_MODULE_MARKER: &str = "#[cfg(test)]";
@@ -415,6 +614,64 @@ mod wire_contract_tracking {
         names
     }
 
+    /// Reports whether one declared constant type is a string type.
+    ///
+    /// The wire contract declares its name constants as `&str`, so a borrowed
+    /// string type is the coverage class the declaration test enumerates. Any
+    /// other type — the `Duration` budgets of `lifecycle.rs`, an integer, a
+    /// slice — belongs to a different class and is skipped instead of guessed.
+    fn is_string_type(declared_type: &str) -> bool {
+        let declared_type = declared_type.trim();
+        declared_type.starts_with('&') && declared_type.ends_with("str")
+    }
+
+    /// Every string constant one facade module declares directly.
+    ///
+    /// The scan mirrors the re-export scan: a declaration starts at a line
+    /// beginning with `pub const`, the identifier before the type colon is the
+    /// declared name, and the declared type decides whether the constant
+    /// belongs to this coverage class. A declaration whose left side is not a
+    /// plain identifier — the signature of a `pub const fn` helper, for
+    /// instance — is skipped the same way.
+    fn declared_string_constants(source: &str) -> BTreeSet<String> {
+        let mut names = BTreeSet::new();
+
+        for raw in source.lines() {
+            let trimmed = strip_line_comment(raw).trim();
+            let Some(rest) = trimmed.strip_prefix("pub const ") else {
+                continue;
+            };
+            let Some((name, type_and_value)) = rest.split_once(':') else {
+                continue;
+            };
+            let declared_type = type_and_value
+                .split_once('=')
+                .map_or(type_and_value, |(head, _)| head)
+                .trim();
+            if !is_string_type(declared_type) {
+                continue;
+            }
+            let name = name.trim();
+            if is_plain_identifier(name) {
+                names.insert(name.to_string());
+            }
+        }
+
+        names
+    }
+
+    /// Root name a declared constant must carry in the facade lists.
+    ///
+    /// A declaration reaches the crate root under its own name unless an entry
+    /// of `FACADE_RENAMES` records a sanctioned rename, so a caller asks this
+    /// function instead of branching on the table itself.
+    fn root_name_of<'a>(module: &str, declared: &'a str) -> &'a str {
+        FACADE_RENAMES
+            .iter()
+            .find(|(facade, name, _)| *facade == module && *name == declared)
+            .map_or(declared, |(_, _, renamed)| *renamed)
+    }
+
     /// Reports whether the exemption table records `module::name`.
     fn is_module_scoped_helper(module: &str, name: &str) -> bool {
         MODULE_SCOPED_HELPERS.contains(&(module, name))
@@ -453,6 +710,38 @@ mod wire_contract_tracking {
         );
     }
 
+    /// Pins the second coverage class the root facade owes: every string
+    /// constant a facade module declares directly.
+    ///
+    /// `root_facade_covers_every_module_facade_reexport` enumerates `pub use`
+    /// statements, so it cannot see a constant the module declares itself.
+    /// `errors.rs` declares its codes directly, which is how five of them left
+    /// the root list while that test stayed green. A declaration resolves at the
+    /// root under its own name unless `FACADE_RENAMES` records a rename.
+    #[test]
+    fn root_facade_covers_every_declared_string_constant() {
+        let root = root_facade_lists();
+        let mut missing: Vec<String> = Vec::new();
+
+        for &(module, source) in FACADE_SOURCES {
+            let root_list = root.get(module);
+            for name in declared_string_constants(source) {
+                let root_name = root_name_of(module, name.as_str());
+                if root_list.is_some_and(|names| names.contains(root_name)) {
+                    continue;
+                }
+                missing.push(format!("{module}::{name}"));
+            }
+        }
+
+        assert!(
+            missing.is_empty(),
+            "these facade declarations do not resolve at the crate root: {missing:?}. \
+             Add each name to the root `pub use <module>::{{ ... }}` list in `lib.rs`, or \
+             record it in `FACADE_RENAMES` when the root exports it under another name."
+        );
+    }
+
     /// Keeps the exemption table exact: every entry still exists and stays out
     /// of the root.
     ///
@@ -483,6 +772,45 @@ mod wire_contract_tracking {
                 "{module}::{name} is recorded in MODULE_SCOPED_HELPERS, but it also resolves \
                  at the crate root; delete the entry so the table records only genuine \
                  exemptions"
+            );
+        }
+    }
+
+    /// Keeps the rename table exact: every entry still matches its declaration,
+    /// its root name, and the absence of the declared name at the root.
+    ///
+    /// A stale entry — a constant that was renamed back, deleted, or never
+    /// renamed at all — fails here, so the table records only genuine renames
+    /// and never widens into a blanket allowance for root omissions.
+    #[test]
+    fn facade_rename_table_stays_honest() {
+        let root = root_facade_lists();
+
+        for &(module, declared, renamed) in FACADE_RENAMES {
+            let source = FACADE_SOURCES
+                .iter()
+                .find(|(facade, _)| *facade == module)
+                .map(|(_, source)| *source);
+            let Some(source) = source else {
+                panic!("no facade source is recorded for rename {module}::{declared}");
+            };
+
+            assert!(
+                declared_string_constants(source).contains(declared),
+                "{module}::{declared} is recorded in FACADE_RENAMES, but the {module} \
+                 module no longer declares it; delete the entry"
+            );
+            let root_list = root.get(module);
+            assert!(
+                root_list.is_some_and(|names| names.contains(renamed)),
+                "{module}::{renamed} is recorded in FACADE_RENAMES as the root name of \
+                 {module}::{declared}, but it does not resolve at the crate root; restore \
+                 the re-export or delete the entry"
+            );
+            assert!(
+                !root_list.is_some_and(|names| names.contains(declared)),
+                "{module}::{declared} is recorded in FACADE_RENAMES, but it also resolves at \
+                 the crate root; delete the entry so the table records only genuine renames"
             );
         }
     }

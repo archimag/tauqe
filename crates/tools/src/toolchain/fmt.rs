@@ -287,6 +287,7 @@ fn compact(text: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    use super::super::exec::PROCESS_GROUP_STABILITY_WINDOW;
     use super::*;
     use tauqe_protocol::ProjectCommandSpec;
 
@@ -480,7 +481,7 @@ mod tests {
         let heartbeat = dir.path().join("heartbeat.log");
         let size_at_kill = std::fs::metadata(&heartbeat).map(|m| m.len()).unwrap_or(0);
         assert!(size_at_kill > 0, "the grandchild never wrote");
-        tokio::time::sleep(std::time::Duration::from_millis(2200)).await;
+        tokio::time::sleep(PROCESS_GROUP_STABILITY_WINDOW).await;
         let size_later = std::fs::metadata(&heartbeat).map(|m| m.len()).unwrap_or(0);
         assert_eq!(
             size_at_kill, size_later,

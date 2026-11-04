@@ -1,7 +1,9 @@
 use crate::edits::protocol::xml::tags::{ParsedPlanItem, ParsedPlanTag};
 use std::path::Path;
 use std::time::SystemTime;
-use tauqe_protocol::{DiscussionPlanAction, DiscussionPlanUpdate, Plan, PlanItem, PlanItemStatus};
+use tauqe_protocol::{
+    DiscussionPlanAction, DiscussionPlanUpdate, Plan, PlanItem, PlanItemStatus, PlanRejection,
+};
 
 use super::{PlanApplicationOutcome, PlanMutationMode, PlanStorage};
 
@@ -171,7 +173,7 @@ impl PlanStorage {
     fn apply_parsed_plans_unlocked(
         repo_root: &Path,
         parsed: Vec<ParsedPlanTag>,
-        mut errors: Vec<String>,
+        errors: Vec<String>,
         replacement: SaveItemsReplacement,
         mode: PlanMutationMode,
     ) -> PlanApplicationOutcome {
@@ -179,6 +181,14 @@ impl PlanStorage {
             return PlanApplicationOutcome::default();
         }
 
+        // A diagnostic the parser already reported describes a payload the
+        // planning contract refused, so the batch enters typed: every entry is
+        // classified here, where the refusal was produced, and no consumer ever
+        // derives a category from the wording of a reason.
+        let mut errors: Vec<PlanRejection> = errors
+            .into_iter()
+            .map(PlanRejection::payload_defect)
+            .collect();
         let mut applied = Vec::new();
         let mut warnings: Vec<String> = Vec::new();
         let now = SystemTime::now()
@@ -196,18 +206,18 @@ impl PlanStorage {
 
             match mode {
                 PlanMutationMode::IsolatedStep => {
-                    errors.push(format!(
+                    errors.push(PlanRejection::mode_forbidden(format!(
                         "Cannot perform plan action '{}' during isolated step execution: plan mutations are strictly prohibited during step execution",
                         action
-                    ));
+                    )));
                     continue;
                 }
                 PlanMutationMode::Repl => {
                     if action != "save" {
-                        errors.push(format!(
+                        errors.push(PlanRejection::mode_forbidden(format!(
                             "Cannot perform plan action '{}' in REPL mode: only 'save' is permitted (plan modifications and deletions belong exclusively in Discussion mode)",
                             action
-                        ));
+                        )));
                         continue;
                     }
                     let already_exists =
@@ -216,10 +226,10 @@ impl PlanStorage {
                                 .iter()
                                 .any(|p: &Plan| p.id.eq_ignore_ascii_case(&tag.id));
                     if already_exists {
-                        errors.push(format!(
+                        errors.push(PlanRejection::mode_forbidden(format!(
                             "Cannot modify existing plan '{}' in REPL mode: modifying existing plans belongs exclusively in Discussion mode",
                             tag.id
-                        ));
+                        )));
                         continue;
                     }
                 }
@@ -229,10 +239,10 @@ impl PlanStorage {
             match action.as_str() {
                 "save" => {
                     if tag.concept.is_empty() {
-                        errors.push(format!(
+                        errors.push(PlanRejection::payload_defect(format!(
                             "Cannot save plan '{}': plan must contain a <concept> section defining architectural intent and invariants",
                             tag.id
-                        ));
+                        )));
                         continue;
                     }
                     let matched_plan =
@@ -292,7 +302,10 @@ impl PlanStorage {
                             warnings.append(&mut tag_warnings);
                         }
                         Err(err) => {
-                            errors.push(format!("Failed to save plan '{}': {:#}", plan.id, err));
+                            errors.push(PlanRejection::payload_defect(format!(
+                                "Failed to save plan '{}': {:#}",
+                                plan.id, err
+                            )));
                         }
                     }
                 }
@@ -303,11 +316,11 @@ impl PlanStorage {
                             crate::plan::matcher::PlanResolution::Ambiguous(candidates) => {
                                 let candidate_ids: Vec<String> =
                                     candidates.iter().map(|p| format!("'{}'", p.id)).collect();
-                                errors.push(format!(
+                                errors.push(PlanRejection::payload_defect(format!(
                                     "Cannot update plan '{}': ambiguous match, candidates: {}",
                                     tag.id,
                                     candidate_ids.join(", ")
-                                ));
+                                )));
                                 continue;
                             }
                             crate::plan::matcher::PlanResolution::NotFound => {
@@ -403,10 +416,10 @@ impl PlanStorage {
                             // moving containers restructures the plan and stays the
                             // sole province of `save`.
                             if !update_item.children.is_empty() {
-                                errors.push(format!(
+                                errors.push(PlanRejection::payload_defect(format!(
                                     "Cannot add step '{}' to plan '{}': update may add leaf steps only, use save to restructure the plan",
                                     update_item.id, plan.id
-                                ));
+                                )));
                                 continue;
                             }
                             // A step the stored plan does not contain is being
@@ -439,10 +452,10 @@ impl PlanStorage {
                                 warnings.append(&mut tag_warnings);
                             }
                             Err(err) => {
-                                errors.push(format!(
+                                errors.push(PlanRejection::payload_defect(format!(
                                     "Failed to save updated plan '{}': {:#}",
                                     plan.id, err
-                                ));
+                                )));
                             }
                         }
                     } else {
@@ -453,10 +466,10 @@ impl PlanStorage {
                         } else {
                             format!("available plans: {}", available.join(", "))
                         };
-                        errors.push(format!(
+                        errors.push(PlanRejection::payload_defect(format!(
                             "Cannot update plan '{}': plan not found ({hint})",
                             tag.id
-                        ));
+                        )));
                     }
                 }
                 "delete" => {
@@ -467,17 +480,23 @@ impl PlanStorage {
                     match Self::delete_plan_unlocked(repo_root, target_id) {
                         Ok(true) => {}
                         Ok(false) => {
-                            errors.push(format!("Cannot delete plan '{}': plan not found", tag.id));
+                            errors.push(PlanRejection::payload_defect(format!(
+                                "Cannot delete plan '{}': plan not found",
+                                tag.id
+                            )));
                         }
                         Err(err) => {
-                            errors.push(format!("Failed to delete plan '{}': {:#}", tag.id, err));
+                            errors.push(PlanRejection::payload_defect(format!(
+                                "Failed to delete plan '{}': {:#}",
+                                tag.id, err
+                            )));
                         }
                     }
                 }
                 other => {
-                    errors.push(format!(
+                    errors.push(PlanRejection::payload_defect(format!(
                         "Unsupported plan action '{other}' (expected save, update, or delete)"
-                    ));
+                    )));
                 }
             }
         }
@@ -552,10 +571,10 @@ impl PlanStorage {
             if action == "save" && update.concept.is_empty() {
                 return PlanApplicationOutcome {
                     applied: Vec::new(),
-                    errors: vec![format!(
+                    errors: vec![PlanRejection::payload_defect(format!(
                         "Cannot save plan '{}': plan must contain a concept tree defining architectural intent and invariants",
                         plan_id
-                    )],
+                    ))],
                     warnings: Vec::new(),
                 };
             }
@@ -601,7 +620,7 @@ impl PlanStorage {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tauqe_protocol::PlanItemStatus;
+    use tauqe_protocol::{PlanItemStatus, PlanRejectionKind};
     use tempfile::tempdir;
 
     #[test]
@@ -661,7 +680,12 @@ Step 1 is done:
         let res = PlanStorage::apply_plan_tags(root, unclosed);
         assert!(res.applied.is_empty());
         assert!(!res.errors.is_empty());
-        assert!(res.errors[0].contains("missing closing tag"));
+        assert_eq!(
+            res.errors[0].kind,
+            PlanRejectionKind::PayloadDefect,
+            "a parser diagnostic describes a defect of the payload"
+        );
+        assert!(res.errors[0].message.contains("missing closing tag"));
 
         // 2. Non-existent plan on update
         let update_missing =
@@ -669,7 +693,10 @@ Step 1 is done:
         let res_missing = PlanStorage::apply_plan_tags(root, update_missing);
         assert!(res_missing.applied.is_empty());
         assert_eq!(res_missing.errors.len(), 1);
-        assert!(res_missing.errors[0].contains("Cannot update plan 'non-existent'"));
+        assert_eq!(res_missing.errors[0].kind, PlanRejectionKind::PayloadDefect);
+        assert!(res_missing.errors[0]
+            .message
+            .contains("Cannot update plan 'non-existent'"));
 
         // 3. Non-existent item on update
         let valid_plan = Plan::from_parts(
@@ -848,8 +875,12 @@ Step 1 is done:
         let dup_res = PlanStorage::apply_plan_tags(root, duplicates);
         assert!(dup_res.applied.is_empty());
         assert_eq!(dup_res.errors.len(), 1);
-        assert!(dup_res.errors[0].contains("Cannot save plan 'validation-plan'"));
-        assert!(dup_res.errors[0].contains("Duplicate step ID: '2'"));
+        assert_eq!(dup_res.errors.len(), 1);
+        assert_eq!(dup_res.errors[0].kind, PlanRejectionKind::PayloadDefect);
+        assert!(dup_res.errors[0]
+            .message
+            .contains("Cannot save plan 'validation-plan'"));
+        assert!(dup_res.errors[0].message.contains("Duplicate step ID: '2'"));
 
         // A new step naming a dependency that does not exist.
         let dangling = r#"
@@ -860,8 +891,17 @@ Step 1 is done:
         let dangling_res = PlanStorage::apply_plan_tags(root, dangling);
         assert!(dangling_res.applied.is_empty());
         assert_eq!(dangling_res.errors.len(), 1);
-        assert!(dangling_res.errors[0].contains("Cannot save plan 'validation-plan'"));
-        assert!(dangling_res.errors[0].contains("references non-existent dependency '99'"));
+        assert_eq!(dangling_res.errors.len(), 1);
+        assert_eq!(
+            dangling_res.errors[0].kind,
+            PlanRejectionKind::PayloadDefect
+        );
+        assert!(dangling_res.errors[0]
+            .message
+            .contains("Cannot save plan 'validation-plan'"));
+        assert!(dangling_res.errors[0]
+            .message
+            .contains("non-existent dependency '99'"));
 
         // Restructuring the tree is not a delta update operation.
         let container = r#"
@@ -874,7 +914,13 @@ Step 1 is done:
         let container_res = PlanStorage::apply_plan_tags(root, container);
         assert!(container_res.applied.is_empty());
         assert_eq!(container_res.errors.len(), 1);
-        assert!(container_res.errors[0].contains("update may add leaf steps only"));
+        assert_eq!(
+            container_res.errors[0].kind,
+            PlanRejectionKind::PayloadDefect
+        );
+        assert!(container_res.errors[0]
+            .message
+            .contains("update may add leaf steps only"));
 
         // Nothing reached disk.
         let reloaded = PlanStorage::load_plan(root, "validation-plan")
@@ -1056,9 +1102,10 @@ Step 1 is done:
         let outcome = PlanStorage::apply_plan_tags(root, update_text);
         assert!(outcome.applied.is_empty());
         assert_eq!(outcome.errors.len(), 1);
-        assert!(outcome.errors[0].contains("ambiguous match"));
-        assert!(outcome.errors[0].contains("'feature-alpha'"));
-        assert!(outcome.errors[0].contains("'feature-beta'"));
+        assert_eq!(outcome.errors[0].kind, PlanRejectionKind::PayloadDefect);
+        assert!(outcome.errors[0].message.contains("ambiguous match"));
+        assert!(outcome.errors[0].message.contains("'feature-alpha'"));
+        assert!(outcome.errors[0].message.contains("'feature-beta'"));
 
         // Neither plan was modified
         let p1_reloaded = PlanStorage::load_plan(root, "feature-alpha")
@@ -1185,7 +1232,13 @@ Step 1 is done:
         );
         assert!(res_isolated.applied.is_empty());
         assert_eq!(res_isolated.errors.len(), 1);
-        assert!(res_isolated.errors[0].contains("isolated step execution"));
+        assert_eq!(
+            res_isolated.errors[0].kind,
+            PlanRejectionKind::ModeForbidden
+        );
+        assert!(res_isolated.errors[0]
+            .message
+            .contains("isolated step execution"));
 
         // 2. REPL mode permits saving a new plan
         let res_repl_save =
@@ -1203,7 +1256,11 @@ Step 1 is done:
             PlanStorage::apply_plan_tags_with_mode(root, update_text, PlanMutationMode::Repl);
         assert!(res_repl_update.applied.is_empty());
         assert_eq!(res_repl_update.errors.len(), 1);
-        assert!(res_repl_update.errors[0].contains("in REPL mode: only 'save' is permitted"));
+        assert_eq!(
+            res_repl_update.errors[0].kind,
+            PlanRejectionKind::ModeForbidden
+        );
+        assert!(res_repl_update.errors[0].message.contains("in REPL mode"));
 
         // 4. REPL mode forbids deleting a plan
         let delete_text = r#"<plan action="delete" id="plan-mode-test" />"#;
@@ -1211,7 +1268,11 @@ Step 1 is done:
             PlanStorage::apply_plan_tags_with_mode(root, delete_text, PlanMutationMode::Repl);
         assert!(res_repl_delete.applied.is_empty());
         assert_eq!(res_repl_delete.errors.len(), 1);
-        assert!(res_repl_delete.errors[0].contains("in REPL mode: only 'save' is permitted"));
+        assert_eq!(
+            res_repl_delete.errors[0].kind,
+            PlanRejectionKind::ModeForbidden
+        );
+        assert!(res_repl_delete.errors[0].message.contains("in REPL mode"));
 
         // 5. REPL mode forbids modifying an existing plan even with action="save"
         let overwrite_text = r#"
@@ -1225,8 +1286,13 @@ Step 1 is done:
             PlanStorage::apply_plan_tags_with_mode(root, overwrite_text, PlanMutationMode::Repl);
         assert!(res_repl_overwrite.applied.is_empty());
         assert_eq!(res_repl_overwrite.errors.len(), 1);
+        assert_eq!(
+            res_repl_overwrite.errors[0].kind,
+            PlanRejectionKind::ModeForbidden
+        );
         assert!(res_repl_overwrite.errors[0]
-            .contains("Cannot modify existing plan 'plan-mode-test' in REPL mode"));
+            .message
+            .contains("in REPL mode"));
 
         // 6. Discussion mode permits update
         let res_disc_update =

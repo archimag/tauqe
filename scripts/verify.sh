@@ -25,6 +25,17 @@ set -euo pipefail
 # anchors itself at the repository root whatever directory the caller used.
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
 
+# The test binaries build their scratch repositories through `tempfile` and
+# `std::env::temp_dir`, and both honour TMPDIR. Pointing TMPDIR at a writable
+# tmpfs mount moves every scratch repository into RAM, so the repository churn
+# the suites perform (git init, commits, file fixtures) stops paying disk
+# latency and no single test has to change. An explicitly set TMPDIR always
+# wins, and a machine without a writable /dev/shm keeps its platform default.
+# A container with a small /dev/shm (Docker defaults to 64 MiB) should raise
+# the mount size instead of relying on this default.
+if [ -z "${TMPDIR:-}" ] && [ -d /dev/shm ] && [ -w /dev/shm ]; then
+    export TMPDIR=/dev/shm
+fi
 # The change set arrives on standard input. A terminal means the script was
 # started by hand, and nothing piped in means the harness did not narrow the run:
 # both cases fall through to the complete suite.
@@ -162,8 +173,8 @@ else
     fi
 fi
 
-printf 'verify: %d changed path(s); cargo=%d (%s) markdown=%d\n' \
-    "${#changed[@]}" "$run_cargo" "${cargo_args[*]:-none}" "$run_md" >&2
+printf 'verify: %d changed path(s); cargo=%d (%s) markdown=%d tmpdir=%s\n' \
+    "${#changed[@]}" "$run_cargo" "${cargo_args[*]:-none}" "$run_md" "${TMPDIR:-system-default}" >&2
 
 # The first failing check decides the verdict, so the remaining ones do not run
 # against a change set that already failed.

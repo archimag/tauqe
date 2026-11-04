@@ -332,6 +332,13 @@ pub struct ReplView {
     pub rendered_lines_count: usize,
     pub copy_flash: Option<(usize, std::time::Instant)>,
     pub code_blocks: Vec<ModelCodeBlock>,
+    /// Hyperlinks of the rendered answer, in the columns the Markdown renderer
+    /// painted them at.
+    ///
+    /// The answer is parsed once, so the registry reads the links of that parse
+    /// instead of re-parsing the body on every frame; the viewport resolves them
+    /// onto the rows it draws (c-1, c-3).
+    pub links: Vec<crate::markdown::ExtractedLink>,
     pub content_width: usize,
     /// Vertical scroll offset of the prompt editor, retained across frames so
     /// the cursor keeps its position instead of sticking to the bottom row.
@@ -391,6 +398,7 @@ impl Default for ReplView {
             rendered_lines_count: 0,
             copy_flash: None,
             code_blocks: Vec::new(),
+            links: Vec::new(),
             content_width: 0,
             input_scroll: 0,
             esc_clear_armed: None,
@@ -418,6 +426,7 @@ impl ReplView {
         self.text.clear();
         self.markdown_lines.clear();
         self.code_blocks.clear();
+        self.links.clear();
         self.diff_cache = DiffRenderCache::default();
         self.markdown_dirty = false;
         self.last_markdown_render = None;
@@ -489,9 +498,10 @@ impl ReplView {
         if self.content_width > 0 {
             theme.max_width = Some(self.content_width);
         }
-        let (lines, blocks) =
+        let (lines, blocks, links) =
             crate::markdown::render_markdown_with_blocks(&self.text, &theme, flashing_id);
         self.markdown_lines = lines;
+        self.links = links;
         self.code_blocks = blocks
             .into_iter()
             .map(|b| ModelCodeBlock {
@@ -857,6 +867,13 @@ mod turn_reset_tests {
             visual_start_line: 0,
             visual_end_line: 1,
         });
+        view.links.push(crate::markdown::ExtractedLink {
+            id: 0,
+            url: "https://example.com".to_string(),
+            line_idx: 0,
+            start_col: 4,
+            end_col: 21,
+        });
         view.files.push(StreamingFileEdit {
             path: "crates/tui/src/lib.rs".to_string(),
             op_type: EditOp::Replace,
@@ -905,6 +922,7 @@ mod turn_reset_tests {
         assert!(view.text.is_empty());
         assert!(view.markdown_lines.is_empty());
         assert!(view.code_blocks.is_empty());
+        assert!(view.links.is_empty());
         assert!(view.files.is_empty());
         assert!(!view.edits_active);
         assert!(view.edit_final_applied.is_none());

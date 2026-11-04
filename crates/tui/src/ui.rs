@@ -50,7 +50,11 @@ const COMPACT_TERM_HEIGHT: u16 = 20;
 /// A component declares the rectangle it has just drawn together with one of
 /// these actions, so adding, moving, or removing an interactive element touches
 /// only the component that renders it and never the input dispatcher (c-1).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// An action may carry owned data — the target of a hyperlink is the address the
+/// renderer painted — so the registry clones a declaration instead of copying it
+/// (c-3).
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum UiAction {
     /// Switch the active tab to another view mode.
     SwitchView(ViewMode),
@@ -67,10 +71,16 @@ pub enum UiAction {
     },
     /// A click landed inside a rendered code block, outside its copy button.
     CodeBlockBody,
+    /// Open a Markdown hyperlink in the developer's browser.
+    ///
+    /// The target travels as the address the renderer painted it with, so the
+    /// pointer dispatcher never re-derives it from a row, a column, or a scroll
+    /// offset (c-3).
+    OpenUrl(String),
 }
 
 /// One interactive rectangle declared by the component that draws it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HitRegion {
     /// Screen rectangle that receives the pointer.
     pub rect: Rect,
@@ -103,12 +113,15 @@ impl HitRegistry {
     ///
     /// Regions are consulted in reverse registration order, so a surface drawn
     /// later — a dialog over a view — wins over whatever it covers.
+    ///
+    /// The declaration is cloned rather than copied because a hyperlink target is
+    /// owned text, so the registry hands back exactly what it was given (c-3).
     pub fn action_at(&self, column: u16, row: u16) -> Option<UiAction> {
         self.regions
             .iter()
             .rev()
             .find(|region| crate::input::mouse::rect_contains(region.rect, column, row))
-            .map(|region| region.action)
+            .map(|region| region.action.clone())
     }
 
     /// Regions declared by the components of the current frame, in draw order.
@@ -161,6 +174,18 @@ fn render_terminal_too_small(frame: &mut ratatui::Frame) {
     frame.render_widget(Paragraph::new(lines).alignment(Alignment::Center), rect);
 }
 
+/// Height the prompt pane occupies for a wrapped draft of `line_count` visual
+/// lines: the two border rows plus the draft, clamped to the terminal budget.
+///
+/// The wrapped count is narrowed through the saturating conversion the crate
+/// uses for every line count, so a draft long enough to overflow the `u16`
+/// viewport unit can neither wrap around in release nor panic under the debug
+/// overflow checks, and the clamp below bounds the result either way (c-2).
+fn prompt_pane_height(line_count: usize, max_input_height: u16) -> u16 {
+    let lines = u16::try_from(line_count).unwrap_or(u16::MAX);
+    lines.saturating_add(2).max(3).min(max_input_height)
+}
+
 pub fn render_ui(frame: &mut ratatui::Frame, state: &mut AppState) {
     let area = frame.area();
     state.last_frame_area = area;
@@ -203,7 +228,7 @@ pub fn render_ui(frame: &mut ratatui::Frame, state: &mut AppState) {
         let (lines, cursor) = state
             .input_editor
             .build_prompt_lines(inner_input_width, is_busy);
-        let height = (lines.len() as u16 + 2).max(3).min(max_input_height);
+        let height = prompt_pane_height(lines.len(), max_input_height);
         (lines, cursor, height)
     } else if compact {
         (Vec::new(), 0, 0)
@@ -449,5 +474,44 @@ mod hit_tests {
                 block: 3,
             })
         );
+    }
+    #[test]
+    fn a_link_region_resolves_to_the_address_it_opens() {
+        let mut registry = HitRegistry::default();
+        registry.register(
+            Rect::new(4, 6, 12, 1),
+            UiAction::OpenUrl("https://example.com".to_string()),
+        );
+
+        assert_eq!(
+            registry.action_at(5, 6),
+            Some(UiAction::OpenUrl("https://example.com".to_string()))
+        );
+        // The right edge is exclusive and empty space resolves to no action, so
+        // a link never swallows a click that belongs to its neighbour.
+        assert_eq!(registry.action_at(16, 6), None);
+        assert_eq!(registry.action_at(20, 6), None);
+    }
+}
+
+#[cfg(test)]
+mod prompt_height_tests {
+    use super::*;
+
+    /// A draft whose wrapped visual lines reach the top of the `u16` range
+    /// would overflow the border-row addition if the count were narrowed first,
+    /// and a longer one would truncate into an arbitrary height. Both stay
+    /// inside the terminal budget instead (c-2).
+    #[test]
+    fn prompt_pane_height_saturates_instead_of_wrapping_the_wrapped_line_count() {
+        assert_eq!(prompt_pane_height(usize::from(u16::MAX) - 1, 16), 16);
+        assert_eq!(prompt_pane_height(usize::from(u16::MAX), 16), 16);
+        assert_eq!(prompt_pane_height(usize::MAX, 16), 16);
+
+        // A short draft keeps its natural height: two border rows plus four
+        // lines, and an empty draft never falls below the three-row minimum.
+        assert_eq!(prompt_pane_height(4, 16), 6);
+        assert_eq!(prompt_pane_height(0, 16), 3);
+        assert_eq!(prompt_pane_height(20, 16), 16);
     }
 }

@@ -57,7 +57,7 @@ use crate::handlers::host::ServerImplementationHost;
 use crate::handlers::PreflightVerdict;
 use crate::state::{AppState, OperationGuard};
 
-use super::common::{clear_auto_context, emit, offload_review, publish_review};
+use super::common::{cleanup_transient_context, emit, offload_review, publish_review};
 
 /// Separator binding the session identifier to the group identifier of a
 /// group-member batch target.
@@ -793,7 +793,9 @@ pub(super) async fn run_review_batch_with_options(
             offload_review(move || ReviewStorage::save_active_id(&save_root, Some(&owner_owned)))
                 .await;
     }
-    clear_auto_context(state).await;
+    // A batch starts from a released transient context: nothing a previous turn
+    // discovered or mounted survives into the findings it is about to run.
+    cleanup_transient_context(state).await;
 
     let started_at = std::time::Instant::now();
 
@@ -880,7 +882,9 @@ pub(super) async fn run_review_batch_with_options(
         }
     };
 
-    clear_auto_context(state).await;
+    // The transient context is released again once the queue settles, so the
+    // next run starts from the same clean basis.
+    cleanup_transient_context(state).await;
 
     emit(
         &state.out,
@@ -1180,6 +1184,7 @@ mod tests {
             id,
             title: format!("Finding {id}"),
             uuid: None,
+            commit: None,
             group: group.map(str::to_string),
             model: None,
             issue_type,

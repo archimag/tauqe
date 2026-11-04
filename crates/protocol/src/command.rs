@@ -13,7 +13,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::context::ContextAccess;
-use crate::discussion::{normalize_repo_map_path, DiscussionPlanAction, DiscussionPlanUpdate};
+use crate::discussion::{DiscussionPlanAction, DiscussionPlanUpdate};
 use crate::edit::EditOperation;
 
 pub mod capability;
@@ -39,22 +39,34 @@ pub enum LlmCommand {
     /// Conversational text emitted to the user interface.
     Text { content: String },
     /// A single file edit operation.
+    ///
+    /// [`EditOperation`] confines every path it carries at the serde boundary,
+    /// so a decoded edit can never address a location outside the repository.
     Edit { operation: EditOperation },
     /// A request to add a file to the context at a given access level.
-    ContextRequest { path: String, access: ContextAccess },
+    ///
+    /// The path follows the same wire rules as an [`EditOperation`] path: the
+    /// serde boundary normalizes a benign spelling and rejects a spelling that
+    /// escapes the repository, because a typed variant cannot silently drop
+    /// itself. The engine still confines the path against the repository root.
+    ContextRequest {
+        #[serde(deserialize_with = "crate::edit::proposal::deserialize_repo_path")]
+        path: String,
+        access: ContextAccess,
+    },
     /// A search request across repository files using Rust/ripgrep regex.
     ///
     /// `path` is repository-relative and confines the search to that subtree;
-    /// an empty path names the whole repository. The serde boundary
-    /// normalizes a benign spelling such as `./src` to `src` and rejects a
-    /// spelling that escapes the repository, because an enum variant cannot
-    /// silently drop itself: a malformed search surfaces as a decode failure
-    /// instead of reaching the engine. A programmatic producer hands over an
-    /// already-normalized path, and the engine still confines the path at
-    /// execution, exactly as
+    /// an empty path names the whole repository. The serde boundary applies the
+    /// crate's shared repository-path rules, so a benign spelling such as
+    /// `./src` normalizes to `src` and a spelling that escapes the repository
+    /// surfaces as a decode failure naming it instead of reaching the engine: a
+    /// typed variant cannot silently drop itself. A programmatic producer hands
+    /// over an already-normalized path, and the engine still confines the path
+    /// at execution, exactly as
     /// [`normalize_repo_path`](crate::edit::normalize_repo_path) documents.
     RepoSearch {
-        #[serde(deserialize_with = "deserialize_repo_search_command_path")]
+        #[serde(deserialize_with = "crate::discussion::normalize::deserialize_repo_map_path")]
         path: String,
         regex: String,
     },
@@ -63,15 +75,26 @@ pub enum LlmCommand {
     /// A request for the targeted symbol map of one subdirectory.
     ///
     /// The path is a repository-relative prefix matching whole path components;
-    /// an empty path names the whole repository.
-    RepoMap { path: String },
+    /// an empty path names the whole repository. The serde boundary applies the
+    /// same rules as the search request: a benign spelling normalizes, and an
+    /// escaping one is a decode failure naming it.
+    RepoMap {
+        #[serde(deserialize_with = "crate::discussion::normalize::deserialize_repo_map_path")]
+        path: String,
+    },
     /// A request for the tracked-file listing of one directory.
     ///
     /// The path is a repository-relative directory prefix matching whole path
     /// components; an empty path names the repository root. `recursive` widens
     /// the listing from the direct children to every tracked file underneath,
-    /// keeping the default request shallow.
-    DirList { path: String, recursive: bool },
+    /// keeping the default request shallow. The serde boundary applies the same
+    /// rules as the search request, so a listing can never address a location
+    /// outside the repository.
+    DirList {
+        #[serde(deserialize_with = "crate::discussion::normalize::deserialize_repo_map_path")]
+        path: String,
+        recursive: bool,
+    },
     /// A request for harness system documentation by topic.
     ///
     /// The command is canonically spelled `tauqe_doc_request`, and the
@@ -180,22 +203,6 @@ impl LlmCommand {
     pub fn phase(&self) -> Option<CapabilityPhase> {
         self.capability().map(LlmCapability::phase)
     }
-}
-/// Deserializes the `path` of an [`LlmCommand::RepoSearch`] through the shared
-/// repository-path rules.
-///
-/// The discovery lists of the discussion boundary drop an escaping entry,
-/// while an enum variant cannot silently drop itself, so a malformed search
-/// path surfaces as a decode failure naming the rejected path instead of
-/// reaching the engine.
-fn deserialize_repo_search_command_path<'de, D>(deserializer: D) -> Result<String, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    let raw = String::deserialize(deserializer)?;
-    normalize_repo_map_path(&raw).ok_or_else(|| {
-        serde::de::Error::custom(format!("Search path '{raw}' must be repository-relative"))
-    })
 }
 
 /// Deterministic toolchain verification target requested by the model.
@@ -328,33 +335,82 @@ mod tests {
         assert!(json.contains("\"recursive\":true"));
         assert_eq!(serde_json::from_str::<LlmCommand>(&json).unwrap(), dir_list);
     }
+    /// Returns one payload per command that carries a repository path.
+    ///
+    /// Every entry addresses the same spelling, so one loop proves that every
+    /// command applies the path rules the search command already applied.
+    fn path_payloads(path: &str) -> Vec<serde_json::Value> {
+        vec![
+            serde_json::json!({"type": "context_request", "path": path, "access": "read_only"}),
+            serde_json::json!({"type": "repo_search", "path": path, "regex": "fn main"}),
+            serde_json::json!({"type": "repo_map", "path": path}),
+            serde_json::json!({"type": "dir_list", "path": path, "recursive": true}),
+            serde_json::json!({"type": "edit", "operation": {"type": "delete", "path": path}}),
+            serde_json::json!({
+                "type": "edit",
+                "operation": {"type": "move", "from": path, "to": "src/b.rs"},
+            }),
+            serde_json::json!({
+                "type": "edit",
+                "operation": {"type": "move_dir", "from": "src/old", "to": path},
+            }),
+        ]
+    }
+
     #[test]
-    fn test_repo_search_command_path_is_normalized_or_rejected() {
-        // A benign spelling decodes to its normalized repository-relative form.
-        let normalized: LlmCommand = serde_json::from_value(serde_json::json!({
-            "type": "repo_search",
-            "path": "./src",
-            "regex": "fn main",
+    fn test_every_command_path_is_normalized_or_rejected() {
+        // A benign spelling reaches the engine already normalized, so no
+        // consumer has to re-clean a path the boundary could have cleaned.
+        let context: LlmCommand = serde_json::from_value(serde_json::json!({
+            "type": "context_request",
+            "path": " ./src/a.rs ",
+            "access": "editable",
         }))
-        .expect("a benign search path must decode");
+        .expect("a benign context path must decode");
         assert_eq!(
-            normalized,
-            LlmCommand::RepoSearch {
-                path: "src".to_string(),
-                regex: "fn main".to_string(),
+            context,
+            LlmCommand::ContextRequest {
+                path: "src/a.rs".to_string(),
+                access: ContextAccess::Editable,
             }
         );
 
-        // An empty path, `.`, and `./` all name the whole repository.
+        let map: LlmCommand =
+            serde_json::from_value(serde_json::json!({"type": "repo_map", "path": "./crates"}))
+                .expect("a benign map path must decode");
+        assert_eq!(
+            map,
+            LlmCommand::RepoMap {
+                path: "crates".to_string(),
+            }
+        );
+
+        // An empty path, `.`, and `./` name the whole repository on both
+        // discovery variants that accept a subtree prefix.
         for spelling in ["", ".", "./"] {
-            let whole_repository: LlmCommand = serde_json::from_value(serde_json::json!({
+            let listing: LlmCommand = serde_json::from_value(serde_json::json!({
+                "type": "dir_list",
+                "path": spelling,
+                "recursive": false,
+            }))
+            .expect("a whole-repository listing path must decode");
+            assert_eq!(
+                listing,
+                LlmCommand::DirList {
+                    path: String::new(),
+                    recursive: false,
+                },
+                "spelling '{spelling}' must name the whole repository"
+            );
+
+            let search: LlmCommand = serde_json::from_value(serde_json::json!({
                 "type": "repo_search",
                 "path": spelling,
                 "regex": "fn main",
             }))
             .expect("a whole-repository search path must decode");
             assert_eq!(
-                whole_repository,
+                search,
                 LlmCommand::RepoSearch {
                     path: String::new(),
                     regex: "fn main".to_string(),
@@ -363,18 +419,52 @@ mod tests {
             );
         }
 
-        // An escaping spelling fails the command decode instead of reaching the
-        // engine, because an enum variant cannot silently drop itself.
+        // A file edit carries its paths through the same boundary, so a move
+        // arrives with both directories normalized.
+        let edit: LlmCommand = serde_json::from_value(serde_json::json!({
+            "type": "edit",
+            "operation": {"type": "move", "from": "./src/a.rs", "to": " ./src/b.rs "},
+        }))
+        .expect("a benign move must decode");
+        assert_eq!(
+            edit,
+            LlmCommand::Edit {
+                operation: EditOperation::Move {
+                    from: "src/a.rs".to_string(),
+                    to: "src/b.rs".to_string(),
+                },
+            }
+        );
+    }
+
+    #[test]
+    fn test_every_command_path_rejects_an_escaping_spelling() {
+        // One set of spellings covers every repository path the wire form
+        // carries. A typed variant cannot silently drop itself, so the
+        // rejection the search command applied must reach every one of them.
         for spelling in ["../escape", "/etc/passwd", "a/../b", r"C:\Windows"] {
-            let error = serde_json::from_value::<LlmCommand>(serde_json::json!({
-                "type": "repo_search",
-                "path": spelling,
-                "regex": "fn main",
-            }))
-            .expect_err("an escaping search path must be rejected");
+            let expected = spelling.replace('\\', "/");
+            for payload in path_payloads(spelling) {
+                let error = serde_json::from_value::<LlmCommand>(payload.clone())
+                    .expect_err("an escaping repository path must be rejected");
+                assert!(
+                    error.to_string().contains(&expected),
+                    "diagnostic for {payload} must name the rejected path: {error}"
+                );
+            }
+        }
+
+        // A context request and a file edit address a file, so an empty path is
+        // a rejection rather than the whole-repository spelling.
+        for payload in [
+            serde_json::json!({"type": "context_request", "path": "  ", "access": "read_only"}),
+            serde_json::json!({"type": "edit", "operation": {"type": "delete", "path": " "}}),
+        ] {
+            let error = serde_json::from_value::<LlmCommand>(payload.clone())
+                .expect_err("an empty file path must be rejected");
             assert!(
-                error.to_string().contains("must be repository-relative"),
-                "diagnostic for '{spelling}' must name the rejected path: {error}"
+                error.to_string().contains("must not be empty"),
+                "diagnostic for {payload} must name the empty path: {error}"
             );
         }
     }

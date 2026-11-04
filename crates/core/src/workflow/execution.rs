@@ -23,7 +23,9 @@ use crate::workflow::policy::ApplyPolicy;
 
 use super::WorkflowExecutionResult;
 use crate::workflow::fsm::guard::rollback_or_log;
-use crate::workflow::fsm::{begin_session_turn, record_session_response, run_fsm_turn_body};
+use crate::workflow::fsm::{
+    announce_plan_diagnostics, begin_session_turn, record_session_response, run_fsm_turn_body,
+};
 use crate::workflow::research::ResearchLimits;
 
 /// Execution options and token budgets for edit workflows.
@@ -209,7 +211,6 @@ impl ExecutionMode for SingleExecution {
         // failed attempt from leaving duplicate history entries behind.
         let turn_id = begin_session_turn(
             prompt,
-            intent,
             context_manager,
             history_manager,
             provider,
@@ -255,21 +256,12 @@ impl ExecutionMode for SingleExecution {
                 let _ = history_manager.rollback_entry(id, "Turn cancelled by the developer");
             }
         } else {
-            record_session_response(history_manager, &turn);
+            record_session_response(history_manager, &turn, intent);
         }
-        // A plan mutation the storage engine refused never fails the turn, but it
-        // is a protocol-level rejection the developer must see: the reason is
-        // streamed as a warning banner, and the history record written above hands
-        // it to the model's next explicit round.
-        if let Some(notice) = turn.plan_rejection_notice() {
-            tracing::warn!("{}", notice);
-            let _ = stream_tx
-                .send(StreamEvent::TextDelta(format!(
-                    "\n\n---\n\u{26a0}\u{fe0f} {}\n\n",
-                    notice
-                )))
-                .await;
-        }
+        // A refused or repaired plan mutation never fails the turn, but it is a
+        // protocol-level diagnostic the developer must see, so the turn stream
+        // announces it exactly once.
+        announce_plan_diagnostics(&turn, &stream_tx).await;
         Ok(WorkflowExecutionResult {
             result: turn.result,
             assistant_text: turn.assistant_text,
@@ -278,13 +270,14 @@ impl ExecutionMode for SingleExecution {
             abort: turn.abort,
             plan_saved: turn.plan_saved,
             plan_errors: turn.plan_errors,
+            plan_warnings: turn.plan_warnings,
         })
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use tauqe_protocol::{ContextAccess, ModelRef, ModelResult, ProviderKind};
+    use tauqe_protocol::{ContextAccess, ModelRef, ModelResult, PlanRejectionKind, ProviderKind};
     use tokio::sync::{mpsc, watch};
 
     use crate::context::ContextManager;
@@ -570,8 +563,14 @@ mod tests {
             "{:?}",
             execution.plan_errors
         );
+        assert_eq!(
+            execution.plan_errors[0].kind,
+            PlanRejectionKind::ModeForbidden,
+            "the regime branch declares the category: {:?}",
+            execution.plan_errors
+        );
         assert!(
-            execution.plan_errors[0].contains("REPL mode"),
+            execution.plan_errors[0].message.contains("REPL mode"),
             "the reason must be carried on the turn result: {:?}",
             execution.plan_errors
         );
@@ -713,5 +712,77 @@ mod tests {
             1,
             "a terminal success must not trigger escalation"
         );
+    }
+
+    /// An isolated step journals a compact result card instead of the reply the
+    /// model wrote, so a batch of steps never inflates the journal with the
+    /// conversational text of every step.
+    #[tokio::test]
+    async fn isolated_step_records_a_compact_result_card() {
+        let (_dir, repo_root) = repo_with_target();
+        let mut context = ContextManager::new(repo_root.clone());
+        context
+            .add_file("target.rs", ContextAccess::Editable)
+            .expect("add target to context");
+        let mut history = HistoryManager::new(repo_root.clone());
+
+        let protocol = crate::prompt::xml::XmlPromptProtocol;
+        let protocol = protocol.with_turn_marker(MARKER).unwrap();
+
+        let narrative = "Applying the approved design to the target module.";
+        let chunk = format!(
+            "{narrative}\n<tauqe_edits_{MARKER} summary=\"Set compute to 42\">\n<edit_{MARKER} path=\"target.rs\">\n<search_{MARKER}>\npub fn compute() -> i32 {{ 0 }}\n</search_{MARKER}>\n<replace_{MARKER}>\npub fn compute() -> i32 {{ 42 }}\n</replace_{MARKER}>\n</edit_{MARKER}>\n</tauqe_edits_{MARKER}>\n<success_{MARKER} commit_message=\"Set compute to 42\" />"
+        );
+        let provider = MockProvider { chunk };
+        let model = ModelRef::openrouter("mock/model");
+        let (tx, _rx) = mpsc::channel(100);
+        let (_cancel_tx, cancel_rx) = watch::channel(false);
+        let mut policy = DirectApplyPolicy::new();
+
+        let exec = SingleExecution::new(WorkflowOptions::default());
+        let execution = exec
+            .execute(
+                &mut policy,
+                "Execute the approved step",
+                tauqe_protocol::TurnIntent::IsolatedStep,
+                &provider,
+                &model,
+                &mut context,
+                &mut history,
+                protocol.as_ref(),
+                tx,
+                cancel_rx,
+            )
+            .await
+            .expect("the isolated step executes");
+
+        assert!(
+            matches!(&execution.result, ModelResult::Edit { outcome, .. } if outcome.applied),
+            "the step must apply its change set: {:?}",
+            execution.result
+        );
+
+        let entries = history.get_entries().expect("the journal reads");
+        assert_eq!(
+            entries.len(),
+            2,
+            "the step journals the card that opened it and the card that closed it"
+        );
+        match &entries[1] {
+            crate::history::HistoryEntry::Response {
+                message, commit, ..
+            } => {
+                assert_eq!(message, "Step completed: Set compute to 42");
+                assert!(
+                    commit.is_none(),
+                    "a direct policy records no commit on the card"
+                );
+                assert!(
+                    !message.contains(narrative),
+                    "the card never carries the reply of the model: {message}"
+                );
+            }
+            other => panic!("expected the step result card, got {other:?}"),
+        }
     }
 }

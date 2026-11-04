@@ -384,6 +384,7 @@ mod tests {
             id: 7,
             title: "Guard the parser".to_string(),
             uuid: None,
+            commit: None,
             group: Some("arch-1".to_string()),
             model: None,
             issue_type: IssueType::Bug,

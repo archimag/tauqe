@@ -400,6 +400,7 @@ fn walk_plan_rows<V: PlanRowVisitor>(
                                 format!("{}│ ", plan_body_indent(PLAN_HEADER_LEVEL + 1)),
                                 engine.fg(palette.text_muted),
                             ));
+                            theme.constrain_table_width(width);
                             let key = plan_description_key(plan_id);
                             let body =
                                 cache.lines_for(&key, &prepared, &theme, Some(width), theme_mode);
@@ -518,6 +519,7 @@ fn walk_plan_rows<V: PlanRowVisitor>(
                                 format!("{}│ ", plan_body_indent(*depth + 1)),
                                 engine.fg(palette.text_muted),
                             ));
+                            theme.constrain_table_width(width);
                             let key = concept_body_key(plan_id, item_id);
                             let body =
                                 cache.lines_for(&key, &prepared, &theme, Some(width), theme_mode);
@@ -787,6 +789,7 @@ fn walk_plan_rows<V: PlanRowVisitor>(
                                 body_prefix.clone(),
                                 engine.fg(palette.text_muted),
                             ));
+                            theme.constrain_table_width(width);
                             let key = step_body_key(plan_id, item_id);
                             let body =
                                 cache.lines_for(&key, &prepared, &theme, Some(width), theme_mode);
