@@ -30,10 +30,10 @@ pub(super) async fn handle_execute_review_dialog(
     mut st: MutexGuard<'_, AppState>,
     server_writer: &mut RpcConnection,
 ) -> anyhow::Result<Option<InputResult>> {
-    let mut target = match st.confirm_execute_review.take() {
+    let mut target = match st.modals.confirm_execute_review.take() {
         Some(target) if target.is_single_target() => target,
         other => {
-            st.confirm_execute_review = other;
+            st.modals.confirm_execute_review = other;
             return Ok(None);
         }
     };
@@ -52,7 +52,7 @@ pub(super) async fn handle_execute_review_dialog(
         // Safe cancellation returns the shared button to its default and drops
         // the dialog without a request.
         ModelListKeyOutcome::Dismiss => {
-            st.confirm_button = ConfirmDialogButton::Cancel;
+            st.modals.confirm_button = ConfirmDialogButton::Cancel;
         }
         // The clipboard read is a native round trip, so it runs inside the
         // shared helper with the state guard released (c-1).
@@ -61,13 +61,13 @@ pub(super) async fn handle_execute_review_dialog(
                 state,
                 st,
                 target,
-                |st, target| st.confirm_execute_review = Some(target),
-                |st| st.confirm_execute_review.take(),
+                |st, target| st.modals.confirm_execute_review = Some(target),
+                |st| st.modals.confirm_execute_review.take(),
             )
             .await;
         }
         ModelListKeyOutcome::Consumed => {
-            st.confirm_execute_review = Some(target);
+            st.modals.confirm_execute_review = Some(target);
         }
     }
     Ok(Some(InputResult::Continue))
@@ -116,7 +116,7 @@ mod tests {
     fn state_with_target() -> AppState {
         let mut st = test_state();
         st.view_mode = ViewMode::Review;
-        st.confirm_execute_review = Some(ConfirmExecuteReviewState::new(
+        st.modals.confirm_execute_review = Some(ConfirmExecuteReviewState::new(
             Some("rev-1".to_string()),
             "Session rev-1".to_string(),
             "Finding 1".to_string(),
@@ -145,6 +145,7 @@ mod tests {
         state
             .lock()
             .await
+            .modals
             .confirm_execute_review
             .clone()
             .expect("dialog stays open")
@@ -152,7 +153,7 @@ mod tests {
 
     async fn set_focus(state: &Arc<Mutex<AppState>>, focus: RefineDialogFocus) {
         let mut guard = state.lock().await;
-        if let Some(target) = guard.confirm_execute_review.as_mut() {
+        if let Some(target) = guard.modals.confirm_execute_review.as_mut() {
             target.focus = focus;
         }
     }
@@ -165,6 +166,7 @@ mod tests {
         {
             let mut guard = state.lock().await;
             let target = guard
+                .modals
                 .confirm_execute_review
                 .as_mut()
                 .expect("dialog must be open");
@@ -191,7 +193,7 @@ mod tests {
         );
 
         let guard = state.lock().await;
-        assert!(guard.confirm_execute_review.is_none());
+        assert!(guard.modals.confirm_execute_review.is_none());
         assert_eq!(guard.view_mode, ViewMode::Repl);
     }
 
@@ -306,7 +308,7 @@ mod tests {
         press(&state, &mut conn, key(KeyCode::Enter)).await;
 
         let guard = state.lock().await;
-        assert!(guard.confirm_execute_review.is_none());
+        assert!(guard.modals.confirm_execute_review.is_none());
         assert!(conn.written().is_empty());
     }
 
@@ -322,7 +324,7 @@ mod tests {
         assert!(payload.contains("review/execute"), "{payload}");
 
         let guard = state.lock().await;
-        assert!(guard.confirm_execute_review.is_none());
+        assert!(guard.modals.confirm_execute_review.is_none());
         assert_eq!(guard.view_mode, ViewMode::Repl);
     }
 
@@ -335,7 +337,7 @@ mod tests {
         press(&state, &mut conn, key(KeyCode::Char('n'))).await;
 
         let guard = state.lock().await;
-        assert!(guard.confirm_execute_review.is_none());
+        assert!(guard.modals.confirm_execute_review.is_none());
         assert_eq!(guard.view_mode, ViewMode::Review);
         assert!(conn.written().is_empty());
     }
@@ -347,7 +349,7 @@ mod tests {
     async fn ctrl_enter_submits_the_targeted_group_step() {
         let mut st = test_state();
         st.view_mode = ViewMode::Review;
-        st.confirm_execute_review = Some(
+        st.modals.confirm_execute_review = Some(
             ConfirmExecuteReviewState::new(
                 Some("rev-1".to_string()),
                 "Session rev-1".to_string(),
@@ -361,6 +363,7 @@ mod tests {
         );
         {
             let target = st
+                .modals
                 .confirm_execute_review
                 .as_mut()
                 .expect("dialog must be open");
@@ -391,7 +394,7 @@ mod tests {
         );
 
         let guard = state.lock().await;
-        assert!(guard.confirm_execute_review.is_none());
+        assert!(guard.modals.confirm_execute_review.is_none());
         assert_eq!(guard.view_mode, ViewMode::Repl);
     }
     /// The letter accelerators are bare presses: `Ctrl+Y` is the editor's yank
@@ -416,7 +419,7 @@ mod tests {
         );
         let guard = state.lock().await;
         assert!(
-            guard.confirm_execute_review.is_some(),
+            guard.modals.confirm_execute_review.is_some(),
             "the dialog stays open with its directives"
         );
         assert_eq!(guard.view_mode, ViewMode::Review);
@@ -440,7 +443,7 @@ mod tests {
 
             let guard = state.lock().await;
             assert!(
-                guard.confirm_execute_review.is_some(),
+                guard.modals.confirm_execute_review.is_some(),
                 "Ctrl+{character} must not dismiss the dialog"
             );
             drop(guard);

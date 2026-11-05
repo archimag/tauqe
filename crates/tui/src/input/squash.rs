@@ -52,7 +52,7 @@ pub async fn handle_squash_key(
 ) -> anyhow::Result<InputResult> {
     let primary = st.tui_config.input.primary_modifier;
     let meta = st.tui_config.input.meta_modifier;
-    let Some(dialog) = st.squash_dialog.as_mut() else {
+    let Some(dialog) = st.modals.squash_dialog.as_mut() else {
         return Ok(InputResult::Continue);
     };
 
@@ -66,7 +66,7 @@ pub async fn handle_squash_key(
             drop(st);
             let clipboard = crate::clipboard::get_from_clipboard_async().await;
             let mut st = state.lock().await;
-            if let Some(dialog) = st.squash_dialog.as_mut() {
+            if let Some(dialog) = st.modals.squash_dialog.as_mut() {
                 if dialog.custom_input_active {
                     dialog.custom_editor.yank_with(clipboard);
                 } else if dialog.focus == SquashDialogFocus::MessageEditor {
@@ -74,7 +74,7 @@ pub async fn handle_squash_key(
                 }
             }
         }
-        SquashAction::Close => st.squash_dialog = None,
+        SquashAction::Close => st.modals.squash_dialog = None,
         SquashAction::Preview(base_ref) => {
             drop(st);
             let params = GitSquashPreviewParams {

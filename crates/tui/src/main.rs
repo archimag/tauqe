@@ -234,7 +234,7 @@ async fn main() -> anyhow::Result<()> {
                     }
                     None => {
                         let mut st = state.lock().await;
-                        if st.server_disconnected.is_none() {
+                        if st.modals.server_disconnected.is_none() {
                             let exit_status = server_child.try_wait().ok().flatten();
                             let status_text = match exit_status {
                                 Some(status) => active_t("notify.server_disconnected.terminated")
@@ -242,7 +242,7 @@ async fn main() -> anyhow::Result<()> {
                                 None => active_t("notify.server_disconnected.unexpected"),
                             };
                             let banner = server_disconnect_banner(&status_text, &server_log_path);
-                            st.server_disconnected = Some(banner.clone());
+                            st.modals.server_disconnected = Some(banner.clone());
                             st.notify_error(banner);
                             dirty = true;
                         }
@@ -252,11 +252,11 @@ async fn main() -> anyhow::Result<()> {
             _ = tokio::time::sleep(sleep_duration) => {
                 if let Ok(Some(status)) = server_child.try_wait() {
                     let mut st = state.lock().await;
-                    if st.server_disconnected.is_none() {
+                    if st.modals.server_disconnected.is_none() {
                         let status_template = active_t("notify.server_disconnected.exited");
                         let status_text = status_template.replacen("{}", &status.to_string(), 1);
                         let banner = server_disconnect_banner(&status_text, &server_log_path);
-                        st.server_disconnected = Some(banner.clone());
+                        st.modals.server_disconnected = Some(banner.clone());
                         st.notify_error(banner);
                         dirty = true;
                     }

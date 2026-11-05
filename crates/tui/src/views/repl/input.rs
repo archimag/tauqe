@@ -722,11 +722,11 @@ pub async fn handle_repl_key(
         }
         ReplAction::ClearPromptSaving => {
             if st.model.is_batch && st.model.is_busy() {
-                st.confirm_batch_cancel = true;
-                st.batch_cancel_button = crate::app::BatchCancelButton::Continue;
+                st.modals.confirm_batch_cancel = true;
+                st.modals.batch_cancel_button = crate::app::BatchCancelButton::Continue;
             } else if st.model.is_busy() {
-                st.confirm_cancel = true;
-                st.confirm_button = crate::app::ConfirmDialogButton::Cancel;
+                st.modals.confirm_cancel = true;
+                st.modals.confirm_button = crate::app::ConfirmDialogButton::Cancel;
             } else if !st.input_editor.is_empty() {
                 let armed = st
                     .model
@@ -741,8 +741,8 @@ pub async fn handle_repl_key(
                     st.notify_info(active_t("notify.prompt_clear_arm"));
                 }
             } else if st.discussion_focus.is_active() {
-                st.confirm_detach_focus = true;
-                st.confirm_button = crate::app::ConfirmDialogButton::Cancel;
+                st.modals.confirm_detach_focus = true;
+                st.modals.confirm_button = crate::app::ConfirmDialogButton::Cancel;
             }
         }
         ReplAction::SendPrompt => {
@@ -837,7 +837,7 @@ pub async fn handle_repl_key(
             // The snapshot belongs to the view, so the prompt chord and the
             // Viewport chords open exactly the same audit (c-1).
             match st.model.inspector_snapshot() {
-                Some(inspector) => st.diff_inspector = Some(inspector),
+                Some(inspector) => st.modals.diff_inspector = Some(inspector),
                 None => st.notify_warning(active_t("notify.diff_inspector_empty")),
             }
         }
@@ -1510,10 +1510,13 @@ mod tests {
 
         let st = state.lock().await;
         assert!(
-            st.confirm_detach_focus,
+            st.modals.confirm_detach_focus,
             "Esc on an empty prompt with an active focus must arm the detach confirmation"
         );
-        assert_eq!(st.confirm_button, crate::app::ConfirmDialogButton::Cancel);
+        assert_eq!(
+            st.modals.confirm_button,
+            crate::app::ConfirmDialogButton::Cancel
+        );
     }
 
     #[tokio::test]
@@ -1529,15 +1532,15 @@ mod tests {
 
         let guard = state.lock().await;
         assert!(
-            guard.confirm_batch_cancel,
+            guard.modals.confirm_batch_cancel,
             "Esc during batch must open three-way batch cancel dialog"
         );
         assert!(
-            !guard.confirm_cancel,
+            !guard.modals.confirm_cancel,
             "Esc during batch must not open binary hard cancel dialog"
         );
         assert_eq!(
-            guard.batch_cancel_button,
+            guard.modals.batch_cancel_button,
             crate::app::BatchCancelButton::Continue
         );
     }
@@ -1554,10 +1557,10 @@ mod tests {
         handle_repl_key(key, &state, &mut conn).await.unwrap();
 
         let guard = state.lock().await;
-        assert!(!guard.confirm_batch_cancel);
-        assert!(guard.confirm_cancel);
+        assert!(!guard.modals.confirm_batch_cancel);
+        assert!(guard.modals.confirm_cancel);
         assert_eq!(
-            guard.confirm_button,
+            guard.modals.confirm_button,
             crate::app::ConfirmDialogButton::Cancel
         );
     }
@@ -1571,8 +1574,8 @@ mod tests {
         handle_repl_key(key, &state, &mut conn).await.unwrap();
 
         let st = state.lock().await;
-        assert!(!st.confirm_detach_focus);
-        assert!(!st.confirm_cancel);
+        assert!(!st.modals.confirm_detach_focus);
+        assert!(!st.modals.confirm_cancel);
     }
 
     #[tokio::test]
@@ -1857,7 +1860,7 @@ mod viewport_scroll_tests {
         .unwrap();
 
         assert!(
-            state.lock().await.diff_inspector.is_some(),
+            state.lock().await.modals.diff_inspector.is_some(),
             "the translated `v` chord must open the diff inspector"
         );
     }
@@ -1917,7 +1920,11 @@ mod viewport_scroll_tests {
             ReplFocus::Editor,
             "the prompt keeps the keyboard while the audit opens over it"
         );
-        let inspector = st.diff_inspector.as_ref().expect("the audit must open");
+        let inspector = st
+            .modals
+            .diff_inspector
+            .as_ref()
+            .expect("the audit must open");
         assert_eq!(
             st.model.files.len(),
             2,

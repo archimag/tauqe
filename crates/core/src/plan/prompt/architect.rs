@@ -71,11 +71,12 @@ pub fn resolve_architect_tier(
     last_replanned_step: Option<&str>,
 ) -> (ArchitectTier, Option<ArchitectLevelUp>) {
     if let Some(selection) = custom_model {
-        let model = cfg.resolve_model(selection);
-        let effort = cfg
-            .models
-            .resolve_selection_effort(ModelRole::Architect, selection);
-        return (ArchitectTier::new(model, effort), None);
+        // An explicit developer selection overrides the ladder, but it never
+        // discards the runtime parameters the configuration declares for the
+        // chosen model: the budget and the escalation opt-out of that entry
+        // travel with the tier, so a manual selection runs within the rounds it
+        // is granted and a model reserved for manual runs stays saturated.
+        return (cfg.models.resolve_selection_architect_tier(selection), None);
     }
 
     let Some(failed_step_id) = failed_step_id else {
@@ -240,12 +241,40 @@ mod tests {
         assert_eq!(tier, manual);
         assert!(level_up.is_none());
 
-        // An explicit developer selection naming the excluded model never escalates
-        // either, so both entry points honour the pinned configuration.
+        // An explicit developer selection naming the excluded model never
+        // escalates either, so both entry points honour the pinned
+        // configuration. The selection keeps the marker and the budget its own
+        // entry declares, which is what saturates the ladder from the start.
         let selection = ModelSelection::Specific(manual.model.clone());
         let (tier, level_up) =
             resolve_architect_tier(&cfg, None, Some(&selection), Some("s-1"), Some("s-1"));
-        assert_eq!(tier, manual);
+        assert_eq!(tier.model, manual.model);
+        assert_eq!(tier.level_up, Some(false));
+        assert_eq!(tier.attempts(), 1);
+        assert!(level_up.is_none());
+    }
+    #[test]
+    fn custom_selection_keeps_the_configured_budget_and_marker() {
+        let manual_model = ModelRef::openrouter("planner/manual");
+        let mut manual_entry = ModelEntry::new(manual_model.clone(), Some(ReasoningEffort::Max));
+        manual_entry.attempts = Some(3);
+        manual_entry.level_up = Some(false);
+        let cfg = config_with_ladder(vec![
+            ModelEntry::new(ModelRef::openrouter("planner/one"), None),
+            manual_entry,
+        ]);
+
+        // An explicit developer selection never escalates, but it keeps the
+        // budget and the escalation opt-out the configuration declares for the
+        // chosen model instead of replacing them with defaults.
+        let selection = ModelSelection::Specific(manual_model.clone());
+        let (tier, level_up) =
+            resolve_architect_tier(&cfg, None, Some(&selection), Some("s-1"), Some("s-1"));
+        assert_eq!(tier.model, manual_model);
+        assert_eq!(tier.effort, Some(ReasoningEffort::Max));
+        assert_eq!(tier.attempts, Some(3));
+        assert_eq!(tier.attempts(), 3);
+        assert_eq!(tier.level_up, Some(false));
         assert!(level_up.is_none());
     }
 }

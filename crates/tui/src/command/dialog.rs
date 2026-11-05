@@ -44,6 +44,15 @@ pub enum DialogCommand {
     /// embedded list can submit from any section while every bare key stays
     /// inside the focused editor.
     SubmitAccelerator,
+    /// Move the keyboard to the next input field of the dialog.
+    ///
+    /// The vertical walk reaches the dialogs that stack several sections: from
+    /// a model ladder or the action bar it steps to the neighbouring section,
+    /// while a multiline editor keeps the chords for cursor line movement
+    /// (Conventions §6.2).
+    FieldNext,
+    /// Move the keyboard to the previous input field of the dialog.
+    FieldPrev,
 }
 
 /// Single source of truth for the universal dialog keybindings.
@@ -164,10 +173,9 @@ pub static DIALOG_COMMAND_MAP: CommandMap<DialogCommand> = CommandMap::new(&[
 /// modifier nor the AltGr compose chord can reach it: `Ctrl+Y` and `Ctrl+Q`
 /// stay the developer's yank and quit chords instead of launching a
 /// token-spending turn or discarding typed instructions.
-// Declared here as the executable contract of the model-list dialog family;
-// the anti-drift suites in `crate::command` exercise it until the handlers
-// resolve it directly.
-#[allow(dead_code)]
+// Declared here as the executable contract of the model-list dialog family.
+// Every dialog of the family resolves this map directly, so the keys the
+// footer advertises and the keys the handlers intercept are one declaration.
 pub static MODEL_LIST_DIALOG_COMMAND_MAP: CommandMap<DialogCommand> = CommandMap::new(&[
     // Interface: dismissal. `Esc` is the canonical chord, `q` is the Magit
     // alias, and `C-g` is the Emacs keyboard-quit.
@@ -265,6 +273,35 @@ pub static MODEL_LIST_DIALOG_COMMAND_MAP: CommandMap<DialogCommand> = CommandMap
         CancelFast,
         Helpers,
         "cmd.dialog.cancel_fast",
+    ),
+    // Interface: vertical field walk. `C-n` / `C-p` step to the next and the
+    // previous input field of the dialog. The raw `Ctrl` spellings keep the
+    // walk reachable on a workstation whose primary modifier is `Alt`, and the
+    // handler delegates the chords back to a multiline editor, which keeps them
+    // for cursor line movement (Conventions §6.2).
+    CommandSpec::new(
+        KeyChord::Primary(KeyCode::Char('n')),
+        FieldNext,
+        Interface,
+        "cmd.dialog.field_next",
+    ),
+    CommandSpec::new(
+        KeyChord::Ctrl(KeyCode::Char('n')),
+        FieldNext,
+        Interface,
+        "cmd.dialog.field_next",
+    ),
+    CommandSpec::new(
+        KeyChord::Primary(KeyCode::Char('p')),
+        FieldPrev,
+        Interface,
+        "cmd.dialog.field_prev",
+    ),
+    CommandSpec::new(
+        KeyChord::Ctrl(KeyCode::Char('p')),
+        FieldPrev,
+        Interface,
+        "cmd.dialog.field_prev",
     ),
     // Essential: submission through the explicit accelerator. The configured
     // primary modifier together with `Enter` is the chord the handlers derive,
@@ -371,7 +408,9 @@ mod tests {
     #[test]
     fn model_list_map_ignores_letter_accelerators_under_command_modifiers() {
         let input = InputConfig::default();
-        for code in [KeyCode::Char('y'), KeyCode::Char('n'), KeyCode::Char('q')] {
+        // The yank and quit accelerators stay bare presses, so no command chord
+        // can confirm or dismiss a dialog that still holds unsent instructions.
+        for code in [KeyCode::Char('y'), KeyCode::Char('q')] {
             for modifiers in [
                 KeyModifiers::CONTROL,
                 KeyModifiers::ALT,
@@ -384,6 +423,18 @@ mod tests {
                 );
             }
         }
+
+        // Once a command modifier is held the cancellation letter names the
+        // vertical field walk, so it reaches that command and never the fast
+        // cancellation (Conventions §6.2).
+        assert_eq!(
+            resolve(
+                &input,
+                KeyEvent::new(KeyCode::Char('N'), KeyModifiers::CONTROL)
+            ),
+            Some(DialogCommand::FieldNext),
+            "C-n names the vertical field walk, never the fast cancellation"
+        );
 
         assert_eq!(
             resolve(
@@ -406,6 +457,46 @@ mod tests {
             ),
             Some(DialogCommand::Dismiss)
         );
+    }
+
+    /// The vertical field walk is declared on the abstract primary chord and on
+    /// the raw `Ctrl` spelling, so it follows a remapped primary modifier while
+    /// staying reachable on a workstation configured with `Alt`. The AltGr
+    /// compose chord selects no field, exactly as it confirms nothing
+    /// (Conventions §5.2, §6.2).
+    #[test]
+    fn model_list_map_declares_the_vertical_field_walk() {
+        let ctrl = InputConfig::default();
+        let alt = alt_primary();
+        for (input, modifiers) in [
+            (&ctrl, KeyModifiers::CONTROL),
+            (&alt, KeyModifiers::ALT),
+            // The raw `Ctrl` spelling keeps the walk reachable on an `Alt`
+            // workstation as well.
+            (&alt, KeyModifiers::CONTROL),
+        ] {
+            assert_eq!(
+                resolve(input, KeyEvent::new(KeyCode::Char('n'), modifiers)),
+                Some(DialogCommand::FieldNext),
+                "C-n must step to the next field under {modifiers:?}"
+            );
+            assert_eq!(
+                resolve(input, KeyEvent::new(KeyCode::Char('p'), modifiers)),
+                Some(DialogCommand::FieldPrev),
+                "C-p must step to the previous field under {modifiers:?}"
+            );
+        }
+
+        for code in [KeyCode::Char('n'), KeyCode::Char('p')] {
+            assert_eq!(
+                resolve(
+                    &ctrl,
+                    KeyEvent::new(code, KeyModifiers::CONTROL | KeyModifiers::ALT)
+                ),
+                None,
+                "{code:?} with the compose chord must reach no command"
+            );
+        }
     }
 
     /// Both terminal spellings of `Shift+Tab` cycle focus backward, so a

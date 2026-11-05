@@ -366,7 +366,7 @@ impl OpenRouterProvider {
                                                     .or(usage.total_cost)
                                                     .or(chunk.cost)
                                                     .or(chunk.total_cost);
-                                                let usage_info = ModelUsageInfo {
+                                                let incoming = ModelUsageInfo {
                                                     prompt_tokens: usage.prompt_tokens,
                                                     completion_tokens: usage.completion_tokens,
                                                     total_tokens: usage.total_tokens,
@@ -378,18 +378,17 @@ impl OpenRouterProvider {
                                                         .and_then(|d| d.cached_tokens),
                                                     cost,
                                                 };
+                                                let usage_info =
+                                                    merge_usage(latest_usage.clone(), incoming);
                                                 latest_usage = Some(usage_info.clone());
                                                 let _ = tx.send(StreamEvent::Usage(usage_info)).await;
                                             } else if chunk.cost.is_some() || chunk.total_cost.is_some() {
-                                                let cost = chunk.cost.or(chunk.total_cost);
-                                                let usage_info = ModelUsageInfo {
-                                                    prompt_tokens: 0,
-                                                    completion_tokens: 0,
-                                                    total_tokens: 0,
-                                                    reasoning_tokens: None,
-                                                    cached_tokens: None,
-                                                    cost,
+                                                let incoming = ModelUsageInfo {
+                                                    cost: chunk.cost.or(chunk.total_cost),
+                                                    ..ModelUsageInfo::default()
                                                 };
+                                                let usage_info =
+                                                    merge_usage(latest_usage.clone(), incoming);
                                                 latest_usage = Some(usage_info.clone());
                                                 let _ = tx.send(StreamEvent::Usage(usage_info)).await;
                                             }
@@ -583,6 +582,31 @@ impl LlmProvider for OpenRouterProvider {
     }
 }
 
+/// Folds a streamed usage payload into the usage accumulated for the turn.
+///
+/// OpenRouter spreads usage across several chunks, and a chunk that carries
+/// only a cost leaves every token counter at its serde default. A field that
+/// arrives with a value replaces the accumulated one, while a field that
+/// arrives empty keeps what the turn already reported, so a partial payload
+/// can never reset the token counters to zero.
+fn merge_usage(accumulated: Option<ModelUsageInfo>, incoming: ModelUsageInfo) -> ModelUsageInfo {
+    let mut merged = accumulated.unwrap_or_default();
+    // Counters only grow within one generation, so a payload that omits them
+    // can never lower what the turn already reported.
+    merged.prompt_tokens = merged.prompt_tokens.max(incoming.prompt_tokens);
+    merged.completion_tokens = merged.completion_tokens.max(incoming.completion_tokens);
+    merged.total_tokens = merged.total_tokens.max(incoming.total_tokens);
+    merged.reasoning_tokens = incoming.reasoning_tokens.or(merged.reasoning_tokens);
+    merged.cached_tokens = incoming.cached_tokens.or(merged.cached_tokens);
+    merged.cost = incoming.cost.or(merged.cost);
+    if merged.total_tokens == 0 {
+        merged.total_tokens = merged
+            .prompt_tokens
+            .saturating_add(merged.completion_tokens);
+    }
+    merged
+}
+
 #[cfg(test)]
 mod tests {
     use std::borrow::Cow;
@@ -713,6 +737,66 @@ mod tests {
         assert_eq!(usage.completion_tokens, 5);
         assert_eq!(usage.cost, Some(0.00045));
     }
+
+    /// A chunk that carries only a cost folds that cost into the usage the turn
+    /// already reported instead of resetting the token counters to zero.
+    #[tokio::test]
+    async fn test_cost_only_chunk_preserves_accumulated_token_counters() {
+        let mock_server = MockServer::start().await;
+
+        let sse_body = "data: {\"id\":\"gen-cost-only\",\"choices\":[{\"delta\":{\"content\":\"Hi\"}}],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":5,\"total_tokens\":15}}\n\n\
+                        data: {\"id\":\"gen-cost-only\",\"choices\":[],\"cost\":0.00045}\n\n\
+                        data: [DONE]\n\n";
+
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_raw(sse_body, "text/event-stream"),
+            )
+            .mount(&mock_server)
+            .await;
+
+        let provider =
+            OpenRouterProvider::new("test-api-key".to_string()).with_base_url(mock_server.uri());
+
+        let (tx, mut rx) = mpsc::channel(10);
+        let (_cancel_tx, cancel_rx) = watch::channel(false);
+
+        let provider_task = tokio::spawn(async move {
+            provider
+                .stream_text("test-model", vec![ChatMessage::user("Hi")], tx, cancel_rx)
+                .await
+        });
+
+        let mut usage_events = Vec::new();
+        while let Some(event) = rx.recv().await {
+            if let StreamEvent::Usage(usage) = event {
+                usage_events.push(usage);
+            }
+        }
+
+        let res = provider_task.await.expect("task join failed");
+        assert!(res.is_ok());
+
+        assert_eq!(
+            usage_events.len(),
+            2,
+            "the usage chunk and the cost chunk must each report usage"
+        );
+        for usage in &usage_events {
+            assert_eq!(usage.prompt_tokens, 10);
+            assert_eq!(usage.completion_tokens, 5);
+            assert_eq!(usage.total_tokens, 15);
+        }
+        assert_eq!(
+            usage_events.last().and_then(|usage| usage.cost),
+            Some(0.00045),
+            "the cost chunk must land in the accumulated usage"
+        );
+    }
+
     /// A stalled generation-stats endpoint must not delay a stream whose body
     /// has already been delivered: the enrichment request times out on its own.
     #[tokio::test]

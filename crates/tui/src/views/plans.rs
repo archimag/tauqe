@@ -177,34 +177,174 @@ impl RefineDialogFocus {
     }
 }
 
+/// Focus section of the plan-synthesis dialogs.
+///
+/// The plan creation form and the plan refinement form stack the same four
+/// keyboard targets: the Planner ladder that drafts the plan, the Critic ladder
+/// that audits it independently, the instructions editor, and the action bar.
+/// Making the section explicit keeps the two ladders, the text field, and the
+/// buttons from fighting over the same keys, exactly as the single-list dialog
+/// family does (Conventions §6, §7; c-typed-plan-creation-dialog,
+/// c-typed-plan-mutation-dialog).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum PlanFormFocus {
+    /// The Architect ladder that drafts the plan.
+    PlannerList,
+    /// The Architect ladder that audits the draft independently.
+    CriticList,
+    /// The directives or refinement instructions editor.
+    #[default]
+    InstructionsEditor,
+    /// The action bar holding the confirm and cancel buttons.
+    Actions,
+}
+
+impl PlanFormFocus {
+    /// Advances focus to the next section in visual order.
+    ///
+    /// The Planner ladder is skipped while a single Architect entry is
+    /// configured — there is nothing to navigate — while the Critic section
+    /// always stays reachable: it owns the switch that disables the independent
+    /// audit phase.
+    pub fn cycle_next(&mut self, planner_available: bool) {
+        *self = match self {
+            Self::PlannerList => Self::CriticList,
+            Self::CriticList => Self::InstructionsEditor,
+            Self::InstructionsEditor => Self::Actions,
+            Self::Actions => {
+                if planner_available {
+                    Self::PlannerList
+                } else {
+                    Self::CriticList
+                }
+            }
+        };
+    }
+
+    /// Moves focus to the previous section in visual order.
+    pub fn cycle_prev(&mut self, planner_available: bool) {
+        *self = match self {
+            Self::PlannerList => Self::Actions,
+            Self::CriticList => {
+                if planner_available {
+                    Self::PlannerList
+                } else {
+                    Self::Actions
+                }
+            }
+            Self::InstructionsEditor => Self::CriticList,
+            Self::Actions => Self::InstructionsEditor,
+        };
+    }
+
+    pub fn is_planner_list(&self) -> bool {
+        matches!(self, Self::PlannerList)
+    }
+
+    pub fn is_critic_list(&self) -> bool {
+        matches!(self, Self::CriticList)
+    }
+
+    pub fn is_instructions_editor(&self) -> bool {
+        matches!(self, Self::InstructionsEditor)
+    }
+
+    pub fn is_actions(&self) -> bool {
+        matches!(self, Self::Actions)
+    }
+}
+
+/// Pending creation of a new plan through the two-phase synthesis pipeline.
+///
+/// The form collects the engineering directives, the Architect that drafts the
+/// plan, and the Architect that audits it, so the typed
+/// `plan/createPipeline` request is assembled without free-form REPL drift and
+/// the issued structure is guaranteed to arrive as a plan rather than as prose
+/// (c-typed-plan-creation-dialog).
+#[derive(Debug, Clone)]
+pub struct PlanCreateDialogState {
+    /// Engineering directives the synthesized plan must satisfy.
+    pub directives_editor: crate::editor::InputEditor,
+    /// Architect that drafts the plan.
+    pub planner: ModelSelector,
+    /// Architect that audits the draft independently.
+    pub critic: ModelSelector,
+    /// Whether the independent critique phase is skipped.
+    pub skip_critique: bool,
+    /// Section that currently owns the keyboard.
+    pub focus: PlanFormFocus,
+    /// Focused action button; the safe `Cancel` holds the default.
+    pub confirm_button: crate::app::ConfirmDialogButton,
+}
+
+impl PlanCreateDialogState {
+    /// Builds the creation form over the configured Architect ladder.
+    ///
+    /// The Planner and the Critic start on the same configured entries and
+    /// advance independently, so one dialog configures both phases while the
+    /// critique can still be audited by a different Architect.
+    pub fn new(architect_entries: Vec<ModelEntry>) -> Self {
+        Self {
+            directives_editor: crate::editor::InputEditor::default(),
+            planner: ModelSelector::new(ModelRole::Architect, architect_entries.clone(), 0),
+            critic: ModelSelector::new(ModelRole::Architect, architect_entries, 0),
+            skip_critique: false,
+            focus: PlanFormFocus::default(),
+            confirm_button: crate::app::ConfirmDialogButton::Cancel,
+        }
+    }
+
+    /// Currently selected Planner entry, if any.
+    pub fn selected_planner(&self) -> Option<&ModelEntry> {
+        self.planner.selected_entry()
+    }
+
+    /// Currently selected Critic entry, if any.
+    pub fn selected_critic(&self) -> Option<&ModelEntry> {
+        self.critic.selected_entry()
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct PlanRefineDialogState {
     pub plan_id: String,
     pub plan_title: String,
-    pub selector: ModelSelector,
+    /// Architect that drafts the modification.
+    pub planner: ModelSelector,
+    /// Architect that audits the modification independently.
+    pub critic: ModelSelector,
+    /// Whether the independent critique phase is skipped.
+    pub skip_critique: bool,
     pub instructions_editor: crate::editor::InputEditor,
     /// Section that currently owns the keyboard.
-    pub focus: RefineDialogFocus,
+    pub focus: PlanFormFocus,
     pub confirm_button: crate::app::ConfirmDialogButton,
 }
 
 impl PlanRefineDialogState {
     /// Builds a plan refinement dialog selecting among the configured
-    /// `architect_entries` for the Architect role.
+    /// `architect_entries` for both the Planner and the Critic role.
     pub fn new(plan_id: String, plan_title: String, architect_entries: Vec<ModelEntry>) -> Self {
         Self {
             plan_id,
             plan_title,
-            selector: ModelSelector::new(ModelRole::Architect, architect_entries, 0),
+            planner: ModelSelector::new(ModelRole::Architect, architect_entries.clone(), 0),
+            critic: ModelSelector::new(ModelRole::Architect, architect_entries, 0),
+            skip_critique: false,
             instructions_editor: crate::editor::InputEditor::default(),
-            focus: RefineDialogFocus::default(),
+            focus: PlanFormFocus::default(),
             confirm_button: crate::app::ConfirmDialogButton::Cancel,
         }
     }
 
-    /// Currently selected architect entry, if any.
-    pub fn selected_entry(&self) -> Option<&ModelEntry> {
-        self.selector.selected_entry()
+    /// Currently selected Planner entry, if any.
+    pub fn selected_planner(&self) -> Option<&ModelEntry> {
+        self.planner.selected_entry()
+    }
+
+    /// Currently selected Critic entry, if any.
+    pub fn selected_critic(&self) -> Option<&ModelEntry> {
+        self.critic.selected_entry()
     }
 }
 
@@ -271,8 +411,6 @@ pub struct PlansViewState {
     pub status_message: Option<String>,
     pub refining: bool,
     pub refining_plan_id: Option<String>,
-    pub refine_dialog: Option<PlanRefineDialogState>,
-    pub refine_blocked: Option<PlanRefineBlockedState>,
     pub theme_mode: crate::config::ThemeMode,
     /// Active discussion focus mirrored from the server, used to render the
     /// `[FOCUS]` indicator. Synced from `AppState::discussion_focus` on render.
@@ -384,7 +522,7 @@ impl PlansViewState {
                     collect_item_keys(plan_id, child, out);
                 }
             }
-            for item in &plan.items {
+            for item in &plan.implementation.items {
                 collect_item_keys(&plan.id, item, &mut self.expanded_items);
             }
         }
@@ -475,10 +613,10 @@ impl PlansViewState {
                 description: plan.description.clone(),
                 total,
                 completed,
-                status: plan.status(),
+                status: plan.implementation.status(),
                 is_expanded,
                 focused: self.is_plan_focused(&plan.id),
-                architect: plan.architect.clone(),
+                architect: plan.implementation.architect.clone(),
             };
             if !visit(index, header) {
                 return;
@@ -490,7 +628,7 @@ impl PlansViewState {
             }
 
             if plan.concept.is_empty() {
-                for item in &plan.items {
+                for item in &plan.implementation.items {
                     if !self.walk_item(&plan.id, item, 1, &mut index, visit) {
                         return;
                     }
@@ -528,7 +666,7 @@ impl PlansViewState {
             }
             index += 1;
             if impl_expanded {
-                for item in &plan.items {
+                for item in &plan.implementation.items {
                     if !self.walk_item(&plan.id, item, 2, &mut index, visit) {
                         return;
                     }
@@ -684,7 +822,7 @@ impl PlansViewState {
             count += 1; // The plan header.
             if self.is_plan_expanded(&plan.id) {
                 if plan.concept.is_empty() {
-                    for item in &plan.items {
+                    for item in &plan.implementation.items {
                         count += self.count_item_rows(&plan.id, item);
                     }
                 } else {
@@ -696,7 +834,7 @@ impl PlansViewState {
                     }
                     count += 1; // The implementation section header.
                     if self.is_impl_section_expanded(&plan.id) {
-                        for item in &plan.items {
+                        for item in &plan.implementation.items {
                             count += self.count_item_rows(&plan.id, item);
                         }
                     }
@@ -940,7 +1078,7 @@ impl PlansViewState {
             }
 
             let mut item_ancestors = Vec::new();
-            for item in &plan.items {
+            for item in &plan.implementation.items {
                 collect_item_leaves(&plan.id, item, &mut item_ancestors, &mut plan_leaves);
             }
 
@@ -2190,7 +2328,7 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
         let mut view = tall_scroll_fixture(5);
-        view.plans[0].items = vec![
+        view.plans[0].implementation.items = vec![
             leaf_item("1", "First step"),
             PlanItem {
                 id: "2".to_string(),
@@ -2250,7 +2388,7 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
         let mut view = scroll_fixture(5);
-        view.plans[0].items = vec![
+        view.plans[0].implementation.items = vec![
             leaf_item("1", "First step"),
             PlanItem {
                 id: "2".to_string(),

@@ -83,6 +83,7 @@ pub fn canonical_catalog() -> Vec<LocaleCatalogItem> {
         item("modal.send", "Send to AI", "Send the discussion prompt button", Some(14)),
         item("modal.start_review", "Start Review", "Start a code review button", Some(14)),
         item("modal.start_refinement", "Start Refinement", "Start an architect plan refinement button", Some(18)),
+        item("modal.create_plan", "Create Plan", "Create a new plan through the two-phase Architect pipeline button", Some(14)),
 
         // ------------------------------------------------------------------
         // Shared modal dialog vocabulary (footer interaction verbs).
@@ -677,6 +678,7 @@ pub fn canonical_catalog() -> Vec<LocaleCatalogItem> {
         item("cmd.global.select_theme", "Select the color theme", "Global command description", None),
         item("cmd.global.select_locale", "Change the interface language (locale)", "Global command description", None),
         item("cmd.global.open_usage_summary", "Open the session and operation usage breakdown", "Global command description", None),
+        item("cmd.global.open_outer_docs_cache", "Open the external documentation cache browser", "Global command description", None),
         item("cmd.global.toggle_reasoning", "Fold or unfold the reasoning stream", "Global command description", None),
         item("cmd.global.open_help", "Open the Help dialog", "Global command description", None),
         item("cmd.global.reload_config", "Reload configuration from disk", "Global command description", None),
@@ -719,6 +721,18 @@ pub fn canonical_catalog() -> Vec<LocaleCatalogItem> {
             "Dialog command description for the model-list submit accelerator",
             None,
         ),
+        item(
+            "cmd.dialog.field_next",
+            "Move the keyboard to the next input field",
+            "Dialog command description for the vertical field walk that steps to the next input field of a dialog",
+            None,
+        ),
+        item(
+            "cmd.dialog.field_prev",
+            "Move the keyboard to the previous input field",
+            "Dialog command description for the vertical field walk that steps to the previous input field of a dialog",
+            None,
+        ),
 
         // ------------------------------------------------------------------
         // Command descriptions for the Context view.
@@ -747,6 +761,161 @@ pub fn canonical_catalog() -> Vec<LocaleCatalogItem> {
             "Context command description",
             None,
         ),
+        // Inspecting the durable external documentation cache (c-3, c-4). The
+        // browser addresses documents by their logical path, so no entry below
+        // names the disk prefix the snapshots are stored under.
+        item(
+            "cmd.context.open_cache",
+            "Inspect the external documentation cache",
+            "Context command description for the key that opens the external documentation cache browser",
+            None,
+        ),
+
+        // ------------------------------------------------------------------
+        // External documentation cache browser and its removal confirmation.
+        // ------------------------------------------------------------------
+        item(
+            "dialog.outer_docs_cache.title",
+            "External Documentation Cache",
+            "Title for the hierarchical external documentation cache browser",
+            None,
+        ),
+        item(
+            "dialog.outer_docs_cache.loading",
+            "Reading the cache inventory...",
+            "Browser placeholder while the cache inventory is loading",
+            None,
+        ),
+        item(
+            "dialog.outer_docs_cache.empty",
+            "The cache holds no documents.",
+            "Browser placeholder when the cache holds no document",
+            None,
+        ),
+        item(
+            "dialog.outer_docs_cache.summary",
+            "{} document(s), ~{} tokens",
+            "Browser summary counting the cached documents and their tokens",
+            None,
+        ),
+        item(
+            "dialog.outer_docs_cache.directory_summary",
+            "{} file(s), ~{} tokens",
+            "Browser detail of a directory row naming the documents it covers",
+            None,
+        ),
+        item(
+            "dialog.outer_docs_cache.document_summary",
+            "~{} tokens, {} B",
+            "Browser detail of a document row naming its tokens and its size in bytes",
+            None,
+        ),
+        item(
+            "dialog.outer_docs_cache.footer",
+            "n / p move • Tab / Space fold • a fold all • Delete remove • Esc close",
+            "Browser footer hint naming navigation, folding, removal, and dismissal",
+            None,
+        ),
+        item(
+            "dialog.outer_docs_cache.remove.title",
+            "Remove from External Documentation Cache",
+            "Title for the cache removal confirmation card",
+            None,
+        ),
+        item(
+            "dialog.outer_docs_cache.remove.question",
+            "Remove this cached entry and everything below it?",
+            "Question line in the cache removal confirmation card",
+            None,
+        ),
+        item(
+            "dialog.outer_docs_cache.remove.path_label",
+            " Path: ",
+            "Removal confirmation field label prefixing the logical cache path",
+            None,
+        ),
+        item(
+            "dialog.outer_docs_cache.remove.note",
+            "The entry leaves the cache and the active context; nothing in the repository is touched.",
+            "Note in the cache removal confirmation card stating that only the cache and its context entry are touched",
+            None,
+        ),
+        item(
+            "notify.outer_docs_cache_removed",
+            "Removed {} file(s) from the external documentation cache",
+            "Notification after a cache removal names the files it dropped",
+            None,
+        ),
+        item(
+            "notify.outer_docs_cache_list_failed",
+            "Failed to read the external documentation cache: {}",
+            "Notification when the cache inventory cannot be read",
+            None,
+        ),
+
+        // ------------------------------------------------------------------
+        // Command descriptions for the external documentation cache browser.
+        // ------------------------------------------------------------------
+        item(
+            "cmd.outer_docs_cache.close",
+            "Close the cache browser",
+            "Cache browser command description",
+            None,
+        ),
+        item(
+            "cmd.outer_docs_cache.prev",
+            "Select the previous cache row",
+            "Cache browser command description",
+            None,
+        ),
+        item(
+            "cmd.outer_docs_cache.next",
+            "Select the next cache row",
+            "Cache browser command description",
+            None,
+        ),
+        item(
+            "cmd.outer_docs_cache.page_up",
+            "Move the cache highlight a page up",
+            "Cache browser command description",
+            None,
+        ),
+        item(
+            "cmd.outer_docs_cache.page_down",
+            "Move the cache highlight a page down",
+            "Cache browser command description",
+            None,
+        ),
+        item(
+            "cmd.outer_docs_cache.first",
+            "Select the first cache row",
+            "Cache browser command description",
+            None,
+        ),
+        item(
+            "cmd.outer_docs_cache.last",
+            "Select the last cache row",
+            "Cache browser command description",
+            None,
+        ),
+        item(
+            "cmd.outer_docs_cache.fold_toggle",
+            "Fold or unfold the selected cache directory",
+            "Cache browser command description",
+            None,
+        ),
+        item(
+            "cmd.outer_docs_cache.fold_all",
+            "Toggle fold or unfold for the whole cache tree",
+            "Cache browser command description",
+            None,
+        ),
+        item(
+            "cmd.outer_docs_cache.remove",
+            "Remove the selected cache entry (with confirmation)",
+            "Cache browser command description",
+            None,
+        ),
 
         // ------------------------------------------------------------------
         // Command descriptions for the History view.
@@ -770,6 +939,12 @@ pub fn canonical_catalog() -> Vec<LocaleCatalogItem> {
         // Command descriptions for the Plans view.
         // ------------------------------------------------------------------
         item("cmd.plans.activate", "Execute a leaf step, or fold groups and headers", "Plans command description", None),
+        item(
+            "cmd.plans.create_plan",
+            "Create a new plan with the two-phase Architect pipeline",
+            "Plans command description",
+            None,
+        ),
         item("cmd.plans.execute", "Execute the selected step, group, or entire plan", "Plans command description", None),
         item("cmd.plans.execute_all", "Execute every ready step of the selected plan as one batch (with confirmation)", "Plans command description", None),
         item("cmd.plans.replan", "Refine or replan the selected plan horizon with the Architect", "Plans command description", None),
@@ -838,6 +1013,12 @@ pub fn canonical_catalog() -> Vec<LocaleCatalogItem> {
         item("cmd.review.fold_toggle", "Fold or unfold the session, summary, group plan branch, or finding details", "Review command description", None),
         item("cmd.review.fold_all", "Toggle fold or unfold for all sessions, groups, plan branches, and findings", "Review command description", None),
         item("cmd.review.copy", "Copy the selected finding or session to the clipboard", "Review command description", None),
+        item(
+            "cmd.review.inspect_diff",
+            "Inspect the diff of the commit recorded in the selected finding or plan step",
+            "Review command description",
+            None,
+        ),
         item("cmd.review.delete", "Delete the review session (with confirmation)", "Review command description", None),
         item(
             "cmd.review.toggle_projection",
@@ -1113,6 +1294,12 @@ pub fn canonical_catalog() -> Vec<LocaleCatalogItem> {
         item("notify.review_copied", "Review findings copied to clipboard", "Review notification after copying findings", None),
         item("notify.review_copied_osc52", "Review findings sent to terminal clipboard (OSC 52)", "Review notification after an OSC 52 copy", None),
         item("notify.review_copy_failed", "Failed to copy to clipboard", "Review notification when copying fails", None),
+        item(
+            "notify.review_step_no_commit",
+            "The selected finding or plan step has no recorded commit to inspect",
+            "Review notification when the inspect chord finds no recorded commit",
+            None,
+        ),
 
         // ------------------------------------------------------------------
         // REPL view notifications.
@@ -1335,6 +1522,21 @@ pub fn canonical_catalog() -> Vec<LocaleCatalogItem> {
         item("dialog.refine.editor_title", "Architect Instructions (optional)", "Refine dialog instructions editor block title", None),
         item("dialog.refine.hint_actions", "Enter confirm • ← / → button • Esc cancel", "Refine dialog footer hint while the action bar has focus", None),
         item("dialog.refine.hint_fields", "{}Enter start • Tab focus • {} model • Esc cancel", "Refine dialog footer hint while a field has focus", None),
+        item("dialog.refine.critic_list_title", " Critic Model ", "Refine dialog critic list title with a single entry", None),
+        item("dialog.refine.critic_list_counter", " Critic Model  [{} of {}] ", "Refine dialog critic list title with a position counter", None),
+        item("dialog.plan_form.no_models", "  (no architect models configured)", "Shared empty Architect ladder placeholder of the plan-synthesis dialogs", None),
+        item("dialog.plan_form.critic_skipped", "[critique skipped]", "Suffix of the critic ladder title stating that the independent audit phase is disabled", None),
+        item("dialog.create_plan.title", "Create Plan (Two-Phase AI Architect)", "Title for the plan creation dialog", None),
+        item("dialog.create_plan.header_note", "The Planner drafts the plan, an independent Critic audits its invariants, and the Planner reconciles the critique into the issued structure.", "Creation dialog header note describing the two-phase pipeline", None),
+        item("dialog.create_plan.header_phases", "Phase 1: draft. Phase 2: independent critique and reconciliation.", "Creation dialog header line naming the two synthesis phases", None),
+        item("dialog.create_plan.planner_list_title", " Planner Model ", "Creation dialog planner list title with a single entry", None),
+        item("dialog.create_plan.planner_list_counter", " Planner Model  [{} of {}] ", "Creation dialog planner list title with a position counter", None),
+        item("dialog.create_plan.critic_list_title", " Critic Model ", "Creation dialog critic list title with a single entry", None),
+        item("dialog.create_plan.critic_list_counter", " Critic Model  [{} of {}] ", "Creation dialog critic list title with a position counter", None),
+        item("dialog.create_plan.editor_title", "Engineering Directives", "Creation dialog directives editor block title", None),
+        item("dialog.create_plan.editor_placeholder", " Describe the engineering goal and constraints the plan must satisfy...", "Creation dialog empty directives placeholder", None),
+        item("dialog.create_plan.hint_actions", "Enter create • ← / → button • Esc cancel", "Creation dialog footer hint while the action bar has focus", None),
+        item("dialog.create_plan.hint_fields", "{}Enter create • Tab focus • Space toggle critique • {} model • Esc cancel", "Creation dialog footer hint while a field has focus", None),
         item("dialog.refine_blocked.heading", "AI Architect Refused Decomposition (Blockers Detected)", "Refine-blocked dialog heading", None),
         item("dialog.refine_blocked.plan_label", "Plan: ", "Refine-blocked dialog plan field label", None),
         item("dialog.refine_blocked.reason_label", "Reason / Contradiction:", "Refine-blocked dialog reason field label", None),
@@ -1519,6 +1721,9 @@ pub fn canonical_catalog() -> Vec<LocaleCatalogItem> {
         item("notify.plan_horizon_updated", "Plan '{}' horizon updated ({}/{} done): {}", "Notification after the Architect updates a plan horizon", None),
         item("notify.plan_horizon_updated_default", "Plan '{}' horizon updated successfully by architect ({}/{} done)", "Notification after the Architect updates a plan horizon without a note", None),
         item("notify.plan_horizon_blocked", "Plan horizon synthesis blocked by architect: manual intervention or replanning required", "Notification when the Architect refuses a plan horizon synthesis", None),
+        item("notify.plan_created", "Plan '{}' created ({}/{} done): {}", "Notification after the two-phase pipeline issues a new plan with its reconciliation note", None),
+        item("notify.plan_created_default", "Plan '{}' created ({}/{} done)", "Notification after the two-phase pipeline issues a new plan without a reconciliation note", None),
+        item("notify.plan_create_directives_empty", "Enter the engineering directives the plan must satisfy", "Notification rejecting an empty plan creation request", None),
         item("notify.turn_desktop_title", "TAUQE", "Desktop notification title for a settled turn", None),
         item("notify.turn_error_desktop_title", "TAUQE Error", "Desktop notification title for a failed turn", None),
         item("notify.turn_error_desktop_body", "Turn failed with error", "Desktop notification body for a failed turn", None),
@@ -2066,13 +2271,62 @@ mod tests {
 
         for (name, source) in sources {
             let production = source.split("#[cfg(test)]").next().unwrap_or_default();
+            let literals = string_literals(production);
             for &fragment in forbidden {
                 assert!(
-                    !production.contains(fragment),
+                    !literals.iter().any(|literal| literal.contains(fragment)),
                     "{name} hardcodes the catalog phrase {fragment:?}"
                 );
             }
         }
+    }
+
+    /// Extracts every double-quoted segment of a Rust source file.
+    ///
+    /// The audit above forbids a renderer from embedding a user-facing phrase
+    /// as a string literal, so the production source is read through its
+    /// quoted segments instead of its raw text: a field declaration or an
+    /// identifier that happens to spell the same characters displays nothing
+    /// and violates no localization rule (Conventions §9).
+    fn string_literals(source: &str) -> Vec<String> {
+        let mut literals = Vec::new();
+        let mut buffer = String::new();
+        let mut inside = false;
+        let mut chars = source.chars();
+        while let Some(ch) = chars.next() {
+            if !inside {
+                if ch == '"' {
+                    inside = true;
+                    buffer.clear();
+                }
+                continue;
+            }
+            if ch == '\\' {
+                if let Some(escaped) = chars.next() {
+                    buffer.push(escaped);
+                }
+            } else if ch == '"' {
+                literals.push(std::mem::take(&mut buffer));
+                inside = false;
+            } else {
+                buffer.push(ch);
+            }
+        }
+        literals
+    }
+
+    /// The scanner must report a quoted phrase while ignoring an identifier
+    /// that spells the same characters, so the audit stays strict about
+    /// literals without failing on a declaration (Conventions §9).
+    #[test]
+    fn test_string_literals_scanner_reads_only_quoted_segments() {
+        let source = "let files: usize = 1; format!(\"files: {}\", files);";
+        let literals = string_literals(source);
+        assert_eq!(literals, vec!["files: {}".to_string()]);
+        assert!(
+            literals.iter().any(|literal| literal.contains("files: ")),
+            "the quoted phrase must stay visible to the audit"
+        );
     }
 
     /// The Viewport file rows, the sticky overlay, and the diff inspector file

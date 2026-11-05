@@ -3,17 +3,27 @@ use std::sync::Arc;
 
 use tauqe_protocol::{Event, Response};
 use tokio::io::{AsyncWrite, AsyncWriteExt};
-use tokio::sync::{mpsc, Notify};
+use tokio::sync::{mpsc, watch, Notify};
 
-/// Queue depth at which the transport reports that the client stopped draining
-/// its stream.
+/// Queue depth at which the transport pauses a streaming producer and reports
+/// that the client stopped draining its stream.
 ///
 /// The queue stays unbounded on purpose: dropping a line would corrupt the wire
 /// stream, because a client cannot tell a discarded event from one that was
-/// never produced. A dead sink now stops the daemon instead, so unbounded
-/// growth is confined to a client that merely reads slower than the daemon
-/// produces, and this threshold makes exactly that condition visible.
-const BACKLOG_WARN_THRESHOLD: usize = 8192;
+/// never produced. The bound therefore comes from the producing side — a contour
+/// that relays token-granularity telemetry waits for
+/// [`OutChannel::wait_for_headroom`] before it enqueues the next fragment, so the
+/// depth follows the writer's progress instead of the length of the operation. A
+/// dead sink still stops the daemon through [`OutChannel::sink_lost`].
+const BACKLOG_HIGH_WATER: usize = 8192;
+
+/// Queue depth the writer must reach before a paused producer resumes.
+///
+/// The gap to [`BACKLOG_HIGH_WATER`] is what keeps the gate from oscillating on
+/// every drained batch: a paused producer resumes only after the writer caught
+/// up by that whole margin, so one stalled episode costs one report and one
+/// pause instead of a flip on every write.
+const BACKLOG_LOW_WATER: usize = BACKLOG_HIGH_WATER / 8;
 
 /// Upper bound on the number of queued lines one sink write coalesces.
 ///
@@ -37,6 +47,9 @@ struct OutboundState {
     pending: AtomicUsize,
     /// Wakes the request loop when the sink dies.
     lost: Notify,
+    /// Releases a producer that paused at [`BACKLOG_HIGH_WATER`] once the writer
+    /// drained the queue back below [`BACKLOG_LOW_WATER`].
+    headroom: Notify,
 }
 
 impl OutboundState {
@@ -47,6 +60,7 @@ impl OutboundState {
             backlog_reported: AtomicBool::new(false),
             pending: AtomicUsize::new(0),
             lost: Notify::new(),
+            headroom: Notify::new(),
         }
     }
 
@@ -68,15 +82,25 @@ impl OutboundState {
         self.lost.notify_one();
     }
 
-    /// Accounts `lines` leaving the queue and re-arms the backlog report once
-    /// the queue has drained.
+    /// Accounts `lines` leaving the queue, re-arms the stall report once the
+    /// queue has drained, and releases the producers that paused above the
+    /// high-water mark.
+    ///
+    /// The depth falls before the wake-up is published, so a producer that read
+    /// the depth just before this batch left the queue cannot sleep through the
+    /// drain meant to release it: it finds the stored permit and re-checks the
+    /// depth immediately.
     fn release_pending(&self, lines: usize) {
         let remaining = self
             .pending
             .fetch_sub(lines, Ordering::Relaxed)
             .saturating_sub(lines);
-        if remaining < BACKLOG_WARN_THRESHOLD {
+        if remaining < BACKLOG_LOW_WATER {
             self.backlog_reported.store(false, Ordering::Relaxed);
+            // Every producer already waiting re-checks the depth, and the stored
+            // permit covers the producer that starts waiting at this instant.
+            self.headroom.notify_waiters();
+            self.headroom.notify_one();
         }
     }
 }
@@ -156,6 +180,37 @@ impl OutChannel {
         }
     }
 
+    /// Awaits until the outbound queue drained below the low-water mark.
+    ///
+    /// This is the backpressure of the transport. A client that keeps its pipe
+    /// open but stops reading cannot make the daemon accumulate every serialized
+    /// line of a long streaming turn: the contour that relays those lines pauses
+    /// here and resumes only once the writer caught up. No line is ever shed —
+    /// the queue keeps every event in order — so the bound applies to the
+    /// producer and never to the payload.
+    ///
+    /// Only a high-rate streaming contour calls this, so responses and control
+    /// events keep flowing and the request loop stays responsive while a stream
+    /// is throttled. The wait ends with the operation: a raised `cancel` signal
+    /// releases it even while the client is still stalled, because a paused
+    /// stream must never outlive the turn that produces it. What is left to
+    /// enqueue afterwards is bounded by the relay channel, since the producer
+    /// stops producing once it observes the cancellation.
+    pub async fn wait_for_headroom(&self, cancel: &mut watch::Receiver<bool>) {
+        if *cancel.borrow() {
+            return;
+        }
+        let drained = async {
+            while self.state.pending.load(Ordering::Acquire) >= BACKLOG_HIGH_WATER {
+                self.state.headroom.notified().await;
+            }
+        };
+        tokio::select! {
+            _ = drained => {}
+            _ = cancel.changed() => {}
+        }
+    }
+
     /// Enqueues one serialized line, recording a dead sink instead of
     /// discarding the send result.
     fn enqueue(&self, line: String) {
@@ -167,13 +222,13 @@ impl OutChannel {
         }
 
         let pending = self.state.pending.fetch_add(1, Ordering::Relaxed) + 1;
-        if pending >= BACKLOG_WARN_THRESHOLD
+        if pending >= BACKLOG_HIGH_WATER
             && !self.state.backlog_reported.swap(true, Ordering::Relaxed)
         {
             tracing::warn!(
                 pending,
-                threshold = BACKLOG_WARN_THRESHOLD,
-                "Outbound backlog is growing; the client is not draining its stream"
+                threshold = BACKLOG_HIGH_WATER,
+                "Outbound backlog reached the high-water mark; the client is not draining its stream"
             );
         }
 
@@ -439,18 +494,89 @@ mod tests {
     #[tokio::test]
     async fn a_growing_backlog_arms_the_depth_report() {
         let (out, _rx) = OutChannel::new();
-        for _ in 0..=BACKLOG_WARN_THRESHOLD {
+        for _ in 0..=BACKLOG_HIGH_WATER {
             out.send_event(&event("test/delta"));
         }
 
         assert_eq!(
             out.state.pending.load(Ordering::Relaxed),
-            BACKLOG_WARN_THRESHOLD + 1,
+            BACKLOG_HIGH_WATER + 1,
             "every queued line must be accounted for"
         );
         assert!(
             out.state.backlog_reported.load(Ordering::Relaxed),
-            "crossing the depth threshold must arm the backlog report"
+            "crossing the high-water mark must arm the backlog report"
         );
+    }
+
+    /// A client that keeps its pipe open but stops reading must not turn a
+    /// streaming turn into an unbounded queue: the producer pauses at the
+    /// high-water mark and resumes only after the writer caught up.
+    #[tokio::test]
+    async fn a_stalled_client_pauses_the_producer_until_the_writer_catches_up() {
+        let (out, rx) = OutChannel::new();
+        let (_cancel_tx, mut cancel) = watch::channel(false);
+
+        tokio::time::timeout(
+            Duration::from_millis(20),
+            out.wait_for_headroom(&mut cancel),
+        )
+        .await
+        .expect("an empty queue must never delay a producer");
+
+        for _ in 0..BACKLOG_HIGH_WATER {
+            out.send_event(&event("test/delta"));
+        }
+        assert!(
+            tokio::time::timeout(
+                Duration::from_millis(20),
+                out.wait_for_headroom(&mut cancel)
+            )
+            .await
+            .is_err(),
+            "a producer must wait while the backlog sits at the high-water mark"
+        );
+
+        let writing = tokio::spawn(out.writer(rx).run_with(tokio::io::sink()));
+        tokio::time::timeout(Duration::from_secs(1), out.wait_for_headroom(&mut cancel))
+            .await
+            .expect("the writer must drain the queue below the low-water mark");
+        assert!(
+            out.state.pending.load(Ordering::Relaxed) < BACKLOG_LOW_WATER,
+            "the released producer must observe the drained depth"
+        );
+
+        writing.abort();
+        let _ = writing.await;
+    }
+
+    /// A cancelled operation must leave the gate even while the client is still
+    /// stalled, so an interrupted turn reaches its terminal events and releases
+    /// its operation slot instead of waiting for a reader that never returns.
+    #[tokio::test]
+    async fn a_cancelled_operation_stops_waiting_for_a_stalled_client() {
+        let (out, _rx) = OutChannel::new();
+        for _ in 0..BACKLOG_HIGH_WATER {
+            out.send_event(&event("test/delta"));
+        }
+        let (cancel_tx, mut cancel) = watch::channel(false);
+
+        assert!(
+            tokio::time::timeout(
+                Duration::from_millis(20),
+                out.wait_for_headroom(&mut cancel)
+            )
+            .await
+            .is_err(),
+            "the stalled client must hold the producer"
+        );
+
+        let _ = cancel_tx.send(true);
+        tokio::time::timeout(
+            Duration::from_millis(20),
+            out.wait_for_headroom(&mut cancel),
+        )
+        .await
+        .expect("a cancelled operation must not wait for the stalled client");
     }
 }

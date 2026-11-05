@@ -24,6 +24,7 @@ use crate::state::AppState;
 
 use super::common::offload_plan;
 use super::engine::{execute_plan_horizon_synthesis, PlanHorizonDiagnosticsOwned};
+use super::two_phase::{execute_two_phase_plan_synthesis, TwoPhaseRequest};
 
 pub use pipeline::handle_plan_execute_pipeline;
 pub(super) use supervisor::{run_plan_batch, BatchOutcome, PlanBatchOptions};
@@ -55,7 +56,10 @@ pub async fn handle_plan_execute(req: Request, state: &Arc<AppState>) -> Respons
         Err(err) => return Response::err(req.id, errors::PLAN_LOAD_FAILED, err),
     };
 
-    let steps = match plan.evaluate_scope(params.step_id.as_deref()) {
+    let steps = match plan
+        .implementation
+        .evaluate_scope(params.step_id.as_deref())
+    {
         PlanScopeEvaluation::Ready(steps) => steps,
         PlanScopeEvaluation::BlockedByDiscussion(items) => {
             return Response::err(
@@ -99,7 +103,7 @@ pub async fn handle_plan_execute(req: Request, state: &Arc<AppState>) -> Respons
             // horizon has no leaf to schedule yet: the batch projects the first
             // horizon just-in-time, so the request is not rejected as a
             // completed scope.
-            if plan.items.is_empty() && !plan.concept.is_empty() {
+            if plan.implementation.items.is_empty() && !plan.concept.is_empty() {
                 Vec::<tauqe_protocol::PlanItem>::new()
             } else {
                 return Response::err(
@@ -164,9 +168,9 @@ pub async fn handle_plan_execute(req: Request, state: &Arc<AppState>) -> Respons
     let step_ids: Vec<String> = steps.iter().map(|s| s.id.clone()).collect();
     // The coder selection travels with the request, so every step of the batch
     // starts from the chosen ladder rung. The plan itself is the single source
-    // of per-step instructions (concept #c-1).
     let options = PlanBatchOptions {
         model: params.model,
+        step_id: params.step_id,
     };
     // The identity of the registered operation travels with the acknowledgement,
     // so a client can attribute every lifecycle event of the batch — the
@@ -240,9 +244,15 @@ pub async fn handle_plan_refine(req: Request, state: &Arc<AppState>) -> Response
     // `id` alias — is the single parser, so a malformed field answers
     // INVALID_PARAMS instead of degrading to a silent active-plan fallback
     // or dropping the model selection (Conventions §2.5).
-    let (plan_id, custom_model, instructions) = match req.params {
+    let (plan_id, custom_model, critic_model, skip_critique, instructions) = match req.params {
         Some(val) => match serde_json::from_value::<PlanRefineParams>(val) {
-            Ok(params) => (params.plan_id, params.model, params.instructions),
+            Ok(params) => (
+                params.plan_id,
+                params.model,
+                params.critic_model,
+                params.skip_critique,
+                params.instructions,
+            ),
             Err(err) => {
                 return Response::err(
                     req.id,
@@ -305,17 +315,24 @@ pub async fn handle_plan_refine(req: Request, state: &Arc<AppState>) -> Response
         }
     };
 
-    tracing::info!(plan_id = %plan.id, "plan refine requested");
+    tracing::info!(
+        plan_id = %plan.id,
+        critique = critic_model.is_some() && !skip_critique,
+        "plan refine requested"
+    );
 
-    execute_plan_horizon_synthesis(
+    execute_two_phase_plan_synthesis(
         req.id,
         state,
-        plan,
-        None,
-        custom_model,
-        instructions,
-        "Deep Plan Refinement",
-        false,
+        TwoPhaseRequest {
+            plan,
+            directives: instructions,
+            planner_model: custom_model,
+            critic_model,
+            skip_critique,
+            creation: false,
+            operation_title: "Deep Plan Refinement",
+        },
         &operation,
     )
     .await
@@ -398,7 +415,7 @@ pub async fn handle_plan_replan(req: Request, state: &Arc<AppState>) -> Response
         Err(err) => return Response::err(req.id, errors::PLAN_LOAD_FAILED, err),
     };
 
-    let step = match plan.find_item(&step_id) {
+    let step = match plan.implementation.find_item(&step_id) {
         Some(item) => item.clone(),
         None => {
             return Response::err(

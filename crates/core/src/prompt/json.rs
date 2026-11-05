@@ -8,16 +8,15 @@
 
 use std::borrow::Cow;
 
+use crate::capabilities::{map_verify_on_success, map_verify_target, PromptRenderContext};
 use crate::edits::protocol::structured::StructuredEditProtocol;
 use crate::edits::protocol::TerminalOutcome;
 use crate::edits::stream::discussion::DiscussionStreamFilter;
 use crate::edits::stream::JsonStreamFilter;
 use tauqe_protocol::{
     CapabilitySet, EditProtocolKind, LlmCapability, LlmCommand, LlmOutcome, ModelResult,
-    PatchStrategy,
+    PatchStrategy, ProjectConfig,
 };
-
-use crate::capabilities::{map_verify_on_success, map_verify_target};
 
 use super::protocol::PromptProtocol;
 
@@ -374,16 +373,20 @@ impl PromptProtocol for JsonPromptProtocol {
         &self,
         editable_paths: &[String],
         patch_strategy: PatchStrategy,
+        project: Option<&ProjectConfig>,
     ) -> Option<crate::providers::ResponseFormat> {
-        // The response schema is a projection of the enabled capability set and
-        // the declared patch strategy, never of the files a turn may address:
-        // the field names are fixed before any file enters the context, so the
-        // permitted paths travel through the protocol contract without reaching
-        // the schema or the discussion payload.
-        let _ = editable_paths;
+        // The edit schema is a projection of the enabled capability set, the
+        // declared patch strategy, and the project command declaration, never of
+        // the files a turn may address: the field names are fixed before any
+        // file enters the context. The permitted paths still seed the render
+        // context, so one projection serves the schema and the instructions a
+        // turn renders from the very same declaration.
         match &self.mode {
             JsonPromptMode::Edits => {
-                StructuredEditProtocol.response_format_for(&self.capabilities, patch_strategy)
+                let render = PromptRenderContext::new(editable_paths, None)
+                    .with_project(project)
+                    .with_patch_strategy(patch_strategy);
+                StructuredEditProtocol.response_format_for(&self.capabilities, &render)
             }
             JsonPromptMode::Discussion { .. } => {
                 Some(crate::providers::ResponseFormat::JsonSchema {
@@ -800,7 +803,7 @@ mod tests {
         // single source of truth across both discussions.
         let widened = JsonPromptProtocol::with_capabilities(CapabilitySet::interactive_repl());
         let format = widened
-            .response_format(&[], PatchStrategy::SearchReplace)
+            .response_format(&[], PatchStrategy::SearchReplace, None)
             .expect("edit mode always carries a response schema");
         let crate::providers::ResponseFormat::JsonSchema { json_schema } = format else {
             panic!("edit mode composes a JSON schema");
@@ -825,8 +828,8 @@ mod tests {
         ]);
         let protocol = JsonPromptProtocol::with_capabilities(text_only);
         let format = protocol
-            .response_format(&[], PatchStrategy::SearchReplace)
-            .expect("discussion mode always carries a response schema");
+            .response_format(&[], PatchStrategy::SearchReplace, None)
+            .expect("discussion mode composes a response schema");
         let crate::providers::ResponseFormat::JsonSchema { json_schema } = format else {
             panic!("discussion mode composes a JSON schema");
         };

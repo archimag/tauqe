@@ -310,13 +310,6 @@ impl TurnInputCache {
         project
     }
 
-    /// Returns the turn-scoped memo of rendered context elements.
-    ///
-    /// The memo is owned by the turn rather than by a single prompt assembly, so
-    /// a file rendered in an earlier round is reproduced verbatim while the
-    /// rounds that widened the context render only the files they added. An
-    /// unchanged file therefore keeps the exact bytes — and the exact line
-    /// anchors — the previous round already sent to the provider.
     /// Returns the context files of a round, reading only the paths this turn
     /// has not read yet.
     ///
@@ -332,7 +325,8 @@ impl TurnInputCache {
     /// A path that cannot be read leaves the memo and is omitted from the round,
     /// which is how an unreadable context file has always been rendered. A
     /// failed offload is reported to the caller instead of silently shrinking
-    /// the context.
+    /// the context. Every returned file carries the insertion watermark of its
+    /// context entry, so a layout places it where it actually arrived.
     pub(super) async fn context_files(
         &mut self,
         repo_root: &Path,
@@ -406,6 +400,7 @@ impl TurnInputCache {
                         path: item.path.clone(),
                         access: item.access,
                         content: entry.content.clone(),
+                        insertion_seq: item.insertion_seq,
                     }
                 })
             })
@@ -413,6 +408,13 @@ impl TurnInputCache {
         Ok(files)
     }
 
+    /// Returns the turn-scoped memo of rendered context elements.
+    ///
+    /// The memo is owned by the turn rather than by a single prompt assembly, so
+    /// a file rendered in an earlier round is reproduced verbatim while the
+    /// rounds that widened the context render only the files they added. An
+    /// unchanged file therefore keeps the exact bytes — and the exact line
+    /// anchors — the previous round already sent to the provider.
     pub(super) fn context_cache(&mut self) -> &mut ContextBlockCache {
         &mut self.context_block
     }
@@ -487,6 +489,9 @@ mod tests {
             path: path.to_string(),
             access: ContextAccess::Editable,
             content: content.to_string(),
+            // The fixture synthesizes files outside the context layers, so it
+            // carries the unrecorded arrival.
+            insertion_seq: 0,
         };
 
         let mut cache = TurnInputCache::default();

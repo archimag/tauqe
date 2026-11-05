@@ -247,7 +247,7 @@ impl ProposalStep {
     }
 
     /// Plan updates carried by the proposal, if any.
-    fn plans(&self) -> &[tauqe_protocol::DiscussionPlanUpdate] {
+    pub(super) fn plans(&self) -> &[tauqe_protocol::DiscussionPlanUpdate] {
         &self.plans
     }
 
@@ -341,6 +341,16 @@ impl TurnState {
             self.abort = Some(abort.clone());
         }
         self.plans.extend(step.plans().iter().cloned());
+    }
+
+    /// Drops the plan mutations accumulated so far.
+    ///
+    /// A corrective round answers for the payload that failed validation, so the
+    /// refused mutations leave the turn state before the corrected round is
+    /// absorbed: the payload is replaced, never accumulated beside the document it
+    /// repairs.
+    pub(super) fn clear_plans(&mut self) {
+        self.plans.clear();
     }
 }
 

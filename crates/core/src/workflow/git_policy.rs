@@ -34,10 +34,20 @@ use crate::git::{
 /// A turn supervisor consults it to avoid force-aborting a workflow task in the
 /// middle of a Git transaction, which would otherwise strand a checkpoint or
 /// step commit until startup crash recovery runs.
+///
+/// The optional `cancel` receiver is the turn's cancellation signal. The capture
+/// and the step commit observe it, so cancelling the turn releases the commit a
+/// repository hook is holding instead of waiting for the hook to finish.
+/// Finalization and rollback stay cancel-blind on purpose: both settle an outcome
+/// the turn already decided, and completing them under the wall-clock budget is
+/// what leaves the working tree in a known state and what makes the deferred
+/// force-abort of a stalled turn deterministic instead of open-ended.
 #[derive(Debug, Default, Clone)]
 pub struct GitTransactionPolicy {
     checkpoint: Option<CheckpointInfo>,
     guard: Option<Arc<AtomicBool>>,
+    /// Turn-scoped cancellation signal the capture and the step commit observe.
+    cancel: Option<watch::Receiver<bool>>,
 }
 
 impl GitTransactionPolicy {
@@ -50,6 +60,17 @@ impl GitTransactionPolicy {
         Self {
             checkpoint: None,
             guard: Some(guard),
+            cancel: None,
+        }
+    }
+
+    /// Creates a policy that reports an open transaction through `guard` and
+    /// observes the turn's cancellation signal while capturing and committing.
+    pub fn with_guard_and_cancel(guard: Arc<AtomicBool>, cancel: watch::Receiver<bool>) -> Self {
+        Self {
+            checkpoint: None,
+            guard: Some(guard),
+            cancel: Some(cancel),
         }
     }
 
@@ -104,8 +125,14 @@ impl ApplyPolicy for GitTransactionPolicy {
         // tree to its true pre-turn state.
         if self.checkpoint.is_none() {
             let root = repo_root.to_path_buf();
-            let checkpoint =
-                crate::blocking::run_blocking_async(move || create_checkpoint(&root)).await??;
+            // The receiver is cloned into the offload because the closure owns
+            // everything it touches; the clone shares the turn's channel, so the
+            // capture observes exactly the signal the turn raises.
+            let cancel = self.cancel.clone();
+            let checkpoint = crate::blocking::run_blocking_async(move || {
+                create_checkpoint(&root, cancel.as_ref())
+            })
+            .await??;
             self.checkpoint = Some(checkpoint);
         }
         self.publish_transaction_state();
@@ -116,8 +143,9 @@ impl ApplyPolicy for GitTransactionPolicy {
         if !changed_files.is_empty() {
             let root = repo_root.to_path_buf();
             let files = changed_files.clone();
+            let cancel = self.cancel.clone();
             crate::blocking::run_blocking_async(move || {
-                create_step_commit(&root, &files, "initial attempt")
+                create_step_commit(&root, &files, "initial attempt", cancel.as_ref())
             })
             .await??;
         }
@@ -131,6 +159,10 @@ impl ApplyPolicy for GitTransactionPolicy {
         changed_files: &[String],
         commit_message: &str,
     ) -> anyhow::Result<Option<String>> {
+        // Finalization stays cancel-blind: it settles an outcome the turn already
+        // decided, and completing it under the wall-clock budget is what leaves the
+        // tree in a known state and lets the server's deferred force-abort wait for
+        // the transaction to close deterministically.
         let root = repo_root.to_path_buf();
         let files = changed_files.to_vec();
         let commit_message_owned = commit_message.to_string();
@@ -160,6 +192,8 @@ impl ApplyPolicy for GitTransactionPolicy {
     }
 
     async fn rollback(&mut self, repo_root: &Path) -> anyhow::Result<bool> {
+        // Rollback stays cancel-blind for the same reason as finalization: it has
+        // to return the tree to the recorded base even when the turn was cancelled.
         self.clear_transaction_state();
         if let Some(checkpoint) = self.checkpoint.take() {
             let root = repo_root.to_path_buf();
@@ -174,9 +208,13 @@ impl ApplyPolicy for GitTransactionPolicy {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::AtomicBool;
+    use std::sync::Arc;
+
     use super::{ApplyPolicy, GitTransactionPolicy};
     use crate::context::ContextManager;
     use tauqe_protocol::{ContextAccess, EditOperation, EditProposal, ProjectConfig};
+    use tokio::sync::watch;
 
     /// Project configuration the policy tests stage under: no formatter, no hook.
     fn project() -> ProjectConfig {
@@ -455,5 +493,122 @@ mod tests {
             "an untracked change set produces no commit: {hash:?}"
         );
         assert_eq!(head_subject(root), "Initial commit");
+    }
+
+    /// Installs a `pre-commit` hook that announces its start and then sleeps far
+    /// beyond the test's patience, so a cancellation has to release the capture.
+    #[cfg(unix)]
+    fn install_sleeping_hook(root: &std::path::Path) {
+        use std::os::unix::fs::PermissionsExt;
+
+        let hooks = root.join(".git/hooks");
+        std::fs::create_dir_all(&hooks).unwrap();
+        let hook = hooks.join("pre-commit");
+        std::fs::write(
+            &hook,
+            "#!/bin/sh\necho started > hook-started.log\nsleep 30\n",
+        )
+        .unwrap();
+        let mut perms = std::fs::metadata(&hook).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&hook, perms).unwrap();
+    }
+
+    /// A cancellation that arrives while a repository hook holds the checkpoint
+    /// commit releases the capture promptly and reports the cancellation.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_cancelled_capture_releases_a_hook_that_holds_the_checkpoint_commit() {
+        use std::time::{Duration, Instant};
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        init_repo(root);
+        // The tree must be dirty for the capture to create its checkpoint commit,
+        // and the project must opt into running the repository hooks.
+        std::fs::write(
+            root.join("tauqe.toml"),
+            "[git]\nbypass_hooks = false\ntimeout_secs = 300\n",
+        )
+        .unwrap();
+        install_sleeping_hook(root);
+        let mut cm = editable_context(root);
+
+        let (cancel_tx, cancel_rx) = watch::channel(false);
+        let marker = root.join("hook-started.log");
+        let canceller = std::thread::spawn(move || {
+            for _ in 0..400 {
+                if marker.exists() {
+                    let _ = cancel_tx.send(true);
+                    return true;
+                }
+                std::thread::sleep(Duration::from_millis(25));
+            }
+            false
+        });
+
+        let guard = Arc::new(AtomicBool::new(false));
+        let mut policy = GitTransactionPolicy::with_guard_and_cancel(guard, cancel_rx);
+        let proposal = EditProposal {
+            summary: "update a.rs".to_string(),
+            edits: replace_edit(),
+        };
+        let started = Instant::now();
+        let error = policy
+            .apply_temporary(root, &project(), &mut cm, &proposal)
+            .await
+            .expect_err("a cancelled capture must not hand back a checkpoint");
+
+        assert!(canceller.join().unwrap(), "the hook never started");
+        let rendered = format!("{error:#}");
+        assert!(rendered.contains("was cancelled"), "error: {rendered}");
+        assert!(
+            started.elapsed() < Duration::from_secs(20),
+            "the cancellation did not release the capture: {:?}",
+            started.elapsed()
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join("a.rs")).unwrap(),
+            "one\n",
+            "the cancelled turn never reached the working tree"
+        );
+    }
+
+    /// A turn cancelled before the capture is refused before the first probe, so no
+    /// transaction marker is written and no developer work is recorded.
+    #[tokio::test]
+    async fn a_turn_cancelled_before_the_capture_opens_no_transaction() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        init_repo(root);
+        // Uncommitted developer work makes a capture observable: a capture that ran
+        // would record it in a checkpoint commit and write the transaction marker.
+        std::fs::write(root.join("notes.txt"), "uncommitted work\n").unwrap();
+        let mut cm = editable_context(root);
+
+        let (_cancel_tx, cancel_rx) = watch::channel(true);
+        let guard = Arc::new(AtomicBool::new(false));
+        let mut policy = GitTransactionPolicy::with_guard_and_cancel(guard, cancel_rx);
+        let proposal = EditProposal {
+            summary: "update a.rs".to_string(),
+            edits: replace_edit(),
+        };
+        let error = policy
+            .apply_temporary(root, &project(), &mut cm, &proposal)
+            .await
+            .expect_err("a cancelled turn must not open a transaction");
+
+        let rendered = format!("{error:#}");
+        assert!(rendered.contains("was cancelled"), "error: {rendered}");
+        assert_eq!(head_subject(root), "Initial commit");
+        assert!(
+            !root.join(".tauqe/active-transaction.json").exists(),
+            "the refusal must come before the capture writes its marker"
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join("notes.txt")).unwrap(),
+            "uncommitted work\n"
+        );
+        assert_eq!(std::fs::read_to_string(root.join("a.rs")).unwrap(), "one\n");
     }
 }

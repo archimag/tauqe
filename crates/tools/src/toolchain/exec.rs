@@ -370,7 +370,7 @@ fn cancelled_result(display: &str) -> ToolchainCheckResult {
 }
 
 #[cfg(unix)]
-fn kill_process_group(pid: u32) {
+pub(crate) fn kill_process_group(pid: u32) {
     extern "C" {
         fn kill(pid: i32, sig: i32) -> i32;
     }
@@ -384,7 +384,7 @@ fn kill_process_group(pid: u32) {
 }
 
 #[cfg(not(unix))]
-fn kill_process_group(_pid: u32) {}
+pub(crate) fn kill_process_group(_pid: u32) {}
 
 pub(super) async fn wait_for_cancel(mut rx: watch::Receiver<bool>) {
     if *rx.borrow() {

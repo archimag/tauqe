@@ -12,11 +12,24 @@
 //! hooks. The declaration lives in `tauqe.toml`, which this crate must not read,
 //! so [`GitHooks`] carries the resolved decision into every committing entry
 //! point while the cognitive crate owns the declaration.
+//!
+//! Every invocation runs under a wall-clock budget. A Git child is never only
+//! Git: a commit that runs the repository hooks executes arbitrary user code,
+//! and a signing configuration waits for an agent that may be blocked on a
+//! passphrase prompt. [`exec`] therefore gives every child its own process
+//! group, bounds the wait and the output drain with one budget, races the
+//! caller's cancellation signal against the natural exit, and tears the whole
+//! group down on expiry. [`cmd::run_git`] carries
+//! [`exec::DEFAULT_GIT_TIMEOUT_SECS`] with no call-site change, while
+//! [`cmd::run_git_with_deadline`] carries an explicit [`GitDeadline`].
 
 pub mod checkpoint;
 pub mod cmd;
 pub mod diff;
+pub mod exec;
 pub mod state;
+
+pub use exec::GitDeadline;
 
 /// Whether a Tauqe commit runs the repository's own Git hooks.
 ///

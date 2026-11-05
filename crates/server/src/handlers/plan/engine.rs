@@ -1,4 +1,10 @@
 //! Architect plan horizon-synthesis engine.
+//!
+//! The single-phase horizon synthesis lives here. The two-phase contour that
+//! drafts a horizon, audits it with an independent Architect entry, and reconciles
+//! the audit before the plan is issued is orchestrated by `super::two_phase`,
+//! which drives the same contour once per Planner beat and persists the result
+//! through the same storage primitives.
 
 use std::sync::Arc;
 
@@ -32,6 +38,11 @@ pub(super) use super::horizon::{collect_plan_context_files, PlanHorizonDiagnosti
 /// Enforces strict session history transactionality: `state.history.record_response` is
 /// called strictly AFTER `replace_uncompleted_horizon` succeeds on disk. Any persistence
 /// or validation error returns early without poisoning the interaction audit trail.
+///
+/// The destructive horizon write is additionally guarded by a final re-check of
+/// the operation's cancellation signal, so a hard cancel delivered after the
+/// contour's final provider round leaves the stored plan untouched and answers a
+/// cancellation instead of a persisted success.
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn execute_plan_horizon_synthesis(
     req_id: tauqe_protocol::RequestId,
@@ -58,10 +69,10 @@ pub(super) async fn execute_plan_horizon_synthesis(
         let cfg = state.config.lock().await.config.clone();
         let (architect_tier, level_up) = tauqe_core::plan::prompt::resolve_architect_tier(
             &cfg,
-            plan.architect.as_ref(),
+            plan.implementation.architect.as_ref(),
             custom_model.as_ref(),
             diagnostics.as_ref().map(|d| d.blocked_step_id.as_str()),
-            plan.last_replanned_step.as_deref(),
+            plan.implementation.last_replanned_step.as_deref(),
         );
         // A manual run on a configuration the automatic ladder excludes cannot
         // escalate, which the published note states instead of leaving the
@@ -355,6 +366,28 @@ pub(super) async fn execute_plan_horizon_synthesis(
         );
     }
 
+    // The operation slot is held for the whole synthesis, so a hard cancel may
+    // land after the contour's final provider round resolved and before this
+    // write. The horizon below destructively replaces the plan's uncompleted
+    // steps, so the authoritative signal is re-checked here, at the same seam
+    // the review subsystem guards before it touches its session on disk. A
+    // raised signal releases the transient context, answers a cancellation, and
+    // leaves the stored plan untouched instead of persisting a horizon for an
+    // operation the developer already aborted.
+    if *operation.cancel_receiver().borrow() {
+        cleanup_transient_context(state).await;
+        tracing::warn!(
+            plan_id = %plan.id,
+            operation = operation_title,
+            "plan horizon synthesis was cancelled before the horizon write"
+        );
+        return Response::err(
+            req_id,
+            errors::CANCELLED,
+            format!("{} was cancelled", operation_title),
+        );
+    }
+
     // Replace the uncompleted horizon while preserving the immutable Done foundation.
     let new_steps = output.items.len();
     let horizon_root = repo_root.clone();
@@ -384,7 +417,7 @@ pub(super) async fn execute_plan_horizon_synthesis(
 
     // Strict history transactionality: record the assistant response ONLY after
     // the synthesized horizon has been atomically written to disk.
-    let (total_items, completed_items) = updated_plan.count_stats();
+    let (total_items, completed_items) = updated_plan.implementation.count_stats();
     tracing::info!(
         plan_id = %updated_plan.id,
         total_items = total_items,

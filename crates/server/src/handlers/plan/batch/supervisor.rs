@@ -67,6 +67,8 @@ pub(in crate::handlers::plan) enum BatchOutcome {
 pub(in crate::handlers::plan) struct PlanBatchOptions {
     /// Coder selection the batch starts from, resolved against the coder ladder.
     pub(crate) model: Option<ModelSelection>,
+    /// Targeted step or subtree to execute, if not the entire plan.
+    pub(crate) step_id: Option<String>,
 }
 
 /// Emits the single terminal `plan/batch_finished` event for a batch run.
@@ -181,6 +183,7 @@ pub(super) async fn run_plan_batch_with(
         &repo_root,
         ExecutionScope::Plan {
             plan_id: plan_id.to_string(),
+            step_id: options.step_id.clone(),
         },
         &host,
         config,

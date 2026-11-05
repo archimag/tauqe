@@ -40,7 +40,7 @@ pub fn format_plan_discussion_prompt(
     }
 
     out.push_str("## Target Plan Context:\n");
-    let (total, completed) = plan.count_stats();
+    let (total, completed) = plan.implementation.count_stats();
     out.push_str(&format!(
         "<active_plan id=\"{}\" title=\"{}\" progress=\"{}/{} completed\">\n",
         escape_xml_attr(&plan.id),
@@ -124,13 +124,13 @@ pub fn format_plan_discussion_prompt(
             }
         }
     }
-    render_discussion_items(&mut out, &plan.items, 0, focused_item_ids);
+    render_discussion_items(&mut out, &plan.implementation.items, 0, focused_item_ids);
     out.push_str("</active_plan>\n\n");
 
     if !focused_item_ids.is_empty() {
         out.push_str("### Items Focused by User for Discussion:\n");
         for id in focused_item_ids {
-            if let Some(item) = plan.find_item(id) {
+            if let Some(item) = plan.implementation.find_item(id) {
                 out.push_str(&format!(
                     "- **#{} {}** (status: {})\n",
                     item.id,
@@ -182,11 +182,11 @@ pub fn format_plan_discussion_prompt(
 
 /// Formats the plan, its concept tree, and implementation items into a prompt block for LLM context.
 pub fn format_active_plan_context(plan: &Plan) -> Option<String> {
-    if plan.concept.is_empty() && plan.items.is_empty() {
+    if plan.concept.is_empty() && plan.implementation.items.is_empty() {
         return None;
     }
 
-    let (total, completed) = plan.count_stats();
+    let (total, completed) = plan.implementation.count_stats();
     let mut out = String::new();
     out.push_str(&format!(
         "<active_plan id=\"{}\" title=\"{}\" progress=\"{}/{} completed\">\n",
@@ -230,7 +230,7 @@ pub fn format_active_plan_context(plan: &Plan) -> Option<String> {
         out.push_str("  </concept>\n");
     }
 
-    if !plan.items.is_empty() {
+    if !plan.implementation.items.is_empty() {
         fn render_items(out: &mut String, items: &[PlanItem], depth: usize) {
             let indent = "  ".repeat(depth + 1);
             for item in items {
@@ -281,7 +281,7 @@ pub fn format_active_plan_context(plan: &Plan) -> Option<String> {
             }
         }
 
-        render_items(&mut out, &plan.items, 0);
+        render_items(&mut out, &plan.implementation.items, 0);
     }
     out.push_str("</active_plan>");
 

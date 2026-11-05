@@ -49,6 +49,6 @@ pub(super) fn collect_plan_context_files(plan: &Plan) -> Vec<String> {
     }
     let mut out = Vec::new();
     let mut seen = HashSet::new();
-    walk(&plan.items, &mut out, &mut seen);
+    walk(&plan.implementation.items, &mut out, &mut seen);
     out
 }

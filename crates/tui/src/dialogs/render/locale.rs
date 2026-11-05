@@ -103,7 +103,7 @@ pub fn locale_dialog_geometry(term: Rect) -> LocaleDialogGeometry {
 
 /// Renders the locale dialog using the active semantic palette.
 pub fn render_locale_dialog(frame: &mut ratatui::Frame, state: &AppState) {
-    let Some(dialog) = state.locale_dialog.as_ref() else {
+    let Some(dialog) = state.modals.locale_dialog.as_ref() else {
         return;
     };
     let geom = locale_dialog_geometry(frame.area());
@@ -241,7 +241,7 @@ mod tests {
         let term = Rect::new(0, 0, 100, 30);
         let mut terminal = Terminal::new(TestBackend::new(term.width, term.height)).unwrap();
         let mut state = crate::app::test_state();
-        state.locale_dialog = Some(LocaleDialogState::default());
+        state.modals.locale_dialog = Some(LocaleDialogState::default());
 
         terminal.draw(|f| render_locale_dialog(f, &state)).unwrap();
 

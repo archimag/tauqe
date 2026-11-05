@@ -163,6 +163,17 @@ marker a finished transaction already cleared.
    launched from a Git hook still addresses the directory the engine passed
    down. The identity variables (`GIT_AUTHOR_*`, `GIT_COMMITTER_*`) stay
    inherited, because the commit path probes and supplements them.
+7. **Every Child Runs Under a Budget:** each `git` invocation reaches the
+   repository through the bounded executor of `git::exec`. The child leads its
+   own process group, one wall-clock budget covers the wait and the output
+   drain, and the caller's cancellation signal races the natural exit. Expiry
+   or cancellation kills the group and reaps the child, so a repository hook
+   that never returns, a signing agent waiting for a passphrase, or a
+   `check-ignore` that stops reading its candidate list can never occupy a
+   blocking thread indefinitely. `run_git` carries the default budget with no
+   call-site change, while `run_git_with_deadline` carries an explicit
+   `GitDeadline`.
+
 ---
 
 ## 6. Repository Map

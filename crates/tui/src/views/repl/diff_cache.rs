@@ -13,11 +13,15 @@ use super::state::{EditOp, StreamingFileEdit, StreamingHunk};
 /// otherwise be repeated for the audited file on every frame and navigation
 /// key. Entries are keyed by file path and invalidated by a cheap fingerprint
 /// of the file's hunks, so a changed hunk always re-renders.
-#[derive(Default)]
+/// The cache travels with the modal subsystem: the overlay state owns an
+/// imported commit audit together with the rendered bodies of its files, and
+/// that state derives `Debug` and `Clone` like every other surface it stores.
+#[derive(Debug, Default, Clone)]
 pub struct DiffRenderCache {
     entries: HashMap<String, DiffCacheEntry>,
 }
 
+#[derive(Debug, Clone)]
 struct DiffCacheEntry {
     fingerprint: u64,
     rendered: RenderedDiff,
@@ -32,7 +36,7 @@ struct DiffCacheEntry {
 /// and names the lines every row occupies on both sides of the patch, so a
 /// two-column gutter reads the coordinates of the patch instead of counting the
 /// rows of the patch itself (c-two-column-gutter).
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub(crate) struct RenderedDiff {
     pub lines: Vec<Line<'static>>,
     pub hunk_rows: Vec<usize>,

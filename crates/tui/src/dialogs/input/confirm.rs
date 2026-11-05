@@ -15,9 +15,9 @@ pub(super) use crate::components::confirm::ConfirmOutcome;
 /// the very layout projection the view command maps resolve: a chord authored
 /// as a Latin key stays reachable from an alternative layout (Conventions §5.1).
 pub(super) fn resolve_confirm(st: &mut AppState, key: KeyEvent) -> ConfirmOutcome {
-    let mut dialog = ConfirmDialog::from_button(st.confirm_button);
+    let mut dialog = ConfirmDialog::from_button(st.modals.confirm_button);
     let outcome = dialog.handle_key(key, &st.tui_config.input);
-    st.confirm_button = dialog.button();
+    st.modals.confirm_button = dialog.button();
     outcome
 }
 
@@ -53,22 +53,22 @@ pub(super) fn resolve_batch_cancel(st: &mut AppState, key: KeyEvent) -> BatchCan
     let bare = is_bare_press(key.modifiers);
     match code {
         KeyCode::Left | KeyCode::BackTab => {
-            st.batch_cancel_button.cycle_prev();
+            st.modals.batch_cancel_button.cycle_prev();
             BatchCancelOutcome::Toggled
         }
         KeyCode::Right | KeyCode::Tab => {
-            st.batch_cancel_button.cycle_next();
+            st.modals.batch_cancel_button.cycle_next();
             BatchCancelOutcome::Toggled
         }
         // The focus walk and the fast accelerators are bare presses, so a
         // command chord or the AltGr compose chord reaches none of them
         // (Conventions §3, §5.1).
         KeyCode::Char('p') if bare => {
-            st.batch_cancel_button.cycle_prev();
+            st.modals.batch_cancel_button.cycle_prev();
             BatchCancelOutcome::Toggled
         }
         KeyCode::Char('n') if bare => {
-            st.batch_cancel_button.cycle_next();
+            st.modals.batch_cancel_button.cycle_next();
             BatchCancelOutcome::Toggled
         }
         KeyCode::Char('s') | KeyCode::Char('S') if bare => {
@@ -83,7 +83,9 @@ pub(super) fn resolve_batch_cancel(st: &mut AppState, key: KeyEvent) -> BatchCan
         KeyCode::Esc => BatchCancelOutcome::Dismissed,
         KeyCode::Char('q') if bare => BatchCancelOutcome::Dismissed,
         KeyCode::Char('g') if is_keyboard_quit(&key) => BatchCancelOutcome::Dismissed,
-        KeyCode::Enter | KeyCode::Char(' ') => BatchCancelOutcome::Chosen(st.batch_cancel_button),
+        KeyCode::Enter | KeyCode::Char(' ') => {
+            BatchCancelOutcome::Chosen(st.modals.batch_cancel_button)
+        }
         _ => BatchCancelOutcome::Toggled,
     }
 }
@@ -127,7 +129,7 @@ mod tests {
             resolve_batch_cancel(&mut st, key(KeyCode::Right)),
             BatchCancelOutcome::Toggled
         );
-        assert_eq!(st.batch_cancel_button, BatchCancelButton::SoftStop);
+        assert_eq!(st.modals.batch_cancel_button, BatchCancelButton::SoftStop);
         assert_eq!(
             resolve_batch_cancel(&mut st, key(KeyCode::Enter)),
             BatchCancelOutcome::Chosen(BatchCancelButton::SoftStop)
@@ -169,13 +171,13 @@ mod tests {
             resolve_batch_cancel(&mut st, key(KeyCode::Char('т'))),
             BatchCancelOutcome::Toggled
         );
-        assert_eq!(st.batch_cancel_button, BatchCancelButton::SoftStop);
+        assert_eq!(st.modals.batch_cancel_button, BatchCancelButton::SoftStop);
 
         assert_eq!(
             resolve_batch_cancel(&mut st, key(KeyCode::Char('з'))),
             BatchCancelOutcome::Toggled
         );
-        assert_eq!(st.batch_cancel_button, BatchCancelButton::Continue);
+        assert_eq!(st.modals.batch_cancel_button, BatchCancelButton::Continue);
     }
 
     fn key_with(code: KeyCode, modifiers: KeyModifiers) -> KeyEvent {
@@ -196,7 +198,7 @@ mod tests {
         ] {
             for letter in letters {
                 let mut st = crate::app::test_state();
-                assert_eq!(st.batch_cancel_button, BatchCancelButton::Continue);
+                assert_eq!(st.modals.batch_cancel_button, BatchCancelButton::Continue);
                 let outcome =
                     resolve_batch_cancel(&mut st, key_with(KeyCode::Char(letter), modifiers));
                 assert_eq!(
@@ -205,7 +207,7 @@ mod tests {
                     "{letter:?} with {modifiers:?} must reach no action"
                 );
                 assert_eq!(
-                    st.batch_cancel_button,
+                    st.modals.batch_cancel_button,
                     BatchCancelButton::Continue,
                     "{letter:?} with {modifiers:?} must not move the focus"
                 );

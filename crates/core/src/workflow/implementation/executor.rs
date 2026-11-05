@@ -111,7 +111,7 @@ impl PlanImplementationStepExecutor<'_> {
             Err(failure) => return BatchStepOutcome::failed(failure.into_reason()),
         };
 
-        let leaf = match frame.plan.find_item(&step.id) {
+        let leaf = match frame.plan.implementation.find_item(&step.id) {
             Some(item) if item.is_leaf() => item.clone(),
             Some(item) => {
                 return BatchStepOutcome::failed(format!(
@@ -154,7 +154,10 @@ impl PlanImplementationStepExecutor<'_> {
         // is assembled from this very rule, so the check guards the run against
         // a status drift between the assembly of the queue and the launch of a
         // step, and a stalled scope is reported through the shared taxonomy.
-        let readiness = frame.plan.evaluate_scope(Some(leaf.id.as_str()));
+        let readiness = frame
+            .plan
+            .implementation
+            .evaluate_scope(Some(leaf.id.as_str()));
         if !matches!(readiness, PlanScopeEvaluation::Ready(_)) {
             let failure = classify_scope_stall(&frame.plan, Some(leaf.id.as_str()), &readiness);
             return BatchStepOutcome::failed(failure.into_reason());
@@ -195,11 +198,14 @@ impl PlanImplementationStepExecutor<'_> {
         let mut reasoning_effort: Option<ReasoningEffort> =
             models.resolve_selection_effort(ModelRole::Coder, &selection);
         // Content attempts already spent on the current coder rung. The counter
-        // resets on promotion, and the budget itself is never cached: it is read
-        // from the rung `ladder_idx` names wherever the spent attempts are
-        // compared, so a promotion switches to the promoted budget with nothing
-        // left to keep in sync.
+        // resets on promotion, and `max_tier_attempts` carries the budget it is
+        // compared against. The budget comes from the selected entry of the
+        // role catalog rather than from the escalation ladder: a model the role
+        // excludes from escalation (`level_up = false`) occupies no ladder
+        // position, so reading the ladder would charge it the budget of an
+        // unrelated rung.
         let mut tier_attempts = 0u32;
+        let mut max_tier_attempts = models.resolve_selection_attempts(ModelRole::Coder, &selection);
 
         let mut prompt = match format_plan_step_execution_prompt(
             &frame.plan,
@@ -328,7 +334,7 @@ impl PlanImplementationStepExecutor<'_> {
                     }
 
                     tier_attempts += 1;
-                    if tier_attempts >= models.coder_tier(ladder_idx).attempts() {
+                    if tier_attempts >= max_tier_attempts {
                         // The rung automatic escalation would enter next. `None`
                         // means the ladder is already saturated: the step sits
                         // on the strongest eligible rung, or the developer
@@ -361,10 +367,12 @@ impl PlanImplementationStepExecutor<'_> {
                                     to_tier = next_idx,
                                     to_model = %tier.model,
                                     effort = ?tier.effort,
+                                    attempts = tier.attempts(),
                                     reason = failure.reason(),
                                     "implementation step coder escalation"
                                 );
                                 ladder_idx = next_idx;
+                                max_tier_attempts = tier.attempts();
                                 selection = ModelSelection::Specific(tier.model);
                                 reasoning_effort = tier.effort;
                                 tier_attempts = 0;
@@ -375,7 +383,7 @@ impl PlanImplementationStepExecutor<'_> {
                             step_id = leaf.id.as_str(),
                             tier = ladder_idx,
                             tier_attempt = tier_attempts,
-                            max_tier_attempts = models.coder_tier(ladder_idx).attempts(),
+                            max_tier_attempts = max_tier_attempts,
                             reason = failure.reason(),
                             "implementation step retries the same coder tier"
                         );
@@ -404,19 +412,21 @@ impl PlanImplementationStepExecutor<'_> {
         };
         let items = scheduled
             .iter()
-            .map(|id| match frame.plan.find_item(id.as_str()) {
-                Some(member) => TurnWorkItem {
-                    id: member.id.clone(),
-                    title: member.title.clone(),
+            .map(
+                |id| match frame.plan.implementation.find_item(id.as_str()) {
+                    Some(member) => TurnWorkItem {
+                        id: member.id.clone(),
+                        title: member.title.clone(),
+                    },
+                    // A scheduled identifier the horizon no longer carries keeps
+                    // the positions aligned: it stands in for the missing title
+                    // instead of silently dropping a member of the queue.
+                    None => TurnWorkItem {
+                        id: id.clone(),
+                        title: id.clone(),
+                    },
                 },
-                // A scheduled identifier the horizon no longer carries keeps
-                // the positions aligned: it stands in for the missing title
-                // instead of silently dropping a member of the queue.
-                None => TurnWorkItem {
-                    id: id.clone(),
-                    title: id.clone(),
-                },
-            })
+            )
             .collect();
         TurnWorkQueue {
             items,
@@ -430,7 +440,7 @@ impl PlanImplementationStepExecutor<'_> {
     /// prefix cache instead of warming a new one per step.
     fn session_id(&self, scope: &ExecutionScope) -> String {
         match scope {
-            ExecutionScope::Plan { plan_id } => format_session_id(SESSION_PREFIX_PLAN, plan_id),
+            ExecutionScope::Plan { plan_id, .. } => format_session_id(SESSION_PREFIX_PLAN, plan_id),
             ExecutionScope::ReviewGroup { review_id, .. }
             | ExecutionScope::ReviewFinding { review_id, .. } => {
                 format_session_id(SESSION_PREFIX_REVIEW, review_id)
@@ -447,7 +457,6 @@ impl PlanImplementationStepExecutor<'_> {
     /// degenerate single-finding run is written onto the finding itself by
     /// [`ReviewStorage::update_session_item_status`].
     ///
-    /// Only the lifecycle the run owns reaches the finding: taking the step
     /// Only the lifecycle the run owns reaches the finding: taking the step
     /// marks it `InProgress`, a reset returns it to `Todo`, and completing it
     /// records the commit that carried the step. The verdict is not written
@@ -468,7 +477,7 @@ impl PlanImplementationStepExecutor<'_> {
         commit: Option<&str>,
     ) -> Result<(), StepFailure> {
         match frame.scope.clone() {
-            ExecutionScope::Plan { plan_id } => {
+            ExecutionScope::Plan { plan_id, .. } => {
                 let updated = PlanStorage::update_item(
                     self.repo_root,
                     &plan_id,
@@ -850,7 +859,29 @@ mod tests {
             ..ModelsConfig::default()
         }
     }
-
+    /// Coder role pairing a participating rung with an opted-out model, so a run
+    /// started on the opted-out model proves which entry owns the budget.
+    fn excluded_model_models(attempts: Option<u32>) -> ModelsConfig {
+        ModelsConfig {
+            primary: vec![ModelEntry::from(ModelRef::openrouter("base/model"))],
+            coder: Some(vec![
+                ModelEntry {
+                    model: ModelRef::openrouter("base/model"),
+                    effort: None,
+                    attempts: Some(2),
+                    level_up: None,
+                },
+                ModelEntry {
+                    model: ModelRef::openrouter("reserved/model"),
+                    effort: None,
+                    attempts,
+                    level_up: Some(false),
+                },
+            ]),
+            auto_level_up: true,
+            ..ModelsConfig::default()
+        }
+    }
     fn channels() -> (
         mpsc::Sender<crate::providers::StreamEvent>,
         watch::Receiver<bool>,
@@ -870,6 +901,7 @@ mod tests {
         }]);
         let scope = ExecutionScope::Plan {
             plan_id: "step-horizon".to_string(),
+            step_id: None,
         };
         let mut executor =
             PlanImplementationStepExecutor::new(dir.path(), scope, &host, run_config("1"));
@@ -884,7 +916,10 @@ mod tests {
         let stored = PlanStorage::load_plan(dir.path(), "step-horizon")
             .unwrap()
             .unwrap();
-        let completed = stored.find_item("1").expect("the step is stored");
+        let completed = stored
+            .implementation
+            .find_item("1")
+            .expect("the step is stored");
         assert_eq!(completed.status, PlanItemStatus::Done);
         assert_eq!(
             completed.commit.as_deref(),
@@ -920,6 +955,7 @@ mod tests {
         )]);
         let scope = ExecutionScope::Plan {
             plan_id: "step-horizon".to_string(),
+            step_id: None,
         };
         let mut executor =
             PlanImplementationStepExecutor::new(dir.path(), scope, &host, run_config("1"));
@@ -938,7 +974,7 @@ mod tests {
         let stored = PlanStorage::load_plan(dir.path(), "step-horizon")
             .unwrap()
             .unwrap();
-        let step = stored.find_item("1").unwrap();
+        let step = stored.implementation.find_item("1").unwrap();
         assert_eq!(step.status, PlanItemStatus::Blocked);
         assert_eq!(
             step.blocked_reason.as_deref(),
@@ -959,6 +995,7 @@ mod tests {
         ]);
         let scope = ExecutionScope::Plan {
             plan_id: "step-horizon".to_string(),
+            step_id: None,
         };
         let mut config = run_config("1");
         config.models = two_rung_models();
@@ -981,7 +1018,10 @@ mod tests {
         let stored = PlanStorage::load_plan(dir.path(), "step-horizon")
             .unwrap()
             .unwrap();
-        assert_eq!(stored.find_item("1").unwrap().status, PlanItemStatus::Done);
+        assert_eq!(
+            stored.implementation.find_item("1").unwrap().status,
+            PlanItemStatus::Done
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -993,6 +1033,7 @@ mod tests {
         ))]);
         let scope = ExecutionScope::Plan {
             plan_id: "step-horizon".to_string(),
+            step_id: None,
         };
         let mut config = run_config("1");
         config.models = two_rung_models();
@@ -1011,9 +1052,88 @@ mod tests {
         let stored = PlanStorage::load_plan(dir.path(), "step-horizon")
             .unwrap()
             .unwrap();
-        assert_eq!(stored.find_item("1").unwrap().status, PlanItemStatus::Todo);
+        assert_eq!(
+            stored.implementation.find_item("1").unwrap().status,
+            PlanItemStatus::Todo
+        );
+    }
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_opted_out_model_runs_its_own_single_adaptive_attempt() {
+        let dir = tempdir().unwrap();
+        PlanStorage::save_plan(dir.path(), &horizon_plan()).unwrap();
+        let host = ScriptedHost::new(vec![
+            StepTurnResult::Failed(StepFailure::domain("the patch did not apply")),
+            StepTurnResult::Failed(StepFailure::domain("the patch did not apply")),
+        ]);
+        let scope = ExecutionScope::Plan {
+            plan_id: "step-horizon".to_string(),
+            step_id: None,
+        };
+        let mut config = run_config("1");
+        config.models = excluded_model_models(None);
+        config.selection = Some(ModelSelection::Specific(ModelRef::openrouter(
+            "reserved/model",
+        )));
+        let mut executor = PlanImplementationStepExecutor::new(dir.path(), scope, &host, config);
+        let (stream_tx, cancel_rx) = channels();
+
+        let outcome = executor
+            .execute_step(&BatchStep::new("1", "seam"), stream_tx, cancel_rx)
+            .await
+            .unwrap();
+
+        assert_eq!(outcome.status, BatchStepStatus::Failed);
+        // The budget belongs to the selected entry and never to a ladder rung:
+        // the opted-out model runs its single adaptive attempt instead of the
+        // two attempts declared by the participating rung it saturates on.
+        assert_eq!(host.requests().len(), 1);
+        let stored = PlanStorage::load_plan(dir.path(), "step-horizon")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            stored.implementation.find_item("1").unwrap().status,
+            PlanItemStatus::Todo
+        );
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_opted_out_model_honours_an_explicit_attempt_budget() {
+        let dir = tempdir().unwrap();
+        PlanStorage::save_plan(dir.path(), &horizon_plan()).unwrap();
+        let host = ScriptedHost::new(vec![
+            StepTurnResult::Failed(StepFailure::domain("the patch did not apply")),
+            StepTurnResult::Failed(StepFailure::domain("the patch did not apply")),
+            StepTurnResult::Failed(StepFailure::domain("the patch did not apply")),
+        ]);
+        let scope = ExecutionScope::Plan {
+            plan_id: "step-horizon".to_string(),
+            step_id: None,
+        };
+        let mut config = run_config("1");
+        config.models = excluded_model_models(Some(3));
+        config.selection = Some(ModelSelection::Specific(ModelRef::openrouter(
+            "reserved/model",
+        )));
+        let mut executor = PlanImplementationStepExecutor::new(dir.path(), scope, &host, config);
+        let (stream_tx, cancel_rx) = channels();
+
+        let outcome = executor
+            .execute_step(&BatchStep::new("1", "seam"), stream_tx, cancel_rx)
+            .await
+            .unwrap();
+
+        assert_eq!(outcome.status, BatchStepStatus::Failed);
+        // An explicit budget always wins over the adaptive default, so the
+        // opted-out model spends exactly the three attempts it declares.
+        assert_eq!(host.requests().len(), 3);
+        let stored = PlanStorage::load_plan(dir.path(), "step-horizon")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            stored.implementation.find_item("1").unwrap().status,
+            PlanItemStatus::Todo
+        );
+    }
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_review_group_step_is_written_through_the_session_storage() {
         let dir = tempdir().unwrap();
@@ -1188,6 +1308,7 @@ mod tests {
         ))]);
         let scope = ExecutionScope::Plan {
             plan_id: "step-horizon".to_string(),
+            step_id: None,
         };
         let mut executor =
             PlanImplementationStepExecutor::new(dir.path(), scope, &host, run_config("1"));
@@ -1203,7 +1324,10 @@ mod tests {
         let stored = PlanStorage::load_plan(dir.path(), "step-horizon")
             .unwrap()
             .unwrap();
-        assert_eq!(stored.find_item("1").unwrap().status, PlanItemStatus::Todo);
+        assert_eq!(
+            stored.implementation.find_item("1").unwrap().status,
+            PlanItemStatus::Todo
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1215,6 +1339,7 @@ mod tests {
         ))]);
         let scope = ExecutionScope::Plan {
             plan_id: "step-horizon".to_string(),
+            step_id: None,
         };
         let mut config = run_config("1");
         config.models = two_rung_models();
@@ -1232,6 +1357,9 @@ mod tests {
         let stored = PlanStorage::load_plan(dir.path(), "step-horizon")
             .unwrap()
             .unwrap();
-        assert_eq!(stored.find_item("1").unwrap().status, PlanItemStatus::Todo);
+        assert_eq!(
+            stored.implementation.find_item("1").unwrap().status,
+            PlanItemStatus::Todo
+        );
     }
 }

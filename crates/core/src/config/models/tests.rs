@@ -1299,3 +1299,256 @@ coder = [
         "an opted-out model is already saturated"
     );
 }
+
+#[test]
+fn test_resolve_selection_attempts_applies_the_adaptive_default() {
+    let config = parse_models(
+        r#"
+primary = ["openrouter:base/primary"]
+coder = [
+    "openrouter:base/coder",
+    { model = "openrouter:manual/coder", level_up = false },
+]
+architect = [
+    "openrouter:planner/one",
+    { model = "openrouter:planner/manual", level_up = false },
+]
+"#,
+    );
+
+    // A model that participates in escalation keeps the default of its role ...
+    assert_eq!(
+        config.resolve_selection_attempts(
+            ModelRole::Coder,
+            &ModelSelection::Specific(ModelRef::openrouter("base/coder"))
+        ),
+        3
+    );
+    assert_eq!(
+        config.resolve_selection_attempts(
+            ModelRole::Architect,
+            &ModelSelection::Specific(ModelRef::openrouter("planner/one"))
+        ),
+        2
+    );
+
+    // ... while a model the role excludes from escalation runs a single attempt.
+    assert_eq!(
+        config.resolve_selection_attempts(
+            ModelRole::Coder,
+            &ModelSelection::Specific(ModelRef::openrouter("manual/coder"))
+        ),
+        1
+    );
+    assert_eq!(
+        config.resolve_selection_attempts(
+            ModelRole::Architect,
+            &ModelSelection::Specific(ModelRef::openrouter("planner/manual"))
+        ),
+        1
+    );
+
+    // A role selection reads the base entry of the role it names.
+    assert_eq!(
+        config
+            .resolve_selection_attempts(ModelRole::Coder, &ModelSelection::Role(ModelRole::Coder)),
+        3
+    );
+}
+
+#[test]
+fn test_resolve_selection_attempts_prefers_the_explicit_budget() {
+    let config = parse_models(
+        r#"
+primary = ["openrouter:base/primary"]
+coder = [
+    { model = "openrouter:base/coder", attempts = 5 },
+    { model = "openrouter:manual/coder", level_up = false, attempts = 4 },
+]
+architect = [{ model = "openrouter:planner/manual", level_up = false, attempts = 1 }]
+"#,
+    );
+
+    // An explicit budget wins over the adaptive default of the marker.
+    assert_eq!(
+        config.resolve_selection_attempts(
+            ModelRole::Coder,
+            &ModelSelection::Specific(ModelRef::openrouter("base/coder"))
+        ),
+        5
+    );
+    assert_eq!(
+        config.resolve_selection_attempts(
+            ModelRole::Coder,
+            &ModelSelection::Specific(ModelRef::openrouter("manual/coder"))
+        ),
+        4
+    );
+    assert_eq!(
+        config.resolve_selection_attempts(
+            ModelRole::Architect,
+            &ModelSelection::Specific(ModelRef::openrouter("planner/manual"))
+        ),
+        1
+    );
+}
+
+#[test]
+fn test_resolve_selection_attempts_reads_the_role_catalog_not_the_ladder() {
+    let config = parse_models(
+        r#"
+primary = ["openrouter:base/primary"]
+coder = [
+    { model = "openrouter:base/coder", attempts = 5 },
+    { model = "openrouter:manual/coder", level_up = false, attempts = 2 },
+]
+"#,
+    );
+
+    // The excluded model occupies no ladder position at all, so the ladder
+    // holds the participating rung alone.
+    let ladder = config.coder_ladder();
+    assert_eq!(ladder.len(), 1);
+    assert_eq!(ladder[0].model, ModelRef::openrouter("base/coder"));
+
+    // Its budget is still resolved from the role catalog, so a manual run on it
+    // is never charged the budget of a ladder rung.
+    assert_eq!(
+        config.resolve_selection_attempts(
+            ModelRole::Coder,
+            &ModelSelection::Specific(ModelRef::openrouter("manual/coder"))
+        ),
+        2
+    );
+}
+
+#[test]
+fn test_resolve_selection_attempts_distinguishes_tiers_of_the_same_model() {
+    let config = parse_models(
+        r#"
+primary = ["openrouter:base/primary"]
+architect = [
+    { model = "openrouter:planner/shared", effort = "low", attempts = 4 },
+    { model = "openrouter:planner/shared", effort = "high" },
+]
+"#,
+    );
+    let model = ModelRef::openrouter("planner/shared");
+
+    // A tier names one exact coordinate, so two rungs of the same model resolve
+    // to the budgets their own entries declare.
+    let low = ModelSelection::Tier {
+        model: model.clone(),
+        effort: Some(ReasoningEffort::Low),
+    };
+    assert_eq!(
+        config.resolve_selection_attempts(ModelRole::Architect, &low),
+        4
+    );
+    let high = ModelSelection::Tier {
+        model: model.clone(),
+        effort: Some(ReasoningEffort::High),
+    };
+    assert_eq!(
+        config.resolve_selection_attempts(ModelRole::Architect, &high),
+        2
+    );
+
+    // A depth the role list does not configure falls back to the first rung of
+    // the same model instead of losing the budget entirely.
+    let unknown = ModelSelection::Tier {
+        model: model.clone(),
+        effort: Some(ReasoningEffort::Max),
+    };
+    assert_eq!(
+        config.resolve_selection_attempts(ModelRole::Architect, &unknown),
+        4
+    );
+    let bare = ModelSelection::Tier {
+        model,
+        effort: None,
+    };
+    assert_eq!(
+        config.resolve_selection_attempts(ModelRole::Architect, &bare),
+        4
+    );
+}
+
+#[test]
+fn test_resolve_selection_attempts_falls_back_to_the_role_default() {
+    let config = parse_models(
+        r#"
+primary = ["openrouter:base/primary"]
+"#,
+    );
+    let unknown = ModelSelection::Specific(ModelRef::openrouter("unknown/model"));
+
+    // A model the role does not configure declares neither a budget nor a
+    // marker, so the deterministic default of the role applies.
+    assert_eq!(
+        config.resolve_selection_attempts(ModelRole::Coder, &unknown),
+        3
+    );
+    assert_eq!(
+        config.resolve_selection_attempts(ModelRole::Architect, &unknown),
+        2
+    );
+
+    // A tier naming a model outside the role falls back the same way.
+    let tier = ModelSelection::Tier {
+        model: ModelRef::openrouter("unknown/model"),
+        effort: Some(ReasoningEffort::XHigh),
+    };
+    assert_eq!(
+        config.resolve_selection_attempts(ModelRole::Coder, &tier),
+        3
+    );
+}
+
+#[test]
+fn test_resolve_selection_architect_tier_keeps_the_configured_parameters() {
+    let config = parse_models(
+        r#"
+primary = ["openrouter:base/primary"]
+architect = [
+    { model = "openrouter:planner/shared", effort = "high", attempts = 3 },
+    { model = "openrouter:planner/manual", effort = "max", level_up = false },
+]
+"#,
+    );
+
+    // An explicit developer selection keeps the budget and the escalation
+    // opt-out of the entry it names instead of falling back to defaults.
+    let shared = ModelSelection::Specific(ModelRef::openrouter("planner/shared"));
+    let tier = config.resolve_selection_architect_tier(&shared);
+    assert_eq!(tier.model, ModelRef::openrouter("planner/shared"));
+    assert_eq!(tier.effort, Some(ReasoningEffort::High));
+    assert_eq!(tier.attempts, Some(3));
+    assert_eq!(tier.level_up, None);
+    assert_eq!(tier.attempts(), 3);
+
+    // A model reserved for a manual run keeps its single attempt.
+    let manual = ModelSelection::Specific(ModelRef::openrouter("planner/manual"));
+    let tier = config.resolve_selection_architect_tier(&manual);
+    assert_eq!(tier.effort, Some(ReasoningEffort::Max));
+    assert_eq!(tier.level_up, Some(false));
+    assert_eq!(tier.attempts(), 1);
+
+    // A tier selection carries its own depth together with the parameters of
+    // its entry.
+    let selected = ModelSelection::Tier {
+        model: ModelRef::openrouter("planner/shared"),
+        effort: Some(ReasoningEffort::XHigh),
+    };
+    let tier = config.resolve_selection_architect_tier(&selected);
+    assert_eq!(tier.effort, Some(ReasoningEffort::XHigh));
+    assert_eq!(tier.attempts(), 3);
+
+    // A selection the role does not configure yields a plain tier, which keeps
+    // the Architect default budget.
+    let unknown = ModelSelection::Specific(ModelRef::openrouter("unknown/model"));
+    let tier = config.resolve_selection_architect_tier(&unknown);
+    assert_eq!(tier.attempts, None);
+    assert_eq!(tier.level_up, None);
+    assert_eq!(tier.attempts(), 2);
+}

@@ -575,6 +575,54 @@ fn a_directory_move_relocates_a_binary_member_verbatim() {
     assert!(root.join("src/old/logo.bin").exists());
     assert!(!root.join("src/new").exists());
 }
+/// A directory move relocates every tracked member of its subtree, including
+/// the names Git escapes in a line-oriented listing.
+#[test]
+fn a_directory_move_relocates_a_quoting_sensitive_member() {
+    let dir = repository();
+    let root = dir.path();
+    let names = ["plain.rs", "quote\"d.rs", "back\\slash.rs", "привет.rs"];
+    for name in names {
+        write(root, &format!("src/old/{name}"), "fn moved() {}\n");
+    }
+    track_all(root);
+
+    let edits = [EditOperation::MoveDir {
+        from: "src/old".to_string(),
+        to: "src/new".to_string(),
+    }];
+    let result = stage_and_validate_edits(
+        root,
+        &ProjectConfig::default(),
+        &context_state(&[]),
+        &edits,
+        None,
+    );
+
+    assert!(
+        result.is_success(),
+        "the move stages: {:?}",
+        result.failed_files
+    );
+    assert_eq!(result.staged_state.staged_files.len(), names.len());
+    for name in names {
+        let source = format!("src/old/{name}");
+        let destination = format!("src/new/{name}");
+        assert_eq!(
+            staged_bytes(&result, &destination),
+            &b"fn moved() {}\n"[..],
+            "the destination carries the moved content for {name:?}"
+        );
+        assert!(
+            result.staged_state.deleted_paths.contains(&source),
+            "the source removal is recorded for {name:?}"
+        );
+    }
+    // The subtree is relocated in memory only, so the working tree keeps every
+    // source.
+    assert!(root.join("src/old/plain.rs").exists());
+    assert!(!root.join("src/new").exists());
+}
 
 /// A relocation carries bytes while every text operation stays text: a
 /// replacement that addresses a binary moved destination is refused with the
@@ -755,5 +803,128 @@ fn a_replacement_addressing_binary_staged_content_is_refused() {
     assert_eq!(
         result.staged_state, staged,
         "the refused member leaves the staged state untouched"
+    );
+}
+
+/// Creates a repository whose index Git cannot read.
+///
+/// `git init` followed by `git add -A` writes the index, and overwriting it
+/// makes every command that consults it fail. `git rev-parse` never reads the
+/// index, so the directory stays an inspectable work tree: the failure is a
+/// refused probe rather than an uninspectable repository.
+fn repository_with_unreadable_index() -> tempfile::TempDir {
+    let dir = repository();
+    let root = dir.path();
+    write(root, ".gitignore", "*.log\n.tauqe/\n");
+    track_all(root);
+    std::fs::write(root.join(".git/index"), b"corrupt").unwrap();
+    dir
+}
+
+/// A probe Git refused refuses the write instead of admitting it: only a target
+/// Git cannot inspect degrades to admitting every path.
+#[test]
+fn a_refused_ignore_probe_refuses_a_create() {
+    let dir = repository_with_unreadable_index();
+    let root = dir.path();
+
+    let created = EditOperation::Create {
+        path: "generated/build.log".into(),
+        content: "artifact\n".into(),
+    };
+    let result = stage_and_validate_edits(
+        root,
+        &ProjectConfig::default(),
+        &context_state(&[]),
+        std::slice::from_ref(&created),
+        None,
+    );
+
+    assert!(!result.is_success());
+    assert_eq!(
+        result.failed_files.len(),
+        1,
+        "the write is refused once: {:?}",
+        result.failed_files
+    );
+    let failure = result.failed_files.first().expect("the create is refused");
+    assert_eq!(failure.path, "generated/build.log");
+    match &failure.error {
+        EditError::IgnoreProbeFailed { path, reason } => {
+            assert_eq!(path, "generated/build.log");
+            assert!(
+                reason.contains("index"),
+                "the refusal must carry Git's diagnostic: {reason}"
+            );
+        }
+        other => panic!("expected a refused ignore probe, got {other:?}"),
+    }
+    assert!(result.successful_paths.is_empty());
+    assert!(result.staged_state.staged_files.is_empty());
+    assert!(!root.join("generated").exists());
+}
+
+/// Both admission branches read the one answer, so a refused probe refuses a
+/// sandbox write as well instead of admitting it on the assumption that Git
+/// ignores `.tauqe/`.
+#[test]
+fn a_refused_ignore_probe_refuses_a_sandbox_write_too() {
+    let dir = repository_with_unreadable_index();
+    let root = dir.path();
+
+    let created = EditOperation::Create {
+        path: ".tauqe/mockups/prototype.rs".into(),
+        content: "pub fn prototype() {}\n".into(),
+    };
+    let result = stage_and_validate_edits(
+        root,
+        &ProjectConfig::default(),
+        &context_state(&[]),
+        std::slice::from_ref(&created),
+        None,
+    );
+
+    assert!(!result.is_success());
+    assert_eq!(
+        result.failed_files.len(),
+        1,
+        "the write is refused once: {:?}",
+        result.failed_files
+    );
+    assert!(matches!(
+        &result.failed_files[0].error,
+        EditError::IgnoreProbeFailed { path, .. } if path == ".tauqe/mockups/prototype.rs"
+    ));
+    assert!(result.staged_state.staged_files.is_empty());
+    assert!(!root.join(".tauqe/mockups/prototype.rs").exists());
+}
+
+/// A target that is not a Git work tree has no ignore rules at all, so the
+/// answer keeps admitting ordinary writes there.
+#[test]
+fn an_uninspectable_target_admits_a_create() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+
+    let created = EditOperation::Create {
+        path: "generated.rs".into(),
+        content: "pub fn generated() {}\n".into(),
+    };
+    let result = stage_and_validate_edits(
+        root,
+        &ProjectConfig::default(),
+        &context_state(&[]),
+        std::slice::from_ref(&created),
+        None,
+    );
+
+    assert!(result.is_success(), "{:?}", result.failed_files);
+    assert_eq!(
+        staged_bytes(&result, "generated.rs"),
+        &b"pub fn generated() {}\n"[..]
+    );
+    assert!(
+        !root.join("generated.rs").exists(),
+        "staging never touches disk"
     );
 }

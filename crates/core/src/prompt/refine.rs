@@ -30,10 +30,11 @@ use std::borrow::Cow;
 
 use tauqe_protocol::{
     CapabilitySet, ContextAccess, EditProtocolKind, LlmCapability, LlmCommand, LlmOutcome,
-    PatchStrategy,
+    PatchStrategy, ProjectConfig,
 };
 
 use crate::edits::stream::discussion::DiscussionStreamFilter;
+use crate::edits::stream::json::decode::{first_json_object_str, strip_code_fence};
 use crate::edits::stream::EditStreamFilter;
 use crate::plan::prompt::{
     parse_plan_refinement_output, plan_refine_response_schema,
@@ -153,6 +154,32 @@ fn contract_values(schema: &serde_json::Value, pointer: &str) -> Vec<String> {
         .unwrap_or_default()
 }
 
+/// Reports why a synthesis payload cannot be honored as a horizon.
+///
+/// Horizon synthesis owns the unfinished horizon alone: the plan payload is the
+/// mutation vehicle of the plan dialogue, so a `plan_update` field in a synthesis
+/// round lies outside the contract of this contour. The payload is therefore
+/// refused through the typed defect channel instead of decoding into a horizon
+/// that silently dropped the mutation the model attempted.
+///
+/// Detection reads the very object the payload parser reads, so a fenced or
+/// prose-wrapped payload is inspected identically. A `null` field is the idle
+/// representation of an untouched plan and is not a defect.
+pub fn unsupported_plan_update_reason(raw_text: &str) -> Option<String> {
+    let value = serde_json::from_str::<serde_json::Value>(strip_code_fence(raw_text))
+        .ok()
+        .or_else(|| {
+            first_json_object_str(raw_text).and_then(|object| serde_json::from_str(object).ok())
+        })?;
+    if value.get("plan_update")?.is_null() {
+        return None;
+    }
+    Some(
+        "The payload carries a `plan_update` field, and the plan refinement contract accepts no plan mutation: the horizon is synthesized here, while plan mutations belong to the plan discussion. Regenerate the payload without `plan_update`."
+            .to_string(),
+    )
+}
+
 /// Normalizes the payload of an active abort.
 ///
 /// A report that states no reason still stops the turn, so the deterministic
@@ -197,6 +224,12 @@ impl PromptProtocol for PlanRefinePromptProtocol {
     }
 
     fn decode(&self, raw_text: &str, _context_paths: &[String]) -> Vec<LlmCommand> {
+        // A synthesis round never mutates the plan, so the payload is refused
+        // before it is decoded: a horizon that silently dropped the mutation
+        // would report a success the developer never asked for.
+        if let Some(reason) = unsupported_plan_update_reason(raw_text) {
+            return vec![LlmCommand::ProtocolError { message: reason }];
+        }
         let output = match parse_plan_refinement_output(raw_text) {
             Ok(output) => output,
             Err(err) => {
@@ -295,6 +328,7 @@ impl PromptProtocol for PlanRefinePromptProtocol {
         &self,
         _editable_paths: &[String],
         _patch_strategy: PatchStrategy,
+        _project: Option<&ProjectConfig>,
     ) -> Option<ResponseFormat> {
         Some(self.response_schema_format())
     }
@@ -349,7 +383,7 @@ mod tests {
     fn test_response_format_derives_from_the_single_schema_definition() {
         let protocol = PlanRefinePromptProtocol::default();
         let format = protocol
-            .response_format(&[], PatchStrategy::SearchReplace)
+            .response_format(&[], PatchStrategy::SearchReplace, None)
             .expect("the synthesis contour always carries a schema");
         let ResponseFormat::JsonSchema { json_schema } = format else {
             panic!("the synthesis contour is a structured contour");
@@ -483,6 +517,41 @@ mod tests {
                 },
             ]
         );
+    }
+
+    #[test]
+    fn test_decode_refuses_a_payload_that_mutates_the_plan() {
+        let protocol = PlanRefinePromptProtocol::default();
+        let mutating = r#"{
+            "status": "success",
+            "explanation": "Horizon synthesized",
+            "reason": null,
+            "plan_update": {"action": "update", "id": "p-1", "title": "P1"},
+            "context_requests": [],
+            "repo_searches": [],
+            "repo_maps": [],
+            "items": []
+        }"#;
+        let commands = protocol.decode(mutating, &[]);
+        assert_eq!(commands.len(), 1, "{commands:?}");
+        match &commands[0] {
+            LlmCommand::ProtocolError { message } => {
+                assert!(message.contains("plan_update"), "{message}");
+            }
+            other => panic!("expected the refusal, got {other:?}"),
+        }
+
+        // The idle representation of an untouched plan is not a defect, so the
+        // very same round decodes into its horizon.
+        let idle = mutating.replace(
+            r#""plan_update": {"action": "update", "id": "p-1", "title": "P1"}"#,
+            r#""plan_update": null"#,
+        );
+        assert!(idle.contains(r#""plan_update": null"#));
+        assert!(!protocol
+            .decode(&idle, &[])
+            .iter()
+            .any(|command| matches!(command, LlmCommand::ProtocolError { .. })));
     }
 
     #[test]

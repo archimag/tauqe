@@ -185,6 +185,10 @@ pub(super) async fn expand_window(
                     path,
                     access: ContextAccess::ReadOnly,
                     content,
+                    // A window is materialized outside the context layers, so
+                    // the matched file never entered one and carries no
+                    // arrival watermark.
+                    insertion_seq: 0,
                 });
             }
 

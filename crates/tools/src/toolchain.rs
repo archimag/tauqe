@@ -24,7 +24,7 @@
 
 mod commands;
 mod diagnostics;
-mod exec;
+pub(crate) mod exec;
 mod fmt;
 mod report;
 pub mod runner;

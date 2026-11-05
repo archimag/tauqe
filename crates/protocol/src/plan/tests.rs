@@ -16,11 +16,22 @@ fn test_plan_refine_types_serde_and_helpers() {
     let params = PlanRefineParams {
         plan_id: "core-feature".to_string(),
         model: Some(ModelSelection::Role(ModelRole::Architect)),
+        critic_model: Some(ModelSelection::Specific(ModelRef::openrouter(
+            "openai/gpt-5",
+        ))),
+        skip_critique: false,
         instructions: Some("Decompose into atomic steps".to_string()),
     };
     let json_params = serde_json::to_string(&params).unwrap();
     assert!(json_params.contains("\"core-feature\""));
     assert!(json_params.contains("\"architect\""));
+    // Both phases of the modification travel on the wire: the critique
+    // selection names its own Architect entry, and the opt-out has its own key.
+    assert!(json_params.contains("\"openai/gpt-5\""), "{json_params}");
+    assert!(
+        json_params.contains("\"skip_critique\":false"),
+        "{json_params}"
+    );
     let de_params: PlanRefineParams = serde_json::from_str(&json_params).unwrap();
     assert_eq!(de_params, params);
 
@@ -61,6 +72,104 @@ fn test_plan_refine_types_serde_and_helpers() {
     assert!(json_blocked.contains("Contradiction in requirements"));
     let de_blocked: PlanRefineResult = serde_json::from_str(&json_blocked).unwrap();
     assert_eq!(de_blocked, blocked_res);
+}
+
+/// The two-phase creation pipeline travels whole: the directives, the Architect
+/// entry of each phase, and the explicit opt-out of the critique. The planner
+/// and the critic are independent selections, so one typed dialog configures
+/// both phases of the synthesis.
+#[test]
+fn test_plan_create_pipeline_params_carry_both_phases() {
+    let params = PlanCreatePipelineParams {
+        directives: "Introduce an audit log for every turn".to_string(),
+        planner_model: Some(ModelSelection::Tier {
+            model: ModelRef::openrouter("anthropic/claude-3.5-sonnet"),
+            effort: Some(ReasoningEffort::High),
+        }),
+        critic_model: Some(ModelSelection::Role(ModelRole::Architect)),
+        skip_critique: false,
+    };
+    let json = serde_json::to_string(&params).unwrap();
+    assert!(
+        json.contains("\"directives\":\"Introduce an audit log for every turn\""),
+        "{json}"
+    );
+    assert!(json.contains("\"effort\":\"high\""), "{json}");
+    assert!(json.contains("\"critic_model\":\"architect\""), "{json}");
+    assert!(json.contains("\"skip_critique\":false"), "{json}");
+
+    let de: PlanCreatePipelineParams = serde_json::from_str(&json).unwrap();
+    assert_eq!(de, params);
+}
+
+/// The directives are the only mandatory coordinate of the pipeline: a payload
+/// that carries them alone starts both phases from their runtime defaults,
+/// while an absent directives key and a malformed value fail the typed parse
+/// instead of being dropped or guessed.
+#[test]
+fn test_plan_create_pipeline_params_defaults_and_rejections() {
+    let minimal: PlanCreatePipelineParams =
+        serde_json::from_value(serde_json::json!({ "directives": "Harden the turn boundary" }))
+            .unwrap();
+    assert_eq!(minimal.directives, "Harden the turn boundary");
+    assert!(minimal.planner_model.is_none());
+    assert!(minimal.critic_model.is_none());
+    assert!(!minimal.skip_critique);
+
+    // An absent selection stays off the wire form instead of emitting nulls.
+    let json = serde_json::to_string(&minimal).unwrap();
+    assert!(!json.contains("planner_model"), "{json}");
+    assert!(!json.contains("critic_model"), "{json}");
+
+    // A request without directives has nothing to plan, so the typed parse
+    // rejects the payload.
+    assert!(serde_json::from_value::<PlanCreatePipelineParams>(serde_json::json!({})).is_err());
+
+    // A malformed value fails the typed parse rather than being dropped.
+    assert!(
+        serde_json::from_value::<PlanCreatePipelineParams>(serde_json::json!({
+            "directives": "x",
+            "planner_model": 42
+        }))
+        .is_err()
+    );
+    assert!(
+        serde_json::from_value::<PlanCreatePipelineParams>(serde_json::json!({
+            "directives": "x",
+            "skip_critique": "yes"
+        }))
+        .is_err()
+    );
+}
+
+/// The critique fields extend the established refinement payload without
+/// breaking it: a request written before they existed decodes with no explicit
+/// critic and the critique phase enabled, so an older client keeps working.
+#[test]
+fn test_plan_refine_params_accept_a_payload_without_the_critique_fields() {
+    let legacy: PlanRefineParams = serde_json::from_value(serde_json::json!({
+        "plan_id": "core-feature",
+        "model": "architect",
+        "instructions": "Tighten the horizon"
+    }))
+    .unwrap();
+    assert_eq!(legacy.plan_id, "core-feature");
+    assert!(legacy.critic_model.is_none());
+    assert!(!legacy.skip_critique);
+
+    // The opt-out travels as its own key, so a pipeline that skips the critique
+    // is never confused with the absence of a critic selection.
+    let skipped = PlanRefineParams {
+        plan_id: "core-feature".to_string(),
+        model: None,
+        critic_model: None,
+        skip_critique: true,
+        instructions: None,
+    };
+    let json = serde_json::to_string(&skipped).unwrap();
+    assert!(json.contains("\"skip_critique\":true"), "{json}");
+    let de: PlanRefineParams = serde_json::from_str(&json).unwrap();
+    assert_eq!(de, skipped);
 }
 
 /// The client requests the active plan with an empty object, so the DTO —
@@ -147,6 +256,72 @@ fn test_plan_execute_pipeline_params_carry_coder_selection() {
         .is_err()
     );
 }
+
+/// A queue launch starts from the same rung an isolated execution starts from:
+/// the model and its reasoning depth travel together, so the server never
+/// re-derives the depth from the configured role lists.
+#[test]
+fn test_plan_execute_pipeline_params_carry_an_explicit_rung() {
+    let params = PlanExecutePipelineParams {
+        plan_ids: vec!["plan-a".to_string()],
+        model: Some(ModelSelection::Tier {
+            model: ModelRef::openrouter("anthropic/claude-3.5-sonnet"),
+            effort: Some(ReasoningEffort::High),
+        }),
+    };
+    let json = serde_json::to_string(&params).unwrap();
+    assert!(json.contains("\"effort\":\"high\""), "{json}");
+    let de: PlanExecutePipelineParams = serde_json::from_str(&json).unwrap();
+    assert_eq!(de, params);
+}
+
+/// A manual replan starts from the same rung an execution starts from: the
+/// model and its reasoning depth travel together, an absent selection stays off
+/// the wire, and a malformed one fails the typed parse instead of being
+/// dropped.
+#[test]
+fn test_plan_replan_params_carry_coder_selection() {
+    let params = PlanReplanParams {
+        plan_id: "core-feature".to_string(),
+        step_id: "2".to_string(),
+        reason: Some("blocked on an unstable invariant".to_string()),
+        model: Some(ModelSelection::Tier {
+            model: ModelRef::openrouter("anthropic/claude-3.5-sonnet"),
+            effort: Some(ReasoningEffort::High),
+        }),
+        instructions: Some("Keep the existing contract".to_string()),
+    };
+    let json = serde_json::to_string(&params).unwrap();
+    assert!(json.contains("\"effort\":\"high\""), "{json}");
+    let de: PlanReplanParams = serde_json::from_str(&json).unwrap();
+    assert_eq!(de, params);
+
+    // A request that predates the selection field keeps decoding unchanged and
+    // reports no explicit selection, so the ladder starts at its base rung.
+    let legacy: PlanReplanParams = serde_json::from_value(serde_json::json!({
+        "plan_id": "legacy-plan",
+        "step_id": "1"
+    }))
+    .unwrap();
+    assert_eq!(legacy.step_id, "1");
+    assert!(legacy.model.is_none());
+
+    // An absent selection stays out of the wire form instead of emitting
+    // explicit nulls.
+    let bare_json = serde_json::to_string(&legacy).unwrap();
+    assert!(!bare_json.contains("model"), "{bare_json}");
+
+    // A malformed selection fails the typed parse rather than being dropped.
+    assert!(
+        serde_json::from_value::<PlanReplanParams>(serde_json::json!({
+            "plan_id": "bad-selection",
+            "step_id": "1",
+            "model": 42
+        }))
+        .is_err()
+    );
+}
+
 #[test]
 fn test_plan_item_status_lifecycle() {
     let status = PlanItemStatus::Discussion;
@@ -326,10 +501,14 @@ fn test_plan_roundtrip_keeps_nested_blocked_reasons() {
     let de: Plan = serde_json::from_str(&json).unwrap();
     assert_eq!(de, plan);
 
-    let stored_leaf = de.find_item("1.1").unwrap();
-    assert_eq!(stored_leaf.status, PlanItemStatus::Blocked);
+    let stored_leaf = de.implementation.find_item("1.1").unwrap();
     assert_eq!(stored_leaf.blocked_reason.as_deref(), Some(reason));
-    assert!(de.find_item("2").unwrap().blocked_reason.is_none());
+    assert!(de
+        .implementation
+        .find_item("2")
+        .unwrap()
+        .blocked_reason
+        .is_none());
 }
 
 #[test]
@@ -354,7 +533,7 @@ fn test_plan_stats_and_summary() {
 
     // Progress counts executable leaves only: the "1" container is a conceptual
     // milestone and is not double-counted alongside its "1.1" child.
-    let (total, completed) = plan.count_stats();
+    let (total, completed) = plan.implementation.count_stats();
     assert_eq!(total, 2);
     assert_eq!(completed, 1);
 
@@ -363,7 +542,7 @@ fn test_plan_stats_and_summary() {
     assert_eq!(summary.completed_items, 1);
     assert_eq!(summary.id, "jwt-auth");
     assert_eq!(summary.status, PlanItemStatus::InProgress);
-    assert_eq!(plan.status(), PlanItemStatus::InProgress);
+    assert_eq!(plan.implementation.status(), PlanItemStatus::InProgress);
 }
 
 #[test]
@@ -391,7 +570,7 @@ fn test_count_stats_reports_only_leaves() {
 
     // Containers are conceptual and carry no authoritative status, so progress
     // counts the three executable leaves, never the container alongside them.
-    assert_eq!(plan.count_stats(), (3, 2));
+    assert_eq!(plan.implementation.count_stats(), (3, 2));
     let summary = plan.summary();
     assert_eq!(summary.total_items, 3);
     assert_eq!(summary.completed_items, 2);
@@ -415,8 +594,8 @@ fn test_count_stats_excludes_cancelled_leaves_and_agrees_with_done_status() {
     // `compute_items_status` treats the plan as Done because every active
     // (non-cancelled) leaf is Done. The progress metric must agree: the cancelled
     // leaf is excluded from `total`, so the ratio stays `1/1`, never `1/2`.
-    assert_eq!(plan.status(), PlanItemStatus::Done);
-    assert_eq!(plan.count_stats(), (1, 1));
+    assert_eq!(plan.implementation.status(), PlanItemStatus::Done);
+    assert_eq!(plan.implementation.count_stats(), (1, 1));
 
     let summary = plan.summary();
     assert_eq!(summary.status, PlanItemStatus::Done);
@@ -443,8 +622,8 @@ fn test_count_stats_excludes_cancelled_leaves_in_mixed_plan() {
     // A mix of Done and Todo leaves keeps the plan InProgress; the cancelled leaf
     // is excluded from the denominator, so the ratio reflects only executable
     // remaining work.
-    assert_eq!(plan.status(), PlanItemStatus::InProgress);
-    assert_eq!(plan.count_stats(), (2, 1));
+    assert_eq!(plan.implementation.status(), PlanItemStatus::InProgress);
+    assert_eq!(plan.implementation.count_stats(), (2, 1));
 }
 
 #[test]
@@ -465,8 +644,8 @@ fn test_count_stats_all_cancelled_reports_zero_and_cancelled_status() {
     // With every leaf cancelled there is no executable work left, so the metric
     // is `0/0` and the aggregated status is Cancelled rather than a misleading
     // `0/2` against a cancelled plan.
-    assert_eq!(plan.status(), PlanItemStatus::Cancelled);
-    assert_eq!(plan.count_stats(), (0, 0));
+    assert_eq!(plan.implementation.status(), PlanItemStatus::Cancelled);
+    assert_eq!(plan.implementation.count_stats(), (0, 0));
 }
 
 #[test]
@@ -491,13 +670,13 @@ fn test_evaluate_scope_reports_only_leaves_for_discussion() {
 
     // Refreshing propagates the Discussion child onto its container. Only the
     // offending leaf is reported, never the container as well.
-    plan.refresh_parent_statuses();
+    plan.implementation.refresh_parent_statuses();
     assert_eq!(
-        plan.find_item("1").unwrap().status,
+        plan.implementation.find_item("1").unwrap().status,
         PlanItemStatus::Discussion
     );
 
-    match plan.evaluate_scope(None) {
+    match plan.implementation.evaluate_scope(None) {
         PlanScopeEvaluation::BlockedByDiscussion(items) => {
             assert_eq!(items.len(), 1);
             assert!(items[0].contains("1.2"));
@@ -505,7 +684,7 @@ fn test_evaluate_scope_reports_only_leaves_for_discussion() {
         other => panic!("Expected BlockedByDiscussion, got {:?}", other),
     }
 
-    match plan.evaluate_scope(Some("1")) {
+    match plan.implementation.evaluate_scope(Some("1")) {
         PlanScopeEvaluation::BlockedByDiscussion(items) => {
             assert_eq!(items.len(), 1);
             assert!(items[0].contains("1.2"));
@@ -540,7 +719,7 @@ fn test_evaluate_scope_dependency_uses_derived_container_status() {
     // The container's stored status is stale (Todo) while all of its children
     // are Done. Readiness derives the container status from its children instead
     // of trusting the stale stored value, so the dependent step is ready.
-    match plan.evaluate_scope(None) {
+    match plan.implementation.evaluate_scope(None) {
         PlanScopeEvaluation::Ready(leaves) => {
             let ids: Vec<&str> = leaves.iter().map(|i| i.id.as_str()).collect();
             assert_eq!(ids, vec!["2"]);
@@ -565,31 +744,31 @@ fn test_plan_status_computation() {
     );
 
     // All Todo -> Todo
-    assert_eq!(plan.status(), PlanItemStatus::Todo);
+    assert_eq!(plan.implementation.status(), PlanItemStatus::Todo);
 
     // One InProgress -> InProgress
-    plan.items[0].status = PlanItemStatus::InProgress;
-    assert_eq!(plan.status(), PlanItemStatus::InProgress);
+    plan.implementation.items[0].status = PlanItemStatus::InProgress;
+    assert_eq!(plan.implementation.status(), PlanItemStatus::InProgress);
 
     // One Done, one Todo -> InProgress
-    plan.items[0].status = PlanItemStatus::Done;
-    assert_eq!(plan.status(), PlanItemStatus::InProgress);
+    plan.implementation.items[0].status = PlanItemStatus::Done;
+    assert_eq!(plan.implementation.status(), PlanItemStatus::InProgress);
 
     // One Discussion -> Discussion (top priority)
-    plan.items[1].status = PlanItemStatus::Discussion;
-    assert_eq!(plan.status(), PlanItemStatus::Discussion);
+    plan.implementation.items[1].status = PlanItemStatus::Discussion;
+    assert_eq!(plan.implementation.status(), PlanItemStatus::Discussion);
 
     // All Done -> Done
-    plan.items[1].status = PlanItemStatus::Done;
-    assert_eq!(plan.status(), PlanItemStatus::Done);
+    plan.implementation.items[1].status = PlanItemStatus::Done;
+    assert_eq!(plan.implementation.status(), PlanItemStatus::Done);
 
     // One Cancelled, one Done -> Done
-    plan.items[0].status = PlanItemStatus::Cancelled;
-    assert_eq!(plan.status(), PlanItemStatus::Done);
+    plan.implementation.items[0].status = PlanItemStatus::Cancelled;
+    assert_eq!(plan.implementation.status(), PlanItemStatus::Done);
 
     // All Cancelled -> Cancelled
-    plan.items[1].status = PlanItemStatus::Cancelled;
-    assert_eq!(plan.status(), PlanItemStatus::Cancelled);
+    plan.implementation.items[1].status = PlanItemStatus::Cancelled;
+    assert_eq!(plan.implementation.status(), PlanItemStatus::Cancelled);
 }
 
 #[test]
@@ -612,35 +791,39 @@ fn test_plan_item_leaf_and_refresh_parent_statuses() {
         )],
     );
 
-    assert_eq!(plan.is_leaf_item("parent"), Some(false));
-    assert_eq!(plan.is_leaf_item("sub-1"), Some(true));
-    assert_eq!(plan.is_leaf_item("unknown"), None);
+    assert_eq!(plan.implementation.is_leaf_item("parent"), Some(false));
+    assert_eq!(plan.implementation.is_leaf_item("sub-1"), Some(true));
+    assert_eq!(plan.implementation.is_leaf_item("unknown"), None);
 
     // Update first sub-item to InProgress: parent becomes InProgress
-    plan.update_item_status("sub-1", PlanItemStatus::InProgress);
+    plan.implementation
+        .update_item_status("sub-1", PlanItemStatus::InProgress);
     assert_eq!(
-        plan.find_item("parent").unwrap().status,
+        plan.implementation.find_item("parent").unwrap().status,
         PlanItemStatus::InProgress
     );
 
     // Update first sub-item to Discussion: parent becomes Discussion (highest attention priority)
-    plan.update_item_status("sub-1", PlanItemStatus::Discussion);
+    plan.implementation
+        .update_item_status("sub-1", PlanItemStatus::Discussion);
     assert_eq!(
-        plan.find_item("parent").unwrap().status,
+        plan.implementation.find_item("parent").unwrap().status,
         PlanItemStatus::Discussion
     );
 
     // Update first sub-item to Done, second is still Todo: parent becomes InProgress
-    plan.update_item_status("sub-1", PlanItemStatus::Done);
+    plan.implementation
+        .update_item_status("sub-1", PlanItemStatus::Done);
     assert_eq!(
-        plan.find_item("parent").unwrap().status,
+        plan.implementation.find_item("parent").unwrap().status,
         PlanItemStatus::InProgress
     );
 
     // Update second sub-item to done: parent automatically transitions to Done
-    plan.update_item_status("sub-2", PlanItemStatus::Done);
+    plan.implementation
+        .update_item_status("sub-2", PlanItemStatus::Done);
     assert_eq!(
-        plan.find_item("parent").unwrap().status,
+        plan.implementation.find_item("parent").unwrap().status,
         PlanItemStatus::Done
     );
 }
@@ -675,31 +858,38 @@ fn test_plan_normalize_leaf_files() {
         vec![top, leaf],
     );
 
-    plan.normalize_leaf_files();
+    plan.implementation.normalize_leaf_files();
 
     // Containers are cleared at every depth.
-    assert!(plan.items[0].files.is_empty());
-    assert!(plan.items[0].readonly_files.is_empty());
-    assert!(plan.items[0].depends_on.is_empty());
-    assert!(plan.items[0].children[0].files.is_empty());
-    assert!(plan.items[0].children[0].readonly_files.is_empty());
-    assert!(plan.items[0].children[0].depends_on.is_empty());
+    assert!(plan.implementation.items[0].files.is_empty());
+    assert!(plan.implementation.items[0].readonly_files.is_empty());
+    assert!(plan.implementation.items[0].depends_on.is_empty());
+    assert!(plan.implementation.items[0].children[0].files.is_empty());
+    assert!(plan.implementation.items[0].children[0]
+        .readonly_files
+        .is_empty());
+    assert!(plan.implementation.items[0].children[0]
+        .depends_on
+        .is_empty());
     // Leaves keep their files, overlapping readonly_files are removed.
     assert_eq!(
-        plan.items[0].children[0].children[0].files,
+        plan.implementation.items[0].children[0].children[0].files,
         vec!["src/inner.rs".to_string(), "src/shared.rs".to_string()]
     );
     assert_eq!(
-        plan.items[0].children[0].children[0].readonly_files,
+        plan.implementation.items[0].children[0].children[0].readonly_files,
         vec!["src/ref.rs".to_string()]
     );
-    assert_eq!(plan.items[1].files, vec!["src/leaf.rs".to_string()]);
     assert_eq!(
-        plan.items[1].readonly_files,
+        plan.implementation.items[1].files,
+        vec!["src/leaf.rs".to_string()]
+    );
+    assert_eq!(
+        plan.implementation.items[1].readonly_files,
         vec!["src/leaf_ref.rs".to_string()]
     );
     assert_eq!(
-        plan.items[0].children[0].children[0].depends_on,
+        plan.implementation.items[0].children[0].children[0].depends_on,
         vec!["2".to_string()]
     );
 }
@@ -728,10 +918,16 @@ fn test_normalize_leaf_files_dedups_readonly_by_canonical_path() {
         vec![leaf],
     );
 
-    plan.normalize_leaf_files();
+    plan.implementation.normalize_leaf_files();
 
-    assert_eq!(plan.items[0].files, vec!["src/keep.rs".to_string()]);
-    assert_eq!(plan.items[0].readonly_files, vec!["src/ref.rs".to_string()]);
+    assert_eq!(
+        plan.implementation.items[0].files,
+        vec!["src/keep.rs".to_string()]
+    );
+    assert_eq!(
+        plan.implementation.items[0].readonly_files,
+        vec!["src/ref.rs".to_string()]
+    );
 }
 
 #[test]
@@ -758,7 +954,7 @@ fn test_plan_evaluate_scope() {
     );
 
     // 1. Entire plan has step 1.2 in Discussion -> Blocked
-    match plan.evaluate_scope(None) {
+    match plan.implementation.evaluate_scope(None) {
         PlanScopeEvaluation::BlockedByDiscussion(items) => {
             assert_eq!(items.len(), 1);
             assert!(items[0].contains("1.2"));
@@ -767,7 +963,7 @@ fn test_plan_evaluate_scope() {
     }
 
     // 2. Leaf step 1.1 is Todo -> Ready with 1 item
-    match plan.evaluate_scope(Some("1.1")) {
+    match plan.implementation.evaluate_scope(Some("1.1")) {
         PlanScopeEvaluation::Ready(leaves) => {
             assert_eq!(leaves.len(), 1);
             assert_eq!(leaves[0].id, "1.1");
@@ -776,7 +972,7 @@ fn test_plan_evaluate_scope() {
     }
 
     // 3. Leaf step 1.2 is Discussion -> Blocked
-    match plan.evaluate_scope(Some("1.2")) {
+    match plan.implementation.evaluate_scope(Some("1.2")) {
         PlanScopeEvaluation::BlockedByDiscussion(items) => {
             assert_eq!(items.len(), 1);
         }
@@ -785,8 +981,10 @@ fn test_plan_evaluate_scope() {
 
     // 4. Once 1.2 is approved to Todo -> entire plan is Ready with 3 items
     let mut clean_plan = plan.clone();
-    clean_plan.update_item_status("1.2", PlanItemStatus::Todo);
-    match clean_plan.evaluate_scope(None) {
+    clean_plan
+        .implementation
+        .update_item_status("1.2", PlanItemStatus::Todo);
+    match clean_plan.implementation.evaluate_scope(None) {
         PlanScopeEvaluation::Ready(leaves) => {
             assert_eq!(leaves.len(), 3);
             assert_eq!(leaves[0].id, "1.1");
@@ -797,7 +995,7 @@ fn test_plan_evaluate_scope() {
     }
 
     // 5. Group 1 is Ready with 2 items
-    match clean_plan.evaluate_scope(Some("1")) {
+    match clean_plan.implementation.evaluate_scope(Some("1")) {
         PlanScopeEvaluation::Ready(leaves) => {
             assert_eq!(leaves.len(), 2);
             assert_eq!(leaves[0].id, "1.1");
@@ -826,7 +1024,7 @@ fn test_plan_evaluate_scope_dependencies() {
     );
 
     // The whole chain is scheduled in dependency order.
-    match plan.evaluate_scope(None) {
+    match plan.implementation.evaluate_scope(None) {
         PlanScopeEvaluation::Ready(leaves) => {
             let ids: Vec<&str> = leaves.iter().map(|i| i.id.as_str()).collect();
             assert_eq!(ids, vec!["1", "2", "3"]);
@@ -835,7 +1033,7 @@ fn test_plan_evaluate_scope_dependencies() {
     }
 
     // A step whose dependency is not DONE yet is blocked when targeted, surfacing unmet prerequisites.
-    match plan.evaluate_scope(Some("2")) {
+    match plan.implementation.evaluate_scope(Some("2")) {
         PlanScopeEvaluation::BlockedByDependencies(items) => {
             assert_eq!(items.len(), 1);
             assert!(items[0].contains("#2"));
@@ -846,9 +1044,11 @@ fn test_plan_evaluate_scope_dependencies() {
 
     // A step in BLOCKED status cannot be executed.
     let mut blocked_plan = plan.clone();
-    blocked_plan.update_item_status("1", PlanItemStatus::Blocked);
+    blocked_plan
+        .implementation
+        .update_item_status("1", PlanItemStatus::Blocked);
     assert_eq!(
-        blocked_plan.evaluate_scope(Some("1")),
+        blocked_plan.implementation.evaluate_scope(Some("1")),
         PlanScopeEvaluation::StepBlocked
     );
 }
@@ -869,7 +1069,7 @@ fn test_plan_evaluate_scope_surfaces_blocked_leaves() {
             item("2", "Stuck B", PlanItemStatus::Blocked, vec![]),
         ],
     );
-    match all_blocked.evaluate_scope(None) {
+    match all_blocked.implementation.evaluate_scope(None) {
         PlanScopeEvaluation::BlockedByBlockers(items) => {
             assert_eq!(items.len(), 2);
             assert!(items[0].contains("#1"));
@@ -892,7 +1092,7 @@ fn test_plan_evaluate_scope_surfaces_blocked_leaves() {
             item("2", "Stuck", PlanItemStatus::Blocked, vec![]),
         ],
     );
-    match mixed.evaluate_scope(None) {
+    match mixed.implementation.evaluate_scope(None) {
         PlanScopeEvaluation::BlockedByBlockers(items) => {
             assert_eq!(items.len(), 1);
             assert!(items[0].contains("#2"));
@@ -918,7 +1118,7 @@ fn test_plan_evaluate_scope_surfaces_blocked_leaves() {
             ],
         )],
     );
-    match group.evaluate_scope(Some("g")) {
+    match group.implementation.evaluate_scope(Some("g")) {
         PlanScopeEvaluation::BlockedByBlockers(items) => {
             assert_eq!(items.len(), 1);
             assert!(items[0].contains("#g.2"));
@@ -940,10 +1140,12 @@ fn test_plan_update_item_status_matches_ids_case_insensitively() {
     );
 
     // `find_item` and `update_item_status` must agree on the id matching rule.
-    assert!(plan.find_item("step-1").is_some());
-    assert!(plan.update_item_status("step-1", PlanItemStatus::Done));
+    assert!(plan.implementation.find_item("step-1").is_some());
+    assert!(plan
+        .implementation
+        .update_item_status("step-1", PlanItemStatus::Done));
     assert_eq!(
-        plan.find_item("STEP-1").unwrap().status,
+        plan.implementation.find_item("STEP-1").unwrap().status,
         PlanItemStatus::Done
     );
 }
@@ -968,18 +1170,77 @@ fn test_plan_update_item_status_rejects_container_targets() {
     // A container target is rejected: its status is derived from its children, so
     // the assignment would be recomputed away immediately. The caller is told the
     // update did not happen instead of silently losing the change.
-    assert!(!plan.update_item_status("g", PlanItemStatus::Done));
-    assert_eq!(plan.find_item("g").unwrap().status, PlanItemStatus::Todo);
+    assert!(!plan
+        .implementation
+        .update_item_status("g", PlanItemStatus::Done));
+    assert_eq!(
+        plan.implementation.find_item("g").unwrap().status,
+        PlanItemStatus::Todo
+    );
 
     // A leaf target is updated and its ancestors are refreshed.
-    assert!(plan.update_item_status("g.1", PlanItemStatus::Done));
-    assert_eq!(plan.find_item("g.1").unwrap().status, PlanItemStatus::Done);
-    assert_eq!(plan.find_item("g").unwrap().status, PlanItemStatus::Done);
+    assert!(plan
+        .implementation
+        .update_item_status("g.1", PlanItemStatus::Done));
+    assert_eq!(
+        plan.implementation.find_item("g.1").unwrap().status,
+        PlanItemStatus::Done
+    );
+    assert_eq!(
+        plan.implementation.find_item("g").unwrap().status,
+        PlanItemStatus::Done
+    );
 
     // An unknown identifier is rejected as well.
-    assert!(!plan.update_item_status("missing", PlanItemStatus::Done));
+    assert!(!plan
+        .implementation
+        .update_item_status("missing", PlanItemStatus::Done));
 }
 
+/// Assigning a leaf the status it already carries is not a durable change, so a
+/// caller is told that the update did not happen instead of receiving a success
+/// it would have to undo. An optimistic-update consumer needs that distinction
+/// to decide whether to emit an update event or perform a rollback.
+#[test]
+fn test_plan_update_item_status_reports_a_no_op_assignment_as_unchanged() {
+    let mut plan = Plan::from_parts(
+        "no-op-status".to_string(),
+        "No Op Status".to_string(),
+        None,
+        1,
+        1,
+        Vec::new(),
+        vec![item(
+            "g",
+            "Group",
+            PlanItemStatus::Todo,
+            vec![item("g.1", "Child", PlanItemStatus::Todo, vec![])],
+        )],
+    );
+
+    // The leaf already carries the requested status, so nothing changed.
+    assert!(!plan
+        .implementation
+        .update_item_status("g.1", PlanItemStatus::Todo));
+    assert_eq!(
+        plan.implementation.find_item("g.1").unwrap().status,
+        PlanItemStatus::Todo
+    );
+
+    // A genuine transition is reported as a change and reaches the ancestor.
+    assert!(plan
+        .implementation
+        .update_item_status("g.1", PlanItemStatus::Done));
+    assert_eq!(
+        plan.implementation.find_item("g").unwrap().status,
+        PlanItemStatus::Done
+    );
+
+    // Repeating a completed transition is a no-op again.
+    assert!(!plan
+        .implementation
+        .update_item_status("g.1", PlanItemStatus::Done));
+}
 #[test]
 fn test_plan_has_started_or_completed_steps() {
     fn plan_with(concept: Vec<ConceptItem>, items: Vec<PlanItem>) -> Plan {
@@ -1005,28 +1266,28 @@ fn test_plan_has_started_or_completed_steps() {
         }],
         vec![],
     );
-    assert!(!conceptual.has_started_or_completed_steps());
+    assert!(!conceptual.implementation.has_started_or_completed_steps());
 
     // A single pending leaf records no progress.
     let todo_only = plan_with(
         vec![],
         vec![item("1", "Pending", PlanItemStatus::Todo, vec![])],
     );
-    assert!(!todo_only.has_started_or_completed_steps());
+    assert!(!todo_only.implementation.has_started_or_completed_steps());
 
     // An in-progress leaf means implementation work is already underway.
     let in_progress = plan_with(
         vec![],
         vec![item("1", "Active", PlanItemStatus::InProgress, vec![])],
     );
-    assert!(in_progress.has_started_or_completed_steps());
+    assert!(in_progress.implementation.has_started_or_completed_steps());
 
     // A finished leaf means progress may already be captured by a Git commit.
     let done = plan_with(
         vec![],
         vec![item("1", "Finished", PlanItemStatus::Done, vec![])],
     );
-    assert!(done.has_started_or_completed_steps());
+    assert!(done.implementation.has_started_or_completed_steps());
 
     // A finished leaf counts at any depth, even beside pending siblings and
     // with a stale container status.
@@ -1042,7 +1303,7 @@ fn test_plan_has_started_or_completed_steps() {
             ],
         )],
     );
-    assert!(nested.has_started_or_completed_steps());
+    assert!(nested.implementation.has_started_or_completed_steps());
 
     // A container whose leaves are all pending holds no progress of its own: the
     // container status is derived from its children and is never inspected, so a
@@ -1059,7 +1320,9 @@ fn test_plan_has_started_or_completed_steps() {
             ],
         )],
     );
-    assert!(!pending_group.has_started_or_completed_steps());
+    assert!(!pending_group
+        .implementation
+        .has_started_or_completed_steps());
 }
 
 #[test]
@@ -1365,12 +1628,11 @@ fn test_identifier_normalization_is_consistent_across_validation_lookup_and_read
     assert!(plan.validate().is_ok());
 
     // Lookup by any spelling of the id resolves to the same step.
-    assert!(plan.find_item("1").is_some());
-    assert!(plan.find_item(" 1 ").is_some());
+    assert!(plan.implementation.find_item(" 1 ").is_some());
 
-    // The dependency `"1 "` is satisfied by the Done producer `" 1 "`, so the
+    assert!(plan.implementation.find_item("1").is_some());
     // dependent step is scheduled instead of staying blocked forever.
-    match plan.evaluate_scope(None) {
+    match plan.implementation.evaluate_scope(None) {
         PlanScopeEvaluation::Ready(leaves) => {
             let ids: Vec<&str> = leaves.iter().map(|i| i.id.as_str()).collect();
             assert_eq!(ids, vec!["2"]);
@@ -1509,7 +1771,9 @@ fn test_plan_validate_ignores_cancelled_leaf_naming_its_ancestor() {
     // Flipping the leaf back to an active status restores the genuine deadlock:
     // the container can only finish once the leaf is `Done`, and the leaf cannot
     // start before the container.
-    assert!(plan.update_item_status("1.1", PlanItemStatus::Todo));
+    assert!(plan
+        .implementation
+        .update_item_status("1.1", PlanItemStatus::Todo));
     let errs = plan.validate().unwrap_err();
     assert_eq!(errs.len(), 1);
     match &errs[0] {
@@ -1545,7 +1809,9 @@ fn test_plan_validate_ignores_done_leaf_naming_its_ancestor() {
     // Flipping the leaf back to an active status restores the genuine deadlock:
     // the container can only finish once the leaf is `Done`, and the leaf cannot
     // start before the container.
-    assert!(plan.update_item_status("1.1", PlanItemStatus::Todo));
+    assert!(plan
+        .implementation
+        .update_item_status("1.1", PlanItemStatus::Todo));
     let errs = plan.validate().unwrap_err();
     assert_eq!(errs.len(), 1);
     match &errs[0] {
@@ -1585,7 +1851,9 @@ fn test_plan_validate_ignores_deep_done_leaf_naming_top_ancestor() {
     // Reactivating the leaf restores the deadlock across nesting levels: the top
     // ancestor can only finish once the deep leaf is `Done`, and the deep leaf
     // cannot start before the ancestor.
-    assert!(plan.update_item_status("1.a.1", PlanItemStatus::Todo));
+    assert!(plan
+        .implementation
+        .update_item_status("1.a.1", PlanItemStatus::Todo));
     match plan.validate().unwrap_err().as_slice() {
         [PlanValidationError::CyclicDependency(cycle)] => {
             assert!(cycle.contains(&"1".to_string()));
@@ -1686,22 +1954,22 @@ fn test_refresh_parent_statuses_and_scope_on_deep_hierarchy() {
 
     // Derived container statuses propagate through every nesting level: the
     // partially finished group is InProgress and so is its parent.
-    plan.refresh_parent_statuses();
+    plan.implementation.refresh_parent_statuses();
     assert_eq!(
-        plan.find_item("1.1").unwrap().status,
+        plan.implementation.find_item("1.1").unwrap().status,
         PlanItemStatus::InProgress
     );
     assert_eq!(
-        plan.find_item("1").unwrap().status,
+        plan.implementation.find_item("1").unwrap().status,
         PlanItemStatus::InProgress
     );
-    assert_eq!(plan.status(), PlanItemStatus::InProgress);
+    assert_eq!(plan.implementation.status(), PlanItemStatus::InProgress);
     // Only executable leaves count: the cancelled leaf stays out of the metric.
-    assert_eq!(plan.count_stats(), (2, 1));
+    assert_eq!(plan.implementation.count_stats(), (2, 1));
 
     // The readiness scan schedules exactly the pending leaf: the finished leaf is
     // already satisfied and the cancelled leaf is skipped instead of stalling it.
-    match plan.evaluate_scope(None) {
+    match plan.implementation.evaluate_scope(None) {
         PlanScopeEvaluation::Ready(leaves) => {
             let ids: Vec<&str> = leaves.iter().map(|i| i.id.as_str()).collect();
             assert_eq!(ids, vec!["1.1.2"]);
@@ -1710,7 +1978,7 @@ fn test_refresh_parent_statuses_and_scope_on_deep_hierarchy() {
     }
 
     // A composite scope at the middle level reports the same single pending leaf.
-    match plan.evaluate_scope(Some("1.1")) {
+    match plan.implementation.evaluate_scope(Some("1.1")) {
         PlanScopeEvaluation::Ready(leaves) => {
             let ids: Vec<&str> = leaves.iter().map(|i| i.id.as_str()).collect();
             assert_eq!(ids, vec!["1.1.2"]);
@@ -1720,12 +1988,23 @@ fn test_refresh_parent_statuses_and_scope_on_deep_hierarchy() {
 
     // Finishing the last executable leaf cascades to the top, and the cancelled
     // sibling keeps the plan Done instead of blocking completion.
-    assert!(plan.update_item_status("1.1.2", PlanItemStatus::Done));
-    assert_eq!(plan.find_item("1.1").unwrap().status, PlanItemStatus::Done);
-    assert_eq!(plan.find_item("1").unwrap().status, PlanItemStatus::Done);
-    assert_eq!(plan.status(), PlanItemStatus::Done);
-    assert_eq!(plan.count_stats(), (2, 2));
-    assert_eq!(plan.evaluate_scope(None), PlanScopeEvaluation::AllCompleted);
+    assert!(plan
+        .implementation
+        .update_item_status("1.1.2", PlanItemStatus::Done));
+    assert_eq!(
+        plan.implementation.find_item("1.1").unwrap().status,
+        PlanItemStatus::Done
+    );
+    assert_eq!(
+        plan.implementation.find_item("1").unwrap().status,
+        PlanItemStatus::Done
+    );
+    assert_eq!(plan.implementation.status(), PlanItemStatus::Done);
+    assert_eq!(plan.implementation.count_stats(), (2, 2));
+    assert_eq!(
+        plan.implementation.evaluate_scope(None),
+        PlanScopeEvaluation::AllCompleted
+    );
 }
 
 #[test]
@@ -1775,11 +2054,11 @@ fn test_plan_implementation_provenance_serde() {
         Vec::new(),
         Vec::new(),
     );
-    plan.last_replanned_step = Some("2".to_string());
+    plan.implementation.last_replanned_step = Some("2".to_string());
     let json = serde_json::to_string(&plan).unwrap();
     assert!(json.contains("\"last_replanned_step\":\"2\""));
     let de: Plan = serde_json::from_str(&json).unwrap();
-    assert_eq!(de.last_replanned_step.as_deref(), Some("2"));
+    assert_eq!(de.implementation.last_replanned_step.as_deref(), Some("2"));
     assert_eq!(de.implementation, plan.implementation);
 
     // An unset marker stays absent from the wire form, so a horizon that was
@@ -1954,10 +2233,10 @@ fn test_plan_from_parts_leaves_provenance_empty() {
     );
     assert_eq!(plan.created_at, 7);
     assert_eq!(plan.updated_at, 9);
-    assert!(plan.architect.is_none());
-    assert!(plan.last_replanned_step.is_none());
+    assert!(plan.implementation.architect.is_none());
+    assert!(plan.implementation.last_replanned_step.is_none());
     assert_eq!(plan.concept, concept);
-    assert_eq!(plan.items, items);
+    assert_eq!(plan.implementation.items, items);
 }
 
 /// The canonical wire form keeps the step graph in its own `implementation`
@@ -1976,7 +2255,7 @@ fn test_plan_wire_form_nests_the_step_graph() {
         Vec::new(),
         vec![step],
     );
-    plan.last_replanned_step = Some("1".to_string());
+    plan.implementation.last_replanned_step = Some("1".to_string());
 
     let json = serde_json::to_string(&plan).unwrap();
     let value: serde_json::Value = serde_json::from_str(&json).unwrap();
@@ -2007,78 +2286,6 @@ fn test_plan_rejects_the_legacy_flat_form() {
     assert!(
         decoded.is_err(),
         "a flat plan document decoded: {decoded:?}"
-    );
-}
-
-/// The graph algebra lives on `PlanImplementation` and reaches a `Plan` through
-/// `Deref`, so one implementation serves both the standalone horizon and the
-/// plan that owns it.
-#[test]
-fn test_plan_implementation_algebra_matches_the_plan_delegation() {
-    let implementation = PlanImplementation {
-        items: vec![item(
-            "1",
-            "Group",
-            PlanItemStatus::Todo,
-            vec![
-                item("1.1", "Done leaf", PlanItemStatus::Done, vec![]),
-                item("1.2", "Pending leaf", PlanItemStatus::Todo, vec![]),
-            ],
-        )],
-        ..PlanImplementation::default()
-    };
-    let mut plan = Plan::from_parts(
-        "parity".to_string(),
-        "Parity".to_string(),
-        None,
-        1,
-        1,
-        Vec::new(),
-        implementation.items.clone(),
-    );
-
-    // Reads resolve to the same values through both entry points.
-    assert_eq!(plan.items, implementation.items);
-    assert_eq!(plan.status(), implementation.status());
-    assert_eq!(plan.count_stats(), implementation.count_stats());
-    assert_eq!(plan.is_leaf_item("1"), implementation.is_leaf_item("1"));
-    assert_eq!(
-        plan.find_item("1.2").map(|item| item.title.as_str()),
-        implementation
-            .find_item("1.2")
-            .map(|item| item.title.as_str())
-    );
-    assert_eq!(
-        plan.has_started_or_completed_steps(),
-        implementation.has_started_or_completed_steps()
-    );
-    assert_eq!(
-        plan.evaluate_scope(None),
-        implementation.evaluate_scope(None)
-    );
-
-    // Mutations reach the same graph, and the derived container status follows.
-    let mut delegated = implementation.clone();
-    assert!(plan.update_item_status("1.2", PlanItemStatus::InProgress));
-    assert!(delegated.update_item_status("1.2", PlanItemStatus::InProgress));
-    assert_eq!(plan.items, delegated.items);
-
-    plan.refresh_parent_statuses();
-    delegated.refresh_parent_statuses();
-    assert_eq!(plan.items, delegated.items);
-
-    // Leaf-only normalization runs on both without diverging.
-    plan.normalize_leaf_files();
-    delegated.normalize_leaf_files();
-    assert_eq!(plan.items, delegated.items);
-
-    // The horizon is a plain nested field, so its provenance is addressable
-    // through the plan itself.
-    plan.architect = None;
-    plan.last_replanned_step = Some("1.2".to_string());
-    assert_eq!(
-        plan.implementation.last_replanned_step.as_deref(),
-        Some("1.2")
     );
 }
 

@@ -136,10 +136,15 @@ first, one rung of the ladder second.
 
 1. The failed attempt's transaction is rolled back and the transient discovery
    context is pruned, so every attempt starts from the same clean pre-turn state.
-2. The same rung receives the next attempt until `develop.max_tier_attempts`
-   content attempts (3 by default) are spent. Every attempt is a fresh generation
-   over a rolled-back working tree, so a failed patch never accumulates into the
-   next one.
+2. The same rung receives the next attempt until the budget of its own role
+   entry is spent. That budget is the `attempts` field of the entry and is read
+   from the selected model rather than from the ladder position, so it defaults
+   adaptively: three attempts for a coder rung that participates in escalation,
+   two for an Architect tier (§3.3), and exactly one for an entry declared
+   `level_up = false`, because a model the developer reserved for a manual run
+   is never levelled up automatically. An explicit `attempts = N` always wins
+   over the default. Every attempt is a fresh generation over a rolled-back
+   working tree, so a failed patch never accumulates into the next one.
 3. Only an exhausted tier advances the ladder, exactly one rung, and that rung
    starts with a fresh budget of its own. A rung counts as an advance whenever the
    model *or* the reasoning depth changes, so recovery can first deepen reasoning
@@ -185,8 +190,11 @@ whose every rung opted out still keeps one base rung instead of becoming empty.
 
 A run started by hand on an opted-out model is already at the top: it occupies
 no ladder position, it starts from the strongest eligible rung, and the ladder
-is saturated immediately. A failed turn therefore ends in an error or a blocked
-outcome instead of quietly promoting the model the developer reserved.
+is saturated immediately. Its attempt budget comes from its own role entry, so
+an opt-out that declares no `attempts` runs exactly one attempt and never
+inherits the budget of the rung the ladder saturates on. A failed turn
+therefore ends in an error or a blocked outcome instead of quietly promoting
+the model the developer reserved.
 
 ### 3.3 The architect ladder
 
@@ -366,3 +374,7 @@ the exact role-list entry the developer chose.
 - **`level_up = false` is not a ban.** The marker removes a model from
   automatic escalation only; the model stays in the role catalog and remains
   reachable through an explicit selection by hand.
+- **The ladder is not the source of an attempt budget.** A run reads the
+  `attempts` of its own role entry, so an opted-out model spends its single
+  adaptive attempt, or the explicit budget it declares, and never inherits the
+  budget of the rung the ladder saturates on.

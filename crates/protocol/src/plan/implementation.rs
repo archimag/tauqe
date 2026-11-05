@@ -388,21 +388,27 @@ impl PlanImplementation {
     /// conceptual container whose status is derived deterministically from its
     /// children by [`Self::refresh_parent_statuses`], so assigning a status to a
     /// container would be recomputed away immediately. Such a container target
-    /// is therefore rejected. The method returns `true` only when a leaf item
-    /// matched and its status was durably changed; it returns `false` both for
-    /// an unknown identifier and for a container target, so a caller never
-    /// mistakes a discarded assignment for a successful update.
+    /// is therefore rejected. A successful update requires both a leaf target and
+    /// a genuine transition: the method returns `true` only when a leaf item
+    /// matched and its status was durably changed. It returns `false` for an
+    /// unknown identifier, for a container target, and for a leaf that already
+    /// carries the requested status, so a caller never mistakes a discarded or
+    /// idempotent assignment for a successful update.
+    ///
+    /// A no-op assignment leaves the ancestors untouched: the leaf keeps the
+    /// value they were already derived from, so no derived status can change.
     ///
     /// The `tui` crate uses this helper for optimistic status updates and their
     /// rollback, so it is part of the sanctioned, I/O-free `protocol` surface
     /// documented in `Conventions.md` §2.
     pub fn update_item_status(&mut self, item_id: &str, status: PlanItemStatus) -> bool {
-        // Locates the target and classifies it: `Some(true)` for an assignable
-        // leaf, `Some(false)` for a non-assignable container, `None` when absent.
+        // Locates the target and classifies it: `Some(true)` for a leaf whose
+        // status actually changes, `Some(false)` for a non-assignable container
+        // or an already-satisfied leaf, `None` when absent.
         fn walk(items: &mut [PlanItem], target: &str, status: PlanItemStatus) -> Option<bool> {
             for item in items {
                 if id_key(&item.id) == target {
-                    if item.is_leaf() {
+                    if item.is_leaf() && item.status != status {
                         item.status = status;
                         return Some(true);
                     }

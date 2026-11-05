@@ -490,6 +490,26 @@ silence. A payload the planning contract itself refuses buys exactly one correct
 exchange, and only the payload of that exchange is settled; a refusal the turn regime
 forbids, or a payload that already left the turn, buys none, because repeating the turn
 cannot change the verdict. The contract is documented in *Local Plans* §3.13.
+**A plan discussion validates its payload before that boundary.** Applying a
+refusal only at settlement would report it after the turn had closed, when the
+dialogue could no longer repair it. A plan discussion therefore validates its
+payload with a non-persisting probe of plan storage: the probe runs the very
+mutation cycle the application runs — identity resolution, the status barrier,
+and the structural barrier of the write path — against an in-memory snapshot of
+the stored plans, under the same storage lock and off the async executor thread,
+and it writes neither a plan document nor the active-plan marker. Because both
+contracts run one barrier, the verdict of the probe is the verdict of the
+application it predicts. A clean verdict costs nothing and leaves settlement as
+the single application; a refusal buys the corrective exchange described above,
+in which the refused mutations leave the turn state so the corrected document
+replaces them instead of being accumulated beside them; and a payload that is
+still refused when that round is spent travels to settlement, which refuses it
+and reports it through the ordinary diagnostic surfaces. A repair of the barrier
+— a status it normalized instead of refusing — never starts the round, because
+the mutation was applied. The phase belongs to the plan-discussion regime alone:
+a round that carries file edits beside a payload keeps the staging contour and
+settles its payload after verification, and the interactive, review-discussion,
+and isolated-step regimes keep their current semantics.
 
 **The session journal is transactional in the same way.** The prompt is appended
 to `.tauqe/history.jsonl` and published as `Active` the moment the turn starts, so
@@ -611,9 +631,15 @@ invalidated.
 Growth inside a turn stays append-only. Research appends an element at the tail of
 the context block, or appends the file after the last record of the transcript, and
 a promotion rewrites a single `access` attribute in place. The chronological order
-comes from the insertion watermark every context entry carries, so a file picked up
-between two turns appears between them, and a file no record observed yet closes the
-transcript.
+comes from the insertion watermark every context entry carries: the policy
+compares that watermark against the `context_watermark` each turn record
+persisted and emits the file after the prompt record of the turn during which
+the watermark was allocated. That slot is stable for the whole session, so the
+next turn appends the response of the discovering turn and its own prompt behind
+the arrival instead of repositioning it. A mid-turn arrival is therefore an
+append-only event, never a fifth invalidation boundary beside the four documented
+ones; a file no watermark-bearing turn bounds falls back to the recorded starting
+context, and a file that carries no watermark at all closes the transcript.
 
 The tail carries everything that legitimately changes: the regime delta first,
 then the active plan, the context manifest of the chronological policy — paths and

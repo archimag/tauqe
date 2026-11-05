@@ -49,7 +49,9 @@ mid-turn leaves synthetic commits at the tip of the branch.
    base, every commit reachable from HEAD — while a marker still recording a
    capture in progress is resolved against HEAD and the recorded base alone,
    because the capture it describes has not produced a range yet.
-
+7. **No Git child outlives the turn.** Every invocation runs under the
+   `[git].timeout_secs` budget inside its own process group, and the checkpoint
+   capture and the step commit also observe the turn's cancellation signal.
 ---
 
 ## 2. Mental Model & Ontology ("What")
@@ -67,6 +69,12 @@ mid-turn leaves synthetic commits at the tip of the branch.
 - **Transaction marker** — the on-disk record of an open transaction.
 - **Crash recovery** — the startup routine that unwinds a provably interrupted
   transaction.
+- **Git budget** — the wall-clock budget `[git].timeout_secs` declares; every Git
+  command of a transaction runs under it, in its own process group, so a hook or a
+  signing agent that never returns is torn down instead of occupying the turn.
+- **Turn cancellation** — the signal a bounded turn raises when the developer
+  cancels. The checkpoint capture and the step commit observe it; finalization and
+  rollback deliberately do not.
 - **Undo** — the explicit reversal of the most recent harness commit.
 - **Change set** — every repository-relative path the turn produced: the paths the
   patch wrote, the artifacts the post-hook generated, the writes a repair round left
@@ -83,9 +91,10 @@ mid-turn leaves synthetic commits at the tip of the branch.
 
 The transaction machinery — checkpoints, step commits, the squash, crash recovery,
 and the proof that the protected paths stay excluded — is deterministic substrate
-and lives in `crates/tools/src/git/`. The engine owns its one harness-specific
-input: the `[git].bypass_hooks` declaration, which it resolves into the decision
-every committing entry point receives.
+and lives in `crates/tools/src/git/`. The engine owns the harness-specific inputs
+the project declares: the `[git].bypass_hooks` declaration, which it resolves into
+the decision every committing entry point receives, and the `[git].timeout_secs`
+budget, which bounds every Git child the substrate starts.
 ### 2.2 Commit kinds
 
 | Kind | Subject | Lifetime |
@@ -172,8 +181,10 @@ idempotent recovery.
 Neither crash window loses captured work, because the `capturing` marker is
 durable before the capture starts and recovery resolves it against HEAD. A crash
 before the checkpoint commit leaves a marker whose recorded base is still HEAD
-while the developer's changes are still in the working tree: recovery clears the
-marker and leaves the tree untouched. A crash after the commit but before the
+while the developer's changes are still in the working tree: recovery returns
+the index to the recorded base, which undoes the `git add -A` the capture ran
+before it crashed, leaves every byte of the working tree untouched, and clears
+the marker. A crash after the commit but before the
 rewrite leaves a `capturing` marker plus a checkpoint commit whose parent is the
 recorded base: recovery unwinds that commit and returns the captured work to the
 working tree. Any other shape is refused, exactly as an unproven settled
@@ -213,15 +224,19 @@ commit — an object that survives in the object database and the reflog long af
 the checkpoint is unwound. A project `.gitignore` outranks `.git/info/exclude`
 and can re-include one of those paths, which is why the exclusion is queried
 rather than assumed.
-
+The capture is also bound to the turn. A capture that begins after the turn was
+cancelled is refused before the first probe, and a cancellation that arrives while
+the capture runs tears the commit down and reports the cancellation. Section 3.10
+states why the refusal comes first.
 ### 3.2 Temporary step commits
 
 Each applied change set is recorded as a step commit so verification heals
 against a reproducible revision. The checkpoint is created exactly once per
 transaction: repeated healing applications reuse it instead of advancing its
 base onto the previous step commit, which would make a later rollback or
-finalization unable to return the tree to its true pre-turn state.
-
+finalization unable to return the tree to its true pre-turn state. A step commit
+observes the turn's cancellation signal exactly as the capture does, so a cancelled
+turn records no further progress (section 3.10).
 ### 3.3 Finalization
 
 On success the harness:
@@ -307,7 +322,9 @@ Recovery runs at startup and is deliberately conservative:
 4. a marker still recording the `capturing` phase describes a crash inside the
    capture itself and is resolved against HEAD and the recorded base instead of
    a commit range: a HEAD that still equals the base means no checkpoint commit
-   was created, so the marker is cleared and the working tree is left untouched;
+   was created, so the index returns to the recorded base — undoing the
+   `git add -A` the capture ran before it crashed — the working tree is left
+   untouched, and the marker is cleared;
    a checkpoint commit whose parent equals the base — for an unborn base, a
    checkpoint commit that is the repository root — means the capture committed
    but crashed before the rewrite that records it, so that commit is unwound,
@@ -388,6 +405,38 @@ with `--no-verify` when `[git].bypass_hooks` is enabled, which defaults to true 
 an autonomous turn never stalls on a user hook. The co-author trailer keeps every
 harness-touched commit identifiable without taking authorship away from the
 developer.
+### 3.10 Budget and cancellation of the transaction layer
+
+Every Git command the transaction layer runs is bounded twice.
+
+- **Wall-clock budget.** `[git].timeout_secs`, 300 seconds by default, covers the
+  wait for the child and the drain of its output. The child leads its own process
+  group, so an expiry tears the hook, the signing agent, and every binary they
+  spawned down together, and the invocation is reported as failed instead of
+  occupying the blocking thread the turn is waiting on.
+- **Turn cancellation.** The checkpoint capture and the step commit observe the
+  bounded turn's cancellation signal, so cancelling the turn releases the commit a
+  user hook is holding instead of waiting for the hook to finish. The signal
+  travels into the transaction layer as the receiver the turn already owns;
+  nothing is polled and no second channel is opened.
+
+Finalization and rollback stay cancel-blind on purpose. Both settle an outcome the
+turn already decided, and finishing them under the budget is what leaves the tree
+in a known state; a cancellation that interrupted finalization would strand the
+very transaction the developer asked to end. The server's deferred force-abort is
+built on the same guarantee: it waits, bounded, for the open transaction to close,
+because a settling command is expected to finish on its own.
+
+A capture that begins after the turn was cancelled is refused before the first
+probe. The capture derives its base and its cleanliness from `rev-parse HEAD` and
+`git status`, and the substrate answers a probe it could not run the way that probe
+answers for a repository without history: a failed `rev-parse HEAD` reads as an
+unborn base and a failed status reads as a clean tree. A probe torn down by the
+cancellation therefore describes a repository that does not exist, so the refusal
+comes first and no rollback can ever trust such a base. Once the capture is under
+way the substrate answers for itself: the interrupted child fails, the command
+reports the cancellation, and the marker the capture already wrote is resolved by
+crash recovery, which distinguishes a capture that committed from one that did not.
 
 ---
 
@@ -406,6 +455,12 @@ developer.
   a process that still runs is skipped with the marker preserved, and no branch
   is reset; only a provably gone writer, or a marker that names none, authorizes
   the history-rewriting branches.
+- **It is not an unbounded wait.** Every Git child of a transaction runs under
+  `[git].timeout_secs` inside its own process group, and the capture and the step
+  commit also observe the turn's cancellation.
+- **It is not interrupted while it settles.** Finalization and rollback complete
+  under the budget alone, because an outcome the turn already decided has to reach
+  a known state.
 - **It is not a checkpoint without a proven exclusion.** A checkpoint whose rules
   cannot be installed, or whose protected paths Git reports as not ignored, aborts
   before `git add -A` runs.
@@ -435,4 +490,4 @@ developer.
 - [Local Plans](../ch04-workflows/plans.md) — step execution and batch
   cancellation.
 - [Configuration and Project Preparation](../ch05-system/configuration.md) —
-  `[git] bypass_hooks` and upstream resolution.
+  `[git] bypass_hooks`, `[git] timeout_secs`, and upstream resolution.

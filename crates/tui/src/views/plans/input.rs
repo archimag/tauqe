@@ -11,7 +11,7 @@ use crate::i18n::engine::active_t;
 use crate::input::InputResult;
 use crate::rpc::{send_request, RpcConnection};
 
-use super::{architect_entries, VisiblePlanRow};
+use super::{architect_entries, PlanCreateDialogState, VisiblePlanRow};
 
 /// Keyboard actions available in the Plans view.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -28,6 +28,7 @@ pub enum PlansAction {
     PageDown,
     FoldToggle,
     Activate,
+    CreatePlan,
     Execute,
     ExecuteAll,
     /// Inspect the diff of the commit recorded in the selected step.
@@ -56,6 +57,14 @@ pub static PLANS_COMMAND_MAP: CommandMap<PlansAction> = CommandMap::new(&[
         PlansAction::Activate,
         Essential,
         "cmd.plans.activate",
+    ),
+    // `N` creates a new plan through the two-phase Architect pipeline
+    // (Conventions §4.5).
+    CommandSpec::new(
+        KeyChord::Bare(KeyCode::Char('N')),
+        PlansAction::CreatePlan,
+        Essential,
+        "cmd.plans.create_plan",
     ),
     CommandSpec::new(
         KeyChord::Bare(KeyCode::Char('x')),
@@ -180,12 +189,6 @@ pub static PLANS_COMMAND_MAP: CommandMap<PlansAction> = CommandMap::new(&[
     ),
     CommandSpec::new(
         KeyChord::Bare(KeyCode::Char('n')),
-        PlansAction::NavNext,
-        Interface,
-        "cmd.plans.nav_next",
-    ),
-    CommandSpec::new(
-        KeyChord::Bare(KeyCode::Char('N')),
         PlansAction::NavNext,
         Interface,
         "cmd.plans.nav_next",
@@ -388,10 +391,10 @@ fn execute_scope_action(
     // horizon yet: the batch projects the first horizon just-in-time, so the
     // confirmation arms with an empty queue instead of reporting a finished
     // scope (c-5).
-    if plan.items.is_empty() && !plan.concept.is_empty() && scope_id.is_none() {
+    if plan.implementation.items.is_empty() && !plan.concept.is_empty() && scope_id.is_none() {
         let coder_entries = st.coder_entries();
-        st.confirm_button = crate::app::ConfirmDialogButton::Cancel;
-        st.confirm_execute_scope = Some(crate::app::ConfirmExecuteScopeState::new(
+        st.modals.confirm_button = crate::app::ConfirmDialogButton::Cancel;
+        st.modals.confirm_execute_scope = Some(crate::app::ConfirmExecuteScopeState::new(
             plan.id.clone(),
             plan.title.clone(),
             scope_title.to_string(),
@@ -402,7 +405,7 @@ fn execute_scope_action(
         return;
     }
 
-    match plan.evaluate_scope(scope_id) {
+    match plan.implementation.evaluate_scope(scope_id) {
         tauqe_protocol::PlanScopeEvaluation::BlockedByDiscussion(items) => {
             let preview = if items.len() <= 2 {
                 items.join(", ")
@@ -453,8 +456,8 @@ fn execute_scope_action(
         }
         tauqe_protocol::PlanScopeEvaluation::Ready(steps) => {
             let coder_entries = st.coder_entries();
-            st.confirm_button = crate::app::ConfirmDialogButton::Cancel;
-            st.confirm_execute_scope = Some(crate::app::ConfirmExecuteScopeState::new(
+            st.modals.confirm_button = crate::app::ConfirmDialogButton::Cancel;
+            st.modals.confirm_execute_scope = Some(crate::app::ConfirmExecuteScopeState::new(
                 plan.id.clone(),
                 plan.title.clone(),
                 scope_title.to_string(),
@@ -475,10 +478,10 @@ fn open_refine_dialog(st: &mut AppState, plan: tauqe_protocol::Plan, seed: Optio
     if let Some(seed) = seed {
         dialog.instructions_editor.insert_str(&seed);
     }
-    if dialog.selector.len() > 1 && dialog.instructions_editor.is_empty() {
-        dialog.focus = super::RefineDialogFocus::ModelList;
+    if dialog.planner.len() > 1 && dialog.instructions_editor.is_empty() {
+        dialog.focus = super::PlanFormFocus::PlannerList;
     }
-    st.plans_view.refine_dialog = Some(dialog);
+    st.modals.refine_dialog = Some(dialog);
 }
 
 /// Commit recorded in a finished step row, when the row carries one.
@@ -512,6 +515,16 @@ pub async fn handle_plans_key(
     match action {
         PlansAction::Return => {
             st.view_mode = ViewMode::Repl;
+        }
+        PlansAction::CreatePlan => {
+            if st.model.is_busy() || st.review.running || st.plans_view.refining {
+                st.notify_warning(active_t("notify.model_busy"));
+                return Ok(InputResult::Continue);
+            }
+            let entries = architect_entries(&st);
+            st.modals.refine_dialog = None;
+            st.modals.confirm_button = crate::app::ConfirmDialogButton::Cancel;
+            st.modals.create_dialog = Some(PlanCreateDialogState::new(entries));
         }
         PlansAction::AccordionNext => {
             st.plans_view.accordion_navigate(true);
@@ -710,7 +723,7 @@ pub async fn handle_plans_key(
             let mut pending_synthesis = Vec::new();
 
             for plan in &st.plans_view.plans {
-                if plan.items.is_empty() && !plan.concept.is_empty() {
+                if plan.implementation.items.is_empty() && !plan.concept.is_empty() {
                     // Concept-only plan: the batch projects its first horizon
                     // just-in-time before the queue reaches it.
                     plan_ids.push(plan.id.clone());
@@ -718,8 +731,8 @@ pub async fn handle_plans_key(
                     pending_synthesis.push(plan.title.clone());
                     continue;
                 }
-                if let tauqe_protocol::PlanScopeEvaluation::Ready(ready) = plan.evaluate_scope(None)
-                {
+                let evaluation = plan.implementation.evaluate_scope(None);
+                if let tauqe_protocol::PlanScopeEvaluation::Ready(ready) = evaluation {
                     plan_ids.push(plan.id.clone());
                     plan_titles.push(plan.title.clone());
                     steps.extend(ready);
@@ -731,8 +744,8 @@ pub async fn handle_plans_key(
                 return Ok(InputResult::Continue);
             }
 
-            st.confirm_button = crate::app::ConfirmDialogButton::Cancel;
-            st.confirm_execute_pipeline = Some(crate::app::ConfirmExecutePipelineState {
+            st.modals.confirm_button = crate::app::ConfirmDialogButton::Cancel;
+            st.modals.confirm_execute_pipeline = Some(crate::app::ConfirmExecutePipelineState {
                 plan_ids,
                 plan_titles,
                 steps,
@@ -776,7 +789,7 @@ pub async fn handle_plans_key(
                         _ => {}
                     }
 
-                    st.prompt_modal = Some(crate::app::PromptModalState::new(
+                    st.modals.prompt_modal = Some(crate::app::PromptModalState::new(
                         crate::app::PromptModalTarget::Plan {
                             plan_id: plan.id.clone(),
                             plan_title: plan.title.clone(),
@@ -851,7 +864,7 @@ pub async fn handle_plans_key(
                         tauqe_protocol::PlanItemStatus::Blocked => 4,
                         tauqe_protocol::PlanItemStatus::Cancelled => 5,
                     };
-                    st.status_dialog = Some(crate::app::StatusDialogState::new(
+                    st.modals.status_dialog = Some(crate::app::StatusDialogState::new(
                         crate::app::StatusDialogTarget::PlanItem {
                             plan_id,
                             item_id,
@@ -873,9 +886,9 @@ pub async fn handle_plans_key(
                 // Only the first tier is armed here: the second tier is raised
                 // after this confirmation reveals unfinished work, so a stale
                 // target of a previously selected plan can never resurface (c-1).
-                st.confirm_delete_plan_final = None;
-                st.confirm_delete_plan = Some(row.plan_id().to_string());
-                st.confirm_button = crate::app::ConfirmDialogButton::Cancel;
+                st.modals.confirm_delete_plan_final = None;
+                st.modals.confirm_delete_plan = Some(row.plan_id().to_string());
+                st.modals.confirm_button = crate::app::ConfirmDialogButton::Cancel;
             }
         }
         PlansAction::CopyMarkdown => {
@@ -915,7 +928,7 @@ pub async fn handle_plans_key(
                 .plans
                 .iter()
                 .find(|p| p.id == plan_id)
-                .map(|p| p.items.is_empty())
+                .map(|p| p.implementation.items.is_empty())
                 .unwrap_or(false);
             // An empty horizon has nothing to clear, so the confirmation is
             // skipped and the developer is told why (Conventions §4.4).
@@ -923,8 +936,8 @@ pub async fn handle_plans_key(
                 st.notify_info(active_t("notify.plan_horizon_already_empty"));
                 return Ok(InputResult::Continue);
             }
-            st.confirm_button = crate::app::ConfirmDialogButton::Cancel;
-            st.confirm_clear_horizon = Some(plan_id);
+            st.modals.confirm_button = crate::app::ConfirmDialogButton::Cancel;
+            st.modals.confirm_clear_horizon = Some(plan_id);
         }
         PlansAction::Replan => {
             if st.model.is_busy() || st.review.running || st.plans_view.refining {
@@ -976,7 +989,7 @@ pub async fn handle_plans_key(
                     // `R` addresses the whole blocked frontier of the plan at
                     // once, seeding the instruction with every blocked step the
                     // scope reports (c-1, c-3).
-                    let seed = match plan.evaluate_scope(None) {
+                    let seed = match plan.implementation.evaluate_scope(None) {
                         tauqe_protocol::PlanScopeEvaluation::BlockedByBlockers(items) => {
                             Some(format!(
                                 "Replan the uncompleted horizon addressing every blocked step:\n{}",
@@ -1053,11 +1066,7 @@ mod tests {
 
         assert!(matches!(res, InputResult::Continue));
         let guard = state.lock().await;
-        let dialog = guard
-            .plans_view
-            .refine_dialog
-            .as_ref()
-            .expect("dialog opened");
+        let dialog = guard.modals.refine_dialog.as_ref().expect("dialog opened");
         assert!(dialog
             .instructions_editor
             .get_text()
@@ -1078,11 +1087,7 @@ mod tests {
         .unwrap();
 
         let guard = state.lock().await;
-        let dialog = guard
-            .plans_view
-            .refine_dialog
-            .as_ref()
-            .expect("dialog opened");
+        let dialog = guard.modals.refine_dialog.as_ref().expect("dialog opened");
         let text = dialog.instructions_editor.get_text();
         assert!(
             text.contains("addressing every blocked step"),
@@ -1141,7 +1146,7 @@ mod tests {
         .await
         .unwrap();
         assert!(matches!(res, InputResult::Continue));
-        assert!(state.lock().await.plans_view.refine_dialog.is_none());
+        assert!(state.lock().await.modals.refine_dialog.is_none());
     }
 
     #[tokio::test]
@@ -1184,6 +1189,7 @@ mod tests {
 
         let guard = state.lock().await;
         let target = guard
+            .modals
             .confirm_execute_pipeline
             .as_ref()
             .expect("pipeline confirmation must be armed");
@@ -1191,7 +1197,7 @@ mod tests {
         assert_eq!(target.plan_titles, vec!["Ready Plan".to_string()]);
         assert_eq!(target.steps.len(), 2);
         assert!(target.pending_synthesis.is_empty());
-        assert!(guard.confirm_execute_scope.is_none());
+        assert!(guard.modals.confirm_execute_scope.is_none());
     }
 
     #[tokio::test]
@@ -1240,6 +1246,7 @@ mod tests {
 
         let guard = state.lock().await;
         let target = guard
+            .modals
             .confirm_execute_pipeline
             .as_ref()
             .expect("pipeline confirmation must be armed");
@@ -1281,6 +1288,7 @@ mod tests {
 
         let guard = state.lock().await;
         let target = guard
+            .modals
             .confirm_execute_scope
             .as_ref()
             .expect("just-in-time confirmation must be armed");
@@ -1319,9 +1327,12 @@ mod tests {
         .unwrap();
 
         let guard = state.lock().await;
-        assert_eq!(guard.confirm_clear_horizon.as_deref(), Some("plan-steps"));
         assert_eq!(
-            guard.confirm_button,
+            guard.modals.confirm_clear_horizon.as_deref(),
+            Some("plan-steps")
+        );
+        assert_eq!(
+            guard.modals.confirm_button,
             crate::app::ConfirmDialogButton::Cancel
         );
     }
@@ -1351,7 +1362,7 @@ mod tests {
         .unwrap();
 
         let guard = state.lock().await;
-        assert!(guard.confirm_clear_horizon.is_none());
+        assert!(guard.modals.confirm_clear_horizon.is_none());
         let notif = guard.active_notification().expect("notification");
         assert!(notif.text.contains("no implementation steps"));
     }
@@ -1503,6 +1514,7 @@ mod tests {
         {
             let guard = state.lock().await;
             let target = guard
+                .modals
                 .confirm_execute_scope
                 .as_ref()
                 .expect("the execution confirmation must be armed");
@@ -1736,7 +1748,7 @@ mod tests {
         let payload = String::from_utf8(conn.written().to_vec()).expect("utf-8 payload");
         assert!(payload.contains("git/getDiff"), "{payload}");
         assert!(payload.contains("0123456789abcdef"), "{payload}");
-        assert!(state.lock().await.diff_inspector.is_none());
+        assert!(state.lock().await.modals.diff_inspector.is_none());
     }
 
     #[tokio::test]
@@ -1756,5 +1768,37 @@ mod tests {
 
         assert!(conn.written().is_empty());
         assert!(state.lock().await.active_notification().is_some());
+    }
+
+    #[tokio::test]
+    async fn test_uppercase_n_opens_the_plan_creation_dialog() {
+        let mut st = crate::app::test_state();
+        st.view_mode = ViewMode::Plans;
+        let state = Arc::new(Mutex::new(st));
+        let mut conn = RpcConnection::new(Vec::<u8>::new());
+
+        handle_plans_key(
+            KeyEvent::new(KeyCode::Char('N'), crossterm::event::KeyModifiers::NONE),
+            &state,
+            &mut conn,
+        )
+        .await
+        .unwrap();
+
+        let guard = state.lock().await;
+        let dialog = guard
+            .modals
+            .create_dialog
+            .as_ref()
+            .expect("the creation dialog must be open");
+        assert!(dialog.directives_editor.is_empty());
+        assert_eq!(dialog.planner.len(), 1);
+        assert!(guard.modals.refine_dialog.is_none());
+        assert_eq!(
+            guard.modals.confirm_button,
+            crate::app::ConfirmDialogButton::Cancel
+        );
+        drop(guard);
+        assert!(conn.written().is_empty());
     }
 }

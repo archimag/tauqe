@@ -127,6 +127,14 @@ pub(super) struct TransactionRollbackGuard<'a> {
     /// proposal: a repair round, a declared post-hook, or the toolchain
     /// rewriting a file while it verified the tree.
     worktree_baseline: Option<WorktreeSnapshot>,
+    /// Working-copy status observed most recently, empty once a write the guard
+    /// cannot account for may have moved it.
+    ///
+    /// The snapshot is the basis of the next differential, so a phase that asks
+    /// for the change set several times pays one `git status` per change set
+    /// instead of one per question. Every write the guard performs drops it, and
+    /// `refresh_worktree_changes` drops it for a write a project step performed.
+    worktree_observation: Option<WorktreeSnapshot>,
 }
 
 impl<'a> TransactionRollbackGuard<'a> {
@@ -145,6 +153,7 @@ impl<'a> TransactionRollbackGuard<'a> {
             cancel_rx,
             armed: false,
             worktree_baseline: None,
+            worktree_observation: None,
         }
     }
 
@@ -190,6 +199,11 @@ impl<'a> TransactionRollbackGuard<'a> {
         &mut self,
         proposal: &EditProposal,
     ) -> anyhow::Result<Vec<String>> {
+        // The change set is about to reach the disk, so the observation recorded
+        // before this call describes a working copy that no longer exists. It
+        // stays empty until the writes below have landed, which is also what
+        // leaves a refused change set to the caller's own differential.
+        self.worktree_observation = None;
         let mut changed_files = self
             .policy
             .apply_temporary(self.repo_root, self.project, self.context_manager, proposal)
@@ -201,16 +215,18 @@ impl<'a> TransactionRollbackGuard<'a> {
             }
         }
 
-        // The working copy is baselined exactly once, right after the first
-        // change set reached the disk. Every path that differs from it later on
-        // was produced by the turn itself, so capturing it once — rather than on
-        // every healing round — keeps the differential from drifting forward and
-        // silently dropping an artifact the toolchain already created.
+        // The change set and the post-hook artifacts are on disk, so the tree is
+        // observed once and that snapshot serves every differential the following
+        // phase asks for. The first observation is also the transaction baseline:
+        // every path that differs from it later on was produced by the turn
+        // itself, so capturing it once — rather than on every healing round —
+        // keeps the differential from drifting forward and silently dropping an
+        // artifact the toolchain already created.
+        if self.worktree_observation.is_none() {
+            self.observe_worktree();
+        }
         if self.worktree_baseline.is_none() {
-            let repo_root = self.repo_root;
-            self.worktree_baseline = Some(crate::blocking::run_blocking(|| {
-                snapshot_worktree(repo_root)
-            }));
+            self.worktree_baseline = self.worktree_observation.clone();
         }
 
         Ok(changed_files)
@@ -223,28 +239,44 @@ impl<'a> TransactionRollbackGuard<'a> {
     /// generated artifacts out of both snapshots. The result is sorted and
     /// de-duplicated, which makes the resulting change set deterministic across
     /// healing rounds.
-    pub(super) fn worktree_changes(&self) -> Vec<String> {
-        let Some(baseline) = self.worktree_baseline.as_ref() else {
+    ///
+    /// The observation recorded when the change set landed is served as-is, so a
+    /// phase that asks for the differential several times pays one `git status`
+    /// per change set instead of one per question. A write the guard did not
+    /// perform — the verification lifecycle refreshing a lock file — stays
+    /// invisible here until `refresh_worktree_changes` re-observes the tree.
+    pub(super) fn worktree_changes(&mut self) -> Vec<String> {
+        if self.worktree_baseline.is_none() {
             return Vec::new();
-        };
-        let repo_root = self.repo_root;
-        let after = crate::blocking::run_blocking(|| snapshot_worktree(repo_root));
-        changed_worktree_paths(baseline, &after)
+        }
+        if self.worktree_observation.is_none() {
+            self.observe_worktree();
+        }
+        match (&self.worktree_baseline, &self.worktree_observation) {
+            (Some(baseline), Some(observation)) => changed_worktree_paths(baseline, observation),
+            _ => Vec::new(),
+        }
     }
 
     /// Runs the declared disk-side post-hook and reports the files it produced.
     ///
-    /// The working copy is snapshotted immediately before the hook starts and
-    /// again once it exited successfully, so the difference is exactly the set of
-    /// files the project step created, rewrote, or removed, with `.gitignore`
-    /// respected through Git itself. The change set that already reached disk
-    /// arrives on the hook's standard input, one path per line, so a generator
-    /// rebuilds only what the turn touched. A hook that fails or is interrupted
-    /// aborts the change set: committing a tree whose generator failed would
-    /// record artifacts nobody can reproduce.
-    async fn run_post_hook(&self, changed_files: &[String]) -> anyhow::Result<Vec<String>> {
+    /// The working copy is observed immediately before the hook starts and again
+    /// once it exited successfully, so the difference is exactly the set of files
+    /// the project step created, rewrote, or removed, with `.gitignore` respected
+    /// through Git itself. The change set that already reached disk arrives on the
+    /// hook's standard input, one path per line, so a generator rebuilds only what
+    /// the turn touched. A hook that fails or is interrupted aborts the change
+    /// set: committing a tree whose generator failed would record artifacts
+    /// nobody can reproduce.
+    async fn run_post_hook(&mut self, changed_files: &[String]) -> anyhow::Result<Vec<String>> {
+        if self.project.post_hook.is_none() {
+            // A project that declares no hook runs nothing, so the working copy
+            // is never observed here: the snapshot would describe a tree this
+            // step did not touch.
+            return Ok(Vec::new());
+        }
         let repo_root = self.repo_root;
-        let before = crate::blocking::run_blocking(|| snapshot_worktree(repo_root));
+        let before = self.observe_worktree();
 
         let response = crate::toolchain::run_post_hooks_with_config(
             repo_root,
@@ -255,17 +287,20 @@ impl<'a> TransactionRollbackGuard<'a> {
         .await
         .map_err(|err| anyhow::anyhow!("the project post-hook could not run: {err}"))?;
         if !response.success {
+            // The hook may have written some of its files before it failed, so the
+            // observation taken before it ran no longer describes the tree.
+            self.worktree_observation = None;
             let reason = response
                 .message
                 .as_deref()
                 .unwrap_or("the project post-hook reported no reason");
             anyhow::bail!("the project post-hook failed: {reason}");
         }
-        if response.executed_hooks.is_empty() {
-            return Ok(Vec::new());
-        }
 
-        let after = crate::blocking::run_blocking(|| snapshot_worktree(repo_root));
+        // The hook wrote to the tree, so the snapshot taken above is superseded by
+        // the one observed now: the difference between them is exactly the set of
+        // files the project step produced.
+        let after = self.observe_worktree();
         let artifacts = changed_worktree_paths(&before, &after);
         if !artifacts.is_empty() {
             tracing::info!(
@@ -274,6 +309,32 @@ impl<'a> TransactionRollbackGuard<'a> {
             );
         }
         Ok(artifacts)
+    }
+
+    /// Re-observes the working copy and reports every path that changed since
+    /// the transaction began.
+    ///
+    /// A project step writes to the tree outside the guard: the verification
+    /// lifecycle refreshes a lock file, a generator regenerates a source, and the
+    /// declared post-hook rebuilds an artifact. A caller that knows such a step
+    /// ran therefore asks for a fresh observation here, so the differential
+    /// reports what that step produced instead of what the last change set left
+    /// behind. Every other caller reads [`Self::worktree_changes`].
+    pub(super) fn refresh_worktree_changes(&mut self) -> Vec<String> {
+        self.worktree_observation = None;
+        self.worktree_changes()
+    }
+
+    /// Observes the working copy and records the snapshot as the latest one.
+    ///
+    /// The snapshot comes from `git status`, so it is taken on the blocking
+    /// pool: running a subprocess on an executor thread would stall the turn for
+    /// the duration of the call.
+    fn observe_worktree(&mut self) -> WorktreeSnapshot {
+        let repo_root = self.repo_root;
+        let observation = crate::blocking::run_blocking(|| snapshot_worktree(repo_root));
+        self.worktree_observation = Some(observation.clone());
+        observation
     }
 }
 
@@ -476,12 +537,14 @@ mod tests {
 
         // A verification command rewrites a tracked file and produces a new one,
         // so both must join the change set even though the model proposed
-        // neither of them.
+        // neither of them. The write happened outside the guard, so the recorded
+        // observation is served as-is until the caller refreshes it.
         std::fs::write(root.join("Cargo.lock"), "generated\n").unwrap();
         std::fs::write(root.join("snapshot.txt"), "generated\n").unwrap();
+        assert!(guard.worktree_changes().is_empty());
 
         let mut total = vec!["a.rs".to_string()];
-        for path in guard.worktree_changes() {
+        for path in guard.refresh_worktree_changes() {
             if !total.contains(&path) {
                 total.push(path);
             }

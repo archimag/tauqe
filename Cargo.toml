@@ -53,6 +53,12 @@ toml = "0.8"
 regex = "1"
 indexmap = "2"
 async-trait = "0.1"
+# The modal enumeration of `crates/tui` derives its variant iterator from the
+# ecosystem crate (Conventions §1.6), so the declaration order of that enum is
+# the single source of truth for the modal stacking priority. The version and
+# the feature set live in the workspace entry, so the build graph resolves one
+# `strum` for every member that consumes it (Conventions §12.3).
+strum = { version = "0.26", features = ["derive"] }
 getrandom = "0.2"
 # Process introspection comes from the ecosystem crate (Conventions §1.6):
 # the staging-sibling policy probes whether the writer a sibling name embeds

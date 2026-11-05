@@ -49,7 +49,7 @@ use crate::context::ContextManager;
 use crate::history::HistoryManager;
 use crate::plan::prompt::{parse_plan_refinement_output, PlanRefinementOutput};
 use crate::plan::storage::PlanMutationMode;
-use crate::prompt::refine::PlanRefinePromptProtocol;
+use crate::prompt::refine::{unsupported_plan_update_reason, PlanRefinePromptProtocol};
 use crate::providers::{format_session_id, LlmProvider, StreamEvent};
 use crate::workflow::policy::DirectApplyPolicy;
 use crate::workflow::research::journal::TurnResearchJournal;
@@ -158,7 +158,7 @@ pub struct StructuredRefineOutcome {
 }
 
 /// Accepted terminal status of one synthesis round.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum RoundStatus {
     /// The Architect finalized the horizon.
     Success,
@@ -166,6 +166,11 @@ enum RoundStatus {
     Blocked,
     /// The Architect aborted: only the developer can unblock the host.
     Aborted,
+    /// The round emitted a plan mutation this contour does not accept.
+    ///
+    /// The typed refusal the refinement contour states instead of decoding a
+    /// horizon that silently dropped the mutation.
+    PlanUpdateRefused(String),
     /// The Architect named the evidence it still needs.
     NeedsContext,
 }
@@ -470,6 +475,22 @@ pub async fn run_structured_refine(
                 let _ = stream_tx.send(StreamEvent::TextDelta(notice)).await;
                 break (Some(output), StructuredRefineStatus::Aborted(report));
             }
+            RoundStatus::PlanUpdateRefused(reason) => {
+                // The round asked for a mutation this contour cannot perform, so
+                // the verdict is a typed refusal: the developer sees the exact
+                // contract the payload violated while the run settles, and the
+                // round spends no generation attempt of the rung.
+                tracing::error!(
+                    workflow = WORKFLOW_NAME,
+                    model = %tier.model,
+                    round = rounds_used + 1,
+                    reason = %reason,
+                    "architect synthesis refused a payload that mutates the plan"
+                );
+                let notice = format!("\n\n---\n⛔ **[Plan Mutation Refused]**\n\n{reason}\n\n");
+                let _ = stream_tx.send(StreamEvent::TextDelta(notice)).await;
+                break (Some(output), StructuredRefineStatus::Blocked { reason });
+            }
             RoundStatus::NeedsContext => {
                 if rounds_used >= options.max_research_rounds {
                     // The budget is spent while the Architect still needs the
@@ -602,6 +623,12 @@ fn parse_round(step: &ProposalStep) -> Result<(PlanRefinementOutput, RoundStatus
     // unrecognized status is a verdict rather than a schema violation to heal.
     if declares_abort(&output) {
         return Ok((output, RoundStatus::Aborted));
+    }
+    // The synthesis contour owns the horizon alone: a payload that mutates the
+    // plan is refused as a typed verdict instead of being decoded into a horizon
+    // that silently dropped the mutation.
+    if let Some(reason) = unsupported_plan_update_reason(step.raw_text()) {
+        return Ok((output, RoundStatus::PlanUpdateRefused(reason)));
     }
     let status = match output.status.trim().to_ascii_lowercase().as_str() {
         "success" => RoundStatus::Success,
@@ -1081,6 +1108,79 @@ mod tests {
         collector.await.expect("the collector joins");
     }
 
+    /// A synthesis round that emits a plan mutation is refused as a typed
+    /// verdict: the plan is authored by the plan dialogue, so a horizon carrying
+    /// `plan_update` would silently drop the mutation the model attempted.
+    #[tokio::test]
+    async fn a_synthesis_payload_that_mutates_the_plan_is_refused() {
+        let (_dir, root) = repo();
+        let models = models("");
+        let mut mutating: serde_json::Value = serde_json::from_str(&payload(
+            "success",
+            "Horizon synthesized from the held material",
+        ))
+        .expect("the fixture is a refinement payload");
+        mutating["plan_update"] =
+            serde_json::json!({"action": "update", "id": "p-1", "title": "P1"});
+        let provider = Arc::new(MockLlmProvider::scripted([MockResponse::text(
+            mutating.to_string(),
+        )]));
+        let client: Arc<dyn LlmProvider> = provider.clone();
+        let mut context = ContextManager::new(root.clone());
+        let options = WorkflowOptions::default();
+        let (stream_tx, mut stream_rx) = mpsc::channel(256);
+        let collector = tokio::spawn(async move {
+            let mut events = Vec::new();
+            while let Some(event) = stream_rx.recv().await {
+                events.push(event);
+            }
+            events
+        });
+        let (_cancel_tx, cancel_rx) = watch::channel(false);
+
+        let outcome = run_structured_refine(
+            &mut context,
+            client,
+            "Synthesize the unfinished horizon",
+            StructuredRefineConfig {
+                repo_root: &root,
+                options: &options,
+                models: &models,
+                tier: models.architect_tier(0),
+                providers: &NoResolver,
+                intro_header: "",
+                budget_hint: "",
+            },
+            stream_tx,
+            cancel_rx,
+        )
+        .await
+        .expect("the synthesis runs to completion");
+
+        match &outcome.status {
+            StructuredRefineStatus::Blocked { reason } => {
+                assert!(reason.contains("plan_update"), "{reason}");
+            }
+            other => panic!("expected a typed refusal, got {other:?}"),
+        }
+        // The refusal is a verdict of the round, so no second generation of the
+        // same payload is requested.
+        assert_eq!(provider.requests().len(), 1);
+
+        drop(_cancel_tx);
+        let events = collector.await.expect("the collector joins");
+        assert!(
+            events.iter().any(|event| matches!(
+                event,
+                StreamEvent::TextDelta(delta) if delta.contains("[Plan Mutation Refused]")
+            )),
+            "the refusal must reach the developer live"
+        );
+        assert!(events
+            .iter()
+            .any(|event| matches!(event, StreamEvent::Done)));
+    }
+
     /// A finished synthesis releases the whole transient context: the files its
     /// research rounds discovered and the external documents it materialized
     /// share one lifetime, so no material of either layer survives the run,
@@ -1157,7 +1257,11 @@ mod tests {
             .expect("the cached snapshot is admitted again");
         assert_eq!(readmitted.layer, ContextLayer::OuterDocs);
         assert_eq!(readmitted.access, ContextAccess::ReadOnly);
-        assert_eq!(context.outer_docs_files(), vec![snapshot]);
+        assert_eq!(readmitted.path, "mylib/index.md");
+        assert_eq!(
+            context.outer_docs_files(),
+            vec!["mylib/index.md".to_string()]
+        );
 
         drop(_cancel_tx);
         collector.await.expect("the collector joins");

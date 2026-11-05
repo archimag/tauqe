@@ -646,6 +646,87 @@ impl TurnKernel<'_> {
 
         Ok(EmptyStepRetry::Proposed(Box::new(step)))
     }
+
+    /// Re-asks the model after the probe refused its plan payload.
+    ///
+    /// The refused payload is replaced rather than accumulated: the corrective round
+    /// answers for the document it repairs, so the mutations the refused round
+    /// carried leave the turn state before the new round is absorbed, and no mutation
+    /// is ever applied in its uncorrected form. The round itself stays narrow — only
+    /// its plan payload and its text join the turn — so a repair cannot widen the turn
+    /// it repairs. The directive joins the turn journal, where it stays visible for the
+    /// rest of the turn, and the corrective request is composed from the task and that
+    /// journal exactly like every other round.
+    pub(super) async fn reask_after_failed_plan(
+        &mut self,
+        directive: &str,
+        attempt: usize,
+        budget: usize,
+    ) -> anyhow::Result<PlanRetry> {
+        tracing::warn!(
+            workflow = self.workflow_name,
+            model = %self.model,
+            attempt = attempt,
+            max_retries = budget,
+            "plan payload refused; asking the model for a corrected mutation"
+        );
+
+        let detail = format!("Plan payload repair {}/{}", attempt, budget);
+        let banner = format!(
+            "\n\n---\n**[Plan Payload Repair {}/{}]** The plan mutation of the previous reply could not be applied; requesting a corrected payload...\n\n",
+            attempt, budget
+        );
+        let _ = self
+            .stream_tx
+            .send(StreamEvent::TextDelta(banner.clone()))
+            .await;
+        log_fsm_phase(
+            self.workflow_name,
+            self.model,
+            self.intent.is_isolated_step(),
+            TurnPhase::Proposal,
+            Some(attempt),
+            Some(budget),
+        );
+        let _ = self
+            .stream_tx
+            .send(StreamEvent::TurnPhase {
+                phase: TurnPhase::Proposal,
+                round: Some(attempt),
+                max_rounds: Some(budget),
+                detail: Some(detail),
+            })
+            .await;
+
+        // The refused payload is replaced, never accumulated, so the mutations it
+        // carried leave the turn state before the corrected round is absorbed.
+        self.state.clear_plans();
+        self.journal.push_block(directive);
+
+        let prompt = self.journal.compose_user_prompt(self.prompt, None);
+        let step = self.propose(&prompt, None).await?;
+
+        if step.is_cancelled {
+            let _ = self.stream_tx.send(StreamEvent::Done).await;
+            return Ok(PlanRetry::Terminate(Box::new(FsmTurnOutcome::cancelled(
+                std::mem::take(&mut self.accumulated_text),
+            ))));
+        }
+
+        // The corrective round answers for the plan payload alone: its mutations
+        // replace the refused ones and its text joins the turn, while the rest of the
+        // surface stays untouched. A repair round therefore cannot turn the answer
+        // into a block, cannot demand a host action, and cannot widen the turn it
+        // repairs.
+        self.state.plans.extend(step.plans().iter().cloned());
+        self.accumulated_text = merge_text(
+            std::mem::take(&mut self.accumulated_text),
+            &banner,
+            step.text(),
+        );
+
+        Ok(PlanRetry::Proposed(Box::new(step)))
+    }
 }
 
 /// Outcome of the research phase of a bounded turn.
@@ -668,6 +749,14 @@ pub(super) enum EmptyStepRetry {
     Proposed(Box<ProposalStep>),
     /// The corrective budget is spent; the caller renders the terminal failure.
     Exhausted,
+    /// The turn must terminate immediately with the carried outcome.
+    Terminate(Box<FsmTurnOutcome>),
+}
+
+/// Outcome of the corrective proposal round requested after a refused plan payload.
+pub(super) enum PlanRetry {
+    /// The model answered the corrective request; carries the new round.
+    Proposed(Box<ProposalStep>),
     /// The turn must terminate immediately with the carried outcome.
     Terminate(Box<FsmTurnOutcome>),
 }
@@ -854,6 +943,9 @@ pub(super) async fn propose_round(
                     path: path.clone(),
                     access: ContextAccess::Editable,
                     content: content.clone(),
+                    // A file created during the turn never entered a context
+                    // layer, so it carries the unrecorded arrival.
+                    insertion_seq: 0,
                 });
             }
         }
@@ -956,7 +1048,12 @@ pub(super) async fn propose_round(
     // keeps matching the prompt prefix it already cached.
     let messages =
         assembly.assemble_chat_messages_with_context_cache(prompt, protocol, cache.context_cache());
-    let response_format = protocol.response_format(&context_paths, patch_strategy);
+    // The composed schema and the rendered prompt rules observe one project
+    // declaration: the frozen snapshot the assembly carries is the very value
+    // handed to the projection, so a field the prompt never mentions can never
+    // be mandated.
+    let response_format =
+        protocol.response_format(&context_paths, patch_strategy, assembly.project.as_ref());
 
     let (llm_tx, llm_rx) = mpsc::channel::<StreamEvent>(100);
     // A session identifier pins the proposal round to one provider backend and

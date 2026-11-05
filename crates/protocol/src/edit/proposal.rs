@@ -1,5 +1,6 @@
 //! Edit proposals: the typed change operations and their normalization.
 
+use std::borrow::Cow;
 use std::fmt;
 
 use serde::{Deserialize, Serialize};
@@ -11,7 +12,10 @@ use crate::edit::EditFileOp;
 /// A decoded operation can never address a location outside the repository: the
 /// serde boundary normalizes and validates every path it carries — the `path`
 /// of a file operation and both directories of a move — through
-/// [`normalize_repo_path`]. An operation is a typed enum variant rather than a
+/// [`normalize_repo_path`], and writes a decoded path back through the inverse
+/// escape of that rule, so serializing the operation and decoding it again
+/// reproduces the same target instead of retargeting it. An operation is a typed
+/// enum variant rather than a
 /// list entry, so a rejected path surfaces as a decode failure naming it
 /// instead of being dropped silently. This is a first line of defence only:
 /// `core` still canonicalizes and confines every path against the repository
@@ -20,24 +24,24 @@ use crate::edit::EditFileOp;
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum EditOperation {
     Replace {
-        #[serde(deserialize_with = "deserialize_repo_path")]
+        #[serde(with = "repo_path")]
         path: String,
         old_text: String,
         new_text: String,
     },
     Create {
-        #[serde(deserialize_with = "deserialize_repo_path")]
+        #[serde(with = "repo_path")]
         path: String,
         content: String,
     },
     Delete {
-        #[serde(deserialize_with = "deserialize_repo_path")]
+        #[serde(with = "repo_path")]
         path: String,
     },
     Move {
-        #[serde(deserialize_with = "deserialize_repo_path")]
+        #[serde(with = "repo_path")]
         from: String,
-        #[serde(deserialize_with = "deserialize_repo_path")]
+        #[serde(with = "repo_path")]
         to: String,
     },
     /// Moves a directory subtree, naming the source and the destination.
@@ -46,13 +50,13 @@ pub enum EditOperation {
     /// staging engine expands it into the per-file moves of the subtree under
     /// `from`. No replaced lines, range bounds, or payload belong to it.
     MoveDir {
-        #[serde(deserialize_with = "deserialize_repo_path")]
+        #[serde(with = "repo_path")]
         from: String,
-        #[serde(deserialize_with = "deserialize_repo_path")]
+        #[serde(with = "repo_path")]
         to: String,
     },
     Overwrite {
-        #[serde(deserialize_with = "deserialize_repo_path")]
+        #[serde(with = "repo_path")]
         path: String,
         content: String,
     },
@@ -63,7 +67,7 @@ pub enum EditOperation {
     /// complete replacement of the addressed range, so the replaced text never
     /// has to be echoed back.
     LineAnchor {
-        #[serde(deserialize_with = "deserialize_repo_path")]
+        #[serde(with = "repo_path")]
         path: String,
         start: String,
         end: String,
@@ -292,21 +296,124 @@ impl StructuredChangeProposal {
     }
 }
 
+/// Strips the surrounding markup a producer may wrap a value in.
+///
+/// The value is trimmed, a backtick run wrapped around it is dropped, and the
+/// result is trimmed once more, so a markdown-wrapped spelling is cleaned
+/// before it is validated. Only the surrounding markup is removed: an interior
+/// backtick stays part of the value, while a value made of backticks alone
+/// becomes empty, exactly as a blank value does. This is the crate's single
+/// shared strip rule, so every wire boundary applies identical tolerance.
+pub(crate) fn strip_surrounding_markup(raw: &str) -> &str {
+    raw.trim().trim_matches('`').trim()
+}
+
+/// Decodes the separator escapes of one repository path.
+///
+/// Two readings of the same byte are in play, and the rules stay purely
+/// syntactic because this crate performs no I/O and therefore cannot ask the
+/// file system which of them a spelling means:
+///
+/// - a single backslash is a separator, so the spelling a Windows producer
+///   emits (`src\lib.rs`) addresses `src/lib.rs`;
+/// - a doubled backslash names one literal backslash byte, so a file whose own
+///   name carries a backslash stays addressable on a file system that permits
+///   it: `src\\new.rs` addresses the file literally named `src\new.rs`, while
+///   the separator rule alone would silently retarget the identical spelling to
+///   the different path `src/new.rs`.
+///
+/// A value carrying no backslash is returned as it is, so the common path costs
+/// no allocation.
+fn decode_path_separators(raw: &str) -> Cow<'_, str> {
+    if !raw.contains('\\') {
+        return Cow::Borrowed(raw);
+    }
+    let mut decoded = String::with_capacity(raw.len());
+    let mut rest = raw;
+    while let Some(index) = rest.find('\\') {
+        decoded.push_str(&rest[..index]);
+        rest = &rest[index + 1..];
+        match rest.strip_prefix('\\') {
+            Some(tail) => {
+                decoded.push('\\');
+                rest = tail;
+            }
+            None => decoded.push('/'),
+        }
+    }
+    decoded.push_str(rest);
+    Cow::Owned(decoded)
+}
+
+/// Encodes every literal backslash byte so the decoder restores it verbatim.
+///
+/// Normalization leaves exactly one byte that the separator rule would otherwise
+/// rewrite: the backslash of a file whose name carries one. Serializing such a
+/// path raw would make this crate's own wire form unre-decodable, because the
+/// reader would take that byte for a separator again. The encoder therefore
+/// applies the inverse of the doubling rule and leaves every other path
+/// untouched.
+fn encode_path_separators(path: &str) -> Cow<'_, str> {
+    if path.contains('\\') {
+        Cow::Owned(path.replace('\\', "\\\\"))
+    } else {
+        Cow::Borrowed(path)
+    }
+}
+
+/// Serde adapter of one repository-relative path field.
+///
+/// Both directions live here, so a field can never be normalized on the way in
+/// and echoed raw on the way out: a decoded path may carry the literal backslash
+/// of a file name, and the round trip must reproduce the value it started from
+/// instead of reading that byte as a separator.
+mod repo_path {
+    use serde::{Deserializer, Serializer};
+
+    use super::{deserialize_repo_path, encode_path_separators};
+
+    pub(super) fn deserialize<'de, D>(deserializer: D) -> Result<String, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        deserialize_repo_path(deserializer)
+    }
+
+    pub(super) fn serialize<S>(path: &str, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(&encode_path_separators(path))
+    }
+}
+
 /// Normalizes and validates a repository-relative path in a single place.
 ///
-/// Surrounding whitespace, backslashes, `.` segments, repeated slashes, and
-/// leading `./` components are normalized, then the path is rejected when it is
-/// empty, absolute, a Windows drive path, contains a `..` traversal component,
-/// or carries a NUL byte. This is the crate's single shared path-cleaning
-/// routine, so every wire boundary applies identical rules. It is a first line
-/// of defence only: `core` must still canonicalize and confine paths against
-/// the repository root, because the protocol cannot guarantee that every path
-/// flows through this helper.
+/// Surrounding whitespace and backtick markup are stripped first, then the
+/// separator escapes are decoded, and then `.` segments, repeated slashes, and
+/// leading `./` components are normalized. A backslash is read two ways,
+/// because a producer and a file name spell the same byte in opposite
+/// directions:
+///
+/// - a single backslash is a separator, so the spelling a Windows producer
+///   emits (`src\lib.rs`) addresses `src/lib.rs`;
+/// - a doubled backslash names one literal backslash byte, so a file whose own
+///   name carries a backslash stays addressable on a file system that permits
+///   it: `src\\new.rs` addresses the file literally named `src\new.rs`, while
+///   the separator rule alone would silently retarget the identical spelling to
+///   the different path `src/new.rs`.
+///
+/// The path is rejected when it is empty, absolute, a Windows drive path,
+/// contains a `..` traversal component, or carries a NUL byte. This is the
+/// crate's single shared path-cleaning routine, so every wire boundary applies
+/// identical rules. It is a first line of defence only: `core` must still
+/// canonicalize and confine paths against the repository root, because the
+/// protocol cannot guarantee that every path flows through this helper.
 pub fn normalize_repo_path(raw: &str) -> Result<String, String> {
     if raw.contains('\0') {
         return Err("Change path must not contain NUL bytes".to_string());
     }
-    let slashed = raw.trim().replace('\\', "/");
+    let slashed = decode_path_separators(strip_surrounding_markup(raw));
     let trimmed = slashed.trim();
     if trimmed.is_empty() {
         return Err("Change path must not be empty".to_string());
@@ -488,15 +595,147 @@ mod tests {
         // Dot segments, repeated slashes, and repeated `./` prefixes collapse.
         assert_eq!(normalize_repo_path("./a/./b//c/").unwrap(), "a/b/c");
         assert_eq!(normalize_repo_path(".//a").unwrap(), "a");
+        // Surrounding whitespace and backtick markup are stripped before the
+        // path is validated, so a markdown-wrapped spelling yields the same
+        // clean result as its bare form.
+        assert_eq!(normalize_repo_path(" `./src/a.rs` ").unwrap(), "src/a.rs");
+        assert_eq!(
+            normalize_repo_path("``crates/core``").unwrap(),
+            "crates/core"
+        );
+        assert_eq!(normalize_repo_path("`src/`").unwrap(), "src");
+
+        // Only the surrounding markup is stripped: an interior backtick stays
+        // part of the path, and a backticks-only spelling is the empty path it
+        // is rather than a literal backtick filename.
+        assert_eq!(
+            normalize_repo_path("src/`odd`/a.rs").unwrap(),
+            "src/`odd`/a.rs"
+        );
+        assert!(normalize_repo_path("``").is_err());
+        assert!(normalize_repo_path(" ` ` ").is_err());
 
         // Traversal in both separators, absolute paths, drive paths, NUL
-        // bytes, and empty results are rejected.
+        // bytes, and empty results are rejected. The surrounding markup never
+        // hides a rejection.
         for raw in [
-            "a/../b", "a\\..\\b", "..", ".", "/abs", "\\abs", "C:\\abs", "a\0b",
+            "a/../b",
+            "a\\..\\b",
+            "..",
+            ".",
+            "/abs",
+            "\\abs",
+            "C:\\abs",
+            "a\0b",
+            "`../escape.rs`",
+            "``/etc/passwd``",
+            "`C:\\Windows`",
         ] {
             assert!(
                 normalize_repo_path(raw).is_err(),
                 "path '{raw}' must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn test_normalize_repo_path_addresses_a_literal_backslash_name() {
+        // A single backslash keeps the documented Windows tolerance, so the
+        // spelling a Windows producer emits still addresses the nested path.
+        assert_eq!(normalize_repo_path(r"src\lib.rs").unwrap(), "src/lib.rs");
+
+        // A doubled backslash names one literal backslash byte, so a file whose
+        // own name carries one stays addressable instead of being silently
+        // retargeted to the nested path the rule above resolves.
+        assert_eq!(normalize_repo_path(r"src\\new.rs").unwrap(), "src\\new.rs");
+        assert_ne!(
+            normalize_repo_path(r"src\\new.rs").unwrap(),
+            normalize_repo_path(r"src\new.rs").unwrap()
+        );
+
+        // The escape composes with the shared strip rule and with the segment
+        // normalization: only the doubled byte survives, and it stays inside
+        // the one segment it was written in.
+        assert_eq!(
+            normalize_repo_path(r" `./src\\new.rs` ").unwrap(),
+            "src\\new.rs"
+        );
+        assert_eq!(normalize_repo_path(r"a\\b/c").unwrap(), "a\\b/c");
+        assert_eq!(normalize_repo_path(r"src\\").unwrap(), "src\\");
+
+        // The escape widens nothing: a traversal spelled with single separators
+        // is still refused, and a doubled separator cannot smuggle a `..`
+        // segment in, because the byte it produces stays part of one name.
+        assert!(normalize_repo_path(r"a\..\b").is_err());
+        assert_eq!(normalize_repo_path(r"a\\..\\b").unwrap(), "a\\..\\b");
+    }
+
+    #[test]
+    fn test_a_wire_path_addresses_a_literal_backslash_name() {
+        // Four backslashes in the payload decode to the two bytes the escape
+        // needs, so the wire form reaches the file literally called
+        // `src\new.rs` instead of the nested `src/new.rs`.
+        let literal: EditOperation =
+            serde_json::from_str(r#"{"type":"create","path":"src\\\\new.rs","content":"x"}"#)
+                .expect("an escaped literal-backslash path must decode");
+        assert_eq!(
+            literal,
+            EditOperation::Create {
+                path: "src\\new.rs".to_string(),
+                content: "x".to_string(),
+            }
+        );
+
+        // The undoubled spelling keeps the Windows tolerance and addresses the
+        // nested file, so the two spellings never collapse into one target.
+        let nested: EditOperation =
+            serde_json::from_str(r#"{"type":"create","path":"src\\new.rs","content":"x"}"#)
+                .expect("a Windows separator spelling must decode");
+        assert_eq!(
+            nested,
+            EditOperation::Create {
+                path: "src/new.rs".to_string(),
+                content: "x".to_string(),
+            }
+        );
+
+        // Serialization applies the inverse escape, so a decoded operation
+        // survives a round trip instead of being retargeted on the way back in.
+        let json = serde_json::to_string(&literal).unwrap();
+        assert!(json.contains(r#""path":"src\\\\new.rs""#), "{json}");
+        assert_eq!(
+            serde_json::from_str::<EditOperation>(&json).unwrap(),
+            literal
+        );
+    }
+
+    #[test]
+    fn test_edit_operation_paths_strip_surrounding_backticks_on_decode() {
+        // A markdown-wrapped path reaches the engine already clean, so a create
+        // never turns the wrapping markup into a phantom leading directory.
+        let decoded: EditOperation =
+            serde_json::from_str(r#"{"type":"create","path":" `./src/new.rs` ","content":"x"}"#)
+                .expect("a wrapped create path must decode");
+        assert_eq!(
+            decoded,
+            EditOperation::Create {
+                path: "src/new.rs".to_string(),
+                content: "x".to_string(),
+            }
+        );
+
+        // The surrounding markup never hides a rejection: an escaping or empty
+        // spelling outside the repository stays a decode failure naming it.
+        for payload in [
+            r#"{"type":"delete","path":"`../escape.rs`"}"#,
+            r#"{"type":"create","path":"``/etc/passwd``","content":""}"#,
+            r#"{"type":"delete","path":"``"}"#,
+        ] {
+            let error = serde_json::from_str::<EditOperation>(payload)
+                .expect_err("a wrapped escaping path must be rejected");
+            assert!(
+                error.to_string().contains("path"),
+                "diagnostic for {payload} must name the rejected path: {error}"
             );
         }
     }

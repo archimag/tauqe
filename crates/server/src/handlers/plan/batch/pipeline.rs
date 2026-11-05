@@ -65,10 +65,10 @@ pub async fn handle_plan_execute_pipeline(req: Request, state: &Arc<AppState>) -
                 Err(err) => return Response::err(req.id, errors::PLAN_LOAD_FAILED, err),
             };
 
-        let step_ids: Vec<String> = match plan.evaluate_scope(None) {
+        let step_ids: Vec<String> = match plan.implementation.evaluate_scope(None) {
             PlanScopeEvaluation::Ready(steps) => steps.into_iter().map(|step| step.id).collect(),
             PlanScopeEvaluation::AllCompleted
-                if plan.items.is_empty() && !plan.concept.is_empty() =>
+                if plan.implementation.items.is_empty() && !plan.concept.is_empty() =>
             {
                 // Concept-only plan: the supervisor projects its horizon.
                 Vec::new()
@@ -147,6 +147,7 @@ pub async fn handle_plan_execute_pipeline(req: Request, state: &Arc<AppState>) -
     // of per-step instructions (concept #c-1).
     let options = PlanBatchOptions {
         model: params.model,
+        step_id: None,
     };
     let response = Response::ok(
         req.id,

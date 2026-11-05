@@ -19,10 +19,10 @@ impl PlanStorage {
         }
 
         let mut done_items = Vec::new();
-        collect_done_items(&existing.items, &mut done_items);
+        collect_done_items(&existing.implementation.items, &mut done_items);
 
         for done_item in done_items {
-            let updated_item = match updated.find_item(&done_item.id) {
+            let updated_item = match updated.implementation.find_item(&done_item.id) {
                 Some(it) => it,
                 None => {
                     anyhow::bail!(
@@ -196,7 +196,7 @@ mod tests {
 
         // 1. Status regression
         let mut regressed = plan.clone();
-        regressed.items[0].status = PlanItemStatus::Todo;
+        regressed.implementation.items[0].status = PlanItemStatus::Todo;
         let err1 = PlanStorage::save_plan(root, &regressed).unwrap_err();
         assert!(err1
             .to_string()
@@ -204,7 +204,7 @@ mod tests {
 
         // 2. Title mutation
         let mut title_mutated = plan.clone();
-        title_mutated.items[0].title = "Altered Title".to_string();
+        title_mutated.implementation.items[0].title = "Altered Title".to_string();
         let err2 = PlanStorage::save_plan(root, &title_mutated).unwrap_err();
         assert!(err2
             .to_string()
@@ -212,7 +212,7 @@ mod tests {
 
         // 3. Details mutation
         let mut details_mutated = plan.clone();
-        details_mutated.items[0].details = Some("Altered Details".to_string());
+        details_mutated.implementation.items[0].details = Some("Altered Details".to_string());
         let err3 = PlanStorage::save_plan(root, &details_mutated).unwrap_err();
         assert!(err3
             .to_string()
@@ -220,7 +220,7 @@ mod tests {
 
         // 4. Target files mutation
         let mut files_mutated = plan.clone();
-        files_mutated.items[0].files = vec!["src/other.rs".to_string()];
+        files_mutated.implementation.items[0].files = vec!["src/other.rs".to_string()];
         let err4 = PlanStorage::save_plan(root, &files_mutated).unwrap_err();
         assert!(err4
             .to_string()
@@ -228,7 +228,7 @@ mod tests {
 
         // 5. Reference files mutation
         let mut readonly_mutated = plan.clone();
-        readonly_mutated.items[0].readonly_files = vec!["src/other.rs".to_string()];
+        readonly_mutated.implementation.items[0].readonly_files = vec!["src/other.rs".to_string()];
         let err5 = PlanStorage::save_plan(root, &readonly_mutated).unwrap_err();
         assert!(err5
             .to_string()
@@ -236,7 +236,7 @@ mod tests {
 
         // 6. Concept references mutation
         let mut concept_mutated = plan.clone();
-        concept_mutated.items[0].concept_refs = vec!["c-2".to_string()];
+        concept_mutated.implementation.items[0].concept_refs = vec!["c-2".to_string()];
         let err6 = PlanStorage::save_plan(root, &concept_mutated).unwrap_err();
         assert!(err6
             .to_string()
@@ -244,7 +244,7 @@ mod tests {
 
         // 7. Dependency graph mutation
         let mut deps_mutated = plan.clone();
-        deps_mutated.items[0].depends_on = vec!["2".to_string()];
+        deps_mutated.implementation.items[0].depends_on = vec!["2".to_string()];
         let err7 = PlanStorage::save_plan(root, &deps_mutated).unwrap_err();
         assert!(err7
             .to_string()

@@ -37,7 +37,7 @@ pub(super) async fn handle_execute_scope_dialog(
     mut st: MutexGuard<'_, AppState>,
     server_writer: &mut RpcConnection,
 ) -> anyhow::Result<Option<InputResult>> {
-    let mut target = match st.confirm_execute_scope.take() {
+    let mut target = match st.modals.confirm_execute_scope.take() {
         Some(target) => target,
         None => return Ok(None),
     };
@@ -57,13 +57,13 @@ pub(super) async fn handle_execute_scope_dialog(
         // Safe cancellation returns the shared button to its default and drops
         // the dialog without a request.
         ModelListKeyOutcome::Dismiss => {
-            st.confirm_button = ConfirmDialogButton::Cancel;
+            st.modals.confirm_button = ConfirmDialogButton::Cancel;
         }
         // The dialog carries no directives editor, so the yank outcome is
         // unreachable; keeping the dialog is the only sensible interpretation of
         // a key it never produces (Conventions §5).
         ModelListKeyOutcome::Consumed | ModelListKeyOutcome::Yank => {
-            st.confirm_execute_scope = Some(target);
+            st.modals.confirm_execute_scope = Some(target);
         }
     }
     Ok(Some(InputResult::Continue))
@@ -91,7 +91,7 @@ mod tests {
     fn state_with_target() -> AppState {
         let mut st = test_state();
         st.view_mode = ViewMode::Plans;
-        st.confirm_execute_scope = Some(ConfirmExecuteScopeState::new(
+        st.modals.confirm_execute_scope = Some(ConfirmExecuteScopeState::new(
             "plan-1".to_string(),
             "Plan One".to_string(),
             "Step One".to_string(),
@@ -122,6 +122,7 @@ mod tests {
         state
             .lock()
             .await
+            .modals
             .confirm_execute_scope
             .clone()
             .expect("dialog stays open")
@@ -129,7 +130,7 @@ mod tests {
 
     async fn set_focus(state: &Arc<Mutex<AppState>>, focus: ExecuteScopeFocus) {
         let mut guard = state.lock().await;
-        if let Some(target) = guard.confirm_execute_scope.as_mut() {
+        if let Some(target) = guard.modals.confirm_execute_scope.as_mut() {
             target.focus = focus;
         }
     }
@@ -142,6 +143,7 @@ mod tests {
         {
             let mut guard = state.lock().await;
             let target = guard
+                .modals
                 .confirm_execute_scope
                 .as_mut()
                 .expect("dialog must be open");
@@ -163,7 +165,7 @@ mod tests {
         assert!(payload.contains("\"step_id\":\"1\""), "{payload}");
 
         let guard = state.lock().await;
-        assert!(guard.confirm_execute_scope.is_none());
+        assert!(guard.modals.confirm_execute_scope.is_none());
         assert_eq!(guard.view_mode, ViewMode::Repl);
     }
 
@@ -252,7 +254,7 @@ mod tests {
         press(&state, &mut conn, key(KeyCode::Enter)).await;
 
         let guard = state.lock().await;
-        assert!(guard.confirm_execute_scope.is_none());
+        assert!(guard.modals.confirm_execute_scope.is_none());
         assert!(conn.written().is_empty());
     }
 
@@ -269,7 +271,7 @@ mod tests {
         assert!(payload.contains("coder-a"), "{payload}");
 
         let guard = state.lock().await;
-        assert!(guard.confirm_execute_scope.is_none());
+        assert!(guard.modals.confirm_execute_scope.is_none());
         assert_eq!(guard.view_mode, ViewMode::Repl);
     }
     /// The `Shift+Tab` spelling that a terminal reports as `Tab` carrying
@@ -315,7 +317,7 @@ mod tests {
             "a command chord must never launch a turn"
         );
         let guard = state.lock().await;
-        assert!(guard.confirm_execute_scope.is_some());
+        assert!(guard.modals.confirm_execute_scope.is_some());
         assert_eq!(guard.view_mode, ViewMode::Plans);
     }
 
@@ -337,7 +339,7 @@ mod tests {
 
             let guard = state.lock().await;
             assert!(
-                guard.confirm_execute_scope.is_some(),
+                guard.modals.confirm_execute_scope.is_some(),
                 "Ctrl+{character} must not dismiss the dialog"
             );
             drop(guard);

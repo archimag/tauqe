@@ -80,7 +80,7 @@ loc-no-tests:
 [doc('Verify the change set: compilation, lints, tests, and markdown hygiene')]
 [metadata('timeout', '1200')]
 verify:
-    bash scripts/verify.sh
+    rust-script scripts/verify.rs
 
 # Compile, lint, and test the workspace. Internal to `scripts/verify.sh`.
 #

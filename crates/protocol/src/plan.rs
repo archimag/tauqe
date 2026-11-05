@@ -21,10 +21,11 @@ mod render;
 mod tests;
 
 pub use dto::{
-    PlanClearHorizonParams, PlanClearHorizonResult, PlanDeleteParams, PlanExecuteParams,
-    PlanExecutePipelineParams, PlanGetParams, PlanGetResult, PlanListChangedEvent, PlanListResult,
-    PlanRefineParams, PlanRefineResult, PlanReplanParams, PlanSaveParams, PlanSetActiveParams,
-    PlanSetActiveResult, PlanUpdateItemParams, PlanUpdateItemResult, PlanUpdatedEvent,
+    PlanClearHorizonParams, PlanClearHorizonResult, PlanCreatePipelineParams, PlanDeleteParams,
+    PlanExecuteParams, PlanExecutePipelineParams, PlanGetParams, PlanGetResult,
+    PlanListChangedEvent, PlanListResult, PlanRefineParams, PlanRefineResult, PlanReplanParams,
+    PlanSaveParams, PlanSetActiveParams, PlanSetActiveResult, PlanUpdateItemParams,
+    PlanUpdateItemResult, PlanUpdatedEvent,
 };
 pub use implementation::{compute_items_status, PlanImplementation, PlanScopeEvaluation};
 pub use item::{ConceptItem, PlanItem, PlanItemStatus};

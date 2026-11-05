@@ -33,6 +33,18 @@ pub struct PlanStorage;
 /// the server is a single process, a process-global mutex makes each cycle atomic
 /// with respect to all other in-process work.
 static PLAN_STORAGE_LOCK: Mutex<()> = Mutex::new(());
+/// Plan the write barrier normalized and validated, ready to be stored.
+///
+/// The barrier lives in one function so the write path and the non-persisting
+/// probe run the very same preparation: the probe discards the document instead
+/// of writing it, which is what makes its verdict the verdict of the application.
+struct PreparedPlan {
+    /// Normalized copy of the plan, exactly as it would be written.
+    plan: Plan,
+    /// File the plan belongs to, reused when the plan already lives under a
+    /// differently sanitized name.
+    target_file: PathBuf,
+}
 
 impl PlanStorage {
     /// Acquires the process-global plan storage lock.
@@ -231,14 +243,13 @@ impl PlanStorage {
 
     /// Lock-free core of [`Self::save_plan`]; the caller must hold the storage lock.
     ///
-    /// The persisted plan enforces the leaf-only file invariant: any item with
-    /// children is a conceptual container and is stored without `files`.
-    /// Also enforces the `Done is Immutable` invariant against any existing on-disk
-    /// plan, refuses to overwrite a file already holding a different plan whose
-    /// sanitized storage name collides with this one, and validates the whole plan
-    /// structurally before a single byte reaches disk, so no mutation source can
-    /// persist a plan that a later mutation would have to reject.
+    /// The barrier itself lives in [`Self::prepare_plan_unlocked`], which is also
+    /// what the non-persisting probe runs, so this function only creates the
+    /// storage directory, writes the prepared document, and records the active-plan
+    /// marker.
     fn save_plan_unlocked(repo_root: &Path, plan: &Plan) -> Result<()> {
+        // The directory is created before the barrier resolves the storage file,
+        // because that resolution inspects the directory it is about to write into.
         let dir = Self::plans_dir(repo_root);
         std::fs::create_dir_all(&dir).with_context(|| {
             format!(
@@ -247,12 +258,38 @@ impl PlanStorage {
             )
         })?;
 
+        let prepared = Self::prepare_plan_unlocked(repo_root, plan)?;
+        let json = serde_json::to_string_pretty(&prepared.plan)
+            .context("Failed to serialize plan to JSON")?;
+        write_atomic(&prepared.target_file, json.as_bytes())?;
+
+        // If no active plan is set, make this plan active so clients always have
+        // a persisted active-plan marker to render.
+        if let Ok(None) = Self::load_active_id_unlocked(repo_root) {
+            let _ = Self::save_active_id_unlocked(repo_root, Some(&prepared.plan.id));
+        }
+
+        Ok(())
+    }
+
+    /// Normalizes a plan and runs the single structural barrier of persistence
+    /// without writing a byte.
+    ///
+    /// The barrier is shared by the write path and the non-persisting probe, which
+    /// is what makes their verdicts identical: the leaf-only file invariant, the
+    /// `Done is Immutable` check against the stored document, the refusal to
+    /// overwrite a colliding storage name, and the structural validation of the
+    /// whole plan all run here, in this order, for both contracts. A plan that
+    /// passes therefore persists, and a plan that fails is refused identically for
+    /// every mutation source.
+    fn prepare_plan_unlocked(repo_root: &Path, plan: &Plan) -> Result<PreparedPlan> {
+        let dir = Self::plans_dir(repo_root);
         let safe_id = Self::sanitize_id(&plan.id);
         let default_target = dir.join(format!("{safe_id}.json"));
 
         let mut normalized = plan.clone();
-        normalized.normalize_leaf_files();
-        normalized.refresh_parent_statuses();
+        normalized.implementation.normalize_leaf_files();
+        normalized.implementation.refresh_parent_statuses();
 
         // Reuse the file that already stores this plan even when its name differs
         // from the sanitized id (for example after an id casing change). Writing to
@@ -295,7 +332,7 @@ impl PlanStorage {
         // The single structural barrier of plan persistence: every mutation
         // source (an explicit `save`, a delta `update`, a discussion payload,
         // and the programmatic horizon primitives) reaches disk through this
-        // function, so a structurally invalid plan is rejected identically for
+        // preparation, so a structurally invalid plan is rejected identically for
         // all of them. The normalized copy is validated because it is exactly
         // what would be written.
         if let Err(errors) = normalized.validate() {
@@ -307,17 +344,10 @@ impl PlanStorage {
             );
         }
 
-        let json = serde_json::to_string_pretty(&normalized)
-            .context("Failed to serialize plan to JSON")?;
-        write_atomic(&target_file, json.as_bytes())?;
-
-        // If no active plan is set, make this plan active so clients always have
-        // a persisted active-plan marker to render.
-        if let Ok(None) = Self::load_active_id_unlocked(repo_root) {
-            let _ = Self::save_active_id_unlocked(repo_root, Some(&plan.id));
-        }
-
-        Ok(())
+        Ok(PreparedPlan {
+            plan: normalized,
+            target_file,
+        })
     }
 
     /// Deletes a plan from storage. Returns `true` if a file was deleted.
@@ -567,9 +597,15 @@ impl PlanStorage {
             false
         }
 
-        let updated = visit_mut(&mut plan.items, item_id, status, blocked_reason, commit);
+        let updated = visit_mut(
+            &mut plan.implementation.items,
+            item_id,
+            status,
+            blocked_reason,
+            commit,
+        );
         if updated {
-            plan.refresh_parent_statuses();
+            plan.implementation.refresh_parent_statuses();
             plan.updated_at = SystemTime::now()
                 .duration_since(SystemTime::UNIX_EPOCH)
                 .unwrap_or_default()
@@ -700,7 +736,10 @@ mod tests {
         .unwrap()
         .unwrap();
 
-        assert_eq!(updated.items[0].children[0].status, PlanItemStatus::Done);
+        assert_eq!(
+            updated.implementation.items[0].children[0].status,
+            PlanItemStatus::Done
+        );
 
         // 5. Active plan marker
         PlanStorage::save_active_id(root, Some("auth-flow")).unwrap();
@@ -782,9 +821,9 @@ mod tests {
         PlanStorage::save_plan(root, &plan).unwrap();
 
         let loaded = PlanStorage::load_plan(root, "leaf-only").unwrap().unwrap();
-        assert!(loaded.items[0].files.is_empty());
+        assert!(loaded.implementation.items[0].files.is_empty());
         assert_eq!(
-            loaded.items[0].children[0].files,
+            loaded.implementation.items[0].children[0].files,
             vec!["src/leaf.rs".to_string()]
         );
     }
@@ -979,6 +1018,7 @@ mod tests {
             .unwrap()
             .unwrap();
         let done = loaded
+            .implementation
             .items
             .iter()
             .filter(|item| item.status == PlanItemStatus::Done)
@@ -1164,8 +1204,8 @@ mod tests {
         let loaded = PlanStorage::load_plan(&root, "runtime-plan")
             .unwrap()
             .unwrap();
-        assert_eq!(loaded.items.len(), 1);
-        assert_eq!(loaded.items[0].status, PlanItemStatus::Todo);
+        assert_eq!(loaded.implementation.items.len(), 1);
+        assert_eq!(loaded.implementation.items[0].status, PlanItemStatus::Todo);
 
         let updated = PlanStorage::update_item(
             &root,
@@ -1177,7 +1217,7 @@ mod tests {
         )
         .unwrap()
         .unwrap();
-        assert_eq!(updated.items[0].status, PlanItemStatus::Done);
+        assert_eq!(updated.implementation.items[0].status, PlanItemStatus::Done);
 
         let refined = PlanStorage::update_concept_item(
             &root,
@@ -1231,7 +1271,7 @@ mod tests {
         )
         .unwrap()
         .unwrap();
-        let blocked_item = blocked.find_item("1").unwrap();
+        let blocked_item = blocked.implementation.find_item("1").unwrap();
         assert_eq!(blocked_item.status, PlanItemStatus::Blocked);
         assert_eq!(blocked_item.blocked_reason.as_deref(), Some("missing git"));
 
@@ -1239,7 +1279,7 @@ mod tests {
         let stored = PlanStorage::load_plan(root, "blocked-plan")
             .unwrap()
             .unwrap();
-        let stored_item = stored.find_item("1").unwrap();
+        let stored_item = stored.implementation.find_item("1").unwrap();
         assert_eq!(stored_item.blocked_reason.as_deref(), Some("missing git"));
 
         // Leaving BLOCKED drops the stale report deterministically.
@@ -1253,7 +1293,7 @@ mod tests {
         )
         .unwrap()
         .unwrap();
-        let resumed_item = resumed.find_item("1").unwrap();
+        let resumed_item = resumed.implementation.find_item("1").unwrap();
         assert_eq!(resumed_item.status, PlanItemStatus::InProgress);
         assert!(resumed_item.blocked_reason.is_none());
     }

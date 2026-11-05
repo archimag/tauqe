@@ -1154,3 +1154,178 @@ async fn a_recorded_review_decision_is_published_as_review_updated() {
 
     let _ = std::fs::remove_dir_all(&root);
 }
+
+/// Provider that relays a cancellation and then parks the workflow task inside a
+/// synchronous stretch, so the task never reaches the suspension point an abort
+/// lands at.
+///
+/// It reproduces the last-resort hazard: a cancelled turn whose workflow sits
+/// between abort landing points outlives both unwind graces while it still
+/// holds the session lock it acquired.
+struct AbortIgnoringProvider {
+    /// Signals that the workflow task entered the synchronous stretch.
+    entered: mpsc::UnboundedSender<()>,
+    /// Set by the test to let the workflow task reach a suspension point.
+    released: Arc<AtomicBool>,
+    /// Set once the synchronous stretch has ended.
+    exited: Arc<AtomicBool>,
+}
+
+impl AbortIgnoringProvider {
+    /// Builds the provider together with the receiver that observes its stall.
+    fn new() -> (Self, mpsc::UnboundedReceiver<()>) {
+        let (entered, receiver) = mpsc::unbounded_channel();
+        (
+            Self {
+                entered,
+                released: Arc::new(AtomicBool::new(false)),
+                exited: Arc::new(AtomicBool::new(false)),
+            },
+            receiver,
+        )
+    }
+}
+
+#[async_trait::async_trait]
+impl LlmProvider for AbortIgnoringProvider {
+    fn kind(&self) -> ProviderKind {
+        ProviderKind::OpenRouter
+    }
+
+    async fn stream_chat(
+        &self,
+        _model: &str,
+        _messages: Vec<ChatMessage>,
+        _response_format: Option<ResponseFormat>,
+        tx: mpsc::Sender<StreamEvent>,
+        _cancel_rx: watch::Receiver<bool>,
+    ) -> anyhow::Result<()> {
+        // Relay the cancellation the turn reacts to, then hold the task inside a
+        // synchronous stretch. An abort only lands at a suspension point, so the
+        // task keeps running and keeps holding the session lock. The cancel
+        // signal is deliberately never observed here: a workflow that ignores it
+        // is exactly what the deferred reaping has to survive.
+        let _ = tx.send(StreamEvent::Cancelled).await;
+        let _ = self.entered.send(());
+        while !self.released.load(Ordering::SeqCst) {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        self.exited.store(true, Ordering::SeqCst);
+        Ok(())
+    }
+}
+
+/// A workflow task that survives the abort must never be detached: the turn hands
+/// the still-owned handle to the shared watchdog, which keeps the operation slot
+/// registered until the task has truly exited, so the zombie releases the session
+/// lock before any new operation can register.
+///
+/// The regression runs on a multi-thread runtime because the stand-in parks the
+/// workflow task inside a synchronous stretch: that stretch never yields, which
+/// is exactly why the abort cannot land there.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_aborted_workflow_keeps_the_slot_until_the_watchdog_reaps_it() {
+    use tauqe_core::workflow::DirectApplyPolicy;
+
+    let root = scratch_root("deferred-reap");
+    tauqe_core::git::init_repository(Some(&root), true).expect("initialise the scratch repository");
+    std::fs::write(root.join("README.md"), "# scratch\n").expect("write the repository fixture");
+    tauqe_core::git::cmd::stage_files(&root, &["README.md".to_string()])
+        .expect("stage the fixture");
+    tauqe_core::git::cmd::commit_with_developer_author(&root, "Add fixture", false)
+        .expect("commit the fixture");
+
+    let state = state_over_root(root.clone());
+    let (provider, mut entered) = AbortIgnoringProvider::new();
+    let released = Arc::clone(&provider.released);
+    let exited = Arc::clone(&provider.exited);
+    let injected: Arc<dyn LlmProvider> = Arc::new(provider);
+    *state.provider_override.lock().await = Some(injected);
+
+    // The production grace exists to give a real workflow time to unwind. Short
+    // graces confined to this turn's task make the second expiry reachable
+    // without changing what any concurrently running test observes.
+    let grace = Duration::from_millis(150);
+    let turn_state = Arc::clone(&state);
+    let turn = tokio::spawn(async move {
+        super::turn::with_unwind_grace(grace, async move {
+            execute_model_turn(
+                &turn_state,
+                "Explain the repository".to_string(),
+                Box::new(DirectApplyPolicy::new()),
+                StepTurnOptions {
+                    intent: TurnIntent::InteractiveRepl,
+                    custom_selection: None,
+                    plan_context: None,
+                    work_context: None,
+                    reasoning_effort: None,
+                    marker: None,
+                    session_id: None,
+                    shared_operation: None,
+                    phase_out: None,
+                },
+            )
+            .await
+        })
+        .await
+    });
+
+    tokio::time::timeout(Duration::from_secs(10), entered.recv())
+        .await
+        .expect("the turn must reach the provider")
+        .expect("the provider signals that the workflow task is parked");
+    state.hard_cancel_active_operation();
+
+    // Both graces expire while the workflow task sits between abort landing
+    // points, so the turn has handed the handle to the watchdog by now.
+    tokio::time::sleep(grace * 5).await;
+    assert!(
+        !exited.load(Ordering::SeqCst),
+        "the workflow task must still be inside the synchronous stretch"
+    );
+
+    let result = tokio::time::timeout(Duration::from_secs(10), turn)
+        .await
+        .expect("the turn must return once the reaping is deferred")
+        .expect("the turn task joins")
+        .expect("the turn returns a cancelled result");
+    assert!(result.is_cancelled, "the turn must report the cancellation");
+    assert!(
+        state.is_operation_active(),
+        "the slot must stay registered while the aborted task still runs"
+    );
+    assert!(
+        state.try_begin_operation().is_err(),
+        "a new operation must stay refused until the aborted task has exited"
+    );
+    assert!(
+        !exited.load(Ordering::SeqCst),
+        "the deferred task must still hold the session lock"
+    );
+
+    // Letting the stretch end gives the pending abort a landing point; the
+    // watchdog then reaps the task and drops the registration with it.
+    released.store(true, Ordering::SeqCst);
+    let mut freed = false;
+    for _ in 0..500 {
+        if !state.is_operation_active() {
+            freed = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(
+        freed,
+        "the watchdog must release the slot once the task exits"
+    );
+    assert!(
+        exited.load(Ordering::SeqCst),
+        "the workflow task must have reached its own end"
+    );
+    assert!(
+        state.try_begin_operation().is_ok(),
+        "the slot must be reusable afterwards"
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+}

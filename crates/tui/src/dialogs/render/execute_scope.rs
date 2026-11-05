@@ -130,7 +130,7 @@ fn model_list_area(chunks: &super::PickerDialogChunks) -> Rect {
 /// coder that runs is the coder shown on screen and the server never
 /// re-derives the selection (c-tui-selector, Conventions §6, §7).
 pub fn render_execute_scope_dialog(frame: &mut ratatui::Frame, state: &AppState) {
-    let Some(target) = state.confirm_execute_scope.as_ref() else {
+    let Some(target) = state.modals.confirm_execute_scope.as_ref() else {
         return;
     };
 
@@ -325,7 +325,7 @@ mod tests {
 
     fn scope_state(coder_entries: Vec<ModelEntry>) -> AppState {
         let mut st = crate::app::test_state();
-        st.confirm_execute_scope = Some(ConfirmExecuteScopeState::new(
+        st.modals.confirm_execute_scope = Some(ConfirmExecuteScopeState::new(
             "plan-1".to_string(),
             "Plan One".to_string(),
             "Step One".to_string(),
@@ -348,7 +348,11 @@ mod tests {
     fn rendered_scope_buttons_match_hit_geometry() {
         let term = Rect::new(0, 0, 100, 40);
         let st = scope_state(vec![ModelEntry::new(ModelRef::openrouter("coder-a"), None)]);
-        let target = st.confirm_execute_scope.as_ref().expect("dialog open");
+        let target = st
+            .modals
+            .confirm_execute_scope
+            .as_ref()
+            .expect("dialog open");
         let entry_count = target.selector.len();
         let single = target.steps.len() == 1;
 

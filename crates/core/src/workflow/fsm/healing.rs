@@ -462,14 +462,11 @@ pub(super) async fn run_apply_and_verify_phase(
                 summary: commit_message.clone(),
                 edits: retry_edits,
             };
-            // The working copy is snapshotted immediately before the attempt, so
-            // a repair that fails halfway cannot strand the files it already
-            // wrote: the paths it left dirty are collected below and join the
-            // change set like any other artifact.
-            let snapshot_root = ctx.repo_root;
-            let worktree_before = crate::blocking::run_blocking(|| {
-                crate::git::state::snapshot_worktree(snapshot_root)
-            });
+            // A repair that fails halfway must not strand the files it already
+            // wrote: the guard drops its observation when a change set starts
+            // reaching the disk, so the failure arm below re-observes the tree,
+            // and the paths it left dirty join the change set like any other
+            // artifact.
             match guard.apply_temporary(&retry_proposal).await {
                 Ok(new_files) => {
                     merge_changed_files(&mut total_changed_files, new_files);
@@ -506,20 +503,12 @@ pub(super) async fn run_apply_and_verify_phase(
                     }
                 }
                 Err(error) => {
-                    // A repair rejected midway may still have written some of its
-                    // files. Those paths stay dirty in the working copy, so they
-                    // must join the change set: otherwise the final commit would
-                    // leave them unaccounted for while the turn reports a clean,
-                    // verified tree.
-                    let snapshot_root = ctx.repo_root;
-                    let worktree_after = crate::blocking::run_blocking(|| {
-                        crate::git::state::snapshot_worktree(snapshot_root)
-                    });
-                    let dirty = crate::git::state::changed_worktree_paths(
-                        &worktree_before,
-                        &worktree_after,
-                    );
-                    merge_changed_files(&mut total_changed_files, dirty);
+                    // A refused repair may still have published some of its
+                    // files. The guard observes the tree once here and reports
+                    // every path that changed since the transaction baseline, so
+                    // those files join the change set instead of surviving as
+                    // unaccounted dirt in a tree the turn reports as clean.
+                    merge_changed_files(&mut total_changed_files, guard.worktree_changes());
                     verify_outcome = VerificationOutcome {
                         status: VerificationStatus::Failed,
                         report: format!("Failed to apply repair edits: {}", error),
@@ -544,7 +533,7 @@ pub(super) async fn run_apply_and_verify_phase(
             // snapshot while it verified the tree. The guard baselined the
             // working copy once, so its differential keeps the atomic commit
             // complete instead of leaving verified artifacts outside it.
-            merge_changed_files(&mut total_changed_files, guard.worktree_changes());
+            merge_changed_files(&mut total_changed_files, guard.refresh_worktree_changes());
             let (commit_hash, commit_error) =
                 guard.finalize(&total_changed_files, &commit_message).await;
             tracing::info!(

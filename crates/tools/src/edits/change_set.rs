@@ -17,7 +17,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use tauqe_protocol::{ContextState, EditOperation, GlobPattern, ProjectConfig};
 
-use super::admission::{admit_move_destination, admit_write, ignored_target_paths};
+use super::admission::{admit_move_destination, admit_write, ignored_target_paths, IgnoreAnswer};
 use super::error::EditError;
 use super::fuzzy::apply_replace;
 use super::protection::{is_protected, protected_dir_move_path, protected_patterns};
@@ -243,7 +243,9 @@ pub(crate) fn stage_and_validate_edits_inner(
     // change set is resolved against Git before the first member applies. A
     // directory move contributes one candidate per file it expands into, which
     // is why the candidates come from the built members rather than from the
-    // raw operations.
+    // raw operations. The typed answer separates a target Git cannot inspect
+    // from a probe Git refused: the first has no ignore rules at all, while the
+    // second refuses every write instead of admitting it on a guess.
     let mut write_targets: Vec<String> = units
         .iter()
         .flat_map(|unit| unit.write_targets())
@@ -251,7 +253,7 @@ pub(crate) fn stage_and_validate_edits_inner(
         .collect();
     write_targets.sort();
     write_targets.dedup();
-    let ignored = ignored_target_paths(repo_root, &write_targets);
+    let ignore_answer = ignored_target_paths(repo_root, &write_targets);
     // The members that applied cleanly, in change-set order. The reported change
     // set is derived from them, so an earlier member that shares a path with a
     // later refused member keeps its place in it.
@@ -287,7 +289,7 @@ pub(crate) fn stage_and_validate_edits_inner(
             unit,
             &mut state,
             &protected,
-            &ignored,
+            &ignore_answer,
             config_validator,
         );
         match applied {
@@ -737,7 +739,7 @@ fn apply_staging_unit(
     unit: &StagingUnit<'_>,
     state: &mut StagedEditsState,
     protected: &[GlobPattern],
-    ignored: &HashSet<String>,
+    ignore_answer: &IgnoreAnswer,
     config_validator: Option<StagedConfigValidator>,
 ) -> Result<(), StagingRejection> {
     match unit {
@@ -752,7 +754,7 @@ fn apply_staging_unit(
                 )
             });
             if writes {
-                admit_write(path, ignored).map_err(|error| rejection(path, error))?;
+                admit_write(path, ignore_answer).map_err(|error| rejection(path, error))?;
             }
             let staged = stage_file_edits(repo_root, context_paths, path, operations, state)
                 .map_err(|error| rejection(path, error))?;
@@ -791,7 +793,8 @@ fn apply_staging_unit(
             if is_protected(protected, to) {
                 return Err(rejection(to, EditError::ProtectedPath(to.clone())));
             }
-            admit_move_destination(repo_root, to, ignored).map_err(|error| rejection(to, error))?;
+            admit_move_destination(repo_root, to, ignore_answer)
+                .map_err(|error| rejection(to, error))?;
             stage_move(repo_root, context_paths, from, to, state)
         }
         StagingUnit::DirMove {
@@ -835,7 +838,7 @@ fn apply_staging_unit(
             // file, before the first file of the subtree stages; the loop below
             // then only transfers content.
             for file in files {
-                admit_move_destination(repo_root, &file.to, ignored)
+                admit_move_destination(repo_root, &file.to, ignore_answer)
                     .map_err(|error| rejection(&file.to, error))?;
             }
             // The subtree moves as one member: the caller recorded the membership

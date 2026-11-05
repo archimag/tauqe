@@ -13,7 +13,7 @@ use crate::state::AppState;
 use crate::transport::OutChannel;
 use tauqe_core::edits::protocol::ContextRequest;
 use tauqe_core::outer_docs::{OuterDocsRegistry, MAX_DOCUMENT_BYTES};
-use tauqe_core::workflow::common::apply_context_requests_detailed;
+use tauqe_core::workflow::research::apply_context_requests_detailed;
 use tauqe_protocol::discussion::DiscussionTarget;
 use tauqe_protocol::{events, ContextAccess, Event};
 use tokio::sync::watch;

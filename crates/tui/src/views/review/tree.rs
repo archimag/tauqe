@@ -9,14 +9,16 @@
 
 use ratatui::style::{Style, Stylize};
 use ratatui::text::{Line, Span};
-use tauqe_protocol::{IssueStatus, IssueType, ModelSelection, PlanItemStatus, ReviewGroupKind};
+use tauqe_protocol::{IssueStatus, IssueType, ModelSelection, ReviewGroupKind};
 use time::macros::format_description;
 
 use crate::markdown::MarkdownBodyCache;
 use crate::theme::engine::current_engine;
 use crate::ui::wrap::{wrap_line, wrapped_line_count};
 use crate::views::plans::architect_badge;
-use crate::views::plans::tree::prepare_plan_markdown;
+use crate::views::plans::tree::{
+    commit_badge, render_plan_step, PlanStepContext, PlanStepRefs, PlanStepRow, TreeRowSink,
+};
 
 use super::VisibleReviewRow;
 
@@ -278,28 +280,9 @@ fn push_diagnostic_block(
     }
 }
 
-/// Receives the rows of the Review tree in the order the shared row walk emits
-/// them.
-///
-/// The walk owns the row order, the blank separator between sessions, and the
-/// match over every row variant, so the rendering visitor and the measuring
-/// visitor can never disagree about which rows exist or how tall they are. A
-/// visitor only decides what to do with each piece it is handed: materialize it,
-/// or count it.
-trait ReviewRowVisitor {
-    /// Emits the blank separator that opens a session.
-    fn separator(&mut self);
-
-    /// Records the first rendered line of the row that follows.
-    fn row_start(&mut self);
-
-    /// Emits one row-summary line, which still has to be wrapped to `width`.
-    fn summary(&mut self, line: Line<'static>, width: usize);
-
-    /// Emits a detail body the Markdown cache already wrapped to the target
-    /// width, so its lines are taken exactly as they are.
-    fn body(&mut self, lines: &[Line<'static>]);
-}
+// The Review walk hands its rows to the same sink contract the Plans walk uses,
+// so the shared plan-step renderer draws its lines into either tree without an
+// adapter (c-1).
 
 /// Rendering visitor: materializes the wrapped lines and the row offsets.
 #[derive(Default)]
@@ -308,7 +291,7 @@ struct ReviewLineRenderer {
     offsets: Vec<usize>,
 }
 
-impl ReviewRowVisitor for ReviewLineRenderer {
+impl TreeRowSink for ReviewLineRenderer {
     fn separator(&mut self) {
         self.lines.push(Line::raw(""));
     }
@@ -334,7 +317,7 @@ struct ReviewLineMeasure {
     height: usize,
 }
 
-impl ReviewRowVisitor for ReviewLineMeasure {
+impl TreeRowSink for ReviewLineMeasure {
     fn separator(&mut self) {
         self.height += 1;
     }
@@ -401,7 +384,7 @@ pub(crate) fn measure_review_rows(
 /// Rendering and measuring therefore observe one identical layout, and a
 /// navigation key reads the selected row's bounds without materializing the
 /// document (c-2).
-fn walk_review_rows<V: ReviewRowVisitor>(
+fn walk_review_rows<V: TreeRowSink>(
     rows: &[VisibleReviewRow],
     selected_idx: usize,
     width: usize,
@@ -549,6 +532,7 @@ fn walk_review_rows<V: ReviewRowVisitor>(
                 title,
                 issue_type,
                 status,
+                commit,
                 model,
                 files,
                 readonly_files,
@@ -617,6 +601,14 @@ fn walk_review_rows<V: ReviewRowVisitor>(
                         ),
                         engine.fg(palette.text_muted),
                     ));
+                }
+                // A fixed finding names the commit that carried its change,
+                // rendered through the shared badge so the Review and Plans
+                // trees abbreviate a commit identically (c-1).
+                if *status == IssueStatus::Fixed {
+                    if let Some(badge) = commit.as_deref().and_then(commit_badge) {
+                        spans.push(badge);
+                    }
                 }
                 if *focused {
                     spans.push(focus_badge());
@@ -791,6 +783,8 @@ fn walk_review_rows<V: ReviewRowVisitor>(
                 title,
                 details,
                 status,
+                commit,
+                blocked_reason,
                 files,
                 readonly_files,
                 outer_docs,
@@ -799,168 +793,48 @@ fn walk_review_rows<V: ReviewRowVisitor>(
                 has_children,
                 is_expandable,
                 is_expanded,
-                ..
             } => {
+                // A subplan step is a full plan step, so it is drawn by the one
+                // shared renderer the Plans tree uses; only its placement and
+                // its cache key differ (c-1, Conventions §4.8).
                 let row_level = subplan_step_level(*depth);
                 let indent = review_indent(row_level);
                 let body_indent = review_body_indent(row_level + 1);
-                let meta_prefix = format!("{body_indent}│ ");
-                let fold_icon = if *is_expandable {
-                    if *is_expanded {
-                        "▼ "
-                    } else {
-                        "▶ "
-                    }
-                } else if is_selected {
-                    "▶ "
-                } else {
-                    "• "
-                };
-                let fold_style = if *is_expandable {
-                    engine.fg(palette.status_warning).bold()
-                } else if is_selected {
-                    engine.fg(palette.status_info).bold()
-                } else {
-                    engine.fg(palette.text_muted)
-                };
-                let title_style = if is_selected {
-                    engine.fg(palette.text_primary).bold()
-                } else if *status == PlanItemStatus::Done || *status == PlanItemStatus::Cancelled {
-                    engine.fg(palette.text_secondary)
-                } else {
-                    Style::default().bold()
-                };
-
-                let clean_title = title.replace(['\r', '\n'], " ").trim().to_string();
-
-                let mut spans = vec![
-                    gutter,
-                    Span::raw(indent.clone()),
-                    Span::styled(fold_icon, fold_style),
-                    Span::styled(format!(" {} ", status), plan_status_style(*status)),
-                    Span::raw(" "),
-                    Span::styled(format!("#{} {}", step_id, clean_title), title_style),
-                ];
-                if !*has_children
-                    && (!files.is_empty() || !readonly_files.is_empty() || !outer_docs.is_empty())
-                {
-                    let mut parts = Vec::new();
-                    if !files.is_empty() {
-                        parts.push(crate::i18n::active_t("plans.file_count").replacen(
-                            "{}",
-                            &files.len().to_string(),
-                            1,
-                        ));
-                    }
-                    if !readonly_files.is_empty() {
-                        parts.push(crate::i18n::active_t("plans.ref_count").replacen(
-                            "{}",
-                            &readonly_files.len().to_string(),
-                            1,
-                        ));
-                    }
-                    if !outer_docs.is_empty() {
-                        parts.push(crate::i18n::active_t("plans.docs_count").replacen(
-                            "{}",
-                            &outer_docs.len().to_string(),
-                            1,
-                        ));
-                    }
-                    spans.push(Span::styled(
-                        format!(" [{}]", parts.join(" + ")),
-                        engine.fg(palette.text_muted),
-                    ));
-                }
-
-                let mut row_line = Line::from(spans).style(row_style);
-                if is_selected {
-                    row_line = pad_line_to_width(row_line, width, row_style);
-                }
-                visitor.summary(row_line, width);
-
-                if *is_expanded {
-                    if !*has_children && !files.is_empty() {
-                        visitor.summary(
-                            Line::from(vec![
-                                Span::styled(meta_prefix.clone(), engine.fg(palette.text_muted)),
-                                Span::styled(
-                                    format!("{} ", crate::i18n::active_t("plans.files_prefix")),
-                                    engine.fg(palette.text_muted),
-                                ),
-                                Span::styled(files.join(", "), engine.fg(palette.status_info)),
-                            ]),
-                            width,
-                        );
-                    }
-                    if !*has_children && !readonly_files.is_empty() {
-                        visitor.summary(
-                            Line::from(vec![
-                                Span::styled(meta_prefix.clone(), engine.fg(palette.text_muted)),
-                                Span::styled(
-                                    format!("{} ", crate::i18n::active_t("plans.ref_prefix")),
-                                    engine.fg(palette.text_muted),
-                                ),
-                                Span::styled(
-                                    readonly_files.join(", "),
-                                    engine.fg(palette.status_info),
-                                ),
-                            ]),
-                            width,
-                        );
-                    }
-                    if !*has_children && !outer_docs.is_empty() {
-                        visitor.summary(
-                            Line::from(vec![
-                                Span::styled(meta_prefix.clone(), engine.fg(palette.text_muted)),
-                                Span::styled(
-                                    format!("{} ", crate::i18n::active_t("plans.docs_prefix")),
-                                    engine.fg(palette.text_muted),
-                                ),
-                                Span::styled(outer_docs.join(", "), engine.fg(palette.status_info)),
-                            ]),
-                            width,
-                        );
-                    }
-                    if !depends_on.is_empty() {
-                        visitor.summary(
-                            Line::from(vec![
-                                Span::styled(meta_prefix.clone(), engine.fg(palette.text_muted)),
-                                Span::styled(
-                                    crate::i18n::active_t("review.depends_on_label"),
-                                    engine.fg(palette.text_muted),
-                                ),
-                                Span::styled(
-                                    depends_on.join(", "),
-                                    engine.fg(palette.status_warning),
-                                ),
-                            ]),
-                            width,
-                        );
-                    }
-                    if let Some(det) = details {
-                        // Model-authored detail blocks inherit the leading
-                        // indent of the payload they were written in. Left as
-                        // is, CommonMark reads those lines as an indented code
-                        // block and renders framed, padded boxes that inflate
-                        // the row height, so the shared normalizer strips the
-                        // common indent first.
-                        let prepared = prepare_plan_markdown(det);
-                        if !prepared.is_empty() {
-                            let mut theme =
-                                crate::markdown::MarkdownTheme::answer_themed(theme_mode);
-                            theme.text_style = engine.fg(palette.text_secondary);
-                            theme.hard_breaks = true;
-                            theme.compact = true;
-                            theme.line_prefix =
-                                Some(Span::styled(meta_prefix, engine.fg(palette.text_muted)));
-                            theme.constrain_table_width(width);
-                            let key = step_body_key(session_id, group_id, step_id);
-                            let body =
-                                cache.lines_for(&key, &prepared, &theme, Some(width), theme_mode);
-                            visitor.body(body);
-                        }
-                    }
-                }
+                let cache_key = step_body_key(session_id, group_id, step_id);
+                render_plan_step(
+                    visitor,
+                    &PlanStepRow {
+                        item_id: step_id,
+                        title,
+                        status: *status,
+                        commit: commit.as_deref(),
+                        blocked_reason: blocked_reason.as_deref(),
+                        details: details.as_deref(),
+                        has_children: *has_children,
+                        is_expandable: *is_expandable,
+                        is_expanded: *is_expanded,
+                        focused: false,
+                    },
+                    &PlanStepRefs {
+                        files,
+                        readonly_files,
+                        outer_docs,
+                        // The Review projection carries no concept references,
+                        // so it offers none to the shared renderer.
+                        concept_refs: &[],
+                        depends_on,
+                    },
+                    &PlanStepContext {
+                        indent: &indent,
+                        body_indent: &body_indent,
+                        cache_key: &cache_key,
+                        width,
+                        theme_mode,
+                        row_style,
+                        is_selected,
+                    },
+                    cache,
+                );
             }
             VisibleReviewRow::GroupHeader {
                 session_id,
@@ -1156,8 +1030,8 @@ mod tests {
     use super::*;
     use crate::views::review::ReviewViewState;
     use tauqe_protocol::{
-        ArchitectTier, IssueStatus, IssueType, ModelRef, PlanImplementation, PlanItem, ReviewGroup,
-        ReviewGroupKind, ReviewIssue, ReviewItem, ReviewSession,
+        ArchitectTier, IssueStatus, IssueType, ModelRef, PlanImplementation, PlanItem,
+        PlanItemStatus, ReviewGroup, ReviewGroupKind, ReviewIssue, ReviewItem, ReviewSession,
     };
 
     fn make_item(id: u32) -> ReviewIssue {
@@ -2684,5 +2558,121 @@ mod tests {
             !rendered.contains("The unified plan cannot be synthesized."),
             "a folded group must hide its blocker panel: {rendered}"
         );
+    }
+    /// A finished step of a group plan names the commit it recorded, and a
+    /// blocked step reveals the reason that stopped it: both are drawn by the
+    /// one shared plan-step renderer the Plans tree uses, so the two surfaces
+    /// can never describe an implementation step differently (c-1).
+    #[test]
+    fn test_subplan_step_renders_its_commit_hash_and_its_blocker() {
+        let mut done = subplan_step("1.1", "Wire the auth guard", PlanItemStatus::Done);
+        done.commit = Some("0123456789abcdef".to_string());
+
+        let mut blocked = subplan_step("1.2", "Rotate the signing key", PlanItemStatus::Blocked);
+        blocked.blocked_reason = Some("The signer exposes no rotation hook.".to_string());
+
+        let mut session = make_session("rev-step-commit", &[1]);
+        session.groups = vec![architectural_group(
+            "arch",
+            "Shared cause",
+            vec![done, blocked],
+        )];
+        session.items[0].group = Some("arch".to_string());
+        let mut view = ReviewViewState {
+            sessions: vec![session],
+            ..Default::default()
+        };
+        view.toggle_subplan_item_expanded("rev-step-commit", "arch", "1.2");
+
+        let (lines, _) = render_view(&mut view, usize::MAX, 160);
+        let text = lines.iter().map(line_text).collect::<Vec<_>>().join("\n");
+        assert!(
+            !text.contains("0123456789abcdef"),
+            "the commit badge must stay short: {text}"
+        );
+
+        let engine = current_engine();
+        let palette = engine.palette();
+        let commit_line = &lines[find_line(&lines, " 0123456")];
+        assert!(
+            commit_line.spans.iter().any(|span| {
+                span.content.contains("0123456")
+                    && span.style.fg == Some(engine.color(palette.status_success))
+            }),
+            "the commit badge keeps the semantic success role: {}",
+            line_text(commit_line)
+        );
+
+        let reason_line = &lines[find_line(&lines, "The signer exposes no rotation hook.")];
+        assert!(
+            reason_line
+                .spans
+                .iter()
+                .any(|span| span.style.fg == Some(engine.color(palette.status_error))),
+            "the blocker keeps the semantic error role: {}",
+            line_text(reason_line)
+        );
+
+        let expandable = view.flatten_rows().into_iter().any(|row| {
+            matches!(
+                row,
+                VisibleReviewRow::SubplanItem {
+                    step_id,
+                    is_expandable: true,
+                    ..
+                } if step_id == "1.2"
+            )
+        });
+        assert!(
+            expandable,
+            "the blocker alone must make the step expandable so it can be revealed"
+        );
+    }
+
+    /// A finding that reached `Fixed` names the commit that carried its change,
+    /// abbreviated exactly as the Plans tree abbreviates a finished step.
+    #[test]
+    fn test_fixed_finding_renders_its_short_commit_hash() {
+        let mut session = make_session("rev-fixed", &[1, 2]);
+        session.items[0] = ReviewItem::from(ReviewIssue {
+            status: IssueStatus::Fixed,
+            commit: Some("fedcba9876543210".to_string()),
+            ..make_item(1)
+        });
+        let mut view = ReviewViewState {
+            sessions: vec![session],
+            ..Default::default()
+        };
+
+        let (lines, _) = render_view(&mut view, usize::MAX, 200);
+        let text = lines.iter().map(line_text).collect::<Vec<_>>().join("\n");
+        assert!(
+            !text.contains("fedcba9876543210"),
+            "the commit badge must stay short: {text}"
+        );
+        assert_eq!(
+            text.matches(" fedcba9").count(),
+            1,
+            "only the fixed finding names its commit: {text}"
+        );
+
+        let engine = current_engine();
+        let palette = engine.palette();
+        let commit_line = &lines[find_line(&lines, " fedcba9")];
+        assert!(
+            commit_line.spans.iter().any(|span| {
+                span.content.contains("fedcba9")
+                    && span.style.fg == Some(engine.color(palette.status_success))
+            }),
+            "the commit badge keeps the semantic success role: {}",
+            line_text(commit_line)
+        );
+
+        // An open finding records no commit and therefore advertises no hash.
+        view.sessions[0].items[0].status = IssueStatus::Todo;
+        view.sessions[0].items[0].commit = None;
+        let (lines, _) = render_view(&mut view, usize::MAX, 200);
+        let text = lines.iter().map(line_text).collect::<Vec<_>>().join("\n");
+        assert!(!text.contains("fedcba9"), "{text}");
     }
 }

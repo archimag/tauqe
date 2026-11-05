@@ -89,37 +89,41 @@ repository able to authorize itself would have no boundary at all.
    `{id}/{relative}` resolves below the directory that holds it. A parent directory, an
    absolute path, a backslash, an empty segment, and a foreign scheme are refused before a
    byte moves.
-8. **Snapshot material is read-only.** It cannot be promoted to editable, renamed, moved,
+8. **The context addresses a document by its logical path.** The OuterDocs layer stores a
+   document under its mount point and resolves that name against the cache root whenever it
+   reads, measures, or prunes the snapshot, so the `<file>` element, the prompt manifest, and
+   the interface name the document by `{id}` and never by `.tauqe/cache/outer_docs/{id}/...`.
+9. **Snapshot material is read-only.** It cannot be promoted to editable, renamed, moved,
    or re-permissioned.
-9. **The cache never joins the change set.** It lives under `.tauqe/`, which every
-   transaction excludes, so no snapshot reaches a commit or a verification run.
-10. **Materialization happens inside the bounded turn.** The transfer races the turn's
+10. **The cache never joins the change set.** It lives under `.tauqe/`, which every
+    transaction excludes, so no snapshot reaches a commit or a verification run.
+11. **Materialization happens inside the bounded turn.** The transfer races the turn's
     cancellation signal and reports a compact reason instead of panicking.
-11. **The OuterDocs layer is context, not transcript.** History compaction never touches it,
+12. **The OuterDocs layer is context, not transcript.** History compaction never touches it,
     and it is released together with the Auto layer on the commit of a turn's change set and
     at the boundary of an isolated step, so a snapshot outlives neither the change set it
     served nor the step that requested it.
-12. **Pricing is shared.** A document costs its content plus the wrapper its own `<file>`
+13. **Pricing is shared.** A document costs its content plus the wrapper its own `<file>`
     element renders, under the single `[context].token_budget` ceiling; the layer has no
     ceiling of its own and evicts nothing.
-13. **A defect invalidates the declaration.** Configuration validation refuses a
+14. **A defect invalidates the declaration.** Configuration validation refuses a
     declaration carrying an unusable entry, a duplicate `id`, or a blank title, and
     reports the reason, so a turn never starts against a declaration the harness could
     not mount.
-14. **Public material needs no entry.** A declared `http(s)` source that resolves to a public
+15. **Public material needs no entry.** A declared `http(s)` source that resolves to a public
     Internet address is fetched without a workspace entry, because published material is
     public. A repository therefore never has to be authorized to quote the public Internet.
-15. **The trust declaration guards the host.** A local source is read without an entry while
+16. **The trust declaration guards the host.** A local source is read without an entry while
     it lies inside the repository, which is the project's own material, and only from a
     directory the workspace declaration lists in `local_roots` once it does not. A remote
     source may reach a loopback, private, link-local, or otherwise non-public address only
     when the entry sets `allow_private_network`. A workspace without an entry reads no host
     material at all.
-16. **A transfer is guarded before the body.** A declared `Content-Length` above the snapshot
+17. **A transfer is guarded before the body.** A declared `Content-Length` above the snapshot
     ceiling abandons the transfer before a body byte is buffered, and a non-textual
     `Content-Type` refuses the response on its headers. A body of unknown length is bounded
     by the bytes accumulated while it is read.
-17. **Only text enters the cache.** Every snapshot is validated as UTF-8 before it is
+18. **Only text enters the cache.** Every snapshot is validated as UTF-8 before it is
     written, on the local and the remote contour alike, so a document the model could never
     read never becomes a cache file.
 
@@ -144,11 +148,15 @@ repository able to authorize itself would have no boundary at all.
   the relative path a link names.
 - **Base Prefix Jail** — the addressing rule that every request names the root document or a
   clean relative path below it, and nothing else.
-- **Cache path** — the repository-relative path of a snapshot:
-  `.tauqe/cache/outer_docs/<id>/<file name>`.
+- **Logical path** — the name a document is addressed by everywhere outside the cache: `{id}`
+  for the root document and `{id}/{relative}` for a document below it. It is what the
+  OuterDocs layer stores, what a `<file>` element renders, and what the interface lists.
+- **Cache path** — the repository-relative path the bytes of a snapshot occupy:
+  `.tauqe/cache/outer_docs/<id>/<file name>`. It is a detail of the storage substrate and
+  never reaches the context layer, the prompt, or the interface.
 - **OuterDocs layer** — the part of the transient context that holds materialized snapshots
-  read-only. The transient context is the Auto layer and this layer together: the material
-  provided so the model can decide, released together once it has.
+  read-only under their logical paths. The transient context is the Auto layer and this layer
+  together: the material provided so the model can decide, released together once it has.
 - **Trust declaration** — the developer's `refs-trust.toml`, written outside the
   repository.
 - **Trust refusal** — a typed decision of that declaration, addressed to the developer.
@@ -235,9 +243,10 @@ snapshot.
 
 1. A declared document stays invisible until a round requests it. Reading the declaration
    materializes nothing.
-2. A requested document arrives at its cache path, `read_only`, and stays in the OuterDocs
-   layer for every later round of the same task. It leaves together with the Auto layer once
-   the turn's change set is committed or the isolated step ends.
+2. A requested document arrives under its logical path, `read_only`, and stays in the
+   OuterDocs layer for every later round of the same task. The snapshot behind it lives at the
+   cache path, which the layer resolves on every read. The document leaves together with the
+   Auto layer once the turn's change set is committed or the isolated step ends.
 3. A request for write access is coerced to `read_only`: the layer never promotes a
    snapshot to editable, because material quoted from outside the repository must not be
    rewritten by the turn that reasons about it.
@@ -248,8 +257,10 @@ materialized copy is cached stays an implementation detail of the harness. A req
 answers the document below it. Not one cache path appears in that answer: a root that
 carries `- [Architecture](architecture.md)` is answered with its own text, and the model
 asks for `mylib/architecture.md` next. A context request naming a path under
-`.tauqe/cache/outer_docs/` reaches the same snapshots directly, which keeps a round that
-already knows a cache path able to ask for it.
+`.tauqe/cache/outer_docs/` is accepted too, because a round that already holds a cache path
+must not be forced to re-derive the mount point; the layer reduces that spelling to the
+logical path, so the document still enters the context as `mylib/architecture.md` and the
+cache directory never appears in a rendered element.
 
 The declaration is nevertheless published. The system prompt carries a compact catalog of
 the declared documents — one line per entry, naming its `id`, its `title`, and its
@@ -275,13 +286,6 @@ allow_private_network = false
 - `root` is the absolute path of the repository the entry authorizes. A repository without
   a matching entry reaches no host material, which is the default: its declared public
   addresses are still fetched and its own files are still read.
-- `local_roots` lists the absolute directories a declared local source may be read from.
-  The comparison runs over canonical paths, so a symlink inside a root cannot carry the
-  read outside it.
-- `allow_private_network` lets a declared remote source address a loopback, private,
-  link-local, or otherwise non-public network. It defaults to `false`, because a host
-  reachable only from inside a network is exactly what a repository nobody reviewed would
-  address.
 - `local_roots` lists the absolute directories a declared local source may be read from.
   The comparison runs over canonical paths, so a symlink inside a root cannot carry the
   read outside it.
@@ -359,10 +363,10 @@ resolves the declaration before it resolves repository facts:
 1. The round collects its context requests and the outer-document requests that name a mount
    point of the declaration.
 2. An outer-document request materializes the document it names: `{id}` materializes the root
-   document, and `{id}/{relative}` materializes the document below it. The resulting cache
-   path joins the round as one read-only context request.
-3. A context request naming a path under `.tauqe/cache/outer_docs/` is reduced to the entry it
-   addresses and materialized in the same way.
+   document, and `{id}/{relative}` materializes the document below it. The snapshot joins the
+   round as one read-only context entry under the logical path the request named.
+3. A context request naming a path under `.tauqe/cache/outer_docs/` is reduced to the logical
+   path it addresses and materialized in the same way.
 4. A path the declaration does not address stays an ordinary request and is reported
    missing unless the snapshot already exists, exactly as any absent file is.
 5. A refusal is recorded with its audience: a trust decision becomes a typed entry of the
@@ -443,6 +447,10 @@ The document then enters the dedicated OuterDocs layer:
 
 - the file must exist, and its cost is estimated from its size like any other context
   entry: its content plus the wrapper its own `<file>` element renders;
+- the layer stores the logical path of the document and resolves it against the cache root
+  whenever it reads, measures, or prunes the snapshot, so the `<file>` element, the prompt
+  manifest, and the interface carry `mylib/architecture.md` while the
+  `.tauqe/cache/outer_docs/` directory stays inside the storage substrate;
 - it competes with the repository files for the single `[context].token_budget` ceiling
   (300,000 tokens by default). A request that would breach that ceiling is refused whole,
   naming every path it asked for, and the snapshot stays in the cache for a later round;
@@ -547,6 +555,11 @@ so refreshing is an explicit act rather than a background policy.
 - **It is not a document store.** The declaration carries an address and the cache holds
   copies; neither is versioned. Content that must live in the repository belongs in the
   repository.
+- **It is not a cache path in the prompt.** The OuterDocs layer, the `<file>` element, the
+  prompt manifest, and the interface address a document by its mount point. The
+  `.tauqe/cache/outer_docs/` prefix belongs to the storage substrate, which resolves it
+  internally, and a request that names it is reduced to the logical path before the document
+  enters the context.
 - **It is not an index parser.** The root document is answered as text. The harness never
   reads a `SUMMARY.md`, an `index.md`, or an `llms.txt` to reconstruct a table of contents,
   and a document is requested one link at a time.

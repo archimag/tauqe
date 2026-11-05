@@ -46,8 +46,8 @@ pub fn merge_subplan(
         Vec::new(),
         combined,
     );
-    wrapper.normalize_leaf_files();
-    wrapper.refresh_parent_statuses();
+    wrapper.implementation.normalize_leaf_files();
+    wrapper.implementation.refresh_parent_statuses();
     validate_synthesized_horizon(&wrapper)?;
 
     Ok(wrapper.implementation.items)
@@ -77,7 +77,7 @@ fn validate_synthesized_horizon(plan: &Plan) -> Result<()> {
         }
     }
 
-    match plan.evaluate_scope(None) {
+    match plan.implementation.evaluate_scope(None) {
         PlanScopeEvaluation::BlockedByDependencies(blocked)
         | PlanScopeEvaluation::BlockedByBlockers(blocked) => {
             anyhow::bail!(
@@ -161,13 +161,13 @@ impl PlanStorage {
             None => anyhow::bail!("Plan '{}' not found", plan_id),
         };
 
-        plan.items = merge_subplan(&plan.items, new_horizon_items)?;
+        plan.implementation.items = merge_subplan(&plan.implementation.items, new_horizon_items)?;
         // Planning is the "What" role's output, so the persisted plan records
         // which Architect configuration produced this horizon.
-        plan.architect = Some(architect);
+        plan.implementation.architect = Some(architect);
         // The reprojected step is persisted with the horizon, so the next wave
         // reads from disk whether this step already failed a replanning round.
-        plan.last_replanned_step = last_replanned_step;
+        plan.implementation.last_replanned_step = last_replanned_step;
         plan.updated_at = SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)
             .unwrap_or_default()
@@ -208,12 +208,12 @@ impl PlanStorage {
             None => return Ok(None),
         };
 
-        plan.items.clear();
+        plan.implementation.items.clear();
         // The cleared horizon leaves no synthesized decomposition behind, so the
         // Architect configuration recorded for it is dropped with it, and no
         // step remains recorded as reprojected.
-        plan.architect = None;
-        plan.last_replanned_step = None;
+        plan.implementation.architect = None;
+        plan.implementation.last_replanned_step = None;
         plan.updated_at = SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)
             .unwrap_or_default()
@@ -566,24 +566,30 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(updated.items.len(), 3);
-        assert_eq!(updated.items[0].id, "1");
-        assert_eq!(updated.items[0].status, PlanItemStatus::Done);
-        assert_eq!(updated.items[1].id, "3");
-        assert_eq!(updated.items[2].id, "4");
+        assert_eq!(updated.implementation.items.len(), 3);
+        assert_eq!(updated.implementation.items[0].id, "1");
+        assert_eq!(updated.implementation.items[0].status, PlanItemStatus::Done);
+        assert_eq!(updated.implementation.items[1].id, "3");
+        assert_eq!(updated.implementation.items[2].id, "4");
         // The superseded non-Done step is replaced by the synthesized horizon.
-        assert!(updated.find_item("2").is_none());
+        assert!(updated.implementation.find_item("2").is_none());
         // The Architect configuration that produced the horizon is recorded on
         // the stored plan, so a later wave can reproduce or escalate it.
-        assert_eq!(updated.architect, Some(architect));
+        assert_eq!(updated.implementation.architect, Some(architect));
         // The reprojected step is recorded with the horizon...
-        assert_eq!(updated.last_replanned_step.as_deref(), Some("2"));
+        assert_eq!(
+            updated.implementation.last_replanned_step.as_deref(),
+            Some("2")
+        );
         // ...and survives a reload, so the next wave derives escalation from
         // disk state instead of in-memory supervisor state.
         let reloaded = PlanStorage::load_plan(root, "horizon-plan")
             .unwrap()
             .unwrap();
-        assert_eq!(reloaded.last_replanned_step.as_deref(), Some("2"));
+        assert_eq!(
+            reloaded.implementation.last_replanned_step.as_deref(),
+            Some("2")
+        );
     }
 
     #[test]
@@ -618,11 +624,11 @@ mod tests {
             None,
         )
         .unwrap();
-        assert_eq!(updated.items.len(), 1);
-        assert_eq!(updated.items[0].id, "1");
-        assert_eq!(updated.items[0].status, PlanItemStatus::Todo);
+        assert_eq!(updated.implementation.items.len(), 1);
+        assert_eq!(updated.implementation.items[0].id, "1");
+        assert_eq!(updated.implementation.items[0].status, PlanItemStatus::Todo);
         // An initial synthesis reprojects no blocked step.
-        assert!(updated.last_replanned_step.is_none());
+        assert!(updated.implementation.last_replanned_step.is_none());
     }
 
     #[test]
@@ -672,12 +678,12 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(updated.items.len(), 2);
+        assert_eq!(updated.implementation.items.len(), 2);
         // The completed step is preserved verbatim; the colliding horizon item is dropped.
-        assert_eq!(updated.items[0].id, "1");
-        assert_eq!(updated.items[0].status, PlanItemStatus::Done);
-        assert_eq!(updated.items[0].title, "Completed");
-        assert_eq!(updated.items[1].id, "2");
+        assert_eq!(updated.implementation.items[0].id, "1");
+        assert_eq!(updated.implementation.items[0].status, PlanItemStatus::Done);
+        assert_eq!(updated.implementation.items[0].title, "Completed");
+        assert_eq!(updated.implementation.items[1].id, "2");
     }
 
     #[test]
@@ -734,11 +740,11 @@ mod tests {
         .unwrap();
 
         // The completed leaf is hoisted out of the discarded container scaffold.
-        assert_eq!(updated.items.len(), 2);
-        assert_eq!(updated.items[0].id, "1.1");
-        assert_eq!(updated.items[0].status, PlanItemStatus::Done);
-        assert_eq!(updated.items[1].id, "2");
-        assert!(updated.find_item("1.2").is_none());
+        assert_eq!(updated.implementation.items.len(), 2);
+        assert_eq!(updated.implementation.items[0].id, "1.1");
+        assert_eq!(updated.implementation.items[0].status, PlanItemStatus::Done);
+        assert_eq!(updated.implementation.items[1].id, "2");
+        assert!(updated.implementation.find_item("1.2").is_none());
     }
 
     #[test]
@@ -788,9 +794,9 @@ mod tests {
 
         // The rejected synthesis never touches the stored plan.
         let stored = PlanStorage::load_plan(root, "cycle-plan").unwrap().unwrap();
-        assert!(stored.items.is_empty());
-        assert!(stored.architect.is_none());
-        assert!(stored.last_replanned_step.is_none());
+        assert!(stored.implementation.items.is_empty());
+        assert!(stored.implementation.architect.is_none());
+        assert!(stored.implementation.last_replanned_step.is_none());
     }
 
     #[test]
@@ -846,10 +852,10 @@ mod tests {
         let stored = PlanStorage::load_plan(root, "dangling-plan")
             .unwrap()
             .unwrap();
-        assert_eq!(stored.items.len(), 1);
-        assert_eq!(stored.items[0].id, "1");
-        assert!(stored.architect.is_none());
-        assert!(stored.last_replanned_step.is_none());
+        assert_eq!(stored.implementation.items.len(), 1);
+        assert_eq!(stored.implementation.items[0].id, "1");
+        assert!(stored.implementation.architect.is_none());
+        assert!(stored.implementation.last_replanned_step.is_none());
     }
 
     #[test]
@@ -904,9 +910,9 @@ mod tests {
 
         // The dead horizon never reaches disk.
         let stored = PlanStorage::load_plan(root, "dead-plan").unwrap().unwrap();
-        assert!(stored.items.is_empty());
-        assert!(stored.architect.is_none());
-        assert!(stored.last_replanned_step.is_none());
+        assert!(stored.implementation.items.is_empty());
+        assert!(stored.implementation.architect.is_none());
+        assert!(stored.implementation.last_replanned_step.is_none());
     }
 
     #[test]
@@ -948,8 +954,8 @@ mod tests {
                 ..Default::default()
             }],
         );
-        plan.architect = Some(test_architect());
-        plan.last_replanned_step = Some("1".to_string());
+        plan.implementation.architect = Some(test_architect());
+        plan.implementation.last_replanned_step = Some("1".to_string());
         PlanStorage::save_plan(root, &plan).unwrap();
 
         let cleared = PlanStorage::clear_horizon(root, "clear-plan")
@@ -960,19 +966,18 @@ mod tests {
         assert_eq!(cleared.id, "clear-plan");
         assert_eq!(cleared.concept.len(), 1);
         assert_eq!(cleared.concept[0].id, "c-1");
-        assert!(cleared.items.is_empty());
+        assert!(cleared.implementation.items.is_empty());
         // The synthesized decomposition is gone, so its Architect provenance is
         // gone with it.
-        assert!(cleared.architect.is_none());
-        assert!(cleared.last_replanned_step.is_none());
+        assert!(cleared.implementation.architect.is_none());
+        assert!(cleared.implementation.last_replanned_step.is_none());
         assert!(cleared.updated_at >= 10);
 
         // The persisted plan is the cleared one, not the previous state.
         let stored = PlanStorage::load_plan(root, "clear-plan").unwrap().unwrap();
-        assert!(stored.items.is_empty());
-        assert_eq!(stored.concept.len(), 1);
-        assert!(stored.architect.is_none());
-        assert!(stored.last_replanned_step.is_none());
+        assert!(stored.implementation.items.is_empty());
+        assert!(stored.implementation.architect.is_none());
+        assert!(stored.implementation.last_replanned_step.is_none());
     }
 
     #[test]
@@ -998,7 +1003,7 @@ mod tests {
 
         // Saving the same plan without its completed step is rejected...
         let mut truncated = plan.clone();
-        truncated.items = Vec::new();
+        truncated.implementation.items = Vec::new();
         assert!(
             PlanStorage::save_plan(root, &truncated).is_err(),
             "a plain save must not discard a completed step"
@@ -1008,10 +1013,11 @@ mod tests {
         let cleared = PlanStorage::clear_horizon(root, "clear-done-plan")
             .unwrap()
             .unwrap();
-        assert!(cleared.items.is_empty());
+        assert!(cleared.implementation.items.is_empty());
         assert!(PlanStorage::load_plan(root, "clear-done-plan")
             .unwrap()
             .unwrap()
+            .implementation
             .items
             .is_empty());
     }

@@ -105,7 +105,7 @@ pub async fn handle_theme_selector_click(
     row: u16,
     term: Rect,
 ) -> bool {
-    let Some(mut selector_state) = st.theme_selector.take() else {
+    let Some(mut selector_state) = st.modals.theme_selector.take() else {
         return false;
     };
 
@@ -145,7 +145,7 @@ pub async fn handle_theme_selector_click(
         }
     }
 
-    st.theme_selector = Some(selector_state);
+    st.modals.theme_selector = Some(selector_state);
     true
 }
 
@@ -279,7 +279,7 @@ pub async fn handle_theme_selector_key(
     mut st: MutexGuard<'_, AppState>,
     visible_height: usize,
 ) -> bool {
-    let Some(mut selector_state) = st.theme_selector.take() else {
+    let Some(mut selector_state) = st.modals.theme_selector.take() else {
         return false;
     };
 
@@ -289,7 +289,7 @@ pub async fn handle_theme_selector_key(
     {
         let preset = selector_state.selected_preset();
         st.apply_theme_preset(preset);
-        st.theme_selector = Some(selector_state);
+        st.modals.theme_selector = Some(selector_state);
         return true;
     }
 
@@ -303,7 +303,7 @@ pub async fn handle_theme_selector_key(
             commit_preset(state, st, preset).await;
         }
         _ => {
-            st.theme_selector = Some(selector_state);
+            st.modals.theme_selector = Some(selector_state);
         }
     }
     true
@@ -350,7 +350,7 @@ mod tests {
             let st = state.lock().await;
             assert_eq!(st.active_theme_preset, ThemePreset::TauqeLight);
             assert!(
-                st.theme_selector.is_some(),
+                st.modals.theme_selector.is_some(),
                 "the dialog stays open while previewing"
             );
         }
@@ -359,7 +359,7 @@ mod tests {
         let st = state.lock().await;
         assert_eq!(st.active_theme_preset, ThemePreset::TauqeDark);
         assert!(
-            st.theme_selector.is_none(),
+            st.modals.theme_selector.is_none(),
             "cancellation closes the dialog"
         );
     }
@@ -373,7 +373,7 @@ mod tests {
 
         press(&state, KeyCode::Char('x'), 5).await;
         let st = state.lock().await;
-        assert!(st.theme_selector.is_some());
+        assert!(st.modals.theme_selector.is_some());
         assert_eq!(st.active_theme_preset, before);
     }
 
@@ -426,7 +426,7 @@ mod tests {
         // already-highlighted one, which would commit instead of selecting.
         st.active_theme_preset = ThemePreset::TauqeDark;
         st.open_theme_selector();
-        let selector_state = st.theme_selector.clone().expect("selector opens");
+        let selector_state = st.modals.theme_selector.clone().expect("selector opens");
 
         let mut terminal = Terminal::new(TestBackend::new(term.width, term.height)).unwrap();
         terminal
@@ -452,6 +452,7 @@ mod tests {
         let selected = state
             .lock()
             .await
+            .modals
             .theme_selector
             .as_ref()
             .expect("selection keeps the dialog open")

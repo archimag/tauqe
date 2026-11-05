@@ -171,18 +171,18 @@ pub(super) fn handle_diff_inspector_key(key: KeyEvent, st: &mut AppState) {
     if command == InspectorCommand::Close {
         // The imported change set of a plan commit belongs to this audit, so the
         // next open starts from the live staged set unless it imports its own.
-        st.diff_audit = None;
-        st.diff_inspector = None;
+        st.modals.diff_audit = None;
+        st.modals.diff_inspector = None;
         return;
     }
 
     // The audited set is either the imported commit audit or the live staged set,
     // so its length is read from the active source before the inspector is borrowed (c-3).
-    let file_count = match &st.diff_audit {
+    let file_count = match &st.modals.diff_audit {
         Some(audit) => audit.files.len(),
         None => st.model.files.len(),
     };
-    let Some(inspector) = st.diff_inspector.as_mut() else {
+    let Some(inspector) = st.modals.diff_inspector.as_mut() else {
         return;
     };
 
@@ -258,7 +258,7 @@ mod tests {
         st.model.files = vec![file("crates/tui/src/a.rs"), file("crates/tui/src/b.rs")];
         st.model.selected_file_index = 1;
         st.model.scroll = 7;
-        st.diff_inspector = Some(DiffInspectorState {
+        st.modals.diff_inspector = Some(DiffInspectorState {
             selected_file: st.model.selected_file_index,
             diff_scroll: 0,
             focus: DiffInspectorFocus::Files,
@@ -274,6 +274,18 @@ mod tests {
         handle_diff_inspector_key(KeyEvent::new(code, KeyModifiers::SHIFT), st);
     }
 
+    /// Reading position of the inspector the dialog dispatch left open.
+    ///
+    /// The audit owns no captured payload: it reads the live staged set the REPL
+    /// view renders, so a test asks the shared modal state for the position the
+    /// dispatch left there (c-3).
+    fn open_inspector(st: &AppState) -> &DiffInspectorState {
+        st.modals
+            .diff_inspector
+            .as_ref()
+            .expect("the dialog stays open")
+    }
+
     #[test]
     fn n_and_p_walk_the_audited_files_and_reset_the_scroll() {
         let mut st = state_with_inspector();
@@ -281,13 +293,13 @@ mod tests {
         press(&mut st, KeyCode::Down);
 
         press(&mut st, KeyCode::Char('p'));
-        let inspector = st.diff_inspector.as_ref().expect("the dialog stays open");
+        let inspector = open_inspector(&st);
         assert_eq!(inspector.selected_file, 0);
         assert_eq!(inspector.diff_scroll, 0);
 
         press(&mut st, KeyCode::Char('n'));
         press(&mut st, KeyCode::Char('n'));
-        let inspector = st.diff_inspector.as_ref().expect("the dialog stays open");
+        let inspector = open_inspector(&st);
         assert_eq!(inspector.selected_file, 1);
         assert_eq!(inspector.diff_scroll, 0, "the last file caps the walk");
     }
@@ -299,13 +311,13 @@ mod tests {
     fn file_walk_reads_the_live_staged_set() {
         let mut st = state_with_inspector();
         st.model.files.truncate(1);
-        if let Some(inspector) = st.diff_inspector.as_mut() {
+        if let Some(inspector) = st.modals.diff_inspector.as_mut() {
             inspector.selected_file = 1;
         }
 
         press(&mut st, KeyCode::Char('n'));
 
-        let inspector = st.diff_inspector.as_ref().expect("the dialog stays open");
+        let inspector = open_inspector(&st);
         assert_eq!(inspector.selected_file, 0);
         assert_eq!(inspector.diff_scroll, 0);
         assert_eq!(
@@ -321,29 +333,20 @@ mod tests {
     fn tab_switches_the_active_pane() {
         let mut st = state_with_inspector();
         assert_eq!(
-            st.diff_inspector.as_ref().map(|dialog| dialog.focus),
-            Some(DiffInspectorFocus::Files),
+            open_inspector(&st).focus,
+            DiffInspectorFocus::Files,
             "the file list owns the keyboard when the audit opens"
         );
 
         press(&mut st, KeyCode::Tab);
-        assert_eq!(
-            st.diff_inspector.as_ref().map(|dialog| dialog.focus),
-            Some(DiffInspectorFocus::Diff)
-        );
+        assert_eq!(open_inspector(&st).focus, DiffInspectorFocus::Diff);
 
         press_shifted(&mut st, KeyCode::Tab);
-        assert_eq!(
-            st.diff_inspector.as_ref().map(|dialog| dialog.focus),
-            Some(DiffInspectorFocus::Files)
-        );
+        assert_eq!(open_inspector(&st).focus, DiffInspectorFocus::Files);
 
         // A terminal reporting the dedicated `BackTab` code reaches the same pane.
         press_shifted(&mut st, KeyCode::BackTab);
-        assert_eq!(
-            st.diff_inspector.as_ref().map(|dialog| dialog.focus),
-            Some(DiffInspectorFocus::Diff)
-        );
+        assert_eq!(open_inspector(&st).focus, DiffInspectorFocus::Diff);
     }
 
     /// The vertical motion follows the focused pane: the list walks its highlight
@@ -356,31 +359,20 @@ mod tests {
 
         press(&mut st, KeyCode::Down);
         press(&mut st, KeyCode::Char('j'));
+        assert_eq!(open_inspector(&st).diff_scroll, 2);
         assert_eq!(
-            st.diff_inspector.as_ref().map(|dialog| dialog.diff_scroll),
-            Some(2)
-        );
-        assert_eq!(
-            st.diff_inspector
-                .as_ref()
-                .map(|dialog| dialog.selected_file),
-            Some(1),
+            open_inspector(&st).selected_file,
+            1,
             "scrolling the patch never moves the highlight behind it"
         );
 
         press(&mut st, KeyCode::PageDown);
-        assert_eq!(
-            st.diff_inspector.as_ref().map(|dialog| dialog.diff_scroll),
-            Some(2 + INSPECTOR_PAGE_STEP)
-        );
+        assert_eq!(open_inspector(&st).diff_scroll, 2 + INSPECTOR_PAGE_STEP);
 
         press(&mut st, KeyCode::PageUp);
         press(&mut st, KeyCode::Up);
         press(&mut st, KeyCode::Char('k'));
-        assert_eq!(
-            st.diff_inspector.as_ref().map(|dialog| dialog.diff_scroll),
-            Some(0)
-        );
+        assert_eq!(open_inspector(&st).diff_scroll, 0);
     }
 
     /// The bracket chords switch files from either pane, so reading a change set
@@ -390,25 +382,15 @@ mod tests {
         let mut st = state_with_inspector();
 
         press(&mut st, KeyCode::Char('['));
-        assert_eq!(
-            st.diff_inspector
-                .as_ref()
-                .map(|dialog| dialog.selected_file),
-            Some(0)
-        );
+        assert_eq!(open_inspector(&st).selected_file, 0);
         press(&mut st, KeyCode::Char(']'));
-        assert_eq!(
-            st.diff_inspector
-                .as_ref()
-                .map(|dialog| dialog.selected_file),
-            Some(1)
-        );
+        assert_eq!(open_inspector(&st).selected_file, 1);
 
         // The patch keeps the keyboard, and the file chords keep working.
         press(&mut st, KeyCode::Tab);
         press(&mut st, KeyCode::Down);
         press(&mut st, KeyCode::Char('['));
-        let inspector = st.diff_inspector.as_ref().expect("the dialog stays open");
+        let inspector = open_inspector(&st);
         assert_eq!(inspector.selected_file, 0);
         assert_eq!(
             inspector.diff_scroll, 0,
@@ -423,7 +405,7 @@ mod tests {
             let mut st = state_with_inspector();
             press(&mut st, close);
 
-            assert!(st.diff_inspector.is_none());
+            assert!(st.modals.diff_inspector.is_none());
             assert_eq!(st.model.scroll, 7, "the reading position is preserved");
             assert_eq!(st.model.selected_file_index, 1);
         }
@@ -433,7 +415,7 @@ mod tests {
     fn file_walk_navigates_commit_audit_when_staged_set_is_empty() {
         let mut st = crate::app::test_state();
         assert!(st.model.files.is_empty());
-        st.diff_audit = Some(crate::app::CommitAudit {
+        st.modals.diff_audit = Some(crate::app::CommitAudit {
             files: vec![
                 file("crates/tui/src/a.rs"),
                 file("crates/tui/src/b.rs"),
@@ -441,26 +423,26 @@ mod tests {
             ],
             cache: crate::views::repl::DiffRenderCache::default(),
         });
-        st.diff_inspector = Some(DiffInspectorState {
+        st.modals.diff_inspector = Some(DiffInspectorState {
             selected_file: 0,
             diff_scroll: 0,
             focus: DiffInspectorFocus::Files,
         });
 
         press(&mut st, KeyCode::Char('n'));
-        let inspector = st.diff_inspector.as_ref().expect("the dialog stays open");
+        let inspector = open_inspector(&st);
         assert_eq!(inspector.selected_file, 1);
 
         press(&mut st, KeyCode::Char('n'));
-        let inspector = st.diff_inspector.as_ref().expect("the dialog stays open");
+        let inspector = open_inspector(&st);
         assert_eq!(inspector.selected_file, 2);
 
         press(&mut st, KeyCode::Char('n'));
-        let inspector = st.diff_inspector.as_ref().expect("the dialog stays open");
+        let inspector = open_inspector(&st);
         assert_eq!(inspector.selected_file, 2, "capped at last file");
 
         press(&mut st, KeyCode::Char('p'));
-        let inspector = st.diff_inspector.as_ref().expect("the dialog stays open");
+        let inspector = open_inspector(&st);
         assert_eq!(inspector.selected_file, 1);
     }
 }

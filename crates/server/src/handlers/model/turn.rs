@@ -23,6 +23,7 @@ use tauqe_protocol::{
     ModelEscalatedEvent, ModelResultEvent, ModelRole, ModelStartedEvent, ReasoningEffort,
     ResponseError, ReviewItem, ReviewSession, ReviewUpdatedEvent, TurnIntent,
 };
+use tokio::sync::watch;
 
 use crate::handlers::common::withdraw_streamed_attempt;
 use crate::handlers::offload;
@@ -150,22 +151,69 @@ fn build_configured_provider(
 /// Grace period granted to a workflow task to unwind cooperatively after a
 /// cancellation or stream error before a supervisor force-aborts it.
 pub(crate) const CANCEL_UNWIND_GRACE: std::time::Duration = std::time::Duration::from_secs(30);
+// Turn-scoped override of [`CANCEL_UNWIND_GRACE`].
+//
+// The last-resort path of a turn is bounded by two consecutive expiries of the
+// grace period, so exercising it would otherwise cost the production grace
+// twice. The override is scoped to the task tree that installed it, so a
+// concurrently running test keeps observing the production grace.
+#[cfg(test)]
+tokio::task_local! {
+    static UNWIND_GRACE_OVERRIDE: std::time::Duration;
+}
 
-/// Builds the apply policy for a turn, wiring the shared git-transaction guard
-/// into the Git-backed policy so a supervisor never force-aborts a workflow
-/// task while a transaction is open.
+/// Resolves the unwind grace currently in force for this turn.
+#[cfg(test)]
+fn unwind_grace() -> std::time::Duration {
+    UNWIND_GRACE_OVERRIDE
+        .try_with(|value| *value)
+        .unwrap_or(CANCEL_UNWIND_GRACE)
+}
+
+/// Resolves the unwind grace currently in force for this turn.
+///
+/// Production always waits out [`CANCEL_UNWIND_GRACE`]; only a test may scope a
+/// shorter value to the task tree that drives the turn.
+#[cfg(not(test))]
+fn unwind_grace() -> std::time::Duration {
+    CANCEL_UNWIND_GRACE
+}
+
+/// Runs `work` under a turn-scoped override of the unwind grace.
+///
+/// The seam mirrors `AppState::marker_override`: production always waits out
+/// [`CANCEL_UNWIND_GRACE`], while a deterministic test drives the last-resort
+/// path without waiting it out.
+#[cfg(test)]
+pub(crate) async fn with_unwind_grace<F>(grace: std::time::Duration, work: F) -> F::Output
+where
+    F: std::future::Future,
+{
+    UNWIND_GRACE_OVERRIDE.scope(grace, work).await
+}
+
+/// Builds the apply policy for a turn, wiring the shared git-transaction guard and
+/// the turn's cancellation signal into the Git-backed policy.
+///
+/// The guard keeps a supervisor from force-aborting a workflow task while a
+/// transaction is open, and the signal lets the checkpoint capture and the step
+/// commit release a repository hook that holds the commit. Finalization and
+/// rollback stay cancel-blind, so the transaction settles under its wall-clock
+/// budget and the supervisor's deferred abort has a deterministic end.
 pub(crate) fn build_apply_policy(
     state: &Arc<AppState>,
     workflow: tauqe_protocol::WorkflowKind,
+    cancel: watch::Receiver<bool>,
 ) -> Box<dyn tauqe_core::workflow::policy::ApplyPolicy> {
     match workflow {
         tauqe_protocol::WorkflowKind::Naive => {
             Box::new(tauqe_core::workflow::policy::DirectApplyPolicy::new())
         }
         tauqe_protocol::WorkflowKind::Git => Box::new(
-            tauqe_core::workflow::git_policy::GitTransactionPolicy::with_guard(Arc::clone(
-                &state.git_transaction_active,
-            )),
+            tauqe_core::workflow::git_policy::GitTransactionPolicy::with_guard_and_cancel(
+                Arc::clone(&state.git_transaction_active),
+                cancel,
+            ),
         ),
     }
 }
@@ -419,7 +467,9 @@ async fn run_prepared_turn(
         phase_out,
     } = prepared;
 
-    let cancel_rx = operation.cancel_receiver();
+    // The relay paces itself against the outbound queue, and that wait ends
+    // with the operation, so it holds the very signal that interrupts the turn.
+    let mut cancel_rx = operation.cancel_receiver();
 
     let (tx, mut rx) = tokio::sync::mpsc::channel::<StreamEvent>(100);
     let protocol = resolve_turn_protocol(intent, app_config.repl.protocol, marker.as_deref());
@@ -524,6 +574,11 @@ async fn run_prepared_turn(
     while let Some(event) = rx.recv().await {
         match event {
             StreamEvent::ReasoningDelta(delta) => {
+                // Reasoning arrives at token granularity, so the relay paces
+                // itself against the outbound queue: a client that stopped
+                // reading pauses the stream here instead of growing daemon
+                // memory for the rest of the turn.
+                state.out.wait_for_headroom(&mut cancel_rx).await;
                 state.out.send_event(&Event {
                     method: events::MODEL_REASONING_DELTA.to_string(),
                     params: Some(serde_json::json!({
@@ -533,6 +588,9 @@ async fn run_prepared_turn(
                 });
             }
             StreamEvent::TextDelta(delta) => {
+                // The answer passes through the same gate as reasoning, so the
+                // accumulated answer and the client copy pause together.
+                state.out.wait_for_headroom(&mut cancel_rx).await;
                 raw_streamed_text.push_str(&delta);
                 state.out.send_event(&Event {
                     method: events::MODEL_TEXT_DELTA.to_string(),
@@ -783,7 +841,7 @@ async fn run_prepared_turn(
         // the cancel signal and unwinds its own transaction. The handle is
         // polled by reference, so the grace wait never consumes the join result
         // and the task stays owned while this turn decides what happens next.
-        let unwind = tokio::time::timeout(CANCEL_UNWIND_GRACE, &mut wf_task).await;
+        let unwind = tokio::time::timeout(unwind_grace(), &mut wf_task).await;
         let mut unwound_error = None;
         match unwind {
             Ok(Ok(Err(err))) => {
@@ -816,7 +874,7 @@ async fn run_prepared_turn(
                 if state.git_transaction_active.load(Ordering::SeqCst) {
                     tracing::warn!(
                         operation_id = %op_id,
-                        grace_secs = CANCEL_UNWIND_GRACE.as_secs(),
+                        grace_secs = unwind_grace().as_secs(),
                         "Turn did not unwind within the grace period; deferring abort while a git transaction is open",
                     );
                     // The task and this turn's operation registration move into
@@ -827,16 +885,19 @@ async fn run_prepared_turn(
                 } else {
                     tracing::warn!(
                         operation_id = %op_id,
-                        grace_secs = CANCEL_UNWIND_GRACE.as_secs(),
+                        grace_secs = unwind_grace().as_secs(),
                         "Turn did not unwind within the grace period; aborting workflow task",
                     );
                     wf_task.abort();
-                    // Wait, bounded, for the abort to land: returning while the
-                    // task may still sit between abort landing points would
-                    // release the slot under a live task.
-                    match tokio::time::timeout(CANCEL_UNWIND_GRACE, wf_task).await {
+                    // The handle is polled by reference, exactly as the
+                    // cooperative wait above does, so this branch keeps
+                    // ownership of the task on every outcome: a task that has
+                    // just proven it reaches no abort landing point must never
+                    // be detached while the turn releases its slot.
+                    match tokio::time::timeout(unwind_grace(), &mut wf_task).await {
                         // The turn settled before the abort landed and adopted
-                        // its own history.
+                        // its own history, so the ordinary return releases the
+                        // slot.
                         Ok(Ok(_)) => {}
                         // The abort dropped the turn together with its private
                         // history clone, so the shared manager is rebuilt from
@@ -849,10 +910,20 @@ async fn run_prepared_turn(
                             );
                             resync_history(state).await;
                         }
-                        Err(_) => tracing::warn!(
-                            operation_id = %op_id,
-                            "Aborted turn did not settle within the grace period; its history adoption may never run",
-                        ),
+                        // The task outlived the abort as well, so it is handed
+                        // to the shared watchdog together with this turn's
+                        // registration: releasing the slot here would let a new
+                        // turn register and then park on the session lock the
+                        // zombie still holds, with no registered operation left
+                        // to cancel.
+                        Err(_) => {
+                            tracing::warn!(
+                                operation_id = %op_id,
+                                grace_secs = unwind_grace().as_secs(),
+                                "Aborted turn did not settle within the grace period; deferring the reaping",
+                            );
+                            state.defer_abort_owning_operation(Arc::clone(&operation), wf_task);
+                        }
                     }
                 }
             }
@@ -1340,10 +1411,14 @@ pub async fn start_model_turn(
     )
     .await?;
     let op_id = prepared.op_id.clone();
+    // The policy observes the very signal that interrupts the turn, so a
+    // cancellation reaches the checkpoint capture instead of waiting for a
+    // repository hook to finish.
+    let cancel = prepared.operation.cancel_receiver();
     let state_clone = Arc::clone(state);
     let workflow = prepared.app_config.repl.workflow;
     tokio::spawn(async move {
-        let policy = build_apply_policy(&state_clone, workflow);
+        let policy = build_apply_policy(&state_clone, workflow, cancel);
         let _ = run_prepared_turn(&state_clone, prompt, prepared, policy).await;
     });
     Ok(op_id)

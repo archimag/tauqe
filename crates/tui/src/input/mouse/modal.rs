@@ -69,87 +69,173 @@ fn geometry_of(
 /// Returns `true` when the event was consumed, including the case where a modal
 /// is open but holds no scrollable body: background content must never scroll
 /// underneath an open dialog.
+///
+/// The dispatch reads the canonical modal stack that rendering, keyboard
+/// dispatch, and hit-testing already share, so the surface drawn on top is the
+/// surface that receives the notch, and a surface added to [`ActiveModal`]
+/// cannot silently inherit the wheel behaviour of another one (Conventions §6,
+/// c-1).
 pub fn handle_modal_scroll(st: &mut AppState, mouse: MouseEvent, term_rect: Rect) -> bool {
-    let up = match mouse.kind {
-        MouseEventKind::ScrollUp => true,
-        MouseEventKind::ScrollDown => false,
-        _ => return false,
-    };
+    if !matches!(
+        mouse.kind,
+        MouseEventKind::ScrollUp | MouseEventKind::ScrollDown
+    ) {
+        return false;
+    }
 
-    if let Some(dialog) = st.status_dialog.as_mut() {
-        let count = dialog.target.options_count();
-        let visible = crate::dialogs::render::status_dialog_options_area(term_rect, count)
-            .height
-            .max(1) as usize;
-        if up {
-            dialog.selector.select_prev(visible);
-        } else {
-            dialog.selector.select_next(visible);
+    match st.active_modal() {
+        // The inline Context path input is the one surface outside the modal
+        // stack: it keeps the wheel for itself so the list behind it cannot move
+        // while a path is typed into it (Conventions §5.1).
+        None => st.context_view.adding_file,
+        // A notch is always consumed by the modal that owns the keyboard, even
+        // when its body cannot move, so no background surface scrolls under an
+        // open card (Conventions §6).
+        Some(modal) => {
+            scroll_modal_surface(st, modal, mouse, term_rect);
+            true
         }
-        return true;
     }
+}
 
-    if let Some(dialog) = st.selection_dialog.as_mut() {
-        // The shared selector owns the scroll window, so the wheel moves the
-        // highlight exactly like the keyboard and the role dialogs (c-1).
-        if up {
-            dialog.selector.select_prev();
-        } else {
-            dialog.selector.select_next();
-        }
-        return true;
-    }
-
-    // The breakdown outranks Help, so its wheel handling is consulted first and
-    // the renderer clamps whatever offset it produces (c-4).
-    if let Some(summary) = st.usage_summary.as_mut() {
-        summary.scroll = if up {
-            summary.scroll.saturating_sub(MOUSE_SCROLL_STEP as u16)
-        } else {
-            summary.scroll.saturating_add(MOUSE_SCROLL_STEP as u16)
-        };
-        return true;
-    }
-
-    if st.show_help {
-        st.help_scroll = if up {
-            st.help_scroll.saturating_sub(MOUSE_SCROLL_STEP as u16)
-        } else {
-            st.help_scroll.saturating_add(MOUSE_SCROLL_STEP as u16)
-        };
-        return true;
-    }
-
-    // Allow wheel scrolling in the squash dialog (diff or file list) while it
-    // has not escalated to a confirmation.
-    if let Some(dialog) = st.squash_dialog.as_mut() {
-        if dialog.confirm.is_none() {
-            let (_area, files_rect, _diff_rect) =
-                crate::dialogs::render::squash_dialog_chunks(term_rect);
-            if rect_contains(files_rect, mouse.column, mouse.row) {
-                if up {
-                    if dialog.selected_file_index > 0 {
-                        dialog.selected_file_index -= 1;
-                        dialog.diff_scroll = 0;
-                    }
-                } else if !dialog.files.is_empty()
-                    && dialog.selected_file_index + 1 < dialog.files.len()
-                {
-                    dialog.selected_file_index += 1;
-                    dialog.diff_scroll = 0;
-                }
-            } else {
-                dialog.diff_scroll = if up {
-                    dialog.diff_scroll.saturating_sub(MOUSE_SCROLL_STEP as u16)
+/// Applies one wheel notch to the body of `modal`.
+///
+/// The match is exhaustive and carries no wildcard: every [`ActiveModal`]
+/// variant states what a notch does to it, and the surfaces without a
+/// scrollable body state that the notch moves nothing. A newly declared surface
+/// therefore cannot compile until its wheel behaviour is written down, so the
+/// routing never falls back to a wildcard arm (c-1).
+fn scroll_modal_surface(st: &mut AppState, modal: ActiveModal, mouse: MouseEvent, term_rect: Rect) {
+    let up = matches!(mouse.kind, MouseEventKind::ScrollUp);
+    match modal {
+        ActiveModal::OuterDocsCache => {
+            // The browser mirrors the keyboard: one notch walks the tree by the
+            // shared step, and the highlight is re-anchored afterwards so the
+            // row it landed on stays visible.
+            if let Some(dialog) = st.modals.outer_docs_cache.as_mut() {
+                dialog.move_cursor(if up {
+                    -(MOUSE_SCROLL_STEP as isize)
                 } else {
-                    dialog.diff_scroll.saturating_add(MOUSE_SCROLL_STEP as u16)
+                    MOUSE_SCROLL_STEP as isize
+                });
+                let visible = crate::dialogs::render::outer_docs_cache_visible_rows(term_rect);
+                dialog.scroll_to_cursor(visible);
+            }
+        }
+        ActiveModal::Status => {
+            // The picker scrolls a window of status rows, so one notch pages the
+            // highlight exactly like `PgUp` / `PgDn`.
+            if let Some(dialog) = st.modals.status_dialog.as_mut() {
+                let count = dialog.target.options_count();
+                let visible = crate::dialogs::render::status_dialog_options_area(term_rect, count)
+                    .height
+                    .max(1) as usize;
+                if up {
+                    dialog.selector.select_prev(visible);
+                } else {
+                    dialog.selector.select_next(visible);
+                }
+            }
+        }
+        ActiveModal::Selection => {
+            // The shared model selector owns the scroll window, so the wheel
+            // moves the highlight exactly like the keyboard and the role dialogs
+            // (c-1).
+            if let Some(dialog) = st.modals.selection_dialog.as_mut() {
+                if up {
+                    dialog.selector.select_prev();
+                } else {
+                    dialog.selector.select_next();
+                }
+            }
+        }
+        ActiveModal::UsageSummary => {
+            // The breakdown outranks Help, and the renderer clamps whatever
+            // offset the notch produces (c-4).
+            if let Some(summary) = st.modals.usage_summary.as_mut() {
+                summary.scroll = if up {
+                    summary.scroll.saturating_sub(MOUSE_SCROLL_STEP as u16)
+                } else {
+                    summary.scroll.saturating_add(MOUSE_SCROLL_STEP as u16)
                 };
             }
-            return true;
         }
+        ActiveModal::Help => {
+            st.modals.help_scroll = if up {
+                st.modals
+                    .help_scroll
+                    .saturating_sub(MOUSE_SCROLL_STEP as u16)
+            } else {
+                st.modals
+                    .help_scroll
+                    .saturating_add(MOUSE_SCROLL_STEP as u16)
+            };
+        }
+        ActiveModal::Squash => {
+            // An escalated squash card is a decision, not a scrollable surface.
+            // Otherwise the wheel walks the file list under the pointer and
+            // scrolls the diff beside it.
+            if let Some(dialog) = st.modals.squash_dialog.as_mut() {
+                if dialog.confirm.is_none() {
+                    let (_area, files_rect, _diff_rect) =
+                        crate::dialogs::render::squash_dialog_chunks(term_rect);
+                    if rect_contains(files_rect, mouse.column, mouse.row) {
+                        if up {
+                            if dialog.selected_file_index > 0 {
+                                dialog.selected_file_index -= 1;
+                                dialog.diff_scroll = 0;
+                            }
+                        } else if !dialog.files.is_empty()
+                            && dialog.selected_file_index + 1 < dialog.files.len()
+                        {
+                            dialog.selected_file_index += 1;
+                            dialog.diff_scroll = 0;
+                        }
+                    } else {
+                        dialog.diff_scroll = if up {
+                            dialog.diff_scroll.saturating_sub(MOUSE_SCROLL_STEP as u16)
+                        } else {
+                            dialog.diff_scroll.saturating_add(MOUSE_SCROLL_STEP as u16)
+                        };
+                    }
+                }
+            }
+        }
+        // Every remaining surface owns a body a notch cannot move: the card
+        // states a decision, a summary, or a single-line field, so the notch is
+        // consumed and the view underneath it keeps its reading position
+        // (Conventions §6). `DiffInspector` keeps its reading position to its own
+        // chords, and `OuterDocsCacheRemove` is the pending decision that
+        // outranks the tree it was raised from.
+        ActiveModal::ServerDisconnected
+        | ActiveModal::ReviewTruncation
+        | ActiveModal::Review
+        | ActiveModal::ConfirmCancel
+        | ActiveModal::ConfirmQuit
+        | ActiveModal::BatchCancel
+        | ActiveModal::ClearAuto
+        | ActiveModal::ClearUser
+        | ActiveModal::RemoveContextFile
+        | ActiveModal::OuterDocsCacheRemove
+        | ActiveModal::ConfirmDetachFocus
+        | ActiveModal::ClearHorizonFinal
+        | ActiveModal::ClearHorizon
+        | ActiveModal::DeletePlanFinal
+        | ActiveModal::DeletePlan
+        | ActiveModal::DeleteReview
+        | ActiveModal::ReviewAnalyze
+        | ActiveModal::ExecuteReview
+        | ActiveModal::ExecutePipeline
+        | ActiveModal::ExecuteScope
+        | ActiveModal::CreatePlan
+        | ActiveModal::RefineDialog
+        | ActiveModal::RefineBlocked
+        | ActiveModal::Prompt
+        | ActiveModal::Locale
+        | ActiveModal::ClearHistory
+        | ActiveModal::DiffInspector
+        | ActiveModal::ThemeSelector => {}
     }
-
-    st.has_active_modal()
 }
 
 /// Routes a left click to the modal that currently owns the keyboard and the
@@ -179,7 +265,7 @@ pub async fn handle_modal_click(
             }
         }
         Some(ActiveModal::Squash) => {
-            if let Some(dialog) = st.squash_dialog.as_mut() {
+            if let Some(dialog) = st.modals.squash_dialog.as_mut() {
                 if let Some(kind) = dialog.confirm {
                     // Reuse the exact confirmation parameters the renderer
                     // builds, so mouse hit-testing can never drift from the
@@ -217,7 +303,7 @@ pub async fn handle_modal_click(
                                     .await?;
                                 }
                                 crate::app::SquashConfirm::Discard => {
-                                    st.squash_dialog = None;
+                                    st.modals.squash_dialog = None;
                                 }
                             }
                             return Ok(InputResult::Continue);
@@ -234,7 +320,7 @@ pub async fn handle_modal_click(
                     crate::dialogs::render::squash_dialog_chunks(term_rect);
                 if !rect_contains(area, mouse.column, mouse.row) {
                     if dialog.message_editor.get_text().trim().is_empty() {
-                        st.squash_dialog = None;
+                        st.modals.squash_dialog = None;
                     } else {
                         dialog.confirm = Some(crate::app::SquashConfirm::Discard);
                         dialog.confirm_button = crate::app::ConfirmDialogButton::Cancel;
@@ -262,7 +348,7 @@ pub async fn handle_modal_click(
             }
         }
         Some(ActiveModal::Review) => {
-            if let Some(mut dialog) = st.review_dialog.take() {
+            if let Some(mut dialog) = st.modals.review_dialog.take() {
                 let geo = crate::dialogs::render::review_dialog_geometry(term_rect, &dialog);
 
                 if rect_contains(geo.confirm_button, mouse.column, mouse.row) {
@@ -347,19 +433,19 @@ pub async fn handle_modal_click(
                     dialog.focus = crate::app::ReviewDialogFocus::PromptEditor;
                 }
 
-                st.review_dialog = Some(dialog);
+                st.modals.review_dialog = Some(dialog);
             }
         }
         Some(ActiveModal::ConfirmCancel) => {
-            if st.confirm_cancel {
+            if st.modals.confirm_cancel {
                 let geom = geometry_of(
                     term_rect,
                     &crate::dialogs::render::confirm_cancel_params(&st),
                 );
                 match check_confirm_hit(&geom, mouse.column, mouse.row) {
                     ModalHit::Confirm => {
-                        st.confirm_cancel = false;
-                        st.confirm_button = crate::app::ConfirmDialogButton::Cancel;
+                        st.modals.confirm_cancel = false;
+                        st.modals.confirm_button = crate::app::ConfirmDialogButton::Cancel;
                         let cancel_review = st.review.running;
                         let cancel_model = st.model.is_busy();
                         drop(st);
@@ -381,26 +467,26 @@ pub async fn handle_modal_click(
                         }
                     }
                     ModalHit::Cancel | ModalHit::Outside => {
-                        st.confirm_cancel = false;
-                        st.confirm_button = crate::app::ConfirmDialogButton::Cancel;
+                        st.modals.confirm_cancel = false;
+                        st.modals.confirm_button = crate::app::ConfirmDialogButton::Cancel;
                     }
                     ModalHit::InsideBody => {}
                 }
             }
         }
         Some(ActiveModal::ConfirmQuit) => {
-            if st.confirm_quit {
+            if st.modals.confirm_quit {
                 let geom =
                     geometry_of(term_rect, &crate::dialogs::render::confirm_quit_params(&st));
                 match check_confirm_hit(&geom, mouse.column, mouse.row) {
                     ModalHit::Confirm => {
-                        st.confirm_quit = false;
-                        st.confirm_button = crate::app::ConfirmDialogButton::Cancel;
+                        st.modals.confirm_quit = false;
+                        st.modals.confirm_button = crate::app::ConfirmDialogButton::Cancel;
                         return Ok(InputResult::Exit);
                     }
                     ModalHit::Cancel | ModalHit::Outside => {
-                        st.confirm_quit = false;
-                        st.confirm_button = crate::app::ConfirmDialogButton::Cancel;
+                        st.modals.confirm_quit = false;
+                        st.modals.confirm_button = crate::app::ConfirmDialogButton::Cancel;
                     }
                     ModalHit::InsideBody => {}
                 }
@@ -425,19 +511,19 @@ pub async fn handle_modal_click(
                     crate::dialogs::input::apply_batch_cancel(st, choice, server_writer).await?;
                 }
                 None => {
-                    st.confirm_batch_cancel = false;
-                    st.batch_cancel_button = crate::app::BatchCancelButton::Continue;
+                    st.modals.confirm_batch_cancel = false;
+                    st.modals.batch_cancel_button = crate::app::BatchCancelButton::Continue;
                 }
             }
             return Ok(InputResult::Continue);
         }
         Some(ActiveModal::ClearAuto) => {
-            if st.context_view.confirm_clear_auto {
+            if st.modals.confirm_clear_auto {
                 let geom = geometry_of(term_rect, &crate::dialogs::render::clear_auto_params(&st));
                 match check_confirm_hit(&geom, mouse.column, mouse.row) {
                     ModalHit::Confirm => {
-                        st.context_view.confirm_clear_auto = false;
-                        st.confirm_button = crate::app::ConfirmDialogButton::Cancel;
+                        st.modals.confirm_clear_auto = false;
+                        st.modals.confirm_button = crate::app::ConfirmDialogButton::Cancel;
                         drop(st);
                         let params = tauqe_protocol::ContextClearParams {
                             layer: Some(tauqe_protocol::ContextLayer::Auto),
@@ -450,20 +536,20 @@ pub async fn handle_modal_click(
                         .await?;
                     }
                     ModalHit::Cancel | ModalHit::Outside => {
-                        st.context_view.confirm_clear_auto = false;
-                        st.confirm_button = crate::app::ConfirmDialogButton::Cancel;
+                        st.modals.confirm_clear_auto = false;
+                        st.modals.confirm_button = crate::app::ConfirmDialogButton::Cancel;
                     }
                     ModalHit::InsideBody => {}
                 }
             }
         }
         Some(ActiveModal::ClearUser) => {
-            if st.context_view.confirm_clear_user {
+            if st.modals.confirm_clear_user {
                 let geom = geometry_of(term_rect, &crate::dialogs::render::clear_user_params(&st));
                 match check_confirm_hit(&geom, mouse.column, mouse.row) {
                     ModalHit::Confirm => {
-                        st.context_view.confirm_clear_user = false;
-                        st.confirm_button = crate::app::ConfirmDialogButton::Cancel;
+                        st.modals.confirm_clear_user = false;
+                        st.modals.confirm_button = crate::app::ConfirmDialogButton::Cancel;
                         drop(st);
                         let params = tauqe_protocol::ContextClearParams {
                             layer: Some(tauqe_protocol::ContextLayer::User),
@@ -476,23 +562,81 @@ pub async fn handle_modal_click(
                         .await?;
                     }
                     ModalHit::Cancel | ModalHit::Outside => {
-                        st.context_view.confirm_clear_user = false;
-                        st.confirm_button = crate::app::ConfirmDialogButton::Cancel;
+                        st.modals.confirm_clear_user = false;
+                        st.modals.confirm_button = crate::app::ConfirmDialogButton::Cancel;
                     }
                     ModalHit::InsideBody => {}
                 }
             }
         }
+        Some(ActiveModal::OuterDocsCacheRemove) => {
+            if let Some(path) = st.modals.confirm_outer_docs_cache_remove.clone() {
+                let geom = match crate::dialogs::render::outer_docs_cache_remove_params(&st) {
+                    Some(params) => geometry_of(term_rect, &params),
+                    None => return Ok(InputResult::Continue),
+                };
+                match check_confirm_hit(&geom, mouse.column, mouse.row) {
+                    ModalHit::Confirm => {
+                        st.modals.confirm_outer_docs_cache_remove = None;
+                        st.modals.confirm_button = crate::app::ConfirmDialogButton::Cancel;
+                        if let Some(dialog) = st.modals.outer_docs_cache.as_mut() {
+                            dialog.loading = true;
+                        }
+                        drop(st);
+                        let params = tauqe_protocol::OuterDocsCacheRemoveParams { path };
+                        send_request(
+                            server_writer,
+                            methods::OUTER_DOCS_CACHE_REMOVE,
+                            serde_json::to_value(params)?,
+                        )
+                        .await?;
+                    }
+                    ModalHit::Cancel | ModalHit::Outside => {
+                        st.modals.confirm_outer_docs_cache_remove = None;
+                        st.modals.confirm_button = crate::app::ConfirmDialogButton::Cancel;
+                    }
+                    ModalHit::InsideBody => {}
+                }
+            }
+        }
+        Some(ActiveModal::OuterDocsCache) => {
+            // The pointer mirrors the keyboard: a click highlights the row it
+            // lands on, and a second click on the highlighted directory folds
+            // it. The row is translated through the very tree pane the renderer
+            // draws with, so the two can never disagree (Conventions §6.6).
+            if let Some(mut dialog) = st.modals.outer_docs_cache.take() {
+                let area = crate::dialogs::render::outer_docs_cache_area(term_rect);
+                let tree = crate::dialogs::render::outer_docs_cache_tree_rect(term_rect);
+                if rect_contains(tree, mouse.column, mouse.row) {
+                    let clicked = usize::from(dialog.scroll) + usize::from(mouse.row - tree.y);
+                    if clicked < dialog.rows().len() {
+                        if clicked == dialog.cursor {
+                            dialog.toggle_fold();
+                        } else {
+                            dialog.cursor = clicked;
+                        }
+                    }
+                } else if !rect_contains(area, mouse.column, mouse.row) {
+                    // A click outside the card dismisses the browser and sends
+                    // nothing (Conventions §6).
+                    return Ok(InputResult::Continue);
+                }
+                let visible = usize::from(tree.height).max(1);
+                dialog.scroll_to_cursor(visible);
+                st.modals.outer_docs_cache = Some(dialog);
+            }
+            return Ok(InputResult::Continue);
+        }
         Some(ActiveModal::RemoveContextFile) => {
-            if st.context_view.pending_remove.is_some() {
+            if st.modals.confirm_remove_context_file.is_some() {
                 let geom = match crate::dialogs::render::remove_context_file_params(&st) {
                     Some(params) => geometry_of(term_rect, &params),
                     None => return Ok(InputResult::Continue),
                 };
                 match check_confirm_hit(&geom, mouse.column, mouse.row) {
                     ModalHit::Confirm => {
-                        if let Some(path) = st.context_view.pending_remove.take() {
-                            st.confirm_button = crate::app::ConfirmDialogButton::Cancel;
+                        if let Some(path) = st.modals.confirm_remove_context_file.take() {
+                            st.modals.confirm_button = crate::app::ConfirmDialogButton::Cancel;
                             drop(st);
                             let params = tauqe_protocol::ContextRemoveParams { path };
                             send_request(
@@ -504,23 +648,23 @@ pub async fn handle_modal_click(
                         }
                     }
                     ModalHit::Cancel | ModalHit::Outside => {
-                        st.context_view.pending_remove = None;
-                        st.confirm_button = crate::app::ConfirmDialogButton::Cancel;
+                        st.modals.confirm_remove_context_file = None;
+                        st.modals.confirm_button = crate::app::ConfirmDialogButton::Cancel;
                     }
                     ModalHit::InsideBody => {}
                 }
             }
         }
         Some(ActiveModal::ConfirmDetachFocus) => {
-            if st.confirm_detach_focus {
+            if st.modals.confirm_detach_focus {
                 let geom = geometry_of(
                     term_rect,
                     &crate::dialogs::render::confirm_detach_focus_params(&st),
                 );
                 match check_confirm_hit(&geom, mouse.column, mouse.row) {
                     ModalHit::Confirm => {
-                        st.confirm_detach_focus = false;
-                        st.confirm_button = crate::app::ConfirmDialogButton::Cancel;
+                        st.modals.confirm_detach_focus = false;
+                        st.modals.confirm_button = crate::app::ConfirmDialogButton::Cancel;
                         st.discussion_focus = DiscussionFocus::None;
                         drop(st);
                         send_request(
@@ -531,26 +675,26 @@ pub async fn handle_modal_click(
                         .await?;
                     }
                     ModalHit::Cancel | ModalHit::Outside => {
-                        st.confirm_detach_focus = false;
-                        st.confirm_button = crate::app::ConfirmDialogButton::Cancel;
+                        st.modals.confirm_detach_focus = false;
+                        st.modals.confirm_button = crate::app::ConfirmDialogButton::Cancel;
                     }
                     ModalHit::InsideBody => {}
                 }
             }
         }
         Some(ActiveModal::ClearHorizon) => {
-            if let Some(plan_id) = st.confirm_clear_horizon.clone() {
+            if let Some(plan_id) = st.modals.confirm_clear_horizon.clone() {
                 // Reuse the exact confirmation parameters the renderer draws, so
                 // hit-testing never desynchronizes from the rendered buttons
                 // (Conventions §6, §7).
-                let geom = geometry_of(
-                    term_rect,
-                    &crate::dialogs::render::clear_horizon_params(&st, &plan_id),
-                );
+                let geom = match crate::dialogs::render::clear_horizon_params(&st) {
+                    Some(params) => geometry_of(term_rect, &params),
+                    None => return Ok(InputResult::Continue),
+                };
                 match check_confirm_hit(&geom, mouse.column, mouse.row) {
                     ModalHit::Confirm => {
-                        st.confirm_clear_horizon = None;
-                        st.confirm_button = crate::app::ConfirmDialogButton::Cancel;
+                        st.modals.confirm_clear_horizon = None;
+                        st.modals.confirm_button = crate::app::ConfirmDialogButton::Cancel;
                         // A horizon that already carries started or completed
                         // steps has committed work in Git: the reset escalates to
                         // the second tier instead of dropping recorded history
@@ -560,9 +704,9 @@ pub async fn handle_modal_click(
                             .plans
                             .iter()
                             .find(|p| p.id == plan_id)
-                            .is_some_and(|p| p.has_started_or_completed_steps());
+                            .is_some_and(|p| p.implementation.has_started_or_completed_steps());
                         if recorded {
-                            st.confirm_clear_horizon_final = Some(plan_id);
+                            st.modals.confirm_clear_horizon_final = Some(plan_id);
                         } else {
                             // The success notice is emitted once the server
                             // confirms the reset in the response handler, not on
@@ -573,99 +717,99 @@ pub async fn handle_modal_click(
                         }
                     }
                     ModalHit::Cancel | ModalHit::Outside => {
-                        st.confirm_clear_horizon = None;
-                        st.confirm_button = crate::app::ConfirmDialogButton::Cancel;
+                        st.modals.confirm_clear_horizon = None;
+                        st.modals.confirm_button = crate::app::ConfirmDialogButton::Cancel;
                     }
                     ModalHit::InsideBody => {}
                 }
             }
         }
         Some(ActiveModal::ClearHorizonFinal) => {
-            if let Some(plan_id) = st.confirm_clear_horizon_final.clone() {
-                let geom = geometry_of(
-                    term_rect,
-                    &crate::dialogs::render::clear_horizon_final_params(&st, &plan_id),
-                );
+            if let Some(plan_id) = st.modals.confirm_clear_horizon_final.clone() {
+                let geom = match crate::dialogs::render::clear_horizon_final_params(&st) {
+                    Some(params) => geometry_of(term_rect, &params),
+                    None => return Ok(InputResult::Continue),
+                };
                 match check_confirm_hit(&geom, mouse.column, mouse.row) {
                     ModalHit::Confirm => {
-                        st.confirm_clear_horizon_final = None;
-                        st.confirm_button = crate::app::ConfirmDialogButton::Cancel;
+                        st.modals.confirm_clear_horizon_final = None;
+                        st.modals.confirm_button = crate::app::ConfirmDialogButton::Cancel;
                         drop(st);
                         crate::dialogs::input::clear_plan_horizon(server_writer, plan_id).await?;
                     }
                     ModalHit::Cancel | ModalHit::Outside => {
-                        st.confirm_clear_horizon_final = None;
-                        st.confirm_button = crate::app::ConfirmDialogButton::Cancel;
+                        st.modals.confirm_clear_horizon_final = None;
+                        st.modals.confirm_button = crate::app::ConfirmDialogButton::Cancel;
                     }
                     ModalHit::InsideBody => {}
                 }
             }
         }
         Some(ActiveModal::DeletePlan) => {
-            if let Some(plan_id) = st.confirm_delete_plan.clone() {
-                let geom = geometry_of(
-                    term_rect,
-                    &crate::dialogs::render::delete_plan_params(&st, &plan_id),
-                );
+            if let Some(plan_id) = st.modals.confirm_delete_plan.clone() {
+                let geom = match crate::dialogs::render::delete_plan_params(&st) {
+                    Some(params) => geometry_of(term_rect, &params),
+                    None => return Ok(InputResult::Continue),
+                };
                 match check_confirm_hit(&geom, mouse.column, mouse.row) {
                     ModalHit::Confirm => {
-                        st.confirm_delete_plan = None;
-                        st.confirm_button = crate::app::ConfirmDialogButton::Cancel;
+                        st.modals.confirm_delete_plan = None;
+                        st.modals.confirm_button = crate::app::ConfirmDialogButton::Cancel;
                         // A plan that still carries unfinished work escalates to
                         // the second tier exactly as pressing `Enter` does, so a
                         // click can never discard progress silently (c-1).
                         if crate::dialogs::input::plan_delete_needs_escalation(&st, &plan_id) {
-                            st.confirm_delete_plan_final = Some(plan_id);
+                            st.modals.confirm_delete_plan_final = Some(plan_id);
                         } else {
                             drop(st);
                             crate::dialogs::input::delete_plan(server_writer, plan_id).await?;
                         }
                     }
                     ModalHit::Cancel | ModalHit::Outside => {
-                        st.confirm_delete_plan = None;
-                        st.confirm_button = crate::app::ConfirmDialogButton::Cancel;
+                        st.modals.confirm_delete_plan = None;
+                        st.modals.confirm_button = crate::app::ConfirmDialogButton::Cancel;
                     }
                     ModalHit::InsideBody => {}
                 }
             }
         }
         Some(ActiveModal::DeletePlanFinal) => {
-            if let Some(plan_id) = st.confirm_delete_plan_final.clone() {
-                let geom = geometry_of(
-                    term_rect,
-                    &crate::dialogs::render::delete_plan_final_params(&st, &plan_id),
-                );
+            if let Some(plan_id) = st.modals.confirm_delete_plan_final.clone() {
+                let geom = match crate::dialogs::render::delete_plan_final_params(&st) {
+                    Some(params) => geometry_of(term_rect, &params),
+                    None => return Ok(InputResult::Continue),
+                };
                 match check_confirm_hit(&geom, mouse.column, mouse.row) {
                     ModalHit::Confirm => {
-                        st.confirm_delete_plan_final = None;
-                        st.confirm_button = crate::app::ConfirmDialogButton::Cancel;
+                        st.modals.confirm_delete_plan_final = None;
+                        st.modals.confirm_button = crate::app::ConfirmDialogButton::Cancel;
                         drop(st);
                         crate::dialogs::input::delete_plan(server_writer, plan_id).await?;
                     }
                     ModalHit::Cancel | ModalHit::Outside => {
-                        st.confirm_delete_plan_final = None;
-                        st.confirm_button = crate::app::ConfirmDialogButton::Cancel;
+                        st.modals.confirm_delete_plan_final = None;
+                        st.modals.confirm_button = crate::app::ConfirmDialogButton::Cancel;
                     }
                     ModalHit::InsideBody => {}
                 }
             }
         }
         Some(ActiveModal::DeleteReview) => {
-            if let Some(review_id) = st.confirm_delete_review.clone() {
-                let geom = geometry_of(
-                    term_rect,
-                    &crate::dialogs::render::delete_review_params(&st, &review_id),
-                );
+            if let Some(review_id) = st.modals.confirm_delete_review.clone() {
+                let geom = match crate::dialogs::render::delete_review_params(&st) {
+                    Some(params) => geometry_of(term_rect, &params),
+                    None => return Ok(InputResult::Continue),
+                };
                 match check_confirm_hit(&geom, mouse.column, mouse.row) {
                     ModalHit::Confirm => {
-                        st.confirm_delete_review = None;
-                        st.confirm_button = crate::app::ConfirmDialogButton::Cancel;
+                        st.modals.confirm_delete_review = None;
+                        st.modals.confirm_button = crate::app::ConfirmDialogButton::Cancel;
                         drop(st);
                         crate::dialogs::input::delete_review(server_writer, review_id).await?;
                     }
                     ModalHit::Cancel | ModalHit::Outside => {
-                        st.confirm_delete_review = None;
-                        st.confirm_button = crate::app::ConfirmDialogButton::Cancel;
+                        st.modals.confirm_delete_review = None;
+                        st.modals.confirm_button = crate::app::ConfirmDialogButton::Cancel;
                     }
                     ModalHit::InsideBody => {}
                 }
@@ -676,14 +820,14 @@ pub async fn handle_modal_click(
             // Architect ladder above the action bar, whose rows and buttons come
             // from one geometry source shared with the renderer (Conventions §6,
             // §7, c-dialog-parity).
-            if let Some(mut target) = st.confirm_review_analyze.take() {
+            if let Some(mut target) = st.modals.confirm_review_analyze.take() {
                 let geo = crate::dialogs::render::review_analyze_dialog_geometry(
                     term_rect,
                     target.selector.len(),
                 );
 
                 if rect_contains(geo.confirm_button, mouse.column, mouse.row) {
-                    st.confirm_button = crate::app::ConfirmDialogButton::Cancel;
+                    st.modals.confirm_button = crate::app::ConfirmDialogButton::Cancel;
                     crate::dialogs::input::confirm_review_analyze(state, st, target, server_writer)
                         .await?;
                     return Ok(InputResult::Continue);
@@ -693,7 +837,7 @@ pub async fn handle_modal_click(
                     || !rect_contains(geo.area, mouse.column, mouse.row)
                 {
                     // Safe cancellation: dismiss without spending tokens.
-                    st.confirm_button = crate::app::ConfirmDialogButton::Cancel;
+                    st.modals.confirm_button = crate::app::ConfirmDialogButton::Cancel;
                     return Ok(InputResult::Continue);
                 }
 
@@ -708,7 +852,7 @@ pub async fn handle_modal_click(
                     target.focus = crate::app::ReviewAnalyzeFocus::ModelList;
                 }
 
-                st.confirm_review_analyze = Some(target);
+                st.modals.confirm_review_analyze = Some(target);
             }
             return Ok(InputResult::Continue);
         }
@@ -720,10 +864,10 @@ pub async fn handle_modal_click(
                 Some(params) => geometry_of(term_rect, &params),
                 None => return Ok(InputResult::Continue),
             };
-            if let Some(target) = st.confirm_review_truncation.take() {
+            if let Some(target) = st.modals.confirm_review_truncation.take() {
                 match check_confirm_hit(&geom, mouse.column, mouse.row) {
                     ModalHit::Confirm => {
-                        st.confirm_button = crate::app::ConfirmDialogButton::Cancel;
+                        st.modals.confirm_button = crate::app::ConfirmDialogButton::Cancel;
                         crate::dialogs::input::launch_review(
                             state,
                             st,
@@ -736,10 +880,10 @@ pub async fn handle_modal_click(
                     ModalHit::Cancel | ModalHit::Outside => {
                         // The safe default returns the launch dialog with its
                         // typed fields and sends nothing (c-3).
-                        st.confirm_button = crate::app::ConfirmDialogButton::Cancel;
-                        st.review_dialog = Some(target.pending.dialog);
+                        st.modals.confirm_button = crate::app::ConfirmDialogButton::Cancel;
+                        st.modals.review_dialog = Some(target.pending.dialog);
                     }
-                    ModalHit::InsideBody => st.confirm_review_truncation = Some(target),
+                    ModalHit::InsideBody => st.modals.confirm_review_truncation = Some(target),
                 }
             }
         }
@@ -748,18 +892,19 @@ pub async fn handle_modal_click(
             // model rows, and editor area come from one geometry source shared
             // with the renderer (Conventions §6, §7).
             let single_target = st
+                .modals
                 .confirm_execute_review
                 .as_ref()
                 .is_some_and(|target| target.is_single_target());
             if single_target {
-                if let Some(mut target) = st.confirm_execute_review.take() {
+                if let Some(mut target) = st.modals.confirm_execute_review.take() {
                     let geo = crate::dialogs::render::execute_review_dialog_geometry(
                         term_rect,
                         target.selector.len(),
                     );
 
                     if rect_contains(geo.confirm_button, mouse.column, mouse.row) {
-                        st.confirm_button = crate::app::ConfirmDialogButton::Cancel;
+                        st.modals.confirm_button = crate::app::ConfirmDialogButton::Cancel;
                         crate::dialogs::input::confirm_execute_review(
                             state,
                             st,
@@ -774,7 +919,7 @@ pub async fn handle_modal_click(
                         || !rect_contains(geo.area, mouse.column, mouse.row)
                     {
                         // Safe cancellation: dismiss without a turn.
-                        st.confirm_button = crate::app::ConfirmDialogButton::Cancel;
+                        st.modals.confirm_button = crate::app::ConfirmDialogButton::Cancel;
                         return Ok(InputResult::Continue);
                     }
 
@@ -791,19 +936,19 @@ pub async fn handle_modal_click(
                         target.focus = crate::views::plans::RefineDialogFocus::InstructionsEditor;
                     }
 
-                    st.confirm_execute_review = Some(target);
+                    st.modals.confirm_execute_review = Some(target);
                 }
                 return Ok(InputResult::Continue);
             }
-            if let Some(target) = st.confirm_execute_review.clone() {
+            if let Some(target) = st.modals.confirm_execute_review.clone() {
                 let geom = match crate::dialogs::render::execute_review_params(&st) {
                     Some(params) => geometry_of(term_rect, &params),
                     None => return Ok(InputResult::Continue),
                 };
                 match check_confirm_hit(&geom, mouse.column, mouse.row) {
                     ModalHit::Confirm => {
-                        st.confirm_execute_review = None;
-                        st.confirm_button = crate::app::ConfirmDialogButton::Cancel;
+                        st.modals.confirm_execute_review = None;
+                        st.modals.confirm_button = crate::app::ConfirmDialogButton::Cancel;
                         crate::dialogs::input::confirm_execute_review(
                             state,
                             st,
@@ -813,8 +958,8 @@ pub async fn handle_modal_click(
                         .await?;
                     }
                     ModalHit::Cancel | ModalHit::Outside => {
-                        st.confirm_execute_review = None;
-                        st.confirm_button = crate::app::ConfirmDialogButton::Cancel;
+                        st.modals.confirm_execute_review = None;
+                        st.modals.confirm_button = crate::app::ConfirmDialogButton::Cancel;
                     }
                     ModalHit::InsideBody => {}
                 }
@@ -825,15 +970,15 @@ pub async fn handle_modal_click(
             // confirmation is the binary confirm/cancel card whose geometry is
             // derived from the same parameters the renderer draws
             // (Conventions §6, §7).
-            if let Some(target) = st.confirm_execute_pipeline.clone() {
+            if let Some(target) = st.modals.confirm_execute_pipeline.clone() {
                 let geom = match crate::dialogs::render::execute_pipeline_params(&st) {
                     Some(params) => geometry_of(term_rect, &params),
                     None => return Ok(InputResult::Continue),
                 };
                 match check_confirm_hit(&geom, mouse.column, mouse.row) {
                     ModalHit::Confirm => {
-                        st.confirm_execute_pipeline = None;
-                        st.confirm_button = crate::app::ConfirmDialogButton::Cancel;
+                        st.modals.confirm_execute_pipeline = None;
+                        st.modals.confirm_button = crate::app::ConfirmDialogButton::Cancel;
                         crate::dialogs::input::confirm_execute_pipeline(
                             state,
                             st,
@@ -843,8 +988,8 @@ pub async fn handle_modal_click(
                         .await?;
                     }
                     ModalHit::Cancel | ModalHit::Outside => {
-                        st.confirm_execute_pipeline = None;
-                        st.confirm_button = crate::app::ConfirmDialogButton::Cancel;
+                        st.modals.confirm_execute_pipeline = None;
+                        st.modals.confirm_button = crate::app::ConfirmDialogButton::Cancel;
                     }
                     ModalHit::InsideBody => {}
                 }
@@ -854,7 +999,7 @@ pub async fn handle_modal_click(
             // Executing a step or a whole scope draws the Coder confirmation,
             // whose action buttons and model rows come from one geometry source
             // shared with the renderer (Conventions §6, §7).
-            if let Some(mut target) = st.confirm_execute_scope.take() {
+            if let Some(mut target) = st.modals.confirm_execute_scope.take() {
                 let geo = crate::dialogs::render::execute_scope_dialog_geometry(
                     term_rect,
                     target.selector.len(),
@@ -862,7 +1007,7 @@ pub async fn handle_modal_click(
                 );
 
                 if rect_contains(geo.confirm_button, mouse.column, mouse.row) {
-                    st.confirm_button = crate::app::ConfirmDialogButton::Cancel;
+                    st.modals.confirm_button = crate::app::ConfirmDialogButton::Cancel;
                     crate::dialogs::input::confirm_execute_scope(state, st, server_writer, target)
                         .await?;
                     return Ok(InputResult::Continue);
@@ -872,7 +1017,7 @@ pub async fn handle_modal_click(
                     || !rect_contains(geo.area, mouse.column, mouse.row)
                 {
                     // Safe cancellation: dismiss without a turn.
-                    st.confirm_button = crate::app::ConfirmDialogButton::Cancel;
+                    st.modals.confirm_button = crate::app::ConfirmDialogButton::Cancel;
                     return Ok(InputResult::Continue);
                 }
 
@@ -887,15 +1032,68 @@ pub async fn handle_modal_click(
                     target.focus = crate::app::ExecuteScopeFocus::ModelList;
                 }
 
-                st.confirm_execute_scope = Some(target);
+                st.modals.confirm_execute_scope = Some(target);
+            }
+            return Ok(InputResult::Continue);
+        }
+        Some(ActiveModal::CreatePlan) => {
+            // The creation form stacks the Planner ladder, the Critic ladder,
+            // the directives editor, and the action bar. Rows and buttons come
+            // from the same geometry the renderer draws with (Conventions §6.6).
+            if let Some(mut dialog) = st.modals.create_dialog.take() {
+                let geo = crate::dialogs::render::create_plan_dialog_geometry(
+                    term_rect,
+                    dialog.planner.len(),
+                    dialog.critic.len(),
+                );
+
+                if rect_contains(geo.confirm_button, mouse.column, mouse.row) {
+                    st.modals.confirm_button = crate::app::ConfirmDialogButton::Cancel;
+                    crate::dialogs::input::submit_create_dialog(state, st, dialog, server_writer)
+                        .await?;
+                    return Ok(InputResult::Continue);
+                }
+
+                if rect_contains(geo.cancel_button, mouse.column, mouse.row)
+                    || !rect_contains(geo.area, mouse.column, mouse.row)
+                {
+                    // Safe cancellation: dismiss without a turn.
+                    st.modals.confirm_button = crate::app::ConfirmDialogButton::Cancel;
+                    return Ok(InputResult::Continue);
+                }
+
+                if rect_contains(geo.planner_rows, mouse.column, mouse.row) {
+                    let visible = geo.planner_rows.height as usize;
+                    let start = dialog.planner.visible_start(visible);
+                    let clicked_row = (mouse.row - geo.planner_rows.y) as usize;
+                    let index = start + clicked_row;
+                    if index < dialog.planner.len() {
+                        dialog.planner.select_index(index);
+                    }
+                    dialog.focus = crate::views::plans::PlanFormFocus::PlannerList;
+                } else if rect_contains(geo.critic_rows, mouse.column, mouse.row) {
+                    let visible = geo.critic_rows.height as usize;
+                    let start = dialog.critic.visible_start(visible);
+                    let clicked_row = (mouse.row - geo.critic_rows.y) as usize;
+                    let index = start + clicked_row;
+                    if index < dialog.critic.len() {
+                        dialog.critic.select_index(index);
+                    }
+                    dialog.focus = crate::views::plans::PlanFormFocus::CriticList;
+                } else if rect_contains(geo.editor_area, mouse.column, mouse.row) {
+                    dialog.focus = crate::views::plans::PlanFormFocus::InstructionsEditor;
+                }
+
+                st.modals.create_dialog = Some(dialog);
             }
             return Ok(InputResult::Continue);
         }
         Some(ActiveModal::RefineDialog) => {
-            if let Some(mut dialog) = st.plans_view.refine_dialog.take() {
+            if let Some(mut dialog) = st.modals.refine_dialog.take() {
                 let geo = crate::dialogs::render::refine_dialog_geometry(
                     term_rect,
-                    dialog.selector.len(),
+                    dialog.planner.len(),
+                    dialog.critic.len(),
                 );
 
                 if rect_contains(geo.confirm_button, mouse.column, mouse.row) {
@@ -911,33 +1109,41 @@ pub async fn handle_modal_click(
                     return Ok(InputResult::Continue);
                 }
 
-                if rect_contains(geo.model_rows, mouse.column, mouse.row) {
-                    let visible = geo.model_rows.height as usize;
-                    let start = dialog.selector.visible_start(visible);
-                    let clicked_row = (mouse.row - geo.model_rows.y) as usize;
+                if rect_contains(geo.planner_rows, mouse.column, mouse.row) {
+                    let visible = geo.planner_rows.height as usize;
+                    let start = dialog.planner.visible_start(visible);
+                    let clicked_row = (mouse.row - geo.planner_rows.y) as usize;
                     let index = start + clicked_row;
-                    if index < dialog.selector.len() {
-                        dialog.selector.select_index(index);
+                    if index < dialog.planner.len() {
+                        dialog.planner.select_index(index);
                     }
-                    dialog.focus = crate::views::plans::RefineDialogFocus::ModelList;
+                    dialog.focus = crate::views::plans::PlanFormFocus::PlannerList;
+                } else if rect_contains(geo.critic_rows, mouse.column, mouse.row) {
+                    let visible = geo.critic_rows.height as usize;
+                    let start = dialog.critic.visible_start(visible);
+                    let clicked_row = (mouse.row - geo.critic_rows.y) as usize;
+                    let index = start + clicked_row;
+                    if index < dialog.critic.len() {
+                        dialog.critic.select_index(index);
+                    }
+                    dialog.focus = crate::views::plans::PlanFormFocus::CriticList;
                 } else if rect_contains(geo.editor_area, mouse.column, mouse.row) {
-                    // Clicking the instructions editor focuses it so the next
-                    // keystroke edits the clicked input.
-                    dialog.focus = crate::views::plans::RefineDialogFocus::InstructionsEditor;
+                    dialog.focus = crate::views::plans::PlanFormFocus::InstructionsEditor;
                 }
 
-                st.plans_view.refine_dialog = Some(dialog);
+                st.modals.refine_dialog = Some(dialog);
             }
         }
         Some(ActiveModal::RefineBlocked) => {
-            if let Some(blocked) = st.plans_view.refine_blocked.clone() {
+            if let Some(blocked) = st.modals.refine_blocked.clone() {
+                let confirm_button = st.modals.confirm_button;
                 let geom = geometry_of(
                     term_rect,
-                    &crate::dialogs::render::refine_blocked_params(&blocked, st.confirm_button),
+                    &crate::dialogs::render::refine_blocked_params(&blocked, confirm_button),
                 );
                 match check_confirm_hit(&geom, mouse.column, mouse.row) {
                     ModalHit::Confirm => {
-                        st.confirm_button = crate::app::ConfirmDialogButton::Cancel;
+                        st.modals.confirm_button = crate::app::ConfirmDialogButton::Cancel;
                         crate::dialogs::input::submit_refine_blocked(
                             state,
                             st,
@@ -947,8 +1153,8 @@ pub async fn handle_modal_click(
                         .await?;
                     }
                     ModalHit::Cancel | ModalHit::Outside => {
-                        st.plans_view.refine_blocked = None;
-                        st.confirm_button = crate::app::ConfirmDialogButton::Cancel;
+                        st.modals.refine_blocked = None;
+                        st.modals.confirm_button = crate::app::ConfirmDialogButton::Cancel;
                     }
                     ModalHit::InsideBody => {}
                 }
@@ -959,7 +1165,7 @@ pub async fn handle_modal_click(
             // any click outside dismiss the modal safely.
             let (confirm_btn, cancel_btn) = crate::dialogs::render::prompt_modal_buttons(term_rect);
             if rect_contains(confirm_btn, mouse.column, mouse.row) {
-                if let Some(dialog) = st.prompt_modal.take() {
+                if let Some(dialog) = st.modals.prompt_modal.take() {
                     // The guard travels by value so the launch transition can
                     // release it before the comment is dispatched (c-1).
                     let _ = crate::dialogs::input::submit_prompt_modal(
@@ -977,7 +1183,7 @@ pub async fn handle_modal_click(
                     mouse.row,
                 )
             {
-                st.prompt_modal = None;
+                st.modals.prompt_modal = None;
             }
         }
         Some(ActiveModal::ThemeSelector) => {
@@ -995,27 +1201,27 @@ pub async fn handle_modal_click(
             .await;
         }
         Some(ActiveModal::ClearHistory) => {
-            if st.confirm_clear_history {
+            if st.modals.confirm_clear_history {
                 let geom = geometry_of(
                     term_rect,
                     &crate::dialogs::render::clear_history_params(&st),
                 );
                 match check_confirm_hit(&geom, mouse.column, mouse.row) {
                     ModalHit::Confirm => {
-                        st.confirm_clear_history = false;
-                        st.confirm_button = crate::app::ConfirmDialogButton::Cancel;
+                        st.modals.confirm_clear_history = false;
+                        st.modals.confirm_button = crate::app::ConfirmDialogButton::Cancel;
                         crate::dialogs::input::confirm_clear_history(st, server_writer).await?;
                     }
                     ModalHit::Cancel | ModalHit::Outside => {
-                        st.confirm_clear_history = false;
-                        st.confirm_button = crate::app::ConfirmDialogButton::Cancel;
+                        st.modals.confirm_clear_history = false;
+                        st.modals.confirm_button = crate::app::ConfirmDialogButton::Cancel;
                     }
                     ModalHit::InsideBody => {}
                 }
             }
         }
         Some(ActiveModal::Status) => {
-            if let Some(dialog) = st.status_dialog.clone() {
+            if let Some(dialog) = st.modals.status_dialog.clone() {
                 let options_count = dialog.target.options_count();
                 let area = crate::dialogs::render::status_dialog_area(term_rect, options_count);
                 let options_area =
@@ -1036,7 +1242,7 @@ pub async fn handle_modal_click(
                     crate::dialogs::input::apply_status_dialog(state, st, chosen, server_writer)
                         .await?;
                 } else if rect_contains(cancel_btn, mouse.column, mouse.row) {
-                    st.status_dialog = None;
+                    st.modals.status_dialog = None;
                 } else if rect_contains(options_area, mouse.column, mouse.row) {
                     // Map the clicked visual row onto the list index, honoring
                     // the current scroll offset and the exact window the rows are
@@ -1054,12 +1260,13 @@ pub async fn handle_modal_click(
                         .await?;
                     }
                 } else if !rect_contains(area, mouse.column, mouse.row) {
-                    st.status_dialog = None;
+                    st.modals.status_dialog = None;
                 }
             }
         }
         Some(ActiveModal::Selection) => {
             let item_count = st
+                .modals
                 .selection_dialog
                 .as_ref()
                 .map(|dialog| dialog.selector.len())
@@ -1072,6 +1279,7 @@ pub async fn handle_modal_click(
             // dismisses.
             if rect_contains(select_btn, mouse.column, mouse.row) {
                 let selected = st
+                    .modals
                     .selection_dialog
                     .as_ref()
                     .and_then(|dialog| dialog.selector.selected_entry())
@@ -1082,12 +1290,12 @@ pub async fn handle_modal_click(
                 return Ok(InputResult::Continue);
             }
             if rect_contains(cancel_btn, mouse.column, mouse.row) {
-                st.selection_dialog = None;
+                st.modals.selection_dialog = None;
                 return Ok(InputResult::Continue);
             }
 
             if !rect_contains(area, mouse.column, mouse.row) {
-                st.selection_dialog = None;
+                st.modals.selection_dialog = None;
                 return Ok(InputResult::Continue);
             }
 
@@ -1102,7 +1310,7 @@ pub async fn handle_modal_click(
                 // The click is translated with the selector's own scroll
                 // arithmetic, so hit-testing and the drawn window cannot drift
                 // apart (c-1).
-                let clicked = st.selection_dialog.as_mut().and_then(|dialog| {
+                let clicked = st.modals.selection_dialog.as_mut().and_then(|dialog| {
                     let visible_height = list_area.height.max(1) as usize;
                     let index = dialog.selector.visible_start(visible_height) + clicked_visible;
                     if index < dialog.selector.len() {
@@ -1139,7 +1347,7 @@ pub async fn handle_modal_click(
                 return Ok(InputResult::Continue);
             }
             if !rect_contains(geom.area, mouse.column, mouse.row) {
-                st.locale_dialog = None;
+                st.modals.locale_dialog = None;
             }
         }
         Some(ActiveModal::UsageSummary) => {
@@ -1148,7 +1356,7 @@ pub async fn handle_modal_click(
             // the keyboard (Conventions §6).
             let area = crate::dialogs::render::usage_summary_area(term_rect);
             if !rect_contains(area, mouse.column, mouse.row) {
-                st.usage_summary = None;
+                st.modals.usage_summary = None;
             }
         }
         Some(ActiveModal::Help) => {
@@ -1156,24 +1364,71 @@ pub async fn handle_modal_click(
             // dismisses the dialog, preserving the click-to-close affordance
             // while making the tabs reachable (Conventions §6.6).
             let geom = crate::dialogs::render::help::help_tab_geometry(term_rect);
+            let help = &mut st.modals;
             if rect_contains(geom.global_tab, mouse.column, mouse.row) {
-                st.help_tab = HelpTab::Global;
-                st.help_scroll = 0;
+                help.help_tab = HelpTab::Global;
+                help.help_scroll = 0;
             } else if rect_contains(geom.current_mode_tab, mouse.column, mouse.row) {
-                st.help_tab = HelpTab::CurrentMode;
-                st.help_scroll = 0;
+                help.help_tab = HelpTab::CurrentMode;
+                help.help_scroll = 0;
             } else if rect_contains(geom.text_editor_tab, mouse.column, mouse.row) {
-                st.help_tab = HelpTab::TextEditor;
-                st.help_scroll = 0;
+                help.help_tab = HelpTab::TextEditor;
+                help.help_scroll = 0;
             } else {
-                st.show_help = false;
-                st.help_scroll = 0;
+                help.show_help = false;
+                help.help_scroll = 0;
             }
         }
-        // The inspector reserves its stacking slot ahead of the renderer and
-        // the pointer routing delivered by the following steps of this plan
-        // (c-3).
-        Some(ActiveModal::DiffInspector) => {}
+        // The inspector is a reading surface whose pointer contract mirrors its
+        // keyboard: a click on an audited file selects it and hands the file list
+        // the keyboard, a click in the reading area focuses the patch, and a
+        // click outside the card dismisses the audit. Both rectangles come from
+        // the geometry the renderer draws with, so the surface that is drawn is
+        // the surface that is clicked and the row window the renderer scrolled to
+        // is the window a click resolves against (Conventions §6.6, c-3).
+        Some(ActiveModal::DiffInspector) => {
+            let geometry = crate::dialogs::render::diff_inspector_geometry(term_rect);
+            if !rect_contains(geometry.area, mouse.column, mouse.row) {
+                // Dismissal never keeps an imported commit change set alive: the
+                // next open starts from the live staged set unless it imports its
+                // own (c-3).
+                st.modals.diff_audit = None;
+                st.modals.diff_inspector = None;
+                return Ok(InputResult::Continue);
+            }
+
+            // The audited set is either the imported commit audit or the live
+            // staged set the viewport owns, so its length is read from the active
+            // source before the inspector is borrowed (c-3).
+            let file_count = match &st.modals.diff_audit {
+                Some(audit) => audit.files.len(),
+                None => st.model.files.len(),
+            };
+            if let Some(inspector) = st.modals.diff_inspector.as_mut() {
+                if rect_contains(geometry.files, mouse.column, mouse.row) {
+                    // The click skips the border row and is translated through the
+                    // same window the renderer scrolled to, so a click below the
+                    // last audited file selects nothing and a deeper row can never
+                    // name a file the pane does not draw (Conventions §6.6, c-3).
+                    let visible = usize::from(geometry.files.height.saturating_sub(2)).max(1);
+                    let offset = (inspector.selected_file + 1).saturating_sub(visible);
+                    let clicked_row =
+                        usize::from(mouse.row.saturating_sub(geometry.files.y.saturating_add(1)));
+                    let index = offset.saturating_add(clicked_row);
+                    if index < file_count && index != inspector.selected_file {
+                        inspector.selected_file = index;
+                        // A new file opens at its first line, so the patch below
+                        // never inherits the offset of the file it replaced (c-2).
+                        inspector.diff_scroll = 0;
+                    }
+                    inspector.focus = crate::app::DiffInspectorFocus::Files;
+                } else if rect_contains(geometry.diff, mouse.column, mouse.row) {
+                    // The reading area owns the vertical motion once it holds the
+                    // keyboard, exactly as `Tab` hands it over (c-2).
+                    inspector.focus = crate::app::DiffInspectorFocus::Diff;
+                }
+            }
+        }
         None => {}
     }
 
@@ -1189,6 +1444,7 @@ mod tests {
     use crate::app::{
         ConfirmDialogButton, NotificationLevel, ReviewDialogFocus, ReviewDialogState, ViewMode,
     };
+    use crate::input::mouse::handle_mouse_event;
 
     /// Builds a review dialog whose directory section derives from the given
     /// repository file list.
@@ -1235,7 +1491,7 @@ mod tests {
         let mut st = crate::app::test_state();
         st.view_mode = ViewMode::Review;
         st.last_frame_area = term;
-        st.review_dialog = Some(dialog);
+        st.modals.review_dialog = Some(dialog);
         let state = Arc::new(Mutex::new(st));
         let mut conn = RpcConnection::new(Vec::<u8>::new());
         let guard = state.lock().await;
@@ -1250,6 +1506,7 @@ mod tests {
 
         let guard = state.lock().await;
         let dialog = guard
+            .modals
             .review_dialog
             .as_ref()
             .expect("the refused launch keeps the dialog open");
@@ -1280,7 +1537,7 @@ mod tests {
         let mut st = crate::app::test_state();
         st.view_mode = ViewMode::Review;
         st.last_frame_area = term;
-        st.review_dialog = Some(dialog);
+        st.modals.review_dialog = Some(dialog);
 
         let state = Arc::new(Mutex::new(st));
         let mut conn = RpcConnection::new(Vec::<u8>::new());
@@ -1296,10 +1553,11 @@ mod tests {
 
         let guard = state.lock().await;
         assert!(
-            guard.review_dialog.is_none(),
+            guard.modals.review_dialog.is_none(),
             "a launchable dialog starts its window projection"
         );
         let pending = guard
+            .modals
             .pending_review_launch
             .as_ref()
             .expect("the launch awaits its projection");
@@ -1323,7 +1581,7 @@ mod tests {
         let mut st = crate::app::test_state();
         st.view_mode = ViewMode::Review;
         st.last_frame_area = term;
-        st.review_dialog = Some(dialog);
+        st.modals.review_dialog = Some(dialog);
 
         let state = Arc::new(Mutex::new(st));
         let mut conn = RpcConnection::new(Vec::<u8>::new());
@@ -1334,7 +1592,11 @@ mod tests {
         assert_eq!(res, InputResult::Continue);
 
         let guard = state.lock().await;
-        let dialog = guard.review_dialog.as_ref().expect("the dialog stays open");
+        let dialog = guard
+            .modals
+            .review_dialog
+            .as_ref()
+            .expect("the dialog stays open");
         assert_eq!(dialog.preset_selector.selected_index(), 1);
         assert_eq!(
             dialog.selected_preset().map(|preset| preset.name.as_str()),
@@ -1355,7 +1617,7 @@ mod tests {
         let mut st = crate::app::test_state();
         st.view_mode = ViewMode::Review;
         st.last_frame_area = term;
-        st.confirm_review_analyze = Some(crate::app::ConfirmReviewAnalyzeState::new(
+        st.modals.confirm_review_analyze = Some(crate::app::ConfirmReviewAnalyzeState::new(
             "rev-1".to_string(),
             "Session rev-1".to_string(),
             vec![
@@ -1371,6 +1633,7 @@ mod tests {
         ));
         {
             let target = st
+                .modals
                 .confirm_review_analyze
                 .as_mut()
                 .expect("the dialog is open");
@@ -1395,7 +1658,7 @@ mod tests {
         );
 
         let guard = state.lock().await;
-        assert!(guard.confirm_review_analyze.is_none());
+        assert!(guard.modals.confirm_review_analyze.is_none());
         assert!(guard.review.analyzing);
     }
 
@@ -1415,7 +1678,7 @@ mod tests {
         let mut st = crate::app::test_state();
         st.view_mode = ViewMode::Review;
         st.last_frame_area = term;
-        st.review_dialog = Some(dialog);
+        st.modals.review_dialog = Some(dialog);
         let state = Arc::new(Mutex::new(st));
         let mut conn = RpcConnection::new(Vec::<u8>::new());
         let guard = state.lock().await;
@@ -1424,9 +1687,170 @@ mod tests {
             .expect("in-memory dispatch never fails");
 
         let guard = state.lock().await;
-        let dialog = guard.review_dialog.as_ref().expect("the dialog stays open");
+        let dialog = guard
+            .modals
+            .review_dialog
+            .as_ref()
+            .expect("the dialog stays open");
         assert_eq!(dialog.path_inputs[0].get_text(), "crates/");
         drop(guard);
         assert!(conn.written().is_empty());
+    }
+    /// The cache browser mirrors the keyboard: a click highlights the row it
+    /// lands on, and a click on the highlighted directory folds it.
+    #[tokio::test]
+    async fn cache_browser_row_click_moves_the_highlight() {
+        let term = Rect::new(0, 0, 120, 40);
+        let mut st = crate::app::test_state();
+        st.view_mode = ViewMode::Context;
+        st.last_frame_area = term;
+        st.modals.outer_docs_cache = Some(crate::app::OuterDocsCacheDialogState {
+            entries: vec![
+                tauqe_protocol::OuterDocsCacheEntry {
+                    path: "openrouter/models".to_string(),
+                    size_bytes: 1024,
+                    estimated_tokens: 256,
+                },
+                tauqe_protocol::OuterDocsCacheEntry {
+                    path: "rust-book/ch04".to_string(),
+                    size_bytes: 512,
+                    estimated_tokens: 128,
+                },
+            ],
+            ..Default::default()
+        });
+
+        let tree = crate::dialogs::render::outer_docs_cache_tree_rect(term);
+        let state = Arc::new(Mutex::new(st));
+        let mut conn = RpcConnection::new(Vec::<u8>::new());
+        let guard = state.lock().await;
+        handle_modal_click(
+            left_click(tree.x + 2, tree.y + 2),
+            term,
+            &state,
+            guard,
+            &mut conn,
+        )
+        .await
+        .expect("in-memory dispatch never fails");
+
+        assert!(conn.written().is_empty());
+        let guard = state.lock().await;
+        let dialog = guard
+            .modals
+            .outer_docs_cache
+            .as_ref()
+            .expect("the browser stays open");
+        assert_eq!(dialog.cursor, 2);
+    }
+    /// A wheel notch delivered by the given kind at the given pointer position.
+    fn wheel(kind: MouseEventKind, column: u16, row: u16) -> MouseEvent {
+        MouseEvent {
+            kind,
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        }
+    }
+
+    /// A wheel notch that arrives on a surface without a scrollable body is
+    /// consumed by that surface: it never leaks into the view underneath the
+    /// card, so the review list keeps its reading position while its launcher
+    /// owns the keyboard (c-1, Conventions §6).
+    #[tokio::test]
+    async fn wheel_on_a_non_scrollable_modal_never_moves_the_view_behind_it() {
+        let term = Rect::new(0, 0, 120, 50);
+        let mut st = crate::app::test_state();
+        st.view_mode = ViewMode::Review;
+        st.last_frame_area = term;
+        st.review.view_height = 20;
+        st.review.rendered_lines = 500;
+        st.review.scroll = 0;
+        st.modals.review_dialog = Some(review_dialog_with_files(&["src/lib.rs"]));
+
+        let state = Arc::new(Mutex::new(st));
+        let mut conn = RpcConnection::new(Vec::<u8>::new());
+        for _ in 0..2 {
+            handle_mouse_event(wheel(MouseEventKind::ScrollDown, 40, 20), &state, &mut conn)
+                .await
+                .expect("in-memory dispatch never fails");
+        }
+
+        let guard = state.lock().await;
+        assert_eq!(
+            guard.review.scroll, 0,
+            "the list behind the dialog must keep its reading position"
+        );
+        assert!(conn.written().is_empty());
+    }
+
+    /// A pending cache removal outranks the browser it was raised from, so the
+    /// wheel is consumed by the decision and the tree behind it keeps both its
+    /// highlight and its offset (Conventions §5.4, §6).
+    #[tokio::test]
+    async fn wheel_on_a_pending_cache_removal_never_moves_the_tree() {
+        let term = Rect::new(0, 0, 120, 40);
+        let mut st = crate::app::test_state();
+        st.view_mode = ViewMode::Context;
+        st.last_frame_area = term;
+        st.modals.outer_docs_cache = Some(crate::app::OuterDocsCacheDialogState {
+            entries: vec![
+                tauqe_protocol::OuterDocsCacheEntry {
+                    path: "openrouter/models".to_string(),
+                    size_bytes: 1024,
+                    estimated_tokens: 256,
+                },
+                tauqe_protocol::OuterDocsCacheEntry {
+                    path: "rust-book/ch04".to_string(),
+                    size_bytes: 512,
+                    estimated_tokens: 128,
+                },
+            ],
+            ..Default::default()
+        });
+        st.modals.confirm_outer_docs_cache_remove = Some("openrouter/models".to_string());
+
+        let state = Arc::new(Mutex::new(st));
+        let mut conn = RpcConnection::new(Vec::<u8>::new());
+        for kind in [MouseEventKind::ScrollDown, MouseEventKind::ScrollUp] {
+            handle_mouse_event(wheel(kind, 40, 20), &state, &mut conn)
+                .await
+                .expect("in-memory dispatch never fails");
+        }
+
+        let guard = state.lock().await;
+        let dialog = guard
+            .modals
+            .outer_docs_cache
+            .as_ref()
+            .expect("the browser stays open behind the card");
+        assert_eq!(dialog.cursor, 0, "the pending decision owns the wheel");
+        assert_eq!(dialog.scroll, 0);
+        assert!(conn.written().is_empty());
+    }
+
+    /// The inline Context path input sits outside the modal stack and keeps the
+    /// wheel for itself, so typing a path never scrolls the list underneath it
+    /// (Conventions §5.1).
+    #[tokio::test]
+    async fn wheel_is_consumed_while_the_inline_context_input_is_open() {
+        let term = Rect::new(0, 0, 100, 30);
+        let mut st = crate::app::test_state();
+        st.view_mode = ViewMode::Context;
+        st.last_frame_area = term;
+        st.context_view.adding_file = true;
+        st.context_view.cursor_index = 1;
+
+        let state = Arc::new(Mutex::new(st));
+        let mut conn = RpcConnection::new(Vec::<u8>::new());
+        handle_mouse_event(wheel(MouseEventKind::ScrollDown, 40, 20), &state, &mut conn)
+            .await
+            .expect("in-memory dispatch never fails");
+
+        let guard = state.lock().await;
+        assert_eq!(
+            guard.context_view.cursor_index, 1,
+            "the picker list keeps its row while a path is typed"
+        );
     }
 }

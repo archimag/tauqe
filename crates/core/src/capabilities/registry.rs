@@ -607,7 +607,18 @@ pub trait CapabilityModule: Send + Sync {
     ) -> Option<serde_json::Value> {
         self.json_schema_fragment()
     }
-
+    /// JSON-schema properties this module contributes under the turn's render context.
+    ///
+    /// A capability whose structured surface is conditional on a declaration its
+    /// prompt rules read — the project command allowlist, for example — overrides
+    /// this method and returns its fragment under the exact condition that makes
+    /// the rule describe the surface. The base implementation projects
+    /// [`CapabilityModule::json_schema_fragment_for`], so a property stays declared
+    /// by the same module that renders its prompt instruction and decodes it,
+    /// under the same render inputs.
+    fn json_schema_fragment_ctx(&self, ctx: &PromptRenderContext<'_>) -> Option<serde_json::Value> {
+        self.json_schema_fragment_for(ctx.patch_strategy)
+    }
     /// Shared JSON-schema definitions referenced by [`Self::json_schema_fragment`].
     ///
     /// A capability whose structured payload nests recursively — a plan is a
@@ -1084,15 +1095,22 @@ impl CapabilityRegistry {
     /// shared definitions through [`CapabilityModule::json_schema_defs`], and
     /// the registry lifts them to the root of the composed schema, where the
     /// `#/$defs/<Name>` references of that fragment resolve.
+    ///
+    /// The render context supplies the patch strategy that decides how a change
+    /// set addresses the replaced lines, together with the project declaration
+    /// the model may invoke, so the schema observes exactly the inputs its own
+    /// prompt rules render from: identical render inputs compose identical
+    /// bytes, and a capability whose rule is conditional on that declaration
+    /// declares its property under the same condition.
     pub fn compose_structured_schema(
         &self,
         set: &CapabilitySet,
-        patch_strategy: PatchStrategy,
+        ctx: &PromptRenderContext<'_>,
     ) -> serde_json::Value {
         let mut properties = serde_json::Map::new();
         let mut definitions = serde_json::Map::new();
         for module in self.enabled(set) {
-            if let Some(fragment) = module.json_schema_fragment_for(patch_strategy) {
+            if let Some(fragment) = module.json_schema_fragment_ctx(ctx) {
                 if let Some(fields) = fragment.as_object() {
                     for (name, schema) in fields {
                         properties
@@ -1235,6 +1253,11 @@ mod tests {
         )
     }
 
+    /// Builds the render context a schema composition uses when the project
+    /// declares no commands.
+    fn schema_render_context(patch_strategy: PatchStrategy) -> PromptRenderContext<'static> {
+        PromptRenderContext::new(&[], None).with_patch_strategy(patch_strategy)
+    }
     #[test]
     fn render_context_eager_repo_map_defaults_off_and_propagates() {
         let render = PromptRenderContext::new(&[], None);
@@ -1654,10 +1677,14 @@ mod tests {
     #[test]
     fn structured_schema_is_composed_from_the_enabled_modules() {
         let registry = CapabilityRegistry::global();
-        let schema = registry.compose_structured_schema(
-            &CapabilitySet::interactive_repl(),
-            PatchStrategy::SearchReplace,
-        );
+        // The full property set includes the conditional `custom_tools` field, so
+        // the composition observes a project that declares one command.
+        let project = project_with_commands(&["check"]);
+        let render = PromptRenderContext::new(&[], None)
+            .with_patch_strategy(PatchStrategy::SearchReplace)
+            .with_project(Some(&project));
+        let schema =
+            registry.compose_structured_schema(&CapabilitySet::interactive_repl(), &render);
 
         assert_eq!(schema["type"], serde_json::json!("object"));
         assert_eq!(schema["additionalProperties"], serde_json::json!(false));
@@ -1696,6 +1723,21 @@ mod tests {
         // `suggested_actions` belongs to no capability, so the registry never
         // advertises it.
         assert!(schema["properties"].get("suggested_actions").is_none());
+
+        // A project that declares no command publishes no `custom_tools` rule, so
+        // the strict schema declares no `custom_tools` property and requires none:
+        // the field and the rule that describes it follow one condition.
+        let set = CapabilitySet::interactive_repl();
+        for bare in [None, Some(project_with_commands(&[]))] {
+            let render = PromptRenderContext::new(&[], None)
+                .with_patch_strategy(PatchStrategy::SearchReplace)
+                .with_project(bare.as_ref());
+            let schema = registry.compose_structured_schema(&set, &render);
+            assert!(schema["properties"].get("custom_tools").is_none());
+            assert!(!schema_required(&schema)
+                .iter()
+                .any(|field| field == "custom_tools"));
+        }
     }
 
     #[test]
@@ -1706,7 +1748,10 @@ mod tests {
             LlmCapability::FileEdits,
             LlmCapability::PlanCreation,
         ]);
-        let schema = registry.compose_structured_schema(&with_plans, PatchStrategy::SearchReplace);
+        let schema = registry.compose_structured_schema(
+            &with_plans,
+            &schema_render_context(PatchStrategy::SearchReplace),
+        );
 
         assert!(schema_properties(&schema).contains(&"plan_update".to_string()));
         let definitions = schema["$defs"]
@@ -1719,7 +1764,7 @@ mod tests {
         // composed schema keeps the flat shape.
         let plain = registry.compose_structured_schema(
             &CapabilitySet::from_slice(&[LlmCapability::TextMessage, LlmCapability::FileEdits]),
-            PatchStrategy::SearchReplace,
+            &schema_render_context(PatchStrategy::SearchReplace),
         );
         assert!(plain.get("$defs").is_none());
 
@@ -1727,7 +1772,7 @@ mod tests {
         // both plan capabilities describe one payload.
         let updating = registry.compose_structured_schema(
             &CapabilitySet::from_slice(&[LlmCapability::TextMessage, LlmCapability::PlanUpdate]),
-            PatchStrategy::SearchReplace,
+            &schema_render_context(PatchStrategy::SearchReplace),
         );
         assert!(schema_properties(&updating).contains(&"plan_update".to_string()));
         assert!(updating["$defs"].is_object());
@@ -1738,7 +1783,10 @@ mod tests {
         let registry = CapabilityRegistry::global();
         let narrowed =
             CapabilitySet::from_slice(&[LlmCapability::TextMessage, LlmCapability::FileEdits]);
-        let schema = registry.compose_structured_schema(&narrowed, PatchStrategy::SearchReplace);
+        let schema = registry.compose_structured_schema(
+            &narrowed,
+            &schema_render_context(PatchStrategy::SearchReplace),
+        );
 
         let mut properties = schema_properties(&schema);
         properties.sort();
@@ -2124,7 +2172,6 @@ mod tests {
             registry.canonical_tag("context_request"),
             Some("context_request")
         );
-        assert_eq!(registry.canonical_tag("success"), Some("success"));
         assert_eq!(registry.canonical_tag("success"), Some("success"));
         // The internal documentation channel publishes one canonical spelling and
         // keeps its pre-canonical spelling as a permanent alias, so an older

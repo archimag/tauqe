@@ -28,6 +28,7 @@ pub mod locale;
 pub mod message;
 pub mod methods;
 pub mod model;
+pub mod outer_docs;
 pub mod plan;
 pub mod project;
 pub mod review;
@@ -145,13 +146,19 @@ pub use model::{
     StructuredOutcomeProposal, ToolchainFinishedEvent, ToolchainStartedEvent, TurnPhase,
     TurnPhaseEvent, TurnWorkContext, TurnWorkItem, TurnWorkQueue, UsageTotals, UsageTotalsSnapshot,
 };
+
+pub use outer_docs::{
+    OuterDocsCacheEntry, OuterDocsCacheListResult, OuterDocsCacheRemoveParams,
+    OuterDocsCacheRemoveResult,
+};
 pub use plan::{
     compute_items_status, ConceptItem, Plan, PlanClearHorizonParams, PlanClearHorizonResult,
-    PlanDeleteParams, PlanExecuteParams, PlanExecutePipelineParams, PlanGetParams, PlanGetResult,
-    PlanImplementation, PlanItem, PlanItemStatus, PlanListChangedEvent, PlanListResult,
-    PlanRefineParams, PlanRefineResult, PlanRejection, PlanRejectionKind, PlanReplanParams,
-    PlanSaveParams, PlanScopeEvaluation, PlanSetActiveParams, PlanSetActiveResult, PlanStats,
-    PlanSummary, PlanUpdateItemParams, PlanUpdateItemResult, PlanUpdatedEvent, PlanValidationError,
+    PlanCreatePipelineParams, PlanDeleteParams, PlanExecuteParams, PlanExecutePipelineParams,
+    PlanGetParams, PlanGetResult, PlanImplementation, PlanItem, PlanItemStatus,
+    PlanListChangedEvent, PlanListResult, PlanRefineParams, PlanRefineResult, PlanRejection,
+    PlanRejectionKind, PlanReplanParams, PlanSaveParams, PlanScopeEvaluation, PlanSetActiveParams,
+    PlanSetActiveResult, PlanStats, PlanSummary, PlanUpdateItemParams, PlanUpdateItemResult,
+    PlanUpdatedEvent, PlanValidationError,
 };
 pub use project::{
     format_diagnostics, Diagnostic, DiagnosticSeverity, ProjectCommandSpec, ProjectConfig,
@@ -201,11 +208,11 @@ mod wire_contract_tracking {
     ///
     /// The ledger is the authoritative record of the compatibility surface, and
     /// `alias_registry_matches_source_attributes` checks it in both directions:
-    /// an attribute without a recorded entry fails completeness, and a
-    /// record whose attribute is gone fails honesty. An alias added in a file
-    /// outside the scan surface therefore requires extending `ALIAS_SOURCES`,
-    /// the same discipline `FACADE_SOURCES` already imposes on the facade parity
-    /// check.
+    /// an attribute without a recorded entry fails completeness, and a record
+    /// whose attribute is gone fails honesty. The scan reads every source file of
+    /// the crate, and `alias_scan_surface_covers_every_declared_module` keeps
+    /// that surface complete as files are added, so a new spelling cannot enter
+    /// the crate without a decision recorded here.
     const ALIAS_REGISTRY: &[AliasRecord] = &[
         // review/item.rs: a category and a severity are read tolerantly, so a
         // payload produced under either vocabulary keeps decoding.
@@ -240,36 +247,141 @@ mod wire_contract_tracking {
         ("context.rs", "ContextLayer::OuterDocs", "refs"),
     ];
 
-    /// Source text of the submodules the alias scan reads besides the facades.
+    /// Source text of every crate file the facade list does not name.
     ///
     /// `FACADE_SOURCES` names one file per wire-contract surface, but a serde
-    /// attribute sits in the submodule that declares the type, not in the facade
-    /// that re-exports it. These files are listed explicitly so the scan reads
-    /// exactly what it claims: an alias added in a file outside this list
-    /// requires extending it, the same discipline `FACADE_SOURCES` imposes on
-    /// the facade parity check.
-    const ALIAS_SOURCES: &[(&str, &str)] = &[
+    /// attribute sits in the module that declares the type, not in the facade
+    /// that re-exports it, and the crate declares serde types far beyond the
+    /// handful of submodules this list once held. The scan therefore reads every
+    /// remaining source file, so an attribute is documented where it is written
+    /// rather than where it is re-exported.
+    ///
+    /// The list is exhaustive by construction rather than by discipline:
+    /// `alias_scan_surface_covers_every_declared_module` walks every tracked
+    /// file, maps each file module it declares onto the path the compiler reads,
+    /// and fails when that path is not tracked here. A new source file therefore
+    /// cannot enter the crate without entering the scan surface.
+    const CRATE_SOURCES: &[(&str, &str)] = &[
+        ("lib.rs", include_str!("lib.rs")),
+        ("methods.rs", include_str!("methods.rs")),
+        (
+            "command/capability.rs",
+            include_str!("command/capability.rs"),
+        ),
+        ("command/topic.rs", include_str!("command/topic.rs")),
+        (
+            "discussion/normalize.rs",
+            include_str!("discussion/normalize.rs"),
+        ),
+        ("discussion/schema.rs", include_str!("discussion/schema.rs")),
+        ("edit/proposal.rs", include_str!("edit/proposal.rs")),
+        ("model/batch.rs", include_str!("model/batch.rs")),
+        ("model/catalog.rs", include_str!("model/catalog.rs")),
+        ("model/effort.rs", include_str!("model/effort.rs")),
+        ("model/entry.rs", include_str!("model/entry.rs")),
+        ("model/reference.rs", include_str!("model/reference.rs")),
+        ("model/role.rs", include_str!("model/role.rs")),
+        ("model/selection.rs", include_str!("model/selection.rs")),
         ("model/turn.rs", include_str!("model/turn.rs")),
+        ("model/usage.rs", include_str!("model/usage.rs")),
         ("plan/dto.rs", include_str!("plan/dto.rs")),
+        (
+            "plan/implementation.rs",
+            include_str!("plan/implementation.rs"),
+        ),
+        ("plan/item.rs", include_str!("plan/item.rs")),
+        ("plan/node.rs", include_str!("plan/node.rs")),
+        ("plan/rejection.rs", include_str!("plan/rejection.rs")),
+        ("plan/render.rs", include_str!("plan/render.rs")),
+        ("plan/tests.rs", include_str!("plan/tests.rs")),
+        ("project/config.rs", include_str!("project/config.rs")),
+        ("review/analysis.rs", include_str!("review/analysis.rs")),
         ("review/dto.rs", include_str!("review/dto.rs")),
+        ("review/events.rs", include_str!("review/events.rs")),
+        ("review/group.rs", include_str!("review/group.rs")),
         ("review/item.rs", include_str!("review/item.rs")),
         ("review/session.rs", include_str!("review/session.rs")),
+        ("review/tests.rs", include_str!("review/tests.rs")),
     ];
 
     /// Every source file the alias scan reads, as `(path, text)` pairs.
     ///
     /// Facade entries are spelled `<module>.rs`, so one path vocabulary covers
     /// both halves of the surface and a registry record names the same file the
-    /// scan read.
+    /// scan read. The two halves together are the whole crate: the facade files
+    /// plus every file `FACADE_SOURCES` does not name.
     fn alias_scan_surface() -> Vec<(String, &'static str)> {
         let mut surface = Vec::new();
         for (module, source) in FACADE_SOURCES {
             surface.push((format!("{module}.rs"), *source));
         }
-        for (path, source) in ALIAS_SOURCES {
+        for (path, source) in CRATE_SOURCES {
             surface.push(((*path).to_string(), *source));
         }
         surface
+    }
+
+    /// Removes a leading `pub` visibility from one module declaration line.
+    ///
+    /// The crate spells module visibility as `pub`, `pub(crate)`, `pub(super)`,
+    /// or `pub(in path)`. The helper drops the keyword together with its
+    /// parenthesized group, so each of those forms reduces to the bare
+    /// declaration the scan looks for. A line without the keyword is returned
+    /// unchanged, which keeps every `pub use`, `pub const`, and `pub struct` line
+    /// out of the module scan.
+    fn strip_module_visibility(line: &str) -> &str {
+        let Some(rest) = line.strip_prefix("pub") else {
+            return line;
+        };
+        let rest = rest.trim_start();
+        let Some(group) = rest.strip_prefix('(') else {
+            return rest;
+        };
+        group
+            .split_once(')')
+            .map_or(line, |(_, remainder)| remainder.trim_start())
+    }
+
+    /// Every file module one source text declares, as bare module names.
+    ///
+    /// A declaration that ends with a semicolon names a file the compiler
+    /// includes, while an inline `mod name { ... }` block declares its body in
+    /// the same file. Only the first shape introduces a source file, so the scan
+    /// strips the visibility, requires the semicolon, and records the bare name.
+    /// Comments are stripped first, so a declaration quoted in prose is never
+    /// read as code.
+    fn declared_file_modules(source: &str) -> BTreeSet<String> {
+        let text = strip_comments(source);
+        let mut names = BTreeSet::new();
+
+        for raw in text.lines() {
+            let line = strip_module_visibility(raw.trim());
+            let Some(rest) = line.strip_prefix("mod ") else {
+                continue;
+            };
+            let Some(name) = rest.trim().strip_suffix(';') else {
+                continue;
+            };
+            let name = name.trim();
+            if is_plain_identifier(name) {
+                names.insert(name.to_string());
+            }
+        }
+
+        names
+    }
+
+    /// Source path the compiler reads for one file module of `path`.
+    ///
+    /// Rust resolves a module declared in `foo.rs` to `foo/<name>.rs` and a
+    /// module declared in the crate root to `<name>.rs`. The mapping reproduces
+    /// that rule, so the completeness gate compares a declaration against the
+    /// path the compiler itself would open.
+    fn child_module_path(path: &str, name: &str) -> String {
+        match path.strip_suffix(".rs") {
+            Some("lib") | None => format!("{name}.rs"),
+            Some(directory) => format!("{directory}/{name}.rs"),
+        }
     }
 
     /// Removes every line and block comment from one source text.
@@ -401,6 +513,50 @@ mod wire_contract_tracking {
              Delete each stale record, or restore the attribute it documents."
         );
     }
+
+    /// Pins the completeness of the alias scan surface itself.
+    ///
+    /// `alias_registry_matches_source_attributes` reports an unregistered
+    /// attribute only in a file it read, so the ledger is complete exactly when
+    /// the surface covers every compiled file. The gate walks each tracked file,
+    /// maps every file module it declares onto the path the compiler reads, and
+    /// requires that path to be tracked too. Because the crate root is tracked
+    /// and every other source file is reachable from it through such
+    /// declarations, a new file cannot join the crate without joining the
+    /// surface: either its declaration names an untracked file and this test
+    /// fails, or nothing declares it and the compiler never reads it.
+    #[test]
+    fn alias_scan_surface_covers_every_declared_module() {
+        let surface = alias_scan_surface();
+        let tracked = surface
+            .iter()
+            .map(|(path, _)| path.as_str())
+            .collect::<BTreeSet<&str>>();
+        let mut missing: Vec<String> = Vec::new();
+
+        assert_eq!(
+            tracked.len(),
+            surface.len(),
+            "the alias scan surface lists one path twice"
+        );
+        for (path, source) in &surface {
+            for name in declared_file_modules(source) {
+                let child = child_module_path(path, &name);
+                if tracked.contains(child.as_str()) {
+                    continue;
+                }
+                missing.push(format!(
+                    "{path} declares {name}, so {child} must be scanned"
+                ));
+            }
+        }
+
+        assert!(
+            missing.is_empty(),
+            "these declared modules fall outside the alias scan surface: {missing:?}. \
+             Add each file to `CRATE_SOURCES` so the scan reads the attributes it declares."
+        );
+    }
     /// Source text of every facade module whose `pub use` statements form the
     /// module half of the wire contract.
     ///
@@ -423,6 +579,7 @@ mod wire_contract_tracking {
         ("locale", include_str!("locale.rs")),
         ("message", include_str!("message.rs")),
         ("model", include_str!("model.rs")),
+        ("outer_docs", include_str!("outer_docs.rs")),
         ("plan", include_str!("plan.rs")),
         ("project", include_str!("project.rs")),
         ("review", include_str!("review.rs")),

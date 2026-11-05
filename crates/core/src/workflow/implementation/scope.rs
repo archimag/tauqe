@@ -27,11 +27,24 @@ use tauqe_protocol::{
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ExecutionScope {
     /// A stored local plan.
-    Plan { plan_id: String },
+    Plan {
+        plan_id: String,
+        step_id: Option<String>,
+    },
     /// An architectural review group executed through its unified horizon.
     ReviewGroup { review_id: String, group_id: String },
     /// A single review finding executed as a degenerate one-step horizon.
     ReviewFinding { review_id: String, item_id: u32 },
+}
+
+impl ExecutionScope {
+    /// Targeted plan step or subtree, if the scope is constrained to one.
+    pub fn target_step_id(&self) -> Option<&str> {
+        match self {
+            Self::Plan { step_id, .. } => step_id.as_deref(),
+            Self::ReviewGroup { .. } | Self::ReviewFinding { .. } => None,
+        }
+    }
 }
 
 impl ExecutionScope {
@@ -43,7 +56,7 @@ impl ExecutionScope {
     /// frame that is never executed leaves the repositories untouched.
     pub fn resolve(&self, repo_root: &Path) -> Result<ImplementationFrame, StepFailure> {
         match self {
-            Self::Plan { plan_id } => resolve_plan(repo_root, plan_id),
+            Self::Plan { plan_id, step_id } => resolve_plan(repo_root, plan_id, step_id.as_deref()),
             Self::ReviewGroup {
                 review_id,
                 group_id,
@@ -71,13 +84,18 @@ pub struct ImplementationFrame {
 }
 
 /// Resolves a stored local plan into its execution frame.
-fn resolve_plan(repo_root: &Path, plan_id: &str) -> Result<ImplementationFrame, StepFailure> {
+fn resolve_plan(
+    repo_root: &Path,
+    plan_id: &str,
+    step_id: Option<&str>,
+) -> Result<ImplementationFrame, StepFailure> {
     let plan = PlanStorage::load_plan(repo_root, plan_id)
         .map_err(|err| StepFailure::infrastructure(err.to_string()))?
         .ok_or_else(|| StepFailure::infrastructure(format!("Plan '{}' not found", plan_id)))?;
     Ok(ImplementationFrame {
         scope: ExecutionScope::Plan {
             plan_id: plan.id.clone(),
+            step_id: step_id.map(str::to_string),
         },
         plan,
         findings: Vec::new(),
@@ -260,7 +278,7 @@ fn dependency_stalled_step(plan: &Plan) -> Option<String> {
         for item in items {
             if item.is_leaf() {
                 if matches!(
-                    plan.evaluate_scope(Some(item.id.as_str())),
+                    plan.implementation.evaluate_scope(Some(item.id.as_str())),
                     PlanScopeEvaluation::BlockedByDependencies(_)
                 ) {
                     return Some(item.id.clone());
@@ -271,7 +289,7 @@ fn dependency_stalled_step(plan: &Plan) -> Option<String> {
         }
         None
     }
-    walk(plan, &plan.items)
+    walk(plan, &plan.implementation.items)
 }
 
 /// Classifies a stalled implementation scope for the pipeline supervisor.
@@ -383,6 +401,7 @@ mod tests {
 
         let scope = ExecutionScope::Plan {
             plan_id: "frame-plan".to_string(),
+            step_id: None,
         };
         let frame = scope.resolve(dir.path()).expect("the stored plan resolves");
 
@@ -391,10 +410,10 @@ mod tests {
         assert!(frame.findings.is_empty());
         let expected = ExecutionScope::Plan {
             plan_id: "frame-plan".to_string(),
+            step_id: None,
         };
         assert_eq!(frame.scope, expected);
     }
-
     #[test]
     fn review_group_scope_renders_the_group_findings_into_the_concept_tree() {
         let dir = tempdir().unwrap();
@@ -472,6 +491,7 @@ mod tests {
 
         let plan = ExecutionScope::Plan {
             plan_id: "ghost".to_string(),
+            step_id: None,
         };
         let group = ExecutionScope::ReviewGroup {
             review_id: "ghost".to_string(),
@@ -523,7 +543,7 @@ mod tests {
     #[test]
     fn dependency_stall_is_a_domain_failure_of_the_stalled_step() {
         let plan = stalled_plan();
-        let stall = plan.evaluate_scope(None);
+        let stall = plan.implementation.evaluate_scope(None);
         assert!(matches!(
             stall,
             PlanScopeEvaluation::BlockedByDependencies(_)
@@ -539,8 +559,8 @@ mod tests {
     #[test]
     fn blocked_scope_remains_an_infrastructure_failure() {
         let mut plan = stalled_plan();
-        plan.items[1].status = PlanItemStatus::Blocked;
-        let stall = plan.evaluate_scope(None);
+        plan.implementation.items[1].status = PlanItemStatus::Blocked;
+        let stall = plan.implementation.evaluate_scope(None);
         assert!(matches!(stall, PlanScopeEvaluation::BlockedByBlockers(_)));
 
         let failure = classify_scope_stall(&plan, None, &stall);
@@ -552,7 +572,7 @@ mod tests {
     #[test]
     fn ready_scope_names_no_stalled_step() {
         let mut plan = stalled_plan();
-        plan.items[0].status = PlanItemStatus::Done;
+        plan.implementation.items[0].status = PlanItemStatus::Done;
         assert_eq!(dependency_stalled_step(&plan), None);
     }
 }

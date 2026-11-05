@@ -52,6 +52,7 @@ pub const PLAN_SET_ACTIVE: &str = "plan/setActive";
 pub const PLAN_CLEAR_HORIZON: &str = "plan/clearHorizon";
 pub const PLAN_EXECUTE: &str = "plan/execute";
 pub const PLAN_EXECUTE_PIPELINE: &str = "plan/executePipeline";
+pub const PLAN_CREATE_PIPELINE: &str = "plan/createPipeline";
 pub const PLAN_REFINE: &str = "plan/refine";
 pub const PLAN_REPLAN: &str = "plan/replan";
 
@@ -60,6 +61,9 @@ pub const DISCUSSION_GET_FOCUS: &str = "discussion/getFocus";
 pub const DISCUSSION_CLEAR_FOCUS: &str = "discussion/clearFocus";
 
 pub const LOCALE_GENERATE: &str = "locale/generate";
+
+pub const OUTER_DOCS_CACHE_LIST: &str = "outerdocs/cacheList";
+pub const OUTER_DOCS_CACHE_REMOVE: &str = "outerdocs/cacheRemove";
 
 #[cfg(test)]
 mod tests {
@@ -117,12 +121,15 @@ mod tests {
             PLAN_CLEAR_HORIZON,
             PLAN_EXECUTE,
             PLAN_EXECUTE_PIPELINE,
+            PLAN_CREATE_PIPELINE,
             PLAN_REFINE,
             PLAN_REPLAN,
             DISCUSSION_SET_FOCUS,
             DISCUSSION_GET_FOCUS,
             DISCUSSION_CLEAR_FOCUS,
             LOCALE_GENERATE,
+            OUTER_DOCS_CACHE_LIST,
+            OUTER_DOCS_CACHE_REMOVE,
         ]
     }
 

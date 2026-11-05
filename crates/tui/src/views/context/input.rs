@@ -47,6 +47,7 @@ pub enum ContextAction {
     ClearUser,
     Copy,
     Refresh,
+    OpenCache,
 }
 
 /// Single source of truth for the Context view keybindings.
@@ -77,6 +78,15 @@ pub static CONTEXT_COMMAND_MAP: CommandMap<ContextAction> = CommandMap::new(&[
         ContextAction::Refresh,
         Helpers,
         "cmd.context.refresh",
+    ),
+    // Helpers: inspecting the durable external documentation cache. The
+    // browser is a reading surface until a removal is explicitly confirmed, so
+    // the chord stays a cheap helper rather than a costly action.
+    CommandSpec::new(
+        KeyChord::Bare(KeyCode::Char('o')),
+        ContextAction::OpenCache,
+        Helpers,
+        "cmd.context.open_cache",
     ),
     // Removing one file is destructive to the curated audit context, so it
     // stays on the canonical `Delete` reservation and always raises the shared
@@ -527,8 +537,8 @@ pub async fn handle_context_key(
             if count == 0 {
                 st.notify_info(active_t("notify.no_auto_files"));
             } else {
-                st.confirm_button = crate::app::ConfirmDialogButton::Cancel;
-                st.context_view.confirm_clear_auto = true;
+                st.modals.confirm_button = crate::app::ConfirmDialogButton::Cancel;
+                st.modals.confirm_clear_auto = true;
             }
         }
         ContextAction::ClearUser => {
@@ -541,8 +551,8 @@ pub async fn handle_context_key(
             if count == 0 {
                 st.notify_info(active_t("notify.no_user_files"));
             } else {
-                st.confirm_button = crate::app::ConfirmDialogButton::Cancel;
-                st.context_view.confirm_clear_user = true;
+                st.modals.confirm_button = crate::app::ConfirmDialogButton::Cancel;
+                st.modals.confirm_clear_user = true;
             }
         }
         ContextAction::Copy => {
@@ -591,6 +601,10 @@ pub async fn handle_context_key(
         ContextAction::Refresh => {
             drop(st);
             send_request(server_writer, methods::CONTEXT_GET, serde_json::json!({})).await?;
+        }
+        ContextAction::OpenCache => {
+            drop(st);
+            crate::input::open_outer_docs_cache(state, server_writer).await?;
         }
         ContextAction::AddEditable => {
             st.context_view.adding_file = true;
@@ -662,8 +676,8 @@ pub async fn handle_context_key(
                     // shared confirmation modal owns the request. `Cancel`
                     // drops the pending path and leaves the layer untouched
                     // (Conventions §4.3, §5.4).
-                    st.confirm_button = crate::app::ConfirmDialogButton::Cancel;
-                    st.context_view.pending_remove = Some(item.path.clone());
+                    st.modals.confirm_button = crate::app::ConfirmDialogButton::Cancel;
+                    st.modals.confirm_remove_context_file = Some(item.path.clone());
                 }
             }
             Some(ContextRow::Header(ContextLayer::Auto)) => {
@@ -676,8 +690,8 @@ pub async fn handle_context_key(
                 if auto_count == 0 {
                     st.notify_info(active_t("notify.no_auto_files"));
                 } else {
-                    st.context_view.confirm_clear_auto = true;
-                    st.confirm_button = crate::app::ConfirmDialogButton::Cancel;
+                    st.modals.confirm_clear_auto = true;
+                    st.modals.confirm_button = crate::app::ConfirmDialogButton::Cancel;
                 }
             }
             Some(ContextRow::Header(ContextLayer::Pinned)) => {
@@ -693,8 +707,8 @@ pub async fn handle_context_key(
                 if user_count == 0 {
                     st.notify_info(active_t("notify.no_user_files"));
                 } else {
-                    st.context_view.confirm_clear_user = true;
-                    st.confirm_button = crate::app::ConfirmDialogButton::Cancel;
+                    st.modals.confirm_clear_user = true;
+                    st.modals.confirm_button = crate::app::ConfirmDialogButton::Cancel;
                 }
             }
             Some(ContextRow::Header(ContextLayer::OuterDocs)) => {
@@ -737,8 +751,8 @@ mod tests {
         handle_context_key(key, &state, &mut conn).await.unwrap();
 
         let st = state.lock().await;
-        assert!(st.context_view.confirm_clear_user);
-        assert!(!st.context_view.confirm_clear_auto);
+        assert!(st.modals.confirm_clear_user);
+        assert!(!st.modals.confirm_clear_auto);
     }
 
     #[tokio::test]
@@ -753,8 +767,8 @@ mod tests {
         handle_context_key(key, &state, &mut conn).await.unwrap();
 
         let st = state.lock().await;
-        assert!(st.context_view.confirm_clear_auto);
-        assert!(!st.context_view.confirm_clear_user);
+        assert!(st.modals.confirm_clear_auto);
+        assert!(!st.modals.confirm_clear_user);
     }
 
     #[tokio::test]
@@ -774,8 +788,8 @@ mod tests {
         handle_context_key(key, &state, &mut conn).await.unwrap();
 
         let st = state.lock().await;
-        assert!(!st.context_view.confirm_clear_auto);
-        assert!(!st.context_view.confirm_clear_user);
+        assert!(!st.modals.confirm_clear_auto);
+        assert!(!st.modals.confirm_clear_user);
     }
 
     #[tokio::test]
@@ -983,8 +997,8 @@ mod tests {
         handle_context_key(key, &state, &mut conn).await.unwrap();
 
         let guard = state.lock().await;
-        assert!(!guard.context_view.confirm_clear_auto);
-        assert!(!guard.context_view.confirm_clear_user);
+        assert!(!guard.modals.confirm_clear_auto);
+        assert!(!guard.modals.confirm_clear_user);
         assert!(
             conn.written().is_empty(),
             "the registry layer is never cleared from the interface"
@@ -1023,7 +1037,7 @@ mod tests {
             .push(item("src/lib.rs", ContextLayer::User));
         // Rows: Pinned, Refs, User header, User item, Auto header.
         st.context_view.cursor_index = 3;
-        st.confirm_button = crate::app::ConfirmDialogButton::Confirm;
+        st.modals.confirm_button = crate::app::ConfirmDialogButton::Confirm;
         let state = Arc::new(Mutex::new(st));
         let mut conn = RpcConnection::new(Vec::<u8>::new());
 
@@ -1036,11 +1050,11 @@ mod tests {
         );
         let guard = state.lock().await;
         assert_eq!(
-            guard.context_view.pending_remove.as_deref(),
+            guard.modals.confirm_remove_context_file.as_deref(),
             Some("src/lib.rs")
         );
         assert_eq!(
-            guard.confirm_button,
+            guard.modals.confirm_button,
             crate::app::ConfirmDialogButton::Cancel,
             "the safe cancel button holds the default focus"
         );
@@ -1065,7 +1079,7 @@ mod tests {
         handle_context_key(key, &state, &mut conn).await.unwrap();
 
         let guard = state.lock().await;
-        assert!(guard.context_view.pending_remove.is_none());
+        assert!(guard.modals.confirm_remove_context_file.is_none());
         assert_eq!(guard.context.items.len(), 1);
         drop(guard);
         assert!(conn.written().is_empty());
@@ -1082,5 +1096,32 @@ mod tests {
         assert!(!chords.iter().any(|(chord, action)| {
             *action == ContextAction::Remove && *chord == KeyChord::Bare(KeyCode::Char('d'))
         }));
+    }
+    #[tokio::test]
+    async fn test_o_opens_the_external_docs_cache_browser() {
+        let mut st = test_state();
+        st.view_mode = ViewMode::Context;
+        let state = Arc::new(Mutex::new(st));
+        let mut conn = RpcConnection::new(Vec::<u8>::new());
+
+        let key = KeyEvent::new(KeyCode::Char('o'), crossterm::event::KeyModifiers::NONE);
+        handle_context_key(key, &state, &mut conn).await.unwrap();
+
+        let guard = state.lock().await;
+        let dialog = guard
+            .modals
+            .outer_docs_cache
+            .as_ref()
+            .expect("the browser opens");
+        assert!(dialog.loading, "the inventory is read over RPC");
+        assert!(dialog.entries.is_empty());
+        drop(guard);
+
+        let written = written_text(&conn);
+        assert!(written.contains(&format!("\"{}\"", methods::OUTER_DOCS_CACHE_LIST)));
+        assert!(
+            !written.contains(".tauqe"),
+            "the disk prefix never reaches the wire"
+        );
     }
 }

@@ -1270,8 +1270,8 @@ async fn fsm_turn_saves_and_activates_plan() {
         .expect("load plan")
         .expect("plan must be persisted");
     assert_eq!(loaded.title, "Integration Plan");
-    assert_eq!(loaded.items.len(), 1);
-    assert_eq!(loaded.items[0].id, "1");
+    assert_eq!(loaded.implementation.items.len(), 1);
+    assert_eq!(loaded.implementation.items[0].id, "1");
 
     let active = tauqe_core::plan::storage::PlanStorage::load_active_id(&repo_root)
         .expect("load active plan id");
@@ -1622,7 +1622,7 @@ async fn plan_semantic_recovery_lifecycle_end_to_end() {
 
     // 2. Invariant #c-2: Done is immutable (regression of Done step is rejected)
     let mut illegal_mutation = plan.clone();
-    illegal_mutation.items[0].status = PlanItemStatus::Todo;
+    illegal_mutation.implementation.items[0].status = PlanItemStatus::Todo;
     let err = tauqe_core::plan::storage::PlanStorage::save_plan(&repo_root, &illegal_mutation)
         .unwrap_err();
     assert!(err
@@ -1630,7 +1630,7 @@ async fn plan_semantic_recovery_lifecycle_end_to_end() {
         .contains("Cannot regress status of completed step '1'"));
 
     // 3. Invariant #c-4: DAG readiness checks before replanning
-    match plan.evaluate_scope(Some("3")) {
+    match plan.implementation.evaluate_scope(Some("3")) {
         PlanScopeEvaluation::BlockedByDependencies(deps) => {
             assert_eq!(deps.len(), 1);
             assert!(deps[0].contains("#3"));
@@ -1638,7 +1638,7 @@ async fn plan_semantic_recovery_lifecycle_end_to_end() {
         other => panic!("Expected BlockedByDependencies, got {:?}", other),
     }
     assert_eq!(
-        plan.evaluate_scope(Some("2")),
+        plan.implementation.evaluate_scope(Some("2")),
         PlanScopeEvaluation::StepBlocked
     );
 
@@ -1682,21 +1682,30 @@ async fn plan_semantic_recovery_lifecycle_end_to_end() {
     .expect("replace uncompleted horizon over blocked step");
 
     // The reprojected step is persisted with the horizon.
-    assert_eq!(recovered.last_replanned_step.as_deref(), Some("2"));
+    assert_eq!(
+        recovered.implementation.last_replanned_step.as_deref(),
+        Some("2")
+    );
 
-    assert_eq!(recovered.items.len(), 4);
-    assert_eq!(recovered.items[0].id, "1");
-    assert_eq!(recovered.items[0].status, PlanItemStatus::Done);
-    assert_eq!(recovered.items[1].id, "2.1");
-    assert_eq!(recovered.items[2].id, "2.2");
-    assert_eq!(recovered.items[3].id, "3");
+    assert_eq!(recovered.implementation.items.len(), 4);
+    assert_eq!(recovered.implementation.items[0].id, "1");
+    assert_eq!(
+        recovered.implementation.items[0].status,
+        PlanItemStatus::Done
+    );
+    assert_eq!(recovered.implementation.items[1].id, "2.1");
+    assert_eq!(recovered.implementation.items[2].id, "2.2");
+    assert_eq!(recovered.implementation.items[3].id, "3");
 
     // Dependent tail step 3 depends on step "2.2"
-    let remapped_dep = recovered.find_item("3").expect("find step 3");
+    let remapped_dep = recovered
+        .implementation
+        .find_item("3")
+        .expect("find step 3");
     assert_eq!(remapped_dep.depends_on, vec!["2.2".to_string()]);
 
     // 5. Invariant #c-4 & #c-5: DAG readiness evaluation on the updated plan
-    match recovered.evaluate_scope(None) {
+    match recovered.implementation.evaluate_scope(None) {
         PlanScopeEvaluation::Ready(leaves) => {
             let ids: Vec<&str> = leaves.iter().map(|l| l.id.as_str()).collect();
             assert_eq!(ids, vec!["2.1", "2.2", "3"]);
@@ -1704,7 +1713,7 @@ async fn plan_semantic_recovery_lifecycle_end_to_end() {
         other => panic!("Expected Ready, got {:?}", other),
     }
 
-    match recovered.evaluate_scope(Some("3")) {
+    match recovered.implementation.evaluate_scope(Some("3")) {
         PlanScopeEvaluation::BlockedByDependencies(deps) => {
             assert_eq!(deps.len(), 1);
             assert!(deps[0].contains("#3"));
@@ -1714,11 +1723,13 @@ async fn plan_semantic_recovery_lifecycle_end_to_end() {
 
     // Advance 2.1 to Done
     let mut progressed = recovered.clone();
-    progressed.update_item_status("2.1", PlanItemStatus::Done);
+    progressed
+        .implementation
+        .update_item_status("2.1", PlanItemStatus::Done);
     tauqe_core::plan::storage::PlanStorage::save_plan(&repo_root, &progressed)
         .expect("save progress");
 
-    match progressed.evaluate_scope(Some("2.2")) {
+    match progressed.implementation.evaluate_scope(Some("2.2")) {
         PlanScopeEvaluation::Ready(leaves) => {
             assert_eq!(leaves.len(), 1);
             assert_eq!(leaves[0].id, "2.2");
@@ -1727,11 +1738,13 @@ async fn plan_semantic_recovery_lifecycle_end_to_end() {
     }
 
     // Advance 2.2 to Done
-    progressed.update_item_status("2.2", PlanItemStatus::Done);
+    progressed
+        .implementation
+        .update_item_status("2.2", PlanItemStatus::Done);
     tauqe_core::plan::storage::PlanStorage::save_plan(&repo_root, &progressed)
         .expect("save progress");
 
-    match progressed.evaluate_scope(Some("3")) {
+    match progressed.implementation.evaluate_scope(Some("3")) {
         PlanScopeEvaluation::Ready(leaves) => {
             assert_eq!(leaves.len(), 1);
             assert_eq!(leaves[0].id, "3");
@@ -2017,8 +2030,11 @@ async fn discussion_turn_persists_plan_update_and_active_marker() {
         .expect("plan_update must be persisted from a discussion turn");
     assert_eq!(plan.title, "Discussion Plan");
     assert_eq!(plan.concept.len(), 1);
-    assert_eq!(plan.items.len(), 1);
-    assert_eq!(plan.items[0].concept_refs, vec!["c-1".to_string()]);
+    assert_eq!(plan.implementation.items.len(), 1);
+    assert_eq!(
+        plan.implementation.items[0].concept_refs,
+        vec!["c-1".to_string()]
+    );
 
     let active = tauqe_core::plan::storage::PlanStorage::load_active_id(&repo_root)
         .expect("load active plan id");
@@ -2052,7 +2068,7 @@ fn plan_discussion_intent_carries_the_dialogue_surface() {
     assert!(narrowed.contains(tauqe_protocol::LlmCapability::PlanCreation));
     assert!(narrowed.contains(tauqe_protocol::LlmCapability::FileEdits));
 
-    match protocol.response_format(&[], tauqe_protocol::PatchStrategy::SearchReplace) {
+    match protocol.response_format(&[], tauqe_protocol::PatchStrategy::SearchReplace, None) {
         Some(tauqe_core::providers::ResponseFormat::JsonSchema { json_schema, .. }) => {
             let schema = &json_schema.schema;
             assert!(schema["properties"].get("changes").is_some());
@@ -4679,6 +4695,157 @@ async fn auto_context_survives_a_text_answer_turn() {
     );
 }
 
+/// Returns the number of leading transcript messages two recorded requests
+/// share.
+///
+/// The head of a request is regenerated between turns — the repository outline
+/// of a later turn excludes the files the earlier turn discovered — so a
+/// cross-turn comparison starts at the first transcript message the
+/// chronological layout emits, and every message it shares is compared byte for
+/// byte.
+fn shared_transcript_messages(first: &[ChatMessage], second: &[ChatMessage]) -> usize {
+    first
+        .iter()
+        .skip(1)
+        .zip(second.iter().skip(1))
+        .take_while(|(left, right)| left == right)
+        .count()
+}
+
+/// A file the chronological transcript discovered while a turn ran keeps the
+/// slot it received on that turn: the recorded response and the prompt of the
+/// next turn append behind it, so the prefix the provider cached through the
+/// arrival survives the turn boundary.
+#[tokio::test]
+async fn discovered_file_keeps_its_transcript_slot_across_the_turn_boundary() {
+    let (_dir, repo_root) = init_repo();
+    std::fs::write(
+        repo_root.join("target.rs"),
+        "pub fn compute() -> i32 { 0 }\n",
+    )
+    .expect("write target fixture");
+    std::fs::write(repo_root.join("helper.rs"), "pub const ANSWER: i32 = 42;\n")
+        .expect("write helper fixture");
+    commit_fixture(&repo_root, &["target.rs", "helper.rs"]);
+
+    let mut context = ContextManager::new(repo_root.clone());
+    context
+        .add_file("target.rs", ContextAccess::Editable)
+        .expect("add target to context");
+    let mut history = HistoryManager::new(repo_root.clone());
+
+    let research = format!(
+        "I need the constant definitions.\n<context_request_{MARKER} path=\"helper.rs\" access=\"read_only\" />"
+    );
+    let answer = "The helper module declares ANSWER as 42, so the task needs no code change.";
+    let follow_up = "The constant is still 42; the earlier analysis stands.";
+    let provider = MockLlmProvider::scripted([
+        MockResponse::text(research),
+        MockResponse::text(answer),
+        MockResponse::text(follow_up),
+    ]);
+    let model = ModelRef::openrouter("mock/model");
+    let protocol = tauqe_core::prompt::xml::XmlPromptProtocol
+        .with_turn_marker(MARKER)
+        .expect("marker-bound protocol");
+    let mut policy = tauqe_core::workflow::policy::DirectApplyPolicy::new();
+    let options = layout_options("chronological");
+
+    let first = {
+        let (stream_tx, cancel_rx) = event_channel();
+        let mut env = build_env(
+            &provider,
+            &model,
+            &mut context,
+            &mut history,
+            protocol.as_ref(),
+            &mut policy,
+            stream_tx,
+            cancel_rx,
+            &options,
+        );
+        AnswerEditLoop::new("Explain the helper constant")
+            .execute(&mut env)
+            .await
+            .expect("the first turn executes")
+    };
+    assert!(matches!(first.result, ModelResult::Answer { .. }));
+    assert_eq!(
+        context.auto_files(),
+        vec!["helper.rs".to_string()],
+        "an answer without edits keeps the file the research round discovered"
+    );
+
+    let second = {
+        let (stream_tx, cancel_rx) = event_channel();
+        let mut env = build_env(
+            &provider,
+            &model,
+            &mut context,
+            &mut history,
+            protocol.as_ref(),
+            &mut policy,
+            stream_tx,
+            cancel_rx,
+            &options,
+        );
+        AnswerEditLoop::new("Repeat the explanation")
+            .execute(&mut env)
+            .await
+            .expect("the second turn executes")
+    };
+    assert!(matches!(second.result, ModelResult::Answer { .. }));
+    assert_eq!(
+        provider.requests().len(),
+        3,
+        "the first turn spends a research round and an answer, the second only an answer"
+    );
+
+    let discovered = &provider.requests()[1];
+    let adopted = &provider.requests()[2];
+
+    // The arrival lands right after the prompt record of the turn that
+    // discovered it, ahead of that turn's response.
+    let arrival = discovered
+        .messages
+        .iter()
+        .position(|message| message.content.contains("path=\"helper.rs\""))
+        .expect("the research round renders the discovered file");
+    assert_eq!(
+        arrival, 2,
+        "the discovered file follows the prompt record of the turn that found it: {:?}",
+        discovered.messages
+    );
+
+    // The next turn reproduces the arrival at the very same index, so the
+    // transcript it already sent through the file is preserved and only the
+    // appended records follow it.
+    assert_eq!(
+        adopted.messages[arrival].content, discovered.messages[arrival].content,
+        "the arrival must keep the slot it received on the discovering turn"
+    );
+    let shared = shared_transcript_messages(&discovered.messages, &adopted.messages);
+    assert!(
+        shared > arrival - 1,
+        "the shared transcript must cover the arrival: {shared} messages"
+    );
+
+    // The response of the discovering turn and the prompt of the next one land
+    // behind the arrival, never in front of it.
+    assert_eq!(adopted.messages[arrival + 1].role, "assistant");
+    assert!(
+        adopted.messages[arrival + 1]
+            .content
+            .contains("ANSWER as 42"),
+        "the recorded response of the discovering turn follows the arrival: {:?}",
+        adopted.messages[arrival + 1].content
+    );
+    assert_eq!(adopted.messages[arrival + 2].role, "user");
+    assert!(adopted.messages[arrival + 2]
+        .content
+        .contains("Repeat the explanation"));
+}
+
 /// A turn whose change set never matches leaves the accumulated research in
 /// place: the auto layer survives the patch-retry failure untouched and the
 /// working tree stays clean.
@@ -5709,12 +5876,13 @@ async fn line_anchor_turn_advertises_a_schema_without_the_overwrite_operation() 
 
     // The search/replace contour keeps the operation: echoing the whole file as
     // `old_text` is how a full rewrite is expressed there.
-    let echoed = match protocol.response_format(&[], tauqe_protocol::PatchStrategy::SearchReplace) {
-        Some(tauqe_core::providers::ResponseFormat::JsonSchema { json_schema, .. }) => {
-            json_schema.schema
-        }
-        other => panic!("expected a JSON-schema response format, got {other:?}"),
-    };
+    let echoed =
+        match protocol.response_format(&[], tauqe_protocol::PatchStrategy::SearchReplace, None) {
+            Some(tauqe_core::providers::ResponseFormat::JsonSchema { json_schema, .. }) => {
+                json_schema.schema
+            }
+            other => panic!("expected a JSON-schema response format, got {other:?}"),
+        };
     let operations = echoed["properties"]["changes"]["items"]["properties"]["op"]["enum"]
         .as_array()
         .expect("the change entry declares its operation selector");
@@ -7860,8 +8028,8 @@ async fn repl_save_of_an_existing_plan_is_reported_as_mode_forbidden() {
         .expect("load the stored plan")
         .expect("the seeded plan survives the refused mutation");
     assert_eq!(stored.title, "Develop Plan");
-    assert_eq!(stored.items[0].title, "Step 1");
-    assert_eq!(stored.items[0].status, PlanItemStatus::Todo);
+    assert_eq!(stored.implementation.items[0].title, "Step 1");
+    assert_eq!(stored.implementation.items[0].status, PlanItemStatus::Todo);
 }
 
 /// A validated answer applies its plan payload and reports every status the
@@ -7941,7 +8109,10 @@ async fn applied_plan_payload_reports_its_normalized_status() {
     let stored = tauqe_core::plan::storage::PlanStorage::load_plan(&repo_root, "warning-plan")
         .expect("load the applied plan")
         .expect("the qualified payload must be persisted");
-    assert_eq!(stored.find_item("1").unwrap().status, PlanItemStatus::Todo);
+    assert_eq!(
+        stored.implementation.find_item("1").unwrap().status,
+        PlanItemStatus::Todo
+    );
 
     let streamed = collector.await.expect("the collector joins");
     assert_eq!(
@@ -8407,7 +8578,10 @@ async fn answer_turn_announces_its_normalized_plan_status() {
     let stored = tauqe_core::plan::storage::PlanStorage::load_plan(&repo_root, "answer-plan")
         .expect("load the applied plan")
         .expect("the qualified payload must be persisted");
-    assert_eq!(stored.find_item("1").unwrap().status, PlanItemStatus::Todo);
+    assert_eq!(
+        stored.implementation.find_item("1").unwrap().status,
+        PlanItemStatus::Todo
+    );
 
     let streamed = collector.await.expect("the collector joins");
     assert_eq!(
@@ -8423,4 +8597,120 @@ async fn answer_turn_announces_its_normalized_plan_status() {
         rendered.contains("Plan mutation normalized"),
         "the repair must reach the recorded history"
     );
+}
+
+/// The custom tool surface follows the project declaration into the strict schema
+/// a structured turn sends to the provider.
+///
+/// The `custom_tools` field describes the command allowlist, so the property and
+/// the rule that explains it are declared under one condition: a project that
+/// declares no `[project.commands]` entry carries neither, while a declared
+/// command restores both the instruction and the required field.
+#[tokio::test]
+async fn structured_turn_declares_the_custom_tool_field_only_for_a_declared_command() {
+    const VERIFY_ONLY: &str = "\
+[models]
+primary = [\"openrouter:mock/model\"]
+
+[project.verify]
+command = \"true\"
+";
+    const WITH_COMMAND: &str = "\
+[models]
+primary = [\"openrouter:mock/model\"]
+
+[project.verify]
+command = \"true\"
+
+[project.commands.check]
+command = \"cargo\"
+args = [\"check\"]
+";
+
+    for (declaration, declared_commands) in [(VERIFY_ONLY, false), (WITH_COMMAND, true)] {
+        let (_dir, repo_root) = init_repo();
+        std::fs::write(
+            repo_root.join("target.rs"),
+            "pub fn compute() -> i32 { 0 }\n",
+        )
+        .expect("write target fixture");
+        std::fs::write(repo_root.join("tauqe.toml"), declaration)
+            .expect("write the project declaration");
+        commit_fixture(&repo_root, &["target.rs", "tauqe.toml"]);
+
+        let mut context = ContextManager::new(repo_root.clone());
+        context
+            .add_file("target.rs", ContextAccess::Editable)
+            .expect("add target to context");
+        let mut history = HistoryManager::new(repo_root.clone());
+
+        let response = serde_json::json!({
+            "message": "Change compute to 42.",
+            "changes": [{
+                "op": "replace",
+                "path": "target.rs",
+                "to": "",
+                "old_text": "pub fn compute() -> i32 { 0 }",
+                "new_text": "pub fn compute() -> i32 { 42 }",
+                "content": ""
+            }],
+            "context_requests": [],
+            "outcome": {
+                "status": "success",
+                "commit_message": "Change compute to 42",
+                "message": "",
+                "reason": ""
+            },
+        })
+        .to_string();
+
+        let provider = MockLlmProvider::scripted([MockResponse::text(response)]);
+        let model = ModelRef::openrouter("mock/model");
+        let protocol = tauqe_core::prompt::json::JsonPromptProtocol::edits();
+        let mut policy = tauqe_core::workflow::policy::DirectApplyPolicy::new();
+        let options = WorkflowOptions::default();
+        let (stream_tx, cancel_rx) = event_channel();
+
+        let output = {
+            let mut env = build_env(
+                &provider,
+                &model,
+                &mut context,
+                &mut history,
+                &protocol,
+                &mut policy,
+                stream_tx,
+                cancel_rx,
+                &options,
+            );
+            AnswerEditLoop::new("Change compute to return 42")
+                .execute(&mut env)
+                .await
+                .expect("structured turn executes")
+        };
+
+        assert!(matches!(
+            &output.result,
+            ModelResult::Edit { outcome, .. } if outcome.applied
+        ));
+
+        let schema = match provider.requests()[0].response_format.clone() {
+            Some(tauqe_core::providers::ResponseFormat::JsonSchema { json_schema, .. }) => {
+                json_schema.schema
+            }
+            other => panic!("expected a JSON-schema response format, got {other:?}"),
+        };
+        let declares_field = schema["properties"].get("custom_tools").is_some();
+        assert_eq!(
+            declares_field, declared_commands,
+            "the schema must declare the field exactly where the rule is described: {schema}"
+        );
+        let requires_field = schema["required"]
+            .as_array()
+            .is_some_and(|required| required.iter().any(|field| field == "custom_tools"));
+        assert_eq!(
+            requires_field, declared_commands,
+            "the required set must mirror the declared properties: {schema}"
+        );
+    }
 }

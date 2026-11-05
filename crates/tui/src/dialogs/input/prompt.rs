@@ -21,7 +21,7 @@ pub(super) async fn handle_prompt_modal(
     mut st: MutexGuard<'_, AppState>,
     server_writer: &mut RpcConnection,
 ) -> anyhow::Result<Option<InputResult>> {
-    let mut modal = match st.prompt_modal.take() {
+    let mut modal = match st.modals.prompt_modal.take() {
         Some(m) => m,
         None => return Ok(None),
     };
@@ -44,12 +44,12 @@ pub(super) async fn handle_prompt_modal(
             }
             KeyCode::Tab | KeyCode::BackTab => {
                 modal.focus = ModalFocus::Editor;
-                st.prompt_modal = Some(modal);
+                st.modals.prompt_modal = Some(modal);
                 return Ok(Some(InputResult::Continue));
             }
             KeyCode::Left | KeyCode::Right => {
                 modal.actions.toggle();
-                st.prompt_modal = Some(modal);
+                st.modals.prompt_modal = Some(modal);
                 return Ok(Some(InputResult::Continue));
             }
             // Both fast accelerators are bare presses, so a command chord or the
@@ -68,7 +68,7 @@ pub(super) async fn handle_prompt_modal(
                 }
             }
             _ => {
-                st.prompt_modal = Some(modal);
+                st.modals.prompt_modal = Some(modal);
                 return Ok(Some(InputResult::Continue));
             }
         }
@@ -79,7 +79,7 @@ pub(super) async fn handle_prompt_modal(
         KeyCode::Tab | KeyCode::BackTab => {
             modal.focus = ModalFocus::Actions;
             modal.actions.reset_to_cancel();
-            st.prompt_modal = Some(modal);
+            st.modals.prompt_modal = Some(modal);
             Ok(Some(InputResult::Continue))
         }
         // Unified send policy across every discussion modal: a bare `Enter` sends the
@@ -99,18 +99,18 @@ pub(super) async fn handle_prompt_modal(
                 // The paste buffer is a native round trip bounded at
                 // NATIVE_CLIPBOARD_TIMEOUT, so it is read with the state guard
                 // released and the answer is applied after the re-lock (c-1).
-                st.prompt_modal = Some(modal);
+                st.modals.prompt_modal = Some(modal);
                 drop(st);
                 let clipboard = crate::clipboard::get_from_clipboard_async().await;
                 let mut st = state.lock().await;
-                if let Some(mut modal) = st.prompt_modal.take() {
+                if let Some(mut modal) = st.modals.prompt_modal.take() {
                     modal.prompt_editor.yank_with(clipboard);
-                    st.prompt_modal = Some(modal);
+                    st.modals.prompt_modal = Some(modal);
                 }
                 return Ok(Some(InputResult::Continue));
             }
             crate::input::handle_editor_key(&mut modal.prompt_editor, key, is_cmd, true);
-            st.prompt_modal = Some(modal);
+            st.modals.prompt_modal = Some(modal);
             Ok(Some(InputResult::Continue))
         }
     }
@@ -133,7 +133,7 @@ pub(crate) async fn submit_prompt_modal(
     let user_comment = dialog.prompt_editor.get_text().trim().to_string();
     if user_comment.is_empty() {
         st.notify_warning(crate::i18n::active_t("notify.comment_empty"));
-        st.prompt_modal = Some(dialog);
+        st.modals.prompt_modal = Some(dialog);
         return Ok(Some(InputResult::Continue));
     }
 
@@ -215,7 +215,7 @@ pub(crate) async fn submit_prompt_modal(
     if let Err(err) = send_request(server_writer, methods::MODEL_ASK, payload).await {
         let mut st = state.lock().await;
         snapshot.restore(&mut st);
-        st.prompt_modal = Some(dialog);
+        st.modals.prompt_modal = Some(dialog);
         st.notify_error(
             crate::i18n::active_t("notify.prompt_send_failed").replace("{}", &err.to_string()),
         );
@@ -286,7 +286,7 @@ mod tests {
             let state = Arc::new(Mutex::new(crate::app::test_state()));
             {
                 let mut st = state.lock().await;
-                st.prompt_modal = Some(actions_modal());
+                st.modals.prompt_modal = Some(actions_modal());
             }
             let mut writer = RpcConnection::new(Vec::<u8>::new());
 
@@ -294,7 +294,11 @@ mod tests {
             assert!(matches!(result, Some(InputResult::Continue)));
 
             let st = state.lock().await;
-            let modal = st.prompt_modal.as_ref().expect("the modal must stay open");
+            let modal = st
+                .modals
+                .prompt_modal
+                .as_ref()
+                .expect("the modal must stay open");
             assert_eq!(modal.prompt_editor.get_text(), "keep this comment");
             assert!(
                 writer.written().is_empty(),
@@ -310,27 +314,27 @@ mod tests {
         let state = Arc::new(Mutex::new(crate::app::test_state()));
         {
             let mut st = state.lock().await;
-            st.prompt_modal = Some(actions_modal());
+            st.modals.prompt_modal = Some(actions_modal());
         }
         let mut writer = RpcConnection::new(Vec::<u8>::new());
         let cancel = key(KeyCode::Char('n'), KeyModifiers::NONE);
         let result = press(&state, cancel, &mut writer).await;
         assert!(matches!(result, Some(InputResult::Continue)));
         assert!(
-            state.lock().await.prompt_modal.is_none(),
+            state.lock().await.modals.prompt_modal.is_none(),
             "a bare n must still cancel the card"
         );
 
         let state = Arc::new(Mutex::new(crate::app::test_state()));
         {
             let mut st = state.lock().await;
-            st.prompt_modal = Some(actions_modal());
+            st.modals.prompt_modal = Some(actions_modal());
         }
         let escape = key(KeyCode::Esc, KeyModifiers::CONTROL);
         let result = press(&state, escape, &mut writer).await;
         assert!(matches!(result, Some(InputResult::Continue)));
         assert!(
-            state.lock().await.prompt_modal.is_none(),
+            state.lock().await.modals.prompt_modal.is_none(),
             "Esc stays unconditional while a command modifier is held"
         );
         assert!(writer.written().is_empty());

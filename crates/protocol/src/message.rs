@@ -63,7 +63,9 @@ fn is_token_metric_key(normalized: &str) -> bool {
 /// `ssh_key_prod`, and `openrouter_key_1` are all recognized. Recognition is
 /// family-based rather than a fixed whitelist of exact names, so variants such
 /// as `access_token`, `refresh_token`, `client_secret`, `authorization`, and
-/// `bearer` cannot slip through in plaintext.
+/// `bearer` cannot slip through in plaintext. The families also cover the
+/// alternative spellings `auth`, `passwd`, `pwd`, and `passphrase`, which name
+/// a credential without containing any of those stems.
 ///
 /// Testing components instead of the whole collapsed key keeps ordinary words
 /// readable: `keyword` and `keyword_v2` carry no credential component and stay
@@ -77,14 +79,20 @@ fn is_sensitive_key(key: &str) -> bool {
     key.split(|c: char| !c.is_alphanumeric())
         .any(is_sensitive_component)
 }
-
 /// Reports whether one alphanumeric component of a JSON object key names a
 /// credential.
 ///
 /// `apiKey` and `apikey` reach this function as a single component, so the
-/// family test keeps its suffix and substring matching on the lowercased
+/// family test keeps its affix and substring matching on the lowercased
 /// component. An empty component, produced by adjacent or leading separators,
 /// matches no family.
+///
+/// Most families are matched as substrings, so an alternative spelling such as
+/// `passwd`, `pwd`, or `passphrase` is recognized wherever it appears. `auth`
+/// is the exception: a substring test would also capture `author`, `authors`,
+/// and `authority`, which are ordinary names carrying no secret. It is matched
+/// by affix instead, so `auth`, `proxy_auth`, `oauth`, and `authentication` are
+/// credentials while the `author` family stays readable.
 fn is_sensitive_component(component: &str) -> bool {
     let normalized = component.to_ascii_lowercase();
 
@@ -93,9 +101,17 @@ fn is_sensitive_component(component: &str) -> bool {
         || normalized.contains("token")
         || normalized.contains("secret")
         || normalized.contains("password")
+        || normalized.contains("passwd")
+        || normalized.contains("passphrase")
+        || normalized.contains("pwd")
         || normalized.contains("credential")
         || normalized.contains("authorization")
         || normalized.contains("bearer")
+        // A component that ends with the `auth` stem (`auth`, `proxy_auth`,
+        // `oauth`) or begins with it (`auth`, `authn`, `authentication`) names
+        // authentication, unless it belongs to the ordinary `author` family.
+        || normalized.ends_with("auth")
+        || (normalized.starts_with("auth") && !normalized.starts_with("author"))
 }
 
 /// Normalizes a JSON object key into its comparison form.
@@ -697,6 +713,17 @@ mod tests {
             "api_keys_v2",
             "ssh_key_prod",
             "openrouter_key_1",
+            "auth",
+            "auth_header",
+            "proxy_auth",
+            "oauth",
+            "authentication",
+            "passwd",
+            "db_passwd",
+            "pwd",
+            "db_pwd",
+            "passphrase",
+            "passphrase_v2",
         ] {
             assert!(is_sensitive_key(key), "{key} must be treated as sensitive");
         }
@@ -709,6 +736,9 @@ mod tests {
             "keyword",
             "keyword_v2",
             "count",
+            "author",
+            "authors",
+            "authority",
         ] {
             assert!(
                 !is_sensitive_key(key),
@@ -943,5 +973,41 @@ mod tests {
         assert!(!rendered.contains("sk-live-event-secret"));
         assert!(rendered.contains("<redacted>"));
         assert!(rendered.contains("45"));
+    }
+
+    #[test]
+    fn test_debug_redacts_abbreviated_credential_keys() {
+        let req = Request {
+            id: RequestId::Number(9),
+            method: "custom/echo".to_string(),
+            params: Some(serde_json::json!({
+                "auth": "Bearer sk-auth-secret",
+                "proxy_auth": "Basic sk-proxy-secret",
+                "oauth": "sk-oauth-secret",
+                "authentication": "sk-authentication-secret",
+                "passwd": "sk-passwd-secret",
+                "db_pwd": "sk-pwd-secret",
+                "passphrase": "sk-passphrase-secret",
+                "author": "Ada Lovelace"
+            })),
+        };
+
+        let rendered = format!("{req:?}");
+        for secret in [
+            "sk-auth-secret",
+            "sk-proxy-secret",
+            "sk-oauth-secret",
+            "sk-authentication-secret",
+            "sk-passwd-secret",
+            "sk-pwd-secret",
+            "sk-passphrase-secret",
+        ] {
+            assert!(!rendered.contains(secret), "{secret} leaked into Debug");
+        }
+        assert!(rendered.contains("<redacted>"));
+
+        // The `author` family names a person or a document rather than a
+        // credential, so its value stays readable.
+        assert!(rendered.contains("Ada Lovelace"));
     }
 }

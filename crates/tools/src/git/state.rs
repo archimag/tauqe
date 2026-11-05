@@ -75,14 +75,33 @@ pub fn get_repository_state(dir: Option<&Path>) -> RepositoryState {
 }
 
 /// Lists all tracked files in the repository.
+///
+/// The listing is NUL-separated (`ls-files -z`), so Git never applies its
+/// C-style path quoting: a name containing a double quote, a backslash, a
+/// control byte, or a non-ASCII character arrives as the literal on-disk
+/// path rather than as an escaped rendering. An escaped string is not a
+/// path, so a consumer that resolves real files — a directory-move
+/// expansion, for example — would name a file that does not exist.
 pub fn list_repository_files(dir: Option<&Path>) -> Result<Vec<String>> {
-    let output = run_git(dir, &["ls-files"])?;
-    let files = output
-        .lines()
-        .map(|l| l.trim().to_string())
-        .filter(|l| !l.is_empty())
-        .collect();
-    Ok(files)
+    let output = run_git(dir, &["ls-files", "-z"])?;
+    Ok(split_nul_list(&output))
+}
+
+/// Lists the tracked files Git records under `subtree`, repository-relative.
+///
+/// The listing is bounded by the subtree through the pathspec itself, so the
+/// caller pays for the files it relocates instead of for the whole tracked
+/// tree. Pathspec magic is disabled with the `:(literal)` prefix, so a subtree
+/// whose name contains `*`, `?`, or `[` is matched verbatim instead of being
+/// read as a pattern. The output is NUL-separated (`ls-files -z`), so Git never
+/// applies its C-style path quoting: a name containing a double quote, a
+/// backslash, a control byte, or a non-ASCII character arrives as the literal
+/// on-disk path rather than as an escaped rendering, which is what a caller
+/// resolving real files needs.
+pub(crate) fn list_tracked_files_under(dir: &Path, subtree: &str) -> Result<Vec<String>> {
+    let literal = format!(":(literal){subtree}");
+    let output = run_git(Some(dir), &["ls-files", "-z", "--", literal.as_str()])?;
+    Ok(split_nul_list(&output))
 }
 
 /// Splits a NUL-separated Git listing into its non-empty entries.
@@ -320,6 +339,69 @@ mod tests {
 
         let files = list_repository_files(Some(path)).unwrap();
         assert!(files.iter().any(|file| file == "tracked.txt"));
+    }
+
+    #[test]
+    fn test_list_repository_files_reads_quoting_sensitive_names_verbatim() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path();
+
+        // With the default `core.quotePath=true` a line-oriented listing would
+        // escape every one of these names; the NUL-separated listing returns
+        // the literal path that exists on disk.
+        let names = ["back\\slash.rs", "quote\"d.rs", "привет.rs", "plain.rs"];
+        for name in names {
+            std::fs::write(path.join(name), "content\n").unwrap();
+        }
+        init_repository(Some(path), true, GitHooks::Bypass).unwrap();
+
+        let mut files = list_repository_files(Some(path)).unwrap();
+        files.sort();
+        let mut expected: Vec<String> = names.iter().map(|name| name.to_string()).collect();
+        expected.sort();
+        assert_eq!(
+            files, expected,
+            "quoting-sensitive names must arrive verbatim"
+        );
+    }
+    #[test]
+    fn test_list_tracked_files_under_lists_only_the_subtree_members_verbatim() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path();
+
+        std::fs::create_dir_all(path.join("src/moved")).unwrap();
+        std::fs::create_dir_all(path.join("src/[draft]")).unwrap();
+        std::fs::write(path.join("outside.rs"), "fn outside() {}\n").unwrap();
+        // A file whose name shares the textual prefix of the subtree stays out
+        // of the listing, because the bound is the pathspec rather than a
+        // prefix filter over the whole tracked tree.
+        std::fs::write(path.join("src/moved.rs"), "fn sibling() {}\n").unwrap();
+        std::fs::write(path.join("src/[draft]/draft.rs"), "fn draft() {}\n").unwrap();
+        // With the default `core.quotePath=true` a line-oriented listing would
+        // escape every one of these names; the NUL-separated bounded listing
+        // returns the literal path that exists on disk.
+        let names = ["back\\slash.rs", "quote\"d.rs", "привет.rs", "plain.rs"];
+        for name in names {
+            std::fs::write(path.join("src/moved").join(name), "fn moved() {}\n").unwrap();
+        }
+        init_repository(Some(path), true, GitHooks::Bypass).unwrap();
+
+        let mut files = list_tracked_files_under(path, "src/moved").unwrap();
+        files.sort();
+        let mut expected: Vec<String> = names
+            .iter()
+            .map(|name| format!("src/moved/{name}"))
+            .collect();
+        expected.sort();
+        assert_eq!(
+            files, expected,
+            "only the subtree members are listed, and their names arrive verbatim"
+        );
+
+        // The literal pathspec keeps a subtree whose name contains glob
+        // characters from matching the paths a pattern would expand to.
+        let draft = list_tracked_files_under(path, "src/[draft]").unwrap();
+        assert_eq!(draft, vec!["src/[draft]/draft.rs".to_string()]);
     }
 
     #[test]

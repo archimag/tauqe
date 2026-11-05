@@ -61,6 +61,46 @@ fn test_review_execute_params_serde() {
     assert_eq!(de, section);
 }
 
+/// Every execution target carries the whole rung: the model together with the
+/// reasoning depth of the configured coder entry. A finding run, a group run,
+/// and a section queue therefore travel the same typed selection.
+#[test]
+fn test_review_execute_params_carry_an_explicit_rung() {
+    let tier = Some(ModelSelection::Tier {
+        model: ModelRef::openrouter("anthropic/claude-3.5-sonnet"),
+        effort: Some(ReasoningEffort::High),
+    });
+
+    let targets = [
+        ReviewExecuteParams {
+            review_id: Some("rev-tier".to_string()),
+            item_id: Some(2),
+            model: tier.clone(),
+            ..Default::default()
+        },
+        ReviewExecuteParams {
+            review_id: Some("rev-tier".to_string()),
+            group_id: Some("arch-1".to_string()),
+            step_id: Some("1.1".to_string()),
+            model: tier.clone(),
+            ..Default::default()
+        },
+        ReviewExecuteParams {
+            review_id: Some("rev-tier".to_string()),
+            item_ids: Some(vec![3, 1]),
+            model: tier.clone(),
+            ..Default::default()
+        },
+    ];
+
+    for params in targets {
+        let json = serde_json::to_string(&params).unwrap();
+        assert!(json.contains("\"effort\":\"high\""), "got: {json}");
+        let de: ReviewExecuteParams = serde_json::from_str(&json).unwrap();
+        assert_eq!(de, params);
+    }
+}
+
 #[test]
 fn test_review_cancel_params_serde() {
     // Legacy clients send an empty object; the mode stays absent and the

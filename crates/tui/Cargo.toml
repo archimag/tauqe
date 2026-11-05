@@ -38,3 +38,8 @@ base64 = "0.22"
 # Shared with `crates/server`, so the workspace entry carries the version and
 # the feature set (Conventions §12.3).
 time.workspace = true
+# The modal enumeration derives its variant iterator from the ecosystem crate
+# (Conventions §1.6), so the declaration order of the enum alone states the
+# stacking priority. The version and the feature set live in the workspace
+# entry, so no member can observe a different `strum` (Conventions §12.3).
+strum.workspace = true

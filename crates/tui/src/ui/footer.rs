@@ -127,7 +127,7 @@ fn render_footer_with_engine(
         // A graceful batch stop is in flight: the current member finishes and
         // the queue halts before the next one, so the developer sees exactly
         // which stop is pending.
-        if state.batch_stopping {
+        if state.modals.batch_stopping {
             footer_spans.push(Span::raw(" "));
             footer_spans.push(Span::styled(
                 active_t("footer.stopping"),
@@ -695,7 +695,7 @@ mod tests {
         let mut state = crate::app::test_state();
         state.model.status = TurnStatus::Responding;
         state.model.is_batch = true;
-        state.batch_stopping = true;
+        state.modals.batch_stopping = true;
 
         terminal
             .draw(|frame| {

@@ -25,9 +25,47 @@ use tauqe_core::prompt::protocol::PromptProtocol;
 use tauqe_core::prompt::xml::XmlPromptProtocol;
 use tauqe_core::prompt::PromptAssembly;
 use tauqe_protocol::{
-    CapabilitySet, DocTopic, EditProtocolKind, LlmCapability, LlmCommand, PatchStrategy, TurnIntent,
+    CapabilitySet, DocTopic, EditProtocolKind, LlmCapability, LlmCommand, PatchStrategy,
+    ProjectConfig, TurnIntent,
 };
+/// Composes the strict schema of a capability surface under one project
+/// declaration.
+///
+/// The composition observes exactly the inputs the prompt rules of that turn
+/// render from: the declared patch strategy and the project declaration, so a
+/// capability whose rule is conditional on the declaration is described under
+/// the same condition.
+fn composed_schema_with_project(
+    surface: &CapabilitySet,
+    project: Option<&ProjectConfig>,
+) -> serde_json::Value {
+    let render = PromptRenderContext::new(&[], None)
+        .with_patch_strategy(PatchStrategy::SearchReplace)
+        .with_project(project);
+    CapabilityRegistry::global().compose_structured_schema(surface, &render)
+}
 
+/// Composes the strict schema of a capability surface for a project that
+/// declares no commands.
+fn composed_schema(surface: &CapabilitySet) -> serde_json::Value {
+    composed_schema_with_project(surface, None)
+}
+
+/// Builds the `[project]` declaration that carries one custom command per name.
+fn project_with_commands(names: &[&str]) -> ProjectConfig {
+    let mut project = ProjectConfig::default();
+    for name in names {
+        project.commands.insert(
+            (*name).to_string(),
+            tauqe_protocol::ProjectCommandSpec {
+                command: "cargo".to_string(),
+                args: vec![(*name).to_string()],
+                ..Default::default()
+            },
+        );
+    }
+    project
+}
 /// Every intent the harness can start a bounded turn with.
 const ALL_INTENTS: [TurnIntent; 4] = [
     TurnIntent::InteractiveRepl,
@@ -377,6 +415,9 @@ fn discussion_schema_declares_exactly_the_fields_of_the_response_dto() {
         repo_maps: vec!["crates/core".to_string()],
         dir_lists: vec![tauqe_protocol::DirListRequest::new("crates/core", true)],
         user_language: Some("Russian".to_string()),
+        // The decode diagnosis is harness-authored, so a document generated from
+        // the schema never carries it and the comparison sees the same field set.
+        plan_update_error: None,
     };
 
     assert_eq!(
@@ -590,15 +631,24 @@ fn required_names(schema: &serde_json::Value) -> Vec<String> {
         .unwrap_or_default()
 }
 
-/// Returns the properties the enabled capability modules declare.
-fn expected_properties(surface: &CapabilitySet) -> Vec<String> {
+/// Returns the properties the enabled capability modules declare under
+/// `project`.
+///
+/// The expected set is derived from the same declaration the composition folds,
+/// so a capability whose property is conditional on the render inputs — the
+/// project command allowlist, for example — is expected exactly where it is
+/// declared.
+fn expected_properties(surface: &CapabilitySet, project: Option<&ProjectConfig>) -> Vec<String> {
     let registry = CapabilityRegistry::global();
     let mut names: Vec<String> = Vec::new();
     for capability in surface.iter() {
         let Some(module) = registry.module(*capability) else {
             continue;
         };
-        let Some(fragment) = module.json_schema_fragment() else {
+        let render = PromptRenderContext::new(&[], None)
+            .with_patch_strategy(PatchStrategy::SearchReplace)
+            .with_project(project);
+        let Some(fragment) = module.json_schema_fragment_ctx(&render) else {
             continue;
         };
         let Some(fields) = fragment.as_object() else {
@@ -616,9 +666,10 @@ fn expected_properties(surface: &CapabilitySet) -> Vec<String> {
 
 /// Returns the top-level properties of the fully advertised structured schema.
 fn structured_property_names() -> Vec<String> {
-    let schema = CapabilityRegistry::global().compose_structured_schema(
+    let project = project_with_commands(&["check"]);
+    let schema = composed_schema_with_project(
         &CapabilitySet::from_slice(LlmCapability::ALL),
-        PatchStrategy::SearchReplace,
+        Some(&project),
     );
     property_names(&schema)
 }
@@ -658,39 +709,55 @@ fn the_discussion_intent_binds_the_dialogue_surface() {
 
 #[test]
 fn structured_schema_is_the_projection_of_the_narrowed_surface() {
-    let registry = CapabilityRegistry::global();
     let structured = JsonPromptProtocol::edits();
+    let project = project_with_commands(&["check"]);
 
     for intent in ALL_INTENTS {
         let surface = narrowed_surface(&structured, intent);
-        let schema = registry.compose_structured_schema(&surface, PatchStrategy::SearchReplace);
+        // The schema observes the very declaration the prompt rules read, so the
+        // conditional `custom_tools` property is asserted both with and without a
+        // declared command.
+        for declaration in [None, Some(&project)] {
+            let schema = composed_schema_with_project(&surface, declaration);
 
-        let mut declared = property_names(&schema);
-        declared.sort();
-        assert_eq!(declared, expected_properties(&surface), "{intent:?} schema");
+            let mut declared = property_names(&schema);
+            declared.sort();
+            assert_eq!(
+                declared,
+                expected_properties(&surface, declaration),
+                "{intent:?}"
+            );
 
-        let mut required = required_names(&schema);
-        required.sort();
-        assert_eq!(required, declared, "{intent:?} strict schema");
+            let mut required = required_names(&schema);
+            required.sort();
+            assert_eq!(required, declared, "{intent:?} strict schema");
 
-        assert_eq!(schema["additionalProperties"], serde_json::json!(false));
+            assert_eq!(schema["additionalProperties"], serde_json::json!(false));
 
-        // A nested plan payload travels as shared definitions; a surface that
-        // cannot author plans carries no definition to lift.
-        let authors_plans = surface.contains(LlmCapability::PlanCreation)
-            || surface.contains(LlmCapability::PlanUpdate);
-        assert_eq!(schema.get("$defs").is_some(), authors_plans);
+            // A nested plan payload travels as shared definitions; a surface that
+            // cannot author plans carries no definition to lift.
+            let authors_plans = surface.contains(LlmCapability::PlanCreation)
+                || surface.contains(LlmCapability::PlanUpdate);
+            assert_eq!(schema.get("$defs").is_some(), authors_plans);
+        }
     }
 }
 
 #[test]
 fn the_plan_abort_and_custom_tool_fields_follow_the_surface() {
-    let registry = CapabilityRegistry::global();
     let structured = JsonPromptProtocol::edits();
+    let project = project_with_commands(&["check"]);
+    // A project that declares no command publishes no `custom_tools` rule, so the
+    // property leaves the schema together with the instruction describing it.
+    let bare = composed_schema(&narrowed_surface(&structured, TurnIntent::InteractiveRepl));
+    assert!(bare["properties"].get("custom_tools").is_none());
+    assert!(!required_names(&bare)
+        .iter()
+        .any(|field| field == "custom_tools"));
 
-    let repl = registry.compose_structured_schema(
+    let repl = composed_schema_with_project(
         &narrowed_surface(&structured, TurnIntent::InteractiveRepl),
-        PatchStrategy::SearchReplace,
+        Some(&project),
     );
     for field in ["plan_update", "abort", "custom_tools", "outer_doc_requests"] {
         assert!(
@@ -699,19 +766,18 @@ fn the_plan_abort_and_custom_tool_fields_follow_the_surface() {
         );
     }
 
-    let step = registry.compose_structured_schema(
+    let step = composed_schema_with_project(
         &narrowed_surface(&structured, TurnIntent::IsolatedStep),
-        PatchStrategy::SearchReplace,
+        Some(&project),
     );
-    assert!(step["properties"].get("plan_update").is_none());
     assert!(step["properties"].get("abort").is_some());
     assert!(step["properties"].get("outer_doc_requests").is_some());
 
     // A plan discussion carries the whole dialogue surface, so its composed
     // schema declares the change set, the plan payload, and every escape.
-    let discussion = registry.compose_structured_schema(
+    let discussion = composed_schema_with_project(
         &narrowed_surface(&structured, TurnIntent::PlanDiscussion),
-        PatchStrategy::SearchReplace,
+        Some(&project),
     );
     for field in [
         "plan_update",
@@ -730,7 +796,6 @@ fn the_plan_abort_and_custom_tool_fields_follow_the_surface() {
 
 #[test]
 fn the_review_decision_field_follows_the_review_discussion_surface() {
-    let registry = CapabilityRegistry::global();
     let structured = JsonPromptProtocol::edits();
 
     // The decision is authorized by the review-discussion regime alone. The
@@ -740,10 +805,7 @@ fn the_review_decision_field_follows_the_review_discussion_surface() {
     let advertised = structured
         .capability_set()
         .with(LlmCapability::ReviewUpdate);
-    let review = registry.compose_structured_schema(
-        &TurnIntent::ReviewDiscussion.narrow_capabilities(&advertised),
-        PatchStrategy::SearchReplace,
-    );
+    let review = composed_schema(&TurnIntent::ReviewDiscussion.narrow_capabilities(&advertised));
     assert!(review["properties"].get("review_update").is_some());
     let mut declared = property_names(&review);
     declared.sort();
@@ -765,10 +827,7 @@ fn the_review_decision_field_follows_the_review_discussion_surface() {
         TurnIntent::PlanDiscussion,
         TurnIntent::IsolatedStep,
     ] {
-        let schema = registry.compose_structured_schema(
-            &intent.narrow_capabilities(&advertised),
-            PatchStrategy::SearchReplace,
-        );
+        let schema = composed_schema(&intent.narrow_capabilities(&advertised));
         assert!(
             schema["properties"].get("review_update").is_none(),
             "{intent:?} declares the review decision"
@@ -941,10 +1000,7 @@ fn the_documentation_channel_decodes_both_spellings_identically() {
 
     // The composed schema advertises the canonical field alone, so the alias is
     // asserted on the decoder rather than on the schema.
-    let schema = CapabilityRegistry::global().compose_structured_schema(
-        &CapabilitySet::interactive_repl(),
-        PatchStrategy::SearchReplace,
-    );
+    let schema = composed_schema(&CapabilitySet::interactive_repl());
     assert!(schema["properties"].get("tauqe_doc_requests").is_some());
     assert!(schema["properties"].get("doc_requests").is_none());
 

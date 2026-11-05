@@ -23,7 +23,7 @@ async fn apply_model_selection(
     selection: ModelSelection,
     server_writer: &mut RpcConnection,
 ) -> anyhow::Result<()> {
-    st.selection_dialog = None;
+    st.modals.selection_dialog = None;
     let prev_model = st.active_model.clone();
     let prev_selection = std::mem::replace(&mut st.model_choice.selection, selection.clone());
     if let Some(effective) = st.model_choice.resolve(&selection) {
@@ -97,7 +97,7 @@ pub(super) async fn handle_selection_dialog_key(
     mut st: MutexGuard<'_, AppState>,
     server_writer: &mut RpcConnection,
 ) -> anyhow::Result<Option<InputResult>> {
-    let mut dialog = match st.selection_dialog.take() {
+    let mut dialog = match st.modals.selection_dialog.take() {
         Some(dialog) => dialog,
         None => return Ok(None),
     };
@@ -111,7 +111,7 @@ pub(super) async fn handle_selection_dialog_key(
     let visible_height = crate::dialogs::render::selection_dialog_visible_height(area);
 
     if dialog.selector.handle_list_key(key, visible_height) {
-        st.selection_dialog = Some(dialog);
+        st.modals.selection_dialog = Some(dialog);
         return Ok(Some(InputResult::Continue));
     }
 
@@ -127,7 +127,7 @@ pub(super) async fn handle_selection_dialog_key(
     match key.code {
         // `Esc` and `q` dismiss the dialog; any other key keeps it open.
         KeyCode::Esc | KeyCode::Char('q') => {}
-        _ => st.selection_dialog = Some(dialog),
+        _ => st.modals.selection_dialog = Some(dialog),
     }
     Ok(Some(InputResult::Continue))
 }
@@ -166,7 +166,7 @@ mod tests {
             ModelRef::openrouter("openai/gpt-4o"),
             Some(ReasoningEffort::High),
         );
-        st.selection_dialog = Some(SelectionDialogState::new(vec![entry.clone()], 0));
+        st.modals.selection_dialog = Some(SelectionDialogState::new(vec![entry.clone()], 0));
 
         let state = Arc::new(Mutex::new(st));
         let mut conn = RpcConnection::new(Vec::<u8>::new());
@@ -189,7 +189,7 @@ mod tests {
         let mut st = test_state();
         // The picker reopens on the rung the developer picked last, which is the
         // index the highlight resolution seeds.
-        st.selection_dialog = Some(SelectionDialogState::new(same_model_rungs(), 1));
+        st.modals.selection_dialog = Some(SelectionDialogState::new(same_model_rungs(), 1));
 
         let state = Arc::new(Mutex::new(st));
         let mut conn = RpcConnection::new(Vec::<u8>::new());
@@ -205,7 +205,7 @@ mod tests {
         .expect("activation succeeds");
         assert!(handled.is_some(), "the picker consumes the key");
         assert!(
-            state.lock().await.selection_dialog.is_none(),
+            state.lock().await.modals.selection_dialog.is_none(),
             "a dispatched selection closes the picker"
         );
 
@@ -220,7 +220,7 @@ mod tests {
     #[tokio::test]
     async fn digit_quick_select_steers_the_following_activation() {
         let mut st = test_state();
-        st.selection_dialog = Some(SelectionDialogState::new(same_model_rungs(), 0));
+        st.modals.selection_dialog = Some(SelectionDialogState::new(same_model_rungs(), 0));
 
         let state = Arc::new(Mutex::new(st));
         let mut conn = RpcConnection::new(Vec::<u8>::new());
@@ -244,6 +244,7 @@ mod tests {
         let highlighted = state
             .lock()
             .await
+            .modals
             .selection_dialog
             .as_ref()
             .map(|dialog| dialog.selector.selected_index());
@@ -271,7 +272,7 @@ mod tests {
     #[tokio::test]
     async fn clicked_row_dispatches_the_rung_the_window_resolves() {
         let mut st = test_state();
-        st.selection_dialog = Some(SelectionDialogState::new(same_model_rungs(), 0));
+        st.modals.selection_dialog = Some(SelectionDialogState::new(same_model_rungs(), 0));
 
         let state = Arc::new(Mutex::new(st));
         let mut conn = RpcConnection::new(Vec::<u8>::new());
@@ -281,7 +282,11 @@ mod tests {
         // which step supplies the model.
         let entry = {
             let mut guard = state.lock().await;
-            let dialog = guard.selection_dialog.as_mut().expect("picker stays open");
+            let dialog = guard
+                .modals
+                .selection_dialog
+                .as_mut()
+                .expect("picker stays open");
             let index = dialog.selector.visible_start(3) + 2;
             dialog.selector.select_index(index);
             dialog
@@ -340,7 +345,7 @@ mod tests {
         let previous_model = ModelRef::openrouter("openai/gpt-4o-mini");
         st.active_model = previous_model.clone();
         st.model_choice.selection = ModelSelection::Role(ModelRole::Coder);
-        st.selection_dialog = Some(SelectionDialogState::new(same_model_rungs(), 2));
+        st.modals.selection_dialog = Some(SelectionDialogState::new(same_model_rungs(), 2));
 
         let state = Arc::new(Mutex::new(st));
         let mut conn = RpcConnection::new(FailingWriter);
@@ -351,6 +356,7 @@ mod tests {
         {
             let guard = state.lock().await;
             let entry = guard
+                .modals
                 .selection_dialog
                 .as_ref()
                 .and_then(|dialog| dialog.selector.selected_entry())
@@ -416,7 +422,7 @@ mod tests {
         let mut st = test_state();
         st.tui_config.input.layout = crate::config::LayoutPreset::RuJcuken;
         st.last_frame_area = ratatui::layout::Rect::new(0, 0, 120, 40);
-        st.selection_dialog = Some(SelectionDialogState::new(same_model_rungs(), 0));
+        st.modals.selection_dialog = Some(SelectionDialogState::new(same_model_rungs(), 0));
 
         let state = Arc::new(Mutex::new(st));
         let mut conn = RpcConnection::new(Vec::<u8>::new());
@@ -425,6 +431,7 @@ mod tests {
             press(&state, &mut conn, code, PLAIN).await;
             let guard = state.lock().await;
             let dialog = guard
+                .modals
                 .selection_dialog
                 .as_ref()
                 .expect("the picker stays open while it navigates");
@@ -441,6 +448,7 @@ mod tests {
             press(&state, &mut conn, KeyCode::Char(character), PLAIN).await;
             let guard = state.lock().await;
             let dialog = guard
+                .modals
                 .selection_dialog
                 .as_ref()
                 .expect("the picker stays open while a digit steers it");
@@ -453,7 +461,7 @@ mod tests {
 
         press(&state, &mut conn, KeyCode::Char('й'), PLAIN).await;
         assert!(
-            state.lock().await.selection_dialog.is_none(),
+            state.lock().await.modals.selection_dialog.is_none(),
             "`й` sits on the physical `q` position and must dismiss the picker"
         );
         assert!(

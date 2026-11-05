@@ -22,6 +22,15 @@ use crate::ui::{centered_rect, wrap_line, wrap_lines};
 pub enum ConfirmOutcome {
     /// The focused button changed; the dialog stays open.
     Toggled,
+    /// The press resolved to no command this confirmation understands, so the
+    /// dialog stays open and its focus is untouched.
+    ///
+    /// The outcome is distinct from [`ConfirmOutcome::Toggled`], which always
+    /// reports a real focus transition, so a caller can tell an unbound key
+    /// from a button move. The submit accelerator of the model-list dialog
+    /// family is never produced by a binary confirmation either, so that chord
+    /// is reported here as well.
+    Ignored,
     /// The user confirmed the action.
     Accepted,
     /// The user cancelled or dismissed the dialog safely.
@@ -77,7 +86,9 @@ impl ConfirmDialog {
     /// is matched directly here (Conventions §3, §5). The arrow keys and
     /// `Tab`/`Shift+Tab` cycle the focused button; `Enter`/`Space` activates it;
     /// `y`/`Y` confirms immediately and `n`/`N`/`Esc`/`q` dismisses safely,
-    /// regardless of which button holds focus.
+    /// regardless of which button holds focus. A press that resolves to no
+    /// command at all is reported as [`ConfirmOutcome::Ignored`], so a caller
+    /// can always tell an actual focus transition from an unbound key.
     ///
     /// `input` is the workstation's configured keyboard mapping, exactly as the
     /// view command maps receive it: the shared chord matcher projects every
@@ -93,7 +104,7 @@ impl ConfirmDialog {
             .resolve(key, input, false)
             .map(|spec| spec.action)
         else {
-            return ConfirmOutcome::Toggled;
+            return ConfirmOutcome::Ignored;
         };
 
         match command {
@@ -123,10 +134,14 @@ impl ConfirmDialog {
             }
             // The model-list submit accelerator is declared only by
             // `MODEL_LIST_DIALOG_COMMAND_MAP`, so a binary confirmation never
-            // resolves it. Keeping the dialog open and its focus untouched
-            // matches the neutral outcome an unrecognized press already
-            // produces (Conventions §4).
-            DialogCommand::SubmitAccelerator => ConfirmOutcome::Toggled,
+            // resolves it. Reporting it as `Ignored` keeps the dialog open and
+            // its focus untouched, exactly like a press the map does not bind
+            // (Conventions §4).
+            // The vertical field walk belongs to dialogs that stack several
+            // sections; a binary confirmation owns one action row, so the chord
+            // reaches nothing and the dialog keeps its focus (Conventions §6.2).
+            DialogCommand::FieldNext | DialogCommand::FieldPrev => ConfirmOutcome::Ignored,
+            DialogCommand::SubmitAccelerator => ConfirmOutcome::Ignored,
         }
     }
 }
@@ -346,6 +361,30 @@ mod tests {
         assert_eq!(
             dialog.handle_key(key(KeyCode::Enter), &canonical()),
             ConfirmOutcome::Accepted
+        );
+        assert!(dialog.is_cancel());
+    }
+
+    /// A press the dialog understands as nothing at all is reported as
+    /// `Ignored` rather than as a focus move, and it never moves the focus, so
+    /// a caller can always tell an unbound key from a real transition.
+    #[test]
+    fn unbound_key_is_reported_as_ignored_without_moving_the_focus() {
+        let mut dialog = ConfirmDialog::new();
+        assert_eq!(
+            dialog.handle_key(key(KeyCode::Char('z')), &canonical()),
+            ConfirmOutcome::Ignored
+        );
+        assert!(dialog.is_cancel(), "the safe default keeps the focus");
+
+        // The submit accelerator belongs to the model-list dialog family, so a
+        // binary confirmation never produces it and reports the chord as
+        // ignored as well.
+        let mut dialog = ConfirmDialog::new();
+        let submit = KeyEvent::new(KeyCode::Enter, KeyModifiers::CONTROL);
+        assert_eq!(
+            dialog.handle_key(submit, &canonical()),
+            ConfirmOutcome::Ignored
         );
         assert!(dialog.is_cancel());
     }

@@ -5,8 +5,8 @@
 //! derivation dependency would violate its mandate (Conventions §2). To keep a
 //! single source of truth (Conventions §1.3), the schema is pinned to the
 //! authoritative Rust data model by `test_schema_matches_data_model`, which
-//! fails the build whenever a field, required key, or enum variant drifts away
-//! from `DiscussionResponse` and its nested types.
+//! fails the build whenever a field, required key, enum variant, or numeric
+//! domain drifts away from `DiscussionResponse` and its nested types.
 //!
 //! Every schema is assembled once into a process-wide cache and served by
 //! shared reference, so a caller composes or serializes through the value the
@@ -26,7 +26,7 @@
 use std::sync::OnceLock;
 
 use crate::plan::PlanItemStatus;
-use crate::review::ReviewDecisionStatus;
+use crate::review::{ReviewDecisionStatus, ReviewUpdateProposal};
 
 /// Process-wide cache of the assembled discussion schema.
 ///
@@ -45,6 +45,9 @@ static REVIEW_UPDATE_SCHEMA: OnceLock<serde_json::Value> = OnceLock::new();
 
 /// Process-wide cache of the assembled structured-output wrapper.
 static DISCUSSION_RESPONSE_SCHEMA_DEFINITION: OnceLock<serde_json::Value> = OnceLock::new();
+
+/// Process-wide cache of the project custom tool invocation contract.
+static CUSTOM_TOOL_CALL_SCHEMA: OnceLock<serde_json::Value> = OnceLock::new();
 
 /// Generates the structured plan payload property of the plan contract.
 ///
@@ -280,7 +283,9 @@ pub fn review_update_schema() -> &'static serde_json::Value {
                     "properties": {
                         "item_id": {
                             "type": "integer",
-                            "description": "Identifier of the finding inside the discussed review session"
+                            "minimum": ReviewUpdateProposal::ITEM_ID_MINIMUM,
+                            "maximum": ReviewUpdateProposal::ITEM_ID_MAXIMUM,
+                            "description": "Identifier of the finding inside the discussed review session, an unsigned 32-bit integer"
                         },
                         "group_id": {
                             "anyOf": [
@@ -508,21 +513,26 @@ pub fn discussion_response_schema_definition() -> &'static serde_json::Value {
 /// harness validates `args` against that declaration instead of accepting an
 /// arbitrary command line, which is what keeps a custom tool from widening into
 /// an unbounded shell.
-pub fn custom_tool_call_schema() -> serde_json::Value {
-    serde_json::json!({
-        "type": "object",
-        "properties": {
-            "name": {
-                "type": "string",
-                "description": "Name of one project-declared command from the custom tool allowlist"
+///
+/// The schema is assembled once and served by a shared reference, so a caller
+/// that composes or serializes it pays no rebuild and no deep copy of the tree.
+pub fn custom_tool_call_schema() -> &'static serde_json::Value {
+    CUSTOM_TOOL_CALL_SCHEMA.get_or_init(|| {
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "name": {
+                    "type": "string",
+                    "description": "Name of one project-declared command from the custom tool allowlist"
+                },
+                "args": {
+                    "type": "object",
+                    "description": "Typed argument object validated against the argument schema declared for this command"
+                }
             },
-            "args": {
-                "type": "object",
-                "description": "Typed argument object validated against the argument schema declared for this command"
-            }
-        },
-        "required": ["name", "args"],
-        "additionalProperties": false
+            "required": ["name", "args"],
+            "additionalProperties": false
+        })
     })
 }
 
@@ -535,13 +545,16 @@ mod tests {
         plan_schema_definitions, plan_update_schema,
     };
     use crate::context::ContextAccess;
-    use crate::discussion::DiscussionPlanAction;
+    use crate::discussion::{DiscussionPlanAction, DiscussionResponse};
     use crate::plan::PlanItemStatus;
-    use crate::review::{IssueStatus, ReviewDecisionStatus};
+    use crate::review::{IssueStatus, ReviewDecisionStatus, ReviewUpdateProposal};
 
     #[test]
     fn test_custom_tool_call_schema_pins_the_invocation_contract() {
         let schema = super::custom_tool_call_schema();
+        // The contract is assembled once and served by a shared reference, so a
+        // repeated call observes the same allocation instead of a rebuilt tree.
+        assert!(std::ptr::eq(schema, super::custom_tool_call_schema()));
         assert_eq!(schema["type"], "object");
         assert_eq!(schema["properties"]["name"]["type"], "string");
         // The argument container is an object whose properties are declared by
@@ -675,7 +688,13 @@ mod tests {
         struct_name: "PlanItem",
         field: "blocked_reason",
         reason: "harness-authored diagnostic: the bounded turn records why the step could not proceed, so the model never authors the field",
-    }];
+    },
+    SchemaFieldExemption {
+        struct_name: "DiscussionResponse",
+        field: "plan_update_error",
+        reason: "decode-boundary diagnostic: the structured stream records why a present plan_update could not be honored, so the model never authors the field",
+    },
+];
 
     /// Net count of square brackets a line opens.
     fn bracket_balance(line: &str) -> i32 {
@@ -1165,5 +1184,80 @@ mod tests {
             .filter_map(|status| status.as_str())
             .collect();
         assert_eq!(decisions, vec!["todo", "skipped", "rejected"]);
+    }
+
+    /// Builds a minimal response that records a decision for one finding.
+    fn decision_payload(item_id: &serde_json::Value) -> serde_json::Value {
+        serde_json::json!({
+            "message": "",
+            "review_update": {
+                "item_id": item_id,
+                "group_id": null,
+                "status": "todo",
+                "note": "",
+                "recommendations": []
+            }
+        })
+    }
+
+    /// Decodes the decision a response carries through the discussion DTO.
+    fn decode_decision(item_id: &serde_json::Value) -> ReviewUpdateProposal {
+        let payload = decision_payload(item_id);
+        let response: DiscussionResponse =
+            serde_json::from_value(payload).expect("the decision decodes");
+        response.review_update.expect("the decision travels")
+    }
+
+    /// The finding identifier is authored by the model, so the domain the strict
+    /// schema publishes must be the domain of the Rust field it mirrors.
+    ///
+    /// A bare `integer` admits values the typed decoder rejects, and because the
+    /// whole response is decoded as one unit, one such value discards the entire
+    /// turn output: the message, the plan update, and every discovery request
+    /// travel together with the offending field. The bounds are therefore read
+    /// from the field they describe instead of being restated here.
+    #[test]
+    fn test_review_item_id_is_bounded_by_the_domain_of_its_field() {
+        let schema = discussion_response_schema();
+        let review_update = &schema["properties"]["review_update"]["anyOf"][0];
+        let item_id = &review_update["properties"]["item_id"];
+
+        assert_eq!(item_id["type"], "integer");
+        let minimum = item_id["minimum"]
+            .as_u64()
+            .expect("the lower bound is an integer");
+        let maximum = item_id["maximum"]
+            .as_u64()
+            .expect("the upper bound is an integer");
+        assert_eq!(minimum, u64::from(ReviewUpdateProposal::ITEM_ID_MINIMUM));
+        assert_eq!(maximum, u64::from(ReviewUpdateProposal::ITEM_ID_MAXIMUM));
+
+        // The published constants are the domain of the field itself, so the
+        // contract and the decoder accept exactly the same values.
+        assert_eq!(ReviewUpdateProposal::ITEM_ID_MINIMUM, u32::MIN);
+        assert_eq!(ReviewUpdateProposal::ITEM_ID_MAXIMUM, u32::MAX);
+
+        // Both endpoints are admissible: the contract states them and the typed
+        // decoder accepts them.
+        for identifier in [
+            ReviewUpdateProposal::ITEM_ID_MINIMUM,
+            ReviewUpdateProposal::ITEM_ID_MAXIMUM,
+        ] {
+            let decision = decode_decision(&serde_json::json!(identifier));
+            assert_eq!(decision.item_id, identifier);
+        }
+
+        // One step outside the domain is refused by the decoder, which is what
+        // makes an unbounded property lossy rather than merely imprecise.
+        for identifier in [
+            serde_json::json!(-1),
+            serde_json::json!(u64::from(ReviewUpdateProposal::ITEM_ID_MAXIMUM) + 1),
+        ] {
+            let payload = decision_payload(&identifier);
+            assert!(
+                serde_json::from_value::<DiscussionResponse>(payload).is_err(),
+                "{identifier} lies outside the domain and must be refused"
+            );
+        }
     }
 }

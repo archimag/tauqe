@@ -309,8 +309,8 @@ pub async fn handle_history_key(
             if st.model.is_busy() {
                 st.notify_warning(active_t("notify.history_clear_busy"));
             } else {
-                st.confirm_clear_history = true;
-                st.confirm_button = crate::app::ConfirmDialogButton::Cancel;
+                st.modals.confirm_clear_history = true;
+                st.modals.confirm_button = crate::app::ConfirmDialogButton::Cancel;
             }
         }
         HistoryAction::Return => {
@@ -554,7 +554,7 @@ mod tests {
     async fn dispatch(key: KeyEvent) -> (bool, bool, crate::app::ConfirmDialogButton) {
         let mut st = crate::app::test_state();
         st.view_mode = ViewMode::History;
-        st.confirm_button = crate::app::ConfirmDialogButton::Confirm;
+        st.modals.confirm_button = crate::app::ConfirmDialogButton::Confirm;
 
         let state = Arc::new(Mutex::new(st));
         let mut conn = RpcConnection::new(Vec::<u8>::new());
@@ -565,9 +565,9 @@ mod tests {
 
         let guard = state.lock().await;
         (
-            guard.confirm_clear_history,
-            guard.confirm_cancel,
-            guard.confirm_button,
+            guard.modals.confirm_clear_history,
+            guard.modals.confirm_cancel,
+            guard.modals.confirm_button,
         )
     }
 

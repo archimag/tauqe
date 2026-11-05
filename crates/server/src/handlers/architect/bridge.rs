@@ -23,6 +23,9 @@
 
 use std::sync::Arc;
 
+use crate::handlers::common::{emit, withdraw_streamed_attempt};
+use crate::state::{AppState, OperationGuard};
+use crate::usage::UsageGuard;
 use async_trait::async_trait;
 use tauqe_core::config::{AppConfig, ModelsConfig};
 use tauqe_core::context::ContextManager;
@@ -35,11 +38,7 @@ use tauqe_protocol::{
     events, ArchitectTier, ModelConnectionRetryingEvent, ModelDeltaEvent, ModelErrorEvent,
     ModelEscalatedEvent, ProviderKind, RepoMapInfoEvent, TurnPhaseEvent,
 };
-use tokio::sync::mpsc;
-
-use crate::handlers::common::{emit, withdraw_streamed_attempt};
-use crate::state::{AppState, OperationGuard};
-use crate::usage::UsageGuard;
+use tokio::sync::{mpsc, watch};
 
 use super::resolve_architect_provider;
 
@@ -101,17 +100,32 @@ pub(crate) struct ContourRelaySummary {
 /// single place that translates one into the other, accumulates the answer the
 /// adapter publishes as `model/finished`, and withdraws the fragments of an
 /// attempt the transport voided.
+/// Relays the contour event stream into the telemetry of the running operation.
 ///
+/// The contour speaks `StreamEvent`, because it is a domain engine that knows
+/// nothing about the wire; the client speaks protocol events. The relay is the
+/// single place that translates one into the other, accumulates the answer the
+/// adapter publishes as `model/finished`, and withdraws the fragments of an
+/// attempt the transport voided.
+///
+/// Token-granularity telemetry is paced against the outbound queue, so a client
+/// that stopped reading pauses the synthesis instead of growing daemon memory,
+/// and a cancelled operation ends that pause instead of outliving it.
 async fn relay_contour_events(
     state: Arc<AppState>,
     op_id: String,
     usage: UsageGuard,
     mut events_rx: mpsc::Receiver<StreamEvent>,
+    mut cancel: watch::Receiver<bool>,
 ) -> ContourRelaySummary {
     let mut summary = ContourRelaySummary::default();
     while let Some(event) = events_rx.recv().await {
         match event {
             StreamEvent::TextDelta(delta) => {
+                // Token-granularity telemetry paces the relay against the
+                // outbound queue: a client that stopped reading pauses the
+                // synthesis instead of growing daemon memory.
+                state.out.wait_for_headroom(&mut cancel).await;
                 summary.assistant_text.push_str(&delta);
                 emit(
                     &state.out,
@@ -124,6 +138,9 @@ async fn relay_contour_events(
                 );
             }
             StreamEvent::ReasoningDelta(delta) => {
+                // Reasoning is paced by the same gate, so a stalled client holds
+                // the whole stream instead of only the answer.
+                state.out.wait_for_headroom(&mut cancel).await;
                 emit(
                     &state.out,
                     events::MODEL_REASONING_DELTA,
@@ -303,6 +320,9 @@ pub(crate) async fn run_contour_synthesis(
     let repo_root = context.repo_root().to_path_buf();
     let (events_tx, events_rx) = mpsc::channel::<StreamEvent>(CONTOUR_EVENT_CAPACITY);
     let cancel_rx = operation.cancel_receiver();
+    // The relay waits out a client that stopped reading, so it shares the very
+    // signal that interrupts the synthesis it relays.
+    let relay_cancel = cancel_rx.clone();
     let resolver = Arc::new(ArchitectProviderResolver::new(Arc::clone(state), config));
 
     // The usage window wraps the whole synthesis, so every round and every tier
@@ -313,6 +333,7 @@ pub(crate) async fn run_contour_synthesis(
         op_id.to_string(),
         usage,
         events_rx,
+        relay_cancel,
     ));
 
     let contour = tokio::spawn(async move {
@@ -358,6 +379,21 @@ pub(crate) async fn run_contour_synthesis(
     let (contour_context, outcome) = match joined {
         Ok(joined) => joined,
         Err(join_error) => {
+            // A contour that ignored the cooperative signal is force-aborted through
+            // the operation slot, so its relayed `Cancelled` event never arrives and
+            // the summary alone would classify the dead task as a provider failure.
+            // The authoritative signal decides the classification: a raised hard
+            // cancel surfaces as a cancellation, while a task that died without it
+            // keeps its failure classification.
+            let mut summary = summary;
+            if *operation.cancel_receiver().borrow() {
+                tracing::warn!(
+                    operation_id = op_id,
+                    error = %join_error,
+                    "Architect contour terminated while the operation was cancelled"
+                );
+                summary.cancelled = true;
+            }
             return (
                 Err(anyhow::anyhow!(
                     "The architect synthesis task terminated unexpectedly: {join_error}"
@@ -468,11 +504,13 @@ mod tests {
         let usage = state.begin_usage().await;
 
         let (events_tx, events_rx) = mpsc::channel(64);
+        let (_cancel_tx, cancel) = watch::channel(false);
         let relay = tokio::spawn(relay_contour_events(
             Arc::clone(&state),
             "op-relay".to_string(),
             usage,
             events_rx,
+            cancel,
         ));
 
         let scripted = [
@@ -591,11 +629,13 @@ mod tests {
         let usage = state.begin_usage().await;
 
         let (events_tx, events_rx) = mpsc::channel(16);
+        let (_cancel_tx, cancel) = watch::channel(false);
         let relay = tokio::spawn(relay_contour_events(
             Arc::clone(&state),
             "op-cancel".to_string(),
             usage,
             events_rx,
+            cancel,
         ));
         events_tx
             .send(StreamEvent::Error(

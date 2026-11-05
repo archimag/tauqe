@@ -19,18 +19,22 @@ use crate::views::repl::{
     ModelCodeBlock, ReasoningState, ReplView, StreamingFileEdit, ToolchainState, TurnStatus,
 };
 
+mod cache;
 mod confirm;
+mod create_plan;
 mod diff_inspector;
 mod execute_review;
 mod execute_scope;
 mod locale;
 mod model_list;
+mod plan_form;
 mod prompt;
 mod refine;
 mod selection;
 mod status;
 
 use confirm::{resolve_batch_cancel, resolve_confirm, BatchCancelOutcome, ConfirmOutcome};
+pub(crate) use create_plan::submit_create_dialog;
 pub(crate) use locale::click_locale_button;
 use model_list::{handle_dialog_key, ModelListKeyOutcome};
 pub(crate) use prompt::submit_prompt_modal;
@@ -44,7 +48,7 @@ pub(crate) use status::apply_status_dialog;
 fn begin_repl_turn(st: &mut AppState) {
     st.view_mode = ViewMode::Repl;
     // A freshly launched turn starts from a clean batch-cancellation state.
-    st.batch_stopping = false;
+    st.modals.batch_stopping = false;
     // Executing code hands control to the Coder role: detach the discussion
     // focus locally so no anchor survives into the new turn.
     st.discussion_focus = DiscussionFocus::None;
@@ -275,6 +279,19 @@ fn begin_plan_refine_turn(st: &mut AppState, plan_id: String) {
     st.plans_view.refining_plan_id = Some(plan_id);
 }
 
+/// Applies the shared start transition for a plan-creation turn.
+///
+/// The Architect role takes over the REPL and the Plans view is flagged as
+/// refining with no target plan yet, so the two-phase pipeline renders as one
+/// in-flight synthesis until the issued plan arrives. It is the creation peer
+/// of [`begin_plan_refine_turn`] and is applied through `start_turn`, so a
+/// failed request rolls the flag back (c-5).
+fn begin_plan_create_turn(st: &mut AppState) {
+    begin_repl_turn(st);
+    st.plans_view.refining = true;
+    st.plans_view.refining_plan_id = None;
+}
+
 /// Launches a review-finding batch execution from a developer confirmation.
 ///
 /// Shared by the keyboard and mouse confirmation paths so a mouse click starts
@@ -447,7 +464,7 @@ pub(crate) async fn start_review_from_dialog(
 ) -> anyhow::Result<()> {
     if !dialog.is_pattern_launchable() {
         let patterns = dialog.path_patterns().join(", ");
-        st.review_dialog = Some(dialog);
+        st.modals.review_dialog = Some(dialog);
         st.notify_warning(
             crate::i18n::active_t("notify.review_pattern_no_matches").replace("{}", &patterns),
         );
@@ -464,8 +481,8 @@ pub(crate) async fn start_review_from_dialog(
     // launch parameters and the dialog itself wait in the pending launch: a
     // refused projection or a declined truncation returns exactly these fields
     // (c-3).
-    st.pending_review_launch = Some(PendingReviewLaunch { dialog, params });
-    st.confirm_button = crate::app::ConfirmDialogButton::Cancel;
+    st.modals.pending_review_launch = Some(PendingReviewLaunch { dialog, params });
+    st.modals.confirm_button = crate::app::ConfirmDialogButton::Cancel;
     drop(st);
 
     // The projection is a read RPC answered before the audit opens: a window the
@@ -473,8 +490,8 @@ pub(crate) async fn start_review_from_dialog(
     // consent first (c-2, c-3).
     if let Err(error) = send_request(server_writer, methods::REVIEW_PREVIEW, payload).await {
         let mut st = state.lock().await;
-        if let Some(pending) = st.pending_review_launch.take() {
-            st.review_dialog = Some(pending.dialog);
+        if let Some(pending) = st.modals.pending_review_launch.take() {
+            st.modals.review_dialog = Some(pending.dialog);
         }
         st.notify_error(
             crate::i18n::active_t("notify.review_preview_failed").replace("{}", &error.to_string()),
@@ -638,7 +655,7 @@ async fn handle_review_analyze_dialog(
     mut st: MutexGuard<'_, AppState>,
     server_writer: &mut RpcConnection,
 ) -> anyhow::Result<Option<InputResult>> {
-    let mut target = match st.confirm_review_analyze.take() {
+    let mut target = match st.modals.confirm_review_analyze.take() {
         Some(target) => target,
         None => return Ok(None),
     };
@@ -657,13 +674,13 @@ async fn handle_review_analyze_dialog(
         // Safe cancellation returns the shared button to its default and drops
         // the dialog without a request.
         ModelListKeyOutcome::Dismiss => {
-            st.confirm_button = crate::app::ConfirmDialogButton::Cancel;
+            st.modals.confirm_button = crate::app::ConfirmDialogButton::Cancel;
         }
         // The classification dialog carries no text editor, so the yank outcome
         // is unreachable; keeping the dialog is the only sensible interpretation
         // of a key it never produces (Conventions §5).
         ModelListKeyOutcome::Consumed | ModelListKeyOutcome::Yank => {
-            st.confirm_review_analyze = Some(target);
+            st.modals.confirm_review_analyze = Some(target);
         }
     }
     Ok(Some(InputResult::Continue))
@@ -685,12 +702,12 @@ pub(crate) async fn apply_batch_cancel(
     choice: BatchCancelButton,
     server_writer: &mut RpcConnection,
 ) -> anyhow::Result<()> {
-    st.confirm_batch_cancel = false;
-    st.batch_cancel_button = BatchCancelButton::Continue;
+    st.modals.confirm_batch_cancel = false;
+    st.modals.batch_cancel_button = BatchCancelButton::Continue;
     match choice {
         BatchCancelButton::Continue => {}
-        BatchCancelButton::SoftStop => st.batch_stopping = true,
-        BatchCancelButton::HardStop => st.batch_stopping = false,
+        BatchCancelButton::SoftStop => st.modals.batch_stopping = true,
+        BatchCancelButton::HardStop => st.modals.batch_stopping = false,
     }
     // A soft stop is advisory: the operation stays registered so the
     // supervisor can finish the current member and unwind on its own. The
@@ -778,7 +795,7 @@ pub(crate) async fn handle_dialog_event(
                 .map(Some);
         }
         Some(ActiveModal::Review) => {
-            if let Some(mut dialog) = st.review_dialog.take() {
+            if let Some(mut dialog) = st.modals.review_dialog.take() {
                 let primary = st.tui_config.input.primary_modifier;
                 let meta = st.tui_config.input.meta_modifier;
                 let visible_rows =
@@ -803,7 +820,7 @@ pub(crate) async fn handle_dialog_event(
                     // return to the state, or switching the reviewer would close
                     // the launcher it was switching inside
                     // (c-modal-dispatch-parity).
-                    st.review_dialog = Some(dialog);
+                    st.modals.review_dialog = Some(dialog);
                     return Ok(Some(InputResult::Continue));
                 }
 
@@ -812,7 +829,7 @@ pub(crate) async fn handle_dialog_event(
                 if dialog.focus.is_model_list()
                     && dialog.selector.handle_list_key(key, visible_rows)
                 {
-                    st.review_dialog = Some(dialog);
+                    st.modals.review_dialog = Some(dialog);
                     return Ok(Some(InputResult::Continue));
                 }
 
@@ -831,7 +848,7 @@ pub(crate) async fn handle_dialog_event(
                         &st.tui_config.input,
                         visible_preset_rows,
                     ) {
-                        st.review_dialog = Some(dialog);
+                        st.modals.review_dialog = Some(dialog);
                         return Ok(Some(InputResult::Continue));
                     }
                 }
@@ -850,7 +867,7 @@ pub(crate) async fn handle_dialog_event(
                         let index = c as usize - '1' as usize;
                         if index < dialog.selector.len() {
                             dialog.selector.select_index(index);
-                            st.review_dialog = Some(dialog);
+                            st.modals.review_dialog = Some(dialog);
                             return Ok(Some(InputResult::Continue));
                         }
                     }
@@ -887,7 +904,7 @@ pub(crate) async fn handle_dialog_event(
                         // carries a usable pattern, so an empty row never grows
                         // a chain of empty fields (c-3).
                         dialog.append_path_row();
-                        st.review_dialog = Some(dialog);
+                        st.modals.review_dialog = Some(dialog);
                         return Ok(Some(InputResult::Continue));
                     }
 
@@ -902,7 +919,7 @@ pub(crate) async fn handle_dialog_event(
                                 dialog.cycle_focus_prev();
                             }
                         }
-                        st.review_dialog = Some(dialog);
+                        st.modals.review_dialog = Some(dialog);
                         return Ok(Some(InputResult::Continue));
                     }
 
@@ -914,7 +931,7 @@ pub(crate) async fn handle_dialog_event(
                         // keyboard to the previous row; a row holding text keeps
                         // the editing behaviour (c-3).
                         dialog.remove_active_path_row();
-                        st.review_dialog = Some(dialog);
+                        st.modals.review_dialog = Some(dialog);
                         return Ok(Some(InputResult::Continue));
                     }
 
@@ -925,7 +942,7 @@ pub(crate) async fn handle_dialog_event(
                         // without a candidate it falls through to the shared
                         // focus move, so the section never swallows the key
                         // (c-5).
-                        st.review_dialog = Some(dialog);
+                        st.modals.review_dialog = Some(dialog);
                         return Ok(Some(InputResult::Continue));
                     }
 
@@ -939,7 +956,7 @@ pub(crate) async fn handle_dialog_event(
                             dialog.prev_path_completion()
                         };
                         if moved {
-                            st.review_dialog = Some(dialog);
+                            st.modals.review_dialog = Some(dialog);
                             return Ok(Some(InputResult::Continue));
                         }
                     }
@@ -948,7 +965,7 @@ pub(crate) async fn handle_dialog_event(
                         // `Esc` closes the menu first and dismisses the dialog
                         // only on the next press (c-5).
                         dialog.close_path_completion();
-                        st.review_dialog = Some(dialog);
+                        st.modals.review_dialog = Some(dialog);
                         return Ok(Some(InputResult::Continue));
                     }
                 }
@@ -976,7 +993,7 @@ pub(crate) async fn handle_dialog_event(
                             }
                             dialog.cycle_focus_next();
                         }
-                        st.review_dialog = Some(dialog);
+                        st.modals.review_dialog = Some(dialog);
                     }
                     Some(DialogCommand::FocusPrev) => {
                         if dialog.focus.is_actions()
@@ -989,7 +1006,7 @@ pub(crate) async fn handle_dialog_event(
                                 dialog.confirm_button = crate::app::ConfirmDialogButton::Confirm;
                             }
                         }
-                        st.review_dialog = Some(dialog);
+                        st.modals.review_dialog = Some(dialog);
                     }
                     // Button stepping moves between the action buttons without
                     // leaving the bar.
@@ -1004,7 +1021,7 @@ pub(crate) async fn handle_dialog_event(
                                 crate::app::ConfirmDialogButton::Cancel
                             }
                         };
-                        st.review_dialog = Some(dialog);
+                        st.modals.review_dialog = Some(dialog);
                     }
                     // Fast accelerators mirror the shared dialog vocabulary. They
                     // are limited to the action bar so bare letters stay literal
@@ -1023,7 +1040,7 @@ pub(crate) async fn handle_dialog_event(
                     Some(DialogCommand::Activate) if dialog.focus.is_preset_list() => {
                         dialog.focus = crate::app::ReviewDialogFocus::Actions;
                         dialog.confirm_button = crate::app::ConfirmDialogButton::Confirm;
-                        st.review_dialog = Some(dialog);
+                        st.modals.review_dialog = Some(dialog);
                     }
                     Some(DialogCommand::Activate) if dialog.focus.is_actions() => {
                         // Starting a review is a long-running operation: it
@@ -1053,18 +1070,18 @@ pub(crate) async fn handle_dialog_event(
                             false
                         };
                         if yank_chord {
-                            st.review_dialog = Some(dialog);
+                            st.modals.review_dialog = Some(dialog);
                             drop(st);
                             let clipboard = crate::clipboard::get_from_clipboard_async().await;
                             let mut st = state.lock().await;
-                            if let Some(mut dialog) = st.review_dialog.take() {
+                            if let Some(mut dialog) = st.modals.review_dialog.take() {
                                 if dialog.focus.is_prompt_editor() {
                                     dialog.prompt_editor.yank_with(clipboard);
                                 } else if let Some(editor) = dialog.active_path_editor_mut() {
                                     editor.yank_with(clipboard);
                                     dialog.refresh_path_completion();
                                 }
-                                st.review_dialog = Some(dialog);
+                                st.modals.review_dialog = Some(dialog);
                             }
                             return Ok(Some(InputResult::Continue));
                         }
@@ -1083,30 +1100,34 @@ pub(crate) async fn handle_dialog_event(
                             if let Some(editor) = dialog.active_path_editor_mut() {
                                 crate::input::handle_editor_key(editor, key, is_cmd, false);
                             }
-                            // Typing narrows the completion of the row being
-                            // edited, while cursor movement leaves the menu
-                            // untouched (c-5).
+                            // The refresh runs after every key this section
+                            // forwards: typing narrows the candidates while
+                            // cursor movement leaves them untouched, and the
+                            // memoized prefix makes the second case one string
+                            // comparison instead of a directory scan (c-5).
                             dialog.refresh_path_completion();
                         }
-                        st.review_dialog = Some(dialog);
+                        st.modals.review_dialog = Some(dialog);
                     }
                 }
             }
             return Ok(Some(InputResult::Continue));
         }
         Some(ActiveModal::ReviewTruncation) => {
-            if let Some(target) = st.confirm_review_truncation.take() {
+            if let Some(target) = st.modals.confirm_review_truncation.take() {
                 match resolve_confirm(&mut st, key) {
-                    ConfirmOutcome::Toggled => st.confirm_review_truncation = Some(target),
+                    ConfirmOutcome::Toggled | ConfirmOutcome::Ignored => {
+                        st.modals.confirm_review_truncation = Some(target)
+                    }
                     ConfirmOutcome::Dismissed => {
                         // Declining the truncated window sends nothing and
                         // returns the launch dialog with its typed fields, so
                         // the developer can narrow the patterns (c-3).
-                        st.confirm_button = crate::app::ConfirmDialogButton::Cancel;
-                        st.review_dialog = Some(target.pending.dialog);
+                        st.modals.confirm_button = crate::app::ConfirmDialogButton::Cancel;
+                        st.modals.review_dialog = Some(target.pending.dialog);
                     }
                     ConfirmOutcome::Accepted => {
-                        st.confirm_button = crate::app::ConfirmDialogButton::Cancel;
+                        st.modals.confirm_button = crate::app::ConfirmDialogButton::Cancel;
                         launch_review(state, st, server_writer, target.pending.params).await?;
                     }
                 }
@@ -1115,10 +1136,10 @@ pub(crate) async fn handle_dialog_event(
         }
         Some(ActiveModal::ConfirmCancel) => {
             match resolve_confirm(&mut st, key) {
-                ConfirmOutcome::Toggled => {}
-                ConfirmOutcome::Dismissed => st.confirm_cancel = false,
+                ConfirmOutcome::Toggled | ConfirmOutcome::Ignored => {}
+                ConfirmOutcome::Dismissed => st.modals.confirm_cancel = false,
                 ConfirmOutcome::Accepted => {
-                    st.confirm_cancel = false;
+                    st.modals.confirm_cancel = false;
                     let cancel_review = st.review.running;
                     let cancel_model = st.model.is_busy();
                     drop(st);
@@ -1136,10 +1157,10 @@ pub(crate) async fn handle_dialog_event(
         }
         Some(ActiveModal::ConfirmQuit) => {
             match resolve_confirm(&mut st, key) {
-                ConfirmOutcome::Toggled => {}
-                ConfirmOutcome::Dismissed => st.confirm_quit = false,
+                ConfirmOutcome::Toggled | ConfirmOutcome::Ignored => {}
+                ConfirmOutcome::Dismissed => st.modals.confirm_quit = false,
                 ConfirmOutcome::Accepted => {
-                    st.confirm_quit = false;
+                    st.modals.confirm_quit = false;
                     return Ok(Some(InputResult::Exit));
                 }
             }
@@ -1149,8 +1170,8 @@ pub(crate) async fn handle_dialog_event(
             match resolve_batch_cancel(&mut st, key) {
                 BatchCancelOutcome::Toggled => {}
                 BatchCancelOutcome::Dismissed => {
-                    st.confirm_batch_cancel = false;
-                    st.batch_cancel_button = BatchCancelButton::Continue;
+                    st.modals.confirm_batch_cancel = false;
+                    st.modals.batch_cancel_button = BatchCancelButton::Continue;
                 }
                 BatchCancelOutcome::Chosen(choice) => {
                     apply_batch_cancel(st, choice, server_writer).await?;
@@ -1160,10 +1181,10 @@ pub(crate) async fn handle_dialog_event(
         }
         Some(ActiveModal::ClearAuto) => {
             match resolve_confirm(&mut st, key) {
-                ConfirmOutcome::Toggled => {}
-                ConfirmOutcome::Dismissed => st.context_view.confirm_clear_auto = false,
+                ConfirmOutcome::Toggled | ConfirmOutcome::Ignored => {}
+                ConfirmOutcome::Dismissed => st.modals.confirm_clear_auto = false,
                 ConfirmOutcome::Accepted => {
-                    st.context_view.confirm_clear_auto = false;
+                    st.modals.confirm_clear_auto = false;
                     drop(st);
                     let params = tauqe_protocol::ContextClearParams {
                         layer: Some(tauqe_protocol::ContextLayer::Auto),
@@ -1180,10 +1201,10 @@ pub(crate) async fn handle_dialog_event(
         }
         Some(ActiveModal::ClearUser) => {
             match resolve_confirm(&mut st, key) {
-                ConfirmOutcome::Toggled => {}
-                ConfirmOutcome::Dismissed => st.context_view.confirm_clear_user = false,
+                ConfirmOutcome::Toggled | ConfirmOutcome::Ignored => {}
+                ConfirmOutcome::Dismissed => st.modals.confirm_clear_user = false,
                 ConfirmOutcome::Accepted => {
-                    st.context_view.confirm_clear_user = false;
+                    st.modals.confirm_clear_user = false;
                     drop(st);
                     let params = tauqe_protocol::ContextClearParams {
                         layer: Some(tauqe_protocol::ContextLayer::User),
@@ -1198,20 +1219,26 @@ pub(crate) async fn handle_dialog_event(
             }
             return Ok(Some(InputResult::Continue));
         }
+        Some(ActiveModal::OuterDocsCacheRemove) => {
+            return cache::handle_outer_docs_cache_remove_key(key, st, server_writer).await;
+        }
+        Some(ActiveModal::OuterDocsCache) => {
+            return cache::handle_outer_docs_cache_key(key, st).await;
+        }
         Some(ActiveModal::RemoveContextFile) => {
             // The pending path is the single source of truth: the card names it,
             // and an explicit confirmation turns exactly that path into the
             // request (Conventions §4.3, §5.4).
-            if let Some(path) = st.context_view.pending_remove.clone() {
+            if let Some(path) = st.modals.confirm_remove_context_file.clone() {
                 match resolve_confirm(&mut st, key) {
-                    ConfirmOutcome::Toggled => {}
+                    ConfirmOutcome::Toggled | ConfirmOutcome::Ignored => {}
                     ConfirmOutcome::Dismissed => {
-                        st.context_view.pending_remove = None;
-                        st.confirm_button = crate::app::ConfirmDialogButton::Cancel;
+                        st.modals.confirm_remove_context_file = None;
+                        st.modals.confirm_button = crate::app::ConfirmDialogButton::Cancel;
                     }
                     ConfirmOutcome::Accepted => {
-                        st.context_view.pending_remove = None;
-                        st.confirm_button = crate::app::ConfirmDialogButton::Cancel;
+                        st.modals.confirm_remove_context_file = None;
+                        st.modals.confirm_button = crate::app::ConfirmDialogButton::Cancel;
                         drop(st);
                         let params = tauqe_protocol::ContextRemoveParams { path };
                         send_request(
@@ -1227,10 +1254,10 @@ pub(crate) async fn handle_dialog_event(
         }
         Some(ActiveModal::ConfirmDetachFocus) => {
             match resolve_confirm(&mut st, key) {
-                ConfirmOutcome::Toggled => {}
-                ConfirmOutcome::Dismissed => st.confirm_detach_focus = false,
+                ConfirmOutcome::Toggled | ConfirmOutcome::Ignored => {}
+                ConfirmOutcome::Dismissed => st.modals.confirm_detach_focus = false,
                 ConfirmOutcome::Accepted => {
-                    st.confirm_detach_focus = false;
+                    st.modals.confirm_detach_focus = false;
                     st.discussion_focus = DiscussionFocus::None;
                     drop(st);
                     send_request(
@@ -1244,11 +1271,13 @@ pub(crate) async fn handle_dialog_event(
             return Ok(Some(InputResult::Continue));
         }
         Some(ActiveModal::ClearHorizon) => {
-            if let Some(plan_id) = st.confirm_clear_horizon.take() {
+            if let Some(plan_id) = st.modals.confirm_clear_horizon.take() {
                 match resolve_confirm(&mut st, key) {
-                    ConfirmOutcome::Toggled => st.confirm_clear_horizon = Some(plan_id),
+                    ConfirmOutcome::Toggled | ConfirmOutcome::Ignored => {
+                        st.modals.confirm_clear_horizon = Some(plan_id)
+                    }
                     ConfirmOutcome::Dismissed => {
-                        st.confirm_button = crate::app::ConfirmDialogButton::Cancel;
+                        st.modals.confirm_button = crate::app::ConfirmDialogButton::Cancel;
                     }
                     ConfirmOutcome::Accepted => {
                         // A horizon that already carries started or completed
@@ -1260,10 +1289,10 @@ pub(crate) async fn handle_dialog_event(
                             .plans
                             .iter()
                             .find(|p| p.id == plan_id)
-                            .is_some_and(|p| p.has_started_or_completed_steps());
+                            .is_some_and(|p| p.implementation.has_started_or_completed_steps());
                         if recorded {
-                            st.confirm_button = crate::app::ConfirmDialogButton::Cancel;
-                            st.confirm_clear_horizon_final = Some(plan_id);
+                            st.modals.confirm_button = crate::app::ConfirmDialogButton::Cancel;
+                            st.modals.confirm_clear_horizon_final = Some(plan_id);
                         } else {
                             // The success notice is emitted once the server
                             // confirms the reset in the response handler, so it
@@ -1277,11 +1306,13 @@ pub(crate) async fn handle_dialog_event(
             return Ok(Some(InputResult::Continue));
         }
         Some(ActiveModal::ClearHorizonFinal) => {
-            if let Some(plan_id) = st.confirm_clear_horizon_final.take() {
+            if let Some(plan_id) = st.modals.confirm_clear_horizon_final.take() {
                 match resolve_confirm(&mut st, key) {
-                    ConfirmOutcome::Toggled => st.confirm_clear_horizon_final = Some(plan_id),
+                    ConfirmOutcome::Toggled | ConfirmOutcome::Ignored => {
+                        st.modals.confirm_clear_horizon_final = Some(plan_id)
+                    }
                     ConfirmOutcome::Dismissed => {
-                        st.confirm_button = crate::app::ConfirmDialogButton::Cancel;
+                        st.modals.confirm_button = crate::app::ConfirmDialogButton::Cancel;
                     }
                     ConfirmOutcome::Accepted => {
                         // The success notice is emitted by the response handler.
@@ -1293,9 +1324,11 @@ pub(crate) async fn handle_dialog_event(
             return Ok(Some(InputResult::Continue));
         }
         Some(ActiveModal::DeletePlan) => {
-            if let Some(plan_id) = st.confirm_delete_plan.take() {
+            if let Some(plan_id) = st.modals.confirm_delete_plan.take() {
                 match resolve_confirm(&mut st, key) {
-                    ConfirmOutcome::Toggled => st.confirm_delete_plan = Some(plan_id),
+                    ConfirmOutcome::Toggled | ConfirmOutcome::Ignored => {
+                        st.modals.confirm_delete_plan = Some(plan_id)
+                    }
                     ConfirmOutcome::Dismissed => {}
                     ConfirmOutcome::Accepted => {
                         // A plan that still carries unfinished work escalates to
@@ -1303,8 +1336,8 @@ pub(crate) async fn handle_dialog_event(
                         // silently; a fully finished plan is deleted directly
                         // (c-1).
                         if plan_delete_needs_escalation(&st, &plan_id) {
-                            st.confirm_button = crate::app::ConfirmDialogButton::Cancel;
-                            st.confirm_delete_plan_final = Some(plan_id);
+                            st.modals.confirm_button = crate::app::ConfirmDialogButton::Cancel;
+                            st.modals.confirm_delete_plan_final = Some(plan_id);
                         } else {
                             drop(st);
                             delete_plan(server_writer, plan_id).await?;
@@ -1315,14 +1348,16 @@ pub(crate) async fn handle_dialog_event(
             return Ok(Some(InputResult::Continue));
         }
         Some(ActiveModal::DeletePlanFinal) => {
-            if let Some(plan_id) = st.confirm_delete_plan_final.take() {
+            if let Some(plan_id) = st.modals.confirm_delete_plan_final.take() {
                 match resolve_confirm(&mut st, key) {
-                    ConfirmOutcome::Toggled => st.confirm_delete_plan_final = Some(plan_id),
+                    ConfirmOutcome::Toggled | ConfirmOutcome::Ignored => {
+                        st.modals.confirm_delete_plan_final = Some(plan_id)
+                    }
                     ConfirmOutcome::Dismissed => {
-                        st.confirm_button = crate::app::ConfirmDialogButton::Cancel;
+                        st.modals.confirm_button = crate::app::ConfirmDialogButton::Cancel;
                     }
                     ConfirmOutcome::Accepted => {
-                        st.confirm_button = crate::app::ConfirmDialogButton::Cancel;
+                        st.modals.confirm_button = crate::app::ConfirmDialogButton::Cancel;
                         // The deletion is a daemon mutation; the plan cache is
                         // refreshed from the response handlers.
                         drop(st);
@@ -1333,9 +1368,11 @@ pub(crate) async fn handle_dialog_event(
             return Ok(Some(InputResult::Continue));
         }
         Some(ActiveModal::DeleteReview) => {
-            if let Some(review_id) = st.confirm_delete_review.take() {
+            if let Some(review_id) = st.modals.confirm_delete_review.take() {
                 match resolve_confirm(&mut st, key) {
-                    ConfirmOutcome::Toggled => st.confirm_delete_review = Some(review_id),
+                    ConfirmOutcome::Toggled | ConfirmOutcome::Ignored => {
+                        st.modals.confirm_delete_review = Some(review_id)
+                    }
                     ConfirmOutcome::Dismissed => {}
                     ConfirmOutcome::Accepted => {
                         drop(st);
@@ -1352,6 +1389,7 @@ pub(crate) async fn handle_dialog_event(
             // Point execution is a form dialog (Coder selector, directives,
             // action buttons); only the batch queue is a binary confirmation.
             let single_target = st
+                .modals
                 .confirm_execute_review
                 .as_ref()
                 .is_some_and(|target| target.is_single_target());
@@ -1359,9 +1397,11 @@ pub(crate) async fn handle_dialog_event(
                 return execute_review::handle_execute_review_dialog(key, state, st, server_writer)
                     .await;
             }
-            if let Some(target) = st.confirm_execute_review.take() {
+            if let Some(target) = st.modals.confirm_execute_review.take() {
                 match resolve_confirm(&mut st, key) {
-                    ConfirmOutcome::Toggled => st.confirm_execute_review = Some(target),
+                    ConfirmOutcome::Toggled | ConfirmOutcome::Ignored => {
+                        st.modals.confirm_execute_review = Some(target)
+                    }
                     ConfirmOutcome::Dismissed => {}
                     ConfirmOutcome::Accepted => {
                         confirm_execute_review(state, st, server_writer, target).await?;
@@ -1371,9 +1411,11 @@ pub(crate) async fn handle_dialog_event(
             return Ok(Some(InputResult::Continue));
         }
         Some(ActiveModal::ExecutePipeline) => {
-            if let Some(target) = st.confirm_execute_pipeline.take() {
+            if let Some(target) = st.modals.confirm_execute_pipeline.take() {
                 match resolve_confirm(&mut st, key) {
-                    ConfirmOutcome::Toggled => st.confirm_execute_pipeline = Some(target),
+                    ConfirmOutcome::Toggled | ConfirmOutcome::Ignored => {
+                        st.modals.confirm_execute_pipeline = Some(target)
+                    }
                     ConfirmOutcome::Dismissed => {}
                     ConfirmOutcome::Accepted => {
                         confirm_execute_pipeline(state, st, server_writer, target).await?;
@@ -1384,6 +1426,9 @@ pub(crate) async fn handle_dialog_event(
         }
         Some(ActiveModal::ExecuteScope) => {
             return execute_scope::handle_execute_scope_dialog(key, state, st, server_writer).await;
+        }
+        Some(ActiveModal::CreatePlan) => {
+            return create_plan::handle_create_plan_dialog(key, state, st, server_writer).await;
         }
         Some(ActiveModal::RefineDialog) => {
             return refine::handle_refine_dialog(key, state, st, server_writer).await;
@@ -1399,17 +1444,17 @@ pub(crate) async fn handle_dialog_event(
         }
         Some(ActiveModal::ClearHistory) => {
             match resolve_confirm(&mut st, key) {
-                ConfirmOutcome::Toggled => {}
-                ConfirmOutcome::Dismissed => st.confirm_clear_history = false,
+                ConfirmOutcome::Toggled | ConfirmOutcome::Ignored => {}
+                ConfirmOutcome::Dismissed => st.modals.confirm_clear_history = false,
                 ConfirmOutcome::Accepted => {
-                    st.confirm_clear_history = false;
+                    st.modals.confirm_clear_history = false;
                     confirm_clear_history(st, server_writer).await?;
                 }
             }
             return Ok(Some(InputResult::Continue));
         }
         Some(ActiveModal::Status) => {
-            if let Some(mut dialog) = st.status_dialog.take() {
+            if let Some(mut dialog) = st.modals.status_dialog.take() {
                 let total_options = dialog.target.options_count();
                 let visible = crate::dialogs::render::status_dialog_options_area(
                     st.last_frame_area,
@@ -1422,7 +1467,7 @@ pub(crate) async fn handle_dialog_event(
                     .selector
                     .handle_nav_key(key, &st.tui_config.input, visible)
                 {
-                    st.status_dialog = Some(dialog);
+                    st.modals.status_dialog = Some(dialog);
                     return Ok(Some(InputResult::Continue));
                 }
 
@@ -1435,18 +1480,18 @@ pub(crate) async fn handle_dialog_event(
                     // optimistic mutation or an RPC (c-2, c-3, Conventions §5.2).
                     KeyCode::Char(c @ '1'..='9') if is_bare_press(key.modifiers) => {
                         let chosen = c as usize - '1' as usize;
-                        st.status_dialog = Some(dialog);
+                        st.modals.status_dialog = Some(dialog);
                         if chosen < total_options {
                             apply_status_dialog(state, st, chosen, server_writer).await?;
                         }
                     }
                     KeyCode::Enter | KeyCode::Char(' ') => {
                         let chosen = dialog.selector.selected_index();
-                        st.status_dialog = Some(dialog);
+                        st.modals.status_dialog = Some(dialog);
                         apply_status_dialog(state, st, chosen, server_writer).await?;
                     }
                     _ => {
-                        st.status_dialog = Some(dialog);
+                        st.modals.status_dialog = Some(dialog);
                     }
                 }
             }
@@ -1470,61 +1515,62 @@ pub(crate) async fn handle_dialog_event(
             // a bare press only, so a command chord or the AltGr compose chord
             // reaches neither a scroll nor a tab accelerator (Conventions §5.2).
             let code = translate_code(key.code, &st.tui_config.input);
+            let help = &mut st.modals;
             match code {
                 KeyCode::Char('?') | KeyCode::Esc | KeyCode::Char('q') => {
-                    st.show_help = false;
-                    st.help_scroll = 0;
+                    help.show_help = false;
+                    help.help_scroll = 0;
                 }
                 // Tab / Shift+Tab cycle the help tabs; bare 1 / 2 / 3 jump directly
                 // to a tab. Switching resets the scroll so each tab opens at
                 // its top (Conventions §3, concept #c-3).
                 KeyCode::Tab => {
-                    st.help_tab = st.help_tab.next();
-                    st.help_scroll = 0;
+                    help.help_tab = help.help_tab.next();
+                    help.help_scroll = 0;
                 }
                 KeyCode::BackTab => {
-                    st.help_tab = st.help_tab.prev();
-                    st.help_scroll = 0;
+                    help.help_tab = help.help_tab.prev();
+                    help.help_scroll = 0;
                 }
                 KeyCode::Char('1') if is_bare_press(key.modifiers) => {
-                    st.help_tab = HelpTab::Global;
-                    st.help_scroll = 0;
+                    help.help_tab = HelpTab::Global;
+                    help.help_scroll = 0;
                 }
                 KeyCode::Char('2') if is_bare_press(key.modifiers) => {
-                    st.help_tab = HelpTab::CurrentMode;
-                    st.help_scroll = 0;
+                    help.help_tab = HelpTab::CurrentMode;
+                    help.help_scroll = 0;
                 }
                 KeyCode::Char('3') if is_bare_press(key.modifiers) => {
-                    st.help_tab = HelpTab::TextEditor;
-                    st.help_scroll = 0;
+                    help.help_tab = HelpTab::TextEditor;
+                    help.help_scroll = 0;
                 }
                 KeyCode::Char('h') | KeyCode::Char('H')
                     if key.modifiers.contains(KeyModifiers::CONTROL)
                         || key.modifiers.contains(KeyModifiers::ALT) =>
                 {
-                    st.show_help = false;
-                    st.help_scroll = 0;
+                    help.show_help = false;
+                    help.help_scroll = 0;
                 }
                 KeyCode::Down => {
-                    st.help_scroll = st.help_scroll.saturating_add(1);
+                    help.help_scroll = help.help_scroll.saturating_add(1);
                 }
                 KeyCode::Char('j') | KeyCode::Char('n') if is_bare_press(key.modifiers) => {
-                    st.help_scroll = st.help_scroll.saturating_add(1);
+                    help.help_scroll = help.help_scroll.saturating_add(1);
                 }
                 KeyCode::Up => {
-                    st.help_scroll = st.help_scroll.saturating_sub(1);
+                    help.help_scroll = help.help_scroll.saturating_sub(1);
                 }
                 KeyCode::Char('k') | KeyCode::Char('p') if is_bare_press(key.modifiers) => {
-                    st.help_scroll = st.help_scroll.saturating_sub(1);
+                    help.help_scroll = help.help_scroll.saturating_sub(1);
                 }
                 KeyCode::PageDown => {
-                    st.help_scroll = st.help_scroll.saturating_add(10);
+                    help.help_scroll = help.help_scroll.saturating_add(10);
                 }
                 KeyCode::PageUp => {
-                    st.help_scroll = st.help_scroll.saturating_sub(10);
+                    help.help_scroll = help.help_scroll.saturating_sub(10);
                 }
                 KeyCode::Home => {
-                    st.help_scroll = 0;
+                    help.help_scroll = 0;
                 }
                 _ => {}
             }
@@ -1541,7 +1587,7 @@ pub(crate) async fn handle_dialog_event(
                 KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q') | KeyCode::Char('?')
             );
             if close {
-                st.usage_summary = None;
+                st.modals.usage_summary = None;
             } else if is_mass_clear_chord(key) {
                 // The reset is a daemon-owned mutation, so it is dispatched
                 // rather than patched locally. The cleared snapshot arrives
@@ -1560,7 +1606,7 @@ pub(crate) async fn handle_dialog_event(
                     .await
                     .notify_success(crate::i18n::active_t("notify.usage_reset"));
                 return Ok(Some(InputResult::Continue));
-            } else if let Some(summary) = st.usage_summary.as_mut() {
+            } else if let Some(summary) = st.modals.usage_summary.as_mut() {
                 match key.code {
                     KeyCode::Down => {
                         summary.scroll = summary.scroll.saturating_add(1);
@@ -1653,7 +1699,7 @@ mod tests {
             crate::app::ReviewDialogFocus::PresetList,
         );
         assert!(dialog.selector.len() > 1, "the reviewer list must be live");
-        st.review_dialog = Some(dialog);
+        st.modals.review_dialog = Some(dialog);
 
         let state = Arc::new(Mutex::new(st));
         let mut conn = RpcConnection::new(Vec::<u8>::new());
@@ -1668,7 +1714,11 @@ mod tests {
         }
         {
             let guard = state.lock().await;
-            let dialog = guard.review_dialog.as_ref().expect("dialog stays open");
+            let dialog = guard
+                .modals
+                .review_dialog
+                .as_ref()
+                .expect("dialog stays open");
             assert_eq!(dialog.preset_selector.selected_index(), 2);
             assert_eq!(
                 dialog.selector.selected_index(),
@@ -1686,7 +1736,11 @@ mod tests {
         .expect("in-memory dispatch never fails");
         {
             let guard = state.lock().await;
-            let dialog = guard.review_dialog.as_ref().expect("dialog stays open");
+            let dialog = guard
+                .modals
+                .review_dialog
+                .as_ref()
+                .expect("dialog stays open");
             assert_eq!(dialog.preset_selector.selected_index(), 1);
             assert_eq!(dialog.selector.selected_index(), 0);
         }
@@ -1716,7 +1770,7 @@ mod tests {
         dialog.path_inputs[0].insert_str("cra");
         dialog.refresh_path_completion();
         assert!(dialog.path_completion.is_open(), "the row offers prefixes");
-        st.review_dialog = Some(dialog);
+        st.modals.review_dialog = Some(dialog);
 
         let state = Arc::new(Mutex::new(st));
         let mut conn = RpcConnection::new(Vec::<u8>::new());
@@ -1729,7 +1783,11 @@ mod tests {
         .expect("in-memory dispatch never fails");
 
         let guard = state.lock().await;
-        let dialog = guard.review_dialog.as_ref().expect("dialog stays open");
+        let dialog = guard
+            .modals
+            .review_dialog
+            .as_ref()
+            .expect("dialog stays open");
         assert_eq!(dialog.path_completion.selected_index(), 1);
         assert_eq!(dialog.path_inputs[0].get_text(), "cra");
         assert_eq!(
@@ -1752,7 +1810,7 @@ mod tests {
             crate::app::ReviewDialogFocus::ModelList,
         );
         assert!(dialog.selector.len() > 1, "the reviewer list must be live");
-        st.review_dialog = Some(dialog);
+        st.modals.review_dialog = Some(dialog);
 
         let state = Arc::new(Mutex::new(st));
         let mut conn = RpcConnection::new(Vec::<u8>::new());
@@ -1761,7 +1819,11 @@ mod tests {
                 .await
                 .expect("in-memory dispatch never fails");
             let guard = state.lock().await;
-            let dialog = guard.review_dialog.as_ref().expect("dialog stays open");
+            let dialog = guard
+                .modals
+                .review_dialog
+                .as_ref()
+                .expect("dialog stays open");
             assert_eq!(dialog.selector.selected_index(), expected);
             assert_eq!(
                 dialog.preset_selector.selected_index(),
@@ -1822,8 +1884,8 @@ mod tests {
     async fn launch_execute_review(key: KeyEvent) -> (ViewMode, Option<String>, bool) {
         let mut st = crate::app::test_state();
         st.view_mode = ViewMode::Review;
-        st.confirm_execute_review = Some(execute_review_target());
-        st.confirm_button = ConfirmDialogButton::Confirm;
+        st.modals.confirm_execute_review = Some(execute_review_target());
+        st.modals.confirm_button = ConfirmDialogButton::Confirm;
 
         let state = Arc::new(Mutex::new(st));
         let mut conn = RpcConnection::new(Vec::<u8>::new());
@@ -1836,7 +1898,7 @@ mod tests {
         (
             guard.view_mode,
             notification,
-            guard.confirm_execute_review.is_some(),
+            guard.modals.confirm_execute_review.is_some(),
         )
     }
     /// Drives the ExecuteReview confirmation through `handle_dialog_event` on a
@@ -1846,8 +1908,8 @@ mod tests {
     async fn launch_execute_review_payload(target: ConfirmExecuteReviewState) -> String {
         let mut st = crate::app::test_state();
         st.view_mode = ViewMode::Review;
-        st.confirm_execute_review = Some(target);
-        st.confirm_button = ConfirmDialogButton::Confirm;
+        st.modals.confirm_execute_review = Some(target);
+        st.modals.confirm_button = ConfirmDialogButton::Confirm;
 
         let state = Arc::new(Mutex::new(st));
         let mut conn = RpcConnection::new(Vec::<u8>::new());
@@ -1926,8 +1988,8 @@ mod tests {
 
         let mut st = crate::app::test_state();
         st.view_mode = ViewMode::Review;
-        st.confirm_execute_review = Some(target);
-        st.confirm_button = ConfirmDialogButton::Confirm;
+        st.modals.confirm_execute_review = Some(target);
+        st.modals.confirm_button = ConfirmDialogButton::Confirm;
 
         let state = Arc::new(Mutex::new(st));
         let mut conn = RpcConnection::new(Vec::<u8>::new());
@@ -1948,7 +2010,7 @@ mod tests {
         );
 
         let guard = state.lock().await;
-        assert!(guard.confirm_execute_review.is_none());
+        assert!(guard.modals.confirm_execute_review.is_none());
         assert_eq!(guard.view_mode, ViewMode::Repl);
         assert!(guard.model.is_batch, "the launch runs as a batch");
         assert!(
@@ -1976,8 +2038,8 @@ mod tests {
                 ..Default::default()
             }],
         )];
-        st.confirm_clear_horizon = Some("plan-h".to_string());
-        st.confirm_button = ConfirmDialogButton::Confirm;
+        st.modals.confirm_clear_horizon = Some("plan-h".to_string());
+        st.modals.confirm_button = ConfirmDialogButton::Confirm;
 
         let state = Arc::new(Mutex::new(st));
         let mut conn = RpcConnection::new(Vec::<u8>::new());
@@ -1990,9 +2052,12 @@ mod tests {
         .expect("in-memory dispatch never fails");
 
         let guard = state.lock().await;
-        assert!(guard.confirm_clear_horizon.is_none());
-        assert_eq!(guard.confirm_clear_horizon_final.as_deref(), Some("plan-h"));
-        assert_eq!(guard.confirm_button, ConfirmDialogButton::Cancel);
+        assert!(guard.modals.confirm_clear_horizon.is_none());
+        assert_eq!(
+            guard.modals.confirm_clear_horizon_final.as_deref(),
+            Some("plan-h")
+        );
+        assert_eq!(guard.modals.confirm_button, ConfirmDialogButton::Cancel);
     }
 
     /// Confirming the first tier on a horizon with no recorded work sends the
@@ -2014,8 +2079,8 @@ mod tests {
                 ..Default::default()
             }],
         )];
-        st.confirm_clear_horizon = Some("plan-clear".to_string());
-        st.confirm_button = ConfirmDialogButton::Confirm;
+        st.modals.confirm_clear_horizon = Some("plan-clear".to_string());
+        st.modals.confirm_button = ConfirmDialogButton::Confirm;
 
         let state = Arc::new(Mutex::new(st));
         let mut conn = RpcConnection::new(Vec::<u8>::new());
@@ -2032,16 +2097,16 @@ mod tests {
         assert!(payload.contains("plan_id"), "{payload}");
 
         let guard = state.lock().await;
-        assert!(guard.confirm_clear_horizon.is_none());
-        assert!(guard.confirm_clear_horizon_final.is_none());
+        assert!(guard.modals.confirm_clear_horizon.is_none());
+        assert!(guard.modals.confirm_clear_horizon_final.is_none());
     }
 
     /// Confirming the second tier dispatches the same typed reset request.
     #[tokio::test]
     async fn clear_horizon_final_confirm_clears_via_rpc() {
         let mut st = crate::app::test_state();
-        st.confirm_clear_horizon_final = Some("plan-final".to_string());
-        st.confirm_button = ConfirmDialogButton::Confirm;
+        st.modals.confirm_clear_horizon_final = Some("plan-final".to_string());
+        st.modals.confirm_button = ConfirmDialogButton::Confirm;
 
         let state = Arc::new(Mutex::new(st));
         let mut conn = RpcConnection::new(Vec::<u8>::new());
@@ -2058,7 +2123,7 @@ mod tests {
         assert!(payload.contains("plan_id"), "{payload}");
 
         let guard = state.lock().await;
-        assert!(guard.confirm_clear_horizon_final.is_none());
+        assert!(guard.modals.confirm_clear_horizon_final.is_none());
     }
 
     /// Confirming the first tier on a plan with unfinished work must escalate to
@@ -2080,8 +2145,8 @@ mod tests {
                 ..Default::default()
             }],
         )];
-        st.confirm_delete_plan = Some("plan-open".to_string());
-        st.confirm_button = ConfirmDialogButton::Confirm;
+        st.modals.confirm_delete_plan = Some("plan-open".to_string());
+        st.modals.confirm_button = ConfirmDialogButton::Confirm;
 
         let state = Arc::new(Mutex::new(st));
         let mut conn = RpcConnection::new(Vec::<u8>::new());
@@ -2094,12 +2159,12 @@ mod tests {
         .expect("in-memory dispatch never fails");
 
         let guard = state.lock().await;
-        assert!(guard.confirm_delete_plan.is_none());
+        assert!(guard.modals.confirm_delete_plan.is_none());
         assert_eq!(
-            guard.confirm_delete_plan_final.as_deref(),
+            guard.modals.confirm_delete_plan_final.as_deref(),
             Some("plan-open")
         );
-        assert_eq!(guard.confirm_button, ConfirmDialogButton::Cancel);
+        assert_eq!(guard.modals.confirm_button, ConfirmDialogButton::Cancel);
         drop(guard);
         assert!(
             conn.written().is_empty(),
@@ -2129,8 +2194,8 @@ mod tests {
                     plan_item("2", status),
                 ],
             )];
-            st.confirm_delete_plan = Some("plan-wip".to_string());
-            st.confirm_button = ConfirmDialogButton::Confirm;
+            st.modals.confirm_delete_plan = Some("plan-wip".to_string());
+            st.modals.confirm_button = ConfirmDialogButton::Confirm;
 
             let state = Arc::new(Mutex::new(st));
             let mut conn = RpcConnection::new(Vec::<u8>::new());
@@ -2143,13 +2208,13 @@ mod tests {
             .expect("in-memory dispatch never fails");
 
             let guard = state.lock().await;
-            assert!(guard.confirm_delete_plan.is_none());
+            assert!(guard.modals.confirm_delete_plan.is_none());
             assert_eq!(
-                guard.confirm_delete_plan_final.as_deref(),
+                guard.modals.confirm_delete_plan_final.as_deref(),
                 Some("plan-wip"),
                 "{status} must escalate the deletion"
             );
-            assert_eq!(guard.confirm_button, ConfirmDialogButton::Cancel);
+            assert_eq!(guard.modals.confirm_button, ConfirmDialogButton::Cancel);
             drop(guard);
             assert!(
                 conn.written().is_empty(),
@@ -2226,8 +2291,8 @@ mod tests {
                 ..Default::default()
             }],
         )];
-        st.confirm_delete_plan = Some("plan-done".to_string());
-        st.confirm_button = ConfirmDialogButton::Confirm;
+        st.modals.confirm_delete_plan = Some("plan-done".to_string());
+        st.modals.confirm_button = ConfirmDialogButton::Confirm;
 
         let state = Arc::new(Mutex::new(st));
         let mut conn = RpcConnection::new(Vec::<u8>::new());
@@ -2244,16 +2309,16 @@ mod tests {
         assert!(payload.contains("plan-done"), "{payload}");
 
         let guard = state.lock().await;
-        assert!(guard.confirm_delete_plan.is_none());
-        assert!(guard.confirm_delete_plan_final.is_none());
+        assert!(guard.modals.confirm_delete_plan.is_none());
+        assert!(guard.modals.confirm_delete_plan_final.is_none());
     }
 
     /// Confirming the second tier dispatches the same typed delete request.
     #[tokio::test]
     async fn delete_plan_final_confirm_sends_request() {
         let mut st = crate::app::test_state();
-        st.confirm_delete_plan_final = Some("plan-open".to_string());
-        st.confirm_button = ConfirmDialogButton::Confirm;
+        st.modals.confirm_delete_plan_final = Some("plan-open".to_string());
+        st.modals.confirm_button = ConfirmDialogButton::Confirm;
 
         let state = Arc::new(Mutex::new(st));
         let mut conn = RpcConnection::new(Vec::<u8>::new());
@@ -2270,7 +2335,7 @@ mod tests {
         assert!(payload.contains("plan-open"), "{payload}");
 
         let guard = state.lock().await;
-        assert!(guard.confirm_delete_plan_final.is_none());
+        assert!(guard.modals.confirm_delete_plan_final.is_none());
     }
 
     /// Confirming the pipeline modal dispatches the typed
@@ -2278,13 +2343,13 @@ mod tests {
     #[tokio::test]
     async fn execute_pipeline_confirm_sends_typed_request() {
         let mut st = crate::app::test_state();
-        st.confirm_execute_pipeline = Some(crate::app::ConfirmExecutePipelineState {
+        st.modals.confirm_execute_pipeline = Some(crate::app::ConfirmExecutePipelineState {
             plan_ids: vec!["plan-a".to_string(), "plan-b".to_string()],
             plan_titles: vec!["A".to_string(), "B".to_string()],
             steps: Vec::new(),
             pending_synthesis: Vec::new(),
         });
-        st.confirm_button = ConfirmDialogButton::Confirm;
+        st.modals.confirm_button = ConfirmDialogButton::Confirm;
 
         let state = Arc::new(Mutex::new(st));
         let mut conn = RpcConnection::new(Vec::<u8>::new());
@@ -2302,7 +2367,7 @@ mod tests {
         assert!(payload.contains("plan-b"), "{payload}");
 
         let guard = state.lock().await;
-        assert!(guard.confirm_execute_pipeline.is_none());
+        assert!(guard.modals.confirm_execute_pipeline.is_none());
         assert_eq!(guard.view_mode, ViewMode::Repl);
         assert!(guard.model.is_batch);
     }
@@ -2313,7 +2378,7 @@ mod tests {
     async fn group_plan_execution_dispatches_the_group_target() {
         let mut st = crate::app::test_state();
         st.view_mode = ViewMode::Review;
-        st.confirm_execute_review = Some(
+        st.modals.confirm_execute_review = Some(
             ConfirmExecuteReviewState::new(
                 Some("rev-1".to_string()),
                 "Session rev-1".to_string(),
@@ -2325,7 +2390,7 @@ mod tests {
             )
             .with_group("arch-auth".to_string(), "Unified auth guard".to_string()),
         );
-        st.confirm_button = ConfirmDialogButton::Confirm;
+        st.modals.confirm_button = ConfirmDialogButton::Confirm;
 
         let state = Arc::new(Mutex::new(st));
         let mut conn = RpcConnection::new(Vec::<u8>::new());
@@ -2347,14 +2412,14 @@ mod tests {
         assert!(!payload.contains("\"step_id\""), "{payload}");
 
         let guard = state.lock().await;
-        assert!(guard.confirm_execute_review.is_none());
+        assert!(guard.modals.confirm_execute_review.is_none());
         assert_eq!(guard.view_mode, ViewMode::Repl);
     }
 
     #[tokio::test]
     async fn help_modal_tab_shortcuts_switch_between_tabs() {
         let mut st = crate::app::test_state();
-        st.show_help = true;
+        st.modals.show_help = true;
         let state = Arc::new(Mutex::new(st));
         let mut conn = RpcConnection::new(Vec::<u8>::new());
 
@@ -2366,7 +2431,7 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(state.lock().await.help_tab, HelpTab::CurrentMode);
+        assert_eq!(state.lock().await.modals.help_tab, HelpTab::CurrentMode);
 
         // Tab again cycles to the Text Editor tab.
         handle_dialog_event(
@@ -2376,7 +2441,7 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(state.lock().await.help_tab, HelpTab::TextEditor);
+        assert_eq!(state.lock().await.modals.help_tab, HelpTab::TextEditor);
 
         // Shift+Tab walks back to the Current Mode tab.
         handle_dialog_event(
@@ -2386,7 +2451,7 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(state.lock().await.help_tab, HelpTab::CurrentMode);
+        assert_eq!(state.lock().await.modals.help_tab, HelpTab::CurrentMode);
 
         // Bare digits select a tab directly.
         handle_dialog_event(
@@ -2396,7 +2461,7 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(state.lock().await.help_tab, HelpTab::TextEditor);
+        assert_eq!(state.lock().await.modals.help_tab, HelpTab::TextEditor);
 
         handle_dialog_event(
             KeyEvent::new(KeyCode::Char('1'), KeyModifiers::NONE),
@@ -2405,7 +2470,7 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(state.lock().await.help_tab, HelpTab::Global);
+        assert_eq!(state.lock().await.modals.help_tab, HelpTab::Global);
 
         handle_dialog_event(
             KeyEvent::new(KeyCode::Char('2'), KeyModifiers::NONE),
@@ -2414,16 +2479,16 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(state.lock().await.help_tab, HelpTab::CurrentMode);
+        assert_eq!(state.lock().await.modals.help_tab, HelpTab::CurrentMode);
 
         // The dialog stays open across every tab switch.
-        assert!(state.lock().await.show_help);
+        assert!(state.lock().await.modals.show_help);
     }
 
     #[tokio::test]
     async fn help_modal_command_chords_do_not_switch_tabs() {
         let mut st = crate::app::test_state();
-        st.show_help = true;
+        st.modals.show_help = true;
         let state = Arc::new(Mutex::new(st));
         let mut conn = RpcConnection::new(Vec::<u8>::new());
 
@@ -2436,7 +2501,7 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(state.lock().await.help_tab, HelpTab::Global);
+        assert_eq!(state.lock().await.modals.help_tab, HelpTab::Global);
     }
 
     /// The AltGr compose chord (`Ctrl+Alt`) is how Windows and X11 report a
@@ -2446,7 +2511,7 @@ mod tests {
     #[tokio::test]
     async fn help_modal_compose_chord_does_not_switch_tabs() {
         let mut st = crate::app::test_state();
-        st.show_help = true;
+        st.modals.show_help = true;
         let state = Arc::new(Mutex::new(st));
         let mut conn = RpcConnection::new(Vec::<u8>::new());
 
@@ -2462,8 +2527,11 @@ mod tests {
         .unwrap();
 
         let guard = state.lock().await;
-        assert_eq!(guard.help_tab, HelpTab::Global);
-        assert!(guard.show_help, "the compose chord leaves the modal open");
+        assert_eq!(guard.modals.help_tab, HelpTab::Global);
+        assert!(
+            guard.modals.show_help,
+            "the compose chord leaves the modal open"
+        );
         drop(guard);
         assert!(conn.written().is_empty());
     }
@@ -2501,7 +2569,7 @@ mod tests {
         st.view_mode = ViewMode::Review;
         let mut dialog = ReviewDialogState::new(1, 10, Vec::new(), Vec::new());
         dialog.focus = ReviewDialogFocus::PathEditor;
-        st.review_dialog = Some(dialog);
+        st.modals.review_dialog = Some(dialog);
 
         let state = Arc::new(Mutex::new(st));
         let mut conn = RpcConnection::new(Vec::<u8>::new());
@@ -2515,7 +2583,11 @@ mod tests {
         .expect("in-memory dispatch never fails");
 
         let guard = state.lock().await;
-        let dialog = guard.review_dialog.as_ref().expect("dialog stays open");
+        let dialog = guard
+            .modals
+            .review_dialog
+            .as_ref()
+            .expect("dialog stays open");
         assert_eq!(dialog.path_inputs[0].get_text(), "x");
         assert!(dialog.prompt_editor.is_empty());
     }
@@ -2542,6 +2614,7 @@ mod tests {
             let guard = state.lock().await;
             assert_eq!(
                 guard
+                    .modals
                     .usage_summary
                     .as_ref()
                     .expect("dialog stays open")
@@ -2559,7 +2632,14 @@ mod tests {
         .await
         .expect("in-memory dispatch never fails");
         assert_eq!(
-            state.lock().await.usage_summary.as_ref().unwrap().scroll,
+            state
+                .lock()
+                .await
+                .modals
+                .usage_summary
+                .as_ref()
+                .unwrap()
+                .scroll,
             u16::MAX
         );
 
@@ -2573,7 +2653,7 @@ mod tests {
             handle_dialog_event(key, &state, &mut conn)
                 .await
                 .expect("in-memory dispatch never fails");
-            assert!(state.lock().await.usage_summary.is_none());
+            assert!(state.lock().await.modals.usage_summary.is_none());
         }
 
         assert!(
@@ -2607,7 +2687,7 @@ mod tests {
 
             let guard = state.lock().await;
             assert!(
-                guard.usage_summary.is_some(),
+                guard.modals.usage_summary.is_some(),
                 "the telemetry dialog stays open after the reset"
             );
             assert_eq!(
@@ -2638,7 +2718,7 @@ mod tests {
             conn.written().is_empty(),
             "a bare lowercase key never reaches the server"
         );
-        assert!(state.lock().await.usage_summary.is_some());
+        assert!(state.lock().await.modals.usage_summary.is_some());
     }
 
     /// A command modifier must never ride along with the mass-clearing chord:
@@ -2671,7 +2751,7 @@ mod tests {
                 "{modifiers:?} must never reset project telemetry"
             );
             assert!(
-                state.lock().await.usage_summary.is_some(),
+                state.lock().await.modals.usage_summary.is_some(),
                 "the read-only dialog stays open"
             );
         }
@@ -2722,8 +2802,8 @@ mod tests {
         st.model.scroll = 7;
         st.model.auto_scroll = false;
         st.discussion_focus = DiscussionFocus::review("rev-1", vec!["2".to_string()]);
-        st.confirm_execute_review = Some(execute_review_target());
-        st.confirm_button = ConfirmDialogButton::Confirm;
+        st.modals.confirm_execute_review = Some(execute_review_target());
+        st.modals.confirm_button = ConfirmDialogButton::Confirm;
 
         let state = Arc::new(Mutex::new(st));
         let mut conn = RpcConnection::new(FailingWriter);
@@ -2783,7 +2863,7 @@ mod tests {
             focused_items: Vec::new(),
         });
         modal.prompt_editor.insert_str("split the first step");
-        st.prompt_modal = Some(modal);
+        st.modals.prompt_modal = Some(modal);
 
         let state = Arc::new(Mutex::new(st));
         let mut conn = RpcConnection::new(FailingWriter);
@@ -2797,6 +2877,7 @@ mod tests {
 
         let guard = state.lock().await;
         let restored = guard
+            .modals
             .prompt_modal
             .as_ref()
             .expect("the failed launch returns the comment to its modal");
@@ -2827,7 +2908,7 @@ mod tests {
         dialog.path_inputs[0].insert_str("srx/*.rs");
         dialog.focus = crate::app::ReviewDialogFocus::Actions;
         dialog.confirm_button = ConfirmDialogButton::Confirm;
-        st.review_dialog = Some(dialog);
+        st.modals.review_dialog = Some(dialog);
 
         let state = Arc::new(Mutex::new(st));
         let mut conn = RpcConnection::new(Vec::<u8>::new());
@@ -2845,6 +2926,7 @@ mod tests {
         );
         let guard = state.lock().await;
         let dialog = guard
+            .modals
             .review_dialog
             .as_ref()
             .expect("the dialog stays open with its fields");
@@ -2869,7 +2951,7 @@ mod tests {
         let mut dialog = ReviewDialogState::new(1, 10, Vec::new(), Vec::new());
         dialog.focus = crate::app::ReviewDialogFocus::Actions;
         dialog.confirm_button = ConfirmDialogButton::Confirm;
-        st.review_dialog = Some(dialog);
+        st.modals.review_dialog = Some(dialog);
 
         let state = Arc::new(Mutex::new(st));
         let mut conn = RpcConnection::new(Vec::<u8>::new());
@@ -2887,10 +2969,11 @@ mod tests {
 
         let guard = state.lock().await;
         assert!(
-            guard.review_dialog.is_none(),
+            guard.modals.review_dialog.is_none(),
             "a launchable review dialog starts its window projection"
         );
         let pending = guard
+            .modals
             .pending_review_launch
             .as_ref()
             .expect("the launch awaits its projection");
@@ -2917,7 +3000,7 @@ mod tests {
             },
         ]);
         dialog.focus = crate::app::ReviewDialogFocus::PresetList;
-        st.review_dialog = Some(dialog);
+        st.modals.review_dialog = Some(dialog);
 
         let state = Arc::new(Mutex::new(st));
         let mut conn = RpcConnection::new(Vec::<u8>::new());
@@ -2933,7 +3016,11 @@ mod tests {
         }
         {
             let guard = state.lock().await;
-            let dialog = guard.review_dialog.as_ref().expect("the dialog stays open");
+            let dialog = guard
+                .modals
+                .review_dialog
+                .as_ref()
+                .expect("the dialog stays open");
             assert_eq!(dialog.preset_selector.selected_index(), 2);
             assert_eq!(
                 dialog.selected_preset().map(|preset| preset.name.as_str()),
@@ -2951,7 +3038,11 @@ mod tests {
         .expect("in-memory dispatch never fails");
 
         let guard = state.lock().await;
-        let dialog = guard.review_dialog.as_ref().expect("the dialog stays open");
+        let dialog = guard
+            .modals
+            .review_dialog
+            .as_ref()
+            .expect("the dialog stays open");
         assert_eq!(dialog.focus, crate::app::ReviewDialogFocus::Actions);
         assert_eq!(dialog.confirm_button, ConfirmDialogButton::Confirm);
         drop(guard);
@@ -2969,7 +3060,7 @@ mod tests {
         let mut st = crate::app::test_state();
         st.view_mode = ViewMode::Review;
         st.last_frame_area = ratatui::layout::Rect::new(0, 0, 120, 50);
-        st.review_dialog = Some(ReviewDialogState::new(1, 10, Vec::new(), Vec::new()));
+        st.modals.review_dialog = Some(ReviewDialogState::new(1, 10, Vec::new(), Vec::new()));
 
         let state = Arc::new(Mutex::new(st));
         let mut conn = RpcConnection::new(Vec::<u8>::new());
@@ -2983,12 +3074,20 @@ mod tests {
             .await
             .expect("in-memory dispatch never fails");
             let guard = state.lock().await;
-            let dialog = guard.review_dialog.as_ref().expect("the dialog stays open");
+            let dialog = guard
+                .modals
+                .review_dialog
+                .as_ref()
+                .expect("the dialog stays open");
             assert_ne!(dialog.focus, crate::app::ReviewDialogFocus::PresetList);
         }
 
         let guard = state.lock().await;
-        let dialog = guard.review_dialog.as_ref().expect("the dialog stays open");
+        let dialog = guard
+            .modals
+            .review_dialog
+            .as_ref()
+            .expect("the dialog stays open");
         assert_eq!(dialog.preset_selector.item_count(), 0);
         assert!(dialog.selected_preset().is_none());
         assert_eq!(dialog.start_params().preset, None);
@@ -3013,7 +3112,7 @@ mod tests {
         dialog = dialog.with_presets(presets);
         let rows = dialog.preset_selector.item_count();
         dialog.preset_selector.select_index(1, rows);
-        st.review_dialog = Some(dialog);
+        st.modals.review_dialog = Some(dialog);
 
         let state = Arc::new(Mutex::new(st));
         let mut conn = RpcConnection::new(Vec::<u8>::new());
@@ -3027,7 +3126,11 @@ mod tests {
             .await
             .expect("in-memory dispatch never fails");
             let guard = state.lock().await;
-            let dialog = guard.review_dialog.as_ref().expect("the dialog stays open");
+            let dialog = guard
+                .modals
+                .review_dialog
+                .as_ref()
+                .expect("the dialog stays open");
             assert_ne!(dialog.focus, crate::app::ReviewDialogFocus::PathEditor);
         }
         assert!(
@@ -3041,7 +3144,7 @@ mod tests {
     async fn review_analyze_confirm_dispatches_the_typed_request() {
         let mut st = crate::app::test_state();
         st.view_mode = ViewMode::Review;
-        st.confirm_review_analyze = Some(crate::app::ConfirmReviewAnalyzeState::new(
+        st.modals.confirm_review_analyze = Some(crate::app::ConfirmReviewAnalyzeState::new(
             "rev-1".to_string(),
             "Session rev-1".to_string(),
             vec![
@@ -3057,6 +3160,7 @@ mod tests {
         ));
         {
             let target = st
+                .modals
                 .confirm_review_analyze
                 .as_mut()
                 .expect("the dialog is open");
@@ -3080,7 +3184,7 @@ mod tests {
         assert!(payload.contains("rev-1"), "{payload}");
 
         let guard = state.lock().await;
-        assert!(guard.confirm_review_analyze.is_none());
+        assert!(guard.modals.confirm_review_analyze.is_none());
         assert!(guard.review.analyzing);
         assert_eq!(
             guard.active_notification().map(|n| n.text.as_str()),
@@ -3094,12 +3198,12 @@ mod tests {
     async fn review_analyze_dismiss_sends_no_request() {
         let mut st = crate::app::test_state();
         st.view_mode = ViewMode::Review;
-        st.confirm_review_analyze = Some(crate::app::ConfirmReviewAnalyzeState::new(
+        st.modals.confirm_review_analyze = Some(crate::app::ConfirmReviewAnalyzeState::new(
             "rev-1".to_string(),
             "Session rev-1".to_string(),
             Vec::new(),
         ));
-        st.confirm_button = ConfirmDialogButton::Confirm;
+        st.modals.confirm_button = ConfirmDialogButton::Confirm;
 
         let state = Arc::new(Mutex::new(st));
         let mut conn = RpcConnection::new(Vec::<u8>::new());
@@ -3113,9 +3217,9 @@ mod tests {
 
         assert!(conn.written().is_empty(), "a dismissal launches nothing");
         let guard = state.lock().await;
-        assert!(guard.confirm_review_analyze.is_none());
+        assert!(guard.modals.confirm_review_analyze.is_none());
         assert!(!guard.review.analyzing);
-        assert_eq!(guard.confirm_button, ConfirmDialogButton::Cancel);
+        assert_eq!(guard.modals.confirm_button, ConfirmDialogButton::Cancel);
     }
 
     /// The post-analysis dialog repeats the execution-dialog focus cycle: `Tab`
@@ -3126,7 +3230,7 @@ mod tests {
     async fn review_analyze_dialog_cycles_focus_and_selects_by_digit() {
         let mut st = crate::app::test_state();
         st.view_mode = ViewMode::Review;
-        st.confirm_review_analyze = Some(crate::app::ConfirmReviewAnalyzeState::new(
+        st.modals.confirm_review_analyze = Some(crate::app::ConfirmReviewAnalyzeState::new(
             "rev-1".to_string(),
             "Session rev-1".to_string(),
             vec![
@@ -3154,7 +3258,11 @@ mod tests {
         .expect("in-memory dispatch never fails");
         {
             let guard = state.lock().await;
-            let target = guard.confirm_review_analyze.as_ref().expect("dialog open");
+            let target = guard
+                .modals
+                .confirm_review_analyze
+                .as_ref()
+                .expect("dialog open");
             assert_eq!(target.selector.selected_index(), 1);
             assert_eq!(target.focus, crate::app::ReviewAnalyzeFocus::ModelList);
         }
@@ -3168,7 +3276,11 @@ mod tests {
         .expect("in-memory dispatch never fails");
         {
             let guard = state.lock().await;
-            let target = guard.confirm_review_analyze.as_ref().expect("dialog open");
+            let target = guard
+                .modals
+                .confirm_review_analyze
+                .as_ref()
+                .expect("dialog open");
             assert_eq!(target.focus, crate::app::ReviewAnalyzeFocus::Actions);
             assert_eq!(target.confirm_button, ConfirmDialogButton::Cancel);
         }
@@ -3182,7 +3294,11 @@ mod tests {
         .expect("in-memory dispatch never fails");
         {
             let guard = state.lock().await;
-            let target = guard.confirm_review_analyze.as_ref().expect("dialog open");
+            let target = guard
+                .modals
+                .confirm_review_analyze
+                .as_ref()
+                .expect("dialog open");
             assert_eq!(target.focus, crate::app::ReviewAnalyzeFocus::Actions);
             assert_eq!(target.confirm_button, ConfirmDialogButton::Confirm);
         }
@@ -3196,7 +3312,11 @@ mod tests {
         .expect("in-memory dispatch never fails");
         {
             let guard = state.lock().await;
-            let target = guard.confirm_review_analyze.as_ref().expect("dialog open");
+            let target = guard
+                .modals
+                .confirm_review_analyze
+                .as_ref()
+                .expect("dialog open");
             assert_eq!(target.focus, crate::app::ReviewAnalyzeFocus::ModelList);
             assert_eq!(target.confirm_button, ConfirmDialogButton::Cancel);
         }
@@ -3212,7 +3332,7 @@ mod tests {
         st.last_frame_area = ratatui::layout::Rect::new(0, 0, 120, 50);
         let mut dialog = ReviewDialogState::new(0, 0, Vec::new(), Vec::new());
         dialog.focus = crate::app::ReviewDialogFocus::PathEditor;
-        st.review_dialog = Some(dialog);
+        st.modals.review_dialog = Some(dialog);
 
         let state = Arc::new(Mutex::new(st));
         let mut conn = RpcConnection::new(Vec::<u8>::new());
@@ -3225,6 +3345,7 @@ mod tests {
             state
                 .lock()
                 .await
+                .modals
                 .review_dialog
                 .as_ref()
                 .expect("dialog stays open")
@@ -3236,6 +3357,7 @@ mod tests {
         state
             .lock()
             .await
+            .modals
             .review_dialog
             .as_mut()
             .expect("dialog stays open")
@@ -3246,7 +3368,11 @@ mod tests {
             .expect("in-memory dispatch never fails");
 
         let guard = state.lock().await;
-        let dialog = guard.review_dialog.as_ref().expect("dialog stays open");
+        let dialog = guard
+            .modals
+            .review_dialog
+            .as_ref()
+            .expect("dialog stays open");
         assert_eq!(dialog.path_row_count(), 2);
         assert_eq!(dialog.path_active, 1);
         assert!(dialog.active_path_editor().expect("row").is_empty());
@@ -3268,7 +3394,7 @@ mod tests {
         dialog.focus = crate::app::ReviewDialogFocus::PathEditor;
         dialog.path_inputs[0].insert_str("src/");
         assert!(dialog.append_path_row());
-        st.review_dialog = Some(dialog);
+        st.modals.review_dialog = Some(dialog);
 
         let state = Arc::new(Mutex::new(st));
         let mut conn = RpcConnection::new(Vec::<u8>::new());
@@ -3280,7 +3406,11 @@ mod tests {
             .expect("in-memory dispatch never fails");
         {
             let guard = state.lock().await;
-            let dialog = guard.review_dialog.as_ref().expect("dialog stays open");
+            let dialog = guard
+                .modals
+                .review_dialog
+                .as_ref()
+                .expect("dialog stays open");
             assert_eq!(dialog.path_active, 0);
             assert_eq!(dialog.focus, crate::app::ReviewDialogFocus::PathEditor);
         }
@@ -3290,8 +3420,13 @@ mod tests {
             .expect("in-memory dispatch never fails");
         {
             let guard = state.lock().await;
-            let dialog = guard.review_dialog.as_ref().expect("dialog stays open");
+            let dialog = guard
+                .modals
+                .review_dialog
+                .as_ref()
+                .expect("dialog stays open");
             assert_eq!(dialog.path_active, 1);
+            assert_eq!(dialog.focus, crate::app::ReviewDialogFocus::PathEditor);
         }
 
         // `C-n` on the last row hands the keyboard to the instructions editor
@@ -3301,7 +3436,11 @@ mod tests {
             .expect("in-memory dispatch never fails");
         {
             let guard = state.lock().await;
-            let dialog = guard.review_dialog.as_ref().expect("dialog stays open");
+            let dialog = guard
+                .modals
+                .review_dialog
+                .as_ref()
+                .expect("dialog stays open");
             assert_eq!(dialog.focus, crate::app::ReviewDialogFocus::PromptEditor);
             assert_eq!(dialog.path_active, 1);
         }
@@ -3309,7 +3448,11 @@ mod tests {
         // `C-p` on the first row leaves the list through the shared focus walk.
         {
             let mut guard = state.lock().await;
-            let dialog = guard.review_dialog.as_mut().expect("dialog stays open");
+            let dialog = guard
+                .modals
+                .review_dialog
+                .as_mut()
+                .expect("dialog stays open");
             dialog.focus = crate::app::ReviewDialogFocus::PathEditor;
             dialog.path_active = 0;
         }
@@ -3318,7 +3461,11 @@ mod tests {
             .expect("in-memory dispatch never fails");
         {
             let guard = state.lock().await;
-            let dialog = guard.review_dialog.as_ref().expect("dialog stays open");
+            let dialog = guard
+                .modals
+                .review_dialog
+                .as_ref()
+                .expect("dialog stays open");
             assert_eq!(dialog.focus, crate::app::ReviewDialogFocus::Actions);
         }
         assert!(conn.written().is_empty());
@@ -3335,7 +3482,7 @@ mod tests {
         dialog.focus = crate::app::ReviewDialogFocus::PathEditor;
         dialog.path_inputs[0].insert_str("src/");
         assert!(dialog.append_path_row());
-        st.review_dialog = Some(dialog);
+        st.modals.review_dialog = Some(dialog);
 
         let state = Arc::new(Mutex::new(st));
         let mut conn = RpcConnection::new(Vec::<u8>::new());
@@ -3348,7 +3495,11 @@ mod tests {
         .expect("in-memory dispatch never fails");
 
         let guard = state.lock().await;
-        let dialog = guard.review_dialog.as_ref().expect("dialog stays open");
+        let dialog = guard
+            .modals
+            .review_dialog
+            .as_ref()
+            .expect("dialog stays open");
         assert_eq!(dialog.path_row_count(), 1);
         assert_eq!(dialog.path_active, 0);
         drop(guard);
@@ -3375,7 +3526,7 @@ mod tests {
         dialog.focus = crate::app::ReviewDialogFocus::PathEditor;
         dialog.path_inputs[0].insert_str("cra");
         dialog.refresh_path_completion();
-        st.review_dialog = Some(dialog);
+        st.modals.review_dialog = Some(dialog);
 
         let state = Arc::new(Mutex::new(st));
         let mut conn = RpcConnection::new(Vec::<u8>::new());
@@ -3388,7 +3539,11 @@ mod tests {
         .expect("in-memory dispatch never fails");
 
         let guard = state.lock().await;
-        let dialog = guard.review_dialog.as_ref().expect("dialog stays open");
+        let dialog = guard
+            .modals
+            .review_dialog
+            .as_ref()
+            .expect("dialog stays open");
         assert_eq!(dialog.path_inputs[0].get_text(), "crates/");
         assert_eq!(
             dialog.focus,
@@ -3408,7 +3563,7 @@ mod tests {
         st.last_frame_area = ratatui::layout::Rect::new(0, 0, 120, 50);
         let mut dialog = ReviewDialogState::new(0, 0, Vec::new(), Vec::new());
         dialog.focus = crate::app::ReviewDialogFocus::PathEditor;
-        st.review_dialog = Some(dialog);
+        st.modals.review_dialog = Some(dialog);
 
         let state = Arc::new(Mutex::new(st));
         let mut conn = RpcConnection::new(Vec::<u8>::new());
@@ -3421,7 +3576,11 @@ mod tests {
         .expect("in-memory dispatch never fails");
 
         let guard = state.lock().await;
-        let dialog = guard.review_dialog.as_ref().expect("dialog stays open");
+        let dialog = guard
+            .modals
+            .review_dialog
+            .as_ref()
+            .expect("dialog stays open");
         assert_eq!(dialog.focus, crate::app::ReviewDialogFocus::PromptEditor);
     }
 
@@ -3442,7 +3601,7 @@ mod tests {
             ],
         );
         dialog.focus = crate::app::ReviewDialogFocus::PathEditor;
-        st.review_dialog = Some(dialog);
+        st.modals.review_dialog = Some(dialog);
 
         let state = Arc::new(Mutex::new(st));
         let mut conn = RpcConnection::new(Vec::<u8>::new());
@@ -3457,7 +3616,11 @@ mod tests {
         }
 
         let guard = state.lock().await;
-        let dialog = guard.review_dialog.as_ref().expect("dialog stays open");
+        let dialog = guard
+            .modals
+            .review_dialog
+            .as_ref()
+            .expect("dialog stays open");
         assert_eq!(dialog.path_inputs[0].get_text(), "cra");
         assert!(dialog.path_completion.is_open());
         assert_eq!(
@@ -3468,6 +3631,87 @@ mod tests {
                 "crates/core/src/".to_string(),
             ]
         );
+    }
+    /// The refresh is issued after every key the path section forwards, so the
+    /// candidates are memoized on the row prefix: a chord that edits no text
+    /// re-serves the previous list instead of re-walking the repository
+    /// directory list, while every distinct prefix scans once (c-5).
+    #[tokio::test]
+    async fn test_path_cursor_movement_does_not_rescan_the_directory_completion() {
+        let mut st = crate::app::test_state();
+        st.view_mode = ViewMode::Review;
+        st.last_frame_area = ratatui::layout::Rect::new(0, 0, 120, 50);
+        let mut dialog = ReviewDialogState::new(
+            0,
+            0,
+            Vec::new(),
+            vec![
+                "crates/core/src/lib.rs".to_string(),
+                "src/lib.rs".to_string(),
+            ],
+        );
+        dialog.focus = crate::app::ReviewDialogFocus::PathEditor;
+        st.modals.review_dialog = Some(dialog);
+
+        let state = Arc::new(Mutex::new(st));
+        let mut conn = RpcConnection::new(Vec::<u8>::new());
+
+        for character in ['c', 'r', 'a'] {
+            handle_dialog_event(
+                KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE),
+                &state,
+                &mut conn,
+            )
+            .await
+            .expect("in-memory dispatch never fails");
+        }
+        let typed_scans = {
+            let guard = state.lock().await;
+            let dialog = guard
+                .modals
+                .review_dialog
+                .as_ref()
+                .expect("dialog stays open");
+            assert_eq!(dialog.path_inputs[0].get_text(), "cra");
+            dialog.path_completion.scans()
+        };
+        assert_eq!(typed_scans, 3, "one scan per distinct typed prefix");
+
+        for key in [
+            KeyCode::Left,
+            KeyCode::Left,
+            KeyCode::Right,
+            KeyCode::Home,
+            KeyCode::End,
+        ] {
+            handle_dialog_event(KeyEvent::new(key, KeyModifiers::NONE), &state, &mut conn)
+                .await
+                .expect("in-memory dispatch never fails");
+        }
+
+        let guard = state.lock().await;
+        let dialog = guard
+            .modals
+            .review_dialog
+            .as_ref()
+            .expect("dialog stays open");
+        assert_eq!(dialog.path_inputs[0].get_text(), "cra");
+        assert_eq!(
+            dialog.path_completion.scans(),
+            typed_scans,
+            "cursor movement never re-walks the directory list"
+        );
+        assert_eq!(
+            dialog.path_completion.candidates(),
+            &[
+                "crates/".to_string(),
+                "crates/core/".to_string(),
+                "crates/core/src/".to_string(),
+            ],
+            "the memoized list still describes the text on screen"
+        );
+        drop(guard);
+        assert!(conn.written().is_empty());
     }
     fn user_context_item(path: &str) -> tauqe_protocol::ContextItem {
         tauqe_protocol::ContextItem {
@@ -3487,8 +3731,8 @@ mod tests {
         let mut st = crate::app::test_state();
         st.view_mode = ViewMode::Context;
         st.context.items.push(user_context_item("src/lib.rs"));
-        st.context_view.pending_remove = Some("src/lib.rs".to_string());
-        st.confirm_button = ConfirmDialogButton::Cancel;
+        st.modals.confirm_remove_context_file = Some("src/lib.rs".to_string());
+        st.modals.confirm_button = ConfirmDialogButton::Cancel;
 
         let state = Arc::new(Mutex::new(st));
         let mut conn = RpcConnection::new(Vec::<u8>::new());
@@ -3505,7 +3749,7 @@ mod tests {
             "the safe Cancel default never removes the file"
         );
         let guard = state.lock().await;
-        assert!(guard.context_view.pending_remove.is_none());
+        assert!(guard.modals.confirm_remove_context_file.is_none());
         assert_eq!(guard.context.items.len(), 1);
         assert!(guard.context.items.iter().any(|it| it.path == "src/lib.rs"));
     }
@@ -3517,8 +3761,8 @@ mod tests {
         let mut st = crate::app::test_state();
         st.view_mode = ViewMode::Context;
         st.context.items.push(user_context_item("src/lib.rs"));
-        st.context_view.pending_remove = Some("src/lib.rs".to_string());
-        st.confirm_button = ConfirmDialogButton::Confirm;
+        st.modals.confirm_remove_context_file = Some("src/lib.rs".to_string());
+        st.modals.confirm_button = ConfirmDialogButton::Confirm;
 
         let state = Arc::new(Mutex::new(st));
         let mut conn = RpcConnection::new(Vec::<u8>::new());
@@ -3535,8 +3779,8 @@ mod tests {
         assert!(payload.contains("src/lib.rs"), "{payload}");
 
         let guard = state.lock().await;
-        assert!(guard.context_view.pending_remove.is_none());
-        assert_eq!(guard.confirm_button, ConfirmDialogButton::Cancel);
+        assert!(guard.modals.confirm_remove_context_file.is_none());
+        assert_eq!(guard.modals.confirm_button, ConfirmDialogButton::Cancel);
     }
 
     /// The `y` / `n` accelerators follow the shared dialog contract: `y`
@@ -3552,8 +3796,8 @@ mod tests {
             let mut st = crate::app::test_state();
             st.view_mode = ViewMode::Context;
             st.context.items.push(user_context_item("src/lib.rs"));
-            st.context_view.pending_remove = Some("src/lib.rs".to_string());
-            st.confirm_button = ConfirmDialogButton::Confirm;
+            st.modals.confirm_remove_context_file = Some("src/lib.rs".to_string());
+            st.modals.confirm_button = ConfirmDialogButton::Confirm;
 
             let state = Arc::new(Mutex::new(st));
             let mut conn = RpcConnection::new(Vec::<u8>::new());
@@ -3567,9 +3811,15 @@ mod tests {
                 expected_request,
                 "{key:?} produced {written:?}"
             );
-            assert!(state.lock().await.context_view.pending_remove.is_none());
+            assert!(state
+                .lock()
+                .await
+                .modals
+                .confirm_remove_context_file
+                .is_none());
         }
     }
+
     /// Builds the pending launch a confirmed dialog leaves behind, over the
     /// typed parameters the projection describes (c-3).
     fn pending_launch(path: &str) -> PendingReviewLaunch {
@@ -3607,11 +3857,11 @@ mod tests {
     async fn truncation_confirm_dispatches_the_projected_launch() {
         let mut st = crate::app::test_state();
         st.view_mode = ViewMode::Review;
-        st.confirm_review_truncation = Some(crate::app::ConfirmReviewTruncationState {
+        st.modals.confirm_review_truncation = Some(crate::app::ConfirmReviewTruncationState {
             pending: pending_launch("src/"),
             window: truncated_window(),
         });
-        st.confirm_button = ConfirmDialogButton::Confirm;
+        st.modals.confirm_button = ConfirmDialogButton::Confirm;
 
         let state = Arc::new(Mutex::new(st));
         let mut conn = RpcConnection::new(Vec::<u8>::new());
@@ -3628,7 +3878,7 @@ mod tests {
         assert!(payload.contains("src/"), "{payload}");
 
         let guard = state.lock().await;
-        assert!(guard.confirm_review_truncation.is_none());
+        assert!(guard.modals.confirm_review_truncation.is_none());
         assert!(guard.review.running);
     }
 
@@ -3638,11 +3888,11 @@ mod tests {
     async fn truncation_cancel_returns_the_launch_dialog_without_a_request() {
         let mut st = crate::app::test_state();
         st.view_mode = ViewMode::Review;
-        st.confirm_review_truncation = Some(crate::app::ConfirmReviewTruncationState {
+        st.modals.confirm_review_truncation = Some(crate::app::ConfirmReviewTruncationState {
             pending: pending_launch("src/**/*.rs"),
             window: truncated_window(),
         });
-        st.confirm_button = ConfirmDialogButton::Confirm;
+        st.modals.confirm_button = ConfirmDialogButton::Confirm;
 
         let state = Arc::new(Mutex::new(st));
         let mut conn = RpcConnection::new(Vec::<u8>::new());
@@ -3659,8 +3909,9 @@ mod tests {
             "a declined consent launches nothing"
         );
         let guard = state.lock().await;
-        assert!(guard.confirm_review_truncation.is_none());
+        assert!(guard.modals.confirm_review_truncation.is_none());
         let dialog = guard
+            .modals
             .review_dialog
             .as_ref()
             .expect("the launch dialog returns with its fields");
@@ -3674,11 +3925,11 @@ mod tests {
     async fn truncation_consent_resolves_its_labels_from_the_catalog() {
         let mut st = crate::app::test_state();
         st.view_mode = ViewMode::Review;
-        st.confirm_review_truncation = Some(crate::app::ConfirmReviewTruncationState {
+        st.modals.confirm_review_truncation = Some(crate::app::ConfirmReviewTruncationState {
             pending: pending_launch("src/"),
             window: truncated_window(),
         });
-        st.confirm_button = ConfirmDialogButton::Cancel;
+        st.modals.confirm_button = ConfirmDialogButton::Cancel;
 
         let params = crate::dialogs::render::review_truncation_params(&st)
             .expect("the pending consent describes its card");
@@ -3705,11 +3956,11 @@ mod tests {
     async fn truncation_consent_confirms_through_the_yes_accelerator() {
         let mut st = crate::app::test_state();
         st.view_mode = ViewMode::Review;
-        st.confirm_review_truncation = Some(crate::app::ConfirmReviewTruncationState {
+        st.modals.confirm_review_truncation = Some(crate::app::ConfirmReviewTruncationState {
             pending: pending_launch("src/**/*.rs"),
             window: truncated_window(),
         });
-        st.confirm_button = ConfirmDialogButton::Cancel;
+        st.modals.confirm_button = ConfirmDialogButton::Cancel;
 
         let state = Arc::new(Mutex::new(st));
         let mut conn = RpcConnection::new(Vec::<u8>::new());
@@ -3726,7 +3977,7 @@ mod tests {
         assert!(payload.contains("src/**/*.rs"), "{payload}");
 
         let guard = state.lock().await;
-        assert!(guard.confirm_review_truncation.is_none());
+        assert!(guard.modals.confirm_review_truncation.is_none());
         assert!(
             guard.review.running,
             "the confirmed window starts the audit"
@@ -3781,7 +4032,7 @@ mod tests {
         st.tui_config.input.layout = crate::config::LayoutPreset::RuJcuken;
         st.view_mode = ViewMode::Plans;
         st.last_frame_area = ratatui::layout::Rect::new(0, 0, 120, 50);
-        st.status_dialog = Some(status_picker());
+        st.modals.status_dialog = Some(status_picker());
 
         let state = Arc::new(Mutex::new(st));
         let mut conn = RpcConnection::new(Vec::<u8>::new());
@@ -3790,6 +4041,7 @@ mod tests {
             press(&state, &mut conn, KeyCode::Char(character), PLAIN).await;
             let guard = state.lock().await;
             let dialog = guard
+                .modals
                 .status_dialog
                 .as_ref()
                 .expect("the picker stays open while it navigates");
@@ -3806,7 +4058,7 @@ mod tests {
 
         press(&state, &mut conn, KeyCode::Char('й'), PLAIN).await;
         assert!(
-            state.lock().await.status_dialog.is_none(),
+            state.lock().await.modals.status_dialog.is_none(),
             "`й` sits on the physical `q` position and must dismiss the picker"
         );
         assert!(conn.written().is_empty());
@@ -3830,7 +4082,7 @@ mod tests {
             vec![],
             vec![plan_item("1", tauqe_protocol::PlanItemStatus::Todo)],
         )];
-        st.status_dialog = Some(status_picker());
+        st.modals.status_dialog = Some(status_picker());
 
         let state = Arc::new(Mutex::new(st));
         let mut conn = RpcConnection::new(Vec::<u8>::new());
@@ -3843,8 +4095,14 @@ mod tests {
         assert!(payload.contains(methods::PLAN_UPDATE_ITEM), "{payload}");
 
         let guard = state.lock().await;
-        assert!(guard.status_dialog.is_none(), "the picker is consumed");
-        assert_eq!(guard.plans_view.plans[0].items[0].status, expected);
+        assert!(
+            guard.modals.status_dialog.is_none(),
+            "the picker is consumed"
+        );
+        assert_eq!(
+            guard.plans_view.plans[0].implementation.items[0].status,
+            expected
+        );
     }
 
     /// The digit quick-select answers only to a bare press, so the `Ctrl+1..5`
@@ -3869,7 +4127,7 @@ mod tests {
                 vec![],
                 vec![plan_item("1", tauqe_protocol::PlanItemStatus::Todo)],
             )];
-            st.status_dialog = Some(status_picker());
+            st.modals.status_dialog = Some(status_picker());
             let state = Arc::new(Mutex::new(st));
             let mut conn = RpcConnection::new(Vec::<u8>::new());
 
@@ -3887,11 +4145,11 @@ mod tests {
             );
             let guard = state.lock().await;
             assert!(
-                guard.status_dialog.is_some(),
+                guard.modals.status_dialog.is_some(),
                 "the picker stays open on a press it does not admit"
             );
             assert_eq!(
-                guard.plans_view.plans[0].items[0].status,
+                guard.plans_view.plans[0].implementation.items[0].status,
                 tauqe_protocol::PlanItemStatus::Todo,
                 "the step keeps its status"
             );
@@ -3914,6 +4172,7 @@ mod tests {
             let guard = state.lock().await;
             assert_eq!(
                 guard
+                    .modals
                     .usage_summary
                     .as_ref()
                     .expect("the breakdown stays open")
@@ -3924,7 +4183,7 @@ mod tests {
         }
 
         press(&state, &mut conn, KeyCode::Char('й'), PLAIN).await;
-        assert!(state.lock().await.usage_summary.is_none());
+        assert!(state.lock().await.modals.usage_summary.is_none());
         assert!(
             conn.written().is_empty(),
             "the read-only dialog never talks to the server"
@@ -3955,6 +4214,7 @@ mod tests {
 
             let guard = state.lock().await;
             let summary = guard
+                .modals
                 .usage_summary
                 .as_ref()
                 .expect("the breakdown stays open");
@@ -3974,8 +4234,8 @@ mod tests {
     async fn help_modal_scrolls_and_dismisses_from_the_jcuken_layout() {
         let mut st = crate::app::test_state();
         st.tui_config.input.layout = crate::config::LayoutPreset::RuJcuken;
-        st.show_help = true;
-        st.help_tab = HelpTab::TextEditor;
+        st.modals.show_help = true;
+        st.modals.help_tab = HelpTab::TextEditor;
         let state = Arc::new(Mutex::new(st));
         let mut conn = RpcConnection::new(Vec::<u8>::new());
 
@@ -3983,17 +4243,20 @@ mod tests {
             press(&state, &mut conn, KeyCode::Char(character), PLAIN).await;
             let guard = state.lock().await;
             assert_eq!(
-                guard.help_scroll, expected,
+                guard.modals.help_scroll, expected,
                 "{character:?} must scroll the active tab"
             );
-            assert!(guard.show_help, "scrolling keeps the modal open");
-            assert_eq!(guard.help_tab, HelpTab::TextEditor);
+            assert!(guard.modals.show_help, "scrolling keeps the modal open");
+            assert_eq!(guard.modals.help_tab, HelpTab::TextEditor);
         }
 
         press(&state, &mut conn, KeyCode::Char('й'), PLAIN).await;
         let guard = state.lock().await;
-        assert!(!guard.show_help, "`й` sits on `q` and must dismiss Help");
-        assert_eq!(guard.help_scroll, 0);
+        assert!(
+            !guard.modals.show_help,
+            "`й` sits on `q` and must dismiss Help"
+        );
+        assert_eq!(guard.modals.help_scroll, 0);
         assert!(conn.written().is_empty());
     }
 
@@ -4009,7 +4272,7 @@ mod tests {
         st.last_frame_area = ratatui::layout::Rect::new(0, 0, 120, 50);
         let mut dialog = ReviewDialogState::new(1, 10, Vec::new(), Vec::new());
         dialog.focus = crate::app::ReviewDialogFocus::PromptEditor;
-        st.review_dialog = Some(dialog);
+        st.modals.review_dialog = Some(dialog);
 
         let state = Arc::new(Mutex::new(st));
         let mut conn = RpcConnection::new(Vec::<u8>::new());
@@ -4019,7 +4282,11 @@ mod tests {
         }
         {
             let guard = state.lock().await;
-            let dialog = guard.review_dialog.as_ref().expect("the dialog stays open");
+            let dialog = guard
+                .modals
+                .review_dialog
+                .as_ref()
+                .expect("the dialog stays open");
             assert_eq!(dialog.prompt_editor.get_text(), "тест");
         }
 
@@ -4027,13 +4294,21 @@ mod tests {
         // same capture boundary.
         {
             let mut guard = state.lock().await;
-            let dialog = guard.review_dialog.as_mut().expect("the dialog stays open");
+            let dialog = guard
+                .modals
+                .review_dialog
+                .as_mut()
+                .expect("the dialog stays open");
             dialog.focus = crate::app::ReviewDialogFocus::PathEditor;
         }
         press(&state, &mut conn, KeyCode::Char('т'), PLAIN).await;
         {
             let guard = state.lock().await;
-            let dialog = guard.review_dialog.as_ref().expect("the dialog stays open");
+            let dialog = guard
+                .modals
+                .review_dialog
+                .as_ref()
+                .expect("the dialog stays open");
             assert_eq!(dialog.path_inputs[0].get_text(), "т");
             assert_eq!(dialog.prompt_editor.get_text(), "тест");
         }
@@ -4056,7 +4331,7 @@ mod tests {
             crate::app::ReviewDialogFocus::PromptEditor,
         );
         dialog.prompt_editor.insert_str("проверить");
-        st.review_dialog = Some(dialog);
+        st.modals.review_dialog = Some(dialog);
 
         let state = Arc::new(Mutex::new(st));
         let mut conn = RpcConnection::new(Vec::<u8>::new());
@@ -4064,7 +4339,11 @@ mod tests {
         press(&state, &mut conn, KeyCode::Char('ь'), CTRL).await;
 
         let guard = state.lock().await;
-        let dialog = guard.review_dialog.as_ref().expect("the dialog stays open");
+        let dialog = guard
+            .modals
+            .review_dialog
+            .as_ref()
+            .expect("the dialog stays open");
         assert_eq!(
             dialog.selector.selected_index(),
             1,
@@ -4083,7 +4362,7 @@ mod tests {
     fn review_analyze_state() -> AppState {
         let mut st = crate::app::test_state();
         st.view_mode = ViewMode::Review;
-        st.confirm_review_analyze = Some(crate::app::ConfirmReviewAnalyzeState::new(
+        st.modals.confirm_review_analyze = Some(crate::app::ConfirmReviewAnalyzeState::new(
             "rev-1".to_string(),
             "Session rev-1".to_string(),
             vec![
@@ -4113,7 +4392,7 @@ mod tests {
         focus: crate::app::ReviewAnalyzeFocus,
     ) {
         let mut guard = state.lock().await;
-        if let Some(target) = guard.confirm_review_analyze.as_mut() {
+        if let Some(target) = guard.modals.confirm_review_analyze.as_mut() {
             target.focus = focus;
         }
     }
@@ -4137,7 +4416,7 @@ mod tests {
         assert!(payload.contains("rev-1"), "{payload}");
 
         let guard = state.lock().await;
-        assert!(guard.confirm_review_analyze.is_none());
+        assert!(guard.modals.confirm_review_analyze.is_none());
         assert!(guard.review.analyzing);
     }
 
@@ -4162,7 +4441,7 @@ mod tests {
             "a command chord must never start the classification"
         );
         let guard = state.lock().await;
-        assert!(guard.confirm_review_analyze.is_some());
+        assert!(guard.modals.confirm_review_analyze.is_some());
         assert!(!guard.review.analyzing);
         assert_eq!(guard.view_mode, ViewMode::Review);
     }
@@ -4185,7 +4464,7 @@ mod tests {
 
             let guard = state.lock().await;
             assert!(
-                guard.confirm_review_analyze.is_some(),
+                guard.modals.confirm_review_analyze.is_some(),
                 "Ctrl+{character} must not dismiss the dialog"
             );
             drop(guard);
@@ -4211,7 +4490,11 @@ mod tests {
         .await;
 
         let guard = state.lock().await;
-        let target = guard.confirm_review_analyze.as_ref().expect("dialog open");
+        let target = guard
+            .modals
+            .confirm_review_analyze
+            .as_ref()
+            .expect("dialog open");
         assert_eq!(target.focus, crate::app::ReviewAnalyzeFocus::ModelList);
         assert_eq!(target.confirm_button, ConfirmDialogButton::Cancel);
         drop(guard);
@@ -4235,7 +4518,11 @@ mod tests {
         .await;
         {
             let guard = state.lock().await;
-            let target = guard.confirm_review_analyze.as_ref().expect("dialog open");
+            let target = guard
+                .modals
+                .confirm_review_analyze
+                .as_ref()
+                .expect("dialog open");
             assert_eq!(
                 target.selector.selected_index(),
                 0,
@@ -4254,7 +4541,11 @@ mod tests {
         }
 
         let guard = state.lock().await;
-        let target = guard.confirm_review_analyze.as_ref().expect("dialog open");
+        let target = guard
+            .modals
+            .confirm_review_analyze
+            .as_ref()
+            .expect("dialog open");
         assert_eq!(target.focus, crate::app::ReviewAnalyzeFocus::Actions);
         assert_eq!(target.confirm_button, ConfirmDialogButton::Cancel);
         assert!(!guard.review.analyzing);

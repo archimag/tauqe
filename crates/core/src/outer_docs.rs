@@ -29,8 +29,10 @@
 pub mod materialize;
 pub(crate) mod trust;
 
+use std::collections::BTreeMap;
 use std::path::Path;
 
+use tauqe_protocol::{OuterDocsCacheEntry, OuterDocsCacheRemoveResult};
 use tokio::sync::watch;
 
 use crate::config::{OuterDocEntry, OuterDocSource};
@@ -70,6 +72,20 @@ pub fn is_outer_docs_cache_path(path: &str) -> bool {
     Path::new(path).starts_with(OUTER_DOCS_CACHE_DIR)
 }
 
+/// Reduces a cache path to the logical document path it addresses.
+///
+/// The stored path of a document carries the cache directory the harness
+/// derived from the declaration, while the wire contract addresses the document
+/// by its logical path alone. A path outside the cache addresses no document
+/// and answers `None`.
+pub fn logical_path(path: &str) -> Option<&str> {
+    let relative = path.strip_prefix(OUTER_DOCS_CACHE_DIR)?.strip_prefix('/')?;
+    if relative.is_empty() {
+        return None;
+    }
+    Some(relative)
+}
+
 /// Byte ceiling of one materialized snapshot.
 ///
 /// A declared document is materialized before it competes for the single
@@ -94,6 +110,288 @@ pub fn is_clean_relative_path(path: &str) -> bool {
         .split('/')
         .all(|segment| !segment.is_empty() && segment != "." && segment != "..");
     portable && !Path::new(path).is_absolute()
+}
+
+/// One document of the cache, as the cache inspection surface reports it.
+///
+/// The reported path is the logical path of the document — the declared
+/// identifier and the relative path below it — so the disk prefix the
+/// declaration compiles to never reaches the wire contract.
+pub fn list_cache_entries(repo_root: &Path) -> Result<Vec<OuterDocsCacheEntry>, String> {
+    let root = repo_root.join(OUTER_DOCS_CACHE_DIR);
+    // Scanning the cache reads every directory of the snapshot tree, so the
+    // walk runs off the async executor thread.
+    crate::blocking::run_blocking(move || -> Result<Vec<OuterDocsCacheEntry>, String> {
+        let mut entries = BTreeMap::new();
+        collect_cache_entries(&root, &root, &mut entries)?;
+        Ok(entries.into_values().collect())
+    })
+}
+
+/// Collects the documents directly below `directory`, descending into every
+/// subdirectory of it.
+///
+/// The map is keyed by logical path, so the inventory is deterministic without
+/// a second sorting pass: one snapshot never appears twice and the traversal
+/// order of the file system never reaches the caller.
+fn collect_cache_entries(
+    root: &Path,
+    directory: &Path,
+    entries: &mut BTreeMap<String, OuterDocsCacheEntry>,
+) -> Result<(), String> {
+    let read = match std::fs::read_dir(directory) {
+        Ok(read) => read,
+        // A cache that was never written holds no document, and an entry an
+        // earlier removal already dropped is indistinguishable from one that
+        // never existed.
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(cache_unreadable(directory, &error)),
+    };
+    for entry in read {
+        let entry = entry.map_err(|error| cache_unreadable(directory, &error))?;
+        let path = entry.path();
+        let file_type = entry.file_type().map_err(|error| {
+            format!(
+                "the external documentation cache entry `{}` could not be inspected: {error}",
+                path.display()
+            )
+        })?;
+        if file_type.is_dir() {
+            collect_cache_entries(root, &path, entries)?;
+        } else if file_type.is_file() {
+            // Only a regular file is a document. A symbolic link is skipped
+            // like a directory, so a snapshot the harness did not write never
+            // enters the inventory and is never followed.
+            let size_bytes = entry.metadata().map(|metadata| metadata.len()).unwrap_or(0);
+            let relative = path.strip_prefix(root).unwrap_or(&path);
+            let logical = relative
+                .to_string_lossy()
+                .replace(std::path::MAIN_SEPARATOR, "/");
+            entries.insert(
+                logical.clone(),
+                OuterDocsCacheEntry {
+                    path: logical,
+                    size_bytes,
+                    estimated_tokens: crate::prompt::estimate_tokens_from_bytes(size_bytes),
+                },
+            );
+        }
+    }
+    Ok(())
+}
+
+/// The diagnostic of a cache directory that could not be read.
+fn cache_unreadable(directory: &Path, error: &std::io::Error) -> String {
+    format!(
+        "the external documentation cache `{}` could not be read: {error}",
+        directory.display()
+    )
+}
+
+/// Why one removal from the external documentation cache did not happen.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CacheRemoveError {
+    /// The requested path is not a clean logical path of the cache.
+    InvalidPath(String),
+    /// The requested path names no cached document or directory.
+    NotFound(String),
+    /// The removal reached the file system and failed.
+    Failed(String),
+}
+
+impl CacheRemoveError {
+    /// One-line cause of the failure.
+    pub fn reason(&self) -> &str {
+        match self {
+            Self::InvalidPath(reason) | Self::NotFound(reason) | Self::Failed(reason) => reason,
+        }
+    }
+}
+
+impl std::fmt::Display for CacheRemoveError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.reason())
+    }
+}
+
+/// Removes one document or one directory below the cache directory.
+///
+/// The logical path is validated before a byte moves: an empty request, a
+/// parent directory, an absolute path, a backslash, and a foreign scheme
+/// address no document the cache holds. Every file is unlinked atomically and
+/// every directory the removal emptied is pruned afterwards, so a crash leaves
+/// either the complete subtree or none of it, and the inventory never reports a
+/// directory that no longer holds a document.
+pub fn remove_cache_entry(
+    repo_root: &Path,
+    logical_path: &str,
+) -> Result<OuterDocsCacheRemoveResult, CacheRemoveError> {
+    let logical = logical_path.trim();
+    if logical.is_empty() {
+        return Err(CacheRemoveError::InvalidPath(
+            "a cache removal names no document".to_string(),
+        ));
+    }
+    if !is_clean_relative_path(logical) {
+        return Err(CacheRemoveError::InvalidPath(format!(
+            "`{logical}` is not a clean logical path of the external documentation cache"
+        )));
+    }
+    let root = repo_root.join(OUTER_DOCS_CACHE_DIR);
+    let target = root.join(logical);
+    let logical = logical.to_string();
+    // Unlinking every file of the subtree touches the disk, so the removal runs
+    // off the async executor thread.
+    crate::blocking::run_blocking(move || remove_cache_target(&root, &target, &logical))
+}
+
+/// Removes the file or the subtree `target` names and prunes what it emptied.
+fn remove_cache_target(
+    root: &Path,
+    target: &Path,
+    logical: &str,
+) -> Result<OuterDocsCacheRemoveResult, CacheRemoveError> {
+    let metadata = match std::fs::symlink_metadata(target) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Err(CacheRemoveError::NotFound(format!(
+                "the external documentation cache holds no `{logical}`"
+            )))
+        }
+        Err(error) => {
+            return Err(CacheRemoveError::Failed(format!(
+                "the cached document `{logical}` could not be inspected: {error}"
+            )))
+        }
+    };
+
+    let mut removal = CacheRemoval::default();
+    if metadata.is_dir() {
+        removal.directory(target)?;
+        // The removal unlinked every file of the subtree, so what remains is
+        // the directory skeleton: it is pruned deepest first until the target
+        // directory itself collapses.
+        prune_empty_directories(target);
+    } else {
+        removal.file(target)?;
+    }
+
+    // Pruning the ancestors runs last, after the whole subtree is gone, so a
+    // directory that still holds a document survives. The cache directory
+    // itself is never removed: it is the root every declaration resolves into.
+    tauqe_tools::atomic_write::prune_empty_parents(root, target);
+    Ok(removal.result())
+}
+
+/// Prunes `target` and every directory below it that a removal emptied.
+///
+/// The documents are already unlinked when this runs, so only the directory
+/// skeleton is left behind. Directories are pruned deepest first, which lets a
+/// whole subtree the removal emptied collapse up to `target` itself.
+///
+/// A pruning step that fails — because a concurrent writer put a document back,
+/// or because the filesystem refuses the removal — ends the walk of that
+/// subtree instead of being reported: the removal already took the documents,
+/// and a surviving empty directory never invalidates it.
+fn prune_empty_directories(target: &Path) {
+    let Ok(read) = std::fs::read_dir(target) else {
+        return;
+    };
+    for entry in read.flatten() {
+        if matches!(entry.file_type(), Ok(kind) if kind.is_dir()) {
+            prune_empty_directories(&entry.path());
+        }
+    }
+    let _ = std::fs::remove_dir(target);
+}
+
+/// What one removal took out of the cache.
+#[derive(Default)]
+struct CacheRemoval {
+    removed_files: usize,
+    removed_bytes: u64,
+}
+
+impl CacheRemoval {
+    /// Removes one cached document.
+    fn file(&mut self, path: &Path) -> Result<(), CacheRemoveError> {
+        let size = std::fs::symlink_metadata(path)
+            .map(|metadata| metadata.len())
+            .unwrap_or(0);
+        tauqe_tools::atomic_write::remove_atomic(path).map_err(|error| {
+            CacheRemoveError::Failed(format!(
+                "the cached document `{}` could not be removed: {error:#}",
+                path.display()
+            ))
+        })?;
+        self.removed_files += 1;
+        self.removed_bytes = self.removed_bytes.saturating_add(size);
+        Ok(())
+    }
+
+    /// Removes every document below `directory`.
+    fn directory(&mut self, directory: &Path) -> Result<(), CacheRemoveError> {
+        let read = std::fs::read_dir(directory).map_err(|error| {
+            CacheRemoveError::Failed(format!(
+                "the cached directory `{}` could not be read: {error}",
+                directory.display()
+            ))
+        })?;
+        for entry in read {
+            let entry = entry.map_err(|error| {
+                CacheRemoveError::Failed(format!(
+                    "the cached directory `{}` could not be read: {error}",
+                    directory.display()
+                ))
+            })?;
+            let path = entry.path();
+            let file_type = entry.file_type().map_err(|error| {
+                CacheRemoveError::Failed(format!(
+                    "the cached entry `{}` could not be inspected: {error}",
+                    path.display()
+                ))
+            })?;
+            if file_type.is_dir() {
+                self.directory(&path)?;
+            } else {
+                self.file(&path)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// The report describing what was removed.
+    fn result(self) -> OuterDocsCacheRemoveResult {
+        OuterDocsCacheRemoveResult {
+            removed_files: self.removed_files,
+            removed_bytes: self.removed_bytes,
+        }
+    }
+}
+
+/// The resident documents that the removal of `removed` addresses.
+///
+/// A resident path is stored as the repository-relative path of its snapshot,
+/// which carries the cache directory the harness derives from the declaration,
+/// while the removal surface addresses logical paths. A removal of a directory
+/// therefore covers every document below it, and the resident layer is
+/// reconciled with exactly the rule the removal applied to the disk.
+pub fn affected_documents(removed: &str, resident: &[String]) -> Vec<String> {
+    let logical = removed.trim();
+    if logical.is_empty() {
+        return Vec::new();
+    }
+    resident
+        .iter()
+        .filter(|path| {
+            let document = logical_path(path.as_str()).unwrap_or(path.as_str());
+            document == logical
+                || document
+                    .strip_prefix(logical)
+                    .is_some_and(|rest| rest.starts_with('/'))
+        })
+        .cloned()
+        .collect()
 }
 
 /// One declared document resolved for runtime use.
@@ -364,27 +662,26 @@ async fn materialize_target(
 /// and the cache directory itself names no single document either: both answer
 /// `None` and stay ordinary requests.
 fn registry_name(path: &str) -> Option<String> {
-    let relative = path.strip_prefix(OUTER_DOCS_CACHE_DIR)?.strip_prefix('/')?;
-    if relative.is_empty() {
-        return None;
-    }
-    Some(relative.to_string())
+    logical_path(path).map(|path| path.to_string())
 }
 
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
 
     use tempfile::tempdir;
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     use super::{
-        document_cache_path, document_dir, is_clean_relative_path, is_outer_docs_cache_path,
-        relative_cache_path, OuterDoc, OuterDocsRegistry, MAX_DOCUMENT_BYTES, OUTER_DOCS_CACHE_DIR,
+        affected_documents, document_cache_path, document_dir, is_clean_relative_path,
+        is_outer_docs_cache_path, list_cache_entries, logical_path, relative_cache_path,
+        remove_cache_entry, CacheRemoveError, OuterDoc, OuterDocsRegistry, MAX_DOCUMENT_BYTES,
+        OUTER_DOCS_CACHE_DIR,
     };
     use crate::config::{OuterDocEntry, OuterDocSource};
     use crate::outer_docs::trust::{RefsTrust, TrustRefusal};
+    use tauqe_protocol::ContextLayer;
 
     /// A declaration with an empty source, which every fixture fills in.
     fn entry(id: &str, title: &str) -> OuterDocEntry {
@@ -649,5 +946,244 @@ mod tests {
             "the refusal must carry the declaration that authorizes the workspace"
         );
         assert!(!dir.path().join(&cache_path).exists());
+    }
+
+    /// Creates one cached document and returns nothing: the fixtures address a
+    /// document by the logical path they pass in.
+    fn cache_file(root: &Path, logical: &str, contents: &str) {
+        let path = root.join(OUTER_DOCS_CACHE_DIR).join(logical);
+        std::fs::create_dir_all(path.parent().expect("the cache path has a directory")).unwrap();
+        std::fs::write(&path, contents).unwrap();
+    }
+
+    #[test]
+    fn test_the_cache_inventory_reports_logical_paths() {
+        let dir = tempdir().unwrap();
+        cache_file(dir.path(), "openrouter/models.md", "models");
+        cache_file(dir.path(), "openrouter/chat-completion/api.md", "endpoints");
+
+        let entries = list_cache_entries(dir.path()).expect("the inventory reads");
+        let paths: Vec<&str> = entries.iter().map(|entry| entry.path.as_str()).collect();
+        assert_eq!(
+            paths,
+            vec!["openrouter/chat-completion/api.md", "openrouter/models.md"]
+        );
+        assert!(entries.iter().all(|entry| entry.size_bytes > 0));
+        assert!(entries.iter().all(|entry| entry.estimated_tokens > 0));
+        assert!(
+            entries
+                .iter()
+                .all(|entry| !entry.path.starts_with(OUTER_DOCS_CACHE_DIR)),
+            "the disk prefix must never reach the wire contract"
+        );
+
+        // A cache that was never written holds no document.
+        let empty = tempdir().unwrap();
+        assert!(list_cache_entries(empty.path()).unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_a_removal_takes_one_document_and_prunes_the_directories_it_emptied() {
+        let dir = tempdir().unwrap();
+        cache_file(dir.path(), "openrouter/api.md", "endpoints");
+        cache_file(dir.path(), "openrouter/models.md", "models");
+
+        let removed =
+            remove_cache_entry(dir.path(), "openrouter/api.md").expect("the removal runs");
+
+        assert_eq!(removed.removed_files, 1);
+        assert_eq!(removed.removed_bytes, "endpoints".len() as u64);
+        let cache = dir.path().join(OUTER_DOCS_CACHE_DIR);
+        assert!(!cache.join("openrouter/api.md").exists());
+        assert!(cache.join("openrouter/models.md").is_file());
+
+        remove_cache_entry(dir.path(), "openrouter/models.md").expect("the second removal runs");
+        assert!(
+            !cache.join("openrouter").exists(),
+            "a directory the removal emptied is pruned"
+        );
+        assert!(cache.is_dir(), "the cache directory itself survives");
+    }
+
+    #[test]
+    fn test_a_removal_of_a_directory_takes_the_whole_subtree() {
+        let dir = tempdir().unwrap();
+        cache_file(dir.path(), "openrouter/api.md", "endpoints");
+        cache_file(dir.path(), "openrouter/chat/completions.md", "chat");
+        cache_file(dir.path(), "vendor/api.md", "vendor");
+
+        let removed = remove_cache_entry(dir.path(), "openrouter").expect("the removal runs");
+
+        assert_eq!(removed.removed_files, 2);
+        assert_eq!(
+            removed.removed_bytes,
+            ("endpoints".len() + "chat".len()) as u64
+        );
+        let cache = dir.path().join(OUTER_DOCS_CACHE_DIR);
+        assert!(!cache.join("openrouter").exists());
+        assert!(cache.join("vendor/api.md").is_file());
+    }
+
+    #[test]
+    fn test_a_removal_that_leaves_the_cache_is_refused() {
+        let dir = tempdir().unwrap();
+        cache_file(dir.path(), "openrouter/api.md", "endpoints");
+        std::fs::write(dir.path().join("secret.md"), "outside").unwrap();
+
+        for path in [
+            "",
+            "   ",
+            "../secret.md",
+            "/etc/passwd",
+            "openrouter/../secret.md",
+            "openrouter\\api.md",
+        ] {
+            let error = remove_cache_entry(dir.path(), path)
+                .expect_err("a path outside the cache is refused");
+            assert!(
+                matches!(error, CacheRemoveError::InvalidPath(_)),
+                "unexpected classification for {path}: {error}"
+            );
+        }
+
+        assert!(dir.path().join("secret.md").is_file());
+        assert!(dir
+            .path()
+            .join(OUTER_DOCS_CACHE_DIR)
+            .join("openrouter/api.md")
+            .is_file());
+    }
+
+    #[test]
+    fn test_a_removal_of_an_absent_document_is_not_found() {
+        let dir = tempdir().unwrap();
+        let error = remove_cache_entry(dir.path(), "openrouter/api.md")
+            .expect_err("an absent document is not found");
+        assert!(
+            matches!(error, CacheRemoveError::NotFound(_)),
+            "unexpected classification: {error}"
+        );
+    }
+
+    #[test]
+    fn test_a_resident_document_is_matched_by_its_logical_path() {
+        let resident = vec![
+            format!("{OUTER_DOCS_CACHE_DIR}/openrouter/api.md"),
+            format!("{OUTER_DOCS_CACHE_DIR}/vendor/api.md"),
+        ];
+
+        assert_eq!(
+            affected_documents("openrouter", &resident),
+            vec![resident[0].clone()]
+        );
+        assert_eq!(
+            affected_documents("openrouter/api.md", &resident),
+            vec![resident[0].clone()]
+        );
+        // A prefix that ends inside a name addresses no neighbour.
+        assert!(affected_documents("openrouter/ap", &resident).is_empty());
+        assert!(affected_documents("", &resident).is_empty());
+
+        // A resident path stored without the cache directory is matched too.
+        let logical = vec!["openrouter/api.md".to_string()];
+        assert_eq!(affected_documents("openrouter", &logical), logical);
+        assert_eq!(logical_path(&resident[0]), Some("openrouter/api.md"));
+        assert_eq!(logical_path("src/lib.rs"), None);
+    }
+
+    /// A materialized document reaches every layer that names it under its
+    /// logical path: the OuterDocs context layer and the rendered `<file>`
+    /// element share the mount point, while the cache directory the snapshot
+    /// occupies never leaves the storage substrate.
+    #[tokio::test]
+    async fn test_a_document_reaches_the_context_under_its_logical_path() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/book/index.md"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string("# MyLib\n\n- [Architecture](architecture.md)\n"),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/book/architecture.md"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("layouts and contracts"))
+            .mount(&server)
+            .await;
+
+        let dir = tempdir().unwrap();
+        let mut declared = entry("mylib", "MyLib Book");
+        declared.source = format!("{}/book/index.md", server.uri());
+        let registry = OuterDocsRegistry::new(&[declared]);
+        let trust = Some(RefsTrust::for_workspace(dir.path(), Vec::new(), true));
+
+        let mut cached = Vec::new();
+        for request in ["mylib", "mylib/architecture.md"] {
+            cached.push(
+                registry
+                    .materialize_declared_with(
+                        dir.path(),
+                        request,
+                        MAX_DOCUMENT_BYTES,
+                        None,
+                        trust.clone(),
+                    )
+                    .await
+                    .expect("the declared document materializes"),
+            );
+        }
+        assert_eq!(
+            cached,
+            vec![
+                format!("{OUTER_DOCS_CACHE_DIR}/mylib/index.md"),
+                format!("{OUTER_DOCS_CACHE_DIR}/mylib/architecture.md"),
+            ]
+        );
+
+        // The layer is filled with the cache paths the materialization reported,
+        // and it answers the logical paths the rest of the harness addresses.
+        let mut context = crate::context::ContextManager::new(dir.path().to_path_buf());
+        for cache_path in &cached {
+            context
+                .add_outer_docs_file(cache_path)
+                .expect("the snapshot enters the context");
+        }
+
+        let state = context.get_state();
+        let documents: Vec<&str> = state
+            .items
+            .iter()
+            .filter(|item| item.layer == ContextLayer::OuterDocs)
+            .map(|item| item.path.as_str())
+            .collect();
+        assert_eq!(documents, vec!["mylib/index.md", "mylib/architecture.md"]);
+        assert!(
+            state
+                .items
+                .iter()
+                .all(|item| !item.path.contains(OUTER_DOCS_CACHE_DIR)),
+            "the cache directory must never reach the wire contract"
+        );
+
+        // The rendered element carries the logical path and the snapshot's bytes.
+        let rendered: Vec<(String, String)> = context
+            .read_context_files()
+            .into_iter()
+            .map(|file| (file.path, file.content))
+            .collect();
+        assert_eq!(
+            rendered,
+            vec![
+                (
+                    "mylib/index.md".to_string(),
+                    "# MyLib\n\n- [Architecture](architecture.md)\n".to_string(),
+                ),
+                (
+                    "mylib/architecture.md".to_string(),
+                    "layouts and contracts".to_string(),
+                ),
+            ]
+        );
     }
 }

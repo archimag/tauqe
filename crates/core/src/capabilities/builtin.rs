@@ -641,6 +641,21 @@ fn plan_specs() -> &'static [&'static XmlTagSpec] {
     resolve_specs(&PLAN_SPECS, &["plan"])
 }
 
+/// Converts the structural diagnostics of the `<plan>` parser into protocol errors.
+///
+/// A `<plan>` container that fails structural validation is a present payload the
+/// harness refused, so it is reported through the typed defect channel instead of
+/// degrading into "no plan update": the bounded turn records the diagnostic, the
+/// model sees it, and a later round can repair the payload.
+fn plan_diagnostics_to_commands(diagnostics: &[String]) -> Vec<LlmCommand> {
+    diagnostics
+        .iter()
+        .map(|diagnostic| LlmCommand::ProtocolError {
+            message: format!("invalid <plan> payload: {diagnostic}"),
+        })
+        .collect()
+}
+
 /// Converts a parsed plan tag into a normalized plan command.
 fn plan_tag_to_command(tag: ParsedPlanTag) -> LlmCommand {
     let action = match tag.action.as_str() {
@@ -821,12 +836,17 @@ impl CapabilityModule for PlanCreationModule {
         _editable_paths: &[String],
         fences: &CodeFences,
     ) -> Vec<LlmCommand> {
-        let (plans, _diagnostics) = XmlParser::new(marker).parse_plan_tags(normalized_text, fences);
-        plans
-            .into_iter()
-            .filter(|tag| tag.action == "save")
-            .map(plan_tag_to_command)
-            .collect()
+        let (plans, diagnostics) = XmlParser::new(marker).parse_plan_tags(normalized_text, fences);
+        // The container module owns the diagnostics of the vehicle, so a refused
+        // payload is reported instead of decoding as an absent mutation.
+        let mut commands = plan_diagnostics_to_commands(&diagnostics);
+        commands.extend(
+            plans
+                .into_iter()
+                .filter(|tag| tag.action == "save")
+                .map(plan_tag_to_command),
+        );
+        commands
     }
 }
 
@@ -868,6 +888,10 @@ impl CapabilityModule for PlanUpdateModule {
         _editable_paths: &[String],
         fences: &CodeFences,
     ) -> Vec<LlmCommand> {
+        // The `<plan>` container is one vehicle shared with plan creation, so its
+        // structural diagnostics are reported once, by the module that owns the
+        // container (`PlanCreationModule`). This module decodes the mutations that
+        // module leaves alone, so a defect is never reported twice.
         let (plans, _diagnostics) = XmlParser::new(marker).parse_plan_tags(normalized_text, fences);
         plans
             .into_iter()
@@ -1412,7 +1436,16 @@ impl CapabilityModule for CustomToolsModule {
     fn json_schema_fragment(&self) -> Option<serde_json::Value> {
         Some(schema::custom_tools_fragment())
     }
-
+    /// The command surface exists only where the project declares commands, so the
+    /// property is declared under exactly the condition that declares the rule
+    /// describing it.
+    fn json_schema_fragment_ctx(&self, ctx: &PromptRenderContext<'_>) -> Option<serde_json::Value> {
+        let project = ctx.project?;
+        if project.commands.is_empty() {
+            return None;
+        }
+        self.json_schema_fragment()
+    }
     fn render_contract_rule(&self, ctx: &ContractContext<'_>) -> Option<ContractRule> {
         let project = ctx.render.project?;
         if project.commands.is_empty() {
@@ -1990,6 +2023,45 @@ mod tests {
     }
 
     #[test]
+    fn a_malformed_plan_container_is_reported_as_a_protocol_error() {
+        use crate::capabilities::registry::CapabilityRegistry;
+
+        let text = "<plan action=\"save\" id=\"p-1\" title=\"P1\"></plan>";
+
+        // The container module owns the diagnostics of the vehicle, so it reports
+        // the defect instead of decoding the payload as an absent mutation.
+        let commands = decode(&PlanCreationModule, text);
+        assert_eq!(commands.len(), 1, "{commands:?}");
+        match &commands[0] {
+            LlmCommand::ProtocolError { message } => {
+                assert!(message.contains("<plan>"), "{message}");
+                assert!(message.contains("<concept>"), "{message}");
+            }
+            other => panic!("expected a protocol error, got {other:?}"),
+        }
+
+        // The container is shared with plan update, so the diagnosis is reported
+        // exactly once even when both capabilities are enabled.
+        let reported = CapabilityRegistry::global()
+            .decode_xml_commands(
+                &tauqe_protocol::CapabilitySet::discussion(),
+                text,
+                None,
+                &[],
+            )
+            .into_iter()
+            .filter(|command| matches!(command, LlmCommand::ProtocolError { .. }))
+            .count();
+        assert_eq!(reported, 1, "the container defect must be reported once");
+
+        // A valid container decodes into the plan command it declares.
+        let valid = "<plan action=\"save\" id=\"p-1\" title=\"P1\"><concept><concept_item id=\"c-1\" title=\"C\" /></concept></plan>";
+        assert!(decode(&PlanCreationModule, valid)
+            .iter()
+            .any(|command| matches!(command, LlmCommand::Plan { .. })));
+    }
+
+    #[test]
     fn the_plan_action_semantics_travel_in_the_delta_rule() {
         let module = PlanCreationModule;
 
@@ -2431,10 +2503,7 @@ mod tests {
         // The composed schema carries the contract of the property it declares,
         // so a structured turn reads it from the schema of its own turn.
         let schema = crate::capabilities::registry::CapabilityRegistry::global()
-            .compose_structured_schema(
-                &tauqe_protocol::CapabilitySet::interactive_repl(),
-                PatchStrategy::SearchReplace,
-            );
+            .compose_structured_schema(&tauqe_protocol::CapabilitySet::interactive_repl(), &render);
         let description = schema["properties"]["outcome"]["properties"]["commit_message"]
             ["description"]
             .as_str()
@@ -2787,5 +2856,45 @@ mod tests {
         assert!(decode(&module, "<outer_doc_request />").is_empty());
         assert!(decode(&module, "<outer_doc_request id=\"  \" />").is_empty());
         assert!(decode(&module, "Finish with an <outer_doc_request> tag.").is_empty());
+    }
+    #[test]
+    fn the_custom_tool_schema_field_follows_the_declaration() {
+        use crate::capabilities::registry::CapabilityRegistry;
+
+        let registry = CapabilityRegistry::global();
+        let set = tauqe_protocol::CapabilitySet::from_slice(&[
+            LlmCapability::TextMessage,
+            LlmCapability::CustomTools,
+        ]);
+
+        let declared_project = project(
+            r#"{
+                "commands": {
+                    "docs": { "command": "cargo", "args": ["docs"] }
+                }
+            }"#,
+        );
+        let declared = registry.compose_structured_schema(
+            &set,
+            &PromptRenderContext::new(&[], None).with_project(Some(&declared_project)),
+        );
+        assert!(declared["properties"].get("custom_tools").is_some());
+        assert!(declared["required"]
+            .as_array()
+            .is_some_and(|required| required.iter().any(|field| field == "custom_tools")));
+
+        // An absent declaration and an empty one both suppress the property: the
+        // schema observes the very condition that suppresses the rule describing
+        // it, so the field and its instruction stay paired.
+        for bare in [None, Some(ProjectConfig::default())] {
+            let schema = registry.compose_structured_schema(
+                &set,
+                &PromptRenderContext::new(&[], None).with_project(bare.as_ref()),
+            );
+            assert!(schema["properties"].get("custom_tools").is_none());
+            assert!(!schema["required"]
+                .as_array()
+                .is_some_and(|required| required.iter().any(|field| field == "custom_tools")));
+        }
     }
 }

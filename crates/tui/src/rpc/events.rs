@@ -87,33 +87,50 @@ fn retry_detail(data: &EditFileRetryingEvent) -> String {
 }
 
 /// Builds the in-app warning that reports the plan mutations the harness refused
-/// or repaired during the turn.
+/// Builds the error record that reports the plan mutations the harness refused
+/// during the turn.
 ///
-/// Both lists arrive typed beside the turn result, so the notice is assembled
-/// from those fields and never re-derived from the streamed answer: the refusal
-/// messages are rendered verbatim and the normalization notes are appended as
-/// they were recorded. `None` reports a turn that left the stored plan
-/// untouched, which raises no interface surface at all (c-4, c-5).
-fn plan_mutation_notice(rejections: &[PlanRejection], warnings: &[String]) -> Option<String> {
-    if rejections.is_empty() && warnings.is_empty() {
+/// A refusal means the stored plan was never updated the way the turn
+/// requested, so it is reported at error level and every refusal message is
+/// rendered verbatim. The record is assembled from the typed field beside the
+/// turn result and is never re-derived from the streamed answer. `None`
+/// reports a turn that committed every mutation it proposed, which raises no
+/// error at all (c-4, c-5).
+fn plan_rejection_notice(rejections: &[PlanRejection]) -> Option<String> {
+    if rejections.is_empty() {
         return None;
     }
+    let details = rejections
+        .iter()
+        .map(|rejection| rejection.message.as_str())
+        .collect::<Vec<_>>()
+        .join("; ");
+    Some(compose_plan_notice(
+        "notify.plan_rejections_detail",
+        &details,
+    ))
+}
+
+/// Builds the warning record that reports the plan mutations the harness
+/// repaired during the turn.
+///
+/// A repair means the mutation was applied after the harness normalized it, so
+/// it is reported at warning level and never masquerades as a failure. `None`
+/// reports a turn that needed no repair at all (c-4, c-5).
+fn plan_repair_notice(warnings: &[String]) -> Option<String> {
+    if warnings.is_empty() {
+        return None;
+    }
+    let details = warnings.join("; ");
+    Some(compose_plan_notice("notify.plan_warnings_detail", &details))
+}
+
+/// Prefixes the shared plan-mutation title to one localized detail sentence.
+fn compose_plan_notice(detail_key: &str, details: &str) -> String {
     let mut notice = active_t("notify.plan_mutations_title");
-    if !rejections.is_empty() {
-        let details = rejections
-            .iter()
-            .map(|rejection| rejection.message.as_str())
-            .collect::<Vec<_>>()
-            .join("; ");
-        let template = active_t("notify.plan_rejections_detail");
-        notice.push_str(&template.replacen("{}", &details, 1));
-    }
-    if !warnings.is_empty() {
-        let details = warnings.join("; ");
-        let template = active_t("notify.plan_warnings_detail");
-        notice.push_str(&template.replacen("{}", &details, 1));
-    }
-    Some(notice)
+    let template = active_t(detail_key);
+    notice.push_str(&template.replacen("{}", details, 1));
+    notice
 }
 
 pub async fn handle_event(ev: Event, state: &Arc<Mutex<AppState>>, is_reasoning: &mut bool) {
@@ -144,7 +161,7 @@ pub async fn handle_event(ev: Event, state: &Arc<Mutex<AppState>>, is_reasoning:
         events::GIT_SQUASH_COMPLETED => {
             if let Some(params) = ev.params {
                 if let Ok(data) = serde_json::from_value::<GitSquashApplyResult>(params) {
-                    st.squash_dialog = None;
+                    st.modals.squash_dialog = None;
                     let first_line = data
                         .message
                         .lines()
@@ -669,11 +686,17 @@ pub async fn handle_event(ev: Event, state: &Arc<Mutex<AppState>>, is_reasoning:
                 if let Ok(data) = serde_json::from_value::<ModelResultEvent>(params) {
                     // A refused plan mutation and a repaired plan status are real
                     // events of the plan lifecycle that the daemon reports typed
-                    // beside the turn result, so the interface raises one warning
-                    // instead of letting the payload vanish (c-4, c-5).
-                    let notice = plan_mutation_notice(&data.plan_rejections, &data.plan_warnings);
-                    if let Some(notice) = notice {
+                    // beside the turn result. A refusal left the stored plan
+                    // untouched, so it is raised at error level; a repair applied
+                    // the mutation, so it stays a warning. The refusal is raised
+                    // last, because the interface retains a single notification
+                    // and the failure must be the record the developer sees
+                    // (c-4, c-5).
+                    if let Some(notice) = plan_repair_notice(&data.plan_warnings) {
                         st.notify_warning(notice);
+                    }
+                    if let Some(notice) = plan_rejection_notice(&data.plan_rejections) {
+                        st.notify_error(notice);
                     }
                     match &data.result {
                         ModelResult::Edit {
@@ -733,7 +756,7 @@ pub async fn handle_event(ev: Event, state: &Arc<Mutex<AppState>>, is_reasoning:
             *is_reasoning = false;
             st.model.reasoning.finalize();
             st.model.reasoning.show = false;
-            st.confirm_cancel = false;
+            st.modals.confirm_cancel = false;
             st.running_model = None;
             if let Some(started) = st.turn_started_at.take() {
                 let elapsed = started.elapsed().as_secs();
@@ -790,10 +813,19 @@ pub async fn handle_event(ev: Event, state: &Arc<Mutex<AppState>>, is_reasoning:
             }
         }
         events::MODEL_CANCELLED => {
+            // A batch member never settles the shared turn on its own either:
+            // the supervisor reports the terminal cause of the queue in its
+            // `plan/batch_finished` / `review/batch_finished` event. Settling
+            // here would clear `is_busy()` while the queue still runs, so a new
+            // prompt could open a turn that the supervisor then overwrites with
+            // the summary of the old one.
+            if st.model.is_batch {
+                return;
+            }
             *is_reasoning = false;
             st.model.reasoning.finalize();
             st.model.reasoning.show = false;
-            st.confirm_cancel = false;
+            st.modals.confirm_cancel = false;
             st.running_model = None;
             st.turn_started_at = None;
             st.model.status = TurnStatus::Cancelled;
@@ -827,7 +859,7 @@ pub async fn handle_event(ev: Event, state: &Arc<Mutex<AppState>>, is_reasoning:
             *is_reasoning = false;
             st.model.reasoning.finalize();
             st.model.reasoning.show = false;
-            st.confirm_cancel = false;
+            st.modals.confirm_cancel = false;
             st.running_model = None;
             if let Some(started) = st.turn_started_at.take() {
                 let elapsed = started.elapsed().as_secs();
@@ -1087,7 +1119,7 @@ pub async fn handle_event(ev: Event, state: &Arc<Mutex<AppState>>, is_reasoning:
                     // The batch has terminated: clear the batch-scoped state so
                     // a later interruption never targets a finished queue, then
                     // settle the turn the members deliberately left open.
-                    st.batch_stopping = false;
+                    st.modals.batch_stopping = false;
                     st.model.is_batch = false;
                     settle_batch_turn(&mut st, &data.summary);
                     notify_batch_finished(&mut st, BatchKind::Plan, &data.summary);
@@ -1099,7 +1131,7 @@ pub async fn handle_event(ev: Event, state: &Arc<Mutex<AppState>>, is_reasoning:
                 if let Ok(data) = serde_json::from_value::<ReviewBatchFinishedEvent>(params) {
                     // Mirror the plan supervisor: the terminal batch event is
                     // the only point that settles the shared turn.
-                    st.batch_stopping = false;
+                    st.modals.batch_stopping = false;
                     st.model.is_batch = false;
                     settle_batch_turn(&mut st, &data.summary);
                     notify_batch_finished(&mut st, BatchKind::Review, &data.summary);
@@ -1184,7 +1216,7 @@ fn end_review_turn(model: &mut ReplView, status: TurnStatus, error: Option<Strin
 fn settle_batch_turn(st: &mut AppState, summary: &BatchFinishSummary) {
     st.running_model = None;
     st.turn_started_at = None;
-    st.confirm_cancel = false;
+    st.modals.confirm_cancel = false;
 
     let applied = st.model.edit_final_applied == Some(true) || st.model.last_commit_hash.is_some();
     let height = st.last_model_height;
@@ -2262,7 +2294,7 @@ mod tests {
             command: "cargo check".to_string(),
         });
         st.model.turn_phase = Some(tauqe_protocol::TurnPhase::Verification);
-        st.batch_stopping = true;
+        st.modals.batch_stopping = true;
         st.turn_started_at = Some(std::time::Instant::now());
 
         let state = Arc::new(Mutex::new(st));
@@ -2283,13 +2315,85 @@ mod tests {
         let guard = state.lock().await;
         assert_eq!(guard.model.status, TurnStatus::Done);
         assert!(!guard.model.is_batch);
-        assert!(!guard.batch_stopping);
+        assert!(!guard.modals.batch_stopping);
         assert!(guard.model.toolchain.is_none());
         assert!(guard.model.turn_phase.is_none());
         assert!(
             guard.turn_started_at.is_none(),
             "the terminal batch event releases the turn timestamp"
         );
+    }
+    #[tokio::test]
+    async fn test_model_cancelled_for_a_batch_member_keeps_the_turn_open() {
+        let mut st = crate::app::test_state();
+        st.model.is_batch = true;
+        st.model.status = TurnStatus::Responding;
+        st.model.edits_active = true;
+        st.model.files.push(StreamingFileEdit {
+            status: FileEditStatus::Running,
+            ..accepted_file("crates/tui/src/main.rs")
+        });
+        st.model.reasoning.append_delta("drafting the step");
+        st.running_model = Some(RunningModel {
+            model: ModelRef::openrouter("coder"),
+            role: None,
+            effort: None,
+        });
+        st.turn_started_at = Some(std::time::Instant::now());
+
+        let state = Arc::new(Mutex::new(st));
+        let mut is_reasoning = false;
+        let cancelled = Event {
+            method: events::MODEL_CANCELLED.to_string(),
+            params: None,
+        };
+
+        handle_event(cancelled, &state, &mut is_reasoning).await;
+
+        {
+            let guard = state.lock().await;
+            assert!(
+                guard.model.is_busy(),
+                "a cancelled batch member must leave the queue's turn busy"
+            );
+            assert_eq!(guard.model.status, TurnStatus::Responding);
+            assert!(
+                guard.running_model.is_some(),
+                "the supervisor still owns the running model of the queue"
+            );
+            assert!(
+                guard.turn_started_at.is_some(),
+                "the queue keeps owning the turn started timestamp"
+            );
+            assert_eq!(
+                guard.model.files[0].status,
+                FileEditStatus::Running,
+                "a member never rejects the edits of the turn the queue owns"
+            );
+            assert!(guard.model.reasoning.is_streaming());
+            assert!(guard.active_notification().is_none());
+        }
+
+        let finished = Event {
+            method: events::PLAN_BATCH_FINISHED.to_string(),
+            params: Some(
+                serde_json::to_value(PlanBatchFinishedEvent {
+                    operation_id: "op-plan-batch".to_string(),
+                    summary: batch_summary(BatchFinishStatus::Cancelled, 1, 3, 42),
+                })
+                .unwrap(),
+            ),
+        };
+        handle_event(finished, &state, &mut is_reasoning).await;
+
+        let guard = state.lock().await;
+        assert_eq!(
+            guard.model.status,
+            TurnStatus::Cancelled,
+            "the supervisor's terminal event remains the single settlement point"
+        );
+        assert!(!guard.model.is_batch);
+        assert!(!guard.model.is_busy());
     }
 
     #[tokio::test]
@@ -2779,7 +2883,7 @@ mod tests {
             guard.turn_started_at.is_none(),
             "the cancellation surfaces no longer target the finished turn"
         );
-        assert!(!guard.confirm_cancel);
+        assert!(!guard.modals.confirm_cancel);
         assert!(!is_reasoning, "the reasoning phase ends with the turn");
         assert!(guard.model.toolchain.is_none());
         assert!(guard.model.turn_phase.is_none());
@@ -3219,7 +3323,7 @@ mod tests {
     #[tokio::test]
     async fn test_open_diff_inspector_observes_the_live_staged_set() {
         let mut st = crate::app::test_state();
-        st.diff_inspector = Some(crate::app::DiffInspectorState {
+        st.modals.diff_inspector = Some(crate::app::DiffInspectorState {
             selected_file: 0,
             diff_scroll: 0,
             focus: crate::app::DiffInspectorFocus::Files,
@@ -3255,7 +3359,7 @@ mod tests {
         {
             let guard = state.lock().await;
             assert!(
-                guard.diff_inspector.is_some(),
+                guard.modals.diff_inspector.is_some(),
                 "the audit stays open across the whole stream"
             );
             // The change set exists exactly once, on the view the Viewport draws
@@ -3278,6 +3382,7 @@ mod tests {
         guard.model.files.clear();
         let file_count = guard.model.files.len();
         let inspector = guard
+            .modals
             .diff_inspector
             .as_mut()
             .expect("the audit stays open across the whole stream");
@@ -3463,12 +3568,59 @@ mod tests {
         }
     }
 
-    /// A turn that refused a plan mutation and repaired a plan status reports
-    /// both typed beside its result, so the interface raises one warning that
-    /// renders the refusal messages and the normalization notes verbatim
+    /// A refused plan mutation left the stored plan untouched, so it reaches the
+    /// developer as an error record that renders the refusal wording verbatim
     /// (c-4, c-5).
     #[tokio::test]
-    async fn test_model_result_surfaces_refused_and_normalized_plan_mutations() {
+    async fn test_model_result_reports_refused_plan_mutations_as_an_error() {
+        let state = Arc::new(Mutex::new(crate::app::test_state()));
+        let mut is_reasoning = false;
+        let ev = model_result_event(
+            vec![PlanRejection::mode_forbidden("the turn regime forbids it")],
+            Vec::new(),
+        );
+
+        handle_event(ev, &state, &mut is_reasoning).await;
+
+        let guard = state.lock().await;
+        let notif = guard
+            .active_notification()
+            .expect("a refused plan mutation must raise an error record");
+        assert_eq!(notif.level, crate::app::NotificationLevel::Error);
+        assert!(notif
+            .text
+            .contains(&active_t("notify.plan_mutations_title")));
+        assert!(notif.text.contains("the turn regime forbids it"));
+    }
+
+    /// A repair applied the mutation after normalization, so it is reported at
+    /// warning level and never masquerades as a failure (c-4, c-5).
+    #[tokio::test]
+    async fn test_model_result_reports_normalized_plan_mutations_as_a_warning() {
+        let state = Arc::new(Mutex::new(crate::app::test_state()));
+        let mut is_reasoning = false;
+        let ev = model_result_event(
+            Vec::new(),
+            vec!["requested status corrected to in progress".to_string()],
+        );
+
+        handle_event(ev, &state, &mut is_reasoning).await;
+
+        let guard = state.lock().await;
+        let notif = guard
+            .active_notification()
+            .expect("a repaired plan mutation must raise a warning record");
+        assert_eq!(notif.level, crate::app::NotificationLevel::Warning);
+        assert!(notif
+            .text
+            .contains("requested status corrected to in progress"));
+    }
+
+    /// A refusal and a repair reported by the same turn leave the refusal as the
+    /// visible record: only one notification is retained, and the failure must
+    /// never be masked by the repair it accompanied (c-4, c-5).
+    #[tokio::test]
+    async fn test_model_result_keeps_the_refusal_visible_over_a_repair() {
         let state = Arc::new(Mutex::new(crate::app::test_state()));
         let mut is_reasoning = false;
         let ev = model_result_event(
@@ -3481,15 +3633,9 @@ mod tests {
         let guard = state.lock().await;
         let notif = guard
             .active_notification()
-            .expect("a plan-mutation warning must be raised");
-        assert_eq!(notif.level, crate::app::NotificationLevel::Warning);
-        assert!(notif
-            .text
-            .contains(&active_t("notify.plan_mutations_title")));
+            .expect("the refusal must remain the visible record");
+        assert_eq!(notif.level, crate::app::NotificationLevel::Error);
         assert!(notif.text.contains("the turn regime forbids it"));
-        assert!(notif
-            .text
-            .contains("requested status corrected to in progress"));
     }
 
     /// A turn that left the stored plan untouched raises nothing: the warning

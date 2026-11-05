@@ -85,7 +85,7 @@ impl ServerImplementationHost {
     /// the review entities the runner executes.
     fn plan_context(scope: &ExecutionScope, queue: &TurnWorkQueue) -> Option<ModelTurnPlanContext> {
         let plan_id = match scope {
-            ExecutionScope::Plan { plan_id } => plan_id,
+            ExecutionScope::Plan { plan_id, .. } => plan_id,
             ExecutionScope::ReviewGroup { .. } | ExecutionScope::ReviewFinding { .. } => {
                 return None
             }
@@ -121,7 +121,7 @@ impl ServerImplementationHost {
         queue: TurnWorkQueue,
     ) -> Option<TurnWorkContext> {
         match scope {
-            ExecutionScope::Plan { plan_id } => Some(TurnWorkContext::PlanStep {
+            ExecutionScope::Plan { plan_id, .. } => Some(TurnWorkContext::PlanStep {
                 plan_id: plan_id.clone(),
                 plan_title: title.to_string(),
                 queue,
@@ -183,6 +183,7 @@ impl ServerImplementationHost {
         };
         frame
             .plan
+            .implementation
             .find_item(step_id)
             .map(|step| step.outer_docs.clone())
             .unwrap_or_default()
@@ -270,7 +271,9 @@ impl ImplementationHost for ServerImplementationHost {
             publish_review(&self.state, &self.repo_root, review_id).await;
         }
 
-        let policy = build_apply_policy(&self.state, self.config.repl.workflow);
+        // The step's own cancellation signal reaches the policy, so cancelling the
+        // batch releases a repository hook that holds the checkpoint capture.
+        let policy = build_apply_policy(&self.state, self.config.repl.workflow, cancel_rx.clone());
         let options = StepTurnOptions {
             intent: TurnIntent::IsolatedStep,
             custom_selection: Some(selection),
@@ -361,7 +364,7 @@ impl ImplementationHost for ServerImplementationHost {
         // horizon: the session is keyed by the plan or the review audit, never by
         // the interactive REPL, so a step turn can never poison the dialogue cache.
         options.session_id = Some(match &frame.scope {
-            ExecutionScope::Plan { plan_id } => {
+            ExecutionScope::Plan { plan_id, .. } => {
                 format_session_id(SESSION_PREFIX_ARCHITECT, plan_id)
             }
             ExecutionScope::ReviewGroup { review_id, .. }
@@ -516,6 +519,7 @@ mod tests {
         let context = ServerImplementationHost::work_context(
             &ExecutionScope::Plan {
                 plan_id: "plan-1".to_string(),
+                step_id: None,
             },
             "Plan One",
             queue(),
@@ -634,6 +638,7 @@ mod tests {
         PlanStorage::save_plan(&root, &plan).expect("store the plan");
         let scope = ExecutionScope::Plan {
             plan_id: "outer-docs-plan".to_string(),
+            step_id: None,
         };
         let queue = |id: &str, title: &str| TurnWorkQueue {
             items: vec![TurnWorkItem {
@@ -674,6 +679,7 @@ mod tests {
         };
         let scope = ExecutionScope::Plan {
             plan_id: "absent".to_string(),
+            step_id: None,
         };
         let root = std::env::temp_dir().join("tauqe-host-absent-scope");
 

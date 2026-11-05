@@ -2,14 +2,16 @@ use serde::{Deserialize, Serialize};
 
 use crate::context::{default_context_access, ContextAccess};
 use crate::edit::normalize_repo_path;
+use crate::edit::proposal::strip_surrounding_markup;
 use crate::plan::{ConceptItem, PlanItem};
 use crate::review::ReviewUpdateProposal;
 use normalize::{
     deserialize_context_access, deserialize_context_requests, deserialize_dir_list_requests,
     deserialize_repo_map_paths,
 };
-
-pub(crate) use normalize::{deserialize_null_as_default, deserialize_repo_search_requests};
+pub(crate) use normalize::{
+    deserialize_null_as_default, deserialize_repo_path_list, deserialize_repo_search_requests,
+};
 
 pub mod normalize;
 pub mod schema;
@@ -188,7 +190,7 @@ impl DiscussionContextRequest {
     pub fn parse_spec(spec: &str) -> Option<Self> {
         // A producer may wrap the whole specification in backticks, so the
         // surrounding markup is removed before the access prefix is read.
-        let spec = spec.trim().trim_matches('`').trim();
+        let spec = strip_surrounding_markup(spec);
         let (access, rest) = if let Some(rest) = strip_access_prefix(spec, "editable:") {
             (ContextAccess::Editable, rest)
         } else if let Some(rest) = strip_access_prefix(spec, "read_only:") {
@@ -196,8 +198,9 @@ impl DiscussionContextRequest {
         } else {
             (ContextAccess::ReadOnly, spec)
         };
-        let cleaned = rest.trim().trim_matches('`').trim();
-        let path = normalize_repo_path(cleaned).ok()?;
+        // The path is cleaned by the shared normalizer, which strips the
+        // backticks a producer may wrap around the path alone.
+        let path = normalize_repo_path(rest).ok()?;
         Some(Self { path, access })
     }
 }
@@ -412,6 +415,16 @@ pub struct DiscussionResponse {
     pub dir_lists: Vec<DirListRequest>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub user_language: Option<String>,
+    /// Decode diagnosis of a `plan_update` payload the DTO could not honor.
+    ///
+    /// The structured stream filter rebuilds this response from a partially
+    /// decodable payload, so a present but malformed `plan_update` is recorded
+    /// here instead of disappearing: the field carries the deserialization error
+    /// of the DTO boundary, and the plan-refinement contour refuses the round on
+    /// it. It is a harness-side diagnostic rather than a model-authored field, so
+    /// it stays out of the strict wire schema and is omitted when absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plan_update_error: Option<String>,
 }
 
 impl DiscussionResponse {
@@ -426,6 +439,7 @@ impl DiscussionResponse {
             repo_maps: Vec::new(),
             dir_lists: Vec::new(),
             user_language: None,
+            plan_update_error: None,
         }
     }
 
@@ -497,6 +511,9 @@ mod tests {
         assert_eq!(ed.path, "src/b.rs");
         assert_eq!(ed.access, ContextAccess::Editable);
         assert!(DiscussionContextRequest::parse_spec("editable:").is_none());
+        // The shared normalizer owns the strip rule, so a backticks-only
+        // specification is the empty path it is.
+        assert!(DiscussionContextRequest::parse_spec("``").is_none());
 
         // Absolute, traversal, and NUL paths are rejected rather than silently
         // rewritten into a relative path.
@@ -723,6 +740,25 @@ mod tests {
         // field out of the wire form, exactly like an absent plan update.
         let idle = serde_json::to_string(&DiscussionResponse::new("Hello")).unwrap();
         assert!(!idle.contains("review_update"), "got: {idle}");
+    }
+    #[test]
+    fn test_discussion_response_plan_update_error_is_a_decode_diagnostic() {
+        // The field records why a present `plan_update` could not be honored, so
+        // the diagnosis travels with the response instead of disappearing.
+        let mut response = DiscussionResponse::new("Partial decode");
+        response.plan_update_error =
+            Some("invalid plan_update: missing field `action`".to_string());
+
+        let json = serde_json::to_string(&response).unwrap();
+        assert!(json.contains("\"plan_update_error\""), "got: {json}");
+        let de: DiscussionResponse = serde_json::from_str(&json).unwrap();
+        assert_eq!(de, response);
+
+        // An absent diagnosis declares nothing and stays out of the wire form.
+        let idle = serde_json::to_string(&DiscussionResponse::new("Hello")).unwrap();
+        assert!(!idle.contains("plan_update_error"), "got: {idle}");
+        let de: DiscussionResponse = serde_json::from_str(&idle).unwrap();
+        assert!(de.plan_update_error.is_none());
     }
 
     #[test]

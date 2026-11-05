@@ -99,11 +99,63 @@ pub struct PlanExecuteParams {
     pub model: Option<ModelSelection>,
 }
 
+/// Parameters of the two-phase plan creation pipeline (`plan/createPipeline`).
+///
+/// The pipeline drafts a plan from the directives, has the draft audited by an
+/// independent Architect entry, and reconciles the critique into the plan it
+/// issues. Both Architect selections travel on the request, so one typed dialog
+/// configures the two phases instead of delegating them to an unstructured
+/// dialogue, and the critique can be opted out of explicitly. The request
+/// answers with [`PlanRefineResult`], exactly as the directed modification
+/// does.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct PlanCreatePipelineParams {
+    /// Engineering directives the synthesized plan must satisfy.
+    ///
+    /// This is the mandatory coordinate of the pipeline: a request without
+    /// directives has nothing to plan, so the key is required and the handler
+    /// rejects a blank value instead of drafting an empty plan.
+    pub directives: String,
+    /// Explicit Architect selection of the drafting phase.
+    ///
+    /// An absent selection leaves the phase to the runtime default instead of
+    /// pinning a model on the wire.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub planner_model: Option<ModelSelection>,
+    /// Explicit Architect selection of the critique phase.
+    ///
+    /// The critic is selected independently of the planner, so the draft can be
+    /// audited by a different Architect entry than the one that wrote it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub critic_model: Option<ModelSelection>,
+    /// Whether the independent critique phase is skipped.
+    ///
+    /// The flag is independent of `critic_model`: an opt-out expresses the
+    /// single-phase intent and never depends on which critic was selected.
+    #[serde(default)]
+    pub skip_critique: bool,
+}
+
+/// Parameters of a directed plan modification (`plan/refine`).
+///
+/// The request carries the same two-phase selection the creation pipeline
+/// declares: the instructions state how the concept and the steps must change,
+/// the planner drafts and reconciles, and the critic audits the draft
+/// independently. The synthesis answers with the mutated plan or a blocker
+/// ([`PlanRefineResult`]) rather than with prose, so a modification always
+/// lands as a structure change.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct PlanRefineParams {
     pub plan_id: String,
+    /// Explicit Architect selection of the drafting phase.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<ModelSelection>,
+    /// Explicit Architect selection of the critique phase.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub critic_model: Option<ModelSelection>,
+    /// Whether the independent critique phase is skipped.
+    #[serde(default)]
+    pub skip_critique: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub instructions: Option<String>,
 }
@@ -120,6 +172,12 @@ pub struct PlanReplanParams {
     pub instructions: Option<String>,
 }
 
+/// Outcome of a structured plan synthesis issued by the Architect contour.
+///
+/// The directed modification (`plan/refine`) and the two-phase creation
+/// pipeline (`plan/createPipeline`) report through this one shape: the
+/// synthesis either issues the plan together with its reconciliation note, or
+/// states why it cannot be issued instead of answering with prose.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "status", rename_all = "snake_case")]
 pub enum PlanRefineResult {

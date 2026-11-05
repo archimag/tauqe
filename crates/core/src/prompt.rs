@@ -879,6 +879,7 @@ mod tests {
             path: "docs/Conventions.md".to_string(),
             access: ContextAccess::ReadOnly,
             content: "# Conventions\nUse Conventional Commits.\n".to_string(),
+            insertion_seq: 0,
         }];
 
         let prompt = build_squash_commit_prompt(&commits, "+new_code", &pinned);
@@ -925,6 +926,7 @@ mod tests {
             path: "src/main.rs".to_string(),
             access: ContextAccess::Editable,
             content: "fn main() {}\n".to_string(),
+            insertion_seq: 0,
         }];
         let history = Some(std::sync::Arc::new(HistorySnapshot::new(vec![
             HistoryEntry::Summary {
@@ -975,11 +977,13 @@ mod tests {
                 path: "src/main.rs".to_string(),
                 access: ContextAccess::Editable,
                 content: "fn main() {}\n".to_string(),
+                insertion_seq: 0,
             },
             ContextFileContent {
                 path: "src/lib.rs".to_string(),
                 access: ContextAccess::ReadOnly,
                 content: "pub fn helper() {}\n".to_string(),
+                insertion_seq: 0,
             },
         ];
         let mut assembly =
@@ -1137,6 +1141,7 @@ mod tests {
             path: path.to_string(),
             access,
             content: format!("// {path}\n"),
+            insertion_seq: 0,
         };
 
         let mut assembly = PromptAssembly::new(
@@ -1179,6 +1184,7 @@ mod tests {
             path: "src/deep/nested/module.rs".to_string(),
             access: ContextAccess::Editable,
             content: "fn main() {}\n".to_string(),
+            insertion_seq: 0,
         };
 
         let open = context_element_open_tag(&file.path, file.access);
@@ -1208,11 +1214,13 @@ mod tests {
                     path: "src/a.rs".to_string(),
                     access: ContextAccess::ReadOnly,
                     content: "alpha\nbeta\n".to_string(),
+                    insertion_seq: 0,
                 },
                 ContextFileContent {
                     path: "src/b.rs".to_string(),
                     access: ContextAccess::Editable,
                     content: "gamma".to_string(),
+                    insertion_seq: 0,
                 },
             ]
         };
@@ -1255,11 +1263,13 @@ mod tests {
                     path: "src/a.rs".to_string(),
                     access: ContextAccess::ReadOnly,
                     content: "alpha\n".to_string(),
+                    insertion_seq: 0,
                 },
                 ContextFileContent {
                     path: "src/b.rs".to_string(),
                     access: ContextAccess::ReadOnly,
                     content: "beta\n".to_string(),
+                    insertion_seq: 0,
                 },
             ],
             "git",
@@ -1310,6 +1320,7 @@ mod tests {
                     path: "src/big.rs".to_string(),
                     access: ContextAccess::ReadOnly,
                     content,
+                    insertion_seq: 0,
                 }],
                 "git",
                 EditProtocolKind::Xml,
@@ -1336,6 +1347,7 @@ mod tests {
             path: "src/main.rs".to_string(),
             access: ContextAccess::Editable,
             content: "fn main() {}\n".to_string(),
+            insertion_seq: 0,
         }];
         let mut assembly = PromptAssembly::new(
             None,
@@ -1582,10 +1594,10 @@ mod tests {
         use crate::capabilities::CapabilityRegistry;
 
         let registry = CapabilityRegistry::global();
-        let interactive = registry.compose_structured_schema(
-            &CapabilitySet::interactive_repl(),
-            PatchStrategy::SearchReplace,
-        );
+        let render =
+            PromptRenderContext::new(&[], None).with_patch_strategy(PatchStrategy::SearchReplace);
+        let interactive =
+            registry.compose_structured_schema(&CapabilitySet::interactive_repl(), &render);
         assert!(interactive["properties"]
             .get("tauqe_doc_requests")
             .is_some());
@@ -1596,10 +1608,7 @@ mod tests {
         // The composed schema is a projection of the capability set, so a turn
         // that cannot consult the documentation never advertises a field its
         // decoder would reject.
-        let step = registry.compose_structured_schema(
-            &CapabilitySet::isolated_step(),
-            PatchStrategy::SearchReplace,
-        );
+        let step = registry.compose_structured_schema(&CapabilitySet::isolated_step(), &render);
         assert!(step["properties"].get("tauqe_doc_requests").is_none());
         assert!(step["properties"].get("doc_requests").is_none());
         assert!(step["properties"].get("changes").is_some());
@@ -1791,6 +1800,7 @@ mod tests {
             path: "src/main.rs".to_string(),
             access: ContextAccess::Editable,
             content: "fn main() {}\n".to_string(),
+            insertion_seq: 0,
         }];
         let assembly =
             PromptAssembly::new(None, 1, files, "git", EditProtocolKind::Xml, None, None);

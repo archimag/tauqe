@@ -76,7 +76,11 @@ Roles and the Coder Ladder* owns that boundary. A plan is where it becomes visib
     payload — and no layer derives that category from the wording of a reason.
 15. **A payload is never lost silently.** A turn settles its mutations through one phase
     at finalization, and a turn that closes without a qualifying result abandons its
-    payload with a typed diagnostic instead of dropping it.
+   payload with a typed diagnostic instead of dropping it.
+16. **Planning has a typed surface.** Creating a plan and directing a modification of one
+    are typed requests — the directives, the Planner, the Critic, and the optional
+    critique flag travel as declared coordinates — so the harness never reinterprets a
+    fluent answer into a plan document.
 
 ---
 
@@ -278,6 +282,12 @@ confirms the offer or asks for a plan explicitly. That answer arrives through th
 `plan_update` payload described above and reaches disk as an ordinary plan save. A
 declined offer is equally binding: if the developer asks for the whole task instead,
 the model executes it completely and never repeats the proposal.
+
+A plan also reaches storage without a dialogue. `N` in the Plans view opens the typed
+creation dialog, which states the directives, the Planner that drafts, and the Critic
+that audits, and issues `plan/createPipeline` as one request (§3.14). The request needs
+its subject: an empty editor is refused while the form still holds the developer's
+text, so a synthesis without directives never reaches the daemon.
 
 Mechanical and localized work never enters this fork. A cross-cutting rename, a
 signature update, or one focused bug fix is compact and indivisible, so it is
@@ -670,7 +680,8 @@ it, and the slot stays registered for as long as one of them runs.
 | `a` | fold or unfold every plan and section |
 | `Enter` / `x` | execute the selected leaf, group, or plan, with confirmation |
 | `X` | start the plan pipeline over every ready plan |
-| `r` / `R` | hand the selected item / every item awaiting decomposition to the Architect for horizon synthesis |
+| `X` | start the plan pipeline over every ready plan |
+| `N` | open the two-phase plan creation dialog |
 | `d` | discuss the selected concept node, step, or the whole plan in Develop |
 | `t` / `s` | open the status dialog |
 | `Shift+C` | clear the implementation horizon, concept preserved |
@@ -747,6 +758,16 @@ declared qualification:
 An empty payload settles into nothing, so a turn that carried no mutation reports no
 diagnostic. The single intentional exception is a turn the developer cancelled: that work
 ended by explicit request, so the abandoned payload is not reported as a defect.
+**A payload is validated before it is applied.** A plan discussion validates the
+payload it accumulated with a non-persisting probe of plan storage, which runs the
+very mutation cycle the application runs — identity resolution, the status barrier,
+and the structural barrier of the write path — against an in-memory snapshot of the
+stored plans, under the same lock and without writing a byte. Its verdict is
+therefore the verdict of the application it predicts, and a clean verdict leaves the
+settlement phase as the single application. The categories keep their meaning across
+both contracts, so a defect the probe reports is the defect the settlement phase would
+report. The phase itself belongs to the turn lifecycle and is described in
+*The Autonomous Bounded Turn FSM*, section *Finalize or roll back*.
 
 **One repair round for payload defects.** `PayloadDefect` is the only category generation
 can correct, so it buys exactly one corrective exchange — never a loop, and never a
@@ -775,6 +796,43 @@ the model and the developer both see that the requested status was corrected.
 | Session history | the diagnostic recorded with the turn | the durable record of the dialogue |
 | Journal | one warning per refusal, repair, and abandonment | post-mortem analysis of the daemon |
 | `ModelResultEvent` | `plan_rejections` and `plan_warnings`, filled by the server from the turn result | the client, which raises one warning notification with a localized heading and the refusal messages as its detail |
+### 3.14 The typed planning dialogs
+
+A plan is created and modified through a form rather than through a negotiation,
+because both acts ask the same two questions: what the plan must satisfy, and which
+Architects run each phase. Both dialogs share one card and one keyboard contract, and
+both answer with a structure instead of prose.
+
+**Creation (`N`).** The form collects the engineering directives, the Planner that
+drafts, and the Critic that audits. Two configured Architect entries advance
+independently, so the critique can be audited by a different configuration than the one
+that wrote the draft. `Space` inside the Critic section disables the independent audit,
+and a disabled phase sends no critic at all instead of a contradictory pair of
+coordinates. The directives are mandatory: the dialog refuses an empty editor while the
+form still holds the developer's text, so a request without a subject never reaches the
+daemon.
+
+**Directed modification (`r` / `R`).** The same card names the plan being modified and
+takes refinement instructions. `r` seeds them from the blocked step under the cursor,
+`R` seeds them from the whole blocked frontier, and an empty editor leaves the Architect
+free to reproject the horizon. The request answers with the mutated plan or with a
+blocker, never with prose.
+
+**One card anatomy.** A header naming the operation, the Planner ladder, the Critic
+ladder with its disable switch, the instructions editor, the action bar, and a docked
+hint strip generated from the shared dialog vocabulary. One blank row separates each
+band, and the card keeps the top inset and the horizontal margin every modal keeps.
+
+**One keyboard contract.** `Tab` and `Shift+Tab` walk the sections, `C-n` / `C-p` are
+the vertical field walk, `Enter` activates the focused button, and the `C-Enter`
+accelerator submits from any section. A ladder owns the arrows, the bare digits, and the
+paging keys only while it holds the keyboard, so a digit typed in the editor stays
+literal text, and `C-M` / `M-M` switches the focused ladder from any section. Validation
+spends nothing: the safe `Cancel` default dismisses the card without a request, and the
+synthesis starts only from the focused confirm button or the explicit accelerator.
+
+---
+
 ## 4. Boundaries & Anti-Patterns ("What it is NOT")
 
 - **It is not a repository artifact.** Plans are local, ignored, and never
@@ -787,6 +845,12 @@ the model and the developer both see that the requested status was corrected.
   in the chat.
 - **It is not a graph the client schedules.** The daemon owns statuses and
   advancement; the interface only starts a scope and renders events.
+- **It is not a free-form planning negotiation.** Creating a plan and directing a
+  modification of one travel as typed dialog requests, so the harness never
+  reinterprets a fluent answer into a plan document.
+- **It is not launched by an accidental keystroke.** Both planning dialogs open on the
+  safe `Cancel` default, refuse an empty subject, and start the synthesis only from the
+  focused confirm button or the explicit accelerator.
 - **It is not an owner of its own executor.** A plan, an architectural review group, and
   a single review finding execute the same pipeline over the same step graph, so a
   workflow never acquires a private scheduler.
@@ -842,3 +906,5 @@ the model and the developer both see that the requested status was corrected.
   executes them through the same pipeline.
 - [Configuration and Project Preparation](../ch05-system/configuration.md) —
   `repl.max_retries`, `repl.max_replans`, and model roles.
+- [Keyboard-First Interface](../ch05-system/tui-ux.md) — the dialog vocabulary and the
+  focus walk the planning forms share.

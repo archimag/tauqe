@@ -1,18 +1,26 @@
 //! Prompt builders, DTOs, and JSON schemas for plan workflows.
 //!
-//! The plan prompt surface is decomposed into four cohesive submodules:
+//! The plan prompt surface is decomposed into five cohesive submodules:
 //! `architect` (the Architect tier-resolution policy shared by plan and review
-//! synthesis), `discussion` (plan Q&A and active-context rendering), `refine`
-//! (Architect horizon synthesis and its schemas), and `step` (isolated plan step
-//! execution). Every public item is re-exported here so callers keep using the
-//! stable `plan::prompt::*` paths.
+//! synthesis), `critique` (the independent audit of a draft horizon and the
+//! reconciliation that answers it), `discussion` (plan Q&A and active-context
+//! rendering), `refine` (Architect horizon synthesis and its schemas), and
+//! `step` (isolated plan step execution). Every public item is re-exported here
+//! so callers keep using the stable `plan::prompt::*` paths.
 
 pub mod architect;
+pub mod critique;
 pub mod discussion;
 pub mod refine;
 pub mod step;
 
 pub use architect::{resolve_architect_tier, ArchitectLevelUp};
+pub use critique::{
+    build_plan_critique_prompt, build_plan_critique_system_prompt,
+    build_plan_reconciliation_prompt, parse_plan_critique_output, plan_critique_response_schema,
+    plan_critique_response_schema_definition, PlanCritiqueCategory, PlanCritiqueFinding,
+    PlanCritiqueOutput, PlanCritiqueVerdict,
+};
 pub use discussion::{
     format_active_plan_context, format_plan_discussion_prompt, PLAN_DISCUSSION_PREFIX,
 };
@@ -330,7 +338,7 @@ mod tests {
 
         // A plan with no DONE steps reports an empty foundation.
         let mut no_done = sample_plan();
-        for item in &mut no_done.items {
+        for item in &mut no_done.implementation.items {
             item.status = PlanItemStatus::Todo;
         }
         let no_done_prompt = build_plan_horizon_user_prompt(&no_done, None, None);

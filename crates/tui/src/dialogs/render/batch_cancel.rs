@@ -150,7 +150,7 @@ pub fn render_confirm_batch_cancel_popup(frame: &mut ratatui::Frame, state: &App
     frame.render_widget(body, geometry.body);
 
     let [l0, l1, l2] = batch_cancel_labels();
-    let focused = state.batch_cancel_button;
+    let focused = state.modals.batch_cancel_button;
     let button_style = |button: BatchCancelButton| {
         if button == focused {
             engine
@@ -188,7 +188,7 @@ mod tests {
         let term = Rect::new(0, 0, 100, 30);
         let mut terminal = Terminal::new(TestBackend::new(term.width, term.height)).unwrap();
         let mut state = crate::app::test_state();
-        state.confirm_batch_cancel = true;
+        state.modals.confirm_batch_cancel = true;
 
         terminal
             .draw(|f| render_confirm_batch_cancel_popup(f, &state))

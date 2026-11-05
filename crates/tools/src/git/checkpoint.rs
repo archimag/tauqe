@@ -1,9 +1,17 @@
-use super::cmd::{commit_with_developer_author, run_git, run_git_check_ignore, stage_files};
-use crate::atomic_write::{is_process_alive, staging_backup_sibling, staging_temp_sibling};
+use super::cmd::{
+    commit_with_developer_author_with_deadline, run_git_check_ignore,
+    run_git_check_ignore_with_deadline, run_git_with_deadline, stage_files_with_deadline,
+};
+use crate::atomic_write::{
+    is_process_alive, move_without_replace, staging_backup_sibling, staging_temp_sibling,
+    NoReplaceMove, STAGING_BACKUP_MARKER, STAGING_TEMP_MARKER,
+};
+use crate::git::exec::{GitDeadline, TERMINATION_GRACE};
 use crate::git::GitHooks;
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 pub const TAUQE_CO_AUTHOR_TRAILER: &str = "Co-authored-by: Tauqe AI <noreply@tauqe.dev>";
 pub const CHECKPOINT_PREFIX: &str = "tauqe-checkpoint:";
@@ -148,10 +156,11 @@ fn transaction_marker_path(dir: &Path) -> PathBuf {
 
 /// Reports whether the recorded transaction base is still part of the history of
 /// the commit currently checked out.
-fn is_ancestor_of_head(dir: &Path, ancestor: &str) -> bool {
-    run_git(
+fn is_ancestor_of_head(dir: &Path, ancestor: &str, deadline: &GitDeadline) -> bool {
+    run_git_with_deadline(
         Some(dir),
         &["merge-base", "--is-ancestor", ancestor, "HEAD"],
+        deadline,
     )
     .is_ok()
 }
@@ -161,8 +170,8 @@ fn is_ancestor_of_head(dir: &Path, ancestor: &str) -> bool {
 /// A range nothing resolves to answers with an empty list, so an unborn
 /// branch or an exhausted range is a valid negative answer rather than a
 /// failure the recovery would have to report.
-fn commit_listing(dir: &Path, rev_range: &str) -> Vec<String> {
-    run_git(Some(dir), &["log", "--format=%H", rev_range])
+fn commit_listing(dir: &Path, rev_range: &str, deadline: &GitDeadline) -> Vec<String> {
+    run_git_with_deadline(Some(dir), &["log", "--format=%H", rev_range], deadline)
         .unwrap_or_default()
         .lines()
         .map(|line| line.trim().to_string())
@@ -231,16 +240,59 @@ fn read_transaction_marker(dir: &Path) -> Option<CheckpointInfo> {
     serde_json::from_str(&content).ok()
 }
 
-/// Reports whether the commit currently checked out has a parent.
+/// Reads the subject line of the commit currently checked out.
 ///
-/// An unborn branch has no commit at all and a repository-root commit has no
-/// parent, so both answer negatively.
-fn head_has_parent(dir: &Path) -> bool {
-    run_git(Some(dir), &["rev-parse", "--verify", "--quiet", "HEAD^"]).is_ok()
+/// An unborn branch holds no commit at all, so it answers with an empty string.
+fn head_subject(dir: &Path, deadline: &GitDeadline) -> String {
+    run_git_with_deadline(Some(dir), &["log", "-1", "--format=%s"], deadline)
+        .unwrap_or_default()
+        .trim()
+        .to_string()
 }
 
-/// Unwinds a temporary checkpoint commit at HEAD if present via mixed reset.
-/// Returns true if a checkpoint commit was unwound.
+/// Resolves the full hash of the commit currently checked out.
+///
+/// An unborn branch holds no commit to resolve, which is the `None` answer.
+fn resolve_head(dir: &Path, deadline: &GitDeadline) -> Option<String> {
+    run_git_with_deadline(
+        Some(dir),
+        &["rev-parse", "--verify", "--quiet", "HEAD"],
+        deadline,
+    )
+    .ok()
+    .map(|head| head.trim().to_string())
+    .filter(|head| !head.is_empty())
+}
+
+/// Resolves the hash of the parent of the commit currently checked out.
+///
+/// An unborn branch and a repository-root commit both have no parent, so both
+/// answer with `None`.
+fn head_parent(dir: &Path, deadline: &GitDeadline) -> Option<String> {
+    run_git_with_deadline(
+        Some(dir),
+        &["rev-parse", "--verify", "--quiet", "HEAD^"],
+        deadline,
+    )
+    .ok()
+    .map(|parent| parent.trim().to_string())
+    .filter(|parent| !parent.is_empty())
+}
+/// Unwinds the temporary checkpoint commit a transaction marker records.
+///
+/// The subject prefix identifies a commit shaped like a temporary checkpoint,
+/// but it never authorizes removing that commit from the branch: a hand-written
+/// commit and a checkpoint commit a developer kept after a refused recovery
+/// carry the same subject, and dropping either of them rewrites history nobody
+/// asked to rewrite. Authorization therefore comes from the recorded
+/// transaction base alone. A settled transaction records the checkpoint commit
+/// it created, so HEAD must resolve to exactly that commit. A capturing
+/// transaction records the revision the capture started from, so the checkpoint
+/// commit it created is the parent of HEAD. An unborn base held no commit at
+/// all, so the checkpoint commit it created is the repository root.
+///
+/// A commit no recorded base accounts for is refused, and the branch, the
+/// index, and the working tree stay exactly as they are.
 ///
 /// A checkpoint opened on an unborn branch becomes the repository root commit,
 /// so `HEAD~1` does not resolve and resetting to it would fail after the caller
@@ -250,24 +302,56 @@ fn head_has_parent(dir: &Path) -> bool {
 /// checkpoint's files in the working tree exactly as they were before the turn —
 /// untracked on an unborn branch — while the temporary commit stops being
 /// reachable. Only a genuine Git failure propagates.
-pub fn unwind_checkpoint_if_present(dir: &Path) -> Result<bool> {
-    let head_subject = run_git(Some(dir), &["log", "-1", "--format=%s"])
-        .unwrap_or_default()
-        .trim()
-        .to_string();
-    if !head_subject.starts_with(CHECKPOINT_PREFIX) {
+pub fn unwind_checkpoint_if_present(dir: &Path, checkpoint: &CheckpointInfo) -> Result<bool> {
+    let deadline = GitDeadline::default();
+    unwind_checkpoint_if_present_with_deadline(dir, checkpoint, &deadline)
+}
+
+/// Unwinds the temporary checkpoint commit a transaction marker records, under
+/// the supplied wall-clock budget.
+fn unwind_checkpoint_if_present_with_deadline(
+    dir: &Path,
+    checkpoint: &CheckpointInfo,
+    deadline: &GitDeadline,
+) -> Result<bool> {
+    if !head_subject(dir, deadline).starts_with(CHECKPOINT_PREFIX) {
         return Ok(false);
     }
-    if head_has_parent(dir) {
-        run_git(Some(dir), &["reset", "HEAD~1"])
+    if !recorded_base_authorizes_unwind(dir, checkpoint, deadline) {
+        return Ok(false);
+    }
+    if head_parent(dir, deadline).is_some() {
+        run_git_with_deadline(Some(dir), &["reset", "HEAD~1"], deadline)
             .context("Failed to unwind temporary checkpoint commit")?;
     } else {
-        run_git(Some(dir), &["update-ref", "-d", "HEAD"])
+        run_git_with_deadline(Some(dir), &["update-ref", "-d", "HEAD"], deadline)
             .context("Failed to delete the branch ref of a root checkpoint commit")?;
-        run_git(Some(dir), &["read-tree", "--empty"])
+        run_git_with_deadline(Some(dir), &["read-tree", "--empty"], deadline)
             .context("Failed to clear the index of a root checkpoint commit")?;
     }
     Ok(true)
+}
+
+/// Reports whether the recorded transaction base names the checkpoint commit
+/// HEAD addresses.
+///
+/// This is the only proof that authorizes a history rewrite, so every shape a
+/// marker can record is matched explicitly and anything else answers `false`.
+fn recorded_base_authorizes_unwind(
+    dir: &Path,
+    checkpoint: &CheckpointInfo,
+    deadline: &GitDeadline,
+) -> bool {
+    let Some(head) = resolve_head(dir, deadline) else {
+        return false;
+    };
+    match &checkpoint.base {
+        TransactionBase::Commit(base) if checkpoint.created_checkpoint_commit => &head == base,
+        TransactionBase::Commit(base) => {
+            head_parent(dir, deadline).as_deref() == Some(base.as_str())
+        }
+        TransactionBase::Unborn => head_parent(dir, deadline).is_none(),
+    }
 }
 
 /// Returns a branch that holds commits to the unborn state.
@@ -282,15 +366,19 @@ pub fn unwind_checkpoint_if_present(dir: &Path) -> Result<bool> {
 ///
 /// A branch that is already unborn changes nothing, so the helper is safe
 /// whatever state a crash left behind.
-fn return_to_unborn(dir: &Path) -> Result<()> {
-    if run_git(Some(dir), &["rev-parse", "--verify", "--quiet", "HEAD"]).is_err() {
+fn return_to_unborn(dir: &Path, deadline: &GitDeadline) -> Result<()> {
+    if resolve_head(dir, deadline).is_none() {
         return Ok(());
     }
-    let tracked = run_git(Some(dir), &["ls-tree", "-r", "--name-only", "-z", "HEAD"])
-        .context("Failed to list the paths tracked by the transaction")?;
-    run_git(Some(dir), &["update-ref", "-d", "HEAD"])
+    let tracked = run_git_with_deadline(
+        Some(dir),
+        &["ls-tree", "-r", "--name-only", "-z", "HEAD"],
+        deadline,
+    )
+    .context("Failed to list the paths tracked by the transaction")?;
+    run_git_with_deadline(Some(dir), &["update-ref", "-d", "HEAD"], deadline)
         .context("Failed to delete the branch ref of an unborn base")?;
-    run_git(Some(dir), &["read-tree", "--empty"])
+    run_git_with_deadline(Some(dir), &["read-tree", "--empty"], deadline)
         .context("Failed to clear the index of an unborn base")?;
     for entry in tracked.split('\0').filter(|entry| !entry.is_empty()) {
         let target = dir.join(entry);
@@ -472,8 +560,12 @@ fn live_writer(writer_pid: Option<u32>) -> Option<u32> {
 /// content staged for a rename that never happened, so nothing will read it
 /// again and the file is removed. A name that parses as a staging backup
 /// sibling holds the original content of a commit that stopped halfway: it is
-/// renamed back into place while the target is absent, and dropped once the
-/// target already carries content.
+/// moved back into place while the target is absent, and dropped once the
+/// target already carries content. The restore-versus-yield decision is one
+/// atomic step owned by the crate's atomic-write policy, so a target a
+/// concurrent writer publishes inside the window keeps its content instead of
+/// being replaced by the stale backup. An unexpected failure leaves the
+/// sibling for a later sweep.
 fn reclaim_staging_sibling(path: &Path, dir: &Path, name: &str) -> bool {
     if let Some(sibling) = staging_temp_sibling(name) {
         return live_writer(sibling.owner_pid).is_none() && std::fs::remove_file(path).is_ok();
@@ -483,10 +575,20 @@ fn reclaim_staging_sibling(path: &Path, dir: &Path, name: &str) -> bool {
             return false;
         }
         let target = dir.join(sibling.original);
-        return if target.exists() {
-            std::fs::remove_file(path).is_ok()
-        } else {
-            std::fs::rename(path, &target).is_ok()
+        return match move_without_replace(path, &target) {
+            Ok(NoReplaceMove::Moved) => true,
+            // A destination that already exists belongs to a writer that
+            // published it, so the stale backup name is dropped while the live
+            // content survives.
+            Ok(NoReplaceMove::Occupied) => std::fs::remove_file(path).is_ok(),
+            Err(error) => {
+                tracing::debug!(
+                    "Kept the staging backup sibling {} for a later sweep: {}",
+                    path.display(),
+                    error
+                );
+                false
+            }
         };
     }
     false
@@ -539,12 +641,254 @@ fn cleanup_state_dir_staging_files(root: &Path) -> usize {
 
     cleaned
 }
-/// Appends the staging-artifact count a sweep reclaimed to a recovery message.
-fn with_cleaned_artifacts(message: &str, cleaned_artifacts: usize) -> String {
-    if cleaned_artifacts == 0 {
+/// The index lock of the repository, resolved through Git.
+///
+/// The lock does not always live at `<repository>/.git/index.lock`: a linked
+/// worktree keeps its own index beside its private Git directory, and a
+/// repository Git addresses through another layout moves it elsewhere again.
+/// Git answers where its index lock lives, so the path is never derived from a
+/// guess.
+///
+/// The answer is relative to the directory the child ran in — the repository
+/// root the caller supplied — while an absolute answer replaces it, which is
+/// how [`Path::join`] treats the two. A repository Git cannot inspect answers
+/// `None`, and the caller then treats the repository as holding no lock it may
+/// reclaim.
+fn index_lock_path(dir: &Path) -> Option<PathBuf> {
+    // The probe that locates the lock runs under the crate's default budget:
+    // the caller's budget is the subject of the staleness question, so an
+    // exhausted one would tear the probe down before it could answer where
+    // the lock lives.
+    let deadline = GitDeadline::default();
+    let args = ["rev-parse", "--git-path", "index.lock"];
+    let resolved = run_git_with_deadline(Some(dir), &args, &deadline).ok()?;
+    let trimmed = resolved.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    Some(dir.join(trimmed))
+}
+
+/// The longest lifetime a legitimate Git invocation may give an index lock.
+///
+/// Every Git child runs under a wall-clock budget and receives the termination
+/// grace period to release its locks before it is killed outright, so a lock
+/// older than the sum of the two cannot belong to an invocation that still
+/// runs: the executor would have torn that invocation down already.
+fn index_lock_lifetime(deadline: &GitDeadline) -> Duration {
+    Duration::from_secs(deadline.timeout_secs()) + TERMINATION_GRACE
+}
+
+/// How long the index lock has existed, derived from its modification time.
+///
+/// Git creates the lock when its invocation starts and removes it when the
+/// invocation ends, so a surviving lock dates from inside the invocation that
+/// left it behind. An unreadable or future-dated timestamp proves nothing and
+/// answers `None`.
+fn index_lock_age(lock: &Path) -> Option<Duration> {
+    std::fs::metadata(lock)
+        .ok()?
+        .modified()
+        .ok()?
+        .elapsed()
+        .ok()
+}
+
+/// Removes the index lock and reports whether it existed.
+///
+/// A lock that is already absent is the state a completed invocation leaves
+/// behind, so nothing was reclaimed. Every other failure is reported to the
+/// journal and answers the same way: reclaiming an artifact never fails the
+/// recovery that runs it, and the Git command the surviving lock obstructs
+/// reports the real reason on its own. A reclaimed lock is recorded at `warn`
+/// level, because it reports a process that died holding the repository index.
+fn remove_index_lock(lock: &Path, reason: &str) -> bool {
+    match std::fs::remove_file(lock) {
+        Ok(()) => {
+            tracing::warn!(
+                path = %lock.display(),
+                reason = %reason,
+                "removed an orphaned Git index lock"
+            );
+            true
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+        Err(error) => {
+            tracing::warn!(
+                path = %lock.display(),
+                reason = %error,
+                "kept an orphaned Git index lock that could not be removed"
+            );
+            false
+        }
+    }
+}
+
+/// Removes an orphaned index lock that outlived every invocation that could
+/// own it, and reports whether one was reclaimed.
+///
+/// A Git invocation torn down between creating the lock and removing it leaves
+/// the lock behind, and every later invocation of the same repository then
+/// fails on it. A crashed harness cannot clean up after itself, so the
+/// surviving lock has to be reclaimed by the next one.
+///
+/// Removal rests on age alone, because no marker names the writer of a plain
+/// Git invocation: a lock older than one wall-clock budget plus the
+/// termination grace period cannot belong to an invocation that still runs,
+/// since the executor tears down every child that reaches that age. A younger
+/// lock may belong to a live invocation — another harness process, a developer
+/// command, or a repository hook — so it is left untouched whatever holds it.
+///
+/// A repository Git cannot inspect, an unreadable timestamp, and a lock a
+/// concurrent process removed first all answer `false`: the caller learns that
+/// no orphan was reclaimed, never that the repository is unusable.
+pub fn recover_stale_index_lock(dir: &Path, deadline: &GitDeadline) -> bool {
+    matches!(
+        index_availability(dir, deadline),
+        IndexAvailability::Reclaimed
+    )
+}
+
+/// Whether the repository index can be locked by a Git invocation right now.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IndexAvailability {
+    /// No lock file covers the index.
+    Free,
+    /// A lock outlived every invocation that could own it and was removed, so
+    /// the index is free again.
+    Reclaimed,
+    /// A lock is young enough that a running invocation may still own it; the
+    /// value is how long it has existed.
+    Held(Duration),
+}
+
+/// Reports whether the repository index can be locked right now, reclaiming a
+/// lock that no running invocation may still own.
+///
+/// This is the one implementation of the staleness question
+/// [`recover_stale_index_lock`] answers, so an entry point that is about to
+/// write the index shares it instead of restating the rule.
+pub fn index_availability(dir: &Path, deadline: &GitDeadline) -> IndexAvailability {
+    let Some(lock) = index_lock_path(dir) else {
+        return IndexAvailability::Free;
+    };
+    let Some(age) = index_lock_age(&lock) else {
+        return IndexAvailability::Free;
+    };
+    if age <= index_lock_lifetime(deadline) {
+        return IndexAvailability::Held(age);
+    }
+    let reason = format!(
+        "it outlived the {}-second Git budget and the termination grace period",
+        deadline.timeout_secs()
+    );
+    if remove_index_lock(&lock, &reason) {
+        return IndexAvailability::Reclaimed;
+    }
+    // The removal may have lost a race with a process that released the lock
+    // itself, so the surviving state decides what the caller may do.
+    match index_lock_age(&lock) {
+        Some(age) => IndexAvailability::Held(age),
+        None => IndexAvailability::Free,
+    }
+}
+
+/// Removes the index lock the recorded transaction writer left behind and
+/// reports whether one was reclaimed.
+///
+/// The ownership gate of [`recover_interrupted_workflow`] proves the writer
+/// that opened the transaction gone before this point, so the lock that writer
+/// held belongs to no process that could remove it: a writer that no longer
+/// runs can never clean up after itself, while the recovery commands that
+/// record the index would all fail on the surviving lock.
+///
+/// The proof here is the writer's death rather than the lock's age, because a
+/// startup recovery may run long before the budget the age rule requires has
+/// passed while the marker already names a writer that no longer exists.
+/// [`recover_stale_index_lock`] covers the invocation no marker ever named.
+fn recover_orphaned_index_lock(dir: &Path, writer_pid: u32) -> bool {
+    let Some(lock) = index_lock_path(dir) else {
+        return false;
+    };
+    remove_index_lock(
+        &lock,
+        &format!("the transaction writer (pid {writer_pid}) no longer runs"),
+    )
+}
+
+/// What the sweeps performed ahead of recovery reclaimed from the repository.
+///
+/// Recovery resolves one of several shapes, and every settled shape reports
+/// what it cleaned up. Both reclamations therefore travel together, so no
+/// branch can forget one of them, and a repository that lost nothing renders
+/// no diagnostic at all.
+#[derive(Debug, Clone, Copy)]
+struct ReclaimedOrphans {
+    /// Staging siblings reclaimed by the worktree and state-directory sweeps.
+    staging_files: usize,
+    /// Set once the orphaned lock of the transaction writer was removed.
+    index_lock: bool,
+}
+
+impl ReclaimedOrphans {
+    /// Reports whether the sweeps reclaimed nothing at all.
+    fn is_empty(self) -> bool {
+        self.staging_files == 0 && !self.index_lock
+    }
+
+    /// Renders the reclaimed artifacts as the object of "cleaned up".
+    fn clause(self) -> String {
+        let mut parts = Vec::new();
+        if self.staging_files > 0 {
+            parts.push(format!(
+                "{} orphaned staging artifact(s)",
+                self.staging_files
+            ));
+        }
+        if self.index_lock {
+            parts.push("1 orphaned Git index lock".to_string());
+        }
+        parts.join(" and ")
+    }
+}
+
+/// Appends the artifacts a recovery reclaimed to a recovery message.
+fn with_reclaimed_orphans(message: &str, reclaimed: ReclaimedOrphans) -> String {
+    if reclaimed.is_empty() {
         return message.to_string();
     }
-    format!("{message}, cleaned up {cleaned_artifacts} orphaned staging artifact(s)")
+    format!("{message}, cleaned up {}", reclaimed.clause())
+}
+
+/// Returns the index of an interrupted capture to the recorded base.
+///
+/// The capture stages the developer's work with `git add -A` before the
+/// checkpoint commit records it, so a crash between the two leaves that work
+/// in the index while HEAD still names the recorded base. Clearing the marker
+/// alone would report a complete restoration while the index kept the staged
+/// capture: the next plain `git commit` would publish work the developer never
+/// staged, and the next checkpoint would see a dirty tree this turn produced.
+/// The index therefore returns to the recorded base — a mixed reset for a born
+/// base, and an emptied index for an unborn one, which holds no commit to
+/// reset to. Both commands write the index alone, so every byte of the
+/// developer's work stays in the working tree.
+fn unstage_interrupted_capture(
+    dir: &Path,
+    base: &TransactionBase,
+    deadline: &GitDeadline,
+) -> Result<()> {
+    match base {
+        TransactionBase::Commit(base) => {
+            run_git_with_deadline(Some(dir), &["reset", "--mixed", base], deadline).context(
+                "Failed to unstage the capture an interrupted transaction left in the index",
+            )?;
+        }
+        TransactionBase::Unborn => {
+            run_git_with_deadline(Some(dir), &["read-tree", "--empty"], deadline)
+                .context("Failed to clear the index of a capture interrupted on an unborn base")?;
+        }
+    }
+    Ok(())
 }
 
 /// Recovers a transaction whose marker still records the capturing phase.
@@ -564,37 +908,31 @@ fn with_cleaned_artifacts(message: &str, cleaned_artifacts: usize) -> String {
 fn recover_capturing_transaction(
     dir: &Path,
     checkpoint: &CheckpointInfo,
-    cleaned_artifacts: usize,
+    reclaimed: ReclaimedOrphans,
+    deadline: &GitDeadline,
 ) -> Result<Option<String>> {
-    let head = run_git(Some(dir), &["rev-parse", "--verify", "--quiet", "HEAD"])
-        .ok()
-        .map(|head| head.trim().to_string())
-        .filter(|head| !head.is_empty());
-    let head_subject = run_git(Some(dir), &["log", "-1", "--format=%s"])
-        .unwrap_or_default()
-        .trim()
-        .to_string();
-    let head_is_checkpoint = head.is_some() && head_subject.starts_with(CHECKPOINT_PREFIX);
+    let head = resolve_head(dir, deadline);
+    let subject = head_subject(dir, deadline);
+    let head_is_checkpoint = head.is_some() && subject.starts_with(CHECKPOINT_PREFIX);
     let checkpoint_parent = if head_is_checkpoint {
-        run_git(Some(dir), &["rev-parse", "--verify", "--quiet", "HEAD^"])
-            .ok()
-            .map(|parent| parent.trim().to_string())
-            .filter(|parent| !parent.is_empty())
+        head_parent(dir, deadline)
     } else {
         None
     };
 
     // The capture crashed before it committed, so the working tree still holds
-    // the developer's changes and only the marker is stale.
+    // the developer's changes while the marker and the staged work of the
+    // interrupted `git add -A` are stale.
     let crashed_before_commit = match &checkpoint.base {
         TransactionBase::Commit(base) => head.as_deref() == Some(base.as_str()),
         TransactionBase::Unborn => head.is_none(),
     };
     if crashed_before_commit {
+        unstage_interrupted_capture(dir, &checkpoint.base, deadline)?;
         clear_transaction_marker(dir)?;
-        return Ok(Some(with_cleaned_artifacts(
-            "Closed an interrupted capture: no checkpoint commit was created and the working tree was left untouched",
-            cleaned_artifacts,
+        return Ok(Some(with_reclaimed_orphans(
+            "Closed an interrupted capture: no checkpoint commit was created, the working tree was left untouched, and the index was returned to the recorded base",
+            reclaimed,
         )));
     }
 
@@ -608,12 +946,12 @@ fn recover_capturing_transaction(
             TransactionBase::Unborn => checkpoint_parent.is_none(),
         };
     if crashed_after_commit {
-        unwind_checkpoint_if_present(dir)
+        unwind_checkpoint_if_present_with_deadline(dir, checkpoint, deadline)
             .context("Failed to unwind the checkpoint commit of an interrupted capture")?;
         clear_transaction_marker(dir)?;
-        return Ok(Some(with_cleaned_artifacts(
+        return Ok(Some(with_reclaimed_orphans(
             "Recovered interrupted capture: unwound the checkpoint commit and returned the captured work to the working tree",
-            cleaned_artifacts,
+            reclaimed,
         )));
     }
 
@@ -643,10 +981,19 @@ fn recover_capturing_transaction(
 /// successful recovery returns the tree to the recorded base and unwinds a
 /// temporary checkpoint commit so uncommitted developer changes are restored
 /// safely.
+///
+/// A marker that names a writer which is provably gone also authorizes
+/// reclaiming the index lock that writer left behind, because every recovery
+/// command that records the index would fail on the orphaned
+/// `.git/index.lock` the dead writer never removed.
+///
+/// Startup owns no turn context, so every Git command of the recovery runs
+/// under the default wall-clock budget.
 pub fn recover_interrupted_workflow(dir: &Path) -> Result<Option<String>> {
     if !crate::git::state::is_git_repository(Some(dir)) {
         return Ok(None);
     }
+    let deadline = GitDeadline::default();
 
     let cleaned_artifacts =
         cleanup_orphaned_staging_files(dir) + cleanup_state_dir_staging_files(dir);
@@ -679,6 +1026,20 @@ pub fn recover_interrupted_workflow(dir: &Path) -> Result<Option<String>> {
         )));
     }
 
+    // A writer that is provably gone cannot still hold the index lock it may
+    // have left behind, and every recovery command that records the index
+    // would fail on the surviving lock. The reclaim runs beside the staging
+    // sweep and rests on the same ownership gate: only a marker that names a
+    // writer which no longer runs authorizes it, while a marker of an earlier
+    // revision, which names no writer at all, keeps the previous behavior.
+    let reclaimed = ReclaimedOrphans {
+        staging_files: cleaned_artifacts,
+        index_lock: match checkpoint.writer_pid {
+            Some(writer_pid) => recover_orphaned_index_lock(dir, writer_pid),
+            None => false,
+        },
+    };
+
     // A capturing marker describes a crash inside the capture itself: the
     // developer's work may or may not have reached a checkpoint commit, and no
     // rewrite has recorded the outcome yet. The phase therefore selects the
@@ -686,7 +1047,7 @@ pub fn recover_interrupted_workflow(dir: &Path) -> Result<Option<String>> {
     // rewriting only for a settled transaction.
     match checkpoint.phase {
         TransactionPhase::Capturing => {
-            return recover_capturing_transaction(dir, &checkpoint, cleaned_artifacts);
+            return recover_capturing_transaction(dir, &checkpoint, reclaimed, &deadline);
         }
         TransactionPhase::Established => {}
     }
@@ -701,19 +1062,19 @@ pub fn recover_interrupted_workflow(dir: &Path) -> Result<Option<String>> {
             // switch the base can belong to another branch entirely, and
             // resetting to it would discard commits that were never part of
             // the transaction.
-            if !is_ancestor_of_head(dir, head) {
+            if !is_ancestor_of_head(dir, head, &deadline) {
                 return Ok(Some(format!(
                     "Skipped crash recovery: recorded transaction base {head} is not an ancestor of HEAD; repository left untouched."
                 )));
             }
-            commit_listing(dir, &format!("{head}..HEAD"))
+            commit_listing(dir, &format!("{head}..HEAD"), &deadline)
         }
         // An unborn base held no commit at all, so every commit reachable
         // from HEAD was recorded by the transaction and enters the proof.
-        TransactionBase::Unborn => commit_listing(dir, "HEAD"),
+        TransactionBase::Unborn => commit_listing(dir, "HEAD", &deadline),
     };
     for commit in &commits {
-        let trailers = run_git(
+        let trailers = run_git_with_deadline(
             Some(dir),
             &[
                 "log",
@@ -721,6 +1082,7 @@ pub fn recover_interrupted_workflow(dir: &Path) -> Result<Option<String>> {
                 "--format=%(trailers:key=Co-authored-by)",
                 commit,
             ],
+            &deadline,
         )
         .unwrap_or_default();
         if !trailers.contains("Tauqe AI") {
@@ -738,13 +1100,10 @@ pub fn recover_interrupted_workflow(dir: &Path) -> Result<Option<String>> {
     // legitimate uncommitted working tree changes.
     if unwound_steps == 0 && !checkpoint.created_checkpoint_commit {
         clear_transaction_marker(dir)?;
-        if cleaned_artifacts > 0 {
-            return Ok(Some(format!(
-                "Cleaned up {} orphaned staging artifact(s).",
-                cleaned_artifacts
-            )));
+        if reclaimed.is_empty() {
+            return Ok(None);
         }
-        return Ok(None);
+        return Ok(Some(format!("Cleaned up {}.", reclaimed.clause())));
     }
 
     // Return the tree to the recorded base and unwind a temporary checkpoint
@@ -755,11 +1114,12 @@ pub fn recover_interrupted_workflow(dir: &Path) -> Result<Option<String>> {
     // leave untracked files alone, matching the previous recovery semantics.
     match &checkpoint.base {
         TransactionBase::Commit(head) => {
-            run_git(Some(dir), &["reset", "--hard", head])
+            run_git_with_deadline(Some(dir), &["reset", "--hard", head], &deadline)
                 .context("Failed to reset to the recorded transaction base")?;
         }
         TransactionBase::Unborn => {
-            return_to_unborn(dir).context("Failed to return the branch to its unborn base")?;
+            return_to_unborn(dir, &deadline)
+                .context("Failed to return the branch to its unborn base")?;
         }
     }
     // The reset above has already replaced the pre-turn working tree, so a
@@ -770,7 +1130,7 @@ pub fn recover_interrupted_workflow(dir: &Path) -> Result<Option<String>> {
     // so recovery completes.
     let mut unwind_error = None;
     if checkpoint.created_checkpoint_commit {
-        if let Err(err) = unwind_checkpoint_if_present(dir) {
+        if let Err(err) = unwind_checkpoint_if_present_with_deadline(dir, &checkpoint, &deadline) {
             tracing::error!(
                 "Failed to unwind the checkpoint commit during recovery: {}",
                 err
@@ -800,11 +1160,8 @@ pub fn recover_interrupted_workflow(dir: &Path) -> Result<Option<String>> {
             "Recovered interrupted workflow: unwound {} step commit(s), restored checkpoint: {}",
             unwound_steps, checkpoint.created_checkpoint_commit
         );
-        if cleaned_artifacts > 0 {
-            msg.push_str(&format!(
-                ", cleaned up {} orphaned staging artifact(s)",
-                cleaned_artifacts
-            ));
+        if !reclaimed.is_empty() {
+            msg.push_str(&format!(", cleaned up {}", reclaimed.clause()));
         }
         if let Some(err) = unwind_error {
             msg.push_str(&format!(
@@ -819,11 +1176,8 @@ pub fn recover_interrupted_workflow(dir: &Path) -> Result<Option<String>> {
             ));
         }
         Ok(Some(msg))
-    } else if cleaned_artifacts > 0 {
-        Ok(Some(format!(
-            "Cleaned up {} orphaned staging artifact(s).",
-            cleaned_artifacts
-        )))
+    } else if !reclaimed.is_empty() {
+        Ok(Some(format!("Cleaned up {}.", reclaimed.clause())))
     } else {
         Ok(None)
     }
@@ -855,8 +1209,23 @@ fn tauqe_ignore_rules() -> Vec<String> {
 /// A rule written by an earlier revision is left in place: within one exclude
 /// file a later rule overrides an earlier one, and a repeated run recognises the
 /// rules of the scheme it wrote instead of appending them a second time.
+///
+/// The complete document is published in a single atomic replacement, so the
+/// multi-writer model the ownership gates declare cannot interleave two
+/// installations: an application that appended each rule on its own `O_APPEND`
+/// handle wrote the pattern bytes and the trailing newline of one rule as
+/// distinct syscalls, and two such writers could fuse two rules into one
+/// meaningless line or tear one apart. An interrupted replacement leaves the
+/// previous complete document in place, and a run that finds every rule already
+/// declared writes nothing at all.
 pub fn ensure_tauqe_ignored(dir: &Path) -> Result<()> {
-    let git_dir_res = run_git(Some(dir), &["rev-parse", "--git-dir"]);
+    let deadline = GitDeadline::default();
+    ensure_tauqe_ignored_with_deadline(dir, &deadline)
+}
+
+/// Applies the same installation under the supplied wall-clock budget.
+fn ensure_tauqe_ignored_with_deadline(dir: &Path, deadline: &GitDeadline) -> Result<()> {
+    let git_dir_res = run_git_with_deadline(Some(dir), &["rev-parse", "--git-dir"], deadline);
     if let Ok(git_dir_str) = git_dir_res {
         let trimmed = git_dir_str.trim();
         if !trimmed.is_empty() {
@@ -867,59 +1236,99 @@ pub fn ensure_tauqe_ignored(dir: &Path) -> Result<()> {
             };
             let info_dir = git_dir.join("info");
             let exclude_path = info_dir.join("exclude");
-            let _ = std::fs::create_dir_all(&info_dir);
-            let content = std::fs::read_to_string(&exclude_path).unwrap_or_default();
-            let patterns = tauqe_ignore_rules();
-            let mut to_append = Vec::new();
-            for pat in patterns {
-                let already_ignored = content.lines().any(|line| {
-                    let t = line.trim();
-                    t == pat
-                        || t == format!("{pat}/")
-                        || t == format!("/{pat}")
-                        || t == format!("/{pat}/")
-                });
-                if !already_ignored {
-                    to_append.push(pat);
-                }
-            }
-            if !to_append.is_empty() {
-                use std::io::Write;
-                let mut file = std::fs::OpenOptions::new()
-                    .create(true)
-                    .append(true)
-                    .open(&exclude_path)
-                    .with_context(|| {
-                        format!("Failed to open the Git exclude file: {:?}", exclude_path)
-                    })?;
-                if !content.is_empty() && !content.ends_with('\n') {
-                    writeln!(file)?;
-                }
-                for pat in to_append {
-                    writeln!(file, "{pat}")?;
-                }
+            crate::atomic_write::create_dir_all_durable(&info_dir).with_context(|| {
+                format!("Failed to create the Git info directory: {:?}", info_dir)
+            })?;
+            let content = std::fs::read(&exclude_path).unwrap_or_default();
+            if let Some(document) = exclusion_document(&content, &tauqe_ignore_rules()) {
+                crate::atomic_write::write_atomic(&exclude_path, &document).with_context(|| {
+                    format!("Failed to publish the Git exclude file: {:?}", exclude_path)
+                })?;
             }
 
-            // Appending a pattern does not prove that Git honours it: a project
+            // Publishing a pattern does not prove that Git honours it: a project
             // `.gitignore` outranks `.git/info/exclude` and can re-include a
             // protected path, and a path already in the index is never ignored.
-            verify_protected_paths_ignored(dir)?;
+            verify_protected_paths_ignored(dir, deadline)?;
         }
     }
     Ok(())
 }
 
+/// Builds the complete exclusion document, or reports that nothing is missing.
+///
+/// A document that already declares every rule answers with `None`, so a
+/// repeated installation leaves the file untouched instead of rewriting
+/// identical bytes. Otherwise the existing content is carried over verbatim, one
+/// separator newline closes it exactly when it is non-empty and lacks a
+/// terminator, and every missing rule follows newline-terminated.
+///
+/// The content travels as bytes, so an exclude file this process cannot decode
+/// keeps every byte it carries; the rule recognition runs over a lossy view,
+/// where an undecodable line simply declares no rule.
+fn exclusion_document(existing: &[u8], rules: &[String]) -> Option<Vec<u8>> {
+    let declared = String::from_utf8_lossy(existing);
+    let missing: Vec<&String> = rules
+        .iter()
+        .filter(|rule| {
+            !declared
+                .lines()
+                .any(|line| declares_rule(line, rule.as_str()))
+        })
+        .collect();
+    if missing.is_empty() {
+        return None;
+    }
+
+    let missing_bytes: usize = missing.iter().map(|rule| rule.len() + 1).sum();
+    let mut document = Vec::with_capacity(existing.len() + 1 + missing_bytes);
+    document.extend_from_slice(existing);
+    if !existing.is_empty() && !existing.ends_with(b"\n") {
+        document.push(b'\n');
+    }
+    for rule in missing {
+        document.extend_from_slice(rule.as_bytes());
+        document.push(b'\n');
+    }
+    Some(document)
+}
+
+/// Reports whether `line` already declares `rule`, under any accepted spelling.
+///
+/// An exclude file a developer or an earlier revision edited may carry the rule
+/// with a leading or a trailing separator, and both spellings cover the same
+/// paths. Recognising them keeps a repeated installation from appending a
+/// duplicate rule beside the equivalent one.
+fn declares_rule(line: &str, rule: &str) -> bool {
+    let trimmed = line.trim();
+    trimmed == rule
+        || trimmed == format!("{rule}/")
+        || trimmed == format!("/{rule}")
+        || trimmed == format!("/{rule}/")
+}
+
 /// Repository-relative paths a checkpoint commit must never stage.
 ///
-/// They hold the OpenRouter API key, so a temporary commit that includes them
-/// keeps the secret in the object database and the reflog long after the
-/// checkpoint is unwound. Rolling history back does not remove the object, and
-/// any tooling that walks dangling commits can read it.
-const PROTECTED_PATHS: [&str; 3] = [
-    ".tauqe/credentials.toml",
-    "credentials.toml",
-    ".credentials.toml",
-];
+/// The credential paths hold the OpenRouter API key, while the transaction
+/// marker and the staging representatives name the harness state and the
+/// artifacts of an interrupted atomic replacement. A temporary commit that
+/// includes any of them keeps it in the object database and the reflog long
+/// after the checkpoint is unwound. Rolling history back does not remove the
+/// object, and any tooling that walks dangling commits can read it.
+///
+/// The two staging representatives are derived from the marker constants the
+/// atomic-write policy declares, so the proof names the suffixes that policy
+/// really writes instead of restating them.
+fn protected_paths() -> Vec<String> {
+    vec![
+        TRANSACTION_MARKER_FILE.to_string(),
+        ".tauqe/credentials.toml".to_string(),
+        "credentials.toml".to_string(),
+        ".credentials.toml".to_string(),
+        format!("draft.rs{STAGING_TEMP_MARKER}"),
+        format!("draft.rs{STAGING_BACKUP_MARKER}"),
+    ]
+}
 
 /// Fails when Git does not exclude every protected path.
 ///
@@ -927,18 +1336,16 @@ const PROTECTED_PATHS: [&str; 3] = [
 /// may only be created once the ignore rules are proven to cover the protected
 /// set. The proof is one batched `git check-ignore` call for the whole set, and it
 /// is deliberately fail-closed: an unanswered or negative probe aborts the
-/// checkpoint instead of committing a credential file into a temporary commit.
-fn verify_protected_paths_ignored(dir: &Path) -> Result<()> {
-    let candidates: Vec<String> = PROTECTED_PATHS
-        .iter()
-        .map(|path| path.to_string())
-        .collect();
-    let ignored = run_git_check_ignore(dir, &candidates)
+/// checkpoint instead of committing a credential file or harness state into a
+/// temporary commit.
+fn verify_protected_paths_ignored(dir: &Path, deadline: &GitDeadline) -> Result<()> {
+    let candidates = protected_paths();
+    let ignored = run_git_check_ignore_with_deadline(dir, &candidates, deadline)
         .context("Failed to verify that the protected paths are ignored by Git")?;
 
-    let leaked: Vec<&str> = PROTECTED_PATHS
+    let leaked: Vec<&str> = candidates
         .iter()
-        .copied()
+        .map(String::as_str)
         .filter(|path| !ignored.iter().any(|entry| entry.as_str() == *path))
         .collect();
 
@@ -948,7 +1355,7 @@ fn verify_protected_paths_ignored(dir: &Path) -> Result<()> {
 
     bail!(
         "Refusing to create a checkpoint: Git does not ignore protected path(s): {}; \
-         unresolvable ignore rules would commit a credential file",
+         unresolvable ignore rules would commit a credential file or harness state",
         leaked.join(", ")
     );
 }
@@ -963,18 +1370,30 @@ fn verify_protected_paths_ignored(dir: &Path) -> Result<()> {
 ///
 /// `hooks` is the hook policy the temporary checkpoint commit follows.
 pub fn create_checkpoint(dir: &Path, hooks: GitHooks) -> Result<CheckpointInfo> {
+    let deadline = GitDeadline::default();
+    create_checkpoint_with_deadline(dir, hooks, &deadline)
+}
+
+/// Creates a safe checkpoint of uncommitted changes, under the supplied
+/// wall-clock budget.
+pub fn create_checkpoint_with_deadline(
+    dir: &Path,
+    hooks: GitHooks,
+    deadline: &GitDeadline,
+) -> Result<CheckpointInfo> {
     // The ignore rules are the only mechanism that keeps the credential file out
     // of `git add -A`, so a failure to install them aborts the checkpoint instead
     // of committing the API key into a temporary commit.
-    ensure_tauqe_ignored(dir)?;
+    ensure_tauqe_ignored_with_deadline(dir, deadline)?;
 
-    let status = run_git(Some(dir), &["status", "--porcelain"]).unwrap_or_default();
+    let status =
+        run_git_with_deadline(Some(dir), &["status", "--porcelain"], deadline).unwrap_or_default();
     let is_dirty = !status.trim().is_empty();
 
     // A resolving HEAD names the commit the transaction starts from; a failing
     // one means the branch is unborn, which the marker records as the typed
     // unborn state rather than the moving ref `HEAD`.
-    let base = match run_git(Some(dir), &["rev-parse", "HEAD"]) {
+    let base = match run_git_with_deadline(Some(dir), &["rev-parse", "HEAD"], deadline) {
         Ok(head) => TransactionBase::Commit(head.trim().to_string()),
         Err(_) => TransactionBase::Unborn,
     };
@@ -1005,17 +1424,18 @@ pub fn create_checkpoint(dir: &Path, hooks: GitHooks) -> Result<CheckpointInfo> 
     // Stage and commit uncommitted user changes into a checkpoint commit.
     // Ignored paths (.tauqe, credentials, temporary files) in .git/info/exclude
     // are automatically skipped by git add -A without argument pathspec errors.
-    run_git(Some(dir), &["add", "-A"])
+    run_git_with_deadline(Some(dir), &["add", "-A"], deadline)
         .context("Failed to stage uncommitted changes for checkpoint")?;
 
-    commit_with_developer_author(
+    commit_with_developer_author_with_deadline(
         dir,
         "tauqe-checkpoint: uncommitted user changes",
         false,
         hooks,
+        deadline,
     )?;
 
-    let new_head = run_git(Some(dir), &["rev-parse", "HEAD"])
+    let new_head = run_git_with_deadline(Some(dir), &["rev-parse", "HEAD"], deadline)
         .unwrap_or_default()
         .trim()
         .to_string();
@@ -1034,17 +1454,28 @@ pub fn create_checkpoint(dir: &Path, hooks: GitHooks) -> Result<CheckpointInfo> 
 
 /// Restores working tree back to pre-checkpoint state (used on workflow failure/cancellation).
 pub fn restore_checkpoint(dir: &Path, checkpoint: &CheckpointInfo) -> Result<()> {
+    let deadline = GitDeadline::default();
+    restore_checkpoint_with_deadline(dir, checkpoint, &deadline)
+}
+
+/// Restores the working tree to the pre-checkpoint state under the supplied
+/// wall-clock budget.
+pub fn restore_checkpoint_with_deadline(
+    dir: &Path,
+    checkpoint: &CheckpointInfo,
+    deadline: &GitDeadline,
+) -> Result<()> {
     // 1. Return the working tree to the checkpoint base. An unborn base
     //    holds no commit to reset to, so returning the tree to it removes
     //    exactly the paths the transaction tracked and deletes the branch
     //    ref.
     match &checkpoint.base {
         TransactionBase::Commit(head) => {
-            run_git(Some(dir), &["reset", "--hard", head])?;
+            run_git_with_deadline(Some(dir), &["reset", "--hard", head], deadline)?;
         }
-        TransactionBase::Unborn => return_to_unborn(dir)?,
+        TransactionBase::Unborn => return_to_unborn(dir, deadline)?,
     }
-    let _ = run_git(
+    let _ = run_git_with_deadline(
         Some(dir),
         &[
             "clean",
@@ -1056,6 +1487,7 @@ pub fn restore_checkpoint(dir: &Path, checkpoint: &CheckpointInfo) -> Result<()>
             "-e",
             ".credentials.toml",
         ],
+        deadline,
     );
 
     // 2. Close the transaction before the checkpoint is unwound. The reset above
@@ -1065,12 +1497,14 @@ pub fn restore_checkpoint(dir: &Path, checkpoint: &CheckpointInfo) -> Result<()>
     //    rollback-retry loop of the engine can act on.
     clear_transaction_marker(dir)?;
     if checkpoint.created_checkpoint_commit {
-        unwind_checkpoint_if_present(dir).with_context(|| {
-            format!(
-                "the working tree was reset but the `{CHECKPOINT_PREFIX}` commit could not \
+        unwind_checkpoint_if_present_with_deadline(dir, checkpoint, deadline).with_context(
+            || {
+                format!(
+                    "the working tree was reset but the `{CHECKPOINT_PREFIX}` commit could not \
                  be unwound; the pre-turn work stays recoverable inside it at HEAD"
-            )
-        })?;
+                )
+            },
+        )?;
     }
 
     cleanup_orphaned_staging_files(dir);
@@ -1086,26 +1520,37 @@ pub fn create_step_commit(
     step_name: &str,
     hooks: GitHooks,
 ) -> Result<String> {
+    let deadline = GitDeadline::default();
+    create_step_commit_with_deadline(dir, changed_files, step_name, hooks, &deadline)
+}
+
+/// Creates an intermediate step commit under the supplied wall-clock budget.
+pub fn create_step_commit_with_deadline(
+    dir: &Path,
+    changed_files: &[String],
+    step_name: &str,
+    hooks: GitHooks,
+    deadline: &GitDeadline,
+) -> Result<String> {
     if changed_files.is_empty() {
         return Ok(String::new());
     }
 
-    stage_files(dir, changed_files)?;
+    stage_files_with_deadline(dir, changed_files, deadline)?;
 
     let commit_message = format!(
         "tauqe-step: {}\n\n{}",
         step_name.trim(),
         TAUQE_CO_AUTHOR_TRAILER
     );
-    commit_with_developer_author(dir, &commit_message, false, hooks)?;
+    commit_with_developer_author_with_deadline(dir, &commit_message, false, hooks, deadline)?;
 
-    let short_hash = run_git(Some(dir), &["rev-parse", "--short", "HEAD"])?
+    let short_hash = run_git_with_deadline(Some(dir), &["rev-parse", "--short", "HEAD"], deadline)?
         .trim()
         .to_string();
 
     Ok(short_hash)
 }
-/// Closes an open transaction whose change set produced no tracked path.
 ///
 /// A bounded turn can verify cleanly while every file it wrote lives outside
 /// Git: the `.tauqe/mockups/` sandbox is the documented case, because the
@@ -1117,9 +1562,11 @@ pub fn create_step_commit(
 fn close_transaction_without_changes(
     dir: &Path,
     checkpoint: Option<&CheckpointInfo>,
+    deadline: &GitDeadline,
 ) -> Result<String> {
-    if matches!(checkpoint, Some(checkpoint) if checkpoint.created_checkpoint_commit) {
-        let _ = unwind_checkpoint_if_present(dir)?;
+    let created = checkpoint.filter(|checkpoint| checkpoint.created_checkpoint_commit);
+    if let Some(checkpoint) = created {
+        let _ = unwind_checkpoint_if_present_with_deadline(dir, checkpoint, deadline)?;
     }
     clear_transaction_marker(dir)?;
     Ok(String::new())
@@ -1139,8 +1586,22 @@ pub fn finalize_ai_commit(
     summary: &str,
     hooks: GitHooks,
 ) -> Result<String> {
+    let deadline = GitDeadline::default();
+    finalize_ai_commit_with_deadline(dir, checkpoint, changed_files, summary, hooks, &deadline)
+}
+
+/// Squashes the intermediate step commits into one AI commit under the supplied
+/// wall-clock budget.
+pub fn finalize_ai_commit_with_deadline(
+    dir: &Path,
+    checkpoint: &CheckpointInfo,
+    changed_files: &[String],
+    summary: &str,
+    hooks: GitHooks,
+    deadline: &GitDeadline,
+) -> Result<String> {
     if changed_files.is_empty() {
-        return close_transaction_without_changes(dir, Some(checkpoint));
+        return close_transaction_without_changes(dir, Some(checkpoint), deadline);
     }
 
     // 1. Soft-reset back to the checkpoint base, so every step commit becomes
@@ -1150,12 +1611,12 @@ pub fn finalize_ai_commit(
     //    squashed root instead of an empty commit on top of the last step.
     match &checkpoint.base {
         TransactionBase::Commit(head) => {
-            run_git(Some(dir), &["reset", "--soft", head])
+            run_git_with_deadline(Some(dir), &["reset", "--soft", head], deadline)
                 .context("Failed to soft reset to checkpoint base")?;
         }
         TransactionBase::Unborn => {
-            if run_git(Some(dir), &["rev-parse", "--verify", "--quiet", "HEAD"]).is_ok() {
-                run_git(Some(dir), &["update-ref", "-d", "HEAD"])
+            if resolve_head(dir, deadline).is_some() {
+                run_git_with_deadline(Some(dir), &["update-ref", "-d", "HEAD"], deadline)
                     .context("Failed to soft reset to the unborn checkpoint base")?;
             }
         }
@@ -1163,7 +1624,7 @@ pub fn finalize_ai_commit(
 
     // 2. If checkpoint commit was created, unwind it so user uncommitted changes stay in working tree
     if checkpoint.created_checkpoint_commit {
-        let _ = unwind_checkpoint_if_present(dir)?;
+        let _ = unwind_checkpoint_if_present_with_deadline(dir, checkpoint, deadline)?;
     }
 
     // Step commits and temporary checkpoint commits have been unwound back to the
@@ -1173,18 +1634,17 @@ pub fn finalize_ai_commit(
     clear_transaction_marker(dir)?;
 
     // 3. Stage touched files
-    stage_files(dir, changed_files)?;
+    stage_files_with_deadline(dir, changed_files, deadline)?;
 
     let commit_message = format!("{}\n\n{}", summary.trim(), TAUQE_CO_AUTHOR_TRAILER);
-    commit_with_developer_author(dir, &commit_message, false, hooks)?;
+    commit_with_developer_author_with_deadline(dir, &commit_message, false, hooks, deadline)?;
 
-    let short_hash = run_git(Some(dir), &["rev-parse", "--short", "HEAD"])?
+    let short_hash = run_git_with_deadline(Some(dir), &["rev-parse", "--short", "HEAD"], deadline)?
         .trim()
         .to_string();
 
     Ok(short_hash)
 }
-
 /// Creates an isolated AI commit containing only the files modified by the model.
 ///
 /// `hooks` is the hook policy the commit follows.
@@ -1194,21 +1654,35 @@ pub fn create_ai_commit(
     summary: &str,
     hooks: GitHooks,
 ) -> Result<String> {
+    let deadline = GitDeadline::default();
+    create_ai_commit_with_deadline(dir, changed_files, summary, hooks, &deadline)
+}
+
+/// Creates an isolated AI commit under the supplied wall-clock budget.
+pub fn create_ai_commit_with_deadline(
+    dir: &Path,
+    changed_files: &[String],
+    summary: &str,
+    hooks: GitHooks,
+    deadline: &GitDeadline,
+) -> Result<String> {
     if changed_files.is_empty() {
-        return close_transaction_without_changes(dir, None);
+        return close_transaction_without_changes(dir, None, deadline);
     }
 
-    // If HEAD is a temporary checkpoint commit, unwind it so user dirty changes remain in working tree
-    let _ = unwind_checkpoint_if_present(dir)?;
+    // An isolated commit holds no transaction marker, so no recorded base
+    // authorizes removing a temporary checkpoint commit from the branch: a
+    // commit of that shape stays in the history, exactly as a hand-written one
+    // would.
 
     clear_transaction_marker(dir)?;
 
-    stage_files(dir, changed_files)?;
+    stage_files_with_deadline(dir, changed_files, deadline)?;
 
     let commit_message = format!("{}\n\n{}", summary.trim(), TAUQE_CO_AUTHOR_TRAILER);
-    commit_with_developer_author(dir, &commit_message, false, hooks)?;
+    commit_with_developer_author_with_deadline(dir, &commit_message, false, hooks, deadline)?;
 
-    let short_hash = run_git(Some(dir), &["rev-parse", "--short", "HEAD"])?
+    let short_hash = run_git_with_deadline(Some(dir), &["rev-parse", "--short", "HEAD"], deadline)?
         .trim()
         .to_string();
 

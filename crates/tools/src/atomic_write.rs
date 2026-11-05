@@ -46,7 +46,11 @@
 //! into the file it stages or backs up and the writer that owns it.
 //! [`is_process_alive`] probes whether such a writer still runs — the
 //! question a reclaim pass must answer before it may touch a sibling another
-//! process might still own.
+//! process might still own. The restore a reclaim pass performs follows the
+//! same rule: [`move_without_replace`] publishes a sibling under its target
+//! only when no destination exists yet, so a target a concurrent writer
+//! created inside the window keeps its content instead of being replaced by
+//! stale bytes.
 //!
 //! The same policy covers the highest-stakes write in the system: committing a
 //! validated change set over the developer's source files. [`SiblingCommit`]
@@ -409,6 +413,59 @@ pub fn is_process_alive(_pid: u32) -> bool {
     true
 }
 
+/// The result of a no-replace move of a staging sibling onto its target.
+///
+/// These are the two answers a reclaim pass acts on: the move published the
+/// source content under the destination name, or another writer already owns
+/// the destination.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum NoReplaceMove {
+    /// The source content now sits at the destination and the source name is
+    /// gone.
+    Moved,
+    /// The destination already existed and kept every byte it carried; the
+    /// source name was left untouched.
+    Occupied,
+}
+
+/// Moves `source` onto `destination` without ever replacing an existing
+/// destination.
+///
+/// A reclaim pass restores the backup sibling of a writer that is provably
+/// gone, yet it runs in the multi-writer model the ownership gates declare:
+/// another harness process may publish the destination while the pass runs.
+/// An existence probe followed by [`std::fs::rename`] is not one operation —
+/// on POSIX the rename replaces a destination created in between — so the
+/// sweep would silently overwrite a file a live process believes it just
+/// published. This primitive therefore decides restore-versus-yield in a
+/// single atomic step: [`std::fs::hard_link`] fails with
+/// [`std::io::ErrorKind::AlreadyExists`] exactly when the destination exists,
+/// and the source name is removed only after the link is in place.
+///
+/// A staging sibling is always created next to its target, so the link never
+/// crosses a filesystem. An existing destination keeps every byte it carries,
+/// and every genuine I/O failure is propagated so the caller leaves the
+/// sibling in place for a later sweep.
+pub(crate) fn move_without_replace(
+    source: &Path,
+    destination: &Path,
+) -> std::io::Result<NoReplaceMove> {
+    match std::fs::hard_link(source, destination) {
+        Ok(()) => {
+            // The destination carries the source content now, so dropping the
+            // source name completes the move. A failure here leaves both names
+            // holding the same bytes while the destination is already
+            // published.
+            std::fs::remove_file(source)?;
+            Ok(NoReplaceMove::Moved)
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            Ok(NoReplaceMove::Occupied)
+        }
+        Err(error) => Err(error),
+    }
+}
+
 /// Copies the permissions of `target` onto `staged` when `target` exists.
 ///
 /// A replacement must never change who may access the file it overwrites: a
@@ -597,9 +654,10 @@ impl SiblingCommit {
 #[cfg(test)]
 mod tests {
     use super::{
-        create_dir_all_durable, is_process_alive, remove_atomic, staging_backup_original_name,
-        staging_backup_sibling, staging_path, staging_temp_original_name, staging_temp_sibling,
-        write_atomic, SiblingCommit,
+        create_dir_all_durable, is_process_alive, move_without_replace, remove_atomic,
+        staging_backup_original_name, staging_backup_sibling, staging_path,
+        staging_temp_original_name, staging_temp_sibling, write_atomic, NoReplaceMove,
+        SiblingCommit,
     };
     use std::path::Path;
     use tempfile::tempdir;
@@ -879,6 +937,57 @@ mod tests {
         assert_eq!(staging_backup_original_name("source.rs"), None);
         assert_eq!(staging_temp_sibling("source.rs"), None);
         assert_eq!(staging_backup_sibling("source.rs"), None);
+    }
+
+    #[test]
+    fn a_no_replace_move_publishes_the_source_content_onto_an_absent_destination() {
+        let dir = tempdir().unwrap();
+        let source = dir.path().join("notes.md.tauqe-bak.4242.1");
+        let destination = dir.path().join("notes.md");
+        std::fs::write(&source, "original content").unwrap();
+
+        let outcome = move_without_replace(&source, &destination).unwrap();
+
+        assert_eq!(outcome, NoReplaceMove::Moved);
+        assert_eq!(
+            std::fs::read_to_string(&destination).unwrap(),
+            "original content"
+        );
+        assert!(!source.exists(), "the source name is gone after the move");
+    }
+
+    #[test]
+    fn a_no_replace_move_preserves_an_occupied_destination() {
+        let dir = tempdir().unwrap();
+        let source = dir.path().join("notes.md.tauqe-bak.4242.2");
+        let destination = dir.path().join("notes.md");
+        std::fs::write(&source, "stale original").unwrap();
+        std::fs::write(&destination, "freshly committed").unwrap();
+
+        let outcome = move_without_replace(&source, &destination).unwrap();
+
+        assert_eq!(outcome, NoReplaceMove::Occupied);
+        assert_eq!(
+            std::fs::read_to_string(&destination).unwrap(),
+            "freshly committed",
+            "an occupied destination keeps every byte it carries"
+        );
+        assert!(source.exists(), "the occupied move leaves the source alone");
+    }
+
+    #[test]
+    fn a_no_replace_move_of_a_missing_source_reports_the_failure() {
+        let dir = tempdir().unwrap();
+        let source = dir.path().join("missing.md.tauqe-bak.4242.3");
+        let destination = dir.path().join("missing.md");
+
+        let outcome = move_without_replace(&source, &destination);
+
+        assert!(
+            outcome.is_err(),
+            "a missing source is an I/O failure, never a move"
+        );
+        assert!(!destination.exists());
     }
 
     #[test]

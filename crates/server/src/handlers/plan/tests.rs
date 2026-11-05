@@ -123,6 +123,7 @@ async fn test_plan_batch_fail_fast_resets_status() {
         .unwrap()
         .unwrap();
     assert!(reloaded
+        .implementation
         .items
         .iter()
         .all(|i| i.status == PlanItemStatus::Todo));
@@ -237,7 +238,7 @@ async fn test_plan_batch_skips_done_and_stops_on_discussion() {
     }
     let reloaded = PlanStorage::load_plan(dir.path(), "skip").unwrap().unwrap();
     assert_eq!(
-        reloaded.find_item("2").unwrap().status,
+        reloaded.implementation.find_item("2").unwrap().status,
         PlanItemStatus::Discussion
     );
 }
@@ -291,11 +292,11 @@ async fn test_plan_batch_skips_done_and_stops_on_blocked() {
         .unwrap()
         .unwrap();
     assert_eq!(
-        reloaded.find_item("2").unwrap().status,
+        reloaded.implementation.find_item("2").unwrap().status,
         PlanItemStatus::Blocked
     );
     assert_eq!(
-        reloaded.find_item("3").unwrap().status,
+        reloaded.implementation.find_item("3").unwrap().status,
         PlanItemStatus::Todo
     );
 }
@@ -634,6 +635,7 @@ async fn test_plan_execute_blocked_by_failed_preflight() {
         .unwrap()
         .unwrap();
     assert!(reloaded
+        .implementation
         .items
         .iter()
         .all(|i| i.status == PlanItemStatus::Todo));
@@ -720,6 +722,7 @@ async fn test_plan_execute_preflight_is_torn_down_by_a_hard_cancel() {
         .unwrap()
         .unwrap();
     assert!(reloaded
+        .implementation
         .items
         .iter()
         .all(|i| i.status == PlanItemStatus::Todo));
@@ -981,11 +984,11 @@ async fn test_handle_plan_replan_with_mock_provider() {
         .unwrap();
     // The Done foundation is preserved, the uncompleted horizon is replaced.
     assert_eq!(
-        reloaded.find_item("1").unwrap().status,
+        reloaded.implementation.find_item("1").unwrap().status,
         PlanItemStatus::Done
     );
-    assert!(reloaded.find_item("2.1").is_some());
-    assert!(reloaded.find_item("2").is_none());
+    assert!(reloaded.implementation.find_item("2.1").is_some());
+    assert!(reloaded.implementation.find_item("2").is_none());
 }
 
 #[tokio::test]
@@ -1152,7 +1155,7 @@ async fn test_handle_plan_replan_retries_when_requested_files_already_loaded() {
     let reloaded = PlanStorage::load_plan(dir.path(), "replan-satisfied")
         .unwrap()
         .unwrap();
-    assert!(reloaded.find_item("2.1").is_some());
+    assert!(reloaded.implementation.find_item("2.1").is_some());
 }
 
 #[tokio::test]
@@ -1531,7 +1534,7 @@ async fn test_plan_step_execution_uses_turn_marker() {
         .unwrap()
         .unwrap();
     assert_eq!(
-        reloaded.find_item("1").unwrap().status,
+        reloaded.implementation.find_item("1").unwrap().status,
         PlanItemStatus::Done
     );
 }
@@ -1621,9 +1624,9 @@ async fn test_plan_batch_automated_replanning_on_blocked_step() {
     let reloaded = PlanStorage::load_plan(dir.path(), "auto-replan")
         .unwrap()
         .unwrap();
-    assert!(reloaded.find_item("1.1").is_some());
+    assert!(reloaded.implementation.find_item("1.1").is_some());
     assert_eq!(
-        reloaded.find_item("1.1").unwrap().status,
+        reloaded.implementation.find_item("1.1").unwrap().status,
         PlanItemStatus::Done
     );
     assert_eq!(
@@ -1728,7 +1731,7 @@ async fn test_plan_batch_defers_architect_escalation_until_repeated_failure() {
         .unwrap()
         .unwrap();
     assert_eq!(
-        reloaded.find_item("1").unwrap().status,
+        reloaded.implementation.find_item("1").unwrap().status,
         PlanItemStatus::Done
     );
     assert_eq!(
@@ -1841,7 +1844,7 @@ async fn test_plan_batch_automated_replanning_limit_exhausted() {
         .unwrap()
         .unwrap();
     assert_eq!(
-        reloaded.find_item("1.1").unwrap().status,
+        reloaded.implementation.find_item("1.1").unwrap().status,
         PlanItemStatus::Blocked
     );
 }
@@ -1946,11 +1949,11 @@ async fn test_plan_batch_stops_on_abort_without_replanning() {
         .unwrap()
         .unwrap();
     assert_eq!(
-        reloaded.find_item("1").unwrap().status,
+        reloaded.implementation.find_item("1").unwrap().status,
         PlanItemStatus::Todo
     );
     assert_eq!(
-        reloaded.find_item("2").unwrap().status,
+        reloaded.implementation.find_item("2").unwrap().status,
         PlanItemStatus::Todo
     );
     assert_eq!(
@@ -2010,6 +2013,7 @@ async fn test_plan_batch_stops_gracefully_on_soft_stop() {
         .unwrap()
         .unwrap();
     assert!(reloaded
+        .implementation
         .items
         .iter()
         .all(|i| i.status == PlanItemStatus::Todo));
@@ -2171,7 +2175,7 @@ async fn test_plan_batch_projects_conceptual_horizon_just_in_time() {
         .unwrap()
         .unwrap();
     assert_eq!(
-        reloaded.find_item("1").unwrap().status,
+        reloaded.implementation.find_item("1").unwrap().status,
         PlanItemStatus::Done
     );
 }
@@ -2270,6 +2274,7 @@ async fn test_plan_pipeline_blocked_by_failed_preflight() {
         .unwrap()
         .unwrap();
     assert!(reloaded
+        .implementation
         .items
         .iter()
         .all(|i| i.status == PlanItemStatus::Todo));
@@ -2356,7 +2361,7 @@ async fn test_handle_plan_refine_renders_targeted_repo_map_feedback() {
     let reloaded = PlanStorage::load_plan(dir.path(), "refine-repomap")
         .unwrap()
         .unwrap();
-    assert!(reloaded.find_item("1.1").is_some());
+    assert!(reloaded.implementation.find_item("1.1").is_some());
 }
 
 #[tokio::test]
@@ -2492,7 +2497,10 @@ async fn test_plan_refine_regenerates_round_after_unparsable_response() {
     let reloaded = PlanStorage::load_plan(dir.path(), "parse-retry")
         .unwrap()
         .unwrap();
-    assert_eq!(reloaded.find_item("1").unwrap().title, "Refined step 1");
+    assert_eq!(
+        reloaded.implementation.find_item("1").unwrap().title,
+        "Refined step 1"
+    );
 }
 
 #[tokio::test]
@@ -2562,8 +2570,8 @@ async fn test_plan_refine_recovers_from_a_transport_break() {
     let reloaded = PlanStorage::load_plan(dir.path(), "stream-break")
         .unwrap()
         .unwrap();
-    assert!(reloaded.find_item("1.1").is_some());
-    assert!(reloaded.find_item("1").is_none());
+    assert!(reloaded.implementation.find_item("1.1").is_some());
+    assert!(reloaded.implementation.find_item("1").is_none());
 }
 
 #[tokio::test]
@@ -2627,9 +2635,12 @@ async fn test_plan_refine_blocks_after_the_tier_budget_is_spent() {
     let reloaded = PlanStorage::load_plan(dir.path(), "parse-exhausted")
         .unwrap()
         .unwrap();
-    assert_eq!(reloaded.find_item("1").unwrap().title, "Step 1");
     assert_eq!(
-        reloaded.find_item("1").unwrap().status,
+        reloaded.implementation.find_item("1").unwrap().title,
+        "Step 1"
+    );
+    assert_eq!(
+        reloaded.implementation.find_item("1").unwrap().status,
         PlanItemStatus::Todo
     );
 }
@@ -2724,9 +2735,13 @@ async fn test_plan_refine_escalates_the_architect_ladder_after_a_spent_tier_budg
     let reloaded = PlanStorage::load_plan(dir.path(), "architect-ladder")
         .unwrap()
         .unwrap();
-    assert!(reloaded.find_item("1.1").is_some());
+    assert!(reloaded.implementation.find_item("1.1").is_some());
     assert_eq!(
-        reloaded.architect.as_ref().map(|tier| tier.model.clone()),
+        reloaded
+            .implementation
+            .architect
+            .as_ref()
+            .map(|tier| tier.model.clone()),
         Some(tauqe_protocol::ModelRef::openrouter("planner/two"))
     );
 }
@@ -2991,7 +3006,7 @@ async fn test_plan_batch_persists_the_blocked_reason_on_disk() {
     let reloaded = PlanStorage::load_plan(dir.path(), "blocked-reason")
         .unwrap()
         .unwrap();
-    let stored = reloaded.find_item("1").unwrap();
+    let stored = reloaded.implementation.find_item("1").unwrap();
     assert_eq!(stored.status, PlanItemStatus::Blocked);
     assert_eq!(stored.blocked_reason.as_deref(), Some(reason));
 
@@ -3098,7 +3113,7 @@ async fn test_plan_step_structured_protocol_execution() {
         .unwrap()
         .unwrap();
     assert_eq!(
-        reloaded.find_item("1").unwrap().status,
+        reloaded.implementation.find_item("1").unwrap().status,
         PlanItemStatus::Done
     );
 }
@@ -3163,6 +3178,7 @@ async fn test_plan_batch_starts_ladder_from_the_selected_coder_tier() {
         model: Some(tauqe_protocol::ModelSelection::Specific(
             tauqe_protocol::ModelRef::openrouter("coder/mid"),
         )),
+        step_id: None,
     };
     let outcome = run_plan_batch(
         &state,
@@ -3189,7 +3205,7 @@ async fn test_plan_batch_starts_ladder_from_the_selected_coder_tier() {
         .unwrap()
         .unwrap();
     assert_eq!(
-        reloaded.find_item("1").unwrap().status,
+        reloaded.implementation.find_item("1").unwrap().status,
         PlanItemStatus::Done
     );
 }
@@ -3252,6 +3268,7 @@ async fn test_plan_batch_selected_coder_rung_completes_on_the_first_attempt() {
         model: Some(tauqe_protocol::ModelSelection::Specific(
             tauqe_protocol::ModelRef::openrouter("coder/mid"),
         )),
+        step_id: None,
     };
     let outcome = run_plan_batch(
         &state,
@@ -3276,15 +3293,15 @@ async fn test_plan_batch_selected_coder_rung_completes_on_the_first_attempt() {
         .unwrap()
         .unwrap();
     assert_eq!(
-        reloaded.find_item("1").unwrap().status,
+        reloaded.implementation.find_item("1").unwrap().status,
         PlanItemStatus::Done
     );
 }
 
 /// A step the developer starts manually on a coder model excluded from the
 /// automatic ladder (`level_up = false`) runs on exactly that model and fails
-/// terminally: the ladder is already saturated, so the whole tier budget is
-/// spent on that rung and no stronger tier is ever entered.
+/// terminally: the ladder is already saturated, so the single adaptive attempt
+/// of that rung is spent and no stronger tier is ever entered.
 #[tokio::test]
 async fn test_plan_batch_manual_excluded_coder_ends_without_escalation() {
     let dir = TestDir::new();
@@ -3307,10 +3324,9 @@ async fn test_plan_batch_manual_excluded_coder_ends_without_escalation() {
     );
     PlanStorage::save_plan(dir.path(), &plan).unwrap();
 
-    // Every attempt answers without a change set, so the step can never
-    // complete: the whole default tier budget is spent on the manual rung.
+    // The single adaptive attempt answers without a change set, so the step can
+    // never complete; a second scripted round would serve an erroneous retry.
     let mock_provider = Arc::new(MockLlmProvider::scripted([
-        MockResponse::text("The step looks complete."),
         MockResponse::text("The step looks complete."),
         MockResponse::text("The step looks complete."),
     ]));
@@ -3342,6 +3358,7 @@ async fn test_plan_batch_manual_excluded_coder_ends_without_escalation() {
     );
     let options = PlanBatchOptions {
         model: Some(tauqe_protocol::ModelSelection::Specific(manual_model)),
+        step_id: None,
     };
     let outcome = run_plan_batch(
         &state,
@@ -3371,13 +3388,13 @@ async fn test_plan_batch_manual_excluded_coder_ends_without_escalation() {
         }
         other => panic!("Expected a failed outcome without escalation, got {other:?}"),
     }
-    // The manual rung spends the whole default tier budget: three attempts, all
-    // on the excluded model, and never another rung.
+    // The manual rung spends its single adaptive attempt, and the ladder never
+    // enters another rung.
     let requests = mock_provider.requests();
     assert_eq!(
         requests.len(),
-        3,
-        "a saturated ladder spends the tier budget and never retries on another model"
+        1,
+        "a saturated ladder spends its single adaptive attempt and never retries on another model"
     );
     assert!(requests
         .iter()
@@ -3399,7 +3416,7 @@ async fn test_plan_batch_manual_excluded_coder_ends_without_escalation() {
         .unwrap()
         .unwrap();
     assert_eq!(
-        reloaded.find_item("1").unwrap().status,
+        reloaded.implementation.find_item("1").unwrap().status,
         PlanItemStatus::Todo
     );
 }
@@ -3498,7 +3515,7 @@ async fn test_plan_batch_retries_the_same_tier_within_the_attempt_budget() {
         .unwrap()
         .unwrap();
     assert_eq!(
-        reloaded.find_item("1").unwrap().status,
+        reloaded.implementation.find_item("1").unwrap().status,
         PlanItemStatus::Done
     );
 }
@@ -3605,7 +3622,7 @@ async fn test_plan_batch_transport_failure_ends_without_spending_an_attempt() {
         .unwrap()
         .unwrap();
     assert_eq!(
-        reloaded.find_item("1").unwrap().status,
+        reloaded.implementation.find_item("1").unwrap().status,
         PlanItemStatus::Todo
     );
 }
@@ -3750,7 +3767,7 @@ async fn test_plan_batch_hard_cancel_never_abandons_the_step_task() {
         .unwrap()
         .unwrap();
     assert_eq!(
-        reloaded.find_item("1").unwrap().status,
+        reloaded.implementation.find_item("1").unwrap().status,
         PlanItemStatus::Todo
     );
 
@@ -3857,7 +3874,285 @@ async fn test_handle_plan_refine_surfaces_the_architect_abort() {
         .unwrap()
         .unwrap();
     assert_eq!(
-        reloaded.find_item("1").unwrap().status,
+        reloaded.implementation.find_item("1").unwrap().status,
         PlanItemStatus::Todo
+    );
+}
+
+/// A contour parked mid-round and then force-aborted through the operation slot
+/// must answer `CANCELLED` instead of a provider failure.
+///
+/// The aborted contour never relays `StreamEvent::Cancelled`, so the bridge
+/// classifies the dead task through the authoritative cancellation signal.
+/// Without that seam the request surfaced as `model/error` with a message that
+/// itself read "was cancelled", and a replanning wave persisted the aborted run
+/// as a semantic blocker.
+#[tokio::test]
+async fn test_plan_refine_force_aborted_contour_answers_cancelled() {
+    let dir = TestDir::new();
+    let plan = Plan::from_parts(
+        "force-abort-refine".to_string(),
+        "Force Abort Refine".to_string(),
+        None,
+        1,
+        1,
+        Vec::new(),
+        vec![test_item("1", PlanItemStatus::Todo)],
+    );
+    PlanStorage::save_plan(dir.path(), &plan).unwrap();
+
+    let (entered_tx, mut entered_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
+    let provider: Arc<dyn tauqe_core::providers::LlmProvider> = Arc::new(ParkingProvider {
+        entered: entered_tx,
+    });
+
+    let (out, mut rx) = OutChannel::new();
+    let (hist_tx, _hist_rx) = tokio::sync::mpsc::unbounded_channel();
+    let state = AppState::new(
+        tauqe_core::config::AppConfig::default(),
+        dir.path().to_path_buf(),
+        hist_tx,
+        out,
+    );
+    *state.provider_override.lock().await = Some(provider);
+
+    let req = Request {
+        id: tauqe_protocol::RequestId::Number(1),
+        method: tauqe_protocol::methods::PLAN_REFINE.to_string(),
+        params: Some(serde_json::json!({ "plan_id": "force-abort-refine" })),
+    };
+    let state_for_req = Arc::clone(&state);
+    let handler = tokio::spawn(async move { handle_plan_refine(req, &state_for_req).await });
+
+    // The synthesis is demonstrably in flight: its provider round is parked and
+    // ignores the cancellation watch.
+    tokio::time::timeout(std::time::Duration::from_secs(10), entered_rx.recv())
+        .await
+        .expect("the synthesis must reach the provider")
+        .expect("the provider signals that its stream was entered");
+
+    // The hard cancel is raised while the contour is parked, and the registered
+    // contour task is then force-aborted: no `StreamEvent::Cancelled` is
+    // relayed, so only the authoritative signal describes the abort.
+    state.cancel_active_operation();
+    state
+        .force_abort_active_operation(std::time::Duration::from_secs(10))
+        .await;
+
+    let res = tokio::time::timeout(std::time::Duration::from_secs(10), handler)
+        .await
+        .expect("the aborted synthesis must return instead of parking the request")
+        .expect("the handler task joins");
+    let err = res
+        .error
+        .expect("an aborted synthesis must answer an error");
+    assert_eq!(
+        err.code,
+        errors::CANCELLED,
+        "a force-aborted contour must never surface as a provider failure: {err:?}"
+    );
+    assert!(
+        err.message.contains("was cancelled"),
+        "the verdict must name the cancelled synthesis: {}",
+        err.message
+    );
+
+    // No terminal answer is published for the aborted synthesis, and the
+    // operation never reported a provider failure either.
+    let mut emitted = Vec::new();
+    while let Ok(raw) = rx.try_recv() {
+        emitted.push(raw);
+    }
+    assert!(
+        !emitted
+            .iter()
+            .any(|event| event.contains(events::MODEL_FINISHED)),
+        "an aborted synthesis must never publish model/finished: {emitted:?}"
+    );
+    assert!(
+        !emitted
+            .iter()
+            .any(|event| event.contains(events::MODEL_ERROR)),
+        "a force-aborted contour must never publish model/error: {emitted:?}"
+    );
+}
+
+/// Provider double whose generation round parks until the test raises the
+/// operation's hard-cancel signal, and then answers with a complete synthesized
+/// payload.
+///
+/// The contour consults the cancel signal at the top of every round, so a raise
+/// that lands inside the round is invisible to it: the round still proposes a
+/// payload the schema accepts. That is exactly the window the synthesis guards
+/// immediately before it rewrites the stored horizon.
+struct CancellingFinalRoundProvider {
+    /// Signals that a generation round was entered.
+    entered: tokio::sync::mpsc::UnboundedSender<()>,
+    /// Released once the test raised the hard-cancel signal.
+    release: Arc<tokio::sync::Notify>,
+    /// Complete synthesized payload the parked round answers with.
+    payload: String,
+}
+
+#[async_trait::async_trait]
+impl tauqe_core::providers::LlmProvider for CancellingFinalRoundProvider {
+    fn kind(&self) -> tauqe_protocol::ProviderKind {
+        tauqe_protocol::ProviderKind::OpenRouter
+    }
+
+    async fn stream_chat(
+        &self,
+        _model: &str,
+        _messages: Vec<tauqe_core::providers::ChatMessage>,
+        _response_format: Option<tauqe_core::providers::ResponseFormat>,
+        tx: tokio::sync::mpsc::Sender<tauqe_core::providers::StreamEvent>,
+        _cancel_rx: tokio::sync::watch::Receiver<bool>,
+    ) -> anyhow::Result<()> {
+        let _ = self.entered.send(());
+        self.release.notified().await;
+        let _ = tx
+            .send(tauqe_core::providers::StreamEvent::TextDelta(
+                self.payload.clone(),
+            ))
+            .await;
+        let _ = tx.send(tauqe_core::providers::StreamEvent::Done).await;
+        Ok(())
+    }
+}
+
+/// A hard cancel delivered after the contour's final provider round resolved but
+/// before the destructive horizon write must never be answered with a persisted
+/// success.
+///
+/// The contour consults the cancel signal only at the top of each round, so a
+/// raise that lands inside the final round is invisible to it and the round
+/// still proposes a payload the schema accepts. The synthesis therefore
+/// re-checks the authoritative signal immediately before it replaces the
+/// uncompleted horizon, at the same seam the review subsystem guards before it
+/// touches its session on disk, and a raised signal releases the transient
+/// context, answers `CANCELLED`, records no session history, and leaves the
+/// stored plan exactly as it was.
+#[tokio::test]
+async fn test_plan_refine_answers_cancelled_before_the_destructive_horizon_write() {
+    let dir = TestDir::new();
+    let plan = Plan::from_parts(
+        "cancel-horizon".to_string(),
+        "Cancel Horizon".to_string(),
+        None,
+        1,
+        1,
+        Vec::new(),
+        vec![test_item("1", PlanItemStatus::Todo)],
+    );
+    PlanStorage::save_plan(dir.path(), &plan).unwrap();
+
+    let refine_output = serde_json::json!({
+        "status": "success",
+        "explanation": "Synthesized while the operation was being cancelled",
+        "items": [
+            {
+                "id": "1.1",
+                "title": "Replacement step",
+                "status": "todo",
+                "files": ["src.rs"],
+                "readonly_files": [],
+                "concept_refs": [],
+                "depends_on": [],
+                "children": []
+            }
+        ]
+    })
+    .to_string();
+
+    let (entered_tx, mut entered_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
+    let release = Arc::new(tokio::sync::Notify::new());
+    let provider: Arc<dyn tauqe_core::providers::LlmProvider> =
+        Arc::new(CancellingFinalRoundProvider {
+            entered: entered_tx,
+            release: Arc::clone(&release),
+            payload: refine_output,
+        });
+
+    let (out, mut rx) = OutChannel::new();
+    let (hist_tx, _hist_rx) = tokio::sync::mpsc::unbounded_channel();
+    let state = AppState::new(
+        tauqe_core::config::AppConfig::default(),
+        dir.path().to_path_buf(),
+        hist_tx,
+        out,
+    );
+    *state.provider_override.lock().await = Some(provider);
+
+    let req = Request {
+        id: tauqe_protocol::RequestId::Number(1),
+        method: tauqe_protocol::methods::PLAN_REFINE.to_string(),
+        params: Some(serde_json::json!({ "plan_id": "cancel-horizon" })),
+    };
+    let state_for_req = Arc::clone(&state);
+    let handler = tokio::spawn(async move { handle_plan_refine(req, &state_for_req).await });
+
+    // The synthesis is demonstrably inside its final generation round, which has
+    // already passed the contour's loop-top cancel check.
+    tokio::time::timeout(std::time::Duration::from_secs(10), entered_rx.recv())
+        .await
+        .expect("the synthesis must reach the provider")
+        .expect("the provider signals that its round was entered");
+
+    // The developer aborts the operation while that round is in flight, and the
+    // round still answers a complete payload the schema accepts.
+    state.cancel_active_operation();
+    release.notify_one();
+
+    let res = tokio::time::timeout(std::time::Duration::from_secs(10), handler)
+        .await
+        .expect("the cancelled synthesis must answer instead of parking the request")
+        .expect("the handler task joins");
+    let err = res
+        .error
+        .expect("a cancelled horizon write must answer an error");
+    assert_eq!(
+        err.code,
+        errors::CANCELLED,
+        "the write must never be reported as a success or a failure: {err:?}"
+    );
+    assert!(
+        err.message.contains("was cancelled"),
+        "the verdict must name the cancelled synthesis: {}",
+        err.message
+    );
+
+    // The stored plan keeps the horizon it had: no replacement was written.
+    let reloaded = PlanStorage::load_plan(dir.path(), "cancel-horizon")
+        .unwrap()
+        .unwrap();
+    let previous = reloaded
+        .implementation
+        .find_item("1")
+        .expect("the previous horizon must survive the aborted write");
+    assert_eq!(previous.title, "Step 1");
+    assert_eq!(previous.status, PlanItemStatus::Todo);
+    assert!(
+        reloaded.implementation.find_item("1.1").is_none(),
+        "the aborted write must not project the synthesized horizon"
+    );
+
+    // No event announced a horizon that was never persisted.
+    let mut emitted = Vec::new();
+    while let Ok(raw) = rx.try_recv() {
+        emitted.push(raw);
+    }
+    assert!(
+        !emitted
+            .iter()
+            .any(|event| event.contains(events::PLAN_UPDATED)),
+        "an aborted write must never announce a plan update: {emitted:?}"
+    );
+
+    // Strict history transactionality: the aborted write records neither the
+    // turn nor its response.
+    let entries = state.history.lock().await.get_entries().unwrap();
+    assert!(
+        entries.is_empty(),
+        "an aborted horizon write must record no session history"
     );
 }

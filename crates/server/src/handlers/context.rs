@@ -814,14 +814,19 @@ mod tests {
     async fn test_handle_context_clear_drops_only_the_outer_docs_layer() {
         let dir = TestDir::new();
         let (state, mut rx) = test_state(&dir);
-        std::fs::write(dir.path().join("ref.md"), "# External snapshot\n").unwrap();
+        // The external document lives in the isolated cache the registry
+        // materializes into. The layer admits it by the cache path the
+        // materialization reports and addresses it by its logical path.
+        let cached = format!("{}/ref.md", tauqe_core::outer_docs::OUTER_DOCS_CACHE_DIR);
+        let snapshot = dir.path().join(&cached);
+        std::fs::create_dir_all(snapshot.parent().expect("the snapshot has a parent")).unwrap();
+        std::fs::write(&snapshot, "# External snapshot\n").unwrap();
         std::fs::write(dir.path().join("user.rs"), "fn user() {}\n").unwrap();
-
         state
             .context
             .write()
             .await
-            .add_outer_docs_file("ref.md")
+            .add_outer_docs_file(&cached)
             .unwrap();
         state
             .context
@@ -829,6 +834,17 @@ mod tests {
             .await
             .add_file("user.rs", ContextAccess::ReadOnly)
             .unwrap();
+        let resident = state.context.read().await.get_state();
+        let document = resident
+            .items
+            .iter()
+            .find(|item| item.layer == ContextLayer::OuterDocs)
+            .expect("the document is resident");
+        assert_eq!(
+            document.path, "ref.md",
+            "the layer reports the logical path, never the cache path"
+        );
+
         let warm_session = state.session_uuid().await;
 
         let req = Request {
@@ -863,5 +879,51 @@ mod tests {
 
         let evt = rx.try_recv().expect("event received");
         assert!(evt.contains(events::CONTEXT_CHANGED));
+    }
+
+    /// The context surface addresses an external document by its logical path, so
+    /// the interface renders the very path `context/get` answers and the cache
+    /// directory the snapshot occupies never reaches the wire contract.
+    #[tokio::test]
+    async fn test_the_outer_docs_layer_reports_logical_paths() {
+        let dir = TestDir::new();
+        let (state, _rx) = test_state(&dir);
+        let cached = format!(
+            "{}/rurqe/SUMMARY.md",
+            tauqe_core::outer_docs::OUTER_DOCS_CACHE_DIR
+        );
+        let snapshot = dir.path().join(&cached);
+        std::fs::create_dir_all(snapshot.parent().expect("the snapshot has a parent")).unwrap();
+        std::fs::write(&snapshot, "# Summary\n").unwrap();
+
+        state
+            .context
+            .write()
+            .await
+            .add_outer_docs_file(&cached)
+            .expect("the snapshot enters the context");
+
+        let req = Request {
+            id: RequestId::Number(1),
+            method: methods::CONTEXT_GET.to_string(),
+            params: None,
+        };
+        let res = handle_context_get(req, &state).await;
+        assert!(res.error.is_none());
+
+        let ctx_state: tauqe_protocol::ContextState =
+            serde_json::from_value(res.result.unwrap()).unwrap();
+        let document = ctx_state
+            .items
+            .iter()
+            .find(|item| item.layer == ContextLayer::OuterDocs)
+            .expect("the document is resident");
+        assert_eq!(document.path, "rurqe/SUMMARY.md");
+        assert!(
+            !document
+                .path
+                .contains(tauqe_core::outer_docs::OUTER_DOCS_CACHE_DIR),
+            "the cache directory must never reach the interface"
+        );
     }
 }

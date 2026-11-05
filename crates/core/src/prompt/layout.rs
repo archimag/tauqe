@@ -16,9 +16,9 @@
 //!   the whole history block each become one stable section of the system
 //!   message.
 //! - [`ChronologicalLayout`] turns the same material into a transcript: a context
-//!   file appears between the turn records that observed its arrival, so the
-//!   prompt grows by appending to its tail instead of rewriting a section in the
-//!   middle.
+//!   file is emitted at the point its own arrival watermark places it among the
+//!   turn records, so the sequence grows by appending records and an arrival
+//!   keeps the position it received.
 //!
 //! ## Chronological invalidation points
 //!
@@ -44,6 +44,14 @@
 //!   rewrites the opening of the transcript. The dialogue session identifier is
 //!   rotated together with it, because the provider must not be asked to reuse a
 //!   node cache whose prefix the dialogue no longer sends.
+//!
+//! A context file that arrives while a turn runs is not a fifth boundary. Its
+//! slot is derived from the watermark the file carries, so the turn that
+//! discovered it emits it right after its own prompt record and every later turn
+//! emits it at the very same point: the response of that turn and the prompt of
+//! the next one append behind the arrival. The prefix the provider cached through
+//! the file therefore survives the turn boundary instead of diverging at the
+//! first record appended after it.
 
 use tauqe_protocol::PromptLayoutKind;
 
@@ -171,11 +179,21 @@ impl PromptLayout for SemanticLayout {
 /// the map is large enough that placing it in the tail would pay a full
 /// reprocessing pass on every round.
 ///
-/// The transcript renders one message per interaction record and emits the
-/// context files a record had already observed right after that record. A file
-/// that no record observed yet is emitted after the last record, so a turn that
-/// discovers a file appends it at the tail of the transcript and never rewrites
-/// an element the provider already cached.
+/// The transcript renders one message per interaction record and emits each
+/// context file at the slot its own arrival watermark places it. A file whose
+/// watermark `w` is bounded by a recorded turn — the last turn that started
+/// before the file arrived, so its persisted `context_watermark` is strictly
+/// below `w` — is emitted immediately after that turn, which is the earliest
+/// position consistent with the arrival order. A file discovered while a turn
+/// runs therefore receives its slot on that turn and keeps it for the whole
+/// session: the response of that turn and the prompt of every later one append
+/// behind the arrival instead of displacing it.
+///
+/// Two placements fall back to the recorded starting context of the first turn
+/// that listed the file: an arrival no watermark-bearing turn bounds, and a
+/// session whose records predate the watermark field. A file that carries no
+/// watermark at all closes the transcript, exactly as a file no record observed
+/// always has.
 ///
 /// The tail compensates for the lost semantic grouping with a compact manifest
 /// of the current context — paths and access, never content — and keeps the
@@ -205,20 +223,20 @@ impl PromptLayout for ChronologicalLayout {
 
         let mut messages = vec![ChatMessage::system(head)];
 
-        // Every context file is placed after the first turn record that already
-        // observed it, which is the water-mark material the persisted records
-        // carry: a turn records the context paths it started with, so a file
-        // that entered the context between two turns appears between them. A
-        // file no record observed yet is the newest arrival and closes the
-        // transcript.
+        // Every context file is placed by its own arrival watermark: a file
+        // is emitted right after the last turn record that started before it
+        // arrived, so the turn that discovered it holds the slot while the
+        // response of that turn and the prompt of every later one append
+        // behind it. A file no watermark-bearing turn bounds falls back to the
+        // recorded starting context, and a file that carries no watermark at
+        // all closes the transcript.
         let records: &[HistoryEntry] = assembly
             .history_snapshot()
             .map(|snapshot| snapshot.entries())
             .unwrap_or(&[]);
         let mut arrivals: Vec<Vec<&ContextFileContent>> = vec![Vec::new(); records.len() + 1];
         for file in &assembly.context_files {
-            let slot = observed_by(file.path.as_str(), records).unwrap_or(records.len());
-            arrivals[slot].push(file);
+            arrivals[arrival_slot(file, records)].push(file);
         }
 
         for (record, slot) in records.iter().zip(arrivals.iter()) {
@@ -257,11 +275,46 @@ impl PromptLayout for ChronologicalLayout {
     }
 }
 
-/// Returns the index of the first turn record that already observed `path`.
+/// Returns the transcript slot a context file is emitted at.
 ///
-/// The observed context of a turn is recorded on disk with the turn itself, so
-/// the placement is derived from durable material instead of from the current
-/// layout state: the same session always yields the same transcript.
+/// The slot is a pure function of the frozen snapshot and the file's own arrival
+/// watermark:
+///
+/// - A file that carries no watermark — an unrecorded arrival of the current
+///   turn, or a payload synthesized outside the context layers — closes the
+///   transcript, exactly as a file no record observed always has.
+/// - A file whose watermark `w` is bounded by a recorded turn, meaning the last
+///   turn that started before the file arrived and therefore persisted a
+///   `context_watermark` strictly below `w`, is emitted immediately after that
+///   turn. The position is the earliest one consistent with the arrival order,
+///   so the turn that discovered the file holds its slot for the whole session:
+///   the response of that turn and the prompt of every later one append behind
+///   the arrival instead of displacing it.
+/// - A file no watermark-bearing turn bounds keeps the placement of the recorded
+///   starting context: a file that arrived before the first recorded turn, and
+///   every file of a session whose records predate the watermark field.
+fn arrival_slot(file: &ContextFileContent, records: &[HistoryEntry]) -> usize {
+    if file.insertion_seq == 0 {
+        return records.len();
+    }
+    if let Some(index) = records.iter().rposition(|record| match record {
+        HistoryEntry::Turn {
+            context_watermark, ..
+        } => context_watermark.is_some_and(|watermark| watermark < file.insertion_seq),
+        _ => false,
+    }) {
+        return index;
+    }
+    observed_by(file.path.as_str(), records).unwrap_or(records.len())
+}
+
+/// Returns the index of the first turn record whose starting context listed
+/// `path`.
+///
+/// The recorded starting context answers the placements the watermark cannot
+/// express. It is persisted on disk with the turn itself, so the fallback is
+/// derived from durable material instead of from the current layout state: the
+/// same session always yields the same transcript.
 fn observed_by(path: &str, records: &[HistoryEntry]) -> Option<usize> {
     records.iter().position(|record| match record {
         HistoryEntry::Turn { context, .. } => context.iter().any(|observed| observed == path),
@@ -344,15 +397,36 @@ mod tests {
     use crate::prompt::xml::XmlPromptProtocol;
     use tauqe_protocol::{ContextAccess, EditProtocolKind};
 
-    fn file(path: &str, access: ContextAccess, content: &str) -> ContextFileContent {
+    /// Builds a context file carrying the arrival watermark it received.
+    ///
+    /// The fixture states the chronology it analyzes explicitly, because the
+    /// transcript places every file by the watermark the file itself carries.
+    fn file(
+        path: &str,
+        access: ContextAccess,
+        content: &str,
+        insertion_seq: u64,
+    ) -> ContextFileContent {
         ContextFileContent {
             path: path.to_string(),
             access,
             content: content.to_string(),
+            insertion_seq,
         }
     }
 
-    fn turn(id: u64, prompt: &str, context: &[&str]) -> HistoryEntry {
+    /// Builds a turn record that persisted the watermark of its starting context.
+    fn turn(id: u64, prompt: &str, context: &[&str], watermark: u64) -> HistoryEntry {
+        HistoryEntry::Turn {
+            id: Some(id),
+            prompt: prompt.to_string(),
+            context: context.iter().map(|path| path.to_string()).collect(),
+            context_watermark: Some(watermark),
+        }
+    }
+
+    /// Builds a turn record written before the watermark field existed.
+    fn legacy_turn(id: u64, prompt: &str, context: &[&str]) -> HistoryEntry {
         HistoryEntry::Turn {
             id: Some(id),
             prompt: prompt.to_string(),
@@ -390,16 +464,16 @@ mod tests {
     }
 
     #[test]
-    fn transcript_interleaves_files_with_the_turns_that_observed_them() {
+    fn transcript_places_files_by_their_arrival_watermark() {
         let assembly = chronological(
             vec![
-                file("pinned.rs", ContextAccess::ReadOnly, "pinned body\n"),
-                file("later.rs", ContextAccess::Editable, "later body\n"),
+                file("pinned.rs", ContextAccess::ReadOnly, "pinned body\n", 1),
+                file("later.rs", ContextAccess::Editable, "later body\n", 2),
             ],
             vec![
-                turn(1, "First task", &["pinned.rs"]),
+                turn(1, "First task", &["pinned.rs"], 1),
                 response(2, "First done"),
-                turn(3, "Second task", &["pinned.rs", "later.rs"]),
+                turn(3, "Second task", &["pinned.rs"], 1),
                 response(4, "Second done"),
             ],
         );
@@ -410,7 +484,8 @@ mod tests {
 
         assert_eq!(messages[1].role, "user");
         assert_eq!(messages[1].content, "First task");
-        // The file the first turn already carried lands right after it.
+        // The file the session opened with lands right after the turn that
+        // started with it in context.
         assert_eq!(messages[2].role, "user");
         assert!(messages[2].content.contains("path=\"pinned.rs\""));
         assert!(!messages[2].content.contains("later.rs"));
@@ -418,8 +493,9 @@ mod tests {
         assert_eq!(messages[3].role, "assistant");
         assert_eq!(messages[3].content, "First done");
 
-        // The file that arrived between the two turns lands after the turn that
-        // observed it, never before it.
+        // The file that arrived while the second turn ran follows the prompt
+        // record of that turn and therefore precedes its response: it never
+        // moves again, because every later record appends behind it.
         assert_eq!(messages[4].content, "Second task");
         assert!(messages[5].content.contains("path=\"later.rs\""));
         assert!(!messages[5].content.contains("pinned.rs"));
@@ -431,14 +507,94 @@ mod tests {
     }
 
     #[test]
+    fn a_session_that_predates_the_watermark_keeps_the_recorded_starting_context_placement() {
+        // A record written before the watermark field existed carries no arrival
+        // signal, so the starting context recorded on the turn remains the only
+        // placement material available.
+        let assembly = chronological(
+            vec![
+                file("pinned.rs", ContextAccess::ReadOnly, "pinned body\n", 1),
+                file("later.rs", ContextAccess::Editable, "later body\n", 2),
+            ],
+            vec![
+                legacy_turn(1, "First task", &["pinned.rs"]),
+                response(2, "First done"),
+                legacy_turn(3, "Second task", &["pinned.rs", "later.rs"]),
+            ],
+        );
+
+        let messages = assembly.assemble_chat_messages("Third task", &XmlPromptProtocol);
+        assert!(messages[2].content.contains("path=\"pinned.rs\""));
+        assert!(!messages[2].content.contains("later.rs"));
+        assert!(messages[5].content.contains("path=\"later.rs\""));
+        assert!(!messages[5].content.contains("pinned.rs"));
+    }
+
+    #[test]
+    fn a_mid_turn_arrival_keeps_its_slot_when_the_next_turn_appends_its_records() {
+        // The session opened with `pinned.rs` and discovered `discovered.rs`
+        // while its second turn ran, so the arrival carries the next watermark
+        // and no later record observed it yet.
+        let files = || {
+            vec![
+                file("pinned.rs", ContextAccess::ReadOnly, "pinned body\n", 1),
+                file(
+                    "discovered.rs",
+                    ContextAccess::Editable,
+                    "discovered body\n",
+                    2,
+                ),
+            ]
+        };
+        let opening = || {
+            vec![
+                turn(1, "First task", &["pinned.rs"], 1),
+                response(2, "First done"),
+                turn(3, "Second task", &["pinned.rs"], 1),
+            ]
+        };
+
+        let during = chronological(files(), opening())
+            .assemble_chat_messages("Second task", &XmlPromptProtocol);
+
+        // The next turn opens with the arrival already in its starting context,
+        // and appends the response of the discovering turn plus its own prompt.
+        let mut adopted_records = opening();
+        adopted_records.push(response(4, "Second done"));
+        adopted_records.push(turn(5, "Third task", &["pinned.rs", "discovered.rs"], 2));
+        let adopted = chronological(files(), adopted_records)
+            .assemble_chat_messages("Fourth task", &XmlPromptProtocol);
+
+        // The arrival closes the transcript of the turn that discovered it: no
+        // later record existed when it was emitted.
+        let arrival = during
+            .iter()
+            .position(|message| message.content.contains("path=\"discovered.rs\""))
+            .expect("the discovering turn emits the arrival");
+        assert!(during[arrival].content.contains("discovered body"));
+
+        // The appended records extend the transcript behind the arrival, so the
+        // whole sequence the first view sent through the file is reproduced byte
+        // for byte and the arrival still precedes the response of its turn.
+        assert_eq!(
+            &adopted[..=arrival],
+            &during[..=arrival],
+            "the response and the prompt of the next turn must append behind the arrival"
+        );
+        assert_eq!(adopted[arrival + 1].role, "assistant");
+        assert_eq!(adopted[arrival + 1].content, "Second done");
+    }
+
+    #[test]
     fn head_carries_the_frozen_outline_and_never_a_context_body() {
         let mut assembly = chronological(
             vec![file(
                 "src/main.rs",
                 ContextAccess::Editable,
                 "fn main() {}\n",
+                1,
             )],
-            vec![turn(1, "First task", &["src/main.rs"])],
+            vec![turn(1, "First task", &["src/main.rs"], 1)],
         );
         assembly.repo_map = Some("crate\n  pub fn main".to_string());
         assembly.target_language = Some("Russian".to_string());
@@ -464,9 +620,9 @@ mod tests {
     #[test]
     fn growth_between_turns_appends_and_confines_divergence_to_the_tail() {
         let before = chronological(
-            vec![file("pinned.rs", ContextAccess::ReadOnly, "pinned\n")],
+            vec![file("pinned.rs", ContextAccess::ReadOnly, "pinned\n", 1)],
             vec![
-                turn(1, "First task", &["pinned.rs"]),
+                turn(1, "First task", &["pinned.rs"], 1),
                 response(2, "First done"),
             ],
         )
@@ -474,15 +630,15 @@ mod tests {
 
         let after = chronological(
             vec![
-                file("pinned.rs", ContextAccess::ReadOnly, "pinned\n"),
-                file("fresh.rs", ContextAccess::Editable, "fresh\n"),
+                file("pinned.rs", ContextAccess::ReadOnly, "pinned\n", 1),
+                file("fresh.rs", ContextAccess::Editable, "fresh\n", 2),
             ],
             vec![
-                turn(1, "First task", &["pinned.rs"]),
+                turn(1, "First task", &["pinned.rs"], 1),
                 response(2, "First done"),
-                turn(3, "Second task", &["pinned.rs"]),
+                turn(3, "Second task", &["pinned.rs"], 1),
                 response(4, "Second done"),
-                turn(5, "Third task", &["pinned.rs", "fresh.rs"]),
+                turn(5, "Third task", &["pinned.rs", "fresh.rs"], 2),
             ],
         )
         .assemble_chat_messages("Fourth task", &XmlPromptProtocol);
@@ -503,10 +659,10 @@ mod tests {
     fn tail_manifest_lists_paths_and_access_without_content() {
         let assembly = chronological(
             vec![
-                file("src/a.rs", ContextAccess::ReadOnly, "alpha body\n"),
-                file("src/b.rs", ContextAccess::Editable, "beta body\n"),
+                file("src/a.rs", ContextAccess::ReadOnly, "alpha body\n", 1),
+                file("src/b.rs", ContextAccess::Editable, "beta body\n", 2),
             ],
-            vec![turn(1, "Task", &["src/a.rs", "src/b.rs"])],
+            vec![turn(1, "Task", &["src/a.rs", "src/b.rs"], 2)],
         );
 
         let messages = assembly.assemble_chat_messages("Go", &XmlPromptProtocol);
@@ -522,7 +678,7 @@ mod tests {
     #[test]
     fn chronological_kind_resolves_to_the_transcript_policy() {
         let mut assembly = assembly(
-            vec![file("src/a.rs", ContextAccess::Editable, "alpha\n")],
+            vec![file("src/a.rs", ContextAccess::Editable, "alpha\n", 1)],
             Vec::new(),
         );
 
@@ -547,8 +703,8 @@ mod tests {
     fn regime_delta_opens_the_trailing_user_message_in_both_policies() {
         let build = |layout: PromptLayoutKind| {
             let mut assembly = assembly(
-                vec![file("src/a.rs", ContextAccess::Editable, "alpha\n")],
-                vec![turn(1, "Task", &["src/a.rs"])],
+                vec![file("src/a.rs", ContextAccess::Editable, "alpha\n", 1)],
+                vec![turn(1, "Task", &["src/a.rs"], 1)],
             );
             assembly.prompt_layout = layout;
             assembly

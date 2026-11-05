@@ -118,6 +118,7 @@ The phase obeys these ceilings:
 | Searches per round | `context.max_search_requests_per_round` | 5 |
 | Matching files reported | `context.max_matched_files_per_search` | 50 |
 | Searchable file size | `MAX_SEARCHABLE_FILE_SIZE` | 2 MiB |
+| Searchable text per round | `MAX_SEARCHABLE_CORPUS_BYTES` | 64 MiB |
 | Targeted outlines per round | `context.max_repo_map_requests_per_round` | 3 |
 | Directory listing entries | `context.max_dir_list_entries` | 100 |
 | Project command output | `context.max_feedback_chars` | 4,000 |
@@ -182,6 +183,10 @@ A search is a Rust regular expression over tracked files, never a disk scan:
 - At most fifty matching files are reported; the remainder is counted.
 - Results are sorted by hit count and then by path, so the same query yields the
   same block.
+- A round retains at most `MAX_SEARCHABLE_CORPUS_BYTES` (64 MiB) of searchable
+  text. Files enter the shared corpus while they fit, and the files left over are
+  reported in the block as unsearched, so a bounded round never reads as a
+  complete absence of matches.
 
 The regex dialect is RE2-compatible with compiled size and DFA limits. Lookaround
 and backreferences are unsupported, and a rejected pattern returns a diagnostic

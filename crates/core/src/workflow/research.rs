@@ -1373,6 +1373,7 @@ mod tests {
             total_matched_files: 1,
             total_matches: 2,
             omitted_files: 0,
+            unsearched_files: 0,
             error: None,
         }
     }
@@ -1917,7 +1918,9 @@ mod tests {
         let outcome = apply_context_requests_detailed(&mut cm, &requests, &[], 300_000);
 
         assert_eq!(outcome.added, vec![cached.clone()]);
-        assert_eq!(cm.outer_docs_files(), vec![cached.clone()]);
+        // The layer addresses the document by its logical path, never by the
+        // cache path it is stored under.
+        assert_eq!(cm.outer_docs_files(), vec!["api.md".to_string()]);
         assert!(!cm.is_editable(&cached).unwrap());
         assert!(outcome.outer_docs_rejected.is_empty());
     }
@@ -1954,7 +1957,10 @@ mod tests {
         // evicting by a recency rank it no longer keeps.
         let outcome = apply_context_requests_detailed(&mut cm, &request(&second), &[], 300_000);
         assert_eq!(outcome.added, vec![second.clone()]);
-        assert_eq!(cm.outer_docs_files(), vec![first, second]);
+        assert_eq!(
+            cm.outer_docs_files(),
+            vec!["a.md".to_string(), "b.md".to_string()]
+        );
     }
 
     /// An external document is priced exactly like a repository file, so a
@@ -2045,7 +2051,7 @@ mod tests {
 
         assert!(outcome.limit_exceeded.is_none());
         assert_eq!(outcome.added, vec!["a.rs".to_string(), cached.clone()]);
-        assert_eq!(cm.outer_docs_files(), vec![cached]);
+        assert_eq!(cm.outer_docs_files(), vec!["api.md".to_string()]);
     }
     /// A trust decision is recorded apart from a delivery failure: the round
     /// outcome carries the exact cause and the declaration that would authorize

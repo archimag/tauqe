@@ -29,7 +29,7 @@ pub(super) async fn handle_locale_dialog(
     mut st: MutexGuard<'_, AppState>,
     server_writer: &mut RpcConnection,
 ) -> anyhow::Result<Option<InputResult>> {
-    let mut dialog = match st.locale_dialog.take() {
+    let mut dialog = match st.modals.locale_dialog.take() {
         Some(dialog) => dialog,
         None => return Ok(None),
     };
@@ -48,7 +48,7 @@ pub(super) async fn handle_locale_dialog(
                 return Ok(Some(InputResult::Continue));
             }
             _ => {
-                st.locale_dialog = Some(dialog);
+                st.modals.locale_dialog = Some(dialog);
                 return Ok(Some(InputResult::Continue));
             }
         }
@@ -60,24 +60,24 @@ pub(super) async fn handle_locale_dialog(
             KeyCode::Esc | KeyCode::Char('q') => return Ok(Some(InputResult::Continue)),
             KeyCode::Tab => {
                 dialog.focus = LocaleDialogFocus::Editor;
-                st.locale_dialog = Some(dialog);
+                st.modals.locale_dialog = Some(dialog);
                 return Ok(Some(InputResult::Continue));
             }
             KeyCode::BackTab | KeyCode::Left => {
                 dialog.button.cycle_prev();
-                st.locale_dialog = Some(dialog);
+                st.modals.locale_dialog = Some(dialog);
                 return Ok(Some(InputResult::Continue));
             }
             KeyCode::Right => {
                 dialog.button.cycle_next();
-                st.locale_dialog = Some(dialog);
+                st.modals.locale_dialog = Some(dialog);
                 return Ok(Some(InputResult::Continue));
             }
             KeyCode::Enter | KeyCode::Char(' ') => {
                 return activate(state, st, dialog, server_writer).await;
             }
             _ => {
-                st.locale_dialog = Some(dialog);
+                st.modals.locale_dialog = Some(dialog);
                 return Ok(Some(InputResult::Continue));
             }
         }
@@ -89,7 +89,7 @@ pub(super) async fn handle_locale_dialog(
         KeyCode::Esc => Ok(Some(InputResult::Continue)),
         KeyCode::Tab | KeyCode::BackTab => {
             dialog.focus = LocaleDialogFocus::Actions;
-            st.locale_dialog = Some(dialog);
+            st.modals.locale_dialog = Some(dialog);
             Ok(Some(InputResult::Continue))
         }
         // A bare `Enter` synthesizes, mirroring the discussion prompt modal;
@@ -105,18 +105,18 @@ pub(super) async fn handle_locale_dialog(
                 // The paste buffer is a native round trip bounded at
                 // NATIVE_CLIPBOARD_TIMEOUT, so it is read with the state guard
                 // released and the answer is applied after the re-lock (c-1).
-                st.locale_dialog = Some(dialog);
+                st.modals.locale_dialog = Some(dialog);
                 drop(st);
                 let clipboard = crate::clipboard::get_from_clipboard_async().await;
                 let mut st = state.lock().await;
-                if let Some(mut dialog) = st.locale_dialog.take() {
+                if let Some(mut dialog) = st.modals.locale_dialog.take() {
                     dialog.language_editor.yank_with(clipboard);
-                    st.locale_dialog = Some(dialog);
+                    st.modals.locale_dialog = Some(dialog);
                 }
                 return Ok(Some(InputResult::Continue));
             }
             crate::input::handle_editor_key(&mut dialog.language_editor, key, is_cmd, false);
-            st.locale_dialog = Some(dialog);
+            st.modals.locale_dialog = Some(dialog);
             Ok(Some(InputResult::Continue))
         }
     }
@@ -148,13 +148,13 @@ async fn synthesize(
     let language = dialog.language_editor.get_text().trim().to_string();
     if language.is_empty() {
         st.notify_warning(active_t("notify.locale_empty_target"));
-        st.locale_dialog = Some(dialog);
+        st.modals.locale_dialog = Some(dialog);
         return Ok(Some(InputResult::Continue));
     }
 
     if st.model.is_busy() || st.review.running {
         st.notify_warning(active_t("notify.model_busy"));
-        st.locale_dialog = Some(dialog);
+        st.modals.locale_dialog = Some(dialog);
         return Ok(Some(InputResult::Continue));
     }
 
@@ -164,7 +164,7 @@ async fn synthesize(
     };
     st.notify_info(active_t("notify.locale_synthesizing").replace("{}", &language));
     dialog.generating = true;
-    st.locale_dialog = Some(dialog);
+    st.modals.locale_dialog = Some(dialog);
     drop(st);
     send_request(
         server_writer,
@@ -186,7 +186,7 @@ async fn cancel_synthesis(
     server_writer: &mut RpcConnection,
 ) -> anyhow::Result<()> {
     let unrelated_busy = st.model.is_busy() || st.review.running;
-    st.locale_dialog = None;
+    st.modals.locale_dialog = None;
     st.notify_info(active_t("notify.locale_cancelled"));
     drop(st);
     if !unrelated_busy {
@@ -215,7 +215,12 @@ pub async fn click_locale_button(
     button: LocaleDialogButton,
     server_writer: &mut RpcConnection,
 ) -> anyhow::Result<()> {
-    let Some(generating) = st.locale_dialog.as_ref().map(|dialog| dialog.generating) else {
+    let Some(generating) = st
+        .modals
+        .locale_dialog
+        .as_ref()
+        .map(|dialog| dialog.generating)
+    else {
         return Ok(());
     };
 
@@ -226,7 +231,7 @@ pub async fn click_locale_button(
         return Ok(());
     }
 
-    let mut dialog = match st.locale_dialog.take() {
+    let mut dialog = match st.modals.locale_dialog.take() {
         Some(dialog) => dialog,
         None => return Ok(()),
     };
@@ -284,14 +289,14 @@ mod tests {
     #[tokio::test]
     async fn empty_language_keeps_the_dialog_and_warns() {
         let mut st = crate::app::test_state();
-        st.locale_dialog = Some(LocaleDialogState::default());
+        st.modals.locale_dialog = Some(LocaleDialogState::default());
         let state = Arc::new(Mutex::new(st));
 
         dispatch(&state, key(KeyCode::Enter)).await.unwrap();
 
         let st = state.lock().await;
         assert!(
-            st.locale_dialog.is_some(),
+            st.modals.locale_dialog.is_some(),
             "the dialog stays open for correction"
         );
         let notif = st.active_notification().expect("a warning is surfaced");
@@ -303,13 +308,14 @@ mod tests {
         let mut st = crate::app::test_state();
         let mut dialog = LocaleDialogState::default();
         dialog.language_editor.insert_str("Elvish");
-        st.locale_dialog = Some(dialog);
+        st.modals.locale_dialog = Some(dialog);
         let state = Arc::new(Mutex::new(st));
 
         dispatch(&state, key(KeyCode::Enter)).await.unwrap();
 
         let st = state.lock().await;
         let d = st
+            .modals
             .locale_dialog
             .as_ref()
             .expect("dialog stays open while generating");
@@ -323,13 +329,13 @@ mod tests {
     #[tokio::test]
     async fn escape_dismisses_without_a_request() {
         let mut st = crate::app::test_state();
-        st.locale_dialog = Some(LocaleDialogState::default());
+        st.modals.locale_dialog = Some(LocaleDialogState::default());
         let state = Arc::new(Mutex::new(st));
 
         dispatch(&state, key(KeyCode::Esc)).await.unwrap();
 
         let st = state.lock().await;
-        assert!(st.locale_dialog.is_none());
+        assert!(st.modals.locale_dialog.is_none());
         assert!(st.active_notification().is_none());
     }
 
@@ -340,13 +346,17 @@ mod tests {
             generating: true,
             ..Default::default()
         };
-        st.locale_dialog = Some(dialog);
+        st.modals.locale_dialog = Some(dialog);
         let state = Arc::new(Mutex::new(st));
 
         dispatch(&state, key(KeyCode::Char('q'))).await.unwrap();
 
         let st = state.lock().await;
-        let d = st.locale_dialog.as_ref().expect("dialog remains present");
+        let d = st
+            .modals
+            .locale_dialog
+            .as_ref()
+            .expect("dialog remains present");
         assert!(d.generating, "generating state preserved");
     }
 
@@ -357,13 +367,13 @@ mod tests {
             generating: true,
             ..Default::default()
         };
-        st.locale_dialog = Some(dialog);
+        st.modals.locale_dialog = Some(dialog);
         let state = Arc::new(Mutex::new(st));
 
         dispatch(&state, key(KeyCode::Esc)).await.unwrap();
 
         let st = state.lock().await;
-        assert!(st.locale_dialog.is_none(), "dialog dismissed on Esc");
+        assert!(st.modals.locale_dialog.is_none(), "dialog dismissed on Esc");
         let notif = st.active_notification().expect("notification present");
         assert!(notif.text.contains("cancelled"));
     }
@@ -371,13 +381,13 @@ mod tests {
     #[tokio::test]
     async fn typing_a_character_lands_in_the_language_field() {
         let mut st = crate::app::test_state();
-        st.locale_dialog = Some(LocaleDialogState::default());
+        st.modals.locale_dialog = Some(LocaleDialogState::default());
         let state = Arc::new(Mutex::new(st));
 
         dispatch(&state, key(KeyCode::Char('Р'))).await.unwrap();
 
         let st = state.lock().await;
-        let dialog = st.locale_dialog.as_ref().expect("dialog stays open");
+        let dialog = st.modals.locale_dialog.as_ref().expect("dialog stays open");
         assert_eq!(dialog.language_editor.get_text(), "Р");
     }
 }

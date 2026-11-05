@@ -7,7 +7,9 @@
 //! pipeline therefore operates purely on normalized semantics and stays
 //! independent of any single protocol format.
 
-use tauqe_protocol::{CapabilitySet, EditProtocolKind, LlmCapability, LlmCommand, PatchStrategy};
+use tauqe_protocol::{
+    CapabilitySet, EditProtocolKind, LlmCapability, LlmCommand, PatchStrategy, ProjectConfig,
+};
 
 /// Decodes raw model output into normalized core commands.
 ///
@@ -116,10 +118,19 @@ pub trait PromptProtocol: Send + Sync {
     ///
     /// Structured-output protocols advertise their JSON schema here; free-form
     /// protocols return `None`.
+    ///
+    /// The schema is a projection of the enabled capability set, the declared
+    /// patch strategy, and the project command declaration `project`, never of
+    /// the permitted paths: the strategy decides how a change set addresses the
+    /// lines it replaces, and the declaration decides whether the project
+    /// command surface exists at all, while the field names are fixed before any
+    /// file enters the context. The paths travel through the protocol contract
+    /// without reaching the schema.
     fn response_format(
         &self,
         _editable_paths: &[String],
         _patch_strategy: PatchStrategy,
+        _project: Option<&ProjectConfig>,
     ) -> Option<crate::providers::ResponseFormat> {
         None
     }

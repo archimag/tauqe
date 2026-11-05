@@ -47,7 +47,7 @@ pub fn confirm_cancel_params(state: &AppState) -> ConfirmModalParams<'_> {
         body_lines,
         confirm_label: active_t("dialog.button.interrupt"),
         cancel_label: active_t("modal.cancel"),
-        confirm_button: state.confirm_button,
+        confirm_button: state.modals.confirm_button,
         destructive: true,
         width: 58,
     }
@@ -67,9 +67,15 @@ pub fn confirm_quit_params(state: &AppState) -> ConfirmModalParams<'_> {
         active_t("dialog.confirm_quit.activity_model")
     } else if !state.input_editor.is_empty() {
         active_t("dialog.confirm_quit.activity_draft")
-    } else if state.squash_dialog.as_ref().is_some_and(|d| d.applying) {
+    } else if state
+        .modals
+        .squash_dialog
+        .as_ref()
+        .is_some_and(|d| d.applying)
+    {
         active_t("dialog.confirm_quit.activity_squash_applying")
     } else if state
+        .modals
         .squash_dialog
         .as_ref()
         .is_some_and(|d| !d.message_editor.is_empty())
@@ -99,7 +105,7 @@ pub fn confirm_quit_params(state: &AppState) -> ConfirmModalParams<'_> {
         body_lines,
         confirm_label: active_t("dialog.button.quit"),
         cancel_label: active_t("modal.cancel"),
-        confirm_button: state.confirm_button,
+        confirm_button: state.modals.confirm_button,
         destructive: true,
         width: 58,
     }
@@ -137,7 +143,7 @@ pub fn confirm_detach_focus_params(state: &AppState) -> ConfirmModalParams<'_> {
         body_lines,
         confirm_label: active_t("dialog.button.detach"),
         cancel_label: active_t("modal.cancel"),
-        confirm_button: state.confirm_button,
+        confirm_button: state.modals.confirm_button,
         destructive: false,
         width: 58,
     }
@@ -191,7 +197,7 @@ fn group_plan_steps(state: &AppState, review_id: Option<&str>, group_id: &str) -
 /// targeted finding or one group step is a form dialog with its own Coder
 /// selector (`crate::dialogs::render::execute_review`) (c-4, c-5).
 pub fn execute_review_params(state: &AppState) -> Option<ConfirmModalParams<'_>> {
-    let target = state.confirm_execute_review.as_ref()?;
+    let target = state.modals.confirm_execute_review.as_ref()?;
     // A single targeted finding or one step of a group plan is a form dialog
     // with its own Coder selector and directives editor, never a binary card
     // (c-4, c-5, Conventions §6).
@@ -354,7 +360,7 @@ pub fn execute_review_params(state: &AppState) -> Option<ConfirmModalParams<'_>>
         body_lines,
         confirm_label,
         cancel_label: active_t("modal.cancel"),
-        confirm_button: state.confirm_button,
+        confirm_button: state.modals.confirm_button,
         destructive: false,
         width: 66,
     })
@@ -362,6 +368,7 @@ pub fn execute_review_params(state: &AppState) -> Option<ConfirmModalParams<'_>>
 
 pub fn render_confirm_execute_review_popup(frame: &mut ratatui::Frame, state: &AppState) {
     if state
+        .modals
         .confirm_execute_review
         .as_ref()
         .is_some_and(|target| target.is_single_target())
@@ -385,7 +392,7 @@ pub fn render_confirm_execute_scope_popup(frame: &mut ratatui::Frame, state: &Ap
 /// for every plan it runs and stops the queue on the first failure
 /// (Conventions §5.4).
 pub fn execute_pipeline_params(state: &AppState) -> Option<ConfirmModalParams<'_>> {
-    let target = state.confirm_execute_pipeline.as_ref()?;
+    let target = state.modals.confirm_execute_pipeline.as_ref()?;
     let engine = current_engine();
     let palette = engine.palette();
 
@@ -468,7 +475,7 @@ pub fn execute_pipeline_params(state: &AppState) -> Option<ConfirmModalParams<'_
         body_lines,
         confirm_label: active_t("dialog.button.execute_pipeline"),
         cancel_label: active_t("modal.cancel"),
-        confirm_button: state.confirm_button,
+        confirm_button: state.modals.confirm_button,
         destructive: false,
         width: 68,
     })
@@ -486,7 +493,7 @@ pub fn render_confirm_execute_pipeline_popup(frame: &mut ratatui::Frame, state: 
 /// already excludes cancelled leaves from the total, so a plan whose leaves are
 /// all completed or cancelled needs no escalation (c-1).
 pub(crate) fn plan_unfinished_steps(plan: &tauqe_protocol::Plan) -> usize {
-    let (total, completed) = plan.count_stats();
+    let (total, completed) = plan.implementation.count_stats();
     total.saturating_sub(completed)
 }
 
@@ -540,11 +547,16 @@ fn delete_plan_line(state: &AppState, plan_id: &str) -> Line<'static> {
 /// The dialog states the derived plan status together with how much unfinished
 /// work the deletion would discard, so the cost is visible before confirming.
 /// The safe `Cancel` button holds the default focus (Conventions §5.4, c-1).
-pub fn delete_plan_params<'a>(state: &'a AppState, plan_id: &str) -> ConfirmModalParams<'a> {
+///
+/// It describes the plan the pending first-tier deletion names, so a surface
+/// that asks for the card without a pending decision receives `None` instead of
+/// a dialog that names nothing (c-1).
+pub fn delete_plan_params(state: &AppState) -> Option<ConfirmModalParams<'_>> {
+    let plan_id = state.modals.confirm_delete_plan.as_deref()?;
     let engine = current_engine();
     let palette = engine.palette();
     let plan = state.plans_view.plans.iter().find(|p| p.id == plan_id);
-    let status = plan.map(|p| p.status()).unwrap_or_default();
+    let status = plan.map(|p| p.implementation.status()).unwrap_or_default();
     let unfinished = plan.map(plan_unfinished_steps).unwrap_or(0);
     let remaining = if unfinished == 0 {
         active_t("dialog.delete_plan.all_completed")
@@ -587,16 +599,16 @@ pub fn delete_plan_params<'a>(state: &'a AppState, plan_id: &str) -> ConfirmModa
         )),
     ];
 
-    ConfirmModalParams {
+    Some(ConfirmModalParams {
         title: active_t("dialog.delete_plan.title"),
         tone: ModalTone::Dangerous,
         body_lines,
         confirm_label: active_t("dialog.button.confirm_delete"),
         cancel_label: active_t("modal.cancel"),
-        confirm_button: state.confirm_button,
+        confirm_button: state.modals.confirm_button,
         destructive: true,
         width: DELETE_PLAN_WIDTH,
-    }
+    })
 }
 
 /// Presentation parameters for the second tier of the plan-deletion
@@ -605,11 +617,14 @@ pub fn delete_plan_params<'a>(state: &'a AppState, plan_id: &str) -> ConfirmModa
 /// A plan whose leaves are still pending, in progress, or blocked carries task
 /// context that no Git commit restores, so the second tier names the remaining
 /// work explicitly and warns that the recorded progress is lost for good (c-1).
-pub fn delete_plan_final_params<'a>(state: &'a AppState, plan_id: &str) -> ConfirmModalParams<'a> {
+pub fn delete_plan_final_params(state: &AppState) -> Option<ConfirmModalParams<'_>> {
+    let plan_id = state.modals.confirm_delete_plan_final.as_deref()?;
     let engine = current_engine();
     let palette = engine.palette();
     let plan = state.plans_view.plans.iter().find(|p| p.id == plan_id);
-    let (total, completed) = plan.map(|p| p.count_stats()).unwrap_or((0, 0));
+    let (total, completed) = plan
+        .map(|p| p.implementation.count_stats())
+        .unwrap_or((0, 0));
     let unfinished = total.saturating_sub(completed);
 
     let body_lines = vec![
@@ -638,36 +653,33 @@ pub fn delete_plan_final_params<'a>(state: &'a AppState, plan_id: &str) -> Confi
         )),
     ];
 
-    ConfirmModalParams {
+    Some(ConfirmModalParams {
         title: active_t("dialog.delete_plan_final.title"),
         tone: ModalTone::Dangerous,
         body_lines,
         confirm_label: active_t("dialog.button.permanently_delete"),
         cancel_label: active_t("modal.cancel"),
-        confirm_button: state.confirm_button,
+        confirm_button: state.modals.confirm_button,
         destructive: true,
         width: DELETE_PLAN_FINAL_WIDTH,
+    })
+}
+
+pub fn render_confirm_delete_plan_popup(frame: &mut ratatui::Frame, state: &AppState) {
+    if let Some(params) = delete_plan_params(state) {
+        render_modal_confirm(frame, params);
     }
 }
 
-pub fn render_confirm_delete_plan_popup(
-    frame: &mut ratatui::Frame,
-    plan_id: &str,
-    state: &AppState,
-) {
-    render_modal_confirm(frame, delete_plan_params(state, plan_id));
-}
-
-pub fn render_confirm_delete_plan_final_popup(
-    frame: &mut ratatui::Frame,
-    plan_id: &str,
-    state: &AppState,
-) {
-    render_modal_confirm(frame, delete_plan_final_params(state, plan_id));
+pub fn render_confirm_delete_plan_final_popup(frame: &mut ratatui::Frame, state: &AppState) {
+    if let Some(params) = delete_plan_final_params(state) {
+        render_modal_confirm(frame, params);
+    }
 }
 
 /// Presentation parameters for the review-deletion confirmation.
-pub fn delete_review_params<'a>(state: &'a AppState, session_id: &str) -> ConfirmModalParams<'a> {
+pub fn delete_review_params(state: &AppState) -> Option<ConfirmModalParams<'_>> {
+    let session_id = state.modals.confirm_delete_review.as_deref()?;
     let engine = current_engine();
     let palette = engine.palette();
     let review_title = state
@@ -710,24 +722,22 @@ pub fn delete_review_params<'a>(state: &'a AppState, session_id: &str) -> Confir
         )),
     ];
 
-    ConfirmModalParams {
+    Some(ConfirmModalParams {
         title: active_t("dialog.delete_review.title"),
         tone: ModalTone::Dangerous,
         body_lines,
         confirm_label: active_t("dialog.button.confirm_delete"),
         cancel_label: active_t("modal.cancel"),
-        confirm_button: state.confirm_button,
+        confirm_button: state.modals.confirm_button,
         destructive: true,
         width: 58,
-    }
+    })
 }
 
-pub fn render_confirm_delete_review_popup(
-    frame: &mut ratatui::Frame,
-    session_id: &str,
-    state: &AppState,
-) {
-    render_modal_confirm(frame, delete_review_params(state, session_id));
+pub fn render_confirm_delete_review_popup(frame: &mut ratatui::Frame, state: &AppState) {
+    if let Some(params) = delete_review_params(state) {
+        render_modal_confirm(frame, params);
+    }
 }
 /// Width of the post-analysis confirmation, as a percentage of the terminal.
 const REVIEW_ANALYZE_DIALOG_WIDTH: u16 = 68;
@@ -822,7 +832,7 @@ pub(crate) fn review_analyze_dialog_geometry(
 /// configuration of the round, never its contract, and the safe `Cancel` button
 /// holds the default focus (c-dialog-parity, Conventions §5.4, §6).
 pub fn render_confirm_review_analyze_popup(frame: &mut ratatui::Frame, state: &AppState) {
-    let Some(target) = state.confirm_review_analyze.as_ref() else {
+    let Some(target) = state.modals.confirm_review_analyze.as_ref() else {
         return;
     };
 
@@ -1012,7 +1022,7 @@ pub fn clear_auto_params(state: &AppState) -> ConfirmModalParams<'_> {
         body_lines,
         confirm_label: active_t("dialog.button.confirm_clear"),
         cancel_label: active_t("modal.cancel"),
-        confirm_button: state.confirm_button,
+        confirm_button: state.modals.confirm_button,
         destructive: false,
         width: 58,
     }
@@ -1062,7 +1072,7 @@ pub fn clear_user_params(state: &AppState) -> ConfirmModalParams<'_> {
         body_lines,
         confirm_label: active_t("dialog.button.confirm_clear"),
         cancel_label: active_t("modal.cancel"),
-        confirm_button: state.confirm_button,
+        confirm_button: state.modals.confirm_button,
         destructive: false,
         width: 58,
     }
@@ -1077,10 +1087,10 @@ pub fn render_confirm_clear_user_popup(frame: &mut ratatui::Frame, state: &AppSt
 /// A curated audit context is destructive to lose, so removing one file travels
 /// through the same shared card as every other context mutation: the dialog
 /// names the exact path, the safe `Cancel` button holds the default focus, and
-/// the pending path stored in the Context view state is what the confirmation
-/// turns into a `context/remove` request (Conventions §4.3, §5.4).
+/// the pending path carried by the modal state is what the confirmation turns
+/// into a `context/remove` request (Conventions §4.3, §5.4).
 pub fn remove_context_file_params(state: &AppState) -> Option<ConfirmModalParams<'_>> {
-    let path = state.context_view.pending_remove.as_deref()?;
+    let path = state.modals.confirm_remove_context_file.as_deref()?;
     let engine = current_engine();
     let palette = engine.palette();
 
@@ -1113,7 +1123,7 @@ pub fn remove_context_file_params(state: &AppState) -> Option<ConfirmModalParams
         body_lines,
         confirm_label: active_t("dialog.button.remove"),
         cancel_label: active_t("modal.cancel"),
-        confirm_button: state.confirm_button,
+        confirm_button: state.modals.confirm_button,
         destructive: true,
         width: 60,
     })
@@ -1153,7 +1163,7 @@ pub fn clear_history_params(state: &AppState) -> ConfirmModalParams<'_> {
         body_lines,
         confirm_label: active_t("dialog.button.confirm_clear"),
         cancel_label: active_t("modal.cancel"),
-        confirm_button: state.confirm_button,
+        confirm_button: state.modals.confirm_button,
         destructive: true,
         width: 58,
     }
@@ -1173,7 +1183,8 @@ const CLEAR_HORIZON_FINAL_WIDTH: u16 = 64;
 /// The first tier states what survives the reset: only the implementation steps
 /// are dropped, while the `<concept>` tree of requirements and invariants stays
 /// untouched (c-2). The safe `Cancel` button holds the default focus.
-pub fn clear_horizon_params<'a>(state: &'a AppState, plan_id: &str) -> ConfirmModalParams<'a> {
+pub fn clear_horizon_params(state: &AppState) -> Option<ConfirmModalParams<'_>> {
+    let plan_id = state.modals.confirm_clear_horizon.as_deref()?;
     let engine = current_engine();
     let palette = engine.palette();
 
@@ -1191,16 +1202,16 @@ pub fn clear_horizon_params<'a>(state: &'a AppState, plan_id: &str) -> ConfirmMo
         )),
     ];
 
-    ConfirmModalParams {
+    Some(ConfirmModalParams {
         title: active_t("dialog.clear_horizon.title"),
         tone: ModalTone::Warning,
         body_lines,
         confirm_label: active_t("dialog.button.clear_horizon"),
         cancel_label: active_t("modal.cancel"),
-        confirm_button: state.confirm_button,
+        confirm_button: state.modals.confirm_button,
         destructive: true,
         width: CLEAR_HORIZON_WIDTH,
-    }
+    })
 }
 
 /// Presentation parameters for the second tier of the clear-horizon confirmation.
@@ -1208,10 +1219,8 @@ pub fn clear_horizon_params<'a>(state: &'a AppState, plan_id: &str) -> ConfirmMo
 /// A plan whose steps are already `InProgress` or `Done` has committed work in
 /// Git. Clearing its horizon does not rewrite that history, so the second tier
 /// raises the desynchronization risk explicitly before the reset runs (c-2).
-pub fn clear_horizon_final_params<'a>(
-    state: &'a AppState,
-    plan_id: &str,
-) -> ConfirmModalParams<'a> {
+pub fn clear_horizon_final_params(state: &AppState) -> Option<ConfirmModalParams<'_>> {
+    let plan_id = state.modals.confirm_clear_horizon_final.as_deref()?;
     let engine = current_engine();
     let palette = engine.palette();
 
@@ -1229,32 +1238,28 @@ pub fn clear_horizon_final_params<'a>(
         )),
     ];
 
-    ConfirmModalParams {
+    Some(ConfirmModalParams {
         title: active_t("dialog.clear_horizon_final.title"),
         tone: ModalTone::Dangerous,
         body_lines,
         confirm_label: active_t("dialog.button.confirm_clear_horizon"),
         cancel_label: active_t("modal.cancel"),
-        confirm_button: state.confirm_button,
+        confirm_button: state.modals.confirm_button,
         destructive: true,
         width: CLEAR_HORIZON_FINAL_WIDTH,
+    })
+}
+
+pub fn render_confirm_clear_horizon_popup(frame: &mut ratatui::Frame, state: &AppState) {
+    if let Some(params) = clear_horizon_params(state) {
+        render_modal_confirm(frame, params);
     }
 }
 
-pub fn render_confirm_clear_horizon_popup(
-    frame: &mut ratatui::Frame,
-    plan_id: &str,
-    state: &AppState,
-) {
-    render_modal_confirm(frame, clear_horizon_params(state, plan_id));
-}
-
-pub fn render_confirm_clear_horizon_final_popup(
-    frame: &mut ratatui::Frame,
-    plan_id: &str,
-    state: &AppState,
-) {
-    render_modal_confirm(frame, clear_horizon_final_params(state, plan_id));
+pub fn render_confirm_clear_horizon_final_popup(frame: &mut ratatui::Frame, state: &AppState) {
+    if let Some(params) = clear_horizon_final_params(state) {
+        render_modal_confirm(frame, params);
+    }
 }
 
 /// Width of the truncated-window consent card.
@@ -1270,7 +1275,7 @@ const REVIEW_TRUNCATION_WIDTH: u16 = 70;
 /// budget the selection shares. The safe `Cancel` button holds the default focus
 /// and returns the launch dialog with its typed fields (Conventions §5.4, c-3).
 pub fn review_truncation_params(state: &AppState) -> Option<ConfirmModalParams<'_>> {
-    let target = state.confirm_review_truncation.as_ref()?;
+    let target = state.modals.confirm_review_truncation.as_ref()?;
     let engine = current_engine();
     let palette = engine.palette();
     let window = &target.window;
@@ -1365,7 +1370,7 @@ pub fn review_truncation_params(state: &AppState) -> Option<ConfirmModalParams<'
         body_lines,
         confirm_label: active_t("review.truncation.confirm"),
         cancel_label: active_t("modal.cancel"),
-        confirm_button: state.confirm_button,
+        confirm_button: state.modals.confirm_button,
         destructive: false,
         width: REVIEW_TRUNCATION_WIDTH,
     })
@@ -1466,7 +1471,7 @@ mod tests {
     #[test]
     fn test_execute_review_params_all_sessions() {
         let mut st = crate::app::test_state();
-        st.confirm_execute_review = Some(crate::app::ConfirmExecuteReviewState::new(
+        st.modals.confirm_execute_review = Some(crate::app::ConfirmExecuteReviewState::new(
             None,
             "All Review Sessions".to_string(),
             "All remaining TODO findings across all sessions (2 items)".to_string(),
@@ -1511,7 +1516,8 @@ mod tests {
             ],
         )];
 
-        let params = delete_plan_params(&st, "plan-open");
+        st.modals.confirm_delete_plan = Some("plan-open".to_string());
+        let params = delete_plan_params(&st).expect("the pending deletion describes its card");
         assert_eq!(params.title, "Delete Plan");
         assert_eq!(params.confirm_label, "Confirm Delete");
         assert_eq!(
@@ -1527,9 +1533,9 @@ mod tests {
 
         // A finished plan needs no escalation and states it.
         if let Some(plan) = st.plans_view.plans.first_mut() {
-            plan.items[1].status = tauqe_protocol::PlanItemStatus::Done;
+            plan.implementation.items[1].status = tauqe_protocol::PlanItemStatus::Done;
         }
-        let done_params = delete_plan_params(&st, "plan-open");
+        let done_params = delete_plan_params(&st).expect("the pending deletion describes its card");
         let done_texts: Vec<String> = done_params
             .body_lines
             .iter()
@@ -1560,7 +1566,9 @@ mod tests {
             ],
         )];
 
-        let params = delete_plan_final_params(&st, "plan-wip");
+        st.modals.confirm_delete_plan_final = Some("plan-wip".to_string());
+        let params =
+            delete_plan_final_params(&st).expect("the pending deletion describes its card");
         assert_eq!(params.title, "Confirm Deleting Active Plan");
         assert_eq!(params.tone, ModalTone::Dangerous);
         assert_eq!(params.confirm_label, "Permanently Delete");
@@ -1602,10 +1610,16 @@ mod tests {
             )],
         )];
 
+        st.modals.confirm_delete_plan = Some("plan-geom".to_string());
+        st.modals.confirm_delete_plan_final = Some("plan-geom".to_string());
+
         let cases = [
-            (delete_plan_params(&st, "plan-geom"), DELETE_PLAN_WIDTH),
             (
-                delete_plan_final_params(&st, "plan-geom"),
+                delete_plan_params(&st).expect("the pending deletion describes its card"),
+                DELETE_PLAN_WIDTH,
+            ),
+            (
+                delete_plan_final_params(&st).expect("the pending deletion describes its card"),
                 DELETE_PLAN_FINAL_WIDTH,
             ),
         ];
@@ -1643,8 +1657,9 @@ mod tests {
 
     #[test]
     fn test_clear_horizon_params_are_warning_and_safe() {
-        let st = crate::app::test_state();
-        let params = clear_horizon_params(&st, "plan-1");
+        let mut st = crate::app::test_state();
+        st.modals.confirm_clear_horizon = Some("plan-1".to_string());
+        let params = clear_horizon_params(&st).expect("the pending reset describes its card");
 
         assert_eq!(params.title, "Clear Implementation Horizon");
         assert_eq!(params.tone, ModalTone::Warning);
@@ -1668,8 +1683,9 @@ mod tests {
     /// desynchronization risk before the reset can run.
     #[test]
     fn test_clear_horizon_final_params_are_dangerous() {
-        let st = crate::app::test_state();
-        let params = clear_horizon_final_params(&st, "plan-2");
+        let mut st = crate::app::test_state();
+        st.modals.confirm_clear_horizon_final = Some("plan-2".to_string());
+        let params = clear_horizon_final_params(&st).expect("the pending reset describes its card");
 
         assert_eq!(params.title, "Confirm Clearing Active Horizon");
         assert_eq!(params.tone, ModalTone::Dangerous);
@@ -1693,16 +1709,18 @@ mod tests {
     #[test]
     fn clear_horizon_buttons_match_hit_geometry() {
         let term = Rect::new(0, 0, 100, 40);
-        let st = crate::app::test_state();
+        let mut st = crate::app::test_state();
+        st.modals.confirm_clear_horizon = Some("plan-3".to_string());
+        st.modals.confirm_clear_horizon_final = Some("plan-4".to_string());
 
         let cases = [
             (
-                clear_horizon_params(&st, "plan-3"),
+                clear_horizon_params(&st).expect("the pending reset describes its card"),
                 "Clear Horizon",
                 CLEAR_HORIZON_WIDTH,
             ),
             (
-                clear_horizon_final_params(&st, "plan-4"),
+                clear_horizon_final_params(&st).expect("the pending reset describes its card"),
                 "Confirm Clear",
                 CLEAR_HORIZON_FINAL_WIDTH,
             ),
@@ -1743,7 +1761,7 @@ mod tests {
     #[test]
     fn test_review_analyze_dialog_lists_the_architect_ladder() {
         let mut st = crate::app::test_state();
-        st.confirm_review_analyze = Some(crate::app::ConfirmReviewAnalyzeState::new(
+        st.modals.confirm_review_analyze = Some(crate::app::ConfirmReviewAnalyzeState::new(
             "rev-9".to_string(),
             "Backend audit".to_string(),
             vec![
@@ -1757,7 +1775,11 @@ mod tests {
                 ),
             ],
         ));
-        let target = st.confirm_review_analyze.as_ref().expect("dialog open");
+        let target = st
+            .modals
+            .confirm_review_analyze
+            .as_ref()
+            .expect("dialog open");
         assert_eq!(target.selector.len(), 2);
         assert_eq!(
             target.confirm_button,
@@ -1789,7 +1811,7 @@ mod tests {
     fn rendered_review_analyze_buttons_match_hit_geometry() {
         let term = Rect::new(0, 0, 100, 40);
         let mut st = crate::app::test_state();
-        st.confirm_review_analyze = Some(crate::app::ConfirmReviewAnalyzeState::new(
+        st.modals.confirm_review_analyze = Some(crate::app::ConfirmReviewAnalyzeState::new(
             "rev-1".to_string(),
             "Session rev-1".to_string(),
             vec![tauqe_protocol::ModelEntry::new(
@@ -1798,6 +1820,7 @@ mod tests {
             )],
         ));
         let entry_count = st
+            .modals
             .confirm_review_analyze
             .as_ref()
             .expect("dialog open")
@@ -1834,7 +1857,7 @@ mod tests {
         let mut st = crate::app::test_state();
         assert!(remove_context_file_params(&st).is_none());
 
-        st.context_view.pending_remove = Some("crates/tui/src/app.rs".to_string());
+        st.modals.confirm_remove_context_file = Some("crates/tui/src/app.rs".to_string());
 
         let params = remove_context_file_params(&st).expect("params should be generated");
         assert_eq!(params.title, "Remove File from Context");
@@ -1861,7 +1884,7 @@ mod tests {
         let mut st = crate::app::test_state();
         assert!(review_truncation_params(&st).is_none());
 
-        st.confirm_review_truncation = Some(crate::app::ConfirmReviewTruncationState {
+        st.modals.confirm_review_truncation = Some(crate::app::ConfirmReviewTruncationState {
             pending: crate::app::PendingReviewLaunch {
                 dialog: crate::app::ReviewDialogState::new(0, 0, Vec::new(), Vec::new()),
                 params: tauqe_protocol::ReviewStartParams::default(),
@@ -1969,7 +1992,7 @@ mod tests {
                 ..plan_item("1", "Container", tauqe_protocol::PlanItemStatus::Todo)
             }],
         )];
-        st.confirm_execute_review = Some(group_confirmation(None));
+        st.modals.confirm_execute_review = Some(group_confirmation(None));
 
         let params = execute_review_params(&st).expect("the group plan renders the card");
         assert_eq!(params.title, "Execute Architecture Group");
@@ -1999,7 +2022,7 @@ mod tests {
     fn test_execute_review_params_group_plan_announces_the_jit_projection() {
         let mut st = crate::app::test_state();
         st.review.sessions = vec![session_with_group("arch-auth", Vec::new())];
-        st.confirm_execute_review = Some(group_confirmation(None));
+        st.modals.confirm_execute_review = Some(group_confirmation(None));
 
         let params = execute_review_params(&st).expect("the group plan renders the card");
         let joined = params
@@ -2017,7 +2040,7 @@ mod tests {
     #[test]
     fn test_execute_review_params_skip_the_group_step_point_form() {
         let mut st = crate::app::test_state();
-        st.confirm_execute_review = Some(group_confirmation(Some("1.1")));
+        st.modals.confirm_execute_review = Some(group_confirmation(Some("1.1")));
 
         assert!(execute_review_params(&st).is_none());
     }
@@ -2027,7 +2050,7 @@ mod tests {
     #[test]
     fn test_execute_review_params_keep_a_one_finding_queue_binary() {
         let mut st = crate::app::test_state();
-        st.confirm_execute_review = Some(crate::app::ConfirmExecuteReviewState::new(
+        st.modals.confirm_execute_review = Some(crate::app::ConfirmExecuteReviewState::new(
             Some("rev-1".to_string()),
             "Session rev-1".to_string(),
             "All remaining TODO findings (1 items)".to_string(),
@@ -2073,7 +2096,8 @@ mod tests {
             )],
         )];
 
-        let params = delete_plan_params(&st, "plan-long-title");
+        st.modals.confirm_delete_plan = Some("plan-long-title".to_string());
+        let params = delete_plan_params(&st).expect("the pending deletion describes its card");
         let note = params
             .body_lines
             .last()

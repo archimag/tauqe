@@ -761,6 +761,37 @@ impl AppState {
         Ok(snapshot)
     }
 
+    /// Drops the documents one external-document cache removal addressed from
+    /// the OuterDocs layer, starting a fresh dialogue session when any of them
+    /// was really resident.
+    ///
+    /// The external documentation layer is part of the stable prompt prefix, so
+    /// a removal that took a document away shrinks it exactly like clearing the
+    /// layer does, and the session identifier rotates with it. A removal that
+    /// took nothing keeps the warm session. The report of what happened travels
+    /// with the resulting snapshot, so the caller publishes one consistent
+    /// state instead of re-reading the manager.
+    pub async fn remove_outer_docs_context(
+        self: &Arc<Self>,
+        documents: Vec<String>,
+    ) -> Result<(bool, ContextState), String> {
+        let (removed, snapshot) = self
+            .mutate_context(move |ctx| {
+                let mut removed = false;
+                for document in documents {
+                    if ctx.remove_file(&document).unwrap_or(false) {
+                        removed = true;
+                    }
+                }
+                (removed, ctx.get_state())
+            })
+            .await?;
+        if removed {
+            self.reset_session_uuid().await;
+        }
+        Ok((removed, snapshot))
+    }
+
     /// Returns the turn marker for the current turn, or `None` when markers are
     /// disabled or the active protocol does not carry them.
     ///
@@ -1001,7 +1032,14 @@ mod tests {
             std::env::temp_dir().join(format!("tauqe-state-transient-{}", next_operation_id()));
         let _ = std::fs::create_dir_all(&root);
         std::fs::write(root.join("auto.rs"), "fn auto() {}\n").unwrap();
-        std::fs::write(root.join("ref.md"), "# External snapshot\n").unwrap();
+        // The external document lives in the isolated cache the registry
+        // materializes into, never in the working tree. The layer addresses
+        // it by its logical path and resolves the bytes in that cache.
+        let snapshot = root
+            .join(tauqe_core::outer_docs::OUTER_DOCS_CACHE_DIR)
+            .join("ref.md");
+        std::fs::create_dir_all(snapshot.parent().expect("the snapshot has a parent")).unwrap();
+        std::fs::write(&snapshot, "# External snapshot\n").unwrap();
 
         let (out, _rx) = OutChannel::new();
         let (history_sender, _history_rx) = tokio::sync::mpsc::unbounded_channel();

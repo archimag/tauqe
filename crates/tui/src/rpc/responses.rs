@@ -12,9 +12,10 @@ use tauqe_protocol::review::ReviewPreviewResult;
 use tauqe_protocol::{
     methods, ConfigState, ContextAddPatternResult, ContextState, GitSquashGenerateMessageResult,
     GitSquashPreviewResult, HistoryGetResult, ModelCurrentResult, ModelRef, ModelRolesSummary,
-    ModelSelectResult, ModelSelection, PlanClearHorizonResult, PlanListResult, PlanRefineResult,
-    RepositoryInitResult, RepositoryListFilesResult, RequestId, Response, ReviewAnalyzeResult,
-    ReviewGetResult, ReviewListResult, SystemStatusResult,
+    ModelSelectResult, ModelSelection, OuterDocsCacheListResult, OuterDocsCacheRemoveResult,
+    PlanClearHorizonResult, PlanListResult, PlanRefineResult, RepositoryInitResult,
+    RepositoryListFilesResult, RequestId, Response, ReviewAnalyzeResult, ReviewGetResult,
+    ReviewListResult, SystemStatusResult,
 };
 use tokio::sync::Mutex;
 
@@ -201,6 +202,33 @@ fn apply_response(
                 st.history_view.apply_page(history, view_height);
             }
         }
+        Some(methods::OUTER_DOCS_CACHE_LIST) => {
+            if let Ok(listed) = serde_json::from_value::<OuterDocsCacheListResult>(value) {
+                if let Some(dialog) = st.modals.outer_docs_cache.as_mut() {
+                    dialog.entries = listed.entries;
+                    dialog.loading = false;
+                    dialog.clamp_cursor();
+                }
+            }
+        }
+        Some(methods::OUTER_DOCS_CACHE_REMOVE) => {
+            if let Ok(removed) = serde_json::from_value::<OuterDocsCacheRemoveResult>(value) {
+                st.notify_success(
+                    active_t("notify.outer_docs_cache_removed")
+                        .replace("{}", &removed.removed_files.to_string()),
+                );
+            }
+            // The tree is rebuilt from the authoritative inventory, so the
+            // removed node leaves the pane as soon as the daemon answers
+            // (c-outer-docs-cache-tui-deletion).
+            if let Some(dialog) = st.modals.outer_docs_cache.as_mut() {
+                dialog.loading = true;
+                follow_ups.push(FollowUp::Request(
+                    methods::OUTER_DOCS_CACHE_LIST,
+                    serde_json::json!({}),
+                ));
+            }
+        }
         Some(methods::PLAN_LIST) => {
             if let Ok(list) = serde_json::from_value::<PlanListResult>(value) {
                 st.plans_view.plans = list.plans;
@@ -216,10 +244,18 @@ fn apply_response(
             }
             st.notify_success(active_t("notify.plan_horizon_cleared"));
         }
-        Some(methods::PLAN_REFINE) | Some(methods::PLAN_REPLAN) => {
+        Some(methods::PLAN_REFINE)
+        | Some(methods::PLAN_REPLAN)
+        | Some(methods::PLAN_CREATE_PIPELINE) => {
+            // The creation pipeline answers with the same result shape as a
+            // directed modification, so the notification below names the issued
+            // plan as created, and the form that requested it is settled here
+            // (c-two-phase-planning-engine).
+            let created = method == Some(methods::PLAN_CREATE_PIPELINE);
             st.plans_view.refining = false;
             st.plans_view.refining_plan_id = None;
-            st.plans_view.refine_dialog = None;
+            st.modals.refine_dialog = None;
+            st.modals.create_dialog = None;
             match serde_json::from_value::<PlanRefineResult>(value) {
                 Ok(PlanRefineResult::Success { plan, explanation }) => {
                     let (done, total) = step_progress(&plan);
@@ -227,13 +263,22 @@ fn apply_response(
                         .as_deref()
                         .map(str::trim)
                         .filter(|text| !text.is_empty());
-                    let message = match explanation {
-                        Some(explanation) => active_t("notify.plan_horizon_updated")
+                    let message = match (created, explanation) {
+                        (true, Some(explanation)) => active_t("notify.plan_created")
                             .replacen("{}", &plan.id, 1)
                             .replacen("{}", &done.to_string(), 1)
                             .replacen("{}", &total.to_string(), 1)
                             .replacen("{}", explanation, 1),
-                        None => active_t("notify.plan_horizon_updated_default")
+                        (true, None) => active_t("notify.plan_created_default")
+                            .replacen("{}", &plan.id, 1)
+                            .replacen("{}", &done.to_string(), 1)
+                            .replacen("{}", &total.to_string(), 1),
+                        (false, Some(explanation)) => active_t("notify.plan_horizon_updated")
+                            .replacen("{}", &plan.id, 1)
+                            .replacen("{}", &done.to_string(), 1)
+                            .replacen("{}", &total.to_string(), 1)
+                            .replacen("{}", explanation, 1),
+                        (false, None) => active_t("notify.plan_horizon_updated_default")
                             .replacen("{}", &plan.id, 1)
                             .replacen("{}", &done.to_string(), 1)
                             .replacen("{}", &total.to_string(), 1),
@@ -273,7 +318,7 @@ fn apply_response(
         }
         Some(methods::GIT_SQUASH_GENERATE_MESSAGE) => {
             if let Ok(generated) = serde_json::from_value::<GitSquashGenerateMessageResult>(value) {
-                if let Some(dialog) = st.squash_dialog.as_mut() {
+                if let Some(dialog) = st.modals.squash_dialog.as_mut() {
                     dialog.generating_message = false;
                     dialog.message_editor.clear();
                     dialog.message_editor.insert_str(&generated.message);
@@ -299,13 +344,13 @@ fn apply_review_preview(
     value: serde_json::Value,
     follow_ups: &mut Vec<FollowUp>,
 ) {
-    let Some(pending) = st.pending_review_launch.take() else {
+    let Some(pending) = st.modals.pending_review_launch.take() else {
         return;
     };
     let preview = match serde_json::from_value::<ReviewPreviewResult>(value) {
         Ok(preview) => preview,
         Err(error) => {
-            st.review_dialog = Some(pending.dialog);
+            st.modals.review_dialog = Some(pending.dialog);
             st.notify_error(
                 active_t("notify.review_preview_failed").replace("{}", &error.to_string()),
             );
@@ -313,11 +358,11 @@ fn apply_review_preview(
         }
     };
     if preview.window.is_truncated() {
-        st.confirm_review_truncation = Some(ConfirmReviewTruncationState {
+        st.modals.confirm_review_truncation = Some(ConfirmReviewTruncationState {
             pending,
             window: preview.window,
         });
-        st.confirm_button = ConfirmDialogButton::Cancel;
+        st.modals.confirm_button = ConfirmDialogButton::Cancel;
     } else {
         follow_ups.push(FollowUp::ReviewLaunch(Box::new(pending)));
     }
@@ -334,10 +379,10 @@ fn reject_response(st: &mut AppState, method: Option<&str>, message: &str) {
         Some(methods::REVIEW_PREVIEW) => {
             // A refused projection settles the launch it started: the dialog
             // returns with its typed fields and no operation opens (c-3).
-            if let Some(pending) = st.pending_review_launch.take() {
-                st.review_dialog = Some(pending.dialog);
+            if let Some(pending) = st.modals.pending_review_launch.take() {
+                st.modals.review_dialog = Some(pending.dialog);
             }
-            st.confirm_button = ConfirmDialogButton::Cancel;
+            st.modals.confirm_button = ConfirmDialogButton::Cancel;
             st.notify_error(active_t("notify.review_preview_failed").replace("{}", message));
         }
         Some(methods::REVIEW_ANALYZE) => {
@@ -345,8 +390,11 @@ fn reject_response(st: &mut AppState, method: Option<&str>, message: &str) {
             st.review.error = Some(message.to_string());
             settle_failed_turn(st, message);
         }
-        Some(methods::PLAN_REFINE) | Some(methods::PLAN_REPLAN) => {
-            st.plans_view.refine_dialog = None;
+        Some(methods::PLAN_REFINE)
+        | Some(methods::PLAN_REPLAN)
+        | Some(methods::PLAN_CREATE_PIPELINE) => {
+            st.modals.refine_dialog = None;
+            st.modals.create_dialog = None;
             st.plans_view.refining = false;
             st.plans_view.refining_plan_id = None;
             st.notify_error(active_t("notify.rpc_error").replace("{}", message));
@@ -359,7 +407,7 @@ fn reject_response(st: &mut AppState, method: Option<&str>, message: &str) {
         Some(methods::GIT_SQUASH_PREVIEW)
         | Some(methods::GIT_SQUASH_GENERATE_MESSAGE)
         | Some(methods::GIT_SQUASH_APPLY) => {
-            if let Some(dialog) = st.squash_dialog.as_mut() {
+            if let Some(dialog) = st.modals.squash_dialog.as_mut() {
                 dialog.loading = false;
                 dialog.generating_message = false;
                 dialog.applying = false;
@@ -368,10 +416,26 @@ fn reject_response(st: &mut AppState, method: Option<&str>, message: &str) {
             st.notify_error(active_t("notify.rpc_error").replace("{}", message));
         }
         Some(methods::LOCALE_GENERATE) => {
-            if let Some(dialog) = st.locale_dialog.as_mut() {
+            if let Some(dialog) = st.modals.locale_dialog.as_mut() {
                 dialog.generating = false;
             }
             st.notify_error(active_t("notify.locale_generate_failed").replace("{}", message));
+        }
+        Some(methods::OUTER_DOCS_CACHE_REMOVE) => {
+            // A refused removal settles the browser's loading state, so the tree
+            // stays readable and the failure is reported (c-3).
+            if let Some(dialog) = st.modals.outer_docs_cache.as_mut() {
+                dialog.loading = false;
+            }
+            st.notify_error(active_t("notify.rpc_error").replace("{}", message));
+        }
+        Some(methods::OUTER_DOCS_CACHE_LIST) => {
+            // A refused inventory settles the browser's loading state instead of
+            // leaving a spinner no answer will ever stop (c-3).
+            if let Some(dialog) = st.modals.outer_docs_cache.as_mut() {
+                dialog.loading = false;
+            }
+            st.notify_error(active_t("notify.outer_docs_cache_list_failed").replace("{}", message));
         }
         Some(methods::HISTORY_GET) => {
             // A refused page settles the handshake it armed: no answer arrives
@@ -390,9 +454,9 @@ fn reject_response(st: &mut AppState, method: Option<&str>, message: &str) {
 fn settle_failed_turn(st: &mut AppState, message: &str) {
     st.running_model = None;
     st.turn_started_at = None;
-    st.confirm_cancel = false;
-    st.confirm_batch_cancel = false;
-    st.batch_stopping = false;
+    st.modals.confirm_cancel = false;
+    st.modals.confirm_batch_cancel = false;
+    st.modals.batch_stopping = false;
     st.review.running = false;
     st.review.analyzing = false;
 
@@ -444,7 +508,8 @@ pub(crate) fn apply_optimistic_rollback(st: &mut AppState, rollback: OptimisticR
                 .iter_mut()
                 .find(|plan| plan.id == plan_id)
             {
-                if let Some(item) = plan.items.iter_mut().find(|item| item.id == item_id) {
+                let items = &mut plan.implementation.items;
+                if let Some(item) = items.iter_mut().find(|item| item.id == item_id) {
                     item.status = prev_status;
                 }
             }
@@ -563,9 +628,9 @@ fn upsert_plan(st: &mut AppState, plan: tauqe_protocol::Plan) {
 
 /// Counts the completed and total implementation steps of a plan.
 fn step_progress(plan: &tauqe_protocol::Plan) -> (usize, usize) {
-    let total = plan.items.len();
-    let done = plan
-        .items
+    let items = &plan.implementation.items;
+    let total = items.len();
+    let done = items
         .iter()
         .filter(|item| item.status == tauqe_protocol::PlanItemStatus::Done)
         .count();
@@ -577,7 +642,7 @@ fn apply_squash_preview(st: &mut AppState, value: serde_json::Value) {
     let Ok(preview) = serde_json::from_value::<GitSquashPreviewResult>(value) else {
         return;
     };
-    let Some(dialog) = st.squash_dialog.as_mut() else {
+    let Some(dialog) = st.modals.squash_dialog.as_mut() else {
         return;
     };
     dialog.loading = false;
@@ -618,7 +683,7 @@ fn handle_locale_response(
     value: serde_json::Value,
     follow_ups: &mut Vec<FollowUp>,
 ) {
-    if let Some(dialog) = st.locale_dialog.as_mut() {
+    if let Some(dialog) = st.modals.locale_dialog.as_mut() {
         dialog.generating = false;
     }
     let Ok(result) = serde_json::from_value::<tauqe_protocol::locale::LocaleGenerateResult>(value)
@@ -627,7 +692,7 @@ fn handle_locale_response(
     };
     let locale = CustomLocale::new(result.language, result.translations);
     st.apply_custom_locale(locale.clone());
-    st.locale_dialog = None;
+    st.modals.locale_dialog = None;
     follow_ups.push(FollowUp::PersistLocale(locale));
 }
 
@@ -704,11 +769,11 @@ fn apply_commit_audit(st: &mut AppState, diff: &str) {
         st.notify_info(active_t("notify.plan_commit_diff_empty"));
         return;
     }
-    st.diff_audit = Some(crate::app::CommitAudit {
+    st.modals.diff_audit = Some(crate::app::CommitAudit {
         files,
         cache: crate::views::repl::DiffRenderCache::default(),
     });
-    st.diff_inspector = Some(crate::app::DiffInspectorState {
+    st.modals.diff_inspector = Some(crate::app::DiffInspectorState {
         selected_file: 0,
         diff_scroll: 0,
         focus: crate::app::DiffInspectorFocus::Files,
@@ -940,7 +1005,7 @@ mod tests {
     async fn an_untruncated_projection_launches_the_audit_immediately() {
         let mut st = crate::app::test_state();
         st.view_mode = ViewMode::Review;
-        st.pending_review_launch = Some(pending_launch("src/"));
+        st.modals.pending_review_launch = Some(pending_launch("src/"));
 
         let state = Arc::new(Mutex::new(st));
         let mut conn = RpcConnection::new(Vec::<u8>::new());
@@ -965,8 +1030,8 @@ mod tests {
         assert!(payload.contains("src/"), "{payload}");
 
         let guard = state.lock().await;
-        assert!(guard.pending_review_launch.is_none());
-        assert!(guard.confirm_review_truncation.is_none());
+        assert!(guard.modals.pending_review_launch.is_none());
+        assert!(guard.modals.confirm_review_truncation.is_none());
         assert!(guard.review.running);
     }
 
@@ -976,7 +1041,7 @@ mod tests {
     async fn a_truncated_projection_opens_the_consent_card() {
         let mut st = crate::app::test_state();
         st.view_mode = ViewMode::Review;
-        st.pending_review_launch = Some(pending_launch("crates/"));
+        st.modals.pending_review_launch = Some(pending_launch("crates/"));
 
         let state = Arc::new(Mutex::new(st));
         let mut conn = RpcConnection::new(Vec::<u8>::new());
@@ -1000,15 +1065,16 @@ mod tests {
 
         let guard = state.lock().await;
         let target = guard
+            .modals
             .confirm_review_truncation
             .as_ref()
             .expect("the truncated window asks for consent");
         assert_eq!(target.window.omitted_files, 5);
         assert_eq!(target.window.omitted_by_budget, 5);
         assert_eq!(target.window.files_token_budget, 60_000);
-        assert!(guard.pending_review_launch.is_none());
+        assert!(guard.modals.pending_review_launch.is_none());
         assert_eq!(guard.active_modal(), Some(ActiveModal::ReviewTruncation));
-        assert_eq!(guard.confirm_button, ConfirmDialogButton::Cancel);
+        assert_eq!(guard.modals.confirm_button, ConfirmDialogButton::Cancel);
         assert!(!guard.review.running, "a pending consent opens no audit");
     }
 
@@ -1018,7 +1084,7 @@ mod tests {
     async fn a_refused_projection_restores_the_launch_dialog() {
         let mut st = crate::app::test_state();
         st.view_mode = ViewMode::Review;
-        st.pending_review_launch = Some(pending_launch("srx/"));
+        st.modals.pending_review_launch = Some(pending_launch("srx/"));
 
         let state = Arc::new(Mutex::new(st));
         let mut conn = RpcConnection::new(Vec::<u8>::new());
@@ -1037,9 +1103,10 @@ mod tests {
         .await;
 
         let guard = state.lock().await;
-        assert!(guard.pending_review_launch.is_none());
-        assert!(guard.confirm_review_truncation.is_none());
+        assert!(guard.modals.pending_review_launch.is_none());
+        assert!(guard.modals.confirm_review_truncation.is_none());
         let dialog = guard
+            .modals
             .review_dialog
             .as_ref()
             .expect("the launch dialog returns with its fields");
@@ -1149,5 +1216,89 @@ mod tests {
         assert_eq!(parse_hunk_header("@@ -1,2 @@"), None);
         assert_eq!(parse_hunk_header("@@ -x,2 +1,2 @@"), None);
         assert_eq!(parse_hunk_header("not a header"), None);
+    }
+    /// The cache inventory answer fills the browser, and a removal refreshes it
+    /// through the same request, so the tree always mirrors the daemon
+    /// (c-outer-docs-cache-tui-browser, c-outer-docs-cache-tui-deletion).
+    #[tokio::test]
+    async fn a_cache_removal_refreshes_the_browser_inventory() {
+        let mut st = crate::app::test_state();
+        st.modals.outer_docs_cache = Some(crate::app::OuterDocsCacheDialogState {
+            loading: true,
+            ..Default::default()
+        });
+
+        let state = Arc::new(Mutex::new(st));
+        let mut conn = RpcConnection::new(Vec::<u8>::new());
+
+        let id = send_request(
+            &mut conn,
+            methods::OUTER_DOCS_CACHE_LIST,
+            serde_json::json!({}),
+        )
+        .await
+        .expect("an in-memory sink never fails to write");
+        handle_response(
+            Response::ok_typed(
+                RequestId::Number(id),
+                &tauqe_protocol::OuterDocsCacheListResult {
+                    entries: vec![tauqe_protocol::OuterDocsCacheEntry {
+                        path: "openrouter/models".to_string(),
+                        size_bytes: 1024,
+                        estimated_tokens: 256,
+                    }],
+                },
+            ),
+            &state,
+            &mut conn,
+        )
+        .await;
+        {
+            let guard = state.lock().await;
+            let dialog = guard
+                .modals
+                .outer_docs_cache
+                .as_ref()
+                .expect("the browser stays open");
+            assert_eq!(dialog.entries.len(), 1);
+            assert!(!dialog.loading);
+        }
+
+        let id = send_request(
+            &mut conn,
+            methods::OUTER_DOCS_CACHE_REMOVE,
+            serde_json::json!({ "path": "openrouter/models" }),
+        )
+        .await
+        .expect("an in-memory sink never fails to write");
+        handle_response(
+            Response::ok_typed(
+                RequestId::Number(id),
+                &tauqe_protocol::OuterDocsCacheRemoveResult {
+                    removed_files: 1,
+                    removed_bytes: 1024,
+                },
+            ),
+            &state,
+            &mut conn,
+        )
+        .await;
+
+        let payload = String::from_utf8(conn.written().to_vec()).expect("utf-8 payload");
+        assert_eq!(
+            payload.matches(methods::OUTER_DOCS_CACHE_LIST).count(),
+            2,
+            "the removal re-reads the inventory: {payload}"
+        );
+        let guard = state.lock().await;
+        assert!(guard
+            .modals
+            .outer_docs_cache
+            .as_ref()
+            .is_some_and(|dialog| dialog.loading));
+        assert_eq!(
+            guard.active_notification().map(|n| n.level),
+            Some(NotificationLevel::Success)
+        );
     }
 }

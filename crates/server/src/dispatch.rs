@@ -95,6 +95,7 @@ mod tests {
         for method in [
             methods::MODEL_ASK,
             methods::PLAN_REFINE,
+            methods::PLAN_CREATE_PIPELINE,
             methods::PLAN_REPLAN,
             methods::PLAN_EXECUTE,
             methods::PLAN_EXECUTE_PIPELINE,
@@ -290,5 +291,21 @@ mod tests {
         expected.sort_unstable();
 
         assert_eq!(actual, expected);
+    }
+    /// The cache inspection and removal handlers read the cache directory and
+    /// unlink files inside it, so neither of them is in-memory work the read
+    /// loop may own.
+    #[test]
+    fn outer_docs_cache_methods_are_offloaded() {
+        for method in [
+            methods::OUTER_DOCS_CACHE_LIST,
+            methods::OUTER_DOCS_CACHE_REMOVE,
+        ] {
+            assert_eq!(
+                dispatch_class(method),
+                DispatchClass::Offload,
+                "'{method}' must be offloaded"
+            );
+        }
     }
 }

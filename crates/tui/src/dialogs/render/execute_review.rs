@@ -92,7 +92,7 @@ pub fn execute_review_dialog_geometry(
 /// header, embedded model list, editor, action bar, docked hint strip — so both
 /// pickers read identically (concept #c-3, Conventions §6, §7).
 pub fn render_execute_review_dialog(frame: &mut ratatui::Frame, state: &AppState) {
-    let Some(target) = state.confirm_execute_review.as_ref() else {
+    let Some(target) = state.modals.confirm_execute_review.as_ref() else {
         return;
     };
 
@@ -340,7 +340,7 @@ mod tests {
     #[test]
     fn group_step_form_renders_the_group_and_the_step() {
         let mut st = crate::app::test_state();
-        st.confirm_execute_review = Some(
+        st.modals.confirm_execute_review = Some(
             ConfirmExecuteReviewState::new(
                 Some("rev-1".to_string()),
                 "Session rev-1".to_string(),

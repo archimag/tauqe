@@ -12,6 +12,15 @@ use super::ResearchLimits;
 /// Maximum file size eligible for regex scanning (2 MiB).
 pub const MAX_SEARCHABLE_FILE_SIZE: u64 = 2 * 1024 * 1024;
 
+/// Maximum aggregate text a single round retains for regex scanning (64 MiB).
+///
+/// A round reads its searchable corpus once and evaluates every query over the
+/// shared texts, so the corpus is the peak memory of the phase. This ceiling
+/// bounds that peak: files enter the corpus in the round's own file order while
+/// they fit, and every file left over is reported to the queries whose scope
+/// covers it instead of being materialized.
+pub const MAX_SEARCHABLE_CORPUS_BYTES: u64 = 64 * 1024 * 1024;
+
 /// Compiled regex size limit to prevent ReDoS and excessive memory usage (10 MiB).
 pub const REGEX_SIZE_LIMIT: usize = 10 * 1024 * 1024;
 
@@ -33,6 +42,9 @@ pub struct RepoSearchResult {
     pub total_matched_files: usize,
     pub total_matches: usize,
     pub omitted_files: usize,
+    /// In-scope files the round left unsearched because the aggregate corpus
+    /// ceiling was reached.
+    pub unsearched_files: usize,
     pub error: Option<String>,
 }
 
@@ -154,13 +166,21 @@ struct CorpusFile<'a> {
 /// Searchable corpus of one Research round.
 ///
 /// The corpus holds the scope-invariant half of a search. The path-exclusion
-/// rule, the symlink boundary check, the regular-file and size gates, the disk
-/// read, the NUL-byte scan, and the UTF-8 validation run once per candidate file
-/// for the whole round, and every query then evaluates its already compiled
-/// pattern over the same retained texts.
+/// rule, the symlink boundary check, the regular-file and size gates, the
+/// aggregate ceiling, the disk read, the NUL-byte scan, and the UTF-8 validation
+/// run once per candidate file for the whole round, and every query then
+/// evaluates its already compiled pattern over the same retained texts.
 struct SearchCorpus<'a> {
     /// Files admitted by at least one prepared query, with their decoded text.
     files: Vec<CorpusFile<'a>>,
+    /// In-scope files the aggregate ceiling left unread, in the round's file
+    /// order.
+    ///
+    /// The path is borrowed from the round's file list, so recording an excluded
+    /// file costs no copy of its body. A query is told only about the entries
+    /// its own scope covers, because a file outside that scope was never a
+    /// candidate for it.
+    unsearched: Vec<&'a str>,
 }
 
 impl<'a> SearchCorpus<'a> {
@@ -170,35 +190,51 @@ impl<'a> SearchCorpus<'a> {
     /// round whose queries all target one subdirectory never reads the rest of
     /// the repository. A file rejected by any gate contributes no text and is
     /// therefore absent: no query could ever match it.
+    ///
+    /// `corpus_budget` bounds the aggregate text the round retains. A file is
+    /// admitted while it fits, its size deciding that before its body is read,
+    /// so a file the round cannot hold costs one metadata read instead of a
+    /// materialization. A file left over is recorded as unsearched instead of
+    /// silently disappearing from the results of the queries that cover it.
     fn resolve(
         repo_root: &Path,
         available_files: &'a [String],
+        corpus_budget: u64,
         in_scope: impl Fn(&str) -> bool,
     ) -> Self {
         let mut files = Vec::new();
+        let mut unsearched = Vec::new();
+        let mut retained_bytes: u64 = 0;
         for candidate in available_files {
             if !in_scope(candidate) || is_excluded_path(candidate) {
                 continue;
             }
-            if let Some(text) = read_searchable_text(repo_root, candidate) {
-                files.push(CorpusFile {
-                    path: candidate.as_str(),
-                    text,
-                });
+            let Some(len) = searchable_file_len(repo_root, candidate) else {
+                continue;
+            };
+            if retained_bytes.saturating_add(len) > corpus_budget {
+                unsearched.push(candidate.as_str());
+                continue;
             }
+            let Some(text) = read_searchable_text(repo_root, candidate) else {
+                continue;
+            };
+            retained_bytes = retained_bytes.saturating_add(len);
+            files.push(CorpusFile {
+                path: candidate.as_str(),
+                text,
+            });
         }
-        Self { files }
+        Self { files, unsearched }
     }
 }
 
-/// Reads the searchable text of one repository file.
+/// Applies every gate that needs no file body and returns the body length.
 ///
-/// Every gate that decides whether a file may be searched lives here, so the
-/// round applies it exactly once per file instead of once per query: a symlink
-/// escaping the repository, a non-regular file, a file larger than
-/// [`MAX_SEARCHABLE_FILE_SIZE`], a body carrying a NUL byte, and a body that is
-/// not valid UTF-8 are all skipped.
-fn read_searchable_text(repo_root: &Path, candidate: &str) -> Option<String> {
+/// A symlink escaping the repository, a non-regular file, and a file larger than
+/// [`MAX_SEARCHABLE_FILE_SIZE`] are refused here, so the round never reads a
+/// body it cannot retain.
+fn searchable_file_len(repo_root: &Path, candidate: &str) -> Option<u64> {
     let full_path = repo_root.join(candidate);
 
     let link_meta = std::fs::symlink_metadata(&full_path).ok()?;
@@ -211,7 +247,16 @@ fn read_searchable_text(repo_root: &Path, candidate: &str) -> Option<String> {
         return None;
     }
 
-    let bytes = std::fs::read(&full_path).ok()?;
+    Some(file_meta.len())
+}
+
+/// Reads the searchable text of one file that already passed
+/// [`searchable_file_len`].
+///
+/// A body carrying a NUL byte and a body that is not valid UTF-8 are refused
+/// here, so only textual material enters the corpus.
+fn read_searchable_text(repo_root: &Path, candidate: &str) -> Option<String> {
+    let bytes = std::fs::read(repo_root.join(candidate)).ok()?;
     if bytes.contains(&0) {
         return None;
     }
@@ -256,7 +301,10 @@ impl RoundQuery<'_> {
     ///
     /// Only the file texts are shared: the scope predicate, the count-descending
     /// ordering, the truncation against `max_matched_files_per_search`, and the
-    /// diagnostic of a rejected query stay the property of the query itself.
+    /// diagnostic of a rejected query stay the property of the query itself. The
+    /// aggregate ceiling is the one corpus-level omission, and it is counted
+    /// against the query's own scope, so a file the query never searched is
+    /// never presented to it as a search gap.
     fn evaluate(self, corpus: &SearchCorpus<'_>, limits: ResearchLimits) -> RepoSearchResult {
         match self {
             Self::Prepared {
@@ -277,7 +325,12 @@ impl RoundQuery<'_> {
                         });
                     }
                 }
-                accounted_search_result(request.clone(), matches, limits)
+                let unsearched_files = corpus
+                    .unsearched
+                    .iter()
+                    .filter(|path| scope.admits(path))
+                    .count();
+                accounted_search_result(request.clone(), matches, unsearched_files, limits)
             }
             Self::Rejected { request, error } => failed_search_result(request.clone(), error),
         }
@@ -309,6 +362,7 @@ fn prepare_query<'a>(repo_root: &Path, query: &'a RepoSearchRequest) -> RoundQue
 fn accounted_search_result(
     query: RepoSearchRequest,
     mut matches: Vec<FileSearchMatch>,
+    unsearched_files: usize,
     limits: ResearchLimits,
 ) -> RepoSearchResult {
     // Deterministic order: highest occurrence count first, then alphabetical.
@@ -325,6 +379,7 @@ fn accounted_search_result(
         total_matched_files,
         total_matches,
         omitted_files,
+        unsearched_files,
         error: None,
     }
 }
@@ -337,6 +392,7 @@ fn failed_search_result(query: RepoSearchRequest, error: String) -> RepoSearchRe
         total_matched_files: 0,
         total_matches: 0,
         omitted_files: 0,
+        unsearched_files: 0,
         error: Some(error),
     }
 }
@@ -354,7 +410,12 @@ fn execute_repo_search_sync(
 ) -> RepoSearchResult {
     let prepared = prepare_query(repo_root, query);
     let in_scope = |candidate: &str| prepared.admits(candidate);
-    let corpus = SearchCorpus::resolve(repo_root, available_files, in_scope);
+    let corpus = SearchCorpus::resolve(
+        repo_root,
+        available_files,
+        MAX_SEARCHABLE_CORPUS_BYTES,
+        in_scope,
+    );
     prepared.evaluate(&corpus, limits)
 }
 
@@ -375,8 +436,8 @@ pub fn execute_repo_search(
 /// Executes multiple repository searches over a corpus resolved once per round.
 ///
 /// The round resolves every query into its scope and compiled pattern first,
-/// then reads the union of those scopes exactly once, and finally evaluates each
-/// query over the shared texts.
+/// then reads the union of those scopes exactly once, within the aggregate
+/// corpus ceiling, and finally evaluates each query over the shared texts.
 fn execute_repo_searches_sync(
     repo_root: &Path,
     queries: &[RepoSearchRequest],
@@ -402,7 +463,12 @@ fn execute_repo_searches_sync(
         .collect();
 
     let in_scope = |candidate: &str| prepared.iter().any(|query| query.admits(candidate));
-    let corpus = SearchCorpus::resolve(repo_root, available_files, in_scope);
+    let corpus = SearchCorpus::resolve(
+        repo_root,
+        available_files,
+        MAX_SEARCHABLE_CORPUS_BYTES,
+        in_scope,
+    );
 
     prepared
         .into_iter()
@@ -450,6 +516,16 @@ pub fn format_single_search_feedback(result: &RepoSearchResult) -> String {
                 result.omitted_files
             ));
         }
+    }
+
+    // The aggregate ceiling decides what the round could search at all, so the
+    // omission is reported even when the query matched nothing.
+    if result.unsearched_files > 0 {
+        out.push_str(&format!(
+            "[{} in-scope file(s) were not searched: the round retains at most {} MiB of text]\n",
+            result.unsearched_files,
+            MAX_SEARCHABLE_CORPUS_BYTES / (1024 * 1024)
+        ));
     }
 
     out.push_str("</search_feedback>");
@@ -758,6 +834,7 @@ mod tests {
             total_matched_files: 0,
             total_matches: 0,
             omitted_files: 0,
+            unsearched_files: 0,
             error: None,
         };
         let feedback = format_single_search_feedback(&no_matches);
@@ -770,9 +847,81 @@ mod tests {
             total_matched_files: 0,
             total_matches: 0,
             omitted_files: 0,
+            unsearched_files: 0,
             error: Some("Directory traversal ('..') is not allowed".to_string()),
         };
         let err_feedback = format_single_search_feedback(&err_res);
         assert!(err_feedback.contains("Error: Directory traversal ('..') is not allowed"));
+    }
+
+    /// The aggregate ceiling stops a round from retaining a whole monorepo: a
+    /// file that does not fit is left unread and recorded instead of silently
+    /// vanishing from the queries that cover it.
+    #[test]
+    fn test_the_corpus_stops_admitting_files_at_the_aggregate_ceiling() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        for name in ["a.txt", "b.txt", "c.txt"] {
+            std::fs::write(root.join(name), "0123456789").unwrap();
+        }
+        let available = vec![
+            "a.txt".to_string(),
+            "b.txt".to_string(),
+            "c.txt".to_string(),
+        ];
+
+        // Three ten-byte bodies under a ceiling of twenty-five bytes: two fit,
+        // the third is reported instead of being materialized.
+        let corpus = SearchCorpus::resolve(root, &available, 25, |_| true);
+        assert_eq!(corpus.files.len(), 2);
+        assert_eq!(corpus.unsearched, vec!["c.txt"]);
+
+        // A ceiling that pays for every body leaves nothing unsearched.
+        let ceiling = MAX_SEARCHABLE_CORPUS_BYTES;
+        let corpus = SearchCorpus::resolve(root, &available, ceiling, |_| true);
+        assert_eq!(corpus.files.len(), 3);
+        assert!(corpus.unsearched.is_empty());
+    }
+
+    /// The omission is reported to the query whose scope covers the file, and
+    /// the block states the ceiling even when the pattern matched nothing.
+    #[test]
+    fn test_an_unsearched_file_is_reported_to_the_query_that_covers_it() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("other")).unwrap();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("other/a.txt"), "needle\n").unwrap();
+        std::fs::write(root.join("src/big.txt"), "needle needle needle\n").unwrap();
+        let available = vec!["other/a.txt".to_string(), "src/big.txt".to_string()];
+
+        let queries = [
+            RepoSearchRequest::new("other", "needle"),
+            RepoSearchRequest::new("", "absent"),
+        ];
+        let prepared: Vec<RoundQuery<'_>> = queries
+            .iter()
+            .map(|query| prepare_query(root, query))
+            .collect();
+        let in_scope = |candidate: &str| prepared.iter().any(|query| query.admits(candidate));
+        // Only the first body fits, so `src/big.txt` stays unsearched.
+        let corpus = SearchCorpus::resolve(root, &available, 7, in_scope);
+
+        let results: Vec<RepoSearchResult> = prepared
+            .into_iter()
+            .map(|query| query.evaluate(&corpus, ResearchLimits::default()))
+            .collect();
+
+        // The subdirectory query never covered the omitted file.
+        assert_eq!(results[0].unsearched_files, 0);
+        assert_eq!(results[0].total_matched_files, 1);
+
+        // The root query covered it, and the block states the ceiling even
+        // though the pattern matched nothing.
+        assert_eq!(results[1].unsearched_files, 1);
+        let feedback = format_single_search_feedback(&results[1]);
+        assert!(feedback.contains("No matches found."));
+        assert!(feedback.contains("1 in-scope file(s) were not searched"));
+        assert!(feedback.contains("MiB of text"));
     }
 }

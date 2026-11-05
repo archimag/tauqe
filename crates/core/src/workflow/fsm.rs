@@ -22,14 +22,15 @@ mod tools;
 use std::collections::HashMap;
 
 use tauqe_protocol::{
-    EditOperation, EditOutcome, HistoryFileChange, ModelRef, ModelResult, PlanRejection, TurnIntent,
+    EditOperation, EditOutcome, HistoryFileChange, ModelRef, ModelResult, PlanRejection,
+    PlanRejectionKind, TurnIntent,
 };
 use tokio::sync::{mpsc, watch};
 
 use crate::context::ContextManager;
 use crate::edits::EditError;
 use crate::history::HistoryManager;
-use crate::plan::storage::PlanMutationMode;
+use crate::plan::storage::{PlanMutationMode, PlanStorage};
 use crate::prompt::protocol::PromptProtocol;
 use crate::providers::{LlmProvider, StreamEvent};
 use crate::workflow::common::{compact_history_if_needed_with_budget, record_workflow_response};
@@ -42,7 +43,9 @@ use crate::workflow::WorkflowOptions;
 use cache::TurnInputCache;
 use guard::{finalize_blocked_turn, finish_turn, rollback_or_log};
 use healing::run_apply_and_verify_phase;
-use kernel::{EmptyStepGuard, EmptyStepRetry, ResearchPhase, TurnKernel, MAX_EMPTY_STEP_RETRIES};
+use kernel::{
+    EmptyStepGuard, EmptyStepRetry, PlanRetry, ResearchPhase, TurnKernel, MAX_EMPTY_STEP_RETRIES,
+};
 use plans::{settle_plans, TurnQualification};
 use proposal::{
     extract_error_message, log_fsm_phase, merge_text, outcome_carries_result, ProposalStep,
@@ -824,6 +827,17 @@ pub(super) async fn run_fsm_turn_body(
         }
     };
 
+    // Phase boundary: a plan discussion validates the plan payload it accumulated
+    // before the turn finalizes, because that payload is applied at finalization
+    // and a refused mutation must reach the model while the turn can still repair
+    // it. The probe shares the write barrier with the application, so a clean
+    // verdict here is the verdict `settle_plans` reaches, and a refused one buys
+    // one corrected round instead of a silently dropped mutation.
+    let step = match heal_plan_payload(&mut ctx, step).await? {
+        PlanHealing::Accepted(step) => *step,
+        PlanHealing::Terminate(outcome) => return Ok(*outcome),
+    };
+
     // An abort collected by any preceding round asserts that no proposed change
     // can complete the work, so nothing is staged and nothing reaches disk.
     if let Some(outcome) = finish_on_abort_outcome(&mut ctx).await {
@@ -1083,6 +1097,17 @@ async fn finish_answer_without_edits(ctx: &mut TurnKernel<'_>) -> FsmTurnOutcome
 /// without leaving any readable text.
 const MAX_WRITTEN_ANSWER_RETRIES: usize = 1;
 
+/// Number of corrective rounds granted to a plan payload the probe refused.
+///
+/// One round is enough for a correctable payload: the directive names every
+/// refusal the mutation barrier reported, so a second attempt either states the
+/// corrected document or shows that the dialogue cannot produce one, and
+/// repeating the same refusal would spend provider rounds without teaching the
+/// model anything. Exhausting the budget is not a silent outcome — the refused
+/// payload travels to finalization, where `settle_plans` refuses it and the
+/// notice reaches the developer.
+const MAX_PLAN_HEALING_RETRIES: usize = 1;
+
 /// Reminder appended to the request when the turn holds no readable answer.
 ///
 /// It names plain conversational text as the expected outcome and states that
@@ -1206,6 +1231,157 @@ async fn ensure_written_answer(
     }
 
     Ok(WrittenAnswer::Ready(Box::new(next)))
+}
+
+/// Outcome of the plan-payload validation phase of a plan discussion.
+enum PlanHealing {
+    /// The round carries an applicable payload, or the regime does not validate.
+    Accepted(Box<ProposalStep>),
+    /// The turn must terminate immediately with the carried outcome.
+    Terminate(Box<FsmTurnOutcome>),
+}
+
+/// Validates the plan payload of a plan-discussion round before it is finalized.
+///
+/// A plan discussion applies its payload at finalization, so a refused mutation
+/// would otherwise surface only after the turn had closed, when the model could
+/// no longer repair it. The probe runs the very barrier the application runs and
+/// writes nothing, so this phase never applies a mutation: a clean payload
+/// continues to finalization, where `settle_plans` applies it exactly once, and a
+/// refused one buys one corrective round through the kernel. When the budget is
+/// spent the refused payload travels to finalization unchanged, so the refusals
+/// reach the developer through the ordinary diagnostic surfaces instead of
+/// disappearing.
+///
+/// A round that carries file edits keeps the staging contour: its payload is
+/// settled after verification, with the diagnostics the settlement reports.
+async fn heal_plan_payload(
+    ctx: &mut TurnKernel<'_>,
+    step: ProposalStep,
+) -> anyhow::Result<PlanHealing> {
+    if !ctx.intent.is_plan_discussion() || !step.edits().is_empty() {
+        return Ok(PlanHealing::Accepted(Box::new(step)));
+    }
+
+    let mut step = step;
+    let mut attempt = 0;
+    loop {
+        let Some(directive) = plan_payload_directive(ctx, &step).await else {
+            return Ok(PlanHealing::Accepted(Box::new(step)));
+        };
+        if attempt >= MAX_PLAN_HEALING_RETRIES {
+            tracing::warn!(
+                workflow = ctx.workflow_name,
+                model = %ctx.model,
+                rounds = attempt,
+                "plan payload stays refused; finalizing the turn with its rejections"
+            );
+            return Ok(PlanHealing::Accepted(Box::new(step)));
+        }
+        attempt += 1;
+        match ctx
+            .reask_after_failed_plan(&directive, attempt, MAX_PLAN_HEALING_RETRIES)
+            .await?
+        {
+            PlanRetry::Proposed(mut repaired) => {
+                // A corrective exchange answers for the plan payload alone, so the
+                // file edits it carries are not staged: the round repairs a
+                // document, it does not open a change set. Discarding them without a
+                // word would hide work the model produced, so the turn reports it.
+                if !repaired.edits.is_empty() {
+                    tracing::warn!(
+                        workflow = ctx.workflow_name,
+                        edits = repaired.edits.len(),
+                        "plan repair round carried file edits; they were not staged"
+                    );
+                    let notice = format!(
+                        "\n\n---\n⚠️ The plan repair round answers for the plan payload alone; the {} file edit(s) it carried were not staged.\n\n",
+                        repaired.edits.len()
+                    );
+                    let _ = ctx.stream_tx.send(StreamEvent::TextDelta(notice)).await;
+                    repaired.edits.clear();
+                }
+                step = *repaired;
+            }
+            PlanRetry::Terminate(outcome) => return Ok(PlanHealing::Terminate(outcome)),
+        }
+    }
+}
+
+/// Collects the reasons a plan payload cannot be applied, if there are any.
+///
+/// Decode defects come from the round itself and refusals come from the probe.
+/// Only a defective payload can be corrected by generation, so a mutation the turn
+/// regime forbids buys no repair round: repeating such a turn cannot change the
+/// verdict. A clean verdict costs nothing, because the probe shares the barrier the
+/// settlement phase applies the payload through.
+async fn plan_payload_directive(ctx: &TurnKernel<'_>, step: &ProposalStep) -> Option<String> {
+    let mut reasons: Vec<String> = step
+        .protocol_errors()
+        .iter()
+        .map(|error| format!("- {error}"))
+        .collect();
+
+    if !ctx.state.plans.is_empty() {
+        let root = ctx.repo_root.to_path_buf();
+        let payload = ctx.state.plans.clone();
+        let mode = ctx.plan_mode;
+        // The probe reads the stored plans and runs the mutation barrier of plan
+        // storage, so it runs off the async executor thread like every other
+        // storage call of the turn.
+        match crate::blocking::run_blocking_async(move || {
+            PlanStorage::validate_discussion_plan_updates(&root, &payload, mode)
+        })
+        .await
+        {
+            Ok(outcome) => {
+                for rejection in &outcome.errors {
+                    if rejection.kind != PlanRejectionKind::PayloadDefect {
+                        tracing::warn!(
+                            workflow = ctx.workflow_name,
+                            kind = ?rejection.kind,
+                            reason = %rejection.message,
+                            "plan payload refused by the probe without a repairable defect"
+                        );
+                        continue;
+                    }
+                    tracing::warn!(
+                        workflow = ctx.workflow_name,
+                        reason = %rejection.message,
+                        "plan payload refused by the probe"
+                    );
+                    reasons.push(format!("- {}", rejection.message));
+                }
+            }
+            Err(error) => {
+                // A probe that never ran is not a clean verdict: the payload was not
+                // validated, so the repair round reports the failure instead of
+                // letting an unvalidated mutation look applicable.
+                crate::blocking::log_join_error(&error, "plan payload validation");
+                reasons.push(format!(
+                    "- the plan payload could not be validated because the storage probe failed: {error}"
+                ));
+            }
+        }
+    }
+
+    if reasons.is_empty() {
+        return None;
+    }
+    Some(plan_healing_directive(&reasons))
+}
+
+/// Directive appended to the journal when the plan payload of a round is refused.
+///
+/// The refused payload is replaced, never accumulated, so the corrective answer
+/// must state a document that stands on its own: the action, the plan identity,
+/// the concept tree, and every step the plan still keeps. The wording names no tag
+/// of either contour, because both transports express the very same payload.
+fn plan_healing_directive(reasons: &[String]) -> String {
+    format!(
+        "<plan_repair_directive>\nThe plan mutation of your previous reply could not be applied:\n{}\n\nNothing of it was stored. State the corrected plan mutation again as one complete, self-contained payload: its action, the plan identity, the concept tree with the architectural intent and invariants, and every step you still intend to keep. A corrected save replaces the whole document, so it must reproduce every step that is already done exactly as stored. This round answers for the plan payload alone: keep it well-formed and state it fully.\n</plan_repair_directive>",
+        reasons.join("\n")
+    )
 }
 
 /// Finalizes the turn when patch application failed after every retry.
@@ -1452,8 +1628,14 @@ mod tests {
         let (_dir, root) = setup_repo(&[
             ("a.rs", TARGET),
             ("notes.rs", "pub fn notes() -> i32 { 1 }\n"),
-            ("external/spec.md", "external specification\n"),
         ]);
+        // The external document lives in the isolated cache the registry
+        // materializes into, never in the working tree.
+        let snapshot = root
+            .join(crate::outer_docs::OUTER_DOCS_CACHE_DIR)
+            .join("external/spec.md");
+        std::fs::create_dir_all(snapshot.parent().expect("the snapshot has a parent")).unwrap();
+        std::fs::write(&snapshot, "external specification\n").unwrap();
         let mut context = context_with_target(&root);
         context
             .add_auto_file("notes.rs", ContextAccess::ReadOnly)
@@ -1604,7 +1786,7 @@ mod tests {
         assert!(loaded.is_some());
         let plan = loaded.unwrap();
         assert_eq!(plan.title, "FSM Plan");
-        assert_eq!(plan.items.len(), 1);
+        assert_eq!(plan.implementation.items.len(), 1);
         // The turn prompt and the answer are the only recorded entries: a
         // successful mutation adds no diagnostic record to the history.
         assert_eq!(
@@ -2063,7 +2245,10 @@ mod tests {
             .unwrap()
             .unwrap();
         // The item must remain Todo because update is rejected in REPL mode
-        assert_eq!(loaded.items[0].status, tauqe_protocol::PlanItemStatus::Todo);
+        assert_eq!(
+            loaded.implementation.items[0].status,
+            tauqe_protocol::PlanItemStatus::Todo
+        );
     }
 
     /// Builds the workflow options a project declares through `[repl]
@@ -2404,5 +2589,289 @@ mod tests {
             "a failed step leaves no card behind"
         );
         assert_eq!(std::fs::read_to_string(root.join("a.rs")).unwrap(), TARGET);
+    }
+    /// A plan discussion validates its payload with the probe and spends no
+    /// corrective round when the payload passes it.
+    #[tokio::test]
+    async fn a_clean_plan_payload_costs_no_repair_round() {
+        let (_dir, root) = setup_repo(&[("a.rs", TARGET)]);
+        let mut context = context_with_target(&root);
+        let mut history = HistoryManager::new(root.clone());
+
+        let response = concat!(
+            "Here is the plan.\n",
+            "<plan action=\"save\" id=\"probe-clean\" title=\"Probe Clean\">\n",
+            "  <concept>\n",
+            "    <concept_item id=\"c-1\" title=\"Invariant\" />\n",
+            "  </concept>\n",
+            "  <item id=\"1\" title=\"Step 1\" files=\"src/step1.rs\" />\n",
+            "</plan>\n",
+        );
+        let provider = MockLlmProvider::scripted([MockResponse::text(response)]);
+        let model = ModelRef::openrouter("mock/model");
+        let protocol = XmlPromptProtocol;
+        let mut policy = DirectApplyPolicy::new();
+        let options = WorkflowOptions::default();
+        let (stream_tx, rx) = mpsc::channel(256);
+        drop(rx);
+        let (_cancel_tx, cancel_rx) = watch::channel(false);
+
+        let outcome = run_fsm_turn(
+            "Plan the migration",
+            tauqe_protocol::TurnIntent::PlanDiscussion,
+            &provider,
+            &model,
+            &mut context,
+            &mut history,
+            &protocol,
+            &mut policy,
+            "git",
+            stream_tx,
+            cancel_rx,
+            &options,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            provider.requests().len(),
+            1,
+            "a payload the probe accepts must not buy a corrective round"
+        );
+        assert!(
+            outcome.plan_errors.is_empty(),
+            "an accepted payload reports no refusal: {:?}",
+            outcome.plan_errors
+        );
+        let stored = crate::plan::storage::PlanStorage::load_plan(&root, "probe-clean")
+            .unwrap()
+            .expect("the accepted plan is stored at finalization");
+        assert_eq!(stored.implementation.items.len(), 1);
+    }
+
+    /// A refused payload buys exactly one corrective round, and the corrected
+    /// document replaces the refused one instead of being accumulated beside it.
+    #[tokio::test]
+    async fn a_refused_plan_payload_buys_one_replacement_round() {
+        let (_dir, root) = setup_repo(&[("a.rs", TARGET)]);
+        let mut context = context_with_target(&root);
+        let mut history = HistoryManager::new(root.clone());
+
+        let refused = concat!(
+            "Drafting the plan.\n",
+            "<plan action=\"save\" id=\"probe-repair\" title=\"Probe Repair\">\n",
+            "  <concept>\n",
+            "    <concept_item id=\"c-1\" title=\"Invariant\" />\n",
+            "  </concept>\n",
+            "  <item id=\"1\" title=\"Broken step\" files=\"src/first.rs\" />\n",
+            "  <item id=\"1\" title=\"Broken step again\" files=\"src/second.rs\" />\n",
+            "</plan>\n",
+        );
+        let repaired = concat!(
+            "Corrected the plan.\n",
+            "<plan action=\"save\" id=\"probe-repair\" title=\"Probe Repair\">\n",
+            "  <concept>\n",
+            "    <concept_item id=\"c-1\" title=\"Invariant\" />\n",
+            "  </concept>\n",
+            "  <item id=\"1\" title=\"Corrected step\" files=\"src/first.rs\" />\n",
+            "</plan>\n",
+        );
+        let provider =
+            MockLlmProvider::scripted([MockResponse::text(refused), MockResponse::text(repaired)]);
+        let model = ModelRef::openrouter("mock/model");
+        let protocol = XmlPromptProtocol;
+        let mut policy = DirectApplyPolicy::new();
+        let options = WorkflowOptions::default();
+        let (stream_tx, rx) = mpsc::channel(256);
+        drop(rx);
+        let (_cancel_tx, cancel_rx) = watch::channel(false);
+
+        let outcome = run_fsm_turn(
+            "Plan the migration",
+            tauqe_protocol::TurnIntent::PlanDiscussion,
+            &provider,
+            &model,
+            &mut context,
+            &mut history,
+            &protocol,
+            &mut policy,
+            "git",
+            stream_tx,
+            cancel_rx,
+            &options,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(provider.requests().len(), 1 + MAX_PLAN_HEALING_RETRIES);
+        assert!(
+            outcome.plan_errors.is_empty(),
+            "the corrected payload applies without a refusal: {:?}",
+            outcome.plan_errors
+        );
+        let stored = crate::plan::storage::PlanStorage::load_plan(&root, "probe-repair")
+            .unwrap()
+            .expect("the corrected plan is stored");
+        assert_eq!(
+            stored.implementation.items.len(),
+            1,
+            "the refused payload must be replaced, not accumulated"
+        );
+        assert_eq!(stored.implementation.items[0].title, "Corrected step");
+
+        // The corrective request carries the refusal it answers.
+        let corrective_prompt = provider.requests()[1]
+            .messages
+            .iter()
+            .map(|message| message.content.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            corrective_prompt.contains("<plan_repair_directive>"),
+            "the corrective round must carry the repair directive"
+        );
+        assert!(
+            corrective_prompt.contains("Duplicate step ID: '1'"),
+            "the directive must name the refusal: {corrective_prompt}"
+        );
+    }
+
+    /// A payload that stays refused ends the turn with its rejections reported
+    /// instead of disappearing behind an accepted answer.
+    #[tokio::test]
+    async fn an_exhausted_plan_repair_reports_its_rejections() {
+        let (_dir, root) = setup_repo(&[("a.rs", TARGET)]);
+        let mut context = context_with_target(&root);
+        let mut history = HistoryManager::new(root.clone());
+
+        let refused = concat!(
+            "Drafting the plan.\n",
+            "<plan action=\"save\" id=\"probe-broken\" title=\"Probe Broken\">\n",
+            "  <concept>\n",
+            "    <concept_item id=\"c-1\" title=\"Invariant\" />\n",
+            "  </concept>\n",
+            "  <item id=\"1\" title=\"Broken step\" files=\"src/first.rs\" />\n",
+            "  <item id=\"1\" title=\"Broken step again\" files=\"src/second.rs\" />\n",
+            "</plan>\n",
+        );
+        // The same refused payload is scripted twice: the round that states it
+        // and the single corrective round it buys.
+        let provider =
+            MockLlmProvider::scripted([MockResponse::text(refused), MockResponse::text(refused)]);
+        let model = ModelRef::openrouter("mock/model");
+        let protocol = XmlPromptProtocol;
+        let mut policy = DirectApplyPolicy::new();
+        let options = WorkflowOptions::default();
+        let (stream_tx, rx) = mpsc::channel(256);
+        drop(rx);
+        let (_cancel_tx, cancel_rx) = watch::channel(false);
+
+        let outcome = run_fsm_turn(
+            "Plan the migration",
+            tauqe_protocol::TurnIntent::PlanDiscussion,
+            &provider,
+            &model,
+            &mut context,
+            &mut history,
+            &protocol,
+            &mut policy,
+            "git",
+            stream_tx,
+            cancel_rx,
+            &options,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(provider.requests().len(), 1 + MAX_PLAN_HEALING_RETRIES);
+        assert_eq!(outcome.plan_errors.len(), 1, "{:?}", outcome.plan_errors);
+        assert_eq!(
+            outcome.plan_errors[0].kind,
+            tauqe_protocol::PlanRejectionKind::PayloadDefect
+        );
+        assert!(
+            outcome.plan_errors[0]
+                .message
+                .contains("Duplicate step ID: '1'"),
+            "{:?}",
+            outcome.plan_errors
+        );
+        assert!(
+            outcome.plan_rejection_notice().is_some(),
+            "the refusal must reach the turn surfaces"
+        );
+        assert!(
+            crate::plan::storage::PlanStorage::load_plan(&root, "probe-broken")
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    /// A round that carries file edits beside a plan payload keeps the staging
+    /// contour, and its payload is settled after verification.
+    #[tokio::test]
+    async fn a_mixed_round_stages_its_edits_before_settling_the_payload() {
+        let (_dir, root) = setup_repo(&[("a.rs", TARGET)]);
+        let mut context = context_with_target(&root);
+        let mut history = HistoryManager::new(root.clone());
+
+        let response = format!(
+            concat!(
+                "{}\n",
+                "<plan action=\"save\" id=\"mixed-round\" title=\"Mixed\">\n",
+                "  <concept>\n",
+                "    <concept_item id=\"c-1\" title=\"Invariant\" />\n",
+                "  </concept>\n",
+                "  <item id=\"1\" title=\"Step 1\" files=\"src/step1.rs\" />\n",
+                "</plan>\n",
+            ),
+            edit_block(
+                "pub fn compute() -> i32 { 0 }",
+                "pub fn compute() -> i32 { 42 }",
+            )
+        );
+        let provider = MockLlmProvider::scripted([MockResponse::text(response)]);
+        let model = ModelRef::openrouter("mock/model");
+        let protocol = XmlPromptProtocol;
+        let mut policy = DirectApplyPolicy::new();
+        let options = WorkflowOptions::default();
+        let (stream_tx, rx) = mpsc::channel(256);
+        drop(rx);
+        let (_cancel_tx, cancel_rx) = watch::channel(false);
+
+        let outcome = run_fsm_turn(
+            "Plan and implement the migration",
+            tauqe_protocol::TurnIntent::PlanDiscussion,
+            &provider,
+            &model,
+            &mut context,
+            &mut history,
+            &protocol,
+            &mut policy,
+            "git",
+            stream_tx,
+            cancel_rx,
+            &options,
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            matches!(&outcome.result, ModelResult::Edit { outcome, .. } if outcome.applied),
+            "a round that carries edits keeps the staging contour: {:?}",
+            outcome.result
+        );
+        assert_eq!(
+            provider.requests().len(),
+            1,
+            "a mixed round must not spend a repair round on its payload"
+        );
+        assert!(outcome.plan_errors.is_empty(), "{:?}", outcome.plan_errors);
+        assert!(
+            crate::plan::storage::PlanStorage::load_plan(&root, "mixed-round")
+                .unwrap()
+                .is_some(),
+            "the payload of a mixed round is settled after verification"
+        );
     }
 }

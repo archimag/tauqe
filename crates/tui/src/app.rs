@@ -1,7 +1,11 @@
+pub mod modals;
+
+pub use modals::{ActiveModal, ModalState};
+
 use ratatui::layout::Rect;
 use tauqe_protocol::{
     ContextState, DiscussionFocus, ModelRef, ModelRole, ModelRolesSummary, ModelSelection,
-    ReasoningEffort, RepositoryState, ReviewStartParams, SystemStatusResult,
+    OuterDocsCacheEntry, ReasoningEffort, RepositoryState, ReviewStartParams, SystemStatusResult,
 };
 
 use crate::components::editor::PromptHistoryJob;
@@ -14,7 +18,7 @@ use crate::i18n::{active_t, I18nEngine};
 use crate::theme::presets::ThemePreset;
 use crate::theme::selector::ThemeSelectorState;
 use crate::ui::HitRegistry;
-use crate::views::context::ContextViewState;
+use crate::views::context::{CacheTreeKind, ContextViewState};
 use crate::views::history::HistoryViewState;
 use crate::views::plans::{PlansViewState, RefineDialogFocus};
 use crate::views::repl::{DiffRenderCache, ReplView, StreamingFileEdit, TurnStatus};
@@ -68,63 +72,6 @@ impl BatchCancelButton {
             Self::HardStop => Self::SoftStop,
         };
     }
-}
-
-/// The single source of truth for modal stacking order.
-///
-/// Every surface that must decide *which* modal is on top — keyboard dispatch,
-/// rendering, mouse hit-testing, and paste routing — derives its decision from
-/// [`AppState::active_modal`]. The variant order encodes priority: the first
-/// active variant wins. Centralizing the list here guarantees that the window a
-/// developer *sees* is always the window that receives keystrokes, mouse events,
-/// and pasted text, and that adding a modal no longer requires editing several
-/// divergent chains (Conventions §7).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ActiveModal {
-    /// Fatal transport state; blocks every other surface.
-    ServerDisconnected,
-    Squash,
-    /// Consent to launch a review whose audited window the configured budgets
-    /// truncate. It outranks the launch dialog it returns to, so a pending
-    /// decision is never hidden behind a reopened dialog (c-3).
-    ReviewTruncation,
-    Review,
-    ConfirmCancel,
-    ConfirmQuit,
-    BatchCancel,
-    ClearAuto,
-    ClearUser,
-    /// A Context file whose removal awaits the shared confirmation card.
-    RemoveContextFile,
-    ConfirmDetachFocus,
-    /// First tier of the implementation-horizon clear confirmation.
-    ClearHorizon,
-    /// Second tier, raised when completed or in-progress work exists.
-    ClearHorizonFinal,
-    DeletePlan,
-    /// Second tier, raised when the plan still carries unfinished work.
-    DeletePlanFinal,
-    DeleteReview,
-    /// Confirmation of the expensive Architect post-analysis over a session.
-    ReviewAnalyze,
-    ExecuteReview,
-    ExecutePipeline,
-    ExecuteScope,
-    RefineDialog,
-    RefineBlocked,
-    Prompt,
-    Locale,
-    ClearHistory,
-    Status,
-    Selection,
-    /// Fullscreen two-pane audit of the change set staged in the REPL
-    /// viewport: a read-only reading surface that outranks the informational
-    /// overlays below it (c-3).
-    DiffInspector,
-    ThemeSelector,
-    /// Full usage telemetry breakdown for the session and the operations.
-    UsageSummary,
-    Help,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -883,6 +830,7 @@ impl DiffInspectorFocus {
 /// keeps only what the reading position needs: the highlighted file, the scroll
 /// offset of the isolated diff pane, and the pane that owns the keyboard (c-2,
 /// c-3).
+#[derive(Debug, Clone)]
 pub struct DiffInspectorState {
     /// Index of the highlighted file inside the live staged set.
     pub selected_file: usize,
@@ -904,13 +852,127 @@ impl DiffInspectorState {
         }
     }
 }
+/// State of the hierarchical external documentation cache browser.
+///
+/// The browser reads the durable cache inventory over RPC and projects it into
+/// a foldable tree of logical paths, so a row names exactly the document the
+/// context layer and the model already address: the disk prefix the snapshots
+/// live under never reaches the dialog (c-outer-docs-logical-paths,
+/// c-outer-docs-cache-tui-browser).
+#[derive(Debug, Clone, Default)]
+pub struct OuterDocsCacheDialogState {
+    /// Inventory the daemon last reported.
+    pub entries: Vec<OuterDocsCacheEntry>,
+    /// Whether the inventory is being (re)loaded.
+    pub loading: bool,
+    /// Logical directory paths the developer folded.
+    pub collapsed: std::collections::HashSet<String>,
+    /// Index of the highlighted row inside the projected tree.
+    pub cursor: usize,
+    /// Vertical scroll offset of the tree pane, kept in range by the renderer.
+    pub scroll: u16,
+}
 
+impl OuterDocsCacheDialogState {
+    /// Projects the inventory into the visible rows of the tree.
+    pub fn rows(&self) -> Vec<crate::views::context::CacheTreeRow> {
+        crate::views::context::cache_tree_rows(&self.entries, &self.collapsed)
+    }
+
+    /// Clamps the highlight into the projected tree.
+    pub fn clamp_cursor(&mut self) {
+        let len = self.rows().len();
+        self.cursor = if len == 0 {
+            0
+        } else {
+            self.cursor.min(len - 1)
+        };
+    }
+
+    /// Moves the highlight by `delta` rows, clamped at both ends.
+    pub fn move_cursor(&mut self, delta: isize) {
+        let len = self.rows().len();
+        if len == 0 {
+            self.cursor = 0;
+            return;
+        }
+        let current = self.cursor.min(len - 1);
+        let next = if delta < 0 {
+            current.saturating_sub(delta.unsigned_abs())
+        } else {
+            current.saturating_add(delta as usize)
+        };
+        self.cursor = next.min(len - 1);
+    }
+
+    /// Highlights the first row of the tree.
+    pub fn select_first(&mut self) {
+        self.cursor = 0;
+        self.scroll = 0;
+    }
+
+    /// Highlights the last row of the tree.
+    pub fn select_last(&mut self) {
+        self.cursor = self.rows().len().saturating_sub(1);
+    }
+
+    /// Folds or unfolds the directory under the highlight.
+    ///
+    /// A document row carries no children, so the chord is inert on it and the
+    /// highlight stays where the developer put it.
+    pub fn toggle_fold(&mut self) {
+        let rows = self.rows();
+        let Some(row) = rows.get(self.cursor) else {
+            return;
+        };
+        if row.kind != CacheTreeKind::Directory {
+            return;
+        }
+        if !self.collapsed.remove(&row.path) {
+            self.collapsed.insert(row.path.clone());
+        }
+        self.clamp_cursor();
+    }
+
+    /// Folds every directory, or unfolds everything when one was folded.
+    pub fn toggle_fold_all(&mut self) {
+        if self.collapsed.is_empty() {
+            let rows = self.rows();
+            self.collapsed = rows
+                .into_iter()
+                .filter(|row| row.kind == CacheTreeKind::Directory)
+                .map(|row| row.path)
+                .collect();
+        } else {
+            self.collapsed.clear();
+        }
+        self.clamp_cursor();
+    }
+
+    /// Keeps the highlight inside a window of `visible_rows` drawn rows.
+    pub fn scroll_to_cursor(&mut self, visible_rows: usize) {
+        let rows = self.rows().len();
+        let visible = visible_rows.max(1).min(rows.max(1));
+        let cursor = self.cursor.min(rows.saturating_sub(1));
+        let scroll = usize::from(self.scroll);
+        let next = if cursor < scroll {
+            cursor
+        } else if cursor >= scroll.saturating_add(visible) {
+            cursor + 1 - visible
+        } else {
+            scroll
+        };
+        let max_scroll = rows.saturating_sub(visible);
+        self.scroll = u16::try_from(next.min(max_scroll)).unwrap_or(u16::MAX);
+    }
+}
 /// Change set of one commit that the fullscreen inspector audits.
 ///
 /// The Develop viewport audits the live staged set it owns, while a plan step
 /// audits the finished change set of the commit recorded in that step. A commit
 /// is a closed snapshot, so it carries its own files and its own render cache,
 /// and opening the audit never touches the staged set of the running turn (c-3).
+#[derive(Debug, Clone)]
 pub struct CommitAudit {
     /// Files the commit changed, in the order its diff lists them.
     pub files: Vec<StreamingFileEdit>,
@@ -1056,6 +1118,14 @@ pub const PATH_COMPLETION_MAX_ROWS: usize = 6;
 pub struct PathCompletion {
     candidates: Vec<String>,
     selected: usize,
+    /// Prefix the current candidate list was computed for.
+    ///
+    /// The chord handler refreshes the menu after every key that reaches the
+    /// path editor, while the row text changes only on an actual edit, so the
+    /// prefix is what separates a genuine rescan from a redundant one.
+    scanned_prefix: Option<String>,
+    /// Number of real directory scans served since the dialog was built.
+    scans: u64,
 }
 
 impl PathCompletion {
@@ -1122,9 +1192,43 @@ impl PathCompletion {
     }
 
     /// Closes the menu without touching the rows.
+    ///
+    /// The memo is released together with the candidates, so a later refresh of
+    /// the unchanged prefix offers them again instead of trusting a list the
+    /// developer dismissed (c-5).
     pub fn close(&mut self) {
         self.candidates.clear();
         self.selected = 0;
+        self.scanned_prefix = None;
+    }
+
+    /// Recomputes the candidates of `prefix` over `directories`, serving the
+    /// memoized list while the prefix is unchanged.
+    ///
+    /// The dialog refreshes the menu after every key that reaches the path
+    /// editor — cursor movement, `Home` / `End`, and row navigation included —
+    /// while the row text changes only on an actual edit. Comparing the prefix
+    /// answers "is there anything new to offer" before the repository directory
+    /// list is walked, so a redundant refresh costs one comparison instead of a
+    /// scan of every prefix in the repository (c-5).
+    fn refresh(&mut self, prefix: &str, directories: &[String]) {
+        if self.scanned_prefix.as_deref() == Some(prefix) {
+            return;
+        }
+        self.scanned_prefix = Some(prefix.to_string());
+        self.scans = self.scans.saturating_add(1);
+        let candidates = completion_candidates(prefix, directories);
+        self.reset(candidates);
+    }
+
+    /// Number of real directory scans served since the dialog was built.
+    ///
+    /// Only the regression test reads this, exactly like `computations` of
+    /// `PatternMatchMemo`, so the allowance keeps the zero-warning gate green
+    /// instead of widening the module surface for a counter.
+    #[allow(dead_code)]
+    pub(crate) fn scans(&self) -> u64 {
+        self.scans
     }
 
     fn clamp(&mut self) {
@@ -1438,13 +1542,18 @@ impl ReviewDialogState {
     }
 
     /// Recomputes the directory completion of the active row (c-5).
+    ///
+    /// The scan is memoized on the row prefix, so the method stays safe to call
+    /// after every key that reaches the path editor: a chord that edits no text
+    /// re-serves the candidates the previous refresh produced instead of walking
+    /// the directory list again.
     pub fn refresh_path_completion(&mut self) {
         let prefix = self
             .active_path_editor()
             .map(|editor| editor.get_text().trim().to_string())
             .unwrap_or_default();
-        let candidates = completion_candidates(&prefix, &self.path_directories);
-        self.path_completion.reset(candidates);
+        self.path_completion
+            .refresh(&prefix, &self.path_directories);
     }
 
     /// Accepts the highlighted directory completion into the active row (c-5).
@@ -1925,53 +2034,15 @@ pub struct AppState {
     pub onboarding: OnboardingState,
     pub input_editor: InputEditor,
     pub tui_config: TuiConfig,
-    pub show_help: bool,
-    pub help_scroll: u16,
-    /// Tab currently shown by the Help modal (`Mode Shortcuts` vs `Text Editor`).
-    pub help_tab: HelpTab,
-    pub confirm_cancel: bool,
-    pub confirm_quit: bool,
-    /// Whether the batch-cancellation dialog is open.
-    pub confirm_batch_cancel: bool,
-    /// Action button currently focused in the batch-cancellation dialog.
-    pub batch_cancel_button: BatchCancelButton,
-    /// Whether a running batch has been asked to stop after its current member.
-    pub batch_stopping: bool,
-    pub confirm_detach_focus: bool,
-    /// Plan awaiting the first-tier implementation-horizon clear confirmation.
-    pub confirm_clear_horizon: Option<String>,
-    /// Plan whose horizon clear escalated to the second tier because work was
-    /// already recorded in Git.
-    pub confirm_clear_horizon_final: Option<String>,
-    pub confirm_clear_history: bool,
-    pub confirm_delete_plan: Option<String>,
-    /// Plan whose deletion escalated to the second tier because unfinished work
-    /// would be discarded.
-    pub confirm_delete_plan_final: Option<String>,
-    pub confirm_delete_review: Option<String>,
-    /// Session awaiting confirmation of the costly Architect post-analysis.
-    pub confirm_review_analyze: Option<ConfirmReviewAnalyzeState>,
-    /// Review launch awaiting its audit-window projection, when one is in flight.
-    pub pending_review_launch: Option<PendingReviewLaunch>,
-    /// Projection awaiting the developer's consent to a truncated audit window.
-    pub confirm_review_truncation: Option<ConfirmReviewTruncationState>,
-    pub confirm_execute_scope: Option<ConfirmExecuteScopeState>,
-    pub confirm_execute_pipeline: Option<ConfirmExecutePipelineState>,
-    pub confirm_execute_review: Option<ConfirmExecuteReviewState>,
-    pub confirm_button: ConfirmDialogButton,
-    pub selection_dialog: Option<SelectionDialogState>,
-    pub status_dialog: Option<StatusDialogState>,
-    pub squash_dialog: Option<SquashDialogState>,
-    pub review_dialog: Option<ReviewDialogState>,
-    pub prompt_modal: Option<PromptModalState>,
-    /// Fullscreen two-pane audit of the change set the REPL viewport stages.
-    pub diff_inspector: Option<DiffInspectorState>,
-    /// Finished change set a plan step commit audits, when the inspector was
-    /// opened from the Plans tree instead of the Develop viewport (c-3).
-    pub diff_audit: Option<CommitAudit>,
+    /// Overlay surfaces that own the keyboard while they are open.
+    ///
+    /// The surfaces, the state each one keeps, and the ranking that decides
+    /// which of them wins are declared together in [`crate::app::modals`], so a
+    /// new dialog extends one subsystem instead of scattering a field across
+    /// several files (Conventions §7).
+    pub modals: ModalState,
     pub notification: Option<AppNotification>,
     pub turn_started_at: Option<std::time::Instant>,
-    pub server_disconnected: Option<String>,
     pub server_log_path: std::path::PathBuf,
     pub last_model_height: u16,
     pub last_frame_area: Rect,
@@ -2010,14 +2081,8 @@ pub struct AppState {
     pub discussion_focus: DiscussionFocus,
     /// Active theme preset currently painted across the interface.
     pub active_theme_preset: ThemePreset,
-    /// Interactive theme preset selector, when open.
-    pub theme_selector: Option<ThemeSelectorState>,
     /// Runtime localization engine: canonical English plus the active custom locale.
     pub i18n: I18nEngine,
-    /// Interface-language (locale) dialog, when open.
-    pub locale_dialog: Option<LocaleDialogState>,
-    /// Full usage telemetry breakdown dialog, when open.
-    pub usage_summary: Option<UsageSummaryState>,
 }
 
 impl AppState {
@@ -2050,38 +2115,9 @@ impl AppState {
             onboarding: init.onboarding,
             input_editor: init.input_editor,
             tui_config: init.tui_config,
-            show_help: false,
-            help_scroll: 0,
-            help_tab: HelpTab::default(),
-            confirm_cancel: false,
-            confirm_quit: false,
-            confirm_batch_cancel: false,
-            batch_cancel_button: BatchCancelButton::Continue,
-            batch_stopping: false,
-            confirm_detach_focus: false,
-            confirm_clear_horizon: None,
-            confirm_clear_horizon_final: None,
-            confirm_clear_history: false,
-            confirm_delete_plan: None,
-            confirm_delete_plan_final: None,
-            confirm_delete_review: None,
-            confirm_review_analyze: None,
-            pending_review_launch: None,
-            confirm_review_truncation: None,
-            confirm_execute_scope: None,
-            confirm_execute_pipeline: None,
-            confirm_execute_review: None,
-            confirm_button: ConfirmDialogButton::Cancel,
-            selection_dialog: None,
-            status_dialog: None,
-            squash_dialog: None,
-            review_dialog: None,
-            prompt_modal: None,
-            diff_inspector: None,
-            diff_audit: None,
+            modals: ModalState::default(),
             notification: None,
             turn_started_at: None,
-            server_disconnected: None,
             server_log_path: init.server_log_path,
             last_model_height: 10,
             last_frame_area: Rect::new(0, 0, 80, 24),
@@ -2094,10 +2130,7 @@ impl AppState {
             running_model: None,
             discussion_focus: DiscussionFocus::None,
             active_theme_preset,
-            theme_selector: None,
             i18n: init.i18n,
-            locale_dialog: None,
-            usage_summary: None,
         };
         // Publish the resolved catalog to the process-wide locale view so chrome
         // rendered without `&AppState` (modal footers) shares one source of
@@ -2201,7 +2234,7 @@ impl AppState {
             ModelSelection::Role(_) => 0,
         };
 
-        self.selection_dialog = Some(SelectionDialogState::new(entries, selected));
+        self.modals.selection_dialog = Some(SelectionDialogState::new(entries, selected));
         true
     }
 
@@ -2273,112 +2306,61 @@ impl AppState {
     /// Returns the highest-priority active modal surface, or `None` when no modal
     /// is open. This is the canonical ordering consulted by keyboard dispatch,
     /// rendering, mouse hit-testing, and paste routing.
+    ///
+    /// The priority is declared by the variant order of [`ActiveModal`] itself:
+    /// the first variant whose surface is open wins, so a surface ranks by where
+    /// it is declared rather than by an arm appended to this method (c-1).
     pub fn active_modal(&self) -> Option<ActiveModal> {
-        if self.server_disconnected.is_some() {
-            return Some(ActiveModal::ServerDisconnected);
+        use strum::IntoEnumIterator;
+
+        ActiveModal::iter().find(|modal| self.modal_is_open(*modal))
+    }
+
+    /// Whether the surface a variant names is currently open.
+    ///
+    /// The match covers every [`ActiveModal`] variant and carries no wildcard
+    /// arm, so declaring a new surface cannot compile until its state probe is
+    /// stated here. The probe itself says nothing about rank: the declaration
+    /// order of the variant alone decides which open surface wins (c-1).
+    fn modal_is_open(&self, modal: ActiveModal) -> bool {
+        match modal {
+            ActiveModal::ServerDisconnected => self.modals.server_disconnected.is_some(),
+            ActiveModal::Squash => self.modals.squash_dialog.is_some(),
+            ActiveModal::ReviewTruncation => self.modals.confirm_review_truncation.is_some(),
+            ActiveModal::Review => self.modals.review_dialog.is_some(),
+            ActiveModal::ConfirmCancel => self.modals.confirm_cancel,
+            ActiveModal::ConfirmQuit => self.modals.confirm_quit,
+            ActiveModal::BatchCancel => self.modals.confirm_batch_cancel,
+            ActiveModal::ClearAuto => self.modals.confirm_clear_auto,
+            ActiveModal::ClearUser => self.modals.confirm_clear_user,
+            ActiveModal::RemoveContextFile => self.modals.confirm_remove_context_file.is_some(),
+            ActiveModal::OuterDocsCacheRemove => {
+                self.modals.confirm_outer_docs_cache_remove.is_some()
+            }
+            ActiveModal::OuterDocsCache => self.modals.outer_docs_cache.is_some(),
+            ActiveModal::ConfirmDetachFocus => self.modals.confirm_detach_focus,
+            ActiveModal::ClearHorizonFinal => self.modals.confirm_clear_horizon_final.is_some(),
+            ActiveModal::ClearHorizon => self.modals.confirm_clear_horizon.is_some(),
+            ActiveModal::DeletePlanFinal => self.modals.confirm_delete_plan_final.is_some(),
+            ActiveModal::DeletePlan => self.modals.confirm_delete_plan.is_some(),
+            ActiveModal::DeleteReview => self.modals.confirm_delete_review.is_some(),
+            ActiveModal::ReviewAnalyze => self.modals.confirm_review_analyze.is_some(),
+            ActiveModal::ExecuteReview => self.modals.confirm_execute_review.is_some(),
+            ActiveModal::ExecutePipeline => self.modals.confirm_execute_pipeline.is_some(),
+            ActiveModal::ExecuteScope => self.modals.confirm_execute_scope.is_some(),
+            ActiveModal::CreatePlan => self.modals.create_dialog.is_some(),
+            ActiveModal::RefineDialog => self.modals.refine_dialog.is_some(),
+            ActiveModal::RefineBlocked => self.modals.refine_blocked.is_some(),
+            ActiveModal::Prompt => self.modals.prompt_modal.is_some(),
+            ActiveModal::Locale => self.modals.locale_dialog.is_some(),
+            ActiveModal::ClearHistory => self.modals.confirm_clear_history,
+            ActiveModal::Status => self.modals.status_dialog.is_some(),
+            ActiveModal::Selection => self.modals.selection_dialog.is_some(),
+            ActiveModal::DiffInspector => self.modals.diff_inspector.is_some(),
+            ActiveModal::ThemeSelector => self.modals.theme_selector.is_some(),
+            ActiveModal::UsageSummary => self.modals.usage_summary.is_some(),
+            ActiveModal::Help => self.modals.show_help,
         }
-        if self.squash_dialog.is_some() {
-            return Some(ActiveModal::Squash);
-        }
-        // A truncated audit window is a pending consent the developer must
-        // answer, so it outranks the launch dialog it will return to (c-3).
-        if self.confirm_review_truncation.is_some() {
-            return Some(ActiveModal::ReviewTruncation);
-        }
-        if self.review_dialog.is_some() {
-            return Some(ActiveModal::Review);
-        }
-        if self.confirm_cancel {
-            return Some(ActiveModal::ConfirmCancel);
-        }
-        if self.confirm_quit {
-            return Some(ActiveModal::ConfirmQuit);
-        }
-        if self.confirm_batch_cancel {
-            return Some(ActiveModal::BatchCancel);
-        }
-        if self.context_view.confirm_clear_auto {
-            return Some(ActiveModal::ClearAuto);
-        }
-        if self.context_view.confirm_clear_user {
-            return Some(ActiveModal::ClearUser);
-        }
-        if self.context_view.pending_remove.is_some() {
-            return Some(ActiveModal::RemoveContextFile);
-        }
-        if self.confirm_detach_focus {
-            return Some(ActiveModal::ConfirmDetachFocus);
-        }
-        // The stricter second tier outranks the first tier, so a horizon that
-        // escalated to the dangerous confirmation always owns the keyboard.
-        if self.confirm_clear_horizon_final.is_some() {
-            return Some(ActiveModal::ClearHorizonFinal);
-        }
-        if self.confirm_clear_horizon.is_some() {
-            return Some(ActiveModal::ClearHorizon);
-        }
-        // The stricter second tier outranks the first tier, so a plan whose
-        // deletion would discard unfinished work always owns the keyboard.
-        if self.confirm_delete_plan_final.is_some() {
-            return Some(ActiveModal::DeletePlanFinal);
-        }
-        if self.confirm_delete_plan.is_some() {
-            return Some(ActiveModal::DeletePlan);
-        }
-        if self.confirm_delete_review.is_some() {
-            return Some(ActiveModal::DeleteReview);
-        }
-        if self.confirm_review_analyze.is_some() {
-            return Some(ActiveModal::ReviewAnalyze);
-        }
-        if self.confirm_execute_review.is_some() {
-            return Some(ActiveModal::ExecuteReview);
-        }
-        if self.confirm_execute_pipeline.is_some() {
-            return Some(ActiveModal::ExecutePipeline);
-        }
-        if self.confirm_execute_scope.is_some() {
-            return Some(ActiveModal::ExecuteScope);
-        }
-        if self.plans_view.refine_dialog.is_some() {
-            return Some(ActiveModal::RefineDialog);
-        }
-        if self.plans_view.refine_blocked.is_some() {
-            return Some(ActiveModal::RefineBlocked);
-        }
-        if self.prompt_modal.is_some() {
-            return Some(ActiveModal::Prompt);
-        }
-        if self.locale_dialog.is_some() {
-            return Some(ActiveModal::Locale);
-        }
-        if self.confirm_clear_history {
-            return Some(ActiveModal::ClearHistory);
-        }
-        if self.status_dialog.is_some() {
-            return Some(ActiveModal::Status);
-        }
-        if self.selection_dialog.is_some() {
-            return Some(ActiveModal::Selection);
-        }
-        // The inspector is a reading surface opened over the Develop viewport:
-        // every confirmation above outranks it, while the informational
-        // overlays below never displace an audit in progress (c-3).
-        if self.diff_inspector.is_some() {
-            return Some(ActiveModal::DiffInspector);
-        }
-        if self.theme_selector.is_some() {
-            return Some(ActiveModal::ThemeSelector);
-        }
-        // The breakdown outranks Help but never displaces a confirmation, so a
-        // read-only telemetry surface can never swallow a pending decision.
-        if self.usage_summary.is_some() {
-            return Some(ActiveModal::UsageSummary);
-        }
-        if self.show_help {
-            return Some(ActiveModal::Help);
-        }
-        None
     }
 
     /// Whether any modal surface (or the inline Context-view file input)
@@ -2422,22 +2404,29 @@ impl AppState {
     /// (c-text-capture-boundary).
     fn modal_captures_text(&self, modal: ActiveModal) -> bool {
         match modal {
-            ActiveModal::Squash => self.squash_dialog.as_ref().is_some_and(|dialog| {
+            ActiveModal::Squash => self.modals.squash_dialog.as_ref().is_some_and(|dialog| {
                 dialog.custom_input_active || dialog.focus == SquashDialogFocus::MessageEditor
             }),
-            ActiveModal::Review => self.review_dialog.as_ref().is_some_and(|dialog| {
+            ActiveModal::Review => self.modals.review_dialog.as_ref().is_some_and(|dialog| {
                 dialog.focus.is_path_editor() || dialog.focus.is_prompt_editor()
             }),
             ActiveModal::Prompt => self
+                .modals
                 .prompt_modal
                 .as_ref()
                 .is_some_and(|state| state.focus.is_editor()),
             ActiveModal::Locale => self
+                .modals
                 .locale_dialog
                 .as_ref()
                 .is_some_and(|dialog| dialog.focus.is_editor()),
+            ActiveModal::CreatePlan => self
+                .modals
+                .create_dialog
+                .as_ref()
+                .is_some_and(|dialog| dialog.focus.is_instructions_editor()),
             ActiveModal::RefineDialog => self
-                .plans_view
+                .modals
                 .refine_dialog
                 .as_ref()
                 .is_some_and(|dialog| dialog.focus.is_instructions_editor()),
@@ -2445,9 +2434,12 @@ impl AppState {
             // queue confirms as a binary card whose focus never reaches a text
             // field.
             ActiveModal::ExecuteReview => {
-                self.confirm_execute_review.as_ref().is_some_and(|target| {
-                    target.is_single_target() && target.focus.is_instructions_editor()
-                })
+                self.modals
+                    .confirm_execute_review
+                    .as_ref()
+                    .is_some_and(|target| {
+                        target.is_single_target() && target.focus.is_instructions_editor()
+                    })
             }
             ActiveModal::ServerDisconnected
             | ActiveModal::ReviewTruncation
@@ -2457,6 +2449,8 @@ impl AppState {
             | ActiveModal::ClearAuto
             | ActiveModal::ClearUser
             | ActiveModal::RemoveContextFile
+            | ActiveModal::OuterDocsCacheRemove
+            | ActiveModal::OuterDocsCache
             | ActiveModal::ConfirmDetachFocus
             | ActiveModal::ClearHorizon
             | ActiveModal::ClearHorizonFinal
@@ -2500,10 +2494,12 @@ impl AppState {
             || self.review.running
             || !self.input_editor.is_empty()
             || self
+                .modals
                 .squash_dialog
                 .as_ref()
                 .is_some_and(|d| d.applying || !d.message_editor.is_empty())
             || self
+                .modals
                 .prompt_modal
                 .as_ref()
                 .is_some_and(|m| !m.prompt_editor.is_empty())
@@ -2536,9 +2532,9 @@ impl AppState {
         let prompt = self.input_editor.get_text().trim().to_string();
         let history_job = self.input_editor.record_history(&prompt);
         self.input_editor.clear();
-        self.confirm_clear_history = false;
-        self.confirm_cancel = false;
-        self.confirm_button = ConfirmDialogButton::Cancel;
+        self.modals.confirm_clear_history = false;
+        self.modals.confirm_cancel = false;
+        self.modals.confirm_button = ConfirmDialogButton::Cancel;
         if prompt.is_empty() {
             return None;
         }
@@ -2646,7 +2642,7 @@ impl AppState {
 
     /// Opens the interactive theme preset selector, seeded on the active preset.
     pub fn open_theme_selector(&mut self) {
-        self.theme_selector = Some(ThemeSelectorState::new(self.active_theme_preset));
+        self.modals.theme_selector = Some(ThemeSelectorState::new(self.active_theme_preset));
     }
 
     /// Opens the full usage breakdown dialog at its top.
@@ -2655,7 +2651,7 @@ impl AppState {
     /// the dialog opens regardless of a running turn and only mirrors the latest
     /// daemon snapshot (c-4).
     pub fn open_usage_summary(&mut self) {
-        self.usage_summary = Some(UsageSummaryState::default());
+        self.modals.usage_summary = Some(UsageSummaryState::default());
     }
 
     /// Opens the interface-language (locale) dialog.
@@ -2668,10 +2664,15 @@ impl AppState {
             self.notify_warning(active_t("notify.locale_busy"));
             return;
         }
-        if self.locale_dialog.as_ref().is_some_and(|d| d.generating) {
+        if self
+            .modals
+            .locale_dialog
+            .as_ref()
+            .is_some_and(|d| d.generating)
+        {
             return;
         }
-        self.locale_dialog = Some(LocaleDialogState::default());
+        self.modals.locale_dialog = Some(LocaleDialogState::default());
     }
 
     /// Hot-swaps the active custom locale, taking effect immediately (c-5).
@@ -2738,26 +2739,26 @@ mod tests {
     #[test]
     fn test_usage_summary_owns_the_keyboard_above_help() {
         let mut st = test_state();
-        assert!(st.usage_summary.is_none());
+        assert!(st.modals.usage_summary.is_none());
 
         st.open_usage_summary();
         assert_eq!(st.active_modal(), Some(ActiveModal::UsageSummary));
         assert!(st.has_active_modal());
 
         // Help is the lowest-priority surface and never displaces the breakdown.
-        st.show_help = true;
+        st.modals.show_help = true;
         assert_eq!(st.active_modal(), Some(ActiveModal::UsageSummary));
 
-        st.usage_summary = None;
+        st.modals.usage_summary = None;
         assert_eq!(st.active_modal(), Some(ActiveModal::Help));
 
-        st.show_help = false;
+        st.modals.show_help = false;
         assert_eq!(st.active_modal(), None);
 
         // A dialog left scrolled reopens at its top.
-        st.usage_summary = Some(UsageSummaryState { scroll: 42 });
+        st.modals.usage_summary = Some(UsageSummaryState { scroll: 42 });
         st.open_usage_summary();
-        assert_eq!(st.usage_summary.as_ref().unwrap().scroll, 0);
+        assert_eq!(st.modals.usage_summary.as_ref().unwrap().scroll, 0);
     }
 
     #[test]
@@ -2766,7 +2767,7 @@ mod tests {
         st.model.status = TurnStatus::Responding;
 
         st.open_locale_dialog();
-        assert!(st.locale_dialog.is_none());
+        assert!(st.modals.locale_dialog.is_none());
         let notif = st.active_notification().expect("warning notification");
         assert!(notif.text.contains("Cannot change locale"));
     }
@@ -2779,10 +2780,14 @@ mod tests {
             ..Default::default()
         };
         dialog.language_editor.insert_str("French");
-        st.locale_dialog = Some(dialog);
+        st.modals.locale_dialog = Some(dialog);
 
         st.open_locale_dialog();
-        let current = st.locale_dialog.as_ref().expect("dialog remains present");
+        let current = st
+            .modals
+            .locale_dialog
+            .as_ref()
+            .expect("dialog remains present");
         assert!(current.generating);
         assert_eq!(current.language_editor.get_text(), "French");
     }
@@ -2882,7 +2887,7 @@ mod tests {
 
     #[test]
     fn test_modal_focus_toggle() {
-        let mut focus = ModalFocus::default();
+        let mut focus = ModalFocus::Editor;
         assert_eq!(focus, ModalFocus::Editor);
         assert!(focus.is_editor());
         assert!(!focus.is_actions());
@@ -3079,7 +3084,10 @@ mod tests {
         };
 
         assert!(state.open_model_dialog());
-        let dialog = state.selection_dialog.expect("dialog should be opened");
+        let dialog = state
+            .modals
+            .selection_dialog
+            .expect("dialog should be opened");
         assert_eq!(dialog.selector.len(), 1);
         assert_eq!(dialog.selector.selected_entry(), Some(&primary_entry));
         assert_eq!(dialog.selector.selected_index(), 0);
@@ -3119,7 +3127,10 @@ mod tests {
         };
 
         assert!(state.open_model_dialog());
-        let mut dialog = state.selection_dialog.expect("dialog should be opened");
+        let mut dialog = state
+            .modals
+            .selection_dialog
+            .expect("dialog should be opened");
 
         // Exactly the primary rungs are selectable: the coder entry configured
         // alongside them is not a picker row.
@@ -3139,7 +3150,7 @@ mod tests {
 
         assert!(!state.open_model_dialog());
         assert!(
-            state.selection_dialog.is_none(),
+            state.modals.selection_dialog.is_none(),
             "the picker must not open without configured primary tiers"
         );
         let notif = state
@@ -3182,6 +3193,7 @@ mod tests {
         };
         assert!(state.open_model_dialog());
         let dialog = state
+            .modals
             .selection_dialog
             .clone()
             .expect("dialog should be opened");
@@ -3195,6 +3207,7 @@ mod tests {
         };
         assert!(state.open_model_dialog());
         let dialog = state
+            .modals
             .selection_dialog
             .clone()
             .expect("dialog should be opened");
@@ -3209,6 +3222,7 @@ mod tests {
         };
         assert!(state.open_model_dialog());
         let dialog = state
+            .modals
             .selection_dialog
             .clone()
             .expect("dialog should be opened");
@@ -3235,21 +3249,21 @@ mod tests {
         assert!(!st.has_active_modal());
 
         // Help is the lowest-priority surface.
-        st.show_help = true;
+        st.modals.show_help = true;
         assert_eq!(st.active_modal(), Some(ActiveModal::Help));
         assert!(st.has_active_modal());
 
         // A confirmation outranks Help, so the visible window receives input.
-        st.confirm_quit = true;
+        st.modals.confirm_quit = true;
         assert_eq!(st.active_modal(), Some(ActiveModal::ConfirmQuit));
 
         // A disconnected transport blocks every other surface.
-        st.server_disconnected = Some("closed".to_string());
+        st.modals.server_disconnected = Some("closed".to_string());
         assert_eq!(st.active_modal(), Some(ActiveModal::ServerDisconnected));
 
-        st.server_disconnected = None;
-        st.confirm_quit = false;
-        st.show_help = false;
+        st.modals.server_disconnected = None;
+        st.modals.confirm_quit = false;
+        st.modals.show_help = false;
         assert_eq!(st.active_modal(), None);
 
         // The inline Context input still suppresses background interaction.
@@ -3264,7 +3278,7 @@ mod tests {
     #[test]
     fn test_diff_inspector_stacks_below_confirmations() {
         let mut st = test_state();
-        st.diff_inspector = Some(DiffInspectorState {
+        st.modals.diff_inspector = Some(DiffInspectorState {
             selected_file: 0,
             diff_scroll: 0,
             focus: DiffInspectorFocus::Files,
@@ -3274,16 +3288,16 @@ mod tests {
         assert!(st.has_active_modal());
 
         // Reading surfaces below it never displace an audit in progress.
-        st.show_help = true;
+        st.modals.show_help = true;
         st.open_usage_summary();
         assert_eq!(st.active_modal(), Some(ActiveModal::DiffInspector));
 
         // A pending confirmation always outranks the inspector.
-        st.confirm_quit = true;
+        st.modals.confirm_quit = true;
         assert_eq!(st.active_modal(), Some(ActiveModal::ConfirmQuit));
 
-        st.confirm_quit = false;
-        st.diff_inspector = None;
+        st.modals.confirm_quit = false;
+        st.modals.diff_inspector = None;
         assert_eq!(st.active_modal(), Some(ActiveModal::UsageSummary));
     }
 
@@ -3292,11 +3306,11 @@ mod tests {
         let mut st = test_state();
 
         // The User-context clear confirmation owns its own surface.
-        st.context_view.confirm_clear_user = true;
+        st.modals.confirm_clear_user = true;
         assert_eq!(st.active_modal(), Some(ActiveModal::ClearUser));
 
         // Help stays a lower-priority surface than the confirmation.
-        st.show_help = true;
+        st.modals.show_help = true;
         assert_eq!(st.active_modal(), Some(ActiveModal::ClearUser));
     }
 
@@ -3307,15 +3321,15 @@ mod tests {
         let mut st = test_state();
         assert_eq!(st.active_modal(), None);
 
-        st.context_view.pending_remove = Some("src/lib.rs".to_string());
+        st.modals.confirm_remove_context_file = Some("src/lib.rs".to_string());
         assert_eq!(st.active_modal(), Some(ActiveModal::RemoveContextFile));
         assert!(st.has_active_modal());
 
         // Help stays a lower-priority surface than the confirmation.
-        st.show_help = true;
+        st.modals.show_help = true;
         assert_eq!(st.active_modal(), Some(ActiveModal::RemoveContextFile));
 
-        st.context_view.pending_remove = None;
+        st.modals.confirm_remove_context_file = None;
         assert_eq!(st.active_modal(), Some(ActiveModal::Help));
     }
 
@@ -3323,19 +3337,19 @@ mod tests {
     fn test_clear_horizon_modal_priority() {
         let mut st = test_state();
 
-        st.confirm_clear_horizon = Some("plan-1".to_string());
+        st.modals.confirm_clear_horizon = Some("plan-1".to_string());
         assert_eq!(st.active_modal(), Some(ActiveModal::ClearHorizon));
         assert!(st.has_active_modal());
 
         // Both tiers armed at once: the stricter second (dangerous) tier wins
         // so the riskier confirmation always owns the keyboard.
-        st.confirm_clear_horizon_final = Some("plan-1".to_string());
+        st.modals.confirm_clear_horizon_final = Some("plan-1".to_string());
         assert_eq!(st.active_modal(), Some(ActiveModal::ClearHorizonFinal));
 
-        st.confirm_clear_horizon = None;
+        st.modals.confirm_clear_horizon = None;
         assert_eq!(st.active_modal(), Some(ActiveModal::ClearHorizonFinal));
 
-        st.confirm_clear_horizon_final = None;
+        st.modals.confirm_clear_horizon_final = None;
         assert_eq!(st.active_modal(), None);
     }
 
@@ -3346,31 +3360,31 @@ mod tests {
     fn test_delete_plan_final_modal_priority() {
         let mut st = test_state();
 
-        st.confirm_delete_plan = Some("plan-1".to_string());
+        st.modals.confirm_delete_plan = Some("plan-1".to_string());
         assert_eq!(st.active_modal(), Some(ActiveModal::DeletePlan));
 
-        st.confirm_delete_plan_final = Some("plan-1".to_string());
+        st.modals.confirm_delete_plan_final = Some("plan-1".to_string());
         assert_eq!(st.active_modal(), Some(ActiveModal::DeletePlanFinal));
 
-        st.confirm_delete_plan = None;
+        st.modals.confirm_delete_plan = None;
         assert_eq!(st.active_modal(), Some(ActiveModal::DeletePlanFinal));
 
-        st.confirm_delete_plan_final = None;
+        st.modals.confirm_delete_plan_final = None;
         assert_eq!(st.active_modal(), None);
     }
 
     #[test]
     fn test_batch_cancel_dialog_priority_and_defaults() {
         let mut st = test_state();
-        assert_eq!(st.batch_cancel_button, BatchCancelButton::Continue);
+        assert_eq!(st.modals.batch_cancel_button, BatchCancelButton::Continue);
 
-        st.confirm_batch_cancel = true;
+        st.modals.confirm_batch_cancel = true;
         assert_eq!(st.active_modal(), Some(ActiveModal::BatchCancel));
         assert!(st.has_active_modal());
 
         // A later confirmation outranks it so the top-most surface always owns
         // the keyboard.
-        st.confirm_quit = true;
+        st.modals.confirm_quit = true;
         assert_eq!(st.active_modal(), Some(ActiveModal::ConfirmQuit));
     }
 
@@ -3671,7 +3685,7 @@ mod tests {
     #[test]
     fn test_review_analyze_confirmation_owns_the_keyboard() {
         let mut st = test_state();
-        st.confirm_review_analyze = Some(ConfirmReviewAnalyzeState {
+        st.modals.confirm_review_analyze = Some(ConfirmReviewAnalyzeState {
             review_id: "rev-1".to_string(),
             review_title: "Session rev-1".to_string(),
             selector: ModelSelector::new(ModelRole::Architect, Vec::new(), 0),
@@ -3681,10 +3695,10 @@ mod tests {
         assert_eq!(st.active_modal(), Some(ActiveModal::ReviewAnalyze));
         assert!(st.has_active_modal());
 
-        st.show_help = true;
+        st.modals.show_help = true;
         assert_eq!(st.active_modal(), Some(ActiveModal::ReviewAnalyze));
 
-        st.confirm_review_analyze = None;
+        st.modals.confirm_review_analyze = None;
         assert_eq!(st.active_modal(), Some(ActiveModal::Help));
     }
 
@@ -3895,10 +3909,10 @@ mod tests {
     #[test]
     fn test_review_truncation_confirmation_owns_the_keyboard() {
         let mut st = test_state();
-        st.review_dialog = Some(ReviewDialogState::new(0, 0, Vec::new(), Vec::new()));
+        st.modals.review_dialog = Some(ReviewDialogState::new(0, 0, Vec::new(), Vec::new()));
         assert_eq!(st.active_modal(), Some(ActiveModal::Review));
 
-        st.confirm_review_truncation = Some(ConfirmReviewTruncationState {
+        st.modals.confirm_review_truncation = Some(ConfirmReviewTruncationState {
             pending: PendingReviewLaunch {
                 dialog: ReviewDialogState::new(0, 0, Vec::new(), Vec::new()),
                 params: ReviewStartParams::default(),
@@ -3912,7 +3926,7 @@ mod tests {
         assert!(st.has_active_modal());
 
         // Answering the decision returns the keyboard to the launch dialog.
-        st.confirm_review_truncation = None;
+        st.modals.confirm_review_truncation = None;
         assert_eq!(st.active_modal(), Some(ActiveModal::Review));
     }
 
@@ -4135,30 +4149,30 @@ mod tests {
             focused_items: Vec::new(),
         });
         assert_eq!(prompt.focus, ModalFocus::Editor);
-        st.prompt_modal = Some(prompt);
+        st.modals.prompt_modal = Some(prompt);
         assert!(
             st.text_input_capturing(),
             "the discussion comment editor captures text"
         );
-        if let Some(modal) = st.prompt_modal.as_mut() {
+        if let Some(modal) = st.modals.prompt_modal.as_mut() {
             modal.focus = ModalFocus::Actions;
         }
         assert!(
             !st.text_input_capturing(),
             "the discussion action bar captures no text"
         );
-        st.prompt_modal = None;
+        st.modals.prompt_modal = None;
 
-        st.locale_dialog = Some(LocaleDialogState::default());
+        st.modals.locale_dialog = Some(LocaleDialogState::default());
         assert_eq!(
-            st.locale_dialog.as_ref().map(|dialog| dialog.focus),
+            st.modals.locale_dialog.as_ref().map(|dialog| dialog.focus),
             Some(LocaleDialogFocus::Editor)
         );
         assert!(
             st.text_input_capturing(),
             "the locale language field captures text"
         );
-        if let Some(dialog) = st.locale_dialog.as_mut() {
+        if let Some(dialog) = st.modals.locale_dialog.as_mut() {
             dialog.focus = LocaleDialogFocus::Actions;
         }
         assert!(
@@ -4184,32 +4198,32 @@ mod tests {
             (ReviewDialogFocus::Actions, false),
         ] {
             dialog.focus = focus;
-            st.review_dialog = Some(dialog.clone());
+            st.modals.review_dialog = Some(dialog.clone());
             assert_eq!(
                 st.text_input_capturing(),
                 expected,
                 "the review launcher {focus:?} section"
             );
         }
-        st.review_dialog = None;
+        st.modals.review_dialog = None;
 
         let squash = SquashDialogState {
             focus: SquashDialogFocus::MessageEditor,
             ..Default::default()
         };
-        st.squash_dialog = Some(squash);
+        st.modals.squash_dialog = Some(squash);
         assert!(
             st.text_input_capturing(),
             "the squash commit message captures text"
         );
-        if let Some(dialog) = st.squash_dialog.as_mut() {
+        if let Some(dialog) = st.modals.squash_dialog.as_mut() {
             dialog.focus = SquashDialogFocus::FileList;
         }
         assert!(
             !st.text_input_capturing(),
             "browsing the squash file list captures no text"
         );
-        if let Some(dialog) = st.squash_dialog.as_mut() {
+        if let Some(dialog) = st.modals.squash_dialog.as_mut() {
             dialog.custom_input_active = true;
         }
         assert!(
@@ -4235,19 +4249,19 @@ mod tests {
             )],
         );
         for (focus, expected) in [
-            (RefineDialogFocus::ModelList, false),
-            (RefineDialogFocus::InstructionsEditor, true),
-            (RefineDialogFocus::Actions, false),
+            (crate::views::plans::PlanFormFocus::PlannerList, false),
+            (crate::views::plans::PlanFormFocus::InstructionsEditor, true),
+            (crate::views::plans::PlanFormFocus::Actions, false),
         ] {
             dialog.focus = focus;
-            st.plans_view.refine_dialog = Some(dialog.clone());
+            st.modals.refine_dialog = Some(dialog.clone());
             assert_eq!(
                 st.text_input_capturing(),
                 expected,
                 "the plan refine dialog {focus:?} section"
             );
         }
-        st.plans_view.refine_dialog = None;
+        st.modals.refine_dialog = None;
 
         let mut point = ConfirmExecuteReviewState::new(
             Some("rev-1".to_string()),
@@ -4259,19 +4273,19 @@ mod tests {
             Vec::new(),
         );
         point.focus = RefineDialogFocus::InstructionsEditor;
-        st.confirm_execute_review = Some(point.clone());
+        st.modals.confirm_execute_review = Some(point.clone());
         assert!(
             st.text_input_capturing(),
             "the review-execution directives editor captures text"
         );
         point.focus = RefineDialogFocus::Actions;
-        st.confirm_execute_review = Some(point);
+        st.modals.confirm_execute_review = Some(point);
         assert!(
             !st.text_input_capturing(),
             "the review-execution action bar captures no text"
         );
 
-        st.confirm_execute_review = Some(ConfirmExecuteReviewState::new(
+        st.modals.confirm_execute_review = Some(ConfirmExecuteReviewState::new(
             Some("rev-1".to_string()),
             "Session rev-1".to_string(),
             "All remaining findings".to_string(),
@@ -4303,23 +4317,23 @@ mod tests {
             !st.text_input_capturing(),
             "the usage breakdown captures no text"
         );
-        st.usage_summary = None;
+        st.modals.usage_summary = None;
 
-        st.show_help = true;
+        st.modals.show_help = true;
         assert!(
             !st.text_input_capturing(),
             "the Help modal captures no text"
         );
-        st.show_help = false;
+        st.modals.show_help = false;
 
         st.open_theme_selector();
         assert!(
             !st.text_input_capturing(),
             "the theme selector captures no text"
         );
-        st.theme_selector = None;
+        st.modals.theme_selector = None;
 
-        st.status_dialog = Some(StatusDialogState::new(
+        st.modals.status_dialog = Some(StatusDialogState::new(
             StatusDialogTarget::PlanItem {
                 plan_id: "plan-1".to_string(),
                 item_id: "1".to_string(),
@@ -4332,9 +4346,9 @@ mod tests {
             !st.text_input_capturing(),
             "the status picker captures no text"
         );
-        st.status_dialog = None;
+        st.modals.status_dialog = None;
 
-        st.selection_dialog = Some(SelectionDialogState::new(
+        st.modals.selection_dialog = Some(SelectionDialogState::new(
             vec![tauqe_protocol::ModelEntry::new(
                 ModelRef::openrouter("primary-a"),
                 None,
@@ -4345,9 +4359,9 @@ mod tests {
             !st.text_input_capturing(),
             "the model picker captures no text"
         );
-        st.selection_dialog = None;
+        st.modals.selection_dialog = None;
 
-        st.diff_inspector = Some(DiffInspectorState {
+        st.modals.diff_inspector = Some(DiffInspectorState {
             selected_file: 0,
             diff_scroll: 0,
             focus: DiffInspectorFocus::Files,
@@ -4356,9 +4370,9 @@ mod tests {
             !st.text_input_capturing(),
             "the diff inspector captures no text"
         );
-        st.diff_inspector = None;
+        st.modals.diff_inspector = None;
 
-        st.confirm_execute_scope = Some(ConfirmExecuteScopeState::new(
+        st.modals.confirm_execute_scope = Some(ConfirmExecuteScopeState::new(
             "plan-1".to_string(),
             "Plan 1".to_string(),
             "Step 1".to_string(),
@@ -4370,9 +4384,9 @@ mod tests {
             !st.text_input_capturing(),
             "the plan execution form exposes no text editor"
         );
-        st.confirm_execute_scope = None;
+        st.modals.confirm_execute_scope = None;
 
-        st.confirm_execute_pipeline = Some(ConfirmExecutePipelineState {
+        st.modals.confirm_execute_pipeline = Some(ConfirmExecutePipelineState {
             plan_ids: vec!["plan-1".to_string()],
             plan_titles: vec!["Plan 1".to_string()],
             steps: Vec::new(),
@@ -4382,9 +4396,9 @@ mod tests {
             !st.text_input_capturing(),
             "the pipeline confirmation captures no text"
         );
-        st.confirm_execute_pipeline = None;
+        st.modals.confirm_execute_pipeline = None;
 
-        st.plans_view.refine_blocked = Some(crate::views::plans::PlanRefineBlockedState {
+        st.modals.refine_blocked = Some(crate::views::plans::PlanRefineBlockedState {
             plan_id: "plan-1".to_string(),
             plan_title: "Plan 1".to_string(),
             reason: "blocking contradiction".to_string(),
@@ -4393,9 +4407,9 @@ mod tests {
             !st.text_input_capturing(),
             "the blocked-refinement confirmation captures no text"
         );
-        st.plans_view.refine_blocked = None;
+        st.modals.refine_blocked = None;
 
-        st.confirm_quit = true;
+        st.modals.confirm_quit = true;
         assert!(
             !st.text_input_capturing(),
             "a confirmation over the REPL prompt captures no text"

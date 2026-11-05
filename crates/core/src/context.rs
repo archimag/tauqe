@@ -15,6 +15,15 @@ pub struct ContextFileContent {
     pub path: String,
     pub access: ContextAccess,
     pub content: String,
+    /// Arrival watermark of the context entry the content came from.
+    ///
+    /// The value is the `insertion_seq` the path holds in the context layers,
+    /// so a reader that places files chronologically uses the order in which
+    /// they actually arrived instead of where their layer sits. `0` denotes an
+    /// unrecorded arrival: a file created during the current turn, or a payload
+    /// synthesized outside the context layers. Watermarks are allocated from
+    /// `1`, so `0` is never a real one.
+    pub insertion_seq: u64,
 }
 
 /// Outcome of adding files by glob pattern in a single batch.
@@ -50,11 +59,13 @@ pub struct ContextManager {
     auto: IndexMap<String, ContextItem>,
     /// Documents materialized from the external documentation registry.
     ///
-    /// The layer is persistent for the whole task: it is context rather than
-    /// transcript, so history compaction never touches it, clearing the Auto or
-    /// the User layer leaves it intact, and only a full context clear drops a
-    /// document. It keeps no eviction order of its own: a snapshot is priced
-    /// like every other file and stays resident until the task ends.
+    /// The layer is part of the transient context: it is context rather than
+    /// transcript, so history compaction never touches it, and clearing the Auto
+    /// or the User layer on its own leaves it intact. The transient context is
+    /// released as a whole through [`Self::clear_transient`], and a full context
+    /// clear drops the documents together with every other layer. It keeps no
+    /// eviction order of its own: a snapshot is priced like every other file and
+    /// stays resident until the transient context is released.
     outer_docs: IndexMap<String, ContextItem>,
 }
 
@@ -78,6 +89,44 @@ fn upgrade_access(item: &mut ContextItem, access: ContextAccess) -> bool {
     } else {
         false
     }
+}
+
+/// Reduces a path a caller may hold to the logical name the OuterDocs layer
+/// stores.
+///
+/// The layer addresses a document by its logical path, while a research round
+/// that just materialized one still holds the cache path its snapshot was
+/// written to. Both spellings name the same document, so a lookup resolves
+/// either of them instead of reporting a second entry.
+fn document_key(path: &str) -> &str {
+    crate::outer_docs::logical_path(path).unwrap_or(path)
+}
+
+/// Diagnostic reported when a caller tries to fill a registry-managed layer.
+///
+/// The OuterDocs layer is filled exclusively by the external documentation
+/// registry, so a manual admission is refused by contract wherever it is
+/// attempted.
+const OUTER_DOCS_MANUAL_ADD: &str =
+    "The OuterDocs layer is registry-managed and cannot be filled manually";
+
+/// Refreshes the recorded metadata of `item` from the file at `full_path`.
+///
+/// The helper reports whether the recorded size actually moved, so a caller
+/// marks the context as changed only when a file really did. A path that cannot
+/// be stat'ed keeps the metadata the entry already carries.
+fn refresh_metadata(item: &mut ContextItem, full_path: &Path) -> bool {
+    let Ok(metadata) = std::fs::metadata(full_path) else {
+        return false;
+    };
+    let size_bytes = metadata.len();
+    let estimated_tokens = estimate_tokens_from_bytes(size_bytes);
+    if item.size_bytes == size_bytes && item.estimated_tokens == estimated_tokens {
+        return false;
+    }
+    item.size_bytes = size_bytes;
+    item.estimated_tokens = estimated_tokens;
+    true
 }
 
 impl ContextManager {
@@ -137,8 +186,11 @@ impl ContextManager {
             }
         }
         // An external document is read-only by construction, so it answers the
-        // same way the read-only entries of the other three layers do.
-        if found || self.outer_docs.contains_key(clean_path) {
+        // same way the read-only entries of the other three layers do. The
+        // layer stores the logical path of a document while a research round
+        // still holds the cache path its snapshot was written to, so both
+        // spellings resolve to the same document.
+        if found || self.outer_docs.contains_key(document_key(clean_path)) {
             Some(ContextAccess::ReadOnly)
         } else {
             None
@@ -183,8 +235,9 @@ impl ContextManager {
     /// Reads every context file together with its insertion watermark.
     ///
     /// Files are emitted in layer order (pinned -> outer_docs -> user -> auto)
-    /// and in each layer's insertion order.
-    fn read_context_files_with_seq(&self) -> Vec<(u64, ContextFileContent)> {
+    /// and in each layer's insertion order, and each file carries the watermark
+    /// its context entry already holds.
+    fn read_context_files_with_seq(&self) -> Vec<ContextFileContent> {
         // Reading every context file is blocking file I/O. Run it through the
         // blocking helper so a large context never stalls an async worker.
         crate::blocking::run_blocking(|| {
@@ -203,23 +256,28 @@ impl ContextManager {
                 if !seen.insert(path.as_str()) {
                     continue;
                 }
-                if verify_path_within_repo(&self.repo_root, path).is_err() {
-                    continue;
-                }
-                let full_path = self.repo_root.join(path);
+                // The OuterDocs layer names a logical document whose bytes live
+                // in the isolated cache; every other layer names a repository
+                // file, which passes the escape boundary before it is read.
+                let full_path = if self.outer_docs.contains_key(path.as_str()) {
+                    self.outer_docs_cache_path(path)
+                } else {
+                    if verify_path_within_repo(&self.repo_root, path).is_err() {
+                        continue;
+                    }
+                    self.repo_root.join(path)
+                };
                 if let Ok(content) = std::fs::read_to_string(&full_path) {
                     let access = self
                         .effective_access_for(path)
                         .unwrap_or(ContextAccess::ReadOnly);
                     let insertion_seq = self.existing_insertion_seq(path).unwrap_or(0);
-                    files.push((
+                    files.push(ContextFileContent {
+                        path: path.clone(),
+                        access,
+                        content,
                         insertion_seq,
-                        ContextFileContent {
-                            path: path.clone(),
-                            access,
-                            content,
-                        },
-                    ));
+                    });
                 }
             }
             files
@@ -230,9 +288,6 @@ impl ContextManager {
     /// outer_docs -> user -> auto) and insertion order within each layer.
     pub fn read_context_files(&self) -> Vec<ContextFileContent> {
         self.read_context_files_with_seq()
-            .into_iter()
-            .map(|(_, file)| file)
-            .collect()
     }
 
     /// Reads the context files ordered by their insertion watermark.
@@ -244,14 +299,14 @@ impl ContextManager {
     /// result stays deterministic.
     pub fn read_context_files_by_insertion(&self) -> Vec<ContextFileContent> {
         let mut files = self.read_context_files_with_seq();
-        files.sort_by_key(|(insertion_seq, _)| *insertion_seq);
-        files.into_iter().map(|(_, file)| file).collect()
+        files.sort_by_key(|file| file.insertion_seq);
+        files
     }
 
     pub fn contains(&self, relative_path: &str) -> Result<bool> {
         let clean_path = self.normalize_path(relative_path)?;
         Ok(self.pinned.contains_key(&clean_path)
-            || self.outer_docs.contains_key(&clean_path)
+            || self.outer_docs.contains_key(document_key(&clean_path))
             || self.user.contains_key(&clean_path)
             || self.auto.contains_key(&clean_path))
     }
@@ -266,7 +321,26 @@ impl ContextManager {
         self.outer_docs.keys().cloned().collect()
     }
 
+    /// Filesystem location of one document of the OuterDocs layer.
+    ///
+    /// The layer keeps the logical path of a document — the declared identifier
+    /// and the relative path below it — while its bytes live in the isolated
+    /// documentation cache. Every disk access of the layer therefore resolves
+    /// the document through this helper, so the cache prefix stays inside the
+    /// harness and never reaches a rendered context element.
+    fn outer_docs_cache_path(&self, clean_path: &str) -> PathBuf {
+        self.repo_root
+            .join(crate::outer_docs::OUTER_DOCS_CACHE_DIR)
+            .join(clean_path)
+    }
+
     /// Admits one external documentation snapshot into the OuterDocs layer.
+    ///
+    /// The layer stores the logical path of the document and never the cache
+    /// path its snapshot is written to, so the `<file path="...">` element, the
+    /// prompt manifest, and the interface all address one document by one name.
+    /// A caller may pass either spelling: a cache path is reduced to the
+    /// logical one the layer keeps.
     ///
     /// The document is stored read-only, because it is a snapshot the harness
     /// materialized and the model must never rewrite it. A repeated request is
@@ -280,8 +354,8 @@ impl ContextManager {
     /// again.
     pub fn add_outer_docs_file(&mut self, relative_path: &str) -> Result<ContextItem> {
         crate::blocking::run_blocking(|| {
-            let clean_path = self.normalize_path(relative_path)?;
-            let full_path = self.repo_root.join(&clean_path);
+            let clean_path = self.normalize_path(document_key(relative_path))?;
+            let full_path = self.outer_docs_cache_path(&clean_path);
             if !full_path.is_file() {
                 bail!("External document not found: {}", clean_path);
             }
@@ -371,6 +445,14 @@ impl ContextManager {
         layer: ContextLayer,
         recompute: bool,
     ) -> Result<ContextItem> {
+        // The OuterDocs layer belongs to the external documentation registry: a
+        // document enters it only through `add_outer_docs_file`, so a manual
+        // admission is refused by contract. The check precedes the repository
+        // file probe, which would otherwise report an unrelated cause: a
+        // logical document lives in the cache and never in the working tree.
+        if layer == ContextLayer::OuterDocs {
+            bail!(OUTER_DOCS_MANUAL_ADD);
+        }
         // Symlink verification, existence checks, and metadata reads are
         // blocking filesystem work, so the whole operation runs off the async
         // executor thread. The nested pinned recomputation stays inline.
@@ -440,9 +522,9 @@ impl ContextManager {
                 // registry: a document enters it only through
                 // `add_outer_docs_file`, so a manual add is refused rather than
                 // stored.
-                ContextLayer::OuterDocs => {
-                    bail!("The OuterDocs layer is registry-managed and cannot be filled manually")
-                }
+                // The registry-managed layer is refused at the entry of this
+                // function; the arm keeps the match exhaustive over the layers.
+                ContextLayer::OuterDocs => bail!(OUTER_DOCS_MANUAL_ADD),
             };
 
             let pinned_changed = if recompute {
@@ -564,84 +646,95 @@ impl ContextManager {
         // Sort for deterministic addition order
         matched_files.sort();
 
-        // The budget covers the whole context, so what the loaded files already
-        // spend is measured first with the same wrapper-aware rule. A matched
-        // path is excluded here because the loop below prices it, whether it
-        // arrives fresh or is promoted out of another layer.
-        let mut spent_tokens: usize = self
-            .get_state()
-            .items
-            .iter()
-            .filter(|item| !matched_files.contains(&item.path))
-            .map(|item| {
-                item.estimated_tokens as usize
-                    + crate::prompt::context_element_overhead_tokens(&item.path, item.access)
+        // What the loaded files already spend is measured first with the same
+        // wrapper-aware rule. A matched path is excluded here because the loop
+        // below prices it, whether it arrives fresh or is promoted out of
+        // another layer. The set keeps that exclusion linear instead of
+        // rescanning every matched path once per loaded item.
+        let mut spent_tokens: usize = {
+            let matched_paths: std::collections::HashSet<&str> =
+                matched_files.iter().map(String::as_str).collect();
+            self.get_state()
+                .items
+                .iter()
+                .filter(|item| !matched_paths.contains(item.path.as_str()))
+                .map(|item| {
+                    item.estimated_tokens as usize
+                        + crate::prompt::context_element_overhead_tokens(&item.path, item.access)
+                })
+                .sum()
+        };
+
+        // Every candidate is priced from its own metadata before admission, so
+        // the pass touches the filesystem. It runs off the async executor
+        // thread, and the helper is reentrant: the offload each admission
+        // performs internally runs inline here instead of stacking a second
+        // hand-off.
+        crate::blocking::run_blocking(|| {
+            let mut added_items = Vec::new();
+            let mut total_added_tokens = 0u64;
+            let mut any_changed = false;
+            let mut truncated = false;
+
+            for path in matched_files {
+                // The candidate is priced from its metadata before admission,
+                // so the wrapper of its own path is charged to the budget it
+                // spends.
+                let cost = match std::fs::metadata(self.repo_root.join(&path)) {
+                    Ok(metadata) => {
+                        estimate_tokens_from_bytes(metadata.len()) as usize
+                            + crate::prompt::context_element_overhead_tokens(&path, access)
+                    }
+                    // A path that vanished between the listing and the read
+                    // adds nothing, and it is not a budget omission.
+                    Err(_) => continue,
+                };
+                if spent_tokens.saturating_add(cost) > token_budget {
+                    truncated = true;
+                    break;
+                }
+                let rev_before = self.revision;
+                if let Ok(item) =
+                    self.add_file_to_layer_internal(&path, access, ContextLayer::User, false)
+                {
+                    spent_tokens += cost;
+                    total_added_tokens += cost as u64;
+                    added_items.push(item);
+                    if self.revision > rev_before {
+                        any_changed = true;
+                    }
+                }
+            }
+
+            let pinned_changed = self.recompute_pinned();
+            if pinned_changed && !any_changed {
+                self.revision += 1;
+            }
+
+            Ok(PatternAddOutcome {
+                added_items,
+                added_tokens: total_added_tokens,
+                truncated,
             })
-            .sum();
-
-        let mut added_items = Vec::new();
-        let mut total_added_tokens = 0u64;
-        let mut any_changed = false;
-        let mut truncated = false;
-
-        for path in matched_files {
-            // The candidate is priced from its metadata before admission, so
-            // the wrapper of its own path is charged to the budget it spends.
-            let cost = match std::fs::metadata(self.repo_root.join(&path)) {
-                Ok(metadata) => {
-                    estimate_tokens_from_bytes(metadata.len()) as usize
-                        + crate::prompt::context_element_overhead_tokens(&path, access)
-                }
-                // A path that vanished between the listing and the read adds
-                // nothing, and it is not a budget omission.
-                Err(_) => continue,
-            };
-            if spent_tokens.saturating_add(cost) > token_budget {
-                truncated = true;
-                break;
-            }
-            let rev_before = self.revision;
-            if let Ok(item) =
-                self.add_file_to_layer_internal(&path, access, ContextLayer::User, false)
-            {
-                spent_tokens += cost;
-                total_added_tokens += cost as u64;
-                added_items.push(item);
-                if self.revision > rev_before {
-                    any_changed = true;
-                }
-            }
-        }
-
-        let pinned_changed = self.recompute_pinned();
-        if pinned_changed && !any_changed {
-            self.revision += 1;
-        }
-
-        Ok(PatternAddOutcome {
-            added_items,
-            added_tokens: total_added_tokens,
-            truncated,
         })
     }
-
     pub fn update_file_metadata(&mut self, relative_path: &str) -> Result<()> {
         // The metadata read is blocking filesystem work, so it runs off the
         // async executor thread.
         crate::blocking::run_blocking(|| {
             let clean_path = self.normalize_path(relative_path)?;
             let full_path = self.repo_root.join(&clean_path);
+            // The OuterDocs layer holds the logical path of a document, so the
+            // snapshot it renders is measured in the cache that keeps its bytes.
+            let document_path = self.outer_docs_cache_path(&clean_path);
             let mut updated = false;
-            if let Ok(metadata) = std::fs::metadata(&full_path) {
-                let size = metadata.len();
-                let tokens = estimate_tokens_from_bytes(size);
-                for layer in [&mut self.pinned, &mut self.user, &mut self.auto] {
-                    if let Some(item) = layer.get_mut(&clean_path) {
-                        item.size_bytes = size;
-                        item.estimated_tokens = tokens;
-                        updated = true;
-                    }
+            for layer in [&mut self.pinned, &mut self.user, &mut self.auto] {
+                if let Some(item) = layer.get_mut(&clean_path) {
+                    updated |= refresh_metadata(item, &full_path);
                 }
+            }
+            if let Some(item) = self.outer_docs.get_mut(&clean_path) {
+                updated |= refresh_metadata(item, &document_path);
             }
             if updated {
                 self.revision += 1;
@@ -663,7 +756,10 @@ impl ContextManager {
         // An external document leaves the layer on an explicit removal, because
         // dropping one document is a deliberate developer action; the registry
         // only withholds access and layer changes.
-        let removed_outer_docs = self.outer_docs.shift_remove(&clean_path).is_some();
+        let removed_outer_docs = self
+            .outer_docs
+            .shift_remove(document_key(&clean_path))
+            .is_some();
         if removed_user || removed_auto || removed_outer_docs {
             self.recompute_pinned();
             self.revision += 1;
@@ -808,13 +904,14 @@ impl ContextManager {
             removed.extend(prune_layer(&mut self.pinned, &self.repo_root));
             removed.extend(prune_layer(&mut self.user, &self.repo_root));
             removed.extend(prune_layer(&mut self.auto, &self.repo_root));
-            // An external snapshot lives in the isolated cache, so a document
-            // whose cached file disappeared is dropped like any other missing
-            // context path instead of lingering as a dangling entry.
+            // A document is stored under its logical path while its snapshot
+            // lives in the isolated cache, so the existence check reads the
+            // cache the layer keeps and never the working tree.
+            let cache_root = self.repo_root.join(crate::outer_docs::OUTER_DOCS_CACHE_DIR);
             let stale_outer_docs: Vec<String> = self
                 .outer_docs
                 .keys()
-                .filter(|path| !self.repo_root.join(path).is_file())
+                .filter(|path| !cache_root.join(path.as_str()).is_file())
                 .cloned()
                 .collect();
             for path in &stale_outer_docs {
@@ -860,11 +957,11 @@ impl ContextManager {
             }
             changed |= previous_auto != self.auto;
 
-            // 1b. Merge the turn's external documents. The layer is persistent
-            // for the whole task, so a document the turn materialized survives
-            // the merge. A snapshot is immutable for the whole task, so a path
-            // present on both sides keeps the item already held instead of
-            // being replaced.
+            // 1b. Merge the turn's external documents. The layer is part of the
+            // transient context, so a document the turn materialized waits in
+            // the live layer until that context is released. A snapshot is
+            // immutable for the whole task, so a path present on both sides
+            // keeps the item already held instead of being replaced.
             for (path, item) in &turn_context.outer_docs {
                 if !self.outer_docs.contains_key(path) {
                     // The path may have entered another layer while the turn
@@ -910,25 +1007,17 @@ impl ContextManager {
             changed |= self.recompute_pinned();
 
             // 4. Refresh metadata for all files in context, the external
-            // documentation snapshots the turn materialized included.
-            for layer in [
-                &mut self.pinned,
-                &mut self.user,
-                &mut self.auto,
-                &mut self.outer_docs,
-            ] {
+            // documentation snapshots the turn materialized included. The
+            // OuterDocs layer holds the logical path of a document, so its
+            // snapshot is measured in the cache that keeps its bytes.
+            for layer in [&mut self.pinned, &mut self.user, &mut self.auto] {
                 for (path, item) in layer.iter_mut() {
-                    let full_path = self.repo_root.join(path);
-                    if let Ok(meta) = std::fs::metadata(&full_path) {
-                        let size = meta.len();
-                        let tokens = estimate_tokens_from_bytes(size);
-                        if item.size_bytes != size || item.estimated_tokens != tokens {
-                            item.size_bytes = size;
-                            item.estimated_tokens = tokens;
-                            changed = true;
-                        }
-                    }
+                    changed |= refresh_metadata(item, &self.repo_root.join(path.as_str()));
                 }
+            }
+            let cache_root = self.repo_root.join(crate::outer_docs::OUTER_DOCS_CACHE_DIR);
+            for (path, item) in self.outer_docs.iter_mut() {
+                changed |= refresh_metadata(item, &cache_root.join(path.as_str()));
             }
 
             // The turn may have consumed watermarks the primary never saw, so
@@ -950,6 +1039,21 @@ mod tests {
     use super::*;
     use tempfile::tempdir;
 
+    /// Writes one external document into the isolated cache a declaration
+    /// materializes into.
+    fn cache_document(root: &std::path::Path, logical: &str, contents: &str) {
+        let path = root
+            .join(crate::outer_docs::OUTER_DOCS_CACHE_DIR)
+            .join(logical);
+        std::fs::create_dir_all(path.parent().expect("the cache path has a directory"))
+            .expect("the cache directory is created");
+        std::fs::write(&path, contents).expect("the snapshot is written");
+    }
+
+    /// Repository-relative path the cache stores `logical` under.
+    fn cache_path(logical: &str) -> String {
+        format!("{}/{logical}", crate::outer_docs::OUTER_DOCS_CACHE_DIR)
+    }
     #[test]
     fn test_add_files_by_pattern() {
         let dir = tempdir().unwrap();
@@ -1007,6 +1111,31 @@ mod tests {
         assert!(outcome.truncated);
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_add_files_by_pattern_prices_candidates_on_an_async_runtime() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("src/a.rs"), "pub fn a() {}").unwrap();
+        std::fs::write(root.join("src/b.rs"), "pub fn b() {}").unwrap();
+
+        let repo_files = vec!["src/a.rs".to_string(), "src/b.rs".to_string()];
+        let mut cm = ContextManager::new(root);
+
+        // The pricing walk reads metadata for every candidate, so the whole
+        // pass is offloaded: it must complete from a multi-threaded executor
+        // exactly as it does from synchronous code.
+        let outcome = cm
+            .add_files_by_pattern("src/*.rs", ContextAccess::Editable, &repo_files, 300_000)
+            .unwrap();
+
+        assert_eq!(outcome.added_items.len(), 2);
+        assert!(!outcome.truncated);
+        assert!(outcome.added_tokens > 0);
+        assert!(cm.is_editable("src/a.rs").unwrap());
+        assert!(cm.is_editable("src/b.rs").unwrap());
+    }
     #[test]
     fn test_set_access_on_pinned_file_is_rejected() {
         let dir = tempdir().unwrap();
@@ -1385,6 +1514,12 @@ mod tests {
         assert_eq!(paths, vec!["pinned.rs", "zeta.rs", "alpha.rs"]);
         let alpha = files.iter().find(|f| f.path == "alpha.rs").unwrap();
         assert_eq!(alpha.access, ContextAccess::Editable);
+        // Every file carries the watermark of the entry it renders, so a
+        // chronological reader never re-derives the arrival order.
+        assert!(files.iter().all(|file| file.insertion_seq > 0));
+        assert!(files
+            .windows(2)
+            .all(|pair| pair[0].insertion_seq < pair[1].insertion_seq));
     }
 
     fn watermark_of(cm: &ContextManager, path: &str) -> u64 {
@@ -1504,15 +1639,42 @@ mod tests {
             .map(|file| file.path)
             .collect();
         assert_eq!(chronological, vec!["pinned.rs", "auto.rs", "user.rs"]);
+
+        // Both readers carry the watermark of the entry they render, so the
+        // chronology is data on the file instead of a second computation.
+        let carried: Vec<(String, u64)> = cm
+            .read_context_files_by_insertion()
+            .into_iter()
+            .map(|file| (file.path, file.insertion_seq))
+            .collect();
+        assert_eq!(
+            carried,
+            vec![
+                ("pinned.rs".to_string(), watermark_of(&cm, "pinned.rs")),
+                ("auto.rs".to_string(), watermark_of(&cm, "auto.rs")),
+                ("user.rs".to_string(), watermark_of(&cm, "user.rs")),
+            ]
+        );
+        // The semantic reader serves the very same values in layer order.
+        let semantic_watermarks: Vec<u64> = cm
+            .read_context_files()
+            .into_iter()
+            .map(|file| file.insertion_seq)
+            .collect();
+        assert_eq!(
+            semantic_watermarks,
+            vec![carried[0].1, carried[2].1, carried[1].1]
+        );
     }
 
     #[test]
     fn test_outer_docs_layer_emits_read_only_documents_in_layer_order() {
         let dir = tempdir().unwrap();
         let root = dir.path().to_path_buf();
-        for name in ["pinned.rs", "docs.md", "user.rs", "auto.rs"] {
+        for name in ["pinned.rs", "user.rs", "auto.rs"] {
             std::fs::write(root.join(name), "fn f() {}\n").unwrap();
         }
+        cache_document(&root, "docs.md", "external notes\n");
 
         let mut cm = ContextManager::new(root);
         cm.load_pinned(&["pinned.rs".to_string()]);
@@ -1523,6 +1685,9 @@ mod tests {
 
         assert_eq!(document.layer, ContextLayer::OuterDocs);
         assert_eq!(document.access, ContextAccess::ReadOnly);
+        // The layer addresses the document by its logical path, never by the
+        // cache path its snapshot is stored under.
+        assert_eq!(document.path, "docs.md");
         assert!(!cm.is_editable("docs.md").unwrap());
         assert_eq!(cm.outer_docs_files(), vec!["docs.md".to_string()]);
 
@@ -1537,19 +1702,23 @@ mod tests {
         assert_eq!(emitted.layer, ContextLayer::OuterDocs);
         assert_eq!(emitted.access, ContextAccess::ReadOnly);
 
+        // The bytes travel from the cache the layer keeps them in, while the
+        // rendered element names the logical path.
         let files = cm.read_context_files();
         let file_paths: Vec<&str> = files.iter().map(|file| file.path.as_str()).collect();
         assert_eq!(
             file_paths,
             vec!["pinned.rs", "docs.md", "user.rs", "auto.rs"]
         );
+        let rendered = files.iter().find(|file| file.path == "docs.md").unwrap();
+        assert_eq!(rendered.content, "external notes\n");
     }
 
     #[test]
     fn test_a_repeated_outer_docs_request_is_a_no_op() {
         let dir = tempdir().unwrap();
         let root = dir.path().to_path_buf();
-        std::fs::write(root.join("docs.md"), "external notes\n").unwrap();
+        cache_document(&root, "docs.md", "external notes\n");
 
         let mut cm = ContextManager::new(root);
         cm.add_outer_docs_file("docs.md").unwrap();
@@ -1561,15 +1730,22 @@ mod tests {
         assert_eq!(again.layer, ContextLayer::OuterDocs);
         assert_eq!(cm.get_state().revision, revision);
         assert_eq!(cm.outer_docs_files(), vec!["docs.md".to_string()]);
+
+        // The cache path and the logical path name the same document, so a
+        // caller still holding the cache spelling reaches the same snapshot.
+        let cached = cache_path("docs.md");
+        assert_eq!(cm.add_outer_docs_file(&cached).unwrap(), again);
+        assert_eq!(cm.outer_docs_files(), vec!["docs.md".to_string()]);
+        assert_eq!(cm.get_state().revision, revision);
     }
 
     #[test]
     fn test_the_outer_docs_layer_keeps_every_admitted_document() {
         let dir = tempdir().unwrap();
         let root = dir.path().to_path_buf();
-        std::fs::write(root.join("a.md"), "external notes\n").unwrap();
-        std::fs::write(root.join("b.md"), "external notes\n").unwrap();
-        std::fs::write(root.join("c.md"), "external notes\n").unwrap();
+        for name in ["a.md", "b.md", "c.md"] {
+            cache_document(&root, name, "external notes\n");
+        }
 
         let mut cm = ContextManager::new(root);
         cm.add_outer_docs_file("a.md").unwrap();
@@ -1594,7 +1770,7 @@ mod tests {
     fn test_the_outer_docs_layer_applies_no_budget_of_its_own() {
         let dir = tempdir().unwrap();
         let root = dir.path().to_path_buf();
-        std::fs::write(root.join("huge.md"), "x".repeat(4096)).unwrap();
+        cache_document(&root, "huge.md", &"x".repeat(4096));
 
         let mut cm = ContextManager::new(root);
         let document = cm
@@ -1610,8 +1786,8 @@ mod tests {
     fn test_the_outer_docs_layer_survives_clear_auto_and_a_turn_merge() {
         let dir = tempdir().unwrap();
         let root = dir.path().to_path_buf();
-        std::fs::write(root.join("base.md"), "base external notes\n").unwrap();
-        std::fs::write(root.join("turn.md"), "turn external notes\n").unwrap();
+        cache_document(&root, "base.md", "base external notes\n");
+        cache_document(&root, "turn.md", "turn external notes\n");
         std::fs::write(root.join("auto.rs"), "fn auto() {}\n").unwrap();
 
         let mut primary = ContextManager::new(root);
@@ -1628,8 +1804,10 @@ mod tests {
             vec!["base.md".to_string(), "turn.md".to_string()]
         );
 
-        // The Auto layer is transient, while external documents persist for the
-        // whole task and survive its removal.
+        // Both layers are transient. Clearing the Auto layer on its own is an
+        // explicit per-layer action, so it keeps the external documents the same
+        // task still needs; releasing the transient context as a whole is what
+        // drops them.
         primary.clear_auto();
         assert_eq!(
             primary.outer_docs_files(),
@@ -1644,7 +1822,7 @@ mod tests {
     fn test_set_access_on_an_outer_docs_document_is_rejected() {
         let dir = tempdir().unwrap();
         let root = dir.path().to_path_buf();
-        std::fs::write(root.join("docs.md"), "external notes\n").unwrap();
+        cache_document(&root, "docs.md", "external notes\n");
 
         let mut cm = ContextManager::new(root);
         cm.add_outer_docs_file("docs.md").unwrap();
@@ -1657,7 +1835,7 @@ mod tests {
     fn test_the_outer_docs_layer_cannot_be_filled_manually() {
         let dir = tempdir().unwrap();
         let root = dir.path().to_path_buf();
-        std::fs::write(root.join("docs.md"), "external notes\n").unwrap();
+        cache_document(&root, "docs.md", "external notes\n");
 
         let mut cm = ContextManager::new(root);
         let error = cm
@@ -1675,7 +1853,7 @@ mod tests {
     fn test_clear_outer_docs_reports_whether_documents_were_removed() {
         let dir = tempdir().unwrap();
         let root = dir.path().to_path_buf();
-        std::fs::write(root.join("docs.md"), "external notes\n").unwrap();
+        cache_document(&root, "docs.md", "external notes\n");
 
         let mut cm = ContextManager::new(root);
         assert!(
@@ -1690,13 +1868,15 @@ mod tests {
         assert!(!cm.clear_outer_docs(), "a repeated clear reports no change");
         assert!(cm.outer_docs_files().is_empty());
     }
+
     #[test]
     fn test_clear_transient_removes_auto_and_outer_docs_only() {
         let dir = tempdir().unwrap();
         let root = dir.path().to_path_buf();
-        for name in ["pinned.rs", "user.rs", "auto.rs", "docs.md"] {
+        for name in ["pinned.rs", "user.rs", "auto.rs"] {
             std::fs::write(root.join(name), "fn f() {}\n").unwrap();
         }
+        cache_document(&root, "docs.md", "external notes\n");
 
         let mut cm = ContextManager::new(root);
         cm.load_pinned(&["pinned.rs".to_string()]);
@@ -1724,7 +1904,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let root = dir.path().to_path_buf();
         std::fs::write(root.join("auto.rs"), "fn auto() {}\n").unwrap();
-        std::fs::write(root.join("docs.md"), "external notes\n").unwrap();
+        cache_document(&root, "docs.md", "external notes\n");
 
         let mut cm = ContextManager::new(root);
         assert!(
@@ -1775,6 +1955,53 @@ mod tests {
         assert!(cm.contains("Conventions.md").unwrap());
         assert!(!cm.contains("crates/core/Conventions.md").unwrap());
     }
+    #[test]
+    fn test_a_repository_file_is_not_an_external_document() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        std::fs::write(root.join("docs.md"), "fn tracked() {}\n").unwrap();
+
+        let mut cm = ContextManager::new(root);
+        let error = cm
+            .add_outer_docs_file("docs.md")
+            .expect_err("only a cached snapshot is an external document");
+
+        assert!(
+            error.to_string().contains("not found"),
+            "unexpected error: {error}"
+        );
+        assert!(cm.outer_docs_files().is_empty());
+    }
+
+    #[test]
+    fn test_prune_missing_files_drops_a_document_whose_snapshot_disappeared() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        cache_document(&root, "docs.md", "external notes\n");
+        // A repository file carrying the very same logical name must not keep a
+        // document whose snapshot is gone: the layer reads the cache.
+        std::fs::write(root.join("docs.md"), "fn tracked() {}\n").unwrap();
+
+        let mut cm = ContextManager::new(root.clone());
+        cm.add_file("docs.md", ContextAccess::ReadOnly).unwrap();
+        cm.add_outer_docs_file("docs.md").unwrap();
+
+        std::fs::remove_file(
+            root.join(crate::outer_docs::OUTER_DOCS_CACHE_DIR)
+                .join("docs.md"),
+        )
+        .unwrap();
+
+        let pruned = cm.prune_missing_files();
+
+        assert_eq!(pruned, vec!["docs.md".to_string()]);
+        assert!(cm.outer_docs_files().is_empty());
+        assert!(
+            cm.contains("docs.md").unwrap(),
+            "the repository file keeps its own entry"
+        );
+    }
+
     fn outer_docs_tokens(cm: &ContextManager) -> u64 {
         cm.get_state()
             .items
@@ -1789,7 +2016,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let root = dir.path().to_path_buf();
         for name in ["a.md", "b.md"] {
-            std::fs::write(root.join(name), "external notes\n").unwrap();
+            cache_document(&root, name, "external notes\n");
         }
 
         let mut primary = ContextManager::new(root);

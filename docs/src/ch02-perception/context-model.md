@@ -151,7 +151,12 @@ An **insertion watermark** is the monotonic counter value a path receives when i
 first enters the context and keeps for as long as it stays there, so a re-add
 upgrades its access in place instead of moving it to the tail of the timeline. The
 watermark is what lets the chronological policy place a file where it actually
-arrived rather than where its layer happens to sort it.
+arrived rather than where its layer happens to sort it: the policy compares that
+watermark against the `context_watermark` each turn record persisted and emits
+the file after the prompt record of the turn during which the watermark was
+allocated. That position never changes afterwards, so a file discovered mid-turn
+keeps its slot when the next turn adopts it and the records appended later land
+behind it.
 
 Both orders are deterministic and both grow append-only: a file that enters the
 context mid-turn extends the sequence at its tail. Alphabetical sorting would

@@ -23,6 +23,7 @@ pub enum GlobalCommand {
     SelectTheme,
     SelectLocale,
     OpenUsageSummary,
+    OpenOuterDocsCache,
     ToggleReasoning,
     OpenHelp,
     ReloadConfig,
@@ -99,6 +100,12 @@ pub static GLOBAL_COMMAND_MAP: CommandMap<GlobalCommand> = CommandMap::new(&[
         OpenUsageSummary,
         Interface,
         "cmd.global.open_usage_summary",
+    ),
+    CommandSpec::new(
+        KeyChord::Meta(KeyCode::Char('o')),
+        OpenOuterDocsCache,
+        Interface,
+        "cmd.global.open_outer_docs_cache",
     ),
     CommandSpec::new(
         KeyChord::Primary(KeyCode::Char('r')),
@@ -274,6 +281,31 @@ mod tests {
         assert_eq!(
             typing.map(|spec| spec.action),
             Some(GlobalCommand::OpenUsageSummary)
+        );
+    }
+
+    #[test]
+    fn global_map_binds_outer_docs_cache_to_the_meta_chord() {
+        let input = InputConfig::default();
+
+        let meta_o = GLOBAL_COMMAND_MAP.resolve(
+            KeyEvent::new(KeyCode::Char('o'), KeyModifiers::ALT),
+            &input,
+            false,
+        );
+        assert_eq!(
+            meta_o.map(|spec| spec.action),
+            Some(GlobalCommand::OpenOuterDocsCache)
+        );
+
+        let typing = GLOBAL_COMMAND_MAP.resolve(
+            KeyEvent::new(KeyCode::Char('o'), KeyModifiers::ALT),
+            &input,
+            true,
+        );
+        assert_eq!(
+            typing.map(|spec| spec.action),
+            Some(GlobalCommand::OpenOuterDocsCache)
         );
     }
 }

@@ -54,6 +54,7 @@ The interaction protocol between Tauqe and large language models is strictly div
    - In structured protocols, the target textual response field (such as `message` in discussion mode) must be streamed on the fly via `StreamEvent::TextDelta` with real-time unescaping, while structural metadata (`plan_update`, context requests, language tags) remains completely hidden from the REPL stream.
 4. **Declarative Prompt Composition:**
    - The system prompt is composed from the enabled capability modules, never from a monolithic template. `CapabilityRegistry::compose_contract_rules`, `compose_xml_protocol_instructions`, and `compose_structured_protocol_instructions` fold each module's fragments through a `PromptRenderContext`, which applies the turn-marker suffix to every tag name it renders.
+   - The strict structured schema folds through the same `PromptRenderContext` as the protocol instructions, so a module whose rule is conditional on the project declaration declares its property under the same condition.
    - A disabled capability therefore contributes no rule, no instruction, and no tag, so the prompt can never advertise a command the decoder would reject. Prompt text and decoding derive from the same `CapabilitySet`.
    - **Contract Rule Composition:** The core system contract is assembled as an ordered sequence of typed `ContractRule { title, body }` values and rendered by one loop with monotonic numbering `1..N`. Rule numbers are never written into string literals, so enabling or disabling a capability (`doc_request`, `scratchpad`, `file_edits`) leaves neither gaps nor lettered surrogates such as `1a.` or `10a.`.
    - Rule placement is decided by typed inputs (`TurnIntent` and `CapabilitySet`), never by text. The prohibition on heuristic intent analysis itself is stated once in the root `Conventions.md` (§1, *Typed Intent over Textual Inference*) and is not repeated here.
@@ -257,9 +258,14 @@ The interaction protocol between Tauqe and large language models is strictly div
      neighbors.
    - The chronological transcript is ordered by the insertion watermark every
      context entry carries (`ContextItem::insertion_seq`). A file is placed after
-     the first history record that already observed it, so a file the dialogue
-     discovered between two turns appears between them, and a file no record
-     observed yet closes the transcript.
+     the prompt record of the turn during which its watermark was allocated: the
+     policy compares the file's `insertion_seq` against the `context_watermark`
+     each `HistoryEntry::Turn` persisted and selects the last turn that started
+     before the file arrived. That slot is stable on every later turn, so a turn
+     adopting a mid-turn arrival appends its own records behind it instead of
+     moving it. A file no watermark-bearing turn bounds keeps the recorded
+     starting context of the first turn that listed it, and a file that carries no
+     watermark at all closes the transcript.
 7. **Isolated Volatile Tail:**
    - All genuinely round-varying content is confined to the end of the message
      sequence: the active plan, the context manifest of the chronological policy,
@@ -429,7 +435,29 @@ The interaction protocol between Tauqe and large language models is strictly div
      `.tauqe/cache/outer_docs/` stays immutable, and a later request re-admits the
      same bytes without a transfer, so the durable cache and the transient entry
      never merge into one lifetime.
-7. **Rationale (Why):**
+7. **Only an explicit request deletes a cached snapshot:**
+   - No automatic boundary deletes a materialized snapshot (rule 6). The
+     durable cache is removed only by an `outerdocs/cacheRemove` request that
+     names a logical path or a logical directory of the cache.
+   - The path is validated before a byte moves: an empty request names no
+     document, and `is_clean_relative_path` refuses a parent directory, an
+     absolute path, a backslash, and a foreign scheme, so a request can never
+     reach material the declaration did not publish. The cache directory
+     itself is never removed.
+   - Every file is unlinked atomically and every directory the removal
+     emptied is pruned afterwards, so the inventory never reports a directory
+     that no longer holds a document.
+   - The resident OuterDocs layer is reconciled in the same request: a
+     document the cache no longer holds leaves the layer, and the release
+     reports whether it really held one. A release that took a document away
+     rotates the dialogue session identifier with the prefix it shrank
+     (rule 5); a release that took nothing keeps the warm session. The
+     removal claims the operation slot, so no turn merges the removed
+     documents back afterwards.
+   - `outerdocs/cacheList` answers the same logical paths, so the interface
+     and the model address one document by one name and the disk prefix
+     reaches neither.
+8. **Rationale (Why):**
    - Discovery material is bought for one decision. Leaving it resident after that
      decision is durable pays for it on every later request of a prompt prefix
      that no longer needs it, and it lets a finished step's documents silently

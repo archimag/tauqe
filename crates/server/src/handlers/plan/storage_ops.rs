@@ -133,7 +133,7 @@ pub async fn handle_plan_save(req: Request, state: &Arc<AppState>) -> Response {
             "Plan ID must be non-empty and must not contain path separators",
         );
     }
-    if let Some(duplicate) = find_duplicate_item_ids(&params.plan.items) {
+    if let Some(duplicate) = find_duplicate_item_ids(&params.plan.implementation.items) {
         return Response::err(
             req.id,
             errors::INVALID_PLAN_TREE,
@@ -146,7 +146,7 @@ pub async fn handle_plan_save(req: Request, state: &Arc<AppState>) -> Response {
 
     // Normalize before persisting so the emitted event matches the stored plan.
     let mut plan = params.plan;
-    plan.normalize_leaf_files();
+    plan.implementation.normalize_leaf_files();
 
     let repo_root = state.context.read().await.repo_root().to_path_buf();
     let save_root = repo_root.clone();

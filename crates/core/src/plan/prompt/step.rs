@@ -38,6 +38,7 @@ pub fn format_plan_step_execution_prompt(
 ) -> Result<String, String> {
     let marker_suffix = marker_suffix(marker);
     let step = plan
+        .implementation
         .find_item(step_id)
         .ok_or_else(|| format!("Step '{}' not found in plan '{}'", step_id, plan.id))?;
 
@@ -103,7 +104,7 @@ pub fn format_plan_step_execution_prompt(
             collect_completed(&item.children, acc);
         }
     }
-    collect_completed(&plan.items, &mut completed_items);
+    collect_completed(&plan.implementation.items, &mut completed_items);
 
     if !completed_items.is_empty() {
         out.push_str("### Already Completed Prerequisites:\n");
@@ -355,7 +356,11 @@ mod tests {
     fn execution_prompt_rejects_a_container_and_an_unknown_target() {
         let mut plan = leaf_plan();
         // A container is a conceptual milestone and never an execution target.
-        let step = plan.items.first_mut().expect("the single step");
+        let step = plan
+            .implementation
+            .items
+            .first_mut()
+            .expect("the single step");
         step.children.push(PlanItem {
             id: "1.1".to_string(),
             title: "Nested implementation step".to_string(),
@@ -462,7 +467,11 @@ mod tests {
     #[test]
     fn execution_prompt_renders_preloaded_external_specifications() {
         let mut plan = leaf_plan();
-        let step = plan.items.first_mut().expect("the single step");
+        let step = plan
+            .implementation
+            .items
+            .first_mut()
+            .expect("the single step");
         step.outer_docs = vec![
             "vendor/api.md".to_string(),
             "mylib/architecture.md".to_string(),
@@ -485,7 +494,11 @@ mod tests {
     #[test]
     fn structured_execution_prompt_names_the_outer_doc_field() {
         let mut plan = leaf_plan();
-        let step = plan.items.first_mut().expect("the single step");
+        let step = plan
+            .implementation
+            .items
+            .first_mut()
+            .expect("the single step");
         step.outer_docs = vec!["vendor/api.md".to_string()];
 
         let prompt =

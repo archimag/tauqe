@@ -7,6 +7,7 @@ pub mod history;
 pub mod host;
 pub mod locale;
 pub mod model;
+pub mod outer_docs;
 pub mod plan;
 pub mod review;
 
@@ -44,6 +45,13 @@ pub async fn handle_request(req: Request, state: &Arc<AppState>) -> Response {
         methods::CONTEXT_SET_ACCESS => context::handle_context_set_access(req, state).await,
         methods::CONTEXT_CLEAR => context::handle_context_clear(req, state).await,
 
+        methods::OUTER_DOCS_CACHE_LIST => {
+            outer_docs::handle_outer_docs_cache_list(req, state).await
+        }
+        methods::OUTER_DOCS_CACHE_REMOVE => {
+            outer_docs::handle_outer_docs_cache_remove(req, state).await
+        }
+
         methods::HISTORY_GET => history::handle_history_get(req, state).await,
 
         methods::MODEL_ASK => model::handle_model_ask(req, state).await,
@@ -78,6 +86,7 @@ pub async fn handle_request(req: Request, state: &Arc<AppState>) -> Response {
         methods::PLAN_CLEAR_HORIZON => plan::handle_plan_clear_horizon(req, state).await,
         methods::PLAN_EXECUTE => plan::handle_plan_execute(req, state).await,
         methods::PLAN_EXECUTE_PIPELINE => plan::handle_plan_execute_pipeline(req, state).await,
+        methods::PLAN_CREATE_PIPELINE => plan::handle_plan_create_pipeline(req, state).await,
         methods::PLAN_REFINE => plan::handle_plan_refine(req, state).await,
         methods::PLAN_REPLAN => plan::handle_plan_replan(req, state).await,
 
@@ -264,6 +273,11 @@ pub(crate) enum PreflightVerdict {
 /// delivered during the build/test suite is observed by the substrate, which
 /// tears the whole process group of the project command down instead of waiting
 /// the suite out.
+///
+/// The repository index is gated the same way: a lock no invocation may still
+/// own is reclaimed, a lock that clears on its own is waited out, and a lock
+/// that outlives the gate refuses the batch before its first step opens a
+/// transaction.
 pub(crate) async fn run_preflight_verification(
     repo_root: &Path,
     cancel_rx: watch::Receiver<bool>,
@@ -273,6 +287,38 @@ pub(crate) async fn run_preflight_verification(
     if *cancel_rx.borrow() {
         tracing::info!("pre-flight verification skipped: the operation was already cancelled");
         return PreflightVerdict::Cancelled;
+    }
+
+    // A locked index blocks every Git transaction the batch is about to open, so
+    // the gate runs before the configuration check and before the suite: the
+    // first capture of the first step would otherwise fail inside the queue,
+    // after a model request was already spent. The gate blocks on its backoff, so
+    // it runs off the async executor thread.
+    let gate_root = repo_root.to_path_buf();
+    let gate_cancel = cancel_rx.clone();
+    let gate = match offload(move || {
+        tauqe_core::git::ensure_index_available(&gate_root, Some(&gate_cancel))
+    })
+    .await
+    {
+        Ok(gate) => gate,
+        Err(reason) => {
+            return PreflightVerdict::Failed(format!(
+                "Pre-flight verification could not inspect the repository index: {reason}"
+            ));
+        }
+    };
+    match gate {
+        Ok(()) => {}
+        Err(tauqe_core::git::IndexGateError::Cancelled) => {
+            tracing::info!("pre-flight verification skipped: the index gate was cancelled");
+            return PreflightVerdict::Cancelled;
+        }
+        Err(error) => {
+            return PreflightVerdict::Failed(format!(
+                "Pre-flight verification refused to start: {error}"
+            ));
+        }
     }
 
     // The configuration integrity check runs first: a batch must not launch
@@ -734,5 +780,34 @@ mod tests {
         let resp = handle_request(req, &state).await;
         assert_eq!(resp.id, RequestId::Number(7));
         assert_eq!(resp.error.unwrap().code, errors::NOT_FOUND);
+    }
+
+    /// A repository whose index another process holds cannot run a batch: the
+    /// pre-flight gate refuses before the first step opens a transaction, instead
+    /// of letting the first capture fail inside the queue.
+    #[tokio::test]
+    async fn test_preflight_verification_refuses_a_locked_index() {
+        let dir = std::env::temp_dir().join(format!(
+            "tauqe-test-preflight-locked-index-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        let _ = std::fs::create_dir_all(&dir);
+        tauqe_core::git::init_repository(Some(&dir), true).unwrap();
+        std::fs::write(dir.join(".git").join("index.lock"), "").unwrap();
+
+        let (_cancel_tx, cancel_rx) = watch::channel(false);
+        let verdict = run_preflight_verification(&dir, cancel_rx).await;
+
+        match verdict {
+            PreflightVerdict::Failed(report) => {
+                assert!(report.contains("index"), "report: {report}");
+            }
+            other => panic!("a locked index must be refused: {other:?}"),
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

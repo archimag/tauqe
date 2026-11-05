@@ -464,7 +464,7 @@ pub fn build_plan_horizon_user_prompt(
         }
     }
     let mut done = Vec::new();
-    collect_done(&plan.items, &mut done);
+    collect_done(&plan.implementation.items, &mut done);
     if done.is_empty() {
         out.push_str("*(No completed steps yet)*\n");
     } else {
@@ -480,7 +480,7 @@ pub fn build_plan_horizon_user_prompt(
 
     if let Some(diag) = diagnostics {
         out.push_str("## Blocked Step Diagnostics:\n");
-        let blocked = plan.find_item(diag.blocked_step_id);
+        let blocked = plan.implementation.find_item(diag.blocked_step_id);
         match &blocked {
             Some(item) => out.push_str(&format!(
                 "- **Blocked Step**: #{} {}\n",

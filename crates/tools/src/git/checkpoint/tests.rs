@@ -6,6 +6,7 @@
 //! produces.
 
 use super::*;
+use crate::git::exec::{GitDeadline, TERMINATION_GRACE};
 use crate::git::GitHooks;
 use std::fs;
 
@@ -557,9 +558,10 @@ fn test_create_checkpoint_refuses_when_ignore_rules_cannot_be_installed() {
     let path = dir.path();
     crate::git::state::init_repository(Some(path), true, GitHooks::Bypass).unwrap();
 
-    // A directory occupying `.git/info/exclude` makes every attempt to append
-    // an ignore rule fail, so `git add -A` would see the credential file as an
-    // ordinary untracked path and commit the API key.
+    // A directory occupying `.git/info/exclude` rejects the atomic replacement
+    // that would publish the rules, so no exclusion is installed at all and
+    // `git add -A` would see the credential file as an ordinary untracked path
+    // and commit the API key.
     let exclude_path = path.join(".git").join("info").join("exclude");
     if exclude_path.is_file() {
         fs::remove_file(&exclude_path).unwrap();
@@ -617,6 +619,133 @@ fn test_create_checkpoint_refuses_when_protected_path_is_not_ignored() {
     assert_eq!(subject, "chore: initial commit");
     let tracked = crate::git::cmd::run_git(Some(path), &["ls-files"]).unwrap();
     assert!(!tracked.contains("credentials.toml"), "{tracked}");
+}
+
+#[test]
+fn test_ensure_tauqe_ignored_publishes_one_stable_document() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path();
+    crate::git::state::init_repository(Some(path), true, GitHooks::Bypass).unwrap();
+
+    // A document an earlier tool left behind: it carries no terminator, so the
+    // publication has to add exactly one separator newline before the rules.
+    let exclude = path.join(".git").join("info").join("exclude");
+    fs::write(&exclude, "*.swp").unwrap();
+
+    ensure_tauqe_ignored(path).unwrap();
+
+    let document = fs::read_to_string(&exclude).unwrap();
+    assert!(
+        document.starts_with("*.swp\n"),
+        "the previous document survives behind one separator newline: {document:?}"
+    );
+    assert!(
+        !document.contains("\n\n"),
+        "the separator is one newline, never a blank rule line: {document:?}"
+    );
+    assert!(document.ends_with('\n'), "{document:?}");
+
+    for rule in tauqe_ignore_rules() {
+        let declarations = document
+            .lines()
+            .filter(|line| declares_rule(line, rule.as_str()))
+            .count();
+        assert_eq!(
+            declarations, 1,
+            "the rule {rule} must be declared exactly once: {document:?}"
+        );
+    }
+
+    // The publication runs through the atomic-write policy, so it leaves no
+    // staging sibling beside the document it publishes.
+    let leftovers: Vec<String> = fs::read_dir(exclude.parent().unwrap())
+        .unwrap()
+        .flatten()
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .filter(|name| {
+            crate::atomic_write::staging_temp_original_name(name).is_some()
+                || crate::atomic_write::staging_backup_original_name(name).is_some()
+        })
+        .collect();
+    assert!(leftovers.is_empty(), "staging artifacts: {leftovers:?}");
+
+    // A repeated installation recognises every rule it wrote, so the document
+    // stays byte-identical instead of collecting a second copy.
+    let published = fs::read(&exclude).unwrap();
+    ensure_tauqe_ignored(path).unwrap();
+    ensure_tauqe_ignored(path).unwrap();
+    assert_eq!(fs::read(&exclude).unwrap(), published);
+}
+
+#[test]
+fn test_create_checkpoint_refuses_when_a_staging_marker_path_is_not_ignored() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path();
+    crate::git::state::init_repository(Some(path), true, GitHooks::Bypass).unwrap();
+
+    // A project `.gitignore` outranks `.git/info/exclude` and re-includes the
+    // staging artifacts, so the rules are installed without covering them.
+    fs::write(path.join(".gitignore"), "!*.tauqe-tmp*\n").unwrap();
+    let orphan = path.join(format!("draft.rs{STAGING_TEMP_MARKER}.4242.1"));
+    fs::write(&orphan, "staged content").unwrap();
+
+    let err = create_checkpoint(path, GitHooks::Bypass)
+        .expect_err("a staging artifact Git does not ignore must abort the checkpoint");
+    assert!(err.to_string().contains(STAGING_TEMP_MARKER), "{err}");
+
+    // Nothing was committed and no transaction was opened, so the artifact the
+    // re-included rule exposes never entered the object database.
+    let subject = crate::git::cmd::run_git(Some(path), &["log", "-1", "--format=%s"])
+        .unwrap()
+        .trim()
+        .to_string();
+    assert_eq!(subject, "chore: initial commit");
+    let tracked = crate::git::cmd::run_git(Some(path), &["ls-files"]).unwrap();
+    assert!(!tracked.contains(STAGING_TEMP_MARKER), "{tracked}");
+    assert!(!transaction_marker_path(path).exists());
+}
+
+#[test]
+fn test_protected_paths_are_proven_on_a_repository_without_harness_state() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path();
+    crate::git::state::init_repository(Some(path), true, GitHooks::Bypass).unwrap();
+    assert!(
+        !path.join(".tauqe").exists(),
+        "the fixture must start without harness state"
+    );
+
+    ensure_tauqe_ignored(path).unwrap();
+
+    // The proof covers the state directory, the credentials, and both staging
+    // markers, and it answers for paths that do not exist yet: the rules are
+    // pattern matches, not observations of the current tree.
+    let probes = protected_paths();
+    let ignored = crate::git::cmd::run_git_check_ignore(path, &probes).unwrap();
+    for probe in &probes {
+        assert!(
+            ignored.iter().any(|entry| entry == probe),
+            "{probe} must be proven ignored: {ignored:?}"
+        );
+    }
+}
+
+#[test]
+fn test_exclusion_document_keeps_bytes_it_cannot_decode_verbatim() {
+    let existing = b"# local excludes \xff\n".to_vec();
+    let rules = vec!["credentials.toml".to_string()];
+
+    let document = exclusion_document(&existing, &rules).expect("the rule is missing");
+
+    assert!(
+        document.starts_with(&existing),
+        "the previous bytes must survive the publication"
+    );
+    assert!(document.ends_with(b"credentials.toml\n"));
+
+    // Once the rule is declared the document is complete, and a repeated
+    // installation answers with nothing to write.
+    assert!(exclusion_document(&document, &rules).is_none());
 }
 
 #[test]
@@ -1362,6 +1491,9 @@ fn test_capturing_recovery_before_the_checkpoint_commit_keeps_the_working_tree()
 
     // The capturing marker is durable while the work still sits uncommitted in
     // the working tree, which is the state a crash before the commit leaves.
+    // The capture runs `git add -A` before it commits, so the index holds the
+    // staged work of that interrupted command.
+    ensure_tauqe_ignored(path).unwrap();
     write_transaction_marker(
         path,
         &CheckpointInfo {
@@ -1372,6 +1504,10 @@ fn test_capturing_recovery_before_the_checkpoint_commit_keeps_the_working_tree()
         },
     )
     .unwrap();
+    crate::git::cmd::run_git(Some(path), &["add", "-A"]).unwrap();
+    let staged =
+        crate::git::cmd::run_git(Some(path), &["diff", "--cached", "--name-only"]).unwrap();
+    assert!(staged.contains("user_work.txt"), "{staged}");
 
     let recovery = recover_interrupted_workflow(path).unwrap();
     let message = recovery.unwrap_or_default();
@@ -1390,6 +1526,14 @@ fn test_capturing_recovery_before_the_checkpoint_commit_keeps_the_working_tree()
         .trim()
         .to_string();
     assert_eq!(head_after, base);
+    // The index returns to the recorded base, so the crash leaves no staged
+    // work behind and the tree reads exactly like the pre-turn shape.
+    let staged_after =
+        crate::git::cmd::run_git(Some(path), &["diff", "--cached", "--name-only"]).unwrap();
+    assert!(
+        staged_after.trim().is_empty(),
+        "the interrupted capture must leave no staged work: {staged_after}"
+    );
     let status = crate::git::cmd::run_git(Some(path), &["status", "--porcelain"]).unwrap();
     assert!(status.contains("?? user_work.txt"), "{status}");
     assert!(read_transaction_marker(path).is_none());
@@ -1403,6 +1547,10 @@ fn test_capturing_recovery_before_the_checkpoint_commit_on_an_unborn_branch() {
 
     let user_file = path.join("user_work.txt");
     fs::write(&user_file, "original uncommitted work").unwrap();
+    // The capture installs the ignore rules and announces itself before it
+    // stages anything, so the fixture reproduces the crash window of a capture
+    // that staged the whole work and never committed it.
+    ensure_tauqe_ignored(path).unwrap();
     write_transaction_marker(
         path,
         &CheckpointInfo {
@@ -1413,6 +1561,9 @@ fn test_capturing_recovery_before_the_checkpoint_commit_on_an_unborn_branch() {
         },
     )
     .unwrap();
+    crate::git::cmd::run_git(Some(path), &["add", "-A"]).unwrap();
+    let staged = crate::git::cmd::run_git(Some(path), &["ls-files"]).unwrap();
+    assert!(staged.contains("user_work.txt"), "{staged}");
 
     let recovery = recover_interrupted_workflow(path).unwrap();
     let message = recovery.unwrap_or_default();
@@ -1423,6 +1574,15 @@ fn test_capturing_recovery_before_the_checkpoint_commit_on_an_unborn_branch() {
 
     // The branch still holds no commit and the developer's file stays untracked.
     assert!(head_is_unborn(path));
+    // An unborn base has no commit to compare the index against, so the
+    // recovery empties it and the captured file becomes untracked again.
+    let staged_after = crate::git::cmd::run_git(Some(path), &["ls-files"]).unwrap();
+    assert!(
+        staged_after.trim().is_empty(),
+        "the interrupted capture must leave no staged work: {staged_after}"
+    );
+    let status = crate::git::cmd::run_git(Some(path), &["status", "--porcelain"]).unwrap();
+    assert!(status.contains("?? user_work.txt"), "{status}");
     assert_eq!(
         fs::read_to_string(&user_file).unwrap(),
         "original uncommitted work"
@@ -1942,4 +2102,295 @@ fn test_sweep_skips_git_ignored_directories() {
     assert!(!root_orphan.exists(), "the root level is swept");
     assert!(!visible_orphan.exists(), "an admitted tree is swept");
     assert!(ignored_orphan.exists(), "an ignored tree is never entered");
+}
+
+#[test]
+fn test_create_ai_commit_keeps_a_checkpoint_commit_no_marker_records() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path();
+    crate::git::state::init_repository(Some(path), true, GitHooks::Bypass).unwrap();
+
+    // A commit whose subject carries the checkpoint prefix, written by hand or
+    // kept by a developer after a refused recovery. No marker records it, so
+    // nothing authorizes removing it from the branch.
+    fs::write(path.join("kept.txt"), "kept work").unwrap();
+    crate::git::cmd::run_git(Some(path), &["add", "kept.txt"]).unwrap();
+    crate::git::cmd::commit_with_developer_author(
+        path,
+        &format!("{CHECKPOINT_PREFIX} kept by hand"),
+        false,
+        GitHooks::Bypass,
+    )
+    .unwrap();
+    let kept = crate::git::cmd::run_git(Some(path), &["rev-parse", "HEAD"])
+        .unwrap()
+        .trim()
+        .to_string();
+
+    // The isolated commit lands on top of the kept commit instead of deleting
+    // it from the branch.
+    fs::write(path.join("ai_work.txt"), "ai work").unwrap();
+    let hash = create_ai_commit(
+        path,
+        &["ai_work.txt".to_string()],
+        "feat: add the generated file",
+        GitHooks::Bypass,
+    )
+    .unwrap();
+    assert!(!hash.is_empty());
+
+    let parent = crate::git::cmd::run_git(Some(path), &["rev-parse", "HEAD^"])
+        .unwrap()
+        .trim()
+        .to_string();
+    assert_eq!(parent, kept, "the kept commit must stay in the history");
+    assert_eq!(
+        fs::read_to_string(path.join("kept.txt")).unwrap(),
+        "kept work"
+    );
+}
+
+#[test]
+fn test_unwind_refuses_a_checkpoint_commit_no_marker_records() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path();
+    crate::git::state::init_repository(Some(path), true, GitHooks::Bypass).unwrap();
+
+    // A temporary checkpoint commit sits at HEAD, exactly as a capture leaves
+    // it, but none of the markers below records this commit.
+    fs::write(path.join("captured.txt"), "captured work").unwrap();
+    crate::git::cmd::run_git(Some(path), &["add", "-A"]).unwrap();
+    crate::git::cmd::commit_with_developer_author(
+        path,
+        &format!("{CHECKPOINT_PREFIX} uncommitted user changes"),
+        false,
+        GitHooks::Bypass,
+    )
+    .unwrap();
+    let head_before = crate::git::cmd::run_git(Some(path), &["rev-parse", "HEAD"])
+        .unwrap()
+        .trim()
+        .to_string();
+
+    let elsewhere = "0123456789abcdef0123456789abcdef01234567".to_string();
+    // A settled marker records another commit as the checkpoint it created.
+    let settled = CheckpointInfo {
+        created_checkpoint_commit: true,
+        base: TransactionBase::Commit(elsewhere.clone()),
+        phase: TransactionPhase::Established,
+        writer_pid: None,
+    };
+    assert!(!unwind_checkpoint_if_present(path, &settled).unwrap());
+    // A capturing marker records a base that is not the parent of HEAD.
+    let capturing = CheckpointInfo {
+        created_checkpoint_commit: false,
+        base: TransactionBase::Commit(elsewhere),
+        phase: TransactionPhase::Capturing,
+        writer_pid: None,
+    };
+    assert!(!unwind_checkpoint_if_present(path, &capturing).unwrap());
+    // An unborn base holds no commit to descend from, so a commit with a
+    // parent is never the root that marker describes.
+    let unborn = CheckpointInfo {
+        created_checkpoint_commit: false,
+        base: TransactionBase::Unborn,
+        phase: TransactionPhase::Established,
+        writer_pid: None,
+    };
+    assert!(!unwind_checkpoint_if_present(path, &unborn).unwrap());
+
+    let head_after = crate::git::cmd::run_git(Some(path), &["rev-parse", "HEAD"])
+        .unwrap()
+        .trim()
+        .to_string();
+    assert_eq!(head_before, head_after);
+    assert_eq!(
+        fs::read_to_string(path.join("captured.txt")).unwrap(),
+        "captured work"
+    );
+}
+
+#[test]
+fn test_unwind_removes_the_checkpoint_commit_its_marker_records() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path();
+    crate::git::state::init_repository(Some(path), true, GitHooks::Bypass).unwrap();
+
+    let base = crate::git::cmd::run_git(Some(path), &["rev-parse", "HEAD"])
+        .unwrap()
+        .trim()
+        .to_string();
+    fs::write(path.join("captured.txt"), "captured work").unwrap();
+    let checkpoint = create_checkpoint(path, GitHooks::Bypass).unwrap();
+    assert!(checkpoint.created_checkpoint_commit);
+
+    // HEAD is exactly the checkpoint commit the marker records, so the marker
+    // authorizes removing it.
+    assert!(unwind_checkpoint_if_present(path, &checkpoint).unwrap());
+
+    let head_after = crate::git::cmd::run_git(Some(path), &["rev-parse", "HEAD"])
+        .unwrap()
+        .trim()
+        .to_string();
+    assert_eq!(head_after, base);
+    assert_eq!(
+        fs::read_to_string(path.join("captured.txt")).unwrap(),
+        "captured work",
+        "the captured work returns to the working tree"
+    );
+}
+
+/// Writes an executable `pre-commit` hook into the repository.
+#[cfg(unix)]
+fn install_pre_commit_hook(dir: &std::path::Path, script: &str) {
+    use std::os::unix::fs::PermissionsExt;
+
+    let hooks = dir.join(".git/hooks");
+    fs::create_dir_all(&hooks).unwrap();
+    let hook = hooks.join("pre-commit");
+    fs::write(&hook, script).unwrap();
+    let mut perms = fs::metadata(&hook).unwrap().permissions();
+    perms.set_mode(0o755);
+    fs::set_permissions(&hook, perms).unwrap();
+}
+
+/// A checkpoint whose commit runs a repository hook must honour the budget it
+/// was given: the hook is arbitrary user code and can wait forever.
+#[cfg(unix)]
+#[test]
+fn test_create_checkpoint_with_deadline_bounds_the_hook_the_commit_runs() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path();
+    crate::git::state::init_repository(Some(path), true, GitHooks::Bypass).unwrap();
+
+    // A dirty tree forces the capture through a commit, which the run policy
+    // lets the repository hook execute.
+    fs::write(path.join("user_work.txt"), "uncommitted work").unwrap();
+    install_pre_commit_hook(path, "#!/bin/sh\nsleep 30\n");
+
+    let started = std::time::Instant::now();
+    let deadline = GitDeadline::with_timeout(1);
+    let error = create_checkpoint_with_deadline(path, GitHooks::Run, &deadline)
+        .expect_err("the hook outlives the budget");
+
+    let rendered = format!("{error:#}");
+    assert!(
+        rendered.contains("exceeded its wall-clock budget"),
+        "error: {rendered}"
+    );
+    assert!(rendered.contains("git commit"), "error: {rendered}");
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(15),
+        "the budget did not release the caller: {:?}",
+        started.elapsed()
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn test_recovery_reclaims_the_index_lock_of_a_dead_writer() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path();
+    crate::git::state::init_repository(Some(path), true, GitHooks::Bypass).unwrap();
+
+    let head = crate::git::cmd::run_git(Some(path), &["rev-parse", "HEAD"])
+        .unwrap()
+        .trim()
+        .to_string();
+    // The writer died between creating the index lock and removing it, which
+    // is exactly the state that blocks every later Git command.
+    let lock = path.join(".git").join("index.lock");
+    fs::write(&lock, "").unwrap();
+
+    write_transaction_marker(
+        path,
+        &CheckpointInfo {
+            created_checkpoint_commit: false,
+            base: TransactionBase::Commit(head),
+            phase: TransactionPhase::Established,
+            writer_pid: Some(dead_process_id()),
+        },
+    )
+    .unwrap();
+
+    let recovery = recover_interrupted_workflow(path).unwrap();
+    let message = recovery.unwrap_or_default();
+    assert!(message.contains("1 orphaned Git index lock"), "{message}");
+    assert!(!lock.exists());
+}
+
+#[test]
+fn test_recovery_keeps_the_index_lock_of_a_writer_that_still_runs() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path();
+    crate::git::state::init_repository(Some(path), true, GitHooks::Bypass).unwrap();
+
+    // The marker names this test process, so the transaction it opened still
+    // owns everything it recorded, the index lock included.
+    let checkpoint = create_checkpoint(path, GitHooks::Bypass).unwrap();
+    assert_eq!(checkpoint.writer_pid, Some(std::process::id()));
+    let lock = path.join(".git").join("index.lock");
+    fs::write(&lock, "").unwrap();
+
+    let recovery = recover_interrupted_workflow(path).unwrap();
+    let message = recovery.unwrap_or_default();
+    assert!(message.contains("is still running"), "{message}");
+    assert!(lock.exists());
+}
+
+#[test]
+fn test_recovery_keeps_the_index_lock_no_marker_attributes() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path();
+    crate::git::state::init_repository(Some(path), true, GitHooks::Bypass).unwrap();
+
+    let head = crate::git::cmd::run_git(Some(path), &["rev-parse", "HEAD"])
+        .unwrap()
+        .trim()
+        .to_string();
+    let lock = path.join(".git").join("index.lock");
+    fs::write(&lock, "").unwrap();
+
+    // A marker written by an earlier revision names no writer, so it proves
+    // nothing about the lock and the previous behavior is kept.
+    write_transaction_marker(
+        path,
+        &CheckpointInfo {
+            created_checkpoint_commit: false,
+            base: TransactionBase::Commit(head),
+            phase: TransactionPhase::Established,
+            writer_pid: None,
+        },
+    )
+    .unwrap();
+
+    let recovery = recover_interrupted_workflow(path).unwrap();
+    assert!(recovery.is_none(), "{recovery:?}");
+    assert!(lock.exists());
+}
+
+#[test]
+fn test_recover_stale_index_lock_reclaims_only_a_lock_that_outlived_its_budget() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path();
+    crate::git::state::init_repository(Some(path), true, GitHooks::Bypass).unwrap();
+    let lock = path.join(".git").join("index.lock");
+    fs::write(&lock, "").unwrap();
+
+    // A lock younger than the budget of a running invocation may belong to
+    // that invocation, so it is kept.
+    assert!(!recover_stale_index_lock(
+        path,
+        &GitDeadline::with_timeout(600)
+    ));
+    assert!(lock.exists());
+
+    // Once the grace period has passed, a zero budget proves that no
+    // invocation can still own the lock.
+    std::thread::sleep(TERMINATION_GRACE + std::time::Duration::from_millis(50));
+    assert!(recover_stale_index_lock(
+        path,
+        &GitDeadline::with_timeout(0)
+    ));
+    assert!(!lock.exists());
 }

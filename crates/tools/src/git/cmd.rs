@@ -1,8 +1,9 @@
-use anyhow::{anyhow, bail, Context, Result};
-use std::io::{Read, Write};
+use anyhow::{bail, Context, Result};
+use std::io::Read;
 use std::path::Path;
-use std::process::{Command, Stdio};
+use std::process::Command;
 
+use crate::git::exec::{self, GitDeadline};
 use crate::git::GitHooks;
 
 pub const DEFAULT_AUTHOR_NAME: &str = "Developer";
@@ -45,7 +46,7 @@ const REDIRECTED_GIT_ENVIRONMENT_PREFIXES: &[&str] = &["GIT_CONFIG_KEY_", "GIT_C
 /// is removed from the child environment only: the identity variables the
 /// commit path probes stay inherited, together with this process's own
 /// environment.
-fn git_command(dir: Option<&Path>) -> Command {
+pub(super) fn git_command(dir: Option<&Path>) -> Command {
     let mut command = Command::new("git");
     if let Some(d) = dir {
         command.current_dir(d);
@@ -68,19 +69,40 @@ fn git_command(dir: Option<&Path>) -> Command {
 }
 
 /// Executes a raw Git command in the given repository directory.
+///
+/// Every invocation carries the default wall-clock budget, so a repository hook
+/// or a signing agent can never outlive the turn that started it. A caller that
+/// holds the turn's cancellation signal or names its own budget calls
+/// [`run_git_with_deadline`].
 pub fn run_git(dir: Option<&Path>, args: &[&str]) -> Result<String> {
+    run_git_with_deadline(dir, args, &GitDeadline::default())
+}
+
+/// Executes a raw Git command under the supplied wall-clock budget, returning
+/// its standard output on success.
+///
+/// A child that outlives the budget or observes the caller's cancellation
+/// signal is torn down with its process group and reported as a failed
+/// invocation, so no Git command can stall the turn that started it.
+pub fn run_git_with_deadline(
+    dir: Option<&Path>,
+    args: &[&str],
+    deadline: &GitDeadline,
+) -> Result<String> {
     // Shelling out to `git` can block for hundreds of milliseconds on a large
     // repository. Run it through the blocking helper so the async worker pool
     // keeps its capacity instead of stalling other tasks.
     crate::blocking::run_blocking(|| {
-        let output = git_command(dir).args(args).output()?;
-        if output.status.success() {
-            Ok(String::from_utf8_lossy(&output.stdout).to_string())
-        } else {
-            bail!(
+        let outcome = exec::run_bounded(dir, args, deadline, None);
+        if let Some(reason) = outcome.killed_reason(args, deadline.timeout_secs()) {
+            bail!("{reason}");
+        }
+        match outcome.code {
+            Some(0) => Ok(String::from_utf8_lossy(&outcome.stdout).to_string()),
+            _ => bail!(
                 "git command failed: {}",
-                String::from_utf8_lossy(&output.stderr)
-            );
+                String::from_utf8_lossy(&outcome.stderr)
+            ),
         }
     })
 }
@@ -101,6 +123,17 @@ pub fn run_git(dir: Option<&Path>, args: &[&str]) -> Result<String> {
 /// failure. Any other non-zero code signals a real failure and is reported
 /// with Git's diagnostic output.
 pub fn run_git_check_ignore(dir: &Path, paths: &[String]) -> Result<Vec<String>> {
+    let deadline = GitDeadline::default();
+    run_git_check_ignore_with_deadline(dir, paths, &deadline)
+}
+
+/// Reports which of the supplied paths repository ignore rules exclude, under
+/// the supplied wall-clock budget.
+pub fn run_git_check_ignore_with_deadline(
+    dir: &Path,
+    paths: &[String],
+    deadline: &GitDeadline,
+) -> Result<Vec<String>> {
     if paths.is_empty() {
         return Ok(Vec::new());
     }
@@ -108,7 +141,7 @@ pub fn run_git_check_ignore(dir: &Path, paths: &[String]) -> Result<Vec<String>>
     crate::blocking::run_blocking(|| {
         let mut ignored = Vec::new();
         for batch in check_ignore_batches(paths) {
-            ignored.extend(check_ignore_batch(dir, batch)?);
+            ignored.extend(check_ignore_batch(dir, batch, deadline)?);
         }
         Ok(ignored)
     })
@@ -147,65 +180,64 @@ fn check_ignore_batches(paths: &[String]) -> Vec<&[String]> {
 
 /// Runs one bounded `check-ignore` invocation over the supplied candidates.
 ///
-/// Both child pipes are drained on dedicated threads while the candidate list
-/// is still being written. `check-ignore` streams its verdicts as it consumes
-/// standard input, so writing the whole list first and reading afterwards
-/// would deadlock as soon as the echoed verdicts filled the child's stdout
-/// pipe. The toolchain executor drains its own children the same way.
+/// The child runs under the same bounded executor as every other Git call: its
+/// candidate list is written on a dedicated thread while its verdicts are
+/// drained on another, so a command that stops reading its standard input is
+/// torn down at the invocation budget instead of blocking the caller's write
+/// forever. `check-ignore` echoes one verdict per candidate, so writing the
+/// whole list before reading would deadlock as soon as the echoed verdicts
+/// filled the child's stdout pipe.
 ///
 /// The child is spawned through the shared `git_command` helper, so it inherits
 /// the same sanitized environment as every other Git call.
-fn check_ignore_batch(dir: &Path, paths: &[String]) -> Result<Vec<String>> {
-    let mut child = git_command(Some(dir))
-        .args(["check-ignore", "-z", "--stdin"])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()?;
+fn check_ignore_batch(dir: &Path, paths: &[String], deadline: &GitDeadline) -> Result<Vec<String>> {
+    let args = ["check-ignore", "-z", "--stdin"];
+    let payload = candidate_payload(paths);
+    let outcome = exec::run_bounded(Some(dir), &args, deadline, Some(payload.as_slice()));
 
-    let stdout_drain = spawn_pipe_drain(child.stdout.take());
-    let stderr_drain = spawn_pipe_drain(child.stderr.take());
+    if let Some(reason) = outcome.killed_reason(&args, deadline.timeout_secs()) {
+        bail!("{reason}");
+    }
 
-    // The handle is scoped so that closing it delivers end of input to
-    // `check-ignore` before the child is awaited.
-    let write_result = {
-        let mut stdin = child.stdin.take().context("Failed to open git stdin")?;
-        write_candidate_paths(&mut stdin, paths)
-    };
-
-    let status = child.wait()?;
-    let stdout = join_pipe_drain(stdout_drain)?;
-    let stderr = join_pipe_drain(stderr_drain)?;
-
-    let code = status.code().unwrap_or(-1);
+    let code = outcome.code.unwrap_or(-1);
     if code != 0 && code != 1 {
         bail!(
             "git check-ignore failed with exit code {code}: {}",
-            String::from_utf8_lossy(&stderr).trim()
+            String::from_utf8_lossy(&outcome.stderr).trim()
         );
     }
-    write_result?;
     if code == 1 {
         return Ok(Vec::new());
     }
-    Ok(String::from_utf8_lossy(&stdout)
+    Ok(String::from_utf8_lossy(&outcome.stdout)
         .split('\0')
         .filter(|entry| !entry.is_empty())
         .map(|entry| entry.to_string())
         .collect())
 }
 
-/// Writes the candidates as a NUL-separated list and closes the stream.
-fn write_candidate_paths(stdin: &mut impl Write, paths: &[String]) -> std::io::Result<()> {
+/// Renders the candidate list as the NUL-separated payload `check-ignore` reads
+/// from its standard input.
+///
+/// NUL separation keeps a path containing a space, a quote, or a newline
+/// intact.
+fn candidate_payload(paths: &[String]) -> Vec<u8> {
+    let mut payload = Vec::new();
     for path in paths {
-        stdin.write_all(path.as_bytes())?;
-        stdin.write_all(b"\0")?;
+        payload.extend_from_slice(path.as_bytes());
+        payload.push(0);
     }
-    stdin.flush()
+    payload
 }
 
 /// Drains a child pipe to EOF on its own thread.
-fn spawn_pipe_drain<R>(pipe: Option<R>) -> std::thread::JoinHandle<std::io::Result<Vec<u8>>>
+///
+/// Reading a pipe independently of the child's exit keeps a command that emits
+/// more than a pipe buffer holds from blocking on its own output, and it lets
+/// the bounded executor observe the child it started while the pipes drain.
+pub(super) fn spawn_pipe_drain<R>(
+    pipe: Option<R>,
+) -> std::thread::JoinHandle<std::io::Result<Vec<u8>>>
 where
     R: Read + Send + 'static,
 {
@@ -216,14 +248,6 @@ where
         }
         Ok(buffer)
     })
-}
-
-/// Collects the bytes a drain thread read.
-fn join_pipe_drain(handle: std::thread::JoinHandle<std::io::Result<Vec<u8>>>) -> Result<Vec<u8>> {
-    let read = handle
-        .join()
-        .map_err(|_| anyhow!("a git check-ignore pipe drain thread panicked"))?;
-    read.context("Failed to drain a git check-ignore pipe")
 }
 
 /// Stages the specified list of files into the Git index.
@@ -240,6 +264,16 @@ fn join_pipe_drain(handle: std::thread::JoinHandle<std::io::Result<Vec<u8>>>) ->
 /// a move lands as one change: the destination is added and the source is
 /// removed in the same commit.
 pub fn stage_files(dir: &Path, files: &[String]) -> Result<()> {
+    let deadline = GitDeadline::default();
+    stage_files_with_deadline(dir, files, &deadline)
+}
+
+/// Stages the specified list of files under the supplied wall-clock budget.
+pub fn stage_files_with_deadline(
+    dir: &Path,
+    files: &[String],
+    deadline: &GitDeadline,
+) -> Result<()> {
     if files.is_empty() {
         return Ok(());
     }
@@ -258,18 +292,17 @@ pub fn stage_files(dir: &Path, files: &[String]) -> Result<()> {
     if !present.is_empty() {
         let mut add_args = vec!["add", "--"];
         add_args.extend_from_slice(&present);
-        run_git(Some(dir), &add_args)?;
+        run_git_with_deadline(Some(dir), &add_args, deadline)?;
     }
 
     if !removed.is_empty() {
         let mut remove_args = vec!["rm", "--cached", "--ignore-unmatch", "-f", "-q", "--"];
         remove_args.extend_from_slice(&removed);
-        run_git(Some(dir), &remove_args)?;
+        run_git_with_deadline(Some(dir), &remove_args, deadline)?;
     }
 
     Ok(())
 }
-
 /// Commits staged changes under the repository's developer identity.
 ///
 /// The identity is probed with a single `git var GIT_AUTHOR_IDENT` call. When
@@ -289,7 +322,25 @@ pub fn commit_with_developer_author(
     allow_empty: bool,
     hooks: GitHooks,
 ) -> Result<()> {
-    let identity_resolved = run_git(Some(dir), &["var", "GIT_AUTHOR_IDENT"]).is_ok();
+    let deadline = GitDeadline::default();
+    commit_with_developer_author_with_deadline(dir, message, allow_empty, hooks, &deadline)
+}
+
+/// Commits staged changes under the repository's developer identity, under the
+/// supplied wall-clock budget.
+///
+/// The budget is the only difference from [`commit_with_developer_author`]: a
+/// repository hook or a signing agent that waits on a passphrase prompt is torn
+/// down at the budget instead of occupying the caller.
+pub fn commit_with_developer_author_with_deadline(
+    dir: &Path,
+    message: &str,
+    allow_empty: bool,
+    hooks: GitHooks,
+    deadline: &GitDeadline,
+) -> Result<()> {
+    let identity_resolved =
+        run_git_with_deadline(Some(dir), &["var", "GIT_AUTHOR_IDENT"], deadline).is_ok();
 
     // Keep the override strings alive until `run_git` consumes the argument
     // vector, since the vector borrows them as `&str`.
@@ -309,7 +360,7 @@ pub fn commit_with_developer_author(
         args.push("--no-verify");
     }
 
-    run_git(Some(dir), &args).context("Failed to commit staged changes")?;
+    run_git_with_deadline(Some(dir), &args, deadline).context("Failed to commit staged changes")?;
     Ok(())
 }
 
@@ -317,6 +368,9 @@ pub fn commit_with_developer_author(
 mod tests {
     use super::*;
     use crate::git::GitHooks;
+
+    #[cfg(unix)]
+    use std::time::{Duration, Instant};
 
     fn init_repo(dir: &Path) {
         run_git(Some(dir), &["init"]).unwrap();
@@ -328,12 +382,18 @@ mod tests {
 
     #[cfg(unix)]
     fn install_failing_pre_commit_hook(dir: &Path) {
+        install_hook(dir, "#!/bin/sh\nexit 1\n");
+    }
+
+    /// Writes an executable `pre-commit` hook into the repository.
+    #[cfg(unix)]
+    fn install_hook(dir: &Path, script: &str) {
         use std::os::unix::fs::PermissionsExt;
 
         let hooks = dir.join(".git/hooks");
         std::fs::create_dir_all(&hooks).unwrap();
         let hook = hooks.join("pre-commit");
-        std::fs::write(&hook, "#!/bin/sh\nexit 1\n").unwrap();
+        std::fs::write(&hook, script).unwrap();
         let mut perms = std::fs::metadata(&hook).unwrap().permissions();
         perms.set_mode(0o755);
         std::fs::set_permissions(&hook, perms).unwrap();
@@ -473,5 +533,141 @@ mod tests {
                 "{key} must be removed from the child environment"
             );
         }
+    }
+
+    #[test]
+    fn a_git_invocation_round_trips_its_standard_output() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        init_repo(root);
+
+        let output = run_git(Some(root), &["rev-parse", "--is-inside-work-tree"]).unwrap();
+
+        assert_eq!(output.trim(), "true");
+    }
+
+    #[test]
+    fn a_failing_exit_status_keeps_the_git_command_failed_diagnostic() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        init_repo(root);
+
+        let error = run_git(Some(root), &["rev-parse", "--verify", "no-such-revision"])
+            .expect_err("an unresolvable revision fails the invocation");
+
+        assert!(
+            error.to_string().contains("git command failed"),
+            "error: {error}"
+        );
+    }
+
+    /// Hook that announces its start and then sleeps far beyond any test budget.
+    #[cfg(unix)]
+    const SLEEPING_HOOK: &str = "#!/bin/sh\necho started > hook-started.log\nsleep 30\n";
+
+    /// Hook whose grandchild keeps a heartbeat alive while the hook itself sleeps.
+    #[cfg(unix)]
+    const HEARTBEAT_HOOK: &str = "#!/bin/sh\nsh -c 'while true; do echo tick >> heartbeat.log; sleep 0.1; done' &\nsleep 30\n";
+
+    /// How long a heartbeat fixture is observed after the process-group kill.
+    ///
+    /// The fixture appends one tick every 100 ms, so a writer that survived the
+    /// kill adds several ticks inside this window and changes the log size.
+    #[cfg(unix)]
+    const HEARTBEAT_WINDOW: Duration = Duration::from_millis(400);
+
+    /// A repository hook that never returns is torn down at the invocation
+    /// budget, together with every descendant it spawned.
+    #[cfg(unix)]
+    #[test]
+    fn a_sleeping_hook_exceeds_the_budget_and_its_descendants_stop() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        init_repo(root);
+        install_hook(root, HEARTBEAT_HOOK);
+
+        let started = Instant::now();
+        let error = run_git_with_deadline(
+            Some(root),
+            &["commit", "-m", "hooked"],
+            &GitDeadline::with_timeout(1),
+        )
+        .expect_err("the hook outlives the one-second budget");
+
+        assert!(
+            error.to_string().contains("exceeded its wall-clock budget"),
+            "error: {error}"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "the budget did not release the turn: {:?}",
+            started.elapsed()
+        );
+
+        let heartbeat = root.join("heartbeat.log");
+        assert!(heartbeat.exists(), "the hook's grandchild never wrote");
+        let size_at_kill = std::fs::metadata(&heartbeat)
+            .map(|meta| meta.len())
+            .unwrap_or(0);
+        std::thread::sleep(HEARTBEAT_WINDOW);
+        let size_later = std::fs::metadata(&heartbeat)
+            .map(|meta| meta.len())
+            .unwrap_or(0);
+        assert_eq!(
+            size_at_kill, size_later,
+            "the grandchild kept writing after the process-group kill"
+        );
+    }
+
+    /// A flipped cancellation receiver kills the child instead of waiting the
+    /// repository hook out.
+    #[cfg(unix)]
+    #[test]
+    fn a_cancelled_invocation_kills_the_child_promptly() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        init_repo(root);
+        install_hook(root, SLEEPING_HOOK);
+
+        let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
+        let deadline = GitDeadline::from_cancel(cancel_rx);
+        let path = root.to_path_buf();
+        let started = Instant::now();
+        let turn = std::thread::spawn(move || {
+            run_git_with_deadline(
+                Some(path.as_path()),
+                &["commit", "-m", "cancelled"],
+                &deadline,
+            )
+        });
+
+        // Cancel only once the hook is demonstrably running, so the prompt
+        // return proves the teardown instead of a slow start.
+        let marker = root.join("hook-started.log");
+        let mut hook_started = false;
+        for _ in 0..100 {
+            if marker.exists() {
+                hook_started = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert!(hook_started, "the hook never started");
+        let _ = cancel_tx.send(true);
+
+        let error = turn
+            .join()
+            .unwrap()
+            .expect_err("a cancelled invocation reports no answer");
+
+        assert!(
+            error.to_string().contains("was cancelled"),
+            "error: {error}"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "the cancellation did not release the turn: {:?}",
+            started.elapsed()
+        );
     }
 }

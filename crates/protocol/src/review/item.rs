@@ -429,6 +429,12 @@ impl From<ReviewDecisionStatus> for IssueStatus {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ReviewUpdateProposal {
     /// Identifier of the finding inside the discussed review session.
+    ///
+    /// The strict discussion schema publishes the domain of this field as the
+    /// `minimum` and the `maximum` of its `item_id` property, so the contract
+    /// the model reads admits exactly the values this decoder accepts. An
+    /// unbounded property would let one out-of-range identifier discard the
+    /// whole response, the conversational message included.
     pub item_id: u32,
     /// Identifier of the review group the decision is recorded for.
     ///
@@ -449,4 +455,19 @@ pub struct ReviewUpdateProposal {
     /// Additional remediation recommendations agreed in the discussion.
     #[serde(default)]
     pub recommendations: Vec<String>,
+}
+
+impl ReviewUpdateProposal {
+    /// Smallest finding identifier the discussion contract admits.
+    ///
+    /// The strict discussion schema publishes this value as the `minimum` of
+    /// its `item_id` property, so the contract states the domain of the field
+    /// instead of a hand-copied bound the decoder could contradict.
+    pub(crate) const ITEM_ID_MINIMUM: u32 = u32::MIN;
+
+    /// Largest finding identifier the discussion contract admits.
+    ///
+    /// Published beside [`Self::ITEM_ID_MINIMUM`] as the `maximum` of the same
+    /// property.
+    pub(crate) const ITEM_ID_MAXIMUM: u32 = u32::MAX;
 }

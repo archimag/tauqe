@@ -193,16 +193,29 @@ impl DiscussionStreamFilter {
                 .map(|s| s.to_string())
                 .unwrap_or_else(|| clean.to_string());
 
-            let plan_update = val
-                .get("plan_update")
-                .filter(|v| !v.is_null())
-                .and_then(|v| serde_json::from_value::<DiscussionPlanUpdate>(v.clone()).ok())
-                .filter(|u| {
-                    u.id.is_some()
-                        || !u.items.is_empty()
-                        || !u.concept.is_empty()
-                        || u.title.is_some()
-                });
+            // A present but undecodable `plan_update` is a defect of the payload
+            // rather than an absent mutation: the reason travels with the response
+            // so the boundary that owns the round can refuse it instead of
+            // dropping the mutation the model attempted.
+            let mut plan_update_error: Option<String> = None;
+            let mut plan_update: Option<DiscussionPlanUpdate> = None;
+            if let Some(field) = val.get("plan_update").filter(|v| !v.is_null()) {
+                match serde_json::from_value::<DiscussionPlanUpdate>(field.clone()) {
+                    Ok(update) => {
+                        // An update without a single actionable field states an
+                        // untouched plan, which is not a defect.
+                        plan_update = Some(update).filter(|u| {
+                            u.id.is_some()
+                                || !u.items.is_empty()
+                                || !u.concept.is_empty()
+                                || u.title.is_some()
+                        });
+                    }
+                    Err(error) => {
+                        plan_update_error = Some(format!("invalid plan_update: {error}"));
+                    }
+                }
+            }
 
             let context_requests = val
                 .get("context_requests")
@@ -227,6 +240,7 @@ impl DiscussionStreamFilter {
             let mut response = DiscussionResponse {
                 message,
                 plan_update,
+                plan_update_error,
                 context_requests,
                 repo_searches,
                 user_language,
@@ -475,6 +489,32 @@ mod tests {
         assert_eq!(streamed, plain);
         assert_eq!(response.message, plain);
         assert!(response.plan_update.is_none());
+    }
+
+    #[test]
+    fn test_discussion_stream_filter_records_an_undecodable_plan_update() {
+        // The partial fallback rebuilds the response from a payload the DTO
+        // rejects, so a present but undecodable `plan_update` is recorded as a
+        // decode diagnosis instead of disappearing.
+        let raw = r#"{"message":"Partial valid message","plan_update":{"items":"not-a-list"}}"#;
+        let resp = DiscussionStreamFilter::parse_response(raw);
+        assert_eq!(resp.message, "Partial valid message");
+        assert!(resp.plan_update.is_none());
+        let error = resp
+            .plan_update_error
+            .expect("an undecodable plan_update must be recorded");
+        assert!(error.contains("plan_update"), "{error}");
+
+        // An idle payload states an untouched plan and no defect, whether the
+        // mutation is null or an update that carries no actionable field.
+        for idle in [
+            r#"{"message":"Hello","plan_update":null}"#,
+            r#"{"message":"Hello","plan_update":{}}"#,
+        ] {
+            let resp = DiscussionStreamFilter::parse_response(idle);
+            assert!(resp.plan_update_error.is_none(), "{idle}");
+            assert!(resp.plan_update.is_none(), "{idle}");
+        }
     }
 
     #[test]

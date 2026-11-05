@@ -28,7 +28,6 @@ use crate::command::dialog::{DialogCommand, MODEL_LIST_DIALOG_COMMAND_MAP};
 use crate::components::model_selector::ModelSelector;
 use crate::config::InputConfig;
 use crate::editor::InputEditor;
-use crate::views::plans::PlanRefineDialogState;
 
 /// Dialog state the shared model-list keyboard contract drives.
 ///
@@ -167,6 +166,18 @@ pub(super) fn handle_dialog_key<D: ModelListDialog>(
         }
         Some(DialogCommand::FocusPrev) => {
             focus_prev(dialog);
+            ModelListKeyOutcome::Consumed
+        }
+        // The vertical walk moves the keyboard between the dialog sections. A
+        // multiline editor keeps the chords for cursor line movement, so a
+        // press inside it falls through to the editor delegation below
+        // (Conventions §6.2).
+        Some(DialogCommand::FieldNext) if !dialog.is_editor_focused() => {
+            dialog.cycle_focus_next();
+            ModelListKeyOutcome::Consumed
+        }
+        Some(DialogCommand::FieldPrev) if !dialog.is_editor_focused() => {
+            dialog.cycle_focus_prev();
             ModelListKeyOutcome::Consumed
         }
         // Stepping moves between the action buttons without leaving the bar.
@@ -356,44 +367,6 @@ impl ModelListDialog for ConfirmReviewAnalyzeState {
 
     fn instructions_editor(&mut self) -> Option<&mut InputEditor> {
         None
-    }
-}
-
-impl ModelListDialog for PlanRefineDialogState {
-    fn selector(&mut self) -> &mut ModelSelector {
-        &mut self.selector
-    }
-
-    fn confirm_button(&self) -> ConfirmDialogButton {
-        self.confirm_button
-    }
-
-    fn set_confirm_button(&mut self, button: ConfirmDialogButton) {
-        self.confirm_button = button;
-    }
-
-    fn is_model_list_focused(&self) -> bool {
-        self.focus.is_model_list()
-    }
-
-    fn is_editor_focused(&self) -> bool {
-        self.focus.is_instructions_editor()
-    }
-
-    fn is_actions_focused(&self) -> bool {
-        self.focus.is_actions()
-    }
-
-    fn cycle_focus_next(&mut self) {
-        self.focus.cycle_next(self.selector.len());
-    }
-
-    fn cycle_focus_prev(&mut self) {
-        self.focus.cycle_prev(self.selector.len());
-    }
-
-    fn instructions_editor(&mut self) -> Option<&mut InputEditor> {
-        Some(&mut self.instructions_editor)
     }
 }
 

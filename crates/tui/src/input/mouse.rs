@@ -211,7 +211,7 @@ async fn dispatch_ui_action(
             }
         }
         UiAction::ToggleHelp => {
-            st.show_help = !st.show_help;
+            st.modals.show_help = !st.modals.show_help;
         }
         // A copy report comes from the surface that rendered the block, so the
         // dispatcher resolves the action against the owning view and reports the
@@ -460,7 +460,7 @@ mod tests {
                 children: vec![],
             }],
         )];
-        st.status_dialog = Some(crate::app::StatusDialogState::new(
+        st.modals.status_dialog = Some(crate::app::StatusDialogState::new(
             crate::app::StatusDialogTarget::PlanItem {
                 plan_id: "plan-1".to_string(),
                 item_id: "1".to_string(),
@@ -485,13 +485,16 @@ mod tests {
         assert_eq!(res, InputResult::Continue);
 
         let st = state.lock().await;
-        assert!(st.status_dialog.is_none(), "the dialog must be consumed");
+        assert!(
+            st.modals.status_dialog.is_none(),
+            "the dialog must be consumed"
+        );
         let item = st
             .plans_view
             .plans
             .iter()
             .find(|p| p.id == "plan-1")
-            .and_then(|p| p.find_item("1"))
+            .and_then(|p| p.implementation.find_item("1"))
             .expect("plan item must exist");
         assert_eq!(
             item.status,
@@ -508,7 +511,7 @@ mod tests {
         st.view_mode = ViewMode::Review;
         st.last_frame_area = Rect::new(0, 0, 100, 30);
         let entries = st.coder_entries();
-        st.confirm_execute_review = Some(crate::app::ConfirmExecuteReviewState::new(
+        st.modals.confirm_execute_review = Some(crate::app::ConfirmExecuteReviewState::new(
             Some("rev-1".to_string()),
             "Session rev-1".to_string(),
             "All remaining TODO findings".to_string(),
@@ -534,6 +537,7 @@ mod tests {
 
         let term = st.last_frame_area;
         let entry_count = st
+            .modals
             .confirm_execute_review
             .as_ref()
             .map(|target| target.selector.len())
@@ -554,7 +558,7 @@ mod tests {
 
         let st = state.lock().await;
         assert_eq!(st.view_mode, ViewMode::Repl);
-        assert!(st.confirm_execute_review.is_none());
+        assert!(st.modals.confirm_execute_review.is_none());
     }
 
     /// A click on a Help header tab must switch to that tab without closing the
@@ -562,7 +566,7 @@ mod tests {
     #[tokio::test]
     async fn help_tab_click_switches_tab_without_closing() {
         let mut st = crate::app::test_state();
-        st.show_help = true;
+        st.modals.show_help = true;
         st.last_frame_area = Rect::new(0, 0, 100, 30);
         let state = Arc::new(Mutex::new(st));
         let mut conn = RpcConnection::new(Vec::<u8>::new());
@@ -578,8 +582,11 @@ mod tests {
         assert_eq!(res, InputResult::Continue);
 
         let st = state.lock().await;
-        assert!(st.show_help, "clicking a tab must not close the dialog");
-        assert_eq!(st.help_tab, crate::app::HelpTab::CurrentMode);
+        assert!(
+            st.modals.show_help,
+            "clicking a tab must not close the dialog"
+        );
+        assert_eq!(st.modals.help_tab, crate::app::HelpTab::CurrentMode);
     }
 
     /// A click on the locale dialog's `Cancel` button must dismiss it.
@@ -587,7 +594,7 @@ mod tests {
     async fn locale_cancel_button_click_dismisses_dialog() {
         let mut st = crate::app::test_state();
         st.last_frame_area = Rect::new(0, 0, 100, 30);
-        st.locale_dialog = Some(crate::app::LocaleDialogState::default());
+        st.modals.locale_dialog = Some(crate::app::LocaleDialogState::default());
         let state = Arc::new(Mutex::new(st));
         let mut conn = RpcConnection::new(Vec::<u8>::new());
 
@@ -602,7 +609,7 @@ mod tests {
         assert_eq!(res, InputResult::Continue);
 
         let st = state.lock().await;
-        assert!(st.locale_dialog.is_none());
+        assert!(st.modals.locale_dialog.is_none());
     }
 
     /// The usage breakdown dismisses on a click outside its frame and stays
@@ -619,12 +626,12 @@ mod tests {
         handle_mouse_event(left_click(area.x + 2, area.y + 2), &state, &mut conn)
             .await
             .unwrap();
-        assert!(state.lock().await.usage_summary.is_some());
+        assert!(state.lock().await.modals.usage_summary.is_some());
 
         handle_mouse_event(left_click(0, 0), &state, &mut conn)
             .await
             .unwrap();
-        assert!(state.lock().await.usage_summary.is_none());
+        assert!(state.lock().await.modals.usage_summary.is_none());
     }
 
     /// The wheel scrolls the breakdown one step per notch, like every other
@@ -645,7 +652,14 @@ mod tests {
         };
         handle_mouse_event(down, &state, &mut conn).await.unwrap();
         assert_eq!(
-            state.lock().await.usage_summary.as_ref().unwrap().scroll,
+            state
+                .lock()
+                .await
+                .modals
+                .usage_summary
+                .as_ref()
+                .unwrap()
+                .scroll,
             MOUSE_SCROLL_STEP as u16
         );
 
@@ -654,7 +668,17 @@ mod tests {
             ..down
         };
         handle_mouse_event(up, &state, &mut conn).await.unwrap();
-        assert_eq!(state.lock().await.usage_summary.as_ref().unwrap().scroll, 0);
+        assert_eq!(
+            state
+                .lock()
+                .await
+                .modals
+                .usage_summary
+                .as_ref()
+                .unwrap()
+                .scroll,
+            0
+        );
     }
 
     fn left_click(column: u16, row: u16) -> MouseEvent {
@@ -694,7 +718,7 @@ mod tests {
                 children: vec![],
             }],
         )];
-        st.status_dialog = Some(crate::app::StatusDialogState::new(
+        st.modals.status_dialog = Some(crate::app::StatusDialogState::new(
             crate::app::StatusDialogTarget::PlanItem {
                 plan_id: "plan-1".to_string(),
                 item_id: "1".to_string(),
@@ -718,6 +742,7 @@ mod tests {
         let st = state_with_plan_status_dialog();
         let term = st.last_frame_area;
         let options_count = st
+            .modals
             .status_dialog
             .as_ref()
             .map(|dialog| dialog.target.options_count())
@@ -727,7 +752,7 @@ mod tests {
         let mut terminal = Terminal::new(TestBackend::new(term.width, term.height)).unwrap();
         terminal
             .draw(|frame| {
-                if let Some(dialog) = st.status_dialog.as_ref() {
+                if let Some(dialog) = st.modals.status_dialog.as_ref() {
                     crate::dialogs::render::render_status_dialog(frame, dialog);
                 }
             })
@@ -752,13 +777,16 @@ mod tests {
         assert!(payload.contains(methods::PLAN_UPDATE_ITEM), "{payload}");
 
         let guard = state.lock().await;
-        assert!(guard.status_dialog.is_none(), "the dialog must be consumed");
+        assert!(
+            guard.modals.status_dialog.is_none(),
+            "the dialog must be consumed"
+        );
         let item = guard
             .plans_view
             .plans
             .iter()
             .find(|plan| plan.id == "plan-1")
-            .and_then(|plan| plan.find_item("1"))
+            .and_then(|plan| plan.implementation.find_item("1"))
             .expect("the plan step must exist");
         assert_eq!(item.status, tauqe_protocol::PlanItemStatus::InProgress);
     }
@@ -783,7 +811,7 @@ mod tests {
 
         let guard = state.lock().await;
         assert!(
-            guard.status_dialog.is_some(),
+            guard.modals.status_dialog.is_some(),
             "an air row keeps the dialog open"
         );
         let item = guard
@@ -791,7 +819,7 @@ mod tests {
             .plans
             .iter()
             .find(|plan| plan.id == "plan-1")
-            .and_then(|plan| plan.find_item("1"))
+            .and_then(|plan| plan.implementation.find_item("1"))
             .expect("the plan step must exist");
         assert_eq!(item.status, tauqe_protocol::PlanItemStatus::Todo);
         assert!(conn.written().is_empty());
@@ -805,6 +833,7 @@ mod tests {
         let st = state_with_plan_status_dialog();
         let term = st.last_frame_area;
         let options_count = st
+            .modals
             .status_dialog
             .as_ref()
             .map(|dialog| dialog.target.options_count())
@@ -824,13 +853,13 @@ mod tests {
 
         assert!(conn.written().is_empty());
         let guard = state.lock().await;
-        assert!(guard.status_dialog.is_none());
+        assert!(guard.modals.status_dialog.is_none());
         let item = guard
             .plans_view
             .plans
             .iter()
             .find(|plan| plan.id == "plan-1")
-            .and_then(|plan| plan.find_item("1"))
+            .and_then(|plan| plan.implementation.find_item("1"))
             .expect("the plan step must exist");
         assert_eq!(item.status, tauqe_protocol::PlanItemStatus::Todo);
     }
@@ -840,7 +869,7 @@ mod tests {
     fn state_with_selection_dialog() -> crate::app::AppState {
         let mut st = crate::app::test_state();
         st.last_frame_area = Rect::new(0, 0, 100, 30);
-        st.selection_dialog = Some(crate::app::SelectionDialogState::new(
+        st.modals.selection_dialog = Some(crate::app::SelectionDialogState::new(
             vec![
                 tauqe_protocol::ModelEntry::new(
                     tauqe_protocol::ModelRef::openrouter("alpha-unique"),
@@ -858,7 +887,8 @@ mod tests {
 
     /// Rung count of the open picker, read without cloning the dialog.
     fn selection_item_count(st: &crate::app::AppState) -> usize {
-        st.selection_dialog
+        st.modals
+            .selection_dialog
             .as_ref()
             .map(|dialog| dialog.selector.len())
             .unwrap_or(0)
@@ -890,7 +920,7 @@ mod tests {
         let payload = String::from_utf8(conn.written().to_vec()).expect("utf-8 payload");
         assert!(payload.contains(methods::MODEL_SELECT), "{payload}");
         assert!(payload.contains("beta-unique"), "{payload}");
-        assert!(state.lock().await.selection_dialog.is_none());
+        assert!(state.lock().await.modals.selection_dialog.is_none());
     }
 
     /// The picker `Select` button activates the highlighted row at the rectangle
@@ -918,7 +948,7 @@ mod tests {
         let payload = String::from_utf8(conn.written().to_vec()).expect("utf-8 payload");
         assert!(payload.contains(methods::MODEL_SELECT), "{payload}");
         assert!(payload.contains("alpha-unique"), "{payload}");
-        assert!(state.lock().await.selection_dialog.is_none());
+        assert!(state.lock().await.modals.selection_dialog.is_none());
     }
 
     /// The picker `Cancel` button dismisses the dialog without a request.
@@ -943,7 +973,7 @@ mod tests {
         .unwrap();
 
         assert!(conn.written().is_empty());
-        assert!(state.lock().await.selection_dialog.is_none());
+        assert!(state.lock().await.modals.selection_dialog.is_none());
     }
 
     /// The intro line above the picker list is not a row: clicking it keeps the
@@ -962,7 +992,7 @@ mod tests {
             .unwrap();
 
         assert!(conn.written().is_empty());
-        assert!(state.lock().await.selection_dialog.is_some());
+        assert!(state.lock().await.modals.selection_dialog.is_some());
     }
 
     /// The first item the picker draws sits exactly on the top row of the
@@ -980,7 +1010,7 @@ mod tests {
         let mut terminal = Terminal::new(TestBackend::new(term.width, term.height)).unwrap();
         terminal
             .draw(|frame| {
-                if let Some(dialog) = st.selection_dialog.as_ref() {
+                if let Some(dialog) = st.modals.selection_dialog.as_ref() {
                     crate::dialogs::render::render_selection_dialog(frame, dialog);
                 }
             })
@@ -1173,7 +1203,7 @@ mod tests {
             .unwrap();
 
         let guard = state.lock().await;
-        assert!(guard.show_help);
+        assert!(guard.modals.show_help);
         assert_eq!(guard.view_mode, ViewMode::Repl);
     }
 
@@ -1195,7 +1225,7 @@ mod tests {
 
         let guard = state.lock().await;
         assert_eq!(guard.view_mode, ViewMode::Repl);
-        assert!(guard.usage_summary.is_none());
+        assert!(guard.modals.usage_summary.is_none());
     }
 
     /// A cleared registry holds no region of the finished frame, so the same
@@ -1211,7 +1241,7 @@ mod tests {
             .await
             .unwrap();
 
-        assert!(!state.lock().await.show_help);
+        assert!(!state.lock().await.modals.show_help);
     }
 
     /// The wheel is free scrolling too: a long expanded subplan scrolls

@@ -77,10 +77,10 @@ The digits are reachable on the primary modifier (`Ctrl+1` … `Ctrl+5`) and on 
 modifier (`M-1` … `M-5`), so a terminal without a dedicated Meta key still reaches
 every view.
 
-Ancillary surfaces are reached without leaving a view: model selection on `C-M` /
-`M-M`, the theme selector on `M-T`, the interface-language dialog on `M-L`, the
-usage breakdown on `M-U`, and the diff inspector on `C-V` / `M-V`.
-
+Ancillary surfaces are reached without leaving a view: model selection on C-M /
+M-M, the theme selector on M-T, the interface-language dialog on M-L, the
+usage breakdown on M-U, the external documentation cache browser on M-O, and
+the diff inspector on C-V / M-V.
 **Model selection is one component, not six.** The picker on `C-M` / `M-M` and the
 five dialogs that choose a model for a role — the review launcher, the plan refinement
 form, the finding decomposition form, the point-execution form, and the post-analysis
@@ -520,6 +520,36 @@ instead of hiding the status of the file.
 panes, the progress counters, the placeholders, the docked hint, and the command
 descriptions behind `v`, `Enter`, and `Ctrl+V` are catalog entries, so a hot-swapped
 locale reaches the compact list and the inspector without editing a renderer.
+### 3.11 Inspecting the external documentation cache
+
+External documentation is materialized into a durable cache that outlives the
+context entry it once fed. The cache browser opens globally on `M-O` (and from the
+Context view on `o`): one card, one logical tree, and one guarded removal at a time.
+
+**Rows are logical paths.** A row names a document exactly as the context layer
+and the prompt name it — the declared identifier followed by the
+document-relative path. The disk prefix the snapshots are stored under never
+appears in the card, so the tree, the context manifest, and the model address
+one document by one name.
+
+**The tree folds by identifier.** A directory row comes before the documents it
+holds, every level is alphabetical, and the row states how many documents it
+covers and what they cost in tokens. `Tab` or `Space` folds the highlighted
+directory, `a` folds the whole tree or unfolds it, `n` / `p`, `j` / `k`, and the
+arrows walk the rows, `Home` / `End` jump to the ends, and `PgUp` / `PgDn` page
+through a deep tree. The pointer mirrors the keyboard: a click highlights the
+row it lands on, and a second click on the highlighted directory folds it.
+
+**Removal is a decision.** `Delete` raises the shared confirmation card with the
+safe `Cancel` default. The card names the logical path and states that only the
+cache and its context entry are touched, so no repository file is ever deleted.
+Confirming sends `outerdocs/cacheRemove`, which unlinks the entry atomically and
+reconciles the resident context layer in the same request; the browser then
+re-reads the inventory, so the removed node leaves the card instead of lingering
+as a phantom row, and the next turn reads exactly what the tree still shows.
+
+**Reading is free, deleting is guarded.** The browser spends no tokens, edits no
+declaration, and never touches the working tree.
 
 ---
 
@@ -569,6 +599,8 @@ locale reaches the compact list and the inspector without editing a renderer.
 - [Structured Code Review](../ch04-workflows/review.md) — the Review commands.
 - [Discussion Focus](../ch02-perception/discussion-focus.md) — the focus banner and the
   guarded detach.
+- [External Project Documentation](../ch02-perception/reference-registry.md) — the
+  declaration, the cache, and the trust boundary the browser inspects.
 - [Zero-Hardcode Interface Localization](i18n-subsystem.md) — the catalog every string
   resolves through.
 - [Configuration and Project Preparation](configuration.md) — `[input]`, `[theme]`, and

@@ -3,7 +3,7 @@ use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 
 use tauqe_protocol::glob::GlobPattern;
-use tauqe_protocol::{ContextAccess, ContextItem, ContextLayer};
+use tauqe_protocol::{ContextAccess, ContextItem, ContextLayer, OuterDocsCacheEntry};
 
 use crate::editor::InputEditor;
 pub mod input;
@@ -48,6 +48,12 @@ impl ContextCandidate {
     }
 }
 
+/// Browsing state of the Context view.
+///
+/// The view owns the section folds, the cursor, and the inline path input. The
+/// confirmations it raises — the two layer clears and the single-file removal —
+/// are modal surfaces that outrank the view while they are open, so they live in
+/// [`crate::app::ModalState`] instead (Conventions §5.4, §7).
 #[derive(Debug, Clone)]
 pub struct ContextViewState {
     pub cursor_index: usize,
@@ -63,15 +69,6 @@ pub struct ContextViewState {
     pub filtered_candidates: Vec<ContextCandidate>,
     pub total_matching: usize,
     pub selected_candidate_index: usize,
-    pub confirm_clear_auto: bool,
-    pub confirm_clear_user: bool,
-    /// Path the developer asked to remove from the context layers and whose
-    /// removal awaits the shared confirmation card. While it is set,
-    /// `AppState::active_modal` reports `ActiveModal::RemoveContextFile`, so the
-    /// `context/remove` request leaves the client only after the developer
-    /// accepts the card and never on the bare keystroke
-    /// (Conventions §4.3, §5.4).
-    pub pending_remove: Option<String>,
     /// Memo of the last candidate scan.
     ///
     /// The picker derives its rows from the whole repository file list, so the
@@ -97,9 +94,6 @@ impl Default for ContextViewState {
             filtered_candidates: Vec::new(),
             total_matching: 0,
             selected_candidate_index: 0,
-            confirm_clear_auto: false,
-            confirm_clear_user: false,
-            pending_remove: None,
             candidate_scan: CandidateScanMemo::default(),
         }
     }
@@ -316,7 +310,149 @@ impl ContextViewState {
         }
     }
 }
+/// One row of the external documentation cache tree.
+///
+/// A row addresses a document by its logical cache path — the path the context
+/// layer and the prompt already carry — so folding, clicking, and removing a
+/// node never expose the disk prefix the snapshots are stored under
+/// (c-outer-docs-logical-paths, c-outer-docs-cache-tui-browser).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CacheTreeRow {
+    /// Nesting depth; the renderer derives the indent from it.
+    pub depth: usize,
+    /// Path segment the row displays.
+    pub label: String,
+    /// Logical cache path the row addresses.
+    pub path: String,
+    /// Whether the row groups documents or names one document.
+    pub kind: CacheTreeKind,
+    /// Documents the row covers, counted recursively for a directory.
+    pub files: usize,
+    /// Bytes the row covers, summed for a directory.
+    pub size_bytes: u64,
+    /// Tokens the row covers, summed for a directory.
+    pub estimated_tokens: u64,
+    /// Whether a directory is folded; always `false` for a document.
+    pub collapsed: bool,
+}
 
+/// Kind of one external documentation cache tree row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CacheTreeKind {
+    /// A directory grouping the documents below one logical prefix.
+    Directory,
+    /// One cached document.
+    Document,
+}
+
+/// Nested inventory of one logical cache directory.
+#[derive(Debug, Default)]
+struct CacheDir {
+    dirs: std::collections::BTreeMap<String, CacheDir>,
+    files: std::collections::BTreeMap<String, (u64, u64)>,
+}
+
+impl CacheDir {
+    /// Inserts one document by the segments of its logical path.
+    fn insert(&mut self, segments: &[&str], size_bytes: u64, estimated_tokens: u64) {
+        let Some((leaf, parents)) = segments.split_last() else {
+            return;
+        };
+        let mut current = self;
+        for segment in parents {
+            current = current.dirs.entry((*segment).to_string()).or_default();
+        }
+        current
+            .files
+            .insert((*leaf).to_string(), (size_bytes, estimated_tokens));
+    }
+
+    /// Documents, bytes, and tokens the directory covers, recursively.
+    fn totals(&self) -> (usize, u64, u64) {
+        let mut files = self.files.len();
+        let mut size_bytes: u64 = self.files.values().map(|(size, _)| *size).sum();
+        let mut estimated_tokens: u64 = self.files.values().map(|(_, tokens)| *tokens).sum();
+        for child in self.dirs.values() {
+            let (child_files, child_size, child_tokens) = child.totals();
+            files += child_files;
+            size_bytes += child_size;
+            estimated_tokens += child_tokens;
+        }
+        (files, size_bytes, estimated_tokens)
+    }
+}
+
+/// Joins one path segment onto the logical prefix of its parent.
+fn join_cache_path(prefix: &str, label: &str) -> String {
+    if prefix.is_empty() {
+        label.to_string()
+    } else {
+        format!("{prefix}/{label}")
+    }
+}
+
+/// Flattens one directory into rows, respecting the folded prefixes.
+fn flatten_cache_dir(
+    dir: &CacheDir,
+    depth: usize,
+    prefix: &str,
+    collapsed: &std::collections::HashSet<String>,
+    rows: &mut Vec<CacheTreeRow>,
+) {
+    for (label, child) in &dir.dirs {
+        let path = join_cache_path(prefix, label);
+        let (files, size_bytes, estimated_tokens) = child.totals();
+        let folded = collapsed.contains(&path);
+        rows.push(CacheTreeRow {
+            depth,
+            label: label.clone(),
+            path: path.clone(),
+            kind: CacheTreeKind::Directory,
+            files,
+            size_bytes,
+            estimated_tokens,
+            collapsed: folded,
+        });
+        if !folded {
+            flatten_cache_dir(child, depth.saturating_add(1), &path, collapsed, rows);
+        }
+    }
+    for (label, (size_bytes, estimated_tokens)) in &dir.files {
+        rows.push(CacheTreeRow {
+            depth,
+            label: label.clone(),
+            path: join_cache_path(prefix, label),
+            kind: CacheTreeKind::Document,
+            files: 1,
+            size_bytes: *size_bytes,
+            estimated_tokens: *estimated_tokens,
+            collapsed: false,
+        });
+    }
+}
+
+/// Projects the flat cache inventory into the foldable rows of the browser.
+///
+/// Directories come before the documents they hold and every level is ordered
+/// alphabetically, so identical inventories always project into identical rows
+/// (c-outer-docs-cache-tui-browser).
+pub fn cache_tree_rows(
+    entries: &[OuterDocsCacheEntry],
+    collapsed: &std::collections::HashSet<String>,
+) -> Vec<CacheTreeRow> {
+    let mut root = CacheDir::default();
+    for entry in entries {
+        let segments: Vec<&str> = entry
+            .path
+            .split('/')
+            .filter(|segment| !segment.is_empty())
+            .collect();
+        root.insert(&segments, entry.size_bytes, entry.estimated_tokens);
+    }
+    let mut rows = Vec::new();
+    flatten_cache_dir(&root, 0, "", collapsed, &mut rows);
+    rows
+}
 /// Maximum number of concrete file rows the picker lists for one query.
 ///
 /// The cap keeps the popup compact: a wider match is narrowed by typing one more
@@ -389,6 +525,7 @@ fn candidate_scan_signature(query: &str, items: &[ContextItem], repo_revision: u
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashSet;
 
     fn item(path: &str, layer: ContextLayer) -> ContextItem {
         ContextItem {
@@ -621,5 +758,71 @@ mod tests {
             view.filtered_candidates.last(),
             Some(&ContextCandidate::File("src/main.rs".to_string()))
         );
+    }
+    fn cache_entry(path: &str, size_bytes: u64, estimated_tokens: u64) -> OuterDocsCacheEntry {
+        OuterDocsCacheEntry {
+            path: path.to_string(),
+            size_bytes,
+            estimated_tokens,
+        }
+    }
+
+    /// One directory row per identifier prefix, one row per document, with
+    /// directories first and every level alphabetical whatever order the
+    /// inventory arrives in (c-outer-docs-cache-tui-browser).
+    #[test]
+    fn cache_tree_projects_directories_before_their_documents() {
+        let entries = vec![
+            cache_entry("openrouter/tts", 2048, 512),
+            cache_entry("openrouter/chat-completion", 4096, 1024),
+            cache_entry("rust-book/ch04", 1024, 128),
+        ];
+
+        let rows = cache_tree_rows(&entries, &HashSet::new());
+
+        let labels: Vec<&str> = rows.iter().map(|row| row.label.as_str()).collect();
+        assert_eq!(
+            labels,
+            vec!["openrouter", "chat-completion", "tts", "rust-book", "ch04"]
+        );
+        assert_eq!(rows[0].kind, CacheTreeKind::Directory);
+        assert_eq!(rows[0].depth, 0);
+        assert_eq!(rows[0].files, 2);
+        assert_eq!(rows[0].estimated_tokens, 1536);
+        assert_eq!(rows[1].kind, CacheTreeKind::Document);
+        assert_eq!(rows[1].depth, 1);
+        assert_eq!(rows[1].path, "openrouter/chat-completion");
+    }
+
+    /// A folded directory hides its subtree while keeping its own aggregate
+    /// row, so a collapsed identifier still states what it covers.
+    #[test]
+    fn cache_tree_folds_the_prefix_it_was_given() {
+        let entries = vec![
+            cache_entry("openrouter/tts", 2048, 512),
+            cache_entry("openrouter/chat-completion", 4096, 1024),
+        ];
+        let mut collapsed = HashSet::new();
+        collapsed.insert("openrouter".to_string());
+
+        let rows = cache_tree_rows(&entries, &collapsed);
+
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].kind, CacheTreeKind::Directory);
+        assert!(rows[0].collapsed);
+        assert_eq!(rows[0].files, 2);
+        assert_eq!(rows[0].size_bytes, 6144);
+    }
+
+    /// A document directly under the cache root stays a document row instead of
+    /// being folded into a phantom directory.
+    #[test]
+    fn cache_tree_keeps_a_root_document_a_document() {
+        let rows = cache_tree_rows(&[cache_entry("index", 16, 4)], &HashSet::new());
+
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].kind, CacheTreeKind::Document);
+        assert_eq!(rows[0].depth, 0);
+        assert_eq!(rows[0].path, "index");
     }
 }

@@ -1,12 +1,11 @@
-//! Keyboard routing for the plan refinement form and its blocked modal.
+//! Keyboard routing for the two-phase plan-synthesis dialogs.
 //!
-//! The refinement dialog belongs to the model-list family, so its keyboard
-//! contract lives in the shared core at [`super::model_list`]: the embedded
-//! Architect ladder, the instructions editor, the action bar, the `Shift+Tab`
-//! spelling, and the bare-press guard of the letter accelerators are resolved
-//! once for every dialog of the family. This adapter keeps only what belongs to
-//! the refinement target itself — the take guard, the dialog geometry, the
-//! hoisted clipboard read, and the launch it dispatches.
+//! The plan refinement form and the plan creation form stack the same sections
+//! — the Planner ladder, the Critic ladder with its disable switch, the
+//! instructions editor, and the action bar — so their keyboard contract lives
+//! in the shared core at [`super::plan_form`]. This adapter keeps only what
+//! belongs to the refinement target itself: the take guard, the dialog
+//! geometry, the hoisted clipboard read, and the launch it dispatches.
 
 use std::sync::Arc;
 
@@ -18,64 +17,66 @@ use crate::app::{AppState, ConfirmDialogButton};
 use crate::input::InputResult;
 use crate::rpc::RpcConnection;
 
-use super::model_list::{handle_dialog_key, hoisted_editor_yank, ModelListKeyOutcome};
+use super::plan_form::{handle_plan_form_key, hoisted_plan_form_yank, PlanFormKeyOutcome};
 
-/// Routes key events for the plan refine dialog: the embedded Architect model
-/// list, the instructions editor, and the confirm/cancel button pair. Focus
-/// cycles through the three sections in visual order with `Tab` / `Shift+Tab`;
-/// the model list owns bare digits and arrows, while the editor keeps text entry
-/// and the `Alt+1..9` / `C-M` selection chords (c-embedded-model-list,
-/// c-magit-key-navigation, c-unified-dialog-integration).
+/// Routes key events for the plan refinement form.
 pub(super) async fn handle_refine_dialog(
     key: KeyEvent,
     state: &Arc<Mutex<AppState>>,
     mut st: MutexGuard<'_, AppState>,
     server_writer: &mut RpcConnection,
 ) -> anyhow::Result<Option<InputResult>> {
-    let mut dialog = match st.plans_view.refine_dialog.take() {
-        Some(d) => d,
+    let mut dialog = match st.modals.refine_dialog.take() {
+        Some(dialog) => dialog,
         None => return Ok(None),
     };
 
-    let visible_rows =
-        crate::dialogs::render::refine_dialog_geometry(st.last_frame_area, dialog.selector.len())
-            .model_rows
-            .height as usize;
+    let geometry = crate::dialogs::render::refine_dialog_geometry(
+        st.last_frame_area,
+        dialog.planner.len(),
+        dialog.critic.len(),
+    );
 
-    match handle_dialog_key(&mut dialog, key, &st.tui_config.input, visible_rows) {
-        ModelListKeyOutcome::Submit => {
+    match handle_plan_form_key(
+        &mut dialog,
+        key,
+        &st.tui_config.input,
+        geometry.planner_rows.height as usize,
+        geometry.critic_rows.height as usize,
+    ) {
+        PlanFormKeyOutcome::Submit => {
             return submit_refine_dialog(state, st, dialog, server_writer).await;
         }
         // The paste buffer is a native round trip bounded at
         // NATIVE_CLIPBOARD_TIMEOUT, so the shared helper releases the state
         // guard around it and applies the answer after the re-lock (c-1).
-        ModelListKeyOutcome::Yank => {
-            hoisted_editor_yank(
+        PlanFormKeyOutcome::Yank => {
+            hoisted_plan_form_yank(
                 state,
                 st,
                 dialog,
-                |st, dialog| st.plans_view.refine_dialog = Some(dialog),
-                |st| st.plans_view.refine_dialog.take(),
+                |st, dialog| st.modals.refine_dialog = Some(dialog),
+                |st| st.modals.refine_dialog.take(),
             )
             .await;
         }
         // Safe cancellation returns the shared button to its default and drops
         // the dialog without a request.
-        ModelListKeyOutcome::Dismiss => {
-            st.confirm_button = ConfirmDialogButton::Cancel;
+        PlanFormKeyOutcome::Dismiss => {
+            st.modals.confirm_button = ConfirmDialogButton::Cancel;
         }
-        ModelListKeyOutcome::Consumed => {
-            st.plans_view.refine_dialog = Some(dialog);
+        PlanFormKeyOutcome::Consumed => {
+            st.modals.refine_dialog = Some(dialog);
         }
     }
     Ok(Some(InputResult::Continue))
 }
 
-/// Validates and submits the plan refinement request. Shared by the keyboard
-/// handler and the mouse `Start Refinement` button so the ordering stays
-/// consistent: resolve the optional instructions and the selected architect,
-/// flag the plan as refining, then hand the turn to the REPL view. If the
-/// model is already busy the dialog simply stays open.
+/// Validates and submits the directed plan modification request. Shared by the
+/// keyboard handler and the mouse `Start Refinement` button so the ordering
+/// stays consistent: resolve the optional instructions, the selected Planner,
+/// and the selected Critic, flag the plan as refining, then hand the turn to
+/// the REPL view. If the model is already busy the dialog simply stays open.
 ///
 /// The optimistic transition is applied through `start_turn`, so a failed
 /// request rolls the refining flag, the view mode, and the turn state back
@@ -89,7 +90,7 @@ pub(crate) async fn submit_refine_dialog(
 ) -> anyhow::Result<Option<InputResult>> {
     if st.model.is_busy() || st.review.running || st.plans_view.refining {
         st.notify_warning(crate::i18n::active_t("notify.model_busy"));
-        st.plans_view.refine_dialog = Some(dialog);
+        st.modals.refine_dialog = Some(dialog);
         return Ok(Some(InputResult::Continue));
     }
 
@@ -99,21 +100,36 @@ pub(crate) async fn submit_refine_dialog(
     } else {
         Some(instructions_raw)
     };
-    // The selected architect rung travels whole: the model together with the
-    // reasoning depth it was configured with, so the architect the developer
-    // picked is the architect that runs.
-    let selected_model =
+    // The selected Planner and Critic rungs travel whole: the model together
+    // with the reasoning depth it was configured with, so the architects the
+    // developer picked are the architects that run. A skipped critique phase
+    // sends no critic at all (c-typed-plan-mutation-dialog).
+    let selected_planner =
         dialog
-            .selector
+            .planner
             .selected_entry()
             .map(|entry| tauqe_protocol::ModelSelection::Tier {
                 model: entry.model.clone(),
                 effort: entry.effort,
             });
+    let skip_critique = dialog.skip_critique;
+    let selected_critic = if skip_critique {
+        None
+    } else {
+        dialog
+            .critic
+            .selected_entry()
+            .map(|entry| tauqe_protocol::ModelSelection::Tier {
+                model: entry.model.clone(),
+                effort: entry.effort,
+            })
+    };
 
     let params = tauqe_protocol::PlanRefineParams {
         plan_id: dialog.plan_id.clone(),
-        model: selected_model,
+        model: selected_planner,
+        critic_model: selected_critic,
+        skip_critique,
         instructions,
     };
     let params = serde_json::to_value(params)?;
@@ -145,14 +161,14 @@ pub(super) async fn handle_refine_blocked(
     mut st: MutexGuard<'_, AppState>,
     server_writer: &mut RpcConnection,
 ) -> anyhow::Result<Option<InputResult>> {
-    let blocked = match st.plans_view.refine_blocked.take() {
+    let blocked = match st.modals.refine_blocked.take() {
         Some(b) => b,
         None => return Ok(None),
     };
 
     match super::resolve_confirm(&mut st, key) {
-        super::ConfirmOutcome::Toggled => {
-            st.plans_view.refine_blocked = Some(blocked);
+        super::ConfirmOutcome::Toggled | super::ConfirmOutcome::Ignored => {
+            st.modals.refine_blocked = Some(blocked);
         }
         super::ConfirmOutcome::Dismissed => {}
         super::ConfirmOutcome::Accepted => {
@@ -183,7 +199,7 @@ pub(crate) async fn submit_refine_blocked(
 ) -> anyhow::Result<()> {
     if st.model.is_busy() || st.review.running || st.plans_view.refining {
         st.notify_warning(crate::i18n::active_t("notify.model_busy"));
-        st.plans_view.refine_blocked = Some(blocked);
+        st.modals.refine_blocked = Some(blocked);
         return Ok(());
     }
 
@@ -194,6 +210,8 @@ pub(crate) async fn submit_refine_blocked(
     let params = tauqe_protocol::PlanRefineParams {
         plan_id: blocked.plan_id.clone(),
         model: None,
+        critic_model: None,
+        skip_critique: false,
         instructions,
     };
     let params = serde_json::to_value(params)?;
@@ -221,8 +239,7 @@ mod tests {
 
     use crate::app::{test_state, AppState, ConfirmDialogButton, ViewMode};
     use crate::rpc::RpcConnection;
-    use crate::views::plans::{PlanRefineBlockedState, PlanRefineDialogState, RefineDialogFocus};
-
+    use crate::views::plans::{PlanFormFocus, PlanRefineBlockedState, PlanRefineDialogState};
     fn blocked_state() -> AppState {
         let mut st = test_state();
         st.plans_view.plans = vec![tauqe_protocol::Plan::from_parts(
@@ -234,7 +251,7 @@ mod tests {
             vec![],
             vec![],
         )];
-        st.plans_view.refine_blocked = Some(PlanRefineBlockedState {
+        st.modals.refine_blocked = Some(PlanRefineBlockedState {
             plan_id: "plan-1".to_string(),
             plan_title: "Test Plan".to_string(),
             reason: "Blocking contradiction".to_string(),
@@ -262,10 +279,10 @@ mod tests {
 
         let guard = state.lock().await;
         assert!(
-            guard.plans_view.refine_blocked.is_some(),
+            guard.modals.refine_blocked.is_some(),
             "the dialog must stay open while the focus moves"
         );
-        assert_eq!(guard.confirm_button, ConfirmDialogButton::Confirm);
+        assert_eq!(guard.modals.confirm_button, ConfirmDialogButton::Confirm);
     }
 
     #[tokio::test]
@@ -278,7 +295,7 @@ mod tests {
         press(&state, &mut conn, KeyCode::Enter).await;
 
         let guard = state.lock().await;
-        assert!(guard.plans_view.refine_blocked.is_none());
+        assert!(guard.modals.refine_blocked.is_none());
         assert!(guard.plans_view.refining);
         assert_eq!(guard.plans_view.refining_plan_id.as_deref(), Some("plan-1"));
         assert_eq!(guard.view_mode, ViewMode::Repl);
@@ -292,7 +309,7 @@ mod tests {
         press(&accept, &mut conn_accept, KeyCode::Char('y')).await;
         let guard = accept.lock().await;
         assert!(guard.plans_view.refining);
-        assert!(guard.plans_view.refine_blocked.is_none());
+        assert!(guard.modals.refine_blocked.is_none());
 
         // `n` dismisses without replanning.
         let dismiss = Arc::new(Mutex::new(blocked_state()));
@@ -300,7 +317,7 @@ mod tests {
         press(&dismiss, &mut conn_dismiss, KeyCode::Char('n')).await;
         let guard = dismiss.lock().await;
         assert!(!guard.plans_view.refining);
-        assert!(guard.plans_view.refine_blocked.is_none());
+        assert!(guard.modals.refine_blocked.is_none());
     }
 
     #[tokio::test]
@@ -313,7 +330,7 @@ mod tests {
 
         let guard = state.lock().await;
         assert!(!guard.plans_view.refining);
-        assert!(guard.plans_view.refine_blocked.is_none());
+        assert!(guard.modals.refine_blocked.is_none());
     }
 
     #[tokio::test]
@@ -326,7 +343,7 @@ mod tests {
         press(&state, &mut conn, KeyCode::Char('y')).await;
 
         let guard = state.lock().await;
-        assert!(guard.plans_view.refine_blocked.is_some());
+        assert!(guard.modals.refine_blocked.is_some());
         assert_eq!(
             guard.active_notification().map(|n| n.text.as_str()),
             Some("Model is currently busy; wait for operation to finish")
@@ -341,7 +358,7 @@ mod tests {
     fn refine_state() -> AppState {
         let mut st = test_state();
         st.view_mode = ViewMode::Plans;
-        st.plans_view.refine_dialog = Some(PlanRefineDialogState::new(
+        st.modals.refine_dialog = Some(PlanRefineDialogState::new(
             "plan-1".to_string(),
             "Plan One".to_string(),
             vec![architect("architect-a"), architect("architect-b")],
@@ -360,22 +377,22 @@ mod tests {
         state
             .lock()
             .await
-            .plans_view
+            .modals
             .refine_dialog
             .clone()
             .expect("dialog stays open")
     }
 
-    async fn set_focus(state: &Arc<Mutex<AppState>>, focus: RefineDialogFocus) {
+    async fn set_focus(state: &Arc<Mutex<AppState>>, focus: PlanFormFocus) {
         let mut guard = state.lock().await;
-        if let Some(dialog) = guard.plans_view.refine_dialog.as_mut() {
+        if let Some(dialog) = guard.modals.refine_dialog.as_mut() {
             dialog.focus = focus;
         }
     }
 
     async fn set_confirm_button(state: &Arc<Mutex<AppState>>, button: ConfirmDialogButton) {
         let mut guard = state.lock().await;
-        if let Some(dialog) = guard.plans_view.refine_dialog.as_mut() {
+        if let Some(dialog) = guard.modals.refine_dialog.as_mut() {
             dialog.confirm_button = button;
         }
     }
@@ -389,11 +406,11 @@ mod tests {
         {
             let mut guard = state.lock().await;
             let dialog = guard
-                .plans_view
+                .modals
                 .refine_dialog
                 .as_mut()
                 .expect("dialog must be open");
-            assert_eq!(dialog.focus, RefineDialogFocus::InstructionsEditor);
+            assert_eq!(dialog.focus, PlanFormFocus::InstructionsEditor);
             dialog
                 .instructions_editor
                 .insert_str("split the first step");
@@ -412,7 +429,7 @@ mod tests {
         assert!(payload.contains("split the first step"), "{payload}");
 
         let guard = state.lock().await;
-        assert!(guard.plans_view.refine_dialog.is_none());
+        assert!(guard.modals.refine_dialog.is_none());
         assert!(guard.plans_view.refining);
         assert_eq!(guard.plans_view.refining_plan_id.as_deref(), Some("plan-1"));
         assert_eq!(guard.view_mode, ViewMode::Repl);
@@ -424,7 +441,7 @@ mod tests {
     async fn y_confirms_from_the_actions_and_n_cancels() {
         let confirm = Arc::new(Mutex::new(refine_state()));
         let mut confirm_conn = RpcConnection::new(Vec::<u8>::new());
-        set_focus(&confirm, RefineDialogFocus::Actions).await;
+        set_focus(&confirm, PlanFormFocus::Actions).await;
         press_dialog(
             &confirm,
             &mut confirm_conn,
@@ -434,13 +451,13 @@ mod tests {
         let payload = String::from_utf8(confirm_conn.written().to_vec()).expect("utf-8 payload");
         assert!(payload.contains("plan/refine"), "{payload}");
         let guard = confirm.lock().await;
-        assert!(guard.plans_view.refine_dialog.is_none());
+        assert!(guard.modals.refine_dialog.is_none());
         assert!(guard.plans_view.refining);
         drop(guard);
 
         let cancel = Arc::new(Mutex::new(refine_state()));
         let mut cancel_conn = RpcConnection::new(Vec::<u8>::new());
-        set_focus(&cancel, RefineDialogFocus::Actions).await;
+        set_focus(&cancel, PlanFormFocus::Actions).await;
         press_dialog(
             &cancel,
             &mut cancel_conn,
@@ -448,7 +465,7 @@ mod tests {
         )
         .await;
         let guard = cancel.lock().await;
-        assert!(guard.plans_view.refine_dialog.is_none());
+        assert!(guard.modals.refine_dialog.is_none());
         assert!(!guard.plans_view.refining);
         assert_eq!(guard.view_mode, ViewMode::Plans);
         drop(guard);
@@ -461,7 +478,7 @@ mod tests {
     async fn esc_dismisses_and_resets_the_shared_confirm_button() {
         let state = Arc::new(Mutex::new(refine_state()));
         let mut conn = RpcConnection::new(Vec::<u8>::new());
-        set_focus(&state, RefineDialogFocus::Actions).await;
+        set_focus(&state, PlanFormFocus::Actions).await;
         set_confirm_button(&state, ConfirmDialogButton::Confirm).await;
 
         press_dialog(
@@ -472,8 +489,8 @@ mod tests {
         .await;
 
         let guard = state.lock().await;
-        assert!(guard.plans_view.refine_dialog.is_none());
-        assert_eq!(guard.confirm_button, ConfirmDialogButton::Cancel);
+        assert!(guard.modals.refine_dialog.is_none());
+        assert_eq!(guard.modals.confirm_button, ConfirmDialogButton::Cancel);
         assert!(!guard.plans_view.refining);
         drop(guard);
         assert!(conn.written().is_empty());
@@ -487,7 +504,7 @@ mod tests {
     async fn ctrl_y_from_the_actions_writes_no_request_and_keeps_the_dialog() {
         let state = Arc::new(Mutex::new(refine_state()));
         let mut conn = RpcConnection::new(Vec::<u8>::new());
-        set_focus(&state, RefineDialogFocus::Actions).await;
+        set_focus(&state, PlanFormFocus::Actions).await;
 
         press_dialog(
             &state,
@@ -501,7 +518,7 @@ mod tests {
             "a command chord must never start a refinement"
         );
         let open = open_dialog(&state).await;
-        assert_eq!(open.focus, RefineDialogFocus::Actions);
+        assert_eq!(open.focus, PlanFormFocus::Actions);
         let guard = state.lock().await;
         assert!(!guard.plans_view.refining);
         assert_eq!(guard.view_mode, ViewMode::Plans);
@@ -514,7 +531,7 @@ mod tests {
         for character in ['q', 'n'] {
             let state = Arc::new(Mutex::new(refine_state()));
             let mut conn = RpcConnection::new(Vec::<u8>::new());
-            set_focus(&state, RefineDialogFocus::Actions).await;
+            set_focus(&state, PlanFormFocus::Actions).await;
 
             press_dialog(
                 &state,
@@ -524,7 +541,7 @@ mod tests {
             .await;
 
             assert!(
-                state.lock().await.plans_view.refine_dialog.is_some(),
+                state.lock().await.modals.refine_dialog.is_some(),
                 "Ctrl+{character} must not dismiss the dialog"
             );
             assert!(conn.written().is_empty());
@@ -538,7 +555,7 @@ mod tests {
     async fn tab_with_shift_cycles_focus_backward() {
         let state = Arc::new(Mutex::new(refine_state()));
         let mut conn = RpcConnection::new(Vec::<u8>::new());
-        set_focus(&state, RefineDialogFocus::InstructionsEditor).await;
+        set_focus(&state, PlanFormFocus::InstructionsEditor).await;
 
         press_dialog(
             &state,
@@ -548,7 +565,7 @@ mod tests {
         .await;
 
         let open = open_dialog(&state).await;
-        assert_eq!(open.focus, RefineDialogFocus::ModelList);
+        assert_eq!(open.focus, PlanFormFocus::CriticList);
         assert!(conn.written().is_empty());
     }
 
@@ -570,7 +587,7 @@ mod tests {
 
         let open = open_dialog(&state).await;
         assert_eq!(open.instructions_editor.get_text(), "qny");
-        assert_eq!(open.focus, RefineDialogFocus::InstructionsEditor);
+        assert_eq!(open.focus, PlanFormFocus::InstructionsEditor);
         assert!(conn.written().is_empty());
     }
 
@@ -581,7 +598,7 @@ mod tests {
         let state = Arc::new(Mutex::new(refine_state()));
         let mut conn = RpcConnection::new(Vec::<u8>::new());
 
-        set_focus(&state, RefineDialogFocus::ModelList).await;
+        set_focus(&state, PlanFormFocus::PlannerList).await;
         press_dialog(
             &state,
             &mut conn,
@@ -589,10 +606,10 @@ mod tests {
         )
         .await;
         let selected = open_dialog(&state).await;
-        assert_eq!(selected.selector.selected_index(), 1);
+        assert_eq!(selected.planner.selected_index(), 1);
         assert!(selected.instructions_editor.is_empty());
 
-        set_focus(&state, RefineDialogFocus::InstructionsEditor).await;
+        set_focus(&state, PlanFormFocus::InstructionsEditor).await;
         press_dialog(
             &state,
             &mut conn,
@@ -602,7 +619,7 @@ mod tests {
         let typed = open_dialog(&state).await;
         assert_eq!(typed.instructions_editor.get_text(), "2");
         assert_eq!(
-            typed.selector.selected_index(),
+            typed.planner.selected_index(),
             1,
             "typing a digit must not switch the architect"
         );
@@ -618,7 +635,7 @@ mod tests {
         let mut conn = RpcConnection::new(Vec::<u8>::new());
         let compose = KeyModifiers::CONTROL | KeyModifiers::ALT;
 
-        set_focus(&state, RefineDialogFocus::ModelList).await;
+        set_focus(&state, PlanFormFocus::PlannerList).await;
         press_dialog(
             &state,
             &mut conn,
@@ -626,12 +643,12 @@ mod tests {
         )
         .await;
         assert_eq!(
-            open_dialog(&state).await.selector.selected_index(),
+            open_dialog(&state).await.planner.selected_index(),
             0,
             "a composed digit must not select an Architect"
         );
 
-        set_focus(&state, RefineDialogFocus::Actions).await;
+        set_focus(&state, PlanFormFocus::Actions).await;
         for code in [
             KeyCode::Char('y'),
             KeyCode::Char('n'),
@@ -642,9 +659,86 @@ mod tests {
         }
 
         let open = open_dialog(&state).await;
-        assert_eq!(open.focus, RefineDialogFocus::Actions);
+        assert_eq!(open.focus, PlanFormFocus::Actions);
         assert_eq!(open.confirm_button, ConfirmDialogButton::Cancel);
         assert!(!state.lock().await.plans_view.refining);
+        assert!(conn.written().is_empty());
+    }
+    /// The selected Planner and Critic travel on the wire with the skip flag,
+    /// so the refinement dialog configures both phases of the synthesis
+    /// (c-typed-plan-mutation-dialog).
+    #[tokio::test]
+    async fn ctrl_enter_sends_the_planner_critic_and_skip_flag() {
+        let state = Arc::new(Mutex::new(refine_state()));
+        let mut conn = RpcConnection::new(Vec::<u8>::new());
+        {
+            let mut guard = state.lock().await;
+            let dialog = guard.modals.refine_dialog.as_mut().expect("dialog");
+            dialog.planner.select_index(1);
+            dialog.critic.select_index(1);
+        }
+
+        press_dialog(
+            &state,
+            &mut conn,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::CONTROL),
+        )
+        .await;
+
+        let payload = String::from_utf8(conn.written().to_vec()).expect("utf-8 payload");
+        assert!(payload.contains("plan/refine"), "{payload}");
+        assert!(payload.contains("architect-b"), "{payload}");
+        assert!(payload.contains("\"skip_critique\":false"), "{payload}");
+    }
+
+    /// Disabling the critique phase drops the critic selection from the request
+    /// instead of sending a contradictory pair (c-typed-plan-mutation-dialog).
+    #[tokio::test]
+    async fn skipping_the_critique_sends_no_critic_model() {
+        let state = Arc::new(Mutex::new(refine_state()));
+        let mut conn = RpcConnection::new(Vec::<u8>::new());
+        {
+            let mut guard = state.lock().await;
+            let dialog = guard.modals.refine_dialog.as_mut().expect("dialog");
+            dialog.skip_critique = true;
+        }
+
+        press_dialog(
+            &state,
+            &mut conn,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::CONTROL),
+        )
+        .await;
+
+        let payload = String::from_utf8(conn.written().to_vec()).expect("utf-8 payload");
+        assert!(payload.contains("plan/refine"), "{payload}");
+        assert!(payload.contains("\"skip_critique\":true"), "{payload}");
+        assert!(!payload.contains("critic_model"), "{payload}");
+    }
+
+    /// The critic ladder is a first-class section: a bare digit selects its rung
+    /// while it owns the keyboard, and Space toggles the independent audit
+    /// phase instead of launching the turn (Conventions §5, §6).
+    #[tokio::test]
+    async fn critic_section_selects_and_toggles_the_critique() {
+        let state = Arc::new(Mutex::new(refine_state()));
+        let mut conn = RpcConnection::new(Vec::<u8>::new());
+        set_focus(&state, PlanFormFocus::CriticList).await;
+
+        press_dialog(&state, &mut conn, key(KeyCode::Char('2'))).await;
+        let selected = open_dialog(&state).await;
+        assert_eq!(selected.critic.selected_index(), 1);
+        assert!(!selected.skip_critique);
+
+        press_dialog(
+            &state,
+            &mut conn,
+            KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE),
+        )
+        .await;
+        let toggled = open_dialog(&state).await;
+        assert!(toggled.skip_critique);
+        assert_eq!(toggled.critic.selected_index(), 1);
         assert!(conn.written().is_empty());
     }
 }

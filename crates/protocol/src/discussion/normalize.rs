@@ -2,15 +2,16 @@
 //!
 //! Every wire boundary applies the same rules: a request whose path cannot
 //! identify a location inside the repository is dropped instead of being
-//! forwarded to the engine. `context_requests`, `repo_maps`, `dir_lists`, and
-//! `repo_searches` therefore all decode through the shared normalizers of this
-//! module rather than through per-field logic of their own.
+//! forwarded to the engine. `context_requests`, `context_drops`, `repo_maps`,
+//! `dir_lists`, and `repo_searches` therefore all decode through the shared
+//! normalizers of this module rather than through per-field logic of their own.
 
 use serde::Deserialize;
 
 use crate::context::ContextAccess;
 use crate::discussion::{DirListRequest, DiscussionContextRequest, RepoSearchRequest};
 use crate::edit::normalize_repo_path;
+use crate::edit::proposal::strip_surrounding_markup;
 
 pub(crate) fn deserialize_null_as_default<'de, D, T>(deserializer: D) -> Result<T, D::Error>
 where
@@ -36,13 +37,17 @@ pub fn normalize_repo_map_path(raw: &str) -> Option<String> {
 
 /// Normalizes a repository-path request, keeping the rejection diagnostic.
 ///
+/// The surrounding markup is stripped by the shared rule before a
+/// whole-repository spelling is recognized, so a backticked `.` keeps naming
+/// the repository root exactly like its bare form.
+///
 /// A boundary that cannot drop a malformed entry decodes through this sibling
 /// instead of the dropping [`normalize_repo_map_path`]: a typed command field
 /// has no representation for "absent", so a rejected path must surface as a
 /// decode failure. Both apply the very same rules and differ only in how they
 /// report a rejection.
 fn normalize_repo_map_path_checked(raw: &str) -> Result<String, String> {
-    let trimmed = raw.trim().trim_matches('`').trim();
+    let trimmed = strip_surrounding_markup(raw);
     if trimmed.is_empty() || trimmed == "." || trimmed == "./" {
         return Ok(String::new());
     }
@@ -151,6 +156,29 @@ where
 {
     let opt = Option::<ContextAccess>::deserialize(deserializer)?;
     Ok(opt.unwrap_or(ContextAccess::ReadOnly))
+}
+
+/// Deserializes a null-tolerant list of repository-relative file paths.
+///
+/// One rule serves every list of repository files that tolerates an explicit
+/// `null`: a `null` payload yields an empty list, and every entry is normalized
+/// and validated through [`normalize_repo_path`], so a list decoded with this
+/// adapter can no longer carry an unvalidated or escaping path. An entry that
+/// cannot identify a repository file (empty, `.`, absolute, a drive path, a
+/// `..` traversal component, or a NUL byte) is dropped instead of being
+/// forwarded, while the usable entries keep their order and their duplicates.
+/// The `context_drops` field of the model-facing result proposal decodes through
+/// this adapter.
+pub(crate) fn deserialize_repo_path_list<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let paths = Option::<Vec<String>>::deserialize(deserializer)?;
+    Ok(paths
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|path| normalize_repo_path(&path).ok())
+        .collect())
 }
 
 #[cfg(test)]
@@ -315,5 +343,77 @@ mod tests {
         .unwrap();
         let decoded: DiscussionResponse = serde_json::from_str(&encoded).unwrap();
         assert_eq!(decoded.repo_searches, vec![valid]);
+    }
+
+    #[test]
+    fn test_repo_path_list_adapter_normalizes_and_drops_unusable_entries() {
+        #[derive(serde::Deserialize)]
+        struct Payload {
+            #[serde(default, deserialize_with = "deserialize_repo_path_list")]
+            paths: Vec<String>,
+        }
+
+        let payload: Payload = serde_json::from_str(
+            r#"{
+                "paths": [
+                    "./src/a.rs",
+                    "src\\b.rs",
+                    "crates/core/",
+                    "`src/c.rs`",
+                    "./src/a.rs",
+                    "",
+                    ".",
+                    "/etc/passwd",
+                    "../escape.rs",
+                    "a/../b.rs"
+                ]
+            }"#,
+        )
+        .unwrap();
+        // Benign spellings arrive clean and in order, a duplicate stays a
+        // duplicate, and every entry that cannot identify a repository file is
+        // dropped instead of being forwarded to the engine.
+        assert_eq!(
+            payload.paths,
+            vec![
+                "src/a.rs".to_string(),
+                "src/b.rs".to_string(),
+                "crates/core".to_string(),
+                "src/c.rs".to_string(),
+                "src/a.rs".to_string(),
+            ]
+        );
+
+        // A JSON null decodes to an empty list and an absent field keeps the
+        // empty default, exactly like the sibling null-tolerant adapters.
+        let null: Payload = serde_json::from_str(r#"{"paths": null}"#).unwrap();
+        assert!(null.paths.is_empty());
+        let absent: Payload = serde_json::from_str("{}").unwrap();
+        assert!(absent.paths.is_empty());
+
+        // The list shape is still enforced, so a scalar stays a decode error.
+        let scalar = serde_json::from_str::<Payload>(r#"{"paths": "src/a.rs"}"#);
+        assert!(scalar.is_err());
+    }
+
+    #[test]
+    fn test_normalize_repo_map_path_strips_surrounding_backticks() {
+        // The whole-repository spellings keep naming the repository root when
+        // a producer wraps them in markdown backticks.
+        assert_eq!(normalize_repo_map_path("` . `"), Some(String::new()));
+        assert_eq!(normalize_repo_map_path("`./`"), Some(String::new()));
+        assert_eq!(normalize_repo_map_path(" `` "), Some(String::new()));
+        assert_eq!(
+            normalize_repo_map_path("`./crates/core/`"),
+            Some("crates/core".to_string())
+        );
+
+        // An interior backtick stays untouched, and a wrapped escaping
+        // spelling is dropped exactly like its bare form.
+        assert_eq!(
+            normalize_repo_map_path("src/`odd`/a.rs"),
+            Some("src/`odd`/a.rs".to_string())
+        );
+        assert_eq!(normalize_repo_map_path("`../escape`"), None);
     }
 }

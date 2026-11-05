@@ -241,6 +241,38 @@ impl ModelsConfig {
             .find(|entry| &entry.model == model)
     }
 
+    /// Returns the configured entry a model selection names.
+    ///
+    /// The lookup mirrors [`ModelsConfig::resolve_selection_effort`] exactly, so
+    /// the reasoning depth and the generation budget of one selection always
+    /// come from the same record. The full role catalog is consulted, never the
+    /// escalation ladder: a model the role excludes from automatic escalation
+    /// still has a configured entry, and reading it is what keeps a manual run
+    /// inside the budget its declaration grants.
+    fn selection_entry(&self, role: ModelRole, selection: &ModelSelection) -> Option<&ModelEntry> {
+        match selection {
+            ModelSelection::Role(selected) => self.base_entry(*selected),
+            ModelSelection::Specific(model) => self.entry_for_model(role, model).or_else(|| {
+                if role != ModelRole::Primary {
+                    self.entry_for_model(ModelRole::Primary, model)
+                } else {
+                    None
+                }
+            }),
+            // A tier names one exact role-list coordinate, so the entry is
+            // matched by the whole pair first and by the model alone after
+            // that. A depth the role list does not configure therefore still
+            // reaches the budget of its own model.
+            ModelSelection::Tier { model, effort } => {
+                let entries = self.role_slice(role)?;
+                entries
+                    .iter()
+                    .find(|entry| &entry.model == model && entry.effort == *effort)
+                    .or_else(|| entries.iter().find(|entry| &entry.model == model))
+            }
+        }
+    }
+
     /// Reports whether the role excludes `model` from automatic escalation.
     ///
     /// A model declared with `level_up = false` stays in the role catalog
@@ -324,21 +356,79 @@ impl ModelsConfig {
         selection: &ModelSelection,
     ) -> Option<ReasoningEffort> {
         match selection {
-            ModelSelection::Role(r) => self.resolve_effort(*r),
-            ModelSelection::Specific(model) => self
-                .entry_for_model(role, model)
-                .or_else(|| {
-                    if role != ModelRole::Primary {
-                        self.entry_for_model(ModelRole::Primary, model)
-                    } else {
-                        None
-                    }
-                })
-                .and_then(|entry| entry.effort),
             // A tier names the exact role-list entry the developer picked, so
             // its reasoning depth travels inside the DTO and is never
             // re-derived by matching the model against the configured entries.
             ModelSelection::Tier { effort, .. } => *effort,
+            _ => self
+                .selection_entry(role, selection)
+                .and_then(|entry| entry.effort),
+        }
+    }
+
+    /// Returns the runtime parameters a selection inherits from its entry.
+    ///
+    /// Only the parameters the entry itself declares are inherited: an absent
+    /// budget or marker stays absent, so the adaptive default of the rung that
+    /// carries the selection resolves it exactly once.
+    fn selection_parameters(
+        &self,
+        role: ModelRole,
+        selection: &ModelSelection,
+    ) -> (Option<u32>, Option<bool>) {
+        match self.selection_entry(role, selection) {
+            Some(entry) => (entry.attempts, entry.level_up),
+            None => (None, None),
+        }
+    }
+
+    /// Resolves the generation-attempt budget a model selection runs within.
+    ///
+    /// The budget is read from the configured entry of `role` rather than from
+    /// the escalation ladder. A model the role excludes from automatic
+    /// escalation (`level_up = false`) occupies no ladder position at all, so a
+    /// manual run on it would otherwise borrow the budget of an unrelated rung:
+    /// reading the full role catalog keeps it inside the single attempt it is
+    /// granted, and keeps a participating model inside the budget its own rung
+    /// declares.
+    ///
+    /// A selection the role does not configure names no entry and keeps the
+    /// deterministic default of the role it runs in, so a model outside the
+    /// configuration never inherits a budget somebody else declared.
+    pub fn resolve_selection_attempts(&self, role: ModelRole, selection: &ModelSelection) -> u32 {
+        let (attempts, level_up) = self.selection_parameters(role, selection);
+        let model = self.resolve_model(selection);
+        let effort = self.resolve_selection_effort(role, selection);
+        // The rung of the selected role resolves the adaptive default, so an
+        // Architect round keeps the Architect budget instead of the coder one.
+        if role == ModelRole::Architect {
+            let mut tier = ArchitectTier::new(model, effort);
+            tier.attempts = attempts;
+            tier.level_up = level_up;
+            return tier.attempts();
+        }
+        let mut rung = ModelEntry::new(model, effort);
+        rung.attempts = attempts;
+        rung.level_up = level_up;
+        rung.attempts()
+    }
+
+    /// Resolves the Architect configuration a developer selection names.
+    ///
+    /// An explicit selection overrides the ladder, but it never discards the
+    /// runtime parameters the configuration declares for the chosen model: the
+    /// generation budget and the escalation opt-out travel with the tier, so a
+    /// manual selection runs within the rounds granted to it and a model the
+    /// developer reserved for manual runs stays saturated. A selection the
+    /// Architect role does not configure yields a plain tier, which keeps the
+    /// Architect default budget.
+    pub fn resolve_selection_architect_tier(&self, selection: &ModelSelection) -> ArchitectTier {
+        let (attempts, level_up) = self.selection_parameters(ModelRole::Architect, selection);
+        ArchitectTier {
+            model: self.resolve_model(selection),
+            effort: self.resolve_selection_effort(ModelRole::Architect, selection),
+            attempts,
+            level_up,
         }
     }
 

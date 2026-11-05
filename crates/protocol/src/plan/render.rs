@@ -68,7 +68,7 @@ impl Plan {
             write_concept(&self.concept, 0, &mut out);
         }
 
-        if !self.concept.is_empty() && !self.items.is_empty() {
+        if !self.concept.is_empty() && !self.implementation.items.is_empty() {
             out.push_str("\n## Implementation\n");
         }
         out.push('\n');
@@ -127,7 +127,7 @@ impl Plan {
             }
         }
 
-        write_items(&self.items, 0, &mut out);
+        write_items(&self.implementation.items, 0, &mut out);
         out
     }
 }

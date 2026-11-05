@@ -2,8 +2,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::command::DocTopic;
 use crate::discussion::{
-    deserialize_null_as_default, deserialize_repo_search_requests, DiscussionContextRequest,
-    DiscussionRequest, RepoSearchRequest,
+    deserialize_null_as_default, deserialize_repo_path_list, deserialize_repo_search_requests,
+    DiscussionContextRequest, DiscussionRequest, RepoSearchRequest,
 };
 use crate::edit::{EditOperation, EditOutcome, StructuredChangeProposal};
 use crate::plan::PlanRejection;
@@ -339,6 +339,11 @@ pub struct ModelResultProposal {
     /// spelling an earlier revision emitted, so a stored transcript or a cached
     /// response keeps decoding identically. Serialization emits the canonical
     /// name alone, so the alias can never spread to a new response.
+    ///
+    /// A `null` element resolves to the tolerant `DocTopic::All` fallback
+    /// instead of rejecting the proposal, matching the missing and unknown
+    /// spellings, while an element of any other non-string shape still reports
+    /// the precise error it produced.
     #[serde(
         default,
         rename = "tauqe_doc_requests",
@@ -355,7 +360,17 @@ pub struct ModelResultProposal {
     pub blocked: Option<StructuredBlockedProposal>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub abort: Option<StructuredAbortProposal>,
-    #[serde(default, deserialize_with = "deserialize_null_as_default")]
+    /// Repository-relative context files the turn asks to drop.
+    ///
+    /// Each entry names a file of the assembled context, normalized and
+    /// validated at the wire boundary exactly like every sibling discovery
+    /// field: a benign spelling (`./src/a.rs`, backslash separators, a trailing
+    /// slash, or a backtick-wrapped path) is cleaned into the stored form, so it
+    /// still matches the context entry it names, while an entry that cannot
+    /// identify a repository file is dropped instead of being forwarded.
+    /// Duplicate entries are preserved. An absent or explicit `null` payload
+    /// decodes to an empty list.
+    #[serde(default, deserialize_with = "deserialize_repo_path_list")]
     pub context_drops: Vec<String>,
     #[serde(default, deserialize_with = "deserialize_null_as_default")]
     pub suggested_actions: Vec<String>,
@@ -869,6 +884,29 @@ mod tests {
         );
         assert!(!encoded.contains("\"doc_requests\""), "{encoded}");
     }
+
+    /// A `null` element of `tauqe_doc_requests` is a partial emission of one
+    /// topic, so it resolves to the tolerant fallback beside its siblings
+    /// instead of rejecting the whole proposal.
+    #[test]
+    fn test_model_result_proposal_tolerates_a_null_doc_topic() {
+        let raw = r#"{
+            "message": "Need the rest of the reference",
+            "changes": [],
+            "tauqe_doc_requests": ["git", null, "workflow"],
+            "scratchpad": "Checked the parser"
+        }"#;
+        let proposal: ModelResultProposal = serde_json::from_str(raw)
+            .expect("a null topic element must not reject the whole proposal");
+        assert_eq!(
+            proposal.doc_requests,
+            vec![DocTopic::Git, DocTopic::All, DocTopic::Workflow]
+        );
+        // The null element takes neither the message nor the scratchpad with it.
+        assert_eq!(proposal.message, "Need the rest of the reference");
+        assert_eq!(proposal.scratchpad.as_deref(), Some("Checked the parser"));
+    }
+
     #[test]
     fn test_model_result_proposal_blocked_and_null_tolerance() {
         let raw = r#"{
@@ -1230,6 +1268,62 @@ mod tests {
         let outcome = with_outcome.outcome.expect("outcome proposal");
         assert_eq!(outcome.status, "success");
         assert_eq!(outcome.commit_message.as_deref(), Some("All checks passed"));
+    }
+
+    /// `context_drops` obeys the same repository-path rules as every sibling
+    /// discovery field: a benign spelling is normalized into the stored form,
+    /// an escaping spelling is dropped instead of reaching the engine, and an
+    /// explicit `null` still decodes to an empty list.
+    #[test]
+    fn test_model_result_proposal_context_drops_normalize_paths() {
+        let raw = r#"{
+            "message": "Drop the research material",
+            "changes": [],
+            "context_drops": [
+                "./src/a.rs",
+                "src\\b.rs",
+                "crates/core/",
+                "`src/c.rs`",
+                "./src/a.rs",
+                "../escape.rs",
+                "/etc/passwd",
+                "",
+                ".",
+                "a/../b.rs"
+            ]
+        }"#;
+        let proposal: ModelResultProposal = serde_json::from_str(raw).unwrap();
+        // Benign spellings reach the engine clean and in the order the model
+        // declared them: `./` collapses, backslashes become separators, a
+        // trailing slash is dropped, a backtick-wrapped path is cleaned by the
+        // shared normalizer, and a repeated spelling stays a duplicate. The
+        // traversal, absolute, empty, and intermediate-`..` entries are dropped
+        // instead of being forwarded.
+        assert_eq!(
+            proposal.context_drops,
+            vec![
+                "src/a.rs".to_string(),
+                "src/b.rs".to_string(),
+                "crates/core".to_string(),
+                "src/c.rs".to_string(),
+                "src/a.rs".to_string(),
+            ]
+        );
+
+        // An explicit null still decodes to an empty list.
+        let null: ModelResultProposal =
+            serde_json::from_str(r#"{"message":"x","context_drops":null}"#).unwrap();
+        assert!(null.context_drops.is_empty());
+
+        // The serialized wire form of the field is unchanged: a plain list of
+        // the normalized strings that round-trips through the same adapter.
+        let json = serde_json::to_string(&proposal).unwrap();
+        assert!(json.contains("\"context_drops\":["), "{json}");
+        assert!(json.contains("\"src/a.rs\",\"src/b.rs\""), "{json}");
+        assert_eq!(
+            serde_json::from_str::<ModelResultProposal>(&json).unwrap(),
+            proposal
+        );
     }
     /// The terminal event carries the typed plan mutations beside the turn
     /// result: each refusal keeps the category its birthplace declared, an

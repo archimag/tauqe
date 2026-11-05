@@ -106,13 +106,13 @@ pub fn render_plans_view(
             .plans_view
             .plans
             .iter()
-            .map(|p| p.count_stats().0)
+            .map(|p| p.implementation.count_stats().0)
             .sum();
         let total_completed: usize = state
             .plans_view
             .plans
             .iter()
-            .map(|p| p.count_stats().1)
+            .map(|p| p.implementation.count_stats().1)
             .sum();
         status_spans.push(Span::styled(
             format!(

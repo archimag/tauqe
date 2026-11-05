@@ -128,7 +128,7 @@ pub async fn open_squash_dialog(
             st.notify_warning(active_t("notify.squash_busy"));
             return Ok(());
         }
-        st.squash_dialog = Some(SquashDialogState::default());
+        st.modals.squash_dialog = Some(SquashDialogState::default());
         GitSquashPreviewParams { base_ref: None }
     };
     send_request(
@@ -140,6 +140,27 @@ pub async fn open_squash_dialog(
     Ok(())
 }
 
+/// Opens the external documentation cache browser over RPC.
+pub async fn open_outer_docs_cache(
+    state: &Arc<Mutex<AppState>>,
+    server_writer: &mut RpcConnection,
+) -> anyhow::Result<()> {
+    {
+        let mut st = state.lock().await;
+        st.modals.outer_docs_cache = Some(crate::app::OuterDocsCacheDialogState {
+            loading: true,
+            ..Default::default()
+        });
+        st.modals.confirm_button = ConfirmDialogButton::Cancel;
+    }
+    send_request(
+        server_writer,
+        methods::OUTER_DOCS_CACHE_LIST,
+        serde_json::json!({}),
+    )
+    .await?;
+    Ok(())
+}
 /// Switches the active view and refreshes the data the target view renders.
 ///
 /// The switch is a presentation transition, so the state lock is held for the
@@ -154,7 +175,7 @@ pub async fn switch_view(
     {
         let mut st = state.lock().await;
         st.view_mode = target;
-        st.confirm_button = ConfirmDialogButton::Cancel;
+        st.modals.confirm_button = ConfirmDialogButton::Cancel;
     }
 
     match target {
@@ -194,7 +215,7 @@ pub fn handle_paste(st: &mut AppState, text: &str) {
     }
     match st.active_modal() {
         Some(ActiveModal::Squash) => {
-            if let Some(dialog) = st.squash_dialog.as_mut() {
+            if let Some(dialog) = st.modals.squash_dialog.as_mut() {
                 if dialog.custom_input_active {
                     dialog.custom_editor.insert_paste_single_line(text);
                 } else {
@@ -203,12 +224,12 @@ pub fn handle_paste(st: &mut AppState, text: &str) {
             }
         }
         Some(ActiveModal::Prompt) => {
-            if let Some(modal) = st.prompt_modal.as_mut() {
+            if let Some(modal) = st.modals.prompt_modal.as_mut() {
                 modal.prompt_editor.insert_paste(text);
             }
         }
         Some(ActiveModal::Review) => {
-            if let Some(dialog) = st.review_dialog.as_mut() {
+            if let Some(dialog) = st.modals.review_dialog.as_mut() {
                 if dialog.focus.is_path_editor() {
                     if let Some(editor) = dialog.active_path_editor_mut() {
                         editor.insert_paste_single_line(text);
@@ -220,11 +241,48 @@ pub fn handle_paste(st: &mut AppState, text: &str) {
             }
         }
         Some(ActiveModal::Locale) => {
-            if let Some(dialog) = st.locale_dialog.as_mut() {
+            if let Some(dialog) = st.modals.locale_dialog.as_mut() {
                 dialog.language_editor.insert_paste_single_line(text);
             }
         }
-        Some(_) => {}
+        // Every remaining surface owns no field the paste path feeds: its body
+        // is a list, a confirmation, or a read-only area, so the payload is
+        // dropped instead of being routed to a guessed field. The variants are
+        // enumerated one by one, so a surface added later must state whether a
+        // paste reaches it instead of inheriting a silent wildcard
+        // (Conventions §5.1, c-text-capture-boundary). The plan-refinement and
+        // review-execution forms do expose an instructions editor; this path
+        // feeds only the four dialogs above, and that split stays as it is.
+        Some(ActiveModal::ServerDisconnected)
+        | Some(ActiveModal::ReviewTruncation)
+        | Some(ActiveModal::ConfirmCancel)
+        | Some(ActiveModal::ConfirmQuit)
+        | Some(ActiveModal::BatchCancel)
+        | Some(ActiveModal::ClearAuto)
+        | Some(ActiveModal::ClearUser)
+        | Some(ActiveModal::RemoveContextFile)
+        | Some(ActiveModal::OuterDocsCacheRemove)
+        | Some(ActiveModal::OuterDocsCache)
+        | Some(ActiveModal::ConfirmDetachFocus)
+        | Some(ActiveModal::ClearHorizonFinal)
+        | Some(ActiveModal::ClearHorizon)
+        | Some(ActiveModal::DeletePlanFinal)
+        | Some(ActiveModal::DeletePlan)
+        | Some(ActiveModal::DeleteReview)
+        | Some(ActiveModal::ReviewAnalyze)
+        | Some(ActiveModal::ExecuteReview)
+        | Some(ActiveModal::ExecutePipeline)
+        | Some(ActiveModal::ExecuteScope)
+        | Some(ActiveModal::CreatePlan)
+        | Some(ActiveModal::RefineDialog)
+        | Some(ActiveModal::RefineBlocked)
+        | Some(ActiveModal::ClearHistory)
+        | Some(ActiveModal::Status)
+        | Some(ActiveModal::Selection)
+        | Some(ActiveModal::DiffInspector)
+        | Some(ActiveModal::ThemeSelector)
+        | Some(ActiveModal::UsageSummary)
+        | Some(ActiveModal::Help) => {}
         None => {
             if st.view_mode == ViewMode::Repl {
                 st.input_editor.insert_paste(text);
@@ -282,7 +340,7 @@ async fn handle_key_event(
             input_config(&st),
             text_input_active(&st),
             st.active_modal().is_some(),
-            st.server_disconnected.is_some(),
+            st.modals.server_disconnected.is_some(),
             st.view_mode,
         )
     };
@@ -346,11 +404,11 @@ async fn execute_global_command(
     match command {
         GlobalCommand::Quit => {
             let mut st = state.lock().await;
-            if st.server_disconnected.is_some() || !st.has_lossy_work() {
+            if st.modals.server_disconnected.is_some() || !st.has_lossy_work() {
                 return Ok(InputResult::Exit);
             }
-            st.confirm_quit = true;
-            st.confirm_button = ConfirmDialogButton::Cancel;
+            st.modals.confirm_quit = true;
+            st.modals.confirm_button = ConfirmDialogButton::Cancel;
         }
         // The chord is normalized to `Esc` before dispatch, so this arm is
         // unreachable in practice; the binding stays declared so the Help
@@ -383,6 +441,9 @@ async fn execute_global_command(
         GlobalCommand::OpenUsageSummary => {
             state.lock().await.open_usage_summary();
         }
+        GlobalCommand::OpenOuterDocsCache => {
+            open_outer_docs_cache(state, server_writer).await?;
+        }
         GlobalCommand::ToggleReasoning => {
             let mut st = state.lock().await;
             st.model.reasoning.toggle_fold();
@@ -390,11 +451,11 @@ async fn execute_global_command(
         }
         GlobalCommand::OpenHelp => {
             let mut st = state.lock().await;
-            let open = !st.show_help;
-            st.show_help = open;
-            st.help_scroll = 0;
+            let open = !st.modals.show_help;
+            st.modals.show_help = open;
+            st.modals.help_scroll = 0;
             if open {
-                st.help_tab = HelpTab::Global;
+                st.modals.help_tab = HelpTab::Global;
             }
         }
         GlobalCommand::ReloadConfig => reload_configuration(state).await,
@@ -409,11 +470,11 @@ async fn execute_global_command(
 /// `Cancel` (Conventions §6.3, §7).
 fn cancel_active_operation(st: &mut AppState) {
     if st.model.is_batch && st.model.is_busy() {
-        st.confirm_batch_cancel = true;
-        st.batch_cancel_button = BatchCancelButton::Continue;
+        st.modals.confirm_batch_cancel = true;
+        st.modals.batch_cancel_button = BatchCancelButton::Continue;
     } else if st.model.is_busy() || st.review.running {
-        st.confirm_cancel = true;
-        st.confirm_button = ConfirmDialogButton::Cancel;
+        st.modals.confirm_cancel = true;
+        st.modals.confirm_button = ConfirmDialogButton::Cancel;
     }
 }
 
@@ -649,7 +710,7 @@ mod tests {
             .await
             .expect("quit command");
         assert_eq!(res, InputResult::Exit);
-        assert!(!state.lock().await.confirm_quit);
+        assert!(!state.lock().await.modals.confirm_quit);
     }
 
     #[tokio::test]
@@ -663,7 +724,7 @@ mod tests {
             .await
             .expect("quit command");
         assert_eq!(res, InputResult::Continue);
-        assert!(state.lock().await.confirm_quit);
+        assert!(state.lock().await.modals.confirm_quit);
     }
 
     /// The layout gate projects a command chord before any surface reads the
@@ -815,6 +876,73 @@ mod tests {
         assert!(
             conn.written().is_empty(),
             "typing and cursor movement never talk to the server"
+        );
+    }
+    /// A command-only modal owns the keyboard and feeds no text field, so a
+    /// pasted payload reaches no buffer behind it: the prompt keeps its draft and
+    /// the status picker keeps its highlighted row (Conventions §5.1,
+    /// c-text-capture-boundary).
+    #[test]
+    fn paste_is_dropped_by_a_command_only_modal() {
+        let mut st = crate::app::test_state();
+        st.input_editor.insert_str("draft");
+        st.modals.status_dialog = Some(crate::app::StatusDialogState::new(
+            crate::app::StatusDialogTarget::PlanItem {
+                plan_id: "plan-1".to_string(),
+                item_id: "1".to_string(),
+                item_title: "Step".to_string(),
+                current_status: tauqe_protocol::PlanItemStatus::Todo,
+            },
+            1,
+        ));
+
+        handle_paste(&mut st, "док");
+
+        assert_eq!(
+            st.input_editor.get_text(),
+            "draft",
+            "the prompt behind the card never receives a pasted payload"
+        );
+        assert_eq!(
+            st.modals
+                .status_dialog
+                .as_ref()
+                .map(|dialog| dialog.selector.selected_index()),
+            Some(1)
+        );
+
+        // The reading surfaces are enumerated one by one as well, so neither
+        // Help nor the usage breakdown forwards a paste to the prompt.
+        st.modals.status_dialog = None;
+        st.modals.show_help = true;
+        handle_paste(&mut st, "док");
+        assert_eq!(st.input_editor.get_text(), "draft");
+        st.modals.show_help = false;
+
+        st.open_usage_summary();
+        handle_paste(&mut st, "док");
+        assert_eq!(st.input_editor.get_text(), "draft");
+        assert!(st.modals.usage_summary.is_some());
+    }
+
+    /// The explicit list of command surfaces never swallows a dialog that does
+    /// expose a field, so a paste still reaches the squash commit message
+    /// (Conventions §5.1).
+    #[test]
+    fn paste_still_reaches_a_dialog_that_exposes_a_field() {
+        let mut st = crate::app::test_state();
+        st.modals.squash_dialog = Some(SquashDialogState::default());
+
+        handle_paste(&mut st, "fix(tui): keep the wheel modal-scoped");
+
+        let dialog = st
+            .modals
+            .squash_dialog
+            .as_ref()
+            .expect("the dialog stays open");
+        assert_eq!(
+            dialog.message_editor.get_text(),
+            "fix(tui): keep the wheel modal-scoped"
         );
     }
 }

@@ -633,9 +633,9 @@ impl ReplView {
     /// still describes the live state, so a stale recording can never misposition
     /// the viewport. The folded inputs are exactly the ones the canvas renders:
     /// the wrap width, the rendered answer Markdown or the raw text behind it,
-    /// the reasoning transcript with its fold and stream lifecycle, the
-    /// diagnostic and toolchain prefixes, the whole staged change set, the commit
-    /// trail, the usage counters, and the copy flash (c-1, c-4).
+    /// the reasoning transcript with its fold, stream lifecycle, and dropped-line
+    /// counter, the diagnostic and toolchain prefixes, the whole staged change
+    /// set, the commit trail, the usage counters, and the copy flash (c-1, c-4).
     ///
     /// The animated spinner is deliberately absent: every glyph of the frame set
     /// occupies exactly one column, so a tick can change the content of a badge
@@ -648,6 +648,7 @@ impl ReplView {
         self.text.len().hash(&mut hasher);
         self.reasoning.lines.len().hash(&mut hasher);
         self.reasoning.text.len().hash(&mut hasher);
+        self.reasoning.truncated_lines().hash(&mut hasher);
         self.reasoning.show.hash(&mut hasher);
         self.reasoning.is_streaming().hash(&mut hasher);
         self.error.hash(&mut hasher);
@@ -1548,6 +1549,59 @@ mod compact_file_list_tests {
         view.reasoning.toggle_fold();
         assert!(view.reasoning.show, "the settled block is expanded");
 
+        assert_derivation_matches_the_canvas(&mut view);
+    }
+
+    /// Crossing the transcript retention cap is a discrete state transition: the
+    /// retained window keeps streaming while a truncation-marker row joins the
+    /// canvas. The fingerprint must observe it, or a recording measured before
+    /// the trim answers after the window grew back to the same length (c-1, c-4).
+    #[test]
+    fn a_tripped_retention_cap_invalidates_the_recorded_projection() {
+        let mut view = view();
+        let line = "reasoning line with a stable length\n";
+        while view.reasoning.text.len() + line.len() <= 100 * 1024 {
+            view.reasoning.append_delta(line);
+        }
+        let recorded_len = view.reasoning.text.len();
+        assert_eq!(
+            view.reasoning.truncated_lines(),
+            0,
+            "the recorded state must precede the retention cap"
+        );
+
+        view.record_canvas_projection(vec![0, 1, 2, 3, 4], vec![0, 1, 2, 3, 4], vec![0, 1], 5);
+        assert_eq!(
+            view.file_summary_visual_rows(),
+            vec![(0, 0), (1, 1)],
+            "the recording is reused while it describes the live state"
+        );
+
+        let appends = (192 * 1024) / line.len();
+        for _ in 0..appends {
+            view.reasoning.append_delta(line);
+        }
+        assert!(
+            view.reasoning.truncated_lines() > 0,
+            "the fixture must trip the retention cap"
+        );
+
+        let restored = recorded_len.saturating_sub(view.reasoning.text.len());
+        view.reasoning
+            .append_delta(&line.repeat(restored / line.len()));
+        view.reasoning
+            .append_delta(&"x".repeat(restored % line.len()));
+        assert_eq!(
+            view.reasoning.text.len(),
+            recorded_len,
+            "only the truncation counter differs from the recorded state"
+        );
+
+        assert_ne!(
+            view.file_summary_visual_rows(),
+            vec![(0, 0), (1, 1)],
+            "a tripped cap must invalidate the stale recording"
+        );
         assert_derivation_matches_the_canvas(&mut view);
     }
 }

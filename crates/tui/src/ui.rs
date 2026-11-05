@@ -20,10 +20,11 @@ use crate::dialogs::render::{
     render_confirm_clear_user_popup, render_confirm_delete_plan_popup,
     render_confirm_delete_review_popup, render_confirm_detach_focus_popup,
     render_confirm_execute_pipeline_popup, render_confirm_execute_review_popup,
-    render_confirm_execute_scope_popup, render_confirm_quit_popup,
-    render_confirm_remove_context_file_popup, render_confirm_review_analyze_popup,
-    render_confirm_review_truncation_popup, render_diff_inspector, render_disconnected_popup,
-    render_help_popup, render_locale_dialog, render_plan_refine_blocked_dialog,
+    render_confirm_execute_scope_popup, render_confirm_outer_docs_cache_remove_popup,
+    render_confirm_quit_popup, render_confirm_remove_context_file_popup,
+    render_confirm_review_analyze_popup, render_confirm_review_truncation_popup,
+    render_diff_inspector, render_disconnected_popup, render_help_popup, render_locale_dialog,
+    render_outer_docs_cache_dialog, render_plan_create_dialog, render_plan_refine_blocked_dialog,
     render_plan_refine_dialog, render_prompt_modal, render_review_dialog, render_selection_dialog,
     render_squash_popup, render_status_dialog, render_usage_summary,
 };
@@ -287,17 +288,17 @@ pub fn render_ui(frame: &mut ratatui::Frame, state: &mut AppState) {
     // visible window is always the window that receives input.
     match state.active_modal() {
         Some(ActiveModal::ServerDisconnected) => {
-            if let Some(msg) = &state.server_disconnected {
+            if let Some(msg) = &state.modals.server_disconnected {
                 render_disconnected_popup(frame, msg);
             }
         }
         Some(ActiveModal::Squash) => {
-            if let Some(dialog) = &mut state.squash_dialog {
+            if let Some(dialog) = &mut state.modals.squash_dialog {
                 render_squash_popup(frame, dialog);
             }
         }
         Some(ActiveModal::Review) => {
-            if let Some(dialog) = &state.review_dialog {
+            if let Some(dialog) = &state.modals.review_dialog {
                 render_review_dialog(frame, dialog, state.tui_config.input.primary_modifier);
             }
         }
@@ -309,53 +310,52 @@ pub fn render_ui(frame: &mut ratatui::Frame, state: &mut AppState) {
         Some(ActiveModal::RemoveContextFile) => {
             render_confirm_remove_context_file_popup(frame, state);
         }
+        Some(ActiveModal::OuterDocsCacheRemove) => {
+            render_confirm_outer_docs_cache_remove_popup(frame, state);
+        }
+        Some(ActiveModal::OuterDocsCache) => {
+            if let Some(dialog) = state.modals.outer_docs_cache.as_mut() {
+                render_outer_docs_cache_dialog(frame, dialog);
+            }
+        }
         Some(ActiveModal::ConfirmDetachFocus) => render_confirm_detach_focus_popup(frame, state),
         Some(ActiveModal::ClearHorizon) => {
-            if let Some(plan_id) = &state.confirm_clear_horizon {
-                crate::dialogs::render::render_confirm_clear_horizon_popup(frame, plan_id, state);
-            }
+            crate::dialogs::render::render_confirm_clear_horizon_popup(frame, state);
         }
         Some(ActiveModal::ClearHorizonFinal) => {
-            if let Some(plan_id) = &state.confirm_clear_horizon_final {
-                crate::dialogs::render::render_confirm_clear_horizon_final_popup(
-                    frame, plan_id, state,
-                );
-            }
+            crate::dialogs::render::render_confirm_clear_horizon_final_popup(frame, state);
         }
         Some(ActiveModal::DeletePlan) => {
-            if let Some(plan_id) = &state.confirm_delete_plan {
-                render_confirm_delete_plan_popup(frame, plan_id, state);
-            }
+            render_confirm_delete_plan_popup(frame, state);
         }
         Some(ActiveModal::DeletePlanFinal) => {
-            if let Some(plan_id) = &state.confirm_delete_plan_final {
-                crate::dialogs::render::render_confirm_delete_plan_final_popup(
-                    frame, plan_id, state,
-                );
-            }
+            crate::dialogs::render::render_confirm_delete_plan_final_popup(frame, state);
         }
         Some(ActiveModal::DeleteReview) => {
-            if let Some(session_id) = &state.confirm_delete_review {
-                render_confirm_delete_review_popup(frame, session_id, state);
-            }
+            render_confirm_delete_review_popup(frame, state);
         }
         Some(ActiveModal::ReviewAnalyze) => render_confirm_review_analyze_popup(frame, state),
         Some(ActiveModal::ReviewTruncation) => render_confirm_review_truncation_popup(frame, state),
         Some(ActiveModal::ExecuteReview) => render_confirm_execute_review_popup(frame, state),
         Some(ActiveModal::ExecutePipeline) => render_confirm_execute_pipeline_popup(frame, state),
         Some(ActiveModal::ExecuteScope) => render_confirm_execute_scope_popup(frame, state),
+        Some(ActiveModal::CreatePlan) => {
+            if let Some(dialog) = &state.modals.create_dialog {
+                render_plan_create_dialog(frame, dialog, state.tui_config.input.primary_modifier);
+            }
+        }
         Some(ActiveModal::RefineDialog) => {
-            if let Some(dialog) = &state.plans_view.refine_dialog {
+            if let Some(dialog) = &state.modals.refine_dialog {
                 render_plan_refine_dialog(frame, dialog, state.tui_config.input.primary_modifier);
             }
         }
         Some(ActiveModal::RefineBlocked) => {
-            if let Some(blocked) = &state.plans_view.refine_blocked {
-                render_plan_refine_blocked_dialog(frame, blocked, state.confirm_button);
+            if let Some(blocked) = &state.modals.refine_blocked {
+                render_plan_refine_blocked_dialog(frame, blocked, state.modals.confirm_button);
             }
         }
         Some(ActiveModal::Prompt) => {
-            if let Some(modal) = &state.prompt_modal {
+            if let Some(modal) = &state.modals.prompt_modal {
                 render_prompt_modal(frame, modal);
             }
         }
@@ -364,12 +364,12 @@ pub fn render_ui(frame: &mut ratatui::Frame, state: &mut AppState) {
         }
         Some(ActiveModal::ClearHistory) => render_confirm_clear_history_popup(frame, state),
         Some(ActiveModal::Status) => {
-            if let Some(dialog) = &state.status_dialog {
+            if let Some(dialog) = &state.modals.status_dialog {
                 render_status_dialog(frame, dialog);
             }
         }
         Some(ActiveModal::Selection) => {
-            if let Some(dialog) = &state.selection_dialog {
+            if let Some(dialog) = &state.modals.selection_dialog {
                 render_selection_dialog(frame, dialog);
             }
         }
@@ -385,21 +385,21 @@ pub fn render_ui(frame: &mut ratatui::Frame, state: &mut AppState) {
             // A plan step audits the finished change set of its commit, while the
             // Develop viewport audits the live staged set it owns. The two
             // borrows are disjoint fields of the shared state (c-3).
-            let (audited, cache) = match state.diff_audit.as_mut() {
+            let (audited, cache) = match state.modals.diff_audit.as_mut() {
                 Some(audit) => (audit.files.as_slice(), &mut audit.cache),
                 None => (state.model.files.as_slice(), &mut state.model.diff_cache),
             };
-            if let Some(inspector) = state.diff_inspector.as_mut() {
+            if let Some(inspector) = state.modals.diff_inspector.as_mut() {
                 render_diff_inspector(frame, inspector, audited, cache, spinner_frame);
             }
         }
         Some(ActiveModal::ThemeSelector) => {
-            if let Some(dialog) = &state.theme_selector {
+            if let Some(dialog) = &state.modals.theme_selector {
                 crate::theme::selector::render_theme_selector(frame, dialog);
             }
         }
         Some(ActiveModal::UsageSummary) => {
-            if let Some(summary) = state.usage_summary.as_mut() {
+            if let Some(summary) = state.modals.usage_summary.as_mut() {
                 render_usage_summary(
                     frame,
                     &state.model.usage_totals,
@@ -412,8 +412,8 @@ pub fn render_ui(frame: &mut ratatui::Frame, state: &mut AppState) {
             render_help_popup(
                 frame,
                 state.view_mode,
-                state.help_tab,
-                &mut state.help_scroll,
+                state.modals.help_tab,
+                &mut state.modals.help_scroll,
                 state.tui_config.input.primary_modifier,
                 state.tui_config.input.meta_modifier,
             );

@@ -13,13 +13,16 @@ pub(crate) use crate::components::modal::{render_modal_frame, ModalFrame, ModalT
 use crate::editor::InputEditor;
 
 pub(crate) mod batch_cancel;
+pub(crate) mod cache;
 pub(crate) mod confirm;
+pub(crate) mod create_plan;
 pub(crate) mod diff_inspector;
 pub(crate) mod disconnected;
 pub(crate) mod execute_review;
 pub(crate) mod execute_scope;
 pub(crate) mod help;
 pub(crate) mod locale;
+pub(crate) mod plan_form;
 pub(crate) mod prompt;
 pub(crate) mod refine;
 pub(crate) mod review;
@@ -29,6 +32,11 @@ pub(crate) mod status;
 pub(crate) mod usage;
 
 pub(crate) use batch_cancel::{batch_cancel_modal_geometry, render_confirm_batch_cancel_popup};
+pub(crate) use cache::{
+    outer_docs_cache_area, outer_docs_cache_remove_params, outer_docs_cache_tree_rect,
+    outer_docs_cache_visible_rows, render_confirm_outer_docs_cache_remove_popup,
+    render_outer_docs_cache_dialog,
+};
 pub(crate) use confirm::{
     clear_auto_params, clear_history_params, clear_horizon_final_params, clear_horizon_params,
     clear_user_params, confirm_cancel_params, confirm_detach_focus_params, confirm_quit_params,
@@ -45,6 +53,7 @@ pub(crate) use confirm::{
     render_confirm_review_truncation_popup, review_analyze_dialog_geometry,
     review_truncation_params,
 };
+pub(crate) use create_plan::{create_plan_dialog_geometry, render_plan_create_dialog};
 pub(crate) use diff_inspector::render_diff_inspector;
 pub(crate) use disconnected::{disconnected_button_geometry, render_disconnected_popup};
 pub(crate) use execute_review::execute_review_dialog_geometry;

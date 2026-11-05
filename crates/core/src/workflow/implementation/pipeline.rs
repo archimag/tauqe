@@ -224,7 +224,7 @@ impl<'a> PlanImplementationPipeline<'a> {
                 }
             };
 
-            if frame.plan.items.is_empty() {
+            if frame.plan.implementation.items.is_empty() {
                 // A plan that carries an architectural concept but no synthesized
                 // horizon, and an architectural review group, still have no leaf to
                 // schedule: the Architect projects the first horizon just in time,
@@ -255,7 +255,11 @@ impl<'a> PlanImplementationPipeline<'a> {
                 }
             }
 
-            let ready: Vec<String> = match frame.plan.evaluate_scope(None) {
+            let ready: Vec<String> = match frame
+                .plan
+                .implementation
+                .evaluate_scope(self.scope.target_step_id())
+            {
                 PlanScopeEvaluation::Ready(steps) => {
                     steps.into_iter().map(|step| step.id).collect()
                 }
@@ -266,7 +270,8 @@ impl<'a> PlanImplementationPipeline<'a> {
                     // A stalled scope is never scheduled blindly: the shared
                     // classifier decides whether reprojecting the horizon can repair
                     // it or whether only the developer can.
-                    let failure = classify_scope_stall(&frame.plan, None, &stall);
+                    let failure =
+                        classify_scope_stall(&frame.plan, self.scope.target_step_id(), &stall);
                     tracing::warn!(
                         scope = ?self.scope,
                         domain = failure.is_domain(),
@@ -578,6 +583,13 @@ impl<'a> PlanImplementationPipeline<'a> {
                 reason: failure.reason().to_string(),
             };
         }
+        // A targeted single-step execution runs specifically that step without
+        // autonomously redesigning the rest of the plan horizon.
+        if self.scope.target_step_id().is_some() {
+            return ReplanOutcome::Unrepaired {
+                reason: failure.reason().to_string(),
+            };
+        }
         // A degenerate single finding owns no persisted horizon, so there is no
         // graph the Architect could reproject and write back.
         if matches!(self.scope, ExecutionScope::ReviewFinding { .. }) {
@@ -734,7 +746,7 @@ impl<'a> PlanImplementationPipeline<'a> {
         last_replanned_step: Option<String>,
     ) -> Result<(), String> {
         match &self.scope {
-            ExecutionScope::Plan { plan_id } => PlanStorage::replace_uncompleted_horizon(
+            ExecutionScope::Plan { plan_id, .. } => PlanStorage::replace_uncompleted_horizon(
                 self.repo_root,
                 plan_id,
                 items,
@@ -1112,6 +1124,7 @@ mod tests {
     fn plan_scope() -> ExecutionScope {
         ExecutionScope::Plan {
             plan_id: PLAN_ID.to_string(),
+            step_id: None,
         }
     }
 
@@ -1215,7 +1228,10 @@ mod tests {
         let stored = PlanStorage::load_plan(dir.path(), PLAN_ID)
             .unwrap()
             .unwrap();
-        assert_eq!(stored.find_item("1").unwrap().status, PlanItemStatus::Done);
+        assert_eq!(
+            stored.implementation.find_item("1").unwrap().status,
+            PlanItemStatus::Done
+        );
         assert_eq!(stored.implementation.architect, Some(tier));
     }
 
@@ -1476,7 +1492,10 @@ mod tests {
         let stored = PlanStorage::load_plan(dir.path(), PLAN_ID)
             .unwrap()
             .unwrap();
-        assert_eq!(stored.find_item("3").unwrap().status, PlanItemStatus::Done);
+        assert_eq!(
+            stored.implementation.find_item("3").unwrap().status,
+            PlanItemStatus::Done
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1545,7 +1564,10 @@ mod tests {
         let stored = PlanStorage::load_plan(dir.path(), PLAN_ID)
             .unwrap()
             .unwrap();
-        assert_eq!(stored.find_item("1").unwrap().status, PlanItemStatus::Todo);
+        assert_eq!(
+            stored.implementation.find_item("1").unwrap().status,
+            PlanItemStatus::Todo
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1597,8 +1619,14 @@ mod tests {
         let stored = PlanStorage::load_plan(dir.path(), PLAN_ID)
             .unwrap()
             .unwrap();
-        assert_eq!(stored.find_item("1").unwrap().status, PlanItemStatus::Done);
-        assert_eq!(stored.find_item("2").unwrap().status, PlanItemStatus::Todo);
+        assert_eq!(
+            stored.implementation.find_item("1").unwrap().status,
+            PlanItemStatus::Done
+        );
+        assert_eq!(
+            stored.implementation.find_item("2").unwrap().status,
+            PlanItemStatus::Todo
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1867,5 +1895,60 @@ mod tests {
         assert_eq!(stored.find_item(8).unwrap().status, IssueStatus::Todo);
         // The degenerate horizon owns no stored graph, so no wave is spent.
         assert!(host.refinements().is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_targeted_plan_scope_executes_only_the_specified_step() {
+        let dir = tempdir().unwrap();
+        PlanStorage::save_plan(
+            dir.path(),
+            &plan_with(
+                concept(),
+                vec![
+                    leaf("1", PlanItemStatus::Todo),
+                    leaf("2", PlanItemStatus::Todo),
+                ],
+                None,
+                None,
+            ),
+        )
+        .unwrap();
+
+        let host = ScriptedHost::new(
+            vec![StepTurnResult::Success {
+                summary: "only step 1".to_string(),
+                commit: None,
+            }],
+            Vec::new(),
+        );
+        let channels = Channels::new();
+
+        let report = run_scope(
+            dir.path(),
+            ExecutionScope::Plan {
+                plan_id: PLAN_ID.to_string(),
+                step_id: Some("1".to_string()),
+            },
+            &host,
+            config_with_ladder(vec![tier_entry("architect/one")], 2),
+            &channels,
+        )
+        .await;
+
+        assert_eq!(report.stop, PlanImplementationStop::Completed);
+        assert_eq!(report.succeeded, 1);
+        assert_eq!(host.steps_run(), 1);
+
+        let stored = PlanStorage::load_plan(dir.path(), PLAN_ID)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            stored.implementation.find_item("1").unwrap().status,
+            PlanItemStatus::Done
+        );
+        assert_eq!(
+            stored.implementation.find_item("2").unwrap().status,
+            PlanItemStatus::Todo
+        );
     }
 }

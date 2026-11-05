@@ -258,10 +258,16 @@ primary = ["openrouter:~google/gemini-flash-latest"]
 # disk, the change set converges into one isolated commit only after it verifies
 # cleanly, and a failed or cancelled turn restores the working tree to its exact
 # pre-turn state.
+#
+# Every Git command runs under a wall-clock budget, because a Git child is not
+# always only Git: a commit that runs the repository hooks executes arbitrary
+# user code, and a signing configuration waits for an agent that can block on a
+# passphrase prompt. The budget bounds the child and every process it spawned.
 
 # [git]
 # upstream = "origin/master"     # base branch for diffs; auto-detected by default
 # bypass_hooks = true            # pass --no-verify so Tauqe commits skip project hooks
+# timeout_secs = 300             # wall-clock budget of one Git command, in seconds
 
 
 # =============================================================================

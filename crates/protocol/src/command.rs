@@ -435,6 +435,37 @@ mod tests {
                 },
             }
         );
+        // A markdown-wrapped path is stripped by the same shared cleaner, so
+        // a producer habit the compact-spec parser anticipates never reaches
+        // the engine as a phantom backtick directory.
+        let wrapped_context: LlmCommand = serde_json::from_value(serde_json::json!({
+            "type": "context_request",
+            "path": "`./src/a.rs`",
+            "access": "read_only",
+        }))
+        .expect("a backtick-wrapped context path must decode");
+        assert_eq!(
+            wrapped_context,
+            LlmCommand::ContextRequest {
+                path: "src/a.rs".to_string(),
+                access: ContextAccess::ReadOnly,
+            }
+        );
+
+        let wrapped_edit: LlmCommand = serde_json::from_value(serde_json::json!({
+            "type": "edit",
+            "operation": {"type": "move", "from": "`./src/a.rs`", "to": " `./src/b.rs` "},
+        }))
+        .expect("a backtick-wrapped move must decode");
+        assert_eq!(
+            wrapped_edit,
+            LlmCommand::Edit {
+                operation: EditOperation::Move {
+                    from: "src/a.rs".to_string(),
+                    to: "src/b.rs".to_string(),
+                },
+            }
+        );
     }
 
     #[test]

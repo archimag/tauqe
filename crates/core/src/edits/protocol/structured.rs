@@ -27,8 +27,8 @@ impl StructuredEditProtocol {
     ///
     /// The default surface is intent-oriented, never transport-specific, so the
     /// structured contour advertises exactly what the XML contour advertises.
-    pub fn schema(patch_strategy: PatchStrategy) -> serde_json::Value {
-        Self::schema_for(&CapabilitySet::interactive_repl(), patch_strategy)
+    pub fn schema(ctx: &PromptRenderContext<'_>) -> serde_json::Value {
+        Self::schema_for(&CapabilitySet::interactive_repl(), ctx)
     }
 
     /// Builds the edit schema for exactly the enabled capabilities.
@@ -39,11 +39,15 @@ impl StructuredEditProtocol {
     /// property therefore cannot drift from the rules that describe it, and the
     /// strict `required` list is derived from the emitted properties, so a
     /// pruned property is never left required.
+    ///
+    /// The render context carries the patch strategy and the project command
+    /// declaration the composed schema must observe, so a caller that renders
+    /// the prompt and composes the schema hands over one identical value.
     pub fn schema_for(
         capabilities: &CapabilitySet,
-        patch_strategy: PatchStrategy,
+        ctx: &PromptRenderContext<'_>,
     ) -> serde_json::Value {
-        CapabilityRegistry::global().compose_structured_schema(capabilities, patch_strategy)
+        CapabilityRegistry::global().compose_structured_schema(capabilities, ctx)
     }
 
     fn proposal_to_model_result(
@@ -193,22 +197,25 @@ impl StructuredEditProtocol {
     }
 
     /// Returns the JSON-schema response format used to constrain generation.
-    pub fn response_format(&self, patch_strategy: PatchStrategy) -> Option<ResponseFormat> {
-        self.response_format_for(&CapabilitySet::interactive_repl(), patch_strategy)
+    pub fn response_format(&self, ctx: &PromptRenderContext<'_>) -> Option<ResponseFormat> {
+        self.response_format_for(&CapabilitySet::interactive_repl(), ctx)
     }
 
     /// Returns the JSON-schema response format for an explicit capability set,
     /// so the wire schema matches the advertised capability surface.
+    /// The render context is handed to the composed schema unchanged, so the
+    /// format a caller constrains generation with is the very projection the
+    /// rendered instruction described.
     pub fn response_format_for(
         &self,
         capabilities: &CapabilitySet,
-        patch_strategy: PatchStrategy,
+        ctx: &PromptRenderContext<'_>,
     ) -> Option<ResponseFormat> {
         Some(ResponseFormat::JsonSchema {
             json_schema: JsonSchemaDefinition {
                 name: "tauqe_edit_proposal".to_string(),
                 description: Some("Structured code modification proposal and response".to_string()),
-                schema: Cow::Owned(Self::schema_for(capabilities, patch_strategy)),
+                schema: Cow::Owned(Self::schema_for(capabilities, ctx)),
                 strict: Some(true),
             },
         })
@@ -317,6 +324,10 @@ impl StructuredEditProtocol {
     /// the pre-canonical spelling stays a permanent alias, so a cached response
     /// written before the rename keeps decoding. Both vehicles carry the same
     /// payload, so a response never has to choose a spelling to be understood.
+    ///
+    /// A `null` element is a partial emission of one topic, so it yields the
+    /// tolerant `DocTopic::All` fallback the DTO boundary resolves it to, while
+    /// an element of any other non-string shape is skipped.
     pub fn parse_doc_requests(&self, raw_text: &str) -> Vec<DocTopic> {
         if let Some(value) = parse_json_object(raw_text) {
             for field in ["tauqe_doc_requests", "doc_requests"] {
@@ -325,8 +336,13 @@ impl StructuredEditProtocol {
                 };
                 let topics: Vec<DocTopic> = entries
                     .iter()
-                    .filter_map(|entry| entry.as_str())
-                    .map(DocTopic::parse_lossy)
+                    .filter_map(|entry| match entry {
+                        // A `null` element resolves to the tolerant fallback at
+                        // the DTO boundary, so the raw reader keeps the request
+                        // the DTO would keep instead of dropping it.
+                        serde_json::Value::Null => Some(DocTopic::All),
+                        other => other.as_str().map(DocTopic::parse_lossy),
+                    })
                     .collect();
                 if !topics.is_empty() {
                     return topics;
@@ -605,7 +621,18 @@ impl StructuredEditProtocol {
             let update = decoded.map_err(|error| format!("invalid plan_update: {error}"))?;
             return Ok(vec![update]);
         }
-        let (tags, _diagnostics) = super::xml::tags::parse_plan_tags_with_diagnostics(raw_text);
+        let (tags, diagnostics) = super::xml::tags::parse_plan_tags_with_diagnostics(raw_text);
+        // A `<plan>` control tag is the second vehicle of the same mutation, so a
+        // structurally malformed container is a present payload the reader
+        // refuses: it is reported through the single error channel of this reader
+        // instead of degrading into "no plan update", and the bounded turn turns
+        // it into a `ProtocolError` command so a later round can repair it.
+        if !diagnostics.is_empty() {
+            return Err(format!(
+                "invalid <plan> payload in the structured response: {}",
+                diagnostics.join("; ")
+            ));
+        }
         Ok(tags.into_iter().map(plan_tag_to_update).collect())
     }
 
@@ -886,6 +913,11 @@ mod tests {
     use crate::edits::protocol::xml::tags::{VerifyOnSuccess, VerifyTarget};
     use tauqe_protocol::ContextAccess;
 
+    /// Builds the render context a schema composition uses when the project
+    /// declares no commands.
+    fn render_context(patch_strategy: PatchStrategy) -> PromptRenderContext<'static> {
+        PromptRenderContext::new(&[], None).with_patch_strategy(patch_strategy)
+    }
     #[test]
     fn test_structured_protocol_repo_searches() {
         let proto = StructuredEditProtocol;
@@ -1074,7 +1106,7 @@ mod tests {
 
     #[test]
     fn test_structured_schema_has_no_nullable_types() {
-        let schema = StructuredEditProtocol::schema(PatchStrategy::SearchReplace);
+        let schema = StructuredEditProtocol::schema(&render_context(PatchStrategy::SearchReplace));
         // Only the idle representation of the plan payload is nullable; every
         // edit field stays a concrete typed value.
         let changes = &schema["properties"]["changes"]["items"];
@@ -1086,7 +1118,7 @@ mod tests {
 
     #[test]
     fn test_structured_schema_and_instructions_include_overwrite() {
-        let schema = StructuredEditProtocol::schema(PatchStrategy::SearchReplace);
+        let schema = StructuredEditProtocol::schema(&render_context(PatchStrategy::SearchReplace));
         let ops = schema["properties"]["changes"]["items"]["properties"]["op"]["enum"]
             .as_array()
             .unwrap();
@@ -1265,7 +1297,7 @@ mod tests {
 
     #[test]
     fn test_anchored_schema_declares_range_fields_instead_of_echoed_text() {
-        let schema = StructuredEditProtocol::schema(PatchStrategy::LineAnchor);
+        let schema = StructuredEditProtocol::schema(&render_context(PatchStrategy::LineAnchor));
         let items = &schema["properties"]["changes"]["items"];
         let properties = items["properties"].as_object().expect("properties object");
         for field in ["op", "path", "to", "start", "end", "content"] {
@@ -1361,7 +1393,7 @@ mod tests {
 
     #[test]
     fn test_structured_schema_declares_control_fields() {
-        let schema = StructuredEditProtocol::schema(PatchStrategy::SearchReplace);
+        let schema = StructuredEditProtocol::schema(&render_context(PatchStrategy::SearchReplace));
         let required: Vec<&str> = schema["required"]
             .as_array()
             .unwrap()
@@ -1457,6 +1489,24 @@ mod tests {
 
         let empty = r#"{"message":"Nothing","changes":[],"tauqe_doc_requests":[],"scratchpad":""}"#;
         assert!(proto.parse_doc_requests(empty).is_empty());
+
+        // A `null` element is a partial emission of one topic, so the raw reader
+        // resolves it to the same tolerant fallback the DTO boundary resolves it
+        // to, while an element of any other non-string shape is still skipped.
+        let partial = r#"{
+            "message": "Need docs",
+            "changes": [],
+            "tauqe_doc_requests": ["git", null, 7, "workflow"]
+        }"#;
+        assert_eq!(
+            proto.parse_doc_requests(partial),
+            vec![DocTopic::Git, DocTopic::All, DocTopic::Workflow]
+        );
+
+        // A list of nothing but non-string junk still requests no documentation,
+        // so the reader keeps falling through to its control-tag vehicle.
+        let junk = r#"{"message":"x","changes":[],"tauqe_doc_requests":[7,false]}"#;
+        assert!(proto.parse_doc_requests(junk).is_empty());
         assert_eq!(proto.parse_scratchpad(empty), None);
     }
 
@@ -1679,7 +1729,7 @@ mod tests {
             })
         );
 
-        let schema = StructuredEditProtocol::schema(PatchStrategy::SearchReplace);
+        let schema = StructuredEditProtocol::schema(&render_context(PatchStrategy::SearchReplace));
         let outcome = &schema["properties"]["outcome"];
         let statuses = outcome["properties"]["status"]["enum"]
             .as_array()
@@ -1808,6 +1858,27 @@ mod tests {
     }
 
     #[test]
+    fn test_structured_protocol_reports_a_malformed_plan_tag() {
+        let proto = StructuredEditProtocol;
+
+        // A `<plan>` container that fails structural validation is a present
+        // payload the reader refused, never a plan that silently disappeared.
+        let malformed = "Refining the plan.\n<plan action=\"save\" id=\"p-1\" title=\"P1\"></plan>";
+        let error = proto
+            .parse_plan_updates(malformed)
+            .expect_err("a malformed <plan> container must be reported");
+        assert!(error.contains("<plan>"), "{error}");
+        assert!(error.contains("<concept>"), "{error}");
+
+        // The very same container decodes once the concept tree is present, so
+        // the strictness belongs to the payload rather than to the vehicle.
+        let valid = "Refining the plan.\n<plan action=\"save\" id=\"p-1\" title=\"P1\"><concept><concept_item id=\"c-1\" title=\"C\" /></concept></plan>";
+        let updates = proto.parse_plan_updates(valid).expect("a valid container");
+        assert_eq!(updates.len(), 1);
+        assert_eq!(updates[0].id.as_deref(), Some("p-1"));
+    }
+
+    #[test]
     fn test_structured_protocol_plan_update_failure_is_reported() {
         let proto = StructuredEditProtocol;
 
@@ -1842,7 +1913,7 @@ mod tests {
 
     #[test]
     fn test_structured_schema_declares_verify_and_user_language() {
-        let schema = StructuredEditProtocol::schema(PatchStrategy::SearchReplace);
+        let schema = StructuredEditProtocol::schema(&render_context(PatchStrategy::SearchReplace));
         let required: Vec<&str> = schema["required"]
             .as_array()
             .unwrap()
@@ -1866,7 +1937,7 @@ mod tests {
 
     #[test]
     fn test_structured_schema_reflects_the_capability_set() {
-        let full = StructuredEditProtocol::schema(PatchStrategy::SearchReplace);
+        let full = StructuredEditProtocol::schema(&render_context(PatchStrategy::SearchReplace));
         let full_properties = full["properties"].as_object().expect("properties object");
         for field in [
             "message",
@@ -1901,7 +1972,7 @@ mod tests {
 
         let narrowed = StructuredEditProtocol::schema_for(
             &CapabilitySet::from_slice(&[LlmCapability::TextMessage, LlmCapability::FileEdits]),
-            PatchStrategy::SearchReplace,
+            &render_context(PatchStrategy::SearchReplace),
         );
         let properties = narrowed["properties"]
             .as_object()
@@ -1947,7 +2018,9 @@ mod tests {
     #[test]
     fn test_structured_response_format_follows_the_capability_set() {
         let narrowed = CapabilitySet::from_slice(&[LlmCapability::TextMessage]);
-        match StructuredEditProtocol.response_format_for(&narrowed, PatchStrategy::SearchReplace) {
+        match StructuredEditProtocol
+            .response_format_for(&narrowed, &render_context(PatchStrategy::SearchReplace))
+        {
             Some(ResponseFormat::JsonSchema { json_schema, .. }) => {
                 let properties = json_schema.schema["properties"]
                     .as_object()
@@ -2002,7 +2075,7 @@ mod tests {
     fn test_review_update_field_follows_the_review_discussion_surface() {
         let review = StructuredEditProtocol::schema_for(
             &CapabilitySet::review_discussion(),
-            PatchStrategy::SearchReplace,
+            &render_context(PatchStrategy::SearchReplace),
         );
         assert!(
             review["properties"].get("review_update").is_some(),
@@ -2023,7 +2096,10 @@ mod tests {
             CapabilitySet::discussion(),
             CapabilitySet::isolated_step(),
         ] {
-            let schema = StructuredEditProtocol::schema_for(&surface, PatchStrategy::SearchReplace);
+            let schema = StructuredEditProtocol::schema_for(
+                &surface,
+                &render_context(PatchStrategy::SearchReplace),
+            );
             assert!(
                 schema["properties"].get("review_update").is_none(),
                 "the decision field leaked into a surface that does not authorize it"

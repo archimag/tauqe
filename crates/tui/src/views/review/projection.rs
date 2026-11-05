@@ -122,6 +122,8 @@ pub enum VisibleReviewRow {
         /// Classified problem type driving the `[BUG]`/`[SEC]`/... badge.
         issue_type: IssueType,
         status: IssueStatus,
+        /// Git commit that carried the fix of this finding, once it is fixed.
+        commit: Option<String>,
         model: Option<ModelSelection>,
         files: Vec<String>,
         /// Immutable contracts, interfaces, and invariants the fix must rely on
@@ -151,6 +153,14 @@ pub enum VisibleReviewRow {
         title: String,
         details: Option<String>,
         status: PlanItemStatus,
+        /// Git commit the step recorded when it finished, if any.
+        commit: Option<String>,
+        /// Diagnostic report of the semantic blocker that stopped the step.
+        ///
+        /// Present only while the step is blocked, so the reason survives the
+        /// interrupted turn on disk and in the tree instead of being lost with
+        /// the transient session.
+        blocked_reason: Option<String>,
         files: Vec<String>,
         readonly_files: Vec<String>,
         /// Identifiers of the project-declared `[[outer_docs]]` entries the step
@@ -462,6 +472,7 @@ impl ReviewViewState {
             title: issue.title.clone(),
             issue_type: issue.issue_type,
             status: issue.status,
+            commit: issue.commit.clone(),
             model: issue.model.clone(),
             files: issue.files.clone(),
             readonly_files: issue.readonly_files.clone(),
@@ -610,6 +621,11 @@ impl ReviewViewState {
                 || !step.readonly_files.is_empty()
                 || !step.outer_docs.is_empty()
                 || !step.depends_on.is_empty();
+            let has_blocked_reason = step
+                .blocked_reason
+                .as_deref()
+                .map(|reason| !reason.trim().is_empty())
+                .unwrap_or(false);
             let is_expanded = self.is_subplan_item_expanded(session_id, group_id, &step.id);
 
             out.push(VisibleReviewRow::SubplanItem {
@@ -619,13 +635,15 @@ impl ReviewViewState {
                 title: step.title.clone(),
                 details: step.details.clone(),
                 status: step.status,
+                commit: step.commit.clone(),
+                blocked_reason: step.blocked_reason.clone(),
                 files: step.files.clone(),
                 readonly_files: step.readonly_files.clone(),
                 outer_docs: step.outer_docs.clone(),
                 depends_on: step.depends_on.clone(),
                 depth,
                 has_children,
-                is_expandable: has_children || has_details || has_meta,
+                is_expandable: has_children || has_details || has_meta || has_blocked_reason,
                 is_expanded,
             });
 

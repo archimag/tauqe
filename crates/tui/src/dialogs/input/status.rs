@@ -17,7 +17,7 @@ pub(crate) async fn apply_status_dialog(
     chosen_idx: usize,
     server_writer: &mut RpcConnection,
 ) -> anyhow::Result<()> {
-    let dialog = match st.status_dialog.take() {
+    let dialog = match st.modals.status_dialog.take() {
         Some(d) => d,
         None => return Ok(()),
     };
@@ -39,7 +39,7 @@ pub(crate) async fn apply_status_dialog(
 
             if new_status != current_status {
                 if let Some(plan) = st.plans_view.plans.iter_mut().find(|p| p.id == plan_id) {
-                    plan.update_item_status(&item_id, new_status);
+                    plan.implementation.update_item_status(&item_id, new_status);
                 }
                 // The rollback value is built first and travels with the
                 // request: the transport records it only once the write
@@ -196,7 +196,7 @@ mod tests {
             session: Some(session("rev-1")),
             ..Default::default()
         };
-        st.status_dialog = Some(StatusDialogState::new(
+        st.modals.status_dialog = Some(StatusDialogState::new(
             StatusDialogTarget::ReviewItem {
                 review_id: Some("rev-2".to_string()),
                 item_id: 1,
@@ -238,7 +238,7 @@ mod tests {
             session: Some(session("rev-1")),
             ..Default::default()
         };
-        st.status_dialog = Some(StatusDialogState::new(
+        st.modals.status_dialog = Some(StatusDialogState::new(
             StatusDialogTarget::ReviewItem {
                 review_id: Some("rev-1".to_string()),
                 item_id: 1,
@@ -261,7 +261,7 @@ mod tests {
             st.review.sessions[0].items[0].status,
             ReviewItemStatus::Fixed
         );
-        assert_eq!(st.status_dialog, None, "the dialog must be consumed");
+        assert_eq!(st.modals.status_dialog, None, "the dialog must be consumed");
     }
     /// Async sink whose every write fails, standing in for a server pipe that
     /// closed before the status update reached it.
@@ -314,7 +314,7 @@ mod tests {
                 ..Default::default()
             }],
         )];
-        st.status_dialog = Some(StatusDialogState::new(
+        st.modals.status_dialog = Some(StatusDialogState::new(
             StatusDialogTarget::PlanItem {
                 plan_id: "plan-1".to_string(),
                 item_id: "1".to_string(),
@@ -347,7 +347,7 @@ mod tests {
 
         let st = state.lock().await;
         assert_eq!(
-            st.plans_view.plans[0].items[0].status,
+            st.plans_view.plans[0].implementation.items[0].status,
             PlanItemStatus::Todo,
             "the row keeps the status the server recorded"
         );
@@ -368,7 +368,7 @@ mod tests {
             session: Some(session("rev-1")),
             ..Default::default()
         };
-        st.status_dialog = Some(StatusDialogState::new(
+        st.modals.status_dialog = Some(StatusDialogState::new(
             StatusDialogTarget::ReviewItem {
                 review_id: Some("rev-1".to_string()),
                 item_id: 1,

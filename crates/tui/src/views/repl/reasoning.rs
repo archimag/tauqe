@@ -205,7 +205,14 @@ impl ReasoningState {
         // survived the cap.
         self.truncated_lines + self.newline_count + usize::from(!self.pending.is_empty())
     }
-
+    /// Number of oldest reasoning lines the retention cap already dropped.
+    ///
+    /// The truncation marker this counter renders occupies a canvas row, while
+    /// the retained window can grow back to a length it already had, so a
+    /// fingerprint of the drawn layout must observe the counter itself (c-1).
+    pub(super) fn truncated_lines(&self) -> usize {
+        self.truncated_lines
+    }
     /// True while a reasoning stream is active and not yet finalized.
     ///
     /// Text channels use this to settle and fold the reasoning block exactly

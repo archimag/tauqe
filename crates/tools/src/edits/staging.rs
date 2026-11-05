@@ -75,18 +75,15 @@ pub(crate) fn expand_dir_move(
 
 /// Lists every tracked file under `from`, repository-relative.
 ///
-/// Git answers for the tracked files, so the expansion covers exactly the paths
-/// a commit can relocate. A repository Git cannot inspect degrades to a scan of
-/// the working tree, which never follows a symbolic link out of the subtree it
-/// started from, so such a repository expands the move it can see instead of
-/// failing an otherwise valid turn.
+/// Git answers for the tracked files of the subtree alone, so the expansion
+/// covers exactly the paths a commit can relocate while the listing stays
+/// bounded to what the move addresses. A repository Git cannot inspect degrades
+/// to a scan of the working tree, which never follows a symbolic link out of the
+/// subtree it started from, so such a repository expands the move it can see
+/// instead of failing an otherwise valid turn.
 fn directory_members(repo_root: &Path, from: &str) -> Vec<String> {
-    let prefix = format!("{from}/");
-    match crate::git::state::list_repository_files(Some(repo_root)) {
-        Ok(files) => files
-            .into_iter()
-            .filter(|path| path.starts_with(prefix.as_str()))
-            .collect(),
+    match crate::git::state::list_tracked_files_under(repo_root, from) {
+        Ok(files) => files,
         Err(err) => {
             tracing::warn!(
                 "Failed to list the tracked files under '{}': {}; scanning the tree",
@@ -94,7 +91,7 @@ fn directory_members(repo_root: &Path, from: &str) -> Vec<String> {
                 err
             );
             let mut members = Vec::new();
-            collect_directory_files(&repo_root.join(from), &prefix, &mut members);
+            collect_directory_files(&repo_root.join(from), &format!("{from}/"), &mut members);
             members
         }
     }

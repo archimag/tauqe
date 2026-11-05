@@ -48,6 +48,10 @@ pub enum EditError {
     MockupsNotIgnored(String),
 
     #[error(
+        "Path '{path}' cannot be admitted: the batched repository ignore probe failed, so the change set cannot prove the path is not excluded by .gitignore or .git/info/exclude. {reason}"
+    )]
+    IgnoreProbeFailed { path: String, reason: String },
+    #[error(
         "Path '{0}' is declared in [project.boundaries.protected] and must never be created, modified, moved, or deleted by a turn: it stays tracked by Git and readable. Request it as a read-only reference instead."
     )]
     ProtectedPath(String),

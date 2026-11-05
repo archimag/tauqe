@@ -13,7 +13,7 @@ use crossterm::event::{KeyCode, KeyEvent};
 use tauqe_protocol::review::DEFAULT_REVIEW_GROUP_ID;
 use tauqe_protocol::{
     methods, DiscussionFocus, DiscussionTarget, IssueStatus, ModelRole, ModelSelection, PlanItem,
-    ReviewGroup, ReviewGroupKind, ReviewIssue, ReviewSession,
+    PlanItemStatus, ReviewGroup, ReviewGroupKind, ReviewIssue, ReviewSession,
 };
 use tokio::sync::Mutex;
 
@@ -26,6 +26,8 @@ pub enum ReviewAction {
     Activate,
     Execute,
     ExecuteAll,
+    /// Inspect the diff of the commit recorded in the selected row.
+    InspectDiff,
     RunReview,
     Discuss,
     Analyze,
@@ -330,6 +332,15 @@ pub static REVIEW_COMMAND_MAP: CommandMap<ReviewAction> = CommandMap::new(&[
         Helpers,
         "cmd.review.copy",
     ),
+    // Inspecting the diff of a commit the selected row recorded mutates
+    // nothing and needs no confirmation, so it is a Helper exactly as it is in
+    // the Plans view (Conventions §4.6, c-tui-diff-inspection).
+    CommandSpec::new(
+        KeyChord::Bare(KeyCode::Char('v')),
+        ReviewAction::InspectDiff,
+        Helpers,
+        "cmd.review.inspect_diff",
+    ),
     CommandSpec::new(
         KeyChord::Bare(KeyCode::Delete),
         ReviewAction::DeleteReview,
@@ -557,8 +568,8 @@ fn execute_review_finding_action(st: &mut AppState, session_id: &str, item_id: u
                 session.title.clone()
             };
             let coder_entries = st.coder_entries();
-            st.confirm_button = crate::app::ConfirmDialogButton::Cancel;
-            st.confirm_execute_review = Some(crate::app::ConfirmExecuteReviewState::new(
+            st.modals.confirm_button = crate::app::ConfirmDialogButton::Cancel;
+            st.modals.confirm_execute_review = Some(crate::app::ConfirmExecuteReviewState::new(
                 Some(session.id.clone()),
                 session_title,
                 item.title.clone(),
@@ -615,13 +626,13 @@ fn execute_review_session_action(st: &mut AppState, session_id: &str) {
         session.title.clone()
     };
     let coder_entries = st.coder_entries();
-    st.confirm_button = crate::app::ConfirmDialogButton::Cancel;
+    st.modals.confirm_button = crate::app::ConfirmDialogButton::Cancel;
     // The session root launches the implicit whole-session queue: the flag
     // records that the confirmation names the session itself and leaves the
     // member list — architectural root-cause plans and independent findings
     // alike — to the server, exactly as the cross-session batch does (c-1, c-2,
     // c-3).
-    st.confirm_execute_review = Some(
+    st.modals.confirm_execute_review = Some(
         crate::app::ConfirmExecuteReviewState::new(
             Some(session.id.clone()),
             session_title,
@@ -682,7 +693,7 @@ fn execute_review_group_action(
         session.title.clone()
     };
     let coder_entries = st.coder_entries();
-    st.confirm_button = crate::app::ConfirmDialogButton::Cancel;
+    st.modals.confirm_button = crate::app::ConfirmDialogButton::Cancel;
 
     let target = match kind {
         ReviewGroupKind::Architectural => {
@@ -714,7 +725,7 @@ fn execute_review_group_action(
             coder_entries,
         ),
     };
-    st.confirm_execute_review = Some(target);
+    st.modals.confirm_execute_review = Some(target);
 }
 
 /// Arms the batch confirmation for every actionable finding across all sessions.
@@ -777,8 +788,8 @@ pub(crate) fn execute_all_reviews_action(st: &mut AppState) {
     }
 
     let coder_entries = st.coder_entries();
-    st.confirm_button = crate::app::ConfirmDialogButton::Cancel;
-    st.confirm_execute_review = Some(crate::app::ConfirmExecuteReviewState::new(
+    st.modals.confirm_button = crate::app::ConfirmDialogButton::Cancel;
+    st.modals.confirm_execute_review = Some(crate::app::ConfirmExecuteReviewState::new(
         None,
         active_t("review.all_sessions_title"),
         queue_scope_title(group_plans),
@@ -840,8 +851,8 @@ fn execute_review_group_step_action(
         .replacen("{}", &group_title, 1);
 
     let coder_entries = st.coder_entries();
-    st.confirm_button = crate::app::ConfirmDialogButton::Cancel;
-    st.confirm_execute_review = Some(
+    st.modals.confirm_button = crate::app::ConfirmDialogButton::Cancel;
+    st.modals.confirm_execute_review = Some(
         crate::app::ConfirmExecuteReviewState::new(
             Some(session.id.clone()),
             session_title,
@@ -873,6 +884,29 @@ fn format_item_for_clipboard(issue: &ReviewIssue) -> String {
         text.push_str(issue.description.trim());
     }
     text
+}
+
+/// Commit recorded in a finished row, when the row carries one.
+///
+/// A finding records the commit that resolved it once the change set is
+/// committed, and a plan step records its commit when it is finalized, so any
+/// other row has nothing to audit. The inspect chord reports that instead of
+/// asking the daemon for a hash the row never recorded
+/// (c-tui-diff-inspection).
+fn row_commit(row: &VisibleReviewRow) -> Option<String> {
+    match row {
+        VisibleReviewRow::ReviewItem {
+            status: IssueStatus::Fixed,
+            commit: Some(commit),
+            ..
+        } if !commit.is_empty() => Some(commit.clone()),
+        VisibleReviewRow::SubplanItem {
+            status: PlanItemStatus::Done,
+            commit: Some(commit),
+            ..
+        } if !commit.is_empty() => Some(commit.clone()),
+        _ => None,
+    }
 }
 
 pub async fn handle_review_key(
@@ -1183,13 +1217,14 @@ pub async fn handle_review_key(
                     ..
                 } = &row
                 {
-                    st.prompt_modal = Some(PromptModalState::new(PromptModalTarget::ReviewGroup {
+                    let prompt_target = PromptModalTarget::ReviewGroup {
                         session_id: session_id.clone(),
                         group_id: group_id.clone(),
                         group_title: title.clone(),
                         blocked_reason: blocked_reason.clone(),
                         purpose: GroupDialoguePurpose::Discuss,
-                    }));
+                    };
+                    st.modals.prompt_modal = Some(PromptModalState::new(prompt_target));
                     return Ok(InputResult::Continue);
                 }
 
@@ -1217,11 +1252,12 @@ pub async fn handle_review_key(
                         }
                         _ => Vec::new(),
                     };
-                    st.prompt_modal = Some(PromptModalState::new(PromptModalTarget::Review {
-                        review_id: session.id.clone(),
-                        review_title: session.title.clone(),
-                        focused_items: focused,
-                    }));
+                    st.modals.prompt_modal =
+                        Some(PromptModalState::new(PromptModalTarget::Review {
+                            review_id: session.id.clone(),
+                            review_title: session.title.clone(),
+                            focused_items: focused,
+                        }));
                 }
             }
         }
@@ -1304,13 +1340,14 @@ pub async fn handle_review_key(
                 ..
             }) = sel_row.as_ref()
             {
-                st.prompt_modal = Some(PromptModalState::new(PromptModalTarget::ReviewGroup {
-                    session_id: session_id.clone(),
-                    group_id: group_id.clone(),
-                    group_title: title.clone(),
-                    blocked_reason: blocked_reason.clone(),
-                    purpose: GroupDialoguePurpose::Resolve,
-                }));
+                st.modals.prompt_modal =
+                    Some(PromptModalState::new(PromptModalTarget::ReviewGroup {
+                        session_id: session_id.clone(),
+                        group_id: group_id.clone(),
+                        group_title: title.clone(),
+                        blocked_reason: blocked_reason.clone(),
+                        purpose: GroupDialoguePurpose::Resolve,
+                    }));
                 return Ok(InputResult::Continue);
             }
             if let Some(VisibleReviewRow::ReviewItem {
@@ -1331,7 +1368,7 @@ pub async fn handle_review_key(
                     IssueStatus::Skipped => 4,
                     IssueStatus::Rejected => 5,
                 };
-                st.status_dialog = Some(crate::app::StatusDialogState::new(
+                st.modals.status_dialog = Some(crate::app::StatusDialogState::new(
                     crate::app::StatusDialogTarget::ReviewItem {
                         review_id: Some(session_id),
                         item_id,
@@ -1354,8 +1391,8 @@ pub async fn handle_review_key(
         ReviewAction::DeleteReview => {
             let sel_row = st.review.selected_row();
             if let Some(row) = sel_row {
-                st.confirm_delete_review = Some(row.session_id().to_string());
-                st.confirm_button = crate::app::ConfirmDialogButton::Cancel;
+                st.modals.confirm_delete_review = Some(row.session_id().to_string());
+                st.modals.confirm_button = crate::app::ConfirmDialogButton::Cancel;
             }
         }
         ReviewAction::Copy => {
@@ -1456,6 +1493,25 @@ pub async fn handle_review_key(
                 }
             }
         }
+        // Only a committed change set owns a diff to audit: a finding records
+        // its commit once it is FIXED and a plan step records it once it is
+        // DONE, so every other row reports that instead of asking the daemon
+        // for a missing hash (c-tui-diff-inspection).
+        ReviewAction::InspectDiff => {
+            let sel_row = st.review.selected_row();
+            let commit = sel_row.as_ref().and_then(row_commit);
+            let Some(commit) = commit else {
+                st.notify_info(active_t("notify.review_step_no_commit"));
+                return Ok(InputResult::Continue);
+            };
+            drop(st);
+            send_request(
+                server_writer,
+                methods::GIT_GET_DIFF,
+                serde_json::json!({ "commit": commit }),
+            )
+            .await?;
+        }
         ReviewAction::RunReview => {
             if st.model.is_busy() {
                 st.review.error = Some(active_t("notify.review_cannot_start_busy"));
@@ -1505,7 +1561,7 @@ pub async fn handle_review_key(
                 if dialog.selector.len() > 1 {
                     dialog.focus = crate::app::ReviewDialogFocus::ModelList;
                 }
-                st.review_dialog = Some(dialog);
+                st.modals.review_dialog = Some(dialog);
             }
         }
         // Launch the Architect post-analysis over the session the cursor rests
@@ -1529,8 +1585,8 @@ pub async fn handle_review_key(
                             .filter(|title| !title.is_empty())
                             .map(str::to_string)
                             .unwrap_or_else(|| review_id.clone());
-                        st.confirm_button = crate::app::ConfirmDialogButton::Cancel;
-                        st.confirm_review_analyze = Some(ConfirmReviewAnalyzeState::new(
+                        st.modals.confirm_button = crate::app::ConfirmDialogButton::Cancel;
+                        st.modals.confirm_review_analyze = Some(ConfirmReviewAnalyzeState::new(
                             review_id,
                             review_title,
                             crate::views::plans::architect_entries(&st),
@@ -1621,7 +1677,11 @@ mod tests {
         assert_eq!(res, InputResult::Continue);
 
         let st = state.lock().await;
-        let dialog = st.review_dialog.as_ref().expect("dialog should be opened");
+        let dialog = st
+            .modals
+            .review_dialog
+            .as_ref()
+            .expect("dialog should be opened");
         assert_eq!(dialog.selector.role(), ModelRole::Reviewer);
         let selected = dialog.selected_entry().expect("entry must exist");
         assert_eq!(selected.model, rev_model);
@@ -1638,7 +1698,7 @@ mod tests {
         let mut st = crate::app::test_state();
         st.model.status = crate::views::repl::TurnStatus::Idle;
         // Start on the destructive button to prove the action resets the focus.
-        st.confirm_button = crate::app::ConfirmDialogButton::Confirm;
+        st.modals.confirm_button = crate::app::ConfirmDialogButton::Confirm;
 
         let session = ReviewSession {
             id: "rev-1".to_string(),
@@ -1675,11 +1735,12 @@ mod tests {
         execute_review_finding_action(&mut st, "rev-1", 1);
 
         assert_eq!(
-            st.confirm_button,
+            st.modals.confirm_button,
             crate::app::ConfirmDialogButton::Cancel,
             "the confirmation must default to safe cancellation"
         );
         let target = st
+            .modals
             .confirm_execute_review
             .as_ref()
             .expect("confirmation state should be armed");
@@ -1749,7 +1810,7 @@ mod tests {
         execute_all_reviews_action(&mut st);
 
         assert!(
-            st.confirm_execute_review.is_none(),
+            st.modals.confirm_execute_review.is_none(),
             "dialog must not open when all findings are in DISCUSSION"
         );
         let notif = st
@@ -1866,6 +1927,7 @@ mod tests {
         execute_all_reviews_action(&mut st);
 
         let target = st
+            .modals
             .confirm_execute_review
             .as_ref()
             .expect("modal confirmation must be armed");
@@ -1874,7 +1936,10 @@ mod tests {
             "cross-session execution must have review_id: None"
         );
         assert_eq!(target.review_title, "All Review Sessions");
-        assert_eq!(st.confirm_button, crate::app::ConfirmDialogButton::Cancel);
+        assert_eq!(
+            st.modals.confirm_button,
+            crate::app::ConfirmDialogButton::Cancel
+        );
         assert_eq!(
             target.items.len(),
             2,
@@ -1922,7 +1987,7 @@ mod tests {
 
         execute_all_reviews_action(&mut st);
 
-        assert!(st.confirm_execute_review.is_none());
+        assert!(st.modals.confirm_execute_review.is_none());
         let notif = st
             .active_notification()
             .expect("notification should be set");
@@ -1942,6 +2007,7 @@ mod tests {
         execute_all_reviews_action(&mut st);
 
         let target = st
+            .modals
             .confirm_execute_review
             .as_ref()
             .expect("modal confirmation must be armed");
@@ -1953,7 +2019,10 @@ mod tests {
         assert_eq!(target.items[0].title, "Todo Finding");
         assert_eq!(target.items[1].title, "Todo Finding");
         assert_eq!(target.review_id, None);
-        assert_eq!(st.confirm_button, crate::app::ConfirmDialogButton::Cancel);
+        assert_eq!(
+            st.modals.confirm_button,
+            crate::app::ConfirmDialogButton::Cancel
+        );
     }
 
     #[tokio::test]
@@ -2026,7 +2095,11 @@ mod tests {
         assert_eq!(res, InputResult::Continue);
 
         let st = state.lock().await;
-        let target = st.confirm_execute_review.as_ref().expect("modal must open");
+        let target = st
+            .modals
+            .confirm_execute_review
+            .as_ref()
+            .expect("modal must open");
         assert_eq!(target.review_id, None);
         assert_eq!(target.items.len(), 1);
     }
@@ -2095,6 +2168,7 @@ mod tests {
 
         let st = state.lock().await;
         let target = st
+            .modals
             .confirm_review_analyze
             .as_ref()
             .expect("the confirmation must be armed");
@@ -2107,7 +2181,10 @@ mod tests {
         assert_eq!(target.selector.len(), expected.len());
         assert_eq!(target.selected_entry(), expected.first());
         assert_eq!(target.focus, crate::app::ReviewAnalyzeFocus::ModelList);
-        assert_eq!(st.confirm_button, crate::app::ConfirmDialogButton::Cancel);
+        assert_eq!(
+            st.modals.confirm_button,
+            crate::app::ConfirmDialogButton::Cancel
+        );
         assert!(
             !st.review.analyzing,
             "the classification starts only after the confirmation"
@@ -2298,6 +2375,7 @@ mod tests {
 
         let guard = state.lock().await;
         let target = guard
+            .modals
             .confirm_execute_review
             .as_ref()
             .expect("the group plan confirmation must be armed");
@@ -2320,7 +2398,7 @@ mod tests {
             "the group findings travel with its plan"
         );
         assert_eq!(
-            guard.confirm_button,
+            guard.modals.confirm_button,
             crate::app::ConfirmDialogButton::Cancel
         );
         assert!(
@@ -2344,6 +2422,7 @@ mod tests {
 
         let guard = state.lock().await;
         let target = guard
+            .modals
             .confirm_execute_review
             .as_ref()
             .expect("the group plan confirmation must be armed");
@@ -2380,6 +2459,7 @@ mod tests {
 
         let guard = state.lock().await;
         let target = guard
+            .modals
             .confirm_execute_review
             .as_ref()
             .expect("the per-finding queue must be armed");
@@ -2413,6 +2493,7 @@ mod tests {
 
         let guard = state.lock().await;
         let target = guard
+            .modals
             .confirm_execute_review
             .as_ref()
             .expect("the step confirmation must be armed");
@@ -2425,7 +2506,7 @@ mod tests {
         );
         assert_eq!(target.items.len(), 1);
         assert_eq!(
-            guard.confirm_button,
+            guard.modals.confirm_button,
             crate::app::ConfirmDialogButton::Cancel
         );
     }
@@ -2447,6 +2528,7 @@ mod tests {
 
         let guard = state.lock().await;
         let target = guard
+            .modals
             .confirm_execute_review
             .as_ref()
             .expect("the group plan confirmation must be armed");
@@ -2459,7 +2541,7 @@ mod tests {
             "Root-cause plan of group 'Shared cause' (2 plan step(s))"
         );
         assert_eq!(
-            guard.confirm_button,
+            guard.modals.confirm_button,
             crate::app::ConfirmDialogButton::Cancel
         );
     }
@@ -2544,7 +2626,7 @@ mod tests {
         press_review_key(&state, &mut conn, KeyCode::Char('x')).await;
 
         let guard = state.lock().await;
-        assert!(guard.confirm_execute_review.is_none());
+        assert!(guard.modals.confirm_execute_review.is_none());
         assert!(conn.written().is_empty());
         assert_eq!(
             guard.active_notification().map(|n| n.text.as_str()),
@@ -2573,6 +2655,7 @@ mod tests {
 
         let guard = state.lock().await;
         let target = guard
+            .modals
             .confirm_execute_review
             .as_ref()
             .expect("the cross-session queue must be armed");
@@ -2600,6 +2683,7 @@ mod tests {
 
         let guard = state.lock().await;
         let target = guard
+            .modals
             .confirm_execute_review
             .as_ref()
             .expect("the session queue must be armed");
@@ -2639,7 +2723,7 @@ mod tests {
 
         {
             let mut guard = state.lock().await;
-            guard.confirm_button = crate::app::ConfirmDialogButton::Confirm;
+            guard.modals.confirm_button = crate::app::ConfirmDialogButton::Confirm;
         }
         crate::dialogs::input::handle_dialog_event(
             KeyEvent::new(KeyCode::Enter, crossterm::event::KeyModifiers::NONE),
@@ -2728,6 +2812,7 @@ mod tests {
         let guard = state.lock().await;
         assert_eq!(
             guard
+                .modals
                 .confirm_execute_review
                 .as_ref()
                 .and_then(|target| target.group_id.as_deref()),
@@ -2773,6 +2858,7 @@ mod tests {
         {
             let guard = state.lock().await;
             let target = guard
+                .modals
                 .confirm_execute_review
                 .as_ref()
                 .expect("the execution confirmation must be armed");
@@ -2790,6 +2876,98 @@ mod tests {
         assert!(
             !conn.written().is_empty(),
             "the refresh chord must reach the daemon"
+        );
+    }
+
+    /// A session whose single finding was resolved by a committed change set,
+    /// so the inspect chord can read the hash it recorded
+    /// (c-tui-diff-inspection).
+    fn committed_finding_session(id: &str, commit: &str) -> tauqe_protocol::ReviewSession {
+        let mut session = todo_session(id, 1);
+        session.items[0].status = IssueStatus::Fixed;
+        session.items[0].commit = Some(commit.to_string());
+        session
+    }
+
+    /// A root-cause plan whose single step finished and recorded a commit, so
+    /// the inspect chord reaches a step row instead of a finding
+    /// (c-tui-diff-inspection).
+    fn committed_root_cause_plan(commit: &str) -> Vec<tauqe_protocol::PlanItem> {
+        vec![tauqe_protocol::PlanItem {
+            status: tauqe_protocol::PlanItemStatus::Done,
+            commit: Some(commit.to_string()),
+            ..plan_step("1", "Finished step")
+        }]
+    }
+
+    /// `v` on a FIXED finding asks the daemon for the diff of the commit that
+    /// resolved it, exactly as `v` does on a finished plan step in the Plans
+    /// view; the inspector itself is opened by the daemon response
+    /// (c-tui-diff-inspection).
+    #[tokio::test]
+    async fn test_v_requests_the_diff_of_the_fixed_finding_commit() {
+        let mut st = crate::app::test_state();
+        st.view_mode = ViewMode::Review;
+        st.review.sessions = vec![committed_finding_session("rev-fixed", "0123456789abcdef")];
+        // Row 0 is the session header, row 1 the group header, row 2 the finding.
+        st.review.selected_index = 2;
+
+        let state = Arc::new(Mutex::new(st));
+        let mut conn = RpcConnection::new(Vec::<u8>::new());
+        press_review_key(&state, &mut conn, KeyCode::Char('v')).await;
+
+        let payload = String::from_utf8(conn.written().to_vec()).expect("utf-8 payload");
+        assert!(payload.contains("git/getDiff"), "{payload}");
+        assert!(payload.contains("0123456789abcdef"), "{payload}");
+        assert!(
+            state.lock().await.modals.diff_inspector.is_none(),
+            "the confirmation dialog launches nothing"
+        );
+    }
+
+    /// `v` on a DONE step of a group plan asks for the diff of the commit the
+    /// step recorded (c-tui-diff-inspection).
+    #[tokio::test]
+    async fn test_v_requests_the_diff_of_the_finished_plan_step_commit() {
+        let mut st = crate::app::test_state();
+        st.view_mode = ViewMode::Review;
+        st.review.sessions = vec![architectural_session(
+            "rev-arch",
+            committed_root_cause_plan("feedfacec0ffee42"),
+        )];
+        // Row 3 is the finished step: the session header, the group header, and
+        // the plan branch precede it.
+        st.review.selected_index = 3;
+
+        let state = Arc::new(Mutex::new(st));
+        let mut conn = RpcConnection::new(Vec::<u8>::new());
+        press_review_key(&state, &mut conn, KeyCode::Char('v')).await;
+
+        let payload = String::from_utf8(conn.written().to_vec()).expect("utf-8 payload");
+        assert!(payload.contains("git/getDiff"), "{payload}");
+        assert!(payload.contains("feedfacec0ffee42"), "{payload}");
+    }
+
+    /// A row that recorded no commit has nothing to audit: the chord reports
+    /// that instead of asking the daemon for a missing hash
+    /// (c-tui-diff-inspection).
+    #[tokio::test]
+    async fn test_v_without_a_recorded_commit_notifies_and_sends_nothing() {
+        let mut st = crate::app::test_state();
+        st.view_mode = ViewMode::Review;
+        st.review.sessions = vec![todo_session("rev-todo", 1)];
+        // Row 2 is the finding, whose change set is not committed yet.
+        st.review.selected_index = 2;
+
+        let state = Arc::new(Mutex::new(st));
+        let mut conn = RpcConnection::new(Vec::<u8>::new());
+        press_review_key(&state, &mut conn, KeyCode::Char('v')).await;
+
+        assert!(conn.written().is_empty());
+        let guard = state.lock().await;
+        assert_eq!(
+            guard.active_notification().map(|n| n.text.as_str()),
+            Some("The selected finding or plan step has no recorded commit to inspect")
         );
     }
 

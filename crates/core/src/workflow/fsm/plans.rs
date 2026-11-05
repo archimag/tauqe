@@ -188,7 +188,10 @@ mod tests {
         let stored = PlanStorage::load_plan(&root, "warning-plan")
             .expect("load the plan")
             .expect("the qualified payload must be stored");
-        assert_eq!(stored.find_item("1").unwrap().status, PlanItemStatus::Todo);
+        assert_eq!(
+            stored.implementation.find_item("1").unwrap().status,
+            PlanItemStatus::Todo
+        );
     }
 
     /// An `update` payload reports the repair without claiming a save.

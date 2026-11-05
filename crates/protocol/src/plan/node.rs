@@ -1,6 +1,5 @@
 use std::collections::HashSet;
 use std::fmt;
-use std::ops::{Deref, DerefMut};
 
 use serde::{Deserialize, Serialize};
 
@@ -165,13 +164,13 @@ impl Plan {
             updated_at: self.updated_at,
             total_items: stats.total,
             completed_items: stats.completed,
-            status: self.status(),
+            status: self.implementation.status(),
         }
     }
 
     /// Counts executable, non-cancelled leaf items and how many are `Done`.
     pub fn stats(&self) -> PlanStats {
-        let (total, completed) = self.count_stats();
+        let (total, completed) = self.implementation.count_stats();
         PlanStats { total, completed }
     }
 
@@ -264,26 +263,5 @@ impl Plan {
         } else {
             Err(errors)
         }
-    }
-}
-
-/// The document header dereferences to the horizon it owns.
-///
-/// The implementation is a distinct section of the wire form rather than a
-/// flattened set of keys, while call sites address the step graph and its
-/// provenance directly (`plan.items`, `plan.find_item(..)`,
-/// `plan.evaluate_scope(..)`). These two impls keep both shapes available at
-/// once instead of duplicating the graph in the header.
-impl Deref for Plan {
-    type Target = PlanImplementation;
-
-    fn deref(&self) -> &Self::Target {
-        &self.implementation
-    }
-}
-
-impl DerefMut for Plan {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.implementation
     }
 }
